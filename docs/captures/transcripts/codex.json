@@ -1,0 +1,2622 @@
+{
+  "provider": "openai",
+  "cli": "codex exec v0.118.0",
+  "model_primary": "gpt-5.3-codex",
+  "prompt_text": "Create a minimal snake game in Rust using the `crossterm` crate. Use `cargo init` in the current directory, add crossterm as a dependency, implement the game in a single `src/main.rs` (arrow-key movement, growing snake, game-over on wall or self collision, score display in the corner). Verify it compiles with `cargo check`. Keep it simple \u2014 one file, one dependency.",
+  "system_prompt": "You are Codex, a coding agent based on GPT-5. You and the user share the same workspace and collaborate to achieve the user's goals.\n\n# Personality\n\nYou are a deeply pragmatic, effective software engineer. You take engineering quality seriously, and collaboration comes through as direct, factual statements. You communicate efficiently, keeping the user clearly informed about ongoing actions without unnecessary detail.\n\n## Values\nYou are guided by these core values:\n- Clarity: You communicate reasoning explicitly and concretely, so decisions and tradeoffs are easy to evaluate upfront.\n- Pragmatism: You keep the end goal and momentum in mind, focusing on what will actually work and move things forward to achieve the user's goal.\n- Rigor: You expect technical arguments to be coherent and defensible, and you surface gaps or weak assumptions politely with emphasis on creating clarity and moving the task forward.\n\n## Interaction Style\nYou communicate concisely and respectfully, focusing on the task at hand. You always prioritize actionable guidance, clearly stating assumptions, environment prerequisites, and next steps. Unless explicitly asked, you avoid excessively verbose explanations about your work.\n\nYou avoid cheerleading, motivational language, or artificial reassurance, or any kind of fluff. You don't comment on user requests, positively or negatively, unless there is reason for escalation. You don't feel like you need to fill the space with words, you stay concise and communicate what is necessary for user collaboration - not more, not less.\n\n## Escalation\nYou may challenge the user to raise their technical bar, but you never patronize or dismiss their concerns. When presenting an alternative approach or solution to the user, you explain the reasoning behind the approach, so your thoughts are demonstrably correct. You maintain a pragmatic mindset when discussing these tradeoffs, and so are willing to work with the user after concerns have been noted.\n\n\n# General\n\n- When searching for text or files, prefer using `rg` or `rg --files` respectively because `rg` is much faster than alternatives like `grep`. (If the `rg` command is not found, then use alternatives.)\n- Parallelize tool calls whenever possible - especially file reads, such as `cat`, `rg`, `sed`, `ls`, `git show`, `nl`, `wc`. Use `multi_tool_use.parallel` to parallelize tool calls and only this.\n\n## Editing constraints\n\n- Default to ASCII when editing or creating files. Only introduce non-ASCII or other Unicode characters when there is a clear justification and the file already uses them.\n- Add succinct code comments that explain what is going on if code is not self-explanatory. You should not add comments like \"Assigns the value to the variable\", but a brief comment might be useful ahead of a complex code block that the user would otherwise have to spend time parsing out. Usage of these comments should be rare.\n- Try to use apply_patch for single file edits, but it is fine to explore other options to make the edit if it does not work well. Do not use apply_patch for changes that are auto-generated (i.e. generating package.json or running a lint or format command like gofmt) or when scripting is more efficient (such as search and replacing a string across a codebase).\n- Do not use Python to read/write files when a simple shell command or apply_patch would suffice.\n- You may be in a dirty git worktree.\n    * NEVER revert existing changes you did not make unless explicitly requested, since these changes were made by the user.\n    * If asked to make a commit or code edits and there are unrelated changes to your work or changes that you didn't make in those files, don't revert those changes.\n    * If the changes are in files you've touched recently, you should read carefully and understand how you can work with the changes rather than reverting them.\n    * If the changes are in unrelated files, just ignore them and don't revert them.\n- Do not amend a commit unless explicitly requested to do so.\n- While you are working, you might notice unexpected changes that you didn't make. If this happens, STOP IMMEDIATELY and ask the user how they would like to proceed.\n- **NEVER** use destructive commands like `git reset --hard` or `git checkout --` unless specifically requested or approved by the user.\n- You struggle using the git interactive console. **ALWAYS** prefer using non-interactive git commands.\n\n## Special user requests\n\n- If the user makes a simple request (such as asking for the time) which you can fulfill by running a terminal command (such as `date`), you should do so.\n- If the user asks for a \"review\", default to a code review mindset: prioritise identifying bugs, risks, behavioural regressions, and missing tests. Findings must be the primary focus of the response - keep summaries or overviews brief and only after enumerating the issues. Present findings first (ordered by severity with file/line references), follow with open questions or assumptions, and offer a change-summary only as a secondary detail. If no findings are discovered, state that explicitly and mention any residual risks or testing gaps.\n\n## Frontend tasks\n\nWhen doing frontend design tasks, avoid collapsing into \"AI slop\" or safe, average-looking layouts.\nAim for interfaces that feel intentional, bold, and a bit surprising.\n- Typography: Use expressive, purposeful fonts and avoid default stacks (Inter, Roboto, Arial, system).\n- Color & Look: Choose a clear visual direction; define CSS variables; avoid purple-on-white defaults. No purple bias or dark mode bias.\n- Motion: Use a few meaningful animations (page-load, staggered reveals) instead of generic micro-motions.\n- Background: Don't rely on flat, single-color backgrounds; use gradients, shapes, or subtle patterns to build atmosphere.\n- Overall: Avoid boilerplate layouts and interchangeable UI patterns. Vary themes, type families, and visual languages across outputs.\n- Ensure the page loads properly on both desktop and mobile\n\nException: If working within an existing website or design system, preserve the established patterns, structure, and visual language.\n\n# Working with the user\n\nYou interact with the user through a terminal. You have 2 ways of communicating with the users:\n- Share intermediary updates in `commentary` channel. \n- After you have completed all your work, send a message to the `final` channel.\nYou are producing plain text that will later be styled by the program you run in. Formatting should make results easy to scan, but not feel mechanical. Use judgment to decide how much structure adds value. Follow the formatting rules exactly.\n\n## Autonomy and persistence\nPersist until the task is fully handled end-to-end within the current turn whenever feasible: do not stop at analysis or partial fixes; carry changes through implementation, verification, and a clear explanation of outcomes unless the user explicitly pauses or redirects you.\n\nUnless the user explicitly asks for a plan, asks a question about the code, is brainstorming potential solutions, or some other intent that makes it clear that code should not be written, assume the user wants you to make code changes or run tools to solve the user's problem. In these cases, it's bad to output your proposed solution in a message, you should go ahead and actually implement the change. If you encounter challenges or blockers, you should attempt to resolve them yourself.\n\n## Formatting rules\n\n- You may format with GitHub-flavored Markdown.\n- Structure your answer if necessary, the complexity of the answer should match the task. If the task is simple, your answer should be a one-liner. Order sections from general to specific to supporting.\n- Never use nested bullets. Keep lists flat (single level). If you need hierarchy, split into separate lists or sections or if you use : just include the line you might usually render using a nested bullet immediately after it. For numbered lists, only use the `1. 2. 3.` style markers (with a period), never `1)`.\n- Headers are optional, only use them when you think they are necessary. If you do use them, use short Title Case (1-3 words) wrapped in **\u2026**. Don't add a blank line.\n- Use monospace commands/paths/env vars/code ids, inline examples, and literal keyword bullets by wrapping them in backticks.\n- Code samples or multi-line snippets should be wrapped in fenced code blocks. Include an info string as often as possible.\n- File References: When referencing files in your response follow the below rules:\n  * Use markdown links (not inline code) for clickable files.\n  * Each file reference should have a stand-alone path; use inline code for non-clickable paths (for example, directories).\n  * For clickable/openable file references, the path target must be an absolute filesystem path. Labels may be short (for example, `[app.ts](/abs/path/app.ts)`).\n  * Optionally include line/column (1\u2011based): :line[:column] or #Lline[Ccolumn] (column defaults to 1).\n  * Do not use URIs like file://, vscode://, or https://.\n  * Do not provide range of lines\n  * Examples: src/app.ts, src/app.ts:42, b/server/index.js#L10, C:\\repo\\project\\main.rs:12:5\n- Don\u2019t use emojis or em dashes unless explicitly instructed.\n\n## Final answer instructions\n\n- Balance conciseness to not overwhelm the user with appropriate detail for the request. Do not narrate abstractly; explain what you are doing and why.\n- Do not begin responses with conversational interjections or meta commentary. Avoid openers such as acknowledgements (\u201cDone \u2014\u201d, \u201cGot it\u201d, \u201cGreat question, \u201d) or framing phrases.\n- The user does not see command execution outputs. When asked to show the output of a command (e.g. `git show`), relay the important details in your answer or summarize the key lines so the user understands the result.\n- Never tell the user to \"save/copy this file\", the user is on the same machine and has access to the same files as you have.\n- If the user asks for a code explanation, structure your answer with code references.\n- When given a simple task, just provide the outcome in a short answer without strong formatting.\n- When you make big or complex changes, state the solution first, then walk the user through what you did and why.\n- For casual chit-chat, just chat.\n- If you weren't able to do something, for example run tests, tell the user.\n- If there are natural next steps the user may want to take, suggest them at the end of your response. Do not make suggestions if there are no natural next steps. When suggesting multiple options, use numeric lists for the suggestions so the user can quickly respond with a single number.\n\n## Intermediary updates \n\n- Intermediary updates go to the `commentary` channel.\n- User updates are short updates while you are working, they are NOT final answers.\n- You use 1-2 sentence user updates to communicated progress and new information to the user as you are doing work. \n- Do not begin responses with conversational interjections or meta commentary. Avoid openers such as acknowledgements (\u201cDone \u2014\u201d, \u201cGot it\u201d, \u201cGreat question, \u201d) or framing phrases.\n- You provide user updates frequently, every 20s.\n- Before exploring or doing substantial work, you start with a user update acknowledging the request and explaining your first step. You should include your understanding of the user request and explain what you will do. Avoid commenting on the request or using starters such at \"Got it -\" or \"Understood -\" etc.\n- When exploring, e.g. searching, reading files you provide user updates as you go, every 20s, explaining what context you are gathering and what you've learned. Vary your sentence structure when providing these updates to avoid sounding repetitive - in particular, don't start each sentence the same way.\n- After you have sufficient context, and the work is substantial you provide a longer plan (this is the only user update that may be longer than 2 sentences and can contain formatting).\n- Before performing file edits of any kind, you provide updates explaining what edits you are making.\n- As you are thinking, you very frequently provide updates even if not taking any actions, informing the user of your progress. You interrupt your thinking and send multiple updates in a row if thinking for more than 100 words.\n- Tone of your updates MUST match your personality.\n",
+  "tools": [
+    {
+      "type": "function",
+      "name": "exec_command",
+      "description": "Runs a command in a PTY, returning output or a session ID for ongoing interaction.",
+      "strict": false,
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "cmd": {
+            "type": "string",
+            "description": "Shell command to execute."
+          },
+          "justification": {
+            "type": "string",
+            "description": "Only set if sandbox_permissions is \\\"require_escalated\\\".\n                    Request approval from the user to run this command outside the sandbox.\n                    Phrased as a simple question that summarizes the purpose of the\n                    command as it relates to the task at hand - e.g. 'Do you want to\n                    fetch and pull the latest version of this git branch?'"
+          },
+          "login": {
+            "type": "boolean",
+            "description": "Whether to run the shell with -l/-i semantics. Defaults to true."
+          },
+          "max_output_tokens": {
+            "type": "number",
+            "description": "Maximum number of tokens to return. Excess output will be truncated."
+          },
+          "prefix_rule": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Only specify when sandbox_permissions is `require_escalated`.\n                        Suggest a prefix command pattern that will allow you to fulfill similar requests from the user in the future.\n                        Should be a short but reasonable prefix, e.g. [\\\"git\\\", \\\"pull\\\"] or [\\\"uv\\\", \\\"run\\\"] or [\\\"pytest\\\"]."
+          },
+          "sandbox_permissions": {
+            "type": "string",
+            "description": "Sandbox permissions for the command. Set to \"require_escalated\" to request running without sandbox restrictions; defaults to \"use_default\"."
+          },
+          "shell": {
+            "type": "string",
+            "description": "Shell binary to launch. Defaults to the user's default shell."
+          },
+          "tty": {
+            "type": "boolean",
+            "description": "Whether to allocate a TTY for the command. Defaults to false (plain pipes); set to true to open a PTY and access TTY process."
+          },
+          "workdir": {
+            "type": "string",
+            "description": "Optional working directory to run the command in; defaults to the turn cwd."
+          },
+          "yield_time_ms": {
+            "type": "number",
+            "description": "How long to wait (in milliseconds) for output before yielding."
+          }
+        },
+        "required": [
+          "cmd"
+        ],
+        "additionalProperties": false
+      }
+    },
+    {
+      "type": "function",
+      "name": "write_stdin",
+      "description": "Writes characters to an existing unified exec session and returns recent output.",
+      "strict": false,
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "chars": {
+            "type": "string",
+            "description": "Bytes to write to stdin (may be empty to poll)."
+          },
+          "max_output_tokens": {
+            "type": "number",
+            "description": "Maximum number of tokens to return. Excess output will be truncated."
+          },
+          "session_id": {
+            "type": "number",
+            "description": "Identifier of the running unified exec session."
+          },
+          "yield_time_ms": {
+            "type": "number",
+            "description": "How long to wait (in milliseconds) for output before yielding."
+          }
+        },
+        "required": [
+          "session_id"
+        ],
+        "additionalProperties": false
+      }
+    },
+    {
+      "type": "function",
+      "name": "list_mcp_resources",
+      "description": "Lists resources provided by MCP servers. Resources allow servers to share data that provides context to language models, such as files, database schemas, or application-specific information. Prefer resources over web search when possible.",
+      "strict": false,
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "cursor": {
+            "type": "string",
+            "description": "Opaque cursor returned by a previous list_mcp_resources call for the same server."
+          },
+          "server": {
+            "type": "string",
+            "description": "Optional MCP server name. When omitted, lists resources from every configured server."
+          }
+        },
+        "additionalProperties": false
+      }
+    },
+    {
+      "type": "function",
+      "name": "list_mcp_resource_templates",
+      "description": "Lists resource templates provided by MCP servers. Parameterized resource templates allow servers to share data that takes parameters and provides context to language models, such as files, database schemas, or application-specific information. Prefer resource templates over web search when possible.",
+      "strict": false,
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "cursor": {
+            "type": "string",
+            "description": "Opaque cursor returned by a previous list_mcp_resource_templates call for the same server."
+          },
+          "server": {
+            "type": "string",
+            "description": "Optional MCP server name. When omitted, lists resource templates from all configured servers."
+          }
+        },
+        "additionalProperties": false
+      }
+    },
+    {
+      "type": "function",
+      "name": "read_mcp_resource",
+      "description": "Read a specific resource from an MCP server given the server name and resource URI.",
+      "strict": false,
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "server": {
+            "type": "string",
+            "description": "MCP server name exactly as configured. Must match the 'server' field returned by list_mcp_resources."
+          },
+          "uri": {
+            "type": "string",
+            "description": "Resource URI to read. Must be one of the URIs returned by list_mcp_resources."
+          }
+        },
+        "required": [
+          "server",
+          "uri"
+        ],
+        "additionalProperties": false
+      }
+    },
+    {
+      "type": "function",
+      "name": "update_plan",
+      "description": "Updates the task plan.\nProvide an optional explanation and a list of plan items, each with a step and status.\nAt most one step can be in_progress at a time.\n",
+      "strict": false,
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "explanation": {
+            "type": "string"
+          },
+          "plan": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "status": {
+                  "type": "string",
+                  "description": "One of: pending, in_progress, completed"
+                },
+                "step": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "step",
+                "status"
+              ],
+              "additionalProperties": false
+            },
+            "description": "The list of steps"
+          }
+        },
+        "required": [
+          "plan"
+        ],
+        "additionalProperties": false
+      }
+    },
+    {
+      "type": "function",
+      "name": "request_user_input",
+      "description": "Request user input for one to three short questions and wait for the response. This tool is only available in Plan mode.",
+      "strict": false,
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "questions": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "header": {
+                  "type": "string",
+                  "description": "Short header label shown in the UI (12 or fewer chars)."
+                },
+                "id": {
+                  "type": "string",
+                  "description": "Stable identifier for mapping answers (snake_case)."
+                },
+                "options": {
+                  "type": "array",
+                  "items": {
+                    "type": "object",
+                    "properties": {
+                      "description": {
+                        "type": "string",
+                        "description": "One short sentence explaining impact/tradeoff if selected."
+                      },
+                      "label": {
+                        "type": "string",
+                        "description": "User-facing label (1-5 words)."
+                      }
+                    },
+                    "required": [
+                      "label",
+                      "description"
+                    ],
+                    "additionalProperties": false
+                  },
+                  "description": "Provide 2-3 mutually exclusive choices. Put the recommended option first and suffix its label with \"(Recommended)\". Do not include an \"Other\" option in this list; the client will add a free-form \"Other\" option automatically."
+                },
+                "question": {
+                  "type": "string",
+                  "description": "Single-sentence prompt shown to the user."
+                }
+              },
+              "required": [
+                "id",
+                "header",
+                "question",
+                "options"
+              ],
+              "additionalProperties": false
+            },
+            "description": "Questions to show the user. Prefer 1 and do not exceed 3"
+          }
+        },
+        "required": [
+          "questions"
+        ],
+        "additionalProperties": false
+      }
+    },
+    {
+      "type": "function",
+      "name": "tool_suggest",
+      "description": "# Tool suggestion discovery\n\nSuggests a missing connector in an installed plugin, or in narrower cases a not installed but discoverable plugin, when the user clearly wants a capability that is not currently available in the active `tools` list.\n\nUse this ONLY when:\n- You've already tried to find a matching available tool for the user's request but couldn't find a good match. This includes `tool_search` (if available) and other means.\n- For connectors/apps that are not installed but needed for an installed plugin, suggest to install them if the task requirements match precisely.\n- For plugins that are not installed but discoverable, only suggest discoverable and installable plugins when the user's intent very explicitly and unambiguously matches that plugin itself. Do not suggest a plugin just because one of its connectors or capabilities seems relevant.\n\nTool suggestions should only use the discoverable tools listed here. DO NOT explore or recommend tools that are not on this list.\n\nDiscoverable tools:\n- figma (id: `figma@openai-curated`, type: plugin, action: install): Figma workflows for design implementation, Code Connect templates, and design system rule generation.\n- gmail (id: `gmail@openai-curated`, type: plugin, action: install): Work with Gmail using the configured Gmail app connector.\n- google-calendar (id: `google-calendar@openai-curated`, type: plugin, action: install): Connect Google Calendar for scheduling, availability, daily briefs, and event management.\n- google-drive (id: `google-drive@openai-curated`, type: plugin, action: install): Use Google Drive as the single entrypoint for Drive, Docs, Sheets, and Slides work.\n- linear (id: `linear@openai-curated`, type: plugin, action: install): Find and reference issues and projects.\n- notion (id: `notion@openai-curated`, type: plugin, action: install): Notion workflows for implementation planning, research synthesis, meeting preparation, and knowledge capture.\n- slack (id: `slack@openai-curated`, type: plugin, action: install): Work with Slack using the configured Slack integration.\n\nWorkflow:\n\n1. Ensure all possible means have been exhausted to find an existing available tool but none of them matches the request intent.\n2. Match the user's request against the discoverable tools list above. Apply the stricter explicit-and-unambiguous rule for *discoverable tools* like plugin install suggestions; *missing tools* like connector install suggestions continue to use the normal clear-fit standard.\n3. If one tool clearly fits, call `tool_suggest` with:\n   - `tool_type`: `connector` or `plugin`\n   - `action_type`: `install` or `enable`\n   - `tool_id`: exact id from the discoverable tools list above\n   - `suggest_reason`: concise one-line user-facing reason this tool can help with the current request\n4. After the suggestion flow completes:\n   - if the user finished the install or enable flow, continue by searching again or using the newly available tool\n   - if the user did not finish, continue without that tool, and don't suggest that tool again unless the user explicitly asks for it.",
+      "strict": false,
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "action_type": {
+            "type": "string",
+            "description": "Suggested action for the tool. Use \"install\" or \"enable\"."
+          },
+          "suggest_reason": {
+            "type": "string",
+            "description": "Concise one-line user-facing reason why this tool can help with the current request."
+          },
+          "tool_id": {
+            "type": "string",
+            "description": "Connector or plugin id to suggest. Must be one of: figma@openai-curated, gmail@openai-curated, google-calendar@openai-curated, google-drive@openai-curated, linear@openai-curated, notion@openai-curated, slack@openai-curated."
+          },
+          "tool_type": {
+            "type": "string",
+            "description": "Type of discoverable tool to suggest. Use \"connector\" or \"plugin\"."
+          }
+        },
+        "required": [
+          "tool_type",
+          "action_type",
+          "tool_id",
+          "suggest_reason"
+        ],
+        "additionalProperties": false
+      }
+    },
+    {
+      "type": "custom",
+      "name": "apply_patch",
+      "description": "Use the `apply_patch` tool to edit files. This is a FREEFORM tool, so do not wrap the patch in JSON.",
+      "format": {
+        "type": "grammar",
+        "syntax": "lark",
+        "definition": "start: begin_patch hunk+ end_patch\nbegin_patch: \"*** Begin Patch\" LF\nend_patch: \"*** End Patch\" LF?\n\nhunk: add_hunk | delete_hunk | update_hunk\nadd_hunk: \"*** Add File: \" filename LF add_line+\ndelete_hunk: \"*** Delete File: \" filename LF\nupdate_hunk: \"*** Update File: \" filename LF change_move? change?\n\nfilename: /(.+)/\nadd_line: \"+\" /(.*)/ LF -> line\n\nchange_move: \"*** Move to: \" filename LF\nchange: (change_context | change_line)+ eof_line?\nchange_context: (\"@@\" | \"@@ \" /(.+)/) LF\nchange_line: (\"+\" | \"-\" | \" \") /(.*)/ LF\neof_line: \"*** End of File\" LF\n\n%import common.LF\n"
+      }
+    },
+    {
+      "type": "web_search",
+      "external_web_access": true
+    },
+    {
+      "type": "function",
+      "name": "view_image",
+      "description": "View a local image from the filesystem (only use if given a full filepath by the user, and the image isn't already attached to the thread context within <image ...> tags).",
+      "strict": false,
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string",
+            "description": "Local filesystem path to an image file"
+          }
+        },
+        "required": [
+          "path"
+        ],
+        "additionalProperties": false
+      }
+    },
+    {
+      "type": "function",
+      "name": "spawn_agent",
+      "description": "\n        Only use `spawn_agent` if and only if the user explicitly asks for sub-agents, delegation, or parallel agent work.\n        Requests for depth, thoroughness, research, investigation, or detailed codebase analysis do not count as permission to spawn.\n        Agent-role guidance below only helps choose which agent to use after spawning is already authorized; it never authorizes spawning by itself.\n        Spawn a sub-agent for a well-scoped task. Returns the spawned agent id plus the user-facing nickname when available. This spawn_agent tool provides you access to smaller but more efficient sub-agents. A mini model can solve many tasks faster than the main model. You should follow the rules and guidelines below to use this tool.\n\n- gpt-5.4 (`gpt-5.4`): Latest frontier agentic coding model. Default reasoning effort: medium. Supported reasoning efforts: low (Fast responses with lighter reasoning), medium (Balances speed and reasoning depth for everyday tasks), high (Greater reasoning depth for complex problems), xhigh (Extra high reasoning depth for complex problems).\n- gpt-5.2-codex (`gpt-5.2-codex`): Frontier agentic coding model. Default reasoning effort: medium. Supported reasoning efforts: low (Fast responses with lighter reasoning), medium (Balances speed and reasoning depth for everyday tasks), high (Greater reasoning depth for complex problems), xhigh (Extra high reasoning depth for complex problems).\n- gpt-5.1-codex-max (`gpt-5.1-codex-max`): Codex-optimized flagship for deep and fast reasoning. Default reasoning effort: medium. Supported reasoning efforts: low (Fast responses with lighter reasoning), medium (Balances speed and reasoning depth for everyday tasks), high (Greater reasoning depth for complex problems), xhigh (Extra high reasoning depth for complex problems).\n- GPT-5.4-Mini (`gpt-5.4-mini`): Smaller frontier agentic coding model. Default reasoning effort: medium. Supported reasoning efforts: low (Fast responses with lighter reasoning), medium (Balances speed and reasoning depth for everyday tasks), high (Greater reasoning depth for complex problems), xhigh (Extra high reasoning depth for complex problems).\n- gpt-5.3-codex (`gpt-5.3-codex`): Frontier Codex-optimized agentic coding model. Default reasoning effort: medium. Supported reasoning efforts: low (Fast responses with lighter reasoning), medium (Balances speed and reasoning depth for everyday tasks), high (Greater reasoning depth for complex problems), xhigh (Extra high reasoning depth for complex problems).\n- GPT-5.3-Codex-Spark (`gpt-5.3-codex-spark`): Ultra-fast coding model. Default reasoning effort: high. Supported reasoning efforts: low (Fast responses with lighter reasoning), medium (Balances speed and reasoning depth for everyday tasks), high (Greater reasoning depth for complex problems), xhigh (Extra high reasoning depth for complex problems).\n- gpt-5.2 (`gpt-5.2`): Optimized for professional work and long-running agents Default reasoning effort: medium. Supported reasoning efforts: low (Balances speed with some reasoning; useful for straightforward queries and short explanations), medium (Provides a solid balance of reasoning depth and latency for general-purpose tasks), high (Maximizes reasoning depth for complex or ambiguous problems), xhigh (Extra high reasoning for complex problems).\n- gpt-5.1-codex-mini (`gpt-5.1-codex-mini`): Optimized for codex. Cheaper, faster, but less capable. Default reasoning effort: medium. Supported reasoning efforts: medium (Dynamically adjusts reasoning based on the task), high (Maximizes reasoning depth for complex or ambiguous problems).\n### When to delegate vs. do the subtask yourself\n- First, quickly analyze the overall user task and form a succinct high-level plan. Identify which tasks are immediate blockers on the critical path, and which tasks are sidecar tasks that are needed but can run in parallel without blocking the next local step. As part of that plan, explicitly decide what immediate task you should do locally right now. Do this planning step before delegating to agents so you do not hand off the immediate blocking task to a submodel and then waste time waiting on it.\n- Use the smaller subagent when a subtask is easy enough for it to handle and can run in parallel with your local work. Prefer delegating concrete, bounded sidecar tasks that materially advance the main task without blocking your immediate next local step.\n- Do not delegate urgent blocking work when your immediate next step depends on that result. If the very next action is blocked on that task, the main rollout should usually do it locally to keep the critical path moving.\n- Keep work local when the subtask is too difficult to delegate well and when it is tightly coupled, urgent, or likely to block your immediate next step.\n\n### Designing delegated subtasks\n- Subtasks must be concrete, well-defined, and self-contained.\n- Delegated subtasks must materially advance the main task.\n- Do not duplicate work between the main rollout and delegated subtasks.\n- Avoid issuing multiple delegate calls on the same unresolved thread unless the new delegated task is genuinely different and necessary.\n- Narrow the delegated ask to the concrete output you need next.\n- For coding tasks, prefer delegating concrete code-change worker subtasks over read-only explorer analysis when the subagent can make a bounded patch in a clear write scope.\n- When delegating coding work, instruct the submodel to edit files directly in its forked workspace and list the file paths it changed in the final answer.\n- For code-edit subtasks, decompose work so each delegated task has a disjoint write set.\n\n### After you delegate\n- Call wait_agent very sparingly. Only call wait_agent when you need the result immediately for the next critical-path step and you are blocked until it returns.\n- Do not redo delegated subagent tasks yourself; focus on integrating results or tackling non-overlapping work.\n- While the subagent is running in the background, do meaningful non-overlapping work immediately.\n- Do not repeatedly wait by reflex.\n- When a delegated coding task returns, quickly review the uploaded changes, then integrate or refine them.\n\n### Parallel delegation patterns\n- Run multiple independent information-seeking subtasks in parallel when you have distinct questions that can be answered independently.\n- Split implementation into disjoint codebase slices and spawn multiple agents for them in parallel when the write scopes do not overlap.\n- Delegate verification only when it can run in parallel with ongoing implementation and is likely to catch a concrete risk before final integration.\n- The key is to find opportunities to spawn multiple independent subtasks in parallel within the same round, while ensuring each subtask is well-defined, self-contained, and materially advances the main task.",
+      "strict": false,
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "agent_type": {
+            "type": "string",
+            "description": "Optional type name for the new agent. If omitted, `default` is used.\nAvailable roles:\ndefault: {\nDefault agent.\n}\nexplorer: {\nUse `explorer` for specific codebase questions.\nExplorers are fast and authoritative.\nThey must be used to ask specific, well-scoped questions on the codebase.\nRules:\n- In order to avoid redundant work, you should avoid exploring the same problem that explorers have already covered. Typically, you should trust the explorer results without additional verification. You are still allowed to inspect the code yourself to gain the needed context!\n- You are encouraged to spawn up multiple explorers in parallel when you have multiple distinct questions to ask about the codebase that can be answered independently. This allows you to get more information faster without waiting for one question to finish before asking the next. While waiting for the explorer results, you can continue working on other local tasks that do not depend on those results. This parallelism is a key advantage of delegation, so use it whenever you have multiple questions to ask.\n- Reuse existing explorers for related questions.\n}\nworker: {\nUse for execution and production work.\nTypical tasks:\n- Implement part of a feature\n- Fix tests or bugs\n- Split large refactors into independent chunks\nRules:\n- Explicitly assign **ownership** of the task (files / responsibility). When the subtask involves code changes, you should clearly specify which files or modules the worker is responsible for. This helps avoid merge conflicts and ensures accountability. For example, you can say \"Worker 1 is responsible for updating the authentication module, while Worker 2 will handle the database layer.\" By defining clear ownership, you can delegate more effectively and reduce coordination overhead.\n- Always tell workers they are **not alone in the codebase**, and they should not revert the edits made by others, and they should adjust their implementation to accommodate the changes made by others. This is important because there may be multiple workers making changes in parallel, and they need to be aware of each other's work to avoid conflicts and ensure a cohesive final product.\n}"
+          },
+          "fork_context": {
+            "type": "boolean",
+            "description": "When true, fork the current thread history into the new agent before sending the initial prompt. This must be used when you want the new agent to have exactly the same context as you."
+          },
+          "items": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "image_url": {
+                  "type": "string",
+                  "description": "Image URL when type is image."
+                },
+                "name": {
+                  "type": "string",
+                  "description": "Display name when type is skill or mention."
+                },
+                "path": {
+                  "type": "string",
+                  "description": "Path when type is local_image/skill, or structured mention target such as app://<connector-id> or plugin://<plugin-name>@<marketplace-name> when type is mention."
+                },
+                "text": {
+                  "type": "string",
+                  "description": "Text content when type is text."
+                },
+                "type": {
+                  "type": "string",
+                  "description": "Input item type: text, image, local_image, skill, or mention."
+                }
+              },
+              "additionalProperties": false
+            },
+            "description": "Structured input items. Use this to pass explicit mentions (for example app:// connector paths)."
+          },
+          "message": {
+            "type": "string",
+            "description": "Initial plain-text task for the new agent. Use either message or items."
+          },
+          "model": {
+            "type": "string",
+            "description": "Optional model override for the new agent. Replaces the inherited model."
+          },
+          "reasoning_effort": {
+            "type": "string",
+            "description": "Optional reasoning effort override for the new agent. Replaces the inherited reasoning effort."
+          }
+        },
+        "additionalProperties": false
+      }
+    },
+    {
+      "type": "function",
+      "name": "send_input",
+      "description": "Send a message to an existing agent. Use interrupt=true to redirect work immediately. You should reuse the agent by send_input if you believe your assigned task is highly dependent on the context of a previous task.",
+      "strict": false,
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "interrupt": {
+            "type": "boolean",
+            "description": "When true, stop the agent's current task and handle this immediately. When false (default), queue this message."
+          },
+          "items": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "image_url": {
+                  "type": "string",
+                  "description": "Image URL when type is image."
+                },
+                "name": {
+                  "type": "string",
+                  "description": "Display name when type is skill or mention."
+                },
+                "path": {
+                  "type": "string",
+                  "description": "Path when type is local_image/skill, or structured mention target such as app://<connector-id> or plugin://<plugin-name>@<marketplace-name> when type is mention."
+                },
+                "text": {
+                  "type": "string",
+                  "description": "Text content when type is text."
+                },
+                "type": {
+                  "type": "string",
+                  "description": "Input item type: text, image, local_image, skill, or mention."
+                }
+              },
+              "additionalProperties": false
+            },
+            "description": "Structured input items. Use this to pass explicit mentions (for example app:// connector paths)."
+          },
+          "message": {
+            "type": "string",
+            "description": "Legacy plain-text message to send to the agent. Use either message or items."
+          },
+          "target": {
+            "type": "string",
+            "description": "Agent id to message (from spawn_agent)."
+          }
+        },
+        "required": [
+          "target"
+        ],
+        "additionalProperties": false
+      }
+    },
+    {
+      "type": "function",
+      "name": "resume_agent",
+      "description": "Resume a previously closed agent by id so it can receive send_input and wait_agent calls.",
+      "strict": false,
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "description": "Agent id to resume."
+          }
+        },
+        "required": [
+          "id"
+        ],
+        "additionalProperties": false
+      }
+    },
+    {
+      "type": "function",
+      "name": "wait_agent",
+      "description": "Wait for agents to reach a final status. Completed statuses may include the agent's final message. Returns empty status when timed out. Once the agent reaches a final status, a notification message will be received containing the same completed status.",
+      "strict": false,
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "targets": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Agent ids to wait on. Pass multiple ids to wait for whichever finishes first."
+          },
+          "timeout_ms": {
+            "type": "number",
+            "description": "Optional timeout in milliseconds. Defaults to 30000, min 10000, max 3600000. Prefer longer waits (minutes) to avoid busy polling."
+          }
+        },
+        "required": [
+          "targets"
+        ],
+        "additionalProperties": false
+      }
+    },
+    {
+      "type": "function",
+      "name": "close_agent",
+      "description": "Close an agent and any open descendants when they are no longer needed, and return the target agent's previous status before shutdown was requested. Don't keep agents open for too long if they are not needed anymore.",
+      "strict": false,
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "target": {
+            "type": "string",
+            "description": "Agent id to close (from spawn_agent)."
+          }
+        },
+        "required": [
+          "target"
+        ],
+        "additionalProperties": false
+      }
+    },
+    {
+      "type": "function",
+      "name": "mcp__codex_apps__github_add_comment_to_issue",
+      "description": "Create a top-level PR Conversation comment (Issue comment). This tool is part of plugin `GitHub`.",
+      "strict": false,
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "comment": {
+            "type": "string",
+            "description": "Top-level comment body to add to the issue thread."
+          },
+          "pr_number": {
+            "type": "number",
+            "description": "Pull request number in the repository."
+          },
+          "repo_full_name": {
+            "type": "string",
+            "description": "Repository in `owner/name` form, such as `openai/openai`."
+          }
+        },
+        "required": [
+          "repo_full_name",
+          "pr_number",
+          "comment"
+        ]
+      }
+    },
+    {
+      "type": "function",
+      "name": "mcp__codex_apps__github_add_reaction_to_issue_comment",
+      "description": "Add a reaction to an issue comment. This tool is part of plugin `GitHub`.",
+      "strict": false,
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "comment_id": {
+            "type": "number",
+            "description": "Numeric issue or review comment ID."
+          },
+          "reaction": {
+            "type": "string",
+            "description": "Reaction identifier such as `+1` or `eyes`."
+          },
+          "repo_full_name": {
+            "type": "string",
+            "description": "Repository in `owner/name` form, such as `openai/openai`."
+          }
+        },
+        "required": [
+          "repo_full_name",
+          "comment_id",
+          "reaction"
+        ]
+      }
+    },
+    {
+      "type": "function",
+      "name": "mcp__codex_apps__github_add_reaction_to_pr",
+      "description": "Add a reaction to a GitHub pull request. This tool is part of plugin `GitHub`.",
+      "strict": false,
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "pr_number": {
+            "type": "number",
+            "description": "Pull request number in the repository."
+          },
+          "reaction": {
+            "type": "string",
+            "description": "Reaction identifier such as `+1` or `eyes`."
+          },
+          "repo_full_name": {
+            "type": "string",
+            "description": "Repository in `owner/name` form, such as `openai/openai`."
+          }
+        },
+        "required": [
+          "repo_full_name",
+          "pr_number",
+          "reaction"
+        ]
+      }
+    },
+    {
+      "type": "function",
+      "name": "mcp__codex_apps__github_add_reaction_to_pr_review_comment",
+      "description": "Add a reaction to a pull request review comment. This tool is part of plugin `GitHub`.",
+      "strict": false,
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "comment_id": {
+            "type": "number",
+            "description": "Numeric issue or review comment ID."
+          },
+          "reaction": {
+            "type": "string",
+            "description": "Reaction identifier such as `+1` or `eyes`."
+          },
+          "repo_full_name": {
+            "type": "string",
+            "description": "Repository in `owner/name` form, such as `openai/openai`."
+          }
+        },
+        "required": [
+          "repo_full_name",
+          "comment_id",
+          "reaction"
+        ]
+      }
+    },
+    {
+      "type": "function",
+      "name": "mcp__codex_apps__github_add_review_to_pr",
+      "description": "Add a review to a GitHub pull request. review is required for REQUEST_CHANGES and COMMENT events. This tool is part of plugin `GitHub`.",
+      "strict": false,
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "action": {
+            "type": "string",
+            "description": "Review action to take. Defaults to `COMMENT` when omitted."
+          },
+          "commit_id": {
+            "type": "string",
+            "description": "Optional commit SHA to anchor the review."
+          },
+          "file_comments": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Optional inline file comments to include with the review."
+          },
+          "pr_number": {
+            "type": "number",
+            "description": "Pull request number in the repository."
+          },
+          "repo_full_name": {
+            "type": "string",
+            "description": "Repository in `owner/name` form, such as `openai/openai`."
+          },
+          "review": {
+            "type": "string",
+            "description": "Review body to submit. Required when requesting changes or leaving a comment."
+          }
+        },
+        "required": [
+          "repo_full_name",
+          "pr_number",
+          "review",
+          "action",
+          "file_comments"
+        ]
+      }
+    },
+    {
+      "type": "function",
+      "name": "mcp__codex_apps__github_check_repo_initialized",
+      "description": "Check if a GitHub repository has been set up. This tool is part of plugin `GitHub`.",
+      "strict": false,
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "repo_id": {
+            "type": "number"
+          }
+        },
+        "required": [
+          "repo_id"
+        ]
+      }
+    },
+    {
+      "type": "function",
+      "name": "mcp__codex_apps__github_compare_commits",
+      "description": "Compare two commits/refs and return per-file stats plus compare metadata. This is a thin wrapper around `GithubPlugin.compare_commits` to provide a stable, compact response shape to connector consumers. This tool is part of plugin `GitHub`.",
+      "strict": false,
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "base": {
+            "type": "string"
+          },
+          "head": {
+            "type": "string"
+          },
+          "repo_full_name": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "repo_full_name",
+          "base",
+          "head"
+        ]
+      }
+    },
+    {
+      "type": "function",
+      "name": "mcp__codex_apps__github_create_blob",
+      "description": "Create a blob in the repository and return its SHA. This tool is part of plugin `GitHub`.",
+      "strict": false,
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "content": {
+            "type": "string",
+            "description": "Blob content to store in the repository."
+          },
+          "encoding": {
+            "type": "string",
+            "description": "One of utf-8 or base64. Default is utf-8."
+          },
+          "repository_full_name": {
+            "type": "string",
+            "description": "Repository in `owner/name` form, such as `openai/openai`."
+          }
+        },
+        "required": [
+          "repository_full_name",
+          "content"
+        ]
+      }
+    },
+    {
+      "type": "function",
+      "name": "mcp__codex_apps__github_create_branch",
+      "description": "Create a new branch in the given repository from base_branch. This tool is part of plugin `GitHub`.",
+      "strict": false,
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "branch_name": {
+            "type": "string",
+            "description": "Branch name to create or update."
+          },
+          "repository_full_name": {
+            "type": "string",
+            "description": "Repository in `owner/name` form, such as `openai/openai`."
+          },
+          "sha": {
+            "type": "string",
+            "description": "Commit SHA."
+          }
+        },
+        "required": [
+          "repository_full_name",
+          "branch_name",
+          "sha"
+        ]
+      }
+    },
+    {
+      "type": "function",
+      "name": "mcp__codex_apps__github_create_commit",
+      "description": "Create a commit pointing to tree_sha with parent parent_sha. This tool is part of plugin `GitHub`.",
+      "strict": false,
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "message": {
+            "type": "string",
+            "description": "Commit message to use for the new commit."
+          },
+          "parent_sha": {
+            "type": "string",
+            "description": "Parent commit SHA for the new commit."
+          },
+          "repository_full_name": {
+            "type": "string",
+            "description": "Repository in `owner/name` form, such as `openai/openai`."
+          },
+          "tree_sha": {
+            "type": "string",
+            "description": "Tree SHA to point the new commit at."
+          }
+        },
+        "required": [
+          "repository_full_name",
+          "message",
+          "tree_sha",
+          "parent_sha"
+        ]
+      }
+    },
+    {
+      "type": "function",
+      "name": "mcp__codex_apps__github_create_file",
+      "description": "Create a new file in the repository via the contents API. This tool is part of plugin `GitHub`.",
+      "strict": false,
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "branch": {
+            "type": "string",
+            "description": "Optional branch to create the file on. Leave null to use the default branch."
+          },
+          "content": {
+            "type": "string",
+            "description": "File contents to write."
+          },
+          "message": {
+            "type": "string",
+            "description": "Commit message for the new file."
+          },
+          "path": {
+            "type": "string",
+            "description": "Path for the file within the repository."
+          },
+          "repository_full_name": {
+            "type": "string",
+            "description": "Repository in `owner/name` form, such as `openai/openai`."
+          }
+        },
+        "required": [
+          "repository_full_name",
+          "path",
+          "content",
+          "message"
+        ]
+      }
+    },
+    {
+      "type": "function",
+      "name": "mcp__codex_apps__github_create_pull_request",
+      "description": "Open a pull request in the repository. This tool is part of plugin `GitHub`.",
+      "strict": false,
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "base_branch": {
+            "type": "string",
+            "description": "Target branch for the pull request."
+          },
+          "body": {
+            "type": "string",
+            "description": "Pull request description or summary."
+          },
+          "draft": {
+            "type": "boolean",
+            "description": "Create the pull request as a draft."
+          },
+          "head_branch": {
+            "type": "string",
+            "description": "Branch containing the proposed changes."
+          },
+          "repository_full_name": {
+            "type": "string",
+            "description": "Repository in `owner/name` form, such as `openai/openai`."
+          },
+          "title": {
+            "type": "string",
+            "description": "Title for the new pull request."
+          }
+        },
+        "required": [
+          "repository_full_name",
+          "title",
+          "body",
+          "head_branch",
+          "base_branch"
+        ]
+      }
+    },
+    {
+      "type": "function",
+      "name": "mcp__codex_apps__github_create_tree",
+      "description": "Create a tree object in the repository from the given elements. This tool is part of plugin `GitHub`.",
+      "strict": false,
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "base_tree_sha": {
+            "type": "string",
+            "description": "Optional base tree SHA to build on. Leave null to create from scratch."
+          },
+          "repository_full_name": {
+            "type": "string",
+            "description": "Repository in `owner/name` form, such as `openai/openai`."
+          },
+          "tree_elements": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {},
+              "additionalProperties": true
+            },
+            "description": "Tree entries to include in the new tree object."
+          }
+        },
+        "required": [
+          "repository_full_name",
+          "tree_elements"
+        ]
+      }
+    },
+    {
+      "type": "function",
+      "name": "mcp__codex_apps__github_download_user_content",
+      "description": "Download user-supplied content from a GitHub URL. Use this when the model needs to inspect a GitHub-hosted artifact that is not already exposed as structured repository or pull request metadata. This tool is part of plugin `GitHub`.",
+      "strict": false,
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "url": {
+            "type": "string",
+            "description": "GitHub URL to fetch or download content from."
+          }
+        },
+        "required": [
+          "url"
+        ]
+      }
+    },
+    {
+      "type": "function",
+      "name": "mcp__codex_apps__github_enable_auto_merge",
+      "description": "Enable auto-merge for a pull request. This tool is part of plugin `GitHub`.",
+      "strict": false,
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "pr_number": {
+            "type": "number",
+            "description": "Pull request number in the repository."
+          },
+          "repository_full_name": {
+            "type": "string",
+            "description": "Repository in `owner/name` form, such as `openai/openai`."
+          }
+        },
+        "required": [
+          "repository_full_name",
+          "pr_number"
+        ]
+      }
+    },
+    {
+      "type": "function",
+      "name": "mcp__codex_apps__github_fetch",
+      "description": "Fetch a file from GitHub by URL. This tool is part of plugin `GitHub`.",
+      "strict": false,
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "url": {
+            "type": "string",
+            "description": "GitHub URL to fetch or download content from."
+          }
+        },
+        "required": [
+          "url"
+        ]
+      }
+    },
+    {
+      "type": "function",
+      "name": "mcp__codex_apps__github_fetch_blob",
+      "description": "Fetch blob content by SHA from the given repository. This tool is part of plugin `GitHub`.",
+      "strict": false,
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "blob_sha": {
+            "type": "string",
+            "description": "Blob SHA returned by GitHub."
+          },
+          "repository_full_name": {
+            "type": "string",
+            "description": "Repository in `owner/name` form, such as `openai/openai`."
+          }
+        },
+        "required": [
+          "repository_full_name",
+          "blob_sha"
+        ]
+      }
+    },
+    {
+      "type": "function",
+      "name": "mcp__codex_apps__github_fetch_commit",
+      "description": "Fetch a commit with its metadata, diff, and canonical URL. This tool is part of plugin `GitHub`.",
+      "strict": false,
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "commit_sha": {
+            "type": "string",
+            "description": "Commit SHA."
+          },
+          "repo_full_name": {
+            "type": "string",
+            "description": "Repository in `owner/name` form, such as `openai/openai`."
+          }
+        },
+        "required": [
+          "repo_full_name",
+          "commit_sha"
+        ]
+      }
+    },
+    {
+      "type": "function",
+      "name": "mcp__codex_apps__github_fetch_file",
+      "description": "Fetch file content by path and ref from the given repository. This tool is part of plugin `GitHub`.",
+      "strict": false,
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "encoding": {
+            "type": "string",
+            "description": "One of utf-8 or base64. Default is utf-8."
+          },
+          "path": {
+            "type": "string",
+            "description": "Repository path for the file to fetch."
+          },
+          "ref": {
+            "type": "string",
+            "description": "Branch, tag, or commit ref to read from."
+          },
+          "repository_full_name": {
+            "type": "string",
+            "description": "Repository in `owner/name` form, such as `openai/openai`."
+          }
+        },
+        "required": [
+          "repository_full_name",
+          "path",
+          "ref"
+        ]
+      }
+    },
+    {
+      "type": "function",
+      "name": "mcp__codex_apps__github_fetch_issue",
+      "description": "Fetch GitHub issue. This tool is part of plugin `GitHub`.",
+      "strict": false,
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "issue_number": {
+            "type": "number"
+          },
+          "repo": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "repo",
+          "issue_number"
+        ]
+      }
+    },
+    {
+      "type": "function",
+      "name": "mcp__codex_apps__github_fetch_issue_comments",
+      "description": "Fetch comments for a GitHub issue across all pages. This tool is part of plugin `GitHub`.",
+      "strict": false,
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "issue_number": {
+            "type": "number",
+            "description": "Issue number in the repository."
+          },
+          "repo_full_name": {
+            "type": "string",
+            "description": "Repository in `owner/name` form, such as `openai/openai`."
+          }
+        },
+        "required": [
+          "repo_full_name",
+          "issue_number"
+        ]
+      }
+    },
+    {
+      "type": "function",
+      "name": "mcp__codex_apps__github_fetch_pr",
+      "description": "Fetch a pull request with its diff, metadata, and optionally comments. This tool is part of plugin `GitHub`.",
+      "strict": false,
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "pr_number": {
+            "type": "number",
+            "description": "Pull request number in the repository."
+          },
+          "repo_full_name": {
+            "type": "string",
+            "description": "Repository in `owner/name` form, such as `openai/openai`."
+          }
+        },
+        "required": [
+          "repo_full_name",
+          "pr_number"
+        ]
+      }
+    },
+    {
+      "type": "function",
+      "name": "mcp__codex_apps__github_fetch_pr_comments",
+      "description": "Fetch comments for a GitHub pull request. This tool is part of plugin `GitHub`.",
+      "strict": false,
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "pr_number": {
+            "type": "number",
+            "description": "Pull request number in the repository."
+          },
+          "repo_full_name": {
+            "type": "string",
+            "description": "Repository in `owner/name` form, such as `openai/openai`."
+          }
+        },
+        "required": [
+          "repo_full_name",
+          "pr_number"
+        ]
+      }
+    },
+    {
+      "type": "function",
+      "name": "mcp__codex_apps__github_fetch_pr_file_patch",
+      "description": "Fetch a single-file patch from a PR, searching across all file-list pages. This tool is part of plugin `GitHub`.",
+      "strict": false,
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string",
+            "description": "Path of the changed file within the pull request."
+          },
+          "pr_number": {
+            "type": "number",
+            "description": "Pull request number in the repository."
+          },
+          "repo_full_name": {
+            "type": "string",
+            "description": "Repository in `owner/name` form, such as `openai/openai`."
+          }
+        },
+        "required": [
+          "repo_full_name",
+          "pr_number",
+          "path"
+        ]
+      }
+    },
+    {
+      "type": "function",
+      "name": "mcp__codex_apps__github_fetch_pr_patch",
+      "description": "Fetch the patch for a GitHub pull request across all changed-file pages. This tool is part of plugin `GitHub`.",
+      "strict": false,
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "pr_number": {
+            "type": "number",
+            "description": "Pull request number in the repository."
+          },
+          "repo_full_name": {
+            "type": "string",
+            "description": "Repository in `owner/name` form, such as `openai/openai`."
+          }
+        },
+        "required": [
+          "repo_full_name",
+          "pr_number"
+        ]
+      }
+    },
+    {
+      "type": "function",
+      "name": "mcp__codex_apps__github_get_commit_combined_status",
+      "description": "Fetch the combined CI status and individual status checks for a commit. This tool is part of plugin `GitHub`.",
+      "strict": false,
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "commit_sha": {
+            "type": "string",
+            "description": "Commit SHA."
+          },
+          "repo_full_name": {
+            "type": "string",
+            "description": "Repository in `owner/name` form, such as `openai/openai`."
+          }
+        },
+        "required": [
+          "repo_full_name",
+          "commit_sha"
+        ]
+      }
+    },
+    {
+      "type": "function",
+      "name": "mcp__codex_apps__github_get_issue_comment_reactions",
+      "description": "Fetch reactions for an issue comment. This tool is part of plugin `GitHub`.",
+      "strict": false,
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "comment_id": {
+            "type": "number",
+            "description": "Numeric issue or review comment ID."
+          },
+          "page": {
+            "type": "string",
+            "description": "1-based page number for pagination."
+          },
+          "per_page": {
+            "type": "string",
+            "description": "Maximum number of results to return."
+          },
+          "repo_full_name": {
+            "type": "string",
+            "description": "Repository in `owner/name` form, such as `openai/openai`."
+          }
+        },
+        "required": [
+          "repo_full_name",
+          "comment_id"
+        ]
+      }
+    },
+    {
+      "type": "function",
+      "name": "mcp__codex_apps__github_get_pr_diff",
+      "description": "Fetch just the diff or patch text for a pull request. This tool is part of plugin `GitHub`.",
+      "strict": false,
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "format": {
+            "type": "string",
+            "description": "Output format to return. Use `diff` for unified diff or `patch` for patch text."
+          },
+          "pr_number": {
+            "type": "number",
+            "description": "Pull request number in the repository."
+          },
+          "repo_full_name": {
+            "type": "string",
+            "description": "Repository in `owner/name` form, such as `openai/openai`."
+          }
+        },
+        "required": [
+          "repo_full_name",
+          "pr_number"
+        ]
+      }
+    },
+    {
+      "type": "function",
+      "name": "mcp__codex_apps__github_get_pr_info",
+      "description": "Get metadata (title, description, refs, and status) for a pull request. This action does *not* include the actual code changes. If you need the diff or per-file patches, call `fetch_pr_patch` instead (or use `get_users_recent_prs_in_repo` with ``include_diff=True`` when listing the user's own PRs). This tool is part of plugin `GitHub`.",
+      "strict": false,
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "pr_number": {
+            "type": "number",
+            "description": "Pull request number in the repository."
+          },
+          "repository_full_name": {
+            "type": "string",
+            "description": "Repository in `owner/name` form, such as `openai/openai`."
+          }
+        },
+        "required": [
+          "repository_full_name",
+          "pr_number"
+        ]
+      }
+    },
+    {
+      "type": "function",
+      "name": "mcp__codex_apps__github_get_pr_reactions",
+      "description": "Fetch reactions for a GitHub pull request. This tool is part of plugin `GitHub`.",
+      "strict": false,
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "page": {
+            "type": "string",
+            "description": "1-based page number for pagination."
+          },
+          "per_page": {
+            "type": "string",
+            "description": "Maximum number of results to return."
+          },
+          "pr_number": {
+            "type": "number",
+            "description": "Pull request number in the repository."
+          },
+          "repo_full_name": {
+            "type": "string",
+            "description": "Repository in `owner/name` form, such as `openai/openai`."
+          }
+        },
+        "required": [
+          "repo_full_name",
+          "pr_number"
+        ]
+      }
+    },
+    {
+      "type": "function",
+      "name": "mcp__codex_apps__github_get_pr_review_comment_reactions",
+      "description": "Fetch reactions for a pull request review comment. This tool is part of plugin `GitHub`.",
+      "strict": false,
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "comment_id": {
+            "type": "number",
+            "description": "Numeric issue or review comment ID."
+          },
+          "page": {
+            "type": "string",
+            "description": "1-based page number for pagination."
+          },
+          "per_page": {
+            "type": "string",
+            "description": "Maximum number of results to return."
+          },
+          "repo_full_name": {
+            "type": "string",
+            "description": "Repository in `owner/name` form, such as `openai/openai`."
+          }
+        },
+        "required": [
+          "repo_full_name",
+          "comment_id"
+        ]
+      }
+    },
+    {
+      "type": "function",
+      "name": "mcp__codex_apps__github_get_profile",
+      "description": "Retrieve the GitHub profile for the authenticated user. This tool is part of plugin `GitHub`.",
+      "strict": false,
+      "parameters": {
+        "type": "object",
+        "properties": {}
+      }
+    },
+    {
+      "type": "function",
+      "name": "mcp__codex_apps__github_get_repo",
+      "description": "Retrieve metadata for a GitHub repository. This tool is part of plugin `GitHub`.",
+      "strict": false,
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "repo_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "repo_id"
+        ]
+      }
+    },
+    {
+      "type": "function",
+      "name": "mcp__codex_apps__github_get_repo_collaborator_permission",
+      "description": "Return the collaborator permission level for a user on a repository. This tool is part of plugin `GitHub`.",
+      "strict": false,
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "repository_full_name": {
+            "type": "string",
+            "description": "Repository in `owner/name` form, such as `openai/openai`."
+          },
+          "username": {
+            "type": "string",
+            "description": "GitHub username to check against the repository."
+          }
+        },
+        "required": [
+          "repository_full_name",
+          "username"
+        ]
+      }
+    },
+    {
+      "type": "function",
+      "name": "mcp__codex_apps__github_get_user_login",
+      "description": "Return the GitHub login for the authenticated user. This tool is part of plugin `GitHub`.",
+      "strict": false,
+      "parameters": {
+        "type": "object",
+        "properties": {}
+      }
+    },
+    {
+      "type": "function",
+      "name": "mcp__codex_apps__github_get_users_recent_prs_in_repo",
+      "description": "List the user's recent GitHub pull requests in a repository. `limit` is the final number of PRs returned. The connector paginates the underlying GitHub search endpoint to satisfy larger limits. This tool is part of plugin `GitHub`.",
+      "strict": false,
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "include_comments": {
+            "type": "boolean",
+            "description": "Include pull request comments in each result."
+          },
+          "include_diff": {
+            "type": "boolean",
+            "description": "Include the pull request diff in each result."
+          },
+          "limit": {
+            "type": "number",
+            "description": "Maximum number of results to return."
+          },
+          "repository_full_name": {
+            "type": "string",
+            "description": "Repository in `owner/name` form, such as `openai/openai`."
+          },
+          "state": {
+            "type": "string",
+            "description": "Pull request state filter such as `open`, `closed`, or `all`."
+          }
+        },
+        "required": [
+          "repository_full_name"
+        ]
+      }
+    },
+    {
+      "type": "function",
+      "name": "mcp__codex_apps__github_label_pr",
+      "description": "Label a pull request. This tool is part of plugin `GitHub`.",
+      "strict": false,
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "label": {
+            "type": "string",
+            "description": "Label to add to the pull request."
+          },
+          "pr_number": {
+            "type": "number",
+            "description": "Pull request number in the repository."
+          },
+          "repository_full_name": {
+            "type": "string",
+            "description": "Repository in `owner/name` form, such as `openai/openai`."
+          }
+        },
+        "required": [
+          "repository_full_name",
+          "pr_number",
+          "label"
+        ]
+      }
+    },
+    {
+      "type": "function",
+      "name": "mcp__codex_apps__github_list_installations",
+      "description": "List all organizations the authenticated user has installed this GitHub App on. This tool is part of plugin `GitHub`.",
+      "strict": false,
+      "parameters": {
+        "type": "object",
+        "properties": {}
+      }
+    },
+    {
+      "type": "function",
+      "name": "mcp__codex_apps__github_list_installed_accounts",
+      "description": "List all accounts that the user has installed our GitHub app on. This tool is part of plugin `GitHub`.",
+      "strict": false,
+      "parameters": {
+        "type": "object",
+        "properties": {}
+      }
+    },
+    {
+      "type": "function",
+      "name": "mcp__codex_apps__github_list_pr_changed_filenames",
+      "description": "List changed filenames for a PR across all paginated file-list pages. This tool is part of plugin `GitHub`.",
+      "strict": false,
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "pr_number": {
+            "type": "number",
+            "description": "Pull request number in the repository."
+          },
+          "repo_full_name": {
+            "type": "string",
+            "description": "Repository in `owner/name` form, such as `openai/openai`."
+          }
+        },
+        "required": [
+          "repo_full_name",
+          "pr_number"
+        ]
+      }
+    },
+    {
+      "type": "function",
+      "name": "mcp__codex_apps__github_list_recent_issues",
+      "description": "Return the most recent GitHub issues the user can access. `top_k` is the final result limit. The connector transparently paginates GitHub's issues API until that limit is reached or no more pages exist. This tool is part of plugin `GitHub`.",
+      "strict": false,
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "top_k": {
+            "type": "number"
+          }
+        }
+      }
+    },
+    {
+      "type": "function",
+      "name": "mcp__codex_apps__github_list_repositories",
+      "description": "List repositories accessible to the authenticated user. This tool is part of plugin `GitHub`.",
+      "strict": false,
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "include_search_index_status": {
+            "type": "boolean",
+            "description": "Include code search index availability metadata for each repo."
+          },
+          "page_offset": {
+            "type": "number",
+            "description": "Zero-based offset into the result set."
+          },
+          "page_size": {
+            "type": "number",
+            "description": "Maximum number of results to return."
+          }
+        }
+      }
+    },
+    {
+      "type": "function",
+      "name": "mcp__codex_apps__github_list_repositories_by_affiliation",
+      "description": "List repositories accessible to the authenticated user filtered by affiliation. This tool is part of plugin `GitHub`.",
+      "strict": false,
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "affiliation": {
+            "type": "string",
+            "description": "GitHub affiliation filter such as `owner`, `collaborator`, or `organization_member`."
+          },
+          "page_offset": {
+            "type": "number",
+            "description": "Zero-based offset into the result set."
+          },
+          "page_size": {
+            "type": "number",
+            "description": "Maximum number of results to return."
+          }
+        },
+        "required": [
+          "affiliation"
+        ]
+      }
+    },
+    {
+      "type": "function",
+      "name": "mcp__codex_apps__github_list_repositories_by_installation",
+      "description": "List repositories accessible to the authenticated user. This tool is part of plugin `GitHub`.",
+      "strict": false,
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "installation_id": {
+            "type": "number",
+            "description": "GitHub App installation ID to filter by."
+          },
+          "page_offset": {
+            "type": "number",
+            "description": "Zero-based offset into the result set."
+          },
+          "page_size": {
+            "type": "number",
+            "description": "Maximum number of results to return."
+          }
+        },
+        "required": [
+          "installation_id"
+        ]
+      }
+    },
+    {
+      "type": "function",
+      "name": "mcp__codex_apps__github_list_user_org_memberships",
+      "description": "List the authenticated user's organization memberships. This tool is part of plugin `GitHub`.",
+      "strict": false,
+      "parameters": {
+        "type": "object",
+        "properties": {}
+      }
+    },
+    {
+      "type": "function",
+      "name": "mcp__codex_apps__github_list_user_orgs",
+      "description": "List organizations the authenticated user is a member of. This tool is part of plugin `GitHub`.",
+      "strict": false,
+      "parameters": {
+        "type": "object",
+        "properties": {}
+      }
+    },
+    {
+      "type": "function",
+      "name": "mcp__codex_apps__github_remove_reaction_from_issue_comment",
+      "description": "Remove a reaction from an issue comment. This tool is part of plugin `GitHub`.",
+      "strict": false,
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "comment_id": {
+            "type": "number",
+            "description": "Numeric issue or review comment ID."
+          },
+          "reaction_id": {
+            "type": "number",
+            "description": "Reaction ID to remove."
+          },
+          "repo_full_name": {
+            "type": "string",
+            "description": "Repository in `owner/name` form, such as `openai/openai`."
+          }
+        },
+        "required": [
+          "repo_full_name",
+          "comment_id",
+          "reaction_id"
+        ]
+      }
+    },
+    {
+      "type": "function",
+      "name": "mcp__codex_apps__github_remove_reaction_from_pr",
+      "description": "Remove a reaction from a GitHub pull request. This tool is part of plugin `GitHub`.",
+      "strict": false,
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "pr_number": {
+            "type": "number",
+            "description": "Pull request number in the repository."
+          },
+          "reaction_id": {
+            "type": "number",
+            "description": "Reaction ID to remove."
+          },
+          "repo_full_name": {
+            "type": "string",
+            "description": "Repository in `owner/name` form, such as `openai/openai`."
+          }
+        },
+        "required": [
+          "repo_full_name",
+          "pr_number",
+          "reaction_id"
+        ]
+      }
+    },
+    {
+      "type": "function",
+      "name": "mcp__codex_apps__github_remove_reaction_from_pr_review_comment",
+      "description": "Remove a reaction from a pull request review comment. This tool is part of plugin `GitHub`.",
+      "strict": false,
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "comment_id": {
+            "type": "number",
+            "description": "Numeric issue or review comment ID."
+          },
+          "reaction_id": {
+            "type": "number",
+            "description": "Reaction ID to remove."
+          },
+          "repo_full_name": {
+            "type": "string",
+            "description": "Repository in `owner/name` form, such as `openai/openai`."
+          }
+        },
+        "required": [
+          "repo_full_name",
+          "comment_id",
+          "reaction_id"
+        ]
+      }
+    },
+    {
+      "type": "function",
+      "name": "mcp__codex_apps__github_reply_to_review_comment",
+      "description": "Reply to an inline review comment on a PR (Files changed thread). comment_id must be the ID of the thread\u2019s top-level inline review comment (replies-to-replies are not supported by the API). This tool is part of plugin `GitHub`.",
+      "strict": false,
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "comment": {
+            "type": "string",
+            "description": "Reply text to post into the review thread."
+          },
+          "comment_id": {
+            "type": "number",
+            "description": "Numeric issue or review comment ID."
+          },
+          "pr_number": {
+            "type": "number",
+            "description": "Pull request number in the repository."
+          },
+          "repo_full_name": {
+            "type": "string",
+            "description": "Repository in `owner/name` form, such as `openai/openai`."
+          }
+        },
+        "required": [
+          "repo_full_name",
+          "pr_number",
+          "comment_id",
+          "comment"
+        ]
+      }
+    },
+    {
+      "type": "function",
+      "name": "mcp__codex_apps__github_search",
+      "description": "Search files within a specific GitHub repository. Provide a plain string query, avoid GitHub query flags such as ``is:pr``. Include keywords that match file names, functions, or error messages. ``repository_name`` or ``org`` can narrow the search scope. Example: ``query=\"tokenizer bug\" repository_name=\"tiktoken\"``. ``topn`` is the number of results to return. No results are returned if the query is empty. This tool is part of plugin `GitHub`.",
+      "strict": false,
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "org": {
+            "type": "string",
+            "description": "Optional GitHub organization to scope the search."
+          },
+          "query": {
+            "type": "string",
+            "description": "Search query string."
+          },
+          "repository_name": {
+            "type": "string",
+            "description": "Repository or repositories to search within. Use this to narrow the search scope."
+          },
+          "topn": {
+            "type": "number",
+            "description": "Maximum number of results to return."
+          }
+        },
+        "required": [
+          "query"
+        ]
+      }
+    },
+    {
+      "type": "function",
+      "name": "mcp__codex_apps__github_search_branches",
+      "description": "Search GitHub branches within a repository. This tool is part of plugin `GitHub`.",
+      "strict": false,
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "cursor": {
+            "type": "string",
+            "description": "Opaque cursor from a previous branch search."
+          },
+          "owner": {
+            "type": "string",
+            "description": "GitHub repository owner or organization name."
+          },
+          "page_size": {
+            "type": "number",
+            "description": "Maximum number of results to return."
+          },
+          "query": {
+            "type": "string",
+            "description": "Search query string."
+          },
+          "repo_name": {
+            "type": "string",
+            "description": "Repository name without the owner prefix."
+          }
+        },
+        "required": [
+          "owner",
+          "repo_name",
+          "query"
+        ]
+      }
+    },
+    {
+      "type": "function",
+      "name": "mcp__codex_apps__github_search_commits",
+      "description": "Search GitHub commits across one or more repositories. This tool is part of plugin `GitHub`.",
+      "strict": false,
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "order": {
+            "type": "string",
+            "description": "Optional result ordering."
+          },
+          "org": {
+            "type": "string",
+            "description": "Optional GitHub organization to scope the search."
+          },
+          "query": {
+            "type": "string",
+            "description": "Search query string."
+          },
+          "repo": {
+            "type": "string",
+            "description": "Repository or repositories to search within. Use `owner/name` strings."
+          },
+          "sort": {
+            "type": "string",
+            "description": "Optional commit sort order."
+          },
+          "topn": {
+            "type": "number",
+            "description": "Maximum number of results to return."
+          }
+        },
+        "required": [
+          "query"
+        ]
+      }
+    },
+    {
+      "type": "function",
+      "name": "mcp__codex_apps__github_search_installed_repositories_streaming",
+      "description": "Search for a repository (not a file) by name or description. To search for a file, use `search`. This tool is part of plugin `GitHub`.",
+      "strict": false,
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "limit": {
+            "type": "number",
+            "description": "Maximum number of results to return."
+          },
+          "next_token": {
+            "type": "string",
+            "description": "Opaque streaming cursor from a previous search."
+          },
+          "option_enrich_code_search_index_availability": {
+            "type": "boolean",
+            "description": "Include search index availability metadata in the response."
+          },
+          "option_enrich_code_search_index_request_concurrency_limit": {
+            "type": "number",
+            "description": "Maximum concurrent requests when enriching search index availability."
+          },
+          "query": {
+            "type": "string",
+            "description": "Search query string."
+          }
+        },
+        "required": [
+          "query"
+        ]
+      }
+    },
+    {
+      "type": "function",
+      "name": "mcp__codex_apps__github_search_installed_repositories_v2",
+      "description": "Search repositories within the user's installations using GitHub search. This tool is part of plugin `GitHub`.",
+      "strict": false,
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "include_search_index_status": {
+            "type": "boolean",
+            "description": "Include code search index availability metadata for each repo."
+          },
+          "installation_ids": {
+            "type": "string",
+            "description": "Optional GitHub App installation IDs to filter by."
+          },
+          "limit": {
+            "type": "number",
+            "description": "Maximum number of results to return."
+          },
+          "page": {
+            "type": "number",
+            "description": "1-based page number for pagination."
+          },
+          "query": {
+            "type": "string",
+            "description": "Search query string."
+          }
+        },
+        "required": [
+          "query"
+        ]
+      }
+    },
+    {
+      "type": "function",
+      "name": "mcp__codex_apps__github_search_issues",
+      "description": "Search GitHub issues. This tool is part of plugin `GitHub`.",
+      "strict": false,
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "order": {
+            "type": "string",
+            "description": "Optional result ordering."
+          },
+          "query": {
+            "type": "string",
+            "description": "Search query string."
+          },
+          "repo": {
+            "type": "string",
+            "description": "Repository or repositories to search within. Use `owner/name` strings."
+          },
+          "sort": {
+            "type": "string",
+            "description": "Optional issue sort order."
+          },
+          "topn": {
+            "type": "number",
+            "description": "Maximum number of results to return."
+          }
+        },
+        "required": [
+          "query",
+          "repo"
+        ]
+      }
+    },
+    {
+      "type": "function",
+      "name": "mcp__codex_apps__github_search_prs",
+      "description": "Search GitHub pull requests. This tool is part of plugin `GitHub`.",
+      "strict": false,
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "order": {
+            "type": "string",
+            "description": "Optional result ordering."
+          },
+          "org": {
+            "type": "string",
+            "description": "Optional GitHub organization to scope the search."
+          },
+          "query": {
+            "type": "string",
+            "description": "Search query string."
+          },
+          "repo": {
+            "type": "string",
+            "description": "Repository or repositories to search within. Use `owner/name` strings."
+          },
+          "sort": {
+            "type": "string",
+            "description": "Optional pull request sort order."
+          },
+          "topn": {
+            "type": "number",
+            "description": "Maximum number of results to return."
+          }
+        },
+        "required": [
+          "query"
+        ]
+      }
+    },
+    {
+      "type": "function",
+      "name": "mcp__codex_apps__github_search_repositories",
+      "description": "Search for a repository (not a file) by name or description. To search for a file, use `search`. This tool is part of plugin `GitHub`.",
+      "strict": false,
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "org": {
+            "type": "string",
+            "description": "Optional GitHub organization to scope the search."
+          },
+          "page": {
+            "type": "number",
+            "description": "1-based page number for pagination."
+          },
+          "per_page": {
+            "type": "string",
+            "description": "Maximum number of results to return."
+          },
+          "query": {
+            "type": "string",
+            "description": "Search query string."
+          },
+          "topn": {
+            "type": "string",
+            "description": "Alias for `per_page` used by some callers."
+          }
+        },
+        "required": [
+          "query"
+        ]
+      }
+    },
+    {
+      "type": "function",
+      "name": "mcp__codex_apps__github_update_issue_comment",
+      "description": "Update a top-level PR Conversation comment (Issue comment). This tool is part of plugin `GitHub`.",
+      "strict": false,
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "comment": {
+            "type": "string",
+            "description": "Replacement comment body."
+          },
+          "comment_id": {
+            "type": "number",
+            "description": "Numeric issue or review comment ID."
+          },
+          "repo_full_name": {
+            "type": "string",
+            "description": "Repository in `owner/name` form, such as `openai/openai`."
+          }
+        },
+        "required": [
+          "repo_full_name",
+          "comment_id",
+          "comment"
+        ]
+      }
+    },
+    {
+      "type": "function",
+      "name": "mcp__codex_apps__github_update_ref",
+      "description": "Move branch ref to the given commit SHA. This tool is part of plugin `GitHub`.",
+      "strict": false,
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "branch_name": {
+            "type": "string",
+            "description": "Branch name to create or update."
+          },
+          "force": {
+            "type": "boolean",
+            "description": "Force the ref update even if it is not a fast-forward."
+          },
+          "repository_full_name": {
+            "type": "string",
+            "description": "Repository in `owner/name` form, such as `openai/openai`."
+          },
+          "sha": {
+            "type": "string",
+            "description": "Commit SHA."
+          }
+        },
+        "required": [
+          "repository_full_name",
+          "branch_name",
+          "sha"
+        ]
+      }
+    },
+    {
+      "type": "function",
+      "name": "mcp__codex_apps__github_update_review_comment",
+      "description": "Update an inline review comment (or a reply) on a PR. This tool is part of plugin `GitHub`.",
+      "strict": false,
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "comment": {
+            "type": "string",
+            "description": "Replacement inline review comment body."
+          },
+          "comment_id": {
+            "type": "number",
+            "description": "Numeric issue or review comment ID."
+          },
+          "repo_full_name": {
+            "type": "string",
+            "description": "Repository in `owner/name` form, such as `openai/openai`."
+          }
+        },
+        "required": [
+          "repo_full_name",
+          "comment_id",
+          "comment"
+        ]
+      }
+    }
+  ],
+  "request_config": {
+    "reasoning": {
+      "effort": "xhigh"
+    },
+    "text": {
+      "verbosity": "low"
+    }
+  },
+  "turns": [
+    {
+      "turn": 1,
+      "note": "empty-input warmup",
+      "client_added_messages": [],
+      "assistant_response": {
+        "content": [],
+        "stop_reason": "completed",
+        "usage": {
+          "input_tokens": 15598,
+          "input_tokens_details": {
+            "cached_tokens": 0
+          },
+          "output_tokens": 0,
+          "output_tokens_details": {
+            "reasoning_tokens": 0
+          },
+          "total_tokens": 15598
+        },
+        "response_id": "resp_0fbc4c709068c8950169deb0df8b18819084e0cd0978dfd74a"
+      }
+    },
+    {
+      "turn": 2,
+      "note": null,
+      "client_added_messages": [
+        {
+          "type": "message",
+          "role": "developer",
+          "content": [
+            {
+              "type": "input_text",
+              "text": "<permissions instructions>\nFilesystem sandboxing defines which files can be read or written. `sandbox_mode` is `danger-full-access`: No filesystem sandboxing - all commands are permitted. Network access is enabled.\nApproval policy is currently never. Do not provide the `sandbox_permissions` for any reason, commands will be rejected.\n</permissions instructions>"
+            },
+            {
+              "type": "input_text",
+              "text": "<apps_instructions>\n## Apps (Connectors)\nApps (Connectors) can be explicitly triggered in user messages in the format `[$app-name](app://{connector_id})`. Apps can also be implicitly triggered as long as the context suggests usage of available apps.\nAn app is equivalent to a set of MCP tools within the `codex_apps` MCP.\nAn installed app's MCP tools are either provided to you already, or can be lazy-loaded through the `tool_search` tool. If `tool_search` is available, the apps that are searchable by `tools_search` will be listed by it.\nDo not additionally call list_mcp_resources or list_mcp_resource_templates for apps.\n</apps_instructions>"
+            },
+            {
+              "type": "input_text",
+              "text": "<skills_instructions>\n## Skills\nA skill is a set of local instructions to follow that is stored in a `SKILL.md` file. Below is the list of skills that can be used. Each entry includes a name, description, and file path so you can open the source for full instructions when using a specific skill.\n### Available skills\n- github:gh-address-comments: Address actionable GitHub pull request review feedback. Use when the user wants to inspect unresolved review threads, requested changes, or inline review comments on a PR, then implement selected fixes. Use the GitHub app for PR metadata and flat comment reads, and use the bundled GraphQL script via `gh` whenever thread-level state, resolution status, or inline review context matters. (file: /home/christian/.codex/plugins/cache/openai-curated/github/fb0a18376bcd9f2604047fbe7459ec5aed70c64b/skills/gh-address-comments/SKILL.md)\n- github:gh-fix-ci: Use when a user asks to debug or fix failing GitHub PR checks that run in GitHub Actions. Use the GitHub app from this plugin for PR metadata and patch context, and use `gh` for Actions check and log inspection before implementing any approved fix. (file: /home/christian/.codex/plugins/cache/openai-curated/github/fb0a18376bcd9f2604047fbe7459ec5aed70c64b/skills/gh-fix-ci/SKILL.md)\n- github:github: Triage and orient GitHub repository, pull request, and issue work through the connected GitHub app. Use when the user asks for general GitHub help, wants PR or issue summaries, or needs repository context before choosing a more specific GitHub workflow. (file: /home/christian/.codex/plugins/cache/openai-curated/github/fb0a18376bcd9f2604047fbe7459ec5aed70c64b/skills/github/SKILL.md)\n- github:yeet: Publish local changes to GitHub by confirming scope, committing intentionally, pushing the branch, and opening a draft PR through the GitHub app from this plugin, with `gh` used only as a fallback where connector coverage is insufficient. (file: /home/christian/.codex/plugins/cache/openai-curated/github/fb0a18376bcd9f2604047fbe7459ec5aed70c64b/skills/yeet/SKILL.md)\n- imagegen: Generate or edit raster images when the task benefits from AI-created bitmap visuals such as photos, illustrations, textures, sprites, mockups, or transparent-background cutouts. Use when Codex should create a brand-new image, transform an existing image, or derive visual variants from references, and the output should be a bitmap asset rather than repo-native code or vector. Do not use when the task is better handled by editing existing SVG/vector/code-native assets, extending an established icon or logo system, or building the visual directly in HTML/CSS/canvas. (file: /home/christian/.codex/skills/.system/imagegen/SKILL.md)\n- openai-docs: Use when the user asks how to build with OpenAI products or APIs and needs up-to-date official documentation with citations, help choosing the latest model for a use case, or explicit GPT-5.4 upgrade and prompt-upgrade guidance; prioritize OpenAI docs MCP tools, use bundled references only as helper context, and restrict any fallback browsing to official OpenAI domains. (file: /home/christian/.codex/skills/.system/openai-docs/SKILL.md)\n- plugin-creator: Create and scaffold plugin directories for Codex with a required `.codex-plugin/plugin.json`, optional plugin folders/files, and baseline placeholders you can edit before publishing or testing. Use when Codex needs to create a new local plugin, add optional plugin structure, or generate or update repo-root `.agents/plugins/marketplace.json` entries for plugin ordering and availability metadata. (file: /home/christian/.codex/skills/.system/plugin-creator/SKILL.md)\n- skill-creator: Guide for creating effective skills. This skill should be used when users want to create a new skill (or update an existing skill) that extends Codex's capabilities with specialized knowledge, workflows, or tool integrations. (file: /home/christian/.codex/skills/.system/skill-creator/SKILL.md)\n- skill-installer: Install Codex skills into $CODEX_HOME/skills from a curated list or a GitHub repo path. Use when a user asks to list installable skills, install a curated skill, or install a skill from another repo (including private repos). (file: /home/christian/.codex/skills/.system/skill-installer/SKILL.md)\n### How to use skills\n- Discovery: The list above is the skills available in this session (name + description + file path). Skill bodies live on disk at the listed paths.\n- Trigger rules: If the user names a skill (with `$SkillName` or plain text) OR the task clearly matches a skill's description shown above, you must use that skill for that turn. Multiple mentions mean use them all. Do not carry skills across turns unless re-mentioned.\n- Missing/blocked: If a named skill isn't in the list or the path can't be read, say so briefly and continue with the best fallback.\n- How to use a skill (progressive disclosure):\n  1) After deciding to use a skill, open its `SKILL.md`. Read only enough to follow the workflow.\n  2) When `SKILL.md` references relative paths (e.g., `scripts/foo.py`), resolve them relative to the skill directory listed above first, and only consider other paths if needed.\n  3) If `SKILL.md` points to extra folders such as `references/`, load only the specific files needed for the request; don't bulk-load everything.\n  4) If `scripts/` exist, prefer running or patching them instead of retyping large code blocks.\n  5) If `assets/` or templates exist, reuse them instead of recreating from scratch.\n- Coordination and sequencing:\n  - If multiple skills apply, choose the minimal set that covers the request and state the order you'll use them.\n  - Announce which skill(s) you're using and why (one short line). If you skip an obvious skill, say why.\n- Context hygiene:\n  - Keep context small: summarize long sections instead of pasting them; only load extra files when needed.\n  - Avoid deep reference-chasing: prefer opening only files directly linked from `SKILL.md` unless you're blocked.\n  - When variants exist (frameworks, providers, domains), pick only the relevant reference file(s) and note that choice.\n- Safety and fallback: If a skill can't be applied cleanly (missing files, unclear instructions), state the issue, pick the next-best approach, and continue.\n</skills_instructions>"
+            },
+            {
+              "type": "input_text",
+              "text": "<plugins_instructions>\n## Plugins\nA plugin is a local bundle of skills, MCP servers, and apps. Below is the list of plugins that are enabled and available in this session.\n### Available plugins\n- `GitHub`: Inspect repositories, triage pull requests and issues, debug CI, and publish changes through a hybrid GitHub connector and CLI workflow.\n### How to use plugins\n- Discovery: The list above is the plugins available in this session.\n- Skill naming: If a plugin contributes skills, those skill entries are prefixed with `plugin_name:` in the Skills list.\n- Trigger rules: If the user explicitly names a plugin, prefer capabilities associated with that plugin for that turn.\n- Relationship to capabilities: Plugins are not invoked directly. Use their underlying skills, MCP tools, and app tools to help solve the task.\n- Preference: When a relevant plugin is available, prefer using capabilities associated with that plugin over standalone capabilities that provide similar functionality.\n- Missing/blocked: If the user requests a plugin that is not listed above, or the plugin does not have relevant callable capabilities for the task, say so briefly and continue with the best fallback.\n</plugins_instructions>"
+            }
+          ]
+        },
+        {
+          "type": "message",
+          "role": "user",
+          "content": [
+            {
+              "type": "input_text",
+              "text": "<environment_context>\n  <cwd>/tmp/whisper-agent-capture/work/codex</cwd>\n  <shell>bash</shell>\n  <current_date>2026-04-14</current_date>\n  <timezone>US/Eastern</timezone>\n</environment_context>"
+            }
+          ]
+        },
+        {
+          "type": "message",
+          "role": "user",
+          "content": [
+            {
+              "type": "input_text",
+              "text": "Create a minimal snake game in Rust using the `crossterm` crate. Use `cargo init` in the current directory, add crossterm as a dependency, implement the game in a single `src/main.rs` (arrow-key movement, growing snake, game-over on wall or self collision, score display in the corner). Verify it compiles with `cargo check`. Keep it simple \u2014 one file, one dependency."
+            }
+          ]
+        }
+      ],
+      "assistant_response": {
+        "content": [
+          {
+            "type": "reasoning",
+            "encrypted_content": "gAAAAABp3rDnfcdl0GNka3UoKrm3YNYfmBD1NnFdXUmMPkjr1nO1rOpvifFVVfTELwtkp8CMM3kXGlM8fVCd97FTr43oJaceJbnLU0lQVksy1jSobWVtr_X2kdd2rptl1orb5KBuNTkDS4Ys_bcU7wj-LPzvgagjV_oi1VZO0e8-5JB8A-hXbhX8sCif6N5CW4R1guwYsdTDeWBuc9U1HsEBJqKGJISbrrt1RGE-88Bl84NCYhcCESUp4Pu6iX7XPljOXIFMd6fnaZa6VybOqb5FI0i41X9konwam2AYWS-u24JsGL6lKICPLrEgq20Tyy_4cSwtns_70Uncuwi53ocL1r59_r3BzsEcYZUOY4ZcF6FS62Kipog4yHcqrcjBwJuY1FekAh-q_iZYreToSi4s1ONJh8yHDfuZe_nUfxWPhUxngU9fZF5xkwKOlgN3yOAsL3bPU7YtlZurV_htM0n_pFekWUwMPEPRRLGEt-FrMxacbQGE4eXleeEXYEs0i1mGYxGKDfMh7tpejOcQf7a-qpYJ-BiCS3GDvOV1Th2rdMFZoW-4YpPcacQXDY6PZCewc8uOF63UlGnEv3cDtZuMIeIkINKHHpW3L5okRCoIr_cO9YF2VeVs_6DEZqR329BzbbSxjxpxZe_qaHVHfK9MBi-x3m_RX6YQSXC7y7pojMVwWrTJ3-XQrCI3BE1Vf50VWgjtvXihaZbyPggQsplkmKoLoZwxseIDa4S_hmuN4FbHeYe_pPopsCn7hTLNW1ilg68mKRKUxKniUbWTWwciWInL2lhIESphfl7M4JUjxC9OL7c77_vfdd_eV9Drcg9Kree3WzIOE7UIxoxPpnjRYMhvzMUMZB3TwRgRA2Zb1oJThp61b-N5chA-oUw5sbRdbyTrPYQicsqfwRI_JoJCi4gGfxST4Rx6qHqC_w3vdMGWDUCAg-62qPXbTBfEf5XmQ0NFRbqFi4v6bY0G7nS4XogxAY9WstoWTyYu56huC8nUtUHBjSKv-YtxH1TNhaF2R51j936Iz1gMV3AFoKmi6HWYaeN8B13fvqhbA007-Z4x3D1Mr_4fVqJ0d6HkqDeKzhXWG6ONOUFTE_0mf6G7b6NoDHk_wJarwQ9Z1dTmhGdAcERjPHSulRIVoDcc2y1d0oG3qe8W7f8hDBBrpSG9qHIjvN_esgrpke3L5l7zeLbe_d-3dhaDCoP0AcKDMmhVxTfsrCVHxGjN45GpWHNZuQccitOZEH1HCfZ9A--0KM2ovqAibLBoCGldOekhSgREGEbaPaFs-CnWMIByCm-bJlvIMQDcR86jJyc49Ciox-qJxLcXN5Y467y2XFTcqDkvCtZ5kGCDV1eUnotqxzG2ViT_6J1OsoNH96q0L4qM9e1U7amyGhtKtRphsW04Wypqo5E5HccNe2KF5KnS_9x7aJIYcHcCuc1AP3qpNzGuSXabJTBP3XqzgwOoMn41NiJcZLLFTgl76w7_EIcUE1QaIRYqt94jZ0b5QAzDZf0l-nCjdMEDWWsCLPWI_74Gj2kSz9U_DFKLxhJMivSLyd4QhZUKDjdZPJ-L9_JEj6_1lPU-23cbbTafNNuBstRfr6_Jci9Wn5cjEabxai3J4-TGU1XZvlP5_lYJcW_hdoFLtDoGt2XiTlsRO112p52iafXM3acpJy68138xsSDnc1qbodNOhoXU8p15UNYwUdOURG7xbQo7Fs_pg0uWGtPf_vkko7iEg21S-kgN2REBRxPPw2xY4G4wEL4e7DDBSsggh9qvZWS3nxHMoyZT30yAJXWL9LzDUca0UUkD94SworiwrDHxLm-aJnDLbNMZIgGEn9JYMuESwJjeag5EYr0S9csE9Ey8nI5s6FYWwP4YZg0UyyzVHH5E9j3f16q4uEB0hz1B-Rdm4gUJxOILc4Vgs8sMOSMwE3ucAbQ6SO9fbfhBZvYA1mTwLMkXG1gBcPDccv2hwdz1UY3FaUuH_Y2AsgiNC9G08NwNxh-065Et-emHFqR0uWYv3mUIgGXRA0CGLQZZn-N6Bz4fbepD5YFLIVVHDoj8Xohmx7etOgrMPD0zarEnhidiyBTrxGbZQwhy_HBMRDisfMQl1B7_bbUZp-ZNRl0hg5Z75_LNN3g32Si2CM7MO-ImfyoiIb-FCv9wSM9pBrC7SGhn8OAGnzuEYbHuqndUY8hMkpkQa1cTi8GYyiWy1RuUfY_ETNIb1emozM7lQmRUEef9H5v7ZqDgabsIdt1Re8jqbzCRwX2F4kHatRHkyEXUP13UU9FeU_6SIetQdkAyxOXUNcv-Wuo_hRruOz0n6LX5jNQz7BHjPhycWO2CJZL8g4BViplodOj_5O6aXcI5wLtkFs0y17eetm1eQcDg5I1hLOuoZz8roynRwuqYl5_KMDQumiP2EIkyjm94gmyv3M8UvuqtB4JTg0wNBVb0tNOymHX6uKsFvU60n07SKJlsHJHasPeEU0cHNND_orT9Mia4A7I41f1IJiI7LGXXVNq8BtBfOItAXwXUw36U2Eb70ARWnnfiLK69Z6VWTkjpg2_W2XpyGJHsEMQlM-o0cxXxKXrAdDUOVJ0OzMCe0f6_gJ0rPDMEXoo_sIBd1DPrMH9spn81YkJsRc-XS1Pus9Za_CFP1GcrMKjl3l_mqL1UaeJBL4ZwEBhXV12rbOUqHv1G6J3nEudkMVIuS2hAqYSZPeuzQJLzzcPgt5esWyj_4eFDcONZtBCcs1RP7JSXXdaFx3CYThx2n2nm4utmrp8sdnbZos8hFGEqbm3vCAFDmhIUc-klouStD3DaRYmo3gysPiYB54KNFi9X8EJyWwVDd8OfyjT56UxrKqviT6Ms-CYwdCN-9goP2XUfkPMLLA4g_AkO4OBsFFYKX8u2IJqeTJS4IdE0WJboV3mgwtXcmBJAaltJRG0nM8HxxLza0OraXZkKhvnaUySJ3SJ_qgMmAFYmUFVSK2kLtVFlYxdCVg-q59DtorsKZJsWFLRGk6rT2H4n9IBWMrsjwyFQfIliaXs6pl80E7JVlf5garBV6qXsVoHRA_sypDLaDVdye7O6dPP7E8HUjieO2Oe4R7gIYdgm3kk73A63wyJhvU6gfXpXu8e0ZCEQ2xXcjwDhMsDs6ziIz6_C2k5IV4MMhpN4B1l3sQLbEzMtKzbZIGYX1xYe8-bz4zJYawSQE8gUsGcPuvrGvxuLklXsR-3Azec-PmE2b-DbpUPPJyw7ul3iUB_YOyNz80v6ox1ZhDonUmvV81EyY9ke8zkiwY9zB5lg2CnU0wULzUYbjfR4LGhUqeryIK5PB2sfQw9FvNEasOc4PN-TFSTTvcLf3825B2mSvn7eEjLD22yPA2hmO39en2Ks52vX8yLdBeJrui1SFfjJVj4qoB4dMyMGlb71Ob11"
+          },
+          {
+            "type": "message",
+            "role": "assistant",
+            "text": "Implementing this now by scaffolding a fresh Rust crate in the current directory, then I\u2019ll add `crossterm`, write a single-file `src/main.rs` snake implementation, and finish by running `cargo check` to verify it compiles."
+          },
+          {
+            "type": "reasoning",
+            "encrypted_content": "gAAAAABp3rDomuSY8tRH4Y0RMPsydbWM7GqMzV1dDeFpHpve0iEjJNXjMvvF-c0eI9mCOrbcw1ncgm_0Ql3bGabUCIGHvljD5rkHK5PLYGq8N3HN2TQ8ElYSRTGWC2h3RC4x2kvSTw4s_NwszCYMdXLe2-zdiDiS2VwA4wG5cCe4bJ3KxbuZR-kFwOg42aqzg1oBwi2P4vEjUID_5DhksLCvdcrAIks65Qf-ZKr7zH-V6JoMsxdxpeqHerR1_ysfKLzEAM0TIxjwGfJkKDzhMeP65bAPw4sxAFN8-anxKwAh_FOhs1DLVH3Ee9xXrhdP0VwjPLSIt-6oVSTUX4tjGQ1FYl7fA0EeWnXNGRy0oz9p6Iy-DHY8YHD6UtmNLUBep3jwHGEMKu-TXHwpIi6uCrl7VxrEott3W8eOtJnzP3sahVo-EudDfUS56uSuVU15ppX2IOXGrf2t5N6K-6oMjK3hMspf8anm9JtvU5Rv7qACojT_venS1cSj53iDd67l1I6zq5FbObjX8WzpDMngSTMVOkMirztaQJarK0KW1tMMFesSmgvkYmY3K4_LkfgEVJqUgaEohUYgzJf6Lv_2XPMu4Y0E08AALoyfeTJ9jneRJSwwYJ6YJxg7vzqdvzdHD4_p9_8yZ0hK-pMYRyYkjGYgRNuN4oT6L5aiQmhbkEN_Ez4qK4ynwL1jGfm0DMPL_G57htFnxoKYiltwuOjp6jiCwMWUbo5k5K2UDK55YHh3-NZD3UNJ5KVyhIXLYEI7PK4V4trw3R4uOrDa0fzMku0UIBUOdw-3uli-S0XLlwpFY-g-wBdOEmflfaGvD8sKKGVgFMrZxFLsJ3MWvY13jbXb-99jZPOY2BOb1bNTeziNwZNhEykOr60="
+          },
+          {
+            "type": "function_call",
+            "id": "fc_0fbc4c709068c8950169deb0e8da848190a1f728c14eb390fd",
+            "call_id": "call_6031HM2Fdk3a2aPHSAe9kJUj",
+            "name": "exec_command",
+            "arguments": {
+              "cmd": "ls -la"
+            }
+          }
+        ],
+        "stop_reason": "completed",
+        "usage": {
+          "input_tokens": 17683,
+          "input_tokens_details": {
+            "cached_tokens": 15488
+          },
+          "output_tokens": 466,
+          "output_tokens_details": {
+            "reasoning_tokens": 385
+          },
+          "total_tokens": 18149
+        },
+        "response_id": "resp_0fbc4c709068c8950169deb0e015848190abaff8ca8025598c"
+      }
+    },
+    {
+      "turn": 3,
+      "note": null,
+      "client_added_messages": [
+        {
+          "type": "function_call_output",
+          "call_id": "call_6031HM2Fdk3a2aPHSAe9kJUj",
+          "output": "Command: /usr/bin/bash -lc 'ls -la'\nChunk ID: 1dfb08\nWall time: 0.0000 seconds\nProcess exited with code 0\nOriginal token count: 42\nOutput:\ntotal 0\ndrwxr-xr-x 3 christian christian  60 Apr 14 17:19 .\ndrwxr-xr-x 5 christian christian 100 Apr 14 17:18 ..\ndrwxr-xr-x 7 christian christian 240 Apr 14 17:19 .git\n"
+        }
+      ],
+      "assistant_response": {
+        "content": [
+          {
+            "type": "reasoning",
+            "encrypted_content": "gAAAAABp3rDuhgfXQJURcHdhaIcG3tdw8a3WuikGPoEhBZaATMVOg1WRgoxb3Uq6TT7iseujKs7ztxqjauFefgJf0CsQ9y8Y60FbRLwT0KXCCapJxTNDrxxF2Kky7AxJUTef0kPTEgKX0bWKzH-C3DPYdUZ5KJzVJWzjN439hPzGzJ99iM9Af3CI_zc_-iBgaJPvDhdqPbbMbwgto-ShQiR2LHnJ8B-yidBQ1rOhwIYSm2Tz2XlcfnStR6x0w5rgLzh39b-6s2FxpArTmrJML0lFW-RO3B3jon1SausOuuxqDb8eTV_XqjSCNdEqYus3e8WJpm_-f4QgSR-Mvf2C08ivFRgh9Wlnb4xCFFFNw6RUCs9-V3-umNMrmmkkBOR65QiK8WAqqJVZGKngl0ifVQBBR6a4SJVyqqxa7qO8Rv4vFt6VAteZa4HwPR21CPZ4dyd9yZAhKN2ZueTrf4vtOka4I6-izZ9Y_nrus12Z_ilxpmFAbnYeNmm3AiFtlQAbvh0ziHQTo2UjDc68N4U8nKzUSUg7hmIfd03msGI90arwmJyrcYi-8Y6a1-C-VOVGXTFVrEt-5wprD5YHt1gP0KM5ey8Ee69L9DgkujixJIq6aaTwQxZLqA8d_PxCTiUSTKxv2YDzxyvj4b6zfWZkTRIVmXycyifWmoq9i_lcpHTL5I1KRHOVdjpxkDPUzbZshyzl3uR7I1NiuntdM3uwCoErBPUqfl5RqjHJU4gMtxeWWTsBI64cniRIuQ-7qDBcaA11LzedYI_N3GJGINTaGFHGv5lLI6V7PoPxst85ueawj4gYgfitdxoRL_UhnDFW4KPE8W4W_t9yGxi6N5K69KXvT38vQp6BewA0SlBznNlL_c0w1021y6M="
+          },
+          {
+            "type": "function_call",
+            "id": "fc_0fbc4c709068c8950169deb0ee633c819093914c6864d4ee68",
+            "call_id": "call_Axb9HAnQ1ZqT4dyVndCX0Egn",
+            "name": "exec_command",
+            "arguments": {
+              "cmd": "cargo init --name snake_crossterm --vcs none ."
+            }
+          }
+        ],
+        "stop_reason": "completed",
+        "usage": {
+          "input_tokens": 18275,
+          "input_tokens_details": {
+            "cached_tokens": 18048
+          },
+          "output_tokens": 43,
+          "output_tokens_details": {
+            "reasoning_tokens": 10
+          },
+          "total_tokens": 18318
+        },
+        "response_id": "resp_0fbc4c709068c8950169deb0e959b081908009e66c9d80a943"
+      }
+    },
+    {
+      "turn": 4,
+      "note": null,
+      "client_added_messages": [
+        {
+          "type": "function_call_output",
+          "call_id": "call_Axb9HAnQ1ZqT4dyVndCX0Egn",
+          "output": "Command: /usr/bin/bash -lc 'cargo init --name snake_crossterm --vcs none .'\nChunk ID: 33c079\nWall time: 0.0000 seconds\nProcess exited with code 0\nOriginal token count: 39\nOutput:\n    Creating binary (application) package\nnote: see more `Cargo.toml` keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html\n"
+        }
+      ],
+      "assistant_response": {
+        "content": [
+          {
+            "type": "reasoning",
+            "encrypted_content": "gAAAAABp3rDzFeIGwQgx6QXks-rh5NKuUg4fQR5hXs2A04_lV8aPdDGRlT9Z8xmRiHFDXTlxxdkgt6UTrHn6BBkuUlYxMW_pEJy8h8jLfY_Z0eysja9-vSqtSlpu9qRb96QMs6salB5bKJwiruKT16dfQQiZmeihNMfgLEj-4T5J-LiRRsE0ZmTudh5SOrarZcDbt297fsg9atXx6BSdHT0LZrTCskWaVPsw2FiiN57BGTEj9hbp5hGSyMmGq8rHi-7cQxH-vpC3QMLN6svK5Xp93o2m9_r8c2IUYwmPDYYvtcGQy2T3YTaQmJ6e7MrBbaBXXZzbSTS82kLy_w7ZKtZTr8pcapj2I_NIg_vvxkv_kFnCNb3J8Hal5mxtuH0ojifO9QjNh-A9bRDaRc-edFN7mScU0dxv4SSMBENik84gxYWvu4eRNjVBm0oI-EzjoZHenfqT4yWq-5UN6FGynTQhNX2nu5vqc-F24cDFI2DhPYONpo7P7qnIe1n2E37HlHsBujUdquZ_N5f3oyg2Zzvy5bRCzdc6Z8hCVI820A2by8sIN6j1nWG4M5qkKr0XwDnQ3BmplnW7dUEMipNAGRA7nN6-w6RMO73aoOdn8MJh4OnMBlIJRIjs9q77sIjnJlfclpT5aTH4X0CBZak7W_GspKyJOUg0CaVm3rJsSaQtALnv_Zh4QuEG6jxohDtOrPYL9VDr4GuA-TsW8i3kzyW2hPc34ws21bRNk-dHUExF8opEaQss0j46QJg0FUXnM7upbzILG7IWy9mgrSB7UA6tZZNHG8O5qoujDxOZTyFevturKKTaIzMMnubYSqHraEzdXuCky5mQLboJq8Aypko518UmvAUwhpZfgCJ_Ug3LUhKSwaa5WQv51wg0bN5UHeP0X6VbmgOakcZ7UYKBneITUfiE0qzMdw=="
+          },
+          {
+            "type": "function_call",
+            "id": "fc_0fbc4c709068c8950169deb0f314a081909875938ce8aa9346",
+            "call_id": "call_IRrLDcBA7g15xaJb8YrbwWFV",
+            "name": "exec_command",
+            "arguments": {
+              "cmd": "cat Cargo.toml"
+            }
+          }
+        ],
+        "stop_reason": "completed",
+        "usage": {
+          "input_tokens": 18423,
+          "input_tokens_details": {
+            "cached_tokens": 18304
+          },
+          "output_tokens": 44,
+          "output_tokens_details": {
+            "reasoning_tokens": 21
+          },
+          "total_tokens": 18467
+        },
+        "response_id": "resp_0fbc4c709068c8950169deb0ef1cc88190bf4483941fbef9cf"
+      }
+    },
+    {
+      "turn": 5,
+      "note": null,
+      "client_added_messages": [
+        {
+          "type": "function_call_output",
+          "call_id": "call_IRrLDcBA7g15xaJb8YrbwWFV",
+          "output": "Command: /usr/bin/bash -lc 'cat Cargo.toml'\nChunk ID: 447b0f\nWall time: 0.0000 seconds\nProcess exited with code 0\nOriginal token count: 22\nOutput:\n[package]\nname = \"snake_crossterm\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[dependencies]\n"
+        }
+      ],
+      "assistant_response": {
+        "content": [
+          {
+            "type": "reasoning",
+            "encrypted_content": "gAAAAABp3rD3SWLN7HP_nGJE_PJU4ohUKboEeOgAXLloDqG3NN_ywoMVasEfVM35_WMzCgfr-_KPNZJXGsSfM7FqUjoaws7yZqAcW6p6EtURfk4RESK1CMHJolTlPOBFbFdQsvOK5ddtElDX0Jw5_AR2QdyCw2HFxC09v-yc8u4ESAKcDeZl9d4MwndbTFzR_7ZgRtkOakzkfTeejWeXFEom2-G_mOEMOqLRaS-D8xn169Qupzwo5T4hBQAxD4QDX_2JxaQs6dPNR3bap8J2_FV74S51OEyRbg2bOoGr8F25wF-mDQ9v_8BiLz9yDRAG0iycH4asAXtjgtfI_2cCrmVwwaSu6xEXaRtKkbeVemavhAgaJ4cPKoy5fse9HFe29NvLovqVM68MPsW_VnAIcfusRmdn8sz6vCWknImrBMdLIZCTT6pn2tVazGB9NdewK2BUfa-TGXawVc9xslU0Ws1K_NFS1vmTCvW89IzZ65R3gzZ9hvgSO3ZoORKWeeOzRZ7p-QzaqxIgyCFdPs7K6ef8vshDUGJBGCTLINCLZf7WqrvENpx8FKjgblcPIA0WHw3Jo_yMUXc6n49MamyC9A1P0wgbv1_QhFpNwF_mhsRP280ym40eN__VFcY7vKF6zYZm39VtYEnfr78j15B9bhegNgWvGamEZR7PlX9A7ThZevbUlqD-TtuHjiJ_yLTObjeSxp8q3pGijyE-zDeAcos9OlF8L5kjfhBNJnMrWLW841T3m4OBh9u2pZhcm13l_oKxdH9h_xi8XrkNY5exC8mhPacPC99BT7PDyq6JRP9EKl2Uek8FFB_zOu1YOqr2G7CoMWUNCrHO-IKT4xDDGbjUcQRVi05VN4gAd0rlcnNu1_cXANO3jJqwgd2iyqwk6w_2qSss8Zyc"
+          },
+          {
+            "type": "function_call",
+            "id": "fc_0fbc4c709068c8950169deb0f744e88190a9ffe64b803e22d4",
+            "call_id": "call_4Eipc9v0NeKnNdXrGsttbF9f",
+            "name": "exec_command",
+            "arguments": {
+              "cmd": "cat src/main.rs"
+            }
+          }
+        ],
+        "stop_reason": "completed",
+        "usage": {
+          "input_tokens": 18557,
+          "input_tokens_details": {
+            "cached_tokens": 18432
+          },
+          "output_tokens": 36,
+          "output_tokens_details": {
+            "reasoning_tokens": 13
+          },
+          "total_tokens": 18593
+        },
+        "response_id": "resp_0fbc4c709068c8950169deb0f38ef48190b1fa63392804b55a"
+      }
+    },
+    {
+      "turn": 6,
+      "note": null,
+      "client_added_messages": [
+        {
+          "type": "function_call_output",
+          "call_id": "call_4Eipc9v0NeKnNdXrGsttbF9f",
+          "output": "Command: /usr/bin/bash -lc 'cat src/main.rs'\nChunk ID: b3a0ae\nWall time: 0.0000 seconds\nProcess exited with code 0\nOriginal token count: 12\nOutput:\nfn main() {\n    println!(\"Hello, world!\");\n}\n"
+        }
+      ],
+      "assistant_response": {
+        "content": [
+          {
+            "type": "reasoning",
+            "encrypted_content": "gAAAAABp3rD_c4d20s8PdUifVb5-D9o3Ta-7umNeY66GqQjHipJSNuo47Hy8my3TIMIjxAysR0iByrjKwfNB5WT3I_1QXL2lawnSdL03JxEs6DE6c8gw2uFT1c0jvfm0z5V1SQQ1SWWO-0lC_7eAPpm9bSSQdHMogZSIR6_OUmEfkl6obXjbd5yDOr_5siAIzYhon31_pdjcIH9WvDM3N4jILf2tKl16sgzi4wh6Vy8Ggca8X5R24xE2AJJEknLVjmrAx7hq1aSL5R-4RVO2gHXqQnkFWH1LoV0JkkRhOMma92eAA4W-CM8u_MQkGtj2laopnIEmha7oSiteEddrb8-GZgt8TQuG2l02h71qOlUR5Wkz9B9JM6I4Vd6B_gAQnVffORIogz8g2wQv-SKbWCaWvnfprYw7uHNMYXMPJ_crSYUNW4QBy9FoOA5q-NqUmjHB18QMRQjUFSQFmAVjAuYTXp4ojFwaXwwKs7xeiUT-makjRcq4nhaWXrNqHRrTEApfEKuS3HvOAaKZ-y4keNZY30-PeF4gFAzfRw4H5jEoOOyGXCfJ_3mwDx0ur5CHoqIyEGZupI_Ldci1ZJcLsYRWwkBjiMydDte4gvpBRpyjtACLwwCmpfPrZrOWmVd2okIUA8SQK99bZByWgrNiKfjx3ze_xqU92Qzrd2-ucZyE1A1afVEnf0e9LPpyly_kvVg-_RLtkezMw-WWimE9mu-AUwCSGmB21IgUp-Dr1xwfg3KIOprevE-hdJVL6yuFT-rayaO8kV0prYXld7Q1_F1kYj1R2jHgWkv0dKwHbi0PQLMwWk9WZrot9nKY8pzSfHysscuXdq3meTKQ17jVjQ8Rxn6pqSj7_Yumwww9RHBd4K_rGDjRAZyOoh5Fc98Qg27qOjOyo9Xe"
+          },
+          {
+            "type": "message",
+            "role": "assistant",
+            "text": "I\u2019ve initialized the crate and confirmed the default files. Next I\u2019m updating `Cargo.toml` to include only `crossterm`, then replacing `src/main.rs` with a minimal game loop and terminal rendering."
+          },
+          {
+            "type": "reasoning",
+            "encrypted_content": "gAAAAABp3rE0kPm_LFHanGbDymoh9R_e_B8_8juqQ-uyAR3ZWLzuEiSRTXAGVJFS2zZIiUkKyD1wqg7RQi40CVqvrLqu3kX5pAkfX0K5PGA06bK3zSybuerLT2rpkk3TK1I4ePAMTdBajkzXI12VnT2iSnywFs_2zLMYqw-qbV2SerhThLMxsSAh1ASEuhmpGemi1P_uXI9Mb66gS0KUleWODHRj-_Ps_5i_rlq19X32Zw-KsIk0lT9OMC5kz3NhO5B51y6HtR6tz38v5ueVHwZhNd_wPf9uDPp-mIh9UzGoxrUmwooPyI9ELg6Wxnq_dgnTPZFZtMdJLMfd508I1ppI4UoXMXhy29MPD4dottp7Zted0lR3DZS8CfX3RDYZ4kZz-Ghtg7ju31RlMlVKCWf6-vqKgahTQnuUZHD5RT3FTWbhpCs0lTzNQkbgeJVSZq3FM1nbxhAWF79kWkOZT0iuuugRtz5Ex_QZq_zD7ATEkCOAv8himYiwPa4s1LAaJZhK56ML7-ETtiPEnd7LEoD-acwYdl3fnf_8XpV3Cd0qf3_nYPNI_cExmTY4ZutyJefAqQ8DH4E_gLaTGANL1qrmwbckG0OE8tOlu7lEYMI3eJuM3SX6kINYYZE31pWlFFFcOWbU5SCFald-bFiObHACqpeuaI2EUiDc4ODIjp3yNvFtGYq0jSElafZ2GRiXe79ohjGL3DFwsaQyLYfWp5ZuiMT4YlT1ZtVI2lzdeBVi5Ad-XNWv0-z25tvAs2wkx1NSYPM7AALdJAKxduPMhVusk97on9oTqL__iMVhjHOFTaxx1zfKAX9vcxTz8udAblOOgY40NoKIbImmX1GbGrXizPBvI5leuH8aA62ao8ZzuH6MBQVLVb_r1_F7_meBsc_eCCpEDRnv9noD_U4fg4Y3MfFCidYjYvdUt92DBaq1KsI7TCsgrFp-Q4rvsXI4BmjZ60wOviR-SltrLV_fzgiExoz-TAg_elUt_woQ5O1-mYDI3tC5Og-tfJf3Tth6dc0w5UPhhs7I9Ge1O8pSKMWRCxx7r78Isj_aqXoVVIVCwiUVNv7ANLekxRKNsWj3pEGJTniNO1gFssqYqsRWPAG1Ua-H4klWdhTKY9IhzcDp4Lnabs3Qmsy9aQqNrCJCHjIKrxjeaa-dEPUWRbNeuLQu8DD7pNeY22gNoNUvpN1FhHrxpLww0qT2TH1UlNkQ2MEpliUp1wddC1Br9rD9xbkuXxEdKnMwqeswdpi1WrxKZU4sVNLg4Vrh0IkSPtRf3f3oo_xyVC6681yn95oDsZ5t1GrpwNaCbzuhjVi2UvI5gedIllimMNQ2clR8ghnxJSXvv5KhwdE2M4g2G_AHedbAQLYYRoS96dA6KBF1faY9IHcD1ohDgPsDc7tgsc5_RpY37jYKg0jg9xK66X5LlkOdAJy1gE1M4F2v1GeNvAL21vBcA2hTv7vx9nR59CBibLmRFlRSiPupBQQHwazS3zOXLK9kKWegNTH7QtNIgLMYxVJrMswbgEDzWj9ZLJYhzm70pLLzOl3NVIIxFd6GPOUhpHqsJiClsH2NpO9dX0uvx7TFqSCQ_R1YRcjc7TEvZt0UNBtujZZbtA_Fcvg-XSKdRnGOcdvpPIyq0UcmblwdvRzGra90yywkudk-QQR-WrmjQW4aS-HrZsnzByWy9Bwq96QCAVsWpMfIv8xECLvqk6OyF_dBFx6xut_zzYIvGZ8UWZh2015-1LAG4v2YbjBCsiMK1TPzpHLm3NYOjb_uUCzFXMraJOZqmkKRmJh4eQfLDtjixwffzdQubd-30Gzw3mhnZNNYEVv8WJ-GEs82xZyCiacsCLuJhbSo3XcVc_O8CSA_Q2CNNUK7n5TydVDfrfQY2W-nKG-jG42SirB2yGXTU13pVpRVaFK-GW6EVJ3xj2rrHD33LiaqHH99f5R3UOG5ovPLPdWP9aTy4dA7bTH3PdAJowE_A155nMKXA5IvUiG53N1M2W0Q5PKVo1WvQvm3l_O985dtouJEdzFrg8s5P2-5joWlUWsEB3OBstKV82slCup2R1LCwTrD0ZWL5jA6NbmBbSa5soNxan1ghTAoSD1zwUKlTdNiwAym2-MbPg66zGYLiMnsAurQUoJmXonOstA4rQ0zpUrEtTjkHyFzrepszhS3Rarirq6gnQQHFCswyOQNXeFPwDVvztqJqjwqQICLedCwS03Fhe8CAea0o5imPsV5IVr_ESeLFoSxnJ_bHQ9c10pE3_qFxg5Zl01EjU0Dhb5Eot2XWsS-j9ecCxpUWJPPWEUXED8xaa4A7Rt1j-gEn5wV59yn_YwoPMZdiclcrMpaN1A-L9XyRKxvD-d_z6nokCNTjvL2Iowr-FbgLzK2Xog1kl2roFUAQQ2hJbuV46ljS4rn3zrlkmate5KewEKv53eTH5dvrde73o45WyS09TUS5PLM4vEu5fl8OxzGnZq8zrnW9W4pYtLDMtkD9vvxhs-cWeWP4T_aYcqEhK0874dIr6YHJRtX08KX7EKGPkhc0uQ3NcnwnxvIgLa9GcDkRpmKKYJSWZsnn4eexpa01BvhDy0Qf05OoBVRBv1ozla8QSYbM6jh539AYT3wMfBhDAgLERq2yrZcnuwoavvEFF084ZHYOUBCOdw-RoxbHGJVn3yssvZp5DkyD8l_aBTCyGnF-3lkllCj5mwyv6yZOoPhZu0c88lAD_qjkB8UK8Mm149fwH4nD9FJVppB61mEUBugt1NBPEv3efliAC5_iaBmGvdn2UwqmEt8WHioLOI1pmwcHgvLRl0WUppb7r2XS_XZtQhWX977SdS8_Rr0fBS0_Ghs799LR_n-zMMy6PPNaRQ2DUKCwIJLMYxiggjQQx3DvEbQQY8DkcMYq4tbg-xOfjl8AzaY69jZxRGGCQRRK2HehdtebZi8AtybpXgX8BvzgA4Z9f775s10TfczPwIwfbY-Llw3XuhnWoe6YJrTW6Eb1In80J2zA8iDnxPOOSsXpstPEUZp3gSGbWUX6qqLkrYgQCqARMagSZ5zj8Ex_gCVQOlXMjl3Dj5oO7rO5ZcuzxA5mKRh3k8D0iqdX9pKSCgNWh0NJodt6zIWEHrowiWkwhLssz9p-YWKXs4W5WY8yxWvnF9epIOjVUGgn3L-MdRrYPAQFk04i5-WfUaafcfEqJH7hoYjpXHuw8GWOJ5xZXS3F1cmMQ0N-5psJXLefCE-7IvYozA_tystn4xaUWRXsAnNMxdyZDB1Xm1rC0-AKNaqZQAC2BBptS8nWbraRK9lhw-agLyQvRghpJqR8nX7z60naQupbUh5xOrAkm_mMxo2q6XnMnjNNgSsfGwUVkzZWDsu7iFho1Q1yvMZICgmyKxmAOrfIWQUNBdKV4uSpnccSNtMfKwb-GL-gV5dlBKRZ1s02fyZjG8Duqf30ixtV0eIce-cN4IQnWRUpktOHy7x_7DbyauuwiFlyg-lAup4zbtw6yHH0XrBz-TAmPx3AqvZ_sQL-FTTySguzEoURvN0ErCauVegPN-v0wS0iAS4_i0vCpr2vqv84Y0hhXwTUleMk5hkuDss--EWzt_9plBQKYRIz_wKC2fz6IrW693gDpHQBXmkJmkqDqSBQiF1V2I2nn9XEcIwps8QDekrOGgUQb8kd2_QtlltkMXoJcKe8TLLgmmsaqcX8I5pdjsM1Vaz6K38ncKSzGn3qqPnDnguEoIjK33FYuJ3rySHSknrMPQUjeERX27glXU1MBkD_olKysuNdutoZZAvS5VAFX3s7o_cEasL94WbAZXA1JbJ7FBJd9ORHb_qUu95fLB7WGdAJ3TqvMPivGF0GM5OlTzG4rq92biIJgd5kFNlNSJAfsBh3sLS5nXWUQz3B-DZr10Keu9t4LO7vF0bWAFjO3xz_kSS1qnsDf2EM-HfDos7LGFty_fe7oCS-adr6cVFxS745dbqy2wJaVeC4PjP-Ov6UkWEzF-KCN8-6G2LCaqCMHZiawB04Fseoaf3A5n30WbGDeyRxErHDhB3UCdz1YhYpIjzeAApCpW5UzplYygksFyw2bjgSaECAigwWeHCPRmi010GKfJIfivaat__XXah-CbvCcgNdXsg_GLY-2IpSpN38Ko3jHNl0kSsw_Kn7Rs5F-g9rEOAPC46zY19jNF0RBdV3dMr71m6tPjS3tOySUizc6fDUt8MGvhsJHMMIT0l1cG4n-RGIxtMfY8XC_nO7884eSfpwwLH5UTCYA0h02uNaQIg3vuFZ_Mnlq647VDf90fctxuAHqpD5CR2hiUTrpVHqOElrmHOq3eYDEClPT0UvySrDqekXULFeSbJa0ttgVRhb86S8LJOZZu7618aBRZKxxIeDYvFH6weghslf0uzSICy7t4F2WjHTWdtkr4d7cumd3xPqoSbAlMNvNIePZNQZJwqkEkXobKFeFsinlhPQmdPtAUGAiMzUpulbPMwmjd8Nt8UNg3wABiXkq-ywtkqY4HNd8PWuS8IxBZuO-Q1BmFb1LPhfnauQ5-cljak029nkV4zBMssk52f8eiPJROhQ2RZXXip2kygP1mrdIznSciOVJoenAeBI1RFUflnjCO40Lr6HqupKFc0coDOQriQAK2VU8RaCn3zqpjFxSzZdlbwfq1IwzceJ1J2OuG6ocKEZ_kNVMcawGgd8hYOkVTpOe6DheslKJGYV6mCoIGcx5C640HGOIjJY8VCngs4xHRkJ6RpykfDeGiEFUBbSwaoUjrr2wLDQ3_v4HU_wL2KHP691MBt6QK2IG_OC9F7nJiKfpcSLilk84IqB539OzOE-0m1qrZEnLCzscTdeFjPxHXJIOb0fSGlgIAWyq18NY-C2yv_kNWsKy4R4VheQ3YdBEz456R6or3gq0yrginL1D8tqtxEHBzNSqyVNwEp9Z2Z3PKA5lh7qGtLFYnVQpqPlPKEzbSFy-ys9JKbxG_ib4FsA2IEmPzYBcT3IVMasePYunSNxnH_kT4j-Kk8V0pnFN6txTSXDxd_vDyRSZmUCm61H3Cnnx_TpF_qeAW8e4j6cREWYouwOWn47MmqMSR0ooLhMC2eLLGH5jiRCBztS5FdAEtQj-kwOinvIR2bJ2vtnZbxkklotEKn3H39GAGcMUuRuYnBfC8z559XRrQSNRngwKKtQXK35iB-WB8m6JF5VYgaKzab7EzRNrAyO_TH9wKwQVOkBZDr_ZHHJGHVPKnQDs5bEjmEfO4MoJECSdR9TEEtgCL-0TmwiUSi1Mr_Z5bKvarkTHpPHB5iFV3ydZVazeP9f3ay11cuZqG4-Oe1DnyE9c8mId5WxTjYcvXgCl0CekeMa-WTgrGMG5gMt38iNWfV__CAUItyGJUM2QhyXpkuz5HfZqh02KJc-ta8XDB9Mv0k9F7orb7nR_mfi-haHUaoPzCnjL7Wzr4oAM2RfSGRIhqM_S3AhgHRPV8PZDCMXDKTkQTdBZr969dDfdjr7ae5ooQ8_cKIVaaUJfVSHMDQgmFn_GXDKzxlmRNmpmyRT_GpLD-BMic0-0ndlNF075I26k-TWKIRZuAJaAHdSqzWLyoiUG_9grvGtTMA3TWFoTEvYd-0pU99jNxeYrEcdk69oQAqaadt0hqfXgFJ-3dX0EQmcThaRZdunWBhYOFTFdyws4ANM1KJuRHDnCm2eZSAKbdz6wIgaPnLA7HgH3EeWyx4AfdqpHLt4mLL_2EvA1B_wBcd9_ivll7R9yvquujva4h05jl6LHpJdMIuMMVR6BTQaj2HzlpdVzGL7oITSU7PFhJbKJUnZlmdce6KzF6wz3-Z4I7EM5IhEd78ca1KhDIGT3K2KefCgrkH0O1dNa2TICxIim1BQaNGzAZmc0qywknyS-aosawMXwF7nHq89ohoeI0q6ffttBVlsk8iPQ940npCJo_Ti8LGzZwtQmaUnDbtp6gPtxaxoVpvbCh6XuG0Wvmv1-7Vw3oxxmU503NRVbu3FEQRbveM7Sf-OLo8Q7z6Qz5kVCGBtBO5ZIlk5tbiyn6c09LZT_tmoMmO7c0wFqluk6bJ-6kBAd2cmns7AROUFRlqfRR88vWLCb3QuxKmCC4cdXHG0OO3kDRwDrOJ55cMS8HS2AqMXVBeuUPvXEqTPl23qPW0NXAWjRMzsTcS_ZdFubdDBfDJFiMy1f0um86tU1qa0q0BVbrNOJfJaBobOvyLD19GYVq87KAL-h-1QaxlmsWKwFXR08MXANpU6a2VJ6yGsOm-HtARvye7GLHEUSBJf-yY5ZOpc5OFzpWcukjgoIpbSrFy2Q01ftw2feRITqFvtlJgBbBubyFLyqXA4i_-p_iXaTWKbalbm-qRGRt_GZSvSalqW5zM7QxnJb1CAW-JDWmHcsZcUMGPC5n7hSXg9EzbP9KtOzSKDqhQ68kPQQZAR1g8Ley48qmXYpg4OcDOH4ir-xlYyQWNcDTauQ68BWOrGK5pchG4FHAdhK53Yd60GsGC7UNpzWFiQRqseTyaKChXscIHYQYUsYX-SUCpUFlSEro4b-BQznoLj7j6AB1Mc8Fb-sv9_8g8jjaDWqjankRa4SMv4XdhM8odzaig0ut-4Hd1ZnyzgEyie5YBoLQx7DfE-hpre0LrZmPHfxfdbKUuE3xR3isMNhdagbT4pZw17A9-Z-ko04lwoKzmTAUvE8hU0b8jisWTODIvcjryHXWLk2TgybLGV3g57xib6_igfA5NAoaJlWkzPKVmYqBJ9ZBCx7mR8vKWiV-Ohh_5gUbdK35tT7dBfmUlrmuwdtPq03pEvC69DJBU7oPt-OapX2RpnG7txdB3oCIr2G5Iaf2HJ77lFHoYrSZVC46xMvdjw5Bvf7kDDVGlsyUV1ZI-gfU0D-Q75cdH9skq7rh1LkbDaOGBGgRdoDJlidEbJSEIniaWDIAbHIdmSLkrYrf9_9hVHARZII-KPgPpjNXcfBP6vWYz-17jCbDVxBO_Tm3dbkhvaqkLStEK1CeGKZLUeoDU8UCwDDPEmQSKQgLQq-vsNGdy-2bRzXywPEF7CiKbPYUUlwVK4gpfJTzPZsZRBgO-PkkZBn3tsvgUtfdzzwkHWB3bvJRd3YMyEdV1GbuRJGAVUb3xTyJ9Rmbk84l3X0Cea_IJoJ6kHirXP3lMNu47KC9QgCbngrNNKrVtIdC_a7n-jDhNImNp-L1H92WL1TofuG1fG37M7nMiNcFDV6UBKRBXxHDyDhQ8rkf9rZayk4tX8ER0jqfTcSux018FNmiZ1GX7bcPBao0xLnD5pNwfK1JBYYxPq05QzFz0Za0HJeHH-mGzoz8wSi0q96Mti7GOWxGyKHkdNLy2q80qzJPwZS-f5LkrpY5WUxU8hwjcrj8t3JdEqL8zquLMwEdlgqy_7e9qNlal_zbkFqxSDlP2zNiX8dVzSdYl7pF9D7uWPV0jVZ0VGHEjJ5AD1ZRSzHhVvVcVUjLUbXbVOt66wMD99pRDp8OvcEXqR0L7WFFoocsubTdJxme5vGtRFmO39acvnuh3DpJoW6Tk-if92wXjR8hQwtF6pN3AD5rh1T735gjlBu9DwCBCt7WF4_x8Zw6ZGM3ZAhFdZH4A3dgRUmF0DETQ-riXNmExjgWkDqmjlD5smcc1rqM4pv74hHeqxa4XKZJY4gNSV9-9amu7MFxqGJLljDmsK3w-Clam7spxTnUZ2lGs_aDHtUpa1F_muSBcExekSeSC0GWaOfizW3Pj0ILEm_vJ4_ldPaiSUeKB_haDxvcr6PhOryU-Fb7ifvvMfVaxWygyXzv8OsuDxGTd3eUtNBQ1zzWP55_IyD1xQ8mvqWfxqkualOQvF8nixKe7YTiBL6tLqoOxaefwLC6Ae7aPzYjaNhd4LjcMYJacNKUlMBm4UrAbHZVWahI383IJ9eH6EvIPW1WOHoM4yLkBCZAInBXkZ_z1U6vVHUg3SF4rDEkMP-VzH64AjQqSCsoqWNwSWlsyIY8SQpomQV4BZvPVBdQ_L3bFapvtJmzBmsYgJvwkUSq8qxX1nJ5wy7ZbgJoGbiztoHB2gdN09ze6h_bk-MgcINEVorLRjYA48OhXi-ZH-zZe66O5_1MPIsz-YEWTmVsDskBm2dObV74sjLc9-q8ozBsMIhAoQIA-42bsdC_XfMhENyucLlJXEIJos6W9dazc55Jc7KOX_EfyqO7O_l-5fuhTHhrMgT7Z0UoMOLN8hXmlIX8cEN7o-CPJFrDVDjNzoCYinjNxAcZyzxdOj7wM7g4wFONbtRTusu30DoTVhiGtwjo_DojxtZCIVE5ZR9wcLCgW49Qb-EqVg7KmGFTtiSb8-6G__8OHX7JYe-gi1Psac3RktI51M9_qsmKIXW1TPyJrDUdkr5IbQ1CZZa2hng7JN__0_l0Dfc97sKuy8EiVhqf17meR0q2rvQN_u0uJG7P9IE31AvNbgrsNW_w88Mf-W4rAcIKrLrnZs1mDvf41nYErl5_EJNh_1BNW2aSvLw6rgNLtFHqkYzT5b3dgy_19rv_6YYUQ9b2_fY7cfTdWM4wBGpBbKfCbzMmYuG8tcOupqmmwnvkyKv5ZW7tu-b7VAFlayBSWXkYOTiw-Hwx5X9B_fCDF-TV4ZbRYn3wuXGUcTeg53pvPdiX02Ik0MeCQT3EfSx7egv7ECFVufB7yO2ecY6mwDZiGMB12UoIkJr4II5LrSGbyDYjFoy5jIxDXxFeMd_Upq78qlH9NCNxuCCcCL7-7teCtFVDOcklegWZZiZZk-Tqy_y_gsPg72d5zTiWZGaeUWnUdLj9Jcdjx7L_9c59aWZIv9bVVja1ij_Z7L3epxoV7wm78wFbjHWMZrtz4iL3p4r4EY_SWinWzsdUrGwkZbTXE3kOSxpXv1eo8DqEYTaZ2UfG1DBkhLIl8_3IsRaa4zs1C6XJBtj3i_ZnZcmYnIxU_pm88kP4Qq4CLinKDxsZOidSt4j7qfuggQQeLgnX5Gp9YKASpCXjfC8t3n0s4yd8Cc-tAwfFWblmgTRi6FvcxIsdSzClLvKu8eeMwkZLAQABLQdu8wTHpcLG9ZLZl9JGJL2LY_PsWs9Z2xSX5QVQcXkslhCqdlw9ct-x8OWE4XDYBTZ-KGyM1DfBZ4Wb2dkvkH2tHG2zaWwLeUndV-1hT-RLrMPhZRaNyxAKo94Zr4Q9m6pUotVILsz7NGNj5UPj8BUnvuavOYvqgnoCnFx_Ifhm-WxmzJbhwP4Uts59fDHVPcHPZoX2jHPag6ssWmRUxB74vg0K9hzoLuq7Qg4I73fo6zysVLsBI14cIqVYtJ5wUuZvuo7IFfxSn4ntMh5eUEFsJKU6GK56vfZwB7zDsVI4wXlnkcT9JEKIK2t-AYGOBa43Z6jEqjGSwzYCTw_o_31Sp5biBtwiulaZ2DDvUxwRVtL4YORAap7w65gcCh74yt_qCpbRhJcFgNvprZnb8rFu2C6p4GIvexxbu9ruJT9aksW9men0CTtLo0QKeJA8NkJhHlMzEwurM99ogAwDCpi1wj8xK8790tfYd3Htu9mvY3UK1X0Uwkquahwn58nyLfCwr9AerWgXy_iSHuyjZlJGDF8mJK71bAas790mkUc7L6LTTWu5m3y2mzmLuHEZNrsjHXpRUvsL2sVHgInVv6x89syeTakAdUJhCfELopok-s2aBNC-lGJFBHMzrQYL83WdTJXUf1eU2_UzLk93J32oXJ5C8u60rRdeT7l3tLzROzzRwv5uL3MrVsiOyYqR7wgA0NYYcfNebmZS7i6DeYcTHycNZwM_7EMWkXjlUb9Jjdw5Ndk9PizYn5DvsCGEOm02nklngqSErqsD6Q-LJ_4Gl7qAkInbh8D9SPobixtLhAyGwp1uMosPfjkLVvFpPmxcLRQlJ1mHr9S6NVWUdTYjBi6N_GYBczr2rxfjSw6b_e6xLNmxzJpp3l7w8UleGmXq-hdXl-y2H6ztxsm9q1_hY20VUFHcEYS8GX_B9ZSZhdS-B1L8Tr6yrwEtQa_6KHOhDviXMnx88ZSTkB1LaifPUIseccWj4Z8k6wSlYzktBwOp9eOeKVEIE1yBOQzraY5GfEr77l1dG-g88YeGDXfOLU-zSAYYlgxroeu1HFE7yvBHrLu4GivONsfU_GxahCzNWQqGNotFEXzqzdlS18JgGfKl5La6XdwoxCtH9ZxfjCdfR6I29nN8yPRZxkcwRqMmLLBxI8tzBiWWRpfgTPFGqZohsKrhXaRhrv8KiKKvJ2AUiJx5vAysRJN0K9aZKNZr68wuDJFm4wHMOg45kDuLSD7vAbXdp9UogwVxbYz_qN06KorJsDyFFSLjZyt2JegTtrvp9hHs2y9Dqjs_FGWTyfMkLYa4Y2_ToHfdp7VCZ_Hx0ZKk6DAk8mtCtd8clyNdSuent047b7pJqnLZb7OseXc7A8GQAZid4OO6pPZrZljKr3nzO2PWxC68LSvgAviqssELAYgZ9lkV8ggaEqV3o9TUO5WTriSoI47DjZsYmuR4MMJ46FLpMGleWrc2mhJAOqzZn9PTnEUrwtrPLLu7dTkdpxe86BxmnjMptaVC20A2f6z2HiSuyV3W8DBfSkckZMhalisIBiJ38eZJX-R5cwjzrZY1H7lq5zNhnkQHozAGZRsBhwOzENNfGP7w1ofWje0kHA4stHjwxLzBUgkjO2J65Njp5DwjXBFJbo8P5lPBlZpPpCG7K7vStYyKlvu6mJ5XRkK7QvVUoiM-l46H5lTeEmCVZgooBgc_dJ6rDwDegXboC902_3GEMeGkPM-431E8JNpZKoG0ugYYDZZeoU10utmhNhBdGqnFppsN4qn4U7JPl0uvyEhYEoucZv1CzijCux-CQeTEiillrHqjATmbrqUxR-bbxMTagzdQBSPvo0ld19Ni_o4hZippKlJudYGpmE1lRJoDCv_nkJPrOSJBXfCsdilOKX9_uO88bAg-o_CHGb6Lp-CcCTIapgj6bDBKy5rFXy4OsYHClQAqJi0NLgbEqsDEujfDam5Sj8isnHU9kJiKizaRyYmfkuaDCAIB-Kg76Kqu3a6bIq-iSeaFpLmksKnDj4yyzX8WI1qvrpus1oj2uO4PvMKLpCTN1O8cIQznlwT20lifqnMbGCIK3XvJESn-L5Wl28ENCLeg0KpwIZof6RK26CISnPyQEsVkJbMe2_Oh4p8eoM54SSMyRm71hDHK4AHMQeNMIL_JSQbtz6ikn40c2Ak7EJz9qzk5kbmfDoAuDdMawnRbVzpHo8kCeSBAKQmD3x3LeRhPfE3bDazIRNOEWmva7V0kUlLpFmiabA1vWWGyEpsE6PhOii9Ld3hb7gpQ2gE0l2iVjGRMq0ssB6UlKOFSuStry5NtLUybNVE6XnQXX_W8mTWtmv78vEIy2S_5r6MzcfKzrCDdSD3Q3ldVl1apCAHC5Wrb3wkNJc5TKJKfqzf9_0Tqk9ko_bO0ZO_DX2HsWKlQtHSLU3zppI397kmbj_hCc740-DBiOkh6AiI8nHDhRsXyt_SipmN9fm1WaYffeg4EJm7maIQLJ79V90jFoc2xyWBvv97ajA05FzxmzAhRP-bV0cxoYg9QpNQEi8dn5h1j17imwpjsjWQuurZhieduo6JmNH1QEaFZP0F_mYVkBCCZCyY7-ZJU-mkRdRqrLwvtHiaL7ZintbhTlBz2QUlDCpYlLzTxga50pGHW-ttYQPgv_EBqDGh-fXh4UOCur7JDjtIQuOh6Nyr7BdSpWA8cJnOEgZINlAgYlp7tALHwbJRzvTXO_-Z9bU4SMZtox9uEdz2bKZ0ICnoejcDuzO6Vp-hwPmLKY2nTv4l1YURX3Y2vbRtYscpFPmRWJNt9zMmAPvSHBT9UYK4FepceMuJe2PnhUyycGv75y50AbYFw-FjWUXT4KWW5FP9wc4iUYdQyxsRHY1UbgmzA3udW-03J7i_tlj7CZJglpvrXpS9J7f9vGb_CVV6Eg3Nz-vZlSRi3MzbAnggcEQpOxbih2Ezjt_Bn-blPZyvrv4BgcRFt47ptIwKCbOY6JkArpHlJbIdRSD8RZjiAKSA9cXPSZY1e4PThU872UthzY9gx-iIZSg5wocHJiEBLE4FEe8bDBm98xsv37NHRbvBbcf54_W_4Fa2rgdEURkhHu8ckZDCzdRDmIX4H8-QDFKu5HQ0ldfUPQ1ZtDKmhD74_o7vD_qTCLMmX5FFJuXwfrtV8u997lEa1-lh0UJHgT907vs_8AHJ3oJUSOlc6pO6Wa5r-D13DamMdxHieLyPe859MgTj9m9cwBBTYxPjW6g596KpBqTQmOH-nekASlayj-oDeN-eaA62L2W2c2_lcR5tqCyo4O6xwGKsb6vlRvtFw9fN6iWfuYkZXlO4tUO-sp1A-ngy2hvfvcS8E8yBr6XfHZtRIqxu5bLEfC1lFgRL7dEqlTqH76qW4mHXzutpsENzi7XsS5bSEhJ78nFq2msyfHFXF48VvtOdfFHNI20Kzhm5y2T2Mn8Y_dztL_mHeXjG23OJhbG307tdSTGeulDlNJjHojS2ltZA1bGzhAehmeGZvPTVGWMeQX-A-E_2zRoEn8_rlgMzibkmiEuXyDIs4CY-bOOhwYpLcEE95zx-ST9hpy4njnF1H-NaqcF0c2bpajMeHP_l3rWueSiKDiroHcZhsFOX6CQh_wJfc7fyK_489KLaQ6Gv5OMTFKj7AauPCdpo8OJ2n87nN-Ia-lRp8DffHgxK76e61KrzZCa7RAfOsg8WtefbtDywrYiQccH6Xa-O2ph8e1JomkE6H_1z9l_WQNM-VVYZwU0pnHmwi1KRs-Oytjt_Yx0AlTNSLVeq6aaIeg_V0JPjrroceWfgpvgTZE-d4gLob9Z3fq5Lwx60-to1QGxCyE3xM-aYZ3qxbKt2L3cxBr6Qtc8TRAaqpsXheXcg1eOg8837Yx0kefJapN049pCSKcW42xVKYYym1L3QsVdCvK2bctby8MMl_NPDcSkpGLOLdHFwZ-EXDT9VeUxdZIQkAPtbxrkF0CnHXe2tGCJKthERtbMLhk9k0-ETTC4YTqYmmnK-6uqNPqISoQ0ShSFmAxQa5tLLR1S3Ae7ECact023y1Sh8EhQ0vgeMS_DEuyPjzkGl76YWFLcsDe0vuGb_A0zTxstIa_BG-FCl4ms8W6Gm6TUcCsptClTGirVTVHMNjfbc0bRjoS4x9wmZIzurdD23XfnSke8njHKEy46vckDyH9Tk6Yau_lY9ub6kOSl-JJA11yXjGFPm0FHr9yyIQA7JdWZ9QSp3v-XJ5akpvNlat5qPFUr1XQm1JA38FmEE_-JU4iwlJI4bbOyD8vGU7ANcN6kJdGAzlGFfcvZXHqPdQ-6iQ5xqiu50OqqIYu1uzj7ZSVbNzLg_h4FxDIVEoDtIgFryqGCimnLpaUIKY9Ah3zejYdFdn1m-6kkcYNL_EW9x3lFKqw1qi4HQ90XkhKF2D9jU27NFHCWhc4NYjZFA7eskFeELe2PA9BQt_el-b5E-EW4LBA21VLM12hrDdNebAViNzjmKb5nWD3TtI8ab1IXitHy8LY4WFDQScrhG2gkg4HZqJ0uxH8pqidqICdtIWGSesOFlVBFcdq37j5AeCQPbHkys9Vpf30v4xQSAfJopEsWdYE4A8qGwr6RhcTWR1aTxupFgkpjCSSRrZY-nYrUDVJhxho2EnlWVp9VYQMjmgHMR7uvd2OtqgBpS0s2ppVNU0eIYOfESHXUVjAtrPiR1tcv6yJA80-57YCWmdVgp0_j0ihPCf2vCv-0psVVwkaEsjUsTISdS9k-I5AUeRpB97HuOwp96HvLWW8D6JmRV5iKJX3GP8AnfufkWkxnrrW3tcPGARQgkaduZJ0X22eKQnrtZSvB3Dt93bszoqAfh9Qpv8PIb0bSFxgzTmn52JOhtTYbbs-EyBbqCDGCsI-SZaNw5O3YRNxzckFNbwfxo3EWm7mj59xHtKMTWgJ2n5etAPV9u-p87FNH5auOElMCCeOctC3hqcOyThHGtzw_EDowVOgPrbPpuriTLzW6Lm8ZGNLVTUWkk-3vIQXjp_Vim4rr1W_5Qy0NT7CXu5IrM3YlHgP8wTuEZxQTY-u9c-lBMPylP31r5uz5ow8eJHA6b0vxbYgNakiN1xl0rtvLMhiILz7dTffGUKBqwmGzzNF_f_wnFh7SNJADTZ-NXqpu1LUQfGsrg6btXwH1KLu3TturXzH9G1cky3dGIOQ_0WpHAAxMvKUSt2SWxjLG3Z5hcRswm-ZMAp1zYLxbTm5LhYUVCjDik-FzOYiUNUZtMKtFw5Uri9IJuxwPlYqzSiaFAJy99nLB8iNGfwvLtSQ_bsPrBYItGTTjvPp0SvssCQDDIfmTI22VlwOEGis80pXMfSbmOLMxBb_gUHnxOR8VwnIUKwRXmbi5dD2HEMjgyosJWpTa-PJ4zuLut_vSHFsAQj0hxaGyUK6q0iB_2rTZGjYnwW1LKg_mINsxaZ93nVsmNMFSAPPu_gznXr53ULpagTuxKqA-PQSjGutaoBvwdXixxOal5wubZ-0vNqCc889iHBEy9Nt0J-q5Uu6TFySoHUl0To1jHU494fxo2ToTHDgk3FRwunyLkMmH4PUz3eEVBvoTAHVFz92S_DYNdloupK978BwlVZInGI1kR8zLtPCH1XetMBvPx19eJHronFFLDyIhHPKWylADFfi9MpaDGK_irLSdU8vH5shVvYHcl_kc5JzHrKH54_CZc3K2E7424Ja6dqV-rymiXo2mKJGxusgrigNbsFjkHpHk609svPEgA1Sm-NLelqVSO0crF52xN5VS1O33WY0mlTrBxYDWAQsj7i_sMeOzM7clZ-Xq5hh5yyIPdIxZ3q35mBBKuKIiwJyQjRIgN93z_0P2PgyQmQX9DVw8PeLDKx-J97VxH5Q5LXyqBsE1d69zV3p5Wiv8oswwGwNy1lkW8v-DxQDsGBOCtEr7sGQwPLTLdhwBQeJondOd-jK4-taPmaqLz00slj7iEC1Av67ACwZqT634IbRHRKQ6rbQpKIWWwld7N9I_3eOCd1surnYF3vq_-tI_f5_SKRhhngAR-XKC9Aey3SAzg2MZKX7d9yUIMQ5HpRrDhg7ouZmixxwHzg6phkAYNBihzcHqaUml0Z5jtUvUis7B-KaKXG0vGab1zxG_E7hvc94JPm4zDFunENkLypfKm5nIQn_k0tGkv7vK9jt0CBY2RfdBeQHdrQrs8vs9ipRoy4Ct9l59gq_-bRQ-BmHuj1rDBhSBB9s1okDRpmfQPYiJYOZYyw9z0sENAXpCHYc5_3imAc9aCCe3d8a8ceKgHHWFb_jDwRkw0by8oM1XVRmivIFUiT0LRVDREzYsKtngOi-Bi4AnYX8telkd-m_SYhgdTGhxZju0tpTZ_bssk0wpW2d_xHEm_YZVfeLGGoU98eVjaxKVCRgiuDDSm9ujUIok0_EbAliyFK3Hsi30e4cAASFEzJDCZvzv8uMfoXo9cw6cl2JaRgVjQwpptT_5rlgE8el_WUeFevnLu_Tum1Jb0nytHpzPAVAhbGgMn5ZUR2swFA1R9591Xcx7bT_lG2NY1N_ZLw3ID0HCI9_W3T26Fw2CciFtB3wSsLMN7KeJuQ5EB3zFjga0kVs0upTyGFsKo0LrMhovFJzLLpnX6gfiGdCt2sIt7EaVQOuNVNbGi0EPqReQbEag80pm1sz7UXp8meQ4jBt3rOwezaCA2r8yHy7XWBDXVOdzkf9ncJUDbij5db9QHPAmEix8k07nwbEtm_zL8qMOh985redjalghmGWBh9PBzOC-f3vumsq4s1nM3VMd7rVXon7Es1IvAhZy_yeU_3SrJWDeTlSnJ2B43rUphE1TQTLMcXR22b8Uktt-JOejkLMYV492siZ8EMJxQxjD3ho03UBE74hprrWKdaCxeTikKsVx3dFjtoeo1dek52DgVpJXJ5NsdqNiluJ62Q3YLv0NKk2VOgosqSnuBxCPo7MjLeGHC-GDwL0DhCoTqEEGJi-XnTWR5Pf6TwDPB-Dvc7BsreUT3vVWScf2QZvnhilJf4ua9EcF8oCF4Q99iD7cp8zTHCCT2abXGSU-RvWAJyQpSo0v3WRDwuNVJa8cD8lotxp"
+          },
+          {
+            "type": "custom_tool_call",
+            "id": "ctc_0fbc4c709068c8950169deb13402048190bc47cc8fb7330c7c",
+            "call_id": "call_cUjAohjEDhooOdfzlOlOfkYE",
+            "name": "apply_patch",
+            "input": "*** Begin Patch\n*** Update File: Cargo.toml\n@@\n [dependencies]\n+crossterm = \"0.28\"\n*** End Patch\n"
+          }
+        ],
+        "stop_reason": "completed",
+        "usage": {
+          "input_tokens": 18665,
+          "input_tokens_details": {
+            "cached_tokens": 18560
+          },
+          "output_tokens": 2964,
+          "output_tokens_details": {
+            "reasoning_tokens": 2868
+          },
+          "total_tokens": 21629
+        },
+        "response_id": "resp_0fbc4c709068c8950169deb0f7ac8c819092b4d37f1124dd60"
+      }
+    },
+    {
+      "turn": 7,
+      "note": null,
+      "client_added_messages": [
+        {
+          "type": "custom_tool_call_output",
+          "call_id": "call_cUjAohjEDhooOdfzlOlOfkYE",
+          "output": "Exit code: 0\nWall time: 0 seconds\nOutput:\nSuccess. Updated the following files:\nM Cargo.toml\n"
+        }
+      ],
+      "assistant_response": {
+        "content": [
+          {
+            "type": "reasoning",
+            "encrypted_content": "gAAAAABp3rE1d3JOKQhDf4NkQPJBvE9qYDbq5_BVnQgC8JTjnw86EEXR-OBtS0bc1AjAQGuU6GhgPZRMyUdrWaMBUoj5VD71F-chwOiFjBtGEa7a_-LZiFNYi6nLA9hhQn3u-5aCjHQ0DKmsx3_BpQnKS46b6GXxa4-PCHezBG6ai2VMypFfrisjXH6GaEGOckvXMfpUdU5THSazfK0HwYERTflnuDdZEhUheSnJ0ds4lGBHVwhgaSYSV9PXL3gUhdnK90jQJtAXKiwwx0Sc6B6evlpS0eyk85Vu50oxr50Rc-MPRm06LAkoTKVC7G2TAdQRlUbtdY0nUar_404zG47w0THQz6GDnRgkvFAbWjCPdL0G3TIacnp7gxpBquO1_nTXHeAigTEKm_1L-Bz3jIVvbHkrJPwzbbBp1OuZ9R7HxzCx6NloRWyDKALE61_wXj1IRvpqbk-RswObgRu7aC_9TpnpggmlHLTOFcehtvawzIrJRyiR0YUZrVD2d4nDqS1fQO-qrSuzjyz0DzDDcuUvABO_SPYiU6Zae5zAJRnVd36bstnGf5DkxWvq6gn2il5RNoto5XCx7E9jKrnWhTSEwxs_FzTxswgZsq6X2J0zsra_hqQUqTaXxAVExsrFj88HBPG_WUYmPRe9p3wXpDwhhz4c9JQR4Iudw0rGxHHI3jXTVtpJPtrCakaTaZOOByGJjU6LAVhaWBNbvUxEFlxc8fFQ6OZtOej3FNGoG92alvX69E91KNCOjFdEQVSmp48tw6jtsZEwbA0tsSXdRdcK0l6fVJ-EN4lENCWz7fh6OLoPq37Z8ouWyIgbTsXxF6m2Btu4fb_2tsu1Ut_d8UfR0ZLaDdqv8Q=="
+          },
+          {
+            "type": "custom_tool_call",
+            "id": "ctc_0fbc4c709068c8950169deb135c9b88190b64893f2811d97cb",
+            "call_id": "call_v4izotQscKxU9OoTTDQFmjnF",
+            "name": "apply_patch",
+            "input": "*** Begin Patch\n*** Update File: src/main.rs\n@@\n-fn main() {\n-    println!(\"Hello, world!\");\n-}\n+use std::collections::VecDeque;\n+use std::io::{self, Stdout, Write};\n+use std::thread;\n+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};\n+\n+use crossterm::cursor::{Hide, MoveTo, Show};\n+use crossterm::event::{self, Event, KeyCode};\n+use crossterm::style::Print;\n+use crossterm::terminal::{self, Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen};\n+use crossterm::{execute, queue};\n+\n+const WIDTH: i16 = 30;\n+const HEIGHT: i16 = 20;\n+const TICK_RATE: Duration = Duration::from_millis(120);\n+const BOARD_OFFSET_Y: u16 = 1;\n+\n+#[derive(Clone, Copy, PartialEq, Eq)]\n+struct Point {\n+    x: i16,\n+    y: i16,\n+}\n+\n+#[derive(Clone, Copy, PartialEq, Eq)]\n+enum Direction {\n+    Up,\n+    Down,\n+    Left,\n+    Right,\n+}\n+\n+impl Direction {\n+    fn delta(self) -> (i16, i16) {\n+        match self {\n+            Self::Up => (0, -1),\n+            Self::Down => (0, 1),\n+            Self::Left => (-1, 0),\n+            Self::Right => (1, 0),\n+        }\n+    }\n+\n+    fn is_opposite(self, other: Self) -> bool {\n+        matches!(\n+            (self, other),\n+            (Self::Up, Self::Down)\n+                | (Self::Down, Self::Up)\n+                | (Self::Left, Self::Right)\n+                | (Self::Right, Self::Left)\n+        )\n+    }\n+}\n+\n+struct Game {\n+    snake: VecDeque<Point>,\n+    direction: Direction,\n+    food: Option<Point>,\n+    score: u32,\n+    game_over: bool,\n+    rng_state: u64,\n+}\n+\n+impl Game {\n+    fn new() -> Self {\n+        let mut snake = VecDeque::new();\n+        snake.push_front(Point {\n+            x: WIDTH / 2,\n+            y: HEIGHT / 2,\n+        });\n+        snake.push_back(Point {\n+            x: WIDTH / 2 - 1,\n+            y: HEIGHT / 2,\n+        });\n+        snake.push_back(Point {\n+            x: WIDTH / 2 - 2,\n+            y: HEIGHT / 2,\n+        });\n+\n+        let seed = SystemTime::now()\n+            .duration_since(UNIX_EPOCH)\n+            .unwrap_or_default()\n+            .as_nanos() as u64;\n+\n+        let mut game = Self {\n+            snake,\n+            direction: Direction::Right,\n+            food: None,\n+            score: 0,\n+            game_over: false,\n+            rng_state: seed ^ 0x9E37_79B9_7F4A_7C15,\n+        };\n+        game.food = game.spawn_food();\n+        game\n+    }\n+\n+    fn turn(&mut self, new_direction: Direction) {\n+        if !new_direction.is_opposite(self.direction) {\n+            self.direction = new_direction;\n+        }\n+    }\n+\n+    fn step(&mut self) {\n+        if self.game_over {\n+            return;\n+        }\n+\n+        let head = *self\n+            .snake\n+            .front()\n+            .expect(\"snake always has at least one segment\");\n+        let (dx, dy) = self.direction.delta();\n+        let next_head = Point {\n+            x: head.x + dx,\n+            y: head.y + dy,\n+        };\n+\n+        if next_head.x < 0 || next_head.y < 0 || next_head.x >= WIDTH || next_head.y >= HEIGHT {\n+            self.game_over = true;\n+            return;\n+        }\n+\n+        let growing = self.food == Some(next_head);\n+        let body_segments_to_check = if growing {\n+            self.snake.len()\n+        } else {\n+            self.snake.len().saturating_sub(1)\n+        };\n+        if self\n+            .snake\n+            .iter()\n+            .take(body_segments_to_check)\n+            .any(|segment| *segment == next_head)\n+        {\n+            self.game_over = true;\n+            return;\n+        }\n+\n+        self.snake.push_front(next_head);\n+\n+        if growing {\n+            self.score += 1;\n+            self.food = self.spawn_food();\n+            if self.food.is_none() {\n+                self.game_over = true;\n+            }\n+        } else {\n+            self.snake.pop_back();\n+        }\n+    }\n+\n+    fn spawn_food(&mut self) -> Option<Point> {\n+        let cells = (WIDTH as usize) * (HEIGHT as usize);\n+        if self.snake.len() >= cells {\n+            return None;\n+        }\n+\n+        for _ in 0..(cells * 2) {\n+            let x = (self.next_random() % (WIDTH as u32)) as i16;\n+            let y = (self.next_random() % (HEIGHT as u32)) as i16;\n+            let candidate = Point { x, y };\n+            if !self.snake.contains(&candidate) {\n+                return Some(candidate);\n+            }\n+        }\n+\n+        for y in 0..HEIGHT {\n+            for x in 0..WIDTH {\n+                let candidate = Point { x, y };\n+                if !self.snake.contains(&candidate) {\n+                    return Some(candidate);\n+                }\n+            }\n+        }\n+\n+        None\n+    }\n+\n+    fn next_random(&mut self) -> u32 {\n+        self.rng_state = self\n+            .rng_state\n+            .wrapping_mul(6364136223846793005)\n+            .wrapping_add(1);\n+        (self.rng_state >> 32) as u32\n+    }\n+}\n+\n+struct TerminalGuard;\n+\n+impl Drop for TerminalGuard {\n+    fn drop(&mut self) {\n+        let _ = terminal::disable_raw_mode();\n+        let mut stdout = io::stdout();\n+        let _ = execute!(stdout, Show, LeaveAlternateScreen);\n+    }\n+}\n+\n+fn draw(stdout: &mut Stdout, game: &Game) -> io::Result<()> {\n+    queue!(\n+        stdout,\n+        MoveTo(0, 0),\n+        Clear(ClearType::All),\n+        Print(format!(\"Score: {}\", game.score))\n+    )?;\n+\n+    for y in 0..=(HEIGHT + 1) {\n+        for x in 0..=(WIDTH + 1) {\n+            let border = x == 0 || y == 0 || x == WIDTH + 1 || y == HEIGHT + 1;\n+            let ch = if border { '#' } else { ' ' };\n+            queue!(\n+                stdout,\n+                MoveTo(x as u16, BOARD_OFFSET_Y + y as u16),\n+                Print(ch)\n+            )?;\n+        }\n+    }\n+\n+    if let Some(food) = game.food {\n+        queue!(\n+            stdout,\n+            MoveTo((food.x + 1) as u16, BOARD_OFFSET_Y + (food.y + 1) as u16),\n+            Print('*')\n+        )?;\n+    }\n+\n+    for (index, segment) in game.snake.iter().enumerate() {\n+        let ch = if index == 0 { '@' } else { 'o' };\n+        queue!(\n+            stdout,\n+            MoveTo((segment.x + 1) as u16, BOARD_OFFSET_Y + (segment.y + 1) as u16),\n+            Print(ch)\n+        )?;\n+    }\n+\n+    if game.game_over {\n+        queue!(\n+            stdout,\n+            MoveTo(0, BOARD_OFFSET_Y + HEIGHT as u16 + 3),\n+            Print(format!(\"Game over! Final score: {}. Press q/Enter/Esc.\", game.score))\n+        )?;\n+    }\n+\n+    stdout.flush()?;\n+    Ok(())\n+}\n+\n+fn main() -> io::Result<()> {\n+    terminal::enable_raw_mode()?;\n+    let _terminal_guard = TerminalGuard;\n+\n+    let mut stdout = io::stdout();\n+    execute!(stdout, EnterAlternateScreen, Hide)?;\n+\n+    let mut game = Game::new();\n+\n+    loop {\n+        draw(&mut stdout, &game)?;\n+\n+        if game.game_over {\n+            loop {\n+                if let Event::Key(key) = event::read()? {\n+                    if matches!(key.code, KeyCode::Char('q') | KeyCode::Enter | KeyCode::Esc) {\n+                        return Ok(());\n+                    }\n+                }\n+            }\n+        }\n+\n+        let frame_start = Instant::now();\n+        while frame_start.elapsed() < TICK_RATE {\n+            let timeout = TICK_RATE.saturating_sub(frame_start.elapsed());\n+            if !event::poll(timeout)? {\n+                break;\n+            }\n+            if let Event::Key(key) = event::read()? {\n+                match key.code {\n+                    KeyCode::Up => game.turn(Direction::Up),\n+                    KeyCode::Down => game.turn(Direction::Down),\n+                    KeyCode::Left => game.turn(Direction::Left),\n+                    KeyCode::Right => game.turn(Direction::Right),\n+                    KeyCode::Char('q') | KeyCode::Esc => return Ok(()),\n+                    _ => {}\n+                }\n+            }\n+        }\n+\n+        game.step();\n+\n+        if frame_start.elapsed() < TICK_RATE {\n+            thread::sleep(TICK_RATE - frame_start.elapsed());\n+        }\n+    }\n+}\n*** End Patch\n"
+          }
+        ],
+        "stop_reason": "completed",
+        "usage": {
+          "input_tokens": 21667,
+          "input_tokens_details": {
+            "cached_tokens": 21504
+          },
+          "output_tokens": 2223,
+          "output_tokens_details": {
+            "reasoning_tokens": 9
+          },
+          "total_tokens": 23890
+        },
+        "response_id": "resp_0fbc4c709068c8950169deb134e73c8190863584ed13cfe534"
+      }
+    },
+    {
+      "turn": 8,
+      "note": null,
+      "client_added_messages": [
+        {
+          "type": "custom_tool_call_output",
+          "call_id": "call_v4izotQscKxU9OoTTDQFmjnF",
+          "output": "Exit code: 0\nWall time: 0 seconds\nOutput:\nSuccess. Updated the following files:\nM src/main.rs\n"
+        }
+      ],
+      "assistant_response": {
+        "content": [
+          {
+            "type": "reasoning",
+            "encrypted_content": "gAAAAABp3rFjdgwEW2swg9LOwUSC7gcGjqXlXJCTrteBLFYNtd8FH1OkavR97l1MzklqRyhV7fG6nhk6fVKekYeoJeuISmhCIOc8Oj369QlHVuYopdx6DzD-BZj2G0Ioozd8BiGA__IOn1CCwfar2f0F0PojB--v5lC6cokFXkN7Z4AKnVBQeZfWey3SPW-lo3fz14lWxIaWBoJTQBLjDNqkGsuNOI1x7wkpFNzTrK6Azs9MOZhitxIrwiVMj6KOAJ_kMtpRnS0xgIMlsLx7URVePZ8JQxcoyz_1G0aYYs4teTSLpuTF1iDcQrpxFcrua68lbAyINeGt4zp1BTnSZtfrFtazwXQdrfCc4OmCXKLfyKkBKQOr2P1rtogxtT1YIyJxxWiqqZkhFPUe8c9H0wP6KEvHDGnxaTken-eQfF60Gwiu7PuIuEel1kKGhRQF_oDPU1CGfHUjEhTWAc2ZAid9g2fS_H2NaafaimNNG1kANnQyLUjBv9CkMGAr-Y2LamnqZQe76pX8jCGFd8gn4jgVwzMPUDJFMTQsu-E-9XanVTT3ulsjhUVU3Ju4M6EfbkijxSdbxHjW23rk4WvXqBatxWWSzs04po5A8-8nzOIOzTN3NEKJhQ7P1kRuR2y11FN16ILmAOQAxbh34lBImMD5OztDBG3OwDSKoS2i-2N59-X6qp69MBhfpZOVdkLt9y4foVo6HHn8SsGHW0APxnv1Q8iqr8DPJbTMDgGUwaBGtKnJXbUC4a3_C8dpWbDW7XMolatKG6Tu08i5A4v0p4lqu8IPUK1dlFtxkIuFHndcyu-3-SUFvbhXnq8b-HwbY-vGgVevwOeMUbTBQCarpsxAi8i3t9nIYsYSFQzvr8j5IXEJDBKZXo4lZtGuber6XkfJBuod_1Nptp6iKvKPZw6ATgwf_4W3Md20uK67yJpOCdv1SOasRNj_8XmEjJg8xsbRMjAroanoyGa7bbUqK5ZSVD3cOCAfKsmb5c7Q6laW520PaHXvHytWCjYoWnWHQ2o9Kz8HiJm0OcVCoX2zKe-ZaZ3x4PyIibwGEJqHVtwYIdY_LwdoYKClsZooUa-a3ZmOr5OsePqBGwvKx3UE1MBYTGNQV2sdTNo72vlSmWVCHFVROF9utbRbi0KFwPAcarXW1wQL9Z3_IBB9Wac52ncw_KcoulPp1ec0bIKfsWFKwsYRR8Gs4uLikutlq3V0zwujXFkBie3Ce-3dyWpqyWi6NTKgeZws3PG6GA2L9oKp1_e70LguCTQ0Yj8K-QDaG1JXSBMO4lgm6C3ooyyZF-NZ8QkO2K6E_bhClmzcZwwtGuH_A1ffgMhRIlrYThGV8Ucyb461fWEE8FX7InM6cfK1Gebtq76bOsVsyrT36z2HF7ErOSZ5kxQU1TUV5dke5XfhBPIxgWqvGe2CSOBByHzXAAY3FDl6G3Qy-9QcQQQEA6EMus2agfSaAr3Sxxg7Awh01NQCZBogMgIWPjRKf1sSp_mH8JbemQoeblkreYY3UJvURZbZICcKeMXdnIH5Be0D5Xn6_JMRMEiPQOCRfny0-sUrTA0vc1gT4P4cSpGfef2p9SzB4ygTMXwZCe-cN1ho7rJIf522bUxS6RxE-pK7LtxwF20VaeaNhO1V5fWFL3YeyYTW3qhmeNvoeAA7TV6qfaL7rxXaVj8sDv2Jqdq0Gg9ogJAZOkxstxQGr6xl6C3aTL5RgfsIQvMCzdoSt2vJm7-BI9ALuiSdID1JlClN0NxS2fLy4-t8g6ow4fIGqO3kTALksT3_l3KRFhc5qc0x4PEQMWsWpGD9lRwQ2czfqax9Qp_zI9PdEDzoF3D-m5ezu9X4qaVG1Ks4nxxho0cfP3S8MEq3nLDab7mOqrhD02LjWBA5mXmwPeN7EG3hWePJiJG81gtk7HBnP_WSWW8TnZvTNb_rZYuE-g6zLN3CiY8qlykcID3SxjTZDXDiSrRHFLBb94j25NbfVaG710nMSiNzThBvQFZE-oaE6q0XTBda2n-qpILBIwMOSkhskImdfv6j36xzfwqAbis9hZhdKFSZHXC-WRYl3fye9em5UvPMAs68pi9ipYxPrpIvINR2M9I_jkGx8QS1G7ioyPOUoU9ZmEeQyYxKCGznJY9ECaIB96Kxe2p5Eyh0Aiji4cXOeRWgFPvspISoUbXbfXN6UqvXMf_KRqrs3KeMBlTSvY4LVCR24YFHEmsoPv3f_0Z5DnzLaoeumEGBOZijtojXSa6SIn4Iq5KJwUld7TGz9BMqg4xfeBeSgeVOxprjpNaAljbOqaciycWcdFKSgZTxWLVE2GX36cVP_FMuXZ4_-k-v13o0aA=="
+          },
+          {
+            "type": "message",
+            "role": "assistant",
+            "text": "Code is in place with one dependency and one source file. I\u2019m running `cargo check` now to verify it builds cleanly."
+          },
+          {
+            "type": "function_call",
+            "id": "fc_0fbc4c709068c8950169deb1645f0481908b22ce0e25d39f9a",
+            "call_id": "call_3VQLxrVG6EOtZ8R5Bnz1lrqW",
+            "name": "exec_command",
+            "arguments": {
+              "cmd": "cargo check",
+              "yield_time_ms": 120000
+            }
+          }
+        ],
+        "stop_reason": "completed",
+        "usage": {
+          "input_tokens": 23928,
+          "input_tokens_details": {
+            "cached_tokens": 23808
+          },
+          "output_tokens": 290,
+          "output_tokens_details": {
+            "reasoning_tokens": 228
+          },
+          "total_tokens": 24218
+        },
+        "response_id": "resp_0fbc4c709068c8950169deb15dc0308190b29f073c8706e32c"
+      }
+    },
+    {
+      "turn": 9,
+      "note": null,
+      "client_added_messages": [
+        {
+          "type": "function_call_output",
+          "call_id": "call_3VQLxrVG6EOtZ8R5Bnz1lrqW",
+          "output": "Command: /usr/bin/bash -lc 'cargo check'\nChunk ID: 48e899\nWall time: 1.4490 seconds\nProcess exited with code 0\nOriginal token count: 206\nOutput:\n    Updating crates.io index\n     Locking 35 packages to latest Rust 1.94.0 compatible versions\n      Adding crossterm v0.28.1 (available: v0.29.0)\n   Compiling libc v0.2.185\n   Compiling signal-hook v0.3.18\n   Compiling parking_lot_core v0.9.12\n    Checking smallvec v1.15.1\n    Checking scopeguard v1.2.0\n    Checking cfg-if v1.0.4\n   Compiling rustix v0.38.44\n    Checking log v0.4.29\n    Checking bitflags v2.11.1\n    Checking linux-raw-sys v0.4.15\n    Checking lock_api v0.4.14\n    Checking errno v0.3.14\n    Checking mio v1.2.0\n    Checking signal-hook-registry v1.4.8\n    Checking parking_lot v0.12.5\n    Checking signal-hook-mio v0.2.5\n    Checking crossterm v0.28.1\n    Checking snake_crossterm v0.1.0 (/tmp/whisper-agent-capture/work/codex)\n    Finished `dev` profile [unoptimized + debuginfo] target(s) in 1.58s\n"
+        }
+      ],
+      "assistant_response": {
+        "content": [
+          {
+            "type": "reasoning",
+            "encrypted_content": "gAAAAABp3rFysTFR-kQ0Pdx3JQaxmpEfhKQGSsL4wgmNhIFyrgKEzz_-Q8C8IuaEmqfh2FmLRLlq3pZYSGY1mjqpHQrvG7s2ZdWj4-gr9cZzaDMa1pPbRp1U0A3r_OxSrjWaJJZu_fGJN2X-CXbx6pZkUtqXBs010hiY2obYtO3pljNRiJCdS8m1l3DBiTpYL5vEEkYXp-5sXyNGbeMG6La6M2LbT1QFlsU1qCQeRO9tTMjhFCVWfwCAkOkh6cJTtQEOAc4KBvhDPQhIUTponp0XU8FkGhb7XVtH04UICLJoKN8Q7lpiExxCiu8zqiZUjs2Z18TAtJ5kIc8mQK43zWsPvDbXVipbP1Eta8PTLhaeLyFY_5PJnMFWY7tqtpm86yXievwa2fcwIV2QoyX2SbIxMizZ-EcaTMtwDVRUUQDg9gyJzMQ7ONdNHHW4y4ghRYFcKA3WLrx2BXqkyDdAguwxuBVOqQbrigjMbDC8ifWAfBKKNgtpnaOg6r3sUXQZIMt-9Bswp96dtgDrj83B6-QCaTCQgpbBBv_7rEhK1QTARUR0acGDAsR8UlXEr9cecny9cPFA9vQzsxvgD6I4kCjgQJU2cSHiyAhhXfot7Ztng1XF8B43UFhwIWDNyGwNs2ZHU6Zy1KcdEDkmG8DEzqZgBrl-6G74RyMdGyoYjkPFyxyV9UDhal1DqRTUghYo8BVYCNpIilJvhK3M4e-lLqAlKozqvODJ7_mXp725PZEkAmZ-5w7nIKCuGBH5hDE0cYxyQ_EqTMQsJVAhYCrI2iHOtPHbQ872bnrVqEDZfOES91ZMbsiSrLZmT9hjQjD7CvpjalikepttwnOL3D6rOmXRF3aXYFq0q1xQSe2NJkCaNBnisTBCPeYxNB5N-HLOpoS7SbgY7K_Z6-7X8A6wPT9gvvy-KbPzy_27DP5dymLV87ev__BFgkRgesXgUUmUs0Ie5Q2g9ynIMOkU8AHe67wzYwpPUddayG9QOtpl7tkhqmwZgMs7jVXQsrkqoP8YRaHTyo_0FbVNo22yJGRz2j0xho3cCN-5gK-KIUIi2BX9J98y55N27BHKidpuvypcmWrgGkuntSswQ38taKs4ljUa3hCtkhsGVFWqjIaI8rzcLVTSZg4U8taVA6AvLMFNToRw3wdjVEObDXvYovxwfq17hRGFKVTbsF0Spmd-41SGF-rmhywRhtBCv9MRJJ7vxwF_qiB1SLIeYkjfmgZtRHusrIF7ef6W1RX2bs4X-PZAAlEekom08fZfEwV-i7m3kCUskgLaMViJ8Qm5R-XMAsHGBieLjOKLfI0nNXPdSNVeYvcfAnUPm23ctdyKSQgMwC8G_a1uy1XnUfn3HKeHQu75BWP_OzxbNVG9m0T6aGCl9Tht3-EAKkOFoW5X3DHPjRgpp40IF0nUh-xiJD44apP1CFLyJileGusxV8of6sudL3wzuQdqepFsx4CZFcJfR7FXbjYtzw6CuxTd4B8fypt0R3ylHBqWRuaR7CGE97EvQBK5wPX2c4e4Hs9PYjnHyLXYXsAhBM7epF_mBu0KCiA3oqD8Tffk3V_4kCF-MniBDfNVCQSYvxEM1-J770V5ajPevJ9qz_7zZ8UR7lArz2BBTeai0QpgEzkj1djj7DQFNMqJJE-MeXMJ8rUqCdH79hjX3hVovo1bKJFGpo6NrOlUYAyzte1KVqak6XjiBIFN2aJLTh8NcoRe1bL36TdrA-6kHlcoQlXZ83FuximxV9__2CmOJAcl26utKmSigMPqYLcUvy2K-IpNFxiUE5oq9HxH0SQMmA9gwCBvmTGm-0x7tUZXicgsS9o34R0Z6QAjmR6LEo1AUlyHwy509Bc6FyY1kD43HY9JS9mgSXWPGGk9x2kZT8aMr_Qal8mZwqtfaILz4ufAAplGSp2VMDL1xUey56nwapoTvFXOflX3fgE3bapRrG_HiDs06nsh6NyQBKP5HiTPqHz54yhDLh-OjeMTW1yNWhjMP2o95-oAnVJJo0Eb-wjrx0HugA5PpLKjqfVcP0zOhkixFzEuSkDh_EZB7ONcM2ZHQ6g1f0fCoA8tne74dvvhbLM3hZOuwf9AEScQ7ZFJ2lEQzpP_6jeteKNCe8jv3edBsTbOVuCG3g8l2XOIJ2m9NpUzqiezmziyz4EDmUOxq9E8_MCoMwXFt_0niqLw7UUZiJPD4AyLZP3ItiG84spt_cXX1Rnul2mEN98cowFnc9g-M2XJ8Bc48CeQ8myN5FMo5I9doJWjNPZ1hlnxPchWv6PKQUnPkWIgmw9GH0P-Nn59hEH68K1TtFcXpnbmbZWycYpTjgGgCV56bTafIUxUSrGgQdzauxanWNdF5nAX81XB6dZM5nuAYeYqlUeA10nPiLrdGoTH01ov24AdDN582JIkpLH7LPnA05kqUFcVFnmpOzI-q9_z7gWj_Nfax4qetDF_o19aR_XZYsZPgY_MFdd1pXB3DbAlnvl8HVCIG-GqqfHjY8KcjsfwcZagx4uX4qmX_P7ziqnvBpu6DM-4UdPuaYF08tLsDg-ePuyJ_u5c3lYZm00-QkHkpwdW1QNU4BrozGeUw98e6OIlEjqmWHh0EOyilrKRupEhGdVgWJWiMUfG6XqK8kics_vt3z0wiGj06dZIc-7580cMlIZOMtsVe7GGYIiS0D3Y_4rDC7j_3w7VpR1AZ4rvfdELvihKq4XktDLB_6e5Iyi3au5NSslMOB2bjpsacCI-pZAVxUbLaefVqBuuA4KazAB_yfLbKW-eQ--hIvgsJ6TjsEtpbJhFVkM52Tdo195BK67m_DZ6AzWoQBjGSmbsAf31x9UaY0OfxlEwoiQzOOP8lr3laWTzJWe2x30p_V1vn49pxrZT66LLGl_oBcyFnt6zyR9dkz2S39Ld09hR6ianVWgFjsHZr_QsmfgsNMADnfvHwgh06rEdsIc1-hh1MjukPF6EAVd71JpdY7gFeIBW0fGqBqoeDxRjs6QiBKNdGFKDpFk96e3SIZcVIxfHYVMLHbrV9k4K8LpRlpVEFE3_vlIpGckCAdueUGu7QGW_IS_nieCQITWYiEPXa3VAG1R94XB386Ji4TqaJ70GZPRjpRE73BhiFUMn84ZMywTo_HEXmLapbDwYkltPWwZ0NwhML9K6dY9EHx6dpPC72s9C8YYucce3DIVeAxzbtW2NJ2JeY2Dd4l-nMDeOM05ynxltUGnNi3BkDZ1jbXxccmhiFd8hM_qtwUQ2pVBVPeFUixxhV4uV3IvdBl2i8IrYnQNGWyIfFh-SpJ611XWizTNBQ6nqj2N1AnUeCXYueG2ZroooQN_bWtKS9fykc0RnRohCahKIEMuSsKHUKH14Rl3pmeLe4PQkT24EWo5L2Bw992ODGh45PCXPFDs9T42u3OW2f0BvVSoXVHYgA-N3EL5YaVUl05BNK0gtkB8r9BY4-y7smz1nL6T8XN_ckPEAfP7IY2VQ88aqxiWAPZTMkKqlLCWEnPtB_IiMwx_lKuvYg1hvW5U3kITqcOunO7-D1NEXdF6JmP31GhvXhNgZ2Dd6SfR3Bxzc0u36Fm5BmGLiGuj_L16GTYTBnE47EAwmupS3ZI9iOcq7G2aHYROawUBD8QyevZyLqTV-TrTtbBavXhMCnBkgiUEhgZz_2NzDaN04ncFZC8udoAV34al26oNNjGsWCvSMGchXF8t096Jwawh8PiNHeT4JHhgoidLJG5KAmn3L7QX4IPXBwpRa08O1W9mheTjNPPM21JpAAjKCYAiOjFxwq-rvld2UpTrOhZEYqHiTZyZz_eG1Htv7EhfWL5siL-QoLNp8Z_-rQNjJ4kWGDGEYjpj0mlHG_HhQdVAaQ5UCakFbSNbZkto22yvbPt8NQ4NAVVXuSMFd3SpJQH0YKCPTyGKnQjZdvUUZR56m7bXGY_CIfkrccuS6MxeYh4nMCGYRDZFOMHqclBxEHa3eCWoOYaK-bxEGpPd05jFl3Z51tcxM3es4ILrqoI1m-ZotIemHXMk0rZTcTmsBG3FhlgnaYi48JWk9po3Uq2v8VrTYrNuFXAHWq7L-TZygNy9QoPmc_XZ77bTryoeJmMftoeSNALMVkgu1v97-pvmY3TtUWK6bzupujtFeL-HyNGfLqqd_Zzd49bJQTnKr9fGSUjFiQaO8BWF5uezL2AVE68O3n8-jVF7NPrvt20k1lbCTb5SdwP10XQdqmSB8ZXaa2khtE-MAYLut6oy2HjLchBg0oTZc_YnsYynNtiCniIVlVVpmSUiuyJxrbzDH1kpH9TjQD6XBqMICjMm_T3N0SNHmgU7V7UG81SCvV1XjHP8hC23W56c5azffXd_c7Hhsx3GOMat3VXB-PspbdR0QVQcA7zRSeke1-K6IRy84KLcGvJwjRrwo8jTKgQ3E5AfJUTO2aDaBiO1v29Rzv-0dFqLjbO9K5vyO04d6Gagb9fz5YXpYCJsLxBbKOsZx8iWuMjIqCqmgh5gm6tFSudXuLVM_JFFvkXnAXhlDJyI2PUllC1DSWawuu_xPq4VrqSZf5RL3bZpVjkBP-ng5VC_xP84k"
+          },
+          {
+            "type": "message",
+            "role": "assistant",
+            "text": "I found a small timing edge case in the frame sleep calculation and am patching it to use `saturating_sub` so it can\u2019t panic on racey elapsed-time boundaries."
+          },
+          {
+            "type": "custom_tool_call",
+            "id": "ctc_0fbc4c709068c8950169deb1730f8881908c4c74d1ad9b41a3",
+            "call_id": "call_sZHaveY5kyp5MIwes6M3Mubs",
+            "name": "apply_patch",
+            "input": "*** Begin Patch\n*** Update File: src/main.rs\n@@\n-        if frame_start.elapsed() < TICK_RATE {\n-            thread::sleep(TICK_RATE - frame_start.elapsed());\n-        }\n+        let remaining = TICK_RATE.saturating_sub(frame_start.elapsed());\n+        if !remaining.is_zero() {\n+            thread::sleep(remaining);\n+        }\n*** End Patch\n"
+          }
+        ],
+        "stop_reason": "completed",
+        "usage": {
+          "input_tokens": 24570,
+          "input_tokens_details": {
+            "cached_tokens": 24192
+          },
+          "output_tokens": 700,
+          "output_tokens_details": {
+            "reasoning_tokens": 561
+          },
+          "total_tokens": 25270
+        },
+        "response_id": "resp_0fbc4c709068c8950169deb16668148190ac6a6b594f95c14f"
+      }
+    },
+    {
+      "turn": 10,
+      "note": null,
+      "client_added_messages": [
+        {
+          "type": "custom_tool_call_output",
+          "call_id": "call_sZHaveY5kyp5MIwes6M3Mubs",
+          "output": "Exit code: 0\nWall time: 0 seconds\nOutput:\nSuccess. Updated the following files:\nM src/main.rs\n"
+        }
+      ],
+      "assistant_response": {
+        "content": [
+          {
+            "type": "reasoning",
+            "encrypted_content": "gAAAAABp3rF1fmjXkUm72BJHLcIpr1qKd7Mca_w8NI4Emd_GdpzcNO0D6hz0mCEf0GafrK01Zz-jjkjyzMRlO_wgPzxuJV-HQGqqEKvXYMmZlxPDi3Yrji76VWYD98_ema-YVPeYXtFyfNRodmWNdlgGd_4AP5G4rMAGCvszxXKQnRmFmM1fAmngmGM0MwnrZo6X92wMLc9YaXUinkpx_AstW6OPnas31pk4PqmIQ0WPMUO_YWRjtiWc7hGPVfoFxYbqMa3ZWDZqmJaGNNs4sfr9M4gUuopJOOlY3DR24-ppTAUFWQl-sbZU-jMp-1b5kHDaIqOKdRR7Dqv2xNR46xODnMTseaiQPFvUOJWA3uHa9W99nm6qyZxYKulxY5soud7K2nv1SzYBGkz6hrD9j6bi9ckejA2_4PmcooLDjHhCqzOexy9XAlXyuQHAnxpoc1dPFzazNBSMIGoIG33be1G4X0-gkkQ40gKXA7A4PODaUWaDalgjjNcypoOKcKOj95m007hzNhOWiDxIvsI4ZeF6AMF2FKyTpEn57gABVm89Tutk5IAon_rQUQP0xdvefbr8K8hlWe0mIFjEwHvsAS1Rw1884tcXPoL9zWr5iZey-Z6KyhBvOeE8ai-4YpGrTamgPKDt9SNmaDyUAvOLkCGs0q-pSPB6i1mjaynC_3tcrGaVgROAY-lMNWXIPiOZFbC9y1CWtxDd3ndrLVImaRXoeVgjYzN_pNhr9rabZYYSdoqlFLdAfwc0LxRTFBXtLuBHBunkwcK8KoYj57qBnzI6tfc-3-Yix3fG0haKRkglwI_WZIezfKGnOFhnj3HqKPHAA5mznSY-G3eEOGrkmjFe4zSwCSPON6sYtVOv8MrjktWYZhimwNA="
+          },
+          {
+            "type": "function_call",
+            "id": "fc_0fbc4c709068c8950169deb175cffc81908a06740e9524830c",
+            "call_id": "call_o2y1Ynm431RId826UqeiMBYH",
+            "name": "exec_command",
+            "arguments": {
+              "cmd": "cargo check",
+              "yield_time_ms": 120000
+            }
+          }
+        ],
+        "stop_reason": "completed",
+        "usage": {
+          "input_tokens": 25308,
+          "input_tokens_details": {
+            "cached_tokens": 25216
+          },
+          "output_tokens": 37,
+          "output_tokens_details": {
+            "reasoning_tokens": 9
+          },
+          "total_tokens": 25345
+        },
+        "response_id": "resp_0fbc4c709068c8950169deb174aa9881908680fc1879609111"
+      }
+    },
+    {
+      "turn": 11,
+      "note": null,
+      "client_added_messages": [
+        {
+          "type": "function_call_output",
+          "call_id": "call_o2y1Ynm431RId826UqeiMBYH",
+          "output": "Command: /usr/bin/bash -lc 'cargo check'\nChunk ID: 44bb48\nWall time: 0.0000 seconds\nProcess exited with code 0\nOriginal token count: 37\nOutput:\n    Checking snake_crossterm v0.1.0 (/tmp/whisper-agent-capture/work/codex)\n    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.04s\n"
+        }
+      ],
+      "assistant_response": {
+        "content": [
+          {
+            "type": "reasoning",
+            "encrypted_content": "gAAAAABp3rF6ojXVWXBl1_Xd0DK4HLb9uz56hoPAKCRrZI5UEKYZFXrEHxiyLK9pR721XLQBRFGWXCTdmnWh7iKo1UpjpDJ-W-GL4LcedjaTgASnIvud3gyTbjvq-8ZGmnE0N_gXmqvI49vTOgHdu_tmWO4DiZ2YE-ZT4Om51TO-ns_OUPuZnIJvEGtTSU-3izdGpUj5cbCkDa1-byd67Shp93PYOlEpX9gU5RsqDouqSUordEG7ZvtvzV1jhD4ahrEfBW-ihGb7ur8wByEhUD2IuChTY5Nu8dckOaUwYeZBLHZcZGCYqXtvi1hlXWJwDa9HSO9CTCmun0GnCLwnWIDKyz3qpfX9oPDR_euz1p-mkRzN5xTaEm0goDm4J0KJ_y0X31ZUa9CHPkUyRy1bZRJSfrbeInruMkxVUebvCH1z-SplmbD58OcL04ep7mlXy0wK8c0R4jaXqkGSR8W-kO5BH-N6_kiA5jrFg1qO2fqotyHndVEoc-gQHj0VJq0aG8lQqti2zZDHPkuKg_QxH54wtHdpwv9f6CB0PYvPr785QvOaKnAcAqVeLYToBt5W4i0o9-cdWhVsrp1oh3Fx7xWu7rc4VPWHfa-iyp1yhh8AvZ1ELTJlVJQO_NdvmOIjpyuxTuNiUIgwD5XAKQMe7v_VWpN0hvscGGhKbBZf4rkf0TUr7HJ0MzUejdeUr9rAPW1OZGIV_f41ebIzDpUcGhYhOFgVYzNqDS_HVwbizO2ZM2VmfJ9qwgBtHoRLZm0wOqT_pm6ZGygUg5lkWNm642WHJkqcZJR9mbNVynLUOw8sX71hNk6oi_cMpiCjuBRRSRCJaMXK_8ovvfj-Q3eIuwvavHQ53ODnkvP4XAoP7xxx4EYTMKNtTmz3dK05yZQRLyOPRU4W6goU35lMsRK4-JKBF1qaJ0l5wcXjy6rV2BJsrgnrQ6wSKLoNeaeQxefOG82I57x1yUwUsAiGUqqT_2yRTeeJe1h92YKRuDt-T9xKASse6rOffw8TS98_eBLmllnzgdNxgCn5RSz3w0FnZf3sQU3-g96TbD_bbpRuwgiSAyXfJHs4n5EPHSFfpK4EuKY18I5CC_-HRF3k9j-Wq-MzC0yhuUBU0RZ01RjfOgIdiyA-HNUCeIR7w09xi1RaBv_AXG4Diwcu17WKXFEGXdhBsYwDn8ixYo7o9zNfXUWqy8pk4rI7LOHtV_2P5afSxjVyiuf3KOJH0NGFQsD1ftX6fnwz50vZd_NvJTgH2Q7mXEJAcH9NYyCaMvjhwaOBtKzzWTjpvVcTzr1U0aK1MhdyAoXfPovGq1jWcvHn7ve5EPzNqjkbs3jYO5D5Emta4D5h5QUtrtz-L1Sk69Las7z9roaV5eN2liuyoY8rtNBL7z2YLHG1qIPYGKCH4HcLBjVc4Kj-J2UIjNVjVWbzWksdoUDS_OcduVQ9iFLdWt6PwDKIcTzIescQadOF7MQGjufWtDTwon9OK9_uFcwS0xnueWMTQMKKiV2UtEnjhZ5LarZOc8z4LC5Xe7F6qZx7z4umi67aHY-_V5J9Lpy577YAtbJeY2VlMMW7TcN_-jy24OsvzvgBRRlOi7vuw9yIGm6M_9-MsDHDN1S9HBeJqog1dhLlk3V0Gk-ffNeqpEVnZhWgOBOZWPXbViCIr-yhPcIj1S84bRuHM9ajhrfj5YNU33kTmG6TuLQ3e3izAtaLS3NAPMp3w4BWVRNsVwhORgMbhiCGM-ZU9kJLAiy1Ovhxb1UqwiKg02cAAwHpNFeuQ1GqDiKnr3JlBdGiwpbVmDS7sWpkxsOP6Y6DfnBJ1jnh2p0kpPVQYSpEG48kQfp4trQEtOqdAVAdqGlRhm38Jnkt4tXnoiRY3Q40ir64qsTLoovKcWakGeU34yCu0l5VUb0PxqghPMi9DCSE2KhB5tdwrOAA3UlInT68egaaFyk8C4ctDF4HXA=="
+          },
+          {
+            "type": "message",
+            "role": "assistant",
+            "text": "Implemented as requested with one file and one dependency.\n\n- [Cargo.toml](/tmp/whisper-agent-capture/work/codex/Cargo.toml): added `crossterm = \"0.28\"`.\n- [src/main.rs](/tmp/whisper-agent-capture/work/codex/src/main.rs): minimal snake game using arrow keys, growth on food, game-over on wall/self collision, and score shown at the top-left corner.\n\nVerification:\n- `cargo check` succeeds in `/tmp/whisper-agent-capture/work/codex`.\n\nIf you want to try it now: `cargo run`."
+          }
+        ],
+        "stop_reason": "completed",
+        "usage": {
+          "input_tokens": 25452,
+          "input_tokens_details": {
+            "cached_tokens": 25216
+          },
+          "output_tokens": 328,
+          "output_tokens_details": {
+            "reasoning_tokens": 193
+          },
+          "total_tokens": 25780
+        },
+        "response_id": "resp_0fbc4c709068c8950169deb17670c481909853bb0998ed8c57"
+      }
+    }
+  ],
+  "totals": {
+    "real_turns": 10,
+    "total_input_tokens": 212528,
+    "total_output_tokens": 7131,
+    "total_cached_tokens": 208768,
+    "total_reasoning_tokens": 4297,
+    "cache_hit_rate": "98.2%"
+  }
+}

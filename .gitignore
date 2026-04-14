@@ -1,0 +1,6 @@
+# Claude Code per-workspace permission cache (developer-local)
+.claude/settings.local.json
+
+# Rust build artifacts (added ahead of any actual Rust code)
+/target/
+**/target/
