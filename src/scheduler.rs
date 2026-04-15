@@ -37,6 +37,7 @@ use crate::anthropic::{
 };
 use crate::audit::{AuditLog, ToolCallEntry, ToolCallOutcome};
 use crate::mcp::McpSession;
+use crate::persist::Persister;
 use crate::task::{
     IoRequest, IoResult, OpId, StepOutcome, Task, TaskEvent, derive_title, new_task_id,
 };
@@ -68,6 +69,7 @@ pub struct Scheduler {
     host_id: String,
     anthropic: Arc<AnthropicClient>,
     audit: AuditLog,
+    persister: Option<Persister>,
 
     tasks: HashMap<String, Task>,
     clients: HashMap<ConnId, mpsc::UnboundedSender<ServerToClient>>,
@@ -77,6 +79,9 @@ pub struct Scheduler {
     tool_descriptors: HashMap<String, Vec<AnthropicTool>>,
 
     next_op_id: OpId,
+    /// Tasks modified during the current scheduler-loop iteration. Flushed to the
+    /// persister before the next iteration starts.
+    dirty: HashSet<String>,
 }
 
 impl Scheduler {
@@ -91,12 +96,49 @@ impl Scheduler {
             host_id,
             anthropic,
             audit,
+            persister: None,
             tasks: HashMap::new(),
             clients: HashMap::new(),
             subscriptions: HashMap::new(),
             mcp_sessions: HashMap::new(),
             tool_descriptors: HashMap::new(),
             next_op_id: 1,
+            dirty: HashSet::new(),
+        }
+    }
+
+    pub fn with_persister(mut self, persister: Persister) -> Self {
+        self.persister = Some(persister);
+        self
+    }
+
+    /// Seed the scheduler with previously-persisted tasks. The persister should have
+    /// already transitioned any in-flight internal states to Failed before handoff.
+    pub fn load_tasks(&mut self, tasks: Vec<Task>) {
+        for task in tasks {
+            self.tasks.insert(task.id.clone(), task);
+        }
+    }
+
+    fn mark_dirty(&mut self, task_id: &str) {
+        if self.persister.is_some() {
+            self.dirty.insert(task_id.to_string());
+        }
+    }
+
+    async fn flush_dirty(&mut self) {
+        let Some(persister) = &self.persister else {
+            self.dirty.clear();
+            return;
+        };
+        let dirty = std::mem::take(&mut self.dirty);
+        for task_id in dirty {
+            let Some(task) = self.tasks.get(&task_id) else {
+                continue;
+            };
+            if let Err(e) = persister.flush(task).await {
+                error!(task_id = %task_id, error = %e, "persist flush failed");
+            }
         }
     }
 
@@ -132,7 +174,7 @@ impl Scheduler {
                 config_override,
             } => {
                 let task_id = self.create_task(conn_id, correlation_id, config_override);
-                // Immediately submit the initial user message to kick off the loop.
+                self.mark_dirty(&task_id);
                 self.send_user_message(&task_id, initial_message);
                 self.step_until_blocked(&task_id, pending_io);
             }
@@ -154,6 +196,7 @@ impl Scheduler {
             ClientToServer::CancelTask { task_id } => {
                 if let Some(task) = self.tasks.get_mut(&task_id) {
                     task.cancel();
+                    self.mark_dirty(&task_id);
                     self.broadcast_task_list(ServerToClient::TaskStateChanged {
                         task_id,
                         state: TaskStateLabel::Cancelled,
@@ -164,6 +207,7 @@ impl Scheduler {
                 if let Some(task) = self.tasks.get_mut(&task_id) {
                     task.archived = true;
                     task.touch();
+                    self.mark_dirty(&task_id);
                     self.broadcast_task_list(ServerToClient::TaskArchived { task_id });
                 }
             }
@@ -252,6 +296,7 @@ impl Scheduler {
     }
 
     fn send_user_message(&mut self, task_id: &str, text: String) {
+        self.mark_dirty(task_id);
         // Derive title on the first user message.
         let title_new = {
             let task = self.tasks.get_mut(task_id).expect("task exists");
@@ -309,13 +354,14 @@ impl Scheduler {
             warn!(%task_id, op_id, "io completion for unknown task");
             return;
         }
-
+        self.mark_dirty(&task_id);
         self.dispatch_task_events(&task_id, events);
     }
 
     /// Advance `task_id`'s state machine until it pauses, pushing new I/O to
     /// `pending_io` as requested.
     fn step_until_blocked(&mut self, task_id: &str, pending_io: &mut FuturesUnordered<IoFuture>) {
+        self.mark_dirty(task_id);
         loop {
             let mut events = Vec::new();
             let outcome = {
@@ -674,6 +720,7 @@ pub async fn run(
                 }
             }
         }
+        scheduler.flush_dirty().await;
     }
 
     // Drain pending I/O on shutdown — give it a grace period so in-flight HTTP can

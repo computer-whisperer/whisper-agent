@@ -55,6 +55,10 @@ struct ServeArgs {
     #[arg(long, default_value = "audit.jsonl")]
     audit_log: PathBuf,
 
+    /// Directory for JSON-per-task persistence. Pass an empty string to disable.
+    #[arg(long, default_value = "tasks")]
+    state_dir: PathBuf,
+
     /// System prompt to send to the model.
     #[arg(long, default_value = DEFAULT_SYSTEM_PROMPT)]
     system_prompt: String,
@@ -123,6 +127,11 @@ async fn main() -> Result<()> {
 }
 
 async fn run_serve(args: ServeArgs) -> Result<()> {
+    let state_dir = if args.state_dir.as_os_str().is_empty() {
+        None
+    } else {
+        Some(args.state_dir)
+    };
     let config = ServerConfig {
         anthropic_api_key: args.anthropic_api_key,
         default_task_config: TaskConfig {
@@ -134,6 +143,7 @@ async fn run_serve(args: ServeArgs) -> Result<()> {
         },
         audit_log_path: args.audit_log,
         host_id: "default".into(),
+        state_dir,
     };
     server::serve(args.listen, config).await
 }

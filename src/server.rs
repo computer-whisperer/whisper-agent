@@ -36,6 +36,7 @@ use whisper_agent_protocol::{ServerToClient, TaskConfig, decode_from_client, enc
 
 use crate::anthropic::AnthropicClient;
 use crate::audit::AuditLog;
+use crate::persist::Persister;
 use crate::scheduler::{ConnId, Scheduler, SchedulerMsg};
 
 const WEBUI_PKG_DIR: &str = concat!(
@@ -56,6 +57,8 @@ pub struct ServerConfig {
     pub default_task_config: TaskConfig,
     pub audit_log_path: PathBuf,
     pub host_id: String,
+    /// Directory for JSON-per-task persistence. If `None`, persistence is disabled.
+    pub state_dir: Option<PathBuf>,
 }
 
 #[derive(Clone)]
@@ -81,12 +84,24 @@ pub async fn serve(listen: SocketAddr, config: ServerConfig) -> anyhow::Result<(
     info!(audit_log = %audit.path().display(), "audit log open");
 
     let anthropic = Arc::new(AnthropicClient::new(config.anthropic_api_key));
-    let scheduler = Scheduler::new(
+    let mut scheduler = Scheduler::new(
         config.default_task_config,
         config.host_id,
         anthropic,
         audit,
     );
+
+    if let Some(state_dir) = config.state_dir {
+        let persister = Persister::new(state_dir.clone())
+            .await
+            .with_context(|| format!("open state dir {}", state_dir.display()))?;
+        let loaded = persister
+            .load_all()
+            .await
+            .with_context(|| "load persisted tasks")?;
+        scheduler.load_tasks(loaded);
+        scheduler = scheduler.with_persister(persister);
+    }
 
     let (inbox_tx, inbox_rx) = mpsc::unbounded_channel::<SchedulerMsg>();
     let scheduler_handle = tokio::spawn(crate::scheduler::run(scheduler, inbox_rx));

@@ -14,3 +14,4 @@ crates/whisper-agent-webui/pkg/
 # Runtime artifacts at the repo root (default paths for `whisper-agent serve` / `run`)
 /audit.jsonl
 /conversation.json
+/tasks/
