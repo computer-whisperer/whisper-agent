@@ -20,3 +20,15 @@ default_model = "claude-sonnet-4-6"
 kind = "openai_chat"
 base_url = "https://llama-gemma-4.cjbal.com/v1"
 default_model = "gemma-4-26B-A4B-it-UD-Q4_K_M.gguf"
+
+[backends.deepseek-r1]
+kind = "openai_chat"
+base_url = "https://llama-deepseek-r1.cjbal.com/v1"
+
+[backends.deepseek-v3]
+kind = "openai_chat"
+base_url = "https://llama-deepseek-v3.cjbal.com/v1"
+
+[backends.mistral-3]
+kind = "openai_chat"
+base_url = "https://llama-mistral-3.cjbal.com/v1"

@@ -68,7 +68,10 @@ type IoFuture = Pin<Box<dyn Future<Output = IoCompletion> + Send>>;
 pub struct BackendEntry {
     pub provider: Arc<dyn ModelProvider>,
     pub kind: String,
-    pub default_model: String,
+    /// Preferred model id when the task doesn't pick one. None for single-model
+    /// endpoints (most local llama.cpp setups) — the scheduler passes an empty
+    /// model through in that case, which those endpoints ignore.
+    pub default_model: Option<String>,
 }
 
 pub struct Scheduler {
@@ -682,9 +685,18 @@ impl Scheduler {
             .map(|tools| tools.iter().map(mcp_tool_to_spec).collect())
             .unwrap_or_default();
         let messages = task.conversation.messages().to_vec();
-        let model = task.config.model.clone();
-        let max_tokens = task.config.max_tokens;
         let backend_name = self.resolve_backend_name(task).to_string();
+        // Empty task.config.model → consult the backend's default_model. If that's
+        // also None (common for single-model local endpoints), pass empty through.
+        let model = if task.config.model.is_empty() {
+            self.backends
+                .get(&backend_name)
+                .and_then(|e| e.default_model.clone())
+                .unwrap_or_default()
+        } else {
+            task.config.model.clone()
+        };
+        let max_tokens = task.config.max_tokens;
         (
             OwnedModelRequest {
                 model: model.clone(),
@@ -955,9 +967,22 @@ fn mcp_tool_to_spec(t: &McpTool) -> ToolSpec {
 
 fn apply_override(base: TaskConfig, ov: Option<TaskConfigOverride>) -> TaskConfig {
     let Some(ov) = ov else { return base };
+    // If the override picks a different backend without specifying a model, don't
+    // inherit the model from the default backend — leave it empty so build_model_request
+    // resolves via the picked backend's default_model at call time (or passes empty to
+    // a single-model endpoint that ignores the field).
+    let backend_changed = ov
+        .backend
+        .as_deref()
+        .is_some_and(|b| b != base.backend);
+    let model = match ov.model {
+        Some(m) => m,
+        None if backend_changed => String::new(),
+        None => base.model.clone(),
+    };
     TaskConfig {
         backend: ov.backend.unwrap_or(base.backend),
-        model: ov.model.unwrap_or(base.model),
+        model,
         system_prompt: ov.system_prompt.unwrap_or(base.system_prompt),
         mcp_host_url: ov.mcp_host_url.unwrap_or(base.mcp_host_url),
         max_tokens: ov.max_tokens.unwrap_or(base.max_tokens),

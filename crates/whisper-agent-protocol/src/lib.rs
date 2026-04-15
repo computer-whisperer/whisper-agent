@@ -131,7 +131,10 @@ pub struct BackendSummary {
     /// Clients can use this for labels or icons; the server doesn't rely on it.
     pub kind: String,
     /// Model id the server would fall back to if a task doesn't specify one.
-    pub default_model: String,
+    /// None when the backend has no configured default — the UI should fetch the
+    /// model list and pick one (typical for single-model local endpoints).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_model: Option<String>,
 }
 
 /// Entry in a `ModelsList` response.

@@ -192,17 +192,28 @@ impl ChatApp {
             .unwrap_or(&self.default_backend)
     }
 
-    /// Resolve the picker-selected model, falling back to the backend's default_model
-    /// from the catalog, or empty if the catalog isn't loaded yet.
+    /// Resolve the picker-selected model. Fallback chain:
+    ///   1. user's explicit picker_model
+    ///   2. backend's default_model from the catalog
+    ///   3. first model from the fetched ModelsList for that backend
+    ///   4. empty (display as "(loading…)")
     fn effective_picker_model(&self) -> String {
         if let Some(m) = &self.picker_model {
             return m.clone();
         }
         let backend = self.effective_picker_backend();
-        self.backends
+        if let Some(m) = self
+            .backends
             .iter()
             .find(|b| b.name == backend)
-            .map(|b| b.default_model.clone())
+            .and_then(|b| b.default_model.clone())
+        {
+            return m;
+        }
+        self.models_by_backend
+            .get(backend)
+            .and_then(|list| list.first())
+            .map(|m| m.id.clone())
             .unwrap_or_default()
     }
 
@@ -482,16 +493,24 @@ impl ChatApp {
     /// default_task_config on the other end.
     fn build_creation_override(&self) -> Option<TaskConfigOverride> {
         let backend = self.picker_backend.clone();
+        // If the user picked a backend but didn't touch the model dropdown, pin down
+        // the model explicitly so the server doesn't fall back to the DEFAULT
+        // backend's default_model (which would be wrong for the picked backend).
+        // Prefer the picked backend's default_model, else the first fetched model,
+        // else None (server will then pass empty to the backend, which single-model
+        // local endpoints typically ignore).
         let model = self.picker_model.clone().or_else(|| {
-            // If the user picked a backend but didn't touch the model dropdown,
-            // send the backend's default_model explicitly so the server doesn't
-            // route this task to the wrong backend's default model.
-            backend.as_ref().and_then(|b| {
-                self.backends
-                    .iter()
-                    .find(|bs| &bs.name == b)
-                    .map(|bs| bs.default_model.clone())
-            })
+            let b = backend.as_ref()?;
+            self.backends
+                .iter()
+                .find(|bs| &bs.name == b)
+                .and_then(|bs| bs.default_model.clone())
+                .or_else(|| {
+                    self.models_by_backend
+                        .get(b)
+                        .and_then(|list| list.first())
+                        .map(|m| m.id.clone())
+                })
         });
         if backend.is_none() && model.is_none() {
             return None;

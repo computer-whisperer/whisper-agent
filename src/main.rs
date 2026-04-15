@@ -156,8 +156,10 @@ async fn run_serve(args: ServeArgs) -> Result<()> {
             let default_model = cfg
                 .backends
                 .get(&cfg.default_backend)
-                .map(|b| b.default_model().to_string())
-                .ok_or_else(|| anyhow!("config: default_backend missing entry"))?;
+                .ok_or_else(|| anyhow!("config: default_backend missing entry"))?
+                .default_model()
+                .map(|s| s.to_string())
+                .unwrap_or_default();
             let mut map = HashMap::new();
             for (name, bcfg) in &cfg.backends {
                 let provider = bcfg
@@ -168,7 +170,7 @@ async fn run_serve(args: ServeArgs) -> Result<()> {
                     BackendEntry {
                         provider,
                         kind: bcfg.kind().into(),
-                        default_model: bcfg.default_model().into(),
+                        default_model: bcfg.default_model().map(|s| s.to_string()),
                     },
                 );
             }
@@ -186,7 +188,7 @@ async fn run_serve(args: ServeArgs) -> Result<()> {
                 BackendEntry {
                     provider: std::sync::Arc::new(AnthropicClient::new(key)),
                     kind: "anthropic".into(),
-                    default_model: args.model.clone(),
+                    default_model: Some(args.model.clone()),
                 },
             );
             (map, DEFAULT_BACKEND_NAME.into(), args.model.clone())

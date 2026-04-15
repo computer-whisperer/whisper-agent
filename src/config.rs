@@ -51,7 +51,8 @@ pub enum BackendConfig {
     Anthropic {
         #[serde(default)]
         api_key_env: Option<String>,
-        default_model: String,
+        #[serde(default)]
+        default_model: Option<String>,
     },
     // serde's snake_case would default this to "open_ai_chat" — override so
     // the config file uses the tighter form.
@@ -60,7 +61,8 @@ pub enum BackendConfig {
         base_url: String,
         #[serde(default)]
         api_key_env: Option<String>,
-        default_model: String,
+        #[serde(default)]
+        default_model: Option<String>,
     },
 }
 
@@ -72,10 +74,12 @@ impl BackendConfig {
         }
     }
 
-    pub fn default_model(&self) -> &str {
+    /// The backend's default model, if one is configured. Local llama.cpp endpoints
+    /// typically only serve one model and ignore the field, so the TOML can omit it.
+    pub fn default_model(&self) -> Option<&str> {
         match self {
-            BackendConfig::Anthropic { default_model, .. } => default_model,
-            BackendConfig::OpenAiChat { default_model, .. } => default_model,
+            BackendConfig::Anthropic { default_model, .. }
+            | BackendConfig::OpenAiChat { default_model, .. } => default_model.as_deref(),
         }
     }
 
