@@ -1,7 +1,8 @@
+use std::net::SocketAddr;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
@@ -9,12 +10,32 @@ use whisper_agent::agent_loop::{LoopConfig, run};
 use whisper_agent::anthropic::AnthropicClient;
 use whisper_agent::audit::AuditLog;
 use whisper_agent::mcp::McpSession;
+use whisper_agent::server;
 
 const DEFAULT_SYSTEM_PROMPT: &str = "You are a software engineering agent. You have access to a set of tools that operate on a workspace directory on the user's machine. Use the tools as needed to complete the user's request. Be concise. When you have finished, summarize what you did.";
 
 #[derive(Parser, Debug)]
-#[command(version, about = "Headless agent loop driving Anthropic Messages + MCP host tools.")]
-struct Args {
+#[command(version, about = "whisper-agent: headless agent loop with embedded webui server.")]
+struct Cli {
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(Subcommand, Debug)]
+enum Command {
+    /// Start the HTTP server (hosts the webui and, eventually, the WebSocket protocol).
+    Serve {
+        /// HTTP listen address.
+        #[arg(long, default_value = "127.0.0.1:8080")]
+        listen: SocketAddr,
+    },
+    /// One-shot CLI: run the agent loop against a prompt and exit. Used for development
+    /// and the CLI-only smoke test in docs/design_mvp.md (step 4).
+    Run(RunArgs),
+}
+
+#[derive(Parser, Debug)]
+struct RunArgs {
     /// Anthropic API key.
     #[arg(long, env = "ANTHROPIC_API_KEY")]
     anthropic_api_key: String,
@@ -54,11 +75,21 @@ struct Args {
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info,whisper_agent=info")))
+        .with_env_filter(
+            EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| EnvFilter::new("info,whisper_agent=info,tower_http=info")),
+        )
         .init();
 
-    let args = Args::parse();
-    info!(model = %args.model, host = %args.mcp_host_url, "starting whisper-agent");
+    let cli = Cli::parse();
+    match cli.command {
+        Command::Serve { listen } => server::serve(listen).await,
+        Command::Run(args) => run_one_shot(args).await,
+    }
+}
+
+async fn run_one_shot(args: RunArgs) -> Result<()> {
+    info!(model = %args.model, host = %args.mcp_host_url, "starting whisper-agent (one-shot)");
 
     let session_id = uuid_v4_pseudo();
     let host_id = "default";
@@ -108,9 +139,5 @@ async fn main() -> Result<()> {
 fn uuid_v4_pseudo() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
     let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos();
-    format!(
-        "ses-{:016x}-{:08x}",
-        nanos as u64,
-        std::process::id()
-    )
+    format!("ses-{:016x}-{:08x}", nanos as u64, std::process::id())
 }

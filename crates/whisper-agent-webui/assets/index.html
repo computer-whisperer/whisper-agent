@@ -1,11 +1,9 @@
 <!DOCTYPE html>
-<html>
+<html lang="en">
 <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>whisper-agent</title>
-    <link data-trunk rel="rust" data-wasm-opt="2" />
-    <base data-trunk-public-url />
     <style>
         html, body {
             margin: 0;
@@ -24,5 +22,15 @@
 </head>
 <body>
     <canvas id="the_canvas_id"></canvas>
+    <script type="module">
+        import init from '/pkg/whisper_agent_webui.js';
+        init().catch(err => {
+            console.error('failed to initialize whisper-agent-webui:', err);
+            document.body.innerHTML =
+                '<pre style="color:#fff;padding:1em;">webui failed to start. ' +
+                'Did you run `wasm-pack build crates/whisper-agent-webui --target web`?\n\n' +
+                String(err) + '</pre>';
+        });
+    </script>
 </body>
 </html>
