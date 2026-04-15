@@ -5,6 +5,27 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
-[[bin]]
-name = "whisper-agent-webui"
-path = "src/main.rs"
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+eframe = { version = "0.33", default-features = false, features = ["default_fonts", "glow", "x11", "wayland"] }
+egui = "0.33"
+log = "0.4"
+serde = { version = "1", features = ["derive"] }
+ciborium = "0.2"
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+console_error_panic_hook = "0.1"
+web-sys = { version = "0.3", features = [
+    "WebSocket",
+    "MessageEvent",
+    "CloseEvent",
+    "ErrorEvent",
+    "Window",
+    "Document",
+    "HtmlCanvasElement",
+] }
+getrandom = { version = "0.4", features = ["wasm_js"] }
