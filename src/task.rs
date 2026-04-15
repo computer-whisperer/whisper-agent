@@ -118,7 +118,7 @@ pub enum IoRequest {
 pub enum IoResult {
     McpConnectSuccess { session: std::sync::Arc<crate::mcp::McpSession> },
     McpConnect(Result<(), String>),
-    ListToolsSuccess { tools: Vec<crate::anthropic::ToolDescriptor> },
+    ListToolsSuccess { tools: Vec<crate::mcp::ToolDescriptor> },
     ListTools(Result<(), String>),
     ModelCall(Result<MessageResponse, String>),
     ToolCall {

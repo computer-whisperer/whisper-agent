@@ -30,12 +30,44 @@ pub enum McpError {
     Malformed(String),
 }
 
-#[derive(Deserialize, Debug)]
+#[derive(Deserialize, Debug, Clone)]
 pub struct ToolDescriptor {
     pub name: String,
     pub description: String,
     #[serde(rename = "inputSchema")]
     pub input_schema: Value,
+    /// Server-declared safety/capability hints. All fields are tri-state (unset / true /
+    /// false) because the spec lets servers be explicit about defaults.
+    #[serde(default)]
+    pub annotations: ToolAnnotations,
+}
+
+/// MCP 2025-06-18 tool annotations. See [`ToolDescriptor::annotations`].
+#[derive(Deserialize, Debug, Clone, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct ToolAnnotations {
+    #[serde(default)]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub read_only_hint: Option<bool>,
+    #[serde(default)]
+    pub destructive_hint: Option<bool>,
+    #[serde(default)]
+    pub idempotent_hint: Option<bool>,
+    #[serde(default)]
+    pub open_world_hint: Option<bool>,
+}
+
+impl ToolAnnotations {
+    /// Server declared this tool is read-only (no side effects).
+    pub fn is_read_only(&self) -> bool {
+        self.read_only_hint == Some(true)
+    }
+
+    /// Server declared this tool is destructive.
+    pub fn is_destructive(&self) -> bool {
+        self.destructive_hint == Some(true)
+    }
 }
 
 #[derive(Deserialize, Debug, Clone)]

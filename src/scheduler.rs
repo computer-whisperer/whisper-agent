@@ -36,7 +36,7 @@ use crate::anthropic::{
     AnthropicClient, CreateMessageRequest, SystemBlock, ToolDescriptor as AnthropicTool,
 };
 use crate::audit::{AuditLog, ToolCallEntry, ToolCallOutcome};
-use crate::mcp::McpSession;
+use crate::mcp::{McpSession, ToolDescriptor as McpTool};
 use crate::persist::Persister;
 use crate::task::{
     IoRequest, IoResult, OpId, StepOutcome, Task, TaskEvent, derive_title, new_task_id,
@@ -76,7 +76,11 @@ pub struct Scheduler {
     subscriptions: HashMap<String, HashSet<ConnId>>,
 
     mcp_sessions: HashMap<String, Arc<McpSession>>,
-    tool_descriptors: HashMap<String, Vec<AnthropicTool>>,
+    /// Per-task tool catalog from the last `tools/list`. Stored in MCP shape (with
+    /// annotations) so the approval layer can consult `read_only_hint` /
+    /// `destructive_hint` at dispatch time; we convert to Anthropic shape on-demand
+    /// when building a model request.
+    tool_descriptors: HashMap<String, Vec<McpTool>>,
 
     next_op_id: OpId,
     /// Tasks modified during the current scheduler-loop iteration. Flushed to the
@@ -416,21 +420,11 @@ impl Scheduler {
                     .expect("mcp session present before ListTools");
                 Box::pin(async move {
                     match mcp.list_tools().await {
-                        Ok(tools) => {
-                            let anthropic_tools = tools
-                                .into_iter()
-                                .map(|t| AnthropicTool {
-                                    name: t.name,
-                                    description: t.description,
-                                    input_schema: t.input_schema,
-                                })
-                                .collect();
-                            IoCompletion {
-                                task_id,
-                                op_id,
-                                result: IoResult::ListToolsSuccess { tools: anthropic_tools },
-                            }
-                        }
+                        Ok(tools) => IoCompletion {
+                            task_id,
+                            op_id,
+                            result: IoResult::ListToolsSuccess { tools },
+                        },
                         Err(e) => IoCompletion {
                             task_id,
                             op_id,
@@ -499,7 +493,11 @@ impl Scheduler {
 
     fn build_model_request(&self, task_id: &str) -> (OwnedModelRequest, String) {
         let task = self.tasks.get(task_id).expect("task exists");
-        let tools = self.tool_descriptors.get(task_id).cloned().unwrap_or_default();
+        let tools: Vec<AnthropicTool> = self
+            .tool_descriptors
+            .get(task_id)
+            .map(|tools| tools.iter().map(mcp_tool_to_anthropic).collect())
+            .unwrap_or_default();
         let system = vec![SystemBlock::cached(task.config.system_prompt.clone())];
         let messages = task.conversation.messages().to_vec();
         let model = task.config.model.clone();
@@ -678,6 +676,14 @@ struct OwnedModelRequest {
     system: Vec<SystemBlock>,
     tools: Vec<AnthropicTool>,
     messages: Vec<whisper_agent_protocol::Message>,
+}
+
+fn mcp_tool_to_anthropic(t: &McpTool) -> AnthropicTool {
+    AnthropicTool {
+        name: t.name.clone(),
+        description: t.description.clone(),
+        input_schema: t.input_schema.clone(),
+    }
 }
 
 fn apply_override(base: TaskConfig, ov: Option<TaskConfigOverride>) -> TaskConfig {
