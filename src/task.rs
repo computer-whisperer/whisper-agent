@@ -17,7 +17,7 @@
 //! sub-phases (e.g. add `AwaitingApproval` between tool dispatch and execution) without
 //! touching the wire.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -45,6 +45,11 @@ pub struct Task {
     /// Turns issued in the current user-message cycle; resets on user message.
     #[serde(default)]
     pub turns_in_cycle: u32,
+    /// Per-task "always allow" set keyed by tool name. Calls to a name in this
+    /// set bypass the approval prompt regardless of `approval_policy`. Persisted
+    /// with the task, so the allowlist survives restart.
+    #[serde(default)]
+    pub tool_allowlist: BTreeSet<String>,
     pub internal: TaskInternalState,
 }
 
@@ -108,8 +113,13 @@ pub struct ToolUseReq {
 #[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum ApprovalDisposition {
-    /// Policy auto-approved this call (e.g. readOnlyHint=true or AutoApproveAll policy).
-    AutoApproved,
+    /// Policy or allowlist auto-approved this call. `reason` becomes the
+    /// `who_decided` field on the audit log entry — `policy:read_only`,
+    /// `policy:auto_approve_all`, or `policy:allowlist`.
+    AutoApproved {
+        #[serde(default)]
+        reason: String,
+    },
     /// Awaiting a user decision keyed by `approval_id`.
     Pending {
         approval_id: String,
@@ -229,6 +239,11 @@ pub enum TaskEvent {
     LoopComplete,
     StateChanged,
     Error { message: String },
+    /// The task's `tool_allowlist` set was modified — either a tool was added
+    /// (via an approve-and-remember decision) or removed (via the revoke UI).
+    /// Carries the full new set so the scheduler can broadcast it without
+    /// recomputing.
+    AllowlistChanged { allowlist: Vec<String> },
     /// Tool call completed. Carried separately from the user-visible ToolCallEnd event
     /// so the scheduler can write an audit entry outside the task state machine.
     AuditToolCall {
@@ -254,6 +269,7 @@ impl Task {
             total_usage: Usage::default(),
             archived: false,
             turns_in_cycle: 0,
+            tool_allowlist: BTreeSet::new(),
             internal: TaskInternalState::Idle,
         }
     }
@@ -300,6 +316,7 @@ impl Task {
             created_at: self.created_at.to_rfc3339(),
             last_active: self.last_active.to_rfc3339(),
             failure: self.failure_detail(),
+            tool_allowlist: self.tool_allowlist.iter().cloned().collect(),
         }
     }
 
@@ -340,6 +357,20 @@ impl Task {
             message: message.into(),
         };
         self.touch();
+    }
+
+    /// Drop a tool name from the allowlist. Returns true if the entry was
+    /// present (so the caller knows whether to broadcast an update).
+    pub fn remove_from_allowlist(&mut self, tool_name: &str) -> bool {
+        let removed = self.tool_allowlist.remove(tool_name);
+        if removed {
+            self.touch();
+        }
+        removed
+    }
+
+    pub fn allowlist_snapshot(&self) -> Vec<String> {
+        self.tool_allowlist.iter().cloned().collect()
     }
 
     /// Is the task accepting new user input right now?
@@ -602,12 +633,17 @@ impl Task {
 
         // Evaluate approval policy for each tool_use.
         let mut dispositions: Vec<ApprovalDisposition> = Vec::with_capacity(tool_uses.len());
+        let mut auto_reasons: HashMap<String, String> = HashMap::new();
         let mut any_pending = false;
         for tool_use in &tool_uses {
             let empty = ToolAnnotations::default();
             let ann = tool_annotations.get(&tool_use.name).unwrap_or(&empty);
-            match evaluate_policy(self.config.approval_policy, ann) {
-                ApprovalOutcome::Auto => dispositions.push(ApprovalDisposition::AutoApproved),
+            let allowlisted = self.tool_allowlist.contains(&tool_use.name);
+            match evaluate_policy(self.config.approval_policy, ann, allowlisted) {
+                ApprovalOutcome::Auto(reason) => {
+                    auto_reasons.insert(tool_use.tool_use_id.clone(), reason.clone());
+                    dispositions.push(ApprovalDisposition::AutoApproved { reason });
+                }
                 ApprovalOutcome::Prompt => {
                     any_pending = true;
                     let approval_id = format!("ap-{}", tool_use.tool_use_id);
@@ -641,11 +677,14 @@ impl Task {
             let approvals: HashMap<String, ApprovalRecord> = tool_uses
                 .iter()
                 .map(|tu| {
+                    let reason = auto_reasons
+                        .remove(&tu.tool_use_id)
+                        .unwrap_or_else(|| "policy:auto".into());
                     (
                         tu.tool_use_id.clone(),
                         ApprovalRecord {
                             decision: "auto".into(),
-                            who_decided: auto_approve_reason(self.config.approval_policy),
+                            who_decided: reason,
                         },
                     )
                 })
@@ -737,15 +776,28 @@ impl Task {
     /// transitions it to `UserApproved`/`UserRejected`, and if every disposition is
     /// now resolved, moves the task into `AwaitingTools` (with synthesized denial
     /// tool_results for rejected calls).
+    ///
+    /// When `remember` is true and the decision is `Approve`, the resolved tool's
+    /// name is added to the per-task allowlist. Any other still-pending approvals
+    /// for the same tool name in the current batch are auto-resolved as approved
+    /// (with reason `policy:allowlist`) and emit their own `ApprovalResolved`
+    /// events so connected clients dismiss them.
     pub fn apply_approval_decision(
         &mut self,
         approval_id: &str,
         decision: ApprovalChoice,
+        remember: bool,
         decided_by_conn: Option<u64>,
         events: &mut Vec<TaskEvent>,
     ) {
         let prev_public = self.public_state();
-        self.apply_approval_decision_inner(approval_id, decision, decided_by_conn, events);
+        self.apply_approval_decision_inner(
+            approval_id,
+            decision,
+            remember,
+            decided_by_conn,
+            events,
+        );
         let new_public = self.public_state();
         if prev_public != new_public {
             events.push(TaskEvent::StateChanged);
@@ -756,6 +808,7 @@ impl Task {
         &mut self,
         approval_id: &str,
         decision: ApprovalChoice,
+        remember: bool,
         decided_by_conn: Option<u64>,
         events: &mut Vec<TaskEvent>,
     ) {
@@ -781,6 +834,15 @@ impl Task {
             return;
         };
 
+        // If the user said "always allow", grow the allowlist before resolving the
+        // cascade so the matching dispositions transition through the allowlist
+        // path rather than a one-off user-approval.
+        let resolved_tool_name = tool_uses[idx].name.clone();
+        let mut allowlist_added = false;
+        if remember && decision == ApprovalChoice::Approve {
+            allowlist_added = self.tool_allowlist.insert(resolved_tool_name.clone());
+        }
+
         dispositions[idx] = match decision {
             ApprovalChoice::Approve => ApprovalDisposition::UserApproved {
                 approval_id: approval_id.to_string(),
@@ -798,6 +860,31 @@ impl Task {
             decided_by_conn,
         });
 
+        // Cascade-resolve other pending approvals for the same tool now that it's
+        // been allowlisted.
+        if allowlist_added {
+            for (i, tool_use) in tool_uses.iter().enumerate() {
+                if tool_use.name != resolved_tool_name {
+                    continue;
+                }
+                let ApprovalDisposition::Pending { approval_id: aid, .. } = &dispositions[i] else {
+                    continue;
+                };
+                let aid = aid.clone();
+                dispositions[i] = ApprovalDisposition::AutoApproved {
+                    reason: "policy:allowlist".into(),
+                };
+                events.push(TaskEvent::ApprovalResolved {
+                    approval_id: aid,
+                    decision: ApprovalChoice::Approve,
+                    decided_by_conn,
+                });
+            }
+            events.push(TaskEvent::AllowlistChanged {
+                allowlist: self.tool_allowlist.iter().cloned().collect(),
+            });
+        }
+
         if dispositions.iter().any(|d| d.is_pending()) {
             return; // more approvals outstanding
         }
@@ -807,18 +894,17 @@ impl Task {
         // in `completed` and also emit audit entries recording the rejection.
         let tool_uses = std::mem::take(tool_uses);
         let dispositions = std::mem::take(dispositions);
-        let policy = self.config.approval_policy;
         let mut pending_dispatch = Vec::new();
         let mut completed = Vec::new();
         let mut approvals: HashMap<String, ApprovalRecord> = HashMap::new();
         for (tool_use, disposition) in tool_uses.into_iter().zip(dispositions) {
             match disposition {
-                ApprovalDisposition::AutoApproved => {
+                ApprovalDisposition::AutoApproved { reason } => {
                     approvals.insert(
                         tool_use.tool_use_id.clone(),
                         ApprovalRecord {
                             decision: "auto".into(),
-                            who_decided: auto_approve_reason(policy),
+                            who_decided: reason,
                         },
                     );
                     pending_dispatch.push(tool_use);
@@ -875,29 +961,32 @@ impl Task {
     }
 }
 
-fn auto_approve_reason(policy: ApprovalPolicy) -> String {
-    match policy {
-        ApprovalPolicy::AutoApproveAll => "policy:auto_approve_all".into(),
-        ApprovalPolicy::PromptDestructive => "policy:read_only".into(),
-    }
-}
-
 fn who_string(conn: Option<u64>) -> String {
     conn.map(|c| format!("user:{c}"))
         .unwrap_or_else(|| "user".into())
 }
 
 enum ApprovalOutcome {
-    Auto,
+    /// Auto-approved; the carried string becomes `who_decided` in the audit log.
+    Auto(String),
     Prompt,
 }
 
-fn evaluate_policy(policy: ApprovalPolicy, annotations: &ToolAnnotations) -> ApprovalOutcome {
+fn evaluate_policy(
+    policy: ApprovalPolicy,
+    annotations: &ToolAnnotations,
+    allowlisted: bool,
+) -> ApprovalOutcome {
+    if allowlisted {
+        return ApprovalOutcome::Auto("policy:allowlist".into());
+    }
     match policy {
-        ApprovalPolicy::AutoApproveAll => ApprovalOutcome::Auto,
+        ApprovalPolicy::AutoApproveAll => {
+            ApprovalOutcome::Auto("policy:auto_approve_all".into())
+        }
         ApprovalPolicy::PromptDestructive => {
             if annotations.is_read_only() {
-                ApprovalOutcome::Auto
+                ApprovalOutcome::Auto("policy:read_only".into())
             } else {
                 ApprovalOutcome::Prompt
             }
@@ -985,4 +1074,109 @@ fn truncate(mut s: String, max: usize) -> String {
         s.push('…');
     }
     s
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use whisper_agent_protocol::ApprovalPolicy;
+
+    fn task_with_pending_batch(tool_names: &[&str]) -> Task {
+        let cfg = TaskConfig {
+            backend: String::new(),
+            model: "test".into(),
+            system_prompt: "test".into(),
+            mcp_host_url: "http://test".into(),
+            max_tokens: 100,
+            max_turns: 10,
+            approval_policy: ApprovalPolicy::PromptDestructive,
+        };
+        let mut task = Task::new("t1".into(), cfg);
+        let tool_uses: Vec<ToolUseReq> = tool_names
+            .iter()
+            .enumerate()
+            .map(|(i, name)| ToolUseReq {
+                tool_use_id: format!("tu-{i}"),
+                name: (*name).into(),
+                input: serde_json::Value::Null,
+            })
+            .collect();
+        let dispositions = tool_uses
+            .iter()
+            .map(|tu| ApprovalDisposition::Pending {
+                approval_id: format!("ap-{}", tu.tool_use_id),
+                destructive: false,
+                read_only: false,
+            })
+            .collect();
+        task.internal = TaskInternalState::AwaitingApproval { tool_uses, dispositions };
+        task
+    }
+
+    #[test]
+    fn always_allow_adds_to_allowlist_and_emits_event() {
+        let mut task = task_with_pending_batch(&["edit_file"]);
+        let mut events = Vec::new();
+        task.apply_approval_decision("ap-tu-0", ApprovalChoice::Approve, true, Some(7), &mut events);
+
+        assert!(task.tool_allowlist.contains("edit_file"));
+        assert!(events.iter().any(|e| matches!(e,
+            TaskEvent::AllowlistChanged { allowlist } if allowlist == &vec!["edit_file".to_string()]
+        )));
+    }
+
+    #[test]
+    fn always_allow_cascades_other_pending_for_same_tool() {
+        let mut task = task_with_pending_batch(&["edit_file", "edit_file", "read_file"]);
+        let mut events = Vec::new();
+        task.apply_approval_decision("ap-tu-0", ApprovalChoice::Approve, true, Some(1), &mut events);
+
+        // edit_file batch (3 pending: 1 directly resolved + 1 cascaded; read_file still pending)
+        let resolved: Vec<&str> = events
+            .iter()
+            .filter_map(|e| match e {
+                TaskEvent::ApprovalResolved { approval_id, .. } => Some(approval_id.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(resolved, vec!["ap-tu-0", "ap-tu-1"]);
+
+        // read_file should still be pending — task should not have transitioned out
+        // of AwaitingApproval.
+        assert!(matches!(task.internal, TaskInternalState::AwaitingApproval { .. }));
+    }
+
+    #[test]
+    fn approve_without_remember_does_not_touch_allowlist() {
+        let mut task = task_with_pending_batch(&["edit_file"]);
+        let mut events = Vec::new();
+        task.apply_approval_decision("ap-tu-0", ApprovalChoice::Approve, false, None, &mut events);
+
+        assert!(task.tool_allowlist.is_empty());
+        assert!(!events.iter().any(|e| matches!(e, TaskEvent::AllowlistChanged { .. })));
+    }
+
+    #[test]
+    fn allowlist_short_circuits_evaluate_policy() {
+        let read_only_ann = ToolAnnotations::default();
+        let allowlisted = matches!(
+            evaluate_policy(ApprovalPolicy::PromptDestructive, &read_only_ann, true),
+            ApprovalOutcome::Auto(_)
+        );
+        let not_listed = matches!(
+            evaluate_policy(ApprovalPolicy::PromptDestructive, &read_only_ann, false),
+            ApprovalOutcome::Prompt
+        );
+        assert!(allowlisted, "allowlisted call must auto-resolve");
+        assert!(not_listed, "non-allowlisted unannotated call must prompt");
+    }
+
+    #[test]
+    fn remove_from_allowlist_returns_true_only_when_present() {
+        let mut task = task_with_pending_batch(&["edit_file"]);
+        task.tool_allowlist.insert("edit_file".into());
+        assert!(task.remove_from_allowlist("edit_file"));
+        assert!(!task.remove_from_allowlist("edit_file"));
+        assert!(!task.remove_from_allowlist("never_added"));
+    }
 }

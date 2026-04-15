@@ -103,6 +103,9 @@ struct TaskView {
     /// Rendered as a persistent banner so it survives re-subscribe (unlike items,
     /// which get rebuilt from the conversation on every snapshot).
     failure: Option<String>,
+    /// Tool names this task has approved-and-remembered. Mirrors
+    /// `TaskSnapshot.tool_allowlist`; refreshed by `TaskAllowlistUpdated`.
+    tool_allowlist: Vec<String>,
 }
 
 struct PendingApproval {
@@ -127,6 +130,7 @@ impl TaskView {
             backend: String::new(),
             model: String::new(),
             failure: None,
+            tool_allowlist: Vec::new(),
         }
     }
 }
@@ -305,6 +309,7 @@ impl ChatApp {
                 let backend = snapshot.config.backend.clone();
                 let model = snapshot.config.model.clone();
                 let failure = snapshot.failure.clone();
+                let allowlist = snapshot.tool_allowlist.clone();
                 let view = self
                     .tasks
                     .entry(task_id.clone())
@@ -317,8 +322,14 @@ impl ChatApp {
                 view.backend = backend;
                 view.model = model;
                 view.failure = failure;
+                view.tool_allowlist = allowlist;
                 // Pending-approval events that follow the snapshot will re-seed this.
                 view.pending_approvals.clear();
+            }
+            ServerToClient::TaskAllowlistUpdated { task_id, tool_allowlist } => {
+                if let Some(view) = self.tasks.get_mut(&task_id) {
+                    view.tool_allowlist = tool_allowlist;
+                }
             }
             ServerToClient::TaskAssistantBegin { .. } => {}
             ServerToClient::TaskAssistantText { task_id, text } => {
@@ -817,7 +828,8 @@ impl eframe::App for ChatApp {
             self.request_models_for(&backend);
         }
 
-        let mut pending_decisions: Vec<(String, String, ApprovalChoice)> = Vec::new();
+        let mut pending_decisions: Vec<(String, String, ApprovalChoice, bool)> = Vec::new();
+        let mut allowlist_revocations: Vec<(String, String)> = Vec::new();
         egui::CentralPanel::default().show(ctx, |ui| {
             match self.selected.clone() {
                 None => {
@@ -840,6 +852,7 @@ impl eframe::App for ChatApp {
                     }
                     Some(view) => {
                         render_failure_banner(ui, view);
+                        render_allowlist_chips(ui, &task_id, view, &mut allowlist_revocations);
                         render_approval_banner(ui, &task_id, view, &mut pending_decisions);
                         ScrollArea::vertical().stick_to_bottom(true).show(ui, |ui| {
                             if view.items.is_empty() {
@@ -863,12 +876,16 @@ impl eframe::App for ChatApp {
         });
 
         // Submit any approval decisions that were clicked this frame.
-        for (task_id, approval_id, decision) in pending_decisions {
+        for (task_id, approval_id, decision, remember) in pending_decisions {
             self.send(ClientToServer::ApprovalDecision {
                 task_id,
                 approval_id,
                 decision,
+                remember,
             });
+        }
+        for (task_id, tool_name) in allowlist_revocations {
+            self.send(ClientToServer::RemoveToolAllowlistEntry { task_id, tool_name });
         }
     }
 }
@@ -907,7 +924,7 @@ fn render_approval_banner(
     ui: &mut egui::Ui,
     task_id: &str,
     view: &mut TaskView,
-    pending_decisions: &mut Vec<(String, String, ApprovalChoice)>,
+    pending_decisions: &mut Vec<(String, String, ApprovalChoice, bool)>,
 ) {
     if view.pending_approvals.is_empty() {
         return;
@@ -948,6 +965,23 @@ fn render_approval_banner(
                                     task_id.to_string(),
                                     approval.approval_id.clone(),
                                     ApprovalChoice::Approve,
+                                    false,
+                                ));
+                            }
+                            if ui
+                                .button(format!("Always allow {}", approval.name))
+                                .on_hover_text(
+                                    "Approve this call and skip future approvals for \
+                                     this tool name (this task only).",
+                                )
+                                .clicked()
+                            {
+                                approval.submitted = true;
+                                pending_decisions.push((
+                                    task_id.to_string(),
+                                    approval.approval_id.clone(),
+                                    ApprovalChoice::Approve,
+                                    true,
                                 ));
                             }
                             if ui.button("Reject").clicked() {
@@ -956,6 +990,7 @@ fn render_approval_banner(
                                     task_id.to_string(),
                                     approval.approval_id.clone(),
                                     ApprovalChoice::Reject,
+                                    false,
                                 ));
                             }
                         });
@@ -972,6 +1007,43 @@ fn render_approval_banner(
             });
         });
     ui.add_space(6.0);
+}
+
+/// Compact strip of "always-allowed" tool names with revoke buttons. Hidden when
+/// the allowlist is empty so it doesn't take vertical space in the common case.
+fn render_allowlist_chips(
+    ui: &mut egui::Ui,
+    task_id: &str,
+    view: &TaskView,
+    revocations: &mut Vec<(String, String)>,
+) {
+    if view.tool_allowlist.is_empty() {
+        return;
+    }
+    ui.horizontal_wrapped(|ui| {
+        ui.label(
+            RichText::new("always allow:")
+                .small()
+                .color(Color32::from_gray(170)),
+        );
+        for tool_name in &view.tool_allowlist {
+            ui.label(
+                RichText::new(tool_name)
+                    .small()
+                    .color(Color32::from_rgb(170, 200, 230))
+                    .monospace(),
+            );
+            if ui
+                .small_button("×")
+                .on_hover_text(format!("Stop always-allowing `{tool_name}`"))
+                .clicked()
+            {
+                revocations.push((task_id.to_string(), tool_name.clone()));
+            }
+            ui.add_space(2.0);
+        }
+    });
+    ui.add_space(4.0);
 }
 
 fn render_item(ui: &mut egui::Ui, item: &DisplayItem) {

@@ -162,6 +162,10 @@ pub struct TaskSnapshot {
     /// failure can still render why. `None` for non-Failed tasks.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub failure: Option<String>,
+    /// Tool names this task has marked "always allow" — they bypass the approval
+    /// prompt for the rest of the task's lifetime. Sorted for stable display.
+    #[serde(default)]
+    pub tool_allowlist: Vec<String>,
 }
 
 // ---------- Wire enums ----------
@@ -182,12 +186,21 @@ pub enum ClientToServer {
     },
     /// Append a follow-up user message to an existing task.
     SendUserMessage { task_id: String, text: String },
-    /// Respond to a pending tool-call approval.
+    /// Respond to a pending tool-call approval. If `remember` is true and the
+    /// decision is `Approve`, the tool's name is added to the task's allowlist —
+    /// future calls to that tool skip the prompt for the rest of the task's
+    /// lifetime. `remember` with `Reject` is currently ignored (no
+    /// "always reject" semantics).
     ApprovalDecision {
         task_id: String,
         approval_id: String,
         decision: ApprovalChoice,
+        #[serde(default)]
+        remember: bool,
     },
+    /// Remove a tool name from the task's allowlist. Future calls to that tool
+    /// will prompt again under the task's policy.
+    RemoveToolAllowlistEntry { task_id: String, tool_name: String },
     /// Cancel a task. Stubbed for now — flips state to `Cancelled` without rolling back
     /// any in-flight tool work. Proper rollback semantics are a v0.3 problem.
     CancelTask { task_id: String },
@@ -290,6 +303,14 @@ pub enum ServerToClient {
         /// Connection id that submitted the decision, if known.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         decided_by_conn: Option<u64>,
+    },
+    /// Task's tool allowlist changed. Sent whenever a tool is added (via an
+    /// `ApprovalDecision` with `remember: true`) or removed (via
+    /// `RemoveToolAllowlistEntry`). Carries the full new list so clients don't
+    /// have to track add/remove deltas.
+    TaskAllowlistUpdated {
+        task_id: String,
+        tool_allowlist: Vec<String>,
     },
     TaskToolCallBegin {
         task_id: String,

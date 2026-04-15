@@ -230,12 +230,14 @@ impl Scheduler {
                 task_id,
                 approval_id,
                 decision,
+                remember,
             } => {
                 let mut events = Vec::new();
                 let known = if let Some(task) = self.tasks.get_mut(&task_id) {
                     task.apply_approval_decision(
                         &approval_id,
                         decision,
+                        remember,
                         Some(conn_id),
                         &mut events,
                     );
@@ -256,6 +258,33 @@ impl Scheduler {
                     self.mark_dirty(&task_id);
                     self.dispatch_task_events(&task_id, events);
                     self.step_until_blocked(&task_id, pending_io);
+                }
+            }
+            ClientToServer::RemoveToolAllowlistEntry { task_id, tool_name } => {
+                let removed = self
+                    .tasks
+                    .get_mut(&task_id)
+                    .map(|t| (t.remove_from_allowlist(&tool_name), t.allowlist_snapshot()));
+                match removed {
+                    Some((true, snapshot)) => {
+                        self.mark_dirty(&task_id);
+                        self.broadcast_to_subscribers(
+                            &task_id,
+                            ServerToClient::TaskAllowlistUpdated {
+                                task_id: task_id.clone(),
+                                tool_allowlist: snapshot,
+                            },
+                        );
+                    }
+                    Some((false, _)) => { /* nothing to remove — silent no-op */ }
+                    None => self.send_to_client(
+                        conn_id,
+                        ServerToClient::Error {
+                            correlation_id: None,
+                            task_id: Some(task_id),
+                            message: "unknown task".into(),
+                        },
+                    ),
                 }
             }
             ClientToServer::CancelTask { task_id } => {
@@ -819,6 +848,15 @@ impl Scheduler {
                             correlation_id: None,
                             task_id: Some(task_id.to_string()),
                             message,
+                        },
+                    );
+                }
+                TaskEvent::AllowlistChanged { allowlist } => {
+                    self.broadcast_to_subscribers(
+                        task_id,
+                        ServerToClient::TaskAllowlistUpdated {
+                            task_id: task_id.to_string(),
+                            tool_allowlist: allowlist,
                         },
                     );
                 }
