@@ -19,3 +19,5 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 clap = { version = "4", features = ["derive"] }
 thiserror = "2"
 anyhow = "1"
+ignore = "0.4"
+globset = "0.4"
