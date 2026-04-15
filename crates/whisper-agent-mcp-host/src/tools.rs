@@ -6,9 +6,10 @@
 
 use std::path::PathBuf;
 use std::process::Stdio;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
+use regex::Regex;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::process::Command;
@@ -316,7 +317,8 @@ fn bash_descriptor() -> Tool {
             "properties": {
                 "command": { "type": "string", "description": "Command to run via `bash -c`." },
                 "cwd": { "type": "string", "description": "Optional cwd relative to the workspace root. Defaults to the workspace root." },
-                "timeout_seconds": { "type": "integer", "description": "Kill the command after this many seconds. Default 120, max 600." }
+                "timeout_seconds": { "type": "integer", "description": "Kill the command after this many seconds. Default 120, max 600." },
+                "strip_ansi": { "type": "boolean", "description": "Strip ANSI escape sequences (colors, cursor codes) from stdout and stderr. Default true — only turn off if you specifically need the raw escape bytes." }
             },
             "required": ["command"]
         }),
@@ -330,6 +332,10 @@ fn bash_descriptor() -> Tool {
     }
 }
 
+fn default_strip_ansi() -> bool {
+    true
+}
+
 #[derive(Deserialize)]
 struct BashArgs {
     command: String,
@@ -337,6 +343,21 @@ struct BashArgs {
     cwd: Option<PathBuf>,
     #[serde(default)]
     timeout_seconds: Option<u64>,
+    #[serde(default = "default_strip_ansi")]
+    strip_ansi: bool,
+}
+
+static ANSI_ESCAPE: LazyLock<Regex> = LazyLock::new(|| {
+    // Matches CSI sequences (ESC `[` … final byte 0x40–0x7E) and every simple
+    // two-char escape in the Fp/Fe/Fs ranges (ESC + 0x30–0x7E, excluding `[`
+    // which starts CSI). Covers SGR colors, cursor moves, erase codes, keypad
+    // mode switches, save/restore cursor — the full set that cargo/gcc/ls/git
+    // actually emit.
+    Regex::new(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|[0-Z\\-~])").expect("ANSI regex is valid")
+});
+
+fn strip_ansi(s: &str) -> String {
+    ANSI_ESCAPE.replace_all(s, "").into_owned()
 }
 
 async fn bash(workspace: &Arc<Workspace>, args: Value) -> CallToolResult {
@@ -372,8 +393,13 @@ async fn bash(workspace: &Arc<Workspace>, args: Value) -> CallToolResult {
     let output_future = child.wait_with_output();
     match timeout(Duration::from_secs(timeout_secs), output_future).await {
         Ok(Ok(output)) => {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            let stderr = String::from_utf8_lossy(&output.stderr);
+            let stdout_raw = String::from_utf8_lossy(&output.stdout);
+            let stderr_raw = String::from_utf8_lossy(&output.stderr);
+            let (stdout, stderr) = if parsed.strip_ansi {
+                (strip_ansi(&stdout_raw), strip_ansi(&stderr_raw))
+            } else {
+                (stdout_raw.into_owned(), stderr_raw.into_owned())
+            };
             let exit_code = output.status.code().unwrap_or(-1);
             let body = format!(
                 "exit_code: {exit_code}\n--- stdout ---\n{stdout}--- stderr ---\n{stderr}"
@@ -815,4 +841,36 @@ fn scan_file(
         }
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn strip_ansi_removes_color_codes() {
+        // Representative cargo-style output with SGR color/reset and bold.
+        let input = "\x1b[1m\x1b[31merror\x1b[0m: \x1b[1mcannot find value `foo`\x1b[0m";
+        assert_eq!(strip_ansi(input), "error: cannot find value `foo`");
+    }
+
+    #[test]
+    fn strip_ansi_removes_cursor_and_erase_codes() {
+        // Progress bars: cursor-up, erase-line, carriage return left intact.
+        let input = "\r\x1b[2K\x1b[1A Downloading crates …";
+        assert_eq!(strip_ansi(input), "\r Downloading crates …");
+    }
+
+    #[test]
+    fn strip_ansi_passes_through_plain_text() {
+        let input = "exit_code: 0\nfinished dev profile\n";
+        assert_eq!(strip_ansi(input), input);
+    }
+
+    #[test]
+    fn strip_ansi_handles_simple_two_char_escapes() {
+        // ESC + letter (e.g. alternate charset, keypad modes).
+        let input = "hello\x1bMworld\x1b=done";
+        assert_eq!(strip_ansi(input), "helloworlddone");
+    }
 }
