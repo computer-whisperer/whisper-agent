@@ -12,13 +12,14 @@
 //! the task's display items. Subsequent turn events append to them.
 
 use std::cell::RefCell;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::rc::Rc;
 
-use egui::{Color32, RichText, ScrollArea, TextEdit};
+use egui::{Color32, ComboBox, RichText, ScrollArea, TextEdit};
 use whisper_agent_protocol::{
-    ApprovalChoice, ClientToServer, ContentBlock, Conversation, Message, Role, ServerToClient,
-    TaskStateLabel, TaskSummary, ToolResultContent, Usage,
+    ApprovalChoice, BackendSummary, ClientToServer, ContentBlock, Conversation, Message,
+    ModelSummary, Role, ServerToClient, TaskConfigOverride, TaskStateLabel, TaskSummary,
+    ToolResultContent, Usage,
 };
 
 /// Events pushed into [`Inbound`]. In addition to decoded wire messages we pipe in
@@ -92,6 +93,12 @@ struct TaskView {
     /// Currently-open approval requests, in arrival order. Cleared on snapshot so
     /// re-subscribe can re-seed them without duplicates.
     pending_approvals: Vec<PendingApproval>,
+    /// Backend alias the server resolved for this task. Populated from TaskSnapshot.
+    /// Empty string means "server default" — the status bar resolves that to the
+    /// known default_backend name at render time.
+    backend: String,
+    /// Model the task was created with. Populated from TaskSnapshot.
+    model: String,
 }
 
 struct PendingApproval {
@@ -113,6 +120,8 @@ impl TaskView {
             total_usage: Usage::default(),
             subscribed: false,
             pending_approvals: Vec::new(),
+            backend: String::new(),
+            model: String::new(),
         }
     }
 }
@@ -132,6 +141,20 @@ pub struct ChatApp {
     inbound: Inbound,
     send_fn: SendFn,
     list_requested: bool,
+
+    // --- Model-backend catalog ---
+    backends: Vec<BackendSummary>,
+    default_backend: String,
+    backends_requested: bool,
+    /// Cached model lists keyed by backend name.
+    models_by_backend: HashMap<String, Vec<ModelSummary>>,
+    /// Backends we've already sent a ListModels request for — dedup so UI changes
+    /// don't re-request repeatedly.
+    models_requested: HashSet<String>,
+    /// Backend chosen in the new-task picker. None = follow server default.
+    picker_backend: Option<String>,
+    /// Model chosen in the new-task picker. None = follow backend default.
+    picker_model: Option<String>,
 }
 
 impl ChatApp {
@@ -147,7 +170,46 @@ impl ChatApp {
             inbound,
             send_fn,
             list_requested: false,
+            backends: Vec::new(),
+            default_backend: String::new(),
+            backends_requested: false,
+            models_by_backend: HashMap::new(),
+            models_requested: HashSet::new(),
+            picker_backend: None,
+            picker_model: None,
         }
+    }
+
+    /// Resolve the picker-selected backend name, falling back to the server default.
+    fn effective_picker_backend(&self) -> &str {
+        self.picker_backend
+            .as_deref()
+            .unwrap_or(&self.default_backend)
+    }
+
+    /// Resolve the picker-selected model, falling back to the backend's default_model
+    /// from the catalog, or empty if the catalog isn't loaded yet.
+    fn effective_picker_model(&self) -> String {
+        if let Some(m) = &self.picker_model {
+            return m.clone();
+        }
+        let backend = self.effective_picker_backend();
+        self.backends
+            .iter()
+            .find(|b| b.name == backend)
+            .map(|b| b.default_model.clone())
+            .unwrap_or_default()
+    }
+
+    fn request_models_for(&mut self, backend: &str) {
+        if backend.is_empty() || self.models_requested.contains(backend) {
+            return;
+        }
+        self.models_requested.insert(backend.to_string());
+        self.send(ClientToServer::ListModels {
+            correlation_id: None,
+            backend: backend.to_string(),
+        });
     }
 
     fn send(&self, msg: ClientToServer) {
@@ -169,6 +231,10 @@ impl ChatApp {
                 if !self.list_requested {
                     self.send(ClientToServer::ListTasks { correlation_id: None });
                     self.list_requested = true;
+                }
+                if !self.backends_requested {
+                    self.send(ClientToServer::ListBackends { correlation_id: None });
+                    self.backends_requested = true;
                 }
             }
             InboundEvent::ConnectionClosed { detail } => {
@@ -220,6 +286,8 @@ impl ChatApp {
             }
             ServerToClient::TaskSnapshot { task_id, snapshot } => {
                 let items = conversation_to_items(&snapshot.conversation);
+                let backend = snapshot.config.backend.clone();
+                let model = snapshot.config.model.clone();
                 let view = self
                     .tasks
                     .entry(task_id.clone())
@@ -229,6 +297,8 @@ impl ChatApp {
                 view.total_usage = snapshot.total_usage;
                 view.items = items;
                 view.subscribed = true;
+                view.backend = backend;
+                view.model = model;
                 // Pending-approval events that follow the snapshot will re-seed this.
                 view.pending_approvals.clear();
             }
@@ -323,8 +393,16 @@ impl ChatApp {
                     self.conn_detail = Some(message);
                 }
             }
-            ServerToClient::BackendsList { .. } | ServerToClient::ModelsList { .. } => {
-                // Picker wiring lands in a follow-up commit; ignore for now.
+            ServerToClient::BackendsList { default_backend, backends, .. } => {
+                self.default_backend = default_backend;
+                self.backends = backends;
+                // Pre-fetch the default backend's models so the picker is ready on
+                // first open without a visible delay.
+                let default = self.default_backend.clone();
+                self.request_models_for(&default);
+            }
+            ServerToClient::ModelsList { backend, models, .. } => {
+                self.models_by_backend.insert(backend, models);
             }
         }
     }
@@ -370,10 +448,11 @@ impl ChatApp {
             return;
         }
         if self.composing_new || self.selected.is_none() {
+            let override_ = self.build_creation_override();
             self.send(ClientToServer::CreateTask {
                 correlation_id: None,
                 initial_message: trimmed.to_string(),
-                config_override: None,
+                config_override: override_,
             });
         } else if let Some(task_id) = self.selected.clone() {
             if let Some(view) = self.tasks.get_mut(&task_id) {
@@ -384,6 +463,32 @@ impl ChatApp {
                 text: trimmed.to_string(),
             });
         }
+    }
+
+    /// Build a TaskConfigOverride from the picker's current state. Only includes the
+    /// fields the user explicitly set — unset fields fall through to the server's
+    /// default_task_config on the other end.
+    fn build_creation_override(&self) -> Option<TaskConfigOverride> {
+        let backend = self.picker_backend.clone();
+        let model = self.picker_model.clone().or_else(|| {
+            // If the user picked a backend but didn't touch the model dropdown,
+            // send the backend's default_model explicitly so the server doesn't
+            // route this task to the wrong backend's default model.
+            backend.as_ref().and_then(|b| {
+                self.backends
+                    .iter()
+                    .find(|bs| &bs.name == b)
+                    .map(|bs| bs.default_model.clone())
+            })
+        });
+        if backend.is_none() && model.is_none() {
+            return None;
+        }
+        Some(TaskConfigOverride {
+            backend,
+            model,
+            ..Default::default()
+        })
     }
 }
 
@@ -509,6 +614,19 @@ impl eframe::App for ChatApp {
                     ui.separator();
                     let (text, c) = state_chip(view.summary.state);
                     ui.label(RichText::new(text).color(c));
+                    let backend_label = if view.backend.is_empty() {
+                        &self.default_backend
+                    } else {
+                        &view.backend
+                    };
+                    if !backend_label.is_empty() {
+                        ui.separator();
+                        ui.label(
+                            RichText::new(format!("{}/{}", backend_label, view.model))
+                                .color(Color32::from_gray(180))
+                                .small(),
+                        );
+                    }
                     let u = view.total_usage;
                     ui.separator();
                     ui.label(
@@ -571,9 +689,72 @@ impl eframe::App for ChatApp {
             if input_enabled { "Message this task" } else { "(connecting)" }
         };
 
+        let show_picker =
+            (self.composing_new || self.selected.is_none()) && !self.backends.is_empty();
+        let mut request_models: Option<String> = None;
         egui::TopBottomPanel::bottom("input_bar")
             .resizable(false)
             .show(ctx, |ui| {
+                if show_picker {
+                    ui.add_space(4.0);
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("backend").small().color(Color32::from_gray(180)));
+                        let current_backend = self.effective_picker_backend().to_string();
+                        let before = current_backend.clone();
+                        ComboBox::from_id_salt("picker_backend")
+                            .selected_text(&current_backend)
+                            .show_ui(ui, |ui| {
+                                for b in &self.backends {
+                                    ui.selectable_value(
+                                        &mut self.picker_backend,
+                                        Some(b.name.clone()),
+                                        format!("{}  ({})", b.name, b.kind),
+                                    );
+                                }
+                            });
+                        let after = self.effective_picker_backend().to_string();
+                        if before != after {
+                            // Reset the model pick so the backend's default wins.
+                            self.picker_model = None;
+                            request_models = Some(after.clone());
+                        }
+
+                        ui.separator();
+                        ui.label(RichText::new("model").small().color(Color32::from_gray(180)));
+                        let current_model = self.effective_picker_model();
+                        let models_for_backend = self
+                            .models_by_backend
+                            .get(&after)
+                            .cloned()
+                            .unwrap_or_default();
+                        ComboBox::from_id_salt("picker_model")
+                            .selected_text(if current_model.is_empty() {
+                                "(loading…)"
+                            } else {
+                                &current_model
+                            })
+                            .show_ui(ui, |ui| {
+                                if models_for_backend.is_empty() {
+                                    ui.label(
+                                        RichText::new("(no models listed — defaults apply)")
+                                            .small()
+                                            .color(Color32::from_gray(160)),
+                                    );
+                                }
+                                for m in &models_for_backend {
+                                    let label = match &m.display_name {
+                                        Some(d) => format!("{}  ({})", m.id, d),
+                                        None => m.id.clone(),
+                                    };
+                                    ui.selectable_value(
+                                        &mut self.picker_model,
+                                        Some(m.id.clone()),
+                                        label,
+                                    );
+                                }
+                            });
+                    });
+                }
                 ui.add_space(4.0);
                 ui.horizontal(|ui| {
                     if let Some(task_id) = self.selected.clone() {
@@ -601,6 +782,9 @@ impl eframe::App for ChatApp {
                 });
                 ui.add_space(4.0);
             });
+        if let Some(backend) = request_models {
+            self.request_models_for(&backend);
+        }
 
         let mut pending_decisions: Vec<(String, String, ApprovalChoice)> = Vec::new();
         egui::CentralPanel::default().show(ctx, |ui| {
