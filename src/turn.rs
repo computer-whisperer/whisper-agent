@@ -15,7 +15,7 @@ use whisper_agent_protocol::{ContentBlock, Conversation, Message, ToolResultCont
 
 use crate::audit::{AuditLog, ToolCallEntry, ToolCallOutcome};
 use crate::mcp::{McpSession, ToolDescriptor as McpTool, ToolEvent};
-use crate::model::{ModelProvider, ModelRequest, ToolSpec};
+use crate::model::{ModelProvider, ModelRequest, ToolSpec, default_cache_policy};
 
 /// Per-turn events emitted during the loop.
 #[derive(Debug, Clone)]
@@ -89,12 +89,14 @@ pub async fn run(
         turns += 1;
         emit(TurnEvent::AssistantBegin { turn: turns });
 
+        let breakpoints = default_cache_policy(conversation.messages(), 2);
         let req = ModelRequest {
             model: cfg.model,
             max_tokens: cfg.max_tokens,
             system_prompt: cfg.system_prompt,
             tools: &tools,
             messages: conversation.messages(),
+            cache_breakpoints: &breakpoints,
         };
         let response = model
             .create_message(&req)

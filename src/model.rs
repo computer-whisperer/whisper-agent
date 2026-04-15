@@ -24,6 +24,24 @@ pub struct ModelRequest<'a> {
     pub system_prompt: &'a str,
     pub tools: &'a [ToolSpec],
     pub messages: &'a [Message],
+    /// Positions at which the backend should mark prompt-cache checkpoints.
+    /// Providers that don't support caching ignore this list. Anthropic caps the
+    /// list at 4 markers per request — the scheduler is responsible for staying
+    /// under that limit.
+    pub cache_breakpoints: &'a [CacheBreakpoint],
+}
+
+/// Logical positions at which a cache checkpoint can be attached. Translated into
+/// provider-specific markers by each [`ModelProvider`] implementation — or ignored
+/// by providers without cache support.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CacheBreakpoint {
+    /// Cache the system prompt (everything up to and including `system`).
+    AfterSystem,
+    /// Cache the tool declarations (everything up to and including `tools`).
+    AfterTools,
+    /// Cache through `messages[index]` (inclusive).
+    AfterMessage(usize),
 }
 
 #[derive(Debug, Clone)]
@@ -63,4 +81,28 @@ pub trait ModelProvider: Send + Sync {
     ) -> BoxFuture<'a, Result<ModelResponse, ModelError>>;
 
     fn list_models<'a>(&'a self) -> BoxFuture<'a, Result<Vec<ModelInfo>, ModelError>>;
+}
+
+/// Default cache policy: cache the (byte-stable) system prompt and tool declarations,
+/// then cache through the most recent user-role messages — up to `max_trailing_user`
+/// of them — so each turn's tool_results become a rolling checkpoint without
+/// exceeding Anthropic's 4-marker cap. Pass `max_trailing_user = 2` to leave headroom
+/// for the two fixed markers.
+pub fn default_cache_policy(messages: &[Message], max_trailing_user: usize) -> Vec<CacheBreakpoint> {
+    let mut out = vec![CacheBreakpoint::AfterSystem, CacheBreakpoint::AfterTools];
+    if max_trailing_user == 0 {
+        return out;
+    }
+    // Walk back through the messages picking the most recent user-role entries —
+    // those are where tool_results live, and each is a natural cache boundary.
+    let user_indices: Vec<usize> = messages
+        .iter()
+        .enumerate()
+        .filter(|(_, m)| matches!(m.role, whisper_agent_protocol::Role::User))
+        .map(|(i, _)| i)
+        .collect();
+    for &i in user_indices.iter().rev().take(max_trailing_user) {
+        out.push(CacheBreakpoint::AfterMessage(i));
+    }
+    out
 }

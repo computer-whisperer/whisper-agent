@@ -35,7 +35,7 @@ use whisper_agent_protocol::{
 
 use crate::audit::{AuditLog, ToolCallEntry, ToolCallOutcome};
 use crate::mcp::{McpSession, ToolAnnotations, ToolDescriptor as McpTool};
-use crate::model::{ModelProvider, ModelRequest, ToolSpec};
+use crate::model::{CacheBreakpoint, ModelProvider, ModelRequest, ToolSpec, default_cache_policy};
 use crate::persist::Persister;
 use crate::task::{
     ApprovalDisposition, IoRequest, IoResult, OpId, StepOutcome, Task, TaskEvent, TaskInternalState,
@@ -659,6 +659,7 @@ impl Scheduler {
                         system_prompt: &owned_req.system_prompt,
                         tools: &owned_req.tools,
                         messages: &owned_req.messages,
+                        cache_breakpoints: &owned_req.cache_breakpoints,
                     };
                     match provider.create_message(&req).await {
                         Ok(resp) => IoCompletion {
@@ -726,6 +727,7 @@ impl Scheduler {
             task.config.model.clone()
         };
         let max_tokens = task.config.max_tokens;
+        let cache_breakpoints = default_cache_policy(&messages, 2);
         (
             OwnedModelRequest {
                 model: model.clone(),
@@ -733,6 +735,7 @@ impl Scheduler {
                 system_prompt: task.config.system_prompt.clone(),
                 tools,
                 messages,
+                cache_breakpoints,
             },
             model,
             backend_name,
@@ -959,6 +962,7 @@ struct OwnedModelRequest {
     system_prompt: String,
     tools: Vec<ToolSpec>,
     messages: Vec<whisper_agent_protocol::Message>,
+    cache_breakpoints: Vec<CacheBreakpoint>,
 }
 
 /// Build the `TaskPendingApproval` events that a newly-subscribed client needs to
