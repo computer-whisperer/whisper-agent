@@ -1,4 +1,4 @@
-//! The canonical conversation state, modeled after Anthropic's content-block shape.
+//! Canonical conversation state, modeled after Anthropic's content-block shape.
 //!
 //! Adapting *down* from this representation to the flatter OpenAI/Gemini shapes is
 //! mechanical; adapting *up* from a flatter shape would require restructuring state.
@@ -75,7 +75,11 @@ fn is_false(b: &bool) -> bool {
     !b
 }
 
-#[derive(Debug, Default)]
+/// Ordered list of messages. Owns the vector; exposes controlled push access so callers
+/// don't splice arbitrarily into the middle (the Anthropic request shape requires a
+/// well-formed alternation of user/assistant roles).
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+#[serde(transparent)]
 pub struct Conversation {
     messages: Vec<Message>,
 }
@@ -91,5 +95,13 @@ impl Conversation {
 
     pub fn messages(&self) -> &[Message] {
         &self.messages
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.messages.is_empty()
+    }
+
+    pub fn len(&self) -> usize {
+        self.messages.len()
     }
 }

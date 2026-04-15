@@ -1,55 +1,78 @@
-//! The agent loop driver.
+//! Pure turn-running logic.
 //!
-//! Sends the conversation to Anthropic, executes any tool_use blocks via MCP, appends
-//! the tool_results, repeats until the model emits a non-tool stop_reason. Auto-approves
-//! every tool call and audits each one.
+//! Appends a user message to the conversation, then drives the Anthropic model →
+//! MCP tool → `tool_result` cycle until the assistant emits a non-tool stop reason or
+//! `max_turns` is hit. Emits [`TurnEvent`]s via an optional sink so callers can stream
+//! them to UIs or logs without this module needing to know about the wire protocol.
 //!
-//! When an event sender is provided, emits [`ServerToClient`] events at key points so
-//! the WebSocket layer can stream them to the UI without doing its own translation.
+//! Used by the task-manager-driven runner for live sessions and by the CLI one-shot path.
 
 use anyhow::{Context, Result};
 use futures::StreamExt;
 use tokio::sync::mpsc::UnboundedSender;
 use tracing::{info, warn};
-use whisper_agent_protocol::{ServerToClient, Usage as WireUsage};
+use whisper_agent_protocol::{ContentBlock, Conversation, Message, ToolResultContent, Usage as WireUsage};
 
 use crate::anthropic::{
     AnthropicClient, CreateMessageRequest, MessageResponse, SystemBlock, ToolDescriptor as AnthropicTool,
     Usage,
 };
 use crate::audit::{AuditLog, ToolCallEntry, ToolCallOutcome};
-use crate::conversation::{ContentBlock, Conversation, Message, ToolResultContent};
 use crate::mcp::{McpSession, ToolDescriptor as McpTool, ToolEvent};
 
-pub struct LoopConfig {
-    pub model: String,
+/// Per-turn events emitted during the loop. Translated by callers into wire-protocol
+/// events (`ServerToClient::TaskAssistant*`, etc.) — see `task_manager.rs`.
+#[derive(Debug, Clone)]
+pub enum TurnEvent {
+    AssistantBegin {
+        turn: u32,
+    },
+    AssistantText {
+        text: String,
+    },
+    ToolCallBegin {
+        tool_use_id: String,
+        name: String,
+        args_preview: String,
+    },
+    ToolCallEnd {
+        tool_use_id: String,
+        result_preview: String,
+        is_error: bool,
+    },
+    AssistantEnd {
+        stop_reason: Option<String>,
+        usage: WireUsage,
+    },
+    LoopComplete,
+}
+
+pub struct TurnConfig<'a> {
+    pub model: &'a str,
     pub max_tokens: u32,
-    pub system_prompt: String,
-    pub session_id: String,
-    pub host_id: String,
+    pub system_prompt: &'a str,
+    pub task_id: &'a str,
+    pub host_id: &'a str,
     pub max_turns: u32,
 }
 
-pub struct LoopOutcome {
+pub struct TurnOutcome {
     pub turns: u32,
     pub usage_total: Usage,
     pub final_stop_reason: Option<String>,
 }
 
-/// Append `new_user_message` to the conversation, then iterate the model/tool loop until
-/// the assistant emits a non-tool stop_reason or `max_turns` is hit. The conversation is
-/// mutated in place so the caller (CLI one-shot or WebSocket session) keeps ownership of
-/// it across calls.
+/// Append `new_user_message` to the conversation and iterate the model/tool loop.
 pub async fn run(
-    cfg: &LoopConfig,
+    cfg: &TurnConfig<'_>,
     anthropic: &AnthropicClient,
     mcp: &McpSession,
     audit: &AuditLog,
     conversation: &mut Conversation,
     new_user_message: String,
-    events: Option<UnboundedSender<ServerToClient>>,
-) -> Result<LoopOutcome> {
-    let send_event = |e: ServerToClient| {
+    events: Option<UnboundedSender<TurnEvent>>,
+) -> Result<TurnOutcome> {
+    let emit = |e: TurnEvent| {
         if let Some(s) = &events {
             let _ = s.send(e);
         }
@@ -61,7 +84,7 @@ pub async fn run(
     let anthropic_tools: Vec<AnthropicTool> = mcp_tools.iter().map(mcp_to_anthropic_tool).collect();
     info!(count = anthropic_tools.len(), "advertising tools to model");
 
-    let system = vec![SystemBlock::cached(cfg.system_prompt.clone())];
+    let system = vec![SystemBlock::cached(cfg.system_prompt.to_string())];
 
     let mut turns = 0u32;
     let mut total = Usage::default();
@@ -73,10 +96,11 @@ pub async fn run(
             break;
         }
 
-        send_event(ServerToClient::AssistantBegin);
+        turns += 1;
+        emit(TurnEvent::AssistantBegin { turn: turns });
 
         let req = CreateMessageRequest {
-            model: &cfg.model,
+            model: cfg.model,
             max_tokens: cfg.max_tokens,
             system: system.clone(),
             tools: anthropic_tools.clone(),
@@ -86,7 +110,6 @@ pub async fn run(
             .create_message(&req)
             .await
             .context("anthropic create_message failed")?;
-        turns += 1;
         accumulate(&mut total, &response.usage);
         last_stop_reason = response.stop_reason.clone();
         info!(
@@ -101,10 +124,9 @@ pub async fn run(
 
         let assistant_blocks = response.content;
 
-        // Emit text blocks now (before tool execution) so the UI can render them while tools run.
         for block in &assistant_blocks {
             if let ContentBlock::Text { text } = block {
-                send_event(ServerToClient::AssistantText { text: text.clone() });
+                emit(TurnEvent::AssistantText { text: text.clone() });
             }
         }
 
@@ -118,7 +140,7 @@ pub async fn run(
             })
             .collect();
 
-        send_event(ServerToClient::AssistantEnd {
+        emit(TurnEvent::AssistantEnd {
             stop_reason: response.stop_reason.clone(),
             usage: convert_usage(&response.usage),
         });
@@ -132,8 +154,8 @@ pub async fn run(
         let mut tool_result_blocks = Vec::with_capacity(tool_uses.len());
         for (use_id, name, input) in tool_uses {
             info!(tool = %name, "invoking");
-            send_event(ServerToClient::ToolCallBegin {
-                id: use_id.clone(),
+            emit(TurnEvent::ToolCallBegin {
+                tool_use_id: use_id.clone(),
                 name: name.clone(),
                 args_preview: truncate(serde_json::to_string(&input).unwrap_or_default(), 200),
             });
@@ -156,8 +178,8 @@ pub async fn run(
             audit
                 .write(&ToolCallEntry {
                     timestamp: chrono::Utc::now(),
-                    session_id: &cfg.session_id,
-                    host_id: &cfg.host_id,
+                    task_id: cfg.task_id,
+                    host_id: cfg.host_id,
                     tool_name: &name,
                     args: input,
                     decision: "auto-approve",
@@ -167,8 +189,8 @@ pub async fn run(
                 .await
                 .context("audit write failed")?;
 
-            send_event(ServerToClient::ToolCallEnd {
-                id: use_id.clone(),
+            emit(TurnEvent::ToolCallEnd {
+                tool_use_id: use_id.clone(),
                 result_preview: truncate(text.clone(), 200),
                 is_error,
             });
@@ -183,9 +205,9 @@ pub async fn run(
         conversation.push(Message::user_blocks(tool_result_blocks));
     }
 
-    send_event(ServerToClient::LoopComplete);
+    emit(TurnEvent::LoopComplete);
 
-    Ok(LoopOutcome { turns, usage_total: total, final_stop_reason: last_stop_reason })
+    Ok(TurnOutcome { turns, usage_total: total, final_stop_reason: last_stop_reason })
 }
 
 async fn invoke_and_collect(

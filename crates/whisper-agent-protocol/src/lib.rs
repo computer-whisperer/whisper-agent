@@ -1,51 +1,39 @@
-//! Wire protocol between the whisper-agent server and its webui.
+//! Wire protocol between the whisper-agent server and its clients (webui, CLI).
 //!
 //! Both directions are CBOR-encoded enums — see the helper functions at the bottom for
-//! the (de)serialization entry points. The shape is deliberately small and explicit:
-//! each variant maps to one logical event the harness wants the UI to render or one
-//! action the user can request.
+//! the (de)serialization entry points.
+//!
+//! This crate also owns the canonical conversation types (`Role`, `Message`,
+//! `ContentBlock`, `Conversation`). They're modeled after Anthropic's content-block shape
+//! so serde serializes directly into Anthropic's request body, and they're shared between
+//! the server (which builds them) and the client (which renders them from task snapshots).
+
+pub mod conversation;
+
+pub use conversation::{ContentBlock, Conversation, Message, Role, ToolResultContent};
 
 use serde::{Deserialize, Serialize};
 
-/// Messages the client (webui) sends to the server (whisper-agent).
-#[derive(Serialize, Deserialize, Debug, Clone)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum ClientToServer {
-    /// User submitted a new prompt.
-    UserMessage { text: String },
-    // Cancel deferred to v0.2.
-}
+// ---------- Task-level types ----------
 
-/// Messages the server sends to the client.
-#[derive(Serialize, Deserialize, Debug, Clone)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum ServerToClient {
-    /// Connection-level status changes ("connected", "ready", "error", etc.).
-    Status { state: SessionState, detail: Option<String> },
-    /// A new assistant turn is starting.
-    AssistantBegin,
-    /// Text emitted by the model in this turn. For MVP (non-streaming Anthropic) this
-    /// arrives as one chunk per turn; once streaming is added, multiple deltas may arrive.
-    AssistantText { text: String },
-    /// The model emitted a tool_use block; we are about to invoke it via MCP.
-    ToolCallBegin { id: String, name: String, args_preview: String },
-    /// Tool returned. `result_preview` is the (possibly truncated) text result.
-    ToolCallEnd { id: String, result_preview: String, is_error: bool },
-    /// Turn ended (either tool_use → next turn, or end_turn → loop done).
-    AssistantEnd { stop_reason: Option<String>, usage: Usage },
-    /// The agent loop finished (model returned a non-tool stop_reason or hit max_turns).
-    LoopComplete,
-    /// Something went wrong inside the harness.
-    Error { message: String },
-}
-
+/// Public-facing state label for a task. The scheduler's internal state has finer
+/// distinctions (e.g. `AwaitingModel` vs `AwaitingTools`) but clients see the collapsed
+/// form so the protocol is stable against scheduler internals.
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-pub enum SessionState {
-    Connected,
-    Ready,
+pub enum TaskStateLabel {
+    /// Ready for new user input.
+    Idle,
+    /// Model call or tool call in flight.
     Working,
-    Error,
+    /// Paused waiting for a human approval decision.
+    AwaitingApproval,
+    /// Turn finished with `end_turn`; open for follow-ups or archive.
+    Completed,
+    /// Terminally failed. `detail` in the last event gives the reason.
+    Failed,
+    /// User cancelled.
+    Cancelled,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, Default)]
@@ -54,6 +42,184 @@ pub struct Usage {
     pub output_tokens: u32,
     pub cache_read_input_tokens: u32,
     pub cache_creation_input_tokens: u32,
+}
+
+impl Usage {
+    pub fn add(&mut self, other: &Usage) {
+        self.input_tokens += other.input_tokens;
+        self.output_tokens += other.output_tokens;
+        self.cache_read_input_tokens += other.cache_read_input_tokens;
+        self.cache_creation_input_tokens += other.cache_creation_input_tokens;
+    }
+}
+
+/// The per-task configuration the server holds. Clients can override pieces of it at
+/// task-creation time via [`TaskConfigOverride`].
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct TaskConfig {
+    pub model: String,
+    pub system_prompt: String,
+    pub mcp_host_url: String,
+    pub max_tokens: u32,
+    pub max_turns: u32,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+pub struct TaskConfigOverride {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub system_prompt: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mcp_host_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_tokens: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_turns: Option<u32>,
+}
+
+/// Lightweight per-task summary. Broadcast to every connected client and used by
+/// `ListTasks` responses.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct TaskSummary {
+    pub task_id: String,
+    pub title: Option<String>,
+    pub state: TaskStateLabel,
+    /// ISO-8601 timestamp. Kept as a plain string on the wire so the protocol crate
+    /// doesn't pull in chrono.
+    pub created_at: String,
+    pub last_active: String,
+}
+
+/// Full per-task snapshot. Sent in response to a `SubscribeToTask` so the client can
+/// render the entire conversation from a cold start.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct TaskSnapshot {
+    pub task_id: String,
+    pub title: Option<String>,
+    pub config: TaskConfig,
+    pub state: TaskStateLabel,
+    pub conversation: Conversation,
+    pub total_usage: Usage,
+    pub created_at: String,
+    pub last_active: String,
+}
+
+// ---------- Wire enums ----------
+
+/// Messages the client sends to the server.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ClientToServer {
+    // --- Task lifecycle ---
+    /// Create a new task. `initial_message` becomes the first user message; the server
+    /// starts driving the loop immediately.
+    CreateTask {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        correlation_id: Option<String>,
+        initial_message: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        config_override: Option<TaskConfigOverride>,
+    },
+    /// Append a follow-up user message to an existing task.
+    SendUserMessage { task_id: String, text: String },
+    /// Cancel a task. Stubbed for now — flips state to `Cancelled` without rolling back
+    /// any in-flight tool work. Proper rollback semantics are a v0.3 problem.
+    CancelTask { task_id: String },
+    /// Archive (hide) a task. It remains on disk but drops off the broadcast list.
+    ArchiveTask { task_id: String },
+
+    // --- Observation ---
+    /// Start receiving per-turn events for this task. Server responds with a
+    /// `TaskSnapshot` and then streams subsequent events.
+    SubscribeToTask { task_id: String },
+    UnsubscribeFromTask { task_id: String },
+    /// Request the current list of non-archived tasks.
+    ListTasks {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        correlation_id: Option<String>,
+    },
+}
+
+/// Messages the server sends to the client.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ServerToClient {
+    // --- Task-list tier (broadcast to every connected client) ---
+    TaskCreated {
+        task_id: String,
+        summary: TaskSummary,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        correlation_id: Option<String>,
+    },
+    TaskStateChanged {
+        task_id: String,
+        state: TaskStateLabel,
+    },
+    TaskTitleUpdated {
+        task_id: String,
+        title: String,
+    },
+    TaskArchived {
+        task_id: String,
+    },
+
+    // --- Request / response ---
+    TaskList {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        correlation_id: Option<String>,
+        tasks: Vec<TaskSummary>,
+    },
+    TaskSnapshot {
+        task_id: String,
+        snapshot: TaskSnapshot,
+    },
+
+    // --- Per-task turn tier (only to subscribers of `task_id`) ---
+    TaskAssistantBegin {
+        task_id: String,
+        turn: u32,
+    },
+    /// A complete text block emitted by the assistant. Always emitted at turn-end so
+    /// clients reconnecting mid-stream see consistent state once the turn settles.
+    TaskAssistantText {
+        task_id: String,
+        text: String,
+    },
+    /// Streaming text partial (reserved — not emitted until SSE streaming lands).
+    TaskAssistantTextDelta {
+        task_id: String,
+        delta: String,
+    },
+    TaskToolCallBegin {
+        task_id: String,
+        tool_use_id: String,
+        name: String,
+        args_preview: String,
+    },
+    TaskToolCallEnd {
+        task_id: String,
+        tool_use_id: String,
+        result_preview: String,
+        is_error: bool,
+    },
+    TaskAssistantEnd {
+        task_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        stop_reason: Option<String>,
+        usage: Usage,
+    },
+    TaskLoopComplete {
+        task_id: String,
+    },
+
+    Error {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        correlation_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        task_id: Option<String>,
+        message: String,
+    },
 }
 
 // ---------- (de)serialization ----------

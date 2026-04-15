@@ -1,18 +1,18 @@
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
+use tokio::sync::mpsc;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
+use whisper_agent_protocol::{Conversation, TaskConfig};
 
-use whisper_agent::agent_loop::{LoopConfig, run};
 use whisper_agent::anthropic::AnthropicClient;
 use whisper_agent::audit::AuditLog;
-use whisper_agent::conversation::Conversation;
 use whisper_agent::mcp::McpSession;
 use whisper_agent::server::{self, ServerConfig};
+use whisper_agent::turn::{self, TurnConfig};
 
 const DEFAULT_SYSTEM_PROMPT: &str = "You are a software engineering agent. You have access to a set of tools that operate on a workspace directory on the user's machine. Use the tools as needed to complete the user's request. Be concise. When you have finished, summarize what you did.";
 
@@ -25,11 +25,11 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Command {
-    /// Start the HTTP server: hosts the webui assets and runs one chat session per
-    /// WebSocket connection.
+    /// Start the HTTP server: hosts the webui assets and drives the task scheduler.
+    /// Clients subscribe to individual tasks via the multiplexed WebSocket protocol.
     Serve(ServeArgs),
-    /// One-shot CLI: run the agent loop against a single prompt and exit. Used for
-    /// development and the CLI-only smoke test in docs/design_mvp.md (step 4).
+    /// One-shot CLI: run a single turn against a hard-coded prompt and exit.
+    /// Bypasses the task manager; uses [`turn::run`] directly.
     Run(RunArgs),
 }
 
@@ -124,13 +124,16 @@ async fn main() -> Result<()> {
 
 async fn run_serve(args: ServeArgs) -> Result<()> {
     let config = ServerConfig {
-        anthropic_api_key: Arc::new(args.anthropic_api_key),
-        mcp_host_url: Arc::new(args.mcp_host_url),
-        model: Arc::new(args.model),
-        system_prompt: Arc::new(args.system_prompt),
-        max_tokens: args.max_tokens,
-        max_turns: args.max_turns,
+        anthropic_api_key: args.anthropic_api_key,
+        default_task_config: TaskConfig {
+            model: args.model,
+            system_prompt: args.system_prompt,
+            mcp_host_url: args.mcp_host_url,
+            max_tokens: args.max_tokens,
+            max_turns: args.max_turns,
+        },
         audit_log_path: args.audit_log,
+        host_id: "default".into(),
     };
     server::serve(args.listen, config).await
 }
@@ -138,7 +141,7 @@ async fn run_serve(args: ServeArgs) -> Result<()> {
 async fn run_one_shot(args: RunArgs) -> Result<()> {
     info!(model = %args.model, host = %args.mcp_host_url, "starting whisper-agent (one-shot)");
 
-    let session_id = pseudo_session_id();
+    let task_id = pseudo_task_id();
     let host_id = "default";
 
     let anthropic = AnthropicClient::new(args.anthropic_api_key);
@@ -148,19 +151,36 @@ async fn run_one_shot(args: RunArgs) -> Result<()> {
     let audit = AuditLog::open(args.audit_log.clone())
         .await
         .with_context(|| format!("open audit log {}", args.audit_log.display()))?;
-    info!(audit_log = %audit.path().display(), session_id = %session_id, "audit log open");
+    info!(audit_log = %audit.path().display(), task_id = %task_id, "audit log open");
 
-    let cfg = LoopConfig {
-        model: args.model,
+    let cfg = TurnConfig {
+        model: &args.model,
         max_tokens: args.max_tokens,
-        system_prompt: args.system_prompt,
-        session_id,
-        host_id: host_id.to_string(),
+        system_prompt: &args.system_prompt,
+        task_id: &task_id,
+        host_id,
         max_turns: args.max_turns,
     };
 
     let mut conversation = Conversation::new();
-    let outcome = run(&cfg, &anthropic, &mcp, &audit, &mut conversation, args.prompt, None).await?;
+    // Drain events to stdout summary; not streaming live for the CLI path.
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let printer = tokio::spawn(async move {
+        while let Some(event) = rx.recv().await {
+            tracing::debug!(?event, "turn event");
+        }
+    });
+    let outcome = turn::run(
+        &cfg,
+        &anthropic,
+        &mcp,
+        &audit,
+        &mut conversation,
+        args.prompt,
+        Some(tx),
+    )
+    .await?;
+    let _ = printer.await;
 
     println!();
     println!("=== loop finished ===");
@@ -183,8 +203,8 @@ async fn run_one_shot(args: RunArgs) -> Result<()> {
     Ok(())
 }
 
-fn pseudo_session_id() -> String {
+fn pseudo_task_id() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
     let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos();
-    format!("ses-{:016x}-{:08x}", nanos as u64, std::process::id())
+    format!("task-{:016x}-{:08x}", nanos as u64, std::process::id())
 }

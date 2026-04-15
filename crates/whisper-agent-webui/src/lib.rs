@@ -14,14 +14,12 @@ mod web_entry {
     use std::collections::VecDeque;
     use std::rc::Rc;
 
-    use wasm_bindgen::prelude::*;
     use wasm_bindgen::JsCast;
+    use wasm_bindgen::prelude::*;
     use web_sys::{BinaryType, CloseEvent, ErrorEvent, MessageEvent, WebSocket};
-    use whisper_agent_protocol::{
-        ClientToServer, ServerToClient, SessionState, decode_from_server, encode_to_server,
-    };
+    use whisper_agent_protocol::{ClientToServer, decode_from_server, encode_to_server};
 
-    use super::app::{ChatApp, Inbound, SendFn};
+    use super::app::{ChatApp, Inbound, InboundEvent, SendFn};
 
     #[wasm_bindgen(start)]
     pub fn start() {
@@ -66,22 +64,21 @@ mod web_entry {
         let socket = WebSocket::new(&url).expect("WebSocket::new");
         socket.set_binary_type(BinaryType::Arraybuffer);
 
-        // onopen → push a Status::Connected event so the UI shows the right state.
+        // onopen → tell the app the connection is up.
         {
             let inbound_for_open = inbound.clone();
             let ctx_for_open = egui_ctx.clone();
             let cb = Closure::wrap(Box::new(move |_: JsValue| {
-                inbound_for_open.borrow_mut().push_back(ServerToClient::Status {
-                    state: SessionState::Connected,
-                    detail: None,
-                });
+                inbound_for_open
+                    .borrow_mut()
+                    .push_back(InboundEvent::ConnectionOpened);
                 ctx_for_open.request_repaint();
             }) as Box<dyn FnMut(JsValue)>);
             socket.set_onopen(Some(cb.as_ref().unchecked_ref()));
             cb.forget();
         }
 
-        // onmessage → decode CBOR and push to inbound queue.
+        // onmessage → decode CBOR and push the wire event to the inbound queue.
         {
             let inbound_for_msg = inbound.clone();
             let ctx_for_msg = egui_ctx.clone();
@@ -92,7 +89,9 @@ mod web_entry {
                     let bytes = array.to_vec();
                     match decode_from_server(&bytes) {
                         Ok(event) => {
-                            inbound_for_msg.borrow_mut().push_back(event);
+                            inbound_for_msg
+                                .borrow_mut()
+                                .push_back(InboundEvent::Wire(event));
                             ctx_for_msg.request_repaint();
                         }
                         Err(err) => log::error!("decode_from_server failed: {err}"),
@@ -105,31 +104,34 @@ mod web_entry {
             cb.forget();
         }
 
-        // onerror → surface as an error event in the UI.
+        // onerror → surface as a connection-error event.
         {
             let inbound_for_err = inbound.clone();
             let ctx_for_err = egui_ctx.clone();
             let cb = Closure::wrap(Box::new(move |e: ErrorEvent| {
                 log::error!("ws error: {}", e.message());
-                inbound_for_err.borrow_mut().push_back(ServerToClient::Error {
-                    message: format!("websocket error: {}", e.message()),
-                });
+                inbound_for_err
+                    .borrow_mut()
+                    .push_back(InboundEvent::ConnectionError {
+                        detail: e.message(),
+                    });
                 ctx_for_err.request_repaint();
             }) as Box<dyn FnMut(ErrorEvent)>);
             socket.set_onerror(Some(cb.as_ref().unchecked_ref()));
             cb.forget();
         }
 
-        // onclose → flip status to Closed (mapped via Error variant since SessionState
-        // doesn't have a Closed variant; we fake it by emitting Error and a system note).
+        // onclose → flip status.
         {
             let inbound_for_close = inbound.clone();
             let ctx_for_close = egui_ctx.clone();
             let cb = Closure::wrap(Box::new(move |e: CloseEvent| {
                 log::warn!("ws closed: code={} reason={}", e.code(), e.reason());
-                inbound_for_close.borrow_mut().push_back(ServerToClient::Error {
-                    message: format!("websocket closed (code {})", e.code()),
-                });
+                inbound_for_close
+                    .borrow_mut()
+                    .push_back(InboundEvent::ConnectionClosed {
+                        detail: format!("code {}", e.code()),
+                    });
                 ctx_for_close.request_repaint();
             }) as Box<dyn FnMut(CloseEvent)>);
             socket.set_onclose(Some(cb.as_ref().unchecked_ref()));

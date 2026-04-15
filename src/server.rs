@@ -1,13 +1,11 @@
-//! HTTP server: hosts the webui assets and the WebSocket protocol.
+//! HTTP server: hosts the webui assets and the multiplexed WebSocket protocol.
 //!
-//! Mirrors whisper-tensor-server's pattern: ServeDir-mounted `/pkg` (wasm-pack output)
-//! and `/assets` (static index.html etc.). The WebSocket at `/ws` runs one chat session
-//! per connection — see [`handle_ws_session`].
+//! Mirrors whisper-tensor-server's pattern: `ServeDir`-mounted `/pkg` (wasm-pack output)
+//! and `/assets` (static index.html etc.).
 //!
-//! The webui's pkg/ and assets/ directories are resolved relative to this binary's
-//! Cargo manifest so the server can find them in a development checkout. For deployed
-//! builds we'll either embed via `include_dir!` or take a runtime path — that's a
-//! future decision; not blocking MVP.
+//! Per-WebSocket state is just a subscription set (client registration lives on the
+//! [`TaskManager`]). The manager runs independently of any connection — tasks outlive
+//! their WebSockets and can be observed by any client.
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -29,15 +27,11 @@ use tokio::sync::mpsc;
 use tower_http::services::{ServeDir, ServeFile};
 use tower_http::trace::TraceLayer;
 use tracing::{error, info, warn};
-use whisper_agent_protocol::{
-    ClientToServer, SessionState, ServerToClient, decode_from_client, encode_to_client,
-};
+use whisper_agent_protocol::{ServerToClient, TaskConfig, decode_from_client, encode_to_client};
 
-use crate::agent_loop::{self, LoopConfig};
 use crate::anthropic::AnthropicClient;
 use crate::audit::AuditLog;
-use crate::conversation::Conversation;
-use crate::mcp::McpSession;
+use crate::task_manager::TaskManager;
 
 const WEBUI_PKG_DIR: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
@@ -52,16 +46,12 @@ const WEBUI_INDEX: &str = concat!(
     "/crates/whisper-agent-webui/assets/index.html"
 );
 
-/// Server-wide configuration shared across all WebSocket sessions.
-#[derive(Clone)]
+/// Server-wide configuration. Consumed at startup to build the shared [`TaskManager`].
 pub struct ServerConfig {
-    pub anthropic_api_key: Arc<String>,
-    pub mcp_host_url: Arc<String>,
-    pub model: Arc<String>,
-    pub system_prompt: Arc<String>,
-    pub max_tokens: u32,
-    pub max_turns: u32,
+    pub anthropic_api_key: String,
+    pub default_task_config: TaskConfig,
     pub audit_log_path: PathBuf,
+    pub host_id: String,
 }
 
 pub async fn serve(listen: SocketAddr, config: ServerConfig) -> anyhow::Result<()> {
@@ -75,6 +65,19 @@ pub async fn serve(listen: SocketAddr, config: ServerConfig) -> anyhow::Result<(
         );
     }
 
+    let audit = AuditLog::open(config.audit_log_path.clone())
+        .await
+        .with_context(|| format!("open audit log {}", config.audit_log_path.display()))?;
+    info!(audit_log = %audit.path().display(), "audit log open");
+
+    let anthropic = Arc::new(AnthropicClient::new(config.anthropic_api_key));
+    let manager = Arc::new(TaskManager::new(
+        config.default_task_config,
+        config.host_id,
+        anthropic,
+        audit,
+    ));
+
     let app = Router::new()
         .route("/health", get(|| async { "ok" }))
         .route("/ws", get(ws_handler))
@@ -83,7 +86,7 @@ pub async fn serve(listen: SocketAddr, config: ServerConfig) -> anyhow::Result<(
         .route_service("/index.html", ServeFile::new(WEBUI_INDEX))
         .route_service("/", ServeFile::new(WEBUI_INDEX))
         .layer(TraceLayer::new_for_http())
-        .with_state(config);
+        .with_state(manager);
 
     let listener = TcpListener::bind(listen)
         .await
@@ -93,30 +96,25 @@ pub async fn serve(listen: SocketAddr, config: ServerConfig) -> anyhow::Result<(
     Ok(())
 }
 
-async fn ws_handler(State(config): State<ServerConfig>, ws: WebSocketUpgrade) -> impl IntoResponse {
-    ws.on_upgrade(move |socket| handle_ws_session(socket, config))
+async fn ws_handler(
+    State(manager): State<Arc<TaskManager>>,
+    ws: WebSocketUpgrade,
+) -> impl IntoResponse {
+    ws.on_upgrade(move |socket| handle_ws_session(socket, manager))
 }
 
-/// One chat session per WebSocket connection. Conversation persists across multiple user
-/// messages within the connection. No multi-session concurrency yet — the inbound reader
-/// blocks on the agent loop while it runs (cancellation is a v0.2 concern).
-async fn handle_ws_session(socket: WebSocket, config: ServerConfig) {
-    let session_id = format!(
-        "ses-{:016x}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos() as u64
-    );
-    info!(session_id, "ws session opened");
+/// Drive one WebSocket connection: register as a client, forward manager events to the
+/// socket, decode inbound frames, hand them to the manager. The connection is stateless
+/// beyond "which client id am I"; tasks live on the manager.
+async fn handle_ws_session(socket: WebSocket, manager: Arc<TaskManager>) {
+    let (outbound_tx, mut outbound_rx) = mpsc::unbounded_channel::<ServerToClient>();
+    let conn_id = manager.register_client(outbound_tx);
+    info!(conn_id, "ws session opened");
 
     let (mut sink, mut stream) = socket.split();
-    let (events_tx, mut events_rx) = mpsc::unbounded_channel::<ServerToClient>();
 
-    // Drain outbound events to the WebSocket. Runs alongside the inbound loop until either
-    // side closes the channel.
-    let outbound_task = tokio::spawn(async move {
-        while let Some(event) = events_rx.recv().await {
+    let writer = tokio::spawn(async move {
+        while let Some(event) = outbound_rx.recv().await {
             match encode_to_client(&event) {
                 Ok(bytes) => {
                     if sink.send(Message::Binary(bytes.into())).await.is_err() {
@@ -126,132 +124,41 @@ async fn handle_ws_session(socket: WebSocket, config: ServerConfig) {
                 Err(e) => error!("encode_to_client failed: {e}"),
             }
         }
+        let _ = sink.close().await;
     });
-
-    let send = |e: ServerToClient| {
-        let _ = events_tx.send(e);
-    };
-
-    // Initial handshake: tell the client we're up and (lazily) connecting to the upstream.
-    send(ServerToClient::Status {
-        state: SessionState::Connected,
-        detail: None,
-    });
-
-    // Open Anthropic + MCP + audit log lazily on first user message? Or eagerly here?
-    // Eagerly is simpler and surfaces config errors immediately.
-    let anthropic = AnthropicClient::new((*config.anthropic_api_key).clone());
-    let mcp = match McpSession::connect(config.mcp_host_url.as_str()).await {
-        Ok(s) => s,
-        Err(e) => {
-            send(ServerToClient::Error {
-                message: format!("mcp connect failed: {e}"),
-            });
-            send(ServerToClient::Status { state: SessionState::Error, detail: None });
-            drop(events_tx);
-            let _ = outbound_task.await;
-            return;
-        }
-    };
-    let audit = match AuditLog::open(config.audit_log_path.clone()).await {
-        Ok(a) => a,
-        Err(e) => {
-            send(ServerToClient::Error {
-                message: format!("audit log open failed: {e}"),
-            });
-            send(ServerToClient::Status { state: SessionState::Error, detail: None });
-            drop(events_tx);
-            let _ = outbound_task.await;
-            return;
-        }
-    };
-
-    send(ServerToClient::Status {
-        state: SessionState::Ready,
-        detail: None,
-    });
-
-    let cfg = LoopConfig {
-        model: (*config.model).clone(),
-        max_tokens: config.max_tokens,
-        system_prompt: (*config.system_prompt).clone(),
-        session_id: session_id.clone(),
-        host_id: "default".into(),
-        max_turns: config.max_turns,
-    };
-
-    let mut conversation = Conversation::new();
 
     while let Some(msg) = stream.next().await {
         let msg = match msg {
             Ok(m) => m,
             Err(e) => {
-                warn!(session_id, error = %e, "ws receive error");
+                warn!(conn_id, error = %e, "ws receive error");
                 break;
             }
         };
         match msg {
             Message::Binary(bytes) => match decode_from_client(&bytes) {
-                Ok(ClientToServer::UserMessage { text }) => {
-                    info!(session_id, len = text.len(), "user message");
-                    send(ServerToClient::Status {
-                        state: SessionState::Working,
-                        detail: None,
-                    });
-                    let result = agent_loop::run(
-                        &cfg,
-                        &anthropic,
-                        &mcp,
-                        &audit,
-                        &mut conversation,
-                        text,
-                        Some(events_tx.clone()),
-                    )
-                    .await;
-                    match result {
-                        Ok(outcome) => {
-                            info!(
-                                session_id,
-                                turns = outcome.turns,
-                                stop_reason = ?outcome.final_stop_reason,
-                                "loop done"
-                            );
-                            send(ServerToClient::Status {
-                                state: SessionState::Ready,
-                                detail: None,
-                            });
-                        }
-                        Err(e) => {
-                            error!(session_id, error = %e, "loop failed");
-                            send(ServerToClient::Error {
-                                message: format!("loop failed: {e}"),
-                            });
-                            send(ServerToClient::Status {
-                                state: SessionState::Error,
-                                detail: None,
-                            });
-                        }
-                    }
+                Ok(parsed) => {
+                    manager.handle_client_message(conn_id, parsed).await;
                 }
                 Err(e) => {
-                    warn!(session_id, error = %e, "decode failed");
-                    send(ServerToClient::Error {
-                        message: format!("decode failed: {e}"),
-                    });
+                    warn!(conn_id, error = %e, "decode failed");
+                    // Surface decode errors inline — no task context.
+                    manager.unregister_client(conn_id);
+                    break;
                 }
             },
             Message::Text(t) => {
-                warn!(session_id, "received text frame (expected binary CBOR): {t}");
+                warn!(conn_id, "received text frame (expected binary CBOR): {t}");
             }
             Message::Close(_) => {
-                info!(session_id, "ws close received");
+                info!(conn_id, "ws close received");
                 break;
             }
             Message::Ping(_) | Message::Pong(_) => {}
         }
     }
 
-    drop(events_tx);
-    let _ = outbound_task.await;
-    info!(session_id, "ws session closed");
+    manager.unregister_client(conn_id);
+    let _ = writer.await;
+    info!(conn_id, "ws session closed");
 }

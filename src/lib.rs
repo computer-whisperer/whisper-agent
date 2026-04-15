@@ -1,8 +1,12 @@
-//! whisper-agent core: conversation state, provider client, MCP client, agent loop, server.
+//! whisper-agent core: task-scheduler runtime, provider client, MCP client, HTTP server.
+//!
+//! Canonical conversation types live in the `whisper-agent-protocol` crate so the webui
+//! can render them from wire snapshots without a server round-trip per event.
 
-pub mod agent_loop;
 pub mod anthropic;
 pub mod audit;
-pub mod conversation;
 pub mod mcp;
 pub mod server;
+pub mod task;
+pub mod task_manager;
+pub mod turn;

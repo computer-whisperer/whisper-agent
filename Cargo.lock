@@ -3940,6 +3940,7 @@ version = "0.1.0"
 dependencies = [
  "ciborium",
  "serde",
+ "serde_json",
  "thiserror 2.0.18",
 ]
 
@@ -3955,6 +3956,7 @@ dependencies = [
  "js-sys",
  "log",
  "serde",
+ "serde_json",
  "wasm-bindgen",
  "wasm-bindgen-futures",
  "web-sys",
