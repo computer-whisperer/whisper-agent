@@ -17,8 +17,8 @@ use std::rc::Rc;
 
 use egui::{Color32, RichText, ScrollArea, TextEdit};
 use whisper_agent_protocol::{
-    ClientToServer, ContentBlock, Conversation, Message, Role, ServerToClient, TaskStateLabel,
-    TaskSummary, ToolResultContent, Usage,
+    ApprovalChoice, ClientToServer, ContentBlock, Conversation, Message, Role, ServerToClient,
+    TaskStateLabel, TaskSummary, ToolResultContent, Usage,
 };
 
 /// Events pushed into [`Inbound`]. In addition to decoded wire messages we pipe in
@@ -89,6 +89,20 @@ struct TaskView {
     items: Vec<DisplayItem>,
     total_usage: Usage,
     subscribed: bool,
+    /// Currently-open approval requests, in arrival order. Cleared on snapshot so
+    /// re-subscribe can re-seed them without duplicates.
+    pending_approvals: Vec<PendingApproval>,
+}
+
+struct PendingApproval {
+    approval_id: String,
+    name: String,
+    args_preview: String,
+    destructive: bool,
+    read_only: bool,
+    /// True after the local user clicked Approve/Reject — buttons disable until the
+    /// server's TaskApprovalResolved arrives (and removes the entry entirely).
+    submitted: bool,
 }
 
 impl TaskView {
@@ -98,6 +112,7 @@ impl TaskView {
             items: Vec::new(),
             total_usage: Usage::default(),
             subscribed: false,
+            pending_approvals: Vec::new(),
         }
     }
 }
@@ -214,6 +229,8 @@ impl ChatApp {
                 view.total_usage = snapshot.total_usage;
                 view.items = items;
                 view.subscribed = true;
+                // Pending-approval events that follow the snapshot will re-seed this.
+                view.pending_approvals.clear();
             }
             ServerToClient::TaskAssistantBegin { .. } => {}
             ServerToClient::TaskAssistantText { task_id, text } => {
@@ -267,21 +284,33 @@ impl ChatApp {
                 }
             }
             ServerToClient::TaskLoopComplete { .. } => {}
-            // Approval-layer events — UI handling lands in the next commit.
-            ServerToClient::TaskPendingApproval { task_id, name, args_preview, .. } => {
+            ServerToClient::TaskPendingApproval {
+                task_id,
+                approval_id,
+                name,
+                args_preview,
+                destructive,
+                read_only,
+                ..
+            } => {
                 if let Some(view) = self.tasks.get_mut(&task_id) {
-                    view.items.push(DisplayItem::SystemNote {
-                        text: format!("(pending approval for {name}({args_preview}))"),
-                        is_error: false,
-                    });
+                    // Deduplicate — the same approval can arrive again if the client
+                    // re-subscribes while a decision is still outstanding.
+                    if !view.pending_approvals.iter().any(|p| p.approval_id == approval_id) {
+                        view.pending_approvals.push(PendingApproval {
+                            approval_id,
+                            name,
+                            args_preview,
+                            destructive,
+                            read_only,
+                            submitted: false,
+                        });
+                    }
                 }
             }
-            ServerToClient::TaskApprovalResolved { task_id, decision, .. } => {
+            ServerToClient::TaskApprovalResolved { task_id, approval_id, .. } => {
                 if let Some(view) = self.tasks.get_mut(&task_id) {
-                    view.items.push(DisplayItem::SystemNote {
-                        text: format!("(approval resolved: {decision:?})"),
-                        is_error: false,
-                    });
+                    view.pending_approvals.retain(|p| p.approval_id != approval_id);
                 }
             }
             ServerToClient::Error { task_id, message, .. } => {
@@ -570,6 +599,7 @@ impl eframe::App for ChatApp {
                 ui.add_space(4.0);
             });
 
+        let mut pending_decisions: Vec<(String, String, ApprovalChoice)> = Vec::new();
         egui::CentralPanel::default().show(ctx, |ui| {
             match self.selected.clone() {
                 None => {
@@ -583,7 +613,7 @@ impl eframe::App for ChatApp {
                         );
                     });
                 }
-                Some(task_id) => match self.tasks.get(&task_id) {
+                Some(task_id) => match self.tasks.get_mut(&task_id) {
                     None => {
                         ui.label(
                             RichText::new(format!("task {task_id} not found"))
@@ -591,6 +621,7 @@ impl eframe::App for ChatApp {
                         );
                     }
                     Some(view) => {
+                        render_approval_banner(ui, &task_id, view, &mut pending_decisions);
                         ScrollArea::vertical().stick_to_bottom(true).show(ui, |ui| {
                             if view.items.is_empty() {
                                 ui.vertical_centered(|ui| {
@@ -611,7 +642,87 @@ impl eframe::App for ChatApp {
                 },
             }
         });
+
+        // Submit any approval decisions that were clicked this frame.
+        for (task_id, approval_id, decision) in pending_decisions {
+            self.send(ClientToServer::ApprovalDecision {
+                task_id,
+                approval_id,
+                decision,
+            });
+        }
     }
+}
+
+fn render_approval_banner(
+    ui: &mut egui::Ui,
+    task_id: &str,
+    view: &mut TaskView,
+    pending_decisions: &mut Vec<(String, String, ApprovalChoice)>,
+) {
+    if view.pending_approvals.is_empty() {
+        return;
+    }
+    egui::Frame::group(ui.style())
+        .fill(Color32::from_rgb(56, 44, 32))
+        .show(ui, |ui| {
+            ui.vertical(|ui| {
+                ui.label(
+                    RichText::new("approval required")
+                        .color(Color32::from_rgb(240, 200, 120))
+                        .strong(),
+                );
+                ui.add_space(2.0);
+                for approval in view.pending_approvals.iter_mut() {
+                    ui.horizontal_top(|ui| {
+                        let hint = if approval.destructive {
+                            RichText::new("destructive")
+                                .color(Color32::from_rgb(220, 110, 110))
+                                .small()
+                        } else if approval.read_only {
+                            RichText::new("read-only").color(Color32::from_gray(180)).small()
+                        } else {
+                            RichText::new("unannotated").color(Color32::from_gray(180)).small()
+                        };
+                        ui.label(hint);
+                        ui.label(
+                            RichText::new(format!("{}({})", approval.name, approval.args_preview))
+                                .color(Color32::from_gray(220))
+                                .monospace(),
+                        );
+                    });
+                    ui.horizontal(|ui| {
+                        ui.add_enabled_ui(!approval.submitted, |ui| {
+                            if ui.button("Approve").clicked() {
+                                approval.submitted = true;
+                                pending_decisions.push((
+                                    task_id.to_string(),
+                                    approval.approval_id.clone(),
+                                    ApprovalChoice::Approve,
+                                ));
+                            }
+                            if ui.button("Reject").clicked() {
+                                approval.submitted = true;
+                                pending_decisions.push((
+                                    task_id.to_string(),
+                                    approval.approval_id.clone(),
+                                    ApprovalChoice::Reject,
+                                ));
+                            }
+                        });
+                        if approval.submitted {
+                            ui.label(
+                                RichText::new("submitted…")
+                                    .color(Color32::from_gray(160))
+                                    .italics(),
+                            );
+                        }
+                    });
+                    ui.add_space(4.0);
+                }
+            });
+        });
+    ui.add_space(6.0);
 }
 
 fn render_item(ui: &mut egui::Ui, item: &DisplayItem) {

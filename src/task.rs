@@ -818,6 +818,21 @@ impl Task {
                     pending_dispatch.push(tool_use);
                 }
                 ApprovalDisposition::UserRejected { decided_by_conn: conn, message, .. } => {
+                    // Emit synthetic ToolCallBegin/End so subscribed clients see the
+                    // rejected call in their chat view alongside approved/executed ones.
+                    events.push(TaskEvent::ToolCallBegin {
+                        tool_use_id: tool_use.tool_use_id.clone(),
+                        name: tool_use.name.clone(),
+                        args_preview: truncate(
+                            serde_json::to_string(&tool_use.input).unwrap_or_default(),
+                            200,
+                        ),
+                    });
+                    events.push(TaskEvent::ToolCallEnd {
+                        tool_use_id: tool_use.tool_use_id.clone(),
+                        result_preview: message.clone(),
+                        is_error: true,
+                    });
                     events.push(TaskEvent::AuditToolCall {
                         tool_name: tool_use.name.clone(),
                         args: tool_use.input.clone(),
