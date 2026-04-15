@@ -80,6 +80,7 @@ struct JsonRpcErrorObj {
     message: String,
 }
 
+#[derive(Debug)]
 pub struct McpSession {
     http: reqwest::Client,
     url: String,

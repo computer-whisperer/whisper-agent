@@ -6,7 +6,7 @@
 pub mod anthropic;
 pub mod audit;
 pub mod mcp;
+pub mod scheduler;
 pub mod server;
 pub mod task;
-pub mod task_manager;
 pub mod turn;

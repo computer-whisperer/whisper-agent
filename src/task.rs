@@ -1,23 +1,35 @@
-//! Task — the unit of long-lived agent work.
+//! Task — the unit of long-lived agent work, modeled as tasks-as-data.
 //!
-//! A task owns one conversation, runs against one provider + one MCP host, and is
-//! observable (and cancellable) independently of any client connection. Tasks-as-data:
-//! the struct is serializable, snapshottable, and mutation goes through a single owner
-//! (the [`TaskManager`]'s per-task runner, today; the central scheduler in a future
-//! commit).
+//! A Task is a serializable state machine. The scheduler drives it via two methods:
 //!
-//! The internal `TaskState` here matches [`TaskStateLabel`] one-to-one for now. The
-//! finer internal states from `design_task_scheduler.md` (`AwaitingModel`/
-//! `AwaitingTools`, `started_at`, in-flight op ids) come with the explicit-scheduler
-//! rework.
+//! - [`Task::step`] advances the state synchronously. It returns a [`StepOutcome`]
+//!   telling the scheduler whether to dispatch an I/O op, continue stepping, or pause
+//!   until input arrives.
+//! - [`Task::apply_io_result`] integrates the completion of a previously-dispatched
+//!   I/O op back into the task.
 //!
-//! [`TaskManager`]: crate::task_manager::TaskManager
+//! Both methods push [`TaskEvent`]s into an out-param so the scheduler can translate
+//! them to wire-protocol events and broadcast to subscribers.
+//!
+//! The internal [`TaskInternalState`] has finer distinctions than the public
+//! [`TaskStateLabel`] — the wire collapses them via [`Task::public_state`]. This
+//! indirection is the point of having a state machine: we can split a phase into
+//! sub-phases (e.g. add `AwaitingApproval` between tool dispatch and execution) without
+//! touching the wire.
+
+use std::collections::HashMap;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use whisper_agent_protocol::{
-    Conversation, TaskConfig, TaskSnapshot, TaskStateLabel, TaskSummary, Usage,
+    ContentBlock, Conversation, Message, TaskConfig, TaskSnapshot, TaskStateLabel, TaskSummary,
+    ToolResultContent, Usage,
 };
+
+use crate::anthropic::{MessageResponse, Usage as AnthropicUsage};
+use crate::mcp::CallToolResult;
+
+pub type OpId = u64;
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Task {
@@ -26,13 +38,135 @@ pub struct Task {
     pub last_active: DateTime<Utc>,
     pub title: Option<String>,
     pub config: TaskConfig,
-    pub state: TaskStateLabel,
     pub conversation: Conversation,
     pub total_usage: Usage,
-    /// True once the user has archived the task. Archived tasks remain loaded so their
-    /// conversation is still readable, but they drop off the `ListTasks` broadcast list.
     #[serde(default)]
     pub archived: bool,
+    /// Turns issued in the current user-message cycle; resets on user message.
+    #[serde(default)]
+    pub turns_in_cycle: u32,
+    pub internal: TaskInternalState,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum TaskInternalState {
+    /// No conversation yet / never run.
+    Idle,
+    /// Previous loop ended on `end_turn`; accepts follow-up user messages.
+    Completed,
+    /// A user message has been appended and we must connect MCP before calling the model.
+    NeedsMcpConnect,
+    AwaitingMcpConnect { op_id: OpId },
+    /// MCP connected; need to list tools before issuing any model call.
+    NeedsListTools,
+    AwaitingListTools { op_id: OpId },
+    /// Ready to dispatch a model call. The conversation already contains the latest
+    /// user or tool_result message.
+    NeedsModelCall,
+    AwaitingModel { op_id: OpId, started_at: DateTime<Utc> },
+    /// Model responded with tool_uses. Each entry in `pending_dispatch` still needs to
+    /// be fired at MCP; `pending_io` maps op_ids of in-flight tool calls to their
+    /// tool_use_ids; `completed` accumulates ToolResult blocks as they return.
+    AwaitingTools {
+        pending_dispatch: Vec<ToolUseReq>,
+        pending_io: HashMap<OpId, String>,
+        completed: Vec<ContentBlock>,
+    },
+    /// Terminal: unrecoverable error.
+    Failed { at_phase: String, message: String },
+    /// Terminal: user-initiated cancellation. In-flight I/O may still complete; their
+    /// results are discarded by the scheduler.
+    Cancelled,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct ToolUseReq {
+    pub tool_use_id: String,
+    pub name: String,
+    pub input: serde_json::Value,
+}
+
+/// Request for an I/O operation to be dispatched by the scheduler.
+#[derive(Debug)]
+pub enum IoRequest {
+    McpConnect {
+        op_id: OpId,
+    },
+    ListTools {
+        op_id: OpId,
+    },
+    ModelCall {
+        op_id: OpId,
+    },
+    ToolCall {
+        op_id: OpId,
+        tool_use_id: String,
+        name: String,
+        input: serde_json::Value,
+    },
+}
+
+/// Successful result of an I/O op. Errors are carried in-band so apply_io_result can
+/// transition the task to Failed with the right phase tag.
+///
+/// The `*Success` variants carry scheduler-owned resources (MCP session, tool list)
+/// that get peeled off in [`crate::scheduler`] before the result reaches the task
+/// state machine; the task itself only sees the slim `McpConnect` / `ListTools`
+/// boolean variants.
+#[derive(Debug)]
+pub enum IoResult {
+    McpConnectSuccess { session: std::sync::Arc<crate::mcp::McpSession> },
+    McpConnect(Result<(), String>),
+    ListToolsSuccess { tools: Vec<crate::anthropic::ToolDescriptor> },
+    ListTools(Result<(), String>),
+    ModelCall(Result<MessageResponse, String>),
+    ToolCall {
+        tool_use_id: String,
+        result: Result<CallToolResult, String>,
+    },
+}
+
+#[derive(Debug)]
+pub enum StepOutcome {
+    /// Dispatch this I/O op, then wait for it.
+    DispatchIo(IoRequest),
+    /// State advanced synchronously; call step() again.
+    Continue,
+    /// No further progress possible until an I/O result or user input arrives.
+    Paused,
+}
+
+/// Internal task event — translated by the scheduler into wire [`ServerToClient`] events.
+#[derive(Debug, Clone)]
+pub enum TaskEvent {
+    AssistantBegin { turn: u32 },
+    AssistantText { text: String },
+    ToolCallBegin {
+        tool_use_id: String,
+        name: String,
+        args_preview: String,
+    },
+    ToolCallEnd {
+        tool_use_id: String,
+        result_preview: String,
+        is_error: bool,
+    },
+    AssistantEnd {
+        stop_reason: Option<String>,
+        usage: Usage,
+    },
+    LoopComplete,
+    StateChanged,
+    Error { message: String },
+    /// Tool call completed. Carried separately from the user-visible ToolCallEnd event
+    /// so the scheduler can write an audit entry outside the task state machine.
+    AuditToolCall {
+        tool_name: String,
+        args: serde_json::Value,
+        is_error: bool,
+        error_message: Option<String>,
+    },
 }
 
 impl Task {
@@ -44,10 +178,11 @@ impl Task {
             last_active: now,
             title: None,
             config,
-            state: TaskStateLabel::Idle,
             conversation: Conversation::new(),
             total_usage: Usage::default(),
             archived: false,
+            turns_in_cycle: 0,
+            internal: TaskInternalState::Idle,
         }
     }
 
@@ -55,11 +190,27 @@ impl Task {
         self.last_active = Utc::now();
     }
 
+    pub fn public_state(&self) -> TaskStateLabel {
+        match &self.internal {
+            TaskInternalState::Idle => TaskStateLabel::Idle,
+            TaskInternalState::Completed => TaskStateLabel::Completed,
+            TaskInternalState::NeedsMcpConnect
+            | TaskInternalState::AwaitingMcpConnect { .. }
+            | TaskInternalState::NeedsListTools
+            | TaskInternalState::AwaitingListTools { .. }
+            | TaskInternalState::NeedsModelCall
+            | TaskInternalState::AwaitingModel { .. }
+            | TaskInternalState::AwaitingTools { .. } => TaskStateLabel::Working,
+            TaskInternalState::Failed { .. } => TaskStateLabel::Failed,
+            TaskInternalState::Cancelled => TaskStateLabel::Cancelled,
+        }
+    }
+
     pub fn summary(&self) -> TaskSummary {
         TaskSummary {
             task_id: self.id.clone(),
             title: self.title.clone(),
-            state: self.state,
+            state: self.public_state(),
             created_at: self.created_at.to_rfc3339(),
             last_active: self.last_active.to_rfc3339(),
         }
@@ -70,12 +221,358 @@ impl Task {
             task_id: self.id.clone(),
             title: self.title.clone(),
             config: self.config.clone(),
-            state: self.state,
+            state: self.public_state(),
             conversation: self.conversation.clone(),
             total_usage: self.total_usage,
             created_at: self.created_at.to_rfc3339(),
             last_active: self.last_active.to_rfc3339(),
         }
+    }
+
+    /// Apply a user-submitted message. Appends to the conversation and starts the
+    /// loop (or re-starts after a completed/failed cycle).
+    pub fn submit_user_message(&mut self, text: String, mcp_connected: bool, tools_listed: bool) {
+        self.conversation.push(Message::user_text(text));
+        self.turns_in_cycle = 0;
+        self.internal = if !mcp_connected {
+            TaskInternalState::NeedsMcpConnect
+        } else if !tools_listed {
+            TaskInternalState::NeedsListTools
+        } else {
+            TaskInternalState::NeedsModelCall
+        };
+        self.touch();
+    }
+
+    pub fn cancel(&mut self) {
+        self.internal = TaskInternalState::Cancelled;
+        self.touch();
+    }
+
+    pub fn fail(&mut self, phase: impl Into<String>, message: impl Into<String>) {
+        self.internal = TaskInternalState::Failed {
+            at_phase: phase.into(),
+            message: message.into(),
+        };
+        self.touch();
+    }
+
+    /// Is the task accepting new user input right now?
+    pub fn is_idle(&self) -> bool {
+        matches!(
+            self.internal,
+            TaskInternalState::Idle
+                | TaskInternalState::Completed
+                | TaskInternalState::Failed { .. }
+                | TaskInternalState::Cancelled
+        )
+    }
+
+    /// Advance the state machine. Caller provides `next_op_id` for fresh I/O ops and
+    /// `events` as the out-param for task events emitted during this step.
+    pub fn step(
+        &mut self,
+        next_op_id: &mut OpId,
+        events: &mut Vec<TaskEvent>,
+    ) -> StepOutcome {
+        let prev_public = self.public_state();
+        let outcome = self.step_inner(next_op_id, events);
+        let new_public = self.public_state();
+        if prev_public != new_public {
+            events.push(TaskEvent::StateChanged);
+        }
+        outcome
+    }
+
+    fn step_inner(
+        &mut self,
+        next_op_id: &mut OpId,
+        events: &mut Vec<TaskEvent>,
+    ) -> StepOutcome {
+        // Break the state out so we can replace it.
+        let current = std::mem::replace(&mut self.internal, TaskInternalState::Idle);
+        match current {
+            TaskInternalState::Idle
+            | TaskInternalState::Completed
+            | TaskInternalState::Cancelled
+            | TaskInternalState::Failed { .. } => {
+                // Restore and pause — caller shouldn't be stepping terminal states.
+                self.internal = current;
+                StepOutcome::Paused
+            }
+            TaskInternalState::NeedsMcpConnect => {
+                let op_id = next_id(next_op_id);
+                self.internal = TaskInternalState::AwaitingMcpConnect { op_id };
+                self.touch();
+                StepOutcome::DispatchIo(IoRequest::McpConnect { op_id })
+            }
+            TaskInternalState::NeedsListTools => {
+                let op_id = next_id(next_op_id);
+                self.internal = TaskInternalState::AwaitingListTools { op_id };
+                self.touch();
+                StepOutcome::DispatchIo(IoRequest::ListTools { op_id })
+            }
+            TaskInternalState::NeedsModelCall => {
+                if self.turns_in_cycle >= self.config.max_turns {
+                    tracing::warn!(max_turns = self.config.max_turns, task_id = %self.id, "max_turns reached");
+                    events.push(TaskEvent::LoopComplete);
+                    self.internal = TaskInternalState::Completed;
+                    self.touch();
+                    return StepOutcome::Continue;
+                }
+                self.turns_in_cycle += 1;
+                events.push(TaskEvent::AssistantBegin { turn: self.turns_in_cycle });
+                let op_id = next_id(next_op_id);
+                self.internal = TaskInternalState::AwaitingModel {
+                    op_id,
+                    started_at: Utc::now(),
+                };
+                self.touch();
+                StepOutcome::DispatchIo(IoRequest::ModelCall { op_id })
+            }
+            TaskInternalState::AwaitingModel { .. }
+            | TaskInternalState::AwaitingMcpConnect { .. }
+            | TaskInternalState::AwaitingListTools { .. } => {
+                // Not stepping these — waiting on I/O.
+                self.internal = current;
+                StepOutcome::Paused
+            }
+            TaskInternalState::AwaitingTools {
+                mut pending_dispatch,
+                mut pending_io,
+                completed,
+            } => {
+                if let Some(next) = pending_dispatch.pop() {
+                    let op_id = next_id(next_op_id);
+                    pending_io.insert(op_id, next.tool_use_id.clone());
+                    events.push(TaskEvent::ToolCallBegin {
+                        tool_use_id: next.tool_use_id.clone(),
+                        name: next.name.clone(),
+                        args_preview: truncate(
+                            serde_json::to_string(&next.input).unwrap_or_default(),
+                            200,
+                        ),
+                    });
+                    let dispatch = IoRequest::ToolCall {
+                        op_id,
+                        tool_use_id: next.tool_use_id.clone(),
+                        name: next.name.clone(),
+                        input: next.input.clone(),
+                    };
+                    self.internal = TaskInternalState::AwaitingTools {
+                        pending_dispatch,
+                        pending_io,
+                        completed,
+                    };
+                    self.touch();
+                    StepOutcome::DispatchIo(dispatch)
+                } else if pending_io.is_empty() {
+                    // All tool calls done — append ToolResult blocks and loop back.
+                    self.conversation.push(Message::user_blocks(completed));
+                    self.internal = TaskInternalState::NeedsModelCall;
+                    self.touch();
+                    StepOutcome::Continue
+                } else {
+                    self.internal = TaskInternalState::AwaitingTools {
+                        pending_dispatch,
+                        pending_io,
+                        completed,
+                    };
+                    StepOutcome::Paused
+                }
+            }
+        }
+    }
+
+    /// Apply an I/O completion. Pushes events describing the integration; the scheduler
+    /// should call `step_until_blocked` afterward.
+    pub fn apply_io_result(
+        &mut self,
+        op_id: OpId,
+        result: IoResult,
+        events: &mut Vec<TaskEvent>,
+    ) {
+        let prev_public = self.public_state();
+        self.apply_io_result_inner(op_id, result, events);
+        let new_public = self.public_state();
+        if prev_public != new_public {
+            events.push(TaskEvent::StateChanged);
+        }
+    }
+
+    fn apply_io_result_inner(
+        &mut self,
+        op_id: OpId,
+        result: IoResult,
+        events: &mut Vec<TaskEvent>,
+    ) {
+        self.touch();
+        // Cancelled task: drop the result on the floor.
+        if matches!(self.internal, TaskInternalState::Cancelled) {
+            return;
+        }
+
+        match (&self.internal, result) {
+            (TaskInternalState::AwaitingMcpConnect { op_id: expected }, IoResult::McpConnect(res))
+                if *expected == op_id =>
+            {
+                match res {
+                    Ok(()) => {
+                        self.internal = TaskInternalState::NeedsListTools;
+                    }
+                    Err(msg) => {
+                        events.push(TaskEvent::Error { message: format!("mcp connect failed: {msg}") });
+                        self.fail("mcp_connect", msg);
+                    }
+                }
+            }
+            (TaskInternalState::AwaitingListTools { op_id: expected }, IoResult::ListTools(res))
+                if *expected == op_id =>
+            {
+                match res {
+                    Ok(()) => {
+                        self.internal = TaskInternalState::NeedsModelCall;
+                    }
+                    Err(msg) => {
+                        events.push(TaskEvent::Error { message: format!("list_tools failed: {msg}") });
+                        self.fail("list_tools", msg);
+                    }
+                }
+            }
+            (TaskInternalState::AwaitingModel { op_id: expected, .. }, IoResult::ModelCall(res))
+                if *expected == op_id =>
+            {
+                match res {
+                    Ok(response) => self.integrate_model_response(response, events),
+                    Err(msg) => {
+                        events.push(TaskEvent::Error { message: format!("model call failed: {msg}") });
+                        self.fail("model_call", msg);
+                    }
+                }
+            }
+            (
+                TaskInternalState::AwaitingTools { .. },
+                IoResult::ToolCall { tool_use_id, result },
+            ) => self.integrate_tool_result(op_id, tool_use_id, result, events),
+            (state, result) => {
+                tracing::warn!(
+                    task_id = %self.id,
+                    op_id,
+                    state = ?std::mem::discriminant(state),
+                    result = ?std::mem::discriminant(&result),
+                    "io result does not match current state — discarding"
+                );
+            }
+        }
+    }
+
+    fn integrate_model_response(
+        &mut self,
+        response: MessageResponse,
+        events: &mut Vec<TaskEvent>,
+    ) {
+        self.total_usage.add(&convert_usage(&response.usage));
+        let assistant_blocks = response.content;
+        for block in &assistant_blocks {
+            if let ContentBlock::Text { text } = block {
+                events.push(TaskEvent::AssistantText { text: text.clone() });
+            }
+        }
+        let tool_uses: Vec<ToolUseReq> = assistant_blocks
+            .iter()
+            .filter_map(|b| match b {
+                ContentBlock::ToolUse { id, name, input } => Some(ToolUseReq {
+                    tool_use_id: id.clone(),
+                    name: name.clone(),
+                    input: input.clone(),
+                }),
+                _ => None,
+            })
+            .collect();
+        events.push(TaskEvent::AssistantEnd {
+            stop_reason: response.stop_reason.clone(),
+            usage: convert_usage(&response.usage),
+        });
+        self.conversation.push(Message::assistant_blocks(assistant_blocks));
+
+        if tool_uses.is_empty() {
+            events.push(TaskEvent::LoopComplete);
+            self.internal = TaskInternalState::Completed;
+        } else {
+            // Reverse so `.pop()` in step() dispatches in original order.
+            let mut pending_dispatch = tool_uses;
+            pending_dispatch.reverse();
+            self.internal = TaskInternalState::AwaitingTools {
+                pending_dispatch,
+                pending_io: HashMap::new(),
+                completed: Vec::new(),
+            };
+        }
+    }
+
+    fn integrate_tool_result(
+        &mut self,
+        op_id: OpId,
+        tool_use_id: String,
+        result: Result<CallToolResult, String>,
+        events: &mut Vec<TaskEvent>,
+    ) {
+        let TaskInternalState::AwaitingTools {
+            pending_dispatch,
+            mut pending_io,
+            mut completed,
+        } = std::mem::replace(&mut self.internal, TaskInternalState::Idle)
+        else {
+            unreachable!("matched guard ensures we're in AwaitingTools")
+        };
+
+        // The op_id should be tracked. Use it to verify; tool_use_id is the canonical
+        // key for the conversation block either way.
+        pending_io.remove(&op_id);
+
+        let (text, is_error, tool_name, args, err_msg) = match result {
+            Ok(r) => {
+                let text = join_mcp_text(&r.content);
+                let tool_name = find_tool_name(&self.conversation, &tool_use_id);
+                let args = find_tool_args(&self.conversation, &tool_use_id);
+                (text, r.is_error, tool_name, args, None)
+            }
+            Err(msg) => {
+                let tool_name = find_tool_name(&self.conversation, &tool_use_id);
+                let args = find_tool_args(&self.conversation, &tool_use_id);
+                (
+                    format!("tool invocation failed: {msg}"),
+                    true,
+                    tool_name,
+                    args,
+                    Some(msg),
+                )
+            }
+        };
+
+        events.push(TaskEvent::ToolCallEnd {
+            tool_use_id: tool_use_id.clone(),
+            result_preview: truncate(text.clone(), 200),
+            is_error,
+        });
+        events.push(TaskEvent::AuditToolCall {
+            tool_name,
+            args,
+            is_error,
+            error_message: err_msg,
+        });
+
+        completed.push(ContentBlock::ToolResult {
+            tool_use_id,
+            content: ToolResultContent::Text(text),
+            is_error,
+        });
+
+        self.internal = TaskInternalState::AwaitingTools {
+            pending_dispatch,
+            pending_io,
+            completed,
+        };
     }
 }
 
@@ -100,4 +597,62 @@ pub fn new_task_id() -> String {
         .unwrap_or_default()
         .as_nanos();
     format!("task-{:016x}", nanos as u64)
+}
+
+fn next_id(counter: &mut OpId) -> OpId {
+    *counter += 1;
+    *counter
+}
+
+fn convert_usage(u: &AnthropicUsage) -> Usage {
+    Usage {
+        input_tokens: u.input_tokens,
+        output_tokens: u.output_tokens,
+        cache_read_input_tokens: u.cache_read_input_tokens,
+        cache_creation_input_tokens: u.cache_creation_input_tokens,
+    }
+}
+
+fn join_mcp_text(blocks: &[crate::mcp::McpContentBlock]) -> String {
+    let mut out = String::new();
+    for b in blocks {
+        match b {
+            crate::mcp::McpContentBlock::Text { text } => out.push_str(text),
+        }
+    }
+    out
+}
+
+fn find_tool_name(conv: &Conversation, tool_use_id: &str) -> String {
+    for msg in conv.messages().iter().rev() {
+        for block in &msg.content {
+            if let ContentBlock::ToolUse { id, name, .. } = block {
+                if id == tool_use_id {
+                    return name.clone();
+                }
+            }
+        }
+    }
+    String::new()
+}
+
+fn find_tool_args(conv: &Conversation, tool_use_id: &str) -> serde_json::Value {
+    for msg in conv.messages().iter().rev() {
+        for block in &msg.content {
+            if let ContentBlock::ToolUse { id, input, .. } = block {
+                if id == tool_use_id {
+                    return input.clone();
+                }
+            }
+        }
+    }
+    serde_json::Value::Null
+}
+
+fn truncate(mut s: String, max: usize) -> String {
+    if s.len() > max {
+        s.truncate(max);
+        s.push('…');
+    }
+    s
 }

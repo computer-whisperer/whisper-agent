@@ -1,15 +1,20 @@
 //! HTTP server: hosts the webui assets and the multiplexed WebSocket protocol.
 //!
-//! Mirrors whisper-tensor-server's pattern: `ServeDir`-mounted `/pkg` (wasm-pack output)
-//! and `/assets` (static index.html etc.).
+//! The server itself holds no task state. Every WebSocket connection:
+//!   1. Generates a ConnId.
+//!   2. Sends [`SchedulerMsg::RegisterClient`] into the scheduler inbox with an mpsc
+//!      outbound channel the scheduler will push wire events to.
+//!   3. Forwards decoded [`ClientToServer`] frames into the scheduler inbox as
+//!      [`SchedulerMsg::ClientMessage`].
+//!   4. On close, sends [`SchedulerMsg::UnregisterClient`].
 //!
-//! Per-WebSocket state is just a subscription set (client registration lives on the
-//! [`TaskManager`]). The manager runs independently of any connection — tasks outlive
-//! their WebSockets and can be observed by any client.
+//! The scheduler (single tokio task, `scheduler::run`) is the only code path that
+//! mutates tasks or broadcasts events.
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::Context;
 use axum::{
@@ -31,7 +36,7 @@ use whisper_agent_protocol::{ServerToClient, TaskConfig, decode_from_client, enc
 
 use crate::anthropic::AnthropicClient;
 use crate::audit::AuditLog;
-use crate::task_manager::TaskManager;
+use crate::scheduler::{ConnId, Scheduler, SchedulerMsg};
 
 const WEBUI_PKG_DIR: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
@@ -46,12 +51,17 @@ const WEBUI_INDEX: &str = concat!(
     "/crates/whisper-agent-webui/assets/index.html"
 );
 
-/// Server-wide configuration. Consumed at startup to build the shared [`TaskManager`].
 pub struct ServerConfig {
     pub anthropic_api_key: String,
     pub default_task_config: TaskConfig,
     pub audit_log_path: PathBuf,
     pub host_id: String,
+}
+
+#[derive(Clone)]
+struct AppState {
+    inbox: mpsc::UnboundedSender<SchedulerMsg>,
+    next_conn_id: Arc<AtomicU64>,
 }
 
 pub async fn serve(listen: SocketAddr, config: ServerConfig) -> anyhow::Result<()> {
@@ -71,12 +81,20 @@ pub async fn serve(listen: SocketAddr, config: ServerConfig) -> anyhow::Result<(
     info!(audit_log = %audit.path().display(), "audit log open");
 
     let anthropic = Arc::new(AnthropicClient::new(config.anthropic_api_key));
-    let manager = Arc::new(TaskManager::new(
+    let scheduler = Scheduler::new(
         config.default_task_config,
         config.host_id,
         anthropic,
         audit,
-    ));
+    );
+
+    let (inbox_tx, inbox_rx) = mpsc::unbounded_channel::<SchedulerMsg>();
+    let scheduler_handle = tokio::spawn(crate::scheduler::run(scheduler, inbox_rx));
+
+    let state = AppState {
+        inbox: inbox_tx.clone(),
+        next_conn_id: Arc::new(AtomicU64::new(1)),
+    };
 
     let app = Router::new()
         .route("/health", get(|| async { "ok" }))
@@ -86,29 +104,41 @@ pub async fn serve(listen: SocketAddr, config: ServerConfig) -> anyhow::Result<(
         .route_service("/index.html", ServeFile::new(WEBUI_INDEX))
         .route_service("/", ServeFile::new(WEBUI_INDEX))
         .layer(TraceLayer::new_for_http())
-        .with_state(manager);
+        .with_state(state);
 
     let listener = TcpListener::bind(listen)
         .await
         .with_context(|| format!("bind {listen}"))?;
     info!(addr = %listen, "whisper-agent server listening (open http://{listen}/ in a browser)");
-    axum::serve(listener, app).await?;
+    let serve_result = axum::serve(listener, app).await;
+
+    // Shutdown: drop the inbox sender so the scheduler exits, then await it.
+    drop(inbox_tx);
+    let _ = scheduler_handle.await;
+    serve_result?;
     Ok(())
 }
 
-async fn ws_handler(
-    State(manager): State<Arc<TaskManager>>,
-    ws: WebSocketUpgrade,
-) -> impl IntoResponse {
-    ws.on_upgrade(move |socket| handle_ws_session(socket, manager))
+async fn ws_handler(State(state): State<AppState>, ws: WebSocketUpgrade) -> impl IntoResponse {
+    ws.on_upgrade(move |socket| handle_ws_session(socket, state))
 }
 
-/// Drive one WebSocket connection: register as a client, forward manager events to the
-/// socket, decode inbound frames, hand them to the manager. The connection is stateless
-/// beyond "which client id am I"; tasks live on the manager.
-async fn handle_ws_session(socket: WebSocket, manager: Arc<TaskManager>) {
+async fn handle_ws_session(socket: WebSocket, state: AppState) {
+    let conn_id: ConnId = state.next_conn_id.fetch_add(1, Ordering::Relaxed);
     let (outbound_tx, mut outbound_rx) = mpsc::unbounded_channel::<ServerToClient>();
-    let conn_id = manager.register_client(outbound_tx);
+
+    // Register with the scheduler.
+    if state
+        .inbox
+        .send(SchedulerMsg::RegisterClient {
+            conn_id,
+            outbound: outbound_tx,
+        })
+        .is_err()
+    {
+        error!("scheduler inbox closed; cannot register client");
+        return;
+    }
     info!(conn_id, "ws session opened");
 
     let (mut sink, mut stream) = socket.split();
@@ -138,12 +168,20 @@ async fn handle_ws_session(socket: WebSocket, manager: Arc<TaskManager>) {
         match msg {
             Message::Binary(bytes) => match decode_from_client(&bytes) {
                 Ok(parsed) => {
-                    manager.handle_client_message(conn_id, parsed).await;
+                    if state
+                        .inbox
+                        .send(SchedulerMsg::ClientMessage {
+                            conn_id,
+                            msg: parsed,
+                        })
+                        .is_err()
+                    {
+                        error!(conn_id, "scheduler inbox closed; dropping message");
+                        break;
+                    }
                 }
                 Err(e) => {
                     warn!(conn_id, error = %e, "decode failed");
-                    // Surface decode errors inline — no task context.
-                    manager.unregister_client(conn_id);
                     break;
                 }
             },
@@ -158,7 +196,9 @@ async fn handle_ws_session(socket: WebSocket, manager: Arc<TaskManager>) {
         }
     }
 
-    manager.unregister_client(conn_id);
+    let _ = state
+        .inbox
+        .send(SchedulerMsg::UnregisterClient { conn_id });
     let _ = writer.await;
     info!(conn_id, "ws session closed");
 }
