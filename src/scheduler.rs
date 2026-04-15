@@ -993,7 +993,11 @@ fn pending_approvals_of(task: &Task) -> Vec<ServerToClient> {
 
 fn truncate(mut s: String, max: usize) -> String {
     if s.len() > max {
-        s.truncate(max);
+        let mut cut = max;
+        while cut > 0 && !s.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        s.truncate(cut);
         s.push('…');
     }
     s

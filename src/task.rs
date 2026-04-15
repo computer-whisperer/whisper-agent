@@ -1070,7 +1070,13 @@ fn find_tool_args(conv: &Conversation, tool_use_id: &str) -> serde_json::Value {
 
 fn truncate(mut s: String, max: usize) -> String {
     if s.len() > max {
-        s.truncate(max);
+        // `max` is a byte count but may land inside a multi-byte UTF-8 sequence;
+        // walk back to the nearest char boundary before cutting.
+        let mut cut = max;
+        while cut > 0 && !s.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        s.truncate(cut);
         s.push('…');
     }
     s
@@ -1080,6 +1086,27 @@ fn truncate(mut s: String, max: usize) -> String {
 mod tests {
     use super::*;
     use whisper_agent_protocol::ApprovalPolicy;
+
+    #[test]
+    fn truncate_handles_multibyte_boundary() {
+        // `…` is 3 bytes (E2 80 A6). Position the char so `max` lands inside it —
+        // the naive `String::truncate(max)` panics here.
+        let s = format!("{}…tail", "a".repeat(198));
+        let out = truncate(s, 200);
+        assert!(out.ends_with('…'));
+        // The cut falls back to byte 198 (end of the "a" run, on a boundary).
+        assert_eq!(out, format!("{}…", "a".repeat(198)));
+    }
+
+    #[test]
+    fn truncate_no_op_when_short() {
+        assert_eq!(truncate("héllo".into(), 200), "héllo");
+    }
+
+    #[test]
+    fn truncate_cuts_on_ascii_boundary() {
+        assert_eq!(truncate("abcdefghij".into(), 4), "abcd…");
+    }
 
     fn task_with_pending_batch(tool_names: &[&str]) -> Task {
         let cfg = TaskConfig {
