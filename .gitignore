@@ -15,3 +15,6 @@ crates/whisper-agent-webui/pkg/
 /audit.jsonl
 /conversation.json
 /tasks/
+
+# Dev-script sandbox: mcp-host workspace + audit log + task JSON (see scripts/dev.sh)
+/sandbox/
