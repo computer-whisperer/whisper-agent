@@ -1,0 +1,10 @@
+[package]
+name = "whisper-agent-mcp-host"
+description = "MCP server exposing a controlled slice of POSIX surface for whisper-agent"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "whisper-agent-mcp-host"
+path = "src/main.rs"

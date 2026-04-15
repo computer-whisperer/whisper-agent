@@ -1,0 +1,10 @@
+[package]
+name = "whisper-agent-webui"
+description = "Browser chat UI for whisper-agent (egui + WASM)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "whisper-agent-webui"
+path = "src/main.rs"
