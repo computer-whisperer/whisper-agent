@@ -3,10 +3,15 @@
 //! Sends the conversation to Anthropic, executes any tool_use blocks via MCP, appends
 //! the tool_results, repeats until the model emits a non-tool stop_reason. Auto-approves
 //! every tool call and audits each one.
+//!
+//! When an event sender is provided, emits [`ServerToClient`] events at key points so
+//! the WebSocket layer can stream them to the UI without doing its own translation.
 
 use anyhow::{Context, Result};
 use futures::StreamExt;
+use tokio::sync::mpsc::UnboundedSender;
 use tracing::{info, warn};
+use whisper_agent_protocol::{ServerToClient, Usage as WireUsage};
 
 use crate::anthropic::{
     AnthropicClient, CreateMessageRequest, MessageResponse, SystemBlock, ToolDescriptor as AnthropicTool,
@@ -26,21 +31,31 @@ pub struct LoopConfig {
 }
 
 pub struct LoopOutcome {
-    pub conversation: Conversation,
     pub turns: u32,
     pub usage_total: Usage,
     pub final_stop_reason: Option<String>,
 }
 
+/// Append `new_user_message` to the conversation, then iterate the model/tool loop until
+/// the assistant emits a non-tool stop_reason or `max_turns` is hit. The conversation is
+/// mutated in place so the caller (CLI one-shot or WebSocket session) keeps ownership of
+/// it across calls.
 pub async fn run(
-    cfg: LoopConfig,
-    anthropic: AnthropicClient,
-    mcp: McpSession,
-    audit: AuditLog,
-    initial_user_prompt: String,
+    cfg: &LoopConfig,
+    anthropic: &AnthropicClient,
+    mcp: &McpSession,
+    audit: &AuditLog,
+    conversation: &mut Conversation,
+    new_user_message: String,
+    events: Option<UnboundedSender<ServerToClient>>,
 ) -> Result<LoopOutcome> {
-    let mut conv = Conversation::new();
-    conv.push(Message::user_text(initial_user_prompt));
+    let send_event = |e: ServerToClient| {
+        if let Some(s) = &events {
+            let _ = s.send(e);
+        }
+    };
+
+    conversation.push(Message::user_text(new_user_message));
 
     let mcp_tools = mcp.list_tools().await.context("mcp list_tools failed")?;
     let anthropic_tools: Vec<AnthropicTool> = mcp_tools.iter().map(mcp_to_anthropic_tool).collect();
@@ -58,12 +73,14 @@ pub async fn run(
             break;
         }
 
+        send_event(ServerToClient::AssistantBegin);
+
         let req = CreateMessageRequest {
             model: &cfg.model,
             max_tokens: cfg.max_tokens,
             system: system.clone(),
             tools: anthropic_tools.clone(),
-            messages: conv.messages(),
+            messages: conversation.messages(),
         };
         let response: MessageResponse = anthropic
             .create_message(&req)
@@ -83,6 +100,14 @@ pub async fn run(
         );
 
         let assistant_blocks = response.content;
+
+        // Emit text blocks now (before tool execution) so the UI can render them while tools run.
+        for block in &assistant_blocks {
+            if let ContentBlock::Text { text } = block {
+                send_event(ServerToClient::AssistantText { text: text.clone() });
+            }
+        }
+
         let tool_uses: Vec<(String, String, serde_json::Value)> = assistant_blocks
             .iter()
             .filter_map(|b| match b {
@@ -93,7 +118,12 @@ pub async fn run(
             })
             .collect();
 
-        conv.push(Message::assistant_blocks(assistant_blocks));
+        send_event(ServerToClient::AssistantEnd {
+            stop_reason: response.stop_reason.clone(),
+            usage: convert_usage(&response.usage),
+        });
+
+        conversation.push(Message::assistant_blocks(assistant_blocks));
 
         if tool_uses.is_empty() {
             break;
@@ -102,18 +132,27 @@ pub async fn run(
         let mut tool_result_blocks = Vec::with_capacity(tool_uses.len());
         for (use_id, name, input) in tool_uses {
             info!(tool = %name, "invoking");
-            let outcome = invoke_and_collect(&mcp, &name, input.clone()).await;
+            send_event(ServerToClient::ToolCallBegin {
+                id: use_id.clone(),
+                name: name.clone(),
+                args_preview: truncate(serde_json::to_string(&input).unwrap_or_default(), 200),
+            });
 
+            let outcome = invoke_and_collect(mcp, &name, input.clone()).await;
+
+            let err_msg;
             let (text, is_error, audit_outcome) = match &outcome {
                 Ok(result) => (
                     join_text(&result.content),
                     result.is_error,
                     ToolCallOutcome::Ok { is_error: result.is_error },
                 ),
-                Err(e) => (format!("tool invocation failed: {e}"), true, ToolCallOutcome::Failed { message: &format!("{e}") }),
+                Err(e) => {
+                    err_msg = format!("tool invocation failed: {e}");
+                    (err_msg.clone(), true, ToolCallOutcome::Failed { message: &err_msg })
+                }
             };
 
-            // Log to audit before re-borrowing for tool_result construction.
             audit
                 .write(&ToolCallEntry {
                     timestamp: chrono::Utc::now(),
@@ -128,6 +167,12 @@ pub async fn run(
                 .await
                 .context("audit write failed")?;
 
+            send_event(ServerToClient::ToolCallEnd {
+                id: use_id.clone(),
+                result_preview: truncate(text.clone(), 200),
+                is_error,
+            });
+
             tool_result_blocks.push(ContentBlock::ToolResult {
                 tool_use_id: use_id,
                 content: ToolResultContent::Text(text),
@@ -135,10 +180,12 @@ pub async fn run(
             });
         }
 
-        conv.push(Message::user_blocks(tool_result_blocks));
+        conversation.push(Message::user_blocks(tool_result_blocks));
     }
 
-    Ok(LoopOutcome { conversation: conv, turns, usage_total: total, final_stop_reason: last_stop_reason })
+    send_event(ServerToClient::LoopComplete);
+
+    Ok(LoopOutcome { turns, usage_total: total, final_stop_reason: last_stop_reason })
 }
 
 async fn invoke_and_collect(
@@ -147,9 +194,6 @@ async fn invoke_and_collect(
     input: serde_json::Value,
 ) -> Result<crate::mcp::CallToolResult, crate::mcp::McpError> {
     let mut stream = mcp.invoke(name, input).await?;
-    // Drain the event stream and surface the final Completed event. For the MVP transport
-    // there is exactly one Completed event per call; once tools start streaming output,
-    // the harness will accumulate intermediate events here for the UI/audit.
     let mut last = None;
     while let Some(event) = stream.next().await {
         match event {
@@ -182,4 +226,21 @@ fn accumulate(total: &mut Usage, delta: &Usage) {
     total.output_tokens += delta.output_tokens;
     total.cache_creation_input_tokens += delta.cache_creation_input_tokens;
     total.cache_read_input_tokens += delta.cache_read_input_tokens;
+}
+
+fn convert_usage(u: &Usage) -> WireUsage {
+    WireUsage {
+        input_tokens: u.input_tokens,
+        output_tokens: u.output_tokens,
+        cache_read_input_tokens: u.cache_read_input_tokens,
+        cache_creation_input_tokens: u.cache_creation_input_tokens,
+    }
+}
+
+fn truncate(mut s: String, max: usize) -> String {
+    if s.len() > max {
+        s.truncate(max);
+        s.push_str("…");
+    }
+    s
 }

@@ -14,18 +14,23 @@ egui = "0.33"
 log = "0.4"
 serde = { version = "1", features = ["derive"] }
 ciborium = "0.2"
+whisper-agent-protocol = { path = "../whisper-agent-protocol" }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 wasm-bindgen = "0.2"
 wasm-bindgen-futures = "0.4"
 console_error_panic_hook = "0.1"
+js-sys = "0.3"
 web-sys = { version = "0.3", features = [
     "WebSocket",
     "MessageEvent",
     "CloseEvent",
     "ErrorEvent",
+    "Event",
+    "Location",
     "Window",
     "Document",
     "HtmlCanvasElement",
+    "BinaryType",
 ] }
 getrandom = { version = "0.4", features = ["wasm_js"] }

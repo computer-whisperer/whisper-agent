@@ -3916,6 +3916,7 @@ dependencies = [
  "tower-http",
  "tracing",
  "tracing-subscriber",
+ "whisper-agent-protocol",
 ]
 
 [[package]]
@@ -3934,6 +3935,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "whisper-agent-protocol"
+version = "0.1.0"
+dependencies = [
+ "ciborium",
+ "serde",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "whisper-agent-webui"
 version = "0.1.0"
 dependencies = [
@@ -3942,11 +3952,13 @@ dependencies = [
  "eframe",
  "egui",
  "getrandom 0.4.2",
+ "js-sys",
  "log",
  "serde",
  "wasm-bindgen",
  "wasm-bindgen-futures",
  "web-sys",
+ "whisper-agent-protocol",
 ]
 
 [[package]]

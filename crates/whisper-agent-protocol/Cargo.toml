@@ -1,0 +1,11 @@
+[package]
+name = "whisper-agent-protocol"
+description = "Wire protocol shared between whisper-agent server and webui (CBOR over WebSocket)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+ciborium = "0.2"
+thiserror = "2"
