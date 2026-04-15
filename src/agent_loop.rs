@@ -1,0 +1,185 @@
+//! The agent loop driver.
+//!
+//! Sends the conversation to Anthropic, executes any tool_use blocks via MCP, appends
+//! the tool_results, repeats until the model emits a non-tool stop_reason. Auto-approves
+//! every tool call and audits each one.
+
+use anyhow::{Context, Result};
+use futures::StreamExt;
+use tracing::{info, warn};
+
+use crate::anthropic::{
+    AnthropicClient, CreateMessageRequest, MessageResponse, SystemBlock, ToolDescriptor as AnthropicTool,
+    Usage,
+};
+use crate::audit::{AuditLog, ToolCallEntry, ToolCallOutcome};
+use crate::conversation::{ContentBlock, Conversation, Message, ToolResultContent};
+use crate::mcp::{McpSession, ToolDescriptor as McpTool, ToolEvent};
+
+pub struct LoopConfig {
+    pub model: String,
+    pub max_tokens: u32,
+    pub system_prompt: String,
+    pub session_id: String,
+    pub host_id: String,
+    pub max_turns: u32,
+}
+
+pub struct LoopOutcome {
+    pub conversation: Conversation,
+    pub turns: u32,
+    pub usage_total: Usage,
+    pub final_stop_reason: Option<String>,
+}
+
+pub async fn run(
+    cfg: LoopConfig,
+    anthropic: AnthropicClient,
+    mcp: McpSession,
+    audit: AuditLog,
+    initial_user_prompt: String,
+) -> Result<LoopOutcome> {
+    let mut conv = Conversation::new();
+    conv.push(Message::user_text(initial_user_prompt));
+
+    let mcp_tools = mcp.list_tools().await.context("mcp list_tools failed")?;
+    let anthropic_tools: Vec<AnthropicTool> = mcp_tools.iter().map(mcp_to_anthropic_tool).collect();
+    info!(count = anthropic_tools.len(), "advertising tools to model");
+
+    let system = vec![SystemBlock::cached(cfg.system_prompt.clone())];
+
+    let mut turns = 0u32;
+    let mut total = Usage::default();
+    let mut last_stop_reason = None;
+
+    loop {
+        if turns >= cfg.max_turns {
+            warn!(max_turns = cfg.max_turns, "max_turns reached, halting");
+            break;
+        }
+
+        let req = CreateMessageRequest {
+            model: &cfg.model,
+            max_tokens: cfg.max_tokens,
+            system: system.clone(),
+            tools: anthropic_tools.clone(),
+            messages: conv.messages(),
+        };
+        let response: MessageResponse = anthropic
+            .create_message(&req)
+            .await
+            .context("anthropic create_message failed")?;
+        turns += 1;
+        accumulate(&mut total, &response.usage);
+        last_stop_reason = response.stop_reason.clone();
+        info!(
+            turn = turns,
+            stop_reason = ?response.stop_reason,
+            input = response.usage.input_tokens,
+            output = response.usage.output_tokens,
+            cache_read = response.usage.cache_read_input_tokens,
+            cache_create = response.usage.cache_creation_input_tokens,
+            "model response"
+        );
+
+        let assistant_blocks = response.content;
+        let tool_uses: Vec<(String, String, serde_json::Value)> = assistant_blocks
+            .iter()
+            .filter_map(|b| match b {
+                ContentBlock::ToolUse { id, name, input } => {
+                    Some((id.clone(), name.clone(), input.clone()))
+                }
+                _ => None,
+            })
+            .collect();
+
+        conv.push(Message::assistant_blocks(assistant_blocks));
+
+        if tool_uses.is_empty() {
+            break;
+        }
+
+        let mut tool_result_blocks = Vec::with_capacity(tool_uses.len());
+        for (use_id, name, input) in tool_uses {
+            info!(tool = %name, "invoking");
+            let outcome = invoke_and_collect(&mcp, &name, input.clone()).await;
+
+            let (text, is_error, audit_outcome) = match &outcome {
+                Ok(result) => (
+                    join_text(&result.content),
+                    result.is_error,
+                    ToolCallOutcome::Ok { is_error: result.is_error },
+                ),
+                Err(e) => (format!("tool invocation failed: {e}"), true, ToolCallOutcome::Failed { message: &format!("{e}") }),
+            };
+
+            // Log to audit before re-borrowing for tool_result construction.
+            audit
+                .write(&ToolCallEntry {
+                    timestamp: chrono::Utc::now(),
+                    session_id: &cfg.session_id,
+                    host_id: &cfg.host_id,
+                    tool_name: &name,
+                    args: input,
+                    decision: "auto-approve",
+                    who_decided: "stub",
+                    outcome: audit_outcome,
+                })
+                .await
+                .context("audit write failed")?;
+
+            tool_result_blocks.push(ContentBlock::ToolResult {
+                tool_use_id: use_id,
+                content: ToolResultContent::Text(text),
+                is_error,
+            });
+        }
+
+        conv.push(Message::user_blocks(tool_result_blocks));
+    }
+
+    Ok(LoopOutcome { conversation: conv, turns, usage_total: total, final_stop_reason: last_stop_reason })
+}
+
+async fn invoke_and_collect(
+    mcp: &McpSession,
+    name: &str,
+    input: serde_json::Value,
+) -> Result<crate::mcp::CallToolResult, crate::mcp::McpError> {
+    let mut stream = mcp.invoke(name, input).await?;
+    // Drain the event stream and surface the final Completed event. For the MVP transport
+    // there is exactly one Completed event per call; once tools start streaming output,
+    // the harness will accumulate intermediate events here for the UI/audit.
+    let mut last = None;
+    while let Some(event) = stream.next().await {
+        match event {
+            ToolEvent::Completed(r) => last = Some(r),
+        }
+    }
+    last.ok_or_else(|| crate::mcp::McpError::Malformed("no Completed event in stream".into()))
+}
+
+fn mcp_to_anthropic_tool(t: &McpTool) -> AnthropicTool {
+    AnthropicTool {
+        name: t.name.clone(),
+        description: t.description.clone(),
+        input_schema: t.input_schema.clone(),
+    }
+}
+
+fn join_text(blocks: &[crate::mcp::McpContentBlock]) -> String {
+    let mut out = String::new();
+    for b in blocks {
+        match b {
+            crate::mcp::McpContentBlock::Text { text } => out.push_str(text),
+        }
+    }
+    out
+}
+
+fn accumulate(total: &mut Usage, delta: &Usage) {
+    total.input_tokens += delta.input_tokens;
+    total.output_tokens += delta.output_tokens;
+    total.cache_creation_input_tokens += delta.cache_creation_input_tokens;
+    total.cache_read_input_tokens += delta.cache_read_input_tokens;
+}

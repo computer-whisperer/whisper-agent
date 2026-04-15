@@ -4,3 +4,6 @@
 # Rust build artifacts (added ahead of any actual Rust code)
 /target/
 **/target/
+
+# Local secrets — cloud API keys, sourced into env for development
+CLOUD_KEYS.txt
