@@ -299,6 +299,18 @@ impl Task {
             total_usage: self.total_usage,
             created_at: self.created_at.to_rfc3339(),
             last_active: self.last_active.to_rfc3339(),
+            failure: self.failure_detail(),
+        }
+    }
+
+    /// If the task is in the Failed state, return a human-readable description of
+    /// why (combining phase + message). Returns None otherwise.
+    pub fn failure_detail(&self) -> Option<String> {
+        match &self.internal {
+            TaskInternalState::Failed { at_phase, message } => {
+                Some(format!("{at_phase}: {message}"))
+            }
+            _ => None,
         }
     }
 

@@ -99,6 +99,10 @@ struct TaskView {
     backend: String,
     /// Model the task was created with. Populated from TaskSnapshot.
     model: String,
+    /// Failure detail carried by the snapshot, if the task ended up in `Failed`.
+    /// Rendered as a persistent banner so it survives re-subscribe (unlike items,
+    /// which get rebuilt from the conversation on every snapshot).
+    failure: Option<String>,
 }
 
 struct PendingApproval {
@@ -122,6 +126,7 @@ impl TaskView {
             pending_approvals: Vec::new(),
             backend: String::new(),
             model: String::new(),
+            failure: None,
         }
     }
 }
@@ -288,6 +293,7 @@ impl ChatApp {
                 let items = conversation_to_items(&snapshot.conversation);
                 let backend = snapshot.config.backend.clone();
                 let model = snapshot.config.model.clone();
+                let failure = snapshot.failure.clone();
                 let view = self
                     .tasks
                     .entry(task_id.clone())
@@ -299,6 +305,7 @@ impl ChatApp {
                 view.subscribed = true;
                 view.backend = backend;
                 view.model = model;
+                view.failure = failure;
                 // Pending-approval events that follow the snapshot will re-seed this.
                 view.pending_approvals.clear();
             }
@@ -387,6 +394,11 @@ impl ChatApp {
                 if let Some(tid) = task_id.as_ref()
                     && let Some(view) = self.tasks.get_mut(tid)
                 {
+                    // Persist on the view so it's visible as a banner even after a
+                    // resnapshot wipes `items`. The scheduler also records the same
+                    // detail on the task's Failed state; this mirrors it locally so
+                    // the UI doesn't have to wait on a re-subscribe round-trip.
+                    view.failure = Some(message.clone());
                     view.items.push(DisplayItem::SystemNote { text: message, is_error: true });
                 } else {
                     // No task scope — surface via conn detail so the banner reflects it.
@@ -808,6 +820,7 @@ impl eframe::App for ChatApp {
                         );
                     }
                     Some(view) => {
+                        render_failure_banner(ui, view);
                         render_approval_banner(ui, &task_id, view, &mut pending_decisions);
                         ScrollArea::vertical().stick_to_bottom(true).show(ui, |ui| {
                             if view.items.is_empty() {
@@ -839,6 +852,36 @@ impl eframe::App for ChatApp {
             });
         }
     }
+}
+
+/// Persistent banner for a task that's entered the Failed state. Survives resnapshot
+/// because `failure` is captured from the snapshot itself rather than derived from
+/// the per-event items list.
+fn render_failure_banner(ui: &mut egui::Ui, view: &TaskView) {
+    let Some(detail) = view.failure.as_deref() else {
+        return;
+    };
+    if view.summary.state != TaskStateLabel::Failed {
+        return;
+    }
+    egui::Frame::group(ui.style())
+        .fill(Color32::from_rgb(64, 28, 28))
+        .show(ui, |ui| {
+            ui.vertical(|ui| {
+                ui.label(
+                    RichText::new("task failed")
+                        .color(Color32::from_rgb(240, 140, 140))
+                        .strong(),
+                );
+                ui.add_space(2.0);
+                ui.label(
+                    RichText::new(detail)
+                        .color(Color32::from_rgb(240, 210, 210))
+                        .monospace(),
+                );
+            });
+        });
+    ui.add_space(4.0);
 }
 
 fn render_approval_banner(

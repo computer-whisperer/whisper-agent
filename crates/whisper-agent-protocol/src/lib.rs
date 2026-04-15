@@ -154,6 +154,11 @@ pub struct TaskSnapshot {
     pub total_usage: Usage,
     pub created_at: String,
     pub last_active: String,
+    /// Reason the task entered the `Failed` state, if any. Populated from the task's
+    /// internal `Failed { at_phase, message }` so clients subscribing after the
+    /// failure can still render why. `None` for non-Failed tasks.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure: Option<String>,
 }
 
 // ---------- Wire enums ----------

@@ -471,6 +471,26 @@ impl Scheduler {
         let IoCompletion { task_id, op_id, result } = completion;
         let mut events = Vec::new();
 
+        // Surface any IO-level error to the operator even if no client is subscribed.
+        // The task's own Failed state captures it for the wire, but operator-visible
+        // logs are how we catch misconfigured backends / unreachable endpoints without
+        // round-tripping through the UI.
+        match &result {
+            IoResult::McpConnect(Err(e)) => {
+                warn!(%task_id, op_id, error = %e, "mcp connect failed");
+            }
+            IoResult::ListTools(Err(e)) => {
+                warn!(%task_id, op_id, error = %e, "list_tools failed");
+            }
+            IoResult::ModelCall(Err(e)) => {
+                warn!(%task_id, op_id, error = %e, "model call failed");
+            }
+            IoResult::ToolCall { tool_use_id, result: Err(e) } => {
+                warn!(%task_id, %tool_use_id, error = %e, "tool call failed");
+            }
+            _ => {}
+        }
+
         // Handle IoResult::McpConnect specially because the session Arc needs to be
         // installed on the scheduler, not the task. We fish it out before calling
         // into the task's apply_io_result.
