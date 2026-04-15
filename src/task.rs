@@ -22,12 +22,12 @@ use std::collections::HashMap;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use whisper_agent_protocol::{
-    ContentBlock, Conversation, Message, TaskConfig, TaskSnapshot, TaskStateLabel, TaskSummary,
-    ToolResultContent, Usage,
+    ApprovalChoice, ApprovalPolicy, ContentBlock, Conversation, Message, TaskConfig, TaskSnapshot,
+    TaskStateLabel, TaskSummary, ToolResultContent, Usage,
 };
 
 use crate::anthropic::{MessageResponse, Usage as AnthropicUsage};
-use crate::mcp::CallToolResult;
+use crate::mcp::{CallToolResult, ToolAnnotations};
 
 pub type OpId = u64;
 
@@ -65,13 +65,29 @@ pub enum TaskInternalState {
     /// user or tool_result message.
     NeedsModelCall,
     AwaitingModel { op_id: OpId, started_at: DateTime<Utc> },
+    /// Model responded with tool_uses; at least one needs user approval before we can
+    /// dispatch. `dispositions` is parallel to `tool_uses`. On every ApprovalDecision the
+    /// corresponding entry transitions Pending → UserApproved / UserRejected; once none
+    /// remain Pending the task moves to `AwaitingTools`.
+    AwaitingApproval {
+        tool_uses: Vec<ToolUseReq>,
+        dispositions: Vec<ApprovalDisposition>,
+    },
     /// Model responded with tool_uses. Each entry in `pending_dispatch` still needs to
     /// be fired at MCP; `pending_io` maps op_ids of in-flight tool calls to their
-    /// tool_use_ids; `completed` accumulates ToolResult blocks as they return.
+    /// tool_use_ids; `completed` accumulates ToolResult blocks as they return. A tool
+    /// that was rejected during the approval phase is already synthesized into
+    /// `completed` here with `is_error: true` so the model's next turn sees the denial.
+    ///
+    /// `approvals` carries the decision that led each tool to be dispatched so the audit
+    /// log can record it when the tool completes (one line per call — see
+    /// `design_permissions.md`). Keyed by tool_use_id.
     AwaitingTools {
         pending_dispatch: Vec<ToolUseReq>,
         pending_io: HashMap<OpId, String>,
         completed: Vec<ContentBlock>,
+        #[serde(default)]
+        approvals: HashMap<String, ApprovalRecord>,
     },
     /// Terminal: unrecoverable error.
     Failed { at_phase: String, message: String },
@@ -85,6 +101,47 @@ pub struct ToolUseReq {
     pub tool_use_id: String,
     pub name: String,
     pub input: serde_json::Value,
+}
+
+/// Per-tool-call approval state carried by [`TaskInternalState::AwaitingApproval`].
+/// Parallel to the tool_uses vector; each entry is always in one of these four states.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum ApprovalDisposition {
+    /// Policy auto-approved this call (e.g. readOnlyHint=true or AutoApproveAll policy).
+    AutoApproved,
+    /// Awaiting a user decision keyed by `approval_id`.
+    Pending {
+        approval_id: String,
+        destructive: bool,
+        read_only: bool,
+    },
+    /// User approved.
+    UserApproved {
+        approval_id: String,
+        decided_by_conn: Option<u64>,
+    },
+    /// User rejected. `message` is the text we'll surface to the model as the
+    /// synthesized tool_result when we leave the approval phase.
+    UserRejected {
+        approval_id: String,
+        decided_by_conn: Option<u64>,
+        message: String,
+    },
+}
+
+impl ApprovalDisposition {
+    fn is_pending(&self) -> bool {
+        matches!(self, ApprovalDisposition::Pending { .. })
+    }
+}
+
+/// Decision record threaded from an approval outcome into the dispatch phase so the
+/// audit log captures who said yes (or that policy auto-approved).
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct ApprovalRecord {
+    pub decision: String,    // "auto" | "approve" | "reject"
+    pub who_decided: String, // "policy:read_only" | "policy:auto_approve_all" | "user:{conn}"
 }
 
 /// Request for an I/O operation to be dispatched by the scheduler.
@@ -152,6 +209,19 @@ pub enum TaskEvent {
         result_preview: String,
         is_error: bool,
     },
+    PendingApproval {
+        approval_id: String,
+        tool_use_id: String,
+        name: String,
+        args_preview: String,
+        destructive: bool,
+        read_only: bool,
+    },
+    ApprovalResolved {
+        approval_id: String,
+        decision: ApprovalChoice,
+        decided_by_conn: Option<u64>,
+    },
     AssistantEnd {
         stop_reason: Option<String>,
         usage: Usage,
@@ -166,6 +236,8 @@ pub enum TaskEvent {
         args: serde_json::Value,
         is_error: bool,
         error_message: Option<String>,
+        decision: String,
+        who_decided: String,
     },
 }
 
@@ -194,6 +266,7 @@ impl Task {
         match &self.internal {
             TaskInternalState::Idle => TaskStateLabel::Idle,
             TaskInternalState::Completed => TaskStateLabel::Completed,
+            TaskInternalState::AwaitingApproval { .. } => TaskStateLabel::AwaitingApproval,
             TaskInternalState::NeedsMcpConnect
             | TaskInternalState::AwaitingMcpConnect { .. }
             | TaskInternalState::NeedsListTools
@@ -332,8 +405,9 @@ impl Task {
             }
             TaskInternalState::AwaitingModel { .. }
             | TaskInternalState::AwaitingMcpConnect { .. }
-            | TaskInternalState::AwaitingListTools { .. } => {
-                // Not stepping these — waiting on I/O.
+            | TaskInternalState::AwaitingListTools { .. }
+            | TaskInternalState::AwaitingApproval { .. } => {
+                // Not stepping these — waiting on I/O or user decision.
                 self.internal = current;
                 StepOutcome::Paused
             }
@@ -341,6 +415,7 @@ impl Task {
                 mut pending_dispatch,
                 mut pending_io,
                 completed,
+                approvals,
             } => {
                 if let Some(next) = pending_dispatch.pop() {
                     let op_id = next_id(next_op_id);
@@ -363,6 +438,7 @@ impl Task {
                         pending_dispatch,
                         pending_io,
                         completed,
+                        approvals,
                     };
                     self.touch();
                     StepOutcome::DispatchIo(dispatch)
@@ -377,6 +453,7 @@ impl Task {
                         pending_dispatch,
                         pending_io,
                         completed,
+                        approvals,
                     };
                     StepOutcome::Paused
                 }
@@ -386,14 +463,18 @@ impl Task {
 
     /// Apply an I/O completion. Pushes events describing the integration; the scheduler
     /// should call `step_until_blocked` afterward.
+    ///
+    /// `tool_annotations` is consulted when a model response arrives so the approval
+    /// policy can be evaluated against each tool's hint flags.
     pub fn apply_io_result(
         &mut self,
         op_id: OpId,
         result: IoResult,
+        tool_annotations: &HashMap<String, ToolAnnotations>,
         events: &mut Vec<TaskEvent>,
     ) {
         let prev_public = self.public_state();
-        self.apply_io_result_inner(op_id, result, events);
+        self.apply_io_result_inner(op_id, result, tool_annotations, events);
         let new_public = self.public_state();
         if prev_public != new_public {
             events.push(TaskEvent::StateChanged);
@@ -404,6 +485,7 @@ impl Task {
         &mut self,
         op_id: OpId,
         result: IoResult,
+        tool_annotations: &HashMap<String, ToolAnnotations>,
         events: &mut Vec<TaskEvent>,
     ) {
         self.touch();
@@ -443,7 +525,7 @@ impl Task {
                 if *expected == op_id =>
             {
                 match res {
-                    Ok(response) => self.integrate_model_response(response, events),
+                    Ok(response) => self.integrate_model_response(response, tool_annotations, events),
                     Err(msg) => {
                         events.push(TaskEvent::Error { message: format!("model call failed: {msg}") });
                         self.fail("model_call", msg);
@@ -469,6 +551,7 @@ impl Task {
     fn integrate_model_response(
         &mut self,
         response: MessageResponse,
+        tool_annotations: &HashMap<String, ToolAnnotations>,
         events: &mut Vec<TaskEvent>,
     ) {
         self.total_usage.add(&convert_usage(&response.usage));
@@ -498,14 +581,64 @@ impl Task {
         if tool_uses.is_empty() {
             events.push(TaskEvent::LoopComplete);
             self.internal = TaskInternalState::Completed;
+            return;
+        }
+
+        // Evaluate approval policy for each tool_use.
+        let mut dispositions: Vec<ApprovalDisposition> = Vec::with_capacity(tool_uses.len());
+        let mut any_pending = false;
+        for tool_use in &tool_uses {
+            let empty = ToolAnnotations::default();
+            let ann = tool_annotations.get(&tool_use.name).unwrap_or(&empty);
+            match evaluate_policy(self.config.approval_policy, ann) {
+                ApprovalOutcome::Auto => dispositions.push(ApprovalDisposition::AutoApproved),
+                ApprovalOutcome::Prompt => {
+                    any_pending = true;
+                    let approval_id = format!("ap-{}", tool_use.tool_use_id);
+                    events.push(TaskEvent::PendingApproval {
+                        approval_id: approval_id.clone(),
+                        tool_use_id: tool_use.tool_use_id.clone(),
+                        name: tool_use.name.clone(),
+                        args_preview: truncate(
+                            serde_json::to_string(&tool_use.input).unwrap_or_default(),
+                            200,
+                        ),
+                        destructive: ann.is_destructive(),
+                        read_only: ann.is_read_only(),
+                    });
+                    dispositions.push(ApprovalDisposition::Pending {
+                        approval_id,
+                        destructive: ann.is_destructive(),
+                        read_only: ann.is_read_only(),
+                    });
+                }
+            }
+        }
+
+        if any_pending {
+            self.internal = TaskInternalState::AwaitingApproval {
+                tool_uses,
+                dispositions,
+            };
         } else {
-            // Reverse so `.pop()` in step() dispatches in original order.
-            let mut pending_dispatch = tool_uses;
-            pending_dispatch.reverse();
+            // Every tool auto-approved — record why so the audit log reflects it.
+            let approvals: HashMap<String, ApprovalRecord> = tool_uses
+                .iter()
+                .map(|tu| {
+                    (
+                        tu.tool_use_id.clone(),
+                        ApprovalRecord {
+                            decision: "auto".into(),
+                            who_decided: auto_approve_reason(self.config.approval_policy),
+                        },
+                    )
+                })
+                .collect();
             self.internal = TaskInternalState::AwaitingTools {
-                pending_dispatch,
+                pending_dispatch: make_dispatch_order(tool_uses),
                 pending_io: HashMap::new(),
                 completed: Vec::new(),
+                approvals,
             };
         }
     }
@@ -521,6 +654,7 @@ impl Task {
             pending_dispatch,
             mut pending_io,
             mut completed,
+            mut approvals,
         } = std::mem::replace(&mut self.internal, TaskInternalState::Idle)
         else {
             unreachable!("matched guard ensures we're in AwaitingTools")
@@ -529,6 +663,11 @@ impl Task {
         // The op_id should be tracked. Use it to verify; tool_use_id is the canonical
         // key for the conversation block either way.
         pending_io.remove(&op_id);
+
+        let approval = approvals.remove(&tool_use_id).unwrap_or_else(|| ApprovalRecord {
+            decision: "dispatched".into(),
+            who_decided: "policy".into(),
+        });
 
         let (text, is_error, tool_name, args, err_msg) = match result {
             Ok(r) => {
@@ -560,6 +699,8 @@ impl Task {
             args,
             is_error,
             error_message: err_msg,
+            decision: approval.decision,
+            who_decided: approval.who_decided,
         });
 
         completed.push(ContentBlock::ToolResult {
@@ -572,8 +713,175 @@ impl Task {
             pending_dispatch,
             pending_io,
             completed,
+            approvals,
         };
     }
+
+    /// Apply a user's approval decision. Finds the pending entry by `approval_id`,
+    /// transitions it to `UserApproved`/`UserRejected`, and if every disposition is
+    /// now resolved, moves the task into `AwaitingTools` (with synthesized denial
+    /// tool_results for rejected calls).
+    pub fn apply_approval_decision(
+        &mut self,
+        approval_id: &str,
+        decision: ApprovalChoice,
+        decided_by_conn: Option<u64>,
+        events: &mut Vec<TaskEvent>,
+    ) {
+        let prev_public = self.public_state();
+        self.apply_approval_decision_inner(approval_id, decision, decided_by_conn, events);
+        let new_public = self.public_state();
+        if prev_public != new_public {
+            events.push(TaskEvent::StateChanged);
+        }
+    }
+
+    fn apply_approval_decision_inner(
+        &mut self,
+        approval_id: &str,
+        decision: ApprovalChoice,
+        decided_by_conn: Option<u64>,
+        events: &mut Vec<TaskEvent>,
+    ) {
+        self.touch();
+        let TaskInternalState::AwaitingApproval { tool_uses, dispositions } = &mut self.internal
+        else {
+            tracing::warn!(
+                task_id = %self.id,
+                approval_id,
+                "approval decision received but task not awaiting approval"
+            );
+            return;
+        };
+
+        let Some(idx) = dispositions.iter().position(|d| {
+            matches!(d, ApprovalDisposition::Pending { approval_id: aid, .. } if aid == approval_id)
+        }) else {
+            tracing::warn!(
+                task_id = %self.id,
+                approval_id,
+                "approval_id not pending — duplicate decision?"
+            );
+            return;
+        };
+
+        dispositions[idx] = match decision {
+            ApprovalChoice::Approve => ApprovalDisposition::UserApproved {
+                approval_id: approval_id.to_string(),
+                decided_by_conn,
+            },
+            ApprovalChoice::Reject => ApprovalDisposition::UserRejected {
+                approval_id: approval_id.to_string(),
+                decided_by_conn,
+                message: "Denied by user.".to_string(),
+            },
+        };
+        events.push(TaskEvent::ApprovalResolved {
+            approval_id: approval_id.to_string(),
+            decision,
+            decided_by_conn,
+        });
+
+        if dispositions.iter().any(|d| d.is_pending()) {
+            return; // more approvals outstanding
+        }
+
+        // Every disposition resolved — transition to AwaitingTools. Approved calls go
+        // into pending_dispatch; rejected calls are synthesized as denial tool_results
+        // in `completed` and also emit audit entries recording the rejection.
+        let tool_uses = std::mem::take(tool_uses);
+        let dispositions = std::mem::take(dispositions);
+        let policy = self.config.approval_policy;
+        let mut pending_dispatch = Vec::new();
+        let mut completed = Vec::new();
+        let mut approvals: HashMap<String, ApprovalRecord> = HashMap::new();
+        for (tool_use, disposition) in tool_uses.into_iter().zip(dispositions) {
+            match disposition {
+                ApprovalDisposition::AutoApproved => {
+                    approvals.insert(
+                        tool_use.tool_use_id.clone(),
+                        ApprovalRecord {
+                            decision: "auto".into(),
+                            who_decided: auto_approve_reason(policy),
+                        },
+                    );
+                    pending_dispatch.push(tool_use);
+                }
+                ApprovalDisposition::UserApproved { decided_by_conn: conn, .. } => {
+                    approvals.insert(
+                        tool_use.tool_use_id.clone(),
+                        ApprovalRecord {
+                            decision: "approve".into(),
+                            who_decided: who_string(conn),
+                        },
+                    );
+                    pending_dispatch.push(tool_use);
+                }
+                ApprovalDisposition::UserRejected { decided_by_conn: conn, message, .. } => {
+                    events.push(TaskEvent::AuditToolCall {
+                        tool_name: tool_use.name.clone(),
+                        args: tool_use.input.clone(),
+                        is_error: true,
+                        error_message: Some(message.clone()),
+                        decision: "reject".into(),
+                        who_decided: who_string(conn),
+                    });
+                    completed.push(ContentBlock::ToolResult {
+                        tool_use_id: tool_use.tool_use_id,
+                        content: ToolResultContent::Text(message),
+                        is_error: true,
+                    });
+                }
+                ApprovalDisposition::Pending { .. } => unreachable!("checked above"),
+            }
+        }
+        self.internal = TaskInternalState::AwaitingTools {
+            pending_dispatch: reverse_for_pop(pending_dispatch),
+            pending_io: HashMap::new(),
+            completed,
+            approvals,
+        };
+    }
+}
+
+fn auto_approve_reason(policy: ApprovalPolicy) -> String {
+    match policy {
+        ApprovalPolicy::AutoApproveAll => "policy:auto_approve_all".into(),
+        ApprovalPolicy::PromptDestructive => "policy:read_only".into(),
+    }
+}
+
+fn who_string(conn: Option<u64>) -> String {
+    conn.map(|c| format!("user:{c}"))
+        .unwrap_or_else(|| "user".into())
+}
+
+enum ApprovalOutcome {
+    Auto,
+    Prompt,
+}
+
+fn evaluate_policy(policy: ApprovalPolicy, annotations: &ToolAnnotations) -> ApprovalOutcome {
+    match policy {
+        ApprovalPolicy::AutoApproveAll => ApprovalOutcome::Auto,
+        ApprovalPolicy::PromptDestructive => {
+            if annotations.is_read_only() {
+                ApprovalOutcome::Auto
+            } else {
+                ApprovalOutcome::Prompt
+            }
+        }
+    }
+}
+
+/// `step()` pops from the back; feed it in reverse so the original order is preserved.
+fn make_dispatch_order(tool_uses: Vec<ToolUseReq>) -> Vec<ToolUseReq> {
+    reverse_for_pop(tool_uses)
+}
+
+fn reverse_for_pop<T>(mut v: Vec<T>) -> Vec<T> {
+    v.reverse();
+    v
 }
 
 /// Derive a title from the user's initial message: trim, collapse internal whitespace,

@@ -62,6 +62,8 @@ pub struct TaskConfig {
     pub mcp_host_url: String,
     pub max_tokens: u32,
     pub max_turns: u32,
+    #[serde(default)]
+    pub approval_policy: ApprovalPolicy,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
@@ -76,6 +78,28 @@ pub struct TaskConfigOverride {
     pub max_tokens: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_turns: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approval_policy: Option<ApprovalPolicy>,
+}
+
+/// Pattern-1 approval policy. See `docs/design_permissions.md`.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ApprovalPolicy {
+    /// Auto-approve every tool call. Useful for dev-mode and unattended runs.
+    AutoApproveAll,
+    /// Auto-approve tools the MCP server marked `readOnlyHint: true`; prompt the user
+    /// for everything else (destructive, open-world, or unannotated). Default.
+    #[default]
+    PromptDestructive,
+}
+
+/// User's decision on a pending approval.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ApprovalChoice {
+    Approve,
+    Reject,
 }
 
 /// Lightweight per-task summary. Broadcast to every connected client and used by
@@ -123,6 +147,12 @@ pub enum ClientToServer {
     },
     /// Append a follow-up user message to an existing task.
     SendUserMessage { task_id: String, text: String },
+    /// Respond to a pending tool-call approval.
+    ApprovalDecision {
+        task_id: String,
+        approval_id: String,
+        decision: ApprovalChoice,
+    },
     /// Cancel a task. Stubbed for now — flips state to `Cancelled` without rolling back
     /// any in-flight tool work. Proper rollback semantics are a v0.3 problem.
     CancelTask { task_id: String },
@@ -190,6 +220,27 @@ pub enum ServerToClient {
     TaskAssistantTextDelta {
         task_id: String,
         delta: String,
+    },
+    /// A tool call needs user approval before it can be dispatched.
+    TaskPendingApproval {
+        task_id: String,
+        approval_id: String,
+        tool_use_id: String,
+        name: String,
+        args_preview: String,
+        /// Server-declared `destructiveHint` (default false if unannotated).
+        destructive: bool,
+        /// Server-declared `readOnlyHint` (default false if unannotated).
+        read_only: bool,
+    },
+    /// A previously-pending approval has been resolved (by any connected client).
+    TaskApprovalResolved {
+        task_id: String,
+        approval_id: String,
+        decision: ApprovalChoice,
+        /// Connection id that submitted the decision, if known.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        decided_by_conn: Option<u64>,
     },
     TaskToolCallBegin {
         task_id: String,

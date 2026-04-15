@@ -267,6 +267,23 @@ impl ChatApp {
                 }
             }
             ServerToClient::TaskLoopComplete { .. } => {}
+            // Approval-layer events — UI handling lands in the next commit.
+            ServerToClient::TaskPendingApproval { task_id, name, args_preview, .. } => {
+                if let Some(view) = self.tasks.get_mut(&task_id) {
+                    view.items.push(DisplayItem::SystemNote {
+                        text: format!("(pending approval for {name}({args_preview}))"),
+                        is_error: false,
+                    });
+                }
+            }
+            ServerToClient::TaskApprovalResolved { task_id, decision, .. } => {
+                if let Some(view) = self.tasks.get_mut(&task_id) {
+                    view.items.push(DisplayItem::SystemNote {
+                        text: format!("(approval resolved: {decision:?})"),
+                        is_error: false,
+                    });
+                }
+            }
             ServerToClient::Error { task_id, message, .. } => {
                 if let Some(tid) = task_id.as_ref()
                     && let Some(view) = self.tasks.get_mut(tid)

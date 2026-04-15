@@ -36,10 +36,11 @@ use crate::anthropic::{
     AnthropicClient, CreateMessageRequest, SystemBlock, ToolDescriptor as AnthropicTool,
 };
 use crate::audit::{AuditLog, ToolCallEntry, ToolCallOutcome};
-use crate::mcp::{McpSession, ToolDescriptor as McpTool};
+use crate::mcp::{McpSession, ToolAnnotations, ToolDescriptor as McpTool};
 use crate::persist::Persister;
 use crate::task::{
-    IoRequest, IoResult, OpId, StepOutcome, Task, TaskEvent, derive_title, new_task_id,
+    ApprovalDisposition, IoRequest, IoResult, OpId, StepOutcome, Task, TaskEvent, TaskInternalState,
+    derive_title, new_task_id,
 };
 
 pub type ConnId = u64;
@@ -197,6 +198,38 @@ impl Scheduler {
                     );
                 }
             }
+            ClientToServer::ApprovalDecision {
+                task_id,
+                approval_id,
+                decision,
+            } => {
+                let mut events = Vec::new();
+                let known = if let Some(task) = self.tasks.get_mut(&task_id) {
+                    task.apply_approval_decision(
+                        &approval_id,
+                        decision,
+                        Some(conn_id),
+                        &mut events,
+                    );
+                    true
+                } else {
+                    false
+                };
+                if !known {
+                    self.send_to_client(
+                        conn_id,
+                        ServerToClient::Error {
+                            correlation_id: None,
+                            task_id: Some(task_id),
+                            message: "unknown task".into(),
+                        },
+                    );
+                } else {
+                    self.mark_dirty(&task_id);
+                    self.dispatch_task_events(&task_id, events);
+                    self.step_until_blocked(&task_id, pending_io);
+                }
+            }
             ClientToServer::CancelTask { task_id } => {
                 if let Some(task) = self.tasks.get_mut(&task_id) {
                     task.cancel();
@@ -222,10 +255,20 @@ impl Scheduler {
                         .or_default()
                         .insert(conn_id);
                     let snapshot = task.snapshot();
+                    // Rehydrate any still-pending approvals so the newly-subscribed
+                    // client can render the approval UI. The snapshot itself doesn't
+                    // carry approval state.
+                    let pending = pending_approvals_of(task);
                     self.send_to_client(
                         conn_id,
-                        ServerToClient::TaskSnapshot { task_id, snapshot },
+                        ServerToClient::TaskSnapshot {
+                            task_id: task_id.clone(),
+                            snapshot,
+                        },
                     );
+                    for event in pending {
+                        self.send_to_client(conn_id, event);
+                    }
                 } else {
                     self.send_to_client(
                         conn_id,
@@ -352,14 +395,28 @@ impl Scheduler {
             other => other,
         };
 
+        // Build per-tool-name annotation map so the task's approval policy can consult it.
+        let annotations = self.annotations_for(&task_id);
         if let Some(task) = self.tasks.get_mut(&task_id) {
-            task.apply_io_result(op_id, result, &mut events);
+            task.apply_io_result(op_id, result, &annotations, &mut events);
         } else {
             warn!(%task_id, op_id, "io completion for unknown task");
             return;
         }
         self.mark_dirty(&task_id);
         self.dispatch_task_events(&task_id, events);
+    }
+
+    fn annotations_for(&self, task_id: &str) -> HashMap<String, ToolAnnotations> {
+        self.tool_descriptors
+            .get(task_id)
+            .map(|tools| {
+                tools
+                    .iter()
+                    .map(|t| (t.name.clone(), t.annotations.clone()))
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     /// Advance `task_id`'s state machine until it pauses, pushing new I/O to
@@ -559,6 +616,38 @@ impl Scheduler {
                         },
                     );
                 }
+                TaskEvent::PendingApproval {
+                    approval_id,
+                    tool_use_id,
+                    name,
+                    args_preview,
+                    destructive,
+                    read_only,
+                } => {
+                    self.broadcast_to_subscribers(
+                        task_id,
+                        ServerToClient::TaskPendingApproval {
+                            task_id: task_id.to_string(),
+                            approval_id,
+                            tool_use_id,
+                            name,
+                            args_preview,
+                            destructive,
+                            read_only,
+                        },
+                    );
+                }
+                TaskEvent::ApprovalResolved { approval_id, decision, decided_by_conn } => {
+                    self.broadcast_to_subscribers(
+                        task_id,
+                        ServerToClient::TaskApprovalResolved {
+                            task_id: task_id.to_string(),
+                            approval_id,
+                            decision,
+                            decided_by_conn,
+                        },
+                    );
+                }
                 TaskEvent::AssistantEnd { stop_reason, usage } => {
                     self.broadcast_to_subscribers(
                         task_id,
@@ -594,8 +683,23 @@ impl Scheduler {
                         },
                     );
                 }
-                TaskEvent::AuditToolCall { tool_name, args, is_error, error_message } => {
-                    self.write_audit(task_id, tool_name, args, is_error, error_message);
+                TaskEvent::AuditToolCall {
+                    tool_name,
+                    args,
+                    is_error,
+                    error_message,
+                    decision,
+                    who_decided,
+                } => {
+                    self.write_audit(
+                        task_id,
+                        tool_name,
+                        args,
+                        is_error,
+                        error_message,
+                        decision,
+                        who_decided,
+                    );
                 }
             }
         }
@@ -608,6 +712,8 @@ impl Scheduler {
         args: serde_json::Value,
         is_error: bool,
         error_message: Option<String>,
+        decision: String,
+        who_decided: String,
     ) {
         // Fire-and-forget — audit writes don't block task progression.
         let audit = self.audit.clone();
@@ -624,8 +730,8 @@ impl Scheduler {
                 host_id: &host_id,
                 tool_name: &tool_name,
                 args,
-                decision: "auto-approve",
-                who_decided: "stub",
+                decision: &decision,
+                who_decided: &who_decided,
                 outcome,
             };
             if let Err(e) = audit.write(&entry).await {
@@ -678,6 +784,40 @@ struct OwnedModelRequest {
     messages: Vec<whisper_agent_protocol::Message>,
 }
 
+/// Build the `TaskPendingApproval` events that a newly-subscribed client needs to
+/// render the approval UI. Returns empty if the task isn't in AwaitingApproval.
+fn pending_approvals_of(task: &Task) -> Vec<ServerToClient> {
+    let TaskInternalState::AwaitingApproval { tool_uses, dispositions } = &task.internal else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for (tool_use, disposition) in tool_uses.iter().zip(dispositions.iter()) {
+        if let ApprovalDisposition::Pending { approval_id, destructive, read_only } = disposition {
+            out.push(ServerToClient::TaskPendingApproval {
+                task_id: task.id.clone(),
+                approval_id: approval_id.clone(),
+                tool_use_id: tool_use.tool_use_id.clone(),
+                name: tool_use.name.clone(),
+                args_preview: truncate(
+                    serde_json::to_string(&tool_use.input).unwrap_or_default(),
+                    200,
+                ),
+                destructive: *destructive,
+                read_only: *read_only,
+            });
+        }
+    }
+    out
+}
+
+fn truncate(mut s: String, max: usize) -> String {
+    if s.len() > max {
+        s.truncate(max);
+        s.push('…');
+    }
+    s
+}
+
 fn mcp_tool_to_anthropic(t: &McpTool) -> AnthropicTool {
     AnthropicTool {
         name: t.name.clone(),
@@ -694,6 +834,7 @@ fn apply_override(base: TaskConfig, ov: Option<TaskConfigOverride>) -> TaskConfi
         mcp_host_url: ov.mcp_host_url.unwrap_or(base.mcp_host_url),
         max_tokens: ov.max_tokens.unwrap_or(base.max_tokens),
         max_turns: ov.max_turns.unwrap_or(base.max_turns),
+        approval_policy: ov.approval_policy.unwrap_or(base.approval_policy),
     }
 }
 

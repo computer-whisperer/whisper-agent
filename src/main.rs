@@ -6,7 +6,7 @@ use clap::{Parser, Subcommand};
 use tokio::sync::mpsc;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
-use whisper_agent_protocol::{Conversation, TaskConfig};
+use whisper_agent_protocol::{ApprovalPolicy, Conversation, TaskConfig};
 
 use whisper_agent::anthropic::AnthropicClient;
 use whisper_agent::audit::AuditLog;
@@ -70,6 +70,11 @@ struct ServeArgs {
     /// max_tokens parameter passed to Anthropic.
     #[arg(long, default_value_t = 4096)]
     max_tokens: u32,
+
+    /// Auto-approve every tool call. Default is to prompt for destructive/unannotated
+    /// tools (MCP readOnlyHint passes through without a prompt).
+    #[arg(long)]
+    auto_approve_all: bool,
 }
 
 #[derive(Parser, Debug)]
@@ -140,6 +145,11 @@ async fn run_serve(args: ServeArgs) -> Result<()> {
             mcp_host_url: args.mcp_host_url,
             max_tokens: args.max_tokens,
             max_turns: args.max_turns,
+            approval_policy: if args.auto_approve_all {
+                ApprovalPolicy::AutoApproveAll
+            } else {
+                ApprovalPolicy::PromptDestructive
+            },
         },
         audit_log_path: args.audit_log,
         host_id: "default".into(),
