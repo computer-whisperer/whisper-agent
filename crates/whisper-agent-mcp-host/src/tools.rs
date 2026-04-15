@@ -24,6 +24,7 @@ pub fn descriptors() -> Vec<Tool> {
         bash_descriptor(),
         list_dir_descriptor(),
         glob_descriptor(),
+        grep_descriptor(),
     ]
 }
 
@@ -34,6 +35,7 @@ pub async fn call(workspace: &Arc<Workspace>, name: &str, args: Value) -> Result
         "bash" => Ok(bash(workspace, args).await),
         "list_dir" => Ok(list_dir(workspace, args).await),
         "glob" => Ok(glob(workspace, args).await),
+        "grep" => Ok(grep(workspace, args).await),
         _ => Err(ToolDispatchError::UnknownTool(name.to_string())),
     }
 }
@@ -444,4 +446,209 @@ async fn glob(workspace: &Arc<Workspace>, args: Value) -> CallToolResult {
         ));
     }
     CallToolResult::text(out)
+}
+
+// ---------- grep ----------
+
+fn grep_descriptor() -> Tool {
+    Tool {
+        name: "grep".into(),
+        description: "Search file contents with a regex. Walks the workspace respecting \
+                      `.gitignore`, scans each text file line-by-line, and returns matches as \
+                      `path:line:text` (ripgrep-style). Use `path_glob` to narrow the file set. \
+                      Binary files are skipped automatically."
+            .into(),
+        input_schema: json!({
+            "type": "object",
+            "properties": {
+                "pattern": {
+                    "type": "string",
+                    "description": "Rust-regex-crate syntax. See https://docs.rs/regex/latest/regex/#syntax."
+                },
+                "path_glob": {
+                    "type": "string",
+                    "description": "Only search files whose path matches this glob (e.g. `**/*.rs`). Optional."
+                },
+                "ignore_case": {
+                    "type": "boolean",
+                    "description": "Case-insensitive match. Default false."
+                },
+                "include_hidden": {
+                    "type": "boolean",
+                    "description": "Traverse dotfiles / dotdirs. Default false."
+                },
+                "include_ignored": {
+                    "type": "boolean",
+                    "description": "Include paths that would be excluded by .gitignore. Default false."
+                },
+                "max_results": {
+                    "type": "integer",
+                    "description": "Cap the total number of hits. Default 200."
+                },
+                "max_per_file": {
+                    "type": "integer",
+                    "description": "Cap per-file hits. Default 20."
+                }
+            },
+            "required": ["pattern"]
+        }),
+        annotations: Some(ToolAnnotations {
+            title: Some("Grep file contents".into()),
+            read_only_hint: Some(true),
+            destructive_hint: Some(false),
+            idempotent_hint: Some(true),
+            open_world_hint: Some(false),
+        }),
+    }
+}
+
+#[derive(Deserialize)]
+struct GrepArgs {
+    pattern: String,
+    #[serde(default)]
+    path_glob: Option<String>,
+    #[serde(default)]
+    ignore_case: bool,
+    #[serde(default)]
+    include_hidden: bool,
+    #[serde(default)]
+    include_ignored: bool,
+    #[serde(default)]
+    max_results: Option<u32>,
+    #[serde(default)]
+    max_per_file: Option<u32>,
+}
+
+async fn grep(workspace: &Arc<Workspace>, args: Value) -> CallToolResult {
+    let parsed: GrepArgs = match serde_json::from_value(args) {
+        Ok(v) => v,
+        Err(e) => return CallToolResult::error_text(format!("invalid arguments: {e}")),
+    };
+
+    let mut rb = regex::RegexBuilder::new(&parsed.pattern);
+    rb.case_insensitive(parsed.ignore_case);
+    let re = match rb.build() {
+        Ok(r) => r,
+        Err(e) => return CallToolResult::error_text(format!("invalid regex: {e}")),
+    };
+
+    let path_matcher = match parsed.path_glob.as_deref() {
+        None => None,
+        Some(g) => match globset::Glob::new(g) {
+            Ok(g) => Some(g.compile_matcher()),
+            Err(e) => return CallToolResult::error_text(format!("invalid path_glob: {e}")),
+        },
+    };
+
+    let max_total = parsed.max_results.unwrap_or(200).max(1) as usize;
+    let max_per_file = parsed.max_per_file.unwrap_or(20).max(1) as usize;
+    let root = workspace.root().to_path_buf();
+    let include_hidden = parsed.include_hidden;
+    let include_ignored = parsed.include_ignored;
+
+    // Blocking pool: sync IO + scanning on many files.
+    let result = tokio::task::spawn_blocking(move || {
+        let mut walker = ignore::WalkBuilder::new(&root);
+        walker
+            .hidden(!include_hidden)
+            .git_ignore(!include_ignored)
+            .git_exclude(!include_ignored)
+            .git_global(!include_ignored)
+            .parents(!include_ignored);
+
+        let mut hits: Vec<String> = Vec::new();
+        let mut truncated = false;
+        'walk: for entry in walker.build() {
+            let entry = match entry {
+                Ok(e) => e,
+                Err(_) => continue,
+            };
+            if !entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
+                continue;
+            }
+            let Ok(rel) = entry.path().strip_prefix(&root) else { continue };
+            if let Some(m) = &path_matcher
+                && !m.is_match(rel)
+            {
+                continue;
+            }
+            match scan_file(entry.path(), &re, max_per_file, max_total - hits.len()) {
+                Ok(lines) => {
+                    for (line_no, line) in lines {
+                        hits.push(format!("{}:{}:{}", rel.display(), line_no, line));
+                        if hits.len() >= max_total {
+                            truncated = true;
+                            break 'walk;
+                        }
+                    }
+                }
+                // Silently skip files we couldn't open or decide are binary.
+                Err(_) => continue,
+            }
+        }
+        (hits, truncated)
+    })
+    .await;
+    let (hits, truncated) = match result {
+        Ok(t) => t,
+        Err(e) => return CallToolResult::error_text(format!("grep task panicked: {e}")),
+    };
+
+    if hits.is_empty() {
+        return CallToolResult::text(format!("(no matches for {})", parsed.pattern));
+    }
+    let mut out = hits.join("\n");
+    out.push('\n');
+    if truncated {
+        out.push_str(&format!(
+            "(truncated at {max_total} total hits; narrow the pattern, use path_glob, or raise max_results)\n"
+        ));
+    }
+    CallToolResult::text(out)
+}
+
+/// Scan one file's lines against `re`. Returns (line_no, line_text) tuples.
+///
+/// - Skips files that look binary (null byte in the first 8 KiB).
+/// - Caps per-file hits at `per_file_cap` and never returns more than `remaining_total`.
+/// - Truncates very long lines at 4 KiB so a pathological file can't wedge the search.
+fn scan_file(
+    path: &std::path::Path,
+    re: &regex::Regex,
+    per_file_cap: usize,
+    remaining_total: usize,
+) -> std::io::Result<Vec<(usize, String)>> {
+    use std::io::{BufRead, BufReader, Read};
+    let mut f = std::fs::File::open(path)?;
+    let mut head = [0u8; 8192];
+    let n = f.read(&mut head)?;
+    if head[..n].contains(&0u8) {
+        return Ok(Vec::new()); // binary; skip
+    }
+    // Reopen so we can stream-read from the start.
+    let f = std::fs::File::open(path)?;
+    let reader = BufReader::new(f);
+    let cap = per_file_cap.min(remaining_total);
+    let mut out: Vec<(usize, String)> = Vec::new();
+    for (idx, line) in reader.lines().enumerate() {
+        let line = match line {
+            Ok(l) => l,
+            Err(_) => return Ok(out), // non-UTF8 line — stop scanning this file
+        };
+        if re.is_match(&line) {
+            const MAX_LINE: usize = 4096;
+            let trimmed = if line.len() > MAX_LINE {
+                let mut s = line[..MAX_LINE].to_string();
+                s.push('…');
+                s
+            } else {
+                line
+            };
+            out.push((idx + 1, trimmed));
+            if out.len() >= cap {
+                break;
+            }
+        }
+    }
+    Ok(out)
 }
