@@ -1,7 +1,8 @@
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
 use clap::{Parser, Subcommand};
 use tokio::sync::mpsc;
 use tracing::info;
@@ -10,11 +11,14 @@ use whisper_agent_protocol::{ApprovalPolicy, Conversation, TaskConfig};
 
 use whisper_agent::anthropic::AnthropicClient;
 use whisper_agent::audit::AuditLog;
+use whisper_agent::config::Config;
 use whisper_agent::mcp::McpSession;
+use whisper_agent::scheduler::BackendEntry;
 use whisper_agent::server::{self, ServerConfig};
 use whisper_agent::turn::{self, TurnConfig};
 
 const DEFAULT_SYSTEM_PROMPT: &str = "You are a software engineering agent. You have access to a set of tools that operate on a workspace directory on the user's machine. Use the tools as needed to complete the user's request. Be concise. When you have finished, summarize what you did.";
+const DEFAULT_BACKEND_NAME: &str = "anthropic";
 
 #[derive(Parser, Debug)]
 #[command(version, about = "whisper-agent: headless agent loop with embedded webui server.")]
@@ -39,11 +43,17 @@ struct ServeArgs {
     #[arg(long, default_value = "127.0.0.1:8080")]
     listen: SocketAddr,
 
-    /// Anthropic API key.
-    #[arg(long, env = "ANTHROPIC_API_KEY")]
-    anthropic_api_key: String,
+    /// Path to a TOML config file describing the model-backend catalog. If omitted,
+    /// the server falls back to a single-backend "anthropic" config built from
+    /// `--anthropic-api-key` + `--model`.
+    #[arg(long)]
+    config: Option<PathBuf>,
 
-    /// Anthropic model ID.
+    /// Anthropic API key (used only when `--config` is not provided).
+    #[arg(long, env = "ANTHROPIC_API_KEY")]
+    anthropic_api_key: Option<String>,
+
+    /// Anthropic model ID (used only when `--config` is not provided).
     #[arg(long, default_value = "claude-sonnet-4-6")]
     model: String,
 
@@ -67,7 +77,7 @@ struct ServeArgs {
     #[arg(long, default_value_t = 30)]
     max_turns: u32,
 
-    /// max_tokens parameter passed to Anthropic.
+    /// max_tokens parameter passed to the model backend.
     #[arg(long, default_value_t = 4096)]
     max_tokens: u32,
 
@@ -137,10 +147,58 @@ async fn run_serve(args: ServeArgs) -> Result<()> {
     } else {
         Some(args.state_dir)
     };
-    let config = ServerConfig {
-        anthropic_api_key: args.anthropic_api_key,
+
+    // Resolve the backend catalog: either a TOML config or a synthesized
+    // single-anthropic-entry fallback from legacy flags.
+    let (backends, default_backend, default_model) = match &args.config {
+        Some(path) => {
+            let cfg = Config::load(path).await?;
+            let default_model = cfg
+                .backends
+                .get(&cfg.default_backend)
+                .map(|b| b.default_model().to_string())
+                .ok_or_else(|| anyhow!("config: default_backend missing entry"))?;
+            let mut map = HashMap::new();
+            for (name, bcfg) in &cfg.backends {
+                let provider = bcfg
+                    .build()
+                    .with_context(|| format!("build backend `{name}`"))?;
+                map.insert(
+                    name.clone(),
+                    BackendEntry {
+                        provider,
+                        kind: bcfg.kind().into(),
+                        default_model: bcfg.default_model().into(),
+                    },
+                );
+            }
+            (map, cfg.default_backend, default_model)
+        }
+        None => {
+            let key = args.anthropic_api_key.clone().ok_or_else(|| {
+                anyhow!(
+                    "no --config provided and ANTHROPIC_API_KEY / --anthropic-api-key is unset"
+                )
+            })?;
+            let mut map = HashMap::new();
+            map.insert(
+                DEFAULT_BACKEND_NAME.into(),
+                BackendEntry {
+                    provider: std::sync::Arc::new(AnthropicClient::new(key)),
+                    kind: "anthropic".into(),
+                    default_model: args.model.clone(),
+                },
+            );
+            (map, DEFAULT_BACKEND_NAME.into(), args.model.clone())
+        }
+    };
+
+    let server_config = ServerConfig {
+        backends,
+        default_backend,
         default_task_config: TaskConfig {
-            model: args.model,
+            backend: String::new(), // empty → scheduler uses default_backend
+            model: default_model,
             system_prompt: args.system_prompt,
             mcp_host_url: args.mcp_host_url,
             max_tokens: args.max_tokens,
@@ -155,7 +213,7 @@ async fn run_serve(args: ServeArgs) -> Result<()> {
         host_id: "default".into(),
         state_dir,
     };
-    server::serve(args.listen, config).await
+    server::serve(args.listen, server_config).await
 }
 
 async fn run_one_shot(args: RunArgs) -> Result<()> {

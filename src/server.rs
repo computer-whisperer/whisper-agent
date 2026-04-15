@@ -34,11 +34,9 @@ use tower_http::trace::TraceLayer;
 use tracing::{error, info, warn};
 use whisper_agent_protocol::{ServerToClient, TaskConfig, decode_from_client, encode_to_client};
 
-use crate::anthropic::AnthropicClient;
 use crate::audit::AuditLog;
-use crate::model::ModelProvider;
 use crate::persist::Persister;
-use crate::scheduler::{ConnId, Scheduler, SchedulerMsg};
+use crate::scheduler::{BackendEntry, ConnId, Scheduler, SchedulerMsg};
 
 const WEBUI_PKG_DIR: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
@@ -54,7 +52,10 @@ const WEBUI_INDEX: &str = concat!(
 );
 
 pub struct ServerConfig {
-    pub anthropic_api_key: String,
+    /// Named backends the scheduler can dispatch model calls to.
+    pub backends: std::collections::HashMap<String, BackendEntry>,
+    /// Fallback backend for tasks that don't specify one. Must be a key in `backends`.
+    pub default_backend: String,
     pub default_task_config: TaskConfig,
     pub audit_log_path: PathBuf,
     pub host_id: String,
@@ -84,12 +85,11 @@ pub async fn serve(listen: SocketAddr, config: ServerConfig) -> anyhow::Result<(
         .with_context(|| format!("open audit log {}", config.audit_log_path.display()))?;
     info!(audit_log = %audit.path().display(), "audit log open");
 
-    let model: Arc<dyn ModelProvider> =
-        Arc::new(AnthropicClient::new(config.anthropic_api_key));
     let mut scheduler = Scheduler::new(
         config.default_task_config,
         config.host_id,
-        model,
+        config.backends,
+        config.default_backend,
         audit,
     );
 

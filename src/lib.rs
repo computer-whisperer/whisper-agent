@@ -5,6 +5,7 @@
 
 pub mod anthropic;
 pub mod audit;
+pub mod config;
 pub mod mcp;
 pub mod model;
 pub mod openai_chat;

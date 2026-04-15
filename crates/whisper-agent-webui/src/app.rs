@@ -323,6 +323,9 @@ impl ChatApp {
                     self.conn_detail = Some(message);
                 }
             }
+            ServerToClient::BackendsList { .. } | ServerToClient::ModelsList { .. } => {
+                // Picker wiring lands in a follow-up commit; ignore for now.
+            }
         }
     }
 

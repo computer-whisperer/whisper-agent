@@ -29,7 +29,8 @@ use futures::stream::FuturesUnordered;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 use whisper_agent_protocol::{
-    ClientToServer, ServerToClient, TaskConfig, TaskConfigOverride, TaskStateLabel,
+    BackendSummary, ClientToServer, ModelSummary, ServerToClient, TaskConfig, TaskConfigOverride,
+    TaskStateLabel,
 };
 
 use crate::audit::{AuditLog, ToolCallEntry, ToolCallOutcome};
@@ -63,10 +64,20 @@ struct IoCompletion {
 
 type IoFuture = Pin<Box<dyn Future<Output = IoCompletion> + Send>>;
 
+/// Entry in the scheduler's backend catalog.
+pub struct BackendEntry {
+    pub provider: Arc<dyn ModelProvider>,
+    pub kind: String,
+    pub default_model: String,
+}
+
 pub struct Scheduler {
     default_config: TaskConfig,
     host_id: String,
-    model: Arc<dyn ModelProvider>,
+    /// Named backends: `TaskConfig.backend` resolves against this map.
+    backends: HashMap<String, BackendEntry>,
+    /// Fallback when a task doesn't specify a backend. Must be a key in `backends`.
+    default_backend: String,
     audit: AuditLog,
     persister: Option<Persister>,
 
@@ -91,13 +102,19 @@ impl Scheduler {
     pub fn new(
         default_config: TaskConfig,
         host_id: String,
-        model: Arc<dyn ModelProvider>,
+        backends: HashMap<String, BackendEntry>,
+        default_backend: String,
         audit: AuditLog,
     ) -> Self {
+        assert!(
+            backends.contains_key(&default_backend),
+            "default_backend must be in backends"
+        );
         Self {
             default_config,
             host_id,
-            model,
+            backends,
+            default_backend,
             audit,
             persister: None,
             tasks: HashMap::new(),
@@ -107,6 +124,16 @@ impl Scheduler {
             tool_descriptors: HashMap::new(),
             next_op_id: 1,
             dirty: HashSet::new(),
+        }
+    }
+
+    /// Returns the backend name the task is configured to use, falling back to the
+    /// server's default if the task left it empty. Does NOT validate existence.
+    fn resolve_backend_name<'a>(&'a self, task: &'a Task) -> &'a str {
+        if task.config.backend.is_empty() {
+            &self.default_backend
+        } else {
+            &task.config.backend
         }
     }
 
@@ -294,6 +321,72 @@ impl Scheduler {
                     conn_id,
                     ServerToClient::TaskList { correlation_id, tasks },
                 );
+            }
+            ClientToServer::ListBackends { correlation_id } => {
+                let backends: Vec<BackendSummary> = self
+                    .backends
+                    .iter()
+                    .map(|(name, entry)| BackendSummary {
+                        name: name.clone(),
+                        kind: entry.kind.clone(),
+                        default_model: entry.default_model.clone(),
+                    })
+                    .collect();
+                self.send_to_client(
+                    conn_id,
+                    ServerToClient::BackendsList {
+                        correlation_id,
+                        default_backend: self.default_backend.clone(),
+                        backends,
+                    },
+                );
+            }
+            ClientToServer::ListModels { correlation_id, backend } => {
+                let entry = self.backends.get(&backend);
+                let Some(entry) = entry else {
+                    self.send_to_client(
+                        conn_id,
+                        ServerToClient::Error {
+                            correlation_id,
+                            task_id: None,
+                            message: format!("unknown backend `{backend}`"),
+                        },
+                    );
+                    return;
+                };
+                // Spawn a detached task so we don't block the scheduler loop on the
+                // backend's network round-trip. The task writes directly to the
+                // client's outbound channel — the scheduler holds no intermediate state.
+                let provider = entry.provider.clone();
+                let outbound = self.clients.get(&conn_id).cloned();
+                let Some(outbound) = outbound else {
+                    return;
+                };
+                tokio::spawn(async move {
+                    match provider.list_models().await {
+                        Ok(models) => {
+                            let models: Vec<ModelSummary> = models
+                                .into_iter()
+                                .map(|m| ModelSummary {
+                                    id: m.id,
+                                    display_name: m.display_name,
+                                })
+                                .collect();
+                            let _ = outbound.send(ServerToClient::ModelsList {
+                                correlation_id,
+                                backend,
+                                models,
+                            });
+                        }
+                        Err(e) => {
+                            let _ = outbound.send(ServerToClient::Error {
+                                correlation_id,
+                                task_id: None,
+                                message: format!("list_models failed: {e}"),
+                            });
+                        }
+                    }
+                });
             }
         }
     }
@@ -489,10 +582,25 @@ impl Scheduler {
                 })
             }
             IoRequest::ModelCall { op_id } => {
-                let (owned_req, model_name) = self.build_model_request(&task_id);
-                let model = self.model.clone();
+                let (owned_req, model_name, backend_name) =
+                    self.build_model_request(&task_id);
+                let provider = match self.backends.get(&backend_name) {
+                    Some(entry) => entry.provider.clone(),
+                    None => {
+                        // Unknown backend — surface as a model-call failure so the
+                        // task transitions to Failed via the existing path.
+                        let msg = format!("unknown backend `{backend_name}`");
+                        return Box::pin(async move {
+                            IoCompletion {
+                                task_id,
+                                op_id,
+                                result: IoResult::ModelCall(Err(msg)),
+                            }
+                        });
+                    }
+                };
                 Box::pin(async move {
-                    debug!(%task_id, op_id, model = %model_name, "dispatching model call");
+                    debug!(%task_id, op_id, backend = %backend_name, model = %model_name, "dispatching model call");
                     let req = ModelRequest {
                         model: &owned_req.model,
                         max_tokens: owned_req.max_tokens,
@@ -500,7 +608,7 @@ impl Scheduler {
                         tools: &owned_req.tools,
                         messages: &owned_req.messages,
                     };
-                    match model.create_message(&req).await {
+                    match provider.create_message(&req).await {
                         Ok(resp) => IoCompletion {
                             task_id,
                             op_id,
@@ -546,7 +654,7 @@ impl Scheduler {
         }
     }
 
-    fn build_model_request(&self, task_id: &str) -> (OwnedModelRequest, String) {
+    fn build_model_request(&self, task_id: &str) -> (OwnedModelRequest, String, String) {
         let task = self.tasks.get(task_id).expect("task exists");
         let tools: Vec<ToolSpec> = self
             .tool_descriptors
@@ -556,6 +664,7 @@ impl Scheduler {
         let messages = task.conversation.messages().to_vec();
         let model = task.config.model.clone();
         let max_tokens = task.config.max_tokens;
+        let backend_name = self.resolve_backend_name(task).to_string();
         (
             OwnedModelRequest {
                 model: model.clone(),
@@ -565,6 +674,7 @@ impl Scheduler {
                 messages,
             },
             model,
+            backend_name,
         )
     }
 
@@ -826,6 +936,7 @@ fn mcp_tool_to_spec(t: &McpTool) -> ToolSpec {
 fn apply_override(base: TaskConfig, ov: Option<TaskConfigOverride>) -> TaskConfig {
     let Some(ov) = ov else { return base };
     TaskConfig {
+        backend: ov.backend.unwrap_or(base.backend),
         model: ov.model.unwrap_or(base.model),
         system_prompt: ov.system_prompt.unwrap_or(base.system_prompt),
         mcp_host_url: ov.mcp_host_url.unwrap_or(base.mcp_host_url),

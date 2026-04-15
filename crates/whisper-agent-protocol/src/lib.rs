@@ -57,6 +57,11 @@ impl Usage {
 /// task-creation time via [`TaskConfigOverride`].
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct TaskConfig {
+    /// Name of the backend in the server's catalog. Empty string means "use the
+    /// server's default backend." Kept as `default`-able so tasks persisted before
+    /// multi-backend support still deserialize.
+    #[serde(default)]
+    pub backend: String,
     pub model: String,
     pub system_prompt: String,
     pub mcp_host_url: String,
@@ -68,6 +73,8 @@ pub struct TaskConfig {
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
 pub struct TaskConfigOverride {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backend: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -113,6 +120,26 @@ pub struct TaskSummary {
     /// doesn't pull in chrono.
     pub created_at: String,
     pub last_active: String,
+}
+
+/// Entry in a `BackendsList` response.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct BackendSummary {
+    /// User-chosen alias — matches `TaskConfig.backend`.
+    pub name: String,
+    /// Which protocol this backend speaks (`"anthropic"`, `"openai_chat"`, …).
+    /// Clients can use this for labels or icons; the server doesn't rely on it.
+    pub kind: String,
+    /// Model id the server would fall back to if a task doesn't specify one.
+    pub default_model: String,
+}
+
+/// Entry in a `ModelsList` response.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct ModelSummary {
+    pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
 }
 
 /// Full per-task snapshot. Sent in response to a `SubscribeToTask` so the client can
@@ -168,6 +195,20 @@ pub enum ClientToServer {
     ListTasks {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         correlation_id: Option<String>,
+    },
+
+    // --- Model catalog ---
+    /// Request the list of configured backends. Cheap / synchronous on the server.
+    ListBackends {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        correlation_id: Option<String>,
+    },
+    /// Request the list of models advertised by a specific backend. Server hits the
+    /// backend's `list_models` endpoint — may take a round-trip.
+    ListModels {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        correlation_id: Option<String>,
+        backend: String,
     },
 }
 
@@ -262,6 +303,20 @@ pub enum ServerToClient {
     },
     TaskLoopComplete {
         task_id: String,
+    },
+
+    // --- Model catalog responses ---
+    BackendsList {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        correlation_id: Option<String>,
+        default_backend: String,
+        backends: Vec<BackendSummary>,
+    },
+    ModelsList {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        correlation_id: Option<String>,
+        backend: String,
+        models: Vec<ModelSummary>,
     },
 
     Error {
