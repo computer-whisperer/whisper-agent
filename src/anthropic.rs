@@ -1,28 +1,24 @@
-//! Anthropic Messages API client.
+//! Anthropic Messages + Models API client.
 //!
-//! Non-streaming for MVP — single POST to /v1/messages, single JSON response.
-//! Streaming via SSE comes when the WebSocket UI lands.
+//! Implements [`ModelProvider`] for the `https://api.anthropic.com` endpoints. All
+//! Anthropic-specific wire types (system-block cache_control, tool schema shape,
+//! `MessageResponse` raw usage) are module-private — external code sees only the
+//! normalized [`ModelRequest`] / [`ModelResponse`].
 //!
-//! One ephemeral cache_control breakpoint placed on the last system block. That
-//! caches `system + tools + initial user message` after the first turn, which is
-//! where the bulk of the per-turn token cost lives.
+//! One ephemeral `cache_control` breakpoint is placed on the system block so that
+//! `system + tools + initial user message` caches after the first turn.
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use thiserror::Error;
+use whisper_agent_protocol::{ContentBlock, Message, Usage};
 
-use whisper_agent_protocol::{ContentBlock, Message};
+use crate::model::{
+    BoxFuture, ModelError, ModelInfo, ModelProvider, ModelRequest, ModelResponse, ToolSpec,
+};
 
 const API_URL: &str = "https://api.anthropic.com/v1/messages";
+const MODELS_URL: &str = "https://api.anthropic.com/v1/models";
 const ANTHROPIC_VERSION: &str = "2023-06-01";
-
-#[derive(Debug, Error)]
-pub enum AnthropicError {
-    #[error("http error: {0}")]
-    Http(#[from] reqwest::Error),
-    #[error("api error {status}: {body}")]
-    Api { status: u16, body: String },
-}
 
 pub struct AnthropicClient {
     http: reqwest::Client,
@@ -37,97 +33,185 @@ impl AnthropicClient {
         }
     }
 
-    pub async fn create_message(
-        &self,
-        request: &CreateMessageRequest<'_>,
-    ) -> Result<MessageResponse, AnthropicError> {
+    async fn do_create_message(&self, req: &ModelRequest<'_>) -> Result<ModelResponse, ModelError> {
+        let tools: Vec<AnthropicTool> = req.tools.iter().map(spec_to_anthropic_tool).collect();
+        let system = vec![SystemBlock::cached(req.system_prompt.to_string())];
+        let body = CreateMessageRequest {
+            model: req.model,
+            max_tokens: req.max_tokens,
+            system,
+            tools,
+            messages: req.messages,
+        };
         let resp = self
             .http
             .post(API_URL)
             .header("x-api-key", &self.api_key)
             .header("anthropic-version", ANTHROPIC_VERSION)
             .header("content-type", "application/json")
-            .json(request)
+            .json(&body)
             .send()
-            .await?;
+            .await
+            .map_err(|e| ModelError::Transport(e.to_string()))?;
         let status = resp.status();
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
-            return Err(AnthropicError::Api { status: status.as_u16(), body });
+            return Err(ModelError::Api {
+                status: status.as_u16(),
+                body,
+            });
         }
-        Ok(resp.json::<MessageResponse>().await?)
+        let parsed: MessageResponse = resp
+            .json()
+            .await
+            .map_err(|e| ModelError::Transport(e.to_string()))?;
+        Ok(ModelResponse {
+            content: parsed.content,
+            stop_reason: parsed.stop_reason,
+            usage: Usage {
+                input_tokens: parsed.usage.input_tokens,
+                output_tokens: parsed.usage.output_tokens,
+                cache_read_input_tokens: parsed.usage.cache_read_input_tokens,
+                cache_creation_input_tokens: parsed.usage.cache_creation_input_tokens,
+            },
+        })
+    }
+
+    async fn do_list_models(&self) -> Result<Vec<ModelInfo>, ModelError> {
+        let resp = self
+            .http
+            .get(MODELS_URL)
+            .header("x-api-key", &self.api_key)
+            .header("anthropic-version", ANTHROPIC_VERSION)
+            .send()
+            .await
+            .map_err(|e| ModelError::Transport(e.to_string()))?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(ModelError::Api {
+                status: status.as_u16(),
+                body,
+            });
+        }
+        let parsed: ListModelsResponse = resp
+            .json()
+            .await
+            .map_err(|e| ModelError::Transport(e.to_string()))?;
+        Ok(parsed
+            .data
+            .into_iter()
+            .map(|m| ModelInfo {
+                id: m.id,
+                display_name: Some(m.display_name),
+            })
+            .collect())
     }
 }
 
+impl ModelProvider for AnthropicClient {
+    fn create_message<'a>(
+        &'a self,
+        req: &'a ModelRequest<'a>,
+    ) -> BoxFuture<'a, Result<ModelResponse, ModelError>> {
+        Box::pin(self.do_create_message(req))
+    }
+
+    fn list_models<'a>(&'a self) -> BoxFuture<'a, Result<Vec<ModelInfo>, ModelError>> {
+        Box::pin(self.do_list_models())
+    }
+}
+
+fn spec_to_anthropic_tool(t: &ToolSpec) -> AnthropicTool {
+    AnthropicTool {
+        name: t.name.clone(),
+        description: t.description.clone(),
+        input_schema: t.input_schema.clone(),
+    }
+}
+
+// ---------- Wire types (private to this module) ----------
+
 #[derive(Serialize, Debug)]
-pub struct CreateMessageRequest<'a> {
-    pub model: &'a str,
-    pub max_tokens: u32,
-    pub system: Vec<SystemBlock>,
+struct CreateMessageRequest<'a> {
+    model: &'a str,
+    max_tokens: u32,
+    system: Vec<SystemBlock>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub tools: Vec<ToolDescriptor>,
-    pub messages: &'a [Message],
+    tools: Vec<AnthropicTool>,
+    messages: &'a [Message],
 }
 
 #[derive(Serialize, Debug, Clone)]
-pub struct SystemBlock {
+struct SystemBlock {
     #[serde(rename = "type")]
-    pub kind: &'static str,
-    pub text: String,
+    kind: &'static str,
+    text: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub cache_control: Option<CacheControl>,
+    cache_control: Option<CacheControl>,
 }
 
 impl SystemBlock {
-    pub fn text(text: impl Into<String>) -> Self {
-        Self { kind: "text", text: text.into(), cache_control: None }
-    }
-
-    pub fn cached(text: impl Into<String>) -> Self {
+    fn cached(text: String) -> Self {
         Self {
             kind: "text",
-            text: text.into(),
+            text,
             cache_control: Some(CacheControl::ephemeral()),
         }
     }
 }
 
 #[derive(Serialize, Debug, Clone)]
-pub struct CacheControl {
+struct CacheControl {
     #[serde(rename = "type")]
-    pub kind: &'static str,
+    kind: &'static str,
 }
 
 impl CacheControl {
-    pub fn ephemeral() -> Self {
+    fn ephemeral() -> Self {
         Self { kind: "ephemeral" }
     }
 }
 
 #[derive(Serialize, Debug, Clone)]
-pub struct ToolDescriptor {
-    pub name: String,
-    pub description: String,
-    pub input_schema: Value,
+struct AnthropicTool {
+    name: String,
+    description: String,
+    input_schema: Value,
 }
 
 #[derive(Deserialize, Debug)]
-pub struct MessageResponse {
-    pub id: String,
-    pub role: String,
-    pub content: Vec<ContentBlock>,
-    pub model: String,
-    pub stop_reason: Option<String>,
-    pub stop_sequence: Option<String>,
-    pub usage: Usage,
+struct MessageResponse {
+    #[allow(dead_code)]
+    id: String,
+    #[allow(dead_code)]
+    role: String,
+    content: Vec<ContentBlock>,
+    #[allow(dead_code)]
+    model: String,
+    stop_reason: Option<String>,
+    #[allow(dead_code)]
+    stop_sequence: Option<String>,
+    usage: AnthropicUsage,
 }
 
 #[derive(Deserialize, Debug, Clone, Copy, Default)]
-pub struct Usage {
-    pub input_tokens: u32,
-    pub output_tokens: u32,
+struct AnthropicUsage {
+    input_tokens: u32,
+    output_tokens: u32,
     #[serde(default)]
-    pub cache_creation_input_tokens: u32,
+    cache_creation_input_tokens: u32,
     #[serde(default)]
-    pub cache_read_input_tokens: u32,
+    cache_read_input_tokens: u32,
+}
+
+#[derive(Deserialize, Debug)]
+struct ListModelsResponse {
+    data: Vec<AnthropicModelInfo>,
+}
+
+#[derive(Deserialize, Debug)]
+struct AnthropicModelInfo {
+    id: String,
+    display_name: String,
 }

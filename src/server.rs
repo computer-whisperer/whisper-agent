@@ -36,6 +36,7 @@ use whisper_agent_protocol::{ServerToClient, TaskConfig, decode_from_client, enc
 
 use crate::anthropic::AnthropicClient;
 use crate::audit::AuditLog;
+use crate::model::ModelProvider;
 use crate::persist::Persister;
 use crate::scheduler::{ConnId, Scheduler, SchedulerMsg};
 
@@ -83,11 +84,12 @@ pub async fn serve(listen: SocketAddr, config: ServerConfig) -> anyhow::Result<(
         .with_context(|| format!("open audit log {}", config.audit_log_path.display()))?;
     info!(audit_log = %audit.path().display(), "audit log open");
 
-    let anthropic = Arc::new(AnthropicClient::new(config.anthropic_api_key));
+    let model: Arc<dyn ModelProvider> =
+        Arc::new(AnthropicClient::new(config.anthropic_api_key));
     let mut scheduler = Scheduler::new(
         config.default_task_config,
         config.host_id,
-        anthropic,
+        model,
         audit,
     );
 

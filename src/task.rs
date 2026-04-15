@@ -26,8 +26,8 @@ use whisper_agent_protocol::{
     TaskStateLabel, TaskSummary, ToolResultContent, Usage,
 };
 
-use crate::anthropic::{MessageResponse, Usage as AnthropicUsage};
 use crate::mcp::{CallToolResult, ToolAnnotations};
+use crate::model::ModelResponse;
 
 pub type OpId = u64;
 
@@ -177,7 +177,7 @@ pub enum IoResult {
     McpConnect(Result<(), String>),
     ListToolsSuccess { tools: Vec<crate::mcp::ToolDescriptor> },
     ListTools(Result<(), String>),
-    ModelCall(Result<MessageResponse, String>),
+    ModelCall(Result<ModelResponse, String>),
     ToolCall {
         tool_use_id: String,
         result: Result<CallToolResult, String>,
@@ -550,12 +550,16 @@ impl Task {
 
     fn integrate_model_response(
         &mut self,
-        response: MessageResponse,
+        response: ModelResponse,
         tool_annotations: &HashMap<String, ToolAnnotations>,
         events: &mut Vec<TaskEvent>,
     ) {
-        self.total_usage.add(&convert_usage(&response.usage));
-        let assistant_blocks = response.content;
+        let ModelResponse {
+            content: assistant_blocks,
+            stop_reason,
+            usage,
+        } = response;
+        self.total_usage.add(&usage);
         for block in &assistant_blocks {
             if let ContentBlock::Text { text } = block {
                 events.push(TaskEvent::AssistantText { text: text.clone() });
@@ -573,8 +577,8 @@ impl Task {
             })
             .collect();
         events.push(TaskEvent::AssistantEnd {
-            stop_reason: response.stop_reason.clone(),
-            usage: convert_usage(&response.usage),
+            stop_reason,
+            usage,
         });
         self.conversation.push(Message::assistant_blocks(assistant_blocks));
 
@@ -925,15 +929,6 @@ pub fn new_task_id() -> String {
 fn next_id(counter: &mut OpId) -> OpId {
     *counter += 1;
     *counter
-}
-
-fn convert_usage(u: &AnthropicUsage) -> Usage {
-    Usage {
-        input_tokens: u.input_tokens,
-        output_tokens: u.output_tokens,
-        cache_read_input_tokens: u.cache_read_input_tokens,
-        cache_creation_input_tokens: u.cache_creation_input_tokens,
-    }
 }
 
 fn join_mcp_text(blocks: &[crate::mcp::McpContentBlock]) -> String {

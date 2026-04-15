@@ -1,35 +1,27 @@
 //! Pure turn-running logic.
 //!
-//! Appends a user message to the conversation, then drives the Anthropic model →
-//! MCP tool → `tool_result` cycle until the assistant emits a non-tool stop reason or
-//! `max_turns` is hit. Emits [`TurnEvent`]s via an optional sink so callers can stream
-//! them to UIs or logs without this module needing to know about the wire protocol.
+//! Appends a user message to the conversation, then drives the model → MCP tool →
+//! `tool_result` cycle until the assistant emits a non-tool stop reason or `max_turns`
+//! is hit. Emits [`TurnEvent`]s via an optional sink so callers can stream them to
+//! UIs or logs without this module needing to know about the wire protocol.
 //!
-//! Used by the task-manager-driven runner for live sessions and by the CLI one-shot path.
+//! Used only by the CLI one-shot path now that the scheduler is authoritative.
 
 use anyhow::{Context, Result};
 use futures::StreamExt;
 use tokio::sync::mpsc::UnboundedSender;
 use tracing::{info, warn};
-use whisper_agent_protocol::{ContentBlock, Conversation, Message, ToolResultContent, Usage as WireUsage};
+use whisper_agent_protocol::{ContentBlock, Conversation, Message, ToolResultContent, Usage};
 
-use crate::anthropic::{
-    AnthropicClient, CreateMessageRequest, MessageResponse, SystemBlock, ToolDescriptor as AnthropicTool,
-    Usage,
-};
 use crate::audit::{AuditLog, ToolCallEntry, ToolCallOutcome};
 use crate::mcp::{McpSession, ToolDescriptor as McpTool, ToolEvent};
+use crate::model::{ModelProvider, ModelRequest, ToolSpec};
 
-/// Per-turn events emitted during the loop. Translated by callers into wire-protocol
-/// events (`ServerToClient::TaskAssistant*`, etc.) — see `task_manager.rs`.
+/// Per-turn events emitted during the loop.
 #[derive(Debug, Clone)]
 pub enum TurnEvent {
-    AssistantBegin {
-        turn: u32,
-    },
-    AssistantText {
-        text: String,
-    },
+    AssistantBegin { turn: u32 },
+    AssistantText { text: String },
     ToolCallBegin {
         tool_use_id: String,
         name: String,
@@ -42,7 +34,7 @@ pub enum TurnEvent {
     },
     AssistantEnd {
         stop_reason: Option<String>,
-        usage: WireUsage,
+        usage: Usage,
     },
     LoopComplete,
 }
@@ -65,7 +57,7 @@ pub struct TurnOutcome {
 /// Append `new_user_message` to the conversation and iterate the model/tool loop.
 pub async fn run(
     cfg: &TurnConfig<'_>,
-    anthropic: &AnthropicClient,
+    model: &dyn ModelProvider,
     mcp: &McpSession,
     audit: &AuditLog,
     conversation: &mut Conversation,
@@ -81,10 +73,8 @@ pub async fn run(
     conversation.push(Message::user_text(new_user_message));
 
     let mcp_tools = mcp.list_tools().await.context("mcp list_tools failed")?;
-    let anthropic_tools: Vec<AnthropicTool> = mcp_tools.iter().map(mcp_to_anthropic_tool).collect();
-    info!(count = anthropic_tools.len(), "advertising tools to model");
-
-    let system = vec![SystemBlock::cached(cfg.system_prompt.to_string())];
+    let tools: Vec<ToolSpec> = mcp_tools.iter().map(mcp_to_tool_spec).collect();
+    info!(count = tools.len(), "advertising tools to model");
 
     let mut turns = 0u32;
     let mut total = Usage::default();
@@ -99,18 +89,18 @@ pub async fn run(
         turns += 1;
         emit(TurnEvent::AssistantBegin { turn: turns });
 
-        let req = CreateMessageRequest {
+        let req = ModelRequest {
             model: cfg.model,
             max_tokens: cfg.max_tokens,
-            system: system.clone(),
-            tools: anthropic_tools.clone(),
+            system_prompt: cfg.system_prompt,
+            tools: &tools,
             messages: conversation.messages(),
         };
-        let response: MessageResponse = anthropic
+        let response = model
             .create_message(&req)
             .await
-            .context("anthropic create_message failed")?;
-        accumulate(&mut total, &response.usage);
+            .map_err(|e| anyhow::anyhow!("model create_message failed: {e}"))?;
+        total.add(&response.usage);
         last_stop_reason = response.stop_reason.clone();
         info!(
             turn = turns,
@@ -142,7 +132,7 @@ pub async fn run(
 
         emit(TurnEvent::AssistantEnd {
             stop_reason: response.stop_reason.clone(),
-            usage: convert_usage(&response.usage),
+            usage: response.usage,
         });
 
         conversation.push(Message::assistant_blocks(assistant_blocks));
@@ -225,8 +215,8 @@ async fn invoke_and_collect(
     last.ok_or_else(|| crate::mcp::McpError::Malformed("no Completed event in stream".into()))
 }
 
-fn mcp_to_anthropic_tool(t: &McpTool) -> AnthropicTool {
-    AnthropicTool {
+fn mcp_to_tool_spec(t: &McpTool) -> ToolSpec {
+    ToolSpec {
         name: t.name.clone(),
         description: t.description.clone(),
         input_schema: t.input_schema.clone(),
@@ -243,26 +233,10 @@ fn join_text(blocks: &[crate::mcp::McpContentBlock]) -> String {
     out
 }
 
-fn accumulate(total: &mut Usage, delta: &Usage) {
-    total.input_tokens += delta.input_tokens;
-    total.output_tokens += delta.output_tokens;
-    total.cache_creation_input_tokens += delta.cache_creation_input_tokens;
-    total.cache_read_input_tokens += delta.cache_read_input_tokens;
-}
-
-fn convert_usage(u: &Usage) -> WireUsage {
-    WireUsage {
-        input_tokens: u.input_tokens,
-        output_tokens: u.output_tokens,
-        cache_read_input_tokens: u.cache_read_input_tokens,
-        cache_creation_input_tokens: u.cache_creation_input_tokens,
-    }
-}
-
 fn truncate(mut s: String, max: usize) -> String {
     if s.len() > max {
         s.truncate(max);
-        s.push_str("…");
+        s.push('…');
     }
     s
 }

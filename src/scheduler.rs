@@ -32,11 +32,9 @@ use whisper_agent_protocol::{
     ClientToServer, ServerToClient, TaskConfig, TaskConfigOverride, TaskStateLabel,
 };
 
-use crate::anthropic::{
-    AnthropicClient, CreateMessageRequest, SystemBlock, ToolDescriptor as AnthropicTool,
-};
 use crate::audit::{AuditLog, ToolCallEntry, ToolCallOutcome};
 use crate::mcp::{McpSession, ToolAnnotations, ToolDescriptor as McpTool};
+use crate::model::{ModelProvider, ModelRequest, ToolSpec};
 use crate::persist::Persister;
 use crate::task::{
     ApprovalDisposition, IoRequest, IoResult, OpId, StepOutcome, Task, TaskEvent, TaskInternalState,
@@ -68,7 +66,7 @@ type IoFuture = Pin<Box<dyn Future<Output = IoCompletion> + Send>>;
 pub struct Scheduler {
     default_config: TaskConfig,
     host_id: String,
-    anthropic: Arc<AnthropicClient>,
+    model: Arc<dyn ModelProvider>,
     audit: AuditLog,
     persister: Option<Persister>,
 
@@ -93,13 +91,13 @@ impl Scheduler {
     pub fn new(
         default_config: TaskConfig,
         host_id: String,
-        anthropic: Arc<AnthropicClient>,
+        model: Arc<dyn ModelProvider>,
         audit: AuditLog,
     ) -> Self {
         Self {
             default_config,
             host_id,
-            anthropic,
+            model,
             audit,
             persister: None,
             tasks: HashMap::new(),
@@ -492,17 +490,17 @@ impl Scheduler {
             }
             IoRequest::ModelCall { op_id } => {
                 let (owned_req, model_name) = self.build_model_request(&task_id);
-                let anthropic = self.anthropic.clone();
+                let model = self.model.clone();
                 Box::pin(async move {
                     debug!(%task_id, op_id, model = %model_name, "dispatching model call");
-                    let req = CreateMessageRequest {
+                    let req = ModelRequest {
                         model: &owned_req.model,
                         max_tokens: owned_req.max_tokens,
-                        system: owned_req.system.clone(),
-                        tools: owned_req.tools.clone(),
+                        system_prompt: &owned_req.system_prompt,
+                        tools: &owned_req.tools,
                         messages: &owned_req.messages,
                     };
-                    match anthropic.create_message(&req).await {
+                    match model.create_message(&req).await {
                         Ok(resp) => IoCompletion {
                             task_id,
                             op_id,
@@ -550,12 +548,11 @@ impl Scheduler {
 
     fn build_model_request(&self, task_id: &str) -> (OwnedModelRequest, String) {
         let task = self.tasks.get(task_id).expect("task exists");
-        let tools: Vec<AnthropicTool> = self
+        let tools: Vec<ToolSpec> = self
             .tool_descriptors
             .get(task_id)
-            .map(|tools| tools.iter().map(mcp_tool_to_anthropic).collect())
+            .map(|tools| tools.iter().map(mcp_tool_to_spec).collect())
             .unwrap_or_default();
-        let system = vec![SystemBlock::cached(task.config.system_prompt.clone())];
         let messages = task.conversation.messages().to_vec();
         let model = task.config.model.clone();
         let max_tokens = task.config.max_tokens;
@@ -563,7 +560,7 @@ impl Scheduler {
             OwnedModelRequest {
                 model: model.clone(),
                 max_tokens,
-                system,
+                system_prompt: task.config.system_prompt.clone(),
                 tools,
                 messages,
             },
@@ -779,8 +776,8 @@ impl Scheduler {
 struct OwnedModelRequest {
     model: String,
     max_tokens: u32,
-    system: Vec<SystemBlock>,
-    tools: Vec<AnthropicTool>,
+    system_prompt: String,
+    tools: Vec<ToolSpec>,
     messages: Vec<whisper_agent_protocol::Message>,
 }
 
@@ -818,8 +815,8 @@ fn truncate(mut s: String, max: usize) -> String {
     s
 }
 
-fn mcp_tool_to_anthropic(t: &McpTool) -> AnthropicTool {
-    AnthropicTool {
+fn mcp_tool_to_spec(t: &McpTool) -> ToolSpec {
+    ToolSpec {
         name: t.name.clone(),
         description: t.description.clone(),
         input_schema: t.input_schema.clone(),
