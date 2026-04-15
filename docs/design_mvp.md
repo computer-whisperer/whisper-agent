@@ -2,6 +2,10 @@
 
 The smallest implementation that exercises whisper-agent's load-bearing architecture end-to-end. Not production. Designed to be ripped out and rewritten as we learn what the shape actually wants to be.
 
+> **Status**: delivered. All six steps in the Sequencing section below landed, ending at commit `319bbe2`. The two-process architecture, the three-crate layout, the MCP streamable-HTTP tool boundary, the Anthropic-shaped canonical conversation state, and the auto-approve + audit-log permission stub are all still the currently-running system.
+>
+> **Superseded**: the MVP's one-conversation-per-WebSocket session model has been replaced by explicit tasks driven by a central scheduler. See [`design_task_scheduler.md`](design_task_scheduler.md) for the new shape — tasks-as-data, multiplexed WebSocket protocol, client/task decoupling. The "Wire protocols" section below has been retained only as a historical note; the UI↔server shape described there is no longer current.
+
 ## What the MVP proves
 
 - The headless-loop separation (`docs/design_headless_loop.md`) works in practice — loop runtime in one process, host actions in another, no shortcuts.
@@ -137,10 +141,7 @@ For MVP: hard-coded Anthropic adapter only. Provider serializers become per-prov
 
 ## Wire protocols
 
-**UI ↔ server**: WebSocket + CBOR. Mirror of whisper-tensor's pattern. Event sketch:
-
-- Client→server: `UserMessage(text)`, `Cancel`, `ApproveElicitation(...)` (later).
-- Server→client: `MessageBegin`, `TextDelta(chunk)`, `ToolCallBegin(name, args_preview)`, `ToolEvent(...)`, `ToolCallComplete(result_preview)`, `MessageEnd`, `ElicitationPrompt(...)` (later), `Status(...)`.
+**UI ↔ server**: **Superseded** — see [`design_task_scheduler.md`](design_task_scheduler.md) for the current (task-multiplexed) shape. The MVP's one-conversation-per-connection enum is being replaced.
 
 **Server ↔ Anthropic API**: standard `https://api.anthropic.com/v1/messages`, SSE streaming response.
 
@@ -167,11 +168,13 @@ Success criterion: same end-state as the claude-code capture (`docs/research/cap
 
 ## Known shortcuts (will be replaced)
 
-- One MCP host, hard-coded by URL in a config file.
+Still current as of the delivered MVP:
+
+- One MCP host, hard-coded by URL in a config file. *(Multi-host routing is on the roadmap — see `design_task_scheduler.md` "Not in scope".)*
 - One provider, hard-coded in code.
-- `bash` returns final stdout/stderr only — no live progress streaming for MVP. The streaming infrastructure exists in the trait; the bash tool just doesn't emit `OutputChunk` events yet.
+- `bash` returns final stdout/stderr only — no live progress streaming yet.
 - Loopback HTTP, no auth, no TLS between webui/server/mcp-host.
-- In-memory conversation state; JSON dump on shutdown for inspection only.
+- In-memory conversation state. *(Per-task JSON persistence comes with the scheduler work.)*
 - No request retry / backoff (will hit rate limits in long sessions).
 - No prompt-cache breakpoints — let Anthropic auto-cache or pay full input tokens; optimize later.
 

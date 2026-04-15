@@ -2,6 +2,8 @@
 
 Whisper-agent's organizing principle: **the agent loop runs on a central server, separate from the hosts it acts on.** Every operation that touches the outside world — a filesystem, a process, a service — happens through a remote tool boundary, not directly inside the loop process.
 
+Companion docs: [`design_task_scheduler.md`](design_task_scheduler.md) describes the internal structure of the loop runtime (tasks-as-data + central scheduler); [`design_permissions.md`](design_permissions.md) covers the three patterns at the tool boundary.
+
 ## Why this separation
 
 A modern agentic CLI (Claude Code, Codex, Gemini) colocates the LLM client, the conversation harness, and host access into one process running on the user's machine. That works for the "human at a terminal" use case those tools target, but doesn't extend cleanly to:
@@ -18,11 +20,12 @@ Moving the loop to a server and putting the host-access boundary at the network 
 ```
 ┌──────────────────────────────────────────────────────────────────┐
 │  Loop runtime (server)                                           │
-│  - Conversation state, message history, scratchpad/memory       │
-│  - Provider abstraction (Anthropic, OpenAI, Gemini, w-t)        │
+│  - Tasks-as-data + central scheduler (design_task_scheduler.md)  │
+│  - Per-task conversation state, scratchpad/memory                │
+│  - Provider client (Anthropic; OpenAI/Gemini/w-t come later)     │
 │  - Context assembly, prompt-cache breakpoint placement           │
 │  - System-reminder injection, compaction, sub-agent spawning     │
-│  - Tool dispatch (internal trait — see below)                    │
+│  - Tool dispatch via direct MCP client (see "Commitment to MCP") │
 │  - Trigger sources: human chat, cron, webhooks, events           │
 └────────────────────────────┬─────────────────────────────────────┘
                              │ tool calls / tool results
@@ -53,28 +56,20 @@ These concerns don't fit a tool-call request/response shape and must live in the
 - **Sub-agent spawning**: full agent loops with their own context windows and tool sets, not single LLM completions.
 - **Conversation-level state**: history, scratchpad, working memory. The loop owns its internals; the boundary is for outside-world access only.
 
-## The design discipline that keeps options open
+## Commitment to MCP (for now)
 
-We're starting with MCP at the tool boundary because the standard exists, the ecosystem is real (Claude Code, Codex both use it heavily — see `docs/research/captures/`), and most of the tool surface we care about fits its shape cleanly enough.
+We deliberately bound the loop directly to our own MCP client rather than introduce an internal trait abstraction that MCP is one implementation of. The reason: we don't yet know what shape a "tool transport" abstraction should actually take, and guessing from first principles leads to bad abstractions. We learn that shape by seeing where MCP specifically pinches.
 
-But MCP has known gaps (see `docs/research/tool_protocols.md`):
+So: the loop's tool-call sites reference MCP types directly. When any of the gaps below becomes load-bearing, we introduce the abstraction at that point with real requirements, not hypothetical ones. **Plan for this binding to be ripped out and rebuilt.**
 
-- Grammar-constrained tool inputs (Codex's `apply_patch`) don't fit JSON Schema.
+Known MCP gaps we'll need to revisit (see [`research/tool_protocols.md`](research/tool_protocols.md)):
+
+- Grammar-constrained tool inputs (like Codex's `apply_patch`) don't fit JSON Schema — flattening them to strings loses the grammar constraint the model was RL-trained against.
 - Streaming / partial tool output is second-class (`notifications/progress` exists but is primitive).
 - Sub-agent spawning maps to MCP `sampling`, but not as a full agent loop.
 - Permission elicitation, cost accounting, and per-call observability aren't first-class.
 
-We should not paint ourselves into a corner.
-
-**Discipline**: the loop's tool dispatch is an internal Rust trait. MCP is *one implementation* of that trait. The trait must accommodate:
-
-- Synchronous request/response tools (trivial MCP case).
-- Streaming tools (`tail -f`, long-running builds with live output).
-- Grammar-constrained tools (parity with how the model was RL-trained).
-- Tools that require harness cooperation (elicitation, sampling for sub-agents).
-- Native in-process tools — bypass the network boundary entirely when the abstraction doesn't fit.
-
-When MCP serves cleanly, use MCP. When it doesn't, the trait still works — drop to a different transport or a direct implementation. The loop's view stays uniform.
+When we hit any of these with a real need, we'll either extend MCP, introduce a complementary transport for the specific case, or build the trait we postponed — with the concrete requirements in hand.
 
 ## The host tool server
 
@@ -98,6 +93,5 @@ Sandboxing primitives — capabilities, mount namespaces, seccomp filters — li
 
 ## What this design is NOT
 
-- **Not a commitment to MCP forever.** MCP is a reasonable first step. If it stops fitting, we change. The internal trait absorbs the swap.
-- **Not lowest-common-denominator.** The trait is expressive enough to cover what the most capable provider-and-tool combinations support, even if our default MCP transport can't reach all of it.
+- **Not a commitment to MCP forever.** MCP is the first-cut transport. If it stops fitting, we change — with concrete requirements learned from where it pinched, not speculatively.
 - **Not finalized.** This is a starting frame, not a spec. Expect it to evolve as prototypes hit reality.
