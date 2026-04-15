@@ -21,6 +21,7 @@ pub fn descriptors() -> Vec<Tool> {
     vec![
         read_file_descriptor(),
         write_file_descriptor(),
+        edit_file_descriptor(),
         bash_descriptor(),
         list_dir_descriptor(),
         glob_descriptor(),
@@ -32,6 +33,7 @@ pub async fn call(workspace: &Arc<Workspace>, name: &str, args: Value) -> Result
     match name {
         "read_file" => Ok(read_file(workspace, args).await),
         "write_file" => Ok(write_file(workspace, args).await),
+        "edit_file" => Ok(edit_file(workspace, args).await),
         "bash" => Ok(bash(workspace, args).await),
         "list_dir" => Ok(list_dir(workspace, args).await),
         "glob" => Ok(glob(workspace, args).await),
@@ -51,13 +53,25 @@ pub enum ToolDispatchError {
 fn read_file_descriptor() -> Tool {
     Tool {
         name: "read_file".into(),
-        description: "Read the contents of a UTF-8 text file within the workspace.".into(),
+        description: "Read the contents of a UTF-8 text file within the workspace. With no line \
+                      options, returns the whole file. Use `offset`/`limit` to target a line \
+                      range when working with large files — cheaper than loading everything just \
+                      to edit a few lines."
+            .into(),
         input_schema: json!({
             "type": "object",
             "properties": {
                 "path": {
                     "type": "string",
                     "description": "Path relative to the workspace root."
+                },
+                "offset": {
+                    "type": "integer",
+                    "description": "1-indexed line to start from. Default 1."
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "Maximum number of lines to return. Default: no limit."
                 }
             },
             "required": ["path"]
@@ -75,6 +89,10 @@ fn read_file_descriptor() -> Tool {
 #[derive(Deserialize)]
 struct ReadFileArgs {
     path: PathBuf,
+    #[serde(default)]
+    offset: Option<u32>,
+    #[serde(default)]
+    limit: Option<u32>,
 }
 
 async fn read_file(workspace: &Arc<Workspace>, args: Value) -> CallToolResult {
@@ -86,10 +104,46 @@ async fn read_file(workspace: &Arc<Workspace>, args: Value) -> CallToolResult {
         Ok(p) => p,
         Err(e) => return CallToolResult::error_text(e.to_string()),
     };
-    match tokio::fs::read_to_string(&path).await {
-        Ok(content) => CallToolResult::text(content),
-        Err(e) => CallToolResult::error_text(format!("read_file({}): {e}", parsed.path.display())),
+    // Whole-file fast path when no line slicing is requested.
+    if parsed.offset.is_none() && parsed.limit.is_none() {
+        return match tokio::fs::read_to_string(&path).await {
+            Ok(content) => CallToolResult::text(content),
+            Err(e) => CallToolResult::error_text(format!(
+                "read_file({}): {e}",
+                parsed.path.display()
+            )),
+        };
     }
+    // Line-sliced read — stream so we don't load a huge file just to keep a few lines.
+    let content = match tokio::fs::read_to_string(&path).await {
+        Ok(s) => s,
+        Err(e) => {
+            return CallToolResult::error_text(format!(
+                "read_file({}): {e}",
+                parsed.path.display()
+            ));
+        }
+    };
+    let offset = parsed.offset.unwrap_or(1).max(1) as usize;
+    let limit = parsed.limit.map(|n| n as usize).unwrap_or(usize::MAX);
+    let lines: Vec<&str> = content.lines().collect();
+    let total = lines.len();
+    let start = (offset - 1).min(total);
+    let end = start.saturating_add(limit).min(total);
+    let slice = lines[start..end].join("\n");
+    // Preserve the trailing newline if the whole file has one — avoids surprising
+    // models with asymmetric read/write behavior.
+    let mut out = slice;
+    if end == total && content.ends_with('\n') {
+        out.push('\n');
+    }
+    if end < total {
+        let last = end;
+        out.push_str(&format!(
+            "\n[showing lines {offset}-{last} of {total}; pass offset/limit to see more]\n"
+        ));
+    }
+    CallToolResult::text(out)
 }
 
 // ---------- write_file ----------
@@ -138,6 +192,116 @@ async fn write_file(workspace: &Arc<Workspace>, args: Value) -> CallToolResult {
     match tokio::fs::write(&path, parsed.content.as_bytes()).await {
         Ok(()) => CallToolResult::text(format!("wrote {} bytes to {}", parsed.content.len(), parsed.path.display())),
         Err(e) => CallToolResult::error_text(format!("write_file({}): {e}", parsed.path.display())),
+    }
+}
+
+// ---------- edit_file ----------
+
+fn edit_file_descriptor() -> Tool {
+    Tool {
+        name: "edit_file".into(),
+        description: "Surgically replace occurrences of `old_string` with `new_string` in a \
+                      file. By default requires exactly one match — pass `expect_count` to apply \
+                      to multiple identical occurrences. Fails if the match count doesn't agree, \
+                      so you never silently half-edit a file. Prefer this over `write_file` for \
+                      targeted changes — much cheaper than rewriting the whole file."
+            .into(),
+        input_schema: json!({
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "Path relative to the workspace root."
+                },
+                "old_string": {
+                    "type": "string",
+                    "description": "Exact substring to find. Must match literally — no regex."
+                },
+                "new_string": {
+                    "type": "string",
+                    "description": "Replacement. May be empty to delete the matched span."
+                },
+                "expect_count": {
+                    "type": "integer",
+                    "description": "Require exactly this many matches. If omitted, the default is 1."
+                }
+            },
+            "required": ["path", "old_string", "new_string"]
+        }),
+        annotations: Some(ToolAnnotations {
+            title: Some("Edit file".into()),
+            read_only_hint: Some(false),
+            destructive_hint: Some(true),
+            // Not idempotent — rerunning after success would find zero matches and error.
+            idempotent_hint: Some(false),
+            open_world_hint: Some(false),
+        }),
+    }
+}
+
+#[derive(Deserialize)]
+struct EditFileArgs {
+    path: PathBuf,
+    old_string: String,
+    new_string: String,
+    #[serde(default)]
+    expect_count: Option<u32>,
+}
+
+async fn edit_file(workspace: &Arc<Workspace>, args: Value) -> CallToolResult {
+    let parsed: EditFileArgs = match serde_json::from_value(args) {
+        Ok(v) => v,
+        Err(e) => return CallToolResult::error_text(format!("invalid arguments: {e}")),
+    };
+    if parsed.old_string.is_empty() {
+        return CallToolResult::error_text(
+            "edit_file: old_string must be non-empty (use write_file to create new files)",
+        );
+    }
+    if parsed.old_string == parsed.new_string {
+        return CallToolResult::error_text(
+            "edit_file: old_string and new_string are identical — no-op",
+        );
+    }
+    let path = match workspace.resolve(&parsed.path) {
+        Ok(p) => p,
+        Err(e) => return CallToolResult::error_text(e.to_string()),
+    };
+    let content = match tokio::fs::read_to_string(&path).await {
+        Ok(s) => s,
+        Err(e) => {
+            return CallToolResult::error_text(format!(
+                "edit_file({}): {e}",
+                parsed.path.display()
+            ));
+        }
+    };
+    let found = content.matches(&parsed.old_string).count();
+    let expected = parsed.expect_count.unwrap_or(1) as usize;
+    if found == 0 {
+        return CallToolResult::error_text(format!(
+            "edit_file({}): old_string not found",
+            parsed.path.display()
+        ));
+    }
+    if found != expected {
+        return CallToolResult::error_text(format!(
+            "edit_file({}): old_string matches {found} times, expected {expected}. \
+             Pass `expect_count: {found}` if you intend to replace all, or make old_string \
+             more specific.",
+            parsed.path.display()
+        ));
+    }
+    let new_content = content.replace(&parsed.old_string, &parsed.new_string);
+    match tokio::fs::write(&path, new_content.as_bytes()).await {
+        Ok(()) => CallToolResult::text(format!(
+            "edit_file({}): replaced {found} occurrence{}",
+            parsed.path.display(),
+            if found == 1 { "" } else { "s" }
+        )),
+        Err(e) => {
+            CallToolResult::error_text(format!("edit_file({}): {e}", parsed.path.display()))
+        }
     }
 }
 
