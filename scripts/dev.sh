@@ -95,6 +95,7 @@ echo "==> starting whisper-agent on $LISTEN_SERVER"
 echo "    open http://$LISTEN_SERVER/ in a browser"
 "$REPO_ROOT/target/release/whisper-agent" serve \
     --listen "$LISTEN_SERVER" \
+    --config "$REPO_ROOT/whisper-agent.toml" \
     --mcp-host-url "http://$LISTEN_MCP/mcp" \
     --audit-log "$SANDBOX/audit.jsonl" \
     --state-dir "$SANDBOX/tasks"

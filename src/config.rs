@@ -53,6 +53,9 @@ pub enum BackendConfig {
         api_key_env: Option<String>,
         default_model: String,
     },
+    // serde's snake_case would default this to "open_ai_chat" — override so
+    // the config file uses the tighter form.
+    #[serde(rename = "openai_chat")]
     OpenAiChat {
         base_url: String,
         #[serde(default)]
