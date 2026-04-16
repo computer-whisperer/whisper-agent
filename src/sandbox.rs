@@ -35,7 +35,7 @@ pub trait SandboxProvider: Send + Sync {
     /// for the task's duration — dropping it may tear down resources.
     fn provision<'a>(
         &'a self,
-        task_id: &'a str,
+        thread_id: &'a str,
         spec: &'a SandboxSpec,
     ) -> BoxFuture<'a, Result<Box<dyn SandboxHandle>, SandboxError>>;
 }
@@ -111,7 +111,7 @@ impl DaemonClient {
 impl SandboxProvider for DaemonClient {
     fn provision<'a>(
         &'a self,
-        task_id: &'a str,
+        thread_id: &'a str,
         spec: &'a SandboxSpec,
     ) -> BoxFuture<'a, Result<Box<dyn SandboxHandle>, SandboxError>> {
         Box::pin(async move {
@@ -119,9 +119,9 @@ impl SandboxProvider for DaemonClient {
                 return Ok(Box::new(BareMetalHandle) as Box<dyn SandboxHandle>);
             }
 
-            info!(task_id, "requesting sandbox from daemon");
+            info!(thread_id, "requesting sandbox from daemon");
             let req = ProvisionRequest {
-                task_id: task_id.to_string(),
+                thread_id: thread_id.to_string(),
                 spec: spec.clone(),
             };
             let url = format!("{}/provision", self.daemon_url);
@@ -147,7 +147,7 @@ impl SandboxProvider for DaemonClient {
                 .map_err(|e| SandboxError::Provision(format!("bad response: {e}")))?;
 
             info!(
-                task_id,
+                thread_id,
                 session_id = %prov.session_id,
                 mcp_url = %prov.mcp_url,
                 "sandbox provisioned"

@@ -27,8 +27,8 @@ use futures::stream::FuturesUnordered;
 use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 use whisper_agent_protocol::{
-    BackendSummary, ClientToServer, ModelSummary, ServerToClient, TaskConfig, TaskConfigOverride,
-    TaskStateLabel,
+    BackendSummary, ClientToServer, ModelSummary, ServerToClient, ThreadConfig, ThreadConfigOverride,
+    ThreadStateLabel,
 };
 
 use crate::audit::AuditLog;
@@ -48,7 +48,7 @@ pub type ConnId = u64;
 
 /// Messages accepted by the scheduler inbox.
 // `ClientMessage` carries a `ClientToServer` (the protocol's largest variant
-// is `CreateTask`, ~300 bytes). The other variants are tens of bytes. Boxing
+// is `CreateThread`, ~300 bytes). The other variants are tens of bytes. Boxing
 // would touch every send-site for a per-message saving that's a rounding
 // error against typical payloads. See `whisper-agent-protocol::ClientToServer`.
 #[allow(clippy::large_enum_variant)]
@@ -79,10 +79,10 @@ pub struct BackendEntry {
 
 /// Entry in the scheduler's shared-MCP-host catalog. Configured at server
 /// start; one connection per host shared across all tasks that opt in via
-/// `TaskConfig.shared_mcp_hosts`.
+/// `ThreadConfig.shared_mcp_hosts`.
 #[derive(Debug, Clone)]
 pub struct SharedHostConfig {
-    /// Stable name; what `TaskConfig.shared_mcp_hosts` references.
+    /// Stable name; what `ThreadConfig.shared_mcp_hosts` references.
     pub name: String,
     /// MCP endpoint URL (typically `http://127.0.0.1:9830/mcp`).
     pub url: String,
@@ -101,8 +101,8 @@ struct McpPool {
 }
 
 pub struct Scheduler {
-    default_config: TaskConfig,
-    /// Named backends: `TaskConfig.backend` resolves against this map.
+    default_config: ThreadConfig,
+    /// Named backends: `ThreadConfig.backend` resolves against this map.
     backends: HashMap<String, BackendEntry>,
     /// Fallback when a task doesn't specify a backend. Must be a key in `backends`.
     default_backend: String,
@@ -122,7 +122,7 @@ pub struct Scheduler {
     sandbox_handles: HashMap<String, Box<dyn SandboxHandle>>,
     /// Connections to shared (singleton) MCP hosts, keyed by name. Connected
     /// once at scheduler start. Tasks reference these by name via
-    /// `TaskConfig.shared_mcp_hosts`.
+    /// `ThreadConfig.shared_mcp_hosts`.
     shared_hosts: HashMap<String, Arc<McpSession>>,
     /// Per-task tool catalog from the last `tools/list`. Stored in MCP shape (with
     /// annotations) so the approval layer can consult `read_only_hint` /
@@ -147,7 +147,7 @@ impl Scheduler {
     /// startup — surfacing misconfiguration at server boot rather than at first
     /// task creation. Returns Err if any shared host fails to handshake.
     pub async fn new(
-        default_config: TaskConfig,
+        default_config: ThreadConfig,
         host_id: String,
         backends: HashMap<String, BackendEntry>,
         default_backend: String,
@@ -211,7 +211,7 @@ impl Scheduler {
         let Some(persister) = self.persister.clone() else {
             let _ = outbound.send(ServerToClient::Error {
                 correlation_id: None,
-                task_id: None,
+                thread_id: None,
                 message: "server has no persister configured".into(),
             });
             return None;
@@ -271,8 +271,8 @@ impl Scheduler {
 
     // ---------- Read-only accessors used by `io_dispatch` ----------
 
-    pub(crate) fn task(&self, task_id: &str) -> Option<&Thread> {
-        self.tasks.get(task_id)
+    pub(crate) fn task(&self, thread_id: &str) -> Option<&Thread> {
+        self.tasks.get(thread_id)
     }
 
     pub(crate) fn backend(&self, name: &str) -> Option<&BackendEntry> {
@@ -283,21 +283,21 @@ impl Scheduler {
         &self.sandbox_provider
     }
 
-    pub(crate) fn tool_descriptors(&self, task_id: &str) -> Option<&[McpTool]> {
-        self.tool_descriptors.get(task_id).map(|v| v.as_slice())
+    pub(crate) fn tool_descriptors(&self, thread_id: &str) -> Option<&[McpTool]> {
+        self.tool_descriptors.get(thread_id).map(|v| v.as_slice())
     }
 
     /// Snapshot of every MCP session in the task's pool, primary first. Used by
     /// `ListTools` to fan out the `tools/list` call across the pool.
-    pub(crate) fn pool_sessions(&self, task_id: &str) -> Option<Vec<Arc<McpSession>>> {
-        self.mcp_pools.get(task_id).map(|p| p.sessions.clone())
+    pub(crate) fn pool_sessions(&self, thread_id: &str) -> Option<Vec<Arc<McpSession>>> {
+        self.mcp_pools.get(thread_id).map(|p| p.sessions.clone())
     }
 
     /// Resolve which pool session a tool call should be routed to. Falls back
     /// to the primary if the routing map hasn't been filled in (defensive —
     /// `ToolCall` follows `ListToolsSuccess`, so routing should always exist).
-    pub(crate) fn route_tool(&self, task_id: &str, tool_name: &str) -> Option<Arc<McpSession>> {
-        let pool = self.mcp_pools.get(task_id)?;
+    pub(crate) fn route_tool(&self, thread_id: &str, tool_name: &str) -> Option<Arc<McpSession>> {
+        let pool = self.mcp_pools.get(thread_id)?;
         let idx = *pool.routing.get(tool_name).unwrap_or(&0);
         pool.sessions.get(idx).cloned()
     }
@@ -325,9 +325,9 @@ impl Scheduler {
         }
     }
 
-    fn mark_dirty(&mut self, task_id: &str) {
+    fn mark_dirty(&mut self, thread_id: &str) {
         if self.persister.is_some() {
-            self.dirty.insert(task_id.to_string());
+            self.dirty.insert(thread_id.to_string());
         }
     }
 
@@ -337,12 +337,12 @@ impl Scheduler {
             return;
         };
         let dirty = std::mem::take(&mut self.dirty);
-        for task_id in dirty {
-            let Some(task) = self.tasks.get(&task_id) else {
+        for thread_id in dirty {
+            let Some(task) = self.tasks.get(&thread_id) else {
                 continue;
             };
             if let Err(e) = persister.flush(task).await {
-                error!(task_id = %task_id, error = %e, "persist flush failed");
+                error!(thread_id = %thread_id, error = %e, "persist flush failed");
             }
         }
     }
@@ -370,15 +370,15 @@ impl Scheduler {
         pending_io: &mut FuturesUnordered<IoFuture>,
     ) {
         match msg {
-            ClientToServer::CreateTask {
+            ClientToServer::CreateThread {
                 correlation_id,
                 initial_message,
                 config_override,
             } => match self.create_task(conn_id, correlation_id.clone(), config_override) {
-                Ok(task_id) => {
-                    self.mark_dirty(&task_id);
-                    self.send_user_message(&task_id, initial_message);
-                    self.step_until_blocked(&task_id, pending_io);
+                Ok(thread_id) => {
+                    self.mark_dirty(&thread_id);
+                    self.send_user_message(&thread_id, initial_message);
+                    self.step_until_blocked(&thread_id, pending_io);
                 }
                 Err(e) => {
                     warn!(error = %e, conn_id, "create_task rejected");
@@ -386,35 +386,35 @@ impl Scheduler {
                         conn_id,
                         ServerToClient::Error {
                             correlation_id,
-                            task_id: None,
+                            thread_id: None,
                             message: format!("create_task: {e}"),
                         },
                     );
                 }
             },
-            ClientToServer::SendUserMessage { task_id, text } => {
-                if self.tasks.contains_key(&task_id) {
-                    self.send_user_message(&task_id, text);
-                    self.step_until_blocked(&task_id, pending_io);
+            ClientToServer::SendUserMessage { thread_id, text } => {
+                if self.tasks.contains_key(&thread_id) {
+                    self.send_user_message(&thread_id, text);
+                    self.step_until_blocked(&thread_id, pending_io);
                 } else {
                     self.router.send_to_client(
                         conn_id,
                         ServerToClient::Error {
                             correlation_id: None,
-                            task_id: Some(task_id),
+                            thread_id: Some(thread_id),
                             message: "unknown task".into(),
                         },
                     );
                 }
             }
             ClientToServer::ApprovalDecision {
-                task_id,
+                thread_id,
                 approval_id,
                 decision,
                 remember,
             } => {
                 let mut events = Vec::new();
-                let known = if let Some(task) = self.tasks.get_mut(&task_id) {
+                let known = if let Some(task) = self.tasks.get_mut(&thread_id) {
                     task.apply_approval_decision(
                         &approval_id,
                         decision,
@@ -431,29 +431,29 @@ impl Scheduler {
                         conn_id,
                         ServerToClient::Error {
                             correlation_id: None,
-                            task_id: Some(task_id),
+                            thread_id: Some(thread_id),
                             message: "unknown task".into(),
                         },
                     );
                 } else {
-                    self.mark_dirty(&task_id);
-                    self.router.dispatch_events(&task_id, events);
-                    self.teardown_sandbox_if_terminal(&task_id);
-                    self.step_until_blocked(&task_id, pending_io);
+                    self.mark_dirty(&thread_id);
+                    self.router.dispatch_events(&thread_id, events);
+                    self.teardown_sandbox_if_terminal(&thread_id);
+                    self.step_until_blocked(&thread_id, pending_io);
                 }
             }
-            ClientToServer::RemoveToolAllowlistEntry { task_id, tool_name } => {
+            ClientToServer::RemoveToolAllowlistEntry { thread_id, tool_name } => {
                 let removed = self
                     .tasks
-                    .get_mut(&task_id)
+                    .get_mut(&thread_id)
                     .map(|t| (t.remove_from_allowlist(&tool_name), t.allowlist_snapshot()));
                 match removed {
                     Some((true, snapshot)) => {
-                        self.mark_dirty(&task_id);
+                        self.mark_dirty(&thread_id);
                         self.router.broadcast_to_subscribers(
-                            &task_id,
-                            ServerToClient::TaskAllowlistUpdated {
-                                task_id: task_id.clone(),
+                            &thread_id,
+                            ServerToClient::ThreadAllowlistUpdated {
+                                thread_id: thread_id.clone(),
                                 tool_allowlist: snapshot,
                             },
                         );
@@ -463,36 +463,36 @@ impl Scheduler {
                         conn_id,
                         ServerToClient::Error {
                             correlation_id: None,
-                            task_id: Some(task_id),
+                            thread_id: Some(thread_id),
                             message: "unknown task".into(),
                         },
                     ),
                 }
             }
-            ClientToServer::CancelTask { task_id } => {
-                if let Some(task) = self.tasks.get_mut(&task_id) {
+            ClientToServer::CancelThread { thread_id } => {
+                if let Some(task) = self.tasks.get_mut(&thread_id) {
                     task.cancel();
-                    self.mark_dirty(&task_id);
+                    self.mark_dirty(&thread_id);
                     self.router
-                        .broadcast_task_list(ServerToClient::TaskStateChanged {
-                            task_id: task_id.clone(),
-                            state: TaskStateLabel::Cancelled,
+                        .broadcast_task_list(ServerToClient::ThreadStateChanged {
+                            thread_id: thread_id.clone(),
+                            state: ThreadStateLabel::Cancelled,
                         });
-                    self.teardown_sandbox_if_terminal(&task_id);
+                    self.teardown_sandbox_if_terminal(&thread_id);
                 }
             }
-            ClientToServer::ArchiveTask { task_id } => {
-                if let Some(task) = self.tasks.get_mut(&task_id) {
+            ClientToServer::ArchiveThread { thread_id } => {
+                if let Some(task) = self.tasks.get_mut(&thread_id) {
                     task.archived = true;
                     task.touch();
-                    self.mark_dirty(&task_id);
+                    self.mark_dirty(&thread_id);
                     self.router
-                        .broadcast_task_list(ServerToClient::TaskArchived { task_id });
+                        .broadcast_task_list(ServerToClient::ThreadArchived { thread_id });
                 }
             }
-            ClientToServer::SubscribeToTask { task_id } => {
-                if let Some(task) = self.tasks.get(&task_id) {
-                    self.router.subscribe(conn_id, &task_id);
+            ClientToServer::SubscribeToThread { thread_id } => {
+                if let Some(task) = self.tasks.get(&thread_id) {
+                    self.router.subscribe(conn_id, &thread_id);
                     let snapshot = task.snapshot();
                     // Rehydrate any still-pending approvals so the newly-subscribed
                     // client can render the approval UI. The snapshot itself doesn't
@@ -500,8 +500,8 @@ impl Scheduler {
                     let pending = pending_approvals_of(task);
                     self.router.send_to_client(
                         conn_id,
-                        ServerToClient::TaskSnapshot {
-                            task_id: task_id.clone(),
+                        ServerToClient::ThreadSnapshot {
+                            thread_id: thread_id.clone(),
                             snapshot,
                         },
                     );
@@ -513,16 +513,16 @@ impl Scheduler {
                         conn_id,
                         ServerToClient::Error {
                             correlation_id: None,
-                            task_id: Some(task_id),
+                            thread_id: Some(thread_id),
                             message: "unknown task".into(),
                         },
                     );
                 }
             }
-            ClientToServer::UnsubscribeFromTask { task_id } => {
-                self.router.unsubscribe(conn_id, &task_id);
+            ClientToServer::UnsubscribeFromThread { thread_id } => {
+                self.router.unsubscribe(conn_id, &thread_id);
             }
-            ClientToServer::ListTasks { correlation_id } => {
+            ClientToServer::ListThreads { correlation_id } => {
                 let tasks = self
                     .tasks
                     .values()
@@ -531,7 +531,7 @@ impl Scheduler {
                     .collect();
                 self.router.send_to_client(
                     conn_id,
-                    ServerToClient::TaskList {
+                    ServerToClient::ThreadList {
                         correlation_id,
                         tasks,
                     },
@@ -581,7 +581,7 @@ impl Scheduler {
                         Err(e) => {
                             let _ = outbound.send(ServerToClient::Error {
                                 correlation_id,
-                                task_id: None,
+                                thread_id: None,
                                 message: format!("list_pods: {e}"),
                             });
                         }
@@ -606,14 +606,14 @@ impl Scheduler {
                         Ok(None) => {
                             let _ = outbound.send(ServerToClient::Error {
                                 correlation_id,
-                                task_id: None,
+                                thread_id: None,
                                 message: format!("pod `{pod_id}` not found"),
                             });
                         }
                         Err(e) => {
                             let _ = outbound.send(ServerToClient::Error {
                                 correlation_id,
-                                task_id: None,
+                                thread_id: None,
                                 message: format!("get_pod: {e}"),
                             });
                         }
@@ -643,7 +643,7 @@ impl Scheduler {
                         Err(e) => {
                             let _ = outbound.send(ServerToClient::Error {
                                 correlation_id,
-                                task_id: None,
+                                thread_id: None,
                                 message: format!("create_pod: {e}"),
                             });
                         }
@@ -675,7 +675,7 @@ impl Scheduler {
                         Err(e) => {
                             let _ = outbound.send(ServerToClient::Error {
                                 correlation_id,
-                                task_id: None,
+                                thread_id: None,
                                 message: format!("update_pod_config: {e}"),
                             });
                         }
@@ -698,7 +698,7 @@ impl Scheduler {
                         Err(e) => {
                             let _ = outbound.send(ServerToClient::Error {
                                 correlation_id: None,
-                                task_id: None,
+                                thread_id: None,
                                 message: format!("archive_pod: {e}"),
                             });
                         }
@@ -715,7 +715,7 @@ impl Scheduler {
                         conn_id,
                         ServerToClient::Error {
                             correlation_id,
-                            task_id: None,
+                            thread_id: None,
                             message: format!("unknown backend `{backend}`"),
                         },
                     );
@@ -747,7 +747,7 @@ impl Scheduler {
                         Err(e) => {
                             let _ = outbound.send(ServerToClient::Error {
                                 correlation_id,
-                                task_id: None,
+                                thread_id: None,
                                 message: format!("list_models failed: {e}"),
                             });
                         }
@@ -761,7 +761,7 @@ impl Scheduler {
         &mut self,
         requester: ConnId,
         correlation_id: Option<String>,
-        config_override: Option<TaskConfigOverride>,
+        config_override: Option<ThreadConfigOverride>,
     ) -> Result<String, String> {
         let config = apply_override(self.default_config.clone(), config_override);
         // Validate shared MCP host names — fresh tasks must reference only
@@ -780,10 +780,10 @@ impl Scheduler {
                 ));
             }
         }
-        let task_id = new_task_id();
-        let task = Thread::new(task_id.clone(), config);
+        let thread_id = new_task_id();
+        let task = Thread::new(thread_id.clone(), config);
         let summary = task.summary();
-        self.tasks.insert(task_id.clone(), task);
+        self.tasks.insert(thread_id.clone(), task);
 
         // Phase 1a: register this task as a user of its backend and of every
         // shared MCP host it references. Counts are added once at creation;
@@ -792,25 +792,25 @@ impl Scheduler {
         // keep their bindings so follow-up messages stay routable.
         let task_ref = self
             .tasks
-            .get(&task_id)
+            .get(&thread_id)
             .expect("just-inserted task is present");
         let backend_id = BackendId::for_name(self.resolve_backend_name(task_ref));
         let shared_names = task_ref.config.shared_mcp_hosts.clone();
-        self.resources.add_backend_user(&backend_id, &task_id);
+        self.resources.add_backend_user(&backend_id, &thread_id);
         self.emit_backend_updated(&backend_id);
         for name in &shared_names {
             let host_id = McpHostId::shared(name);
-            self.resources.add_mcp_user(&host_id, &task_id);
+            self.resources.add_mcp_user(&host_id, &thread_id);
             self.emit_mcp_host_updated(&host_id);
         }
 
-        info!(task_id = %task_id, "task created");
-        // Every client gets exactly one TaskCreated; the requester's copy carries
+        info!(thread_id = %thread_id, "task created");
+        // Every client gets exactly one ThreadCreated; the requester's copy carries
         // correlation_id if they provided one.
         if correlation_id.is_some() {
             self.router.broadcast_task_list_except(
-                ServerToClient::TaskCreated {
-                    task_id: task_id.clone(),
+                ServerToClient::ThreadCreated {
+                    thread_id: thread_id.clone(),
                     summary: summary.clone(),
                     correlation_id: None,
                 },
@@ -818,28 +818,28 @@ impl Scheduler {
             );
             self.router.send_to_client(
                 requester,
-                ServerToClient::TaskCreated {
-                    task_id: task_id.clone(),
+                ServerToClient::ThreadCreated {
+                    thread_id: thread_id.clone(),
                     summary,
                     correlation_id,
                 },
             );
         } else {
             self.router
-                .broadcast_task_list(ServerToClient::TaskCreated {
-                    task_id: task_id.clone(),
+                .broadcast_task_list(ServerToClient::ThreadCreated {
+                    thread_id: thread_id.clone(),
                     summary,
                     correlation_id: None,
                 });
         }
-        Ok(task_id)
+        Ok(thread_id)
     }
 
-    fn send_user_message(&mut self, task_id: &str, text: String) {
-        self.mark_dirty(task_id);
+    fn send_user_message(&mut self, thread_id: &str, text: String) {
+        self.mark_dirty(thread_id);
         // Derive title on the first user message.
         let title_new = {
-            let task = self.tasks.get_mut(task_id).expect("task exists");
+            let task = self.tasks.get_mut(thread_id).expect("task exists");
             if task.title.is_none() {
                 let t = derive_title(&text);
                 task.title = Some(t.clone());
@@ -850,22 +850,22 @@ impl Scheduler {
         };
         if let Some(title) = title_new {
             self.router
-                .broadcast_task_list(ServerToClient::TaskTitleUpdated {
-                    task_id: task_id.to_string(),
+                .broadcast_task_list(ServerToClient::ThreadTitleUpdated {
+                    thread_id: thread_id.to_string(),
                     title,
                 });
         }
 
-        let mcp_connected = self.mcp_pools.contains_key(task_id);
-        let tools_listed = self.tool_descriptors.contains_key(task_id);
+        let mcp_connected = self.mcp_pools.contains_key(thread_id);
+        let tools_listed = self.tool_descriptors.contains_key(thread_id);
         let new_state = {
-            let task = self.tasks.get_mut(task_id).expect("task exists");
+            let task = self.tasks.get_mut(thread_id).expect("task exists");
             task.submit_user_message(text, mcp_connected, tools_listed);
             task.public_state()
         };
         self.router
-            .broadcast_task_list(ServerToClient::TaskStateChanged {
-                task_id: task_id.to_string(),
+            .broadcast_task_list(ServerToClient::ThreadStateChanged {
+                thread_id: thread_id.to_string(),
                 state: new_state,
             });
     }
@@ -873,7 +873,7 @@ impl Scheduler {
     /// Apply one I/O completion to its task and dispatch any resulting events.
     fn apply_io_completion(&mut self, completion: IoCompletion) {
         let IoCompletion {
-            task_id,
+            thread_id,
             op_id,
             result,
         } = completion;
@@ -885,19 +885,19 @@ impl Scheduler {
         // round-tripping through the UI.
         match &result {
             IoResult::McpConnect(Err(e)) => {
-                warn!(%task_id, op_id, error = %e, "mcp connect failed");
+                warn!(%thread_id, op_id, error = %e, "mcp connect failed");
             }
             IoResult::ListTools(Err(e)) => {
-                warn!(%task_id, op_id, error = %e, "list_tools failed");
+                warn!(%thread_id, op_id, error = %e, "list_tools failed");
             }
             IoResult::ModelCall(Err(e)) => {
-                warn!(%task_id, op_id, error = %e, "model call failed");
+                warn!(%thread_id, op_id, error = %e, "model call failed");
             }
             IoResult::ToolCall {
                 tool_use_id,
                 result: Err(e),
             } => {
-                warn!(%task_id, %tool_use_id, error = %e, "tool call failed");
+                warn!(%thread_id, %tool_use_id, error = %e, "tool call failed");
             }
             _ => {}
         }
@@ -916,7 +916,7 @@ impl Scheduler {
                 // task whose host was removed since save lands here.
                 let (allow, sandbox_spec) = self
                     .tasks
-                    .get(&task_id)
+                    .get(&thread_id)
                     .map(|t| (t.config.shared_mcp_hosts.clone(), t.config.sandbox.clone()))
                     .unwrap_or_default();
                 let mut sessions = vec![session.clone()];
@@ -924,7 +924,7 @@ impl Scheduler {
                     match self.shared_hosts.get(name) {
                         Some(s) => sessions.push(s.clone()),
                         None => warn!(
-                            %task_id, host = %name,
+                            %thread_id, host = %name,
                             "task references unknown shared MCP host (skipping)",
                         ),
                     }
@@ -937,35 +937,35 @@ impl Scheduler {
                     .and_then(|h| h.mcp_url().map(str::to_string))
                     .unwrap_or_else(|| {
                         self.tasks
-                            .get(&task_id)
+                            .get(&thread_id)
                             .map(|t| t.config.mcp_host_url.clone())
                             .unwrap_or_default()
                     });
                 let primary_id =
                     self.resources
-                        .insert_primary_mcp_host(&task_id, primary_url, session);
+                        .insert_primary_mcp_host(&thread_id, primary_url, session);
                 self.emit_mcp_host_created(&primary_id);
                 if sandbox_handle.is_some() {
                     let sandbox_id = self
                         .resources
-                        .insert_sandbox_for_task(&task_id, sandbox_spec);
+                        .insert_sandbox_for_task(&thread_id, sandbox_spec);
                     self.emit_sandbox_created(&sandbox_id);
                 }
 
                 self.mcp_pools.insert(
-                    task_id.clone(),
+                    thread_id.clone(),
                     McpPool {
                         sessions,
                         routing: HashMap::new(),
                     },
                 );
                 if let Some(handle) = sandbox_handle {
-                    self.sandbox_handles.insert(task_id.clone(), handle);
+                    self.sandbox_handles.insert(thread_id.clone(), handle);
                 }
                 IoResult::McpConnect(Ok(()))
             }
             IoResult::ListToolsSuccess { tools, routing } => {
-                if let Some(pool) = self.mcp_pools.get_mut(&task_id) {
+                if let Some(pool) = self.mcp_pools.get_mut(&thread_id) {
                     pool.routing = routing;
                 }
                 // Phase 1a: mirror the per-task primary's tools into the
@@ -974,7 +974,7 @@ impl Scheduler {
                 // because in Phase 1a there's no shared-host tools-list flow
                 // (shared hosts publish tools too, but that wiring lands in
                 // Phase 1b alongside the wire surface).
-                let primary_id = McpHostId::primary_for_task(&task_id);
+                let primary_id = McpHostId::primary_for_task(&thread_id);
                 let annotations: HashMap<String, ToolAnnotations> = tools
                     .iter()
                     .map(|t| (t.name.clone(), t.annotations.clone()))
@@ -982,28 +982,28 @@ impl Scheduler {
                 self.resources
                     .populate_mcp_tools(&primary_id, tools.clone(), annotations);
                 self.emit_mcp_host_updated(&primary_id);
-                self.tool_descriptors.insert(task_id.clone(), tools);
+                self.tool_descriptors.insert(thread_id.clone(), tools);
                 IoResult::ListTools(Ok(()))
             }
             other => other,
         };
 
         // Build per-tool-name annotation map so the task's approval policy can consult it.
-        let annotations = self.annotations_for(&task_id);
-        if let Some(task) = self.tasks.get_mut(&task_id) {
+        let annotations = self.annotations_for(&thread_id);
+        if let Some(task) = self.tasks.get_mut(&thread_id) {
             task.apply_io_result(op_id, result, &annotations, &mut events);
         } else {
-            warn!(%task_id, op_id, "io completion for unknown task");
+            warn!(%thread_id, op_id, "io completion for unknown task");
             return;
         }
-        self.mark_dirty(&task_id);
-        self.router.dispatch_events(&task_id, events);
-        self.teardown_sandbox_if_terminal(&task_id);
+        self.mark_dirty(&thread_id);
+        self.router.dispatch_events(&thread_id, events);
+        self.teardown_sandbox_if_terminal(&thread_id);
     }
 
-    fn annotations_for(&self, task_id: &str) -> HashMap<String, ToolAnnotations> {
+    fn annotations_for(&self, thread_id: &str) -> HashMap<String, ToolAnnotations> {
         self.tool_descriptors
-            .get(task_id)
+            .get(thread_id)
             .map(|tools| {
                 tools
                     .iter()
@@ -1013,25 +1013,25 @@ impl Scheduler {
             .unwrap_or_default()
     }
 
-    /// Advance `task_id`'s state machine until it pauses, pushing new I/O to
+    /// Advance `thread_id`'s state machine until it pauses, pushing new I/O to
     /// `pending_io` as requested.
-    fn step_until_blocked(&mut self, task_id: &str, pending_io: &mut FuturesUnordered<IoFuture>) {
-        self.mark_dirty(task_id);
+    fn step_until_blocked(&mut self, thread_id: &str, pending_io: &mut FuturesUnordered<IoFuture>) {
+        self.mark_dirty(thread_id);
         loop {
             let mut events = Vec::new();
             let outcome = {
-                let Some(task) = self.tasks.get_mut(task_id) else {
+                let Some(task) = self.tasks.get_mut(thread_id) else {
                     return;
                 };
                 task.step(&mut self.next_op_id, &mut events)
             };
-            self.router.dispatch_events(task_id, events);
+            self.router.dispatch_events(thread_id, events);
 
             match outcome {
                 StepOutcome::DispatchIo(req) => {
                     // Push the future but keep stepping — `AwaitingTools` dispatches all
                     // N tool calls in parallel before pausing.
-                    let fut = io_dispatch::build_io_future(self, task_id.to_string(), req);
+                    let fut = io_dispatch::build_io_future(self, thread_id.to_string(), req);
                     pending_io.push(fut);
                 }
                 StepOutcome::Continue => continue,
@@ -1041,36 +1041,36 @@ impl Scheduler {
     }
 
     /// If the task is in a terminal state, tear down its sandbox (if any).
-    fn teardown_sandbox_if_terminal(&mut self, task_id: &str) {
+    fn teardown_sandbox_if_terminal(&mut self, thread_id: &str) {
         // Completed is NOT terminal — the task can receive follow-up messages.
         // Only tear down on truly irreversible states.
-        let is_terminal = self.tasks.get(task_id).is_some_and(|t| {
+        let is_terminal = self.tasks.get(thread_id).is_some_and(|t| {
             matches!(
                 t.public_state(),
-                TaskStateLabel::Failed | TaskStateLabel::Cancelled
+                ThreadStateLabel::Failed | ThreadStateLabel::Cancelled
             )
         });
         if is_terminal {
             // Pool's primary session points at the sandbox MCP host that's
             // about to die. Drop the pool too — shared session Arcs survive
             // because `self.shared_hosts` still holds them.
-            self.mcp_pools.remove(task_id);
+            self.mcp_pools.remove(thread_id);
             // Phase 1a: mark the per-task primary MCP + sandbox as torn down
             // in the registry so inspectability tools see the right state.
             // Backend and shared-host user counts are intentionally left
             // alone — the task itself still exists in `self.tasks` and the
             // existing code never removes terminal tasks.
-            let primary_id = McpHostId::primary_for_task(task_id);
-            let sandbox_id = SandboxId::for_task(task_id);
+            let primary_id = McpHostId::primary_for_task(thread_id);
+            let sandbox_id = SandboxId::for_task(thread_id);
             self.resources.mark_mcp_torn_down(&primary_id);
             self.emit_mcp_host_updated(&primary_id);
             self.resources.mark_sandbox_torn_down(&sandbox_id);
             self.emit_sandbox_updated(&sandbox_id);
-            if let Some(mut handle) = self.sandbox_handles.remove(task_id) {
-                let tid = task_id.to_string();
+            if let Some(mut handle) = self.sandbox_handles.remove(thread_id) {
+                let tid = thread_id.to_string();
                 tokio::spawn(async move {
                     if let Err(e) = handle.teardown().await {
-                        warn!(task_id = %tid, error = %e, "sandbox teardown failed");
+                        warn!(thread_id = %tid, error = %e, "sandbox teardown failed");
                     }
                 });
             }
@@ -1078,7 +1078,7 @@ impl Scheduler {
     }
 }
 
-/// Build the `TaskPendingApproval` events that a newly-subscribed client needs to
+/// Build the `ThreadPendingApproval` events that a newly-subscribed client needs to
 /// render the approval UI. Returns empty if the task isn't in AwaitingApproval.
 fn pending_approvals_of(task: &Thread) -> Vec<ServerToClient> {
     let ThreadInternalState::AwaitingApproval {
@@ -1096,8 +1096,8 @@ fn pending_approvals_of(task: &Thread) -> Vec<ServerToClient> {
             read_only,
         } = disposition
         {
-            out.push(ServerToClient::TaskPendingApproval {
-                task_id: task.id.clone(),
+            out.push(ServerToClient::ThreadPendingApproval {
+                thread_id: task.id.clone(),
                 approval_id: approval_id.clone(),
                 tool_use_id: tool_use.tool_use_id.clone(),
                 name: tool_use.name.clone(),
@@ -1125,7 +1125,7 @@ fn truncate(mut s: String, max: usize) -> String {
     s
 }
 
-fn apply_override(base: TaskConfig, ov: Option<TaskConfigOverride>) -> TaskConfig {
+fn apply_override(base: ThreadConfig, ov: Option<ThreadConfigOverride>) -> ThreadConfig {
     let Some(ov) = ov else { return base };
     // If the override picks a different backend without specifying a model, don't
     // inherit the model from the default backend — leave it empty so build_model_request
@@ -1137,7 +1137,7 @@ fn apply_override(base: TaskConfig, ov: Option<TaskConfigOverride>) -> TaskConfi
         None if backend_changed => String::new(),
         None => base.model.clone(),
     };
-    TaskConfig {
+    ThreadConfig {
         backend: ov.backend.unwrap_or(base.backend),
         model,
         system_prompt: ov.system_prompt.unwrap_or(base.system_prompt),
@@ -1170,9 +1170,9 @@ pub async fn run(mut scheduler: Scheduler, mut inbox: mpsc::UnboundedReceiver<Sc
             }
             maybe_completion = next_completion(&mut pending_io), if !pending_io.is_empty() => {
                 if let Some(completion) = maybe_completion {
-                    let task_id = completion.task_id.clone();
+                    let thread_id = completion.thread_id.clone();
                     scheduler.apply_io_completion(completion);
-                    scheduler.step_until_blocked(&task_id, &mut pending_io);
+                    scheduler.step_until_blocked(&thread_id, &mut pending_io);
                 }
             }
         }

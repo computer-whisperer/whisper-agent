@@ -25,7 +25,7 @@ use serde::{Deserialize, Serialize};
 /// form so the protocol is stable against scheduler internals.
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-pub enum TaskStateLabel {
+pub enum ThreadStateLabel {
     /// Ready for new user input.
     Idle,
     /// Model call or tool call in flight.
@@ -58,9 +58,9 @@ impl Usage {
 }
 
 /// The per-task configuration the server holds. Clients can override pieces of it at
-/// task-creation time via [`TaskConfigOverride`].
+/// task-creation time via [`ThreadConfigOverride`].
 #[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct TaskConfig {
+pub struct ThreadConfig {
     /// Name of the backend in the server's catalog. Empty string means "use the
     /// server's default backend." Kept as `default`-able so tasks persisted before
     /// multi-backend support still deserialize.
@@ -86,7 +86,7 @@ pub struct TaskConfig {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
-pub struct TaskConfigOverride {
+pub struct ThreadConfigOverride {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub backend: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -135,12 +135,12 @@ pub enum ApprovalChoice {
 }
 
 /// Lightweight per-task summary. Broadcast to every connected client and used by
-/// `ListTasks` responses.
+/// `ListThreads` responses.
 #[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct TaskSummary {
-    pub task_id: String,
+pub struct ThreadSummary {
+    pub thread_id: String,
     pub title: Option<String>,
-    pub state: TaskStateLabel,
+    pub state: ThreadStateLabel,
     /// ISO-8601 timestamp. Kept as a plain string on the wire so the protocol crate
     /// doesn't pull in chrono.
     pub created_at: String,
@@ -150,7 +150,7 @@ pub struct TaskSummary {
 /// Entry in a `BackendsList` response.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct BackendSummary {
-    /// User-chosen alias — matches `TaskConfig.backend`.
+    /// User-chosen alias — matches `ThreadConfig.backend`.
     pub name: String,
     /// Which protocol this backend speaks (`"anthropic"`, `"openai_chat"`, …).
     /// Clients can use this for labels or icons; the server doesn't rely on it.
@@ -256,14 +256,14 @@ impl ResourceSnapshot {
     }
 }
 
-/// Full per-task snapshot. Sent in response to a `SubscribeToTask` so the client can
+/// Full per-task snapshot. Sent in response to a `SubscribeToThread` so the client can
 /// render the entire conversation from a cold start.
 #[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct TaskSnapshot {
-    pub task_id: String,
+pub struct ThreadSnapshot {
+    pub thread_id: String,
     pub title: Option<String>,
-    pub config: TaskConfig,
-    pub state: TaskStateLabel,
+    pub config: ThreadConfig,
+    pub state: ThreadStateLabel,
     pub conversation: Conversation,
     pub total_usage: Usage,
     pub created_at: String,
@@ -282,7 +282,7 @@ pub struct TaskSnapshot {
 // ---------- Wire enums ----------
 
 /// Messages the client sends to the server.
-// `CreateTask` carries a `TaskConfigOverride` (~300 bytes of Options); other
+// `CreateThread` carries a `ThreadConfigOverride` (~300 bytes of Options); other
 // variants are tens of bytes. Boxing the override would change every
 // construction site for a bytes-saved-per-message that's a rounding error
 // against typical `initial_message` payloads. Revisit if profiling shows it.
@@ -293,16 +293,16 @@ pub enum ClientToServer {
     // --- Task lifecycle ---
     /// Create a new task. `initial_message` becomes the first user message; the server
     /// starts driving the loop immediately.
-    CreateTask {
+    CreateThread {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         correlation_id: Option<String>,
         initial_message: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        config_override: Option<TaskConfigOverride>,
+        config_override: Option<ThreadConfigOverride>,
     },
     /// Append a follow-up user message to an existing task.
     SendUserMessage {
-        task_id: String,
+        thread_id: String,
         text: String,
     },
     /// Respond to a pending tool-call approval. If `remember` is true and the
@@ -311,7 +311,7 @@ pub enum ClientToServer {
     /// lifetime. `remember` with `Reject` is currently ignored (no
     /// "always reject" semantics).
     ApprovalDecision {
-        task_id: String,
+        thread_id: String,
         approval_id: String,
         decision: ApprovalChoice,
         #[serde(default)]
@@ -320,30 +320,30 @@ pub enum ClientToServer {
     /// Remove a tool name from the task's allowlist. Future calls to that tool
     /// will prompt again under the task's policy.
     RemoveToolAllowlistEntry {
-        task_id: String,
+        thread_id: String,
         tool_name: String,
     },
     /// Cancel a task. Stubbed for now — flips state to `Cancelled` without rolling back
     /// any in-flight tool work. Proper rollback semantics are a v0.3 problem.
-    CancelTask {
-        task_id: String,
+    CancelThread {
+        thread_id: String,
     },
     /// Archive (hide) a task. It remains on disk but drops off the broadcast list.
-    ArchiveTask {
-        task_id: String,
+    ArchiveThread {
+        thread_id: String,
     },
 
     // --- Observation ---
     /// Start receiving per-turn events for this task. Server responds with a
-    /// `TaskSnapshot` and then streams subsequent events.
-    SubscribeToTask {
-        task_id: String,
+    /// `ThreadSnapshot` and then streams subsequent events.
+    SubscribeToThread {
+        thread_id: String,
     },
-    UnsubscribeFromTask {
-        task_id: String,
+    UnsubscribeFromThread {
+        thread_id: String,
     },
     /// Request the current list of non-archived tasks.
-    ListTasks {
+    ListThreads {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         correlation_id: Option<String>,
     },
@@ -409,7 +409,7 @@ pub enum ClientToServer {
 }
 
 /// Messages the server sends to the client.
-// `TaskSnapshot` is much larger (~470 bytes — full conversation, config, usage)
+// `ThreadSnapshot` is much larger (~470 bytes — full conversation, config, usage)
 // than the streaming variants (~50 bytes each). Snapshots are sent rarely (one
 // per subscribe), so the per-clone cost during scheduler broadcasts is the
 // streaming-variant size, not the snapshot's. Boxing would change every
@@ -420,63 +420,63 @@ pub enum ClientToServer {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ServerToClient {
     // --- Task-list tier (broadcast to every connected client) ---
-    TaskCreated {
-        task_id: String,
-        summary: TaskSummary,
+    ThreadCreated {
+        thread_id: String,
+        summary: ThreadSummary,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         correlation_id: Option<String>,
     },
-    TaskStateChanged {
-        task_id: String,
-        state: TaskStateLabel,
+    ThreadStateChanged {
+        thread_id: String,
+        state: ThreadStateLabel,
     },
-    TaskTitleUpdated {
-        task_id: String,
+    ThreadTitleUpdated {
+        thread_id: String,
         title: String,
     },
-    TaskArchived {
-        task_id: String,
+    ThreadArchived {
+        thread_id: String,
     },
 
     // --- Request / response ---
-    TaskList {
+    ThreadList {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         correlation_id: Option<String>,
-        tasks: Vec<TaskSummary>,
+        tasks: Vec<ThreadSummary>,
     },
-    TaskSnapshot {
-        task_id: String,
-        snapshot: TaskSnapshot,
+    ThreadSnapshot {
+        thread_id: String,
+        snapshot: ThreadSnapshot,
     },
 
-    // --- Per-task turn tier (only to subscribers of `task_id`) ---
-    TaskAssistantBegin {
-        task_id: String,
+    // --- Per-task turn tier (only to subscribers of `thread_id`) ---
+    ThreadAssistantBegin {
+        thread_id: String,
         turn: u32,
     },
     /// A complete text block emitted by the assistant. Always emitted at turn-end so
     /// clients reconnecting mid-stream see consistent state once the turn settles.
-    TaskAssistantText {
-        task_id: String,
+    ThreadAssistantText {
+        thread_id: String,
         text: String,
     },
     /// Chain-of-thought block emitted by the assistant — Anthropic
     /// extended-thinking, OpenAI-compat `reasoning_content`, or inline
-    /// `<think>...</think>`. Order-preserved with `TaskAssistantText` so the
+    /// `<think>...</think>`. Order-preserved with `ThreadAssistantText` so the
     /// client can render reasoning, replies, and tool-calls in the order the
     /// model emitted them.
-    TaskAssistantReasoning {
-        task_id: String,
+    ThreadAssistantReasoning {
+        thread_id: String,
         text: String,
     },
     /// Streaming text partial (reserved — not emitted until SSE streaming lands).
-    TaskAssistantTextDelta {
-        task_id: String,
+    ThreadAssistantTextDelta {
+        thread_id: String,
         delta: String,
     },
     /// A tool call needs user approval before it can be dispatched.
-    TaskPendingApproval {
-        task_id: String,
+    ThreadPendingApproval {
+        thread_id: String,
         approval_id: String,
         tool_use_id: String,
         name: String,
@@ -487,8 +487,8 @@ pub enum ServerToClient {
         read_only: bool,
     },
     /// A previously-pending approval has been resolved (by any connected client).
-    TaskApprovalResolved {
-        task_id: String,
+    ThreadApprovalResolved {
+        thread_id: String,
         approval_id: String,
         decision: ApprovalChoice,
         /// Connection id that submitted the decision, if known.
@@ -499,30 +499,30 @@ pub enum ServerToClient {
     /// `ApprovalDecision` with `remember: true`) or removed (via
     /// `RemoveToolAllowlistEntry`). Carries the full new list so clients don't
     /// have to track add/remove deltas.
-    TaskAllowlistUpdated {
-        task_id: String,
+    ThreadAllowlistUpdated {
+        thread_id: String,
         tool_allowlist: Vec<String>,
     },
-    TaskToolCallBegin {
-        task_id: String,
+    ThreadToolCallBegin {
+        thread_id: String,
         tool_use_id: String,
         name: String,
         args_preview: String,
     },
-    TaskToolCallEnd {
-        task_id: String,
+    ThreadToolCallEnd {
+        thread_id: String,
         tool_use_id: String,
         result_preview: String,
         is_error: bool,
     },
-    TaskAssistantEnd {
-        task_id: String,
+    ThreadAssistantEnd {
+        thread_id: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         stop_reason: Option<String>,
         usage: Usage,
     },
-    TaskLoopComplete {
-        task_id: String,
+    ThreadLoopComplete {
+        thread_id: String,
     },
 
     // --- Model catalog responses ---
@@ -595,7 +595,7 @@ pub enum ServerToClient {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         correlation_id: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        task_id: Option<String>,
+        thread_id: Option<String>,
         message: String,
     },
 }

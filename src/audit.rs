@@ -18,7 +18,7 @@ use tokio::sync::Mutex;
 #[derive(Serialize, Debug)]
 pub struct ToolCallEntry<'a> {
     pub timestamp: DateTime<Utc>,
-    pub task_id: &'a str,
+    pub thread_id: &'a str,
     pub host_id: &'a str,
     pub tool_name: &'a str,
     pub args: Value,

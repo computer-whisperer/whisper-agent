@@ -5,7 +5,7 @@
 //! Owns:
 //!   - **Clients**: `ConnId → outbound mpsc::Sender<ServerToClient>`. The server's
 //!     WebSocket task registers a sender on connect and unregisters on close.
-//!   - **Subscriptions**: `task_id → set<ConnId>`. Per-task event tier (assistant
+//!   - **Subscriptions**: `thread_id → set<ConnId>`. Per-task event tier (assistant
 //!     text, tool calls, approvals) only goes to subscribers.
 //!   - **Audit log**: tool-call audit entries are written here as fire-and-forget
 //!     tokio tasks driven by [`ThreadEvent::AuditToolCall`].
@@ -60,15 +60,15 @@ impl ThreadEventRouter {
 
     // ---------- Subscription lifecycle ----------
 
-    pub(crate) fn subscribe(&mut self, conn_id: ConnId, task_id: &str) {
+    pub(crate) fn subscribe(&mut self, conn_id: ConnId, thread_id: &str) {
         self.subscriptions
-            .entry(task_id.to_string())
+            .entry(thread_id.to_string())
             .or_default()
             .insert(conn_id);
     }
 
-    pub(crate) fn unsubscribe(&mut self, conn_id: ConnId, task_id: &str) {
-        if let Some(subs) = self.subscriptions.get_mut(task_id) {
+    pub(crate) fn unsubscribe(&mut self, conn_id: ConnId, thread_id: &str) {
+        if let Some(subs) = self.subscriptions.get_mut(thread_id) {
             subs.remove(&conn_id);
         }
     }
@@ -113,8 +113,8 @@ impl ThreadEventRouter {
         }
     }
 
-    pub(crate) fn broadcast_to_subscribers(&self, task_id: &str, event: ServerToClient) {
-        let Some(subs) = self.subscriptions.get(task_id) else {
+    pub(crate) fn broadcast_to_subscribers(&self, thread_id: &str, event: ServerToClient) {
+        let Some(subs) = self.subscriptions.get(thread_id) else {
             return;
         };
         for conn_id in subs {
@@ -136,35 +136,35 @@ impl ThreadEventRouter {
 
     // ---------- Event translation ----------
 
-    /// Translate a batch of [`ThreadEvent`]s for `task_id` into wire events and
+    /// Translate a batch of [`ThreadEvent`]s for `thread_id` into wire events and
     /// dispatch them to the right audience: per-task subscribers for the turn
     /// tier, every client for state-list updates, the audit log for tool calls.
-    pub(crate) fn dispatch_events(&self, task_id: &str, events: Vec<ThreadEvent>) {
+    pub(crate) fn dispatch_events(&self, thread_id: &str, events: Vec<ThreadEvent>) {
         for event in events {
             match event {
                 ThreadEvent::AssistantBegin { turn } => {
                     self.broadcast_to_subscribers(
-                        task_id,
-                        ServerToClient::TaskAssistantBegin {
-                            task_id: task_id.to_string(),
+                        thread_id,
+                        ServerToClient::ThreadAssistantBegin {
+                            thread_id: thread_id.to_string(),
                             turn,
                         },
                     );
                 }
                 ThreadEvent::AssistantText { text } => {
                     self.broadcast_to_subscribers(
-                        task_id,
-                        ServerToClient::TaskAssistantText {
-                            task_id: task_id.to_string(),
+                        thread_id,
+                        ServerToClient::ThreadAssistantText {
+                            thread_id: thread_id.to_string(),
                             text,
                         },
                     );
                 }
                 ThreadEvent::AssistantReasoning { text } => {
                     self.broadcast_to_subscribers(
-                        task_id,
-                        ServerToClient::TaskAssistantReasoning {
-                            task_id: task_id.to_string(),
+                        thread_id,
+                        ServerToClient::ThreadAssistantReasoning {
+                            thread_id: thread_id.to_string(),
                             text,
                         },
                     );
@@ -175,9 +175,9 @@ impl ThreadEventRouter {
                     args_preview,
                 } => {
                     self.broadcast_to_subscribers(
-                        task_id,
-                        ServerToClient::TaskToolCallBegin {
-                            task_id: task_id.to_string(),
+                        thread_id,
+                        ServerToClient::ThreadToolCallBegin {
+                            thread_id: thread_id.to_string(),
                             tool_use_id,
                             name,
                             args_preview,
@@ -190,9 +190,9 @@ impl ThreadEventRouter {
                     is_error,
                 } => {
                     self.broadcast_to_subscribers(
-                        task_id,
-                        ServerToClient::TaskToolCallEnd {
-                            task_id: task_id.to_string(),
+                        thread_id,
+                        ServerToClient::ThreadToolCallEnd {
+                            thread_id: thread_id.to_string(),
                             tool_use_id,
                             result_preview,
                             is_error,
@@ -208,9 +208,9 @@ impl ThreadEventRouter {
                     read_only,
                 } => {
                     self.broadcast_to_subscribers(
-                        task_id,
-                        ServerToClient::TaskPendingApproval {
-                            task_id: task_id.to_string(),
+                        thread_id,
+                        ServerToClient::ThreadPendingApproval {
+                            thread_id: thread_id.to_string(),
                             approval_id,
                             tool_use_id,
                             name,
@@ -226,9 +226,9 @@ impl ThreadEventRouter {
                     decided_by_conn,
                 } => {
                     self.broadcast_to_subscribers(
-                        task_id,
-                        ServerToClient::TaskApprovalResolved {
-                            task_id: task_id.to_string(),
+                        thread_id,
+                        ServerToClient::ThreadApprovalResolved {
+                            thread_id: thread_id.to_string(),
                             approval_id,
                             decision,
                             decided_by_conn,
@@ -237,9 +237,9 @@ impl ThreadEventRouter {
                 }
                 ThreadEvent::AssistantEnd { stop_reason, usage } => {
                     self.broadcast_to_subscribers(
-                        task_id,
-                        ServerToClient::TaskAssistantEnd {
-                            task_id: task_id.to_string(),
+                        thread_id,
+                        ServerToClient::ThreadAssistantEnd {
+                            thread_id: thread_id.to_string(),
                             stop_reason,
                             usage,
                         },
@@ -247,33 +247,33 @@ impl ThreadEventRouter {
                 }
                 ThreadEvent::LoopComplete => {
                     self.broadcast_to_subscribers(
-                        task_id,
-                        ServerToClient::TaskLoopComplete {
-                            task_id: task_id.to_string(),
+                        thread_id,
+                        ServerToClient::ThreadLoopComplete {
+                            thread_id: thread_id.to_string(),
                         },
                     );
                 }
                 ThreadEvent::StateChanged { state } => {
-                    self.broadcast_task_list(ServerToClient::TaskStateChanged {
-                        task_id: task_id.to_string(),
+                    self.broadcast_task_list(ServerToClient::ThreadStateChanged {
+                        thread_id: thread_id.to_string(),
                         state,
                     });
                 }
                 ThreadEvent::Error { message } => {
                     self.broadcast_to_subscribers(
-                        task_id,
+                        thread_id,
                         ServerToClient::Error {
                             correlation_id: None,
-                            task_id: Some(task_id.to_string()),
+                            thread_id: Some(thread_id.to_string()),
                             message,
                         },
                     );
                 }
                 ThreadEvent::AllowlistChanged { allowlist } => {
                     self.broadcast_to_subscribers(
-                        task_id,
-                        ServerToClient::TaskAllowlistUpdated {
-                            task_id: task_id.to_string(),
+                        thread_id,
+                        ServerToClient::ThreadAllowlistUpdated {
+                            thread_id: thread_id.to_string(),
                             tool_allowlist: allowlist,
                         },
                     );
@@ -287,7 +287,7 @@ impl ThreadEventRouter {
                     who_decided,
                 } => {
                     self.write_audit(
-                        task_id,
+                        thread_id,
                         tool_name,
                         args,
                         is_error,
@@ -306,7 +306,7 @@ impl ThreadEventRouter {
     #[allow(clippy::too_many_arguments)]
     fn write_audit(
         &self,
-        task_id: &str,
+        thread_id: &str,
         tool_name: String,
         args: serde_json::Value,
         is_error: bool,
@@ -315,7 +315,7 @@ impl ThreadEventRouter {
         who_decided: String,
     ) {
         let audit = self.audit.clone();
-        let task_id = task_id.to_string();
+        let thread_id = thread_id.to_string();
         let host_id = self.host_id.clone();
         tokio::spawn(async move {
             let outcome = match &error_message {
@@ -324,7 +324,7 @@ impl ThreadEventRouter {
             };
             let entry = ToolCallEntry {
                 timestamp: chrono::Utc::now(),
-                task_id: &task_id,
+                thread_id: &thread_id,
                 host_id: &host_id,
                 tool_name: &tool_name,
                 args,

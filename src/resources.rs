@@ -8,7 +8,7 @@
 //! the per-task `mcp_pools`/`sandbox_handles` fields, and add wire/UI surface.
 //!
 //! Keys throughout this module are `String` rather than wrapped task/thread IDs
-//! because Phase 1a still routes everything through `task_id`. When Phase 2
+//! because Phase 1a still routes everything through `thread_id`. When Phase 2
 //! introduces `ThreadId`, the `users: BTreeSet<String>` field swaps for
 //! `BTreeSet<ThreadId>` and the rest of the module stays put.
 
@@ -31,14 +31,14 @@ pub struct McpHostId(pub String);
 pub struct BackendId(pub String);
 
 impl SandboxId {
-    pub fn for_task(task_id: &str) -> Self {
-        Self(format!("sb-{task_id}"))
+    pub fn for_task(thread_id: &str) -> Self {
+        Self(format!("sb-{thread_id}"))
     }
 }
 
 impl McpHostId {
-    pub fn primary_for_task(task_id: &str) -> Self {
-        Self(format!("mcp-primary-{task_id}"))
+    pub fn primary_for_task(thread_id: &str) -> Self {
+        Self(format!("mcp-primary-{thread_id}"))
     }
     pub fn shared(name: &str) -> Self {
         Self(format!("mcp-shared-{name}"))
@@ -102,7 +102,7 @@ pub struct McpHostSpec {
     /// configured URL.
     pub url: String,
     /// Stable display name. For shared hosts this is the catalog name; for
-    /// per-task primaries it's `"primary:<task_id>"`.
+    /// per-task primaries it's `"primary:<thread_id>"`.
     pub label: String,
     /// True for the per-task primary (its lifecycle is bound to a task today).
     /// False for shared singletons.
@@ -300,11 +300,11 @@ impl ResourceRegistry {
     /// moves it here).
     pub fn insert_primary_mcp_host(
         &mut self,
-        task_id: &str,
+        thread_id: &str,
         url: String,
         session: Arc<McpSession>,
     ) -> McpHostId {
-        let id = McpHostId::primary_for_task(task_id);
+        let id = McpHostId::primary_for_task(thread_id);
         let now = Utc::now();
         self.mcp_hosts.insert(
             id.clone(),
@@ -312,14 +312,14 @@ impl ResourceRegistry {
                 id: id.clone(),
                 spec: McpHostSpec {
                     url,
-                    label: format!("primary:{task_id}"),
+                    label: format!("primary:{thread_id}"),
                     per_task: true,
                 },
                 state: ResourceState::Ready,
                 session: Some(session),
                 tools: Vec::new(),
                 annotations: HashMap::new(),
-                users: BTreeSet::from([task_id.to_string()]),
+                users: BTreeSet::from([thread_id.to_string()]),
                 pinned: false,
                 created_at: now,
                 last_used: now,
@@ -329,8 +329,8 @@ impl ResourceRegistry {
     }
 
     /// Insert a Ready per-task sandbox entry.
-    pub fn insert_sandbox_for_task(&mut self, task_id: &str, spec: SandboxSpec) -> SandboxId {
-        let id = SandboxId::for_task(task_id);
+    pub fn insert_sandbox_for_task(&mut self, thread_id: &str, spec: SandboxSpec) -> SandboxId {
+        let id = SandboxId::for_task(thread_id);
         let now = Utc::now();
         self.sandboxes.insert(
             id.clone(),
@@ -338,7 +338,7 @@ impl ResourceRegistry {
                 id: id.clone(),
                 spec,
                 state: ResourceState::Ready,
-                users: BTreeSet::from([task_id.to_string()]),
+                users: BTreeSet::from([thread_id.to_string()]),
                 pinned: false,
                 created_at: now,
                 last_used: now,

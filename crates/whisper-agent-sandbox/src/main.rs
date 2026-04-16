@@ -43,7 +43,7 @@ struct Args {
 }
 
 struct Session {
-    task_id: String,
+    thread_id: String,
     child: Child,
 }
 
@@ -89,7 +89,7 @@ async fn main() {
     // Clean up all sessions on shutdown.
     let mut sessions = state.sessions.lock().await;
     for (id, mut session) in sessions.drain() {
-        info!(session_id = %id, task_id = %session.task_id, "killing orphaned session");
+        info!(session_id = %id, thread_id = %session.thread_id, "killing orphaned session");
         let _ = session.child.kill().await;
     }
 
@@ -100,11 +100,11 @@ async fn handle_provision(
     State(state): State<Arc<DaemonState>>,
     Json(req): Json<ProvisionRequest>,
 ) -> impl IntoResponse {
-    info!(task_id = %req.task_id, "provision request");
+    info!(thread_id = %req.thread_id, "provision request");
 
     match &req.spec {
         SandboxSpec::None => {
-            warn!(task_id = %req.task_id, "provision called with SandboxSpec::None");
+            warn!(thread_id = %req.thread_id, "provision called with SandboxSpec::None");
             return (
                 StatusCode::BAD_REQUEST,
                 Json(serde_json::json!({
@@ -114,7 +114,7 @@ async fn handle_provision(
                 .into_response();
         }
         SandboxSpec::Container { image, .. } => {
-            info!(task_id = %req.task_id, %image, "container provisioning not yet implemented");
+            info!(thread_id = %req.thread_id, %image, "container provisioning not yet implemented");
             return (
                 StatusCode::NOT_IMPLEMENTED,
                 Json(serde_json::json!({
@@ -126,7 +126,7 @@ async fn handle_provision(
         SandboxSpec::Landlock { network, .. } => {
             if matches!(network, NetworkPolicy::AllowList { .. }) {
                 warn!(
-                    task_id = %req.task_id,
+                    thread_id = %req.thread_id,
                     "landlock cannot do per-host network filtering; \
                      AllowList will be treated as Isolated"
                 );
@@ -136,14 +136,14 @@ async fn handle_provision(
 
     match provision::provision(&req.spec, &state.mcp_host_bin).await {
         Ok(session) => {
-            let session_id = req.task_id.clone();
+            let session_id = req.thread_id.clone();
             let mcp_url = session.mcp_url.clone();
 
             let mut sessions = state.sessions.lock().await;
             sessions.insert(
                 session_id.clone(),
                 Session {
-                    task_id: req.task_id,
+                    thread_id: req.thread_id,
                     child: session.child,
                 },
             );
@@ -161,7 +161,7 @@ async fn handle_provision(
                 .into_response()
         }
         Err(e) => {
-            error!(task_id = %req.task_id, error = %e, "provision failed");
+            error!(thread_id = %req.thread_id, error = %e, "provision failed");
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({ "error": e.to_string() })),
@@ -182,7 +182,7 @@ async fn handle_teardown(
         Some(mut session) => {
             info!(
                 session_id = %req.session_id,
-                task_id = %session.task_id,
+                thread_id = %session.thread_id,
                 "tearing down session"
             );
             if let Err(e) = session.child.kill().await {

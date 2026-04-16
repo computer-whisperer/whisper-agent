@@ -8,7 +8,7 @@
 //!     CBOR and calls `WebSocket::send_with_u8_array`; on native it's a no-op stub.
 //!
 //! The UI maintains a view model per task (title, state chip, message list). On task
-//! selection we send `SubscribeToTask`; the server's `TaskSnapshot` response rebuilds
+//! selection we send `SubscribeToThread`; the server's `ThreadSnapshot` response rebuilds
 //! the task's display items. Subsequent turn events append to them.
 
 use std::cell::RefCell;
@@ -21,7 +21,7 @@ use whisper_agent_protocol::sandbox::{AccessMode, NetworkPolicy, PathAccess};
 use whisper_agent_protocol::{
     ApprovalChoice, BackendSummary, ClientToServer, ContentBlock, Conversation, Message,
     ModelSummary, ResourceSnapshot, ResourceStateLabel, Role, SandboxSpec, ServerToClient,
-    TaskConfigOverride, TaskStateLabel, TaskSummary, ToolResultContent, Usage,
+    ThreadConfigOverride, ThreadStateLabel, ThreadSummary, ToolResultContent, Usage,
 };
 
 /// A user-saved sandbox configuration. Currently only encodes Landlock; future
@@ -111,7 +111,7 @@ fn save_presets(_presets: &[LandlockPreset]) {}
 /// Events pushed into [`Inbound`]. In addition to decoded wire messages we pipe in
 /// connection-level signals (open/close/error) so the UI can show a connection status
 /// distinct from per-task state.
-// `Wire(TaskSnapshot)` dwarfs the connection variants. Boxing would change every
+// `Wire(ThreadSnapshot)` dwarfs the connection variants. Boxing would change every
 // inbound enqueue site; the queue is shallow and short-lived, so the bytes saved
 // per item don't justify the churn. Same trade-off as `whisper-agent-protocol::ServerToClient`.
 #[allow(clippy::large_enum_variant)]
@@ -144,14 +144,14 @@ impl ConnectionStatus {
     }
 }
 
-fn state_chip(state: TaskStateLabel) -> (&'static str, Color32) {
+fn state_chip(state: ThreadStateLabel) -> (&'static str, Color32) {
     match state {
-        TaskStateLabel::Idle => ("idle", Color32::from_gray(160)),
-        TaskStateLabel::Working => ("working", Color32::from_rgb(120, 180, 240)),
-        TaskStateLabel::AwaitingApproval => ("approval", Color32::from_rgb(240, 180, 90)),
-        TaskStateLabel::Completed => ("completed", Color32::from_rgb(120, 200, 140)),
-        TaskStateLabel::Failed => ("failed", Color32::from_rgb(220, 110, 110)),
-        TaskStateLabel::Cancelled => ("cancelled", Color32::from_rgb(180, 140, 140)),
+        ThreadStateLabel::Idle => ("idle", Color32::from_gray(160)),
+        ThreadStateLabel::Working => ("working", Color32::from_rgb(120, 180, 240)),
+        ThreadStateLabel::AwaitingApproval => ("approval", Color32::from_rgb(240, 180, 90)),
+        ThreadStateLabel::Completed => ("completed", Color32::from_rgb(120, 200, 140)),
+        ThreadStateLabel::Failed => ("failed", Color32::from_rgb(220, 110, 110)),
+        ThreadStateLabel::Cancelled => ("cancelled", Color32::from_rgb(180, 140, 140)),
     }
 }
 
@@ -182,25 +182,25 @@ enum DisplayItem {
 }
 
 struct TaskView {
-    summary: TaskSummary,
+    summary: ThreadSummary,
     items: Vec<DisplayItem>,
     total_usage: Usage,
     subscribed: bool,
     /// Currently-open approval requests, in arrival order. Cleared on snapshot so
     /// re-subscribe can re-seed them without duplicates.
     pending_approvals: Vec<PendingApproval>,
-    /// Backend alias the server resolved for this task. Populated from TaskSnapshot.
+    /// Backend alias the server resolved for this task. Populated from ThreadSnapshot.
     /// Empty string means "server default" — the status bar resolves that to the
     /// known default_backend name at render time.
     backend: String,
-    /// Model the task was created with. Populated from TaskSnapshot.
+    /// Model the task was created with. Populated from ThreadSnapshot.
     model: String,
     /// Failure detail carried by the snapshot, if the task ended up in `Failed`.
     /// Rendered as a persistent banner so it survives re-subscribe (unlike items,
     /// which get rebuilt from the conversation on every snapshot).
     failure: Option<String>,
     /// Tool names this task has approved-and-remembered. Mirrors
-    /// `TaskSnapshot.tool_allowlist`; refreshed by `TaskAllowlistUpdated`.
+    /// `ThreadSnapshot.tool_allowlist`; refreshed by `ThreadAllowlistUpdated`.
     tool_allowlist: Vec<String>,
 }
 
@@ -211,12 +211,12 @@ struct PendingApproval {
     destructive: bool,
     read_only: bool,
     /// True after the local user clicked Approve/Reject — buttons disable until the
-    /// server's TaskApprovalResolved arrives (and removes the entry entirely).
+    /// server's ThreadApprovalResolved arrives (and removes the entry entirely).
     submitted: bool,
 }
 
 impl TaskView {
-    fn new(summary: TaskSummary) -> Self {
+    fn new(summary: ThreadSummary) -> Self {
         Self {
             summary,
             items: Vec::new(),
@@ -387,7 +387,7 @@ impl ChatApp {
                 self.conn_status = ConnectionStatus::Connected;
                 self.conn_detail = None;
                 if !self.list_requested {
-                    self.send(ClientToServer::ListTasks {
+                    self.send(ClientToServer::ListThreads {
                         correlation_id: None,
                     });
                     self.list_requested = true;
@@ -419,45 +419,45 @@ impl ChatApp {
 
     fn handle_wire(&mut self, msg: ServerToClient) {
         match msg {
-            ServerToClient::TaskCreated {
-                task_id,
+            ServerToClient::ThreadCreated {
+                thread_id,
                 summary,
                 correlation_id: _,
             } => {
                 self.upsert_task(summary);
                 self.recompute_order();
                 // Auto-select newly created tasks.
-                if self.selected.as_deref() != Some(&task_id) {
-                    self.select_task(task_id);
+                if self.selected.as_deref() != Some(&thread_id) {
+                    self.select_task(thread_id);
                 }
             }
-            ServerToClient::TaskStateChanged { task_id, state } => {
-                if let Some(view) = self.tasks.get_mut(&task_id) {
+            ServerToClient::ThreadStateChanged { thread_id, state } => {
+                if let Some(view) = self.tasks.get_mut(&thread_id) {
                     view.summary.state = state;
                 }
             }
-            ServerToClient::TaskTitleUpdated { task_id, title } => {
-                if let Some(view) = self.tasks.get_mut(&task_id) {
+            ServerToClient::ThreadTitleUpdated { thread_id, title } => {
+                if let Some(view) = self.tasks.get_mut(&thread_id) {
                     view.summary.title = Some(title);
                 }
             }
-            ServerToClient::TaskArchived { task_id } => {
-                self.tasks.remove(&task_id);
-                self.task_order.retain(|id| id != &task_id);
-                if self.selected.as_deref() == Some(&task_id) {
+            ServerToClient::ThreadArchived { thread_id } => {
+                self.tasks.remove(&thread_id);
+                self.task_order.retain(|id| id != &thread_id);
+                if self.selected.as_deref() == Some(&thread_id) {
                     self.selected = None;
                     self.composing_new = true;
                 }
             }
-            ServerToClient::TaskList { tasks, .. } => {
+            ServerToClient::ThreadList { tasks, .. } => {
                 self.tasks
-                    .retain(|id, _| tasks.iter().any(|t| &t.task_id == id));
+                    .retain(|id, _| tasks.iter().any(|t| &t.thread_id == id));
                 for summary in tasks {
                     self.upsert_task(summary);
                 }
                 self.recompute_order();
             }
-            ServerToClient::TaskSnapshot { task_id, snapshot } => {
+            ServerToClient::ThreadSnapshot { thread_id, snapshot } => {
                 let items = conversation_to_items(&snapshot.conversation);
                 let backend = snapshot.config.backend.clone();
                 let model = snapshot.config.model.clone();
@@ -465,7 +465,7 @@ impl ChatApp {
                 let allowlist = snapshot.tool_allowlist.clone();
                 let view = self
                     .tasks
-                    .entry(task_id.clone())
+                    .entry(thread_id.clone())
                     .or_insert_with(|| TaskView::new(snapshot_summary(&snapshot)));
                 view.summary.state = snapshot.state;
                 view.summary.title = snapshot.title;
@@ -479,27 +479,27 @@ impl ChatApp {
                 // Pending-approval events that follow the snapshot will re-seed this.
                 view.pending_approvals.clear();
             }
-            ServerToClient::TaskAllowlistUpdated {
-                task_id,
+            ServerToClient::ThreadAllowlistUpdated {
+                thread_id,
                 tool_allowlist,
             } => {
-                if let Some(view) = self.tasks.get_mut(&task_id) {
+                if let Some(view) = self.tasks.get_mut(&thread_id) {
                     view.tool_allowlist = tool_allowlist;
                 }
             }
-            ServerToClient::TaskAssistantBegin { .. } => {}
-            ServerToClient::TaskAssistantText { task_id, text } => {
-                if let Some(view) = self.tasks.get_mut(&task_id) {
+            ServerToClient::ThreadAssistantBegin { .. } => {}
+            ServerToClient::ThreadAssistantText { thread_id, text } => {
+                if let Some(view) = self.tasks.get_mut(&thread_id) {
                     view.items.push(DisplayItem::AssistantText { text });
                 }
             }
-            ServerToClient::TaskAssistantReasoning { task_id, text } => {
-                if let Some(view) = self.tasks.get_mut(&task_id) {
+            ServerToClient::ThreadAssistantReasoning { thread_id, text } => {
+                if let Some(view) = self.tasks.get_mut(&thread_id) {
                     view.items.push(DisplayItem::Reasoning { text });
                 }
             }
-            ServerToClient::TaskAssistantTextDelta { task_id, delta } => {
-                if let Some(view) = self.tasks.get_mut(&task_id) {
+            ServerToClient::ThreadAssistantTextDelta { thread_id, delta } => {
+                if let Some(view) = self.tasks.get_mut(&thread_id) {
                     if let Some(DisplayItem::AssistantText { text }) = view.items.last_mut() {
                         text.push_str(&delta);
                     } else {
@@ -507,13 +507,13 @@ impl ChatApp {
                     }
                 }
             }
-            ServerToClient::TaskToolCallBegin {
-                task_id,
+            ServerToClient::ThreadToolCallBegin {
+                thread_id,
                 tool_use_id,
                 name,
                 args_preview,
             } => {
-                if let Some(view) = self.tasks.get_mut(&task_id) {
+                if let Some(view) = self.tasks.get_mut(&thread_id) {
                     view.items.push(DisplayItem::ToolCall {
                         tool_use_id,
                         name,
@@ -523,13 +523,13 @@ impl ChatApp {
                     });
                 }
             }
-            ServerToClient::TaskToolCallEnd {
-                task_id,
+            ServerToClient::ThreadToolCallEnd {
+                thread_id,
                 tool_use_id,
                 result_preview,
                 is_error,
             } => {
-                if let Some(view) = self.tasks.get_mut(&task_id) {
+                if let Some(view) = self.tasks.get_mut(&thread_id) {
                     for item in view.items.iter_mut().rev() {
                         if let DisplayItem::ToolCall {
                             tool_use_id: id,
@@ -546,14 +546,14 @@ impl ChatApp {
                     }
                 }
             }
-            ServerToClient::TaskAssistantEnd { task_id, usage, .. } => {
-                if let Some(view) = self.tasks.get_mut(&task_id) {
+            ServerToClient::ThreadAssistantEnd { thread_id, usage, .. } => {
+                if let Some(view) = self.tasks.get_mut(&thread_id) {
                     view.total_usage.add(&usage);
                 }
             }
-            ServerToClient::TaskLoopComplete { .. } => {}
-            ServerToClient::TaskPendingApproval {
-                task_id,
+            ServerToClient::ThreadLoopComplete { .. } => {}
+            ServerToClient::ThreadPendingApproval {
+                thread_id,
                 approval_id,
                 name,
                 args_preview,
@@ -561,7 +561,7 @@ impl ChatApp {
                 read_only,
                 ..
             } => {
-                if let Some(view) = self.tasks.get_mut(&task_id) {
+                if let Some(view) = self.tasks.get_mut(&thread_id) {
                     // Deduplicate — the same approval can arrive again if the client
                     // re-subscribes while a decision is still outstanding.
                     if !view
@@ -580,20 +580,20 @@ impl ChatApp {
                     }
                 }
             }
-            ServerToClient::TaskApprovalResolved {
-                task_id,
+            ServerToClient::ThreadApprovalResolved {
+                thread_id,
                 approval_id,
                 ..
             } => {
-                if let Some(view) = self.tasks.get_mut(&task_id) {
+                if let Some(view) = self.tasks.get_mut(&thread_id) {
                     view.pending_approvals
                         .retain(|p| p.approval_id != approval_id);
                 }
             }
             ServerToClient::Error {
-                task_id, message, ..
+                thread_id, message, ..
             } => {
-                if let Some(tid) = task_id.as_ref()
+                if let Some(tid) = thread_id.as_ref()
                     && let Some(view) = self.tasks.get_mut(tid)
                 {
                     // Persist on the view so it's visible as a banner even after a
@@ -651,8 +651,8 @@ impl ChatApp {
         }
     }
 
-    fn upsert_task(&mut self, summary: TaskSummary) {
-        let id = summary.task_id.clone();
+    fn upsert_task(&mut self, summary: ThreadSummary) {
+        let id = summary.thread_id.clone();
         self.tasks
             .entry(id)
             .and_modify(|v| v.summary = summary.clone())
@@ -677,19 +677,19 @@ impl ChatApp {
         self.task_order = ids;
     }
 
-    fn select_task(&mut self, task_id: String) {
-        if self.selected.as_deref() == Some(&task_id) {
+    fn select_task(&mut self, thread_id: String) {
+        if self.selected.as_deref() == Some(&thread_id) {
             return;
         }
-        self.selected = Some(task_id.clone());
+        self.selected = Some(thread_id.clone());
         self.composing_new = false;
         let need_subscribe = self
             .tasks
-            .get(&task_id)
+            .get(&thread_id)
             .map(|v| !v.subscribed)
             .unwrap_or(true);
         if need_subscribe {
-            self.send(ClientToServer::SubscribeToTask { task_id });
+            self.send(ClientToServer::SubscribeToThread { thread_id });
         }
     }
 
@@ -701,28 +701,28 @@ impl ChatApp {
         }
         if self.composing_new || self.selected.is_none() {
             let override_ = self.build_creation_override();
-            self.send(ClientToServer::CreateTask {
+            self.send(ClientToServer::CreateThread {
                 correlation_id: None,
                 initial_message: trimmed.to_string(),
                 config_override: override_,
             });
-        } else if let Some(task_id) = self.selected.clone() {
-            if let Some(view) = self.tasks.get_mut(&task_id) {
+        } else if let Some(thread_id) = self.selected.clone() {
+            if let Some(view) = self.tasks.get_mut(&thread_id) {
                 view.items.push(DisplayItem::User {
                     text: trimmed.to_string(),
                 });
             }
             self.send(ClientToServer::SendUserMessage {
-                task_id,
+                thread_id,
                 text: trimmed.to_string(),
             });
         }
     }
 
-    /// Build a TaskConfigOverride from the picker's current state. Only includes the
+    /// Build a ThreadConfigOverride from the picker's current state. Only includes the
     /// fields the user explicitly set — unset fields fall through to the server's
     /// default_task_config on the other end.
-    fn build_creation_override(&self) -> Option<TaskConfigOverride> {
+    fn build_creation_override(&self) -> Option<ThreadConfigOverride> {
         let backend = self.picker_backend.clone();
         // If the user picked a backend but didn't touch the model dropdown, pin down
         // the model explicitly so the server doesn't fall back to the DEFAULT
@@ -751,7 +751,7 @@ impl ChatApp {
         if backend.is_none() && model.is_none() && sandbox.is_none() {
             return None;
         }
-        Some(TaskConfigOverride {
+        Some(ThreadConfigOverride {
             backend,
             model,
             sandbox,
@@ -760,9 +760,9 @@ impl ChatApp {
     }
 }
 
-fn snapshot_summary(s: &whisper_agent_protocol::TaskSnapshot) -> TaskSummary {
-    TaskSummary {
-        task_id: s.task_id.clone(),
+fn snapshot_summary(s: &whisper_agent_protocol::ThreadSnapshot) -> ThreadSummary {
+    ThreadSummary {
+        thread_id: s.thread_id.clone(),
         title: s.title.clone(),
         state: s.state,
         created_at: s.created_at.clone(),
@@ -1089,14 +1089,14 @@ impl eframe::App for ChatApp {
                 }
                 ui.add_space(4.0);
                 ui.horizontal(|ui| {
-                    if let Some(task_id) = self.selected.clone() {
+                    if let Some(thread_id) = self.selected.clone() {
                         if ui.button("Cancel").clicked() {
-                            self.send(ClientToServer::CancelTask {
-                                task_id: task_id.clone(),
+                            self.send(ClientToServer::CancelThread {
+                                thread_id: thread_id.clone(),
                             });
                         }
                         if ui.button("Archive").clicked() {
-                            self.send(ClientToServer::ArchiveTask { task_id });
+                            self.send(ClientToServer::ArchiveThread { thread_id });
                         }
                         ui.separator();
                     }
@@ -1134,17 +1134,17 @@ impl eframe::App for ChatApp {
                     );
                 });
             }
-            Some(task_id) => match self.tasks.get_mut(&task_id) {
+            Some(thread_id) => match self.tasks.get_mut(&thread_id) {
                 None => {
                     ui.label(
-                        RichText::new(format!("task {task_id} not found"))
+                        RichText::new(format!("task {thread_id} not found"))
                             .color(Color32::from_rgb(220, 120, 120)),
                     );
                 }
                 Some(view) => {
                     render_failure_banner(ui, view);
-                    render_allowlist_chips(ui, &task_id, view, &mut allowlist_revocations);
-                    render_approval_banner(ui, &task_id, view, &mut pending_decisions);
+                    render_allowlist_chips(ui, &thread_id, view, &mut allowlist_revocations);
+                    render_approval_banner(ui, &thread_id, view, &mut pending_decisions);
                     ScrollArea::vertical().stick_to_bottom(true).show(ui, |ui| {
                         if view.items.is_empty() {
                             ui.vertical_centered(|ui| {
@@ -1166,16 +1166,16 @@ impl eframe::App for ChatApp {
         });
 
         // Submit any approval decisions that were clicked this frame.
-        for (task_id, approval_id, decision, remember) in pending_decisions {
+        for (thread_id, approval_id, decision, remember) in pending_decisions {
             self.send(ClientToServer::ApprovalDecision {
-                task_id,
+                thread_id,
                 approval_id,
                 decision,
                 remember,
             });
         }
-        for (task_id, tool_name) in allowlist_revocations {
-            self.send(ClientToServer::RemoveToolAllowlistEntry { task_id, tool_name });
+        for (thread_id, tool_name) in allowlist_revocations {
+            self.send(ClientToServer::RemoveToolAllowlistEntry { thread_id, tool_name });
         }
 
         self.render_preset_modal(ctx);
@@ -1194,16 +1194,16 @@ impl ChatApp {
         ui.separator();
         ScrollArea::vertical().show(ui, |ui| {
             let order = self.task_order.clone();
-            for task_id in order {
-                let Some(view) = self.tasks.get(&task_id) else {
+            for thread_id in order {
+                let Some(view) = self.tasks.get(&thread_id) else {
                     continue;
                 };
-                let is_selected = self.selected.as_deref() == Some(&task_id);
+                let is_selected = self.selected.as_deref() == Some(&thread_id);
                 let title = view
                     .summary
                     .title
                     .clone()
-                    .unwrap_or_else(|| task_id[..task_id.len().min(14)].to_string());
+                    .unwrap_or_else(|| thread_id[..thread_id.len().min(14)].to_string());
                 let (chip, chip_color) = state_chip(view.summary.state);
                 let row = ui.add_sized(
                     [ui.available_width(), 0.0],
@@ -1217,7 +1217,7 @@ impl ChatApp {
                     ),
                 );
                 if row.clicked() {
-                    self.select_task(task_id.clone());
+                    self.select_task(thread_id.clone());
                 }
             }
         });
@@ -1453,7 +1453,7 @@ fn render_failure_banner(ui: &mut egui::Ui, view: &TaskView) {
     let Some(detail) = view.failure.as_deref() else {
         return;
     };
-    if view.summary.state != TaskStateLabel::Failed {
+    if view.summary.state != ThreadStateLabel::Failed {
         return;
     }
     egui::Frame::group(ui.style())
@@ -1478,7 +1478,7 @@ fn render_failure_banner(ui: &mut egui::Ui, view: &TaskView) {
 
 fn render_approval_banner(
     ui: &mut egui::Ui,
-    task_id: &str,
+    thread_id: &str,
     view: &mut TaskView,
     pending_decisions: &mut Vec<(String, String, ApprovalChoice, bool)>,
 ) {
@@ -1522,7 +1522,7 @@ fn render_approval_banner(
                             if ui.button("Approve").clicked() {
                                 approval.submitted = true;
                                 pending_decisions.push((
-                                    task_id.to_string(),
+                                    thread_id.to_string(),
                                     approval.approval_id.clone(),
                                     ApprovalChoice::Approve,
                                     false,
@@ -1538,7 +1538,7 @@ fn render_approval_banner(
                             {
                                 approval.submitted = true;
                                 pending_decisions.push((
-                                    task_id.to_string(),
+                                    thread_id.to_string(),
                                     approval.approval_id.clone(),
                                     ApprovalChoice::Approve,
                                     true,
@@ -1547,7 +1547,7 @@ fn render_approval_banner(
                             if ui.button("Reject").clicked() {
                                 approval.submitted = true;
                                 pending_decisions.push((
-                                    task_id.to_string(),
+                                    thread_id.to_string(),
                                     approval.approval_id.clone(),
                                     ApprovalChoice::Reject,
                                     false,
@@ -1573,7 +1573,7 @@ fn render_approval_banner(
 /// the allowlist is empty so it doesn't take vertical space in the common case.
 fn render_allowlist_chips(
     ui: &mut egui::Ui,
-    task_id: &str,
+    thread_id: &str,
     view: &TaskView,
     revocations: &mut Vec<(String, String)>,
 ) {
@@ -1598,7 +1598,7 @@ fn render_allowlist_chips(
                 .on_hover_text(format!("Stop always-allowing `{tool_name}`"))
                 .clicked()
             {
-                revocations.push((task_id.to_string(), tool_name.clone()));
+                revocations.push((thread_id.to_string(), tool_name.clone()));
             }
             ui.add_space(2.0);
         }

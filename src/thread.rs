@@ -12,7 +12,7 @@
 //! them to wire-protocol events and broadcast to subscribers.
 //!
 //! The internal [`ThreadInternalState`] has finer distinctions than the public
-//! [`TaskStateLabel`] — the wire collapses them via [`Thread::public_state`]. This
+//! [`ThreadStateLabel`] — the wire collapses them via [`Thread::public_state`]. This
 //! indirection is the point of having a state machine: we can split a phase into
 //! sub-phases (e.g. add `AwaitingApproval` between tool dispatch and execution) without
 //! touching the wire.
@@ -22,8 +22,8 @@ use std::collections::{BTreeSet, HashMap};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use whisper_agent_protocol::{
-    ApprovalChoice, ApprovalPolicy, ContentBlock, Conversation, Message, TaskConfig, TaskSnapshot,
-    TaskStateLabel, TaskSummary, ToolResultContent, Usage,
+    ApprovalChoice, ApprovalPolicy, ContentBlock, Conversation, Message, ThreadConfig, ThreadSnapshot,
+    ThreadStateLabel, ThreadSummary, ToolResultContent, Usage,
 };
 
 use crate::mcp::{CallToolResult, ToolAnnotations};
@@ -37,7 +37,7 @@ pub struct Thread {
     pub created_at: DateTime<Utc>,
     pub last_active: DateTime<Utc>,
     pub title: Option<String>,
-    pub config: TaskConfig,
+    pub config: ThreadConfig,
     pub conversation: Conversation,
     pub total_usage: Usage,
     #[serde(default)]
@@ -265,10 +265,10 @@ pub enum ThreadEvent {
     },
     LoopComplete,
     /// The task's `public_state()` flipped. Carries the new label so the
-    /// scheduler's router can emit a wire `TaskStateChanged` without looking
+    /// scheduler's router can emit a wire `ThreadStateChanged` without looking
     /// the task back up.
     StateChanged {
-        state: TaskStateLabel,
+        state: ThreadStateLabel,
     },
     Error {
         message: String,
@@ -293,7 +293,7 @@ pub enum ThreadEvent {
 }
 
 impl Thread {
-    pub fn new(id: String, config: TaskConfig) -> Self {
+    pub fn new(id: String, config: ThreadConfig) -> Self {
         let now = Utc::now();
         Self {
             id,
@@ -314,26 +314,26 @@ impl Thread {
         self.last_active = Utc::now();
     }
 
-    pub fn public_state(&self) -> TaskStateLabel {
+    pub fn public_state(&self) -> ThreadStateLabel {
         match &self.internal {
-            ThreadInternalState::Idle => TaskStateLabel::Idle,
-            ThreadInternalState::Completed => TaskStateLabel::Completed,
-            ThreadInternalState::AwaitingApproval { .. } => TaskStateLabel::AwaitingApproval,
+            ThreadInternalState::Idle => ThreadStateLabel::Idle,
+            ThreadInternalState::Completed => ThreadStateLabel::Completed,
+            ThreadInternalState::AwaitingApproval { .. } => ThreadStateLabel::AwaitingApproval,
             ThreadInternalState::NeedsMcpConnect
             | ThreadInternalState::AwaitingMcpConnect { .. }
             | ThreadInternalState::NeedsListTools
             | ThreadInternalState::AwaitingListTools { .. }
             | ThreadInternalState::NeedsModelCall
             | ThreadInternalState::AwaitingModel { .. }
-            | ThreadInternalState::AwaitingTools { .. } => TaskStateLabel::Working,
-            ThreadInternalState::Failed { .. } => TaskStateLabel::Failed,
-            ThreadInternalState::Cancelled => TaskStateLabel::Cancelled,
+            | ThreadInternalState::AwaitingTools { .. } => ThreadStateLabel::Working,
+            ThreadInternalState::Failed { .. } => ThreadStateLabel::Failed,
+            ThreadInternalState::Cancelled => ThreadStateLabel::Cancelled,
         }
     }
 
-    pub fn summary(&self) -> TaskSummary {
-        TaskSummary {
-            task_id: self.id.clone(),
+    pub fn summary(&self) -> ThreadSummary {
+        ThreadSummary {
+            thread_id: self.id.clone(),
             title: self.title.clone(),
             state: self.public_state(),
             created_at: self.created_at.to_rfc3339(),
@@ -341,9 +341,9 @@ impl Thread {
         }
     }
 
-    pub fn snapshot(&self) -> TaskSnapshot {
-        TaskSnapshot {
-            task_id: self.id.clone(),
+    pub fn snapshot(&self) -> ThreadSnapshot {
+        ThreadSnapshot {
+            thread_id: self.id.clone(),
             title: self.title.clone(),
             config: self.config.clone(),
             state: self.public_state(),
@@ -458,7 +458,7 @@ impl Thread {
             }
             ThreadInternalState::NeedsModelCall => {
                 if self.turns_in_cycle >= self.config.max_turns {
-                    tracing::warn!(max_turns = self.config.max_turns, task_id = %self.id, "max_turns reached");
+                    tracing::warn!(max_turns = self.config.max_turns, thread_id = %self.id, "max_turns reached");
                     events.push(ThreadEvent::LoopComplete);
                     self.internal = ThreadInternalState::Completed;
                     self.touch();
@@ -619,7 +619,7 @@ impl Thread {
             ) => self.integrate_tool_result(op_id, tool_use_id, result, events),
             (state, result) => {
                 tracing::warn!(
-                    task_id = %self.id,
+                    thread_id = %self.id,
                     op_id,
                     state = ?std::mem::discriminant(state),
                     result = ?std::mem::discriminant(&result),
@@ -865,7 +865,7 @@ impl Thread {
         } = &mut self.internal
         else {
             tracing::warn!(
-                task_id = %self.id,
+                thread_id = %self.id,
                 approval_id,
                 "approval decision received but task not awaiting approval"
             );
@@ -876,7 +876,7 @@ impl Thread {
             matches!(d, ApprovalDisposition::Pending { approval_id: aid, .. } if aid == approval_id)
         }) else {
             tracing::warn!(
-                task_id = %self.id,
+                thread_id = %self.id,
                 approval_id,
                 "approval_id not pending — duplicate decision?"
             );
@@ -1169,7 +1169,7 @@ mod tests {
     }
 
     fn task_with_pending_batch(tool_names: &[&str]) -> Thread {
-        let cfg = TaskConfig {
+        let cfg = ThreadConfig {
             backend: String::new(),
             model: "test".into(),
             system_prompt: "test".into(),

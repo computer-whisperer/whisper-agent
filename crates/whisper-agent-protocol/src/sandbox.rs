@@ -103,7 +103,7 @@ pub struct ResourceLimits {
 /// execution environment for a task.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct ProvisionRequest {
-    pub task_id: String,
+    pub thread_id: String,
     pub spec: SandboxSpec,
 }
 
@@ -179,7 +179,7 @@ mod tests {
     #[test]
     fn none_deserializes_from_legacy_missing_field() {
         // Existing persisted tasks have no `sandbox` field — serde(default)
-        // on TaskConfig must produce SandboxSpec::None.
+        // on ThreadConfig must produce SandboxSpec::None.
         let spec: SandboxSpec = serde_json::from_str(r#"{"type":"none"}"#).unwrap();
         assert_eq!(spec, SandboxSpec::None);
     }

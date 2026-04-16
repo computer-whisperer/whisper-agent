@@ -4,7 +4,7 @@
 //! TOML parsing and validation stay in the server.
 //!
 //! `created_at` is an RFC-3339 string rather than a `chrono::DateTime` for
-//! the same reason `TaskSummary.created_at` is — the protocol crate
+//! the same reason `ThreadSummary.created_at` is — the protocol crate
 //! deliberately does not depend on chrono.
 
 use serde::{Deserialize, Serialize};
@@ -109,6 +109,6 @@ pub struct PodSnapshot {
     pub pod_id: String,
     pub config: PodConfig,
     pub toml_text: String,
-    pub threads: Vec<crate::TaskSummary>,
+    pub threads: Vec<crate::ThreadSummary>,
     pub archived: bool,
 }

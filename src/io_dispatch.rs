@@ -25,7 +25,7 @@ use crate::thread::{IoRequest, IoResult, OpId};
 
 /// Completion message delivered by every I/O future the scheduler dispatches.
 pub(crate) struct IoCompletion {
-    pub(crate) task_id: String,
+    pub(crate) thread_id: String,
     pub(crate) op_id: OpId,
     pub(crate) result: IoResult,
 }
@@ -33,29 +33,29 @@ pub(crate) struct IoCompletion {
 pub(crate) type IoFuture = Pin<Box<dyn Future<Output = IoCompletion> + Send>>;
 
 /// Build a future that executes one I/O op and yields an [`IoCompletion`].
-pub(crate) fn build_io_future(scheduler: &Scheduler, task_id: String, req: IoRequest) -> IoFuture {
+pub(crate) fn build_io_future(scheduler: &Scheduler, thread_id: String, req: IoRequest) -> IoFuture {
     match req {
-        IoRequest::McpConnect { op_id } => mcp_connect(scheduler, task_id, op_id),
-        IoRequest::ListTools { op_id } => list_tools(scheduler, task_id, op_id),
-        IoRequest::ModelCall { op_id } => model_call(scheduler, task_id, op_id),
+        IoRequest::McpConnect { op_id } => mcp_connect(scheduler, thread_id, op_id),
+        IoRequest::ListTools { op_id } => list_tools(scheduler, thread_id, op_id),
+        IoRequest::ModelCall { op_id } => model_call(scheduler, thread_id, op_id),
         IoRequest::ToolCall {
             op_id,
             tool_use_id,
             name,
             input,
-        } => tool_call(scheduler, task_id, op_id, tool_use_id, name, input),
+        } => tool_call(scheduler, thread_id, op_id, tool_use_id, name, input),
     }
 }
 
-fn mcp_connect(scheduler: &Scheduler, task_id: String, op_id: OpId) -> IoFuture {
-    let task = scheduler.task(&task_id).expect("task exists");
+fn mcp_connect(scheduler: &Scheduler, thread_id: String, op_id: OpId) -> IoFuture {
+    let task = scheduler.task(&thread_id).expect("task exists");
     let fallback_url = task.config.mcp_host_url.clone();
     let sandbox_spec = task.config.sandbox.clone();
     let provider = scheduler.sandbox_provider().clone();
 
     Box::pin(async move {
         // Provision sandbox if the task has a non-None spec.
-        let (mcp_url, sandbox_handle) = match provider.provision(&task_id, &sandbox_spec).await {
+        let (mcp_url, sandbox_handle) = match provider.provision(&thread_id, &sandbox_spec).await {
             Ok(handle) => {
                 let url = handle
                     .mcp_url()
@@ -65,7 +65,7 @@ fn mcp_connect(scheduler: &Scheduler, task_id: String, op_id: OpId) -> IoFuture 
             }
             Err(e) => {
                 return IoCompletion {
-                    task_id,
+                    thread_id,
                     op_id,
                     result: IoResult::McpConnect(Err(format!("sandbox provision failed: {e}"))),
                 };
@@ -74,7 +74,7 @@ fn mcp_connect(scheduler: &Scheduler, task_id: String, op_id: OpId) -> IoFuture 
 
         match McpSession::connect(&mcp_url).await {
             Ok(s) => IoCompletion {
-                task_id,
+                thread_id,
                 op_id,
                 result: IoResult::McpConnectSuccess {
                     session: Arc::new(s),
@@ -82,7 +82,7 @@ fn mcp_connect(scheduler: &Scheduler, task_id: String, op_id: OpId) -> IoFuture 
                 },
             },
             Err(e) => IoCompletion {
-                task_id,
+                thread_id,
                 op_id,
                 result: IoResult::McpConnect(Err(e.to_string())),
             },
@@ -90,9 +90,9 @@ fn mcp_connect(scheduler: &Scheduler, task_id: String, op_id: OpId) -> IoFuture 
     })
 }
 
-fn list_tools(scheduler: &Scheduler, task_id: String, op_id: OpId) -> IoFuture {
+fn list_tools(scheduler: &Scheduler, thread_id: String, op_id: OpId) -> IoFuture {
     let sessions = scheduler
-        .pool_sessions(&task_id)
+        .pool_sessions(&thread_id)
         .expect("mcp pool present before ListTools");
     Box::pin(async move {
         let mut all_tools: Vec<McpTool> = Vec::new();
@@ -104,7 +104,7 @@ fn list_tools(scheduler: &Scheduler, task_id: String, op_id: OpId) -> IoFuture {
                         if let Some(prev) = routing.get(&tool.name) {
                             // Earlier session wins (primary first).
                             warn!(
-                                %task_id, op_id, name = %tool.name,
+                                %thread_id, op_id, name = %tool.name,
                                 kept_idx = prev, dropped_idx = idx,
                                 "tool name collision across MCP sessions; dropping later"
                             );
@@ -116,7 +116,7 @@ fn list_tools(scheduler: &Scheduler, task_id: String, op_id: OpId) -> IoFuture {
                 }
                 Err(e) => {
                     return IoCompletion {
-                        task_id,
+                        thread_id,
                         op_id,
                         result: IoResult::ListTools(Err(format!("session {idx}: {e}"))),
                     };
@@ -124,7 +124,7 @@ fn list_tools(scheduler: &Scheduler, task_id: String, op_id: OpId) -> IoFuture {
             }
         }
         IoCompletion {
-            task_id,
+            thread_id,
             op_id,
             result: IoResult::ListToolsSuccess {
                 tools: all_tools,
@@ -134,8 +134,8 @@ fn list_tools(scheduler: &Scheduler, task_id: String, op_id: OpId) -> IoFuture {
     })
 }
 
-fn model_call(scheduler: &Scheduler, task_id: String, op_id: OpId) -> IoFuture {
-    let (owned_req, model_name, backend_name) = build_model_request(scheduler, &task_id);
+fn model_call(scheduler: &Scheduler, thread_id: String, op_id: OpId) -> IoFuture {
+    let (owned_req, model_name, backend_name) = build_model_request(scheduler, &thread_id);
     let provider = match scheduler.backend(&backend_name) {
         Some(entry) => entry.provider.clone(),
         None => {
@@ -144,7 +144,7 @@ fn model_call(scheduler: &Scheduler, task_id: String, op_id: OpId) -> IoFuture {
             let msg = format!("unknown backend `{backend_name}`");
             return Box::pin(async move {
                 IoCompletion {
-                    task_id,
+                    thread_id,
                     op_id,
                     result: IoResult::ModelCall(Err(msg)),
                 }
@@ -152,7 +152,7 @@ fn model_call(scheduler: &Scheduler, task_id: String, op_id: OpId) -> IoFuture {
         }
     };
     Box::pin(async move {
-        debug!(%task_id, op_id, backend = %backend_name, model = %model_name, "dispatching model call");
+        debug!(%thread_id, op_id, backend = %backend_name, model = %model_name, "dispatching model call");
         let req = ModelRequest {
             model: &owned_req.model,
             max_tokens: owned_req.max_tokens,
@@ -163,12 +163,12 @@ fn model_call(scheduler: &Scheduler, task_id: String, op_id: OpId) -> IoFuture {
         };
         match provider.create_message(&req).await {
             Ok(resp) => IoCompletion {
-                task_id,
+                thread_id,
                 op_id,
                 result: IoResult::ModelCall(Ok(resp)),
             },
             Err(e) => IoCompletion {
-                task_id,
+                thread_id,
                 op_id,
                 result: IoResult::ModelCall(Err(e.to_string())),
             },
@@ -178,7 +178,7 @@ fn model_call(scheduler: &Scheduler, task_id: String, op_id: OpId) -> IoFuture {
 
 fn tool_call(
     scheduler: &Scheduler,
-    task_id: String,
+    thread_id: String,
     op_id: OpId,
     tool_use_id: String,
     name: String,
@@ -188,7 +188,7 @@ fn tool_call(
     // primary if routing wasn't filled in (shouldn't happen because ToolCall
     // always follows a successful ListTools, but we'd rather try than panic).
     let mcp = scheduler
-        .route_tool(&task_id, &name)
+        .route_tool(&thread_id, &name)
         .expect("mcp pool present before ToolCall");
     Box::pin(async move {
         let result = match mcp.invoke(&name, input).await {
@@ -207,7 +207,7 @@ fn tool_call(
             Err(e) => Err(e.to_string()),
         };
         IoCompletion {
-            task_id,
+            thread_id,
             op_id,
             result: IoResult::ToolCall {
                 tool_use_id,
@@ -230,11 +230,11 @@ struct OwnedModelRequest {
 
 fn build_model_request(
     scheduler: &Scheduler,
-    task_id: &str,
+    thread_id: &str,
 ) -> (OwnedModelRequest, String, String) {
-    let task = scheduler.task(task_id).expect("task exists");
+    let task = scheduler.task(thread_id).expect("task exists");
     let tools: Vec<ToolSpec> = scheduler
-        .tool_descriptors(task_id)
+        .tool_descriptors(thread_id)
         .map(|tools| tools.iter().map(mcp_tool_to_spec).collect())
         .unwrap_or_default();
     let messages = task.conversation.messages().to_vec();

@@ -10,7 +10,7 @@ use tracing::info;
 use tracing_subscriber::EnvFilter;
 use whisper_agent_protocol::sandbox::{AccessMode, NetworkPolicy, PathAccess, SandboxSpec};
 use whisper_agent_protocol::{
-    ApprovalPolicy, ClientToServer, Role, ServerToClient, TaskConfig, TaskStateLabel,
+    ApprovalPolicy, ClientToServer, Role, ServerToClient, ThreadConfig, ThreadStateLabel,
 };
 
 use whisper_agent::anthropic::AnthropicClient;
@@ -299,7 +299,7 @@ async fn run_serve(args: ServeArgs) -> Result<()> {
     let server_config = ServerConfig {
         backends,
         default_backend,
-        default_task_config: TaskConfig {
+        default_task_config: ThreadConfig {
             backend: String::new(), // empty → scheduler uses default_backend
             model: default_model,
             system_prompt: args.system_prompt,
@@ -377,7 +377,7 @@ async fn run_one_shot(args: RunArgs) -> Result<()> {
         .with_context(|| format!("open audit log {}", args.audit_log.display()))?;
     info!(audit_log = %audit.path().display(), "audit log open");
 
-    let task_config = TaskConfig {
+    let task_config = ThreadConfig {
         backend: backend_name.clone(),
         model: args.model.clone(),
         system_prompt: args.system_prompt,
@@ -414,7 +414,7 @@ async fn run_one_shot(args: RunArgs) -> Result<()> {
     inbox_tx
         .send(SchedulerMsg::ClientMessage {
             conn_id: CONN_ID,
-            msg: ClientToServer::CreateTask {
+            msg: ClientToServer::CreateThread {
                 correlation_id: Some("cli-one-shot".into()),
                 initial_message: args.prompt,
                 config_override: None,
@@ -422,53 +422,53 @@ async fn run_one_shot(args: RunArgs) -> Result<()> {
         })
         .map_err(|_| anyhow!("scheduler inbox closed before create_task"))?;
 
-    let mut task_id: Option<String> = None;
+    let mut thread_id: Option<String> = None;
     let mut last_stop_reason: Option<String> = None;
     let mut final_snapshot = None;
     let mut last_error: Option<String> = None;
 
     while let Some(event) = outbound_rx.recv().await {
         match event {
-            ServerToClient::TaskCreated { task_id: tid, .. } => {
-                task_id = Some(tid.clone());
+            ServerToClient::ThreadCreated { thread_id: tid, .. } => {
+                thread_id = Some(tid.clone());
                 inbox_tx
                     .send(SchedulerMsg::ClientMessage {
                         conn_id: CONN_ID,
-                        msg: ClientToServer::SubscribeToTask { task_id: tid },
+                        msg: ClientToServer::SubscribeToThread { thread_id: tid },
                     })
                     .map_err(|_| anyhow!("scheduler inbox closed"))?;
             }
-            ServerToClient::TaskAssistantEnd { stop_reason, .. } => {
+            ServerToClient::ThreadAssistantEnd { stop_reason, .. } => {
                 last_stop_reason = stop_reason;
             }
             ServerToClient::Error { message, .. } => {
                 last_error = Some(message);
             }
-            ServerToClient::TaskStateChanged { state, .. } => {
+            ServerToClient::ThreadStateChanged { state, .. } => {
                 if matches!(
                     state,
-                    TaskStateLabel::Completed | TaskStateLabel::Failed | TaskStateLabel::Cancelled
+                    ThreadStateLabel::Completed | ThreadStateLabel::Failed | ThreadStateLabel::Cancelled
                 ) {
                     // Re-subscribe to get a fresh snapshot containing the
-                    // final conversation + total_usage. SubscribeToTask is
+                    // final conversation + total_usage. SubscribeToThread is
                     // idempotent — the scheduler always replies with a fresh
-                    // TaskSnapshot regardless of existing membership.
-                    if let Some(tid) = &task_id {
+                    // ThreadSnapshot regardless of existing membership.
+                    if let Some(tid) = &thread_id {
                         inbox_tx
                             .send(SchedulerMsg::ClientMessage {
                                 conn_id: CONN_ID,
-                                msg: ClientToServer::SubscribeToTask {
-                                    task_id: tid.clone(),
+                                msg: ClientToServer::SubscribeToThread {
+                                    thread_id: tid.clone(),
                                 },
                             })
                             .map_err(|_| anyhow!("scheduler inbox closed"))?;
                     }
                 }
             }
-            ServerToClient::TaskSnapshot { snapshot, .. } => {
+            ServerToClient::ThreadSnapshot { snapshot, .. } => {
                 if matches!(
                     snapshot.state,
-                    TaskStateLabel::Completed | TaskStateLabel::Failed | TaskStateLabel::Cancelled
+                    ThreadStateLabel::Completed | ThreadStateLabel::Failed | ThreadStateLabel::Cancelled
                 ) {
                     final_snapshot = Some(snapshot);
                     break;
@@ -515,7 +515,7 @@ async fn run_one_shot(args: RunArgs) -> Result<()> {
         println!("conversation dumped to {}", path.display());
     }
 
-    if matches!(snap.state, TaskStateLabel::Failed) {
+    if matches!(snap.state, ThreadStateLabel::Failed) {
         return Err(anyhow!(
             "task failed: {}",
             snap.failure.unwrap_or_else(|| "unknown".into())

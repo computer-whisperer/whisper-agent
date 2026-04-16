@@ -3,7 +3,7 @@
 //! `<pods_root>/<pod_id>/pod.toml`.
 //!
 //! Phase 2b lays the on-disk shape down without renaming the in-memory `Thread`
-//! type or splitting `TaskConfig`. The `pod.toml` is synthesized from the
+//! type or splitting `ThreadConfig`. The `pod.toml` is synthesized from the
 //! task's config on first flush and *not* clobbered on subsequent flushes —
 //! hand-edits survive even though the scheduler doesn't yet read them
 //! (Phase 3 makes pod.toml authoritative).
@@ -18,7 +18,7 @@
 //!     threads/
 //!       <thread_id>.json
 //!   <other-pod>/...
-//!   .pre-pod-refactor-<ts>/           stash of legacy `<pods_root>/<task_id>.json`
+//!   .pre-pod-refactor-<ts>/           stash of legacy `<pods_root>/<thread_id>.json`
 //!                                     files swept aside on startup
 //! ```
 //!
@@ -36,7 +36,7 @@ use tracing::{info, warn};
 use crate::pod::{self, POD_TOML, THREADS_DIR};
 use crate::thread::{Thread, ThreadInternalState};
 use whisper_agent_protocol::{
-    NamedSandboxSpec, PodAllow, PodConfig, PodLimits, PodSnapshot, PodSummary, TaskSummary,
+    NamedSandboxSpec, PodAllow, PodConfig, PodLimits, PodSnapshot, PodSummary, ThreadSummary,
     ThreadDefaults,
 };
 
@@ -336,7 +336,7 @@ async fn count_threads(pod_dir: &Path) -> u32 {
     n
 }
 
-async fn read_thread_summaries(pod_dir: &Path) -> Vec<TaskSummary> {
+async fn read_thread_summaries(pod_dir: &Path) -> Vec<ThreadSummary> {
     let threads_dir = pod_dir.join(THREADS_DIR);
     let mut entries = match fs::read_dir(&threads_dir).await {
         Ok(e) => e,
@@ -446,7 +446,7 @@ async fn sweep_legacy(pods_root: &Path) -> Result<Option<PathBuf>> {
 
 fn synthesize_pod_config(task: &Thread) -> PodConfig {
     // The synthesized config describes the task's bindings as if pods were
-    // already authoritative. Backend may be empty (the existing TaskConfig
+    // already authoritative. Backend may be empty (the existing ThreadConfig
     // accepts that as "use server default"); we mirror that — validation
     // accepts a self-consistent config even with empty strings.
     let backend = task.config.backend.clone();
@@ -481,7 +481,7 @@ fn synthesize_pod_config(task: &Thread) -> PodConfig {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU64, Ordering};
-    use whisper_agent_protocol::{ApprovalPolicy, SandboxSpec, TaskConfig};
+    use whisper_agent_protocol::{ApprovalPolicy, SandboxSpec, ThreadConfig};
 
     static COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -496,7 +496,7 @@ mod tests {
     }
 
     fn sample_task(id: &str) -> Thread {
-        let cfg = TaskConfig {
+        let cfg = ThreadConfig {
             backend: "anthropic".into(),
             model: "claude-opus-4-7".into(),
             system_prompt: "Hello.".into(),

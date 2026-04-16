@@ -32,7 +32,7 @@ use tokio::sync::mpsc;
 use tower_http::services::{ServeDir, ServeFile};
 use tower_http::trace::TraceLayer;
 use tracing::{error, info, warn};
-use whisper_agent_protocol::{ServerToClient, TaskConfig, decode_from_client, encode_to_client};
+use whisper_agent_protocol::{ServerToClient, ThreadConfig, decode_from_client, encode_to_client};
 
 use crate::audit::AuditLog;
 use crate::persist::Persister;
@@ -56,14 +56,14 @@ pub struct ServerConfig {
     pub backends: std::collections::HashMap<String, BackendEntry>,
     /// Fallback backend for tasks that don't specify one. Must be a key in `backends`.
     pub default_backend: String,
-    pub default_task_config: TaskConfig,
+    pub default_task_config: ThreadConfig,
     pub audit_log_path: PathBuf,
     pub host_id: String,
     /// Pods root directory. If `None`, persistence is disabled.
     pub pods_root: Option<PathBuf>,
     pub sandbox_provider: std::sync::Arc<dyn crate::sandbox::SandboxProvider>,
     /// Catalog of shared (singleton) MCP hosts the scheduler connects to at
-    /// startup. Tasks opt in by name via `TaskConfig.shared_mcp_hosts`.
+    /// startup. Tasks opt in by name via `ThreadConfig.shared_mcp_hosts`.
     pub shared_mcp_hosts: Vec<SharedHostConfig>,
 }
 
