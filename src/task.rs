@@ -1117,6 +1117,7 @@ mod tests {
             max_tokens: 100,
             max_turns: 10,
             approval_policy: ApprovalPolicy::PromptDestructive,
+            sandbox: Default::default(),
         };
         let mut task = Task::new("t1".into(), cfg);
         let tool_uses: Vec<ToolUseReq> = tool_names

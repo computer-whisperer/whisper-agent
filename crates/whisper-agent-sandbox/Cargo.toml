@@ -1,0 +1,21 @@
+[package]
+name = "whisper-agent-sandbox"
+description = "Sandbox provisioning daemon — creates isolated execution environments and runs MCP hosts inside them"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "whisper-agent-sandbox"
+path = "src/main.rs"
+
+[dependencies]
+whisper-agent-protocol = { path = "../whisper-agent-protocol" }
+axum = "0.8"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "process", "fs", "signal"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+clap = { version = "4", features = ["derive"] }
+thiserror = "2"

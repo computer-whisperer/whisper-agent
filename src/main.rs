@@ -210,6 +210,7 @@ async fn run_serve(args: ServeArgs) -> Result<()> {
             } else {
                 ApprovalPolicy::PromptDestructive
             },
+            sandbox: Default::default(),
         },
         audit_log_path: args.audit_log,
         host_id: "default".into(),

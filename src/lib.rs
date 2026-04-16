@@ -10,6 +10,7 @@ pub mod mcp;
 pub mod model;
 pub mod openai_chat;
 pub mod persist;
+pub mod sandbox;
 pub mod scheduler;
 pub mod server;
 pub mod task;

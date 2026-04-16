@@ -1034,6 +1034,7 @@ fn apply_override(base: TaskConfig, ov: Option<TaskConfigOverride>) -> TaskConfi
         max_tokens: ov.max_tokens.unwrap_or(base.max_tokens),
         max_turns: ov.max_turns.unwrap_or(base.max_turns),
         approval_policy: ov.approval_policy.unwrap_or(base.approval_policy),
+        sandbox: ov.sandbox.unwrap_or(base.sandbox),
     }
 }
 

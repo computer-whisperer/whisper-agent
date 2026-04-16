@@ -9,8 +9,10 @@
 //! the server (which builds them) and the client (which renders them from task snapshots).
 
 pub mod conversation;
+pub mod sandbox;
 
 pub use conversation::{ContentBlock, Conversation, Message, Role, ToolResultContent};
+pub use sandbox::SandboxSpec;
 
 use serde::{Deserialize, Serialize};
 
@@ -69,6 +71,8 @@ pub struct TaskConfig {
     pub max_turns: u32,
     #[serde(default)]
     pub approval_policy: ApprovalPolicy,
+    #[serde(default)]
+    pub sandbox: SandboxSpec,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
@@ -87,6 +91,8 @@ pub struct TaskConfigOverride {
     pub max_turns: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub approval_policy: Option<ApprovalPolicy>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sandbox: Option<SandboxSpec>,
 }
 
 /// Pattern-1 approval policy. See `docs/design_permissions.md`.
