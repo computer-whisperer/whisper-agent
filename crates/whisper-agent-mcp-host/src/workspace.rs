@@ -87,6 +87,9 @@ mod tests {
 #[cfg(test)]
 mod tempdir_lite {
     use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
 
     pub struct TempDir {
         path: PathBuf,
@@ -94,7 +97,11 @@ mod tempdir_lite {
     impl TempDir {
         pub fn new() -> Self {
             let mut path = std::env::temp_dir();
-            let name = format!("wamh-test-{}", std::process::id());
+            // Per-pid + per-call counter — tests in this module run in
+            // parallel within the same process and would otherwise collide
+            // on the directory name and race each other's Drop cleanup.
+            let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+            let name = format!("wamh-test-{}-{n}", std::process::id());
             path.push(name);
             std::fs::create_dir_all(&path).unwrap();
             Self { path }
