@@ -205,10 +205,6 @@ pub enum IoResult {
     McpConnect(Result<(), String>),
     ListToolsSuccess {
         tools: Vec<crate::mcp::ToolDescriptor>,
-        /// `tool_name → index into the task's pool sessions vec`. Scheduler-
-        /// internal — peeled off in apply_io_completion before the task sees
-        /// the result.
-        routing: std::collections::HashMap<String, usize>,
     },
     ListTools(Result<(), String>),
     ModelCall(Result<ModelResponse, String>),

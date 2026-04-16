@@ -90,18 +90,6 @@ pub struct SharedHostConfig {
     pub url: String,
 }
 
-/// Per-task bundle of MCP sessions. Routing is built from the merged
-/// `tools/list` response across every session in the pool — primary first so
-/// its tool names win on collision. Empty `routing` means `tools/list` hasn't
-/// completed yet.
-struct McpPool {
-    /// Session 0 is the per-task primary (sandbox MCP). Sessions 1.. are
-    /// clones of shared singletons selected by the task's allowlist.
-    sessions: Vec<Arc<McpSession>>,
-    /// `tool_name -> sessions index`. Filled when `ListToolsSuccess` lands.
-    routing: HashMap<String, usize>,
-}
-
 pub struct Scheduler {
     /// MCP host URL passed through to threads when their pod doesn't carry a
     /// sandbox-provided URL. Pods don't model this — it's a server-level
@@ -127,25 +115,10 @@ pub struct Scheduler {
     /// `ThreadEvent → ServerToClient` translation layer.
     router: ThreadEventRouter,
 
-    /// Per-task MCP host pool. Index 0 of each pool's `sessions` vec is the
-    /// task's primary (sandbox-provisioned filesystem); index 1.. are clones
-    /// of `shared_hosts` Arcs filtered by the task's `shared_mcp_hosts`
-    /// allowlist.
-    mcp_pools: HashMap<String, McpPool>,
-    /// Connections to shared (singleton) MCP hosts, keyed by name. Connected
-    /// once at scheduler start. Tasks reference these by name via
-    /// `ThreadConfig.shared_mcp_hosts`.
-    shared_hosts: HashMap<String, Arc<McpSession>>,
-    /// Per-task tool catalog from the last `tools/list`. Stored in MCP shape (with
-    /// annotations) so the approval layer can consult `read_only_hint` /
-    /// `destructive_hint` at dispatch time; we convert to Anthropic shape on-demand
-    /// when building a model request.
-    tool_descriptors: HashMap<String, Vec<McpTool>>,
-
-    /// Phase 1a shadow registry — populated alongside the per-task plumbing
-    /// above, never read by the I/O dispatch path. Phase 1b exposes it on the
-    /// wire; later phases promote it to the source of truth and the per-task
-    /// fields above go away. See `docs/design_pod_thread_scheduler.md`.
+    /// Phase 3c: the registry is the single source of truth for MCP
+    /// sessions, tool descriptors, and sandbox handles. Per-task
+    /// `mcp_pools` / `tool_descriptors` / `sandbox_handles` are gone;
+    /// the io_dispatch accessors walk this on demand.
     resources: ResourceRegistry,
 
     next_op_id: OpId,
@@ -186,14 +159,30 @@ impl Scheduler {
             resources.insert_backend(name.clone(), entry.kind.clone(), entry.default_model.clone());
         }
 
-        let mut shared_hosts: HashMap<String, Arc<McpSession>> = HashMap::new();
         for cfg in shared_host_configs {
             info!(name = %cfg.name, url = %cfg.url, "connecting to shared MCP host");
             let session = Arc::new(McpSession::connect(&cfg.url).await.map_err(|e| {
                 anyhow::anyhow!("shared MCP host `{}` ({}): {e}", cfg.name, cfg.url)
             })?);
-            resources.insert_shared_mcp_host(cfg.name.clone(), cfg.url.clone(), session.clone());
-            shared_hosts.insert(cfg.name, session);
+            // Phase 3c: list tools at startup so per-thread routing can
+            // walk the registry without a per-thread fan-out. Failure
+            // here is a startup failure — a misbehaving shared host that
+            // can't list tools is the same kind of fatal misconfiguration
+            // as one that can't handshake.
+            let tools = session
+                .list_tools()
+                .await
+                .map_err(|e| anyhow::anyhow!("list_tools on shared MCP `{}`: {e}", cfg.name))?;
+            let id = resources.insert_shared_mcp_host(
+                cfg.name.clone(),
+                cfg.url.clone(),
+                session,
+            );
+            let annotations: HashMap<String, ToolAnnotations> = tools
+                .iter()
+                .map(|t| (t.name.clone(), t.annotations.clone()))
+                .collect();
+            resources.populate_mcp_tools(&id, tools, annotations);
         }
 
         let default_pod_id = default_pod.id.clone();
@@ -210,9 +199,6 @@ impl Scheduler {
             sandbox_provider,
             tasks: HashMap::new(),
             router: ThreadEventRouter::new(audit, host_id),
-            mcp_pools: HashMap::new(),
-            shared_hosts,
-            tool_descriptors: HashMap::new(),
             resources,
             next_op_id: 1,
             dirty: HashSet::new(),
@@ -323,23 +309,88 @@ impl Scheduler {
             .map(|e| (e.id.clone(), e.mcp_url.clone().unwrap_or_default()))
     }
 
-    pub(crate) fn tool_descriptors(&self, thread_id: &str) -> Option<&[McpTool]> {
-        self.tool_descriptors.get(thread_id).map(|v| v.as_slice())
+    /// Phase 3c: build the thread's effective tool catalog by walking its
+    /// bound MCP hosts in precedence order — primary first, then each
+    /// shared host the thread allows. Tool-name collisions resolve in
+    /// favor of the earlier host (matching the prior `route_tool`
+    /// behavior). Empty when the primary hasn't completed `list_tools`
+    /// yet AND no shared hosts are bound.
+    pub(crate) fn tool_descriptors(&self, thread_id: &str) -> Vec<McpTool> {
+        let mut out: Vec<McpTool> = Vec::new();
+        let mut seen: HashSet<String> = HashSet::new();
+        for host in self.bound_mcp_hosts(thread_id) {
+            for tool in &host.tools {
+                if seen.insert(tool.name.clone()) {
+                    out.push(tool.clone());
+                }
+            }
+        }
+        out
     }
 
-    /// Snapshot of every MCP session in the task's pool, primary first. Used by
-    /// `ListTools` to fan out the `tools/list` call across the pool.
+    /// Sessions for every MCP host the thread is bound to, in precedence
+    /// order. Returns `None` when the primary hasn't been provisioned yet
+    /// (mirrors the old `pool_sessions` semantics, which io_dispatch's
+    /// `ListTools` uses to detect "MCP not ready").
     pub(crate) fn pool_sessions(&self, thread_id: &str) -> Option<Vec<Arc<McpSession>>> {
-        self.mcp_pools.get(thread_id).map(|p| p.sessions.clone())
+        let primary_id = McpHostId::primary_for_task(thread_id);
+        let primary = self.resources.mcp_hosts.get(&primary_id)?;
+        let primary_session = primary.session.clone()?;
+        let mut sessions = vec![primary_session];
+        let Some(task) = self.tasks.get(thread_id) else {
+            return Some(sessions);
+        };
+        for name in &task.config.shared_mcp_hosts {
+            let id = McpHostId::shared(name);
+            if let Some(entry) = self.resources.mcp_hosts.get(&id)
+                && let Some(s) = entry.session.clone()
+            {
+                sessions.push(s);
+            }
+        }
+        Some(sessions)
     }
 
-    /// Resolve which pool session a tool call should be routed to. Falls back
-    /// to the primary if the routing map hasn't been filled in (defensive —
-    /// `ToolCall` follows `ListToolsSuccess`, so routing should always exist).
+    /// Resolve which MCP session should receive a tool invocation. Walks
+    /// the thread's bound hosts in precedence order and returns the first
+    /// host whose tool catalog includes `tool_name`. Falls back to the
+    /// primary's session when nothing matches — defensive, since the
+    /// model shouldn't be calling tools we didn't advertise.
     pub(crate) fn route_tool(&self, thread_id: &str, tool_name: &str) -> Option<Arc<McpSession>> {
-        let pool = self.mcp_pools.get(thread_id)?;
-        let idx = *pool.routing.get(tool_name).unwrap_or(&0);
-        pool.sessions.get(idx).cloned()
+        for host in self.bound_mcp_hosts(thread_id) {
+            if host.tools.iter().any(|t| t.name == tool_name)
+                && let Some(s) = host.session.clone()
+            {
+                return Some(s);
+            }
+        }
+        let primary_id = McpHostId::primary_for_task(thread_id);
+        self.resources
+            .mcp_hosts
+            .get(&primary_id)
+            .and_then(|e| e.session.clone())
+    }
+
+    /// Iterate the thread's bound MCP host entries in precedence order
+    /// (primary first, then each shared host the thread allows that the
+    /// scheduler still has wired up). Internal helper for the accessors
+    /// above and `annotations_for`.
+    fn bound_mcp_hosts(&self, thread_id: &str) -> Vec<&crate::resources::McpHostEntry> {
+        let mut out = Vec::new();
+        let primary_id = McpHostId::primary_for_task(thread_id);
+        if let Some(entry) = self.resources.mcp_hosts.get(&primary_id) {
+            out.push(entry);
+        }
+        let Some(task) = self.tasks.get(thread_id) else {
+            return out;
+        };
+        for name in &task.config.shared_mcp_hosts {
+            let id = McpHostId::shared(name);
+            if let Some(entry) = self.resources.mcp_hosts.get(&id) {
+                out.push(entry);
+            }
+        }
+        out
     }
 
     pub fn with_persister(mut self, persister: Persister) -> Self {
@@ -847,7 +898,11 @@ impl Scheduler {
         // a name allowed by the pod but not actually wired up at the server
         // is a misconfiguration we want to surface at create-time.
         for name in &config.shared_mcp_hosts {
-            if !self.shared_hosts.contains_key(name) {
+            if !self
+                .resources
+                .mcp_hosts
+                .contains_key(&McpHostId::shared(name))
+            {
                 return Err(format!(
                     "shared MCP host `{name}` not configured on this server (pod `{pod_id}` allows it but no upstream is wired up)",
                 ));
@@ -934,8 +989,14 @@ impl Scheduler {
                 });
         }
 
-        let mcp_connected = self.mcp_pools.contains_key(thread_id);
-        let tools_listed = self.tool_descriptors.contains_key(thread_id);
+        // Phase 3c: "MCP connected" and "tools listed" are now properties
+        // of the per-thread primary McpHost in the registry. The primary
+        // is created when McpConnect succeeds; its `tools` populates when
+        // ListTools succeeds.
+        let primary_id = McpHostId::primary_for_task(thread_id);
+        let primary = self.resources.mcp_hosts.get(&primary_id);
+        let mcp_connected = primary.is_some_and(|e| e.session.is_some());
+        let tools_listed = primary.is_some_and(|e| !e.tools.is_empty());
         let new_state = {
             let task = self.tasks.get_mut(thread_id).expect("task exists");
             task.submit_user_message(text, mcp_connected, tools_listed);
@@ -988,33 +1049,16 @@ impl Scheduler {
                 session,
                 sandbox_handle,
             } => {
-                // Build the task's pool: primary first, then shared singletons
-                // selected by the task's allowlist. Unknown names are warn-skipped
-                // — they shouldn't survive create_task validation, but a persisted
-                // task whose host was removed since save lands here.
-                let (allow, sandbox_spec) = self
+                // Phase 3c: the sessions / pool / tool_descriptors maps are
+                // gone — everything lives on the registry now. We register
+                // the per-thread primary MCP host (carrying its session)
+                // and the (possibly deduped) sandbox; tool routing
+                // accessors walk the registry on demand.
+                let sandbox_spec = self
                     .tasks
                     .get(&thread_id)
-                    .map(|t| (t.config.shared_mcp_hosts.clone(), t.config.sandbox.clone()))
+                    .map(|t| t.config.sandbox.clone())
                     .unwrap_or_default();
-                let mut sessions = vec![session.clone()];
-                for name in &allow {
-                    match self.shared_hosts.get(name) {
-                        Some(s) => sessions.push(s.clone()),
-                        None => warn!(
-                            %thread_id, host = %name,
-                            "task references unknown shared MCP host (skipping)",
-                        ),
-                    }
-                }
-                // Phase 1a: mirror the just-acquired primary MCP + sandbox
-                // into the resource registry. Phase 1b: emit ResourceCreated
-                // so subscribed clients see them appear. Phase 3a: the
-                // sandbox handle moves into the registry too, replacing the
-                // dropped `scheduler.sandbox_handles` map. Phase 3b: the
-                // registry dedups by spec — a second thread with the same
-                // sandbox spec re-uses the existing entry and the just-
-                // provisioned handle gets torn down right away.
                 let primary_url = sandbox_handle
                     .as_ref()
                     .and_then(|h| h.mcp_url().map(str::to_string))
@@ -1056,35 +1100,21 @@ impl Scheduler {
                         }
                     }
                 }
-
-                self.mcp_pools.insert(
-                    thread_id.clone(),
-                    McpPool {
-                        sessions,
-                        routing: HashMap::new(),
-                    },
-                );
                 IoResult::McpConnect(Ok(()))
             }
-            IoResult::ListToolsSuccess { tools, routing } => {
-                if let Some(pool) = self.mcp_pools.get_mut(&thread_id) {
-                    pool.routing = routing;
-                }
-                // Phase 1a: mirror the per-task primary's tools into the
-                // registry. The merged list contains tools from every session
-                // in the pool; we only attribute to the primary entry here
-                // because in Phase 1a there's no shared-host tools-list flow
-                // (shared hosts publish tools too, but that wiring lands in
-                // Phase 1b alongside the wire surface).
+            IoResult::ListToolsSuccess { tools } => {
+                // Phase 3c: just the primary's tools land here — shared
+                // hosts published their catalogs at startup. Storing in
+                // the registry is enough; the per-thread effective list
+                // is built on demand by `tool_descriptors(thread_id)`.
                 let primary_id = McpHostId::primary_for_task(&thread_id);
                 let annotations: HashMap<String, ToolAnnotations> = tools
                     .iter()
                     .map(|t| (t.name.clone(), t.annotations.clone()))
                     .collect();
                 self.resources
-                    .populate_mcp_tools(&primary_id, tools.clone(), annotations);
+                    .populate_mcp_tools(&primary_id, tools, annotations);
                 self.emit_mcp_host_updated(&primary_id);
-                self.tool_descriptors.insert(thread_id.clone(), tools);
                 IoResult::ListTools(Ok(()))
             }
             other => other,
@@ -1104,15 +1134,16 @@ impl Scheduler {
     }
 
     fn annotations_for(&self, thread_id: &str) -> HashMap<String, ToolAnnotations> {
-        self.tool_descriptors
-            .get(thread_id)
-            .map(|tools| {
-                tools
-                    .iter()
-                    .map(|t| (t.name.clone(), t.annotations.clone()))
-                    .collect()
-            })
-            .unwrap_or_default()
+        let mut out = HashMap::new();
+        for host in self.bound_mcp_hosts(thread_id) {
+            for (name, ann) in &host.annotations {
+                // First host wins on collision — matches `route_tool`'s
+                // primary-first precedence so the policy decision agrees
+                // with where the call will actually land.
+                out.entry(name.clone()).or_insert_with(|| ann.clone());
+            }
+        }
+        out
     }
 
     /// Advance `thread_id`'s state machine until it pauses, pushing new I/O to
@@ -1153,15 +1184,12 @@ impl Scheduler {
             )
         });
         if is_terminal {
-            // Pool's primary session points at the sandbox MCP host that's
-            // about to die. Drop the pool too — shared session Arcs survive
-            // because `self.shared_hosts` still holds them.
-            self.mcp_pools.remove(thread_id);
-            // Phase 1a: mark the per-task primary MCP + sandbox as torn down
-            // in the registry so inspectability tools see the right state.
-            // Backend and shared-host user counts are intentionally left
-            // alone — the task itself still exists in `self.tasks` and the
-            // existing code never removes terminal tasks.
+            // Phase 3c: the per-thread primary MCP host owns its session
+            // in the registry; marking it torn down drops the session Arc
+            // and the routing accessors stop returning it. Backend and
+            // shared-host user counts are intentionally left alone — the
+            // task itself still exists in `self.tasks` and the existing
+            // code never removes terminal tasks.
             let primary_id = McpHostId::primary_for_task(thread_id);
             self.resources.mark_mcp_torn_down(&primary_id);
             self.emit_mcp_host_updated(&primary_id);

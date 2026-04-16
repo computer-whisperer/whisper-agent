@@ -10,13 +10,12 @@
 //! [`IoRequest`] variant only touches this module plus the task state machine — not
 //! the scheduler's run loop or event-routing layer.
 
-use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
 use futures::StreamExt;
-use tracing::{debug, warn};
+use tracing::debug;
 
 use crate::mcp::{McpSession, ToolDescriptor as McpTool};
 use crate::model::{CacheBreakpoint, ModelRequest, ToolSpec, default_cache_policy};
@@ -108,44 +107,24 @@ fn mcp_connect(scheduler: &Scheduler, thread_id: String, op_id: OpId) -> IoFutur
 }
 
 fn list_tools(scheduler: &Scheduler, thread_id: String, op_id: OpId) -> IoFuture {
+    // Phase 3c: only the primary needs a per-thread `tools/list` — shared
+    // hosts published their catalogs at startup. The accessor returns
+    // sessions in pool order (primary first); we just need the head.
     let sessions = scheduler
         .pool_sessions(&thread_id)
-        .expect("mcp pool present before ListTools");
+        .expect("primary MCP host present before ListTools");
+    let primary = sessions.into_iter().next().expect("primary present");
     Box::pin(async move {
-        let mut all_tools: Vec<McpTool> = Vec::new();
-        let mut routing: HashMap<String, usize> = HashMap::new();
-        for (idx, session) in sessions.iter().enumerate() {
-            match session.list_tools().await {
-                Ok(tools) => {
-                    for tool in tools {
-                        if let Some(prev) = routing.get(&tool.name) {
-                            // Earlier session wins (primary first).
-                            warn!(
-                                %thread_id, op_id, name = %tool.name,
-                                kept_idx = prev, dropped_idx = idx,
-                                "tool name collision across MCP sessions; dropping later"
-                            );
-                            continue;
-                        }
-                        routing.insert(tool.name.clone(), idx);
-                        all_tools.push(tool);
-                    }
-                }
-                Err(e) => {
-                    return IoCompletion {
-                        thread_id,
-                        op_id,
-                        result: IoResult::ListTools(Err(format!("session {idx}: {e}"))),
-                    };
-                }
-            }
-        }
-        IoCompletion {
-            thread_id,
-            op_id,
-            result: IoResult::ListToolsSuccess {
-                tools: all_tools,
-                routing,
+        match primary.list_tools().await {
+            Ok(tools) => IoCompletion {
+                thread_id,
+                op_id,
+                result: IoResult::ListToolsSuccess { tools },
+            },
+            Err(e) => IoCompletion {
+                thread_id,
+                op_id,
+                result: IoResult::ListTools(Err(e.to_string())),
             },
         }
     })
@@ -252,8 +231,9 @@ fn build_model_request(
     let task = scheduler.task(thread_id).expect("task exists");
     let tools: Vec<ToolSpec> = scheduler
         .tool_descriptors(thread_id)
-        .map(|tools| tools.iter().map(mcp_tool_to_spec).collect())
-        .unwrap_or_default();
+        .iter()
+        .map(mcp_tool_to_spec)
+        .collect();
     let messages = task.conversation.messages().to_vec();
     let backend_name = scheduler.resolve_backend_name(task).to_string();
     // Empty task.config.model → consult the backend's default_model. If that's
