@@ -1,11 +1,11 @@
-//! Workspace root and path safety.
+//! Workspace root — acts as the default cwd for relative paths.
 //!
-//! Every filesystem path the tools accept is resolved through [`Workspace::resolve`], which
-//! rejects anything that escapes the configured root. There is intentionally no symlink
-//! traversal at this layer — that's a sandboxing concern for the host MCP server's eventual
-//! seccomp/namespace deployment, not for path policy.
+//! Prior versions rejected absolute paths and `..` escapes to confine the agent.
+//! That enforcement now lives in the sandbox layer (landlock / container bind-mounts),
+//! so this module's job is just to turn a user-supplied path into an absolute
+//! filesystem path: relative → joined against the root, absolute → used as-is.
 
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 
 use thiserror::Error;
 
@@ -15,10 +15,6 @@ pub enum WorkspaceError {
     NotFound(PathBuf),
     #[error("workspace root {0} is not a directory")]
     NotADirectory(PathBuf),
-    #[error("path {0} escapes the workspace root")]
-    Escapes(PathBuf),
-    #[error("absolute paths are not accepted; got {0}")]
-    Absolute(PathBuf),
 }
 
 #[derive(Debug)]
@@ -41,31 +37,14 @@ impl Workspace {
         &self.root
     }
 
-    /// Resolve a workspace-relative path to an absolute path under the root.
-    /// Rejects absolute paths and any `..` components that would escape the root.
+    /// Absolute path → returned as-is. Relative path → joined against the
+    /// workspace root. No containment check; the sandbox enforces boundaries.
     pub fn resolve(&self, path: &Path) -> Result<PathBuf, WorkspaceError> {
         if path.is_absolute() {
-            return Err(WorkspaceError::Absolute(path.to_path_buf()));
+            Ok(path.to_path_buf())
+        } else {
+            Ok(self.root.join(path))
         }
-        let mut absolute = self.root.clone();
-        for component in path.components() {
-            match component {
-                Component::Normal(part) => absolute.push(part),
-                Component::CurDir => {}
-                Component::ParentDir => {
-                    if !absolute.pop() || !absolute.starts_with(&self.root) {
-                        return Err(WorkspaceError::Escapes(path.to_path_buf()));
-                    }
-                }
-                Component::Prefix(_) | Component::RootDir => {
-                    return Err(WorkspaceError::Absolute(path.to_path_buf()));
-                }
-            }
-        }
-        if !absolute.starts_with(&self.root) {
-            return Err(WorkspaceError::Escapes(path.to_path_buf()));
-        }
-        Ok(absolute)
     }
 }
 
@@ -80,23 +59,26 @@ mod tests {
     }
 
     #[test]
-    fn rejects_absolute_paths() {
+    fn absolute_path_returned_as_is() {
         let (_dir, ws) = temp_workspace();
-        assert!(ws.resolve(Path::new("/etc/passwd")).is_err());
+        let p = ws.resolve(Path::new("/etc/passwd")).unwrap();
+        assert_eq!(p, PathBuf::from("/etc/passwd"));
     }
 
     #[test]
-    fn rejects_escaping_parent() {
-        let (_dir, ws) = temp_workspace();
-        assert!(ws.resolve(Path::new("../escape")).is_err());
-        assert!(ws.resolve(Path::new("a/../../escape")).is_err());
-    }
-
-    #[test]
-    fn accepts_relative_within() {
+    fn relative_path_joined_against_root() {
         let (_dir, ws) = temp_workspace();
         let p = ws.resolve(Path::new("a/b/c.txt")).unwrap();
         assert!(p.starts_with(ws.root()));
+        assert!(p.ends_with("a/b/c.txt"));
+    }
+
+    #[test]
+    fn parent_dir_components_now_pass_through() {
+        // No containment check — sandbox enforces boundaries.
+        let (_dir, ws) = temp_workspace();
+        let p = ws.resolve(Path::new("../sibling/file")).unwrap();
+        assert!(p.to_string_lossy().contains(".."));
     }
 }
 

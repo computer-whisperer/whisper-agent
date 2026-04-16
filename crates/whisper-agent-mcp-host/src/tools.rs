@@ -64,7 +64,7 @@ fn read_file_descriptor() -> Tool {
             "properties": {
                 "path": {
                     "type": "string",
-                    "description": "Path relative to the workspace root."
+                    "description": "Path — absolute, or relative to the workspace root."
                 },
                 "offset": {
                     "type": "integer",
@@ -162,7 +162,7 @@ fn write_file_descriptor() -> Tool {
         input_schema: json!({
             "type": "object",
             "properties": {
-                "path": { "type": "string", "description": "Path relative to the workspace root." },
+                "path": { "type": "string", "description": "Path — absolute, or relative to the workspace root." },
                 "content": { "type": "string", "description": "File contents to write." }
             },
             "required": ["path", "content"]
@@ -218,7 +218,7 @@ fn edit_file_descriptor() -> Tool {
             "properties": {
                 "path": {
                     "type": "string",
-                    "description": "Path relative to the workspace root."
+                    "description": "Path — absolute, or relative to the workspace root."
                 },
                 "old_string": {
                     "type": "string",
@@ -384,7 +384,7 @@ fn bash_descriptor() -> Tool {
             "type": "object",
             "properties": {
                 "command": { "type": "string", "description": "Command to run via `bash -c`." },
-                "cwd": { "type": "string", "description": "Optional cwd relative to the workspace root. Defaults to the workspace root." },
+                "cwd": { "type": "string", "description": "Optional cwd — absolute, or relative to the workspace root. Defaults to the workspace root." },
                 "timeout_seconds": { "type": "integer", "description": "Kill the command after this many seconds. Default 120, max 600." },
                 "strip_ansi": { "type": "boolean", "description": "Strip ANSI escape sequences (colors, cursor codes) from stdout and stderr. Default true — only turn off if you specifically need the raw escape bytes." }
             },
@@ -529,7 +529,7 @@ fn list_dir_descriptor() -> Tool {
             "properties": {
                 "path": {
                     "type": "string",
-                    "description": "Directory path relative to the workspace root. Defaults to \".\"."
+                    "description": "Directory path — absolute, or relative to the workspace root. Defaults to \".\"."
                 },
                 "include_hidden": {
                     "type": "boolean",

@@ -114,10 +114,10 @@ struct ServeArgs {
     #[arg(long, default_value_t = 4096)]
     max_tokens: u32,
 
-    /// Auto-approve every tool call. Default is to prompt for destructive/unannotated
-    /// tools (MCP readOnlyHint passes through without a prompt).
+    /// Prompt the user before running non-read-only tool calls. Default is to
+    /// auto-approve everything — the sandbox layer is the safety boundary.
     #[arg(long)]
-    auto_approve_all: bool,
+    prompt_destructive: bool,
 
     /// URL of the sandbox provisioning daemon. When set, tasks with non-None
     /// SandboxSpec will be provisioned via this daemon. When omitted, only
@@ -250,10 +250,10 @@ async fn run_serve(args: ServeArgs) -> Result<()> {
             mcp_host_url: args.mcp_host_url,
             max_tokens: args.max_tokens,
             max_turns: args.max_turns,
-            approval_policy: if args.auto_approve_all {
-                ApprovalPolicy::AutoApproveAll
-            } else {
+            approval_policy: if args.prompt_destructive {
                 ApprovalPolicy::PromptDestructive
+            } else {
+                ApprovalPolicy::AutoApproveAll
             },
             sandbox: build_default_sandbox(&args.sandbox_workspace),
         },

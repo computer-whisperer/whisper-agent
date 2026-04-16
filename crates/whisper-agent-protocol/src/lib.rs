@@ -96,14 +96,18 @@ pub struct TaskConfigOverride {
 }
 
 /// Pattern-1 approval policy. See `docs/design_permissions.md`.
+///
+/// Default is `AutoApproveAll` because the sandbox layer (landlock /
+/// containers) is the primary safety boundary. Opt into `PromptDestructive`
+/// when running without a sandbox or when human-in-loop is desired.
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum ApprovalPolicy {
-    /// Auto-approve every tool call. Useful for dev-mode and unattended runs.
+    /// Auto-approve every tool call. Default.
+    #[default]
     AutoApproveAll,
     /// Auto-approve tools the MCP server marked `readOnlyHint: true`; prompt the user
-    /// for everything else (destructive, open-world, or unannotated). Default.
-    #[default]
+    /// for everything else (destructive, open-world, or unannotated).
     PromptDestructive,
 }
 
