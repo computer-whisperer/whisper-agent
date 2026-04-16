@@ -263,6 +263,7 @@ impl Scheduler {
                 } else {
                     self.mark_dirty(&task_id);
                     self.dispatch_task_events(&task_id, events);
+                    self.teardown_sandbox_if_terminal(&task_id);
                     self.step_until_blocked(&task_id, pending_io);
                 }
             }
@@ -298,9 +299,10 @@ impl Scheduler {
                     task.cancel();
                     self.mark_dirty(&task_id);
                     self.broadcast_task_list(ServerToClient::TaskStateChanged {
-                        task_id,
+                        task_id: task_id.clone(),
                         state: TaskStateLabel::Cancelled,
                     });
+                    self.teardown_sandbox_if_terminal(&task_id);
                 }
             }
             ClientToServer::ArchiveTask { task_id } => {
@@ -557,6 +559,7 @@ impl Scheduler {
         }
         self.mark_dirty(&task_id);
         self.dispatch_task_events(&task_id, events);
+        self.teardown_sandbox_if_terminal(&task_id);
     }
 
     fn annotations_for(&self, task_id: &str) -> HashMap<String, ToolAnnotations> {
@@ -775,6 +778,29 @@ impl Scheduler {
             model,
             backend_name,
         )
+    }
+
+    /// If the task is in a terminal state, tear down its sandbox (if any).
+    fn teardown_sandbox_if_terminal(&mut self, task_id: &str) {
+        let is_terminal = self
+            .tasks
+            .get(task_id)
+            .is_some_and(|t| matches!(
+                t.public_state(),
+                TaskStateLabel::Completed
+                    | TaskStateLabel::Failed
+                    | TaskStateLabel::Cancelled
+            ));
+        if is_terminal {
+            if let Some(mut handle) = self.sandbox_handles.remove(task_id) {
+                let tid = task_id.to_string();
+                tokio::spawn(async move {
+                    if let Err(e) = handle.teardown().await {
+                        warn!(task_id = %tid, error = %e, "sandbox teardown failed");
+                    }
+                });
+            }
+        }
     }
 
     // ---------- Event dispatch ----------
