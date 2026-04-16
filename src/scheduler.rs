@@ -35,8 +35,8 @@ use crate::audit::AuditLog;
 use crate::io_dispatch::{self, IoCompletion, IoFuture};
 use crate::mcp::{McpSession, ToolAnnotations, ToolDescriptor as McpTool};
 use crate::model::ModelProvider;
-use crate::sandbox::{SandboxHandle, SandboxProvider};
 use crate::persist::Persister;
+use crate::sandbox::{SandboxHandle, SandboxProvider};
 use crate::task::{
     ApprovalDisposition, IoResult, OpId, StepOutcome, Task, TaskInternalState, derive_title,
     new_task_id,
@@ -46,14 +46,24 @@ use crate::task_router::TaskEventRouter;
 pub type ConnId = u64;
 
 /// Messages accepted by the scheduler inbox.
+// `ClientMessage` carries a `ClientToServer` (the protocol's largest variant
+// is `CreateTask`, ~300 bytes). The other variants are tens of bytes. Boxing
+// would touch every send-site for a per-message saving that's a rounding
+// error against typical payloads. See `whisper-agent-protocol::ClientToServer`.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug)]
 pub enum SchedulerMsg {
-    ClientMessage { conn_id: ConnId, msg: ClientToServer },
+    ClientMessage {
+        conn_id: ConnId,
+        msg: ClientToServer,
+    },
     RegisterClient {
         conn_id: ConnId,
         outbound: mpsc::UnboundedSender<ServerToClient>,
     },
-    UnregisterClient { conn_id: ConnId },
+    UnregisterClient {
+        conn_id: ConnId,
+    },
 }
 
 /// Entry in the scheduler's backend catalog.
@@ -274,26 +284,24 @@ impl Scheduler {
                 correlation_id,
                 initial_message,
                 config_override,
-            } => {
-                match self.create_task(conn_id, correlation_id.clone(), config_override) {
-                    Ok(task_id) => {
-                        self.mark_dirty(&task_id);
-                        self.send_user_message(&task_id, initial_message);
-                        self.step_until_blocked(&task_id, pending_io);
-                    }
-                    Err(e) => {
-                        warn!(error = %e, conn_id, "create_task rejected");
-                        self.router.send_to_client(
-                            conn_id,
-                            ServerToClient::Error {
-                                correlation_id,
-                                task_id: None,
-                                message: format!("create_task: {e}"),
-                            },
-                        );
-                    }
+            } => match self.create_task(conn_id, correlation_id.clone(), config_override) {
+                Ok(task_id) => {
+                    self.mark_dirty(&task_id);
+                    self.send_user_message(&task_id, initial_message);
+                    self.step_until_blocked(&task_id, pending_io);
                 }
-            }
+                Err(e) => {
+                    warn!(error = %e, conn_id, "create_task rejected");
+                    self.router.send_to_client(
+                        conn_id,
+                        ServerToClient::Error {
+                            correlation_id,
+                            task_id: None,
+                            message: format!("create_task: {e}"),
+                        },
+                    );
+                }
+            },
             ClientToServer::SendUserMessage { task_id, text } => {
                 if self.tasks.contains_key(&task_id) {
                     self.send_user_message(&task_id, text);
@@ -375,10 +383,11 @@ impl Scheduler {
                 if let Some(task) = self.tasks.get_mut(&task_id) {
                     task.cancel();
                     self.mark_dirty(&task_id);
-                    self.router.broadcast_task_list(ServerToClient::TaskStateChanged {
-                        task_id: task_id.clone(),
-                        state: TaskStateLabel::Cancelled,
-                    });
+                    self.router
+                        .broadcast_task_list(ServerToClient::TaskStateChanged {
+                            task_id: task_id.clone(),
+                            state: TaskStateLabel::Cancelled,
+                        });
                     self.teardown_sandbox_if_terminal(&task_id);
                 }
             }
@@ -387,7 +396,8 @@ impl Scheduler {
                     task.archived = true;
                     task.touch();
                     self.mark_dirty(&task_id);
-                    self.router.broadcast_task_list(ServerToClient::TaskArchived { task_id });
+                    self.router
+                        .broadcast_task_list(ServerToClient::TaskArchived { task_id });
                 }
             }
             ClientToServer::SubscribeToTask { task_id } => {
@@ -431,7 +441,10 @@ impl Scheduler {
                     .collect();
                 self.router.send_to_client(
                     conn_id,
-                    ServerToClient::TaskList { correlation_id, tasks },
+                    ServerToClient::TaskList {
+                        correlation_id,
+                        tasks,
+                    },
                 );
             }
             ClientToServer::ListBackends { correlation_id } => {
@@ -453,7 +466,10 @@ impl Scheduler {
                     },
                 );
             }
-            ClientToServer::ListModels { correlation_id, backend } => {
+            ClientToServer::ListModels {
+                correlation_id,
+                backend,
+            } => {
                 let entry = self.backends.get(&backend);
                 let Some(entry) = entry else {
                     self.router.send_to_client(
@@ -517,7 +533,11 @@ impl Scheduler {
             if !self.shared_hosts.contains_key(name) {
                 return Err(format!(
                     "unknown shared MCP host `{name}`; configured: [{}]",
-                    self.shared_hosts.keys().cloned().collect::<Vec<_>>().join(", ")
+                    self.shared_hosts
+                        .keys()
+                        .cloned()
+                        .collect::<Vec<_>>()
+                        .join(", ")
                 ));
             }
         }
@@ -547,11 +567,12 @@ impl Scheduler {
                 },
             );
         } else {
-            self.router.broadcast_task_list(ServerToClient::TaskCreated {
-                task_id: task_id.clone(),
-                summary,
-                correlation_id: None,
-            });
+            self.router
+                .broadcast_task_list(ServerToClient::TaskCreated {
+                    task_id: task_id.clone(),
+                    summary,
+                    correlation_id: None,
+                });
         }
         Ok(task_id)
     }
@@ -570,10 +591,11 @@ impl Scheduler {
             }
         };
         if let Some(title) = title_new {
-            self.router.broadcast_task_list(ServerToClient::TaskTitleUpdated {
-                task_id: task_id.to_string(),
-                title,
-            });
+            self.router
+                .broadcast_task_list(ServerToClient::TaskTitleUpdated {
+                    task_id: task_id.to_string(),
+                    title,
+                });
         }
 
         let mcp_connected = self.mcp_pools.contains_key(task_id);
@@ -583,15 +605,20 @@ impl Scheduler {
             task.submit_user_message(text, mcp_connected, tools_listed);
             task.public_state()
         };
-        self.router.broadcast_task_list(ServerToClient::TaskStateChanged {
-            task_id: task_id.to_string(),
-            state: new_state,
-        });
+        self.router
+            .broadcast_task_list(ServerToClient::TaskStateChanged {
+                task_id: task_id.to_string(),
+                state: new_state,
+            });
     }
 
     /// Apply one I/O completion to its task and dispatch any resulting events.
     fn apply_io_completion(&mut self, completion: IoCompletion) {
-        let IoCompletion { task_id, op_id, result } = completion;
+        let IoCompletion {
+            task_id,
+            op_id,
+            result,
+        } = completion;
         let mut events = Vec::new();
 
         // Surface any IO-level error to the operator even if no client is subscribed.
@@ -608,7 +635,10 @@ impl Scheduler {
             IoResult::ModelCall(Err(e)) => {
                 warn!(%task_id, op_id, error = %e, "model call failed");
             }
-            IoResult::ToolCall { tool_use_id, result: Err(e) } => {
+            IoResult::ToolCall {
+                tool_use_id,
+                result: Err(e),
+            } => {
                 warn!(%task_id, %tool_use_id, error = %e, "tool call failed");
             }
             _ => {}
@@ -618,7 +648,10 @@ impl Scheduler {
         // session Arcs and routing map are scheduler-owned resources that
         // get peeled off before the task sees the slim variant.
         let result = match result {
-            IoResult::McpConnectSuccess { session, sandbox_handle } => {
+            IoResult::McpConnectSuccess {
+                session,
+                sandbox_handle,
+            } => {
                 // Build the task's pool: primary first, then shared singletons
                 // selected by the task's allowlist. Unknown names are warn-skipped
                 // — they shouldn't survive create_task validation, but a persisted
@@ -640,7 +673,10 @@ impl Scheduler {
                 }
                 self.mcp_pools.insert(
                     task_id.clone(),
-                    McpPool { sessions, routing: HashMap::new() },
+                    McpPool {
+                        sessions,
+                        routing: HashMap::new(),
+                    },
                 );
                 if let Some(handle) = sandbox_handle {
                     self.sandbox_handles.insert(task_id.clone(), handle);
@@ -713,13 +749,12 @@ impl Scheduler {
     fn teardown_sandbox_if_terminal(&mut self, task_id: &str) {
         // Completed is NOT terminal — the task can receive follow-up messages.
         // Only tear down on truly irreversible states.
-        let is_terminal = self
-            .tasks
-            .get(task_id)
-            .is_some_and(|t| matches!(
+        let is_terminal = self.tasks.get(task_id).is_some_and(|t| {
+            matches!(
                 t.public_state(),
                 TaskStateLabel::Failed | TaskStateLabel::Cancelled
-            ));
+            )
+        });
         if is_terminal {
             // Pool's primary session points at the sandbox MCP host that's
             // about to die. Drop the pool too — shared session Arcs survive
@@ -735,18 +770,26 @@ impl Scheduler {
             }
         }
     }
-
 }
 
 /// Build the `TaskPendingApproval` events that a newly-subscribed client needs to
 /// render the approval UI. Returns empty if the task isn't in AwaitingApproval.
 fn pending_approvals_of(task: &Task) -> Vec<ServerToClient> {
-    let TaskInternalState::AwaitingApproval { tool_uses, dispositions } = &task.internal else {
+    let TaskInternalState::AwaitingApproval {
+        tool_uses,
+        dispositions,
+    } = &task.internal
+    else {
         return Vec::new();
     };
     let mut out = Vec::new();
     for (tool_use, disposition) in tool_uses.iter().zip(dispositions.iter()) {
-        if let ApprovalDisposition::Pending { approval_id, destructive, read_only } = disposition {
+        if let ApprovalDisposition::Pending {
+            approval_id,
+            destructive,
+            read_only,
+        } = disposition
+        {
             out.push(ServerToClient::TaskPendingApproval {
                 task_id: task.id.clone(),
                 approval_id: approval_id.clone(),
@@ -782,10 +825,7 @@ fn apply_override(base: TaskConfig, ov: Option<TaskConfigOverride>) -> TaskConfi
     // inherit the model from the default backend — leave it empty so build_model_request
     // resolves via the picked backend's default_model at call time (or passes empty to
     // a single-model endpoint that ignores the field).
-    let backend_changed = ov
-        .backend
-        .as_deref()
-        .is_some_and(|b| b != base.backend);
+    let backend_changed = ov.backend.as_deref().is_some_and(|b| b != base.backend);
     let model = match ov.model {
         Some(m) => m,
         None if backend_changed => String::new(),
@@ -806,10 +846,7 @@ fn apply_override(base: TaskConfig, ov: Option<TaskConfigOverride>) -> TaskConfi
 
 // ---------- Run loop ----------
 
-pub async fn run(
-    mut scheduler: Scheduler,
-    mut inbox: mpsc::UnboundedReceiver<SchedulerMsg>,
-) {
+pub async fn run(mut scheduler: Scheduler, mut inbox: mpsc::UnboundedReceiver<SchedulerMsg>) {
     let mut pending_io: FuturesUnordered<IoFuture> = FuturesUnordered::new();
 
     info!("scheduler starting");

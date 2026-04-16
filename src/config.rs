@@ -97,8 +97,7 @@ impl BackendConfig {
                 default_model: _,
             } => {
                 let var = api_key_env.as_deref().unwrap_or("ANTHROPIC_API_KEY");
-                let key = std::env::var(var)
-                    .with_context(|| format!("env var `{var}` not set"))?;
+                let key = std::env::var(var).with_context(|| format!("env var `{var}` not set"))?;
                 Ok(Arc::new(AnthropicClient::new(key)))
             }
             BackendConfig::OpenAiChat {
@@ -108,8 +107,7 @@ impl BackendConfig {
             } => {
                 let key = match api_key_env {
                     Some(var) => Some(
-                        std::env::var(var)
-                            .with_context(|| format!("env var `{var}` not set"))?,
+                        std::env::var(var).with_context(|| format!("env var `{var}` not set"))?,
                     ),
                     None => None,
                 };
@@ -124,8 +122,8 @@ impl Config {
         let text = tokio::fs::read_to_string(path)
             .await
             .with_context(|| format!("read config {}", path.display()))?;
-        let config: Config = toml::from_str(&text)
-            .with_context(|| format!("parse config {}", path.display()))?;
+        let config: Config =
+            toml::from_str(&text).with_context(|| format!("parse config {}", path.display()))?;
         config.validate()?;
         Ok(config)
     }

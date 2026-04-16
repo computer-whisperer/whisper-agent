@@ -74,8 +74,7 @@ async fn handle_post(State(state): State<AppState>, Json(req): Json<JsonRpcReque
 }
 
 fn initialize(id: Value, params: Option<Value>) -> JsonRpcResponse {
-    let parsed: Result<InitializeParams, _> =
-        serde_json::from_value(params.unwrap_or(Value::Null));
+    let parsed: Result<InitializeParams, _> = serde_json::from_value(params.unwrap_or(Value::Null));
     let _client_protocol = match parsed {
         Ok(p) => p.protocol_version,
         Err(e) => {

@@ -45,7 +45,12 @@ pub struct JsonRpcError {
 
 impl JsonRpcResponse {
     pub fn success(id: Value, result: Value) -> Self {
-        Self { jsonrpc: "2.0", id, result: Some(result), error: None }
+        Self {
+            jsonrpc: "2.0",
+            id,
+            result: Some(result),
+            error: None,
+        }
     }
 
     pub fn error(id: Value, code: i32, message: impl Into<String>) -> Self {
@@ -53,7 +58,11 @@ impl JsonRpcResponse {
             jsonrpc: "2.0",
             id,
             result: None,
-            error: Some(JsonRpcError { code, message: message.into(), data: None }),
+            error: Some(JsonRpcError {
+                code,
+                message: message.into(),
+                data: None,
+            }),
         }
     }
 }
@@ -155,11 +164,17 @@ pub struct CallToolResult {
 
 impl CallToolResult {
     pub fn text(text: impl Into<String>) -> Self {
-        Self { content: vec![ContentBlock::Text { text: text.into() }], is_error: None }
+        Self {
+            content: vec![ContentBlock::Text { text: text.into() }],
+            is_error: None,
+        }
     }
 
     pub fn error_text(text: impl Into<String>) -> Self {
-        Self { content: vec![ContentBlock::Text { text: text.into() }], is_error: Some(true) }
+        Self {
+            content: vec![ContentBlock::Text { text: text.into() }],
+            is_error: Some(true),
+        }
     }
 }
 

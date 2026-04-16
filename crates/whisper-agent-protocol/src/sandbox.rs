@@ -79,9 +79,7 @@ pub enum NetworkPolicy {
     /// No network access at all.
     Isolated,
     /// Allow connections to specific hosts only (e.g. `["crates.io", "github.com"]`).
-    AllowList {
-        hosts: Vec<String>,
-    },
+    AllowList { hosts: Vec<String> },
 }
 
 /// Resource limits for the sandbox. All fields optional — backends apply
@@ -162,8 +160,14 @@ mod tests {
     fn landlock_spec_round_trips_through_json() {
         let spec = SandboxSpec::Landlock {
             allowed_paths: vec![
-                PathAccess { path: "/home/me/project".into(), mode: AccessMode::ReadWrite },
-                PathAccess { path: "/usr".into(), mode: AccessMode::ReadOnly },
+                PathAccess {
+                    path: "/home/me/project".into(),
+                    mode: AccessMode::ReadWrite,
+                },
+                PathAccess {
+                    path: "/usr".into(),
+                    mode: AccessMode::ReadOnly,
+                },
             ],
             network: NetworkPolicy::Isolated,
         };
@@ -182,10 +186,7 @@ mod tests {
 
     #[test]
     fn access_mode_defaults_to_read_only() {
-        let m: Mount = serde_json::from_str(
-            r#"{"host":"/a","guest":"/b"}"#,
-        )
-        .unwrap();
+        let m: Mount = serde_json::from_str(r#"{"host":"/a","guest":"/b"}"#).unwrap();
         assert_eq!(m.mode, AccessMode::ReadOnly);
     }
 }

@@ -194,6 +194,11 @@ pub struct TaskSnapshot {
 // ---------- Wire enums ----------
 
 /// Messages the client sends to the server.
+// `CreateTask` carries a `TaskConfigOverride` (~300 bytes of Options); other
+// variants are tens of bytes. Boxing the override would change every
+// construction site for a bytes-saved-per-message that's a rounding error
+// against typical `initial_message` payloads. Revisit if profiling shows it.
+#[allow(clippy::large_enum_variant)]
 #[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ClientToServer {
@@ -208,7 +213,10 @@ pub enum ClientToServer {
         config_override: Option<TaskConfigOverride>,
     },
     /// Append a follow-up user message to an existing task.
-    SendUserMessage { task_id: String, text: String },
+    SendUserMessage {
+        task_id: String,
+        text: String,
+    },
     /// Respond to a pending tool-call approval. If `remember` is true and the
     /// decision is `Approve`, the tool's name is added to the task's allowlist —
     /// future calls to that tool skip the prompt for the rest of the task's
@@ -223,18 +231,29 @@ pub enum ClientToServer {
     },
     /// Remove a tool name from the task's allowlist. Future calls to that tool
     /// will prompt again under the task's policy.
-    RemoveToolAllowlistEntry { task_id: String, tool_name: String },
+    RemoveToolAllowlistEntry {
+        task_id: String,
+        tool_name: String,
+    },
     /// Cancel a task. Stubbed for now — flips state to `Cancelled` without rolling back
     /// any in-flight tool work. Proper rollback semantics are a v0.3 problem.
-    CancelTask { task_id: String },
+    CancelTask {
+        task_id: String,
+    },
     /// Archive (hide) a task. It remains on disk but drops off the broadcast list.
-    ArchiveTask { task_id: String },
+    ArchiveTask {
+        task_id: String,
+    },
 
     // --- Observation ---
     /// Start receiving per-turn events for this task. Server responds with a
     /// `TaskSnapshot` and then streams subsequent events.
-    SubscribeToTask { task_id: String },
-    UnsubscribeFromTask { task_id: String },
+    SubscribeToTask {
+        task_id: String,
+    },
+    UnsubscribeFromTask {
+        task_id: String,
+    },
     /// Request the current list of non-archived tasks.
     ListTasks {
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -257,6 +276,13 @@ pub enum ClientToServer {
 }
 
 /// Messages the server sends to the client.
+// `TaskSnapshot` is much larger (~470 bytes — full conversation, config, usage)
+// than the streaming variants (~50 bytes each). Snapshots are sent rarely (one
+// per subscribe), so the per-clone cost during scheduler broadcasts is the
+// streaming-variant size, not the snapshot's. Boxing would change every
+// construction site for marginal gain. Revisit if snapshot broadcasts ever land
+// on the hot path.
+#[allow(clippy::large_enum_variant)]
 #[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ServerToClient {

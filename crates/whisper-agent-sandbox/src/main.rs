@@ -150,11 +150,13 @@ async fn handle_provision(
 
             (
                 StatusCode::OK,
-                Json(serde_json::to_value(ProvisionResponse {
-                    session_id,
-                    mcp_url,
-                })
-                .unwrap()),
+                Json(
+                    serde_json::to_value(ProvisionResponse {
+                        session_id,
+                        mcp_url,
+                    })
+                    .unwrap(),
+                ),
             )
                 .into_response()
         }

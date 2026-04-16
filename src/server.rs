@@ -221,9 +221,7 @@ async fn handle_ws_session(socket: WebSocket, state: AppState) {
         }
     }
 
-    let _ = state
-        .inbox
-        .send(SchedulerMsg::UnregisterClient { conn_id });
+    let _ = state.inbox.send(SchedulerMsg::UnregisterClient { conn_id });
     let _ = writer.await;
     info!(conn_id, "ws session closed");
 }

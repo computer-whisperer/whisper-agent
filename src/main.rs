@@ -56,7 +56,10 @@ README files unless the user explicitly asks.
 const DEFAULT_BACKEND_NAME: &str = "anthropic";
 
 #[derive(Parser, Debug)]
-#[command(version, about = "whisper-agent: headless agent loop with embedded webui server.")]
+#[command(
+    version,
+    about = "whisper-agent: headless agent loop with embedded webui server."
+)]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -259,9 +262,7 @@ async fn run_serve(args: ServeArgs) -> Result<()> {
         }
         None => {
             let key = args.anthropic_api_key.clone().ok_or_else(|| {
-                anyhow!(
-                    "no --config provided and ANTHROPIC_API_KEY / --anthropic-api-key is unset"
-                )
+                anyhow!("no --config provided and ANTHROPIC_API_KEY / --anthropic-api-key is unset")
             })?;
             let mut map = HashMap::new();
             map.insert(
@@ -444,9 +445,7 @@ async fn run_one_shot(args: RunArgs) -> Result<()> {
             ServerToClient::TaskStateChanged { state, .. } => {
                 if matches!(
                     state,
-                    TaskStateLabel::Completed
-                        | TaskStateLabel::Failed
-                        | TaskStateLabel::Cancelled
+                    TaskStateLabel::Completed | TaskStateLabel::Failed | TaskStateLabel::Cancelled
                 ) {
                     // Re-subscribe to get a fresh snapshot containing the
                     // final conversation + total_usage. SubscribeToTask is
@@ -467,9 +466,7 @@ async fn run_one_shot(args: RunArgs) -> Result<()> {
             ServerToClient::TaskSnapshot { snapshot, .. } => {
                 if matches!(
                     snapshot.state,
-                    TaskStateLabel::Completed
-                        | TaskStateLabel::Failed
-                        | TaskStateLabel::Cancelled
+                    TaskStateLabel::Completed | TaskStateLabel::Failed | TaskStateLabel::Cancelled
                 ) {
                     final_snapshot = Some(snapshot);
                     break;

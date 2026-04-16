@@ -11,8 +11,8 @@ use std::pin::Pin;
 
 use thiserror::Error;
 use tracing::info;
-use whisper_agent_protocol::sandbox::{ProvisionRequest, ProvisionResponse, TeardownRequest};
 use whisper_agent_protocol::SandboxSpec;
+use whisper_agent_protocol::sandbox::{ProvisionRequest, ProvisionResponse, TeardownRequest};
 
 type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
@@ -66,9 +66,7 @@ impl SandboxProvider for BareMetal {
     ) -> BoxFuture<'a, Result<Box<dyn SandboxHandle>, SandboxError>> {
         Box::pin(async move {
             match spec {
-                SandboxSpec::None => {
-                    Ok(Box::new(BareMetalHandle) as Box<dyn SandboxHandle>)
-                }
+                SandboxSpec::None => Ok(Box::new(BareMetalHandle) as Box<dyn SandboxHandle>),
                 SandboxSpec::Container { .. } => Err(SandboxError::Unsupported(
                     "BareMetal provider cannot provision containers".into(),
                 )),

@@ -139,15 +139,13 @@ mod web_entry {
         }
 
         let socket_for_send = socket.clone();
-        let send_fn: SendFn = Box::new(move |msg: ClientToServer| {
-            match encode_to_server(&msg) {
-                Ok(bytes) => {
-                    if let Err(e) = socket_for_send.send_with_u8_array(&bytes) {
-                        log::error!("ws send failed: {e:?}");
-                    }
+        let send_fn: SendFn = Box::new(move |msg: ClientToServer| match encode_to_server(&msg) {
+            Ok(bytes) => {
+                if let Err(e) = socket_for_send.send_with_u8_array(&bytes) {
+                    log::error!("ws send failed: {e:?}");
                 }
-                Err(e) => log::error!("encode_to_server failed: {e}"),
             }
+            Err(e) => log::error!("encode_to_server failed: {e}"),
         });
 
         (inbound, send_fn)
@@ -156,11 +154,7 @@ mod web_entry {
     fn ws_url() -> String {
         let location = web_sys::window().expect("no window").location();
         let host = location.host().unwrap_or_else(|_| "127.0.0.1:8080".into());
-        let proto = if location
-            .protocol()
-            .map(|p| p == "https:")
-            .unwrap_or(false)
-        {
+        let proto = if location.protocol().map(|p| p == "https:").unwrap_or(false) {
             "wss"
         } else {
             "ws"

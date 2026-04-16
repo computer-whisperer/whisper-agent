@@ -74,9 +74,15 @@ const PRESETS_STORAGE_KEY: &str = "whisper-agent.sandbox-presets";
 
 #[cfg(target_arch = "wasm32")]
 fn load_presets() -> Vec<LandlockPreset> {
-    let Some(window) = web_sys::window() else { return Vec::new() };
-    let Ok(Some(storage)) = window.local_storage() else { return Vec::new() };
-    let Ok(Some(json)) = storage.get_item(PRESETS_STORAGE_KEY) else { return Vec::new() };
+    let Some(window) = web_sys::window() else {
+        return Vec::new();
+    };
+    let Ok(Some(storage)) = window.local_storage() else {
+        return Vec::new();
+    };
+    let Ok(Some(json)) = storage.get_item(PRESETS_STORAGE_KEY) else {
+        return Vec::new();
+    };
     serde_json::from_str(&json).unwrap_or_default()
 }
 
@@ -87,9 +93,15 @@ fn load_presets() -> Vec<LandlockPreset> {
 
 #[cfg(target_arch = "wasm32")]
 fn save_presets(presets: &[LandlockPreset]) {
-    let Some(window) = web_sys::window() else { return };
-    let Ok(Some(storage)) = window.local_storage() else { return };
-    let Ok(json) = serde_json::to_string(presets) else { return };
+    let Some(window) = web_sys::window() else {
+        return;
+    };
+    let Ok(Some(storage)) = window.local_storage() else {
+        return;
+    };
+    let Ok(json) = serde_json::to_string(presets) else {
+        return;
+    };
     let _ = storage.set_item(PRESETS_STORAGE_KEY, &json);
 }
 
@@ -99,6 +111,10 @@ fn save_presets(_presets: &[LandlockPreset]) {}
 /// Events pushed into [`Inbound`]. In addition to decoded wire messages we pipe in
 /// connection-level signals (open/close/error) so the UI can show a connection status
 /// distinct from per-task state.
+// `Wire(TaskSnapshot)` dwarfs the connection variants. Boxing would change every
+// inbound enqueue site; the queue is shallow and short-lived, so the bytes saved
+// per item don't justify the churn. Same trade-off as `whisper-agent-protocol::ServerToClient`.
+#[allow(clippy::large_enum_variant)]
 pub enum InboundEvent {
     Wire(ServerToClient),
     ConnectionOpened,
@@ -354,11 +370,15 @@ impl ChatApp {
                 self.conn_status = ConnectionStatus::Connected;
                 self.conn_detail = None;
                 if !self.list_requested {
-                    self.send(ClientToServer::ListTasks { correlation_id: None });
+                    self.send(ClientToServer::ListTasks {
+                        correlation_id: None,
+                    });
                     self.list_requested = true;
                 }
                 if !self.backends_requested {
-                    self.send(ClientToServer::ListBackends { correlation_id: None });
+                    self.send(ClientToServer::ListBackends {
+                        correlation_id: None,
+                    });
                     self.backends_requested = true;
                 }
             }
@@ -376,7 +396,11 @@ impl ChatApp {
 
     fn handle_wire(&mut self, msg: ServerToClient) {
         match msg {
-            ServerToClient::TaskCreated { task_id, summary, correlation_id: _ } => {
+            ServerToClient::TaskCreated {
+                task_id,
+                summary,
+                correlation_id: _,
+            } => {
                 self.upsert_task(summary);
                 self.recompute_order();
                 // Auto-select newly created tasks.
@@ -403,7 +427,8 @@ impl ChatApp {
                 }
             }
             ServerToClient::TaskList { tasks, .. } => {
-                self.tasks.retain(|id, _| tasks.iter().any(|t| &t.task_id == id));
+                self.tasks
+                    .retain(|id, _| tasks.iter().any(|t| &t.task_id == id));
                 for summary in tasks {
                     self.upsert_task(summary);
                 }
@@ -431,7 +456,10 @@ impl ChatApp {
                 // Pending-approval events that follow the snapshot will re-seed this.
                 view.pending_approvals.clear();
             }
-            ServerToClient::TaskAllowlistUpdated { task_id, tool_allowlist } => {
+            ServerToClient::TaskAllowlistUpdated {
+                task_id,
+                tool_allowlist,
+            } => {
                 if let Some(view) = self.tasks.get_mut(&task_id) {
                     view.tool_allowlist = tool_allowlist;
                 }
@@ -456,7 +484,12 @@ impl ChatApp {
                     }
                 }
             }
-            ServerToClient::TaskToolCallBegin { task_id, tool_use_id, name, args_preview } => {
+            ServerToClient::TaskToolCallBegin {
+                task_id,
+                tool_use_id,
+                name,
+                args_preview,
+            } => {
                 if let Some(view) = self.tasks.get_mut(&task_id) {
                     view.items.push(DisplayItem::ToolCall {
                         tool_use_id,
@@ -475,14 +508,17 @@ impl ChatApp {
             } => {
                 if let Some(view) = self.tasks.get_mut(&task_id) {
                     for item in view.items.iter_mut().rev() {
-                        if let DisplayItem::ToolCall { tool_use_id: id, result, is_error: err, .. } =
-                            item
+                        if let DisplayItem::ToolCall {
+                            tool_use_id: id,
+                            result,
+                            is_error: err,
+                            ..
+                        } = item
+                            && id == &tool_use_id
                         {
-                            if id == &tool_use_id {
-                                *result = Some(result_preview);
-                                *err = is_error;
-                                break;
-                            }
+                            *result = Some(result_preview);
+                            *err = is_error;
+                            break;
                         }
                     }
                 }
@@ -505,7 +541,11 @@ impl ChatApp {
                 if let Some(view) = self.tasks.get_mut(&task_id) {
                     // Deduplicate — the same approval can arrive again if the client
                     // re-subscribes while a decision is still outstanding.
-                    if !view.pending_approvals.iter().any(|p| p.approval_id == approval_id) {
+                    if !view
+                        .pending_approvals
+                        .iter()
+                        .any(|p| p.approval_id == approval_id)
+                    {
                         view.pending_approvals.push(PendingApproval {
                             approval_id,
                             name,
@@ -517,12 +557,19 @@ impl ChatApp {
                     }
                 }
             }
-            ServerToClient::TaskApprovalResolved { task_id, approval_id, .. } => {
+            ServerToClient::TaskApprovalResolved {
+                task_id,
+                approval_id,
+                ..
+            } => {
                 if let Some(view) = self.tasks.get_mut(&task_id) {
-                    view.pending_approvals.retain(|p| p.approval_id != approval_id);
+                    view.pending_approvals
+                        .retain(|p| p.approval_id != approval_id);
                 }
             }
-            ServerToClient::Error { task_id, message, .. } => {
+            ServerToClient::Error {
+                task_id, message, ..
+            } => {
                 if let Some(tid) = task_id.as_ref()
                     && let Some(view) = self.tasks.get_mut(tid)
                 {
@@ -531,13 +578,20 @@ impl ChatApp {
                     // detail on the task's Failed state; this mirrors it locally so
                     // the UI doesn't have to wait on a re-subscribe round-trip.
                     view.failure = Some(message.clone());
-                    view.items.push(DisplayItem::SystemNote { text: message, is_error: true });
+                    view.items.push(DisplayItem::SystemNote {
+                        text: message,
+                        is_error: true,
+                    });
                 } else {
                     // No task scope — surface via conn detail so the banner reflects it.
                     self.conn_detail = Some(message);
                 }
             }
-            ServerToClient::BackendsList { default_backend, backends, .. } => {
+            ServerToClient::BackendsList {
+                default_backend,
+                backends,
+                ..
+            } => {
                 self.default_backend = default_backend;
                 self.backends = backends;
                 // Pre-fetch the default backend's models so the picker is ready on
@@ -545,7 +599,9 @@ impl ChatApp {
                 let default = self.default_backend.clone();
                 self.request_models_for(&default);
             }
-            ServerToClient::ModelsList { backend, models, .. } => {
+            ServerToClient::ModelsList {
+                backend, models, ..
+            } => {
                 self.models_by_backend.insert(backend, models);
             }
         }
@@ -562,8 +618,16 @@ impl ChatApp {
     fn recompute_order(&mut self) {
         let mut ids: Vec<String> = self.tasks.keys().cloned().collect();
         ids.sort_by(|a, b| {
-            let ta = self.tasks.get(a).map(|v| v.summary.created_at.clone()).unwrap_or_default();
-            let tb = self.tasks.get(b).map(|v| v.summary.created_at.clone()).unwrap_or_default();
+            let ta = self
+                .tasks
+                .get(a)
+                .map(|v| v.summary.created_at.clone())
+                .unwrap_or_default();
+            let tb = self
+                .tasks
+                .get(b)
+                .map(|v| v.summary.created_at.clone())
+                .unwrap_or_default();
             tb.cmp(&ta)
         });
         self.task_order = ids;
@@ -600,7 +664,9 @@ impl ChatApp {
             });
         } else if let Some(task_id) = self.selected.clone() {
             if let Some(view) = self.tasks.get_mut(&task_id) {
-                view.items.push(DisplayItem::User { text: trimmed.to_string() });
+                view.items.push(DisplayItem::User {
+                    text: trimmed.to_string(),
+                });
             }
             self.send(ClientToServer::SendUserMessage {
                 task_id,
@@ -673,21 +739,31 @@ fn add_message_items(msg: &Message, out: &mut Vec<DisplayItem>) {
         Role::User => {
             for block in &msg.content {
                 match block {
-                    ContentBlock::Text { text } => out.push(DisplayItem::User { text: text.clone() }),
-                    ContentBlock::ToolResult { tool_use_id, content, is_error } => {
+                    ContentBlock::Text { text } => {
+                        out.push(DisplayItem::User { text: text.clone() })
+                    }
+                    ContentBlock::ToolResult {
+                        tool_use_id,
+                        content,
+                        is_error,
+                    } => {
                         let text = tool_result_text(content);
                         // Backfill the result onto a matching ToolCall item, or push a system note.
                         let mut matched = false;
                         for existing in out.iter_mut().rev() {
-                            if let DisplayItem::ToolCall { tool_use_id: id, result, is_error: err, .. }
-                                = existing
+                            if let DisplayItem::ToolCall {
+                                tool_use_id: id,
+                                result,
+                                is_error: err,
+                                ..
+                            } = existing
+                                && id == tool_use_id
+                                && result.is_none()
                             {
-                                if id == tool_use_id && result.is_none() {
-                                    *result = Some(text.clone());
-                                    *err = *is_error;
-                                    matched = true;
-                                    break;
-                                }
+                                *result = Some(text.clone());
+                                *err = *is_error;
+                                matched = true;
+                                break;
                             }
                         }
                         if !matched {
@@ -720,7 +796,9 @@ fn add_message_items(msg: &Message, out: &mut Vec<DisplayItem>) {
                         });
                     }
                     ContentBlock::Thinking { thinking, .. } => {
-                        out.push(DisplayItem::Reasoning { text: thinking.clone() });
+                        out.push(DisplayItem::Reasoning {
+                            text: thinking.clone(),
+                        });
                     }
                     _ => {}
                 }
@@ -813,7 +891,9 @@ impl eframe::App for ChatApp {
                 ScrollArea::vertical().show(ui, |ui| {
                     let order = self.task_order.clone();
                     for task_id in order {
-                        let Some(view) = self.tasks.get(&task_id) else { continue };
+                        let Some(view) = self.tasks.get(&task_id) else {
+                            continue;
+                        };
                         let is_selected = self.selected.as_deref() == Some(&task_id);
                         let title = view
                             .summary
@@ -825,9 +905,11 @@ impl eframe::App for ChatApp {
                             [ui.available_width(), 0.0],
                             egui::Button::selectable(
                                 is_selected,
-                                RichText::new(format!("{title}  [{chip}]")).color(
-                                    if is_selected { Color32::WHITE } else { chip_color },
-                                ),
+                                RichText::new(format!("{title}  [{chip}]")).color(if is_selected {
+                                    Color32::WHITE
+                                } else {
+                                    chip_color
+                                }),
                             ),
                         );
                         if row.clicked() {
@@ -839,9 +921,17 @@ impl eframe::App for ChatApp {
 
         let input_enabled = matches!(self.conn_status, ConnectionStatus::Connected);
         let hint = if self.composing_new || self.selected.is_none() {
-            if input_enabled { "Describe a new task" } else { "(connecting)" }
+            if input_enabled {
+                "Describe a new task"
+            } else {
+                "(connecting)"
+            }
         } else {
-            if input_enabled { "Message this task" } else { "(connecting)" }
+            if input_enabled {
+                "Message this task"
+            } else {
+                "(connecting)"
+            }
         };
 
         let show_picker =
@@ -853,7 +943,11 @@ impl eframe::App for ChatApp {
                 if show_picker {
                     ui.add_space(4.0);
                     ui.horizontal(|ui| {
-                        ui.label(RichText::new("backend").small().color(Color32::from_gray(180)));
+                        ui.label(
+                            RichText::new("backend")
+                                .small()
+                                .color(Color32::from_gray(180)),
+                        );
                         let current_backend = self.effective_picker_backend().to_string();
                         let before = current_backend.clone();
                         ComboBox::from_id_salt("picker_backend")
@@ -875,7 +969,11 @@ impl eframe::App for ChatApp {
                         }
 
                         ui.separator();
-                        ui.label(RichText::new("model").small().color(Color32::from_gray(180)));
+                        ui.label(
+                            RichText::new("model")
+                                .small()
+                                .color(Color32::from_gray(180)),
+                        );
                         let current_model = self.effective_picker_model();
                         let models_for_backend = self
                             .models_by_backend
@@ -910,7 +1008,11 @@ impl eframe::App for ChatApp {
                             });
 
                         ui.separator();
-                        ui.label(RichText::new("sandbox").small().color(Color32::from_gray(180)));
+                        ui.label(
+                            RichText::new("sandbox")
+                                .small()
+                                .color(Color32::from_gray(180)),
+                        );
                         let sandbox_label: String = match self.picker_sandbox {
                             SandboxChoice::ServerDefault => "default".into(),
                             SandboxChoice::None => "none".into(),
@@ -958,7 +1060,9 @@ impl eframe::App for ChatApp {
                 ui.horizontal(|ui| {
                     if let Some(task_id) = self.selected.clone() {
                         if ui.button("Cancel").clicked() {
-                            self.send(ClientToServer::CancelTask { task_id: task_id.clone() });
+                            self.send(ClientToServer::CancelTask {
+                                task_id: task_id.clone(),
+                            });
                         }
                         if ui.button("Archive").clicked() {
                             self.send(ClientToServer::ArchiveTask { task_id });
@@ -971,8 +1075,8 @@ impl eframe::App for ChatApp {
                             [ui.available_width(), 28.0],
                             TextEdit::singleline(&mut self.input).hint_text(hint),
                         );
-                        let enter_pressed = response.lost_focus()
-                            && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                        let enter_pressed =
+                            response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
                         if (send_pressed || enter_pressed) && input_enabled {
                             self.submit();
                             response.request_focus();
@@ -987,49 +1091,47 @@ impl eframe::App for ChatApp {
 
         let mut pending_decisions: Vec<(String, String, ApprovalChoice, bool)> = Vec::new();
         let mut allowlist_revocations: Vec<(String, String)> = Vec::new();
-        egui::CentralPanel::default().show(ctx, |ui| {
-            match self.selected.clone() {
+        egui::CentralPanel::default().show(ctx, |ui| match self.selected.clone() {
+            None => {
+                ui.vertical_centered(|ui| {
+                    ui.add_space(60.0);
+                    ui.label(
+                        RichText::new(
+                            "no task selected — type a prompt below to create a new task",
+                        )
+                        .color(Color32::from_gray(140)),
+                    );
+                });
+            }
+            Some(task_id) => match self.tasks.get_mut(&task_id) {
                 None => {
-                    ui.vertical_centered(|ui| {
-                        ui.add_space(60.0);
-                        ui.label(
-                            RichText::new(
-                                "no task selected — type a prompt below to create a new task",
-                            )
-                            .color(Color32::from_gray(140)),
-                        );
+                    ui.label(
+                        RichText::new(format!("task {task_id} not found"))
+                            .color(Color32::from_rgb(220, 120, 120)),
+                    );
+                }
+                Some(view) => {
+                    render_failure_banner(ui, view);
+                    render_allowlist_chips(ui, &task_id, view, &mut allowlist_revocations);
+                    render_approval_banner(ui, &task_id, view, &mut pending_decisions);
+                    ScrollArea::vertical().stick_to_bottom(true).show(ui, |ui| {
+                        if view.items.is_empty() {
+                            ui.vertical_centered(|ui| {
+                                ui.add_space(40.0);
+                                ui.label(
+                                    RichText::new("(no messages yet)")
+                                        .color(Color32::from_gray(140)),
+                                );
+                            });
+                        } else {
+                            for item in &view.items {
+                                render_item(ui, item);
+                                ui.add_space(6.0);
+                            }
+                        }
                     });
                 }
-                Some(task_id) => match self.tasks.get_mut(&task_id) {
-                    None => {
-                        ui.label(
-                            RichText::new(format!("task {task_id} not found"))
-                                .color(Color32::from_rgb(220, 120, 120)),
-                        );
-                    }
-                    Some(view) => {
-                        render_failure_banner(ui, view);
-                        render_allowlist_chips(ui, &task_id, view, &mut allowlist_revocations);
-                        render_approval_banner(ui, &task_id, view, &mut pending_decisions);
-                        ScrollArea::vertical().stick_to_bottom(true).show(ui, |ui| {
-                            if view.items.is_empty() {
-                                ui.vertical_centered(|ui| {
-                                    ui.add_space(40.0);
-                                    ui.label(
-                                        RichText::new("(no messages yet)")
-                                            .color(Color32::from_gray(140)),
-                                    );
-                                });
-                            } else {
-                                for item in &view.items {
-                                    render_item(ui, item);
-                                    ui.add_space(6.0);
-                                }
-                            }
-                        });
-                    }
-                },
-            }
+            },
         });
 
         // Submit any approval decisions that were clicked this frame.
@@ -1191,9 +1293,13 @@ fn render_approval_banner(
                                 .color(Color32::from_rgb(220, 110, 110))
                                 .small()
                         } else if approval.read_only {
-                            RichText::new("read-only").color(Color32::from_gray(180)).small()
+                            RichText::new("read-only")
+                                .color(Color32::from_gray(180))
+                                .small()
                         } else {
-                            RichText::new("unannotated").color(Color32::from_gray(180)).small()
+                            RichText::new("unannotated")
+                                .color(Color32::from_gray(180))
+                                .small()
                         };
                         ui.label(hint);
                         ui.label(
@@ -1295,13 +1401,21 @@ fn render_item(ui: &mut egui::Ui, item: &DisplayItem) {
     match item {
         DisplayItem::User { text } => {
             ui.horizontal_top(|ui| {
-                ui.label(RichText::new("you").color(Color32::from_rgb(120, 180, 240)).strong());
+                ui.label(
+                    RichText::new("you")
+                        .color(Color32::from_rgb(120, 180, 240))
+                        .strong(),
+                );
                 ui.label(text);
             });
         }
         DisplayItem::AssistantText { text } => {
             ui.horizontal_top(|ui| {
-                ui.label(RichText::new("agent").color(Color32::from_rgb(160, 220, 160)).strong());
+                ui.label(
+                    RichText::new("agent")
+                        .color(Color32::from_rgb(160, 220, 160))
+                        .strong(),
+                );
                 ui.label(text);
             });
         }
@@ -1329,17 +1443,23 @@ fn render_item(ui: &mut egui::Ui, item: &DisplayItem) {
                 .id_salt(("reasoning", text.as_ptr() as usize))
                 .default_open(false)
                 .show(ui, |ui| {
-                    ui.label(
-                        RichText::new(text)
-                            .color(Color32::from_gray(170))
-                            .italics(),
-                    );
+                    ui.label(RichText::new(text).color(Color32::from_gray(170)).italics());
                 });
             });
         }
-        DisplayItem::ToolCall { name, args_preview, result, is_error, .. } => {
+        DisplayItem::ToolCall {
+            name,
+            args_preview,
+            result,
+            is_error,
+            ..
+        } => {
             ui.horizontal_top(|ui| {
-                ui.label(RichText::new("tool").color(Color32::from_rgb(220, 180, 100)).strong());
+                ui.label(
+                    RichText::new("tool")
+                        .color(Color32::from_rgb(220, 180, 100))
+                        .strong(),
+                );
                 ui.vertical(|ui| {
                     ui.label(
                         RichText::new(format!("{name}({args_preview})"))

@@ -98,7 +98,12 @@ async fn provision_landlock(
     let network_owned = network.clone();
 
     let mut cmd = Command::new(mcp_host_bin);
-    cmd.args(["--listen", &listen_addr, "--workspace-root", &workspace_root]);
+    cmd.args([
+        "--listen",
+        &listen_addr,
+        "--workspace-root",
+        &workspace_root,
+    ]);
     cmd.stdin(std::process::Stdio::null());
     cmd.stdout(std::process::Stdio::inherit());
     cmd.stderr(std::process::Stdio::inherit());
@@ -157,22 +162,13 @@ fn apply_landlock(
     ))?;
 
     // /proc read-only (cargo, rustc, many tools need it).
-    created = created.add_rules(path_beneath_rules(
-        ["/proc"],
-        AccessFs::from_read(abi),
-    ))?;
+    created = created.add_rules(path_beneath_rules(["/proc"], AccessFs::from_read(abi)))?;
 
     // /tmp read-write (compilation tempfiles, etc.).
-    created = created.add_rules(path_beneath_rules(
-        ["/tmp"],
-        AccessFs::from_all(abi),
-    ))?;
+    created = created.add_rules(path_beneath_rules(["/tmp"], AccessFs::from_all(abi)))?;
 
     // The MCP host binary's directory — read+execute so exec() works.
-    created = created.add_rules(path_beneath_rules(
-        [bin_dir],
-        AccessFs::from_read(abi),
-    ))?;
+    created = created.add_rules(path_beneath_rules([bin_dir], AccessFs::from_read(abi)))?;
 
     // User-specified paths from the spec.
     for pa in allowed_paths {

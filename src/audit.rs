@@ -50,7 +50,10 @@ impl AuditLog {
             .append(true)
             .open(&path)
             .await?;
-        Ok(Self { inner: Arc::new(Mutex::new(file)), path })
+        Ok(Self {
+            inner: Arc::new(Mutex::new(file)),
+            path,
+        })
     }
 
     pub fn path(&self) -> &std::path::Path {

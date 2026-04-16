@@ -184,17 +184,28 @@ impl McpSession {
 
     async fn call(&self, method: &str, params: Option<Value>) -> Result<Value, McpError> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        let req = JsonRpcRequest { jsonrpc: "2.0", id, method, params };
+        let req = JsonRpcRequest {
+            jsonrpc: "2.0",
+            id,
+            method,
+            params,
+        };
         debug!(method, "rpc out");
         let resp = self.http.post(&self.url).json(&req).send().await?;
         let status = resp.status();
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
-            return Err(McpError::Transport { status: status.as_u16(), body });
+            return Err(McpError::Transport {
+                status: status.as_u16(),
+                body,
+            });
         }
         let parsed: JsonRpcResponse = resp.json().await?;
         if let Some(e) = parsed.error {
-            return Err(McpError::Rpc { code: e.code, message: e.message });
+            return Err(McpError::Rpc {
+                code: e.code,
+                message: e.message,
+            });
         }
         parsed
             .result
@@ -212,7 +223,10 @@ impl McpSession {
         let status = resp.status();
         if !status.is_success() && status.as_u16() != 202 {
             let body = resp.text().await.unwrap_or_default();
-            return Err(McpError::Transport { status: status.as_u16(), body });
+            return Err(McpError::Transport {
+                status: status.as_u16(),
+                body,
+            });
         }
         Ok(())
     }

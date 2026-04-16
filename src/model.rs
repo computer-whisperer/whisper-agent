@@ -88,7 +88,10 @@ pub trait ModelProvider: Send + Sync {
 /// of them — so each turn's tool_results become a rolling checkpoint without
 /// exceeding Anthropic's 4-marker cap. Pass `max_trailing_user = 2` to leave headroom
 /// for the two fixed markers.
-pub fn default_cache_policy(messages: &[Message], max_trailing_user: usize) -> Vec<CacheBreakpoint> {
+pub fn default_cache_policy(
+    messages: &[Message],
+    max_trailing_user: usize,
+) -> Vec<CacheBreakpoint> {
     let mut out = vec![CacheBreakpoint::AfterSystem, CacheBreakpoint::AfterTools];
     if max_trailing_user == 0 {
         return out;

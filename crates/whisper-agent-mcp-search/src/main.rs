@@ -16,7 +16,10 @@ mod server;
 mod tools;
 
 #[derive(Parser, Debug)]
-#[command(version, about = "MCP server exposing the web_search tool (Brave Search API).")]
+#[command(
+    version,
+    about = "MCP server exposing the web_search tool (Brave Search API)."
+)]
 struct Args {
     /// HTTP listen address.
     #[arg(long, default_value = "127.0.0.1:9831")]
@@ -54,7 +57,11 @@ async fn main() -> anyhow::Result<()> {
 
     let http = reqwest::Client::builder()
         .timeout(Duration::from_secs(args.request_timeout_seconds))
-        .user_agent(concat!(env!("CARGO_PKG_NAME"), "/", env!("CARGO_PKG_VERSION")))
+        .user_agent(concat!(
+            env!("CARGO_PKG_NAME"),
+            "/",
+            env!("CARGO_PKG_VERSION")
+        ))
         .build()
         .context("build reqwest client")?;
 

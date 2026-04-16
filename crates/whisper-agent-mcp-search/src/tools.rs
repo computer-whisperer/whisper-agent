@@ -146,7 +146,11 @@ async fn web_search(cfg: &Arc<SearchConfig>, args: Value) -> CallToolResult {
     let requested = parsed.count.unwrap_or(cfg.default_count).max(1);
     let upstream_count = requested.min(MAX_COUNT);
     if requested > MAX_COUNT {
-        warn!(requested, capped = MAX_COUNT, "count clamped to upstream limit");
+        warn!(
+            requested,
+            capped = MAX_COUNT,
+            "count clamped to upstream limit"
+        );
     }
 
     // Domain filters happen after we get results back, so over-request a bit
@@ -188,14 +192,8 @@ async fn web_search(cfg: &Arc<SearchConfig>, args: Value) -> CallToolResult {
     };
 
     let results = parsed_resp.web.map(|w| w.results).unwrap_or_default();
-    let allowed = parsed
-        .allowed_domains
-        .as_deref()
-        .map(|d| normalize_domains(d));
-    let blocked = parsed
-        .blocked_domains
-        .as_deref()
-        .map(|d| normalize_domains(d));
+    let allowed = parsed.allowed_domains.as_deref().map(normalize_domains);
+    let blocked = parsed.blocked_domains.as_deref().map(normalize_domains);
 
     let mut kept: Vec<&BraveResult> = Vec::with_capacity(results.len());
     let mut filtered = 0usize;
@@ -222,10 +220,10 @@ async fn web_search(cfg: &Arc<SearchConfig>, args: Value) -> CallToolResult {
     for (i, r) in kept.iter().enumerate() {
         out.push_str(&format!("{}. {}\n", i + 1, plain_text(&r.title)));
         out.push_str(&format!("   {}\n", r.url));
-        if let Some(age) = &r.age {
-            if !age.is_empty() {
-                out.push_str(&format!("   {}\n", age));
-            }
+        if let Some(age) = &r.age
+            && !age.is_empty()
+        {
+            out.push_str(&format!("   {}\n", age));
         }
         let snippet = plain_text(&r.description);
         if !snippet.is_empty() {
@@ -251,7 +249,9 @@ fn extra_hint(status: StatusCode) -> &'static str {
         403 => " (auth: subscription does not permit this endpoint)",
         // Brave returns 422 for both bad params AND invalid api keys
         // (SUBSCRIPTION_TOKEN_INVALID); the body's `error.code` disambiguates.
-        422 => " (client error — see body; common causes: bad query params, BRAVE_API_KEY rejected)",
+        422 => {
+            " (client error — see body; common causes: bad query params, BRAVE_API_KEY rejected)"
+        }
         429 => " (rate limit — Brave free tier allows ~1 query/sec, 2k/month)",
         _ => "",
     }
@@ -269,12 +269,11 @@ fn normalize_domains(input: &[String]) -> Vec<String> {
 
 /// Apply allow/block lists to a result URL's host. Blocked wins over allowed
 /// (a blocked subdomain inside an allowed domain is still blocked).
-fn host_matches_filters(
-    url: &str,
-    allowed: Option<&[String]>,
-    blocked: Option<&[String]>,
-) -> bool {
-    let Some(host) = Url::parse(url).ok().and_then(|u| u.host_str().map(str::to_owned)) else {
+fn host_matches_filters(url: &str, allowed: Option<&[String]>, blocked: Option<&[String]>) -> bool {
+    let Some(host) = Url::parse(url)
+        .ok()
+        .and_then(|u| u.host_str().map(str::to_owned))
+    else {
         // Result without a parsable URL — drop only if an allowlist is set;
         // keep it through (and let the caller see) when no filter applies.
         return allowed.is_none();
@@ -353,9 +352,9 @@ fn decode_entity(name: &str) -> Option<char> {
         "quot" => Some('"'),
         "apos" | "#39" | "#039" => Some('\''),
         "nbsp" => Some(' '),
-        n if n.starts_with("#x") || n.starts_with("#X") => {
-            u32::from_str_radix(&n[2..], 16).ok().and_then(char::from_u32)
-        }
+        n if n.starts_with("#x") || n.starts_with("#X") => u32::from_str_radix(&n[2..], 16)
+            .ok()
+            .and_then(char::from_u32),
         n if n.starts_with('#') => n[1..].parse::<u32>().ok().and_then(char::from_u32),
         _ => None,
     }

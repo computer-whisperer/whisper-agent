@@ -123,9 +123,7 @@ impl OpenAiChatClient {
                     Value::Object(Default::default())
                 } else {
                     serde_json::from_str(&tc.function.arguments).map_err(|e| {
-                        ModelError::Transport(format!(
-                            "tool_call arguments not valid JSON: {e}"
-                        ))
+                        ModelError::Transport(format!("tool_call arguments not valid JSON: {e}"))
                     })?
                 };
                 content.push(ContentBlock::ToolUse {
@@ -222,7 +220,11 @@ fn convert_user_message(blocks: &[ContentBlock], out: &mut Vec<OaMessage>) {
                 }
                 text_accum.push_str(text);
             }
-            ContentBlock::ToolResult { tool_use_id, content, is_error } => {
+            ContentBlock::ToolResult {
+                tool_use_id,
+                content,
+                is_error,
+            } => {
                 // Flush any accumulated plain text first so ordering survives.
                 if !text_accum.is_empty() {
                     out.push(OaMessage {
@@ -374,7 +376,10 @@ fn push_reasoning_content(reasoning: Option<String>, out: &mut Vec<ContentBlock>
     if let Some(r) = reasoning
         && !r.trim().is_empty()
     {
-        out.push(ContentBlock::Thinking { signature: None, thinking: r });
+        out.push(ContentBlock::Thinking {
+            signature: None,
+            thinking: r,
+        });
     }
 }
 
@@ -426,7 +431,9 @@ fn push_text_with_inline_thinking(text: &str, out: &mut Vec<ContentBlock>) {
 
 fn push_text_if_nonblank(s: &str, out: &mut Vec<ContentBlock>) {
     if !s.trim().is_empty() {
-        out.push(ContentBlock::Text { text: s.to_string() });
+        out.push(ContentBlock::Text {
+            text: s.to_string(),
+        });
     }
 }
 
@@ -602,7 +609,9 @@ mod tests {
     #[test]
     fn assistant_text_then_tool_uses_converts_to_one_message() {
         let blocks = vec![
-            ContentBlock::Text { text: "let me check".into() },
+            ContentBlock::Text {
+                text: "let me check".into(),
+            },
             ContentBlock::ToolUse {
                 id: "toolu_1".into(),
                 name: "read_file".into(),
@@ -672,15 +681,15 @@ mod tests {
         assert_eq!(out.len(), 1);
         assert!(out[0].content.is_none());
         let v = serde_json::to_value(&out[0]).unwrap();
-        assert!(v.get("content").is_none(), "tool_call-only turn must not carry content field");
+        assert!(
+            v.get("content").is_none(),
+            "tool_call-only turn must not carry content field"
+        );
     }
 
     #[test]
     fn is_error_prefixes_tool_result_text() {
-        let t = tool_result_as_text(
-            &ToolResultContent::Text("boom".into()),
-            true,
-        );
+        let t = tool_result_as_text(&ToolResultContent::Text("boom".into()), true);
         assert_eq!(t, "ERROR: boom");
     }
 
@@ -692,7 +701,10 @@ mod tests {
         push_reasoning_content(Some("let me think...\nthe answer is 42".into()), &mut out);
         assert_eq!(out.len(), 1);
         match &out[0] {
-            ContentBlock::Thinking { thinking, signature } => {
+            ContentBlock::Thinking {
+                thinking,
+                signature,
+            } => {
                 assert_eq!(thinking, "let me think...\nthe answer is 42");
                 assert!(signature.is_none());
             }
@@ -796,7 +808,9 @@ mod tests {
                 signature: None,
                 thinking: "I should look at foo.txt first".into(),
             },
-            ContentBlock::Text { text: "let me check".into() },
+            ContentBlock::Text {
+                text: "let me check".into(),
+            },
             ContentBlock::ToolUse {
                 id: "toolu_1".into(),
                 name: "read_file".into(),
@@ -822,9 +836,17 @@ mod tests {
     #[test]
     fn multiple_thinking_blocks_concatenate_with_blank_line() {
         let blocks = vec![
-            ContentBlock::Thinking { signature: None, thinking: "first thought".into() },
-            ContentBlock::Thinking { signature: None, thinking: "second thought".into() },
-            ContentBlock::Text { text: "answer".into() },
+            ContentBlock::Thinking {
+                signature: None,
+                thinking: "first thought".into(),
+            },
+            ContentBlock::Thinking {
+                signature: None,
+                thinking: "second thought".into(),
+            },
+            ContentBlock::Text {
+                text: "answer".into(),
+            },
         ];
         let mut out = Vec::new();
         convert_assistant_message(&blocks, &mut out);

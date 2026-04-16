@@ -54,7 +54,11 @@ async fn main() -> anyhow::Result<()> {
         // We enforce redirect count manually so we can re-check SSRF on each hop.
         .redirect(reqwest::redirect::Policy::none())
         .timeout(Duration::from_secs(args.request_timeout_seconds))
-        .user_agent(concat!(env!("CARGO_PKG_NAME"), "/", env!("CARGO_PKG_VERSION")))
+        .user_agent(concat!(
+            env!("CARGO_PKG_NAME"),
+            "/",
+            env!("CARGO_PKG_VERSION")
+        ))
         .build()
         .context("build reqwest client")?;
 

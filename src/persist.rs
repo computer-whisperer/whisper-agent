@@ -64,7 +64,9 @@ impl Persister {
             }
             match load_one(&path).await {
                 Ok(task) => tasks.push(task),
-                Err(e) => warn!(path = %path.display(), error = %e, "skipping unreadable task file"),
+                Err(e) => {
+                    warn!(path = %path.display(), error = %e, "skipping unreadable task file")
+                }
             }
         }
         info!(count = tasks.len(), "loaded persisted tasks");
@@ -76,8 +78,8 @@ async fn load_one(path: &Path) -> Result<Task> {
     let bytes = fs::read(path)
         .await
         .with_context(|| format!("read {}", path.display()))?;
-    let mut task: Task = serde_json::from_slice(&bytes)
-        .with_context(|| format!("parse {}", path.display()))?;
+    let mut task: Task =
+        serde_json::from_slice(&bytes).with_context(|| format!("parse {}", path.display()))?;
     if is_in_flight(&task.internal) {
         task.fail("resume", "task was in-flight at last shutdown");
     }

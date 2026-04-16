@@ -163,10 +163,8 @@ fn build_request_body<'a>(req: &'a ModelRequest<'a>) -> CreateMessageRequest<'a>
     }];
 
     let mut tools: Vec<AnthropicTool> = req.tools.iter().map(spec_to_anthropic_tool).collect();
-    if cache_tools {
-        if let Some(last) = tools.last_mut() {
-            last.cache_control = Some(CacheControl::ephemeral_1h());
-        }
+    if cache_tools && let Some(last) = tools.last_mut() {
+        last.cache_control = Some(CacheControl::ephemeral_1h());
     }
 
     let messages: Vec<Value> = req

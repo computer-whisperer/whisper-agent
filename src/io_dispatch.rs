@@ -33,18 +33,17 @@ pub(crate) struct IoCompletion {
 pub(crate) type IoFuture = Pin<Box<dyn Future<Output = IoCompletion> + Send>>;
 
 /// Build a future that executes one I/O op and yields an [`IoCompletion`].
-pub(crate) fn build_io_future(
-    scheduler: &Scheduler,
-    task_id: String,
-    req: IoRequest,
-) -> IoFuture {
+pub(crate) fn build_io_future(scheduler: &Scheduler, task_id: String, req: IoRequest) -> IoFuture {
     match req {
         IoRequest::McpConnect { op_id } => mcp_connect(scheduler, task_id, op_id),
         IoRequest::ListTools { op_id } => list_tools(scheduler, task_id, op_id),
         IoRequest::ModelCall { op_id } => model_call(scheduler, task_id, op_id),
-        IoRequest::ToolCall { op_id, tool_use_id, name, input } => {
-            tool_call(scheduler, task_id, op_id, tool_use_id, name, input)
-        }
+        IoRequest::ToolCall {
+            op_id,
+            tool_use_id,
+            name,
+            input,
+        } => tool_call(scheduler, task_id, op_id, tool_use_id, name, input),
     }
 }
 
@@ -127,7 +126,10 @@ fn list_tools(scheduler: &Scheduler, task_id: String, op_id: OpId) -> IoFuture {
         IoCompletion {
             task_id,
             op_id,
-            result: IoResult::ListToolsSuccess { tools: all_tools, routing },
+            result: IoResult::ListToolsSuccess {
+                tools: all_tools,
+                routing,
+            },
         }
     })
 }
@@ -207,7 +209,10 @@ fn tool_call(
         IoCompletion {
             task_id,
             op_id,
-            result: IoResult::ToolCall { tool_use_id, result },
+            result: IoResult::ToolCall {
+                tool_use_id,
+                result,
+            },
         }
     })
 }

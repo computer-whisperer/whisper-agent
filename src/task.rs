@@ -62,14 +62,21 @@ pub enum TaskInternalState {
     Completed,
     /// A user message has been appended and we must connect MCP before calling the model.
     NeedsMcpConnect,
-    AwaitingMcpConnect { op_id: OpId },
+    AwaitingMcpConnect {
+        op_id: OpId,
+    },
     /// MCP connected; need to list tools before issuing any model call.
     NeedsListTools,
-    AwaitingListTools { op_id: OpId },
+    AwaitingListTools {
+        op_id: OpId,
+    },
     /// Ready to dispatch a model call. The conversation already contains the latest
     /// user or tool_result message.
     NeedsModelCall,
-    AwaitingModel { op_id: OpId, started_at: DateTime<Utc> },
+    AwaitingModel {
+        op_id: OpId,
+        started_at: DateTime<Utc>,
+    },
     /// Model responded with tool_uses; at least one needs user approval before we can
     /// dispatch. `dispositions` is parallel to `tool_uses`. On every ApprovalDecision the
     /// corresponding entry transitions Pending → UserApproved / UserRejected; once none
@@ -95,7 +102,10 @@ pub enum TaskInternalState {
         approvals: HashMap<String, ApprovalRecord>,
     },
     /// Terminal: unrecoverable error.
-    Failed { at_phase: String, message: String },
+    Failed {
+        at_phase: String,
+        message: String,
+    },
     /// Terminal: user-initiated cancellation. In-flight I/O may still complete; their
     /// results are discarded by the scheduler.
     Cancelled,
@@ -215,11 +225,17 @@ pub enum StepOutcome {
 /// Internal task event — translated by the scheduler into wire [`ServerToClient`] events.
 #[derive(Debug, Clone)]
 pub enum TaskEvent {
-    AssistantBegin { turn: u32 },
-    AssistantText { text: String },
+    AssistantBegin {
+        turn: u32,
+    },
+    AssistantText {
+        text: String,
+    },
     /// Chain-of-thought block. Emitted in the same order as text/tool-use
     /// blocks so the client can interleave them faithfully.
-    AssistantReasoning { text: String },
+    AssistantReasoning {
+        text: String,
+    },
     ToolCallBegin {
         tool_use_id: String,
         name: String,
@@ -251,13 +267,19 @@ pub enum TaskEvent {
     /// The task's `public_state()` flipped. Carries the new label so the
     /// scheduler's router can emit a wire `TaskStateChanged` without looking
     /// the task back up.
-    StateChanged { state: TaskStateLabel },
-    Error { message: String },
+    StateChanged {
+        state: TaskStateLabel,
+    },
+    Error {
+        message: String,
+    },
     /// The task's `tool_allowlist` set was modified — either a tool was added
     /// (via an approve-and-remember decision) or removed (via the revoke UI).
     /// Carries the full new set so the scheduler can broadcast it without
     /// recomputing.
-    AllowlistChanged { allowlist: Vec<String> },
+    AllowlistChanged {
+        allowlist: Vec<String>,
+    },
     /// Tool call completed. Carried separately from the user-visible ToolCallEnd event
     /// so the scheduler can write an audit entry outside the task state machine.
     AuditToolCall {
@@ -400,11 +422,7 @@ impl Task {
 
     /// Advance the state machine. Caller provides `next_op_id` for fresh I/O ops and
     /// `events` as the out-param for task events emitted during this step.
-    pub fn step(
-        &mut self,
-        next_op_id: &mut OpId,
-        events: &mut Vec<TaskEvent>,
-    ) -> StepOutcome {
+    pub fn step(&mut self, next_op_id: &mut OpId, events: &mut Vec<TaskEvent>) -> StepOutcome {
         let prev_public = self.public_state();
         let outcome = self.step_inner(next_op_id, events);
         let new_public = self.public_state();
@@ -414,11 +432,7 @@ impl Task {
         outcome
     }
 
-    fn step_inner(
-        &mut self,
-        next_op_id: &mut OpId,
-        events: &mut Vec<TaskEvent>,
-    ) -> StepOutcome {
+    fn step_inner(&mut self, next_op_id: &mut OpId, events: &mut Vec<TaskEvent>) -> StepOutcome {
         // Break the state out so we can replace it.
         let current = std::mem::replace(&mut self.internal, TaskInternalState::Idle);
         match current {
@@ -451,7 +465,9 @@ impl Task {
                     return StepOutcome::Continue;
                 }
                 self.turns_in_cycle += 1;
-                events.push(TaskEvent::AssistantBegin { turn: self.turns_in_cycle });
+                events.push(TaskEvent::AssistantBegin {
+                    turn: self.turns_in_cycle,
+                });
                 let op_id = next_id(next_op_id);
                 self.internal = TaskInternalState::AwaitingModel {
                     op_id,
@@ -552,46 +568,54 @@ impl Task {
         }
 
         match (&self.internal, result) {
-            (TaskInternalState::AwaitingMcpConnect { op_id: expected }, IoResult::McpConnect(res))
-                if *expected == op_id =>
-            {
-                match res {
-                    Ok(()) => {
-                        self.internal = TaskInternalState::NeedsListTools;
-                    }
-                    Err(msg) => {
-                        events.push(TaskEvent::Error { message: format!("mcp connect failed: {msg}") });
-                        self.fail("mcp_connect", msg);
-                    }
+            (
+                TaskInternalState::AwaitingMcpConnect { op_id: expected },
+                IoResult::McpConnect(res),
+            ) if *expected == op_id => match res {
+                Ok(()) => {
+                    self.internal = TaskInternalState::NeedsListTools;
                 }
-            }
-            (TaskInternalState::AwaitingListTools { op_id: expected }, IoResult::ListTools(res))
-                if *expected == op_id =>
-            {
-                match res {
-                    Ok(()) => {
-                        self.internal = TaskInternalState::NeedsModelCall;
-                    }
-                    Err(msg) => {
-                        events.push(TaskEvent::Error { message: format!("list_tools failed: {msg}") });
-                        self.fail("list_tools", msg);
-                    }
+                Err(msg) => {
+                    events.push(TaskEvent::Error {
+                        message: format!("mcp connect failed: {msg}"),
+                    });
+                    self.fail("mcp_connect", msg);
                 }
-            }
-            (TaskInternalState::AwaitingModel { op_id: expected, .. }, IoResult::ModelCall(res))
-                if *expected == op_id =>
-            {
-                match res {
-                    Ok(response) => self.integrate_model_response(response, tool_annotations, events),
-                    Err(msg) => {
-                        events.push(TaskEvent::Error { message: format!("model call failed: {msg}") });
-                        self.fail("model_call", msg);
-                    }
+            },
+            (
+                TaskInternalState::AwaitingListTools { op_id: expected },
+                IoResult::ListTools(res),
+            ) if *expected == op_id => match res {
+                Ok(()) => {
+                    self.internal = TaskInternalState::NeedsModelCall;
                 }
-            }
+                Err(msg) => {
+                    events.push(TaskEvent::Error {
+                        message: format!("list_tools failed: {msg}"),
+                    });
+                    self.fail("list_tools", msg);
+                }
+            },
+            (
+                TaskInternalState::AwaitingModel {
+                    op_id: expected, ..
+                },
+                IoResult::ModelCall(res),
+            ) if *expected == op_id => match res {
+                Ok(response) => self.integrate_model_response(response, tool_annotations, events),
+                Err(msg) => {
+                    events.push(TaskEvent::Error {
+                        message: format!("model call failed: {msg}"),
+                    });
+                    self.fail("model_call", msg);
+                }
+            },
             (
                 TaskInternalState::AwaitingTools { .. },
-                IoResult::ToolCall { tool_use_id, result },
+                IoResult::ToolCall {
+                    tool_use_id,
+                    result,
+                },
             ) => self.integrate_tool_result(op_id, tool_use_id, result, events),
             (state, result) => {
                 tracing::warn!(
@@ -623,7 +647,9 @@ impl Task {
                     events.push(TaskEvent::AssistantText { text: text.clone() });
                 }
                 ContentBlock::Thinking { thinking, .. } => {
-                    events.push(TaskEvent::AssistantReasoning { text: thinking.clone() });
+                    events.push(TaskEvent::AssistantReasoning {
+                        text: thinking.clone(),
+                    });
                 }
                 _ => {}
             }
@@ -639,11 +665,9 @@ impl Task {
                 _ => None,
             })
             .collect();
-        events.push(TaskEvent::AssistantEnd {
-            stop_reason,
-            usage,
-        });
-        self.conversation.push(Message::assistant_blocks(assistant_blocks));
+        events.push(TaskEvent::AssistantEnd { stop_reason, usage });
+        self.conversation
+            .push(Message::assistant_blocks(assistant_blocks));
 
         if tool_uses.is_empty() {
             events.push(TaskEvent::LoopComplete);
@@ -739,10 +763,12 @@ impl Task {
         // key for the conversation block either way.
         pending_io.remove(&op_id);
 
-        let approval = approvals.remove(&tool_use_id).unwrap_or_else(|| ApprovalRecord {
-            decision: "dispatched".into(),
-            who_decided: "policy".into(),
-        });
+        let approval = approvals
+            .remove(&tool_use_id)
+            .unwrap_or_else(|| ApprovalRecord {
+                decision: "dispatched".into(),
+                who_decided: "policy".into(),
+            });
 
         let (text, is_error, tool_name, args, err_msg) = match result {
             Ok(r) => {
@@ -833,7 +859,10 @@ impl Task {
         events: &mut Vec<TaskEvent>,
     ) {
         self.touch();
-        let TaskInternalState::AwaitingApproval { tool_uses, dispositions } = &mut self.internal
+        let TaskInternalState::AwaitingApproval {
+            tool_uses,
+            dispositions,
+        } = &mut self.internal
         else {
             tracing::warn!(
                 task_id = %self.id,
@@ -887,7 +916,10 @@ impl Task {
                 if tool_use.name != resolved_tool_name {
                     continue;
                 }
-                let ApprovalDisposition::Pending { approval_id: aid, .. } = &dispositions[i] else {
+                let ApprovalDisposition::Pending {
+                    approval_id: aid, ..
+                } = &dispositions[i]
+                else {
                     continue;
                 };
                 let aid = aid.clone();
@@ -929,7 +961,10 @@ impl Task {
                     );
                     pending_dispatch.push(tool_use);
                 }
-                ApprovalDisposition::UserApproved { decided_by_conn: conn, .. } => {
+                ApprovalDisposition::UserApproved {
+                    decided_by_conn: conn,
+                    ..
+                } => {
                     approvals.insert(
                         tool_use.tool_use_id.clone(),
                         ApprovalRecord {
@@ -939,7 +974,11 @@ impl Task {
                     );
                     pending_dispatch.push(tool_use);
                 }
-                ApprovalDisposition::UserRejected { decided_by_conn: conn, message, .. } => {
+                ApprovalDisposition::UserRejected {
+                    decided_by_conn: conn,
+                    message,
+                    ..
+                } => {
                     // Emit synthetic ToolCallBegin/End so subscribed clients see the
                     // rejected call in their chat view alongside approved/executed ones.
                     events.push(TaskEvent::ToolCallBegin {
@@ -1001,9 +1040,7 @@ fn evaluate_policy(
         return ApprovalOutcome::Auto("policy:allowlist".into());
     }
     match policy {
-        ApprovalPolicy::AutoApproveAll => {
-            ApprovalOutcome::Auto("policy:auto_approve_all".into())
-        }
+        ApprovalPolicy::AutoApproveAll => ApprovalOutcome::Auto("policy:auto_approve_all".into()),
         ApprovalPolicy::PromptDestructive => {
             if annotations.is_read_only() {
                 ApprovalOutcome::Auto("policy:read_only".into())
@@ -1027,7 +1064,10 @@ fn reverse_for_pop<T>(mut v: Vec<T>) -> Vec<T> {
 /// Derive a title from the user's initial message: trim, collapse internal whitespace,
 /// truncate to ~50 chars (rounded to a char boundary) with a trailing ellipsis.
 pub fn derive_title(initial_message: &str) -> String {
-    let collapsed: String = initial_message.split_whitespace().collect::<Vec<_>>().join(" ");
+    let collapsed: String = initial_message
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
     const MAX: usize = 50;
     if collapsed.chars().count() <= MAX {
         collapsed
@@ -1065,10 +1105,10 @@ fn join_mcp_text(blocks: &[crate::mcp::McpContentBlock]) -> String {
 fn find_tool_name(conv: &Conversation, tool_use_id: &str) -> String {
     for msg in conv.messages().iter().rev() {
         for block in &msg.content {
-            if let ContentBlock::ToolUse { id, name, .. } = block {
-                if id == tool_use_id {
-                    return name.clone();
-                }
+            if let ContentBlock::ToolUse { id, name, .. } = block
+                && id == tool_use_id
+            {
+                return name.clone();
             }
         }
     }
@@ -1078,10 +1118,10 @@ fn find_tool_name(conv: &Conversation, tool_use_id: &str) -> String {
 fn find_tool_args(conv: &Conversation, tool_use_id: &str) -> serde_json::Value {
     for msg in conv.messages().iter().rev() {
         for block in &msg.content {
-            if let ContentBlock::ToolUse { id, input, .. } = block {
-                if id == tool_use_id {
-                    return input.clone();
-                }
+            if let ContentBlock::ToolUse { id, input, .. } = block
+                && id == tool_use_id
+            {
+                return input.clone();
             }
         }
     }
@@ -1158,7 +1198,10 @@ mod tests {
                 read_only: false,
             })
             .collect();
-        task.internal = TaskInternalState::AwaitingApproval { tool_uses, dispositions };
+        task.internal = TaskInternalState::AwaitingApproval {
+            tool_uses,
+            dispositions,
+        };
         task
     }
 
@@ -1166,7 +1209,13 @@ mod tests {
     fn always_allow_adds_to_allowlist_and_emits_event() {
         let mut task = task_with_pending_batch(&["edit_file"]);
         let mut events = Vec::new();
-        task.apply_approval_decision("ap-tu-0", ApprovalChoice::Approve, true, Some(7), &mut events);
+        task.apply_approval_decision(
+            "ap-tu-0",
+            ApprovalChoice::Approve,
+            true,
+            Some(7),
+            &mut events,
+        );
 
         assert!(task.tool_allowlist.contains("edit_file"));
         assert!(events.iter().any(|e| matches!(e,
@@ -1178,7 +1227,13 @@ mod tests {
     fn always_allow_cascades_other_pending_for_same_tool() {
         let mut task = task_with_pending_batch(&["edit_file", "edit_file", "read_file"]);
         let mut events = Vec::new();
-        task.apply_approval_decision("ap-tu-0", ApprovalChoice::Approve, true, Some(1), &mut events);
+        task.apply_approval_decision(
+            "ap-tu-0",
+            ApprovalChoice::Approve,
+            true,
+            Some(1),
+            &mut events,
+        );
 
         // edit_file batch (3 pending: 1 directly resolved + 1 cascaded; read_file still pending)
         let resolved: Vec<&str> = events
@@ -1192,7 +1247,10 @@ mod tests {
 
         // read_file should still be pending — task should not have transitioned out
         // of AwaitingApproval.
-        assert!(matches!(task.internal, TaskInternalState::AwaitingApproval { .. }));
+        assert!(matches!(
+            task.internal,
+            TaskInternalState::AwaitingApproval { .. }
+        ));
     }
 
     #[test]
@@ -1202,7 +1260,11 @@ mod tests {
         task.apply_approval_decision("ap-tu-0", ApprovalChoice::Approve, false, None, &mut events);
 
         assert!(task.tool_allowlist.is_empty());
-        assert!(!events.iter().any(|e| matches!(e, TaskEvent::AllowlistChanged { .. })));
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, TaskEvent::AllowlistChanged { .. }))
+        );
     }
 
     #[test]

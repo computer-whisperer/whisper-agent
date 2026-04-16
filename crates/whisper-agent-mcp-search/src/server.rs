@@ -70,8 +70,7 @@ async fn handle_post(State(state): State<AppState>, Json(req): Json<JsonRpcReque
 }
 
 fn initialize(id: Value, params: Option<Value>) -> JsonRpcResponse {
-    let parsed: Result<InitializeParams, _> =
-        serde_json::from_value(params.unwrap_or(Value::Null));
+    let parsed: Result<InitializeParams, _> = serde_json::from_value(params.unwrap_or(Value::Null));
     if let Err(e) = parsed {
         return JsonRpcResponse::error(
             id,
@@ -82,7 +81,9 @@ fn initialize(id: Value, params: Option<Value>) -> JsonRpcResponse {
     let result = InitializeResult {
         protocol_version: PROTOCOL_VERSION,
         capabilities: ServerCapabilities {
-            tools: Some(ToolsCapability { list_changed: false }),
+            tools: Some(ToolsCapability {
+                list_changed: false,
+            }),
         },
         server_info: Implementation {
             name: env!("CARGO_PKG_NAME").into(),

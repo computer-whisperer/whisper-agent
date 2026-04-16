@@ -182,7 +182,11 @@ async fn web_fetch(cfg: &Arc<FetchConfig>, args: Value) -> CallToolResult {
                 .map(|r| format!(" {r}"))
                 .unwrap_or_default(),
             current_url,
-            if content_type.is_empty() { "(none)" } else { &content_type }
+            if content_type.is_empty() {
+                "(none)"
+            } else {
+                &content_type
+            }
         );
         out.push_str(&rendered);
         if truncated {
@@ -222,11 +226,13 @@ fn bytes_to_string_capped(bytes: &[u8], max: usize) -> (String, bool) {
 }
 
 fn is_html_content_type(ct: &str) -> bool {
-    let main = ct.split(';').next().unwrap_or("").trim().to_ascii_lowercase();
-    matches!(
-        main.as_str(),
-        "text/html" | "application/xhtml+xml"
-    )
+    let main = ct
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    matches!(main.as_str(), "text/html" | "application/xhtml+xml")
 }
 
 fn clean_html(body: &str, _base_url: &str) -> String {
@@ -338,7 +344,7 @@ mod tests {
             "172.31.255.255",
             "192.168.1.1",
             "169.254.169.254", // AWS/GCP metadata service
-            "100.64.0.1",       // CGNAT
+            "100.64.0.1",      // CGNAT
             "0.0.0.0",
         ] {
             assert!(
@@ -371,7 +377,11 @@ mod tests {
 
     #[tokio::test]
     async fn validate_url_rejects_non_http_schemes() {
-        for u in ["file:///etc/passwd", "ftp://example.com", "ssh://example.com"] {
+        for u in [
+            "file:///etc/passwd",
+            "ftp://example.com",
+            "ssh://example.com",
+        ] {
             let url = Url::parse(u).unwrap();
             assert!(validate_url(&url, false).await.is_err(), "{u}");
         }

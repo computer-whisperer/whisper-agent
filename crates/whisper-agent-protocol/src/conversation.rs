@@ -32,11 +32,17 @@ impl Message {
     }
 
     pub fn user_blocks(blocks: Vec<ContentBlock>) -> Self {
-        Self { role: Role::User, content: blocks }
+        Self {
+            role: Role::User,
+            content: blocks,
+        }
     }
 
     pub fn assistant_blocks(blocks: Vec<ContentBlock>) -> Self {
-        Self { role: Role::Assistant, content: blocks }
+        Self {
+            role: Role::Assistant,
+            content: blocks,
+        }
     }
 }
 

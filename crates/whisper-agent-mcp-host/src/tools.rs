@@ -32,7 +32,11 @@ pub fn descriptors() -> Vec<Tool> {
     ]
 }
 
-pub async fn call(workspace: &Arc<Workspace>, name: &str, args: Value) -> Result<CallToolResult, ToolDispatchError> {
+pub async fn call(
+    workspace: &Arc<Workspace>,
+    name: &str,
+    args: Value,
+) -> Result<CallToolResult, ToolDispatchError> {
     match name {
         "read_file" => Ok(read_file(workspace, args).await),
         "write_file" => Ok(write_file(workspace, args).await),
@@ -112,10 +116,9 @@ async fn read_file(workspace: &Arc<Workspace>, args: Value) -> CallToolResult {
     if parsed.offset.is_none() && parsed.limit.is_none() {
         return match tokio::fs::read_to_string(&path).await {
             Ok(content) => CallToolResult::text(content),
-            Err(e) => CallToolResult::error_text(format!(
-                "read_file({}): {e}",
-                parsed.path.display()
-            )),
+            Err(e) => {
+                CallToolResult::error_text(format!("read_file({}): {e}", parsed.path.display()))
+            }
         };
     }
     // Line-sliced read — stream so we don't load a huge file just to keep a few lines.
@@ -196,11 +199,16 @@ async fn write_file(workspace: &Arc<Workspace>, args: Value) -> CallToolResult {
         Err(e) => return CallToolResult::error_text(e.to_string()),
     };
     if let Some(parent) = path.parent()
-        && let Err(e) = tokio::fs::create_dir_all(parent).await {
-            return CallToolResult::error_text(format!("create_dir_all({}): {e}", parent.display()));
-        }
+        && let Err(e) = tokio::fs::create_dir_all(parent).await
+    {
+        return CallToolResult::error_text(format!("create_dir_all({}): {e}", parent.display()));
+    }
     match tokio::fs::write(&path, parsed.content.as_bytes()).await {
-        Ok(()) => CallToolResult::text(format!("wrote {} bytes to {}", parsed.content.len(), parsed.path.display())),
+        Ok(()) => CallToolResult::text(format!(
+            "wrote {} bytes to {}",
+            parsed.content.len(),
+            parsed.path.display()
+        )),
         Err(e) => CallToolResult::error_text(format!("write_file({}): {e}", parsed.path.display())),
     }
 }
@@ -312,9 +320,7 @@ async fn edit_file(workspace: &Arc<Workspace>, args: Value) -> CallToolResult {
             parsed.path.display(),
             if found == 1 { "" } else { "s" }
         )),
-        Err(e) => {
-            CallToolResult::error_text(format!("edit_file({}): {e}", parsed.path.display()))
-        }
+        Err(e) => CallToolResult::error_text(format!("edit_file({}): {e}", parsed.path.display())),
     }
 }
 
@@ -362,10 +368,11 @@ fn nearest_match_hint(content: &str, old_string: &str) -> String {
         best_score,
         window_size,
     );
-    for i in ctx_start..ctx_end {
+    for (offset, line) in file_lines[ctx_start..ctx_end].iter().enumerate() {
+        let i = ctx_start + offset;
         let in_window = i >= best_start && i < best_start + window_size;
         let marker = if in_window { ">" } else { " " };
-        out.push_str(&format!("{marker} {:5} │ {}\n", i + 1, file_lines[i]));
+        out.push_str(&format!("{marker} {:5} │ {}\n", i + 1, line));
     }
     out
 }
@@ -709,7 +716,9 @@ async fn glob(workspace: &Arc<Workspace>, args: Value) -> CallToolResult {
             if !entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
                 continue;
             }
-            let Ok(rel) = entry.path().strip_prefix(&root) else { continue };
+            let Ok(rel) = entry.path().strip_prefix(&root) else {
+                continue;
+            };
             if matcher.is_match(rel) {
                 if hits.len() >= max {
                     truncated = true;
@@ -858,7 +867,9 @@ async fn grep(workspace: &Arc<Workspace>, args: Value) -> CallToolResult {
             if !entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
                 continue;
             }
-            let Ok(rel) = entry.path().strip_prefix(&root) else { continue };
+            let Ok(rel) = entry.path().strip_prefix(&root) else {
+                continue;
+            };
             if let Some(m) = &path_matcher
                 && !m.is_match(rel)
             {
@@ -1145,7 +1156,10 @@ fn parse_version(v: &str) -> (Vec<u64>, String) {
     let cut = v.find(['-', '+']).unwrap_or(v.len());
     let nums_part = &v[..cut];
     let suffix = v[cut..].to_string();
-    let nums: Vec<u64> = nums_part.split('.').map(|p| p.parse().unwrap_or(0)).collect();
+    let nums: Vec<u64> = nums_part
+        .split('.')
+        .map(|p| p.parse().unwrap_or(0))
+        .collect();
     (nums, suffix)
 }
 
@@ -1182,10 +1196,7 @@ fn brief_listing(dir: &std::path::Path) -> std::io::Result<String> {
         let name = entry.file_name().to_string_lossy().into_owned();
         let (is_dir, size) = match entry.file_type() {
             Ok(ft) if ft.is_dir() => (true, 0),
-            Ok(_) => (
-                false,
-                entry.metadata().map(|m| m.len()).unwrap_or(0),
-            ),
+            Ok(_) => (false, entry.metadata().map(|m| m.len()).unwrap_or(0)),
             Err(_) => (false, 0),
         };
         entries.push((name, is_dir, size));
@@ -1312,7 +1323,10 @@ fn main() {
         // Empty suffix beats non-empty: "1.0.0" > "1.0.0-rc1"
         assert_eq!(compare_versions("1.0.0", "1.0.0-rc1"), Ordering::Greater);
         assert_eq!(compare_versions("1.0.0-rc1", "1.0.0"), Ordering::Less);
-        assert_eq!(compare_versions("1.0.0-alpha", "1.0.0-beta"), Ordering::Less);
+        assert_eq!(
+            compare_versions("1.0.0-alpha", "1.0.0-beta"),
+            Ordering::Less
+        );
     }
 
     #[test]
@@ -1325,7 +1339,8 @@ fn main() {
     #[test]
     fn scan_registry_filters_by_name_prefix_and_digit() {
         // Build a fake registry-src tree and verify we pick only `<name>-<digit>*` dirs.
-        let tmp = std::env::temp_dir().join(format!("wamh-crate-source-test-{}", std::process::id()));
+        let tmp =
+            std::env::temp_dir().join(format!("wamh-crate-source-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
         let reg = tmp.join("reg-abc");
         std::fs::create_dir_all(reg.join("tokio-1.48.0/src")).unwrap();

@@ -76,10 +76,10 @@ impl TaskEventRouter {
     // ---------- Send / broadcast ----------
 
     pub(crate) fn send_to_client(&self, conn_id: ConnId, event: ServerToClient) {
-        if let Some(tx) = self.clients.get(&conn_id) {
-            if tx.send(event).is_err() {
-                warn!(conn_id, "send_to_client: outbound channel closed");
-            }
+        if let Some(tx) = self.clients.get(&conn_id)
+            && tx.send(event).is_err()
+        {
+            warn!(conn_id, "send_to_client: outbound channel closed");
         }
     }
 
@@ -153,7 +153,11 @@ impl TaskEventRouter {
                         },
                     );
                 }
-                TaskEvent::ToolCallBegin { tool_use_id, name, args_preview } => {
+                TaskEvent::ToolCallBegin {
+                    tool_use_id,
+                    name,
+                    args_preview,
+                } => {
                     self.broadcast_to_subscribers(
                         task_id,
                         ServerToClient::TaskToolCallBegin {
@@ -164,7 +168,11 @@ impl TaskEventRouter {
                         },
                     );
                 }
-                TaskEvent::ToolCallEnd { tool_use_id, result_preview, is_error } => {
+                TaskEvent::ToolCallEnd {
+                    tool_use_id,
+                    result_preview,
+                    is_error,
+                } => {
                     self.broadcast_to_subscribers(
                         task_id,
                         ServerToClient::TaskToolCallEnd {
@@ -196,7 +204,11 @@ impl TaskEventRouter {
                         },
                     );
                 }
-                TaskEvent::ApprovalResolved { approval_id, decision, decided_by_conn } => {
+                TaskEvent::ApprovalResolved {
+                    approval_id,
+                    decision,
+                    decided_by_conn,
+                } => {
                     self.broadcast_to_subscribers(
                         task_id,
                         ServerToClient::TaskApprovalResolved {
@@ -273,6 +285,9 @@ impl TaskEventRouter {
     }
 
     /// Fire-and-forget audit write — never blocks task progression.
+    // The args mirror `TaskEvent::AuditToolCall` 1:1; grouping them into a
+    // struct just shuffles the same fields without buying clarity.
+    #[allow(clippy::too_many_arguments)]
     fn write_audit(
         &self,
         task_id: &str,

@@ -15,7 +15,10 @@ mod workspace;
 use crate::workspace::Workspace;
 
 #[derive(Parser, Debug)]
-#[command(version, about = "MCP server exposing read_file, write_file, and bash within a workspace root.")]
+#[command(
+    version,
+    about = "MCP server exposing read_file, write_file, and bash within a workspace root."
+)]
 struct Args {
     /// HTTP listen address.
     #[arg(long, default_value = "127.0.0.1:8800")]
@@ -29,12 +32,14 @@ struct Args {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+        )
         .init();
 
     let args = Args::parse();
-    let workspace =
-        Workspace::new(&args.workspace_root).with_context(|| format!("invalid workspace root {:?}", args.workspace_root))?;
+    let workspace = Workspace::new(&args.workspace_root)
+        .with_context(|| format!("invalid workspace root {:?}", args.workspace_root))?;
 
     let state = server::AppState {
         workspace: Arc::new(workspace),
