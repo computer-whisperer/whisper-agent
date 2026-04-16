@@ -782,14 +782,14 @@ impl Scheduler {
 
     /// If the task is in a terminal state, tear down its sandbox (if any).
     fn teardown_sandbox_if_terminal(&mut self, task_id: &str) {
+        // Completed is NOT terminal — the task can receive follow-up messages.
+        // Only tear down on truly irreversible states.
         let is_terminal = self
             .tasks
             .get(task_id)
             .is_some_and(|t| matches!(
                 t.public_state(),
-                TaskStateLabel::Completed
-                    | TaskStateLabel::Failed
-                    | TaskStateLabel::Cancelled
+                TaskStateLabel::Failed | TaskStateLabel::Cancelled
             ));
         if is_terminal {
             if let Some(mut handle) = self.sandbox_handles.remove(task_id) {

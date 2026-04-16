@@ -8,6 +8,7 @@ use clap::{Parser, Subcommand};
 use tokio::sync::mpsc;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
+use whisper_agent_protocol::sandbox::{AccessMode, NetworkPolicy, PathAccess, SandboxSpec};
 use whisper_agent_protocol::{ApprovalPolicy, Conversation, TaskConfig};
 
 use whisper_agent::anthropic::AnthropicClient;
@@ -93,6 +94,12 @@ struct ServeArgs {
     /// SandboxSpec::None is supported (bare-metal execution).
     #[arg(long, env = "SANDBOX_DAEMON_URL")]
     sandbox_daemon_url: Option<String>,
+
+    /// Convenience: default all tasks to a Landlock sandbox with this directory
+    /// as the read-write workspace. Automatically adds ~/.cargo and ~/.rustup
+    /// as read-only if they exist. Requires --sandbox-daemon-url.
+    #[arg(long)]
+    sandbox_workspace: Option<PathBuf>,
 }
 
 #[derive(Parser, Debug)]
@@ -218,7 +225,7 @@ async fn run_serve(args: ServeArgs) -> Result<()> {
             } else {
                 ApprovalPolicy::PromptDestructive
             },
-            sandbox: Default::default(),
+            sandbox: build_default_sandbox(&args.sandbox_workspace),
         },
         audit_log_path: args.audit_log,
         host_id: "default".into(),
@@ -229,6 +236,38 @@ async fn run_serve(args: ServeArgs) -> Result<()> {
         },
     };
     server::serve(args.listen, server_config).await
+}
+
+fn build_default_sandbox(workspace: &Option<PathBuf>) -> SandboxSpec {
+    let Some(ws) = workspace else {
+        return SandboxSpec::None;
+    };
+    let ws_str = ws.to_string_lossy().into_owned();
+    let mut paths = vec![PathAccess {
+        path: ws_str,
+        mode: AccessMode::ReadWrite,
+    }];
+    let home = std::env::var("HOME").unwrap_or_default();
+    if !home.is_empty() {
+        for subdir in [".cargo", ".rustup"] {
+            let p = format!("{home}/{subdir}");
+            if std::path::Path::new(&p).exists() {
+                paths.push(PathAccess {
+                    path: p,
+                    mode: AccessMode::ReadOnly,
+                });
+            }
+        }
+    }
+    info!(
+        workspace = %paths[0].path,
+        extra_ro = paths.len() - 1,
+        "default sandbox: landlock"
+    );
+    SandboxSpec::Landlock {
+        allowed_paths: paths,
+        network: NetworkPolicy::Unrestricted,
+    }
 }
 
 async fn run_one_shot(args: RunArgs) -> Result<()> {

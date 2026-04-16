@@ -100,8 +100,8 @@ async fn provision_landlock(
     let mut cmd = Command::new(mcp_host_bin);
     cmd.args(["--listen", &listen_addr, "--workspace-root", &workspace_root]);
     cmd.stdin(std::process::Stdio::null());
-    cmd.stdout(std::process::Stdio::piped());
-    cmd.stderr(std::process::Stdio::piped());
+    cmd.stdout(std::process::Stdio::inherit());
+    cmd.stderr(std::process::Stdio::inherit());
     cmd.kill_on_drop(true);
 
     unsafe {
@@ -118,7 +118,7 @@ async fn provision_landlock(
 
     wait_for_ready(&listen_addr, 10).await?;
 
-    let mcp_url = format!("http://{listen_addr}");
+    let mcp_url = format!("http://{listen_addr}/mcp");
     info!(%mcp_url, "MCP host ready");
 
     Ok(ProvisionedSession { child, mcp_url })
