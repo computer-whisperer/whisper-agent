@@ -5,12 +5,11 @@
 //! instance of `whisper-agent-mcp-host` inside it — the scheduler connects MCP
 //! to the returned URL.
 //!
-//! Supported backends (planned):
-//!   - **Podman/Docker**: full OCI container isolation.
-//!   - **Landlock**: lightweight Linux-native filesystem sandboxing.
-//!
-//! Currently a scaffold — provision requests are accepted but return
-//! "not implemented" until a backend is wired up.
+//! Supported backends:
+//!   - **Landlock**: lightweight Linux-native filesystem + network sandboxing.
+//!   - **Podman/Docker** (planned): full OCI container isolation.
+
+mod provision;
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -22,10 +21,13 @@ use axum::response::IntoResponse;
 use axum::routing::post;
 use axum::{Json, Router};
 use clap::Parser;
+use tokio::process::Child;
 use tokio::signal;
 use tokio::sync::Mutex;
-use tracing::{info, warn};
-use whisper_agent_protocol::sandbox::{ProvisionRequest, SandboxSpec, TeardownRequest};
+use tracing::{error, info, warn};
+use whisper_agent_protocol::sandbox::{
+    NetworkPolicy, ProvisionRequest, ProvisionResponse, SandboxSpec, TeardownRequest,
+};
 
 #[derive(Parser, Debug)]
 #[command(name = "whisper-agent-sandbox", about = "Sandbox provisioning daemon")]
@@ -40,18 +42,13 @@ struct Args {
     mcp_host_bin: String,
 }
 
-/// A live sandbox session.
-#[allow(dead_code)]
 struct Session {
     task_id: String,
-    spec: SandboxSpec,
-    mcp_url: String,
-    // Future: container ID, child PID, etc.
+    child: Child,
 }
 
 struct DaemonState {
-    #[allow(dead_code)]
-    args: Args,
+    mcp_host_bin: String,
     sessions: Mutex<HashMap<String, Session>>,
 }
 
@@ -68,7 +65,7 @@ async fn main() {
     let listen = args.listen;
 
     let state = Arc::new(DaemonState {
-        args,
+        mcp_host_bin: args.mcp_host_bin,
         sessions: Mutex::new(HashMap::new()),
     });
 
@@ -76,7 +73,7 @@ async fn main() {
         .route("/provision", post(handle_provision))
         .route("/teardown", post(handle_teardown))
         .route("/health", axum::routing::get(|| async { "ok" }))
-        .with_state(state);
+        .with_state(state.clone());
 
     info!(%listen, "sandbox daemon starting");
 
@@ -89,48 +86,83 @@ async fn main() {
         .await
         .expect("server error");
 
+    // Clean up all sessions on shutdown.
+    let mut sessions = state.sessions.lock().await;
+    for (id, mut session) in sessions.drain() {
+        info!(session_id = %id, task_id = %session.task_id, "killing orphaned session");
+        let _ = session.child.kill().await;
+    }
+
     info!("sandbox daemon stopped");
 }
 
 async fn handle_provision(
-    State(_state): State<Arc<DaemonState>>,
+    State(state): State<Arc<DaemonState>>,
     Json(req): Json<ProvisionRequest>,
 ) -> impl IntoResponse {
     info!(task_id = %req.task_id, "provision request");
 
     match &req.spec {
         SandboxSpec::None => {
-            // No sandbox needed — shouldn't normally reach the daemon, but
-            // handle gracefully.
             warn!(task_id = %req.task_id, "provision called with SandboxSpec::None");
-            (
+            return (
                 StatusCode::BAD_REQUEST,
                 Json(serde_json::json!({
                     "error": "SandboxSpec::None does not require provisioning"
                 })),
             )
-                .into_response()
+                .into_response();
         }
         SandboxSpec::Container { image, .. } => {
             info!(task_id = %req.task_id, %image, "container provisioning not yet implemented");
-            // TODO: podman run --rm -d --name <session_id>
-            //       bind-mount mounts, apply network policy, start mcp-host
-            (
+            return (
                 StatusCode::NOT_IMPLEMENTED,
                 Json(serde_json::json!({
                     "error": "container provisioning not yet implemented"
                 })),
             )
+                .into_response();
+        }
+        SandboxSpec::Landlock { network, .. } => {
+            if matches!(network, NetworkPolicy::AllowList { .. }) {
+                warn!(
+                    task_id = %req.task_id,
+                    "landlock cannot do per-host network filtering; \
+                     AllowList will be treated as Isolated"
+                );
+            }
+        }
+    }
+
+    match provision::provision(&req.spec, &state.mcp_host_bin).await {
+        Ok(session) => {
+            let session_id = req.task_id.clone();
+            let mcp_url = session.mcp_url.clone();
+
+            let mut sessions = state.sessions.lock().await;
+            sessions.insert(
+                session_id.clone(),
+                Session {
+                    task_id: req.task_id,
+                    child: session.child,
+                },
+            );
+
+            (
+                StatusCode::OK,
+                Json(serde_json::to_value(ProvisionResponse {
+                    session_id,
+                    mcp_url,
+                })
+                .unwrap()),
+            )
                 .into_response()
         }
-        SandboxSpec::Landlock { .. } => {
-            info!(task_id = %req.task_id, "landlock provisioning not yet implemented");
-            // TODO: fork, apply landlock rules, exec mcp-host
+        Err(e) => {
+            error!(task_id = %req.task_id, error = %e, "provision failed");
             (
-                StatusCode::NOT_IMPLEMENTED,
-                Json(serde_json::json!({
-                    "error": "landlock provisioning not yet implemented"
-                })),
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": e.to_string() })),
             )
                 .into_response()
         }
@@ -145,13 +177,19 @@ async fn handle_teardown(
 
     let mut sessions = state.sessions.lock().await;
     match sessions.remove(&req.session_id) {
-        Some(session) => {
+        Some(mut session) => {
             info!(
                 session_id = %req.session_id,
                 task_id = %session.task_id,
-                "session torn down"
+                "tearing down session"
             );
-            // TODO: podman stop / kill child process
+            if let Err(e) = session.child.kill().await {
+                warn!(
+                    session_id = %req.session_id,
+                    error = %e,
+                    "failed to kill child (may have already exited)"
+                );
+            }
             StatusCode::OK.into_response()
         }
         None => (
