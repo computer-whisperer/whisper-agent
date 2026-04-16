@@ -36,6 +36,7 @@ use crate::io_dispatch::{self, IoCompletion, IoFuture};
 use crate::mcp::{McpSession, ToolAnnotations, ToolDescriptor as McpTool};
 use crate::model::ModelProvider;
 use crate::persist::Persister;
+use crate::resources::{BackendId, McpHostId, ResourceRegistry, SandboxId};
 use crate::sandbox::{SandboxHandle, SandboxProvider};
 use crate::task::{
     ApprovalDisposition, IoResult, OpId, StepOutcome, Task, TaskInternalState, derive_title,
@@ -129,6 +130,12 @@ pub struct Scheduler {
     /// when building a model request.
     tool_descriptors: HashMap<String, Vec<McpTool>>,
 
+    /// Phase 1a shadow registry — populated alongside the per-task plumbing
+    /// above, never read by the I/O dispatch path. Phase 1b exposes it on the
+    /// wire; later phases promote it to the source of truth and the per-task
+    /// fields above go away. See `docs/design_session_thread_scheduler.md`.
+    resources: ResourceRegistry,
+
     next_op_id: OpId,
     /// Tasks modified during the current scheduler-loop iteration. Flushed to the
     /// persister before the next iteration starts.
@@ -153,13 +160,19 @@ impl Scheduler {
             "default_backend must be in backends"
         );
 
+        let mut resources = ResourceRegistry::new();
+        for (name, entry) in &backends {
+            resources.insert_backend(name.clone(), entry.kind.clone(), entry.default_model.clone());
+        }
+
         let mut shared_hosts: HashMap<String, Arc<McpSession>> = HashMap::new();
         for cfg in shared_host_configs {
             info!(name = %cfg.name, url = %cfg.url, "connecting to shared MCP host");
-            let session = McpSession::connect(&cfg.url).await.map_err(|e| {
+            let session = Arc::new(McpSession::connect(&cfg.url).await.map_err(|e| {
                 anyhow::anyhow!("shared MCP host `{}` ({}): {e}", cfg.name, cfg.url)
-            })?;
-            shared_hosts.insert(cfg.name, Arc::new(session));
+            })?);
+            resources.insert_shared_mcp_host(cfg.name.clone(), cfg.url.clone(), session.clone());
+            shared_hosts.insert(cfg.name, session);
         }
 
         Ok(Self {
@@ -174,9 +187,16 @@ impl Scheduler {
             sandbox_handles: HashMap::new(),
             shared_hosts,
             tool_descriptors: HashMap::new(),
+            resources,
             next_op_id: 1,
             dirty: HashSet::new(),
         })
+    }
+
+    /// Read-only access to the Phase 1a shadow registry. Currently only used by
+    /// tests and (in Phase 1b) the wire layer.
+    pub fn resources(&self) -> &ResourceRegistry {
+        &self.resources
     }
 
     /// Returns the backend name the task is configured to use, falling back to the
@@ -231,6 +251,16 @@ impl Scheduler {
     /// already transitioned any in-flight internal states to Failed before handoff.
     pub fn load_tasks(&mut self, tasks: Vec<Task>) {
         for task in tasks {
+            // Phase 1a: mirror the registry registrations that create_task
+            // would have done. Per-task primary MCP + sandbox entries don't
+            // exist for persisted tasks yet — they're created lazily on the
+            // next McpConnect, same as fresh tasks.
+            let backend_id = BackendId::for_name(self.resolve_backend_name(&task));
+            self.resources.add_backend_user(&backend_id, &task.id);
+            for name in &task.config.shared_mcp_hosts {
+                self.resources
+                    .add_mcp_user(&McpHostId::shared(name), &task.id);
+            }
             self.tasks.insert(task.id.clone(), task);
         }
     }
@@ -546,6 +576,23 @@ impl Scheduler {
         let summary = task.summary();
         self.tasks.insert(task_id.clone(), task);
 
+        // Phase 1a: register this task as a user of its backend and of every
+        // shared MCP host it references. Counts are added once at creation;
+        // the teardown path clears per-task entries (primary MCP + sandbox)
+        // but leaves backend/shared-host associations alone — Completed tasks
+        // keep their bindings so follow-up messages stay routable.
+        let task_ref = self
+            .tasks
+            .get(&task_id)
+            .expect("just-inserted task is present");
+        let backend_id = BackendId::for_name(self.resolve_backend_name(task_ref));
+        let shared_names = task_ref.config.shared_mcp_hosts.clone();
+        self.resources.add_backend_user(&backend_id, &task_id);
+        for name in &shared_names {
+            self.resources
+                .add_mcp_user(&McpHostId::shared(name), &task_id);
+        }
+
         info!(task_id = %task_id, "task created");
         // Every client gets exactly one TaskCreated; the requester's copy carries
         // correlation_id if they provided one.
@@ -656,12 +703,12 @@ impl Scheduler {
                 // selected by the task's allowlist. Unknown names are warn-skipped
                 // — they shouldn't survive create_task validation, but a persisted
                 // task whose host was removed since save lands here.
-                let allow = self
+                let (allow, sandbox_spec) = self
                     .tasks
                     .get(&task_id)
-                    .map(|t| t.config.shared_mcp_hosts.clone())
+                    .map(|t| (t.config.shared_mcp_hosts.clone(), t.config.sandbox.clone()))
                     .unwrap_or_default();
-                let mut sessions = vec![session];
+                let mut sessions = vec![session.clone()];
                 for name in &allow {
                     match self.shared_hosts.get(name) {
                         Some(s) => sessions.push(s.clone()),
@@ -671,6 +718,24 @@ impl Scheduler {
                         ),
                     }
                 }
+                // Phase 1a: mirror the just-acquired primary MCP + sandbox
+                // into the resource registry.
+                let primary_url = sandbox_handle
+                    .as_ref()
+                    .and_then(|h| h.mcp_url().map(str::to_string))
+                    .unwrap_or_else(|| {
+                        self.tasks
+                            .get(&task_id)
+                            .map(|t| t.config.mcp_host_url.clone())
+                            .unwrap_or_default()
+                    });
+                self.resources
+                    .insert_primary_mcp_host(&task_id, primary_url, session);
+                if sandbox_handle.is_some() {
+                    self.resources
+                        .insert_sandbox_for_task(&task_id, sandbox_spec);
+                }
+
                 self.mcp_pools.insert(
                     task_id.clone(),
                     McpPool {
@@ -687,6 +752,19 @@ impl Scheduler {
                 if let Some(pool) = self.mcp_pools.get_mut(&task_id) {
                     pool.routing = routing;
                 }
+                // Phase 1a: mirror the per-task primary's tools into the
+                // registry. The merged list contains tools from every session
+                // in the pool; we only attribute to the primary entry here
+                // because in Phase 1a there's no shared-host tools-list flow
+                // (shared hosts publish tools too, but that wiring lands in
+                // Phase 1b alongside the wire surface).
+                let primary_id = McpHostId::primary_for_task(&task_id);
+                let annotations: HashMap<String, ToolAnnotations> = tools
+                    .iter()
+                    .map(|t| (t.name.clone(), t.annotations.clone()))
+                    .collect();
+                self.resources
+                    .populate_mcp_tools(&primary_id, tools.clone(), annotations);
                 self.tool_descriptors.insert(task_id.clone(), tools);
                 IoResult::ListTools(Ok(()))
             }
@@ -760,6 +838,15 @@ impl Scheduler {
             // about to die. Drop the pool too — shared session Arcs survive
             // because `self.shared_hosts` still holds them.
             self.mcp_pools.remove(task_id);
+            // Phase 1a: mark the per-task primary MCP + sandbox as torn down
+            // in the registry so inspectability tools see the right state.
+            // Backend and shared-host user counts are intentionally left
+            // alone — the task itself still exists in `self.tasks` and the
+            // existing code never removes terminal tasks.
+            self.resources
+                .mark_mcp_torn_down(&McpHostId::primary_for_task(task_id));
+            self.resources
+                .mark_sandbox_torn_down(&SandboxId::for_task(task_id));
             if let Some(mut handle) = self.sandbox_handles.remove(task_id) {
                 let tid = task_id.to_string();
                 tokio::spawn(async move {
