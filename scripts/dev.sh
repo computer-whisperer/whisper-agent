@@ -15,12 +15,15 @@
 #   LISTEN_SERVER     default: 127.0.0.1:8080
 #   LISTEN_SANDBOX    default: 127.0.0.1:9810  (sandbox daemon)
 #   LISTEN_FETCH      default: 127.0.0.1:9830  (web-fetch MCP daemon)
+#   LISTEN_SEARCH     default: 127.0.0.1:9831  (web-search MCP daemon)
 #   LISTEN_MCP        default: 127.0.0.1:8800  (standalone MCP, --no-sandbox only)
 #
 # Flags:
 #   --skip-wasm       skip the wasm-pack build (use when only Rust code changed)
 #   --no-sandbox      use a single shared MCP host instead of the sandbox daemon
 #   --no-fetch        skip starting the web-fetch daemon (no `web_fetch` tool)
+#   --no-search       skip starting the web-search daemon (no `web_search` tool).
+#                     Auto-set when BRAVE_API_KEY is unset in CLOUD_KEYS.txt.
 
 set -euo pipefail
 
@@ -32,16 +35,19 @@ SANDBOX="${SANDBOX:-$REPO_ROOT/sandbox}"
 LISTEN_SERVER="${LISTEN_SERVER:-127.0.0.1:8080}"
 LISTEN_SANDBOX="${LISTEN_SANDBOX:-127.0.0.1:9810}"
 LISTEN_FETCH="${LISTEN_FETCH:-127.0.0.1:9830}"
+LISTEN_SEARCH="${LISTEN_SEARCH:-127.0.0.1:9831}"
 LISTEN_MCP="${LISTEN_MCP:-127.0.0.1:8800}"
 
 SKIP_WASM=0
 USE_SANDBOX=1
 USE_FETCH=1
+USE_SEARCH=1
 for arg in "$@"; do
     case "$arg" in
         --skip-wasm)    SKIP_WASM=1 ;;
         --no-sandbox)   USE_SANDBOX=0 ;;
         --no-fetch)     USE_FETCH=0 ;;
+        --no-search)    USE_SEARCH=0 ;;
         -h|--help)
             sed -n '2,/^$/p' "$0" | sed 's/^# \{0,1\}//'
             exit 0
@@ -58,6 +64,14 @@ fi
 # shellcheck disable=SC1091
 source CLOUD_KEYS.txt
 export ANTHROPIC_API_KEY
+export BRAVE_API_KEY="${BRAVE_API_KEY:-}"
+
+# Skip the search daemon silently if no key is configured — the rest of the
+# stack works fine without it.
+if [[ "$USE_SEARCH" -eq 1 && -z "$BRAVE_API_KEY" ]]; then
+    echo "==> BRAVE_API_KEY unset in CLOUD_KEYS.txt — skipping web-search daemon"
+    USE_SEARCH=0
+fi
 
 mkdir -p "$SANDBOX"
 
@@ -67,6 +81,9 @@ if [[ "$USE_SANDBOX" -eq 1 ]]; then
 fi
 if [[ "$USE_FETCH" -eq 1 ]]; then
     PACKAGES="$PACKAGES -p whisper-agent-mcp-fetch"
+fi
+if [[ "$USE_SEARCH" -eq 1 ]]; then
+    PACKAGES="$PACKAGES -p whisper-agent-mcp-search"
 fi
 
 echo "==> building ($PACKAGES) (release)"
@@ -111,6 +128,23 @@ if [[ "$USE_FETCH" -eq 1 ]]; then
     done
 
     SHARED_HOST_ARGS+=(--shared-mcp-host "fetch=http://$LISTEN_FETCH/mcp")
+fi
+
+if [[ "$USE_SEARCH" -eq 1 ]]; then
+    echo "==> starting whisper-agent-mcp-search on $LISTEN_SEARCH"
+    "$REPO_ROOT/target/release/whisper-agent-mcp-search" \
+        --listen "$LISTEN_SEARCH" &
+    CHILD_PIDS+=($!)
+
+    for _ in $(seq 1 20); do
+        if curl -sf -X POST "http://$LISTEN_SEARCH/mcp" \
+            -H 'content-type: application/json' \
+            -d '{"jsonrpc":"2.0","id":1,"method":"ping"}' > /dev/null 2>&1
+        then break; fi
+        sleep 0.25
+    done
+
+    SHARED_HOST_ARGS+=(--shared-mcp-host "search=http://$LISTEN_SEARCH/mcp")
 fi
 
 if [[ "$USE_SANDBOX" -eq 1 ]]; then

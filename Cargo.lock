@@ -4266,6 +4266,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "whisper-agent-mcp-search"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "clap",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "url",
+ "whisper-agent-mcp-proto",
+]
+
+[[package]]
 name = "whisper-agent-protocol"
 version = "0.1.0"
 dependencies = [
