@@ -311,7 +311,10 @@ async fn edit_file(workspace: &Arc<Workspace>, args: Value) -> CallToolResult {
 fn bash_descriptor() -> Tool {
     Tool {
         name: "bash".into(),
-        description: "Run a bash command within the workspace. Returns stdout, stderr, and exit code on completion.".into(),
+        description: "Run a bash command within the workspace. Returns stdout and stderr \
+                      merged in shell-emission order; on non-zero exit the first line is \
+                      `Exit code <N>`. Large outputs are head-truncated with a marker."
+            .into(),
         input_schema: json!({
             "type": "object",
             "properties": {
@@ -360,6 +363,11 @@ fn strip_ansi(s: &str) -> String {
     ANSI_ESCAPE.replace_all(s, "").into_owned()
 }
 
+/// Cap on bash tool_result size. Matches claude-code's BASH_MAX_OUTPUT_LENGTH.
+/// Oversized output is head-truncated — cargo-style compile errors land at the
+/// tail, which is the part the model almost always needs.
+const BASH_MAX_OUTPUT_BYTES: usize = 30_000;
+
 async fn bash(workspace: &Arc<Workspace>, args: Value) -> CallToolResult {
     let parsed: BashArgs = match serde_json::from_value(args) {
         Ok(v) => v,
@@ -376,12 +384,21 @@ async fn bash(workspace: &Arc<Workspace>, args: Value) -> CallToolResult {
 
     let timeout_secs = parsed.timeout_seconds.unwrap_or(120).min(600);
 
+    // Merge stdout+stderr at shell level so the model sees one interleaved
+    // stream in shell-emission order (matching claude-code's bash envelope).
+    // The curly-brace group preserves the inner command's exit code; the
+    // newline before `}` stops a trailing `#` comment from swallowing the
+    // close.
+    let wrapped = format!("{{ {cmd}\n}} 2>&1", cmd = parsed.command);
+
     let mut cmd = Command::new("bash");
     cmd.arg("-c")
-        .arg(&parsed.command)
+        .arg(&wrapped)
         .current_dir(&cwd)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
+        // bash's own stderr is only written to on wrapper-parse errors; keep
+        // it piped so we don't silently swallow those.
         .stderr(Stdio::piped())
         .kill_on_drop(true);
 
@@ -393,17 +410,19 @@ async fn bash(workspace: &Arc<Workspace>, args: Value) -> CallToolResult {
     let output_future = child.wait_with_output();
     match timeout(Duration::from_secs(timeout_secs), output_future).await {
         Ok(Ok(output)) => {
-            let stdout_raw = String::from_utf8_lossy(&output.stdout);
-            let stderr_raw = String::from_utf8_lossy(&output.stderr);
-            let (stdout, stderr) = if parsed.strip_ansi {
-                (strip_ansi(&stdout_raw), strip_ansi(&stderr_raw))
-            } else {
-                (stdout_raw.into_owned(), stderr_raw.into_owned())
-            };
+            let mut merged = String::new();
+            merged.push_str(&String::from_utf8_lossy(&output.stdout));
+            merged.push_str(&String::from_utf8_lossy(&output.stderr));
+            if parsed.strip_ansi {
+                merged = strip_ansi(&merged);
+            }
+            let merged = head_truncate(merged, BASH_MAX_OUTPUT_BYTES);
             let exit_code = output.status.code().unwrap_or(-1);
-            let body = format!(
-                "exit_code: {exit_code}\n--- stdout ---\n{stdout}--- stderr ---\n{stderr}"
-            );
+            let body = if output.status.success() {
+                merged
+            } else {
+                format!("Exit code {exit_code}\n{merged}")
+            };
             if output.status.success() {
                 CallToolResult::text(body)
             } else {
@@ -413,6 +432,21 @@ async fn bash(workspace: &Arc<Workspace>, args: Value) -> CallToolResult {
         Ok(Err(e)) => CallToolResult::error_text(format!("bash wait failed: {e}")),
         Err(_) => CallToolResult::error_text(format!("bash timed out after {timeout_secs}s")),
     }
+}
+
+/// Keep the last `max` bytes of `s`, prefixed with a marker noting how much
+/// was dropped. Walks forward to a UTF-8 char boundary so we never split a
+/// multi-byte sequence. Returns `s` unchanged if it already fits.
+fn head_truncate(s: String, max: usize) -> String {
+    if s.len() <= max {
+        return s;
+    }
+    let mut start = s.len() - max;
+    while start < s.len() && !s.is_char_boundary(start) {
+        start += 1;
+    }
+    let dropped = start;
+    format!("... {dropped} bytes truncated ...\n{}", &s[start..])
 }
 
 // ---------- list_dir ----------
@@ -863,7 +897,7 @@ mod tests {
 
     #[test]
     fn strip_ansi_passes_through_plain_text() {
-        let input = "exit_code: 0\nfinished dev profile\n";
+        let input = "Compiling foo v0.1.0\nFinished dev profile\n";
         assert_eq!(strip_ansi(input), input);
     }
 
@@ -872,5 +906,29 @@ mod tests {
         // ESC + letter (e.g. alternate charset, keypad modes).
         let input = "hello\x1bMworld\x1b=done";
         assert_eq!(strip_ansi(input), "helloworlddone");
+    }
+
+    #[test]
+    fn head_truncate_no_op_when_under_cap() {
+        let s = "short output".to_string();
+        assert_eq!(head_truncate(s.clone(), 1000), s);
+    }
+
+    #[test]
+    fn head_truncate_keeps_tail_with_marker() {
+        let s: String = "abcdefghij".into(); // 10 bytes
+        let got = head_truncate(s, 4);
+        // Keeps last 4 bytes, notes 6 dropped.
+        assert_eq!(got, "... 6 bytes truncated ...\nghij");
+    }
+
+    #[test]
+    fn head_truncate_walks_forward_to_char_boundary() {
+        // 3-byte é repeated — if we cut mid-codepoint, walk forward.
+        let s: String = "éééé".into(); // 4 × 2 bytes = 8 bytes
+        let got = head_truncate(s, 5);
+        // Cutting to keep 5 trailing bytes would start mid-é; we walk forward
+        // to the next boundary (byte 4) and report 4 dropped.
+        assert_eq!(got, "... 4 bytes truncated ...\néé");
     }
 }

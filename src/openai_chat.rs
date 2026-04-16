@@ -266,17 +266,29 @@ fn convert_assistant_message(blocks: &[ContentBlock], out: &mut Vec<OaMessage>) 
             }
         }
     }
+    // Wire contract: an assistant message must carry `content` OR `tool_calls`
+    // (OpenAI and llama.cpp's compat endpoint both reject a message that
+    // carries neither with a 400). When the model returned truly-empty output
+    // — no text and no tools — we still have to emit a valid shape, so fall
+    // back to an empty-string content. A tool-call-only turn correctly omits
+    // content; a text turn carries the accumulated text.
+    let has_tool_calls = !tool_calls.is_empty();
+    let content = if text_accum.is_empty() {
+        if has_tool_calls {
+            None
+        } else {
+            Some(OaContent::Text(String::new()))
+        }
+    } else {
+        Some(OaContent::Text(text_accum))
+    };
     out.push(OaMessage {
         role: "assistant".into(),
-        content: if text_accum.is_empty() {
-            None
-        } else {
-            Some(OaContent::Text(text_accum))
-        },
-        tool_calls: if tool_calls.is_empty() {
-            None
-        } else {
+        content,
+        tool_calls: if has_tool_calls {
             Some(tool_calls)
+        } else {
+            None
         },
         tool_call_id: None,
     });
@@ -512,6 +524,39 @@ mod tests {
         assert_eq!(out[0].role, "tool");
         assert_eq!(out[0].tool_call_id.as_deref(), Some("toolu_1"));
         assert_eq!(out[1].tool_call_id.as_deref(), Some("toolu_2"));
+    }
+
+    #[test]
+    fn empty_assistant_blocks_emit_empty_string_content() {
+        // Regression: an assistant message with no blocks used to serialize as
+        // `{"role":"assistant"}` (both content and tool_calls omitted), which
+        // OpenAI-compat servers reject with 400. We now emit `content: ""`.
+        let mut out = Vec::new();
+        convert_assistant_message(&[], &mut out);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].role, "assistant");
+        assert!(matches!(out[0].content, Some(OaContent::Text(ref s)) if s.is_empty()));
+        assert!(out[0].tool_calls.is_none());
+        // And the serialized JSON actually carries the content field.
+        let v = serde_json::to_value(&out[0]).unwrap();
+        assert_eq!(v["content"], serde_json::Value::String(String::new()));
+    }
+
+    #[test]
+    fn tool_call_only_assistant_omits_content_field() {
+        // Tool-call-only turns should still omit `content` entirely — OpenAI
+        // accepts that shape and some strict servers prefer it to a null/empty.
+        let blocks = vec![ContentBlock::ToolUse {
+            id: "toolu_1".into(),
+            name: "bash".into(),
+            input: serde_json::json!({"command": "ls"}),
+        }];
+        let mut out = Vec::new();
+        convert_assistant_message(&blocks, &mut out);
+        assert_eq!(out.len(), 1);
+        assert!(out[0].content.is_none());
+        let v = serde_json::to_value(&out[0]).unwrap();
+        assert!(v.get("content").is_none(), "tool_call-only turn must not carry content field");
     }
 
     #[test]
