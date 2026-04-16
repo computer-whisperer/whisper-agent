@@ -19,27 +19,26 @@
 //! `task.step()` / `task.apply_io_result()`). No other code path writes to a Task.
 
 use std::collections::{HashMap, HashSet};
-use std::future::Future;
-use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
 use futures::StreamExt;
 use futures::stream::FuturesUnordered;
 use tokio::sync::mpsc;
-use tracing::{debug, error, info, warn};
+use tracing::{error, info, warn};
 use whisper_agent_protocol::{
     BackendSummary, ClientToServer, ModelSummary, ServerToClient, TaskConfig, TaskConfigOverride,
     TaskStateLabel,
 };
 
 use crate::audit::{AuditLog, ToolCallEntry, ToolCallOutcome};
+use crate::io_dispatch::{self, IoCompletion, IoFuture};
 use crate::mcp::{McpSession, ToolAnnotations, ToolDescriptor as McpTool};
-use crate::model::{CacheBreakpoint, ModelProvider, ModelRequest, ToolSpec, default_cache_policy};
+use crate::model::ModelProvider;
 use crate::sandbox::{SandboxHandle, SandboxProvider};
 use crate::persist::Persister;
 use crate::task::{
-    ApprovalDisposition, IoRequest, IoResult, OpId, StepOutcome, Task, TaskEvent, TaskInternalState,
+    ApprovalDisposition, IoResult, OpId, StepOutcome, Task, TaskEvent, TaskInternalState,
     derive_title, new_task_id,
 };
 
@@ -55,15 +54,6 @@ pub enum SchedulerMsg {
     },
     UnregisterClient { conn_id: ConnId },
 }
-
-/// Completion message delivered by every I/O future the scheduler dispatches.
-struct IoCompletion {
-    task_id: String,
-    op_id: OpId,
-    result: IoResult,
-}
-
-type IoFuture = Pin<Box<dyn Future<Output = IoCompletion> + Send>>;
 
 /// Entry in the scheduler's backend catalog.
 pub struct BackendEntry {
@@ -184,12 +174,45 @@ impl Scheduler {
 
     /// Returns the backend name the task is configured to use, falling back to the
     /// server's default if the task left it empty. Does NOT validate existence.
-    fn resolve_backend_name<'a>(&'a self, task: &'a Task) -> &'a str {
+    pub(crate) fn resolve_backend_name<'a>(&'a self, task: &'a Task) -> &'a str {
         if task.config.backend.is_empty() {
             &self.default_backend
         } else {
             &task.config.backend
         }
+    }
+
+    // ---------- Read-only accessors used by `io_dispatch` ----------
+
+    pub(crate) fn task(&self, task_id: &str) -> Option<&Task> {
+        self.tasks.get(task_id)
+    }
+
+    pub(crate) fn backend(&self, name: &str) -> Option<&BackendEntry> {
+        self.backends.get(name)
+    }
+
+    pub(crate) fn sandbox_provider(&self) -> &Arc<dyn SandboxProvider> {
+        &self.sandbox_provider
+    }
+
+    pub(crate) fn tool_descriptors(&self, task_id: &str) -> Option<&[McpTool]> {
+        self.tool_descriptors.get(task_id).map(|v| v.as_slice())
+    }
+
+    /// Snapshot of every MCP session in the task's pool, primary first. Used by
+    /// `ListTools` to fan out the `tools/list` call across the pool.
+    pub(crate) fn pool_sessions(&self, task_id: &str) -> Option<Vec<Arc<McpSession>>> {
+        self.mcp_pools.get(task_id).map(|p| p.sessions.clone())
+    }
+
+    /// Resolve which pool session a tool call should be routed to. Falls back
+    /// to the primary if the routing map hasn't been filled in (defensive —
+    /// `ToolCall` follows `ListToolsSuccess`, so routing should always exist).
+    pub(crate) fn route_tool(&self, task_id: &str, tool_name: &str) -> Option<Arc<McpSession>> {
+        let pool = self.mcp_pools.get(task_id)?;
+        let idx = *pool.routing.get(tool_name).unwrap_or(&0);
+        pool.sessions.get(idx).cloned()
     }
 
     pub fn with_persister(mut self, persister: Persister) -> Self {
@@ -689,222 +712,13 @@ impl Scheduler {
                 StepOutcome::DispatchIo(req) => {
                     // Push the future but keep stepping — `AwaitingTools` dispatches all
                     // N tool calls in parallel before pausing.
-                    let fut = self.build_io_future(task_id.to_string(), req);
+                    let fut = io_dispatch::build_io_future(self, task_id.to_string(), req);
                     pending_io.push(fut);
                 }
                 StepOutcome::Continue => continue,
                 StepOutcome::Paused => break,
             }
         }
-    }
-
-    fn build_io_future(&self, task_id: String, req: IoRequest) -> IoFuture {
-        match req {
-            IoRequest::McpConnect { op_id } => {
-                let task = self.tasks.get(&task_id).expect("task exists");
-                let fallback_url = task.config.mcp_host_url.clone();
-                let sandbox_spec = task.config.sandbox.clone();
-                let provider = self.sandbox_provider.clone();
-
-                Box::pin(async move {
-                    // Provision sandbox if the task has a non-None spec.
-                    let (mcp_url, sandbox_handle) = match provider
-                        .provision(&task_id, &sandbox_spec)
-                        .await
-                    {
-                        Ok(handle) => {
-                            let url = handle
-                                .mcp_url()
-                                .map(|u| u.to_string())
-                                .unwrap_or(fallback_url);
-                            (url, Some(handle))
-                        }
-                        Err(e) => {
-                            return IoCompletion {
-                                task_id,
-                                op_id,
-                                result: IoResult::McpConnect(Err(format!(
-                                    "sandbox provision failed: {e}"
-                                ))),
-                            };
-                        }
-                    };
-
-                    match McpSession::connect(&mcp_url).await {
-                        Ok(s) => IoCompletion {
-                            task_id,
-                            op_id,
-                            result: IoResult::McpConnectSuccess {
-                                session: Arc::new(s),
-                                sandbox_handle,
-                            },
-                        },
-                        Err(e) => IoCompletion {
-                            task_id,
-                            op_id,
-                            result: IoResult::McpConnect(Err(e.to_string())),
-                        },
-                    }
-                })
-            }
-            IoRequest::ListTools { op_id } => {
-                let sessions: Vec<Arc<McpSession>> = self
-                    .mcp_pools
-                    .get(&task_id)
-                    .map(|p| p.sessions.clone())
-                    .expect("mcp pool present before ListTools");
-                Box::pin(async move {
-                    let mut all_tools: Vec<McpTool> = Vec::new();
-                    let mut routing: HashMap<String, usize> = HashMap::new();
-                    for (idx, session) in sessions.iter().enumerate() {
-                        match session.list_tools().await {
-                            Ok(tools) => {
-                                for tool in tools {
-                                    if let Some(prev) = routing.get(&tool.name) {
-                                        // Earlier session wins (primary first).
-                                        warn!(
-                                            %task_id, op_id, name = %tool.name,
-                                            kept_idx = prev, dropped_idx = idx,
-                                            "tool name collision across MCP sessions; dropping later"
-                                        );
-                                        continue;
-                                    }
-                                    routing.insert(tool.name.clone(), idx);
-                                    all_tools.push(tool);
-                                }
-                            }
-                            Err(e) => {
-                                return IoCompletion {
-                                    task_id,
-                                    op_id,
-                                    result: IoResult::ListTools(Err(format!(
-                                        "session {idx}: {e}"
-                                    ))),
-                                };
-                            }
-                        }
-                    }
-                    IoCompletion {
-                        task_id,
-                        op_id,
-                        result: IoResult::ListToolsSuccess { tools: all_tools, routing },
-                    }
-                })
-            }
-            IoRequest::ModelCall { op_id } => {
-                let (owned_req, model_name, backend_name) =
-                    self.build_model_request(&task_id);
-                let provider = match self.backends.get(&backend_name) {
-                    Some(entry) => entry.provider.clone(),
-                    None => {
-                        // Unknown backend — surface as a model-call failure so the
-                        // task transitions to Failed via the existing path.
-                        let msg = format!("unknown backend `{backend_name}`");
-                        return Box::pin(async move {
-                            IoCompletion {
-                                task_id,
-                                op_id,
-                                result: IoResult::ModelCall(Err(msg)),
-                            }
-                        });
-                    }
-                };
-                Box::pin(async move {
-                    debug!(%task_id, op_id, backend = %backend_name, model = %model_name, "dispatching model call");
-                    let req = ModelRequest {
-                        model: &owned_req.model,
-                        max_tokens: owned_req.max_tokens,
-                        system_prompt: &owned_req.system_prompt,
-                        tools: &owned_req.tools,
-                        messages: &owned_req.messages,
-                        cache_breakpoints: &owned_req.cache_breakpoints,
-                    };
-                    match provider.create_message(&req).await {
-                        Ok(resp) => IoCompletion {
-                            task_id,
-                            op_id,
-                            result: IoResult::ModelCall(Ok(resp)),
-                        },
-                        Err(e) => IoCompletion {
-                            task_id,
-                            op_id,
-                            result: IoResult::ModelCall(Err(e.to_string())),
-                        },
-                    }
-                })
-            }
-            IoRequest::ToolCall { op_id, tool_use_id, name, input } => {
-                // Route to whichever pool session contributed this tool. Falls
-                // back to the primary if routing wasn't filled in (shouldn't
-                // happen because ToolCall always follows a successful ListTools,
-                // but we'd rather try than panic).
-                let mcp = self
-                    .mcp_pools
-                    .get(&task_id)
-                    .and_then(|p| {
-                        let idx = *p.routing.get(&name).unwrap_or(&0);
-                        p.sessions.get(idx).cloned()
-                    })
-                    .expect("mcp pool present before ToolCall");
-                Box::pin(async move {
-                    let result = match mcp.invoke(&name, input).await {
-                        Ok(mut stream) => {
-                            let mut last = None;
-                            while let Some(event) = stream.next().await {
-                                match event {
-                                    crate::mcp::ToolEvent::Completed(r) => last = Some(r),
-                                }
-                            }
-                            match last {
-                                Some(r) => Ok(r),
-                                None => Err("no Completed event in tool stream".to_string()),
-                            }
-                        }
-                        Err(e) => Err(e.to_string()),
-                    };
-                    IoCompletion {
-                        task_id,
-                        op_id,
-                        result: IoResult::ToolCall { tool_use_id, result },
-                    }
-                })
-            }
-        }
-    }
-
-    fn build_model_request(&self, task_id: &str) -> (OwnedModelRequest, String, String) {
-        let task = self.tasks.get(task_id).expect("task exists");
-        let tools: Vec<ToolSpec> = self
-            .tool_descriptors
-            .get(task_id)
-            .map(|tools| tools.iter().map(mcp_tool_to_spec).collect())
-            .unwrap_or_default();
-        let messages = task.conversation.messages().to_vec();
-        let backend_name = self.resolve_backend_name(task).to_string();
-        // Empty task.config.model → consult the backend's default_model. If that's
-        // also None (common for single-model local endpoints), pass empty through.
-        let model = if task.config.model.is_empty() {
-            self.backends
-                .get(&backend_name)
-                .and_then(|e| e.default_model.clone())
-                .unwrap_or_default()
-        } else {
-            task.config.model.clone()
-        };
-        let max_tokens = task.config.max_tokens;
-        let cache_breakpoints = default_cache_policy(&messages, 2);
-        (
-            OwnedModelRequest {
-                model: model.clone(),
-                max_tokens,
-                system_prompt: task.config.system_prompt.clone(),
-                tools,
-                messages,
-                cache_breakpoints,
-            },
-            model,
-            backend_name,
-        )
     }
 
     /// If the task is in a terminal state, tear down its sandbox (if any).
@@ -1155,17 +969,6 @@ impl Scheduler {
     }
 }
 
-// A model-call payload owned by value so the future outliving the scheduler's borrow
-// can hold onto it without lifetime gymnastics.
-struct OwnedModelRequest {
-    model: String,
-    max_tokens: u32,
-    system_prompt: String,
-    tools: Vec<ToolSpec>,
-    messages: Vec<whisper_agent_protocol::Message>,
-    cache_breakpoints: Vec<CacheBreakpoint>,
-}
-
 /// Build the `TaskPendingApproval` events that a newly-subscribed client needs to
 /// render the approval UI. Returns empty if the task isn't in AwaitingApproval.
 fn pending_approvals_of(task: &Task) -> Vec<ServerToClient> {
@@ -1202,14 +1005,6 @@ fn truncate(mut s: String, max: usize) -> String {
         s.push('…');
     }
     s
-}
-
-fn mcp_tool_to_spec(t: &McpTool) -> ToolSpec {
-    ToolSpec {
-        name: t.name.clone(),
-        description: t.description.clone(),
-        input_schema: t.input_schema.clone(),
-    }
 }
 
 fn apply_override(base: TaskConfig, ov: Option<TaskConfigOverride>) -> TaskConfig {
