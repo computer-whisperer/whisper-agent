@@ -12,7 +12,18 @@
 //!   - [`ContentBlock::ToolResult`] → a separate `role: "tool"` message with
 //!     `tool_call_id`. (A single user message with mixed text + tool_results becomes
 //!     multiple OpenAI messages.)
-//!   - [`ContentBlock::Thinking`] → dropped (not representable).
+//!   - [`ContentBlock::Thinking`] → emitted on the assistant `OaMessage` as the
+//!     non-standard `reasoning_content` field (concatenated when there are several).
+//!     Servers that don't recognize the field ignore it; servers that do (vLLM,
+//!     recent Ollama, llama.cpp w/ reasoning models) replay it as the model's
+//!     prior chain-of-thought, which keeps multi-turn reasoning coherent.
+//!
+//! Inbound parsing recovers reasoning from two places:
+//!   - Top-level `reasoning_content` on the response message (the canonical form).
+//!   - Inline `<think>...</think>` spans inside the response `content` text
+//!     (what llama.cpp typically passes through unmodified).
+//!
+//! Both paths produce [`ContentBlock::Thinking`].
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -55,6 +66,7 @@ impl OpenAiChatClient {
                 content: Some(OaContent::Text(req.system_prompt.to_string())),
                 tool_calls: None,
                 tool_call_id: None,
+                reasoning_content: None,
             });
         }
         for m in req.messages {
@@ -97,10 +109,13 @@ impl OpenAiChatClient {
             .ok_or_else(|| ModelError::Transport("response had no choices[]".into()))?;
 
         let mut content: Vec<ContentBlock> = Vec::new();
+        // Reasoning first if present — preserves the natural "thought → reply
+        // → tool call" order in the conversation log.
+        push_reasoning_content(choice.message.reasoning_content, &mut content);
         if let Some(text) = choice.message.content.and_then(content_as_text)
             && !text.is_empty()
         {
-            content.push(ContentBlock::Text { text });
+            push_text_with_inline_thinking(&text, &mut content);
         }
         if let Some(tool_calls) = choice.message.tool_calls {
             for tc in tool_calls {
@@ -215,6 +230,7 @@ fn convert_user_message(blocks: &[ContentBlock], out: &mut Vec<OaMessage>) {
                         content: Some(OaContent::Text(std::mem::take(&mut text_accum))),
                         tool_calls: None,
                         tool_call_id: None,
+                        reasoning_content: None,
                     });
                 }
                 let text = tool_result_as_text(content, *is_error);
@@ -223,6 +239,7 @@ fn convert_user_message(blocks: &[ContentBlock], out: &mut Vec<OaMessage>) {
                     content: Some(OaContent::Text(text)),
                     tool_calls: None,
                     tool_call_id: Some(tool_use_id.clone()),
+                    reasoning_content: None,
                 });
             }
             ContentBlock::ToolUse { .. } | ContentBlock::Thinking { .. } => {
@@ -236,12 +253,14 @@ fn convert_user_message(blocks: &[ContentBlock], out: &mut Vec<OaMessage>) {
             content: Some(OaContent::Text(text_accum)),
             tool_calls: None,
             tool_call_id: None,
+            reasoning_content: None,
         });
     }
 }
 
 fn convert_assistant_message(blocks: &[ContentBlock], out: &mut Vec<OaMessage>) {
     let mut text_accum = String::new();
+    let mut reasoning_accum = String::new();
     let mut tool_calls: Vec<OaToolCall> = Vec::new();
     for block in blocks {
         match block {
@@ -250,6 +269,14 @@ fn convert_assistant_message(blocks: &[ContentBlock], out: &mut Vec<OaMessage>) 
                     text_accum.push('\n');
                 }
                 text_accum.push_str(text);
+            }
+            ContentBlock::Thinking { thinking, .. } => {
+                // Concatenate multi-block reasoning with a blank line between
+                // so paragraph structure survives the round-trip.
+                if !reasoning_accum.is_empty() {
+                    reasoning_accum.push_str("\n\n");
+                }
+                reasoning_accum.push_str(thinking);
             }
             ContentBlock::ToolUse { id, name, input } => {
                 tool_calls.push(OaToolCall {
@@ -261,8 +288,8 @@ fn convert_assistant_message(blocks: &[ContentBlock], out: &mut Vec<OaMessage>) 
                     },
                 });
             }
-            ContentBlock::Thinking { .. } | ContentBlock::ToolResult { .. } => {
-                // Thinking: no OpenAI equivalent. ToolResult: doesn't belong on assistant.
+            ContentBlock::ToolResult { .. } => {
+                // ToolResult doesn't belong on an assistant message.
             }
         }
     }
@@ -291,6 +318,11 @@ fn convert_assistant_message(blocks: &[ContentBlock], out: &mut Vec<OaMessage>) 
             None
         },
         tool_call_id: None,
+        reasoning_content: if reasoning_accum.is_empty() {
+            None
+        } else {
+            Some(reasoning_accum)
+        },
     });
 }
 
@@ -335,6 +367,78 @@ fn content_as_text(c: OaContent) -> Option<String> {
     }
 }
 
+/// Push a Thinking block from the response's `reasoning_content` field. No-op
+/// when the field is absent or whitespace-only — empty Thinking blocks would
+/// just be noise in the conversation log.
+fn push_reasoning_content(reasoning: Option<String>, out: &mut Vec<ContentBlock>) {
+    if let Some(r) = reasoning
+        && !r.trim().is_empty()
+    {
+        out.push(ContentBlock::Thinking { signature: None, thinking: r });
+    }
+}
+
+/// Walk `text` and push alternating Text / Thinking blocks for any inline
+/// `<think>...</think>` spans. Used for endpoints (typically llama.cpp) that
+/// pass through the model's raw chain-of-thought instead of moving it into a
+/// separate `reasoning_content` field.
+///
+/// Edge cases:
+/// - Unclosed `<think>` (model truncated mid-reasoning): everything after the
+///   tag becomes a Thinking block. Better than losing the partial reasoning.
+/// - Empty `<think></think>`: skipped.
+/// - Whitespace-only Text spans: skipped (avoids cluttering the log with
+///   blank lines around think tags).
+/// - No tags at all: emits a single Text block with the input verbatim.
+/// - Tags are matched literally as `<think>` / `</think>` — case-sensitive
+///   lowercase, no attribute support. Models that emit other variants get
+///   their reasoning preserved as plain text, which is acceptable.
+fn push_text_with_inline_thinking(text: &str, out: &mut Vec<ContentBlock>) {
+    const OPEN: &str = "<think>";
+    const CLOSE: &str = "</think>";
+    let mut rest = text;
+    loop {
+        match rest.find(OPEN) {
+            None => {
+                // No more think tags — flush remaining as text.
+                push_text_if_nonblank(rest, out);
+                return;
+            }
+            Some(open_idx) => {
+                // Text before the tag.
+                push_text_if_nonblank(&rest[..open_idx], out);
+                let after_open = &rest[open_idx + OPEN.len()..];
+                match after_open.find(CLOSE) {
+                    Some(close_idx) => {
+                        push_thinking_if_nonblank(&after_open[..close_idx], out);
+                        rest = &after_open[close_idx + CLOSE.len()..];
+                    }
+                    None => {
+                        // Unclosed: the rest is all reasoning.
+                        push_thinking_if_nonblank(after_open, out);
+                        return;
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn push_text_if_nonblank(s: &str, out: &mut Vec<ContentBlock>) {
+    if !s.trim().is_empty() {
+        out.push(ContentBlock::Text { text: s.to_string() });
+    }
+}
+
+fn push_thinking_if_nonblank(s: &str, out: &mut Vec<ContentBlock>) {
+    if !s.trim().is_empty() {
+        out.push(ContentBlock::Thinking {
+            signature: None,
+            thinking: s.to_string(),
+        });
+    }
+}
+
 /// Normalize OpenAI `finish_reason` values to the Anthropic-style labels we use
 /// elsewhere so the UI can render a single vocabulary.
 fn normalize_finish_reason(s: String) -> String {
@@ -366,6 +470,12 @@ struct OaMessage {
     tool_calls: Option<Vec<OaToolCall>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_call_id: Option<String>,
+    /// Replays the assistant's prior reasoning. Recognized by vLLM, recent
+    /// Ollama, and llama.cpp w/ reasoning templates; ignored as an unknown
+    /// field by stricter servers. Skipped entirely when empty so we don't
+    /// poke servers that haven't seen the field.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning_content: Option<String>,
 }
 
 /// Emitted as either a plain string or explicit JSON null. OpenAI requires `content`
@@ -451,6 +561,12 @@ struct OaResponseMessage {
     content: Option<OaContent>,
     #[serde(default)]
     tool_calls: Option<Vec<OaToolCall>>,
+    /// Non-standard but widely used field for reasoning models. vLLM, recent
+    /// Ollama, and llama.cpp w/ reasoning model templates emit it; OpenAI's
+    /// own reasoning models keep their reasoning encrypted. We capture it
+    /// when present and skip it cleanly when not.
+    #[serde(default)]
+    reasoning_content: Option<String>,
 }
 
 #[derive(Deserialize, Debug)]
@@ -566,5 +682,167 @@ mod tests {
             true,
         );
         assert_eq!(t, "ERROR: boom");
+    }
+
+    // ---------- reasoning / thinking ----------
+
+    #[test]
+    fn reasoning_content_field_becomes_thinking_block() {
+        let mut out = Vec::new();
+        push_reasoning_content(Some("let me think...\nthe answer is 42".into()), &mut out);
+        assert_eq!(out.len(), 1);
+        match &out[0] {
+            ContentBlock::Thinking { thinking, signature } => {
+                assert_eq!(thinking, "let me think...\nthe answer is 42");
+                assert!(signature.is_none());
+            }
+            _ => panic!("expected Thinking block"),
+        }
+    }
+
+    #[test]
+    fn reasoning_content_blank_or_missing_emits_nothing() {
+        let mut out = Vec::new();
+        push_reasoning_content(None, &mut out);
+        push_reasoning_content(Some(String::new()), &mut out);
+        push_reasoning_content(Some("   \n\t".into()), &mut out);
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn inline_think_tags_split_into_alternating_blocks() {
+        let mut out = Vec::new();
+        push_text_with_inline_thinking(
+            "before <think>reasoning here</think>after the tag",
+            &mut out,
+        );
+        assert_eq!(out.len(), 3);
+        match &out[0] {
+            ContentBlock::Text { text } => assert_eq!(text, "before "),
+            _ => panic!(),
+        }
+        match &out[1] {
+            ContentBlock::Thinking { thinking, .. } => {
+                assert_eq!(thinking, "reasoning here");
+            }
+            _ => panic!(),
+        }
+        match &out[2] {
+            ContentBlock::Text { text } => assert_eq!(text, "after the tag"),
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn inline_think_handles_multiple_blocks() {
+        let mut out = Vec::new();
+        push_text_with_inline_thinking(
+            "<think>first</think>middle<think>second</think>tail",
+            &mut out,
+        );
+        let kinds: Vec<&str> = out
+            .iter()
+            .map(|b| match b {
+                ContentBlock::Text { .. } => "T",
+                ContentBlock::Thinking { .. } => "R",
+                _ => "?",
+            })
+            .collect();
+        assert_eq!(kinds, vec!["R", "T", "R", "T"]);
+    }
+
+    #[test]
+    fn unclosed_think_tag_treats_rest_as_thinking() {
+        // A model that hits max_tokens partway through reasoning. We'd rather
+        // preserve the partial reasoning than lose it entirely.
+        let mut out = Vec::new();
+        push_text_with_inline_thinking("visible <think>started but never finished", &mut out);
+        assert_eq!(out.len(), 2);
+        match &out[0] {
+            ContentBlock::Text { text } => assert_eq!(text, "visible "),
+            _ => panic!(),
+        }
+        match &out[1] {
+            ContentBlock::Thinking { thinking, .. } => {
+                assert_eq!(thinking, "started but never finished");
+            }
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn empty_think_tags_are_skipped() {
+        let mut out = Vec::new();
+        push_text_with_inline_thinking("hello <think></think>world", &mut out);
+        // The empty Thinking is dropped; surrounding text survives. No empty
+        // Text spans either.
+        assert_eq!(out.len(), 2);
+        assert!(matches!(&out[0], ContentBlock::Text { text } if text == "hello "));
+        assert!(matches!(&out[1], ContentBlock::Text { text } if text == "world"));
+    }
+
+    #[test]
+    fn no_tags_emits_single_text_block() {
+        let mut out = Vec::new();
+        push_text_with_inline_thinking("just some text", &mut out);
+        assert_eq!(out.len(), 1);
+        assert!(matches!(&out[0], ContentBlock::Text { text } if text == "just some text"));
+    }
+
+    #[test]
+    fn thinking_block_in_assistant_emits_reasoning_content_field() {
+        let blocks = vec![
+            ContentBlock::Thinking {
+                signature: None,
+                thinking: "I should look at foo.txt first".into(),
+            },
+            ContentBlock::Text { text: "let me check".into() },
+            ContentBlock::ToolUse {
+                id: "toolu_1".into(),
+                name: "read_file".into(),
+                input: serde_json::json!({"path": "foo.txt"}),
+            },
+        ];
+        let mut out = Vec::new();
+        convert_assistant_message(&blocks, &mut out);
+        assert_eq!(out.len(), 1);
+        let m = &out[0];
+        assert_eq!(m.role, "assistant");
+        assert!(matches!(m.content, Some(OaContent::Text(ref s)) if s == "let me check"));
+        assert!(m.tool_calls.is_some());
+        assert_eq!(
+            m.reasoning_content.as_deref(),
+            Some("I should look at foo.txt first")
+        );
+        // Wire check: the field actually appears.
+        let v = serde_json::to_value(m).unwrap();
+        assert_eq!(v["reasoning_content"], "I should look at foo.txt first");
+    }
+
+    #[test]
+    fn multiple_thinking_blocks_concatenate_with_blank_line() {
+        let blocks = vec![
+            ContentBlock::Thinking { signature: None, thinking: "first thought".into() },
+            ContentBlock::Thinking { signature: None, thinking: "second thought".into() },
+            ContentBlock::Text { text: "answer".into() },
+        ];
+        let mut out = Vec::new();
+        convert_assistant_message(&blocks, &mut out);
+        assert_eq!(
+            out[0].reasoning_content.as_deref(),
+            Some("first thought\n\nsecond thought")
+        );
+    }
+
+    #[test]
+    fn no_thinking_means_field_is_omitted_from_wire() {
+        let blocks = vec![ContentBlock::Text { text: "hi".into() }];
+        let mut out = Vec::new();
+        convert_assistant_message(&blocks, &mut out);
+        let v = serde_json::to_value(&out[0]).unwrap();
+        assert!(
+            v.get("reasoning_content").is_none(),
+            "absent reasoning must not serialize the field"
+        );
     }
 }

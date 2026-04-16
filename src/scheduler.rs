@@ -957,6 +957,15 @@ impl Scheduler {
                         },
                     );
                 }
+                TaskEvent::AssistantReasoning { text } => {
+                    self.broadcast_to_subscribers(
+                        task_id,
+                        ServerToClient::TaskAssistantReasoning {
+                            task_id: task_id.to_string(),
+                            text,
+                        },
+                    );
+                }
                 TaskEvent::ToolCallBegin { tool_use_id, name, args_preview } => {
                     self.broadcast_to_subscribers(
                         task_id,

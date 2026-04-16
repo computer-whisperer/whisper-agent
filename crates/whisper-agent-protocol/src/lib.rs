@@ -301,6 +301,15 @@ pub enum ServerToClient {
         task_id: String,
         text: String,
     },
+    /// Chain-of-thought block emitted by the assistant — Anthropic
+    /// extended-thinking, OpenAI-compat `reasoning_content`, or inline
+    /// `<think>...</think>`. Order-preserved with `TaskAssistantText` so the
+    /// client can render reasoning, replies, and tool-calls in the order the
+    /// model emitted them.
+    TaskAssistantReasoning {
+        task_id: String,
+        text: String,
+    },
     /// Streaming text partial (reserved — not emitted until SSE streaming lands).
     TaskAssistantTextDelta {
         task_id: String,

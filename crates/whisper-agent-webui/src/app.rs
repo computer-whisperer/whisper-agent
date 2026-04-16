@@ -146,6 +146,12 @@ enum DisplayItem {
     AssistantText {
         text: String,
     },
+    /// Model's chain-of-thought (Anthropic extended-thinking, OpenAI-compat
+    /// `reasoning_content`, or inline `<think>...</think>`). Rendered as a
+    /// collapsing header so it's preserved without dominating the conversation.
+    Reasoning {
+        text: String,
+    },
     ToolCall {
         tool_use_id: String,
         name: String,
@@ -436,6 +442,11 @@ impl ChatApp {
                     view.items.push(DisplayItem::AssistantText { text });
                 }
             }
+            ServerToClient::TaskAssistantReasoning { task_id, text } => {
+                if let Some(view) = self.tasks.get_mut(&task_id) {
+                    view.items.push(DisplayItem::Reasoning { text });
+                }
+            }
             ServerToClient::TaskAssistantTextDelta { task_id, delta } => {
                 if let Some(view) = self.tasks.get_mut(&task_id) {
                     if let Some(DisplayItem::AssistantText { text }) = view.items.last_mut() {
@@ -709,10 +720,7 @@ fn add_message_items(msg: &Message, out: &mut Vec<DisplayItem>) {
                         });
                     }
                     ContentBlock::Thinking { thinking, .. } => {
-                        out.push(DisplayItem::SystemNote {
-                            text: format!("thinking: {thinking}"),
-                            is_error: false,
-                        });
+                        out.push(DisplayItem::Reasoning { text: thinking.clone() });
                     }
                     _ => {}
                 }
@@ -1295,6 +1303,38 @@ fn render_item(ui: &mut egui::Ui, item: &DisplayItem) {
             ui.horizontal_top(|ui| {
                 ui.label(RichText::new("agent").color(Color32::from_rgb(160, 220, 160)).strong());
                 ui.label(text);
+            });
+        }
+        DisplayItem::Reasoning { text } => {
+            ui.horizontal_top(|ui| {
+                ui.label(
+                    RichText::new("think")
+                        .color(Color32::from_rgb(180, 160, 220))
+                        .strong(),
+                );
+                let preview = text.lines().next().unwrap_or("").trim();
+                let header = if preview.len() > 80 {
+                    format!("{}…", &preview[..80])
+                } else if preview.is_empty() {
+                    "(reasoning)".to_string()
+                } else {
+                    preview.to_string()
+                };
+                // Default-collapsed: reasoning is preserved but doesn't dominate the view.
+                egui::CollapsingHeader::new(
+                    RichText::new(header)
+                        .color(Color32::from_gray(140))
+                        .italics(),
+                )
+                .id_salt(("reasoning", text.as_ptr() as usize))
+                .default_open(false)
+                .show(ui, |ui| {
+                    ui.label(
+                        RichText::new(text)
+                            .color(Color32::from_gray(170))
+                            .italics(),
+                    );
+                });
             });
         }
         DisplayItem::ToolCall { name, args_preview, result, is_error, .. } => {

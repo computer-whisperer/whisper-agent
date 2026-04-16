@@ -217,6 +217,9 @@ pub enum StepOutcome {
 pub enum TaskEvent {
     AssistantBegin { turn: u32 },
     AssistantText { text: String },
+    /// Chain-of-thought block. Emitted in the same order as text/tool-use
+    /// blocks so the client can interleave them faithfully.
+    AssistantReasoning { text: String },
     ToolCallBegin {
         tool_use_id: String,
         name: String,
@@ -612,8 +615,14 @@ impl Task {
         } = response;
         self.total_usage.add(&usage);
         for block in &assistant_blocks {
-            if let ContentBlock::Text { text } = block {
-                events.push(TaskEvent::AssistantText { text: text.clone() });
+            match block {
+                ContentBlock::Text { text } => {
+                    events.push(TaskEvent::AssistantText { text: text.clone() });
+                }
+                ContentBlock::Thinking { thinking, .. } => {
+                    events.push(TaskEvent::AssistantReasoning { text: thinking.clone() });
+                }
+                _ => {}
             }
         }
         let tool_uses: Vec<ToolUseReq> = assistant_blocks
