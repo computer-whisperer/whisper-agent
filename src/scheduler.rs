@@ -38,7 +38,7 @@ use crate::model::ModelProvider;
 use crate::persist::{LoadedState, Persister};
 use crate::pod::{Pod, PodId};
 use crate::resources::{BackendId, McpHostId, ResourceRegistry, SandboxId};
-use crate::sandbox::{SandboxHandle, SandboxProvider};
+use crate::sandbox::SandboxProvider;
 use crate::thread::{
     ApprovalDisposition, IoResult, OpId, StepOutcome, Thread, ThreadInternalState, derive_title,
     new_task_id,
@@ -132,7 +132,6 @@ pub struct Scheduler {
     /// of `shared_hosts` Arcs filtered by the task's `shared_mcp_hosts`
     /// allowlist.
     mcp_pools: HashMap<String, McpPool>,
-    sandbox_handles: HashMap<String, Box<dyn SandboxHandle>>,
     /// Connections to shared (singleton) MCP hosts, keyed by name. Connected
     /// once at scheduler start. Tasks reference these by name via
     /// `ThreadConfig.shared_mcp_hosts`.
@@ -212,7 +211,6 @@ impl Scheduler {
             tasks: HashMap::new(),
             router: ThreadEventRouter::new(audit, host_id),
             mcp_pools: HashMap::new(),
-            sandbox_handles: HashMap::new(),
             shared_hosts,
             tool_descriptors: HashMap::new(),
             resources,
@@ -997,7 +995,9 @@ impl Scheduler {
                 }
                 // Phase 1a: mirror the just-acquired primary MCP + sandbox
                 // into the resource registry. Phase 1b: emit ResourceCreated
-                // so subscribed clients see them appear.
+                // so subscribed clients see them appear. Phase 3a: the
+                // sandbox handle moves into the registry too, replacing the
+                // dropped `scheduler.sandbox_handles` map.
                 let primary_url = sandbox_handle
                     .as_ref()
                     .and_then(|h| h.mcp_url().map(str::to_string))
@@ -1012,9 +1012,11 @@ impl Scheduler {
                         .insert_primary_mcp_host(&thread_id, primary_url, session);
                 self.emit_mcp_host_created(&primary_id);
                 if sandbox_handle.is_some() {
-                    let sandbox_id = self
-                        .resources
-                        .insert_sandbox_for_task(&thread_id, sandbox_spec);
+                    let sandbox_id = self.resources.insert_sandbox_for_task(
+                        &thread_id,
+                        sandbox_spec,
+                        sandbox_handle,
+                    );
                     self.emit_sandbox_created(&sandbox_id);
                 }
 
@@ -1025,9 +1027,6 @@ impl Scheduler {
                         routing: HashMap::new(),
                     },
                 );
-                if let Some(handle) = sandbox_handle {
-                    self.sandbox_handles.insert(thread_id.clone(), handle);
-                }
                 IoResult::McpConnect(Ok(()))
             }
             IoResult::ListToolsSuccess { tools, routing } => {
@@ -1130,9 +1129,12 @@ impl Scheduler {
             let sandbox_id = SandboxId::for_task(thread_id);
             self.resources.mark_mcp_torn_down(&primary_id);
             self.emit_mcp_host_updated(&primary_id);
+            // Pull the handle out of the registry before flipping state so
+            // we don't race a future inspector that consults the entry.
+            let handle = self.resources.take_sandbox_handle(&sandbox_id);
             self.resources.mark_sandbox_torn_down(&sandbox_id);
             self.emit_sandbox_updated(&sandbox_id);
-            if let Some(mut handle) = self.sandbox_handles.remove(thread_id) {
+            if let Some(mut handle) = handle {
                 let tid = thread_id.to_string();
                 tokio::spawn(async move {
                     if let Err(e) = handle.teardown().await {

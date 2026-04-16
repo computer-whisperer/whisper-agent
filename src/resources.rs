@@ -20,6 +20,7 @@ use serde::{Deserialize, Serialize};
 use whisper_agent_protocol::{ResourceSnapshot, ResourceStateLabel, SandboxSpec};
 
 use crate::mcp::{McpSession, ToolAnnotations, ToolDescriptor};
+use crate::sandbox::SandboxHandle;
 
 #[derive(Serialize, Deserialize, Debug, Clone, Hash, PartialEq, Eq, PartialOrd, Ord)]
 pub struct SandboxId(pub String);
@@ -83,7 +84,6 @@ impl ResourceState {
     }
 }
 
-#[derive(Debug)]
 pub struct SandboxEntry {
     pub id: SandboxId,
     pub spec: SandboxSpec,
@@ -93,6 +93,27 @@ pub struct SandboxEntry {
     pub pinned: bool,
     pub created_at: DateTime<Utc>,
     pub last_used: DateTime<Utc>,
+    /// The provisioned sandbox itself. Owned by the registry (Phase 3a).
+    /// Taken out of the entry by `take_sandbox_handle` at teardown so the
+    /// scheduler can spawn the async teardown future without holding a
+    /// borrow. Cleared on `mark_sandbox_torn_down` when the handle has
+    /// already been retrieved.
+    pub handle: Option<Box<dyn SandboxHandle>>,
+}
+
+impl std::fmt::Debug for SandboxEntry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SandboxEntry")
+            .field("id", &self.id)
+            .field("spec", &self.spec)
+            .field("state", &self.state)
+            .field("users", &self.users)
+            .field("pinned", &self.pinned)
+            .field("created_at", &self.created_at)
+            .field("last_used", &self.last_used)
+            .field("handle", &self.handle.as_ref().map(|_| "<sandbox>"))
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -328,8 +349,16 @@ impl ResourceRegistry {
         id
     }
 
-    /// Insert a Ready per-task sandbox entry.
-    pub fn insert_sandbox_for_task(&mut self, thread_id: &str, spec: SandboxSpec) -> SandboxId {
+    /// Insert a Ready per-task sandbox entry. The handle (when present) is
+    /// stored on the entry so it can be reclaimed at teardown via
+    /// `take_sandbox_handle`. `BareMetal` sandboxes pass `None` because
+    /// their handle has nothing to reclaim — teardown is a no-op.
+    pub fn insert_sandbox_for_task(
+        &mut self,
+        thread_id: &str,
+        spec: SandboxSpec,
+        handle: Option<Box<dyn SandboxHandle>>,
+    ) -> SandboxId {
         let id = SandboxId::for_task(thread_id);
         let now = Utc::now();
         self.sandboxes.insert(
@@ -342,9 +371,21 @@ impl ResourceRegistry {
                 pinned: false,
                 created_at: now,
                 last_used: now,
+                handle,
             },
         );
         id
+    }
+
+    /// Pull the sandbox handle out of the registry so the caller can spawn
+    /// an async teardown without holding a borrow on the registry. The
+    /// entry remains in the map (with `handle: None`) so inspectors can
+    /// still see "this sandbox existed" — `mark_sandbox_torn_down` is the
+    /// follow-up call that flips its state.
+    pub fn take_sandbox_handle(&mut self, id: &SandboxId) -> Option<Box<dyn SandboxHandle>> {
+        self.sandboxes
+            .get_mut(id)
+            .and_then(|entry| entry.handle.take())
     }
 
     // ---------- Mutation helpers ----------
@@ -450,7 +491,7 @@ mod tests {
     #[test]
     fn sandbox_teardown_clears_users() {
         let mut reg = ResourceRegistry::new();
-        let id = reg.insert_sandbox_for_task("t-1", SandboxSpec::None);
+        let id = reg.insert_sandbox_for_task("t-1", SandboxSpec::None, None);
         assert!(reg.sandboxes[&id].state.is_ready());
         assert_eq!(reg.sandboxes[&id].users.len(), 1);
         reg.mark_sandbox_torn_down(&id);
