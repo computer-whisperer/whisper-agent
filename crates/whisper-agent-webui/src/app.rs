@@ -20,8 +20,8 @@ use serde::{Deserialize, Serialize};
 use whisper_agent_protocol::sandbox::{AccessMode, NetworkPolicy, PathAccess};
 use whisper_agent_protocol::{
     ApprovalChoice, BackendSummary, ClientToServer, ContentBlock, Conversation, Message,
-    ModelSummary, Role, SandboxSpec, ServerToClient, TaskConfigOverride, TaskStateLabel,
-    TaskSummary, ToolResultContent, Usage,
+    ModelSummary, ResourceSnapshot, ResourceStateLabel, Role, SandboxSpec, ServerToClient,
+    TaskConfigOverride, TaskStateLabel, TaskSummary, ToolResultContent, Usage,
 };
 
 /// A user-saved sandbox configuration. Currently only encodes Landlock; future
@@ -266,6 +266,20 @@ pub struct ChatApp {
     presets: Vec<LandlockPreset>,
     /// Modal state for creating a new preset. `None` = closed.
     preset_modal: Option<PresetModalState>,
+
+    // --- Resource registry (Phase 1c read-only inspector) ---
+    /// Snapshot of every resource the server has reported. Keyed by resource id.
+    resources: HashMap<String, ResourceSnapshot>,
+    resources_requested: bool,
+    /// Which view the left side panel is showing.
+    left_mode: LeftPanelMode,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum LeftPanelMode {
+    #[default]
+    Tasks,
+    Resources,
 }
 
 struct PresetModalState {
@@ -307,6 +321,9 @@ impl ChatApp {
             picker_sandbox: SandboxChoice::default(),
             presets: load_presets(),
             preset_modal: None,
+            resources: HashMap::new(),
+            resources_requested: false,
+            left_mode: LeftPanelMode::default(),
         }
     }
 
@@ -380,6 +397,12 @@ impl ChatApp {
                         correlation_id: None,
                     });
                     self.backends_requested = true;
+                }
+                if !self.resources_requested {
+                    self.send(ClientToServer::ListResources {
+                        correlation_id: None,
+                    });
+                    self.resources_requested = true;
                 }
             }
             InboundEvent::ConnectionClosed { detail } => {
@@ -604,13 +627,19 @@ impl ChatApp {
             } => {
                 self.models_by_backend.insert(backend, models);
             }
-            // Phase 1b: resource-tier events arrive over the same socket but
-            // the webui's resource pane lands in Phase 1c. Drop them silently
-            // for now so the build stays exhaustive.
-            ServerToClient::ResourceList { .. }
-            | ServerToClient::ResourceCreated { .. }
-            | ServerToClient::ResourceUpdated { .. }
-            | ServerToClient::ResourceDestroyed { .. } => {}
+            ServerToClient::ResourceList { resources, .. } => {
+                self.resources.clear();
+                for r in resources {
+                    self.resources.insert(r.id().to_string(), r);
+                }
+            }
+            ServerToClient::ResourceCreated { resource }
+            | ServerToClient::ResourceUpdated { resource } => {
+                self.resources.insert(resource.id().to_string(), resource);
+            }
+            ServerToClient::ResourceDestroyed { id, .. } => {
+                self.resources.remove(&id);
+            }
         }
     }
 
@@ -889,41 +918,28 @@ impl eframe::App for ChatApp {
             .default_width(220.0)
             .show(ctx, |ui| {
                 ui.add_space(4.0);
-                if ui.button("+ New task").clicked() {
-                    self.selected = None;
-                    self.composing_new = true;
-                    self.input.clear();
-                }
-                ui.separator();
-                ScrollArea::vertical().show(ui, |ui| {
-                    let order = self.task_order.clone();
-                    for task_id in order {
-                        let Some(view) = self.tasks.get(&task_id) else {
-                            continue;
-                        };
-                        let is_selected = self.selected.as_deref() == Some(&task_id);
-                        let title = view
-                            .summary
-                            .title
-                            .clone()
-                            .unwrap_or_else(|| task_id[..task_id.len().min(14)].to_string());
-                        let (chip, chip_color) = state_chip(view.summary.state);
-                        let row = ui.add_sized(
-                            [ui.available_width(), 0.0],
-                            egui::Button::selectable(
-                                is_selected,
-                                RichText::new(format!("{title}  [{chip}]")).color(if is_selected {
-                                    Color32::WHITE
-                                } else {
-                                    chip_color
-                                }),
-                            ),
-                        );
-                        if row.clicked() {
-                            self.select_task(task_id.clone());
-                        }
+                ui.horizontal(|ui| {
+                    if ui
+                        .selectable_label(self.left_mode == LeftPanelMode::Tasks, "Tasks")
+                        .clicked()
+                    {
+                        self.left_mode = LeftPanelMode::Tasks;
+                    }
+                    if ui
+                        .selectable_label(
+                            self.left_mode == LeftPanelMode::Resources,
+                            format!("Resources ({})", self.resources.len()),
+                        )
+                        .clicked()
+                    {
+                        self.left_mode = LeftPanelMode::Resources;
                     }
                 });
+                ui.separator();
+                match self.left_mode {
+                    LeftPanelMode::Tasks => self.render_task_list(ui),
+                    LeftPanelMode::Resources => render_resource_list(ui, &self.resources),
+                }
             });
 
         let input_enabled = matches!(self.conn_status, ConnectionStatus::Connected);
@@ -1161,6 +1177,44 @@ impl eframe::App for ChatApp {
 impl ChatApp {
     /// Renders the "new sandbox preset" modal if open. On Save, appends a new
     /// preset to `self.presets`, persists, and selects it in the picker.
+    fn render_task_list(&mut self, ui: &mut egui::Ui) {
+        if ui.button("+ New task").clicked() {
+            self.selected = None;
+            self.composing_new = true;
+            self.input.clear();
+        }
+        ui.separator();
+        ScrollArea::vertical().show(ui, |ui| {
+            let order = self.task_order.clone();
+            for task_id in order {
+                let Some(view) = self.tasks.get(&task_id) else {
+                    continue;
+                };
+                let is_selected = self.selected.as_deref() == Some(&task_id);
+                let title = view
+                    .summary
+                    .title
+                    .clone()
+                    .unwrap_or_else(|| task_id[..task_id.len().min(14)].to_string());
+                let (chip, chip_color) = state_chip(view.summary.state);
+                let row = ui.add_sized(
+                    [ui.available_width(), 0.0],
+                    egui::Button::selectable(
+                        is_selected,
+                        RichText::new(format!("{title}  [{chip}]")).color(if is_selected {
+                            Color32::WHITE
+                        } else {
+                            chip_color
+                        }),
+                    ),
+                );
+                if row.clicked() {
+                    self.select_task(task_id.clone());
+                }
+            }
+        });
+    }
+
     fn render_preset_modal(&mut self, ctx: &egui::Context) {
         let Some(mut modal) = self.preset_modal.take() else {
             return;
@@ -1247,6 +1301,146 @@ impl ChatApp {
 /// Persistent banner for a task that's entered the Failed state. Survives resnapshot
 /// because `failure` is captured from the snapshot itself rather than derived from
 /// the per-event items list.
+fn render_resource_list(ui: &mut egui::Ui, resources: &HashMap<String, ResourceSnapshot>) {
+    let mut sandboxes: Vec<&ResourceSnapshot> = Vec::new();
+    let mut mcp_hosts: Vec<&ResourceSnapshot> = Vec::new();
+    let mut backends: Vec<&ResourceSnapshot> = Vec::new();
+    for r in resources.values() {
+        match r {
+            ResourceSnapshot::Sandbox { .. } => sandboxes.push(r),
+            ResourceSnapshot::McpHost { .. } => mcp_hosts.push(r),
+            ResourceSnapshot::Backend { .. } => backends.push(r),
+        }
+    }
+    sandboxes.sort_by_key(|r| r.id().to_string());
+    mcp_hosts.sort_by_key(|r| r.id().to_string());
+    backends.sort_by_key(|r| r.id().to_string());
+
+    ScrollArea::vertical().show(ui, |ui| {
+        egui::CollapsingHeader::new(format!("Sandboxes ({})", sandboxes.len()))
+            .default_open(true)
+            .show(ui, |ui| {
+                for r in &sandboxes {
+                    render_resource_row(ui, r);
+                }
+                if sandboxes.is_empty() {
+                    ui.label(
+                        RichText::new("(none)")
+                            .color(Color32::from_gray(140))
+                            .small(),
+                    );
+                }
+            });
+        egui::CollapsingHeader::new(format!("MCP Hosts ({})", mcp_hosts.len()))
+            .default_open(true)
+            .show(ui, |ui| {
+                for r in &mcp_hosts {
+                    render_resource_row(ui, r);
+                }
+                if mcp_hosts.is_empty() {
+                    ui.label(
+                        RichText::new("(none)")
+                            .color(Color32::from_gray(140))
+                            .small(),
+                    );
+                }
+            });
+        egui::CollapsingHeader::new(format!("Backends ({})", backends.len()))
+            .default_open(true)
+            .show(ui, |ui| {
+                for r in &backends {
+                    render_resource_row(ui, r);
+                }
+                if backends.is_empty() {
+                    ui.label(
+                        RichText::new("(none)")
+                            .color(Color32::from_gray(140))
+                            .small(),
+                    );
+                }
+            });
+    });
+}
+
+fn render_resource_row(ui: &mut egui::Ui, resource: &ResourceSnapshot) {
+    let (label, sub, state, users) = match resource {
+        ResourceSnapshot::Sandbox {
+            id,
+            spec,
+            state,
+            users,
+            ..
+        } => (id.clone(), spec_label(spec), *state, users.len()),
+        ResourceSnapshot::McpHost {
+            id,
+            label,
+            url,
+            tools,
+            state,
+            users,
+            ..
+        } => (
+            label.clone(),
+            format!("{} · {} tools · {}", id, tools.len(), url),
+            *state,
+            users.len(),
+        ),
+        ResourceSnapshot::Backend {
+            name,
+            backend_kind,
+            default_model,
+            state,
+            users,
+            ..
+        } => {
+            let model = default_model.as_deref().unwrap_or("(no default)");
+            (
+                name.clone(),
+                format!("{backend_kind} · {model}"),
+                *state,
+                users.len(),
+            )
+        }
+    };
+    let (chip, chip_color) = resource_state_chip(state);
+    ui.horizontal(|ui| {
+        ui.label(RichText::new(label).strong());
+        ui.label(RichText::new(format!("[{chip}]")).color(chip_color).small());
+        ui.label(
+            RichText::new(format!("{users} users"))
+                .color(Color32::from_gray(160))
+                .small(),
+        );
+    });
+    if !sub.is_empty() {
+        ui.label(
+            RichText::new(sub)
+                .color(Color32::from_gray(150))
+                .small(),
+        );
+    }
+    ui.add_space(4.0);
+}
+
+fn spec_label(spec: &SandboxSpec) -> String {
+    match spec {
+        SandboxSpec::None => "no isolation".into(),
+        SandboxSpec::Container { image, .. } => format!("container: {image}"),
+        SandboxSpec::Landlock { allowed_paths, .. } => {
+            format!("landlock · {} paths", allowed_paths.len())
+        }
+    }
+}
+
+fn resource_state_chip(state: ResourceStateLabel) -> (&'static str, Color32) {
+    match state {
+        ResourceStateLabel::Provisioning => ("provisioning", Color32::from_rgb(180, 160, 90)),
+        ResourceStateLabel::Ready => ("ready", Color32::from_rgb(120, 180, 120)),
+        ResourceStateLabel::Errored => ("errored", Color32::from_rgb(200, 110, 110)),
+        ResourceStateLabel::TornDown => ("torn down", Color32::from_gray(140)),
+    }
+}
+
 fn render_failure_banner(ui: &mut egui::Ui, view: &TaskView) {
     let Some(detail) = view.failure.as_deref() else {
         return;
