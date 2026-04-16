@@ -36,6 +36,7 @@ use whisper_agent_protocol::{
 use crate::audit::{AuditLog, ToolCallEntry, ToolCallOutcome};
 use crate::mcp::{McpSession, ToolAnnotations, ToolDescriptor as McpTool};
 use crate::model::{CacheBreakpoint, ModelProvider, ModelRequest, ToolSpec, default_cache_policy};
+use crate::sandbox::{SandboxHandle, SandboxProvider};
 use crate::persist::Persister;
 use crate::task::{
     ApprovalDisposition, IoRequest, IoResult, OpId, StepOutcome, Task, TaskEvent, TaskInternalState,
@@ -83,12 +84,14 @@ pub struct Scheduler {
     default_backend: String,
     audit: AuditLog,
     persister: Option<Persister>,
+    sandbox_provider: Arc<dyn SandboxProvider>,
 
     tasks: HashMap<String, Task>,
     clients: HashMap<ConnId, mpsc::UnboundedSender<ServerToClient>>,
     subscriptions: HashMap<String, HashSet<ConnId>>,
 
     mcp_sessions: HashMap<String, Arc<McpSession>>,
+    sandbox_handles: HashMap<String, Box<dyn SandboxHandle>>,
     /// Per-task tool catalog from the last `tools/list`. Stored in MCP shape (with
     /// annotations) so the approval layer can consult `read_only_hint` /
     /// `destructive_hint` at dispatch time; we convert to Anthropic shape on-demand
@@ -108,6 +111,7 @@ impl Scheduler {
         backends: HashMap<String, BackendEntry>,
         default_backend: String,
         audit: AuditLog,
+        sandbox_provider: Arc<dyn SandboxProvider>,
     ) -> Self {
         assert!(
             backends.contains_key(&default_backend),
@@ -120,10 +124,12 @@ impl Scheduler {
             default_backend,
             audit,
             persister: None,
+            sandbox_provider,
             tasks: HashMap::new(),
             clients: HashMap::new(),
             subscriptions: HashMap::new(),
             mcp_sessions: HashMap::new(),
+            sandbox_handles: HashMap::new(),
             tool_descriptors: HashMap::new(),
             next_op_id: 1,
             dirty: HashSet::new(),
@@ -527,8 +533,11 @@ impl Scheduler {
         // installed on the scheduler, not the task. We fish it out before calling
         // into the task's apply_io_result.
         let result = match result {
-            IoResult::McpConnectSuccess { session } => {
+            IoResult::McpConnectSuccess { session, sandbox_handle } => {
                 self.mcp_sessions.insert(task_id.clone(), session);
+                if let Some(handle) = sandbox_handle {
+                    self.sandbox_handles.insert(task_id.clone(), handle);
+                }
                 IoResult::McpConnect(Ok(()))
             }
             IoResult::ListToolsSuccess { tools } => {
@@ -592,17 +601,43 @@ impl Scheduler {
     fn build_io_future(&self, task_id: String, req: IoRequest) -> IoFuture {
         match req {
             IoRequest::McpConnect { op_id } => {
-                let url = self
-                    .tasks
-                    .get(&task_id)
-                    .map(|t| t.config.mcp_host_url.clone())
-                    .unwrap_or_default();
+                let task = self.tasks.get(&task_id).expect("task exists");
+                let fallback_url = task.config.mcp_host_url.clone();
+                let sandbox_spec = task.config.sandbox.clone();
+                let provider = self.sandbox_provider.clone();
+
                 Box::pin(async move {
-                    match McpSession::connect(&url).await {
+                    // Provision sandbox if the task has a non-None spec.
+                    let (mcp_url, sandbox_handle) = match provider
+                        .provision(&task_id, &sandbox_spec)
+                        .await
+                    {
+                        Ok(handle) => {
+                            let url = handle
+                                .mcp_url()
+                                .map(|u| u.to_string())
+                                .unwrap_or(fallback_url);
+                            (url, Some(handle))
+                        }
+                        Err(e) => {
+                            return IoCompletion {
+                                task_id,
+                                op_id,
+                                result: IoResult::McpConnect(Err(format!(
+                                    "sandbox provision failed: {e}"
+                                ))),
+                            };
+                        }
+                    };
+
+                    match McpSession::connect(&mcp_url).await {
                         Ok(s) => IoCompletion {
                             task_id,
                             op_id,
-                            result: IoResult::McpConnectSuccess { session: Arc::new(s) },
+                            result: IoResult::McpConnectSuccess {
+                                session: Arc::new(s),
+                                sandbox_handle,
+                            },
                         },
                         Err(e) => IoCompletion {
                             task_id,

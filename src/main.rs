@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow};
 use clap::{Parser, Subcommand};
@@ -13,6 +14,7 @@ use whisper_agent::anthropic::AnthropicClient;
 use whisper_agent::audit::AuditLog;
 use whisper_agent::config::Config;
 use whisper_agent::mcp::McpSession;
+use whisper_agent::sandbox::{BareMetal, DaemonClient};
 use whisper_agent::scheduler::BackendEntry;
 use whisper_agent::server::{self, ServerConfig};
 use whisper_agent::turn::{self, TurnConfig};
@@ -85,6 +87,12 @@ struct ServeArgs {
     /// tools (MCP readOnlyHint passes through without a prompt).
     #[arg(long)]
     auto_approve_all: bool,
+
+    /// URL of the sandbox provisioning daemon. When set, tasks with non-None
+    /// SandboxSpec will be provisioned via this daemon. When omitted, only
+    /// SandboxSpec::None is supported (bare-metal execution).
+    #[arg(long, env = "SANDBOX_DAEMON_URL")]
+    sandbox_daemon_url: Option<String>,
 }
 
 #[derive(Parser, Debug)]
@@ -215,6 +223,10 @@ async fn run_serve(args: ServeArgs) -> Result<()> {
         audit_log_path: args.audit_log,
         host_id: "default".into(),
         state_dir,
+        sandbox_provider: match args.sandbox_daemon_url {
+            Some(url) => Arc::new(DaemonClient::new(url)),
+            None => Arc::new(BareMetal),
+        },
     };
     server::serve(args.listen, server_config).await
 }

@@ -181,9 +181,11 @@ pub enum IoRequest {
 /// that get peeled off in [`crate::scheduler`] before the result reaches the task
 /// state machine; the task itself only sees the slim `McpConnect` / `ListTools`
 /// boolean variants.
-#[derive(Debug)]
 pub enum IoResult {
-    McpConnectSuccess { session: std::sync::Arc<crate::mcp::McpSession> },
+    McpConnectSuccess {
+        session: std::sync::Arc<crate::mcp::McpSession>,
+        sandbox_handle: Option<Box<dyn crate::sandbox::SandboxHandle>>,
+    },
     McpConnect(Result<(), String>),
     ListToolsSuccess { tools: Vec<crate::mcp::ToolDescriptor> },
     ListTools(Result<(), String>),

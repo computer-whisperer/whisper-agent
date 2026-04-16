@@ -61,6 +61,7 @@ pub struct ServerConfig {
     pub host_id: String,
     /// Directory for JSON-per-task persistence. If `None`, persistence is disabled.
     pub state_dir: Option<PathBuf>,
+    pub sandbox_provider: std::sync::Arc<dyn crate::sandbox::SandboxProvider>,
 }
 
 #[derive(Clone)]
@@ -91,6 +92,7 @@ pub async fn serve(listen: SocketAddr, config: ServerConfig) -> anyhow::Result<(
         config.backends,
         config.default_backend,
         audit,
+        config.sandbox_provider,
     );
 
     if let Some(state_dir) = config.state_dir {
