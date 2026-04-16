@@ -17,7 +17,7 @@ use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use whisper_agent_protocol::SandboxSpec;
+use whisper_agent_protocol::{ResourceSnapshot, ResourceStateLabel, SandboxSpec};
 
 use crate::mcp::{McpSession, ToolAnnotations, ToolDescriptor};
 
@@ -72,6 +72,14 @@ impl ResourceState {
     }
     pub fn is_terminal(&self) -> bool {
         matches!(self, ResourceState::Errored { .. } | ResourceState::TornDown)
+    }
+    pub fn label(&self) -> ResourceStateLabel {
+        match self {
+            ResourceState::Provisioning { .. } => ResourceStateLabel::Provisioning,
+            ResourceState::Ready => ResourceStateLabel::Ready,
+            ResourceState::Errored { .. } => ResourceStateLabel::Errored,
+            ResourceState::TornDown => ResourceStateLabel::TornDown,
+        }
     }
 }
 
@@ -147,9 +155,84 @@ pub struct ResourceRegistry {
     pub backends: HashMap<BackendId, BackendEntry>,
 }
 
+impl SandboxEntry {
+    pub fn to_snapshot(&self) -> ResourceSnapshot {
+        ResourceSnapshot::Sandbox {
+            id: self.id.0.clone(),
+            spec: self.spec.clone(),
+            state: self.state.label(),
+            users: self.users.iter().cloned().collect(),
+            pinned: self.pinned,
+            created_at: self.created_at.to_rfc3339(),
+            last_used: self.last_used.to_rfc3339(),
+        }
+    }
+}
+
+impl McpHostEntry {
+    pub fn to_snapshot(&self) -> ResourceSnapshot {
+        ResourceSnapshot::McpHost {
+            id: self.id.0.clone(),
+            url: self.spec.url.clone(),
+            label: self.spec.label.clone(),
+            per_task: self.spec.per_task,
+            state: self.state.label(),
+            tools: self.tools.iter().map(|t| t.name.clone()).collect(),
+            users: self.users.iter().cloned().collect(),
+            pinned: self.pinned,
+            created_at: self.created_at.to_rfc3339(),
+            last_used: self.last_used.to_rfc3339(),
+        }
+    }
+}
+
+impl BackendEntry {
+    pub fn to_snapshot(&self) -> ResourceSnapshot {
+        ResourceSnapshot::Backend {
+            id: self.id.0.clone(),
+            name: self.name.clone(),
+            backend_kind: self.kind.clone(),
+            default_model: self.default_model.clone(),
+            state: self.state.label(),
+            users: self.users.iter().cloned().collect(),
+            pinned: self.pinned,
+            created_at: self.created_at.to_rfc3339(),
+            last_used: self.last_used.to_rfc3339(),
+        }
+    }
+}
+
 impl ResourceRegistry {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Snapshot every entry for `ListResources` responses. Order is sandboxes,
+    /// then mcp hosts, then backends — stable and human-readable.
+    pub fn snapshot_all(&self) -> Vec<ResourceSnapshot> {
+        let mut out: Vec<ResourceSnapshot> = Vec::with_capacity(
+            self.sandboxes.len() + self.mcp_hosts.len() + self.backends.len(),
+        );
+        let mut sandboxes: Vec<&SandboxEntry> = self.sandboxes.values().collect();
+        sandboxes.sort_by(|a, b| a.id.cmp(&b.id));
+        out.extend(sandboxes.into_iter().map(SandboxEntry::to_snapshot));
+        let mut mcps: Vec<&McpHostEntry> = self.mcp_hosts.values().collect();
+        mcps.sort_by(|a, b| a.id.cmp(&b.id));
+        out.extend(mcps.into_iter().map(McpHostEntry::to_snapshot));
+        let mut backends: Vec<&BackendEntry> = self.backends.values().collect();
+        backends.sort_by(|a, b| a.id.cmp(&b.id));
+        out.extend(backends.into_iter().map(BackendEntry::to_snapshot));
+        out
+    }
+
+    pub fn snapshot_sandbox(&self, id: &SandboxId) -> Option<ResourceSnapshot> {
+        self.sandboxes.get(id).map(SandboxEntry::to_snapshot)
+    }
+    pub fn snapshot_mcp_host(&self, id: &McpHostId) -> Option<ResourceSnapshot> {
+        self.mcp_hosts.get(id).map(McpHostEntry::to_snapshot)
+    }
+    pub fn snapshot_backend(&self, id: &BackendId) -> Option<ResourceSnapshot> {
+        self.backends.get(id).map(BackendEntry::to_snapshot)
     }
 
     // ---------- Construction helpers ----------

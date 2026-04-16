@@ -604,6 +604,13 @@ impl ChatApp {
             } => {
                 self.models_by_backend.insert(backend, models);
             }
+            // Phase 1b: resource-tier events arrive over the same socket but
+            // the webui's resource pane lands in Phase 1c. Drop them silently
+            // for now so the build stays exhaustive.
+            ServerToClient::ResourceList { .. }
+            | ServerToClient::ResourceCreated { .. }
+            | ServerToClient::ResourceUpdated { .. }
+            | ServerToClient::ResourceDestroyed { .. } => {}
         }
     }
 

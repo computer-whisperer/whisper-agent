@@ -199,6 +199,46 @@ impl Scheduler {
         &self.resources
     }
 
+    // ---------- Resource event emission (Phase 1b) ----------
+    //
+    // Each mutation of the registry is followed by one of these so connected
+    // clients see the change without polling. Created fires once per entry's
+    // appearance; Updated fires on every subsequent field change. Entries
+    // populated at startup (backends, shared MCP hosts) don't get a Created
+    // event — there are no clients connected yet, and a fresh client gets the
+    // full set via `ListResources`.
+
+    fn emit_sandbox_created(&self, id: &SandboxId) {
+        if let Some(snap) = self.resources.snapshot_sandbox(id) {
+            self.router
+                .broadcast_resource(ServerToClient::ResourceCreated { resource: snap });
+        }
+    }
+    fn emit_sandbox_updated(&self, id: &SandboxId) {
+        if let Some(snap) = self.resources.snapshot_sandbox(id) {
+            self.router
+                .broadcast_resource(ServerToClient::ResourceUpdated { resource: snap });
+        }
+    }
+    fn emit_mcp_host_created(&self, id: &McpHostId) {
+        if let Some(snap) = self.resources.snapshot_mcp_host(id) {
+            self.router
+                .broadcast_resource(ServerToClient::ResourceCreated { resource: snap });
+        }
+    }
+    fn emit_mcp_host_updated(&self, id: &McpHostId) {
+        if let Some(snap) = self.resources.snapshot_mcp_host(id) {
+            self.router
+                .broadcast_resource(ServerToClient::ResourceUpdated { resource: snap });
+        }
+    }
+    fn emit_backend_updated(&self, id: &BackendId) {
+        if let Some(snap) = self.resources.snapshot_backend(id) {
+            self.router
+                .broadcast_resource(ServerToClient::ResourceUpdated { resource: snap });
+        }
+    }
+
     /// Returns the backend name the task is configured to use, falling back to the
     /// server's default if the task left it empty. Does NOT validate existence.
     pub(crate) fn resolve_backend_name<'a>(&'a self, task: &'a Task) -> &'a str {
@@ -496,6 +536,16 @@ impl Scheduler {
                     },
                 );
             }
+            ClientToServer::ListResources { correlation_id } => {
+                let resources = self.resources.snapshot_all();
+                self.router.send_to_client(
+                    conn_id,
+                    ServerToClient::ResourceList {
+                        correlation_id,
+                        resources,
+                    },
+                );
+            }
             ClientToServer::ListModels {
                 correlation_id,
                 backend,
@@ -588,9 +638,11 @@ impl Scheduler {
         let backend_id = BackendId::for_name(self.resolve_backend_name(task_ref));
         let shared_names = task_ref.config.shared_mcp_hosts.clone();
         self.resources.add_backend_user(&backend_id, &task_id);
+        self.emit_backend_updated(&backend_id);
         for name in &shared_names {
-            self.resources
-                .add_mcp_user(&McpHostId::shared(name), &task_id);
+            let host_id = McpHostId::shared(name);
+            self.resources.add_mcp_user(&host_id, &task_id);
+            self.emit_mcp_host_updated(&host_id);
         }
 
         info!(task_id = %task_id, "task created");
@@ -719,7 +771,8 @@ impl Scheduler {
                     }
                 }
                 // Phase 1a: mirror the just-acquired primary MCP + sandbox
-                // into the resource registry.
+                // into the resource registry. Phase 1b: emit ResourceCreated
+                // so subscribed clients see them appear.
                 let primary_url = sandbox_handle
                     .as_ref()
                     .and_then(|h| h.mcp_url().map(str::to_string))
@@ -729,11 +782,15 @@ impl Scheduler {
                             .map(|t| t.config.mcp_host_url.clone())
                             .unwrap_or_default()
                     });
-                self.resources
-                    .insert_primary_mcp_host(&task_id, primary_url, session);
-                if sandbox_handle.is_some() {
+                let primary_id =
                     self.resources
+                        .insert_primary_mcp_host(&task_id, primary_url, session);
+                self.emit_mcp_host_created(&primary_id);
+                if sandbox_handle.is_some() {
+                    let sandbox_id = self
+                        .resources
                         .insert_sandbox_for_task(&task_id, sandbox_spec);
+                    self.emit_sandbox_created(&sandbox_id);
                 }
 
                 self.mcp_pools.insert(
@@ -765,6 +822,7 @@ impl Scheduler {
                     .collect();
                 self.resources
                     .populate_mcp_tools(&primary_id, tools.clone(), annotations);
+                self.emit_mcp_host_updated(&primary_id);
                 self.tool_descriptors.insert(task_id.clone(), tools);
                 IoResult::ListTools(Ok(()))
             }
@@ -843,10 +901,12 @@ impl Scheduler {
             // Backend and shared-host user counts are intentionally left
             // alone — the task itself still exists in `self.tasks` and the
             // existing code never removes terminal tasks.
-            self.resources
-                .mark_mcp_torn_down(&McpHostId::primary_for_task(task_id));
-            self.resources
-                .mark_sandbox_torn_down(&SandboxId::for_task(task_id));
+            let primary_id = McpHostId::primary_for_task(task_id);
+            let sandbox_id = SandboxId::for_task(task_id);
+            self.resources.mark_mcp_torn_down(&primary_id);
+            self.emit_mcp_host_updated(&primary_id);
+            self.resources.mark_sandbox_torn_down(&sandbox_id);
+            self.emit_sandbox_updated(&sandbox_id);
             if let Some(mut handle) = self.sandbox_handles.remove(task_id) {
                 let tid = task_id.to_string();
                 tokio::spawn(async move {

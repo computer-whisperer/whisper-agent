@@ -168,6 +168,92 @@ pub struct ModelSummary {
     pub display_name: Option<String>,
 }
 
+// ---------- Resource registry ----------
+
+/// Lifecycle state for a resource, collapsed for the wire. Internal scheduler
+/// distinctions (e.g. provisioning op_id) are dropped — clients only see the
+/// state they can act on.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ResourceStateLabel {
+    Provisioning,
+    Ready,
+    Errored,
+    TornDown,
+}
+
+/// Discriminator for resource events. The resource id strings are namespaced
+/// by prefix (`sb-`, `mcp-primary-`, `mcp-shared-`, `backend-`) but carrying
+/// the kind explicitly lets clients route without prefix-parsing.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ResourceKind {
+    Sandbox,
+    McpHost,
+    Backend,
+}
+
+/// One resource entry, in a shape that's serializable and stable for clients.
+/// Mirrors `crate::resources::*Entry` types in the server but keeps wire-only
+/// concerns (no `Arc<McpSession>`, timestamps as RFC-3339 strings, tool list
+/// reduced to names).
+#[derive(Serialize, Deserialize, Debug, Clone)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ResourceSnapshot {
+    Sandbox {
+        id: String,
+        spec: SandboxSpec,
+        state: ResourceStateLabel,
+        /// User ids (task ids today, thread ids after Phase 2). Sorted.
+        users: Vec<String>,
+        pinned: bool,
+        created_at: String,
+        last_used: String,
+    },
+    McpHost {
+        id: String,
+        url: String,
+        label: String,
+        per_task: bool,
+        state: ResourceStateLabel,
+        /// Names of tools the host advertises. Empty until the first
+        /// `tools/list` lands. Full descriptors are not on the wire — clients
+        /// that need them can subscribe to a task and read its snapshot.
+        tools: Vec<String>,
+        users: Vec<String>,
+        pinned: bool,
+        created_at: String,
+        last_used: String,
+    },
+    Backend {
+        id: String,
+        name: String,
+        backend_kind: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        default_model: Option<String>,
+        state: ResourceStateLabel,
+        users: Vec<String>,
+        pinned: bool,
+        created_at: String,
+        last_used: String,
+    },
+}
+
+impl ResourceSnapshot {
+    pub fn id(&self) -> &str {
+        match self {
+            Self::Sandbox { id, .. } | Self::McpHost { id, .. } | Self::Backend { id, .. } => id,
+        }
+    }
+    pub fn kind(&self) -> ResourceKind {
+        match self {
+            Self::Sandbox { .. } => ResourceKind::Sandbox,
+            Self::McpHost { .. } => ResourceKind::McpHost,
+            Self::Backend { .. } => ResourceKind::Backend,
+        }
+    }
+}
+
 /// Full per-task snapshot. Sent in response to a `SubscribeToTask` so the client can
 /// render the entire conversation from a cold start.
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -272,6 +358,16 @@ pub enum ClientToServer {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         correlation_id: Option<String>,
         backend: String,
+    },
+
+    // --- Resource registry (read-only in Phase 1b) ---
+    /// Request a snapshot of every entry in the scheduler's resource registry
+    /// (sandboxes, MCP hosts, backends). Server responds with `ResourceList`.
+    /// Subsequent registry mutations are pushed unsolicited via
+    /// `ResourceCreated` / `ResourceUpdated` / `ResourceDestroyed`.
+    ListResources {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        correlation_id: Option<String>,
     },
 }
 
@@ -404,6 +500,31 @@ pub enum ServerToClient {
         correlation_id: Option<String>,
         backend: String,
         models: Vec<ModelSummary>,
+    },
+
+    // --- Resource registry tier (broadcast to every connected client) ---
+    /// Snapshot response to `ListResources`.
+    ResourceList {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        correlation_id: Option<String>,
+        resources: Vec<ResourceSnapshot>,
+    },
+    /// A new entry appeared in the registry.
+    ResourceCreated {
+        resource: ResourceSnapshot,
+    },
+    /// An existing entry's fields changed (state, users, tool list, etc.).
+    /// Carries a full snapshot rather than a delta — entries are small, and
+    /// full snapshots let clients ignore field-by-field churn.
+    ResourceUpdated {
+        resource: ResourceSnapshot,
+    },
+    /// An entry was removed from the registry. Reserved — Phase 1b doesn't
+    /// emit it (TornDown is a state on the Updated event); a future GC pass
+    /// that reaps TornDown entries will start emitting it.
+    ResourceDestroyed {
+        id: String,
+        kind: ResourceKind,
     },
 
     Error {

@@ -89,6 +89,15 @@ impl TaskEventRouter {
         }
     }
 
+    /// Broadcast a resource-tier event to every connected client. Same fan-out
+    /// as `broadcast_task_list`; named separately so the call sites are honest
+    /// about which event tier they're emitting.
+    pub(crate) fn broadcast_resource(&self, event: ServerToClient) {
+        for tx in self.clients.values() {
+            let _ = tx.send(event.clone());
+        }
+    }
+
     pub(crate) fn broadcast_task_list_except(&self, event: ServerToClient, skip: ConnId) {
         for (conn_id, tx) in &self.clients {
             if *conn_id != skip {
