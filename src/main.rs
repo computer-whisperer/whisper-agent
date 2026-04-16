@@ -110,8 +110,10 @@ struct ServeArgs {
     #[arg(long, default_value_t = 30)]
     max_turns: u32,
 
-    /// max_tokens parameter passed to the model backend.
-    #[arg(long, default_value_t = 4096)]
+    /// max_tokens parameter passed to the model backend. Generous by default
+    /// because a large `write_file` or multi-edit can easily exceed 4k tokens,
+    /// and the model truncates mid-tool-call if it runs out of budget.
+    #[arg(long, default_value_t = 16384)]
     max_tokens: u32,
 
     /// Prompt the user before running non-read-only tool calls. Default is to
@@ -163,7 +165,7 @@ struct RunArgs {
     max_turns: u32,
 
     /// max_tokens parameter passed to Anthropic.
-    #[arg(long, default_value_t = 4096)]
+    #[arg(long, default_value_t = 16384)]
     max_tokens: u32,
 
     /// The user prompt that drives the loop.
