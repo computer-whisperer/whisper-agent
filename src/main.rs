@@ -16,9 +16,11 @@ use whisper_agent_protocol::{
 use whisper_agent::anthropic::AnthropicClient;
 use whisper_agent::audit::AuditLog;
 use whisper_agent::config::Config;
+use whisper_agent::pod::Pod;
 use whisper_agent::sandbox::{BareMetal, DaemonClient};
 use whisper_agent::scheduler::{
     self, BackendEntry, ConnId, Scheduler, SchedulerMsg, SharedHostConfig,
+    build_default_pod_config,
 };
 use whisper_agent::server::{self, ServerConfig};
 
@@ -381,7 +383,7 @@ async fn run_one_shot(args: RunArgs) -> Result<()> {
         backend: backend_name.clone(),
         model: args.model.clone(),
         system_prompt: args.system_prompt,
-        mcp_host_url: args.mcp_host_url,
+        mcp_host_url: args.mcp_host_url.clone(),
         max_tokens: args.max_tokens,
         max_turns: args.max_turns,
         approval_policy: ApprovalPolicy::AutoApproveAll,
@@ -389,8 +391,29 @@ async fn run_one_shot(args: RunArgs) -> Result<()> {
         shared_mcp_hosts: Vec::new(),
     };
 
+    // Build the in-memory default pod from the one-shot's runtime config.
+    // Persistence is disabled in this code path (no Persister), so the
+    // pod stays in memory only — `dir` is informational.
+    let backend_names: Vec<String> = backends.keys().cloned().collect();
+    let default_pod_config = build_default_pod_config(
+        "default",
+        &task_config,
+        &backend_names,
+        &[],
+    );
+    let raw_toml = whisper_agent::pod::to_toml(&default_pod_config)
+        .context("encode default pod.toml")?;
+    let default_pod = Pod::new(
+        "default".into(),
+        std::path::PathBuf::from("./default"),
+        default_pod_config,
+        raw_toml,
+        task_config.system_prompt.clone(),
+    );
+
     let scheduler = Scheduler::new(
-        task_config,
+        args.mcp_host_url,
+        default_pod,
         "default".into(),
         backends,
         backend_name,
@@ -416,6 +439,7 @@ async fn run_one_shot(args: RunArgs) -> Result<()> {
             conn_id: CONN_ID,
             msg: ClientToServer::CreateThread {
                 correlation_id: Some("cli-one-shot".into()),
+                pod_id: None,
                 initial_message: args.prompt,
                 config_override: None,
             },

@@ -9,16 +9,61 @@
 //! See `docs/design_pod_thread_scheduler.md` for the full design.
 
 use std::collections::BTreeSet;
+use std::path::PathBuf;
 
 use thiserror::Error;
 use whisper_agent_protocol::PodConfig;
 
 pub type PodId = String;
+pub type ThreadId = String;
 
 /// Filename of the per-pod config inside the pod's directory.
 pub const POD_TOML: &str = "pod.toml";
 /// Subdirectory under the pod that holds per-thread JSON files.
 pub const THREADS_DIR: &str = "threads";
+
+/// In-memory representation of a pod the scheduler is currently tracking.
+///
+/// One per pod directory under `<pods_root>/`. The `config` is the parsed
+/// `pod.toml`; `raw_toml` is the on-disk text (kept verbatim so the wire
+/// can return it for raw editing without re-serializing). `threads` is the
+/// scheduler's view of which threads currently belong to this pod —
+/// authoritative at runtime; the on-disk truth is `<pod>/threads/*.json`.
+///
+/// `system_prompt` is the text of the file referenced by
+/// `config.thread_defaults.system_prompt_file`, loaded eagerly so the
+/// scheduler can build a fresh `ThreadConfig` without blocking on I/O.
+/// Empty string when the file is absent or `system_prompt_file` is empty.
+#[derive(Debug, Clone)]
+pub struct Pod {
+    pub id: PodId,
+    pub dir: PathBuf,
+    pub config: PodConfig,
+    pub raw_toml: String,
+    pub system_prompt: String,
+    pub threads: BTreeSet<ThreadId>,
+    pub archived: bool,
+}
+
+impl Pod {
+    pub fn new(
+        id: PodId,
+        dir: PathBuf,
+        config: PodConfig,
+        raw_toml: String,
+        system_prompt: String,
+    ) -> Self {
+        Self {
+            id,
+            dir,
+            config,
+            raw_toml,
+            system_prompt,
+            threads: BTreeSet::new(),
+            archived: false,
+        }
+    }
+}
 
 #[derive(Debug, Error)]
 pub enum PodConfigError {

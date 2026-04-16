@@ -35,7 +35,8 @@ use crate::audit::AuditLog;
 use crate::io_dispatch::{self, IoCompletion, IoFuture};
 use crate::mcp::{McpSession, ToolAnnotations, ToolDescriptor as McpTool};
 use crate::model::ModelProvider;
-use crate::persist::Persister;
+use crate::persist::{LoadedState, Persister};
+use crate::pod::{Pod, PodId};
 use crate::resources::{BackendId, McpHostId, ResourceRegistry, SandboxId};
 use crate::sandbox::{SandboxHandle, SandboxProvider};
 use crate::thread::{
@@ -43,6 +44,7 @@ use crate::thread::{
     new_task_id,
 };
 use crate::thread_router::ThreadEventRouter;
+use whisper_agent_protocol::SandboxSpec;
 
 pub type ConnId = u64;
 
@@ -101,7 +103,18 @@ struct McpPool {
 }
 
 pub struct Scheduler {
-    default_config: ThreadConfig,
+    /// MCP host URL passed through to threads when their pod doesn't carry a
+    /// sandbox-provided URL. Pods don't model this — it's a server-level
+    /// concern (where the filesystem MCP daemon lives) that pre-dates the
+    /// pod-aware refactor. Stays here as a fallback until Phase 3 / 4
+    /// rework makes per-thread bindings authoritative.
+    default_mcp_host_url: String,
+    /// Pod the scheduler picks when `CreateThread` doesn't name one. Always
+    /// a key in `pods`; the server bootstrap synthesizes it on first start.
+    default_pod_id: PodId,
+    /// All pods the scheduler knows about. Loaded from `<pods_root>/`
+    /// at startup; mutated when threads are created/archived/etc.
+    pods: HashMap<PodId, Pod>,
     /// Named backends: `ThreadConfig.backend` resolves against this map.
     backends: HashMap<String, BackendEntry>,
     /// Fallback when a task doesn't specify a backend. Must be a key in `backends`.
@@ -146,8 +159,17 @@ impl Scheduler {
     /// Async because we eagerly connect to every configured shared MCP host at
     /// startup — surfacing misconfiguration at server boot rather than at first
     /// task creation. Returns Err if any shared host fails to handshake.
+    ///
+    /// `default_pod` becomes the in-memory entry the scheduler routes
+    /// no-pod-specified `CreateThread` requests to. The caller is responsible
+    /// for materializing it on disk (the server does this via
+    /// `Persister::ensure_pod_toml`); the scheduler trusts what it's handed.
+    // Grouping these into a `SchedulerInit` struct doesn't buy clarity —
+    // every field is independent and the call sites read fine positionally.
+    #[allow(clippy::too_many_arguments)]
     pub async fn new(
-        default_config: ThreadConfig,
+        default_mcp_host_url: String,
+        default_pod: Pod,
         host_id: String,
         backends: HashMap<String, BackendEntry>,
         default_backend: String,
@@ -175,8 +197,14 @@ impl Scheduler {
             shared_hosts.insert(cfg.name, session);
         }
 
+        let default_pod_id = default_pod.id.clone();
+        let mut pods = HashMap::new();
+        pods.insert(default_pod_id.clone(), default_pod);
+
         Ok(Self {
-            default_config,
+            default_mcp_host_url,
+            default_pod_id,
+            pods,
             backends,
             default_backend,
             persister: None,
@@ -307,10 +335,17 @@ impl Scheduler {
         self
     }
 
-    /// Seed the scheduler with previously-persisted tasks. The persister should have
-    /// already transitioned any in-flight internal states to Failed before handoff.
-    pub fn load_tasks(&mut self, tasks: Vec<Thread>) {
-        for task in tasks {
+    /// Seed the scheduler with pods + threads loaded from disk. The persister
+    /// should have already transitioned any in-flight internal states to
+    /// Failed before handoff. Pods loaded here win over the default pod
+    /// inserted at construction time (in case a real on-disk default exists).
+    pub fn load_state(&mut self, state: LoadedState) {
+        for pod in state.pods {
+            // Replace the construction-time default if disk has a pod with
+            // the same id — disk wins.
+            self.pods.insert(pod.id.clone(), pod);
+        }
+        for task in state.threads {
             // Phase 1a: mirror the registry registrations that create_task
             // would have done. Per-task primary MCP + sandbox entries don't
             // exist for persisted tasks yet — they're created lazily on the
@@ -321,7 +356,19 @@ impl Scheduler {
                 self.resources
                     .add_mcp_user(&McpHostId::shared(name), &task.id);
             }
-            self.tasks.insert(task.id.clone(), task);
+            // Make sure the owning pod knows about this thread. If the pod
+            // wasn't in `state.pods` (shouldn't happen — load_pod walks both
+            // together) we drop the thread on the floor with a warning.
+            if let Some(pod) = self.pods.get_mut(&task.pod_id) {
+                pod.threads.insert(task.id.clone());
+                self.tasks.insert(task.id.clone(), task);
+            } else {
+                warn!(
+                    thread_id = %task.id,
+                    pod_id = %task.pod_id,
+                    "loaded thread references unknown pod; dropping",
+                );
+            }
         }
     }
 
@@ -372,9 +419,10 @@ impl Scheduler {
         match msg {
             ClientToServer::CreateThread {
                 correlation_id,
+                pod_id,
                 initial_message,
                 config_override,
-            } => match self.create_task(conn_id, correlation_id.clone(), config_override) {
+            } => match self.create_task(conn_id, correlation_id.clone(), pod_id, config_override) {
                 Ok(thread_id) => {
                     self.mark_dirty(&thread_id);
                     self.send_user_message(&thread_id, initial_message);
@@ -761,29 +809,47 @@ impl Scheduler {
         &mut self,
         requester: ConnId,
         correlation_id: Option<String>,
+        pod_id: Option<String>,
         config_override: Option<ThreadConfigOverride>,
     ) -> Result<String, String> {
-        let config = apply_override(self.default_config.clone(), config_override);
-        // Validate shared MCP host names — fresh tasks must reference only
-        // hosts that are actually configured. (Persisted tasks loaded from
-        // disk may legitimately reference hosts that have since been removed
-        // — those get warn-skipped at pool-build time, see McpConnectSuccess.)
+        // Resolve which pod this thread lands in. None routes to the
+        // server's default pod.
+        let pod_id = pod_id.unwrap_or_else(|| self.default_pod_id.clone());
+        let pod = self
+            .pods
+            .get(&pod_id)
+            .ok_or_else(|| format!("unknown pod `{pod_id}`"))?;
+
+        // Build the base ThreadConfig from the pod's thread_defaults, then
+        // layer the override on top. Server-level fallback URL fills in the
+        // mcp_host_url field — pods don't model it yet.
+        let base = base_thread_config_from_pod(pod, &self.default_mcp_host_url);
+        let config = apply_override(base, config_override);
+
+        // Validate against the pod's allowlist: backend and shared MCP host
+        // names must each appear in `[allow]`. Sandbox spec validation
+        // arrives in Phase 3 with the resource resolver.
+        validate_thread_against_pod(&config, pod)?;
+
+        // Validate shared MCP host names against the server catalog too —
+        // a name allowed by the pod but not actually wired up at the server
+        // is a misconfiguration we want to surface at create-time.
         for name in &config.shared_mcp_hosts {
             if !self.shared_hosts.contains_key(name) {
                 return Err(format!(
-                    "unknown shared MCP host `{name}`; configured: [{}]",
-                    self.shared_hosts
-                        .keys()
-                        .cloned()
-                        .collect::<Vec<_>>()
-                        .join(", ")
+                    "shared MCP host `{name}` not configured on this server (pod `{pod_id}` allows it but no upstream is wired up)",
                 ));
             }
         }
+
         let thread_id = new_task_id();
-        let task = Thread::new(thread_id.clone(), config);
+        let task = Thread::new(thread_id.clone(), pod_id.clone(), config);
         let summary = task.summary();
         self.tasks.insert(thread_id.clone(), task);
+        // Mirror the new thread into the owning pod's `threads` set.
+        if let Some(pod) = self.pods.get_mut(&pod_id) {
+            pod.threads.insert(thread_id.clone());
+        }
 
         // Phase 1a: register this task as a user of its backend and of every
         // shared MCP host it references. Counts are added once at creation;
@@ -804,7 +870,7 @@ impl Scheduler {
             self.emit_mcp_host_updated(&host_id);
         }
 
-        info!(thread_id = %thread_id, "task created");
+        info!(thread_id = %thread_id, pod_id = %pod_id, "task created");
         // Every client gets exactly one ThreadCreated; the requester's copy carries
         // correlation_id if they provided one.
         if correlation_id.is_some() {
@@ -1123,6 +1189,115 @@ fn truncate(mut s: String, max: usize) -> String {
         s.push('…');
     }
     s
+}
+
+/// Synthesize a `PodConfig` from the server's runtime defaults — used to
+/// bootstrap the in-memory default pod when no real pod.toml exists.
+///
+/// The resulting `[allow]` table reflects exactly what the server has wired
+/// up at startup: every configured backend, every shared MCP host, and a
+/// single named sandbox slot pulled from `default_task_config.sandbox`. The
+/// pod isn't restrictive — it allows everything the server can do today, so
+/// `CreateThread` against the default pod has the same effective surface as
+/// the pre-pod-aware code path.
+pub fn build_default_pod_config(
+    pod_id: &str,
+    defaults: &ThreadConfig,
+    backend_names: &[String],
+    shared_host_names: &[String],
+) -> whisper_agent_protocol::PodConfig {
+    use whisper_agent_protocol::{
+        NamedSandboxSpec, PodAllow, PodConfig, PodLimits, ThreadDefaults,
+    };
+    let sandbox_name = "default".to_string();
+    let now = chrono::Utc::now().to_rfc3339();
+    PodConfig {
+        name: pod_id.to_string(),
+        description: Some(
+            "Auto-synthesized default pod. Mutate via UpdatePodConfig (or hand-edit \
+             pod.toml) to change thread defaults or tighten the allow cap."
+                .into(),
+        ),
+        created_at: now,
+        allow: PodAllow {
+            backends: backend_names.to_vec(),
+            mcp_hosts: shared_host_names.to_vec(),
+            sandbox: vec![NamedSandboxSpec {
+                name: sandbox_name.clone(),
+                spec: defaults.sandbox.clone(),
+            }],
+        },
+        thread_defaults: ThreadDefaults {
+            backend: defaults.backend.clone(),
+            model: defaults.model.clone(),
+            system_prompt_file: "system_prompt.md".into(),
+            max_tokens: defaults.max_tokens,
+            max_turns: defaults.max_turns,
+            approval_policy: defaults.approval_policy,
+            sandbox: sandbox_name,
+            mcp_hosts: defaults.shared_mcp_hosts.clone(),
+        },
+        limits: PodLimits::default(),
+    }
+}
+
+/// Render the pod's `thread_defaults` into a fresh `ThreadConfig`.
+///
+/// `default_mcp_url` is the server's filesystem-MCP fallback — pods don't
+/// model it (it's where the MCP daemon lives, a server-level concern). The
+/// resolved `sandbox` field is filled by looking the named entry up in
+/// `pod.config.allow.sandbox`; if not present, defaults to `SandboxSpec::None`
+/// (matches today's behavior when no sandbox is configured).
+fn base_thread_config_from_pod(pod: &Pod, default_mcp_url: &str) -> ThreadConfig {
+    let defaults = &pod.config.thread_defaults;
+    let sandbox = pod
+        .config
+        .allow
+        .sandbox
+        .iter()
+        .find(|s| s.name == defaults.sandbox)
+        .map(|s| s.spec.clone())
+        .unwrap_or(SandboxSpec::None);
+    ThreadConfig {
+        backend: defaults.backend.clone(),
+        model: defaults.model.clone(),
+        system_prompt: pod.system_prompt.clone(),
+        mcp_host_url: default_mcp_url.to_string(),
+        max_tokens: defaults.max_tokens,
+        max_turns: defaults.max_turns,
+        approval_policy: defaults.approval_policy,
+        sandbox,
+        shared_mcp_hosts: defaults.mcp_hosts.clone(),
+    }
+}
+
+/// Reject thread configs that escape the pod's `[allow]` cap.
+///
+/// Today this checks `backend` and `shared_mcp_hosts` against the pod's
+/// allowed names. Sandbox-spec validation is deferred to Phase 3 alongside
+/// the resource resolver (the resolver is the natural place to verify a
+/// requested SandboxSpec deep-equals one of `[[allow.sandbox]]`).
+fn validate_thread_against_pod(config: &ThreadConfig, pod: &Pod) -> Result<(), String> {
+    if !config.backend.is_empty()
+        && !pod.config.allow.backends.iter().any(|b| b == &config.backend)
+    {
+        return Err(format!(
+            "backend `{}` not in pod `{}`'s allow.backends ({})",
+            config.backend,
+            pod.id,
+            pod.config.allow.backends.join(", ")
+        ));
+    }
+    for name in &config.shared_mcp_hosts {
+        if !pod.config.allow.mcp_hosts.iter().any(|h| h == name) {
+            return Err(format!(
+                "shared MCP host `{name}` not in pod `{}`'s allow.mcp_hosts ({})",
+                pod.id,
+                pod.config.allow.mcp_hosts.join(", ")
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn apply_override(base: ThreadConfig, ov: Option<ThreadConfigOverride>) -> ThreadConfig {

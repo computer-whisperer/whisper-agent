@@ -36,7 +36,10 @@ use whisper_agent_protocol::{ServerToClient, ThreadConfig, decode_from_client, e
 
 use crate::audit::AuditLog;
 use crate::persist::Persister;
-use crate::scheduler::{BackendEntry, ConnId, Scheduler, SchedulerMsg, SharedHostConfig};
+use crate::pod::{Pod, PodId};
+use crate::scheduler::{
+    BackendEntry, ConnId, Scheduler, SchedulerMsg, SharedHostConfig, build_default_pod_config,
+};
 
 const WEBUI_PKG_DIR: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
@@ -89,8 +92,40 @@ pub async fn serve(listen: SocketAddr, config: ServerConfig) -> anyhow::Result<(
         .with_context(|| format!("open audit log {}", config.audit_log_path.display()))?;
     info!(audit_log = %audit.path().display(), "audit log open");
 
+    // Synthesize the default pod from the server-level config. The actual
+    // on-disk pod.toml is materialized below (only when persistence is
+    // enabled); the in-memory entry is what the scheduler routes
+    // no-pod-specified `CreateThread` requests to.
+    const DEFAULT_POD_ID: &str = "default";
+    let default_pod_id: PodId = DEFAULT_POD_ID.into();
+    let backend_names: Vec<String> = config.backends.keys().cloned().collect();
+    let shared_host_names: Vec<String> = config.shared_mcp_hosts.iter().map(|h| h.name.clone()).collect();
+    let default_pod_config = build_default_pod_config(
+        &default_pod_id,
+        &config.default_task_config,
+        &backend_names,
+        &shared_host_names,
+    );
+    let default_pod_dir = config
+        .pods_root
+        .as_ref()
+        .map(|root| root.join(&default_pod_id))
+        .unwrap_or_else(|| PathBuf::from(format!("./{default_pod_id}")));
+    let default_mcp_host_url = config.default_task_config.mcp_host_url.clone();
+    let default_system_prompt = config.default_task_config.system_prompt.clone();
+    let raw_toml = crate::pod::to_toml(&default_pod_config)
+        .context("encode default pod.toml for in-memory bootstrap")?;
+    let default_pod = Pod::new(
+        default_pod_id.clone(),
+        default_pod_dir.clone(),
+        default_pod_config.clone(),
+        raw_toml,
+        default_system_prompt.clone(),
+    );
+
     let mut scheduler = Scheduler::new(
-        config.default_task_config,
+        default_mcp_host_url,
+        default_pod,
         config.host_id,
         config.backends,
         config.default_backend,
@@ -105,11 +140,28 @@ pub async fn serve(listen: SocketAddr, config: ServerConfig) -> anyhow::Result<(
         let persister = Persister::new(pods_root.clone())
             .await
             .with_context(|| format!("open pods_root {}", pods_root.display()))?;
+        // Materialize the default pod on disk so future server starts find
+        // it via `load_all`. ensure_pod_toml is a no-op when a pod.toml
+        // already exists, so hand-edits survive.
+        persister
+            .ensure_pod_toml(&default_pod_id, &default_pod_config)
+            .await
+            .context("write default pod.toml")?;
+        let prompt_path = pods_root
+            .join(&default_pod_id)
+            .join(&default_pod_config.thread_defaults.system_prompt_file);
+        if !default_system_prompt.is_empty()
+            && !tokio::fs::try_exists(&prompt_path).await.unwrap_or(false)
+        {
+            tokio::fs::write(&prompt_path, &default_system_prompt)
+                .await
+                .with_context(|| format!("write {}", prompt_path.display()))?;
+        }
         let loaded = persister
             .load_all()
             .await
-            .with_context(|| "load persisted tasks")?;
-        scheduler.load_tasks(loaded);
+            .with_context(|| "load persisted state")?;
+        scheduler.load_state(loaded);
         scheduler = scheduler.with_persister(persister);
     }
 

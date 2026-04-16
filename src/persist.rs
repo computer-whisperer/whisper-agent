@@ -33,12 +33,20 @@ use chrono::Utc;
 use tokio::fs;
 use tracing::{info, warn};
 
-use crate::pod::{self, POD_TOML, THREADS_DIR};
+use crate::pod::{self, Pod, PodId, POD_TOML, THREADS_DIR};
 use crate::thread::{Thread, ThreadInternalState};
 use whisper_agent_protocol::{
     NamedSandboxSpec, PodAllow, PodConfig, PodLimits, PodSnapshot, PodSummary, ThreadSummary,
     ThreadDefaults,
 };
+
+/// Result of `Persister::load_all`. Pods and threads are kept side-by-side so
+/// the scheduler can register threads against their owning pod without
+/// re-walking the directory tree.
+pub struct LoadedState {
+    pub pods: Vec<Pod>,
+    pub threads: Vec<Thread>,
+}
 
 #[derive(Clone)]
 pub struct Persister {
@@ -78,15 +86,22 @@ impl Persister {
             .join(format!("{thread_id}.json"))
     }
 
-    /// Write the task's thread JSON. Synthesizes `pod.toml` and
-    /// `system_prompt.md` on first flush only — subsequent flushes touch
-    /// only the thread file.
+    /// Write the task's thread JSON. The thread lands at
+    /// `<pods_root>/<thread.pod_id>/threads/<thread.id>.json`. If the owning
+    /// pod's `pod.toml` is missing (legacy pre-2d.iii threads still using
+    /// pod_id == thread_id), one is synthesized so the directory is
+    /// self-describing — the scheduler is the source of truth for live pods,
+    /// but a hand-edited file system shouldn't end up with orphan thread
+    /// JSONs.
     pub async fn flush(&self, task: &Thread) -> Result<()> {
-        // Phase 2b shim: one task = one pod = one thread, all sharing the
-        // same id. The pod_id/thread_id distinction lives in the directory
-        // shape so the rest of the migration only needs to rename, not
-        // restructure.
-        let pod_id = &task.id;
+        // Backstop for threads that were loaded before pod_id existed in
+        // the JSON (serde defaulted to ""); fall back to id so the thread
+        // still lands somewhere coherent.
+        let pod_id = if task.pod_id.is_empty() {
+            &task.id
+        } else {
+            &task.pod_id
+        };
         let thread_id = &task.id;
 
         let pod_dir = self.pod_dir(pod_id);
@@ -121,15 +136,39 @@ impl Persister {
         Ok(())
     }
 
-    /// Walk `<pods_root>/*/threads/*.json` and load every task. Hidden
-    /// directories (those whose name starts with `.`) are skipped — the
-    /// `.pre-pod-refactor-*/` stash and `.archived/` future archive dir
-    /// are both ignored.
-    pub async fn load_all(&self) -> Result<Vec<Thread>> {
-        let mut tasks = Vec::new();
+    /// Write a fresh pod's `pod.toml` to disk. Used by the scheduler when it
+    /// synthesizes the default pod at startup. Idempotent — does nothing if
+    /// the file already exists.
+    pub async fn ensure_pod_toml(&self, pod_id: &str, config: &PodConfig) -> Result<()> {
+        validate_pod_id(pod_id)?;
+        let pod_dir = self.pod_dir(pod_id);
+        fs::create_dir_all(pod_dir.join(THREADS_DIR))
+            .await
+            .with_context(|| format!("mkdir {}", pod_dir.display()))?;
+        let pod_toml = pod_dir.join(POD_TOML);
+        if fs::try_exists(&pod_toml).await.unwrap_or(false) {
+            return Ok(());
+        }
+        let toml_text = pod::to_toml(config).context("encode pod.toml")?;
+        fs::write(&pod_toml, toml_text)
+            .await
+            .with_context(|| format!("write {}", pod_toml.display()))
+    }
+
+    /// Walk `<pods_root>/*` and load every pod's `pod.toml` + every thread
+    /// JSON underneath. Hidden directories (those whose name starts with `.`)
+    /// are skipped — the `.pre-pod-refactor-*/` stash and `.archived/` future
+    /// archive dir are both ignored. Pods whose `pod.toml` fails to parse
+    /// are skipped with a warn (their threads are dropped too — the cap they
+    /// declare is the only thing that makes the threads safe to run).
+    pub async fn load_all(&self) -> Result<LoadedState> {
+        let mut state = LoadedState {
+            pods: Vec::new(),
+            threads: Vec::new(),
+        };
         let mut entries = match fs::read_dir(&self.pods_root).await {
             Ok(e) => e,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(tasks),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(state),
             Err(e) => {
                 return Err(e).with_context(|| format!("read_dir {}", self.pods_root.display()));
             }
@@ -152,10 +191,22 @@ impl Persister {
             if !metadata.is_dir() {
                 continue;
             }
-            load_pod_threads(&path, &mut tasks).await;
+            match load_pod(&path, name).await {
+                Ok((pod, threads)) => {
+                    state.pods.push(pod);
+                    state.threads.extend(threads);
+                }
+                Err(e) => {
+                    warn!(path = %path.display(), error = %e, "skip pod: failed to load");
+                }
+            }
         }
-        info!(count = tasks.len(), "loaded persisted tasks");
-        Ok(tasks)
+        info!(
+            pods = state.pods.len(),
+            threads = state.threads.len(),
+            "loaded persisted state",
+        );
+        Ok(state)
     }
 
     // ---------- Pod CRUD (Phase 2d.i wire surface) ----------
@@ -199,7 +250,7 @@ impl Persister {
             .await
             .with_context(|| format!("read {}", toml_path.display()))?;
         let config = pod::parse_toml(&toml_text).with_context(|| format!("parse {pod_id}/pod.toml"))?;
-        let threads = read_thread_summaries(&pod_dir).await;
+        let threads = read_thread_summaries(&pod_dir, pod_id).await;
         Ok(Some(PodSnapshot {
             pod_id: pod_id.to_string(),
             config,
@@ -336,7 +387,7 @@ async fn count_threads(pod_dir: &Path) -> u32 {
     n
 }
 
-async fn read_thread_summaries(pod_dir: &Path) -> Vec<ThreadSummary> {
+async fn read_thread_summaries(pod_dir: &Path, pod_id: &str) -> Vec<ThreadSummary> {
     let threads_dir = pod_dir.join(THREADS_DIR);
     let mut entries = match fs::read_dir(&threads_dir).await {
         Ok(e) => e,
@@ -348,7 +399,7 @@ async fn read_thread_summaries(pod_dir: &Path) -> Vec<ThreadSummary> {
         if path.extension().and_then(|e| e.to_str()) != Some("json") {
             continue;
         }
-        match load_one(&path).await {
+        match load_one(&path, pod_id).await {
             Ok(thread) => out.push(thread.summary()),
             Err(e) => warn!(path = %path.display(), error = %e, "skip thread summary"),
         }
@@ -357,40 +408,61 @@ async fn read_thread_summaries(pod_dir: &Path) -> Vec<ThreadSummary> {
     out
 }
 
-async fn load_pod_threads(pod_dir: &Path, out: &mut Vec<Thread>) {
-    let threads_dir = pod_dir.join(THREADS_DIR);
-    let mut entries = match fs::read_dir(&threads_dir).await {
-        Ok(e) => e,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
-        Err(e) => {
-            warn!(path = %threads_dir.display(), error = %e, "read threads/ failed");
-            return;
-        }
+/// Load one pod directory: parse `pod.toml`, then walk `threads/` and read
+/// every JSON underneath. Stamps `pod_id` onto each loaded thread so the
+/// scheduler can register it against the right pod.
+async fn load_pod(pod_dir: &Path, pod_id: &str) -> Result<(Pod, Vec<Thread>)> {
+    let toml_path = pod_dir.join(POD_TOML);
+    let raw_toml = fs::read_to_string(&toml_path)
+        .await
+        .with_context(|| format!("read {}", toml_path.display()))?;
+    let config = pod::parse_toml(&raw_toml).with_context(|| format!("parse {pod_id}/pod.toml"))?;
+
+    let system_prompt = if config.thread_defaults.system_prompt_file.is_empty() {
+        String::new()
+    } else {
+        let path = pod_dir.join(&config.thread_defaults.system_prompt_file);
+        fs::read_to_string(&path).await.unwrap_or_default()
     };
-    while let Some(entry) = match entries.next_entry().await {
-        Ok(opt) => opt,
-        Err(e) => {
-            warn!(path = %threads_dir.display(), error = %e, "iter threads/ failed");
-            return;
-        }
-    } {
-        let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) != Some("json") {
-            continue;
-        }
-        match load_one(&path).await {
-            Ok(task) => out.push(task),
-            Err(e) => warn!(path = %path.display(), error = %e, "skip unreadable thread file"),
+
+    let mut threads = Vec::new();
+    let threads_dir = pod_dir.join(THREADS_DIR);
+    if let Ok(mut entries) = fs::read_dir(&threads_dir).await {
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("json") {
+                continue;
+            }
+            match load_one(&path, pod_id).await {
+                Ok(task) => threads.push(task),
+                Err(e) => warn!(path = %path.display(), error = %e, "skip unreadable thread file"),
+            }
         }
     }
+
+    let mut pod = Pod::new(
+        PodId::from(pod_id),
+        pod_dir.to_path_buf(),
+        config,
+        raw_toml,
+        system_prompt,
+    );
+    for t in &threads {
+        pod.threads.insert(t.id.clone());
+    }
+    Ok((pod, threads))
 }
 
-async fn load_one(path: &Path) -> Result<Thread> {
+async fn load_one(path: &Path, pod_id: &str) -> Result<Thread> {
     let bytes = fs::read(path)
         .await
         .with_context(|| format!("read {}", path.display()))?;
     let mut task: Thread =
         serde_json::from_slice(&bytes).with_context(|| format!("parse {}", path.display()))?;
+    // Stamp pod_id from the directory we found it in. This wins over any
+    // value baked into the JSON — a pod that was renamed on disk should
+    // have its threads follow.
+    task.pod_id = pod_id.to_string();
     if is_in_flight(&task.internal) {
         task.fail("resume", "task was in-flight at last shutdown");
     }
@@ -507,7 +579,7 @@ mod tests {
             sandbox: SandboxSpec::None,
             shared_mcp_hosts: vec!["fetch".into()],
         };
-        let mut task = Thread::new(id.into(), cfg);
+        let mut task = Thread::new(id.into(), id.into(), cfg);
         task.title = Some("Sample task".into());
         task
     }
@@ -528,9 +600,13 @@ mod tests {
                 .is_file()
         );
         let loaded = p.load_all().await.unwrap();
-        assert_eq!(loaded.len(), 1);
-        assert_eq!(loaded[0].id, "t-rt");
-        assert_eq!(loaded[0].title.as_deref(), Some("Sample task"));
+        assert_eq!(loaded.threads.len(), 1);
+        assert_eq!(loaded.threads[0].id, "t-rt");
+        assert_eq!(loaded.threads[0].pod_id, "t-rt");
+        assert_eq!(loaded.threads[0].title.as_deref(), Some("Sample task"));
+        assert_eq!(loaded.pods.len(), 1);
+        assert_eq!(loaded.pods[0].id, "t-rt");
+        assert!(loaded.pods[0].threads.contains("t-rt"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -591,8 +667,8 @@ mod tests {
         )
         .unwrap();
         let loaded = p.load_all().await.unwrap();
-        assert_eq!(loaded.len(), 1);
-        assert_eq!(loaded[0].id, "real-pod");
+        assert_eq!(loaded.threads.len(), 1);
+        assert_eq!(loaded.threads[0].id, "real-pod");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -139,6 +139,10 @@ pub enum ApprovalChoice {
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct ThreadSummary {
     pub thread_id: String,
+    /// Pod the thread belongs to. Empty for legacy snapshots from before the
+    /// pod-aware scheduler landed (Phase 2d.iii).
+    #[serde(default)]
+    pub pod_id: String,
     pub title: Option<String>,
     pub state: ThreadStateLabel,
     /// ISO-8601 timestamp. Kept as a plain string on the wire so the protocol crate
@@ -261,6 +265,9 @@ impl ResourceSnapshot {
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct ThreadSnapshot {
     pub thread_id: String,
+    /// Pod this thread belongs to. Empty for legacy snapshots.
+    #[serde(default)]
+    pub pod_id: String,
     pub title: Option<String>,
     pub config: ThreadConfig,
     pub state: ThreadStateLabel,
@@ -296,6 +303,11 @@ pub enum ClientToServer {
     CreateThread {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         correlation_id: Option<String>,
+        /// Which pod the new thread should land in. `None` routes the thread
+        /// to the server's default pod — currently the only path the webui
+        /// uses, since multi-pod creation arrives in Phase 2e/4.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pod_id: Option<String>,
         initial_message: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         config_override: Option<ThreadConfigOverride>,

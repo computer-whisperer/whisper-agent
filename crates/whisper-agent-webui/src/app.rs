@@ -703,6 +703,7 @@ impl ChatApp {
             let override_ = self.build_creation_override();
             self.send(ClientToServer::CreateThread {
                 correlation_id: None,
+                pod_id: None,
                 initial_message: trimmed.to_string(),
                 config_override: override_,
             });
@@ -763,6 +764,7 @@ impl ChatApp {
 fn snapshot_summary(s: &whisper_agent_protocol::ThreadSnapshot) -> ThreadSummary {
     ThreadSummary {
         thread_id: s.thread_id.clone(),
+        pod_id: s.pod_id.clone(),
         title: s.title.clone(),
         state: s.state,
         created_at: s.created_at.clone(),

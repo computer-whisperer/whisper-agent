@@ -34,6 +34,12 @@ pub type OpId = u64;
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Thread {
     pub id: String,
+    /// Pod this thread belongs to. Matches a key in
+    /// `Scheduler::pods`. Defaults to `id` for legacy persisted threads
+    /// that pre-date the pod-aware load (Phase 2b shim treated each
+    /// thread as its own pod, so id and pod_id were the same anyway).
+    #[serde(default)]
+    pub pod_id: String,
     pub created_at: DateTime<Utc>,
     pub last_active: DateTime<Utc>,
     pub title: Option<String>,
@@ -293,10 +299,11 @@ pub enum ThreadEvent {
 }
 
 impl Thread {
-    pub fn new(id: String, config: ThreadConfig) -> Self {
+    pub fn new(id: String, pod_id: String, config: ThreadConfig) -> Self {
         let now = Utc::now();
         Self {
             id,
+            pod_id,
             created_at: now,
             last_active: now,
             title: None,
@@ -334,6 +341,7 @@ impl Thread {
     pub fn summary(&self) -> ThreadSummary {
         ThreadSummary {
             thread_id: self.id.clone(),
+            pod_id: self.pod_id.clone(),
             title: self.title.clone(),
             state: self.public_state(),
             created_at: self.created_at.to_rfc3339(),
@@ -344,6 +352,7 @@ impl Thread {
     pub fn snapshot(&self) -> ThreadSnapshot {
         ThreadSnapshot {
             thread_id: self.id.clone(),
+            pod_id: self.pod_id.clone(),
             title: self.title.clone(),
             config: self.config.clone(),
             state: self.public_state(),
@@ -1180,7 +1189,7 @@ mod tests {
             sandbox: Default::default(),
             shared_mcp_hosts: Vec::new(),
         };
-        let mut task = Thread::new("t1".into(), cfg);
+        let mut task = Thread::new("t1".into(), "t1".into(), cfg);
         let tool_uses: Vec<ToolUseReq> = tool_names
             .iter()
             .enumerate()
