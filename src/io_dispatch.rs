@@ -21,7 +21,7 @@ use tracing::{debug, warn};
 use crate::mcp::{McpSession, ToolDescriptor as McpTool};
 use crate::model::{CacheBreakpoint, ModelRequest, ToolSpec, default_cache_policy};
 use crate::scheduler::Scheduler;
-use crate::task::{IoRequest, IoResult, OpId};
+use crate::thread::{IoRequest, IoResult, OpId};
 
 /// Completion message delivered by every I/O future the scheduler dispatches.
 pub(crate) struct IoCompletion {

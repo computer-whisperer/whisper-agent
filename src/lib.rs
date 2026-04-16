@@ -16,5 +16,5 @@ pub mod resources;
 pub mod sandbox;
 pub mod scheduler;
 pub mod server;
-pub mod task;
-pub mod task_router;
+pub mod thread;
+pub mod thread_router;

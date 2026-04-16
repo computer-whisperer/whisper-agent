@@ -1,5 +1,5 @@
-//! Task event routing: connection registry, subscriptions, and the
-//! `TaskEvent → ServerToClient` translation that the scheduler hands off after
+//! Thread event routing: connection registry, subscriptions, and the
+//! `ThreadEvent → ServerToClient` translation that the scheduler hands off after
 //! every `task.step()` / `task.apply_io_result()` cycle.
 //!
 //! Owns:
@@ -8,7 +8,7 @@
 //!   - **Subscriptions**: `task_id → set<ConnId>`. Per-task event tier (assistant
 //!     text, tool calls, approvals) only goes to subscribers.
 //!   - **Audit log**: tool-call audit entries are written here as fire-and-forget
-//!     tokio tasks driven by [`TaskEvent::AuditToolCall`].
+//!     tokio tasks driven by [`ThreadEvent::AuditToolCall`].
 //!
 //! Adding a new wire event type — or changing how events are batched / filtered —
 //! is a local edit on this module. The scheduler's run loop and I/O dispatch stay
@@ -22,16 +22,16 @@ use whisper_agent_protocol::ServerToClient;
 
 use crate::audit::{AuditLog, ToolCallEntry, ToolCallOutcome};
 use crate::scheduler::ConnId;
-use crate::task::TaskEvent;
+use crate::thread::ThreadEvent;
 
-pub(crate) struct TaskEventRouter {
+pub(crate) struct ThreadEventRouter {
     clients: HashMap<ConnId, mpsc::UnboundedSender<ServerToClient>>,
     subscriptions: HashMap<String, HashSet<ConnId>>,
     audit: AuditLog,
     host_id: String,
 }
 
-impl TaskEventRouter {
+impl ThreadEventRouter {
     pub(crate) fn new(audit: AuditLog, host_id: String) -> Self {
         Self {
             clients: HashMap::new(),
@@ -129,13 +129,13 @@ impl TaskEventRouter {
 
     // ---------- Event translation ----------
 
-    /// Translate a batch of [`TaskEvent`]s for `task_id` into wire events and
+    /// Translate a batch of [`ThreadEvent`]s for `task_id` into wire events and
     /// dispatch them to the right audience: per-task subscribers for the turn
     /// tier, every client for state-list updates, the audit log for tool calls.
-    pub(crate) fn dispatch_events(&self, task_id: &str, events: Vec<TaskEvent>) {
+    pub(crate) fn dispatch_events(&self, task_id: &str, events: Vec<ThreadEvent>) {
         for event in events {
             match event {
-                TaskEvent::AssistantBegin { turn } => {
+                ThreadEvent::AssistantBegin { turn } => {
                     self.broadcast_to_subscribers(
                         task_id,
                         ServerToClient::TaskAssistantBegin {
@@ -144,7 +144,7 @@ impl TaskEventRouter {
                         },
                     );
                 }
-                TaskEvent::AssistantText { text } => {
+                ThreadEvent::AssistantText { text } => {
                     self.broadcast_to_subscribers(
                         task_id,
                         ServerToClient::TaskAssistantText {
@@ -153,7 +153,7 @@ impl TaskEventRouter {
                         },
                     );
                 }
-                TaskEvent::AssistantReasoning { text } => {
+                ThreadEvent::AssistantReasoning { text } => {
                     self.broadcast_to_subscribers(
                         task_id,
                         ServerToClient::TaskAssistantReasoning {
@@ -162,7 +162,7 @@ impl TaskEventRouter {
                         },
                     );
                 }
-                TaskEvent::ToolCallBegin {
+                ThreadEvent::ToolCallBegin {
                     tool_use_id,
                     name,
                     args_preview,
@@ -177,7 +177,7 @@ impl TaskEventRouter {
                         },
                     );
                 }
-                TaskEvent::ToolCallEnd {
+                ThreadEvent::ToolCallEnd {
                     tool_use_id,
                     result_preview,
                     is_error,
@@ -192,7 +192,7 @@ impl TaskEventRouter {
                         },
                     );
                 }
-                TaskEvent::PendingApproval {
+                ThreadEvent::PendingApproval {
                     approval_id,
                     tool_use_id,
                     name,
@@ -213,7 +213,7 @@ impl TaskEventRouter {
                         },
                     );
                 }
-                TaskEvent::ApprovalResolved {
+                ThreadEvent::ApprovalResolved {
                     approval_id,
                     decision,
                     decided_by_conn,
@@ -228,7 +228,7 @@ impl TaskEventRouter {
                         },
                     );
                 }
-                TaskEvent::AssistantEnd { stop_reason, usage } => {
+                ThreadEvent::AssistantEnd { stop_reason, usage } => {
                     self.broadcast_to_subscribers(
                         task_id,
                         ServerToClient::TaskAssistantEnd {
@@ -238,7 +238,7 @@ impl TaskEventRouter {
                         },
                     );
                 }
-                TaskEvent::LoopComplete => {
+                ThreadEvent::LoopComplete => {
                     self.broadcast_to_subscribers(
                         task_id,
                         ServerToClient::TaskLoopComplete {
@@ -246,13 +246,13 @@ impl TaskEventRouter {
                         },
                     );
                 }
-                TaskEvent::StateChanged { state } => {
+                ThreadEvent::StateChanged { state } => {
                     self.broadcast_task_list(ServerToClient::TaskStateChanged {
                         task_id: task_id.to_string(),
                         state,
                     });
                 }
-                TaskEvent::Error { message } => {
+                ThreadEvent::Error { message } => {
                     self.broadcast_to_subscribers(
                         task_id,
                         ServerToClient::Error {
@@ -262,7 +262,7 @@ impl TaskEventRouter {
                         },
                     );
                 }
-                TaskEvent::AllowlistChanged { allowlist } => {
+                ThreadEvent::AllowlistChanged { allowlist } => {
                     self.broadcast_to_subscribers(
                         task_id,
                         ServerToClient::TaskAllowlistUpdated {
@@ -271,7 +271,7 @@ impl TaskEventRouter {
                         },
                     );
                 }
-                TaskEvent::AuditToolCall {
+                ThreadEvent::AuditToolCall {
                     tool_name,
                     args,
                     is_error,
@@ -294,7 +294,7 @@ impl TaskEventRouter {
     }
 
     /// Fire-and-forget audit write — never blocks task progression.
-    // The args mirror `TaskEvent::AuditToolCall` 1:1; grouping them into a
+    // The args mirror `ThreadEvent::AuditToolCall` 1:1; grouping them into a
     // struct just shuffles the same fields without buying clarity.
     #[allow(clippy::too_many_arguments)]
     fn write_audit(

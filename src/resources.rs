@@ -1,7 +1,7 @@
 //! Resource registries — sandboxes, MCP hosts, and model backends as first-class
 //! entities with lifecycles independent of the tasks/threads that reference them.
 //!
-//! See `docs/design_session_thread_scheduler.md` for the end-state design. This
+//! See `docs/design_pod_thread_scheduler.md` for the end-state design. This
 //! module is the Phase 1a foundation: types and a passive registry that mirrors
 //! the existing per-task resource ownership without changing behavior. Later
 //! phases promote this from a shadow registry to the authoritative store, drop

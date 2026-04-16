@@ -2,7 +2,7 @@
 //! `<pods_root>/<pod_id>/threads/<thread_id>.json` alongside a synthesized
 //! `<pods_root>/<pod_id>/pod.toml`.
 //!
-//! Phase 2b lays the on-disk shape down without renaming the in-memory `Task`
+//! Phase 2b lays the on-disk shape down without renaming the in-memory `Thread`
 //! type or splitting `TaskConfig`. The `pod.toml` is synthesized from the
 //! task's config on first flush and *not* clobbered on subsequent flushes —
 //! hand-edits survive even though the scheduler doesn't yet read them
@@ -36,7 +36,7 @@ use tracing::{info, warn};
 use crate::pod::{
     NamedSandboxSpec, POD_TOML, PodAllow, PodConfig, PodLimits, THREADS_DIR, ThreadDefaults,
 };
-use crate::task::{Task, TaskInternalState};
+use crate::thread::{Thread, ThreadInternalState};
 
 pub struct Persister {
     pods_root: PathBuf,
@@ -78,7 +78,7 @@ impl Persister {
     /// Write the task's thread JSON. Synthesizes `pod.toml` and
     /// `system_prompt.md` on first flush only — subsequent flushes touch
     /// only the thread file.
-    pub async fn flush(&self, task: &Task) -> Result<()> {
+    pub async fn flush(&self, task: &Thread) -> Result<()> {
         // Phase 2b shim: one task = one pod = one thread, all sharing the
         // same id. The pod_id/thread_id distinction lives in the directory
         // shape so the rest of the migration only needs to rename, not
@@ -123,7 +123,7 @@ impl Persister {
     /// directories (those whose name starts with `.`) are skipped — the
     /// `.pre-pod-refactor-*/` stash and `.archived/` future archive dir
     /// are both ignored.
-    pub async fn load_all(&self) -> Result<Vec<Task>> {
+    pub async fn load_all(&self) -> Result<Vec<Thread>> {
         let mut tasks = Vec::new();
         let mut entries = match fs::read_dir(&self.pods_root).await {
             Ok(e) => e,
@@ -157,7 +157,7 @@ impl Persister {
     }
 }
 
-async fn load_pod_threads(pod_dir: &Path, out: &mut Vec<Task>) {
+async fn load_pod_threads(pod_dir: &Path, out: &mut Vec<Thread>) {
     let threads_dir = pod_dir.join(THREADS_DIR);
     let mut entries = match fs::read_dir(&threads_dir).await {
         Ok(e) => e,
@@ -185,11 +185,11 @@ async fn load_pod_threads(pod_dir: &Path, out: &mut Vec<Task>) {
     }
 }
 
-async fn load_one(path: &Path) -> Result<Task> {
+async fn load_one(path: &Path) -> Result<Thread> {
     let bytes = fs::read(path)
         .await
         .with_context(|| format!("read {}", path.display()))?;
-    let mut task: Task =
+    let mut task: Thread =
         serde_json::from_slice(&bytes).with_context(|| format!("parse {}", path.display()))?;
     if is_in_flight(&task.internal) {
         task.fail("resume", "task was in-flight at last shutdown");
@@ -197,16 +197,16 @@ async fn load_one(path: &Path) -> Result<Task> {
     Ok(task)
 }
 
-fn is_in_flight(state: &TaskInternalState) -> bool {
+fn is_in_flight(state: &ThreadInternalState) -> bool {
     matches!(
         state,
-        TaskInternalState::NeedsMcpConnect
-            | TaskInternalState::AwaitingMcpConnect { .. }
-            | TaskInternalState::NeedsListTools
-            | TaskInternalState::AwaitingListTools { .. }
-            | TaskInternalState::NeedsModelCall
-            | TaskInternalState::AwaitingModel { .. }
-            | TaskInternalState::AwaitingTools { .. }
+        ThreadInternalState::NeedsMcpConnect
+            | ThreadInternalState::AwaitingMcpConnect { .. }
+            | ThreadInternalState::NeedsListTools
+            | ThreadInternalState::AwaitingListTools { .. }
+            | ThreadInternalState::NeedsModelCall
+            | ThreadInternalState::AwaitingModel { .. }
+            | ThreadInternalState::AwaitingTools { .. }
     )
 }
 
@@ -244,7 +244,7 @@ async fn sweep_legacy(pods_root: &Path) -> Result<Option<PathBuf>> {
     Ok(Some(stash))
 }
 
-fn synthesize_pod_config(task: &Task) -> PodConfig {
+fn synthesize_pod_config(task: &Thread) -> PodConfig {
     // The synthesized config describes the task's bindings as if pods were
     // already authoritative. Backend may be empty (the existing TaskConfig
     // accepts that as "use server default"); we mirror that — validation
@@ -295,7 +295,7 @@ mod tests {
         path
     }
 
-    fn sample_task(id: &str) -> Task {
+    fn sample_task(id: &str) -> Thread {
         let cfg = TaskConfig {
             backend: "anthropic".into(),
             model: "claude-opus-4-7".into(),
@@ -307,7 +307,7 @@ mod tests {
             sandbox: SandboxSpec::None,
             shared_mcp_hosts: vec!["fetch".into()],
         };
-        let mut task = Task::new(id.into(), cfg);
+        let mut task = Thread::new(id.into(), cfg);
         task.title = Some("Sample task".into());
         task
     }

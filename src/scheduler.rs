@@ -10,13 +10,13 @@
 //!   - **Pending I/O** completions: model responses, MCP connects, tool results.
 //!
 //! Each event triggers:
-//!   1. `apply_*` — mutate task state, collect [`TaskEvent`]s from the state machine.
+//!   1. `apply_*` — mutate task state, collect [`ThreadEvent`]s from the state machine.
 //!   2. `router.dispatch_events` — translate task events to wire events and broadcast.
 //!   3. `step_until_blocked` — keep calling `task.step()` until the task requests I/O
 //!      or pauses; pushes fresh I/O futures to the `FuturesUnordered`.
 //!
 //! Tasks-as-data discipline: state mutation happens exclusively in this module (via
-//! `task.step()` / `task.apply_io_result()`). No other code path writes to a Task.
+//! `task.step()` / `task.apply_io_result()`). No other code path writes to a Thread.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -38,11 +38,11 @@ use crate::model::ModelProvider;
 use crate::persist::Persister;
 use crate::resources::{BackendId, McpHostId, ResourceRegistry, SandboxId};
 use crate::sandbox::{SandboxHandle, SandboxProvider};
-use crate::task::{
-    ApprovalDisposition, IoResult, OpId, StepOutcome, Task, TaskInternalState, derive_title,
+use crate::thread::{
+    ApprovalDisposition, IoResult, OpId, StepOutcome, Thread, ThreadInternalState, derive_title,
     new_task_id,
 };
-use crate::task_router::TaskEventRouter;
+use crate::thread_router::ThreadEventRouter;
 
 pub type ConnId = u64;
 
@@ -109,10 +109,10 @@ pub struct Scheduler {
     persister: Option<Persister>,
     sandbox_provider: Arc<dyn SandboxProvider>,
 
-    tasks: HashMap<String, Task>,
+    tasks: HashMap<String, Thread>,
     /// Owns the connection registry, subscription map, audit log, and the
-    /// `TaskEvent → ServerToClient` translation layer.
-    router: TaskEventRouter,
+    /// `ThreadEvent → ServerToClient` translation layer.
+    router: ThreadEventRouter,
 
     /// Per-task MCP host pool. Index 0 of each pool's `sessions` vec is the
     /// task's primary (sandbox-provisioned filesystem); index 1.. are clones
@@ -133,7 +133,7 @@ pub struct Scheduler {
     /// Phase 1a shadow registry — populated alongside the per-task plumbing
     /// above, never read by the I/O dispatch path. Phase 1b exposes it on the
     /// wire; later phases promote it to the source of truth and the per-task
-    /// fields above go away. See `docs/design_session_thread_scheduler.md`.
+    /// fields above go away. See `docs/design_pod_thread_scheduler.md`.
     resources: ResourceRegistry,
 
     next_op_id: OpId,
@@ -182,7 +182,7 @@ impl Scheduler {
             persister: None,
             sandbox_provider,
             tasks: HashMap::new(),
-            router: TaskEventRouter::new(audit, host_id),
+            router: ThreadEventRouter::new(audit, host_id),
             mcp_pools: HashMap::new(),
             sandbox_handles: HashMap::new(),
             shared_hosts,
@@ -241,7 +241,7 @@ impl Scheduler {
 
     /// Returns the backend name the task is configured to use, falling back to the
     /// server's default if the task left it empty. Does NOT validate existence.
-    pub(crate) fn resolve_backend_name<'a>(&'a self, task: &'a Task) -> &'a str {
+    pub(crate) fn resolve_backend_name<'a>(&'a self, task: &'a Thread) -> &'a str {
         if task.config.backend.is_empty() {
             &self.default_backend
         } else {
@@ -251,7 +251,7 @@ impl Scheduler {
 
     // ---------- Read-only accessors used by `io_dispatch` ----------
 
-    pub(crate) fn task(&self, task_id: &str) -> Option<&Task> {
+    pub(crate) fn task(&self, task_id: &str) -> Option<&Thread> {
         self.tasks.get(task_id)
     }
 
@@ -289,7 +289,7 @@ impl Scheduler {
 
     /// Seed the scheduler with previously-persisted tasks. The persister should have
     /// already transitioned any in-flight internal states to Failed before handoff.
-    pub fn load_tasks(&mut self, tasks: Vec<Task>) {
+    pub fn load_tasks(&mut self, tasks: Vec<Thread>) {
         for task in tasks {
             // Phase 1a: mirror the registry registrations that create_task
             // would have done. Per-task primary MCP + sandbox entries don't
@@ -622,7 +622,7 @@ impl Scheduler {
             }
         }
         let task_id = new_task_id();
-        let task = Task::new(task_id.clone(), config);
+        let task = Thread::new(task_id.clone(), config);
         let summary = task.summary();
         self.tasks.insert(task_id.clone(), task);
 
@@ -921,8 +921,8 @@ impl Scheduler {
 
 /// Build the `TaskPendingApproval` events that a newly-subscribed client needs to
 /// render the approval UI. Returns empty if the task isn't in AwaitingApproval.
-fn pending_approvals_of(task: &Task) -> Vec<ServerToClient> {
-    let TaskInternalState::AwaitingApproval {
+fn pending_approvals_of(task: &Thread) -> Vec<ServerToClient> {
+    let ThreadInternalState::AwaitingApproval {
         tool_uses,
         dispositions,
     } = &task.internal
