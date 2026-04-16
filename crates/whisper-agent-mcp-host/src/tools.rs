@@ -152,7 +152,13 @@ async fn read_file(workspace: &Arc<Workspace>, args: Value) -> CallToolResult {
 fn write_file_descriptor() -> Tool {
     Tool {
         name: "write_file".into(),
-        description: "Write UTF-8 text to a file within the workspace, creating parent directories as needed. Overwrites if the file exists.".into(),
+        description: "Write UTF-8 text to a file within the workspace, creating parent \
+                      directories as needed. Overwrites if the file exists. Prefer \
+                      `edit_file` for changes to an existing file — it's much cheaper than \
+                      rewriting. Use `write_file` only to create a new file or fully rewrite \
+                      one. Do NOT create Markdown (*.md) or README files unless the user \
+                      explicitly asks."
+            .into(),
         input_schema: json!({
             "type": "object",
             "properties": {
@@ -368,7 +374,11 @@ fn bash_descriptor() -> Tool {
         name: "bash".into(),
         description: "Run a bash command within the workspace. Returns stdout and stderr \
                       merged in shell-emission order; on non-zero exit the first line is \
-                      `Exit code <N>`. Large outputs are head-truncated with a marker."
+                      `Exit code <N>`. Large outputs are head-truncated with a marker. \
+                      Do NOT use bash for tasks that have a dedicated tool: `read_file` (not \
+                      cat/head/tail), `edit_file` (not sed/awk), `write_file` (not echo >/\
+                      heredoc), `grep` (not grep/rg), `glob` (not find), `list_dir` (not ls). \
+                      Reserve bash for builds, tests, git, and other shell-only operations."
             .into(),
         input_schema: json!({
             "type": "object",
