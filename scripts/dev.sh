@@ -14,11 +14,13 @@
 #   SANDBOX           default: $REPO_ROOT/sandbox
 #   LISTEN_SERVER     default: 127.0.0.1:8080
 #   LISTEN_SANDBOX    default: 127.0.0.1:9810  (sandbox daemon)
+#   LISTEN_FETCH      default: 127.0.0.1:9830  (web-fetch MCP daemon)
 #   LISTEN_MCP        default: 127.0.0.1:8800  (standalone MCP, --no-sandbox only)
 #
 # Flags:
 #   --skip-wasm       skip the wasm-pack build (use when only Rust code changed)
 #   --no-sandbox      use a single shared MCP host instead of the sandbox daemon
+#   --no-fetch        skip starting the web-fetch daemon (no `web_fetch` tool)
 
 set -euo pipefail
 
@@ -29,14 +31,17 @@ cd "$REPO_ROOT"
 SANDBOX="${SANDBOX:-$REPO_ROOT/sandbox}"
 LISTEN_SERVER="${LISTEN_SERVER:-127.0.0.1:8080}"
 LISTEN_SANDBOX="${LISTEN_SANDBOX:-127.0.0.1:9810}"
+LISTEN_FETCH="${LISTEN_FETCH:-127.0.0.1:9830}"
 LISTEN_MCP="${LISTEN_MCP:-127.0.0.1:8800}"
 
 SKIP_WASM=0
 USE_SANDBOX=1
+USE_FETCH=1
 for arg in "$@"; do
     case "$arg" in
         --skip-wasm)    SKIP_WASM=1 ;;
         --no-sandbox)   USE_SANDBOX=0 ;;
+        --no-fetch)     USE_FETCH=0 ;;
         -h|--help)
             sed -n '2,/^$/p' "$0" | sed 's/^# \{0,1\}//'
             exit 0
@@ -59,6 +64,9 @@ mkdir -p "$SANDBOX"
 PACKAGES="-p whisper-agent -p whisper-agent-mcp-host"
 if [[ "$USE_SANDBOX" -eq 1 ]]; then
     PACKAGES="$PACKAGES -p whisper-agent-sandbox"
+fi
+if [[ "$USE_FETCH" -eq 1 ]]; then
+    PACKAGES="$PACKAGES -p whisper-agent-mcp-fetch"
 fi
 
 echo "==> building ($PACKAGES) (release)"
@@ -86,6 +94,25 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
+SHARED_HOST_ARGS=()
+if [[ "$USE_FETCH" -eq 1 ]]; then
+    echo "==> starting whisper-agent-mcp-fetch on $LISTEN_FETCH"
+    "$REPO_ROOT/target/release/whisper-agent-mcp-fetch" \
+        --listen "$LISTEN_FETCH" &
+    CHILD_PIDS+=($!)
+
+    # Wait for fetch daemon to accept connections (cheap MCP ping).
+    for _ in $(seq 1 20); do
+        if curl -sf -X POST "http://$LISTEN_FETCH/mcp" \
+            -H 'content-type: application/json' \
+            -d '{"jsonrpc":"2.0","id":1,"method":"ping"}' > /dev/null 2>&1
+        then break; fi
+        sleep 0.25
+    done
+
+    SHARED_HOST_ARGS+=(--shared-mcp-host "fetch=http://$LISTEN_FETCH/mcp")
+fi
+
 if [[ "$USE_SANDBOX" -eq 1 ]]; then
     # ---------- Sandboxed mode ----------
     echo "==> starting whisper-agent-sandbox on $LISTEN_SANDBOX"
@@ -107,7 +134,8 @@ if [[ "$USE_SANDBOX" -eq 1 ]]; then
         --sandbox-daemon-url "http://$LISTEN_SANDBOX" \
         --sandbox-workspace "$SANDBOX" \
         --audit-log "$SANDBOX/audit.jsonl" \
-        --state-dir "$SANDBOX/tasks"
+        --state-dir "$SANDBOX/tasks" \
+        "${SHARED_HOST_ARGS[@]}"
 else
     # ---------- Standalone MCP host mode (legacy) ----------
     echo "==> starting whisper-agent-mcp-host on $LISTEN_MCP (workspace=$SANDBOX)"
@@ -135,5 +163,6 @@ else
         --config "$REPO_ROOT/whisper-agent.toml" \
         --mcp-host-url "http://$LISTEN_MCP/mcp" \
         --audit-log "$SANDBOX/audit.jsonl" \
-        --state-dir "$SANDBOX/tasks"
+        --state-dir "$SANDBOX/tasks" \
+        "${SHARED_HOST_ARGS[@]}"
 fi

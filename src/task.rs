@@ -187,7 +187,13 @@ pub enum IoResult {
         sandbox_handle: Option<Box<dyn crate::sandbox::SandboxHandle>>,
     },
     McpConnect(Result<(), String>),
-    ListToolsSuccess { tools: Vec<crate::mcp::ToolDescriptor> },
+    ListToolsSuccess {
+        tools: Vec<crate::mcp::ToolDescriptor>,
+        /// `tool_name → index into the task's pool sessions vec`. Scheduler-
+        /// internal — peeled off in apply_io_completion before the task sees
+        /// the result.
+        routing: std::collections::HashMap<String, usize>,
+    },
     ListTools(Result<(), String>),
     ModelCall(Result<ModelResponse, String>),
     ToolCall {
@@ -1120,6 +1126,7 @@ mod tests {
             max_turns: 10,
             approval_policy: ApprovalPolicy::PromptDestructive,
             sandbox: Default::default(),
+            shared_mcp_hosts: Vec::new(),
         };
         let mut task = Task::new("t1".into(), cfg);
         let tool_uses: Vec<ToolUseReq> = tool_names

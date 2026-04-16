@@ -73,6 +73,14 @@ pub struct TaskConfig {
     pub approval_policy: ApprovalPolicy,
     #[serde(default)]
     pub sandbox: SandboxSpec,
+    /// Names of shared MCP hosts (from the server's catalog) this task is
+    /// allowed to use. Empty list = no shared hosts; the task only sees its
+    /// own per-task primary (filesystem). The server's `default_task_config`
+    /// fills this with every configured host so fresh tasks default to full
+    /// access; persisted tasks from before this field deserialize as empty,
+    /// which is the safe default (no sudden new tool access).
+    #[serde(default)]
+    pub shared_mcp_hosts: Vec<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
@@ -93,6 +101,11 @@ pub struct TaskConfigOverride {
     pub approval_policy: Option<ApprovalPolicy>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sandbox: Option<SandboxSpec>,
+    /// Per-task override for the shared MCP host allowlist. None = inherit
+    /// from `default_task_config`; `Some(vec)` = use exactly this set (empty
+    /// vec means "deny all shared hosts").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shared_mcp_hosts: Option<Vec<String>>,
 }
 
 /// Pattern-1 approval policy. See `docs/design_permissions.md`.

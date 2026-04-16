@@ -16,7 +16,7 @@ use whisper_agent::audit::AuditLog;
 use whisper_agent::config::Config;
 use whisper_agent::mcp::McpSession;
 use whisper_agent::sandbox::{BareMetal, DaemonClient};
-use whisper_agent::scheduler::BackendEntry;
+use whisper_agent::scheduler::{BackendEntry, SharedHostConfig};
 use whisper_agent::server::{self, ServerConfig};
 use whisper_agent::turn::{self, TurnConfig};
 
@@ -132,6 +132,32 @@ struct ServeArgs {
     /// as read-only if they exist. Requires --sandbox-daemon-url.
     #[arg(long)]
     sandbox_workspace: Option<PathBuf>,
+
+    /// Register a singleton MCP host the scheduler should connect to at
+    /// startup. Format: `name=url`. Repeatable. Tasks opt in by listing the
+    /// names in their `shared_mcp_hosts` field; the server's
+    /// `default_task_config` includes every name configured here, so fresh
+    /// tasks default to using all of them.
+    ///
+    /// Example: `--shared-mcp-host fetch=http://127.0.0.1:9830/mcp`.
+    /// Also configurable in TOML: `[shared_mcp_hosts] fetch = "http://..."`.
+    #[arg(long = "shared-mcp-host", value_parser = parse_shared_host_arg)]
+    shared_mcp_hosts: Vec<(String, String)>,
+}
+
+/// Parse a `name=url` pair for `--shared-mcp-host`. Names must be non-empty
+/// and free of `=` so future syntax extensions stay possible.
+fn parse_shared_host_arg(s: &str) -> Result<(String, String), String> {
+    let (name, url) = s
+        .split_once('=')
+        .ok_or_else(|| "expected `name=url`".to_string())?;
+    if name.is_empty() {
+        return Err("name must be non-empty".into());
+    }
+    if url.is_empty() {
+        return Err("url must be non-empty".into());
+    }
+    Ok((name.to_string(), url.to_string()))
 }
 
 #[derive(Parser, Debug)]
@@ -195,9 +221,10 @@ async fn run_serve(args: ServeArgs) -> Result<()> {
         Some(args.state_dir)
     };
 
-    // Resolve the backend catalog: either a TOML config or a synthesized
-    // single-anthropic-entry fallback from legacy flags.
-    let (backends, default_backend, default_model) = match &args.config {
+    // Resolve the backend catalog and shared-host map. Either source can come
+    // from a TOML config; CLI --shared-mcp-host flags layer on top (CLI wins
+    // on name conflict).
+    let (backends, default_backend, default_model, mut shared_host_map) = match &args.config {
         Some(path) => {
             let cfg = Config::load(path).await?;
             let default_model = cfg
@@ -221,7 +248,12 @@ async fn run_serve(args: ServeArgs) -> Result<()> {
                     },
                 );
             }
-            (map, cfg.default_backend, default_model)
+            (
+                map,
+                cfg.default_backend,
+                default_model,
+                cfg.shared_mcp_hosts.into_iter().collect::<HashMap<_, _>>(),
+            )
         }
         None => {
             let key = args.anthropic_api_key.clone().ok_or_else(|| {
@@ -238,9 +270,26 @@ async fn run_serve(args: ServeArgs) -> Result<()> {
                     default_model: Some(args.model.clone()),
                 },
             );
-            (map, DEFAULT_BACKEND_NAME.into(), args.model.clone())
+            (
+                map,
+                DEFAULT_BACKEND_NAME.into(),
+                args.model.clone(),
+                HashMap::new(),
+            )
         }
     };
+    for (name, url) in args.shared_mcp_hosts {
+        shared_host_map.insert(name, url);
+    }
+    let mut shared_mcp_hosts: Vec<SharedHostConfig> = shared_host_map
+        .into_iter()
+        .map(|(name, url)| SharedHostConfig { name, url })
+        .collect();
+    // Stable order so log output and the default_task_config list don't
+    // depend on HashMap iteration order.
+    shared_mcp_hosts.sort_by(|a, b| a.name.cmp(&b.name));
+    let default_shared_host_names: Vec<String> =
+        shared_mcp_hosts.iter().map(|h| h.name.clone()).collect();
 
     let server_config = ServerConfig {
         backends,
@@ -258,6 +307,7 @@ async fn run_serve(args: ServeArgs) -> Result<()> {
                 ApprovalPolicy::AutoApproveAll
             },
             sandbox: build_default_sandbox(&args.sandbox_workspace),
+            shared_mcp_hosts: default_shared_host_names,
         },
         audit_log_path: args.audit_log,
         host_id: "default".into(),
@@ -266,6 +316,7 @@ async fn run_serve(args: ServeArgs) -> Result<()> {
             Some(url) => Arc::new(DaemonClient::new(url)),
             None => Arc::new(BareMetal),
         },
+        shared_mcp_hosts,
     };
     server::serve(args.listen, server_config).await
 }

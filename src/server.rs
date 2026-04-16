@@ -36,7 +36,7 @@ use whisper_agent_protocol::{ServerToClient, TaskConfig, decode_from_client, enc
 
 use crate::audit::AuditLog;
 use crate::persist::Persister;
-use crate::scheduler::{BackendEntry, ConnId, Scheduler, SchedulerMsg};
+use crate::scheduler::{BackendEntry, ConnId, Scheduler, SchedulerMsg, SharedHostConfig};
 
 const WEBUI_PKG_DIR: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
@@ -62,6 +62,9 @@ pub struct ServerConfig {
     /// Directory for JSON-per-task persistence. If `None`, persistence is disabled.
     pub state_dir: Option<PathBuf>,
     pub sandbox_provider: std::sync::Arc<dyn crate::sandbox::SandboxProvider>,
+    /// Catalog of shared (singleton) MCP hosts the scheduler connects to at
+    /// startup. Tasks opt in by name via `TaskConfig.shared_mcp_hosts`.
+    pub shared_mcp_hosts: Vec<SharedHostConfig>,
 }
 
 #[derive(Clone)]
@@ -93,7 +96,10 @@ pub async fn serve(listen: SocketAddr, config: ServerConfig) -> anyhow::Result<(
         config.default_backend,
         audit,
         config.sandbox_provider,
-    );
+        config.shared_mcp_hosts,
+    )
+    .await
+    .context("scheduler init")?;
 
     if let Some(state_dir) = config.state_dir {
         let persister = Persister::new(state_dir.clone())

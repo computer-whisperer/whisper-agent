@@ -75,6 +75,29 @@ pub struct BackendEntry {
     pub default_model: Option<String>,
 }
 
+/// Entry in the scheduler's shared-MCP-host catalog. Configured at server
+/// start; one connection per host shared across all tasks that opt in via
+/// `TaskConfig.shared_mcp_hosts`.
+#[derive(Debug, Clone)]
+pub struct SharedHostConfig {
+    /// Stable name; what `TaskConfig.shared_mcp_hosts` references.
+    pub name: String,
+    /// MCP endpoint URL (typically `http://127.0.0.1:9830/mcp`).
+    pub url: String,
+}
+
+/// Per-task bundle of MCP sessions. Routing is built from the merged
+/// `tools/list` response across every session in the pool — primary first so
+/// its tool names win on collision. Empty `routing` means `tools/list` hasn't
+/// completed yet.
+struct McpPool {
+    /// Session 0 is the per-task primary (sandbox MCP). Sessions 1.. are
+    /// clones of shared singletons selected by the task's allowlist.
+    sessions: Vec<Arc<McpSession>>,
+    /// `tool_name -> sessions index`. Filled when `ListToolsSuccess` lands.
+    routing: HashMap<String, usize>,
+}
+
 pub struct Scheduler {
     default_config: TaskConfig,
     host_id: String,
@@ -90,8 +113,16 @@ pub struct Scheduler {
     clients: HashMap<ConnId, mpsc::UnboundedSender<ServerToClient>>,
     subscriptions: HashMap<String, HashSet<ConnId>>,
 
-    mcp_sessions: HashMap<String, Arc<McpSession>>,
+    /// Per-task MCP host pool. Index 0 of each pool's `sessions` vec is the
+    /// task's primary (sandbox-provisioned filesystem); index 1.. are clones
+    /// of `shared_hosts` Arcs filtered by the task's `shared_mcp_hosts`
+    /// allowlist.
+    mcp_pools: HashMap<String, McpPool>,
     sandbox_handles: HashMap<String, Box<dyn SandboxHandle>>,
+    /// Connections to shared (singleton) MCP hosts, keyed by name. Connected
+    /// once at scheduler start. Tasks reference these by name via
+    /// `TaskConfig.shared_mcp_hosts`.
+    shared_hosts: HashMap<String, Arc<McpSession>>,
     /// Per-task tool catalog from the last `tools/list`. Stored in MCP shape (with
     /// annotations) so the approval layer can consult `read_only_hint` /
     /// `destructive_hint` at dispatch time; we convert to Anthropic shape on-demand
@@ -105,19 +136,33 @@ pub struct Scheduler {
 }
 
 impl Scheduler {
-    pub fn new(
+    /// Async because we eagerly connect to every configured shared MCP host at
+    /// startup — surfacing misconfiguration at server boot rather than at first
+    /// task creation. Returns Err if any shared host fails to handshake.
+    pub async fn new(
         default_config: TaskConfig,
         host_id: String,
         backends: HashMap<String, BackendEntry>,
         default_backend: String,
         audit: AuditLog,
         sandbox_provider: Arc<dyn SandboxProvider>,
-    ) -> Self {
+        shared_host_configs: Vec<SharedHostConfig>,
+    ) -> anyhow::Result<Self> {
         assert!(
             backends.contains_key(&default_backend),
             "default_backend must be in backends"
         );
-        Self {
+
+        let mut shared_hosts: HashMap<String, Arc<McpSession>> = HashMap::new();
+        for cfg in shared_host_configs {
+            info!(name = %cfg.name, url = %cfg.url, "connecting to shared MCP host");
+            let session = McpSession::connect(&cfg.url).await.map_err(|e| {
+                anyhow::anyhow!("shared MCP host `{}` ({}): {e}", cfg.name, cfg.url)
+            })?;
+            shared_hosts.insert(cfg.name, Arc::new(session));
+        }
+
+        Ok(Self {
             default_config,
             host_id,
             backends,
@@ -128,12 +173,13 @@ impl Scheduler {
             tasks: HashMap::new(),
             clients: HashMap::new(),
             subscriptions: HashMap::new(),
-            mcp_sessions: HashMap::new(),
+            mcp_pools: HashMap::new(),
             sandbox_handles: HashMap::new(),
+            shared_hosts,
             tool_descriptors: HashMap::new(),
             next_op_id: 1,
             dirty: HashSet::new(),
-        }
+        })
     }
 
     /// Returns the backend name the task is configured to use, falling back to the
@@ -212,10 +258,24 @@ impl Scheduler {
                 initial_message,
                 config_override,
             } => {
-                let task_id = self.create_task(conn_id, correlation_id, config_override);
-                self.mark_dirty(&task_id);
-                self.send_user_message(&task_id, initial_message);
-                self.step_until_blocked(&task_id, pending_io);
+                match self.create_task(conn_id, correlation_id.clone(), config_override) {
+                    Ok(task_id) => {
+                        self.mark_dirty(&task_id);
+                        self.send_user_message(&task_id, initial_message);
+                        self.step_until_blocked(&task_id, pending_io);
+                    }
+                    Err(e) => {
+                        warn!(error = %e, conn_id, "create_task rejected");
+                        self.send_to_client(
+                            conn_id,
+                            ServerToClient::Error {
+                                correlation_id,
+                                task_id: None,
+                                message: format!("create_task: {e}"),
+                            },
+                        );
+                    }
+                }
             }
             ClientToServer::SendUserMessage { task_id, text } => {
                 if self.tasks.contains_key(&task_id) {
@@ -436,8 +496,20 @@ impl Scheduler {
         requester: ConnId,
         correlation_id: Option<String>,
         config_override: Option<TaskConfigOverride>,
-    ) -> String {
+    ) -> Result<String, String> {
         let config = apply_override(self.default_config.clone(), config_override);
+        // Validate shared MCP host names — fresh tasks must reference only
+        // hosts that are actually configured. (Persisted tasks loaded from
+        // disk may legitimately reference hosts that have since been removed
+        // — those get warn-skipped at pool-build time, see McpConnectSuccess.)
+        for name in &config.shared_mcp_hosts {
+            if !self.shared_hosts.contains_key(name) {
+                return Err(format!(
+                    "unknown shared MCP host `{name}`; configured: [{}]",
+                    self.shared_hosts.keys().cloned().collect::<Vec<_>>().join(", ")
+                ));
+            }
+        }
         let task_id = new_task_id();
         let task = Task::new(task_id.clone(), config);
         let summary = task.summary();
@@ -470,7 +542,7 @@ impl Scheduler {
                 correlation_id: None,
             });
         }
-        task_id
+        Ok(task_id)
     }
 
     fn send_user_message(&mut self, task_id: &str, text: String) {
@@ -493,7 +565,7 @@ impl Scheduler {
             });
         }
 
-        let mcp_connected = self.mcp_sessions.contains_key(task_id);
+        let mcp_connected = self.mcp_pools.contains_key(task_id);
         let tools_listed = self.tool_descriptors.contains_key(task_id);
         let new_state = {
             let task = self.tasks.get_mut(task_id).expect("task exists");
@@ -531,18 +603,43 @@ impl Scheduler {
             _ => {}
         }
 
-        // Handle IoResult::McpConnect specially because the session Arc needs to be
-        // installed on the scheduler, not the task. We fish it out before calling
-        // into the task's apply_io_result.
+        // Handle IoResult::McpConnect / ListTools specially because the
+        // session Arcs and routing map are scheduler-owned resources that
+        // get peeled off before the task sees the slim variant.
         let result = match result {
             IoResult::McpConnectSuccess { session, sandbox_handle } => {
-                self.mcp_sessions.insert(task_id.clone(), session);
+                // Build the task's pool: primary first, then shared singletons
+                // selected by the task's allowlist. Unknown names are warn-skipped
+                // — they shouldn't survive create_task validation, but a persisted
+                // task whose host was removed since save lands here.
+                let allow = self
+                    .tasks
+                    .get(&task_id)
+                    .map(|t| t.config.shared_mcp_hosts.clone())
+                    .unwrap_or_default();
+                let mut sessions = vec![session];
+                for name in &allow {
+                    match self.shared_hosts.get(name) {
+                        Some(s) => sessions.push(s.clone()),
+                        None => warn!(
+                            %task_id, host = %name,
+                            "task references unknown shared MCP host (skipping)",
+                        ),
+                    }
+                }
+                self.mcp_pools.insert(
+                    task_id.clone(),
+                    McpPool { sessions, routing: HashMap::new() },
+                );
                 if let Some(handle) = sandbox_handle {
                     self.sandbox_handles.insert(task_id.clone(), handle);
                 }
                 IoResult::McpConnect(Ok(()))
             }
-            IoResult::ListToolsSuccess { tools } => {
+            IoResult::ListToolsSuccess { tools, routing } => {
+                if let Some(pool) = self.mcp_pools.get_mut(&task_id) {
+                    pool.routing = routing;
+                }
                 self.tool_descriptors.insert(task_id.clone(), tools);
                 IoResult::ListTools(Ok(()))
             }
@@ -651,23 +748,46 @@ impl Scheduler {
                 })
             }
             IoRequest::ListTools { op_id } => {
-                let mcp = self
-                    .mcp_sessions
+                let sessions: Vec<Arc<McpSession>> = self
+                    .mcp_pools
                     .get(&task_id)
-                    .cloned()
-                    .expect("mcp session present before ListTools");
+                    .map(|p| p.sessions.clone())
+                    .expect("mcp pool present before ListTools");
                 Box::pin(async move {
-                    match mcp.list_tools().await {
-                        Ok(tools) => IoCompletion {
-                            task_id,
-                            op_id,
-                            result: IoResult::ListToolsSuccess { tools },
-                        },
-                        Err(e) => IoCompletion {
-                            task_id,
-                            op_id,
-                            result: IoResult::ListTools(Err(e.to_string())),
-                        },
+                    let mut all_tools: Vec<McpTool> = Vec::new();
+                    let mut routing: HashMap<String, usize> = HashMap::new();
+                    for (idx, session) in sessions.iter().enumerate() {
+                        match session.list_tools().await {
+                            Ok(tools) => {
+                                for tool in tools {
+                                    if let Some(prev) = routing.get(&tool.name) {
+                                        // Earlier session wins (primary first).
+                                        warn!(
+                                            %task_id, op_id, name = %tool.name,
+                                            kept_idx = prev, dropped_idx = idx,
+                                            "tool name collision across MCP sessions; dropping later"
+                                        );
+                                        continue;
+                                    }
+                                    routing.insert(tool.name.clone(), idx);
+                                    all_tools.push(tool);
+                                }
+                            }
+                            Err(e) => {
+                                return IoCompletion {
+                                    task_id,
+                                    op_id,
+                                    result: IoResult::ListTools(Err(format!(
+                                        "session {idx}: {e}"
+                                    ))),
+                                };
+                            }
+                        }
+                    }
+                    IoCompletion {
+                        task_id,
+                        op_id,
+                        result: IoResult::ListToolsSuccess { tools: all_tools, routing },
                     }
                 })
             }
@@ -714,11 +834,18 @@ impl Scheduler {
                 })
             }
             IoRequest::ToolCall { op_id, tool_use_id, name, input } => {
+                // Route to whichever pool session contributed this tool. Falls
+                // back to the primary if routing wasn't filled in (shouldn't
+                // happen because ToolCall always follows a successful ListTools,
+                // but we'd rather try than panic).
                 let mcp = self
-                    .mcp_sessions
+                    .mcp_pools
                     .get(&task_id)
-                    .cloned()
-                    .expect("mcp session present before ToolCall");
+                    .and_then(|p| {
+                        let idx = *p.routing.get(&name).unwrap_or(&0);
+                        p.sessions.get(idx).cloned()
+                    })
+                    .expect("mcp pool present before ToolCall");
                 Box::pin(async move {
                     let result = match mcp.invoke(&name, input).await {
                         Ok(mut stream) => {
@@ -792,6 +919,10 @@ impl Scheduler {
                 TaskStateLabel::Failed | TaskStateLabel::Cancelled
             ));
         if is_terminal {
+            // Pool's primary session points at the sandbox MCP host that's
+            // about to die. Drop the pool too — shared session Arcs survive
+            // because `self.shared_hosts` still holds them.
+            self.mcp_pools.remove(task_id);
             if let Some(mut handle) = self.sandbox_handles.remove(task_id) {
                 let tid = task_id.to_string();
                 tokio::spawn(async move {
@@ -1096,6 +1227,7 @@ fn apply_override(base: TaskConfig, ov: Option<TaskConfigOverride>) -> TaskConfi
         max_turns: ov.max_turns.unwrap_or(base.max_turns),
         approval_policy: ov.approval_policy.unwrap_or(base.approval_policy),
         sandbox: ov.sandbox.unwrap_or(base.sandbox),
+        shared_mcp_hosts: ov.shared_mcp_hosts.unwrap_or(base.shared_mcp_hosts),
     }
 }
 

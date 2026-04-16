@@ -43,6 +43,11 @@ pub struct Config {
     pub default_backend: String,
     #[serde(default)]
     pub backends: BTreeMap<String, BackendConfig>,
+    /// Optional `[shared_mcp_hosts]` table mapping name → url. CLI-provided
+    /// `--shared-mcp-host` flags are merged with these (CLI wins on name
+    /// conflict).
+    #[serde(default)]
+    pub shared_mcp_hosts: BTreeMap<String, String>,
 }
 
 #[derive(Deserialize, Debug, Clone)]
