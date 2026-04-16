@@ -8,7 +8,6 @@ use tokio::net::TcpListener;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
-mod protocol;
 mod server;
 mod tools;
 mod workspace;

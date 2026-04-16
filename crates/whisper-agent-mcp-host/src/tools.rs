@@ -15,7 +15,8 @@ use serde_json::{Value, json};
 use tokio::process::Command;
 use tokio::time::timeout;
 
-use crate::protocol::{CallToolResult, Tool, ToolAnnotations};
+use whisper_agent_mcp_proto::{CallToolResult, Tool, ToolAnnotations};
+
 use crate::workspace::Workspace;
 
 pub fn descriptors() -> Vec<Tool> {

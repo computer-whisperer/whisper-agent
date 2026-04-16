@@ -1,6 +1,11 @@
-//! MCP and JSON-RPC types. Hand-rolled for the subset we need.
+//! MCP and JSON-RPC types shared by whisper-agent's MCP servers.
 //!
 //! Spec: <https://modelcontextprotocol.io/specification/2025-06-18>
+//!
+//! Hand-rolled for the subset whisper-agent actually exercises. Both
+//! `whisper-agent-mcp-host` (per-task filesystem tools) and
+//! `whisper-agent-mcp-fetch` (singleton web-fetch) speak this wire format,
+//! so the types live here rather than being duplicated.
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -53,7 +58,7 @@ impl JsonRpcResponse {
     }
 }
 
-// Standard JSON-RPC error codes (the subset we currently emit).
+/// Standard JSON-RPC error codes (the subset we currently emit).
 pub mod error_codes {
     pub const INVALID_REQUEST: i32 = -32600;
     pub const METHOD_NOT_FOUND: i32 = -32601;

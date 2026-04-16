@@ -1,8 +1,6 @@
 //! HTTP server: single POST endpoint at `/mcp` dispatching JSON-RPC method names.
-//!
-//! Streamable-HTTP allows the server to respond with either a single JSON body or an SSE
-//! stream. For MVP we always respond with JSON since none of the tools stream output yet.
-//! No GET endpoint, no `Mcp-Session-Id` enforcement: the server is stateless across requests.
+//! Mirrors the shape of `whisper-agent-mcp-host` so the scheduler can talk to
+//! both with the same client.
 
 use std::sync::Arc;
 
@@ -22,12 +20,11 @@ use whisper_agent_mcp_proto::{
     error_codes,
 };
 
-use crate::tools;
-use crate::workspace::Workspace;
+use crate::tools::{self, FetchConfig};
 
 #[derive(Clone)]
 pub struct AppState {
-    pub workspace: Arc<Workspace>,
+    pub cfg: Arc<FetchConfig>,
 }
 
 pub fn router(state: AppState) -> Router {
@@ -49,7 +46,6 @@ async fn handle_post(State(state): State<AppState>, Json(req): Json<JsonRpcReque
         .into_response();
     }
 
-    // Notifications carry no id and expect no response (RFC). Return 202 Accepted.
     if req.id.is_none() {
         debug!(method = %req.method, "notification (no response)");
         return StatusCode::ACCEPTED.into_response();
@@ -58,7 +54,7 @@ async fn handle_post(State(state): State<AppState>, Json(req): Json<JsonRpcReque
     let id = req.id.unwrap();
     let response = match req.method.as_str() {
         "initialize" => initialize(id, req.params),
-        "tools/list" => list_tools(id, &state),
+        "tools/list" => list_tools(id),
         "tools/call" => call_tool(id, &state, req.params).await,
         "ping" => JsonRpcResponse::success(id, json!({})),
         other => {
@@ -76,17 +72,13 @@ async fn handle_post(State(state): State<AppState>, Json(req): Json<JsonRpcReque
 fn initialize(id: Value, params: Option<Value>) -> JsonRpcResponse {
     let parsed: Result<InitializeParams, _> =
         serde_json::from_value(params.unwrap_or(Value::Null));
-    let _client_protocol = match parsed {
-        Ok(p) => p.protocol_version,
-        Err(e) => {
-            return JsonRpcResponse::error(
-                id,
-                error_codes::INVALID_PARAMS,
-                format!("initialize params: {e}"),
-            );
-        }
-    };
-
+    if let Err(e) = parsed {
+        return JsonRpcResponse::error(
+            id,
+            error_codes::INVALID_PARAMS,
+            format!("initialize params: {e}"),
+        );
+    }
     let result = InitializeResult {
         protocol_version: PROTOCOL_VERSION,
         capabilities: ServerCapabilities {
@@ -97,13 +89,13 @@ fn initialize(id: Value, params: Option<Value>) -> JsonRpcResponse {
             version: env!("CARGO_PKG_VERSION").into(),
         },
         instructions: Some(
-            "Workspace-confined POSIX tools: read_file, write_file, bash. Paths are relative to the configured workspace root.".into(),
+            "Web fetch over http(s) with SSRF, size, timeout, and redirect caps.".into(),
         ),
     };
     JsonRpcResponse::success(id, serde_json::to_value(result).unwrap())
 }
 
-fn list_tools(id: Value, _state: &AppState) -> JsonRpcResponse {
+fn list_tools(id: Value) -> JsonRpcResponse {
     let result = ListToolsResult {
         tools: tools::descriptors(),
         next_cursor: None,
@@ -122,7 +114,7 @@ async fn call_tool(id: Value, state: &AppState, params: Option<Value>) -> JsonRp
             );
         }
     };
-    match tools::call(&state.workspace, &parsed.name, parsed.arguments).await {
+    match tools::call(&state.cfg, &parsed.name, parsed.arguments).await {
         Ok(result) => JsonRpcResponse::success(id, serde_json::to_value(result).unwrap()),
         Err(tools::ToolDispatchError::UnknownTool(name)) => JsonRpcResponse::error(
             id,
