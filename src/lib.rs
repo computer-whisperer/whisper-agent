@@ -11,6 +11,7 @@ pub mod mcp;
 pub mod model;
 pub mod openai_chat;
 pub mod persist;
+pub mod pod;
 pub mod resources;
 pub mod sandbox;
 pub mod scheduler;
