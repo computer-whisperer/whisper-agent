@@ -9,16 +9,18 @@ use tokio::sync::mpsc;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 use whisper_agent_protocol::sandbox::{AccessMode, NetworkPolicy, PathAccess, SandboxSpec};
-use whisper_agent_protocol::{ApprovalPolicy, Conversation, TaskConfig};
+use whisper_agent_protocol::{
+    ApprovalPolicy, ClientToServer, Role, ServerToClient, TaskConfig, TaskStateLabel,
+};
 
 use whisper_agent::anthropic::AnthropicClient;
 use whisper_agent::audit::AuditLog;
 use whisper_agent::config::Config;
-use whisper_agent::mcp::McpSession;
 use whisper_agent::sandbox::{BareMetal, DaemonClient};
-use whisper_agent::scheduler::{BackendEntry, SharedHostConfig};
+use whisper_agent::scheduler::{
+    self, BackendEntry, ConnId, Scheduler, SchedulerMsg, SharedHostConfig,
+};
 use whisper_agent::server::{self, ServerConfig};
-use whisper_agent::turn::{self, TurnConfig};
 
 const DEFAULT_SYSTEM_PROMPT: &str = "\
 You are a software engineering agent working in a workspace on the user's machine. Use the \
@@ -65,8 +67,8 @@ enum Command {
     /// Start the HTTP server: hosts the webui assets and drives the task scheduler.
     /// Clients subscribe to individual tasks via the multiplexed WebSocket protocol.
     Serve(ServeArgs),
-    /// One-shot CLI: run a single turn against a hard-coded prompt and exit.
-    /// Bypasses the task manager; uses [`turn::run`] directly.
+    /// One-shot CLI: drive a single task through the scheduler against a
+    /// hard-coded prompt and exit.
     Run(RunArgs),
 }
 
@@ -356,70 +358,169 @@ fn build_default_sandbox(workspace: &Option<PathBuf>) -> SandboxSpec {
 async fn run_one_shot(args: RunArgs) -> Result<()> {
     info!(model = %args.model, host = %args.mcp_host_url, "starting whisper-agent (one-shot)");
 
-    let task_id = pseudo_task_id();
-    let host_id = "default";
+    let backend_name = DEFAULT_BACKEND_NAME.to_string();
+    let mut backends = HashMap::new();
+    backends.insert(
+        backend_name.clone(),
+        BackendEntry {
+            provider: Arc::new(AnthropicClient::new(args.anthropic_api_key)),
+            kind: "anthropic".into(),
+            default_model: Some(args.model.clone()),
+        },
+    );
 
-    let anthropic = AnthropicClient::new(args.anthropic_api_key);
-    let mcp = McpSession::connect(&args.mcp_host_url)
-        .await
-        .with_context(|| format!("connect to MCP host {}", args.mcp_host_url))?;
     let audit = AuditLog::open(args.audit_log.clone())
         .await
         .with_context(|| format!("open audit log {}", args.audit_log.display()))?;
-    info!(audit_log = %audit.path().display(), task_id = %task_id, "audit log open");
+    info!(audit_log = %audit.path().display(), "audit log open");
 
-    let cfg = TurnConfig {
-        model: &args.model,
+    let task_config = TaskConfig {
+        backend: backend_name.clone(),
+        model: args.model.clone(),
+        system_prompt: args.system_prompt,
+        mcp_host_url: args.mcp_host_url,
         max_tokens: args.max_tokens,
-        system_prompt: &args.system_prompt,
-        task_id: &task_id,
-        host_id,
         max_turns: args.max_turns,
+        approval_policy: ApprovalPolicy::AutoApproveAll,
+        sandbox: SandboxSpec::None,
+        shared_mcp_hosts: Vec::new(),
     };
 
-    let mut conversation = Conversation::new();
-    // Drain events to stdout summary; not streaming live for the CLI path.
-    let (tx, mut rx) = mpsc::unbounded_channel();
-    let printer = tokio::spawn(async move {
-        while let Some(event) = rx.recv().await {
-            tracing::debug!(?event, "turn event");
-        }
-    });
-    let outcome = turn::run(
-        &cfg,
-        &anthropic,
-        &mcp,
-        &audit,
-        &mut conversation,
-        args.prompt,
-        Some(tx),
+    let scheduler = Scheduler::new(
+        task_config,
+        "default".into(),
+        backends,
+        backend_name,
+        audit,
+        Arc::new(BareMetal),
+        Vec::new(),
     )
     .await?;
-    let _ = printer.await;
+
+    let (inbox_tx, inbox_rx) = mpsc::unbounded_channel::<SchedulerMsg>();
+    let (outbound_tx, mut outbound_rx) = mpsc::unbounded_channel::<ServerToClient>();
+    let scheduler_handle = tokio::spawn(scheduler::run(scheduler, inbox_rx));
+
+    const CONN_ID: ConnId = 1;
+    inbox_tx
+        .send(SchedulerMsg::RegisterClient {
+            conn_id: CONN_ID,
+            outbound: outbound_tx,
+        })
+        .map_err(|_| anyhow!("scheduler inbox closed before registration"))?;
+    inbox_tx
+        .send(SchedulerMsg::ClientMessage {
+            conn_id: CONN_ID,
+            msg: ClientToServer::CreateTask {
+                correlation_id: Some("cli-one-shot".into()),
+                initial_message: args.prompt,
+                config_override: None,
+            },
+        })
+        .map_err(|_| anyhow!("scheduler inbox closed before create_task"))?;
+
+    let mut task_id: Option<String> = None;
+    let mut last_stop_reason: Option<String> = None;
+    let mut final_snapshot = None;
+    let mut last_error: Option<String> = None;
+
+    while let Some(event) = outbound_rx.recv().await {
+        match event {
+            ServerToClient::TaskCreated { task_id: tid, .. } => {
+                task_id = Some(tid.clone());
+                inbox_tx
+                    .send(SchedulerMsg::ClientMessage {
+                        conn_id: CONN_ID,
+                        msg: ClientToServer::SubscribeToTask { task_id: tid },
+                    })
+                    .map_err(|_| anyhow!("scheduler inbox closed"))?;
+            }
+            ServerToClient::TaskAssistantEnd { stop_reason, .. } => {
+                last_stop_reason = stop_reason;
+            }
+            ServerToClient::Error { message, .. } => {
+                last_error = Some(message);
+            }
+            ServerToClient::TaskStateChanged { state, .. } => {
+                if matches!(
+                    state,
+                    TaskStateLabel::Completed
+                        | TaskStateLabel::Failed
+                        | TaskStateLabel::Cancelled
+                ) {
+                    // Re-subscribe to get a fresh snapshot containing the
+                    // final conversation + total_usage. SubscribeToTask is
+                    // idempotent — the scheduler always replies with a fresh
+                    // TaskSnapshot regardless of existing membership.
+                    if let Some(tid) = &task_id {
+                        inbox_tx
+                            .send(SchedulerMsg::ClientMessage {
+                                conn_id: CONN_ID,
+                                msg: ClientToServer::SubscribeToTask {
+                                    task_id: tid.clone(),
+                                },
+                            })
+                            .map_err(|_| anyhow!("scheduler inbox closed"))?;
+                    }
+                }
+            }
+            ServerToClient::TaskSnapshot { snapshot, .. } => {
+                if matches!(
+                    snapshot.state,
+                    TaskStateLabel::Completed
+                        | TaskStateLabel::Failed
+                        | TaskStateLabel::Cancelled
+                ) {
+                    final_snapshot = Some(snapshot);
+                    break;
+                }
+                // Initial snapshot from our first subscribe — task still
+                // working, so wait for the terminal-state re-subscribe.
+            }
+            _ => {}
+        }
+    }
+
+    drop(inbox_tx);
+    let _ = scheduler_handle.await;
+
+    let snap = final_snapshot.ok_or_else(|| anyhow!("scheduler exited before final snapshot"))?;
+    let turns = snap
+        .conversation
+        .messages()
+        .iter()
+        .filter(|m| matches!(m.role, Role::Assistant))
+        .count();
 
     println!();
     println!("=== loop finished ===");
-    println!("turns: {}", outcome.turns);
-    println!("stop_reason: {:?}", outcome.final_stop_reason);
+    println!("state: {:?}", snap.state);
+    println!("turns: {turns}");
+    println!("stop_reason: {last_stop_reason:?}");
     println!(
         "tokens: input={} output={} cache_read={} cache_create={}",
-        outcome.usage_total.input_tokens,
-        outcome.usage_total.output_tokens,
-        outcome.usage_total.cache_read_input_tokens,
-        outcome.usage_total.cache_creation_input_tokens
+        snap.total_usage.input_tokens,
+        snap.total_usage.output_tokens,
+        snap.total_usage.cache_read_input_tokens,
+        snap.total_usage.cache_creation_input_tokens
     );
+    if let Some(detail) = &snap.failure {
+        println!("failure: {detail}");
+    } else if let Some(msg) = &last_error {
+        println!("last_error: {msg}");
+    }
 
     if let Some(path) = args.dump_conversation {
-        let serialized = serde_json::to_string_pretty(conversation.messages())?;
+        let serialized = serde_json::to_string_pretty(snap.conversation.messages())?;
         tokio::fs::write(&path, serialized).await?;
         println!("conversation dumped to {}", path.display());
     }
 
+    if matches!(snap.state, TaskStateLabel::Failed) {
+        return Err(anyhow!(
+            "task failed: {}",
+            snap.failure.unwrap_or_else(|| "unknown".into())
+        ));
+    }
     Ok(())
-}
-
-fn pseudo_task_id() -> String {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos();
-    format!("task-{:016x}-{:08x}", nanos as u64, std::process::id())
 }
