@@ -27,6 +27,7 @@ pub fn descriptors() -> Vec<Tool> {
         list_dir_descriptor(),
         glob_descriptor(),
         grep_descriptor(),
+        crate_source_descriptor(),
     ]
 }
 
@@ -39,6 +40,7 @@ pub async fn call(workspace: &Arc<Workspace>, name: &str, args: Value) -> Result
         "list_dir" => Ok(list_dir(workspace, args).await),
         "glob" => Ok(glob(workspace, args).await),
         "grep" => Ok(grep(workspace, args).await),
+        "crate_source" => Ok(crate_source(args).await),
         _ => Err(ToolDispatchError::UnknownTool(name.to_string())),
     }
 }
@@ -942,6 +944,263 @@ fn scan_file(
     Ok(out)
 }
 
+// ---------- crate_source ----------
+
+fn crate_source_descriptor() -> Tool {
+    Tool {
+        name: "crate_source".into(),
+        description: "Resolve a Rust crate name (and optional version) to its vendored source \
+                      directory in the local Cargo registry. Returns the absolute path so you \
+                      can `read_file` / `grep` / `list_dir` / `glob` against it to study type \
+                      definitions, doc comments, and examples. Only resolves crates already \
+                      downloaded under $CARGO_HOME/registry/src — which is every dep of any \
+                      workspace you've built, plus anything touched by `cargo fetch`. No \
+                      network; if the crate isn't vendored, build a workspace that depends on \
+                      it or run `cargo fetch -p <name>` first."
+            .into(),
+        input_schema: json!({
+            "type": "object",
+            "properties": {
+                "crate_name": {
+                    "type": "string",
+                    "description": "Crate name as it appears on crates.io (e.g. \"tokio\", \
+                                    \"serde_json\"). Underscores vs hyphens matter."
+                },
+                "version": {
+                    "type": "string",
+                    "description": "Exact version, e.g. \"1.48.0\". Omit to pick the highest \
+                                    vendored version; other available versions are listed in \
+                                    the response."
+                }
+            },
+            "required": ["crate_name"]
+        }),
+        annotations: Some(ToolAnnotations {
+            title: Some("Resolve Rust crate source".into()),
+            read_only_hint: Some(true),
+            destructive_hint: Some(false),
+            idempotent_hint: Some(true),
+            open_world_hint: Some(false),
+        }),
+    }
+}
+
+#[derive(Deserialize)]
+struct CrateSourceArgs {
+    crate_name: String,
+    #[serde(default)]
+    version: Option<String>,
+}
+
+async fn crate_source(args: Value) -> CallToolResult {
+    let parsed: CrateSourceArgs = match serde_json::from_value(args) {
+        Ok(v) => v,
+        Err(e) => return CallToolResult::error_text(format!("invalid arguments: {e}")),
+    };
+    let name = parsed.crate_name.trim().to_string();
+    if name.is_empty() {
+        return CallToolResult::error_text("crate_source: crate_name must be non-empty");
+    }
+
+    let cargo_home = match resolve_cargo_home() {
+        Some(p) => p,
+        None => {
+            return CallToolResult::error_text(
+                "crate_source: neither CARGO_HOME nor HOME is set; cannot locate cargo registry",
+            );
+        }
+    };
+    let registry_src = cargo_home.join("registry").join("src");
+    let requested_version = parsed.version.clone();
+    let scan_name = name.clone();
+
+    // Directory walking is sync; shunt to the blocking pool to keep the runtime clean.
+    let scan = tokio::task::spawn_blocking(move || {
+        scan_registry_for_crate(&registry_src, &scan_name).map(|hits| (registry_src, hits))
+    })
+    .await;
+    let (registry_src, candidates) = match scan {
+        Ok(Ok(t)) => t,
+        Ok(Err(e)) => return CallToolResult::error_text(format!("crate_source scan: {e}")),
+        Err(e) => return CallToolResult::error_text(format!("crate_source task panicked: {e}")),
+    };
+
+    if !registry_src.exists() {
+        return CallToolResult::error_text(format!(
+            "crate_source: {} does not exist — no crates have been vendored",
+            registry_src.display()
+        ));
+    }
+    if candidates.is_empty() {
+        return CallToolResult::error_text(format!(
+            "crate_source: no vendored copy of `{name}` under {}. \
+             Run `cargo fetch -p {name}` or build a workspace that depends on it.",
+            registry_src.display()
+        ));
+    }
+
+    let chosen = match &requested_version {
+        Some(v) => match candidates.iter().find(|(ver, _)| ver == v) {
+            Some(c) => c.clone(),
+            None => {
+                let mut versions: Vec<&str> = candidates.iter().map(|(v, _)| v.as_str()).collect();
+                versions.sort_by(|a, b| compare_versions(b, a));
+                return CallToolResult::error_text(format!(
+                    "crate_source: `{name}@{v}` not vendored. Available: {}",
+                    versions.join(", ")
+                ));
+            }
+        },
+        None => {
+            let mut sorted = candidates.clone();
+            sorted.sort_by(|a, b| compare_versions(&b.0, &a.0));
+            sorted[0].clone()
+        }
+    };
+
+    let (version, abs_path) = chosen;
+    let listing = match brief_listing(&abs_path) {
+        Ok(s) => s,
+        Err(e) => format!("(could not list directory: {e})\n"),
+    };
+
+    let mut out = format!("{name} v{version}\n{}\n", abs_path.display());
+    if requested_version.is_none() && candidates.len() > 1 {
+        let mut others: Vec<&str> = candidates
+            .iter()
+            .map(|(v, _)| v.as_str())
+            .filter(|v| *v != version)
+            .collect();
+        others.sort_by(|a, b| compare_versions(b, a));
+        out.push_str(&format!("Other vendored versions: {}\n", others.join(", ")));
+    }
+    out.push_str("\nTop-level entries:\n");
+    out.push_str(&listing);
+    CallToolResult::text(out)
+}
+
+fn resolve_cargo_home() -> Option<PathBuf> {
+    if let Ok(h) = std::env::var("CARGO_HOME")
+        && !h.is_empty()
+    {
+        return Some(PathBuf::from(h));
+    }
+    std::env::var("HOME")
+        .ok()
+        .filter(|h| !h.is_empty())
+        .map(|h| PathBuf::from(h).join(".cargo"))
+}
+
+/// Walk `registry_src/*` (one dir per configured registry) and collect every
+/// `<name>-<version>` entry. Version must begin with a digit so that e.g. a
+/// query for `serde` doesn't accidentally pick up `serde_json-1.0.0`.
+fn scan_registry_for_crate(
+    registry_src: &std::path::Path,
+    name: &str,
+) -> std::io::Result<Vec<(String, PathBuf)>> {
+    let mut out = Vec::new();
+    let prefix = format!("{name}-");
+    let outer = match std::fs::read_dir(registry_src) {
+        Ok(r) => r,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(out),
+        Err(e) => return Err(e),
+    };
+    for entry in outer {
+        let entry = match entry {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+            continue;
+        }
+        let reg_path = entry.path();
+        let inner = match std::fs::read_dir(&reg_path) {
+            Ok(r) => r,
+            Err(_) => continue,
+        };
+        for child in inner {
+            let child = match child {
+                Ok(c) => c,
+                Err(_) => continue,
+            };
+            if !child.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                continue;
+            }
+            let fname = child.file_name();
+            let fname = fname.to_string_lossy();
+            if let Some(ver) = fname.strip_prefix(&prefix)
+                && ver.chars().next().is_some_and(|c| c.is_ascii_digit())
+            {
+                out.push((ver.to_string(), child.path()));
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Split version into (numeric parts, suffix). "1.48.0-alpha.2+build" →
+/// ([1, 48, 0], "-alpha.2+build"). Non-parseable numeric parts become 0.
+fn parse_version(v: &str) -> (Vec<u64>, String) {
+    let cut = v.find(['-', '+']).unwrap_or(v.len());
+    let nums_part = &v[..cut];
+    let suffix = v[cut..].to_string();
+    let nums: Vec<u64> = nums_part.split('.').map(|p| p.parse().unwrap_or(0)).collect();
+    (nums, suffix)
+}
+
+fn compare_versions(a: &str, b: &str) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    let (na, sa) = parse_version(a);
+    let (nb, sb) = parse_version(b);
+    for i in 0..na.len().max(nb.len()) {
+        let x = na.get(i).copied().unwrap_or(0);
+        let y = nb.get(i).copied().unwrap_or(0);
+        match x.cmp(&y) {
+            Ordering::Equal => continue,
+            o => return o,
+        }
+    }
+    // Per semver: empty pre-release suffix > non-empty. "1.0.0" > "1.0.0-rc1".
+    match (sa.is_empty(), sb.is_empty()) {
+        (true, false) => Ordering::Greater,
+        (false, true) => Ordering::Less,
+        _ => sa.cmp(&sb),
+    }
+}
+
+/// One-line-per-entry summary of a crate's top-level directory. Dirs first,
+/// then files; trailing `/` marks dirs; file sizes are shown so the agent can
+/// judge whether a `read_file` is cheap or needs an `offset`/`limit`.
+fn brief_listing(dir: &std::path::Path) -> std::io::Result<String> {
+    let mut entries: Vec<(String, bool, u64)> = Vec::new();
+    for entry in std::fs::read_dir(dir)? {
+        let entry = match entry {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let (is_dir, size) = match entry.file_type() {
+            Ok(ft) if ft.is_dir() => (true, 0),
+            Ok(_) => (
+                false,
+                entry.metadata().map(|m| m.len()).unwrap_or(0),
+            ),
+            Err(_) => (false, 0),
+        };
+        entries.push((name, is_dir, size));
+    }
+    entries.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    let mut out = String::new();
+    for (name, is_dir, size) in entries {
+        if is_dir {
+            out.push_str(&format!("d  {:>10}  {name}/\n", ""));
+        } else {
+            out.push_str(&format!("f  {size:>10}  {name}\n"));
+        }
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1032,5 +1291,62 @@ fn main() {
         let old = "fn example() {\n    unused();\n}\n";
         let hint = nearest_match_hint(content, old);
         assert!(hint.contains("No closely-matching region"));
+    }
+
+    #[test]
+    fn compare_versions_orders_numeric_parts() {
+        use std::cmp::Ordering;
+        assert_eq!(compare_versions("1.48.0", "1.49.0"), Ordering::Less);
+        assert_eq!(compare_versions("1.49.0", "1.48.0"), Ordering::Greater);
+        assert_eq!(compare_versions("1.48.0", "1.48.0"), Ordering::Equal);
+        // 1.10.0 > 1.9.0 (numeric, not lexicographic)
+        assert_eq!(compare_versions("1.10.0", "1.9.0"), Ordering::Greater);
+        // Short version padded with zeros
+        assert_eq!(compare_versions("2.0", "1.999.999"), Ordering::Greater);
+    }
+
+    #[test]
+    fn compare_versions_prerelease_semver_ordering() {
+        use std::cmp::Ordering;
+        // Empty suffix beats non-empty: "1.0.0" > "1.0.0-rc1"
+        assert_eq!(compare_versions("1.0.0", "1.0.0-rc1"), Ordering::Greater);
+        assert_eq!(compare_versions("1.0.0-rc1", "1.0.0"), Ordering::Less);
+        assert_eq!(compare_versions("1.0.0-alpha", "1.0.0-beta"), Ordering::Less);
+    }
+
+    #[test]
+    fn parse_version_handles_plus_build_metadata() {
+        let (nums, suffix) = parse_version("1.2.3+build.5");
+        assert_eq!(nums, vec![1, 2, 3]);
+        assert_eq!(suffix, "+build.5");
+    }
+
+    #[test]
+    fn scan_registry_filters_by_name_prefix_and_digit() {
+        // Build a fake registry-src tree and verify we pick only `<name>-<digit>*` dirs.
+        let tmp = std::env::temp_dir().join(format!("wamh-crate-source-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let reg = tmp.join("reg-abc");
+        std::fs::create_dir_all(reg.join("tokio-1.48.0/src")).unwrap();
+        std::fs::create_dir_all(reg.join("tokio-1.49.0/src")).unwrap();
+        // Same-prefix trap: `tokio_util` should not match a query for `tokio`.
+        std::fs::create_dir_all(reg.join("tokio_util-0.7.0")).unwrap();
+        // Non-version-shaped suffix: should be skipped.
+        std::fs::create_dir_all(reg.join("tokio-macros")).unwrap();
+
+        let hits = scan_registry_for_crate(&tmp, "tokio").unwrap();
+        let mut versions: Vec<String> = hits.iter().map(|(v, _)| v.clone()).collect();
+        versions.sort();
+        assert_eq!(versions, vec!["1.48.0".to_string(), "1.49.0".to_string()]);
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn scan_registry_returns_empty_when_dir_missing() {
+        let nope = std::env::temp_dir().join("wamh-does-not-exist-xyz");
+        let _ = std::fs::remove_dir_all(&nope);
+        let hits = scan_registry_for_crate(&nope, "tokio").unwrap();
+        assert!(hits.is_empty());
     }
 }
