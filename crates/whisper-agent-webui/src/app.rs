@@ -18,9 +18,21 @@ use std::rc::Rc;
 use egui::{Color32, ComboBox, RichText, ScrollArea, TextEdit};
 use whisper_agent_protocol::{
     ApprovalChoice, BackendSummary, ClientToServer, ContentBlock, Conversation, Message,
-    ModelSummary, Role, ServerToClient, TaskConfigOverride, TaskStateLabel, TaskSummary,
-    ToolResultContent, Usage,
+    ModelSummary, Role, SandboxSpec, ServerToClient, TaskConfigOverride, TaskStateLabel,
+    TaskSummary, ToolResultContent, Usage,
 };
+use whisper_agent_protocol::sandbox::{AccessMode, NetworkPolicy, PathAccess};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum SandboxPreset {
+    /// Use whatever the server configured as default.
+    #[default]
+    ServerDefault,
+    /// Explicitly no sandbox.
+    None,
+    /// Landlock sandbox with a user-specified workspace path.
+    Sandboxed,
+}
 
 /// Events pushed into [`Inbound`]. In addition to decoded wire messages we pipe in
 /// connection-level signals (open/close/error) so the UI can show a connection status
@@ -164,6 +176,8 @@ pub struct ChatApp {
     picker_backend: Option<String>,
     /// Model chosen in the new-task picker. None = follow backend default.
     picker_model: Option<String>,
+    picker_sandbox: SandboxPreset,
+    picker_sandbox_workspace: String,
 }
 
 impl ChatApp {
@@ -186,6 +200,8 @@ impl ChatApp {
             models_requested: HashSet::new(),
             picker_backend: None,
             picker_model: None,
+            picker_sandbox: SandboxPreset::default(),
+            picker_sandbox_workspace: String::new(),
         }
     }
 
@@ -523,12 +539,31 @@ impl ChatApp {
                         .map(|m| m.id.clone())
                 })
         });
-        if backend.is_none() && model.is_none() {
+        let sandbox = match self.picker_sandbox {
+            SandboxPreset::ServerDefault => None,
+            SandboxPreset::None => Some(SandboxSpec::None),
+            SandboxPreset::Sandboxed => {
+                let ws = self.picker_sandbox_workspace.trim().to_string();
+                if ws.is_empty() {
+                    None
+                } else {
+                    Some(SandboxSpec::Landlock {
+                        allowed_paths: vec![PathAccess {
+                            path: ws,
+                            mode: AccessMode::ReadWrite,
+                        }],
+                        network: NetworkPolicy::Unrestricted,
+                    })
+                }
+            }
+        };
+        if backend.is_none() && model.is_none() && sandbox.is_none() {
             return None;
         }
         Some(TaskConfigOverride {
             backend,
             model,
+            sandbox,
             ..Default::default()
         })
     }
@@ -795,6 +830,41 @@ impl eframe::App for ChatApp {
                                     );
                                 }
                             });
+
+                        ui.separator();
+                        ui.label(RichText::new("sandbox").small().color(Color32::from_gray(180)));
+                        let sandbox_label = match self.picker_sandbox {
+                            SandboxPreset::ServerDefault => "default",
+                            SandboxPreset::None => "none",
+                            SandboxPreset::Sandboxed => "sandboxed",
+                        };
+                        ComboBox::from_id_salt("picker_sandbox")
+                            .selected_text(sandbox_label)
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(
+                                    &mut self.picker_sandbox,
+                                    SandboxPreset::ServerDefault,
+                                    "default  (server decides)",
+                                );
+                                ui.selectable_value(
+                                    &mut self.picker_sandbox,
+                                    SandboxPreset::None,
+                                    "none  (bare metal)",
+                                );
+                                ui.selectable_value(
+                                    &mut self.picker_sandbox,
+                                    SandboxPreset::Sandboxed,
+                                    "sandboxed  (landlock)",
+                                );
+                            });
+                        if self.picker_sandbox == SandboxPreset::Sandboxed {
+                            ui.label(RichText::new("workspace").small().color(Color32::from_gray(180)));
+                            ui.add(
+                                TextEdit::singleline(&mut self.picker_sandbox_workspace)
+                                    .desired_width(200.0)
+                                    .hint_text("/path/to/workspace"),
+                            );
+                        }
                     });
                 }
                 ui.add_space(4.0);
