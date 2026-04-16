@@ -201,11 +201,11 @@ async fn write_file(workspace: &Arc<Workspace>, args: Value) -> CallToolResult {
 fn edit_file_descriptor() -> Tool {
     Tool {
         name: "edit_file".into(),
-        description: "Surgically replace occurrences of `old_string` with `new_string` in a \
-                      file. By default requires exactly one match — pass `expect_count` to apply \
-                      to multiple identical occurrences. Fails if the match count doesn't agree, \
-                      so you never silently half-edit a file. Prefer this over `write_file` for \
-                      targeted changes — much cheaper than rewriting the whole file."
+        description: "Replace text in a file. `old_string` must match literally — no regex. \
+                      By default requires exactly one match; pass `replace_all: true` to \
+                      change every occurrence. If old_string isn't found, the error shows the \
+                      closest matching region of the file so you can correct the next call. \
+                      Prefer this over write_file for targeted changes."
             .into(),
         input_schema: json!({
             "type": "object",
@@ -216,15 +216,18 @@ fn edit_file_descriptor() -> Tool {
                 },
                 "old_string": {
                     "type": "string",
-                    "description": "Exact substring to find. Must match literally — no regex."
+                    "description": "Exact substring to find. Must match literally, including \
+                                    whitespace and indentation. Be specific enough that it \
+                                    occurs only once, or set replace_all."
                 },
                 "new_string": {
                     "type": "string",
                     "description": "Replacement. May be empty to delete the matched span."
                 },
-                "expect_count": {
-                    "type": "integer",
-                    "description": "Require exactly this many matches. If omitted, the default is 1."
+                "replace_all": {
+                    "type": "boolean",
+                    "description": "If true, replace every occurrence of old_string. If false \
+                                    (default), require exactly one match."
                 }
             },
             "required": ["path", "old_string", "new_string"]
@@ -246,7 +249,7 @@ struct EditFileArgs {
     old_string: String,
     new_string: String,
     #[serde(default)]
-    expect_count: Option<u32>,
+    replace_all: bool,
 }
 
 async fn edit_file(workspace: &Arc<Workspace>, args: Value) -> CallToolResult {
@@ -278,18 +281,18 @@ async fn edit_file(workspace: &Arc<Workspace>, args: Value) -> CallToolResult {
         }
     };
     let found = content.matches(&parsed.old_string).count();
-    let expected = parsed.expect_count.unwrap_or(1) as usize;
     if found == 0 {
+        let hint = nearest_match_hint(&content, &parsed.old_string);
         return CallToolResult::error_text(format!(
-            "edit_file({}): old_string not found",
+            "edit_file({}): old_string not found.{hint}",
             parsed.path.display()
         ));
     }
-    if found != expected {
+    if found > 1 && !parsed.replace_all {
         return CallToolResult::error_text(format!(
-            "edit_file({}): old_string matches {found} times, expected {expected}. \
-             Pass `expect_count: {found}` if you intend to replace all, or make old_string \
-             more specific.",
+            "edit_file({}): old_string matches {found} times. Either extend old_string with \
+             surrounding context to make it unique, or pass replace_all:true to replace every \
+             occurrence.",
             parsed.path.display()
         ));
     }
@@ -304,6 +307,58 @@ async fn edit_file(workspace: &Arc<Workspace>, args: Value) -> CallToolResult {
             CallToolResult::error_text(format!("edit_file({}): {e}", parsed.path.display()))
         }
     }
+}
+
+/// When `old_string` isn't in the file, scan for the sliding window of lines
+/// whose whitespace-trimmed contents best match. Returns a formatted hint
+/// with line numbers so the model can see the real content and correct its
+/// next call. Returns an empty string (caller's error message stands alone)
+/// if nothing matches at all.
+fn nearest_match_hint(content: &str, old_string: &str) -> String {
+    const CONTEXT: usize = 2;
+    let file_lines: Vec<&str> = content.lines().collect();
+    let old_lines: Vec<&str> = old_string.lines().collect();
+    if old_lines.is_empty() || file_lines.is_empty() {
+        return String::new();
+    }
+    let window_size = old_lines.len();
+    if window_size > file_lines.len() {
+        return String::new();
+    }
+
+    let mut best_score = 0usize;
+    let mut best_start = 0usize;
+    for start in 0..=(file_lines.len() - window_size) {
+        let score: usize = (0..window_size)
+            .filter(|&i| file_lines[start + i].trim() == old_lines[i].trim())
+            .count();
+        if score > best_score {
+            best_score = score;
+            best_start = start;
+        }
+    }
+
+    if best_score == 0 {
+        return " No closely-matching region found in the file.".into();
+    }
+
+    let ctx_start = best_start.saturating_sub(CONTEXT);
+    let ctx_end = (best_start + window_size + CONTEXT).min(file_lines.len());
+    let mut out = format!(
+        "\nClosest matching region (lines {}-{}; {}/{} lines match after whitespace trim). \
+         Lines marked '>' are where old_string would have replaced; check for indentation, \
+         trailing whitespace, or stale content:\n",
+        best_start + 1,
+        best_start + window_size,
+        best_score,
+        window_size,
+    );
+    for i in ctx_start..ctx_end {
+        let in_window = i >= best_start && i < best_start + window_size;
+        let marker = if in_window { ">" } else { " " };
+        out.push_str(&format!("{marker} {:5} │ {}\n", i + 1, file_lines[i]));
+    }
+    out
 }
 
 // ---------- bash ----------
@@ -930,5 +985,42 @@ mod tests {
         // Cutting to keep 5 trailing bytes would start mid-é; we walk forward
         // to the next boundary (byte 4) and report 4 dropped.
         assert_eq!(got, "... 4 bytes truncated ...\néé");
+    }
+
+    #[test]
+    fn nearest_match_hint_finds_best_window_with_indent_drift() {
+        let content = "\
+fn main() {
+    let x = 10;
+    let y = 20;
+    println!(\"hi\");
+}
+";
+        // Model guessed 4-space indent but the file happens to have 4-space
+        // too. The whitespace-trim match catches it even when we throw in
+        // slightly different leading whitespace.
+        let old = "    let x = 99;\n    let y = 20;\n";
+        let hint = nearest_match_hint(content, old);
+        assert!(hint.contains("Closest matching region"));
+        assert!(hint.contains("lines 2-3"));
+        // The marker '>' should precede the lines inside the window.
+        assert!(hint.contains(">     2"));
+        assert!(hint.contains(">     3"));
+    }
+
+    #[test]
+    fn nearest_match_hint_empty_when_window_bigger_than_file() {
+        let content = "just one line\n";
+        let old = "five\nline\nold\nstring\nhere\n";
+        let hint = nearest_match_hint(content, old);
+        assert_eq!(hint, "");
+    }
+
+    #[test]
+    fn nearest_match_hint_reports_no_match() {
+        let content = "totally unrelated content\nwith three lines\nof nothing\n";
+        let old = "fn example() {\n    unused();\n}\n";
+        let hint = nearest_match_hint(content, old);
+        assert!(hint.contains("No closely-matching region"));
     }
 }
