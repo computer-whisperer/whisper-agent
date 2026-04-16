@@ -640,6 +640,14 @@ impl ChatApp {
             ServerToClient::ResourceDestroyed { id, .. } => {
                 self.resources.remove(&id);
             }
+            // Phase 2d.i: pod CRUD wire surface lands but the webui's pod
+            // list/editor are Phase 2e. Drop these so the build stays
+            // exhaustive.
+            ServerToClient::PodList { .. }
+            | ServerToClient::PodSnapshot { .. }
+            | ServerToClient::PodCreated { .. }
+            | ServerToClient::PodConfigUpdated { .. }
+            | ServerToClient::PodArchived { .. } => {}
         }
     }
 

@@ -9,9 +9,11 @@
 //! the server (which builds them) and the client (which renders them from task snapshots).
 
 pub mod conversation;
+pub mod pod;
 pub mod sandbox;
 
 pub use conversation::{ContentBlock, Conversation, Message, Role, ToolResultContent};
+pub use pod::{NamedSandboxSpec, PodAllow, PodConfig, PodLimits, PodSnapshot, PodSummary, ThreadDefaults};
 pub use sandbox::SandboxSpec;
 
 use serde::{Deserialize, Serialize};
@@ -369,6 +371,41 @@ pub enum ClientToServer {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         correlation_id: Option<String>,
     },
+
+    // --- Pod registry (Phase 2d.i — wire surface only; the scheduler
+    //     becomes pod-aware in 2d.iii). ---
+    /// Walk `<pods_root>/` and return every non-archived pod's summary.
+    ListPods {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        correlation_id: Option<String>,
+    },
+    /// Read one pod's config + thread summaries.
+    GetPod {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        correlation_id: Option<String>,
+        pod_id: String,
+    },
+    /// Create a new pod directory + write its `pod.toml`. Fails if the pod
+    /// id already exists (use `UpdatePodConfig` to mutate).
+    CreatePod {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        correlation_id: Option<String>,
+        pod_id: String,
+        config: PodConfig,
+    },
+    /// Replace the pod's `pod.toml` with the given text. Server parses and
+    /// validates before writing; on validation failure no file changes.
+    UpdatePodConfig {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        correlation_id: Option<String>,
+        pod_id: String,
+        toml_text: String,
+    },
+    /// Move the pod's directory under `<pods_root>/.archived/`. Threads
+    /// inside become unreachable (they're not loaded from .archived/).
+    ArchivePod {
+        pod_id: String,
+    },
 }
 
 /// Messages the server sends to the client.
@@ -525,6 +562,33 @@ pub enum ServerToClient {
     ResourceDestroyed {
         id: String,
         kind: ResourceKind,
+    },
+
+    // --- Pod registry tier (broadcast to every connected client) ---
+    PodList {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        correlation_id: Option<String>,
+        pods: Vec<PodSummary>,
+    },
+    PodSnapshot {
+        snapshot: PodSnapshot,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        correlation_id: Option<String>,
+    },
+    PodCreated {
+        pod: PodSummary,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        correlation_id: Option<String>,
+    },
+    PodConfigUpdated {
+        pod_id: String,
+        toml_text: String,
+        parsed: PodConfig,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        correlation_id: Option<String>,
+    },
+    PodArchived {
+        pod_id: String,
     },
 
     Error {

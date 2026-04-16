@@ -1,24 +1,17 @@
-//! Pod data model and `pod.toml` (de)serialization.
+//! Pod TOML parsing, validation, and on-disk constants.
 //!
-//! A pod is a directory on disk owning a `pod.toml` config plus per-thread
-//! JSON files. This module owns the in-memory shape of the parsed config and
-//! the round-trip with TOML; directory walking, file I/O, and the broader
-//! `Scheduler` integration land in `crate::pod_persist` (Phase 2b) and the
-//! scheduler refactor (Phase 2c).
+//! The data types themselves (`PodConfig`, `PodAllow`, `NamedSandboxSpec`,
+//! `ThreadDefaults`, `PodLimits`) live in the protocol crate so the webui
+//! can render them directly from wire snapshots. This module owns the
+//! server-side concerns: filename constants, the TOML round-trip, and
+//! structural validation.
 //!
 //! See `docs/design_pod_thread_scheduler.md` for the full design.
-//!
-//! Validation discipline: `parse` runs structural validation (every
-//! `thread_defaults` reference resolves into the surrounding `[allow]` set,
-//! sandbox names are unique). Pods that fail validation can't be loaded — a
-//! pod-level Errored state in the registry is the wire-side answer (Phase 2b).
 
 use std::collections::BTreeSet;
 
-use chrono::{DateTime, Utc};
-use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use whisper_agent_protocol::{ApprovalPolicy, SandboxSpec};
+use whisper_agent_protocol::PodConfig;
 
 pub type PodId = String;
 
@@ -45,176 +38,85 @@ pub enum PodConfigError {
     },
 }
 
-/// Parsed `pod.toml`. The struct is the pod's truth — anything not present in
-/// `[allow]` is unreachable to threads in this pod.
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-pub struct PodConfig {
-    pub name: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub description: Option<String>,
-    pub created_at: DateTime<Utc>,
-
-    pub allow: PodAllow,
-    pub thread_defaults: ThreadDefaults,
-    #[serde(default)]
-    pub limits: PodLimits,
-    // [[hooks]] reserved for future Lua integration; not parsed yet.
+/// Parse pod.toml text, then run structural validation.
+pub fn parse_toml(text: &str) -> Result<PodConfig, PodConfigError> {
+    let config: PodConfig = toml::from_str(text)?;
+    validate(&config)?;
+    Ok(config)
 }
 
-/// The capability boundary for threads in this pod. Backends / MCP hosts
-/// reference the server catalog by name; sandboxes are inline specs (pods are
-/// self-contained for sandbox definitions).
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default)]
-pub struct PodAllow {
-    #[serde(default)]
-    pub backends: Vec<String>,
-    #[serde(default)]
-    pub mcp_hosts: Vec<String>,
-    #[serde(default)]
-    pub sandbox: Vec<NamedSandboxSpec>,
+pub fn to_toml(config: &PodConfig) -> Result<String, PodConfigError> {
+    Ok(toml::to_string_pretty(config)?)
 }
 
-/// An inline sandbox spec with a name. The name is the handle threads use to
-/// pick a sandbox (`thread_defaults.sandbox = "..."` or
-/// `bindings.sandbox = "..."` on a `CreateThread` request).
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-pub struct NamedSandboxSpec {
-    pub name: String,
-    /// `SandboxSpec` is `tag = "type"` so the inner discriminant lifts to a
-    /// sibling key here. TOML form:
-    /// ```toml
-    /// [[allow.sandbox]]
-    /// name = "landlock-rw"
-    /// type = "landlock"
-    /// allowed_paths = [...]
-    /// network = { policy = "unrestricted" }
-    /// ```
-    #[serde(flatten)]
-    pub spec: SandboxSpec,
-}
-
-/// Defaults applied to every fresh thread in this pod. Each field is
-/// overridable per-thread; any reference must resolve into the surrounding
-/// `[allow]` set or `parse` rejects the pod.
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-pub struct ThreadDefaults {
-    pub backend: String,
-    pub model: String,
-    /// Path relative to the pod directory. The persistence layer reads the
-    /// referenced file and treats its contents as the system prompt; this
-    /// keeps long prompts editable as standalone files.
-    pub system_prompt_file: String,
-    pub max_tokens: u32,
-    pub max_turns: u32,
-    #[serde(default)]
-    pub approval_policy: ApprovalPolicy,
-    /// Name of one of the `[[allow.sandbox]]` entries. Empty string is allowed
-    /// only if `[allow].sandbox` is also empty (no-sandbox pod).
-    #[serde(default)]
-    pub sandbox: String,
-    #[serde(default)]
-    pub mcp_hosts: Vec<String>,
-}
-
-/// Pod-level limits. Only `max_concurrent_threads` is wired today; token /
-/// cost budgets land when there's a concrete enforcement path.
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-pub struct PodLimits {
-    #[serde(default = "default_max_concurrent_threads")]
-    pub max_concurrent_threads: u32,
-}
-
-fn default_max_concurrent_threads() -> u32 {
-    10
-}
-
-impl Default for PodLimits {
-    fn default() -> Self {
-        Self {
-            max_concurrent_threads: default_max_concurrent_threads(),
+/// Verify every reference in `thread_defaults` resolves into `[allow]` and
+/// that sandbox names are unique. Safe to call after in-memory mutations
+/// (e.g. when applying an `UpdatePodConfig` patch).
+pub fn validate(config: &PodConfig) -> Result<(), PodConfigError> {
+    let mut seen: BTreeSet<&str> = BTreeSet::new();
+    for nss in &config.allow.sandbox {
+        if !seen.insert(nss.name.as_str()) {
+            return Err(PodConfigError::DuplicateSandboxName(nss.name.clone()));
         }
     }
-}
 
-impl PodConfig {
-    /// Parse from TOML text and run structural validation.
-    pub fn parse(text: &str) -> Result<Self, PodConfigError> {
-        let config: PodConfig = toml::from_str(text)?;
-        config.validate()?;
-        Ok(config)
+    if !config.allow.backends.iter().any(|b| b == &config.thread_defaults.backend) {
+        return Err(PodConfigError::UnknownThreadDefault {
+            field: "backend",
+            value: config.thread_defaults.backend.clone(),
+            valid: config.allow.backends.join(", "),
+        });
     }
 
-    /// Serialize to TOML text. Round-trips with `parse`.
-    pub fn to_toml(&self) -> Result<String, PodConfigError> {
-        Ok(toml::to_string_pretty(self)?)
+    // Sandbox: empty is valid only if pod has no allowed sandboxes (degenerate
+    // no-isolation pod). Otherwise must name an entry in [[allow.sandbox]].
+    if !config.thread_defaults.sandbox.is_empty()
+        && !config
+            .allow
+            .sandbox
+            .iter()
+            .any(|nss| nss.name == config.thread_defaults.sandbox)
+    {
+        let valid = config
+            .allow
+            .sandbox
+            .iter()
+            .map(|nss| nss.name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(PodConfigError::UnknownThreadDefault {
+            field: "sandbox",
+            value: config.thread_defaults.sandbox.clone(),
+            valid,
+        });
     }
 
-    /// Verify every reference in `thread_defaults` resolves into `[allow]`
-    /// and that sandbox names are unique. Called by `parse`; safe to call
-    /// after in-memory mutations too.
-    pub fn validate(&self) -> Result<(), PodConfigError> {
-        let mut seen: BTreeSet<&str> = BTreeSet::new();
-        for nss in &self.allow.sandbox {
-            if !seen.insert(nss.name.as_str()) {
-                return Err(PodConfigError::DuplicateSandboxName(nss.name.clone()));
-            }
-        }
-
-        if !self.allow.backends.iter().any(|b| b == &self.thread_defaults.backend) {
+    for host in &config.thread_defaults.mcp_hosts {
+        if !config.allow.mcp_hosts.iter().any(|h| h == host) {
             return Err(PodConfigError::UnknownThreadDefault {
-                field: "backend",
-                value: self.thread_defaults.backend.clone(),
-                valid: self.allow.backends.join(", "),
+                field: "mcp_hosts",
+                value: host.clone(),
+                valid: config.allow.mcp_hosts.join(", "),
             });
         }
-
-        // Sandbox: empty is valid only if pod has no allowed sandboxes (degenerate
-        // no-isolation pod). Otherwise must name an entry in [[allow.sandbox]].
-        if !self.thread_defaults.sandbox.is_empty()
-            && !self
-                .allow
-                .sandbox
-                .iter()
-                .any(|nss| nss.name == self.thread_defaults.sandbox)
-        {
-            let valid = self
-                .allow
-                .sandbox
-                .iter()
-                .map(|nss| nss.name.as_str())
-                .collect::<Vec<_>>()
-                .join(", ");
-            return Err(PodConfigError::UnknownThreadDefault {
-                field: "sandbox",
-                value: self.thread_defaults.sandbox.clone(),
-                valid,
-            });
-        }
-
-        for host in &self.thread_defaults.mcp_hosts {
-            if !self.allow.mcp_hosts.iter().any(|h| h == host) {
-                return Err(PodConfigError::UnknownThreadDefault {
-                    field: "mcp_hosts",
-                    value: host.clone(),
-                    valid: self.allow.mcp_hosts.join(", "),
-                });
-            }
-        }
-
-        Ok(())
     }
+
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use whisper_agent_protocol::sandbox::{AccessMode, NetworkPolicy, PathAccess};
+    use whisper_agent_protocol::{
+        ApprovalPolicy, NamedSandboxSpec, PodAllow, PodLimits, SandboxSpec, ThreadDefaults,
+    };
 
     fn sample_config() -> PodConfig {
         PodConfig {
             name: "whisper-agent dev".into(),
             description: Some("Working on whisper-agent itself".into()),
-            created_at: "2026-04-16T10:23:11Z".parse().unwrap(),
+            created_at: "2026-04-16T10:23:11Z".into(),
             allow: PodAllow {
                 backends: vec!["anthropic".into(), "openai-compat".into()],
                 mcp_hosts: vec!["fetch".into(), "search".into()],
@@ -254,8 +156,8 @@ mod tests {
     #[test]
     fn round_trips_through_toml() {
         let cfg = sample_config();
-        let text = cfg.to_toml().unwrap();
-        let back = PodConfig::parse(&text).unwrap();
+        let text = to_toml(&cfg).unwrap();
+        let back = parse_toml(&text).unwrap();
         assert_eq!(cfg, back);
     }
 
@@ -263,10 +165,10 @@ mod tests {
     fn detects_duplicate_sandbox_name() {
         let mut cfg = sample_config();
         cfg.allow.sandbox.push(NamedSandboxSpec {
-            name: "landlock-rw".into(), // duplicate
+            name: "landlock-rw".into(),
             spec: SandboxSpec::None,
         });
-        let err = cfg.validate().unwrap_err();
+        let err = validate(&cfg).unwrap_err();
         assert!(matches!(err, PodConfigError::DuplicateSandboxName(_)));
     }
 
@@ -274,7 +176,7 @@ mod tests {
     fn rejects_unknown_default_backend() {
         let mut cfg = sample_config();
         cfg.thread_defaults.backend = "not-a-backend".into();
-        let err = cfg.validate().unwrap_err();
+        let err = validate(&cfg).unwrap_err();
         match err {
             PodConfigError::UnknownThreadDefault { field, value, .. } => {
                 assert_eq!(field, "backend");
@@ -288,7 +190,7 @@ mod tests {
     fn rejects_unknown_default_sandbox() {
         let mut cfg = sample_config();
         cfg.thread_defaults.sandbox = "phantom".into();
-        let err = cfg.validate().unwrap_err();
+        let err = validate(&cfg).unwrap_err();
         match err {
             PodConfigError::UnknownThreadDefault { field, .. } => assert_eq!(field, "sandbox"),
             other => panic!("expected UnknownThreadDefault, got {other:?}"),
@@ -300,14 +202,14 @@ mod tests {
         let mut cfg = sample_config();
         cfg.allow.sandbox.clear();
         cfg.thread_defaults.sandbox = String::new();
-        cfg.validate().unwrap();
+        validate(&cfg).unwrap();
     }
 
     #[test]
     fn rejects_unknown_default_mcp_host() {
         let mut cfg = sample_config();
         cfg.thread_defaults.mcp_hosts.push("phantom".into());
-        let err = cfg.validate().unwrap_err();
+        let err = validate(&cfg).unwrap_err();
         match err {
             PodConfigError::UnknownThreadDefault { field, value, .. } => {
                 assert_eq!(field, "mcp_hosts");
@@ -335,7 +237,7 @@ system_prompt_file = "system_prompt.md"
 max_tokens = 8000
 max_turns = 50
 "#;
-        let cfg = PodConfig::parse(text).unwrap();
+        let cfg = parse_toml(text).unwrap();
         assert_eq!(cfg.name, "minimal");
         assert_eq!(cfg.thread_defaults.max_tokens, 8000);
         // limits omitted → default 10
@@ -344,7 +246,7 @@ max_turns = 50
 
     #[test]
     fn unparseable_toml_returns_parse_error() {
-        let err = PodConfig::parse("not = valid {toml").unwrap_err();
+        let err = parse_toml("not = valid {toml").unwrap_err();
         assert!(matches!(err, PodConfigError::Parse(_)));
     }
 }

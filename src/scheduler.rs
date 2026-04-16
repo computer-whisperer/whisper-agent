@@ -199,6 +199,26 @@ impl Scheduler {
         &self.resources
     }
 
+    /// Convenience for the pod-CRUD handlers (Phase 2d.i): grabs a clone of
+    /// the persister and the requester's outbound channel together. Returns
+    /// `None` after sending an error to the requester when either piece is
+    /// missing (no persister configured, or the connection has dropped).
+    fn persister_and_outbound(
+        &self,
+        conn_id: ConnId,
+    ) -> Option<(Persister, mpsc::UnboundedSender<ServerToClient>)> {
+        let outbound = self.router.outbound(conn_id)?;
+        let Some(persister) = self.persister.clone() else {
+            let _ = outbound.send(ServerToClient::Error {
+                correlation_id: None,
+                task_id: None,
+                message: "server has no persister configured".into(),
+            });
+            return None;
+        };
+        Some((persister, outbound))
+    }
+
     // ---------- Resource event emission (Phase 1b) ----------
     //
     // Each mutation of the registry is followed by one of these so connected
@@ -545,6 +565,145 @@ impl Scheduler {
                         resources,
                     },
                 );
+            }
+            ClientToServer::ListPods { correlation_id } => {
+                let Some((persister, outbound)) = self.persister_and_outbound(conn_id) else {
+                    return;
+                };
+                tokio::spawn(async move {
+                    match persister.list_pods().await {
+                        Ok(pods) => {
+                            let _ = outbound.send(ServerToClient::PodList {
+                                correlation_id,
+                                pods,
+                            });
+                        }
+                        Err(e) => {
+                            let _ = outbound.send(ServerToClient::Error {
+                                correlation_id,
+                                task_id: None,
+                                message: format!("list_pods: {e}"),
+                            });
+                        }
+                    }
+                });
+            }
+            ClientToServer::GetPod {
+                correlation_id,
+                pod_id,
+            } => {
+                let Some((persister, outbound)) = self.persister_and_outbound(conn_id) else {
+                    return;
+                };
+                tokio::spawn(async move {
+                    match persister.get_pod(&pod_id).await {
+                        Ok(Some(snapshot)) => {
+                            let _ = outbound.send(ServerToClient::PodSnapshot {
+                                snapshot,
+                                correlation_id,
+                            });
+                        }
+                        Ok(None) => {
+                            let _ = outbound.send(ServerToClient::Error {
+                                correlation_id,
+                                task_id: None,
+                                message: format!("pod `{pod_id}` not found"),
+                            });
+                        }
+                        Err(e) => {
+                            let _ = outbound.send(ServerToClient::Error {
+                                correlation_id,
+                                task_id: None,
+                                message: format!("get_pod: {e}"),
+                            });
+                        }
+                    }
+                });
+            }
+            ClientToServer::CreatePod {
+                correlation_id,
+                pod_id,
+                config,
+            } => {
+                let Some((persister, outbound)) = self.persister_and_outbound(conn_id) else {
+                    return;
+                };
+                let broadcast = self.router.outbound_snapshot();
+                tokio::spawn(async move {
+                    match persister.create_pod(&pod_id, config).await {
+                        Ok(summary) => {
+                            let ev = ServerToClient::PodCreated {
+                                pod: summary,
+                                correlation_id,
+                            };
+                            for tx in broadcast {
+                                let _ = tx.send(ev.clone());
+                            }
+                        }
+                        Err(e) => {
+                            let _ = outbound.send(ServerToClient::Error {
+                                correlation_id,
+                                task_id: None,
+                                message: format!("create_pod: {e}"),
+                            });
+                        }
+                    }
+                });
+            }
+            ClientToServer::UpdatePodConfig {
+                correlation_id,
+                pod_id,
+                toml_text,
+            } => {
+                let Some((persister, outbound)) = self.persister_and_outbound(conn_id) else {
+                    return;
+                };
+                let broadcast = self.router.outbound_snapshot();
+                tokio::spawn(async move {
+                    match persister.update_pod_config(&pod_id, &toml_text).await {
+                        Ok(parsed) => {
+                            let ev = ServerToClient::PodConfigUpdated {
+                                pod_id,
+                                toml_text,
+                                parsed,
+                                correlation_id,
+                            };
+                            for tx in broadcast {
+                                let _ = tx.send(ev.clone());
+                            }
+                        }
+                        Err(e) => {
+                            let _ = outbound.send(ServerToClient::Error {
+                                correlation_id,
+                                task_id: None,
+                                message: format!("update_pod_config: {e}"),
+                            });
+                        }
+                    }
+                });
+            }
+            ClientToServer::ArchivePod { pod_id } => {
+                let Some((persister, outbound)) = self.persister_and_outbound(conn_id) else {
+                    return;
+                };
+                let broadcast = self.router.outbound_snapshot();
+                tokio::spawn(async move {
+                    match persister.archive_pod(&pod_id).await {
+                        Ok(()) => {
+                            let ev = ServerToClient::PodArchived { pod_id };
+                            for tx in broadcast {
+                                let _ = tx.send(ev.clone());
+                            }
+                        }
+                        Err(e) => {
+                            let _ = outbound.send(ServerToClient::Error {
+                                correlation_id: None,
+                                task_id: None,
+                                message: format!("archive_pod: {e}"),
+                            });
+                        }
+                    }
+                });
             }
             ClientToServer::ListModels {
                 correlation_id,

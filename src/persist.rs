@@ -33,11 +33,14 @@ use chrono::Utc;
 use tokio::fs;
 use tracing::{info, warn};
 
-use crate::pod::{
-    NamedSandboxSpec, POD_TOML, PodAllow, PodConfig, PodLimits, THREADS_DIR, ThreadDefaults,
-};
+use crate::pod::{self, POD_TOML, THREADS_DIR};
 use crate::thread::{Thread, ThreadInternalState};
+use whisper_agent_protocol::{
+    NamedSandboxSpec, PodAllow, PodConfig, PodLimits, PodSnapshot, PodSummary, TaskSummary,
+    ThreadDefaults,
+};
 
+#[derive(Clone)]
 pub struct Persister {
     pods_root: PathBuf,
 }
@@ -95,9 +98,8 @@ impl Persister {
         let pod_toml = pod_dir.join(POD_TOML);
         if !fs::try_exists(&pod_toml).await.unwrap_or(false) {
             let synthesized = synthesize_pod_config(task);
-            let toml_text = synthesized
-                .to_toml()
-                .context("encode synthesized pod.toml")?;
+            let toml_text =
+                pod::to_toml(&synthesized).context("encode synthesized pod.toml")?;
             fs::write(&pod_toml, toml_text)
                 .await
                 .with_context(|| format!("write {}", pod_toml.display()))?;
@@ -155,6 +157,204 @@ impl Persister {
         info!(count = tasks.len(), "loaded persisted tasks");
         Ok(tasks)
     }
+
+    // ---------- Pod CRUD (Phase 2d.i wire surface) ----------
+
+    /// Walk `<pods_root>/` and return one `PodSummary` per non-archived pod.
+    /// Pods whose `pod.toml` fails to parse are still listed (so the UI can
+    /// show them with an error state) — only the name/description fields
+    /// fall back to defaults.
+    pub async fn list_pods(&self) -> Result<Vec<PodSummary>> {
+        let mut out = Vec::new();
+        let mut entries = match fs::read_dir(&self.pods_root).await {
+            Ok(e) => e,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(out),
+            Err(e) => {
+                return Err(e).with_context(|| format!("read_dir {}", self.pods_root.display()));
+            }
+        };
+        while let Some(entry) = entries.next_entry().await? {
+            let path = entry.path();
+            let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            if name.starts_with('.') || !entry.metadata().await?.is_dir() {
+                continue;
+            }
+            out.push(read_pod_summary(name, &path).await);
+        }
+        out.sort_by(|a, b| a.pod_id.cmp(&b.pod_id));
+        Ok(out)
+    }
+
+    /// Read one pod's parsed config, raw TOML, and thread summaries.
+    pub async fn get_pod(&self, pod_id: &str) -> Result<Option<PodSnapshot>> {
+        validate_pod_id(pod_id)?;
+        let pod_dir = self.pod_dir(pod_id);
+        if !fs::try_exists(&pod_dir).await.unwrap_or(false) {
+            return Ok(None);
+        }
+        let toml_path = pod_dir.join(POD_TOML);
+        let toml_text = fs::read_to_string(&toml_path)
+            .await
+            .with_context(|| format!("read {}", toml_path.display()))?;
+        let config = pod::parse_toml(&toml_text).with_context(|| format!("parse {pod_id}/pod.toml"))?;
+        let threads = read_thread_summaries(&pod_dir).await;
+        Ok(Some(PodSnapshot {
+            pod_id: pod_id.to_string(),
+            config,
+            toml_text,
+            threads,
+            archived: false,
+        }))
+    }
+
+    /// Create a fresh pod directory and write `pod.toml` from the supplied
+    /// config. Fails if a pod with the same id already exists or if the
+    /// config doesn't validate.
+    pub async fn create_pod(&self, pod_id: &str, config: PodConfig) -> Result<PodSummary> {
+        validate_pod_id(pod_id)?;
+        pod::validate(&config)?;
+        let pod_dir = self.pod_dir(pod_id);
+        if fs::try_exists(&pod_dir).await.unwrap_or(false) {
+            return Err(anyhow::anyhow!("pod `{pod_id}` already exists"));
+        }
+        fs::create_dir_all(pod_dir.join(THREADS_DIR))
+            .await
+            .with_context(|| format!("mkdir {}", pod_dir.display()))?;
+        let toml_text = pod::to_toml(&config).context("encode pod.toml")?;
+        fs::write(pod_dir.join(POD_TOML), &toml_text)
+            .await
+            .with_context(|| format!("write {pod_id}/pod.toml"))?;
+        Ok(PodSummary {
+            pod_id: pod_id.to_string(),
+            name: config.name,
+            description: config.description,
+            created_at: config.created_at,
+            thread_count: 0,
+            archived: false,
+        })
+    }
+
+    /// Replace the pod's `pod.toml` with the given text. Parses + validates
+    /// before writing — on failure the on-disk file is untouched. Returns
+    /// the parsed config so the caller can broadcast the new shape.
+    pub async fn update_pod_config(&self, pod_id: &str, toml_text: &str) -> Result<PodConfig> {
+        validate_pod_id(pod_id)?;
+        let parsed = pod::parse_toml(toml_text).context("parse new pod.toml")?;
+        let pod_dir = self.pod_dir(pod_id);
+        if !fs::try_exists(&pod_dir).await.unwrap_or(false) {
+            return Err(anyhow::anyhow!("pod `{pod_id}` does not exist"));
+        }
+        fs::write(pod_dir.join(POD_TOML), toml_text)
+            .await
+            .with_context(|| format!("write {pod_id}/pod.toml"))?;
+        Ok(parsed)
+    }
+
+    /// Move the pod to `<pods_root>/.archived/<pod_id>-<ts>/`. Idempotent on
+    /// already-archived pods (no-op if the source dir is missing).
+    pub async fn archive_pod(&self, pod_id: &str) -> Result<()> {
+        validate_pod_id(pod_id)?;
+        let src = self.pod_dir(pod_id);
+        if !fs::try_exists(&src).await.unwrap_or(false) {
+            return Ok(());
+        }
+        let archive_root = self.pods_root.join(".archived");
+        fs::create_dir_all(&archive_root)
+            .await
+            .with_context(|| format!("mkdir {}", archive_root.display()))?;
+        let stamp = Utc::now().format("%Y%m%dT%H%M%SZ");
+        let dst = archive_root.join(format!("{pod_id}-{stamp}"));
+        fs::rename(&src, &dst)
+            .await
+            .with_context(|| format!("mv {} -> {}", src.display(), dst.display()))?;
+        Ok(())
+    }
+}
+
+/// Reject pod ids containing path separators or other shell-hostile bits.
+/// Pod ids become directory names; we don't want `..` traversal or `/`-rooted
+/// absolute paths sneaking in via the wire.
+fn validate_pod_id(pod_id: &str) -> Result<()> {
+    if pod_id.is_empty() {
+        return Err(anyhow::anyhow!("pod_id is empty"));
+    }
+    if pod_id.starts_with('.') {
+        return Err(anyhow::anyhow!("pod_id may not start with '.'"));
+    }
+    if pod_id.contains(['/', '\\', '\0']) || pod_id == ".." {
+        return Err(anyhow::anyhow!("pod_id contains illegal characters"));
+    }
+    Ok(())
+}
+
+/// Build a `PodSummary` from the on-disk pod directory. If `pod.toml` is
+/// missing or unparseable, fall back to the directory name as the display
+/// name and an epoch timestamp — the UI can render the entry but the user
+/// will need to fix the TOML to do anything with the pod.
+async fn read_pod_summary(pod_id: &str, pod_dir: &Path) -> PodSummary {
+    let toml_path = pod_dir.join(POD_TOML);
+    let (name, description, created_at) = match fs::read_to_string(&toml_path).await {
+        Ok(text) => match pod::parse_toml(&text) {
+            Ok(cfg) => (cfg.name, cfg.description, cfg.created_at),
+            Err(_) => (
+                pod_id.to_string(),
+                None,
+                "1970-01-01T00:00:00Z".to_string(),
+            ),
+        },
+        Err(_) => (
+            pod_id.to_string(),
+            None,
+            "1970-01-01T00:00:00Z".to_string(),
+        ),
+    };
+    let thread_count = count_threads(pod_dir).await;
+    PodSummary {
+        pod_id: pod_id.to_string(),
+        name,
+        description,
+        created_at,
+        thread_count,
+        archived: false,
+    }
+}
+
+async fn count_threads(pod_dir: &Path) -> u32 {
+    let threads_dir = pod_dir.join(THREADS_DIR);
+    let mut entries = match fs::read_dir(&threads_dir).await {
+        Ok(e) => e,
+        Err(_) => return 0,
+    };
+    let mut n = 0u32;
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        if entry.path().extension().and_then(|e| e.to_str()) == Some("json") {
+            n += 1;
+        }
+    }
+    n
+}
+
+async fn read_thread_summaries(pod_dir: &Path) -> Vec<TaskSummary> {
+    let threads_dir = pod_dir.join(THREADS_DIR);
+    let mut entries = match fs::read_dir(&threads_dir).await {
+        Ok(e) => e,
+        Err(_) => return Vec::new(),
+    };
+    let mut out = Vec::new();
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+        match load_one(&path).await {
+            Ok(thread) => out.push(thread.summary()),
+            Err(e) => warn!(path = %path.display(), error = %e, "skip thread summary"),
+        }
+    }
+    out.sort_by(|a, b| a.created_at.cmp(&b.created_at));
+    out
 }
 
 async fn load_pod_threads(pod_dir: &Path, out: &mut Vec<Thread>) {
@@ -254,7 +454,7 @@ fn synthesize_pod_config(task: &Thread) -> PodConfig {
     PodConfig {
         name: task.title.clone().unwrap_or_else(|| task.id.clone()),
         description: None,
-        created_at: task.created_at,
+        created_at: task.created_at.to_rfc3339(),
         allow: PodAllow {
             backends: vec![backend.clone()],
             mcp_hosts: task.config.shared_mcp_hosts.clone(),

@@ -98,6 +98,13 @@ impl ThreadEventRouter {
         }
     }
 
+    /// Snapshot of every connected client's outbound channel. Used by code
+    /// that broadcasts from a detached `tokio::spawn` (currently pod CRUD,
+    /// which awaits async file I/O before fanning out the result).
+    pub(crate) fn outbound_snapshot(&self) -> Vec<mpsc::UnboundedSender<ServerToClient>> {
+        self.clients.values().cloned().collect()
+    }
+
     pub(crate) fn broadcast_task_list_except(&self, event: ServerToClient, skip: ConnId) {
         for (conn_id, tx) in &self.clients {
             if *conn_id != skip {

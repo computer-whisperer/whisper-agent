@@ -6,7 +6,7 @@
 #
 # Passed to the server via `--config whisper-agent.toml`.
 
-default_backend = "anthropic"
+default_backend = "gemma-4"
 
 [backends.anthropic]
 kind = "anthropic"
@@ -19,7 +19,6 @@ default_model = "claude-sonnet-4-6"
 [backends.gemma-4]
 kind = "openai_chat"
 base_url = "https://llama-gemma-4.cjbal.com/v1"
-default_model = "gemma-4-26B-A4B-it-UD-Q4_K_M.gguf"
 
 [backends.deepseek-r1]
 kind = "openai_chat"
