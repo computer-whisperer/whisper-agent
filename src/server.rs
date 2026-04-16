@@ -59,8 +59,8 @@ pub struct ServerConfig {
     pub default_task_config: TaskConfig,
     pub audit_log_path: PathBuf,
     pub host_id: String,
-    /// Directory for JSON-per-task persistence. If `None`, persistence is disabled.
-    pub state_dir: Option<PathBuf>,
+    /// Pods root directory. If `None`, persistence is disabled.
+    pub pods_root: Option<PathBuf>,
     pub sandbox_provider: std::sync::Arc<dyn crate::sandbox::SandboxProvider>,
     /// Catalog of shared (singleton) MCP hosts the scheduler connects to at
     /// startup. Tasks opt in by name via `TaskConfig.shared_mcp_hosts`.
@@ -101,10 +101,10 @@ pub async fn serve(listen: SocketAddr, config: ServerConfig) -> anyhow::Result<(
     .await
     .context("scheduler init")?;
 
-    if let Some(state_dir) = config.state_dir {
-        let persister = Persister::new(state_dir.clone())
+    if let Some(pods_root) = config.pods_root {
+        let persister = Persister::new(pods_root.clone())
             .await
-            .with_context(|| format!("open state dir {}", state_dir.display()))?;
+            .with_context(|| format!("open pods_root {}", pods_root.display()))?;
         let loaded = persister
             .load_all()
             .await

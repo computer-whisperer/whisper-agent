@@ -103,9 +103,11 @@ struct ServeArgs {
     #[arg(long, default_value = "audit.jsonl")]
     audit_log: PathBuf,
 
-    /// Directory for JSON-per-task persistence. Pass an empty string to disable.
-    #[arg(long, default_value = "tasks")]
-    state_dir: PathBuf,
+    /// Pods root directory. Each pod is a subdirectory containing a
+    /// `pod.toml` and a `threads/` folder of per-thread JSON. Pass an
+    /// empty string to disable persistence.
+    #[arg(long, default_value = "pods")]
+    pods_root: PathBuf,
 
     /// System prompt to send to the model.
     #[arg(long, default_value = DEFAULT_SYSTEM_PROMPT)]
@@ -220,10 +222,10 @@ async fn main() -> Result<()> {
 }
 
 async fn run_serve(args: ServeArgs) -> Result<()> {
-    let state_dir = if args.state_dir.as_os_str().is_empty() {
+    let pods_root = if args.pods_root.as_os_str().is_empty() {
         None
     } else {
-        Some(args.state_dir)
+        Some(args.pods_root)
     };
 
     // Resolve the backend catalog and shared-host map. Either source can come
@@ -314,7 +316,7 @@ async fn run_serve(args: ServeArgs) -> Result<()> {
         },
         audit_log_path: args.audit_log,
         host_id: "default".into(),
-        state_dir,
+        pods_root,
         sandbox_provider: match args.sandbox_daemon_url {
             Some(url) => Arc::new(DaemonClient::new(url)),
             None => Arc::new(BareMetal),

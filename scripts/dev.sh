@@ -168,7 +168,7 @@ if [[ "$USE_SANDBOX" -eq 1 ]]; then
         --sandbox-daemon-url "http://$LISTEN_SANDBOX" \
         --sandbox-workspace "$SANDBOX" \
         --audit-log "$SANDBOX/audit.jsonl" \
-        --state-dir "$SANDBOX/tasks" \
+        --pods-root "$SANDBOX/pods" \
         "${SHARED_HOST_ARGS[@]}"
 else
     # ---------- Standalone MCP host mode (legacy) ----------
@@ -197,6 +197,6 @@ else
         --config "$REPO_ROOT/whisper-agent.toml" \
         --mcp-host-url "http://$LISTEN_MCP/mcp" \
         --audit-log "$SANDBOX/audit.jsonl" \
-        --state-dir "$SANDBOX/tasks" \
+        --pods-root "$SANDBOX/pods" \
         "${SHARED_HOST_ARGS[@]}"
 fi
