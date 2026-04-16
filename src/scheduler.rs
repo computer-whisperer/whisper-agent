@@ -11,7 +11,7 @@
 //!
 //! Each event triggers:
 //!   1. `apply_*` — mutate task state, collect [`TaskEvent`]s from the state machine.
-//!   2. `dispatch_task_events` — translate task events to wire events and broadcast.
+//!   2. `router.dispatch_events` — translate task events to wire events and broadcast.
 //!   3. `step_until_blocked` — keep calling `task.step()` until the task requests I/O
 //!      or pauses; pushes fresh I/O futures to the `FuturesUnordered`.
 //!
@@ -31,16 +31,17 @@ use whisper_agent_protocol::{
     TaskStateLabel,
 };
 
-use crate::audit::{AuditLog, ToolCallEntry, ToolCallOutcome};
+use crate::audit::AuditLog;
 use crate::io_dispatch::{self, IoCompletion, IoFuture};
 use crate::mcp::{McpSession, ToolAnnotations, ToolDescriptor as McpTool};
 use crate::model::ModelProvider;
 use crate::sandbox::{SandboxHandle, SandboxProvider};
 use crate::persist::Persister;
 use crate::task::{
-    ApprovalDisposition, IoResult, OpId, StepOutcome, Task, TaskEvent, TaskInternalState,
-    derive_title, new_task_id,
+    ApprovalDisposition, IoResult, OpId, StepOutcome, Task, TaskInternalState, derive_title,
+    new_task_id,
 };
+use crate::task_router::TaskEventRouter;
 
 pub type ConnId = u64;
 
@@ -90,18 +91,17 @@ struct McpPool {
 
 pub struct Scheduler {
     default_config: TaskConfig,
-    host_id: String,
     /// Named backends: `TaskConfig.backend` resolves against this map.
     backends: HashMap<String, BackendEntry>,
     /// Fallback when a task doesn't specify a backend. Must be a key in `backends`.
     default_backend: String,
-    audit: AuditLog,
     persister: Option<Persister>,
     sandbox_provider: Arc<dyn SandboxProvider>,
 
     tasks: HashMap<String, Task>,
-    clients: HashMap<ConnId, mpsc::UnboundedSender<ServerToClient>>,
-    subscriptions: HashMap<String, HashSet<ConnId>>,
+    /// Owns the connection registry, subscription map, audit log, and the
+    /// `TaskEvent → ServerToClient` translation layer.
+    router: TaskEventRouter,
 
     /// Per-task MCP host pool. Index 0 of each pool's `sessions` vec is the
     /// task's primary (sandbox-provisioned filesystem); index 1.. are clones
@@ -154,15 +154,12 @@ impl Scheduler {
 
         Ok(Self {
             default_config,
-            host_id,
             backends,
             default_backend,
-            audit,
             persister: None,
             sandbox_provider,
             tasks: HashMap::new(),
-            clients: HashMap::new(),
-            subscriptions: HashMap::new(),
+            router: TaskEventRouter::new(audit, host_id),
             mcp_pools: HashMap::new(),
             sandbox_handles: HashMap::new(),
             shared_hosts,
@@ -255,13 +252,10 @@ impl Scheduler {
     fn apply_input(&mut self, input: SchedulerMsg, pending_io: &mut FuturesUnordered<IoFuture>) {
         match input {
             SchedulerMsg::RegisterClient { conn_id, outbound } => {
-                self.clients.insert(conn_id, outbound);
+                self.router.register_client(conn_id, outbound);
             }
             SchedulerMsg::UnregisterClient { conn_id } => {
-                self.clients.remove(&conn_id);
-                for subs in self.subscriptions.values_mut() {
-                    subs.remove(&conn_id);
-                }
+                self.router.unregister_client(conn_id);
             }
             SchedulerMsg::ClientMessage { conn_id, msg } => {
                 self.apply_client_message(conn_id, msg, pending_io);
@@ -289,7 +283,7 @@ impl Scheduler {
                     }
                     Err(e) => {
                         warn!(error = %e, conn_id, "create_task rejected");
-                        self.send_to_client(
+                        self.router.send_to_client(
                             conn_id,
                             ServerToClient::Error {
                                 correlation_id,
@@ -305,7 +299,7 @@ impl Scheduler {
                     self.send_user_message(&task_id, text);
                     self.step_until_blocked(&task_id, pending_io);
                 } else {
-                    self.send_to_client(
+                    self.router.send_to_client(
                         conn_id,
                         ServerToClient::Error {
                             correlation_id: None,
@@ -335,7 +329,7 @@ impl Scheduler {
                     false
                 };
                 if !known {
-                    self.send_to_client(
+                    self.router.send_to_client(
                         conn_id,
                         ServerToClient::Error {
                             correlation_id: None,
@@ -345,7 +339,7 @@ impl Scheduler {
                     );
                 } else {
                     self.mark_dirty(&task_id);
-                    self.dispatch_task_events(&task_id, events);
+                    self.router.dispatch_events(&task_id, events);
                     self.teardown_sandbox_if_terminal(&task_id);
                     self.step_until_blocked(&task_id, pending_io);
                 }
@@ -358,7 +352,7 @@ impl Scheduler {
                 match removed {
                     Some((true, snapshot)) => {
                         self.mark_dirty(&task_id);
-                        self.broadcast_to_subscribers(
+                        self.router.broadcast_to_subscribers(
                             &task_id,
                             ServerToClient::TaskAllowlistUpdated {
                                 task_id: task_id.clone(),
@@ -367,7 +361,7 @@ impl Scheduler {
                         );
                     }
                     Some((false, _)) => { /* nothing to remove — silent no-op */ }
-                    None => self.send_to_client(
+                    None => self.router.send_to_client(
                         conn_id,
                         ServerToClient::Error {
                             correlation_id: None,
@@ -381,7 +375,7 @@ impl Scheduler {
                 if let Some(task) = self.tasks.get_mut(&task_id) {
                     task.cancel();
                     self.mark_dirty(&task_id);
-                    self.broadcast_task_list(ServerToClient::TaskStateChanged {
+                    self.router.broadcast_task_list(ServerToClient::TaskStateChanged {
                         task_id: task_id.clone(),
                         state: TaskStateLabel::Cancelled,
                     });
@@ -393,21 +387,18 @@ impl Scheduler {
                     task.archived = true;
                     task.touch();
                     self.mark_dirty(&task_id);
-                    self.broadcast_task_list(ServerToClient::TaskArchived { task_id });
+                    self.router.broadcast_task_list(ServerToClient::TaskArchived { task_id });
                 }
             }
             ClientToServer::SubscribeToTask { task_id } => {
                 if let Some(task) = self.tasks.get(&task_id) {
-                    self.subscriptions
-                        .entry(task_id.clone())
-                        .or_default()
-                        .insert(conn_id);
+                    self.router.subscribe(conn_id, &task_id);
                     let snapshot = task.snapshot();
                     // Rehydrate any still-pending approvals so the newly-subscribed
                     // client can render the approval UI. The snapshot itself doesn't
                     // carry approval state.
                     let pending = pending_approvals_of(task);
-                    self.send_to_client(
+                    self.router.send_to_client(
                         conn_id,
                         ServerToClient::TaskSnapshot {
                             task_id: task_id.clone(),
@@ -415,10 +406,10 @@ impl Scheduler {
                         },
                     );
                     for event in pending {
-                        self.send_to_client(conn_id, event);
+                        self.router.send_to_client(conn_id, event);
                     }
                 } else {
-                    self.send_to_client(
+                    self.router.send_to_client(
                         conn_id,
                         ServerToClient::Error {
                             correlation_id: None,
@@ -429,9 +420,7 @@ impl Scheduler {
                 }
             }
             ClientToServer::UnsubscribeFromTask { task_id } => {
-                if let Some(subs) = self.subscriptions.get_mut(&task_id) {
-                    subs.remove(&conn_id);
-                }
+                self.router.unsubscribe(conn_id, &task_id);
             }
             ClientToServer::ListTasks { correlation_id } => {
                 let tasks = self
@@ -440,7 +429,7 @@ impl Scheduler {
                     .filter(|t| !t.archived)
                     .map(|t| t.summary())
                     .collect();
-                self.send_to_client(
+                self.router.send_to_client(
                     conn_id,
                     ServerToClient::TaskList { correlation_id, tasks },
                 );
@@ -455,7 +444,7 @@ impl Scheduler {
                         default_model: entry.default_model.clone(),
                     })
                     .collect();
-                self.send_to_client(
+                self.router.send_to_client(
                     conn_id,
                     ServerToClient::BackendsList {
                         correlation_id,
@@ -467,7 +456,7 @@ impl Scheduler {
             ClientToServer::ListModels { correlation_id, backend } => {
                 let entry = self.backends.get(&backend);
                 let Some(entry) = entry else {
-                    self.send_to_client(
+                    self.router.send_to_client(
                         conn_id,
                         ServerToClient::Error {
                             correlation_id,
@@ -481,8 +470,7 @@ impl Scheduler {
                 // backend's network round-trip. The task writes directly to the
                 // client's outbound channel — the scheduler holds no intermediate state.
                 let provider = entry.provider.clone();
-                let outbound = self.clients.get(&conn_id).cloned();
-                let Some(outbound) = outbound else {
+                let Some(outbound) = self.router.outbound(conn_id) else {
                     return;
                 };
                 tokio::spawn(async move {
@@ -542,7 +530,7 @@ impl Scheduler {
         // Every client gets exactly one TaskCreated; the requester's copy carries
         // correlation_id if they provided one.
         if correlation_id.is_some() {
-            self.broadcast_task_list_except(
+            self.router.broadcast_task_list_except(
                 ServerToClient::TaskCreated {
                     task_id: task_id.clone(),
                     summary: summary.clone(),
@@ -550,7 +538,7 @@ impl Scheduler {
                 },
                 requester,
             );
-            self.send_to_client(
+            self.router.send_to_client(
                 requester,
                 ServerToClient::TaskCreated {
                     task_id: task_id.clone(),
@@ -559,7 +547,7 @@ impl Scheduler {
                 },
             );
         } else {
-            self.broadcast_task_list(ServerToClient::TaskCreated {
+            self.router.broadcast_task_list(ServerToClient::TaskCreated {
                 task_id: task_id.clone(),
                 summary,
                 correlation_id: None,
@@ -582,7 +570,7 @@ impl Scheduler {
             }
         };
         if let Some(title) = title_new {
-            self.broadcast_task_list(ServerToClient::TaskTitleUpdated {
+            self.router.broadcast_task_list(ServerToClient::TaskTitleUpdated {
                 task_id: task_id.to_string(),
                 title,
             });
@@ -595,7 +583,7 @@ impl Scheduler {
             task.submit_user_message(text, mcp_connected, tools_listed);
             task.public_state()
         };
-        self.broadcast_task_list(ServerToClient::TaskStateChanged {
+        self.router.broadcast_task_list(ServerToClient::TaskStateChanged {
             task_id: task_id.to_string(),
             state: new_state,
         });
@@ -678,7 +666,7 @@ impl Scheduler {
             return;
         }
         self.mark_dirty(&task_id);
-        self.dispatch_task_events(&task_id, events);
+        self.router.dispatch_events(&task_id, events);
         self.teardown_sandbox_if_terminal(&task_id);
     }
 
@@ -706,7 +694,7 @@ impl Scheduler {
                 };
                 task.step(&mut self.next_op_id, &mut events)
             };
-            self.dispatch_task_events(task_id, events);
+            self.router.dispatch_events(task_id, events);
 
             match outcome {
                 StepOutcome::DispatchIo(req) => {
@@ -748,225 +736,6 @@ impl Scheduler {
         }
     }
 
-    // ---------- Event dispatch ----------
-
-    fn dispatch_task_events(&self, task_id: &str, events: Vec<TaskEvent>) {
-        for event in events {
-            match event {
-                TaskEvent::AssistantBegin { turn } => {
-                    self.broadcast_to_subscribers(
-                        task_id,
-                        ServerToClient::TaskAssistantBegin {
-                            task_id: task_id.to_string(),
-                            turn,
-                        },
-                    );
-                }
-                TaskEvent::AssistantText { text } => {
-                    self.broadcast_to_subscribers(
-                        task_id,
-                        ServerToClient::TaskAssistantText {
-                            task_id: task_id.to_string(),
-                            text,
-                        },
-                    );
-                }
-                TaskEvent::AssistantReasoning { text } => {
-                    self.broadcast_to_subscribers(
-                        task_id,
-                        ServerToClient::TaskAssistantReasoning {
-                            task_id: task_id.to_string(),
-                            text,
-                        },
-                    );
-                }
-                TaskEvent::ToolCallBegin { tool_use_id, name, args_preview } => {
-                    self.broadcast_to_subscribers(
-                        task_id,
-                        ServerToClient::TaskToolCallBegin {
-                            task_id: task_id.to_string(),
-                            tool_use_id,
-                            name,
-                            args_preview,
-                        },
-                    );
-                }
-                TaskEvent::ToolCallEnd { tool_use_id, result_preview, is_error } => {
-                    self.broadcast_to_subscribers(
-                        task_id,
-                        ServerToClient::TaskToolCallEnd {
-                            task_id: task_id.to_string(),
-                            tool_use_id,
-                            result_preview,
-                            is_error,
-                        },
-                    );
-                }
-                TaskEvent::PendingApproval {
-                    approval_id,
-                    tool_use_id,
-                    name,
-                    args_preview,
-                    destructive,
-                    read_only,
-                } => {
-                    self.broadcast_to_subscribers(
-                        task_id,
-                        ServerToClient::TaskPendingApproval {
-                            task_id: task_id.to_string(),
-                            approval_id,
-                            tool_use_id,
-                            name,
-                            args_preview,
-                            destructive,
-                            read_only,
-                        },
-                    );
-                }
-                TaskEvent::ApprovalResolved { approval_id, decision, decided_by_conn } => {
-                    self.broadcast_to_subscribers(
-                        task_id,
-                        ServerToClient::TaskApprovalResolved {
-                            task_id: task_id.to_string(),
-                            approval_id,
-                            decision,
-                            decided_by_conn,
-                        },
-                    );
-                }
-                TaskEvent::AssistantEnd { stop_reason, usage } => {
-                    self.broadcast_to_subscribers(
-                        task_id,
-                        ServerToClient::TaskAssistantEnd {
-                            task_id: task_id.to_string(),
-                            stop_reason,
-                            usage,
-                        },
-                    );
-                }
-                TaskEvent::LoopComplete => {
-                    self.broadcast_to_subscribers(
-                        task_id,
-                        ServerToClient::TaskLoopComplete {
-                            task_id: task_id.to_string(),
-                        },
-                    );
-                }
-                TaskEvent::StateChanged => {
-                    let Some(task) = self.tasks.get(task_id) else { continue };
-                    self.broadcast_task_list(ServerToClient::TaskStateChanged {
-                        task_id: task_id.to_string(),
-                        state: task.public_state(),
-                    });
-                }
-                TaskEvent::Error { message } => {
-                    self.broadcast_to_subscribers(
-                        task_id,
-                        ServerToClient::Error {
-                            correlation_id: None,
-                            task_id: Some(task_id.to_string()),
-                            message,
-                        },
-                    );
-                }
-                TaskEvent::AllowlistChanged { allowlist } => {
-                    self.broadcast_to_subscribers(
-                        task_id,
-                        ServerToClient::TaskAllowlistUpdated {
-                            task_id: task_id.to_string(),
-                            tool_allowlist: allowlist,
-                        },
-                    );
-                }
-                TaskEvent::AuditToolCall {
-                    tool_name,
-                    args,
-                    is_error,
-                    error_message,
-                    decision,
-                    who_decided,
-                } => {
-                    self.write_audit(
-                        task_id,
-                        tool_name,
-                        args,
-                        is_error,
-                        error_message,
-                        decision,
-                        who_decided,
-                    );
-                }
-            }
-        }
-    }
-
-    fn write_audit(
-        &self,
-        task_id: &str,
-        tool_name: String,
-        args: serde_json::Value,
-        is_error: bool,
-        error_message: Option<String>,
-        decision: String,
-        who_decided: String,
-    ) {
-        // Fire-and-forget — audit writes don't block task progression.
-        let audit = self.audit.clone();
-        let task_id = task_id.to_string();
-        let host_id = self.host_id.clone();
-        tokio::spawn(async move {
-            let outcome = match &error_message {
-                Some(msg) => ToolCallOutcome::Failed { message: msg },
-                None => ToolCallOutcome::Ok { is_error },
-            };
-            let entry = ToolCallEntry {
-                timestamp: chrono::Utc::now(),
-                task_id: &task_id,
-                host_id: &host_id,
-                tool_name: &tool_name,
-                args,
-                decision: &decision,
-                who_decided: &who_decided,
-                outcome,
-            };
-            if let Err(e) = audit.write(&entry).await {
-                error!(error = %e, "audit write failed");
-            }
-        });
-    }
-
-    fn send_to_client(&self, conn_id: ConnId, event: ServerToClient) {
-        if let Some(tx) = self.clients.get(&conn_id) {
-            if tx.send(event).is_err() {
-                warn!(conn_id, "send_to_client: outbound channel closed");
-            }
-        }
-    }
-
-    fn broadcast_task_list(&self, event: ServerToClient) {
-        for tx in self.clients.values() {
-            let _ = tx.send(event.clone());
-        }
-    }
-
-    fn broadcast_task_list_except(&self, event: ServerToClient, skip: ConnId) {
-        for (conn_id, tx) in &self.clients {
-            if *conn_id != skip {
-                let _ = tx.send(event.clone());
-            }
-        }
-    }
-
-    fn broadcast_to_subscribers(&self, task_id: &str, event: ServerToClient) {
-        let Some(subs) = self.subscriptions.get(task_id) else {
-            return;
-        };
-        for conn_id in subs {
-            if let Some(tx) = self.clients.get(conn_id) {
-                let _ = tx.send(event.clone());
-            }
-        }
-    }
 }
 
 /// Build the `TaskPendingApproval` events that a newly-subscribed client needs to

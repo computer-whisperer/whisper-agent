@@ -248,7 +248,10 @@ pub enum TaskEvent {
         usage: Usage,
     },
     LoopComplete,
-    StateChanged,
+    /// The task's `public_state()` flipped. Carries the new label so the
+    /// scheduler's router can emit a wire `TaskStateChanged` without looking
+    /// the task back up.
+    StateChanged { state: TaskStateLabel },
     Error { message: String },
     /// The task's `tool_allowlist` set was modified — either a tool was added
     /// (via an approve-and-remember decision) or removed (via the revoke UI).
@@ -406,7 +409,7 @@ impl Task {
         let outcome = self.step_inner(next_op_id, events);
         let new_public = self.public_state();
         if prev_public != new_public {
-            events.push(TaskEvent::StateChanged);
+            events.push(TaskEvent::StateChanged { state: new_public });
         }
         outcome
     }
@@ -531,7 +534,7 @@ impl Task {
         self.apply_io_result_inner(op_id, result, tool_annotations, events);
         let new_public = self.public_state();
         if prev_public != new_public {
-            events.push(TaskEvent::StateChanged);
+            events.push(TaskEvent::StateChanged { state: new_public });
         }
     }
 
@@ -817,7 +820,7 @@ impl Task {
         );
         let new_public = self.public_state();
         if prev_public != new_public {
-            events.push(TaskEvent::StateChanged);
+            events.push(TaskEvent::StateChanged { state: new_public });
         }
     }
 
