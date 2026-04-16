@@ -20,8 +20,8 @@ use serde::{Deserialize, Serialize};
 use whisper_agent_protocol::sandbox::{AccessMode, NetworkPolicy, PathAccess};
 use whisper_agent_protocol::{
     ApprovalChoice, BackendSummary, ClientToServer, ContentBlock, Conversation, Message,
-    ModelSummary, ResourceSnapshot, ResourceStateLabel, Role, SandboxSpec, ServerToClient,
-    ThreadConfigOverride, ThreadStateLabel, ThreadSummary, ToolResultContent, Usage,
+    ModelSummary, PodSummary, ResourceSnapshot, ResourceStateLabel, Role, SandboxSpec,
+    ServerToClient, ThreadConfigOverride, ThreadStateLabel, ThreadSummary, ToolResultContent, Usage,
 };
 
 /// A user-saved sandbox configuration. Currently only encodes Landlock; future
@@ -271,14 +271,28 @@ pub struct ChatApp {
     /// Snapshot of every resource the server has reported. Keyed by resource id.
     resources: HashMap<String, ResourceSnapshot>,
     resources_requested: bool,
+
+    // --- Pods (Phase 2e: pod-grouped left panel) ---
+    /// Pod summaries keyed by `pod_id`. Used to render the pod headers in the
+    /// left panel and resolve display names for thread rows. Threads carry
+    /// `pod_id` directly (since 2d.iii) so the source of truth for "which
+    /// threads are in this pod" lives in `tasks`, not here.
+    pods: HashMap<String, PodSummary>,
+    pods_requested: bool,
+    /// Set of pod ids the user has manually collapsed in the left panel.
+    /// Default is "all expanded"; toggling a header inverts membership.
+    /// Persisted only in memory — re-expands across reloads.
+    collapsed_pods: HashSet<String>,
+
     /// Which view the left side panel is showing.
     left_mode: LeftPanelMode,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 enum LeftPanelMode {
+    /// Pod-grouped tree of every thread the user can see.
     #[default]
-    Tasks,
+    Threads,
     Resources,
 }
 
@@ -323,6 +337,9 @@ impl ChatApp {
             preset_modal: None,
             resources: HashMap::new(),
             resources_requested: false,
+            pods: HashMap::new(),
+            pods_requested: false,
+            collapsed_pods: HashSet::new(),
             left_mode: LeftPanelMode::default(),
         }
     }
@@ -403,6 +420,12 @@ impl ChatApp {
                         correlation_id: None,
                     });
                     self.resources_requested = true;
+                }
+                if !self.pods_requested {
+                    self.send(ClientToServer::ListPods {
+                        correlation_id: None,
+                    });
+                    self.pods_requested = true;
                 }
             }
             InboundEvent::ConnectionClosed { detail } => {
@@ -640,14 +663,42 @@ impl ChatApp {
             ServerToClient::ResourceDestroyed { id, .. } => {
                 self.resources.remove(&id);
             }
-            // Phase 2d.i: pod CRUD wire surface lands but the webui's pod
-            // list/editor are Phase 2e. Drop these so the build stays
-            // exhaustive.
-            ServerToClient::PodList { .. }
-            | ServerToClient::PodSnapshot { .. }
-            | ServerToClient::PodCreated { .. }
-            | ServerToClient::PodConfigUpdated { .. }
-            | ServerToClient::PodArchived { .. } => {}
+            ServerToClient::PodList { pods, .. } => {
+                self.pods = pods.into_iter().map(|p| (p.pod_id.clone(), p)).collect();
+            }
+            ServerToClient::PodCreated { pod, .. } => {
+                self.pods.insert(pod.pod_id.clone(), pod);
+            }
+            ServerToClient::PodConfigUpdated {
+                pod_id, parsed, ..
+            } => {
+                // Mirror the new top-level fields (name/description) onto the
+                // summary so the left panel reflects edits without waiting
+                // for a full ListPods refresh. thread_count is unchanged by
+                // a config edit.
+                if let Some(summary) = self.pods.get_mut(&pod_id) {
+                    summary.name = parsed.name;
+                    summary.description = parsed.description;
+                    summary.created_at = parsed.created_at;
+                }
+            }
+            ServerToClient::PodArchived { pod_id } => {
+                self.pods.remove(&pod_id);
+                // Drop any threads we were tracking under the archived pod —
+                // the server won't send further events for them and they're
+                // unreachable from the UI now.
+                self.tasks.retain(|_, v| v.summary.pod_id != pod_id);
+                self.recompute_order();
+                if let Some(sel) = &self.selected
+                    && !self.tasks.contains_key(sel)
+                {
+                    self.selected = None;
+                    self.composing_new = true;
+                }
+            }
+            // PodSnapshot is a response to GetPod, which the webui doesn't
+            // call yet (the pod editor lands in Phase 4). Drop for now.
+            ServerToClient::PodSnapshot { .. } => {}
         }
     }
 
@@ -930,10 +981,10 @@ impl eframe::App for ChatApp {
                 ui.add_space(4.0);
                 ui.horizontal(|ui| {
                     if ui
-                        .selectable_label(self.left_mode == LeftPanelMode::Tasks, "Tasks")
+                        .selectable_label(self.left_mode == LeftPanelMode::Threads, "Threads")
                         .clicked()
                     {
-                        self.left_mode = LeftPanelMode::Tasks;
+                        self.left_mode = LeftPanelMode::Threads;
                     }
                     if ui
                         .selectable_label(
@@ -947,7 +998,7 @@ impl eframe::App for ChatApp {
                 });
                 ui.separator();
                 match self.left_mode {
-                    LeftPanelMode::Tasks => self.render_task_list(ui),
+                    LeftPanelMode::Threads => self.render_thread_tree(ui),
                     LeftPanelMode::Resources => render_resource_list(ui, &self.resources),
                 }
             });
@@ -1185,44 +1236,111 @@ impl eframe::App for ChatApp {
 }
 
 impl ChatApp {
-    /// Renders the "new sandbox preset" modal if open. On Save, appends a new
-    /// preset to `self.presets`, persists, and selects it in the picker.
-    fn render_task_list(&mut self, ui: &mut egui::Ui) {
-        if ui.button("+ New task").clicked() {
+    /// Renders the left panel as a pod-grouped tree: each pod gets a header
+    /// (with display name + thread count) and its threads nest underneath
+    /// as selectable rows. Threads whose `pod_id` doesn't match any known
+    /// pod get bucketed under a synthetic "(unknown pod)" group — happens
+    /// in practice when a thread arrives via `ThreadCreated` before the
+    /// `ListPods` round-trip completes.
+    fn render_thread_tree(&mut self, ui: &mut egui::Ui) {
+        if ui.button("+ New thread").clicked() {
             self.selected = None;
             self.composing_new = true;
             self.input.clear();
         }
         ui.separator();
+
+        // Group threads by pod_id, preserving the existing newest-first
+        // sort within each pod (task_order is already created_at desc).
+        let order = self.task_order.clone();
+        let mut by_pod: HashMap<String, Vec<String>> = HashMap::new();
+        for thread_id in &order {
+            let Some(view) = self.tasks.get(thread_id) else {
+                continue;
+            };
+            by_pod
+                .entry(view.summary.pod_id.clone())
+                .or_default()
+                .push(thread_id.clone());
+        }
+
+        // Pod header order: known pods alphabetically by display name, then
+        // the synthetic "(unknown pod)" bucket if non-empty. Stable across
+        // renders so headers don't jitter as state churns.
+        let mut pod_ids: Vec<String> = self.pods.keys().cloned().collect();
+        pod_ids.sort_by(|a, b| {
+            let na = self.pods.get(a).map(|p| p.name.as_str()).unwrap_or(a);
+            let nb = self.pods.get(b).map(|p| p.name.as_str()).unwrap_or(b);
+            na.cmp(nb)
+        });
+        // Surface any pod_ids that have threads but no PodSummary — typically
+        // new threads created before ListPods returned.
+        for pid in by_pod.keys() {
+            if !self.pods.contains_key(pid) && !pod_ids.contains(pid) {
+                pod_ids.push(pid.clone());
+            }
+        }
+
         ScrollArea::vertical().show(ui, |ui| {
-            let order = self.task_order.clone();
-            for thread_id in order {
-                let Some(view) = self.tasks.get(&thread_id) else {
-                    continue;
-                };
-                let is_selected = self.selected.as_deref() == Some(&thread_id);
-                let title = view
-                    .summary
-                    .title
-                    .clone()
-                    .unwrap_or_else(|| thread_id[..thread_id.len().min(14)].to_string());
-                let (chip, chip_color) = state_chip(view.summary.state);
-                let row = ui.add_sized(
-                    [ui.available_width(), 0.0],
-                    egui::Button::selectable(
-                        is_selected,
-                        RichText::new(format!("{title}  [{chip}]")).color(if is_selected {
-                            Color32::WHITE
-                        } else {
-                            chip_color
-                        }),
-                    ),
-                );
-                if row.clicked() {
-                    self.select_task(thread_id.clone());
-                }
+            for pid in &pod_ids {
+                self.render_pod_section(ui, pid, by_pod.get(pid).map(|v| v.as_slice()));
             }
         });
+    }
+
+    fn render_pod_section(
+        &mut self,
+        ui: &mut egui::Ui,
+        pod_id: &str,
+        thread_ids: Option<&[String]>,
+    ) {
+        let label = match self.pods.get(pod_id) {
+            Some(summary) => format!("{}  ({})", summary.name, thread_ids.map(|t| t.len()).unwrap_or(0)),
+            None => format!("{pod_id}  ({})", thread_ids.map(|t| t.len()).unwrap_or(0)),
+        };
+        let collapsed_id = format!("pod-section-{pod_id}");
+        let default_open = !self.collapsed_pods.contains(pod_id);
+        let header = egui::CollapsingHeader::new(RichText::new(label).strong())
+            .id_salt(&collapsed_id)
+            .default_open(default_open)
+            .show(ui, |ui| {
+                let Some(thread_ids) = thread_ids else {
+                    ui.label(RichText::new("(no threads)").italics().color(Color32::from_gray(140)));
+                    return;
+                };
+                for thread_id in thread_ids {
+                    let Some(view) = self.tasks.get(thread_id) else {
+                        continue;
+                    };
+                    let is_selected = self.selected.as_deref() == Some(thread_id.as_str());
+                    let title = view
+                        .summary
+                        .title
+                        .clone()
+                        .unwrap_or_else(|| thread_id[..thread_id.len().min(14)].to_string());
+                    let (chip, chip_color) = state_chip(view.summary.state);
+                    let row = ui.add_sized(
+                        [ui.available_width(), 0.0],
+                        egui::Button::selectable(
+                            is_selected,
+                            RichText::new(format!("{title}  [{chip}]")).color(if is_selected {
+                                Color32::WHITE
+                            } else {
+                                chip_color
+                            }),
+                        ),
+                    );
+                    if row.clicked() {
+                        self.select_task(thread_id.clone());
+                    }
+                }
+            });
+        // Track collapse state so it persists across renders.
+        if header.fully_closed() {
+            self.collapsed_pods.insert(pod_id.to_string());
+        } else {
+            self.collapsed_pods.remove(pod_id);
+        }
     }
 
     fn render_preset_modal(&mut self, ctx: &egui::Context) {
