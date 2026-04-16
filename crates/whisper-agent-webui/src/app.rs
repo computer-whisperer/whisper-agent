@@ -16,23 +16,85 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::rc::Rc;
 
 use egui::{Color32, ComboBox, RichText, ScrollArea, TextEdit};
+use serde::{Deserialize, Serialize};
+use whisper_agent_protocol::sandbox::{AccessMode, NetworkPolicy, PathAccess};
 use whisper_agent_protocol::{
     ApprovalChoice, BackendSummary, ClientToServer, ContentBlock, Conversation, Message,
     ModelSummary, Role, SandboxSpec, ServerToClient, TaskConfigOverride, TaskStateLabel,
     TaskSummary, ToolResultContent, Usage,
 };
-use whisper_agent_protocol::sandbox::{AccessMode, NetworkPolicy, PathAccess};
 
+/// A user-saved sandbox configuration. Currently only encodes Landlock; future
+/// variants (container image, resource limits) plug in alongside.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct LandlockPreset {
+    name: String,
+    /// Read-write workspace path.
+    workspace: String,
+    /// If true, the whole filesystem is granted read-only access on top of the
+    /// workspace's read-write scope. Useful for tasks that need to inspect
+    /// system files (/etc, /proc, the user's other projects) without being
+    /// able to modify them.
+    read_everywhere: bool,
+}
+
+impl LandlockPreset {
+    fn to_spec(&self) -> SandboxSpec {
+        let mut allowed_paths = vec![PathAccess {
+            path: self.workspace.clone(),
+            mode: AccessMode::ReadWrite,
+        }];
+        if self.read_everywhere {
+            allowed_paths.push(PathAccess {
+                path: "/".into(),
+                mode: AccessMode::ReadOnly,
+            });
+        }
+        SandboxSpec::Landlock {
+            allowed_paths,
+            network: NetworkPolicy::Unrestricted,
+        }
+    }
+}
+
+/// Selection in the new-task sandbox dropdown.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-enum SandboxPreset {
+enum SandboxChoice {
     /// Use whatever the server configured as default.
     #[default]
     ServerDefault,
     /// Explicitly no sandbox.
     None,
-    /// Landlock sandbox with a user-specified workspace path.
-    Sandboxed,
+    /// Index into ChatApp::presets.
+    Preset(usize),
 }
+
+#[cfg(target_arch = "wasm32")]
+const PRESETS_STORAGE_KEY: &str = "whisper-agent.sandbox-presets";
+
+#[cfg(target_arch = "wasm32")]
+fn load_presets() -> Vec<LandlockPreset> {
+    let Some(window) = web_sys::window() else { return Vec::new() };
+    let Ok(Some(storage)) = window.local_storage() else { return Vec::new() };
+    let Ok(Some(json)) = storage.get_item(PRESETS_STORAGE_KEY) else { return Vec::new() };
+    serde_json::from_str(&json).unwrap_or_default()
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn load_presets() -> Vec<LandlockPreset> {
+    Vec::new()
+}
+
+#[cfg(target_arch = "wasm32")]
+fn save_presets(presets: &[LandlockPreset]) {
+    let Some(window) = web_sys::window() else { return };
+    let Ok(Some(storage)) = window.local_storage() else { return };
+    let Ok(json) = serde_json::to_string(presets) else { return };
+    let _ = storage.set_item(PRESETS_STORAGE_KEY, &json);
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn save_presets(_presets: &[LandlockPreset]) {}
 
 /// Events pushed into [`Inbound`]. In addition to decoded wire messages we pipe in
 /// connection-level signals (open/close/error) so the UI can show a connection status
@@ -176,8 +238,28 @@ pub struct ChatApp {
     picker_backend: Option<String>,
     /// Model chosen in the new-task picker. None = follow backend default.
     picker_model: Option<String>,
-    picker_sandbox: SandboxPreset,
-    picker_sandbox_workspace: String,
+    picker_sandbox: SandboxChoice,
+    /// User-saved sandbox presets, persisted in localStorage (WASM) or kept
+    /// in memory (native test builds).
+    presets: Vec<LandlockPreset>,
+    /// Modal state for creating a new preset. `None` = closed.
+    preset_modal: Option<PresetModalState>,
+}
+
+struct PresetModalState {
+    name: String,
+    workspace: String,
+    read_everywhere: bool,
+}
+
+impl PresetModalState {
+    fn new() -> Self {
+        Self {
+            name: String::new(),
+            workspace: String::new(),
+            read_everywhere: false,
+        }
+    }
 }
 
 impl ChatApp {
@@ -200,8 +282,9 @@ impl ChatApp {
             models_requested: HashSet::new(),
             picker_backend: None,
             picker_model: None,
-            picker_sandbox: SandboxPreset::default(),
-            picker_sandbox_workspace: String::new(),
+            picker_sandbox: SandboxChoice::default(),
+            presets: load_presets(),
+            preset_modal: None,
         }
     }
 
@@ -540,22 +623,9 @@ impl ChatApp {
                 })
         });
         let sandbox = match self.picker_sandbox {
-            SandboxPreset::ServerDefault => None,
-            SandboxPreset::None => Some(SandboxSpec::None),
-            SandboxPreset::Sandboxed => {
-                let ws = self.picker_sandbox_workspace.trim().to_string();
-                if ws.is_empty() {
-                    None
-                } else {
-                    Some(SandboxSpec::Landlock {
-                        allowed_paths: vec![PathAccess {
-                            path: ws,
-                            mode: AccessMode::ReadWrite,
-                        }],
-                        network: NetworkPolicy::Unrestricted,
-                    })
-                }
-            }
+            SandboxChoice::ServerDefault => None,
+            SandboxChoice::None => Some(SandboxSpec::None),
+            SandboxChoice::Preset(idx) => self.presets.get(idx).map(|p| p.to_spec()),
         };
         if backend.is_none() && model.is_none() && sandbox.is_none() {
             return None;
@@ -833,37 +903,46 @@ impl eframe::App for ChatApp {
 
                         ui.separator();
                         ui.label(RichText::new("sandbox").small().color(Color32::from_gray(180)));
-                        let sandbox_label = match self.picker_sandbox {
-                            SandboxPreset::ServerDefault => "default",
-                            SandboxPreset::None => "none",
-                            SandboxPreset::Sandboxed => "sandboxed",
+                        let sandbox_label: String = match self.picker_sandbox {
+                            SandboxChoice::ServerDefault => "default".into(),
+                            SandboxChoice::None => "none".into(),
+                            SandboxChoice::Preset(idx) => self
+                                .presets
+                                .get(idx)
+                                .map(|p| p.name.clone())
+                                .unwrap_or_else(|| "(missing preset)".into()),
                         };
+                        let mut open_modal = false;
                         ComboBox::from_id_salt("picker_sandbox")
                             .selected_text(sandbox_label)
                             .show_ui(ui, |ui| {
                                 ui.selectable_value(
                                     &mut self.picker_sandbox,
-                                    SandboxPreset::ServerDefault,
+                                    SandboxChoice::ServerDefault,
                                     "default  (server decides)",
                                 );
                                 ui.selectable_value(
                                     &mut self.picker_sandbox,
-                                    SandboxPreset::None,
+                                    SandboxChoice::None,
                                     "none  (bare metal)",
                                 );
-                                ui.selectable_value(
-                                    &mut self.picker_sandbox,
-                                    SandboxPreset::Sandboxed,
-                                    "sandboxed  (landlock)",
-                                );
+                                if !self.presets.is_empty() {
+                                    ui.separator();
+                                    for (i, p) in self.presets.iter().enumerate() {
+                                        ui.selectable_value(
+                                            &mut self.picker_sandbox,
+                                            SandboxChoice::Preset(i),
+                                            &p.name,
+                                        );
+                                    }
+                                }
+                                ui.separator();
+                                if ui.button("+ New preset…").clicked() {
+                                    open_modal = true;
+                                }
                             });
-                        if self.picker_sandbox == SandboxPreset::Sandboxed {
-                            ui.label(RichText::new("workspace").small().color(Color32::from_gray(180)));
-                            ui.add(
-                                TextEdit::singleline(&mut self.picker_sandbox_workspace)
-                                    .desired_width(200.0)
-                                    .hint_text("/path/to/workspace"),
-                            );
+                        if open_modal && self.preset_modal.is_none() {
+                            self.preset_modal = Some(PresetModalState::new());
                         }
                     });
                 }
@@ -956,6 +1035,94 @@ impl eframe::App for ChatApp {
         }
         for (task_id, tool_name) in allowlist_revocations {
             self.send(ClientToServer::RemoveToolAllowlistEntry { task_id, tool_name });
+        }
+
+        self.render_preset_modal(ctx);
+    }
+}
+
+impl ChatApp {
+    /// Renders the "new sandbox preset" modal if open. On Save, appends a new
+    /// preset to `self.presets`, persists, and selects it in the picker.
+    fn render_preset_modal(&mut self, ctx: &egui::Context) {
+        let Some(mut modal) = self.preset_modal.take() else {
+            return;
+        };
+        let mut open = true;
+        let mut save_clicked = false;
+        let mut cancel_clicked = false;
+
+        egui::Window::new("New sandbox preset")
+            .collapsible(false)
+            .resizable(false)
+            .default_width(420.0)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .open(&mut open)
+            .show(ctx, |ui| {
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    ui.label("name");
+                    ui.add(
+                        TextEdit::singleline(&mut modal.name)
+                            .hint_text("e.g. 'rust-dev'")
+                            .desired_width(f32::INFINITY),
+                    );
+                });
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    ui.label("workspace");
+                    ui.add(
+                        TextEdit::singleline(&mut modal.workspace)
+                            .hint_text("/absolute/path (read-write)")
+                            .desired_width(f32::INFINITY),
+                    );
+                });
+                ui.add_space(4.0);
+                ui.checkbox(
+                    &mut modal.read_everywhere,
+                    "Read everywhere (grant read-only access to the entire filesystem)",
+                );
+                ui.add_space(4.0);
+                ui.label(
+                    RichText::new(
+                        "Sandbox uses Linux landlock. Files outside the workspace are \
+                         read-only (if 'Read everywhere' is on) or denied entirely.",
+                    )
+                    .small()
+                    .color(Color32::from_gray(160)),
+                );
+                ui.add_space(8.0);
+                ui.separator();
+                ui.horizontal(|ui| {
+                    let save_enabled =
+                        !modal.name.trim().is_empty() && !modal.workspace.trim().is_empty();
+                    if ui
+                        .add_enabled(save_enabled, egui::Button::new("Save"))
+                        .clicked()
+                    {
+                        save_clicked = true;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        cancel_clicked = true;
+                    }
+                });
+            });
+
+        if save_clicked {
+            let preset = LandlockPreset {
+                name: modal.name.trim().to_string(),
+                workspace: modal.workspace.trim().to_string(),
+                read_everywhere: modal.read_everywhere,
+            };
+            self.presets.push(preset);
+            save_presets(&self.presets);
+            self.picker_sandbox = SandboxChoice::Preset(self.presets.len() - 1);
+            // Modal closes (we don't put it back).
+        } else if cancel_clicked || !open {
+            // Modal closes.
+        } else {
+            // Stay open — restore modal state.
+            self.preset_modal = Some(modal);
         }
     }
 }

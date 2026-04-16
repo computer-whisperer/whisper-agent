@@ -33,5 +33,6 @@ web-sys = { version = "0.3", features = [
     "Document",
     "HtmlCanvasElement",
     "BinaryType",
+    "Storage",
 ] }
 getrandom = { version = "0.4", features = ["wasm_js"] }
