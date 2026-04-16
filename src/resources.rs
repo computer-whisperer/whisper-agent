@@ -32,8 +32,22 @@ pub struct McpHostId(pub String);
 pub struct BackendId(pub String);
 
 impl SandboxId {
-    pub fn for_task(thread_id: &str) -> Self {
-        Self(format!("sb-{thread_id}"))
+    /// Derive a stable id from the sandbox spec. Identical specs hash to
+    /// identical ids — this is how Phase 3b's dedup works: when a second
+    /// thread requests a sandbox whose spec matches an existing entry,
+    /// `register_sandbox` finds the entry by id and adds the thread as a
+    /// user instead of inserting a duplicate.
+    ///
+    /// Hash is `DefaultHasher` over the spec's JSON serialization. Not
+    /// cryptographic; collision risk on a few-hundred-pod scale is
+    /// negligible. The 16-hex-char width keeps ids readable in logs.
+    pub fn for_spec(spec: &SandboxSpec) -> Self {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+        let json = serde_json::to_string(spec).unwrap_or_default();
+        let mut hasher = DefaultHasher::new();
+        json.hash(&mut hasher);
+        Self(format!("sb-{:016x}", hasher.finish()))
     }
 }
 
@@ -99,6 +113,11 @@ pub struct SandboxEntry {
     /// borrow. Cleared on `mark_sandbox_torn_down` when the handle has
     /// already been retrieved.
     pub handle: Option<Box<dyn SandboxHandle>>,
+    /// The MCP URL the sandbox advertises (or the fallback used to connect
+    /// to it when the sandbox doesn't run its own MCP). Cached on the
+    /// entry so dedup hits don't have to consult the live handle — and so
+    /// the URL stays correct even after the handle is taken for teardown.
+    pub mcp_url: Option<String>,
 }
 
 impl std::fmt::Debug for SandboxEntry {
@@ -112,8 +131,24 @@ impl std::fmt::Debug for SandboxEntry {
             .field("created_at", &self.created_at)
             .field("last_used", &self.last_used)
             .field("handle", &self.handle.as_ref().map(|_| "<sandbox>"))
+            .field("mcp_url", &self.mcp_url)
             .finish()
     }
+}
+
+/// Outcome of `ResourceRegistry::register_sandbox`. Distinguishes a fresh
+/// insert from a dedup hit so the caller knows whether to spawn teardown
+/// of the now-redundant handle it just provisioned.
+pub enum RegisterSandboxOutcome {
+    /// New entry inserted; the passed handle is now owned by the registry.
+    Created(SandboxId),
+    /// An entry with this spec already existed; the passed handle is
+    /// returned to the caller (so it can spawn teardown). The thread has
+    /// been added to the existing entry's user set.
+    AlreadyExists {
+        id: SandboxId,
+        unused_handle: Option<Box<dyn SandboxHandle>>,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -349,17 +384,32 @@ impl ResourceRegistry {
         id
     }
 
-    /// Insert a Ready per-task sandbox entry. The handle (when present) is
-    /// stored on the entry so it can be reclaimed at teardown via
-    /// `take_sandbox_handle`. `BareMetal` sandboxes pass `None` because
-    /// their handle has nothing to reclaim — teardown is a no-op.
-    pub fn insert_sandbox_for_task(
+    /// Spec-based registration. If a Ready entry with the same spec id
+    /// already exists, add this thread as a user and hand the unused
+    /// handle back to the caller so it can spawn its teardown. Otherwise
+    /// insert a fresh entry with the given handle.
+    ///
+    /// `mcp_url` is the URL the sandbox is reachable at (from
+    /// `handle.mcp_url()` or the configured fallback) — cached on the
+    /// entry so future dedup hits don't have to consult the handle.
+    pub fn register_sandbox(
         &mut self,
         thread_id: &str,
         spec: SandboxSpec,
+        mcp_url: Option<String>,
         handle: Option<Box<dyn SandboxHandle>>,
-    ) -> SandboxId {
-        let id = SandboxId::for_task(thread_id);
+    ) -> RegisterSandboxOutcome {
+        let id = SandboxId::for_spec(&spec);
+        if let Some(entry) = self.sandboxes.get_mut(&id)
+            && entry.state.is_ready()
+        {
+            entry.users.insert(thread_id.to_string());
+            entry.last_used = Utc::now();
+            return RegisterSandboxOutcome::AlreadyExists {
+                id,
+                unused_handle: handle,
+            };
+        }
         let now = Utc::now();
         self.sandboxes.insert(
             id.clone(),
@@ -372,9 +422,47 @@ impl ResourceRegistry {
                 created_at: now,
                 last_used: now,
                 handle,
+                mcp_url,
             },
         );
-        id
+        RegisterSandboxOutcome::Created(id)
+    }
+
+    /// Find a Ready sandbox whose spec matches; used by the dispatcher to
+    /// skip provisioning when an existing sandbox can be reused. Only
+    /// returns entries whose handle is still present — we don't want to
+    /// dedup onto a sandbox whose handle was just taken for teardown.
+    pub fn find_ready_sandbox_for_spec(
+        &self,
+        spec: &SandboxSpec,
+    ) -> Option<&SandboxEntry> {
+        let id = SandboxId::for_spec(spec);
+        self.sandboxes
+            .get(&id)
+            .filter(|e| e.state.is_ready() && e.handle.is_some())
+    }
+
+    /// Find which sandbox a given thread is currently bound to. Linear
+    /// scan over the registry — fine at the few-dozen-sandbox scale
+    /// Phase 3 targets. Phase 3d's `ThreadBindings` makes this an O(1)
+    /// thread-side lookup.
+    pub fn find_sandbox_used_by(&self, thread_id: &str) -> Option<SandboxId> {
+        self.sandboxes
+            .values()
+            .find(|e| e.users.contains(thread_id))
+            .map(|e| e.id.clone())
+    }
+
+    /// Drop `thread_id` from the sandbox's user set and return the new
+    /// user count. Caller decides whether to tear down (count == 0 and
+    /// not pinned).
+    pub fn release_sandbox_user(&mut self, id: &SandboxId, thread_id: &str) -> usize {
+        let Some(entry) = self.sandboxes.get_mut(id) else {
+            return 0;
+        };
+        entry.users.remove(thread_id);
+        entry.last_used = Utc::now();
+        entry.users.len()
     }
 
     /// Pull the sandbox handle out of the registry so the caller can spawn
@@ -467,7 +555,12 @@ mod tests {
 
     #[test]
     fn id_constructors_are_stable() {
-        assert_eq!(SandboxId::for_task("t-1").0, "sb-t-1");
+        // Spec-derived sandbox ids are deterministic — same spec, same id.
+        let id1 = SandboxId::for_spec(&SandboxSpec::None);
+        let id2 = SandboxId::for_spec(&SandboxSpec::None);
+        assert_eq!(id1, id2);
+        assert!(id1.0.starts_with("sb-"));
+        assert_eq!(id1.0.len(), "sb-".len() + 16); // sb- + 16 hex chars
         assert_eq!(
             McpHostId::primary_for_task("t-1").0,
             "mcp-primary-t-1"
@@ -491,7 +584,10 @@ mod tests {
     #[test]
     fn sandbox_teardown_clears_users() {
         let mut reg = ResourceRegistry::new();
-        let id = reg.insert_sandbox_for_task("t-1", SandboxSpec::None, None);
+        let outcome = reg.register_sandbox("t-1", SandboxSpec::None, None, None);
+        let RegisterSandboxOutcome::Created(id) = outcome else {
+            panic!("first register should be Created");
+        };
         assert!(reg.sandboxes[&id].state.is_ready());
         assert_eq!(reg.sandboxes[&id].users.len(), 1);
         reg.mark_sandbox_torn_down(&id);
@@ -500,6 +596,37 @@ mod tests {
             ResourceState::TornDown
         ));
         assert!(reg.sandboxes[&id].users.is_empty());
+    }
+
+    #[test]
+    fn register_sandbox_dedups_by_spec() {
+        let mut reg = ResourceRegistry::new();
+        let first = reg.register_sandbox("t-1", SandboxSpec::None, None, None);
+        let second = reg.register_sandbox("t-2", SandboxSpec::None, None, None);
+        let RegisterSandboxOutcome::Created(id_a) = first else {
+            panic!("first should be Created");
+        };
+        let RegisterSandboxOutcome::AlreadyExists { id: id_b, .. } = second else {
+            panic!("second should be AlreadyExists");
+        };
+        assert_eq!(id_a, id_b);
+        // Both threads now share the entry's user set.
+        assert_eq!(reg.sandboxes[&id_a].users.len(), 2);
+        assert!(reg.sandboxes[&id_a].users.contains("t-1"));
+        assert!(reg.sandboxes[&id_a].users.contains("t-2"));
+    }
+
+    #[test]
+    fn release_sandbox_user_decrements_count() {
+        let mut reg = ResourceRegistry::new();
+        let RegisterSandboxOutcome::Created(id) =
+            reg.register_sandbox("t-1", SandboxSpec::None, None, None)
+        else {
+            panic!("created");
+        };
+        reg.register_sandbox("t-2", SandboxSpec::None, None, None);
+        assert_eq!(reg.release_sandbox_user(&id, "t-1"), 1);
+        assert_eq!(reg.release_sandbox_user(&id, "t-2"), 0);
     }
 
     #[test]

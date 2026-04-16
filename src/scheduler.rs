@@ -37,7 +37,7 @@ use crate::mcp::{McpSession, ToolAnnotations, ToolDescriptor as McpTool};
 use crate::model::ModelProvider;
 use crate::persist::{LoadedState, Persister};
 use crate::pod::{Pod, PodId};
-use crate::resources::{BackendId, McpHostId, ResourceRegistry, SandboxId};
+use crate::resources::{BackendId, McpHostId, RegisterSandboxOutcome, ResourceRegistry, SandboxId};
 use crate::sandbox::SandboxProvider;
 use crate::thread::{
     ApprovalDisposition, IoResult, OpId, StepOutcome, Thread, ThreadInternalState, derive_title,
@@ -307,6 +307,20 @@ impl Scheduler {
 
     pub(crate) fn sandbox_provider(&self) -> &Arc<dyn SandboxProvider> {
         &self.sandbox_provider
+    }
+
+    /// Phase 3b: read-only accessor used by `io_dispatch` to skip the
+    /// provision call when an existing sandbox already matches the spec.
+    /// Returns `(SandboxId, mcp_url)` for the dedup target. Only entries
+    /// whose handle is still attached are eligible — see
+    /// `find_ready_sandbox_for_spec`.
+    pub(crate) fn find_ready_sandbox_for_spec(
+        &self,
+        spec: &whisper_agent_protocol::SandboxSpec,
+    ) -> Option<(crate::resources::SandboxId, String)> {
+        self.resources
+            .find_ready_sandbox_for_spec(spec)
+            .map(|e| (e.id.clone(), e.mcp_url.clone().unwrap_or_default()))
     }
 
     pub(crate) fn tool_descriptors(&self, thread_id: &str) -> Option<&[McpTool]> {
@@ -997,7 +1011,10 @@ impl Scheduler {
                 // into the resource registry. Phase 1b: emit ResourceCreated
                 // so subscribed clients see them appear. Phase 3a: the
                 // sandbox handle moves into the registry too, replacing the
-                // dropped `scheduler.sandbox_handles` map.
+                // dropped `scheduler.sandbox_handles` map. Phase 3b: the
+                // registry dedups by spec — a second thread with the same
+                // sandbox spec re-uses the existing entry and the just-
+                // provisioned handle gets torn down right away.
                 let primary_url = sandbox_handle
                     .as_ref()
                     .and_then(|h| h.mcp_url().map(str::to_string))
@@ -1009,15 +1026,35 @@ impl Scheduler {
                     });
                 let primary_id =
                     self.resources
-                        .insert_primary_mcp_host(&thread_id, primary_url, session);
+                        .insert_primary_mcp_host(&thread_id, primary_url.clone(), session);
                 self.emit_mcp_host_created(&primary_id);
-                if sandbox_handle.is_some() {
-                    let sandbox_id = self.resources.insert_sandbox_for_task(
-                        &thread_id,
-                        sandbox_spec,
-                        sandbox_handle,
-                    );
-                    self.emit_sandbox_created(&sandbox_id);
+                let outcome = self.resources.register_sandbox(
+                    &thread_id,
+                    sandbox_spec,
+                    Some(primary_url),
+                    sandbox_handle,
+                );
+                match outcome {
+                    RegisterSandboxOutcome::Created(sandbox_id) => {
+                        self.emit_sandbox_created(&sandbox_id);
+                    }
+                    RegisterSandboxOutcome::AlreadyExists {
+                        id: sandbox_id,
+                        unused_handle,
+                    } => {
+                        // Dedup hit — emit Updated so subscribers see the
+                        // user count tick up. If we got here from a peek
+                        // miss followed by a race-loser provision, the
+                        // unused handle needs teardown.
+                        self.emit_sandbox_updated(&sandbox_id);
+                        if let Some(mut handle) = unused_handle {
+                            tokio::spawn(async move {
+                                if let Err(e) = handle.teardown().await {
+                                    warn!(error = %e, "teardown of dedup-loser sandbox failed");
+                                }
+                            });
+                        }
+                    }
                 }
 
                 self.mcp_pools.insert(
@@ -1126,21 +1163,39 @@ impl Scheduler {
             // alone — the task itself still exists in `self.tasks` and the
             // existing code never removes terminal tasks.
             let primary_id = McpHostId::primary_for_task(thread_id);
-            let sandbox_id = SandboxId::for_task(thread_id);
             self.resources.mark_mcp_torn_down(&primary_id);
             self.emit_mcp_host_updated(&primary_id);
-            // Pull the handle out of the registry before flipping state so
-            // we don't race a future inspector that consults the entry.
-            let handle = self.resources.take_sandbox_handle(&sandbox_id);
-            self.resources.mark_sandbox_torn_down(&sandbox_id);
-            self.emit_sandbox_updated(&sandbox_id);
-            if let Some(mut handle) = handle {
-                let tid = thread_id.to_string();
-                tokio::spawn(async move {
-                    if let Err(e) = handle.teardown().await {
-                        warn!(thread_id = %tid, error = %e, "sandbox teardown failed");
+
+            // Phase 3b: the sandbox is shared across threads with matching
+            // specs. Drop this thread from the user set; only tear the
+            // sandbox down when the count hits zero and it isn't pinned.
+            if let Some(sandbox_id) = self.resources.find_sandbox_used_by(thread_id) {
+                let remaining = self
+                    .resources
+                    .release_sandbox_user(&sandbox_id, thread_id);
+                let pinned = self
+                    .resources
+                    .sandboxes
+                    .get(&sandbox_id)
+                    .map(|e| e.pinned)
+                    .unwrap_or(false);
+                if remaining == 0 && !pinned {
+                    let handle = self.resources.take_sandbox_handle(&sandbox_id);
+                    self.resources.mark_sandbox_torn_down(&sandbox_id);
+                    self.emit_sandbox_updated(&sandbox_id);
+                    if let Some(mut handle) = handle {
+                        let tid = thread_id.to_string();
+                        tokio::spawn(async move {
+                            if let Err(e) = handle.teardown().await {
+                                warn!(thread_id = %tid, error = %e, "sandbox teardown failed");
+                            }
+                        });
                     }
-                });
+                } else {
+                    // Sandbox lives on for the other threads using it; the
+                    // user list changed so subscribers want a refresh.
+                    self.emit_sandbox_updated(&sandbox_id);
+                }
             }
         }
     }

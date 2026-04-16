@@ -53,23 +53,40 @@ fn mcp_connect(scheduler: &Scheduler, thread_id: String, op_id: OpId) -> IoFutur
     let sandbox_spec = task.config.sandbox.clone();
     let provider = scheduler.sandbox_provider().clone();
 
+    // Phase 3b dedup: if a Ready sandbox with the same spec already exists,
+    // skip provisioning entirely — the dispatcher returns an MCP session
+    // pointing at the existing sandbox's URL and `apply_io_completion`
+    // adds the thread to the existing entry's user set.
+    let dedup_target = scheduler.find_ready_sandbox_for_spec(&sandbox_spec);
+
     Box::pin(async move {
-        // Provision sandbox if the task has a non-None spec.
-        let (mcp_url, sandbox_handle) = match provider.provision(&thread_id, &sandbox_spec).await {
-            Ok(handle) => {
-                let url = handle
-                    .mcp_url()
-                    .map(|u| u.to_string())
-                    .unwrap_or(fallback_url);
-                (url, Some(handle))
-            }
-            Err(e) => {
-                return IoCompletion {
-                    thread_id,
-                    op_id,
-                    result: IoResult::McpConnect(Err(format!("sandbox provision failed: {e}"))),
+        let (mcp_url, sandbox_handle) = match dedup_target {
+            Some((_existing_id, existing_url)) => {
+                let url = if existing_url.is_empty() {
+                    fallback_url
+                } else {
+                    existing_url
                 };
+                (url, None)
             }
+            None => match provider.provision(&thread_id, &sandbox_spec).await {
+                Ok(handle) => {
+                    let url = handle
+                        .mcp_url()
+                        .map(|u| u.to_string())
+                        .unwrap_or(fallback_url);
+                    (url, Some(handle))
+                }
+                Err(e) => {
+                    return IoCompletion {
+                        thread_id,
+                        op_id,
+                        result: IoResult::McpConnect(Err(format!(
+                            "sandbox provision failed: {e}"
+                        ))),
+                    };
+                }
+            },
         };
 
         match McpSession::connect(&mcp_url).await {
