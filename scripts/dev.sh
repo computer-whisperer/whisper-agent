@@ -160,13 +160,17 @@ if [[ "$USE_SANDBOX" -eq 1 ]]; then
         sleep 0.25
     done
 
-    echo "==> starting whisper-agent on $LISTEN_SERVER (sandbox workspace=$SANDBOX)"
+    echo "==> starting whisper-agent on $LISTEN_SERVER (host-env workspace=$SANDBOX)"
     echo "    open http://$LISTEN_SERVER/ in a browser"
+    # `local-landlock` is the catalog name we register the local
+    # sandbox daemon under; the synthesized default pod's host env
+    # binds to it with this workspace.
     "$REPO_ROOT/target/release/whisper-agent" serve \
         --listen "$LISTEN_SERVER" \
         --config "$REPO_ROOT/whisper-agent.toml" \
-        --sandbox-daemon-url "http://$LISTEN_SANDBOX" \
-        --sandbox-workspace "$SANDBOX" \
+        --host-env-provider "local-landlock=http://$LISTEN_SANDBOX" \
+        --default-host-env-provider "local-landlock" \
+        --default-host-env-workspace "$SANDBOX" \
         --audit-log "$SANDBOX/audit.jsonl" \
         --pods-root "$SANDBOX/pods" \
         "${SHARED_HOST_ARGS[@]}"
