@@ -23,17 +23,24 @@
 //!   field, not as a role=system content entry.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use tokio::sync::{Mutex, OnceCell};
 use whisper_agent_protocol::{ContentBlock, Message, Role, ToolResultContent, Usage};
 
+use crate::gemini_auth::GeminiAuth;
 use crate::model::{
     BoxFuture, ModelError, ModelInfo, ModelProvider, ModelRequest, ModelResponse, ToolSpec,
 };
 
 pub const GEMINI_API_BASE: &str = "https://generativelanguage.googleapis.com/v1beta";
+/// Code Assist route — reachable via gemini-cli OAuth tokens but not by a
+/// plain AI Studio API key. Serves the same `generateContent` primitive
+/// wrapped in a `{model, project, request, user_prompt_id}` envelope.
+pub const GEMINI_CODE_ASSIST_BASE: &str = "https://cloudcode-pa.googleapis.com/v1internal";
 
 /// Prefix for the opaque call_id we synthesize for each Gemini `functionCall`
 /// part. Gemini doesn't emit an id; the scheduler requires one to pair
@@ -47,96 +54,263 @@ fn next_call_id() -> String {
     format!("{GENERATED_CALL_ID_PREFIX}{n:x}")
 }
 
+/// Runtime auth for a Gemini client. `ApiKey` talks to the public AI Studio
+/// endpoint; `GeminiCli` talks to the Code Assist endpoint using tokens from
+/// `~/.gemini/oauth_creds.json`, refreshed on demand.
+pub enum ClientAuth {
+    ApiKey(String),
+    GeminiCli {
+        auth: Arc<Mutex<GeminiAuth>>,
+        /// Project ID discovered via `:loadCodeAssist`. Populated lazily on
+        /// first request so construction stays cheap and errors surface only
+        /// when the user actually tries to use the provider.
+        project: Arc<OnceCell<String>>,
+    },
+}
+
 pub struct GeminiClient {
     http: reqwest::Client,
     base_url: String,
-    api_key: String,
+    auth: ClientAuth,
 }
 
 impl GeminiClient {
     pub fn with_api_key(base_url: String, api_key: String) -> Self {
+        Self::new(base_url, ClientAuth::ApiKey(api_key))
+    }
+
+    pub fn with_gemini_cli_auth(base_url: String, auth: GeminiAuth) -> Self {
+        Self::new(
+            base_url,
+            ClientAuth::GeminiCli {
+                auth: Arc::new(Mutex::new(auth)),
+                project: Arc::new(OnceCell::new()),
+            },
+        )
+    }
+
+    fn new(base_url: String, auth: ClientAuth) -> Self {
         let base_url = base_url.trim_end_matches('/').to_string();
         Self {
             http: reqwest::Client::new(),
             base_url,
-            api_key,
+            auth,
         }
+    }
+
+    /// Refresh tokens if needed and return the current bearer for Code Assist
+    /// requests. API-key auth never uses this path — the key goes in the URL.
+    async fn oauth_bearer(&self) -> Result<String, ModelError> {
+        match &self.auth {
+            ClientAuth::ApiKey(_) => {
+                Err(ModelError::Transport("oauth_bearer called on api-key auth".into()))
+            }
+            ClientAuth::GeminiCli { auth, .. } => {
+                let mut guard = auth.lock().await;
+                guard
+                    .ensure_fresh(&self.http)
+                    .await
+                    .map_err(|e| ModelError::Transport(format!("gemini auth refresh: {e}")))?;
+                Ok(guard.access_token().to_string())
+            }
+        }
+    }
+
+    /// Resolve the Code Assist project id, calling `:loadCodeAssist` once and
+    /// caching the result. Honours `GOOGLE_CLOUD_PROJECT` so users with a
+    /// specific GCP project can route through it without an env-var on every
+    /// launch.
+    async fn codex_project(&self) -> Result<String, ModelError> {
+        let ClientAuth::GeminiCli { project, .. } = &self.auth else {
+            return Err(ModelError::Transport("codex_project called on non-oauth auth".into()));
+        };
+        project
+            .get_or_try_init(|| async {
+                if let Ok(env_proj) = std::env::var("GOOGLE_CLOUD_PROJECT")
+                    && !env_proj.is_empty()
+                {
+                    return Ok(env_proj);
+                }
+                let bearer = self.oauth_bearer().await?;
+                let body = LoadCodeAssistRequest {
+                    cloudaicompanion_project: None,
+                    metadata: LoadCodeAssistMetadata {
+                        ide_type: "IDE_UNSPECIFIED",
+                        platform: "PLATFORM_UNSPECIFIED",
+                        plugin_type: "GEMINI",
+                    },
+                };
+                let url = format!("{}:loadCodeAssist", self.base_url);
+                let resp = self
+                    .http
+                    .post(&url)
+                    .bearer_auth(&bearer)
+                    .json(&body)
+                    .send()
+                    .await
+                    .map_err(|e| ModelError::Transport(e.to_string()))?;
+                let status = resp.status();
+                if !status.is_success() {
+                    let body = resp.text().await.unwrap_or_default();
+                    return Err(ModelError::Api {
+                        status: status.as_u16(),
+                        body,
+                    });
+                }
+                let parsed: LoadCodeAssistResponse = resp
+                    .json()
+                    .await
+                    .map_err(|e| ModelError::Transport(e.to_string()))?;
+                parsed.cloudaicompanion_project.ok_or_else(|| {
+                    // User hasn't completed onboarding with gemini-cli. We don't
+                    // implement the onboardUser flow ourselves; point them at the
+                    // tool that does.
+                    ModelError::Transport(
+                        "Code Assist has no project for this account — run `gemini` once \
+                         interactively to complete onboarding, then retry."
+                            .into(),
+                    )
+                })
+            })
+            .await
+            .cloned()
     }
 
     async fn do_create_message(&self, req: &ModelRequest<'_>) -> Result<ModelResponse, ModelError> {
-        let body = build_gemini_request(req);
-        // Non-streaming: we don't expose a streaming trait at the provider layer,
-        // and the public Gemini endpoint supports the unary variant without the
-        // `stream: true` requirement that the ChatGPT backend imposes.
-        let url = format!(
-            "{}/models/{}:generateContent?key={}",
-            self.base_url,
-            req.model,
-            urlencode(&self.api_key)
-        );
-        let resp = self
-            .http
-            .post(&url)
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| ModelError::Transport(e.to_string()))?;
-        let status = resp.status();
-        if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
-            return Err(ModelError::Api {
-                status: status.as_u16(),
-                body,
-            });
+        let inner = build_gemini_request(req);
+        match &self.auth {
+            ClientAuth::ApiKey(key) => {
+                // Non-streaming: we don't expose a streaming trait at the provider
+                // layer, and the public Gemini endpoint supports the unary variant
+                // without the `stream: true` requirement that the ChatGPT backend
+                // imposes.
+                let url = format!(
+                    "{}/models/{}:generateContent?key={}",
+                    self.base_url,
+                    req.model,
+                    urlencode(key)
+                );
+                let resp = self
+                    .http
+                    .post(&url)
+                    .json(&inner)
+                    .send()
+                    .await
+                    .map_err(|e| ModelError::Transport(e.to_string()))?;
+                let status = resp.status();
+                if !status.is_success() {
+                    let body = resp.text().await.unwrap_or_default();
+                    return Err(ModelError::Api {
+                        status: status.as_u16(),
+                        body,
+                    });
+                }
+                let parsed: GenerateContentResponse = resp
+                    .json()
+                    .await
+                    .map_err(|e| ModelError::Transport(e.to_string()))?;
+                Ok(parsed_to_model_response(parsed))
+            }
+            ClientAuth::GeminiCli { .. } => {
+                let project = self.codex_project().await?;
+                let bearer = self.oauth_bearer().await?;
+                let envelope = CaGenerateContentRequest {
+                    model: req.model,
+                    project,
+                    request: inner,
+                };
+                let url = format!("{}:generateContent", self.base_url);
+                let resp = self
+                    .http
+                    .post(&url)
+                    .bearer_auth(&bearer)
+                    .json(&envelope)
+                    .send()
+                    .await
+                    .map_err(|e| ModelError::Transport(e.to_string()))?;
+                let status = resp.status();
+                if !status.is_success() {
+                    let body = resp.text().await.unwrap_or_default();
+                    return Err(ModelError::Api {
+                        status: status.as_u16(),
+                        body,
+                    });
+                }
+                let wrapped: CaGenerateContentResponse = resp
+                    .json()
+                    .await
+                    .map_err(|e| ModelError::Transport(e.to_string()))?;
+                let inner = wrapped.response.ok_or_else(|| {
+                    ModelError::Transport(
+                        "Code Assist response missing `response` envelope field".into(),
+                    )
+                })?;
+                Ok(parsed_to_model_response(inner))
+            }
         }
-        let parsed: GenerateContentResponse = resp
-            .json()
-            .await
-            .map_err(|e| ModelError::Transport(e.to_string()))?;
-        Ok(parsed_to_model_response(parsed))
     }
 
     async fn do_list_models(&self) -> Result<Vec<ModelInfo>, ModelError> {
-        let url = format!("{}/models?key={}", self.base_url, urlencode(&self.api_key));
-        let resp = self
-            .http
-            .get(&url)
-            .send()
-            .await
-            .map_err(|e| ModelError::Transport(e.to_string()))?;
-        let status = resp.status();
-        if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
-            return Err(ModelError::Api {
-                status: status.as_u16(),
-                body,
-            });
+        match &self.auth {
+            ClientAuth::ApiKey(key) => {
+                let url = format!("{}/models?key={}", self.base_url, urlencode(key));
+                let resp = self
+                    .http
+                    .get(&url)
+                    .send()
+                    .await
+                    .map_err(|e| ModelError::Transport(e.to_string()))?;
+                let status = resp.status();
+                if !status.is_success() {
+                    let body = resp.text().await.unwrap_or_default();
+                    return Err(ModelError::Api {
+                        status: status.as_u16(),
+                        body,
+                    });
+                }
+                let parsed: ListModelsResponse = resp
+                    .json()
+                    .await
+                    .map_err(|e| ModelError::Transport(e.to_string()))?;
+                Ok(parsed
+                    .models
+                    .into_iter()
+                    .filter(|m| {
+                        // Surface only models that actually support generateContent —
+                        // /v1beta/models also lists embedding, tuning, and audio models.
+                        m.supported_generation_methods
+                            .iter()
+                            .any(|s| s == "generateContent")
+                    })
+                    .map(|m| ModelInfo {
+                        // Trim the "models/" prefix so the id matches what users type
+                        // into `default_model` in config.
+                        id: m
+                            .name
+                            .strip_prefix("models/")
+                            .unwrap_or(&m.name)
+                            .to_string(),
+                        display_name: m.display_name,
+                    })
+                    .collect())
+            }
+            ClientAuth::GeminiCli { .. } => {
+                // Code Assist doesn't expose a `/models` catalog, so we return a
+                // small hardcoded list of the models the free tier accepts. This
+                // mirrors what Codex's hardcoded-model fallback does — users
+                // still pick via config if they want a different id.
+                Ok(vec![
+                    ModelInfo {
+                        id: "gemini-2.5-pro".into(),
+                        display_name: Some("Gemini 2.5 Pro".into()),
+                    },
+                    ModelInfo {
+                        id: "gemini-2.5-flash".into(),
+                        display_name: Some("Gemini 2.5 Flash".into()),
+                    },
+                ])
+            }
         }
-        let parsed: ListModelsResponse = resp
-            .json()
-            .await
-            .map_err(|e| ModelError::Transport(e.to_string()))?;
-        Ok(parsed
-            .models
-            .into_iter()
-            .filter(|m| {
-                // Surface only models that actually support generateContent —
-                // /v1beta/models also lists embedding, tuning, and audio models.
-                m.supported_generation_methods
-                    .iter()
-                    .any(|s| s == "generateContent")
-            })
-            .map(|m| ModelInfo {
-                // Trim the "models/" prefix so the id matches what users type
-                // into `default_model` in config.
-                id: m
-                    .name
-                    .strip_prefix("models/")
-                    .unwrap_or(&m.name)
-                    .to_string(),
-                display_name: m.display_name,
-            })
-            .collect())
     }
 }
 
@@ -545,6 +719,47 @@ pub(crate) struct UsageMetadata {
     #[serde(default)]
     pub(crate) cached_content_token_count: Option<u32>,
 }
+
+// ---------- Code Assist (OAuth route) envelope ----------
+
+#[derive(Serialize, Debug)]
+#[serde(rename_all = "camelCase")]
+struct CaGenerateContentRequest<'a> {
+    model: &'a str,
+    project: String,
+    request: GenerateContentRequest,
+}
+
+#[derive(Deserialize, Debug)]
+struct CaGenerateContentResponse {
+    #[serde(default)]
+    response: Option<GenerateContentResponse>,
+}
+
+#[derive(Serialize, Debug)]
+#[serde(rename_all = "camelCase")]
+struct LoadCodeAssistRequest {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cloudaicompanion_project: Option<String>,
+    metadata: LoadCodeAssistMetadata,
+}
+
+#[derive(Serialize, Debug)]
+#[serde(rename_all = "camelCase")]
+struct LoadCodeAssistMetadata {
+    ide_type: &'static str,
+    platform: &'static str,
+    plugin_type: &'static str,
+}
+
+#[derive(Deserialize, Debug)]
+#[serde(rename_all = "camelCase")]
+struct LoadCodeAssistResponse {
+    #[serde(default)]
+    cloudaicompanion_project: Option<String>,
+}
+
+// ---------- /v1beta/models (API-key route) ----------
 
 #[derive(Deserialize, Debug)]
 struct ListModelsResponse {

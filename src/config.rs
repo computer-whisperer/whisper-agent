@@ -41,7 +41,8 @@ use std::path::PathBuf;
 
 use crate::anthropic::AnthropicClient;
 use crate::codex_auth::CodexAuth;
-use crate::gemini::{GEMINI_API_BASE, GeminiClient};
+use crate::gemini::{GEMINI_API_BASE, GEMINI_CODE_ASSIST_BASE, GeminiClient};
+use crate::gemini_auth::GeminiAuth;
 use crate::model::ModelProvider;
 use crate::openai_chat::OpenAiChatClient;
 use crate::openai_responses::{CHATGPT_CODEX_BASE, OPENAI_API_BASE, OpenAiResponsesClient};
@@ -109,6 +110,13 @@ pub enum Auth {
         #[serde(default)]
         path: Option<PathBuf>,
     },
+    /// Use Google OAuth tokens minted by a companion tool. Today the only
+    /// `source` is `gemini_cli` — we read `~/.gemini/oauth_creds.json`.
+    GoogleOauth {
+        source: GoogleOauthSource,
+        #[serde(default)]
+        path: Option<PathBuf>,
+    },
 }
 
 #[derive(Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
@@ -116,6 +124,13 @@ pub enum Auth {
 pub enum ChatgptSubscriptionSource {
     /// `~/.codex/auth.json`, maintained by `codex login`.
     Codex,
+}
+
+#[derive(Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum GoogleOauthSource {
+    /// `~/.gemini/oauth_creds.json`, maintained by `gemini` interactive login.
+    GeminiCli,
 }
 
 impl Auth {
@@ -133,7 +148,7 @@ impl Auth {
                 }
                 (None, None) => Err(anyhow!("auth.api_key: missing `value` or `env`")),
             },
-            Auth::ChatgptSubscription { .. } => {
+            Auth::ChatgptSubscription { .. } | Auth::GoogleOauth { .. } => {
                 Err(anyhow!("this backend requires `auth.mode = \"api_key\"`"))
             }
         }
@@ -239,6 +254,15 @@ fn build_gemini(base_url: Option<&str>, auth: &Auth) -> Result<Arc<dyn ModelProv
                 .unwrap_or_else(|| GEMINI_API_BASE.to_string());
             Ok(Arc::new(GeminiClient::with_api_key(url, key)))
         }
+        Auth::GoogleOauth { source, path } => {
+            let GoogleOauthSource::GeminiCli = source;
+            let gemini_auth = GeminiAuth::load(path.clone())
+                .context("load gemini oauth_creds.json for gemini-cli auth")?;
+            let url = base_url
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| GEMINI_CODE_ASSIST_BASE.to_string());
+            Ok(Arc::new(GeminiClient::with_gemini_cli_auth(url, gemini_auth)))
+        }
         Auth::ChatgptSubscription { .. } => {
             Err(anyhow!("gemini: auth.mode `chatgpt_subscription` not supported"))
         }
@@ -262,6 +286,9 @@ fn build_openai_responses(base_url: Option<&str>, auth: &Auth) -> Result<Arc<dyn
                 .map(|s| s.to_string())
                 .unwrap_or_else(|| CHATGPT_CODEX_BASE.to_string());
             Ok(Arc::new(OpenAiResponsesClient::with_codex_auth(url, codex)))
+        }
+        Auth::GoogleOauth { .. } => {
+            Err(anyhow!("openai_responses: auth.mode `google_oauth` not supported"))
         }
     }
 }
