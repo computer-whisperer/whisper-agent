@@ -39,13 +39,15 @@ use serde::Deserialize;
 
 use std::path::PathBuf;
 
-use crate::anthropic::AnthropicClient;
-use crate::codex_auth::CodexAuth;
-use crate::gemini::{GEMINI_API_BASE, GEMINI_CODE_ASSIST_BASE, GeminiClient};
-use crate::gemini_auth::GeminiAuth;
-use crate::model::ModelProvider;
-use crate::openai_chat::OpenAiChatClient;
-use crate::openai_responses::{CHATGPT_CODEX_BASE, OPENAI_API_BASE, OpenAiResponsesClient};
+use crate::providers::anthropic::AnthropicClient;
+use crate::providers::codex_auth::CodexAuth;
+use crate::providers::gemini::{GEMINI_API_BASE, GEMINI_CODE_ASSIST_BASE, GeminiClient};
+use crate::providers::gemini_auth::GeminiAuth;
+use crate::providers::model::ModelProvider;
+use crate::providers::openai_chat::OpenAiChatClient;
+use crate::providers::openai_responses::{
+    CHATGPT_CODEX_BASE, OPENAI_API_BASE, OpenAiResponsesClient,
+};
 
 #[derive(Deserialize, Debug, Clone)]
 pub struct Config {

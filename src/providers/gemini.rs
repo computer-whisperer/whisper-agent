@@ -31,8 +31,8 @@ use serde_json::Value;
 use tokio::sync::{Mutex, OnceCell};
 use whisper_agent_protocol::{ContentBlock, Message, Role, ToolResultContent, Usage};
 
-use crate::gemini_auth::GeminiAuth;
-use crate::model::{
+use crate::providers::gemini_auth::GeminiAuth;
+use crate::providers::model::{
     BoxFuture, ModelError, ModelInfo, ModelProvider, ModelRequest, ModelResponse, ToolSpec,
 };
 

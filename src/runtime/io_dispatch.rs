@@ -24,12 +24,12 @@ use std::sync::Arc;
 use futures::StreamExt;
 use tracing::debug;
 
-use crate::mcp::{McpSession, ToolDescriptor as McpTool};
-use crate::model::{CacheBreakpoint, ModelRequest, ToolSpec, default_cache_policy};
-use crate::resources::HostEnvId;
-use crate::sandbox::HostEnvHandle;
-use crate::scheduler::Scheduler;
-use crate::thread::{IoRequest, IoResult, OpId};
+use crate::pod::resources::HostEnvId;
+use crate::providers::model::{CacheBreakpoint, ModelRequest, ToolSpec, default_cache_policy};
+use crate::runtime::scheduler::Scheduler;
+use crate::runtime::thread::{IoRequest, IoResult, OpId};
+use crate::tools::mcp::{McpSession, ToolDescriptor as McpTool};
+use crate::tools::sandbox::HostEnvHandle;
 
 /// Completion message delivered by every per-thread I/O future the
 /// scheduler dispatches via `step_until_blocked`.
@@ -43,7 +43,7 @@ pub(crate) struct IoCompletion {
     pub(crate) thread_id: String,
     pub(crate) op_id: OpId,
     pub(crate) result: IoResult,
-    pub(crate) pod_update: Option<crate::builtin_tools::PodUpdate>,
+    pub(crate) pod_update: Option<crate::tools::builtin_tools::PodUpdate>,
 }
 
 /// Completion message delivered by every host-env provisioning future.
@@ -61,7 +61,7 @@ pub(crate) enum ProvisionResult {
         host_env_handle: Box<dyn HostEnvHandle>,
         mcp_url: String,
         mcp_session: Arc<McpSession>,
-        tools: Vec<crate::mcp::ToolDescriptor>,
+        tools: Vec<crate::tools::mcp::ToolDescriptor>,
     },
     /// Provisioning failed somewhere in the chain (host env, MCP
     /// connect, or initial `tools/list`). The carried `phase` tells
@@ -277,13 +277,14 @@ struct DedupNoopHandle {
     mcp_url: String,
 }
 
-impl crate::sandbox::HostEnvHandle for DedupNoopHandle {
+impl crate::tools::sandbox::HostEnvHandle for DedupNoopHandle {
     fn mcp_url(&self) -> &str {
         &self.mcp_url
     }
     fn teardown(
         &mut self,
-    ) -> Pin<Box<dyn Future<Output = Result<(), crate::sandbox::HostEnvError>> + Send + '_>> {
+    ) -> Pin<Box<dyn Future<Output = Result<(), crate::tools::sandbox::HostEnvError>> + Send + '_>>
+    {
         Box::pin(async { Ok(()) })
     }
 }
@@ -299,7 +300,7 @@ enum HostEnvAction {
     },
     /// Needs provisioning; call into the resolved provider with this spec.
     Provision {
-        provider: Arc<dyn crate::sandbox::HostEnvProvider>,
+        provider: Arc<dyn crate::tools::sandbox::HostEnvProvider>,
         spec: whisper_agent_protocol::HostEnvSpec,
         host_env_id: HostEnvId,
     },
@@ -361,16 +362,16 @@ fn model_call(scheduler: &Scheduler, thread_id: String, op_id: OpId) -> Schedule
 const MAX_RATE_LIMIT_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
 
 async fn call_with_rate_limit_retry(
-    provider: &dyn crate::model::ModelProvider,
+    provider: &dyn crate::providers::model::ModelProvider,
     req: &ModelRequest<'_>,
     thread_id: &str,
     op_id: OpId,
-) -> Result<crate::model::ModelResponse, crate::model::ModelError> {
+) -> Result<crate::providers::model::ModelResponse, crate::providers::model::ModelError> {
     match provider.create_message(req).await {
         Ok(resp) => Ok(resp),
-        Err(crate::model::ModelError::RateLimited { retry_after, body }) => {
+        Err(crate::providers::model::ModelError::RateLimited { retry_after, body }) => {
             if retry_after > MAX_RATE_LIMIT_WAIT {
-                return Err(crate::model::ModelError::RateLimited { retry_after, body });
+                return Err(crate::providers::model::ModelError::RateLimited { retry_after, body });
             }
             tracing::warn!(
                 %thread_id,
@@ -395,7 +396,7 @@ fn tool_call(
     name: String,
     input: serde_json::Value,
 ) -> SchedulerFuture {
-    use crate::scheduler::ToolRoute;
+    use crate::runtime::scheduler::ToolRoute;
     match scheduler.route_tool(&thread_id, &name) {
         Some(ToolRoute::Builtin { pod_id }) => {
             // Snapshot pod dir + config now while we have the sync
@@ -419,9 +420,13 @@ fn tool_call(
                 }
             };
             Box::pin(async move {
-                let outcome =
-                    crate::builtin_tools::dispatch(snapshot.pod_dir, snapshot.config, &name, input)
-                        .await;
+                let outcome = crate::tools::builtin_tools::dispatch(
+                    snapshot.pod_dir,
+                    snapshot.config,
+                    &name,
+                    input,
+                )
+                .await;
                 let pod_update = outcome.pod_update;
                 let result = if outcome.result.is_error {
                     // Surface tool-level errors as Err in the task-facing
@@ -450,7 +455,7 @@ fn tool_call(
                     let mut last = None;
                     while let Some(event) = stream.next().await {
                         match event {
-                            crate::mcp::ToolEvent::Completed(r) => last = Some(r),
+                            crate::tools::mcp::ToolEvent::Completed(r) => last = Some(r),
                         }
                     }
                     match last {
@@ -484,11 +489,11 @@ fn tool_call(
     }
 }
 
-fn join_text(blocks: &[crate::mcp::McpContentBlock]) -> String {
+fn join_text(blocks: &[crate::tools::mcp::McpContentBlock]) -> String {
     let mut out = String::new();
     for b in blocks {
         match b {
-            crate::mcp::McpContentBlock::Text { text } => out.push_str(text),
+            crate::tools::mcp::McpContentBlock::Text { text } => out.push_str(text),
         }
     }
     out

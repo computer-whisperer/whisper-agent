@@ -34,7 +34,7 @@ use tokio::fs;
 use tracing::{info, warn};
 
 use crate::pod::{self, POD_TOML, Pod, PodId, THREADS_DIR};
-use crate::thread::{Thread, ThreadInternalState};
+use crate::runtime::thread::{Thread, ThreadInternalState};
 use whisper_agent_protocol::{
     PodAllow, PodConfig, PodLimits, PodSnapshot, PodSummary, ThreadDefaults, ThreadSummary,
 };

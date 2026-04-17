@@ -26,8 +26,8 @@ use whisper_agent_protocol::{
     ThreadConfig, ThreadSnapshot, ThreadStateLabel, ThreadSummary, ToolResultContent, Usage,
 };
 
-use crate::mcp::{CallToolResult, ToolAnnotations};
-use crate::model::ModelResponse;
+use crate::providers::model::ModelResponse;
+use crate::tools::mcp::{CallToolResult, ToolAnnotations};
 
 pub type OpId = u64;
 
@@ -173,7 +173,7 @@ pub struct ApprovalRecord {
 /// Phase 3d.ii: only the per-thread, state-machine-driven ops live here.
 /// Resource provisioning (sandbox + primary MCP host) is dispatched
 /// separately by the scheduler at thread-creation time and routed through
-/// [`crate::io_dispatch::SchedulerCompletion::Provision`].
+/// [`crate::runtime::io_dispatch::SchedulerCompletion::Provision`].
 #[derive(Debug)]
 pub enum IoRequest {
     ModelCall {
@@ -660,7 +660,7 @@ impl Thread {
             let empty = ToolAnnotations::default();
             let ann = tool_annotations.get(&tool_use.name).unwrap_or(&empty);
             let allowlisted = self.tool_allowlist.contains(&tool_use.name);
-            let is_pod_modify = crate::builtin_tools::is_pod_modify(&tool_use.name);
+            let is_pod_modify = crate::tools::builtin_tools::is_pod_modify(&tool_use.name);
             match evaluate_policy(self.config.approval_policy, ann, allowlisted, is_pod_modify) {
                 ApprovalOutcome::Auto(reason) => {
                     auto_reasons.insert(tool_use.tool_use_id.clone(), reason.clone());
@@ -1090,11 +1090,11 @@ fn next_id(counter: &mut OpId) -> OpId {
     *counter
 }
 
-fn join_mcp_text(blocks: &[crate::mcp::McpContentBlock]) -> String {
+fn join_mcp_text(blocks: &[crate::tools::mcp::McpContentBlock]) -> String {
     let mut out = String::new();
     for b in blocks {
         match b {
-            crate::mcp::McpContentBlock::Text { text } => out.push_str(text),
+            crate::tools::mcp::McpContentBlock::Text { text } => out.push_str(text),
         }
     }
     out

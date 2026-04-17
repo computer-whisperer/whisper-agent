@@ -7,6 +7,17 @@
 //! structural validation.
 //!
 //! See `docs/design_pod_thread_scheduler.md` for the full design.
+//!
+//! Submodules:
+//! - [`config`] — server-side catalog config (the TOML that lists model
+//!   backends the server is willing to drive).
+//! - [`persist`] — pod/thread on-disk I/O (read, write, list, rename).
+//! - [`resources`] — registry of sandboxes, MCP hosts, and model backends
+//!   as first-class entities with lifecycles independent of tasks.
+
+pub mod config;
+pub mod persist;
+pub mod resources;
 
 use std::collections::BTreeSet;
 use std::path::PathBuf;

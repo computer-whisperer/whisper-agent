@@ -29,8 +29,8 @@ use serde_json::Value;
 use tokio::sync::Mutex;
 use whisper_agent_protocol::{ContentBlock, Message, Role, ToolResultContent, Usage};
 
-use crate::codex_auth::CodexAuth;
-use crate::model::{
+use crate::providers::codex_auth::CodexAuth;
+use crate::providers::model::{
     BoxFuture, ModelError, ModelInfo, ModelProvider, ModelRequest, ModelResponse, ToolSpec,
 };
 

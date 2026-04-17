@@ -29,7 +29,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use whisper_agent_protocol::{ContentBlock, Message, Role, ToolResultContent, Usage};
 
-use crate::model::{
+use crate::providers::model::{
     BoxFuture, ModelError, ModelInfo, ModelProvider, ModelRequest, ModelResponse, ToolSpec,
 };
 

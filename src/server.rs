@@ -10,6 +10,12 @@
 //!
 //! The scheduler (single tokio task, `scheduler::run`) is the only code path that
 //! mutates tasks or broadcasts events.
+//!
+//! [`thread_router`] owns the connection registry, subscriptions, and the
+//! `ThreadEvent → ServerToClient` translation that the scheduler hands off
+//! after each step.
+
+pub mod thread_router;
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -36,10 +42,10 @@ use whisper_agent_protocol::{
     HostEnvSpec, ServerToClient, ThreadConfig, decode_from_client, encode_to_client,
 };
 
-use crate::audit::AuditLog;
-use crate::persist::Persister;
+use crate::pod::persist::Persister;
 use crate::pod::{Pod, PodId};
-use crate::scheduler::{
+use crate::runtime::audit::AuditLog;
+use crate::runtime::scheduler::{
     BackendEntry, ConnId, Scheduler, SchedulerMsg, SharedHostConfig, build_default_pod_config,
 };
 
@@ -79,7 +85,7 @@ pub struct ServerConfig {
     pub pods_root: Option<PathBuf>,
     /// Host-env provider catalog. Empty registry is a valid config —
     /// threads in such a server just have no host-env MCP connection.
-    pub host_env_registry: crate::sandbox::HostEnvRegistry,
+    pub host_env_registry: crate::tools::sandbox::HostEnvRegistry,
     /// Catalog of shared (singleton) MCP hosts the scheduler connects to at
     /// startup. Pods opt in by name via `[allow].mcp_hosts`.
     pub shared_mcp_hosts: Vec<SharedHostConfig>,
@@ -180,7 +186,7 @@ pub async fn serve(listen: SocketAddr, config: ServerConfig) -> anyhow::Result<(
     }
 
     let (inbox_tx, inbox_rx) = mpsc::unbounded_channel::<SchedulerMsg>();
-    let scheduler_handle = tokio::spawn(crate::scheduler::run(scheduler, inbox_rx));
+    let scheduler_handle = tokio::spawn(crate::runtime::scheduler::run(scheduler, inbox_rx));
 
     let state = AppState {
         inbox: inbox_tx.clone(),

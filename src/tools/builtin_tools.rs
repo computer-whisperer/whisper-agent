@@ -12,7 +12,7 @@
 //!
 //! Successful writes emit a [`PodUpdate`] so the scheduler can refresh
 //! in-memory pod state and broadcast the change to subscribers in the
-//! same step as the disk write. See [`crate::scheduler::Scheduler::apply_pod_config_update`].
+//! same step as the disk write. See [`crate::runtime::scheduler::Scheduler::apply_pod_config_update`].
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -21,8 +21,10 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use whisper_agent_protocol::PodConfig;
 
-use crate::mcp::{CallToolResult, McpContentBlock, ToolAnnotations, ToolDescriptor as McpTool};
 use crate::pod;
+use crate::tools::mcp::{
+    CallToolResult, McpContentBlock, ToolAnnotations, ToolDescriptor as McpTool,
+};
 
 fn text_result(text: String) -> CallToolResult {
     CallToolResult {
@@ -806,10 +808,10 @@ max_turns = 50
         assert!(hint.contains("1 further match omitted"));
     }
 
-    fn join_blocks(blocks: &[crate::mcp::McpContentBlock]) -> String {
+    fn join_blocks(blocks: &[crate::tools::mcp::McpContentBlock]) -> String {
         let mut s = String::new();
         for b in blocks {
-            let crate::mcp::McpContentBlock::Text { text } = b;
+            let crate::tools::mcp::McpContentBlock::Text { text } = b;
             s.push_str(text);
         }
         s

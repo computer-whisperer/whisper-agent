@@ -19,8 +19,8 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use whisper_agent_protocol::{HostEnvSpec, ResourceSnapshot, ResourceStateLabel};
 
-use crate::mcp::{McpSession, ToolAnnotations, ToolDescriptor};
-use crate::sandbox::HostEnvHandle;
+use crate::tools::mcp::{McpSession, ToolAnnotations, ToolDescriptor};
+use crate::tools::sandbox::HostEnvHandle;
 
 #[derive(Serialize, Deserialize, Debug, Clone, Hash, PartialEq, Eq, PartialOrd, Ord)]
 pub struct HostEnvId(pub String);

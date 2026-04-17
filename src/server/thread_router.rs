@@ -20,9 +20,9 @@ use tokio::sync::mpsc;
 use tracing::{error, warn};
 use whisper_agent_protocol::ServerToClient;
 
-use crate::audit::{AuditLog, ToolCallEntry, ToolCallOutcome};
-use crate::scheduler::ConnId;
-use crate::thread::ThreadEvent;
+use crate::runtime::audit::{AuditLog, ToolCallEntry, ToolCallOutcome};
+use crate::runtime::scheduler::ConnId;
+use crate::runtime::thread::ThreadEvent;
 
 pub(crate) struct ThreadEventRouter {
     clients: HashMap<ConnId, mpsc::UnboundedSender<ServerToClient>>,

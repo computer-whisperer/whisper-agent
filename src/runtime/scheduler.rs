@@ -32,22 +32,24 @@ use whisper_agent_protocol::{
     ThreadConfig, ThreadConfigOverride, ThreadStateLabel,
 };
 
-use crate::audit::AuditLog;
-use crate::io_dispatch::{
+use crate::pod::persist::{LoadedState, Persister};
+use crate::pod::resources::{
+    BackendId, CompleteHostEnvOutcome, HostEnvId, McpHostId, ResourceRegistry,
+};
+use crate::pod::{Pod, PodId};
+use crate::providers::model::ModelProvider;
+use crate::runtime::audit::AuditLog;
+use crate::runtime::io_dispatch::{
     self, IoCompletion, ProvisionCompletion, ProvisionPhase, ProvisionResult, SchedulerCompletion,
     SchedulerFuture,
 };
-use crate::mcp::{McpSession, ToolAnnotations, ToolDescriptor as McpTool};
-use crate::model::ModelProvider;
-use crate::persist::{LoadedState, Persister};
-use crate::pod::{Pod, PodId};
-use crate::resources::{BackendId, CompleteHostEnvOutcome, HostEnvId, McpHostId, ResourceRegistry};
-use crate::sandbox::HostEnvProvider;
-use crate::thread::{
+use crate::runtime::thread::{
     ApprovalDisposition, IoResult, OpId, StepOutcome, Thread, ThreadInternalState, derive_title,
     new_task_id,
 };
-use crate::thread_router::ThreadEventRouter;
+use crate::server::thread_router::ThreadEventRouter;
+use crate::tools::mcp::{McpSession, ToolAnnotations, ToolDescriptor as McpTool};
+use crate::tools::sandbox::HostEnvProvider;
 use whisper_agent_protocol::HostEnvSpec;
 
 pub type ConnId = u64;
@@ -55,7 +57,7 @@ pub type ConnId = u64;
 /// How `route_tool` wants a given tool invocation handled. Produced
 /// during dispatch and consumed by `io_dispatch::tool_call`.
 pub enum ToolRoute {
-    /// Handle in-process via [`crate::builtin_tools::dispatch`], scoped
+    /// Handle in-process via [`crate::tools::builtin_tools::dispatch`], scoped
     /// to the pod's own directory.
     Builtin { pod_id: PodId },
     /// Forward to the named MCP session via JSON-RPC.
@@ -143,7 +145,7 @@ pub struct Scheduler {
     /// server was started without any `[[host_env_providers]]` entries
     /// — threads in such a server can still run, just without any
     /// host-env MCP (so their tool catalog is shared-only).
-    host_env_registry: crate::sandbox::HostEnvRegistry,
+    host_env_registry: crate::tools::sandbox::HostEnvRegistry,
 
     tasks: HashMap<String, Thread>,
     /// Owns the connection registry, subscription map, audit log, and the
@@ -184,7 +186,7 @@ impl Scheduler {
         backends: HashMap<String, BackendEntry>,
         default_backend: String,
         audit: AuditLog,
-        host_env_registry: crate::sandbox::HostEnvRegistry,
+        host_env_registry: crate::tools::sandbox::HostEnvRegistry,
         shared_host_configs: Vec<SharedHostConfig>,
     ) -> anyhow::Result<Self> {
         assert!(
@@ -365,7 +367,7 @@ impl Scheduler {
     pub(crate) fn host_env_for_thread(
         &self,
         thread_id: &str,
-    ) -> Option<&crate::resources::HostEnvEntry> {
+    ) -> Option<&crate::pod::resources::HostEnvEntry> {
         let id = self.host_env_id_for_thread(thread_id)?;
         self.resources.host_envs.get(&id)
     }
@@ -379,7 +381,7 @@ impl Scheduler {
     pub(crate) fn tool_descriptors(&self, thread_id: &str) -> Vec<McpTool> {
         let mut out: Vec<McpTool> = Vec::new();
         let mut seen: HashSet<String> = HashSet::new();
-        for tool in crate::builtin_tools::descriptors() {
+        for tool in crate::tools::builtin_tools::descriptors() {
             if seen.insert(tool.name.clone()) {
                 out.push(tool);
             }
@@ -401,7 +403,7 @@ impl Scheduler {
     /// nothing claims the name — the model called a tool we didn't
     /// advertise.
     pub(crate) fn route_tool(&self, thread_id: &str, tool_name: &str) -> Option<ToolRoute> {
-        if crate::builtin_tools::is_builtin(tool_name) {
+        if crate::tools::builtin_tools::is_builtin(tool_name) {
             let pod_id = self.tasks.get(thread_id)?.pod_id.clone();
             return Some(ToolRoute::Builtin { pod_id });
         }
@@ -430,7 +432,7 @@ impl Scheduler {
     /// host in pod-declared order. Skips ids whose entry isn't yet in
     /// the registry (host-env MCP is created when provisioning
     /// dispatches; shared entries exist from startup).
-    fn bound_mcp_hosts(&self, thread_id: &str) -> Vec<&crate::resources::McpHostEntry> {
+    fn bound_mcp_hosts(&self, thread_id: &str) -> Vec<&crate::pod::resources::McpHostEntry> {
         let mut out = Vec::new();
         if let Some(he_id) = self.host_env_id_for_thread(thread_id) {
             let mcp_id = McpHostId::for_host_env(&he_id);
@@ -1292,7 +1294,7 @@ impl Scheduler {
                 // The disk write happens in the background (logged on
                 // failure); the in-memory state is what subsequent
                 // CreateThread / GetPod calls consult.
-                if let Err(e) = crate::persist::validate_pod_id(&pod_id) {
+                if let Err(e) = crate::pod::persist::validate_pod_id(&pod_id) {
                     self.router.send_to_client(
                         conn_id,
                         ServerToClient::Error {
@@ -1391,7 +1393,7 @@ impl Scheduler {
                 pod_id,
                 toml_text,
             } => {
-                if let Err(e) = crate::persist::validate_pod_id(&pod_id) {
+                if let Err(e) = crate::pod::persist::validate_pod_id(&pod_id) {
                     self.router.send_to_client(
                         conn_id,
                         ServerToClient::Error {
@@ -1431,7 +1433,7 @@ impl Scheduler {
                 self.persist_pod_config(pod_id, toml_text, Some(conn_id));
             }
             ClientToServer::ArchivePod { pod_id } => {
-                if let Err(e) = crate::persist::validate_pod_id(&pod_id) {
+                if let Err(e) = crate::pod::persist::validate_pod_id(&pod_id) {
                     self.router.send_to_client(
                         conn_id,
                         ServerToClient::Error {
@@ -1878,7 +1880,7 @@ impl Scheduler {
                 if let Some(task) = self.tasks.get_mut(&thread_id) {
                     task.fail(phase.as_str(), message);
                     let mut events = Vec::new();
-                    events.push(crate::thread::ThreadEvent::Error {
+                    events.push(crate::runtime::thread::ThreadEvent::Error {
                         message: format!(
                             "{}: {}",
                             phase.as_str(),
@@ -1894,7 +1896,7 @@ impl Scheduler {
     }
 
     fn annotations_for(&self, thread_id: &str) -> HashMap<String, ToolAnnotations> {
-        let mut out: HashMap<String, ToolAnnotations> = crate::builtin_tools::annotations();
+        let mut out: HashMap<String, ToolAnnotations> = crate::tools::builtin_tools::annotations();
         for host in self.bound_mcp_hosts(thread_id) {
             for (name, ann) in &host.annotations {
                 // First-wins matches `route_tool`'s builtin-then-host
@@ -1911,17 +1913,21 @@ impl Scheduler {
     /// kind; both helpers handle the in-memory refresh + broadcast.
     /// The builtin tool already wrote the change to disk — no further
     /// persist work is needed here.
-    fn apply_pod_update(&mut self, thread_id: &str, update: crate::builtin_tools::PodUpdate) {
+    fn apply_pod_update(
+        &mut self,
+        thread_id: &str,
+        update: crate::tools::builtin_tools::PodUpdate,
+    ) {
         let Some(task) = self.tasks.get(thread_id) else {
             warn!(%thread_id, "apply_pod_update: task not found");
             return;
         };
         let pod_id = task.pod_id.clone();
         match update {
-            crate::builtin_tools::PodUpdate::Config { toml_text, parsed } => {
+            crate::tools::builtin_tools::PodUpdate::Config { toml_text, parsed } => {
                 self.apply_pod_config_update(&pod_id, toml_text, *parsed, None);
             }
-            crate::builtin_tools::PodUpdate::SystemPrompt { text } => {
+            crate::tools::builtin_tools::PodUpdate::SystemPrompt { text } => {
                 self.apply_system_prompt_update(&pod_id, text, None);
             }
         }

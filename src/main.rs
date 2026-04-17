@@ -9,11 +9,11 @@ use tracing_subscriber::EnvFilter;
 use whisper_agent_protocol::sandbox::{HostEnvSpec, NetworkPolicy, PathAccess};
 use whisper_agent_protocol::{ApprovalPolicy, ThreadConfig};
 
-use whisper_agent::anthropic::AnthropicClient;
-use whisper_agent::config::Config;
-use whisper_agent::sandbox::{HostEnvProviderEntry, HostEnvRegistry};
-use whisper_agent::scheduler::{BackendEntry, SharedHostConfig};
+use whisper_agent::pod::config::Config;
+use whisper_agent::providers::anthropic::AnthropicClient;
+use whisper_agent::runtime::scheduler::{BackendEntry, SharedHostConfig};
 use whisper_agent::server::{self, ServerConfig};
+use whisper_agent::tools::sandbox::{HostEnvProviderEntry, HostEnvRegistry};
 
 const DEFAULT_SYSTEM_PROMPT: &str = "\
 You are a software engineering agent working in a workspace on the user's machine. Use the \

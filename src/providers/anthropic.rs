@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use whisper_agent_protocol::{ContentBlock, Message, Usage};
 
-use crate::model::{
+use crate::providers::model::{
     BoxFuture, CacheBreakpoint, ModelError, ModelInfo, ModelProvider, ModelRequest, ModelResponse,
     ToolSpec,
 };
@@ -418,7 +418,7 @@ mod tests {
     fn full_policy_caches_system_tools_and_trailing_user_messages() {
         let tools = make_tools();
         let messages = make_messages();
-        let breakpoints = crate::model::default_cache_policy(&messages, 2);
+        let breakpoints = crate::providers::model::default_cache_policy(&messages, 2);
         let req = ModelRequest {
             model: "claude-opus-4-6",
             max_tokens: 1024,
