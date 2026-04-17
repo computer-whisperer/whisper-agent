@@ -24,6 +24,11 @@ toml = { version = "0.8", default-features = false, features = ["display", "pars
 # tool calls. Default features include `bytes` + `text`; we only need
 # the text diff API.
 similar = { version = "2", default-features = false, features = ["text"] }
+# Markdown viewer for chat log messages. Stripped to the text-parser
+# only: no `load-images` (don't fetch network resources from rendered
+# output) and no syntect-backed `better_syntax_highlighting` (keeps
+# the wasm bundle small — plain monospace on code blocks reads fine).
+egui_commonmark = { version = "0.22", default-features = false, features = ["pulldown_cmark"] }
 whisper-agent-protocol = { path = "../whisper-agent-protocol" }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]

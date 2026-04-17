@@ -16,6 +16,7 @@ use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::rc::Rc;
 
 use egui::{Color32, ComboBox, DragValue, Grid, RichText, ScrollArea, TextEdit};
+use egui_commonmark::{CommonMarkCache, CommonMarkViewer};
 use whisper_agent_protocol::sandbox::{
     AccessMode, Mount, NetworkPolicy, PathAccess, ResourceLimits,
 };
@@ -273,6 +274,12 @@ pub struct ChatApp {
 
     /// Which view the left side panel is showing.
     left_mode: LeftPanelMode,
+
+    /// Shared parse-result cache for the chat-log markdown renderer.
+    /// CommonMarkViewer hashes the input text per call and reuses the
+    /// parsed AST, so keeping one cache on the app avoids re-parsing
+    /// the entire scrollback every frame.
+    md_cache: CommonMarkCache,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -492,6 +499,7 @@ impl ChatApp {
             pod_configs: HashMap::new(),
             pod_configs_requested: HashSet::new(),
             left_mode: LeftPanelMode::default(),
+            md_cache: CommonMarkCache::default(),
         }
     }
 
@@ -1572,7 +1580,14 @@ impl eframe::App for ChatApp {
 
         let mut pending_decisions: Vec<(String, String, ApprovalChoice, bool)> = Vec::new();
         let mut allowlist_revocations: Vec<(String, String)> = Vec::new();
-        egui::CentralPanel::default().show(ctx, |ui| match self.selected.clone() {
+        // Pre-split borrows: the closure needs `&mut self.tasks` (via
+        // get_mut) and `&mut self.md_cache` simultaneously. Destructuring
+        // up front lets the closure capture each field independently
+        // instead of re-borrowing through `&mut self`.
+        let selected = self.selected.clone();
+        let tasks = &mut self.tasks;
+        let md_cache = &mut self.md_cache;
+        egui::CentralPanel::default().show(ctx, |ui| match selected {
             None => {
                 ui.vertical_centered(|ui| {
                     ui.add_space(60.0);
@@ -1584,7 +1599,7 @@ impl eframe::App for ChatApp {
                     );
                 });
             }
-            Some(thread_id) => match self.tasks.get_mut(&thread_id) {
+            Some(thread_id) => match tasks.get_mut(&thread_id) {
                 None => {
                     ui.label(
                         RichText::new(format!("task {thread_id} not found"))
@@ -1606,7 +1621,7 @@ impl eframe::App for ChatApp {
                             });
                         } else {
                             for item in &view.items {
-                                render_item(ui, item);
+                                render_item(ui, md_cache, item);
                                 ui.add_space(6.0);
                             }
                         }
@@ -2663,7 +2678,7 @@ fn item_palette(item: &DisplayItem) -> (Color32, Color32) {
     }
 }
 
-fn render_item(ui: &mut egui::Ui, item: &DisplayItem) {
+fn render_item(ui: &mut egui::Ui, cache: &mut CommonMarkCache, item: &DisplayItem) {
     let (gutter_color, fill) = item_palette(item);
     let frame = egui::Frame::default()
         .fill(fill)
@@ -2676,9 +2691,9 @@ fn render_item(ui: &mut egui::Ui, item: &DisplayItem) {
     let resp = frame.show(ui, |ui| {
         ui.set_min_width(ui.available_width());
         match item {
-            DisplayItem::User { text } => render_user(ui, text),
-            DisplayItem::AssistantText { text } => render_assistant_text(ui, text),
-            DisplayItem::Reasoning { text } => render_reasoning(ui, text),
+            DisplayItem::User { text } => render_user(ui, cache, text),
+            DisplayItem::AssistantText { text } => render_assistant_text(ui, cache, text),
+            DisplayItem::Reasoning { text } => render_reasoning(ui, cache, text),
             DisplayItem::ToolCall {
                 tool_use_id,
                 name,
@@ -2712,26 +2727,26 @@ fn render_item(ui: &mut egui::Ui, item: &DisplayItem) {
     ui.painter().rect_filled(gutter_rect, 0.0, gutter_color);
 }
 
-fn render_user(ui: &mut egui::Ui, text: &str) {
-    ui.horizontal_wrapped(|ui| {
-        ui.label(
-            RichText::new("USER")
-                .color(COLOR_USER)
-                .strong()
-                .small(),
-        );
-        ui.add_space(8.0);
-        ui.label(text);
-    });
+fn render_user(ui: &mut egui::Ui, cache: &mut CommonMarkCache, text: &str) {
+    // Role label sits above the body rather than inline so a multi-line
+    // markdown body (code block, list, blockquote) doesn't wrap awkwardly
+    // around the "USER" chip the way horizontal_wrapped would force.
+    ui.label(
+        RichText::new("USER")
+            .color(COLOR_USER)
+            .strong()
+            .small(),
+    );
+    render_markdown(ui, cache, ("user", text), text);
 }
 
-fn render_assistant_text(ui: &mut egui::Ui, text: &str) {
+fn render_assistant_text(ui: &mut egui::Ui, cache: &mut CommonMarkCache, text: &str) {
     // No role label — the gutter color carries it. This is the bulk
     // of the conversation; we want it visually quiet.
-    ui.label(text);
+    render_markdown(ui, cache, ("assistant", text), text);
 }
 
-fn render_reasoning(ui: &mut egui::Ui, text: &str) {
+fn render_reasoning(ui: &mut egui::Ui, cache: &mut CommonMarkCache, text: &str) {
     let id = ui.make_persistent_id(("reasoning", text.as_ptr() as usize));
     let preview = text.lines().next().unwrap_or("").trim();
     let header = if preview.is_empty() {
@@ -2759,9 +2774,37 @@ fn render_reasoning(ui: &mut egui::Ui, text: &str) {
             );
         })
         .body(|ui| {
-            ui.label(RichText::new(text).color(Color32::from_gray(170)).italics());
+            render_markdown(ui, cache, ("reasoning", text), text);
         });
 }
+
+/// Render a chat-log body as CommonMark. `id_source` scopes the viewer's
+/// internal widget ids so two items with identical text (e.g. two "ok"
+/// assistant replies) don't collide on persistent state like collapsing
+/// headers inside the rendered markdown.
+fn render_markdown(
+    ui: &mut egui::Ui,
+    cache: &mut CommonMarkCache,
+    id_source: (&'static str, &str),
+    text: &str,
+) {
+    ui.push_id(id_source, |ui| {
+        // Inline code (`foo`) uses `Visuals::code_bg_color` as its
+        // rect fill via RichText::code(). egui's dark-mode default
+        // (from_gray(64)) reads as a blocky highlight; swap in a
+        // softer translucent tint that sits closer to GitHub's
+        // dark-mode inline-code style. push_id creates a scoped
+        // child Ui, so the override doesn't leak out of this block.
+        ui.visuals_mut().code_bg_color = INLINE_CODE_BG;
+        CommonMarkViewer::new().show(ui, cache, text);
+    });
+}
+
+/// Tint used behind `inline code`. Slightly-lighter-than-background
+/// neutral at low alpha — reads as "subtly different" rather than the
+/// blocky "highlighted span" effect of egui's dark-mode default (#404040).
+/// Premultiplied: the unmultiplied equivalent is roughly rgba(150, 160, 180, 80).
+const INLINE_CODE_BG: Color32 = Color32::from_rgba_premultiplied(47, 50, 56, 80);
 
 fn render_system_note(ui: &mut egui::Ui, text: &str, is_error: bool) {
     let color = if is_error { COLOR_ERROR } else { COLOR_NEUTRAL };
