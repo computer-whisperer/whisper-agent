@@ -120,4 +120,9 @@ pub struct PodSnapshot {
     pub toml_text: String,
     pub threads: Vec<crate::ThreadSummary>,
     pub archived: bool,
+    /// Behavior catalog — one entry per `<pod>/behaviors/<id>/`. Empty when
+    /// the pod has no behaviors subdirectory. Entries whose `behavior.toml`
+    /// failed to parse are still present; their `load_error` is populated.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub behaviors: Vec<crate::BehaviorSummary>,
 }

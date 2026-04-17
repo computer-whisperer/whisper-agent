@@ -9,21 +9,26 @@
 //! See `docs/design_pod_thread_scheduler.md` for the full design.
 //!
 //! Submodules:
+//! - [`behaviors`] — per-pod autonomous-behavior catalog: parsing,
+//!   validation, on-disk loader (see `docs/design_behaviors.md`).
 //! - [`config`] — server-side catalog config (the TOML that lists model
 //!   backends the server is willing to drive).
 //! - [`persist`] — pod/thread on-disk I/O (read, write, list, rename).
 //! - [`resources`] — registry of sandboxes, MCP hosts, and model backends
 //!   as first-class entities with lifecycles independent of tasks.
 
+pub mod behaviors;
 pub mod config;
 pub mod persist;
 pub mod resources;
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
 use thiserror::Error;
 use whisper_agent_protocol::PodConfig;
+
+use crate::pod::behaviors::{Behavior, BehaviorId};
 
 pub type PodId = String;
 pub type ThreadId = String;
@@ -53,6 +58,10 @@ pub struct Pod {
     pub raw_toml: String,
     pub system_prompt: String,
     pub threads: BTreeSet<ThreadId>,
+    /// Behavior catalog loaded from `<pod>/behaviors/`. Empty when the pod
+    /// has no behaviors subdirectory. Keyed by behavior id (== directory
+    /// name); sorted iteration matches on-disk lexical order.
+    pub behaviors: BTreeMap<BehaviorId, Behavior>,
     pub archived: bool,
 }
 
@@ -71,6 +80,7 @@ impl Pod {
             raw_toml,
             system_prompt,
             threads: BTreeSet::new(),
+            behaviors: BTreeMap::new(),
             archived: false,
         }
     }

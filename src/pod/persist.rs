@@ -33,6 +33,7 @@ use chrono::Utc;
 use tokio::fs;
 use tracing::{info, warn};
 
+use crate::pod::behaviors::{self as pod_behaviors};
 use crate::pod::{self, POD_TOML, Pod, PodId, THREADS_DIR};
 use crate::runtime::thread::{Thread, ThreadInternalState};
 use whisper_agent_protocol::{
@@ -250,12 +251,18 @@ impl Persister {
         let config =
             pod::parse_toml(&toml_text).with_context(|| format!("parse {pod_id}/pod.toml"))?;
         let threads = read_thread_summaries(&pod_dir, pod_id).await;
+        let behaviors: Vec<_> = pod_behaviors::load_behaviors_for_pod(&pod_dir, pod_id)
+            .await
+            .into_iter()
+            .map(|b| b.summary())
+            .collect();
         Ok(Some(PodSnapshot {
             pod_id: pod_id.to_string(),
             config,
             toml_text,
             threads,
             archived: false,
+            behaviors,
         }))
     }
 
@@ -446,6 +453,9 @@ async fn load_pod(pod_dir: &Path, pod_id: &str) -> Result<(Pod, Vec<Thread>)> {
     );
     for t in &threads {
         pod.threads.insert(t.id.clone());
+    }
+    for b in pod_behaviors::load_behaviors_for_pod(pod_dir, pod_id).await {
+        pod.behaviors.insert(b.id.clone(), b);
     }
     Ok((pod, threads))
 }

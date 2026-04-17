@@ -1507,6 +1507,68 @@ impl Scheduler {
                     });
                 }
             }
+            ClientToServer::ListBehaviors {
+                correlation_id,
+                pod_id,
+            } => {
+                let Some(pod) = self.pods.get(&pod_id) else {
+                    self.router.send_to_client(
+                        conn_id,
+                        ServerToClient::Error {
+                            correlation_id,
+                            thread_id: None,
+                            message: format!("list_behaviors: unknown pod `{pod_id}`"),
+                        },
+                    );
+                    return;
+                };
+                let behaviors: Vec<_> = pod.behaviors.values().map(|b| b.summary()).collect();
+                self.router.send_to_client(
+                    conn_id,
+                    ServerToClient::BehaviorList {
+                        correlation_id,
+                        pod_id,
+                        behaviors,
+                    },
+                );
+            }
+            ClientToServer::GetBehavior {
+                correlation_id,
+                pod_id,
+                behavior_id,
+            } => {
+                let Some(pod) = self.pods.get(&pod_id) else {
+                    self.router.send_to_client(
+                        conn_id,
+                        ServerToClient::Error {
+                            correlation_id,
+                            thread_id: None,
+                            message: format!("get_behavior: unknown pod `{pod_id}`"),
+                        },
+                    );
+                    return;
+                };
+                let Some(behavior) = pod.behaviors.get(&behavior_id) else {
+                    self.router.send_to_client(
+                        conn_id,
+                        ServerToClient::Error {
+                            correlation_id,
+                            thread_id: None,
+                            message: format!(
+                                "get_behavior: unknown behavior `{behavior_id}` under pod `{pod_id}`"
+                            ),
+                        },
+                    );
+                    return;
+                };
+                self.router.send_to_client(
+                    conn_id,
+                    ServerToClient::BehaviorSnapshot {
+                        correlation_id,
+                        snapshot: behavior.snapshot(),
+                    },
+                );
+            }
             ClientToServer::ListModels {
                 correlation_id,
                 backend,

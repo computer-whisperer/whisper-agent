@@ -8,10 +8,15 @@
 //! so serde serializes directly into Anthropic's request body, and they're shared between
 //! the server (which builds them) and the client (which renders them from task snapshots).
 
+pub mod behavior;
 pub mod conversation;
 pub mod pod;
 pub mod sandbox;
 
+pub use behavior::{
+    BehaviorBindingsOverride, BehaviorConfig, BehaviorOutcome, BehaviorSnapshot, BehaviorState,
+    BehaviorSummary, BehaviorThreadOverride, CatchUp, Overlap, RetentionPolicy, TriggerSpec,
+};
 pub use conversation::{ContentBlock, Conversation, Message, Role, ToolResultContent};
 pub use pod::{
     NamedHostEnv, PodAllow, PodConfig, PodLimits, PodSnapshot, PodSummary, ThreadDefaults,
@@ -576,6 +581,23 @@ pub enum ClientToServer {
     ArchivePod {
         pod_id: String,
     },
+
+    // --- Behavior registry (read-only in phase 1 — see
+    //     docs/design_behaviors.md). Create / update / delete / run arrive
+    //     in phase 2 alongside manual-trigger support. ---
+    /// List the behaviors declared under one pod.
+    ListBehaviors {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        correlation_id: Option<String>,
+        pod_id: String,
+    },
+    /// Read one behavior's full config + prompt + persisted state.
+    GetBehavior {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        correlation_id: Option<String>,
+        pod_id: String,
+        behavior_id: String,
+    },
 }
 
 /// Messages the server sends to the client.
@@ -800,6 +822,19 @@ pub enum ServerToClient {
     },
     PodArchived {
         pod_id: String,
+    },
+
+    // --- Behavior registry (read-only in phase 1). ---
+    BehaviorList {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        correlation_id: Option<String>,
+        pod_id: String,
+        behaviors: Vec<BehaviorSummary>,
+    },
+    BehaviorSnapshot {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        correlation_id: Option<String>,
+        snapshot: BehaviorSnapshot,
     },
 
     Error {

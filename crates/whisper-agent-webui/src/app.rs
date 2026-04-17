@@ -1021,6 +1021,11 @@ impl ChatApp {
                 self.pod_configs
                     .insert(snapshot.pod_id.clone(), snapshot.config);
             }
+            // Behaviors: phase 1 adds read-side wire only. The UI surface
+            // (a behaviors panel in the pod detail view) is phase 5 work —
+            // until then the events arrive and are dropped. See
+            // docs/design_behaviors.md.
+            ServerToClient::BehaviorList { .. } | ServerToClient::BehaviorSnapshot { .. } => {}
         }
     }
 
