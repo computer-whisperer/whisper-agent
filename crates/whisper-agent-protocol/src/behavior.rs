@@ -176,6 +176,27 @@ pub enum BehaviorOutcome {
     Cancelled,
 }
 
+/// Provenance stamp carried by every thread a behavior spawned. Lets the
+/// UI group "all runs of daily_ci_check" without a side table and keeps
+/// the trigger context (what fired this run, when, with what payload)
+/// available for debugging. Absent on interactive threads.
+///
+/// Persisted as part of the thread's JSON. Also echoed onto
+/// `ThreadSummary` / `ThreadSnapshot` so every client observing the
+/// thread sees the same origin without a second round trip.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct BehaviorOrigin {
+    pub behavior_id: String,
+    /// RFC-3339 timestamp of when the trigger fired. Plain string so the
+    /// protocol crate stays chrono-free.
+    pub fired_at: String,
+    /// Trigger-defined payload. `Null` for manual / cron fires that
+    /// didn't supply data; arbitrary JSON for webhook fires (request
+    /// body) and future event-source variants.
+    #[serde(default)]
+    pub trigger_payload: Value,
+}
+
 /// Lightweight list entry used in `PodSnapshot.behaviors` and in
 /// `BehaviorList` responses. Carries enough for the webui to render a row
 /// without asking for the full config.

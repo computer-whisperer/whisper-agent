@@ -998,11 +998,12 @@ impl Scheduler {
                 config_override,
                 bindings_request,
             } => match self.create_task(
-                conn_id,
+                Some(conn_id),
                 correlation_id.clone(),
                 pod_id,
                 config_override,
                 bindings_request,
+                None,
                 pending_io,
             ) {
                 Ok(thread_id) => {
@@ -1131,6 +1132,7 @@ impl Scheduler {
                             state: ThreadStateLabel::Cancelled,
                         });
                     self.teardown_host_env_if_terminal(&thread_id);
+                    self.on_behavior_thread_terminal(&thread_id);
                 }
             }
             ClientToServer::ArchiveThread { thread_id } => {
@@ -1569,6 +1571,30 @@ impl Scheduler {
                     },
                 );
             }
+            ClientToServer::RunBehavior {
+                correlation_id,
+                pod_id,
+                behavior_id,
+                payload,
+            } => {
+                if let Err(e) = self.run_behavior(
+                    Some(conn_id),
+                    correlation_id.clone(),
+                    &pod_id,
+                    &behavior_id,
+                    payload,
+                    pending_io,
+                ) {
+                    self.router.send_to_client(
+                        conn_id,
+                        ServerToClient::Error {
+                            correlation_id,
+                            thread_id: None,
+                            message: format!("run_behavior: {e}"),
+                        },
+                    );
+                }
+            }
             ClientToServer::ListModels {
                 correlation_id,
                 backend,
@@ -1621,13 +1647,19 @@ impl Scheduler {
         }
     }
 
+    /// Spawn a fresh thread under `pod_id`. `requester` identifies the
+    /// connection that asked for it, if any; trigger-driven spawns
+    /// (behaviors, cron, etc.) pass `None`. `origin` stamps behavior
+    /// provenance on the thread; `None` for interactive work.
+    #[allow(clippy::too_many_arguments)]
     fn create_task(
         &mut self,
-        requester: ConnId,
+        requester: Option<ConnId>,
         correlation_id: Option<String>,
         pod_id: Option<String>,
         config_override: Option<ThreadConfigOverride>,
         bindings_request: Option<ThreadBindingsRequest>,
+        origin: Option<whisper_agent_protocol::BehaviorOrigin>,
         pending_io: &mut FuturesUnordered<SchedulerFuture>,
     ) -> Result<String, String> {
         // Resolve which pod this thread lands in. None routes to the
@@ -1689,7 +1721,10 @@ impl Scheduler {
             tool_filter: None,
         };
 
-        let task = Thread::new(thread_id.clone(), pod_id.clone(), config, bindings);
+        let mut task = Thread::new(thread_id.clone(), pod_id.clone(), config, bindings);
+        if let Some(origin) = origin {
+            task = task.with_origin(origin);
+        }
         let summary = task.summary();
         self.tasks.insert(thread_id.clone(), task);
         // Mirror the new thread into the owning pod's `threads` set.
@@ -1716,34 +1751,185 @@ impl Scheduler {
         self.ensure_host_env_provisioning(&thread_id, pending_io);
 
         info!(thread_id = %thread_id, pod_id = %pod_id, "task created");
-        // Every client gets exactly one ThreadCreated; the requester's copy carries
-        // correlation_id if they provided one.
-        if correlation_id.is_some() {
-            self.router.broadcast_task_list_except(
-                ServerToClient::ThreadCreated {
-                    thread_id: thread_id.clone(),
-                    summary: summary.clone(),
-                    correlation_id: None,
-                },
-                requester,
-            );
-            self.router.send_to_client(
-                requester,
-                ServerToClient::ThreadCreated {
-                    thread_id: thread_id.clone(),
-                    summary,
-                    correlation_id,
-                },
-            );
-        } else {
-            self.router
-                .broadcast_task_list(ServerToClient::ThreadCreated {
-                    thread_id: thread_id.clone(),
-                    summary,
-                    correlation_id: None,
-                });
+        // Every client gets exactly one ThreadCreated. When there's a
+        // requester AND a correlation_id, the requester's copy carries the
+        // correlation_id so they can match it against their request;
+        // otherwise we broadcast one uncorrelated event to everyone.
+        // Trigger-driven spawns (behaviors, cron) arrive with requester=None
+        // and fall through to the plain broadcast path — no one is
+        // "waiting" on a correlated ack.
+        match (requester, correlation_id) {
+            (Some(conn), Some(cid)) => {
+                self.router.broadcast_task_list_except(
+                    ServerToClient::ThreadCreated {
+                        thread_id: thread_id.clone(),
+                        summary: summary.clone(),
+                        correlation_id: None,
+                    },
+                    conn,
+                );
+                self.router.send_to_client(
+                    conn,
+                    ServerToClient::ThreadCreated {
+                        thread_id: thread_id.clone(),
+                        summary,
+                        correlation_id: Some(cid),
+                    },
+                );
+            }
+            _ => {
+                self.router
+                    .broadcast_task_list(ServerToClient::ThreadCreated {
+                        thread_id: thread_id.clone(),
+                        summary,
+                        correlation_id: None,
+                    });
+            }
         }
         Ok(thread_id)
+    }
+
+    /// Spawn a thread from a behavior trigger. Resolves the behavior's
+    /// effective thread config + bindings against the pod's defaults and
+    /// `[allow]` cap, renders the prompt template with the payload, and
+    /// drives the resulting thread through `create_task` →
+    /// `send_user_message` → `step_until_blocked` like a normal
+    /// interactive spawn. The thread carries `BehaviorOrigin` so the
+    /// on-terminal hook knows to update behavior state when it finishes.
+    ///
+    /// `requester` is `Some` for UI-initiated `RunBehavior` (so the
+    /// requester's `ThreadCreated` carries their correlation_id) and
+    /// `None` for cron/webhook/etc fires that arrive without a client
+    /// connection. See `create_task` for the headless-spawn semantics.
+    fn run_behavior(
+        &mut self,
+        requester: Option<ConnId>,
+        correlation_id: Option<String>,
+        pod_id: &str,
+        behavior_id: &str,
+        payload: Option<serde_json::Value>,
+        pending_io: &mut FuturesUnordered<SchedulerFuture>,
+    ) -> Result<String, String> {
+        // Snapshot everything we need out of the behavior entry up front,
+        // so we don't hold an immutable borrow of `self.pods` across the
+        // `create_task` / `send_user_message` calls (both of which take
+        // `&mut self`).
+        let (config, prompt) = {
+            let pod = self
+                .pods
+                .get(pod_id)
+                .ok_or_else(|| format!("unknown pod `{pod_id}`"))?;
+            let behavior = pod
+                .behaviors
+                .get(behavior_id)
+                .ok_or_else(|| format!("unknown behavior `{behavior_id}` under pod `{pod_id}`"))?;
+            if let Some(err) = &behavior.load_error {
+                return Err(format!(
+                    "behavior `{behavior_id}` failed to load and cannot fire: {err}"
+                ));
+            }
+            let config = behavior
+                .config
+                .clone()
+                .ok_or_else(|| "behavior has no parsed config".to_string())?;
+            (config, behavior.prompt.clone())
+        };
+
+        let payload = payload.unwrap_or(serde_json::Value::Null);
+        let rendered_prompt = render_behavior_prompt(&prompt, &payload);
+
+        let (config_override, bindings_request) = behavior_override_to_requests(&config.thread);
+
+        let origin = whisper_agent_protocol::BehaviorOrigin {
+            behavior_id: behavior_id.to_string(),
+            fired_at: chrono::Utc::now().to_rfc3339(),
+            trigger_payload: payload,
+        };
+
+        let thread_id = self.create_task(
+            requester,
+            correlation_id,
+            Some(pod_id.to_string()),
+            config_override,
+            bindings_request,
+            Some(origin),
+            pending_io,
+        )?;
+        self.mark_dirty(&thread_id);
+        self.send_user_message(&thread_id, rendered_prompt, pending_io);
+        self.step_until_blocked(&thread_id, pending_io);
+        Ok(thread_id)
+    }
+
+    /// On-terminal hook for behavior-spawned threads. Idempotent — safe
+    /// to call at every teardown site; no-op when the thread either
+    /// doesn't exist, has no `origin`, isn't in a terminal state, or has
+    /// already been recorded (thread_id already == behavior.state
+    /// .last_thread_id with a set outcome). The check against
+    /// `last_thread_id` means interactive follow-ups on a Completed
+    /// behavior thread don't double-count.
+    fn on_behavior_thread_terminal(&mut self, thread_id: &str) {
+        let Some(task) = self.tasks.get(thread_id) else {
+            return;
+        };
+        let Some(origin) = task.origin.clone() else {
+            return;
+        };
+        let outcome = match task.public_state() {
+            ThreadStateLabel::Completed => whisper_agent_protocol::BehaviorOutcome::Completed,
+            ThreadStateLabel::Failed => whisper_agent_protocol::BehaviorOutcome::Failed {
+                message: task.failure_detail().unwrap_or_default(),
+            },
+            ThreadStateLabel::Cancelled => whisper_agent_protocol::BehaviorOutcome::Cancelled,
+            _ => return,
+        };
+        let pod_id = task.pod_id.clone();
+        let Some(pod) = self.pods.get_mut(&pod_id) else {
+            return;
+        };
+        let Some(behavior) = pod.behaviors.get_mut(&origin.behavior_id) else {
+            return;
+        };
+        // Idempotence: if we already recorded this thread's outcome,
+        // don't double-count. A Completed thread that receives an
+        // interactive follow-up will re-enter Working → Completed and
+        // try to fire this hook again; we bail here.
+        if behavior.state.last_thread_id.as_deref() == Some(thread_id)
+            && behavior.state.last_outcome.is_some()
+        {
+            return;
+        }
+        behavior.state.last_thread_id = Some(thread_id.to_string());
+        behavior.state.last_outcome = Some(outcome);
+        behavior.state.run_count = behavior.state.run_count.saturating_add(1);
+        let snapshot_state = behavior.state.clone();
+        let state_path = behavior.dir.join(crate::pod::behaviors::BEHAVIOR_STATE);
+
+        // Persist asynchronously — the in-memory update already happened,
+        // so even if the write fails the UI and subsequent reads see the
+        // new value. On restart the state reverts to the last successful
+        // write; logged at warn for forensics.
+        let persist_state = snapshot_state.clone();
+        tokio::spawn(async move {
+            let payload = match serde_json::to_vec_pretty(&persist_state) {
+                Ok(b) => b,
+                Err(e) => {
+                    warn!(error = %e, "serialize behavior state");
+                    return;
+                }
+            };
+            if let Err(e) = tokio::fs::write(&state_path, payload).await {
+                warn!(path = %state_path.display(), error = %e, "write behavior state.json");
+            }
+        });
+
+        // Broadcast so every connected client sees the last-run update.
+        self.router
+            .broadcast_task_list(ServerToClient::BehaviorStateChanged {
+                pod_id,
+                behavior_id: origin.behavior_id,
+                state: snapshot_state,
+            });
     }
 
     fn send_user_message(
@@ -1952,6 +2138,7 @@ impl Scheduler {
                     self.mark_dirty(&thread_id);
                     self.router.dispatch_events(&thread_id, events);
                     self.teardown_host_env_if_terminal(&thread_id);
+                    self.on_behavior_thread_terminal(&thread_id);
                 }
             }
         }
@@ -2099,6 +2286,12 @@ impl Scheduler {
                 StepOutcome::Paused => break,
             }
         }
+        // Catch Completed/Failed/Cancelled transitions for behavior-spawned
+        // threads. Idempotent (no-op when origin is None or state isn't
+        // terminal). Covers every stepping path; CancelThread and the
+        // failed-provisioning site don't go through here and call the
+        // hook directly.
+        self.on_behavior_thread_terminal(thread_id);
     }
 
     /// If the task is in a terminal state, tear down its sandbox (if any).
@@ -2372,6 +2565,57 @@ fn apply_config_override(base: ThreadConfig, ov: Option<ThreadConfigOverride>) -
     }
 }
 
+/// Translate a behavior's thread-override block into the
+/// (ThreadConfigOverride, ThreadBindingsRequest) pair `create_task`
+/// consumes. `None` returns for either side mean "inherit everything
+/// from pod defaults."
+fn behavior_override_to_requests(
+    ov: &whisper_agent_protocol::BehaviorThreadOverride,
+) -> (Option<ThreadConfigOverride>, Option<ThreadBindingsRequest>) {
+    let config_override = if ov.model.is_some()
+        || ov.max_tokens.is_some()
+        || ov.max_turns.is_some()
+        || ov.approval_policy.is_some()
+    {
+        Some(ThreadConfigOverride {
+            model: ov.model.clone(),
+            system_prompt: None, // behaviors inherit pod system_prompt
+            max_tokens: ov.max_tokens,
+            max_turns: ov.max_turns,
+            approval_policy: ov.approval_policy,
+        })
+    } else {
+        None
+    };
+    let b = &ov.bindings;
+    let bindings_request = if b.backend.is_some() || b.host_env.is_some() || b.mcp_hosts.is_some() {
+        Some(ThreadBindingsRequest {
+            backend: b.backend.clone(),
+            host_env: b.host_env.clone(),
+            mcp_hosts: b.mcp_hosts.clone(),
+        })
+    } else {
+        None
+    };
+    (config_override, bindings_request)
+}
+
+/// Render a behavior's prompt template. Minimal v1: a single
+/// `{{payload}}` token expands to the pretty-printed JSON payload
+/// (empty string for `Null`). Richer templating (accessor paths,
+/// conditionals) is deferred until we see what behaviors actually want.
+fn render_behavior_prompt(template: &str, payload: &serde_json::Value) -> String {
+    if !template.contains("{{payload}}") {
+        return template.to_string();
+    }
+    let payload_text = if payload.is_null() {
+        String::new()
+    } else {
+        serde_json::to_string_pretty(payload).unwrap_or_default()
+    };
+    template.replace("{{payload}}", &payload_text)
+}
+
 /// Resolved binding-side choices for a fresh thread. Validated against
 /// the pod's `[allow]` cap before construction.
 struct ResolvedBindings {
@@ -2514,4 +2758,89 @@ async fn next_completion(
     pending: &mut FuturesUnordered<SchedulerFuture>,
 ) -> Option<SchedulerCompletion> {
     pending.next().await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use whisper_agent_protocol::{BehaviorBindingsOverride, BehaviorThreadOverride, Overlap};
+
+    #[test]
+    fn render_leaves_template_alone_when_no_placeholder() {
+        let out = render_behavior_prompt("do the thing", &serde_json::Value::Null);
+        assert_eq!(out, "do the thing");
+    }
+
+    #[test]
+    fn render_expands_null_payload_to_empty() {
+        let out = render_behavior_prompt("before {{payload}} after", &serde_json::Value::Null);
+        assert_eq!(out, "before  after");
+    }
+
+    #[test]
+    fn render_expands_object_payload_to_pretty_json() {
+        let payload = serde_json::json!({ "from": "alice", "subject": "hi" });
+        let out = render_behavior_prompt("email: {{payload}}", &payload);
+        assert!(out.starts_with("email: {"));
+        assert!(out.contains("\"from\": \"alice\""));
+        assert!(out.contains("\"subject\": \"hi\""));
+    }
+
+    #[test]
+    fn override_translates_every_set_field() {
+        let ov = BehaviorThreadOverride {
+            model: Some("sonnet-4-6".into()),
+            max_tokens: Some(8192),
+            max_turns: Some(20),
+            approval_policy: Some(whisper_agent_protocol::ApprovalPolicy::AutoApproveAll),
+            bindings: BehaviorBindingsOverride {
+                backend: Some("anthropic".into()),
+                host_env: Some("readonly".into()),
+                mcp_hosts: Some(vec!["fetch".into()]),
+            },
+        };
+        let (cfg, bindings) = behavior_override_to_requests(&ov);
+        let cfg = cfg.expect("config_override populated");
+        assert_eq!(cfg.model.as_deref(), Some("sonnet-4-6"));
+        assert_eq!(cfg.max_tokens, Some(8192));
+        assert_eq!(cfg.max_turns, Some(20));
+        assert!(matches!(
+            cfg.approval_policy,
+            Some(whisper_agent_protocol::ApprovalPolicy::AutoApproveAll)
+        ));
+        // Behaviors never override system_prompt — pod default is authoritative.
+        assert!(cfg.system_prompt.is_none());
+        let b = bindings.expect("bindings_request populated");
+        assert_eq!(b.backend.as_deref(), Some("anthropic"));
+        assert_eq!(b.host_env.as_deref(), Some("readonly"));
+        assert_eq!(b.mcp_hosts.as_deref(), Some(&["fetch".to_string()][..]));
+    }
+
+    #[test]
+    fn override_returns_none_when_nothing_set() {
+        let ov = BehaviorThreadOverride::default();
+        let (cfg, bindings) = behavior_override_to_requests(&ov);
+        assert!(cfg.is_none());
+        assert!(bindings.is_none());
+    }
+
+    #[test]
+    fn override_partial_sets_only_relevant_side() {
+        // Only a binding override, no config override.
+        let ov = BehaviorThreadOverride {
+            bindings: BehaviorBindingsOverride {
+                mcp_hosts: Some(vec!["fetch".into()]),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let (cfg, bindings) = behavior_override_to_requests(&ov);
+        assert!(cfg.is_none(), "no config-side fields were set");
+        assert!(bindings.is_some());
+    }
+
+    // Suppress an unused-import warning when the snippet above doesn't exercise
+    // every imported item under every cfg combination.
+    #[allow(dead_code)]
+    fn _overlap_type_is_in_scope(_: Overlap) {}
 }

@@ -14,8 +14,9 @@ pub mod pod;
 pub mod sandbox;
 
 pub use behavior::{
-    BehaviorBindingsOverride, BehaviorConfig, BehaviorOutcome, BehaviorSnapshot, BehaviorState,
-    BehaviorSummary, BehaviorThreadOverride, CatchUp, Overlap, RetentionPolicy, TriggerSpec,
+    BehaviorBindingsOverride, BehaviorConfig, BehaviorOrigin, BehaviorOutcome, BehaviorSnapshot,
+    BehaviorState, BehaviorSummary, BehaviorThreadOverride, CatchUp, Overlap, RetentionPolicy,
+    TriggerSpec,
 };
 pub use conversation::{ContentBlock, Conversation, Message, Role, ToolResultContent};
 pub use pod::{
@@ -279,6 +280,12 @@ pub struct ThreadSummary {
     /// doesn't pull in chrono.
     pub created_at: String,
     pub last_active: String,
+    /// Behavior-origin stamp when this thread was spawned by a behavior
+    /// trigger. `None` for interactive threads. Present on the list tier
+    /// because clients want to badge / group behavior-spawned threads
+    /// without fetching the full snapshot.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<BehaviorOrigin>,
 }
 
 /// Entry in a `BackendsList` response.
@@ -421,6 +428,11 @@ pub struct ThreadSnapshot {
     /// prompt for the rest of the task's lifetime. Sorted for stable display.
     #[serde(default)]
     pub tool_allowlist: Vec<String>,
+    /// Behavior-origin stamp for threads spawned by a behavior trigger.
+    /// Carries the full payload (`ThreadSummary` carries the same field
+    /// but payload-size concerns may trim it there later).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<BehaviorOrigin>,
 }
 
 // ---------- Wire enums ----------
@@ -597,6 +609,22 @@ pub enum ClientToServer {
         correlation_id: Option<String>,
         pod_id: String,
         behavior_id: String,
+    },
+    /// Manually trigger a behavior: spawn a thread with the behavior's
+    /// templated prompt + resolved config + `BehaviorOrigin`, run to
+    /// terminal. Request carries an optional JSON payload that is
+    /// substituted into the prompt template (`{{payload}}`) and stamped
+    /// onto the thread's origin.
+    RunBehavior {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        correlation_id: Option<String>,
+        pod_id: String,
+        behavior_id: String,
+        /// Payload exposed to the prompt template and recorded on
+        /// `BehaviorOrigin.trigger_payload`. `None` → treated as
+        /// `serde_json::Value::Null`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        payload: Option<serde_json::Value>,
     },
 }
 
@@ -824,7 +852,7 @@ pub enum ServerToClient {
         pod_id: String,
     },
 
-    // --- Behavior registry (read-only in phase 1). ---
+    // --- Behavior registry ---
     BehaviorList {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         correlation_id: Option<String>,
@@ -835,6 +863,15 @@ pub enum ServerToClient {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         correlation_id: Option<String>,
         snapshot: BehaviorSnapshot,
+    },
+    /// A behavior's persisted state changed (a trigger fired, a run
+    /// finished, a queued payload was consumed). Carries a full snapshot
+    /// of the state so clients can render badges / last-run info
+    /// without tracking deltas.
+    BehaviorStateChanged {
+        pod_id: String,
+        behavior_id: String,
+        state: BehaviorState,
     },
 
     Error {

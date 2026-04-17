@@ -1021,11 +1021,13 @@ impl ChatApp {
                 self.pod_configs
                     .insert(snapshot.pod_id.clone(), snapshot.config);
             }
-            // Behaviors: phase 1 adds read-side wire only. The UI surface
-            // (a behaviors panel in the pod detail view) is phase 5 work —
-            // until then the events arrive and are dropped. See
-            // docs/design_behaviors.md.
-            ServerToClient::BehaviorList { .. } | ServerToClient::BehaviorSnapshot { .. } => {}
+            // Behaviors: phase 1/2 add read-side + manual-fire wire. The
+            // UI surface (a behaviors panel in the pod detail view) is
+            // phase 5 work — until then the events arrive and are
+            // dropped. See docs/design_behaviors.md.
+            ServerToClient::BehaviorList { .. }
+            | ServerToClient::BehaviorSnapshot { .. }
+            | ServerToClient::BehaviorStateChanged { .. } => {}
         }
     }
 
@@ -1165,6 +1167,7 @@ fn snapshot_summary(s: &whisper_agent_protocol::ThreadSnapshot) -> ThreadSummary
         state: s.state,
         created_at: s.created_at.clone(),
         last_active: s.last_active.clone(),
+        origin: s.origin.clone(),
     }
 }
 

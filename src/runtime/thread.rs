@@ -22,8 +22,9 @@ use std::collections::{BTreeSet, HashMap};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use whisper_agent_protocol::{
-    ApprovalChoice, ApprovalPolicy, ContentBlock, Conversation, Message, ThreadBindings,
-    ThreadConfig, ThreadSnapshot, ThreadStateLabel, ThreadSummary, ToolResultContent, Usage,
+    ApprovalChoice, ApprovalPolicy, BehaviorOrigin, ContentBlock, Conversation, Message,
+    ThreadBindings, ThreadConfig, ThreadSnapshot, ThreadStateLabel, ThreadSummary,
+    ToolResultContent, Usage,
 };
 
 use crate::providers::model::ModelResponse;
@@ -62,6 +63,11 @@ pub struct Thread {
     /// with the task, so the allowlist survives restart.
     #[serde(default)]
     pub tool_allowlist: BTreeSet<String>,
+    /// Provenance stamp for threads spawned by a behavior trigger. `None`
+    /// for interactive threads. Load-only plumbing: the scheduler stamps
+    /// this on spawn and the on-completion hook reads it back.
+    #[serde(default)]
+    pub origin: Option<BehaviorOrigin>,
     pub internal: ThreadInternalState,
 }
 
@@ -298,8 +304,18 @@ impl Thread {
             archived: false,
             turns_in_cycle: 0,
             tool_allowlist: BTreeSet::new(),
+            origin: None,
             internal: ThreadInternalState::Idle,
         }
+    }
+
+    /// Builder-style setter for behavior provenance. The scheduler uses
+    /// this when spawning threads from a `RunBehavior` / trigger fire so
+    /// the hook that updates `BehaviorState` on terminal transitions
+    /// knows which behavior this thread belongs to.
+    pub fn with_origin(mut self, origin: BehaviorOrigin) -> Self {
+        self.origin = Some(origin);
+        self
     }
 
     pub fn touch(&mut self) {
@@ -328,6 +344,7 @@ impl Thread {
             state: self.public_state(),
             created_at: self.created_at.to_rfc3339(),
             last_active: self.last_active.to_rfc3339(),
+            origin: self.origin.clone(),
         }
     }
 
@@ -345,6 +362,7 @@ impl Thread {
             last_active: self.last_active.to_rfc3339(),
             failure: self.failure_detail(),
             tool_allowlist: self.tool_allowlist.iter().cloned().collect(),
+            origin: self.origin.clone(),
         }
     }
 
