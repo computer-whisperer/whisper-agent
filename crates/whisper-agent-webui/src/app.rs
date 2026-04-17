@@ -12,12 +12,14 @@
 //! the task's display items. Subsequent turn events append to them.
 
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::rc::Rc;
 
-use egui::{Color32, ComboBox, RichText, ScrollArea, TextEdit};
+use egui::{Color32, ComboBox, DragValue, Grid, RichText, ScrollArea, TextEdit};
 use serde::{Deserialize, Serialize};
-use whisper_agent_protocol::sandbox::{AccessMode, NetworkPolicy, PathAccess};
+use whisper_agent_protocol::sandbox::{
+    AccessMode, Mount, NetworkPolicy, PathAccess, ResourceLimits,
+};
 use whisper_agent_protocol::{
     ApprovalChoice, ApprovalPolicy, BackendSummary, ClientToServer, ContentBlock, Conversation,
     Message, ModelSummary, NamedSandboxSpec, PodAllow, PodConfig, PodLimits, PodSummary,
@@ -342,30 +344,126 @@ impl PresetModalState {
     }
 }
 
-/// State for the "Edit config" modal — a raw-TOML editor for one pod's
-/// `pod.toml`. The structured form variant is deferred to a later phase;
-/// for now the user edits the text directly and the server validates on
-/// save (parse + `pod::validate`). Open the modal -> we send `GetPod`
-/// for the latest text -> populate `toml_text` when the `PodSnapshot`
-/// lands. On Save we send `UpdatePodConfig` with `pending_correlation`
-/// and wait for the matching `PodConfigUpdated` (close) or `Error`
-/// (show inline + leave the modal open so edits aren't lost).
+/// State for the per-pod config editor. The modal is tabbed: three
+/// structured tabs (Allow / Defaults / Limits) edit a working
+/// `PodConfig` directly, and a fourth (Raw TOML) is the escape hatch
+/// for paste-and-go or fields the structured form doesn't cover (e.g.
+/// every `[[allow.sandbox]]` body has its own dedicated sub-modal, but
+/// power users can still hand-edit them in raw text).
+///
+/// Lifecycle: open then issue `GetPod`; on snapshot, populate `working`
+/// and `server_baseline`; user edits; Save serializes `working` (or
+/// `raw_buffer` if the Raw tab is canonical) and sends `UpdatePodConfig`
+/// with a fresh correlation_id. Server validation errors land via the
+/// matching `Error` event and surface inline, leaving the user's edits
+/// intact for fixing.
 struct PodEditorModalState {
     pod_id: String,
-    /// `None` until the `PodSnapshot` arrives. The editor renders a
-    /// "loading…" placeholder in the meantime.
-    toml_text: Option<String>,
+    /// Working in-memory edit. `None` until the snapshot lands.
+    /// All structured tabs read/write this directly.
+    working: Option<PodConfig>,
+    /// The server's last known config — used as the Revert baseline
+    /// and to drive the dirty indicator (Save is enabled only when
+    /// `working` differs from this).
+    server_baseline: Option<PodConfig>,
+    /// Backing buffer for the Raw TOML tab. Whenever the user enters
+    /// the Raw tab, we regenerate this from `working` *unless*
+    /// `raw_dirty` says they have unsaved raw edits to preserve.
+    raw_buffer: String,
+    /// True when the Raw tab's text has diverged from the structured
+    /// `working`. Cleared whenever `working` is updated from raw or
+    /// vice-versa (e.g. on tab switch with a clean Raw buffer).
+    raw_dirty: bool,
+    /// Active tab.
+    tab: PodEditorTab,
+    /// Last server validation error, surfaced inline in the footer.
+    /// Cleared when the user starts a new save or switches tabs.
     error: Option<String>,
+    /// Set to the correlation_id of the in-flight `UpdatePodConfig`.
+    /// `Some` means a save is currently in flight (Save button reads
+    /// "saving…" and is disabled).
     pending_correlation: Option<String>,
+    /// Sub-modal state for editing one `[[allow.sandbox]]` entry.
+    /// `Some` means the sub-modal is open and consuming input
+    /// (the parent tabs render but are non-interactive while it's up).
+    sandbox_entry_editor: Option<SandboxEntryEditorState>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PodEditorTab {
+    Allow,
+    Defaults,
+    Limits,
+    RawToml,
+}
+
+impl PodEditorTab {
+    fn label(self) -> &'static str {
+        match self {
+            PodEditorTab::Allow => "Allow",
+            PodEditorTab::Defaults => "Thread defaults",
+            PodEditorTab::Limits => "Limits",
+            PodEditorTab::RawToml => "Raw TOML",
+        }
+    }
 }
 
 impl PodEditorModalState {
     fn new(pod_id: String) -> Self {
         Self {
             pod_id,
-            toml_text: None,
+            working: None,
+            server_baseline: None,
+            raw_buffer: String::new(),
+            raw_dirty: false,
+            tab: PodEditorTab::Allow,
             error: None,
             pending_correlation: None,
+            sandbox_entry_editor: None,
+        }
+    }
+
+    /// Has the user changed anything since the snapshot landed?
+    fn is_dirty(&self) -> bool {
+        match (&self.working, &self.server_baseline) {
+            (Some(w), Some(s)) => w != s || self.raw_dirty,
+            _ => false,
+        }
+    }
+}
+
+/// Sub-modal for editing one `[[allow.sandbox]]` entry. Stays in front
+/// of the parent pod editor; the parent's tabs render but are
+/// non-interactive while this is open. Save writes the entry back to
+/// `working.allow.sandbox` at `index` (or appends when `index` is
+/// `None`).
+struct SandboxEntryEditorState {
+    /// Position in `working.allow.sandbox`. `None` for "add new".
+    index: Option<usize>,
+    /// Working copy of the entry — applied back to `working` on save.
+    entry: NamedSandboxSpec,
+    /// Local validation hint (empty name, etc.). Server-side checks
+    /// land later via the parent modal's pod-level Save round-trip.
+    error: Option<String>,
+}
+
+impl SandboxEntryEditorState {
+    fn new_for_index(index: usize, entry: NamedSandboxSpec) -> Self {
+        Self {
+            index: Some(index),
+            entry,
+            error: None,
+        }
+    }
+
+    fn new_for_add() -> Self {
+        Self {
+            index: None,
+            entry: NamedSandboxSpec {
+                name: String::new(),
+                spec: SandboxSpec::None,
+            },
+            error: None,
         }
     }
 }
@@ -827,23 +925,41 @@ impl ChatApp {
                     summary.created_at = parsed.created_at.clone();
                 }
                 if pod_id == self.server_default_pod_id {
-                    self.default_pod_template = Some(parsed);
+                    self.default_pod_template = Some(parsed.clone());
                 }
-                // If the editor was waiting for this update (matched by
-                // correlation_id), close it. Updates from other sources
-                // for the same pod refresh the editor's text in place
-                // instead of clobbering — but our save flow is the only
-                // one that mints a correlation, so this is the typical
-                // close-on-success path.
+                // The editor stays open across saves — refresh its
+                // baseline so subsequent edits are diffed against the
+                // newly-persisted state, not the stale one. We keep
+                // the user's `working` value if they're matching the
+                // correlation we just sent (their own save
+                // round-tripped — `working` already matches `parsed`),
+                // and we replace `working` if this update came from
+                // another client (otherwise their off-screen edits
+                // would silently clobber the local view).
                 if let Some(modal) = self.pod_editor_modal.as_mut()
                     && modal.pod_id == pod_id
                 {
-                    if modal.pending_correlation.is_some()
-                        && modal.pending_correlation == correlation_id
-                    {
-                        self.pod_editor_modal = None;
-                    } else {
-                        modal.toml_text = Some(toml_text);
+                    let our_save = modal.pending_correlation.is_some()
+                        && modal.pending_correlation == correlation_id;
+                    modal.server_baseline = Some(parsed.clone());
+                    if our_save {
+                        // Refresh `working` from the server's parse too —
+                        // necessary when we saved from the Raw tab (where
+                        // `working` wasn't the source of truth) and a no-op
+                        // when we saved from a structured tab.
+                        modal.working = Some(parsed);
+                        modal.pending_correlation = None;
+                        modal.error = None;
+                        modal.raw_buffer = toml_text;
+                        modal.raw_dirty = false;
+                    } else if !modal.is_dirty() {
+                        // Foreign update + we have no local edits =>
+                        // adopt it cleanly. If we *do* have edits,
+                        // leave them alone; the next Save will collide
+                        // server-side and we'll show that error.
+                        modal.working = Some(parsed);
+                        modal.raw_buffer = toml_text;
+                        modal.raw_dirty = false;
                         modal.error = None;
                     }
                 }
@@ -877,9 +993,12 @@ impl ChatApp {
                 }
                 if let Some(modal) = self.pod_editor_modal.as_mut()
                     && modal.pod_id == snapshot.pod_id
-                    && modal.toml_text.is_none()
+                    && modal.working.is_none()
                 {
-                    modal.toml_text = Some(snapshot.toml_text);
+                    modal.server_baseline = Some(snapshot.config.clone());
+                    modal.working = Some(snapshot.config);
+                    modal.raw_buffer = snapshot.toml_text;
+                    modal.raw_dirty = false;
                 }
             }
         }
@@ -1814,124 +1933,315 @@ impl ChatApp {
         let Some(mut modal) = self.pod_editor_modal.take() else {
             return;
         };
+
+        // Snapshot the catalogs the form needs into owned data so the
+        // inner closures don't have to borrow `self`. These are small
+        // (single-digit lists in practice) so the clone is cheap.
+        let backend_catalog: Vec<String> =
+            self.backends.iter().map(|b| b.name.clone()).collect();
+        let shared_mcp_catalog: Vec<String> = self
+            .resources
+            .values()
+            .filter_map(|r| match r {
+                ResourceSnapshot::McpHost {
+                    label,
+                    per_task: false,
+                    ..
+                } => Some(label.clone()),
+                _ => None,
+            })
+            .collect();
+
         let mut open = true;
         let mut save_clicked = false;
         let mut cancel_clicked = false;
         let mut revert_clicked = false;
-        let title = format!("Edit pod config — {}", modal.pod_id);
-        // Cap the window so it can't grow past the visible viewport when
-        // the inner editor reports a tall desired size or when the error
-        // label appears.
+        let mut switch_to: Option<PodEditorTab> = None;
+        let mut sandbox_entry_open: Option<SandboxEntryEditorState> = None;
+        let mut sandbox_entry_delete: Option<usize> = None;
+
+        let title = format!("Edit pod — {}", modal.pod_id);
         let screen = ctx.content_rect();
-        let max_h = (screen.height() - 60.0).max(240.0);
-        let max_w = (screen.width() - 60.0).max(360.0);
+        let max_h = (screen.height() - 60.0).max(280.0);
+        let max_w = (screen.width() - 60.0).max(420.0);
+        let dirty = modal.is_dirty();
+        let saving = modal.pending_correlation.is_some();
+        let sub_modal_open = modal.sandbox_entry_editor.is_some();
 
         egui::Window::new(title)
             .collapsible(false)
             .resizable(true)
-            .default_width(640.0_f32.min(max_w))
-            .default_height(520.0_f32.min(max_h))
+            .default_width(720.0_f32.min(max_w))
+            .default_height(560.0_f32.min(max_h))
             .max_width(max_w)
             .max_height(max_h)
             .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
             .open(&mut open)
             .show(ctx, |ui| {
-                // Footer first so it claims its height up-front; the
-                // central panel then fills the remaining space without
-                // pushing total content past the window's max_height.
-                egui::TopBottomPanel::bottom("pod_editor_footer")
-                    .show_inside(ui, |ui| {
-                        ui.add_space(6.0);
-                        if let Some(err) = &modal.error {
-                            ui.colored_label(Color32::from_rgb(220, 80, 80), err);
+                // Disable the parent while the per-sandbox sub-modal is
+                // up so clicks on the parent don't interleave with the
+                // sub-modal's edits.
+                ui.add_enabled_ui(!sub_modal_open, |ui| {
+                    egui::TopBottomPanel::bottom("pod_editor_footer")
+                        .show_inside(ui, |ui| {
                             ui.add_space(6.0);
-                        }
-                        ui.separator();
-                        ui.horizontal(|ui| {
-                            let saving = modal.pending_correlation.is_some();
-                            let save_enabled = modal.toml_text.is_some() && !saving;
-                            if ui
-                                .add_enabled(save_enabled, egui::Button::new("Save"))
-                                .clicked()
-                            {
-                                save_clicked = true;
+                            if let Some(err) = &modal.error {
+                                ui.colored_label(Color32::from_rgb(220, 80, 80), err);
+                                ui.add_space(4.0);
                             }
-                            if ui.button("Revert").clicked() {
-                                revert_clicked = true;
-                            }
-                            if ui.button("Cancel").clicked() {
-                                cancel_clicked = true;
-                            }
-                            if saving {
-                                ui.label(
-                                    RichText::new("saving…")
-                                        .italics()
-                                        .color(Color32::from_gray(160)),
-                                );
-                            }
-                        });
-                    });
-                egui::TopBottomPanel::top("pod_editor_header")
-                    .show_inside(ui, |ui| {
-                        ui.add_space(4.0);
-                        ui.label(
-                            RichText::new(
-                                "Raw pod.toml — server validates parse + structural rules \
-                                 (sandbox names unique, thread_defaults reference allow.* \
-                                 entries) on save. Validation failures keep your edits open \
-                                 for fixing.",
-                            )
-                            .small()
-                            .color(Color32::from_gray(160)),
-                        );
-                        ui.add_space(6.0);
-                    });
-                egui::CentralPanel::default().show_inside(ui, |ui| match modal.toml_text.as_mut() {
-                    Some(text) => {
-                        egui::ScrollArea::vertical()
-                            .auto_shrink([false, false])
-                            .show(ui, |ui| {
-                                ui.add_sized(
-                                    ui.available_size(),
-                                    TextEdit::multiline(text).code_editor(),
+                            ui.separator();
+                            ui.horizontal(|ui| {
+                                let save_enabled =
+                                    modal.working.is_some() && dirty && !saving;
+                                if ui
+                                    .add_enabled(save_enabled, egui::Button::new("Save"))
+                                    .clicked()
+                                {
+                                    save_clicked = true;
+                                }
+                                if ui
+                                    .add_enabled(
+                                        modal.working.is_some() && dirty && !saving,
+                                        egui::Button::new("Revert"),
+                                    )
+                                    .clicked()
+                                {
+                                    revert_clicked = true;
+                                }
+                                if ui.button("Close").clicked() {
+                                    cancel_clicked = true;
+                                }
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| {
+                                        if saving {
+                                            ui.label(
+                                                RichText::new("saving…")
+                                                    .italics()
+                                                    .color(Color32::from_gray(160)),
+                                            );
+                                        } else if dirty {
+                                            ui.label(
+                                                RichText::new("● unsaved changes")
+                                                    .small()
+                                                    .color(Color32::from_rgb(220, 170, 90)),
+                                            );
+                                        } else if modal.working.is_some() {
+                                            ui.label(
+                                                RichText::new("✓ saved")
+                                                    .small()
+                                                    .color(Color32::from_gray(140)),
+                                            );
+                                        }
+                                    },
                                 );
                             });
-                    }
-                    None => {
-                        ui.add_space(20.0);
-                        ui.label(
-                            RichText::new("loading…")
-                                .italics()
-                                .color(Color32::from_gray(160)),
-                        );
-                    }
+                        });
+                    egui::TopBottomPanel::top("pod_editor_tabs")
+                        .show_inside(ui, |ui| {
+                            ui.add_space(4.0);
+                            ui.horizontal(|ui| {
+                                for tab in [
+                                    PodEditorTab::Allow,
+                                    PodEditorTab::Defaults,
+                                    PodEditorTab::Limits,
+                                    PodEditorTab::RawToml,
+                                ] {
+                                    let active = modal.tab == tab;
+                                    let label = if active {
+                                        RichText::new(tab.label()).strong()
+                                    } else {
+                                        RichText::new(tab.label())
+                                            .color(Color32::from_gray(170))
+                                    };
+                                    if ui
+                                        .selectable_label(active, label)
+                                        .clicked()
+                                        && !active
+                                    {
+                                        switch_to = Some(tab);
+                                    }
+                                }
+                            });
+                            ui.add_space(2.0);
+                            ui.separator();
+                        });
+                    egui::CentralPanel::default().show_inside(ui, |ui| {
+                        let Some(working) = modal.working.as_mut() else {
+                            ui.add_space(24.0);
+                            ui.label(
+                                RichText::new("loading pod config…")
+                                    .italics()
+                                    .color(Color32::from_gray(160)),
+                            );
+                            return;
+                        };
+                        egui::ScrollArea::vertical()
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| match modal.tab {
+                                PodEditorTab::Allow => {
+                                    render_pod_editor_allow_tab(
+                                        ui,
+                                        working,
+                                        &backend_catalog,
+                                        &shared_mcp_catalog,
+                                        &mut sandbox_entry_open,
+                                        &mut sandbox_entry_delete,
+                                    );
+                                }
+                                PodEditorTab::Defaults => {
+                                    render_pod_editor_defaults_tab(
+                                        ui,
+                                        working,
+                                        &backend_catalog,
+                                    );
+                                }
+                                PodEditorTab::Limits => {
+                                    render_pod_editor_limits_tab(ui, working);
+                                }
+                                PodEditorTab::RawToml => {
+                                    render_pod_editor_raw_tab(
+                                        ui,
+                                        &mut modal.raw_buffer,
+                                        &mut modal.raw_dirty,
+                                    );
+                                }
+                            });
+                    });
                 });
             });
 
-        if save_clicked
-            && let Some(text) = modal.toml_text.clone()
+        // Sub-modal: per-sandbox-entry editor. Rendered after the parent
+        // so it's drawn above. The parent above is wrapped in an
+        // `add_enabled_ui(!sub_modal_open, ...)` so clicks pass through
+        // visually but don't interact while this is up.
+        if let Some(mut sub) = modal.sandbox_entry_editor.take() {
+            let mut sub_open = true;
+            let mut sub_save = false;
+            let mut sub_cancel = false;
+            render_sandbox_entry_modal(ctx, &mut sub, &mut sub_open, &mut sub_save, &mut sub_cancel);
+            if sub_save {
+                if sub.entry.name.trim().is_empty() {
+                    sub.error = Some("name is required".into());
+                    modal.sandbox_entry_editor = Some(sub);
+                } else if let Some(working) = modal.working.as_mut() {
+                    let name = sub.entry.name.trim().to_string();
+                    // Reject duplicate names within the same allow.sandbox table.
+                    let dup = working.allow.sandbox.iter().enumerate().any(|(i, e)| {
+                        e.name == name && Some(i) != sub.index
+                    });
+                    if dup {
+                        sub.error = Some(format!("a sandbox named `{name}` already exists"));
+                        modal.sandbox_entry_editor = Some(sub);
+                    } else {
+                        sub.entry.name = name;
+                        match sub.index {
+                            Some(i) if i < working.allow.sandbox.len() => {
+                                working.allow.sandbox[i] = sub.entry;
+                            }
+                            _ => working.allow.sandbox.push(sub.entry),
+                        }
+                        modal.raw_dirty = false;
+                    }
+                }
+            } else if sub_cancel || !sub_open {
+                // Sub-modal closes.
+            } else {
+                modal.sandbox_entry_editor = Some(sub);
+            }
+        }
+        if let Some(idx) = sandbox_entry_delete
+            && let Some(working) = modal.working.as_mut()
+            && idx < working.allow.sandbox.len()
         {
+            // Best-effort: also clear thread_defaults.sandbox if it
+            // pointed at the deleted entry, so the form doesn't carry
+            // a now-dangling reference into the server's validator.
+            let removed = working.allow.sandbox.remove(idx);
+            if working.thread_defaults.sandbox == removed.name {
+                working.thread_defaults.sandbox = String::new();
+            }
+        }
+        if let Some(sub) = sandbox_entry_open {
+            modal.sandbox_entry_editor = Some(sub);
+        }
+
+        // Tab switch happens after the inner closure so we can do the
+        // raw->structured reparse without holding any UI borrows.
+        if let Some(target) = switch_to {
+            if modal.tab == PodEditorTab::RawToml && target != PodEditorTab::RawToml {
+                if modal.raw_dirty {
+                    match toml::from_str::<PodConfig>(&modal.raw_buffer) {
+                        Ok(parsed) => {
+                            modal.working = Some(parsed);
+                            modal.raw_dirty = false;
+                            modal.error = None;
+                            modal.tab = target;
+                        }
+                        Err(e) => {
+                            modal.error = Some(format!(
+                                "raw TOML doesn't parse — fix it or click Revert: {e}"
+                            ));
+                        }
+                    }
+                } else {
+                    modal.tab = target;
+                }
+            } else {
+                if target == PodEditorTab::RawToml
+                    && let Some(working) = &modal.working
+                    && !modal.raw_dirty
+                {
+                    modal.raw_buffer = toml::to_string_pretty(working).unwrap_or_default();
+                }
+                modal.tab = target;
+                modal.error = None;
+            }
+        }
+
+        if save_clicked
+            && let Some(working) = &modal.working
+        {
+            let toml_text = if modal.tab == PodEditorTab::RawToml && modal.raw_dirty {
+                modal.raw_buffer.clone()
+            } else {
+                match toml::to_string_pretty(working) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        modal.error = Some(format!("encode pod.toml: {e}"));
+                        self.pod_editor_modal = Some(modal);
+                        return;
+                    }
+                }
+            };
             let correlation = self.next_correlation_id();
             modal.pending_correlation = Some(correlation.clone());
             modal.error = None;
             self.send(ClientToServer::UpdatePodConfig {
                 correlation_id: Some(correlation),
                 pod_id: modal.pod_id.clone(),
-                toml_text: text,
+                toml_text,
             });
             self.pod_editor_modal = Some(modal);
         } else if revert_clicked {
-            // Drop local edits and re-fetch the server's current text.
-            modal.toml_text = None;
-            modal.error = None;
-            modal.pending_correlation = None;
-            self.send(ClientToServer::GetPod {
-                correlation_id: None,
-                pod_id: modal.pod_id.clone(),
-            });
+            if let Some(baseline) = &modal.server_baseline {
+                modal.working = Some(baseline.clone());
+                modal.raw_buffer = toml::to_string_pretty(baseline).unwrap_or_default();
+                modal.raw_dirty = false;
+                modal.error = None;
+                modal.pending_correlation = None;
+            } else {
+                self.send(ClientToServer::GetPod {
+                    correlation_id: None,
+                    pod_id: modal.pod_id.clone(),
+                });
+                modal.working = None;
+                modal.error = None;
+                modal.pending_correlation = None;
+            }
             self.pod_editor_modal = Some(modal);
         } else if cancel_clicked || !open {
-            // Modal closes.
+            // Modal closes (drop modal).
         } else {
             self.pod_editor_modal = Some(modal);
         }
@@ -2379,5 +2689,912 @@ fn render_item(ui: &mut egui::Ui, item: &DisplayItem) {
             };
             ui.label(RichText::new(text).color(color).italics());
         }
+    }
+}
+
+// ====================================================================
+// Pod editor — structured form
+//
+// The renderer in `render_pod_editor_modal` dispatches to one of these
+// per-tab helpers, plus the per-sandbox-entry sub-modal. They take
+// `working: &mut PodConfig` rather than the modal struct so they can be
+// reused trivially in tests / future inline previews; mutations land
+// directly on `working` and the parent treats any change as "dirty"
+// via its baseline diff.
+// ====================================================================
+
+fn render_pod_editor_allow_tab(
+    ui: &mut egui::Ui,
+    working: &mut PodConfig,
+    backend_catalog: &[String],
+    shared_mcp_catalog: &[String],
+    sandbox_open: &mut Option<SandboxEntryEditorState>,
+    sandbox_delete: &mut Option<usize>,
+) {
+    ui.add_space(4.0);
+    section_heading(ui, "Identity");
+    Grid::new("pod_editor_identity")
+        .num_columns(2)
+        .min_col_width(110.0)
+        .spacing([12.0, 6.0])
+        .show(ui, |ui| {
+            ui.label("name");
+            ui.add(
+                TextEdit::singleline(&mut working.name)
+                    .hint_text("display name")
+                    .desired_width(f32::INFINITY),
+            );
+            ui.end_row();
+            ui.label("description");
+            let mut desc = working.description.clone().unwrap_or_default();
+            let resp = ui.add(
+                TextEdit::multiline(&mut desc)
+                    .hint_text("optional — surfaced in the pod list")
+                    .desired_rows(2)
+                    .desired_width(f32::INFINITY),
+            );
+            if resp.changed() {
+                working.description = if desc.trim().is_empty() {
+                    None
+                } else {
+                    Some(desc)
+                };
+            }
+            ui.end_row();
+        });
+
+    ui.add_space(10.0);
+    section_heading(ui, "Allowed backends");
+    hint(
+        ui,
+        "Threads in this pod may bind to any backend listed here. \
+         `thread_defaults.backend` must be one of these.",
+    );
+    if backend_catalog.is_empty() {
+        ui.label(
+            RichText::new("(no backends — server hasn't reported any yet)")
+                .italics()
+                .color(Color32::from_gray(160)),
+        );
+    } else {
+        ui.horizontal_wrapped(|ui| {
+            for name in backend_catalog {
+                let mut on = working.allow.backends.iter().any(|b| b == name);
+                if ui.checkbox(&mut on, name).changed() {
+                    if on {
+                        if !working.allow.backends.iter().any(|b| b == name) {
+                            working.allow.backends.push(name.clone());
+                        }
+                    } else {
+                        working.allow.backends.retain(|b| b != name);
+                    }
+                }
+            }
+        });
+    }
+
+    ui.add_space(10.0);
+    section_heading(ui, "Allowed shared MCP hosts");
+    hint(
+        ui,
+        "Singleton MCP hosts the pod can use. `thread_defaults.mcp_hosts` \
+         must reference these by name.",
+    );
+    if shared_mcp_catalog.is_empty() {
+        ui.label(
+            RichText::new("(no shared MCP hosts configured server-side)")
+                .italics()
+                .color(Color32::from_gray(160)),
+        );
+    } else {
+        ui.horizontal_wrapped(|ui| {
+            for name in shared_mcp_catalog {
+                let mut on = working.allow.mcp_hosts.iter().any(|m| m == name);
+                if ui.checkbox(&mut on, name).changed() {
+                    if on {
+                        if !working.allow.mcp_hosts.iter().any(|m| m == name) {
+                            working.allow.mcp_hosts.push(name.clone());
+                        }
+                    } else {
+                        working.allow.mcp_hosts.retain(|m| m != name);
+                    }
+                }
+            }
+        });
+    }
+
+    ui.add_space(10.0);
+    section_heading(ui, "Sandbox specs");
+    hint(
+        ui,
+        "Each entry here is a named sandbox preset threads in this pod can bind to. \
+         `thread_defaults.sandbox` must reference one of these by name (or be empty).",
+    );
+    if working.allow.sandbox.is_empty() {
+        ui.label(
+            RichText::new("(no sandbox presets — threads will run bare-metal)")
+                .italics()
+                .color(Color32::from_gray(160)),
+        );
+    } else {
+        Grid::new("pod_editor_sandboxes")
+            .num_columns(4)
+            .spacing([12.0, 4.0])
+            .min_col_width(100.0)
+            .striped(true)
+            .show(ui, |ui| {
+                ui.label(RichText::new("name").strong());
+                ui.label(RichText::new("type").strong());
+                ui.label(RichText::new("summary").strong());
+                ui.label("");
+                ui.end_row();
+                for (i, entry) in working.allow.sandbox.iter().enumerate() {
+                    ui.label(&entry.name);
+                    ui.label(spec_type_label(&entry.spec));
+                    ui.label(
+                        RichText::new(spec_label(&entry.spec))
+                            .color(Color32::from_gray(170)),
+                    );
+                    ui.horizontal(|ui| {
+                        if ui.small_button("Edit").clicked() {
+                            *sandbox_open = Some(
+                                SandboxEntryEditorState::new_for_index(i, entry.clone()),
+                            );
+                        }
+                        if ui.small_button(RichText::new("Delete").color(
+                            Color32::from_rgb(220, 100, 100),
+                        )).clicked() {
+                            *sandbox_delete = Some(i);
+                        }
+                    });
+                    ui.end_row();
+                }
+            });
+    }
+    ui.add_space(4.0);
+    if ui.button("+ Add sandbox").clicked() {
+        *sandbox_open = Some(SandboxEntryEditorState::new_for_add());
+    }
+    ui.add_space(8.0);
+}
+
+fn render_pod_editor_defaults_tab(
+    ui: &mut egui::Ui,
+    working: &mut PodConfig,
+    backend_catalog: &[String],
+) {
+    ui.add_space(4.0);
+    hint(
+        ui,
+        "These values seed every thread created in this pod. They can still be \
+         overridden per-thread at create-time by the webui's compose form.",
+    );
+    ui.add_space(4.0);
+    Grid::new("pod_editor_defaults")
+        .num_columns(2)
+        .min_col_width(140.0)
+        .spacing([12.0, 8.0])
+        .show(ui, |ui| {
+            // Backend
+            ui.label("backend");
+            let backend_in_allow = working
+                .allow
+                .backends
+                .iter()
+                .any(|b| b == &working.thread_defaults.backend);
+            ComboBox::from_id_salt("pod_editor_defaults_backend")
+                .selected_text(if working.thread_defaults.backend.is_empty() {
+                    "(none)".to_string()
+                } else {
+                    working.thread_defaults.backend.clone()
+                })
+                .show_ui(ui, |ui| {
+                    if working.allow.backends.is_empty() {
+                        ui.label(
+                            RichText::new("(no backends in [allow])")
+                                .italics()
+                                .color(Color32::from_gray(160)),
+                        );
+                    }
+                    for name in &working.allow.backends {
+                        ui.selectable_value(
+                            &mut working.thread_defaults.backend,
+                            name.clone(),
+                            name,
+                        );
+                    }
+                    let extras: Vec<String> = backend_catalog
+                        .iter()
+                        .filter(|b| !working.allow.backends.iter().any(|x| x == *b))
+                        .cloned()
+                        .collect();
+                    if !extras.is_empty() {
+                        ui.separator();
+                        ui.label(
+                            RichText::new("not in [allow] — picking would error on save")
+                                .small()
+                                .color(Color32::from_gray(160)),
+                        );
+                        for name in extras {
+                            ui.selectable_value(
+                                &mut working.thread_defaults.backend,
+                                name.clone(),
+                                RichText::new(name)
+                                    .color(Color32::from_rgb(220, 170, 90)),
+                            );
+                        }
+                    }
+                });
+            ui.end_row();
+            if !backend_in_allow && !working.thread_defaults.backend.is_empty() {
+                ui.label("");
+                ui.label(
+                    RichText::new(format!(
+                        "`{}` is not in allow.backends — server will reject this on save",
+                        working.thread_defaults.backend
+                    ))
+                    .small()
+                    .color(Color32::from_rgb(220, 90, 90)),
+                );
+                ui.end_row();
+            }
+
+            ui.label("model");
+            ui.add(
+                TextEdit::singleline(&mut working.thread_defaults.model)
+                    .hint_text("e.g. claude-sonnet-4-6")
+                    .desired_width(f32::INFINITY),
+            );
+            ui.end_row();
+
+            ui.label("system prompt file");
+            ui.add(
+                TextEdit::singleline(&mut working.thread_defaults.system_prompt_file)
+                    .hint_text("path relative to the pod directory (empty = none)")
+                    .desired_width(f32::INFINITY),
+            );
+            ui.end_row();
+
+            ui.label("max tokens");
+            ui.add(
+                DragValue::new(&mut working.thread_defaults.max_tokens)
+                    .range(1..=200_000)
+                    .speed(50.0),
+            );
+            ui.end_row();
+
+            ui.label("max turns");
+            ui.add(
+                DragValue::new(&mut working.thread_defaults.max_turns)
+                    .range(1..=10_000)
+                    .speed(1.0),
+            );
+            ui.end_row();
+
+            ui.label("approval policy");
+            ComboBox::from_id_salt("pod_editor_defaults_approval")
+                .selected_text(approval_policy_label(working.thread_defaults.approval_policy))
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(
+                        &mut working.thread_defaults.approval_policy,
+                        ApprovalPolicy::AutoApproveAll,
+                        approval_policy_label(ApprovalPolicy::AutoApproveAll),
+                    );
+                    ui.selectable_value(
+                        &mut working.thread_defaults.approval_policy,
+                        ApprovalPolicy::PromptDestructive,
+                        approval_policy_label(ApprovalPolicy::PromptDestructive),
+                    );
+                });
+            ui.end_row();
+
+            ui.label("sandbox");
+            let sb_in_allow = working.thread_defaults.sandbox.is_empty()
+                || working
+                    .allow
+                    .sandbox
+                    .iter()
+                    .any(|s| s.name == working.thread_defaults.sandbox);
+            ComboBox::from_id_salt("pod_editor_defaults_sandbox")
+                .selected_text(if working.thread_defaults.sandbox.is_empty() {
+                    "(none — bare-metal)".to_string()
+                } else {
+                    working.thread_defaults.sandbox.clone()
+                })
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(
+                        &mut working.thread_defaults.sandbox,
+                        String::new(),
+                        "(none — bare-metal)",
+                    );
+                    for entry in &working.allow.sandbox {
+                        ui.selectable_value(
+                            &mut working.thread_defaults.sandbox,
+                            entry.name.clone(),
+                            &entry.name,
+                        );
+                    }
+                });
+            ui.end_row();
+            if !sb_in_allow {
+                ui.label("");
+                ui.label(
+                    RichText::new(format!(
+                        "`{}` is not in allow.sandbox — server will reject on save",
+                        working.thread_defaults.sandbox
+                    ))
+                    .small()
+                    .color(Color32::from_rgb(220, 90, 90)),
+                );
+                ui.end_row();
+            }
+        });
+
+    ui.add_space(10.0);
+    section_heading(ui, "Default MCP hosts");
+    hint(
+        ui,
+        "Threads created in this pod start subscribed to these shared MCP hosts \
+         (in addition to the per-thread primary).",
+    );
+    if working.allow.mcp_hosts.is_empty() {
+        ui.label(
+            RichText::new("(no shared MCP hosts in [allow])")
+                .italics()
+                .color(Color32::from_gray(160)),
+        );
+    } else {
+        ui.horizontal_wrapped(|ui| {
+            for name in working.allow.mcp_hosts.clone() {
+                let mut on = working.thread_defaults.mcp_hosts.iter().any(|m| m == &name);
+                if ui.checkbox(&mut on, &name).changed() {
+                    if on {
+                        if !working.thread_defaults.mcp_hosts.iter().any(|m| m == &name) {
+                            working.thread_defaults.mcp_hosts.push(name);
+                        }
+                    } else {
+                        working.thread_defaults.mcp_hosts.retain(|m| m != &name);
+                    }
+                }
+            }
+        });
+    }
+    ui.add_space(8.0);
+}
+
+fn render_pod_editor_limits_tab(ui: &mut egui::Ui, working: &mut PodConfig) {
+    ui.add_space(4.0);
+    hint(
+        ui,
+        "Pod-level caps. Most installations keep the defaults; tighten when a \
+         pod's threads contend for a constrained resource (model quota, sandbox \
+         capacity).",
+    );
+    ui.add_space(6.0);
+    Grid::new("pod_editor_limits")
+        .num_columns(2)
+        .min_col_width(180.0)
+        .spacing([12.0, 8.0])
+        .show(ui, |ui| {
+            ui.label("max concurrent threads");
+            ui.add(
+                DragValue::new(&mut working.limits.max_concurrent_threads)
+                    .range(1..=1000)
+                    .speed(1.0),
+            );
+            ui.end_row();
+        });
+    ui.add_space(8.0);
+}
+
+fn render_pod_editor_raw_tab(ui: &mut egui::Ui, raw: &mut String, dirty: &mut bool) {
+    ui.add_space(4.0);
+    hint(
+        ui,
+        "Raw pod.toml. Edits here override the structured tabs on save. \
+         Switching back to a structured tab tries to parse this text first; \
+         a parse error keeps you here so the edit isn't lost.",
+    );
+    ui.add_space(4.0);
+    let resp = ui.add_sized(
+        [ui.available_width(), ui.available_height().max(180.0)],
+        TextEdit::multiline(raw).code_editor(),
+    );
+    if resp.changed() {
+        *dirty = true;
+    }
+}
+
+fn render_sandbox_entry_modal(
+    ctx: &egui::Context,
+    sub: &mut SandboxEntryEditorState,
+    open: &mut bool,
+    save: &mut bool,
+    cancel: &mut bool,
+) {
+    let title = match sub.index {
+        Some(_) => "Edit sandbox spec".to_string(),
+        None => "Add sandbox spec".to_string(),
+    };
+    let screen = ctx.content_rect();
+    let max_h = (screen.height() - 80.0).max(280.0);
+    let max_w = (screen.width() - 80.0).max(420.0);
+
+    egui::Window::new(title)
+        .collapsible(false)
+        .resizable(true)
+        .default_width(560.0_f32.min(max_w))
+        .default_height(480.0_f32.min(max_h))
+        .max_width(max_w)
+        .max_height(max_h)
+        .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+        .open(open)
+        .show(ctx, |ui| {
+            egui::TopBottomPanel::bottom("sandbox_entry_footer").show_inside(ui, |ui| {
+                ui.add_space(6.0);
+                if let Some(err) = &sub.error {
+                    ui.colored_label(Color32::from_rgb(220, 80, 80), err);
+                    ui.add_space(4.0);
+                }
+                ui.separator();
+                ui.horizontal(|ui| {
+                    if ui.button("Save").clicked() {
+                        *save = true;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        *cancel = true;
+                    }
+                });
+            });
+            egui::CentralPanel::default().show_inside(ui, |ui| {
+                ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        ui.add_space(4.0);
+                        Grid::new("sandbox_entry_top")
+                            .num_columns(2)
+                            .min_col_width(100.0)
+                            .spacing([12.0, 6.0])
+                            .show(ui, |ui| {
+                                ui.label("name");
+                                ui.add(
+                                    TextEdit::singleline(&mut sub.entry.name)
+                                        .hint_text("e.g. landlock-rw, container-cargo")
+                                        .desired_width(f32::INFINITY),
+                                );
+                                ui.end_row();
+                                ui.label("type");
+                                let current = spec_type_label(&sub.entry.spec);
+                                ComboBox::from_id_salt("sandbox_entry_type")
+                                    .selected_text(current)
+                                    .show_ui(ui, |ui| {
+                                        if ui
+                                            .selectable_label(
+                                                matches!(sub.entry.spec, SandboxSpec::None),
+                                                "none (bare-metal)",
+                                            )
+                                            .clicked()
+                                            && !matches!(sub.entry.spec, SandboxSpec::None)
+                                        {
+                                            sub.entry.spec = SandboxSpec::None;
+                                        }
+                                        if ui
+                                            .selectable_label(
+                                                matches!(sub.entry.spec, SandboxSpec::Landlock { .. }),
+                                                "landlock",
+                                            )
+                                            .clicked()
+                                            && !matches!(
+                                                sub.entry.spec,
+                                                SandboxSpec::Landlock { .. }
+                                            )
+                                        {
+                                            sub.entry.spec = SandboxSpec::Landlock {
+                                                allowed_paths: Vec::new(),
+                                                network: NetworkPolicy::default(),
+                                            };
+                                        }
+                                        if ui
+                                            .selectable_label(
+                                                matches!(sub.entry.spec, SandboxSpec::Container { .. }),
+                                                "container",
+                                            )
+                                            .clicked()
+                                            && !matches!(
+                                                sub.entry.spec,
+                                                SandboxSpec::Container { .. }
+                                            )
+                                        {
+                                            sub.entry.spec = SandboxSpec::Container {
+                                                image: String::new(),
+                                                mounts: Vec::new(),
+                                                network: NetworkPolicy::default(),
+                                                limits: None,
+                                                env: BTreeMap::new(),
+                                            };
+                                        }
+                                    });
+                                ui.end_row();
+                            });
+                        ui.add_space(8.0);
+                        ui.separator();
+                        ui.add_space(8.0);
+                        match &mut sub.entry.spec {
+                            SandboxSpec::None => {
+                                ui.label(
+                                    RichText::new(
+                                        "Bare-metal — tools execute on the host with no \
+                                         isolation beyond workspace path clamping.",
+                                    )
+                                    .italics()
+                                    .color(Color32::from_gray(160)),
+                                );
+                            }
+                            SandboxSpec::Landlock {
+                                allowed_paths,
+                                network,
+                            } => {
+                                render_landlock_body(ui, allowed_paths, network);
+                            }
+                            SandboxSpec::Container {
+                                image,
+                                mounts,
+                                network,
+                                limits,
+                                env,
+                            } => {
+                                render_container_body(ui, image, mounts, network, limits, env);
+                            }
+                        }
+                    });
+            });
+        });
+}
+
+fn render_landlock_body(
+    ui: &mut egui::Ui,
+    allowed_paths: &mut Vec<PathAccess>,
+    network: &mut NetworkPolicy,
+) {
+    section_heading(ui, "Allowed paths");
+    hint(
+        ui,
+        "Each row grants the listed access to one host path. Paths not listed \
+         are denied entirely.",
+    );
+    let mut delete: Option<usize> = None;
+    Grid::new("landlock_paths")
+        .num_columns(3)
+        .spacing([8.0, 4.0])
+        .min_col_width(80.0)
+        .show(ui, |ui| {
+            ui.label(RichText::new("path").strong());
+            ui.label(RichText::new("mode").strong());
+            ui.label("");
+            ui.end_row();
+            for (i, p) in allowed_paths.iter_mut().enumerate() {
+                ui.add(
+                    TextEdit::singleline(&mut p.path)
+                        .hint_text("/absolute/path")
+                        .desired_width(280.0),
+                );
+                access_mode_combo(ui, &mut p.mode, &format!("landlock_mode_{i}"));
+                if ui.small_button("✕").on_hover_text("remove path").clicked() {
+                    delete = Some(i);
+                }
+                ui.end_row();
+            }
+        });
+    if let Some(i) = delete {
+        allowed_paths.remove(i);
+    }
+    ui.add_space(2.0);
+    if ui.button("+ Add path").clicked() {
+        allowed_paths.push(PathAccess {
+            path: String::new(),
+            mode: AccessMode::ReadOnly,
+        });
+    }
+
+    ui.add_space(10.0);
+    section_heading(ui, "Network");
+    network_policy_editor(ui, network, "landlock_network");
+}
+
+fn render_container_body(
+    ui: &mut egui::Ui,
+    image: &mut String,
+    mounts: &mut Vec<Mount>,
+    network: &mut NetworkPolicy,
+    limits: &mut Option<ResourceLimits>,
+    env: &mut BTreeMap<String, String>,
+) {
+    Grid::new("container_top")
+        .num_columns(2)
+        .min_col_width(100.0)
+        .spacing([12.0, 6.0])
+        .show(ui, |ui| {
+            ui.label("image");
+            ui.add(
+                TextEdit::singleline(image)
+                    .hint_text("e.g. docker.io/library/rust:1.83")
+                    .desired_width(f32::INFINITY),
+            );
+            ui.end_row();
+        });
+
+    ui.add_space(10.0);
+    section_heading(ui, "Mounts");
+    hint(
+        ui,
+        "Bind-mounts from the host into the container. Mode controls write access.",
+    );
+    let mut del_mount: Option<usize> = None;
+    Grid::new("container_mounts")
+        .num_columns(4)
+        .spacing([8.0, 4.0])
+        .min_col_width(80.0)
+        .show(ui, |ui| {
+            ui.label(RichText::new("host").strong());
+            ui.label(RichText::new("guest").strong());
+            ui.label(RichText::new("mode").strong());
+            ui.label("");
+            ui.end_row();
+            for (i, m) in mounts.iter_mut().enumerate() {
+                ui.add(
+                    TextEdit::singleline(&mut m.host)
+                        .hint_text("/host/path")
+                        .desired_width(180.0),
+                );
+                ui.add(
+                    TextEdit::singleline(&mut m.guest)
+                        .hint_text("/guest/path")
+                        .desired_width(180.0),
+                );
+                access_mode_combo(ui, &mut m.mode, &format!("container_mount_mode_{i}"));
+                if ui.small_button("✕").on_hover_text("remove mount").clicked() {
+                    del_mount = Some(i);
+                }
+                ui.end_row();
+            }
+        });
+    if let Some(i) = del_mount {
+        mounts.remove(i);
+    }
+    ui.add_space(2.0);
+    if ui.button("+ Add mount").clicked() {
+        mounts.push(Mount {
+            host: String::new(),
+            guest: String::new(),
+            mode: AccessMode::ReadOnly,
+        });
+    }
+
+    ui.add_space(10.0);
+    section_heading(ui, "Network");
+    network_policy_editor(ui, network, "container_network");
+
+    ui.add_space(10.0);
+    section_heading(ui, "Resource limits");
+    let mut enabled = limits.is_some();
+    if ui.checkbox(&mut enabled, "set explicit limits").changed() {
+        if enabled {
+            *limits = Some(ResourceLimits {
+                cpus: None,
+                memory_mb: None,
+                timeout_s: None,
+            });
+        } else {
+            *limits = None;
+        }
+    }
+    if let Some(lim) = limits.as_mut() {
+        Grid::new("container_limits")
+            .num_columns(2)
+            .min_col_width(120.0)
+            .spacing([12.0, 6.0])
+            .show(ui, |ui| {
+                ui.label("cpus");
+                optional_uint_field(ui, &mut lim.cpus, "container_limits_cpu", 1, 256, 1.0);
+                ui.end_row();
+                ui.label("memory (MiB)");
+                optional_uint_field(
+                    ui,
+                    &mut lim.memory_mb,
+                    "container_limits_mem",
+                    16,
+                    1_048_576,
+                    64.0,
+                );
+                ui.end_row();
+                ui.label("timeout (sec)");
+                optional_uint_field(
+                    ui,
+                    &mut lim.timeout_s,
+                    "container_limits_timeout",
+                    1,
+                    86_400,
+                    10.0,
+                );
+                ui.end_row();
+            });
+    }
+
+    ui.add_space(10.0);
+    section_heading(ui, "Environment");
+    hint(ui, "Extra env vars set inside the container.");
+    let mut to_remove: Option<String> = None;
+    let mut to_rename: Option<(String, String)> = None;
+    Grid::new("container_env")
+        .num_columns(3)
+        .spacing([8.0, 4.0])
+        .min_col_width(100.0)
+        .show(ui, |ui| {
+            ui.label(RichText::new("key").strong());
+            ui.label(RichText::new("value").strong());
+            ui.label("");
+            ui.end_row();
+            for (k, v) in env.iter_mut() {
+                let mut k_buf = k.clone();
+                let resp = ui.add(
+                    TextEdit::singleline(&mut k_buf)
+                        .hint_text("KEY")
+                        .desired_width(160.0),
+                );
+                if resp.lost_focus() && k_buf != *k {
+                    to_rename = Some((k.clone(), k_buf));
+                }
+                ui.add(
+                    TextEdit::singleline(v)
+                        .hint_text("value")
+                        .desired_width(220.0),
+                );
+                if ui.small_button("✕").on_hover_text("remove key").clicked() {
+                    to_remove = Some(k.clone());
+                }
+                ui.end_row();
+            }
+        });
+    if let Some(k) = to_remove {
+        env.remove(&k);
+    }
+    if let Some((old, new)) = to_rename
+        && !new.is_empty()
+        && !env.contains_key(&new)
+        && let Some(v) = env.remove(&old)
+    {
+        env.insert(new, v);
+    }
+    ui.add_space(2.0);
+    if ui.button("+ Add env var").clicked() {
+        // Find a free placeholder key — `KEY`, `KEY_1`, ...
+        let mut idx = 0u32;
+        let mut key = String::from("KEY");
+        while env.contains_key(&key) {
+            idx += 1;
+            key = format!("KEY_{idx}");
+        }
+        env.insert(key, String::new());
+    }
+}
+
+fn network_policy_editor(ui: &mut egui::Ui, policy: &mut NetworkPolicy, salt: &str) {
+    let mut variant: u8 = match policy {
+        NetworkPolicy::Unrestricted => 0,
+        NetworkPolicy::Isolated => 1,
+        NetworkPolicy::AllowList { .. } => 2,
+    };
+    ui.horizontal(|ui| {
+        if ui.radio_value(&mut variant, 0, "unrestricted").clicked() {
+            *policy = NetworkPolicy::Unrestricted;
+        }
+        if ui.radio_value(&mut variant, 1, "isolated (no network)").clicked() {
+            *policy = NetworkPolicy::Isolated;
+        }
+        if ui.radio_value(&mut variant, 2, "allow-list").clicked()
+            && !matches!(policy, NetworkPolicy::AllowList { .. })
+        {
+            *policy = NetworkPolicy::AllowList { hosts: Vec::new() };
+        }
+    });
+    if let NetworkPolicy::AllowList { hosts } = policy {
+        ui.add_space(4.0);
+        let mut delete: Option<usize> = None;
+        Grid::new(format!("{salt}_hosts"))
+            .num_columns(2)
+            .spacing([8.0, 4.0])
+            .show(ui, |ui| {
+                ui.label(RichText::new("host").strong());
+                ui.label("");
+                ui.end_row();
+                for (i, h) in hosts.iter_mut().enumerate() {
+                    ui.add(
+                        TextEdit::singleline(h)
+                            .hint_text("e.g. crates.io")
+                            .desired_width(280.0),
+                    );
+                    if ui.small_button("✕").on_hover_text("remove host").clicked() {
+                        delete = Some(i);
+                    }
+                    ui.end_row();
+                }
+            });
+        if let Some(i) = delete {
+            hosts.remove(i);
+        }
+        if ui.button("+ Add host").clicked() {
+            hosts.push(String::new());
+        }
+    }
+}
+
+fn access_mode_combo(ui: &mut egui::Ui, mode: &mut AccessMode, salt: &str) {
+    ComboBox::from_id_salt(salt)
+        .selected_text(match mode {
+            AccessMode::ReadOnly => "read-only",
+            AccessMode::ReadWrite => "read-write",
+        })
+        .width(110.0)
+        .show_ui(ui, |ui| {
+            ui.selectable_value(mode, AccessMode::ReadOnly, "read-only");
+            ui.selectable_value(mode, AccessMode::ReadWrite, "read-write");
+        });
+}
+
+/// DragValue for an `Option<u32>` with an enable checkbox. When unchecked,
+/// the field is None (server uses its own default).
+fn optional_uint_field(
+    ui: &mut egui::Ui,
+    value: &mut Option<u32>,
+    salt: &str,
+    min: u32,
+    max: u32,
+    speed: f32,
+) {
+    let _ = salt;
+    let mut enabled = value.is_some();
+    ui.horizontal(|ui| {
+        if ui.checkbox(&mut enabled, "").changed() {
+            if enabled {
+                *value = Some(min);
+            } else {
+                *value = None;
+            }
+        }
+        ui.add_enabled_ui(enabled, |ui| {
+            let mut v = value.unwrap_or(min);
+            let resp = ui.add(DragValue::new(&mut v).range(min..=max).speed(speed));
+            if resp.changed() && enabled {
+                *value = Some(v);
+            }
+        });
+    });
+}
+
+fn section_heading(ui: &mut egui::Ui, text: &str) {
+    ui.label(RichText::new(text).strong().size(14.0));
+    ui.add_space(2.0);
+}
+
+fn hint(ui: &mut egui::Ui, text: &str) {
+    ui.label(
+        RichText::new(text)
+            .small()
+            .color(Color32::from_gray(160)),
+    );
+}
+
+fn approval_policy_label(p: ApprovalPolicy) -> &'static str {
+    match p {
+        ApprovalPolicy::AutoApproveAll => "auto — approve all tool calls",
+        ApprovalPolicy::PromptDestructive => "prompt — ask before non-readonly tool calls",
+    }
+}
+
+fn spec_type_label(spec: &SandboxSpec) -> &'static str {
+    match spec {
+        SandboxSpec::None => "none",
+        SandboxSpec::Landlock { .. } => "landlock",
+        SandboxSpec::Container { .. } => "container",
     }
 }
