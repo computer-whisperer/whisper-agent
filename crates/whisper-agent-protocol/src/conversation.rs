@@ -2,7 +2,6 @@
 //!
 //! Adapting *down* from this representation to the flatter OpenAI/Gemini shapes is
 //! mechanical; adapting *up* from a flatter shape would require restructuring state.
-//! See `docs/design_mvp.md` for the rationale.
 //!
 //! Field names use snake_case so serde serializes directly into Anthropic's request
 //! shape — no manual translator needed for that path.

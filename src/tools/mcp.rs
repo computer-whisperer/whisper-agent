@@ -4,7 +4,6 @@
 //! an `Mcp-Session-Id` once the server assigns one. Tool invocations return a
 //! `Stream<ToolEvent>` even when the underlying HTTP response is a single JSON object —
 //! the streaming shape is the API's contract; the transport is an implementation detail.
-//! See `docs/design_mvp.md` for the trait/streaming rationale.
 
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};

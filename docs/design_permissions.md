@@ -1,95 +1,100 @@
 # Permissions
 
-The most load-bearing problem whisper-agent has to solve. The same architecture that gives a local agent the ability to fix a typo in `~/notes/` gives it the ability to `rm -rf $HOME` by mistake. The same protocol that lets a cloud agent triage k8s alerts could let it read files it has no business reading. Get this wrong and the system is either unsafe or unusable.
+The most load-bearing problem whisper-agent has to solve. The same architecture that gives an agent the ability to fix a typo in a notes directory gives it the ability to `rm -rf $HOME` by mistake. The same protocol that lets a remote agent triage k8s alerts could let it read files it has no business reading. Getting this wrong makes the system either unsafe or unusable.
 
-This doc lays out the design space. Specifics (UX, storage, exact policy DSL) are deliberately left open until prototypes hit reality.
+This doc describes what's implemented today, what the ceiling looks like, and what's deliberately deferred.
 
-Note: after the task-scheduler redesign (see [`design_task_scheduler.md`](design_task_scheduler.md)), "session" throughout this doc refers to a **task** — the long-lived agent conversation owned by the TaskManager. Client connections are transient; tasks are durable. Policy attaches to tasks (and to the identity that created them), not to individual WebSocket connections.
-
-## Three distinct patterns — we need all three
+## Three distinct patterns
 
 Permission decisions in agentic systems separate cleanly into three patterns. They solve different problems and don't substitute for one another.
 
-### Pattern 1 — Pre-execution client-side approval
+### Pattern 1 — Pre-execution client-side approval *(implemented)*
 
-The harness/client decides *before* invoking the tool whether to prompt the user. This is what Claude Code's `--permission-mode` controls.
+The harness decides *before* invoking a tool whether to prompt the user. This is our primary line of defense for interactive threads.
 
 Inputs to the decision:
-- **Tool annotations** declared by the MCP server (`destructiveHint`, `readOnlyHint`, `idempotentHint`, `openWorldHint`).
-- **Per-task policy** (auto / prompt / deny per tool name or class, set at task creation).
-- **Per-host policy** (this host requires confirmation for `exec`; that host doesn't).
 
-If the user denies, the tool call is never dispatched. The model receives a `tool_result` saying "denied" and continues from there. Bread-and-butter case — fast, works with every MCP-compliant server, doesn't require any cooperation from the server.
+- **Tool annotations** from the MCP server: `readOnlyHint`, `destructiveHint`, `idempotentHint`, `openWorldHint`. Carried on `ToolAnnotations` in `src/tools/mcp.rs`.
+- **Thread's `ApprovalPolicy`** (`crates/whisper-agent-protocol/src/lib.rs`):
+  - `AutoApproveAll` — auto-approve every call. Appropriate for unattended threads where the sandbox is the safety boundary.
+  - `PromptPodModify` *(default for new pods)* — auto-approve read-only and non-pod-modifying tools; prompt on the builtin pod-editing tools. The sandbox bounds blast radius for everything else; self-modification of the pod's own config gets a distinct gate because it's a privilege-escalation vector.
+  - `PromptDestructive` — auto-approve only tools the MCP server marked `readOnlyHint: true`; prompt on destructive MCP tools *and* pod-modifying builtins. Strictest useful policy, for sandbox-free or human-in-the-loop configurations.
+- **Per-thread `tool_allowlist`**. When the user approves a call with "remember," the tool name is added to the thread's allowlist and future calls to that name skip the prompt. Persisted with the thread.
 
-### Pattern 2 — Server-initiated mid-execution elicitation
+If the user denies, the tool call is never dispatched — the model receives a synthesized `tool_result` saying it was denied and continues from there. The state-machine variant `AwaitingApproval` handles the pause; `ApprovalDisposition` tracks per-call outcome (`AutoApproved | Pending | UserApproved | UserRejected`).
 
-MCP added native support for this in the **2025-06-18 spec** under the name **elicitation**. It's the answer to "the server knows something at runtime that requires confirmation."
+### Pattern 2 — Server-initiated mid-execution elicitation *(deferred)*
 
-Flow:
-- Server begins processing a tool call.
-- Mid-execution, the server sends an `elicitation/create` request to the client over a separate server→client RPC channel.
-- The client (the harness/fixture, *not* the LLM) surfaces the request to the user.
-- The user responds (approve/reject/answer-question).
-- The client returns the response. The server proceeds or aborts based on it.
+MCP's 2025-06-18 spec defines **elicitation** — a server→client RPC channel for "the server knows something at runtime that requires confirmation." Server pauses mid-call, sends `elicitation/create`, client surfaces the prompt, user responds, server continues or aborts.
 
-The LLM never sees the elicitation flow — it doesn't appear in the conversation transcript at all. Useful for:
-- "I'm about to delete 47 files, confirm?" — the server only realizes the operation is bulk after planning it.
-- Diff preview before applying an edit.
-- Multi-step operations where each step might warrant approval.
+We don't use elicitation. Our MCP client (`src/tools/mcp.rs`) sends `notifications/initialized` after handshake and otherwise doesn't implement the server→client notification channel. Adding it requires a bidirectional transport (SSE or WebSocket) on top of the current plain HTTP POST. When we hit a concrete use case — large-diff preview, "confirm deleting 47 files" — we'll wire it up. Until then, Pattern 1 carries the full load.
 
-Server cooperation is required, and ecosystem adoption is uneven (the spec is recent), so we shouldn't lean on this exclusively. But it's a real escape valve for context-sensitive prompts.
+### Pattern 3 — Per-identity capability tiers *(deferred)*
 
-### Pattern 3 — Per-task policy and per-identity capability tiers
+Orthogonal to Patterns 1 and 2. Before any per-call decision, *who is running this thread* determines what it can see at all. "A remote agent shouldn't access local-only files" is not a per-call approval problem; it's an authn/authz problem MCP doesn't standardize. The intended shape:
 
-Orthogonal to the first two. Two layered policy attachments determine what a task can do at all, before any per-call decision arises:
+- **Connection-level identity** via mTLS or signed bearer tokens; the identity carries into any threads that principal creates.
+- **Per-thread tool catalog filtering** — the host MCP server returns a different `tools/list` based on the calling thread's identity.
+- **Per-tool authz inside the tool implementation** — even if a tool is exposed, the implementation checks "is this thread allowed to read this path?" before acting.
+- **Connection-level refusal** — sensitive hosts only accept connections from identities tagged appropriately.
 
-- **Task policy** (attached at task creation, carries with the task for its lifetime):
-  - "This task is autonomous (cron-triggered) — auto-approve everything but log."
-  - "This task is human-driven — prompt for anything destructive."
-- **Client/creator identity** (attached to the principal that created the task):
-  - "Cloud-originated tasks never access `/home/$USER/private/`."
-  - "Only local-resident creators can spawn tasks that talk to the desktop MCP host."
+Today this is out of scope: the transport is loopback-only, there is no identity layer. The pod/host-env/MCP layering is structurally compatible with Pattern 3 — host_env providers could refuse to provision sandboxes for unauthorized principals, MCP hosts could filter tools per principal — but nothing enforces that yet.
 
-This is where **"a cloud agent shouldn't access local-only files"** lives. It is *not* a per-call approval problem. It is an **authn/authz design problem that MCP does not standardize**. We build it on top:
+## How the current defenses compose
 
-- **Connection-level identity**: mTLS cert or per-connection bearer token identifies which principal is connecting. The identity carries into any tasks that principal creates.
-- **Per-task tool catalog filtering**: the host MCP server returns different `tools/list` based on the calling task's identity (this task sees `read_file`; that one also sees `exec`).
-- **Per-tool authz inside the tool implementation**: even if the tool is exposed, the implementation checks "is this task allowed to read this path?" before acting.
-- **Connection-level refusal**: a "sensitive" host MCP server only accepts connections from task identities tagged `local`, with cert pinning.
+Pattern 1 is one layer. The others are **sandboxing** and **audit**.
 
-MCP gives us the wire protocol; the policy and identity model are ours to design and enforce.
+**Sandboxing** is the load-bearing safety boundary for unattended work. Each thread binds to a `host_env` — a named (provider, spec) pair declared in the pod's `[[allow.host_env]]` table. The provider (today: `local-landlock`, via `whisper-agent-sandbox`) provisions the host-env for the thread and spawns the MCP host inside it, scoped to the allowed paths and network policy. Tools running inside can't escape the landlock ruleset regardless of what they're asked to do. See [sandbox architecture memory](../) for the layering rationale: per-task `SandboxSpec`, `SandboxBackend` trait, provisioned below the MCP layer because MCP's roots (advisory `file://` URIs) don't carry an image, mount mode, or network policy — real isolation has to come from below.
 
-## A reframing the headless-loop architecture enables
+This is why `AutoApproveAll` is a sensible default for autonomous behaviors: the sandbox bounds blast radius regardless of what the model decides to do. For interactive use where the sandbox is relaxed, `PromptPodModify` gives a second line of defense around self-modification.
 
-In a colocated agent (Claude Code), "where the agent runs" and "what it can access" are the same thing — both are the user's machine. That conflation makes Pattern 3 hard to express: there's no clean way to say "this agent is on my machine but should be treated as untrusted."
+**Audit.** Every tool call writes one line to a JSONL audit log (`src/runtime/audit.rs`). Shape:
 
-In whisper-agent's headless-loop architecture, the loop is always remote from the host it acts on, and *every* host connection is mediated by an MCP server with its own policy. That separation makes Pattern 3 natural: the desktop's MCP server is the single place that decides "does this incoming task have desktop-level access?" — independent of where the loop runtime is. A cloud-originated task and a local-originated task both connect to the desktop's MCP server the same way, and the desktop's policy (per-identity) is what differs.
+```rust
+struct ToolCallEntry {
+    timestamp: DateTime<Utc>,
+    thread_id: &str,
+    host_id: &str,
+    tool_name: &str,
+    args: Value,
+    decision: &str,       // "auto" | "approve" | "reject"
+    who_decided: &str,    // "policy:read_only" | "policy:auto_approve_all" |
+                          // "policy:allowlist" | "user:{conn_id}"
+    outcome: ToolCallOutcome,  // Ok { is_error } | Failed { message }
+}
+```
 
-This is one of the cleanest architectural wins of the headless-loop model.
+The log is append-only, machine-readable, and has existed since the MVP. It's the input for any future policy tightening ("this thread keeps prompting on the same tool; auto-approve it") and the forensic trail if something goes wrong.
 
-## Suggested posture
+## The reframing the headless-loop architecture enables
 
-For the first build, all three patterns from day one — but with realistic phasing:
+In a colocated agent, "where the agent runs" and "what it can access" are the same thing — both are the user's machine. That conflation makes Pattern 3 hard to express: there's no clean way to say "this agent is on my machine but should be treated as untrusted."
 
-1. **Pattern 1 (pre-execution prompt) is non-negotiable.** Default-prompt for any tool annotated `destructiveHint`. Auto-approve `readOnlyHint` tools by default. User-configurable per task.
-2. **Pattern 3 (per-task + per-identity policy) is the security boundary.** Build the identity model (mTLS or signed bearer tokens), the per-host policy file format, and the catalog-filtering hook from the start. Even if early policies are coarse ("this task = full access" / "this task = read-only"), the *machinery* must exist.
-3. **Pattern 2 (elicitation) is opportunistic.** Wire the client to support it, but don't require host MCP servers to use it. As we build our own host MCP server, use elicitation for the operations that benefit (bulk-destructive ops, large diffs).
+In whisper-agent's headless-loop architecture, the loop is remote from the hosts it acts on, and every host connection is mediated by an MCP server with its own policy. That separation makes Pattern 3 natural: the host's MCP server is the single place that decides "does this incoming thread have desktop-level access?" — independent of where the loop runtime is. Both local and remote principals would connect to that server the same way; per-identity policy is what differs.
 
-Tool annotations (`destructiveHint`, etc.) are the language between server and client for "should this be auto-approved or prompt-by-default." Whatever host MCP servers we write, annotate exhaustively.
+This is one of the cleanest architectural wins of the model, and the reason we're careful not to short-circuit it by slipping per-principal logic into the loop runtime.
 
-**Audit log every approval and denial**, with `(task_id, client_identity, host, tool_name, args excerpt, decision, who_decided, timestamp)`. Non-negotiable. The audit log is also the input for refining policy over time ("this task keeps prompting on the same tool; auto-approve it").
+## What's in the protocol wire
+
+Pattern 1 surfaces as:
+
+- `PendingApproval { approval_id, tool_use_id, name, args_preview, destructive, read_only }` events when a call needs human review.
+- `ClientToServer::ApprovalDecision { thread_id, approval_id, choice, remember }` client→server.
+- `ApprovalResolved { approval_id, decision, decided_by_conn }` events when a decision lands.
+- `AllowlistChanged { allowlist }` when the thread's allowlist changes (via remember-yes or explicit revoke).
+
+The pod config carries `thread_defaults.approval_policy` (a `PodConfig` field); per-thread overrides live in `ThreadConfig`.
 
 ## Open questions
 
-- **Approval UX.** Web dashboard? Mobile push? Slack DM? Terminal pager? Different tasks want different channels. The harness needs a pluggable approval-channel abstraction.
-- **Per-task lifetime of approvals.** "Approve once" vs. "approve for this task" vs. "approve for this task for the next N minutes" vs. "remember always for this client identity."
-- **Audit log storage and retention.** Local file? Postgres? S3? How long do we keep approvals?
-- **Policy DSL or just Rust code.** A declarative per-host policy file, or just Rust functions hooked at the right callbacks. Probably start with Rust, add a DSL only if a non-engineer needs to edit policies.
-- **How the loop reacts to denial.** When a user denies a tool call, what does the model see in the `tool_result`? "Denied by user" verbatim, or something more structured? Affects whether the model retries differently, gives up, asks for clarification.
-- **Sandboxing inside the host MCP server.** Capabilities, namespaces, seccomp — what's the trust boundary the server itself enforces independent of the policy? (E.g., even a fully-trusted session can't escape the server's chroot / namespace.) Defense in depth.
+- **Approval UX surfaces.** Web dashboard today. Future: mobile push, Slack DM, terminal pager. Different threads want different channels; the harness would need a pluggable approval-channel abstraction. No concrete need yet.
+- **Approval lifetime granularity.** Today: "approve this one call" vs. "approve for this thread" (the remember toggle). No "approve for N minutes" or "remember always for this identity" — waiting for a use case.
+- **Policy DSL vs. Rust code.** Approval policy is a closed enum today; extending to something declarative is premature until there's a non-engineer who needs to edit policies.
+- **Reaction to denial.** When a user denies, the synthesized `tool_result` carries the user's message. Is that the right framing? Does the model retry, give up, ask for clarification? Empirically it mostly gives up cleanly, but the right denial payload is underexplored.
+- **Audit log retention.** Local JSONL, no rotation, no retention policy. Fine at current scale; revisit when log volume or durability becomes a concrete concern.
 
 ## What this design is NOT
 
-- **Not a guarantee of safety.** Permissions are a layer of defense. They reduce blast radius; they don't make agents foolproof. The audit log is what makes incidents recoverable.
-- **Not committed to MCP-only.** If a tool can't be exposed cleanly through MCP (e.g., needs streaming, or needs a non-JSON-schema input grammar), the same three permission patterns must apply at whatever boundary replaces MCP for that tool. The patterns are protocol-independent.
-- **Not done.** Each open question above will need a follow-up doc once we've made enough progress to choose intelligently.
+- **Not a guarantee of safety.** Permissions reduce blast radius; they don't make agents foolproof. The sandbox is the hard perimeter. The audit log is what makes incidents recoverable.
+- **Not committed to MCP-only.** If a tool can't be exposed cleanly through MCP, the same three permission patterns still apply at whatever boundary replaces MCP for that tool. The patterns are protocol-independent.
+- **Not finished.** Pattern 1 is real; Patterns 2 and 3 wait for concrete need.
