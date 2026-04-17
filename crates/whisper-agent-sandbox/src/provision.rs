@@ -9,7 +9,7 @@ use std::time::Duration;
 use tokio::net::TcpStream;
 use tokio::process::{Child, Command};
 use tracing::info;
-use whisper_agent_protocol::sandbox::{AccessMode, NetworkPolicy, PathAccess, HostEnvSpec};
+use whisper_agent_protocol::sandbox::{AccessMode, HostEnvSpec, NetworkPolicy, PathAccess};
 
 /// Port range for spawned MCP host instances. Each provision bumps the counter.
 static NEXT_PORT: AtomicU16 = AtomicU16::new(9820);

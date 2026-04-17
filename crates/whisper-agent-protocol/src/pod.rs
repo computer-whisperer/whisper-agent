@@ -9,8 +9,8 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::sandbox::HostEnvSpec;
 use crate::ApprovalPolicy;
+use crate::sandbox::HostEnvSpec;
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct PodConfig {

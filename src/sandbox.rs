@@ -210,8 +210,7 @@ impl HostEnvRegistry {
             }
             providers.insert(
                 entry.name.clone(),
-                Arc::new(DaemonClient::new(entry.name, entry.url))
-                    as Arc<dyn HostEnvProvider>,
+                Arc::new(DaemonClient::new(entry.name, entry.url)) as Arc<dyn HostEnvProvider>,
             );
         }
         Ok(Self { providers })

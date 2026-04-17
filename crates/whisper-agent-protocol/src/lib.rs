@@ -13,7 +13,9 @@ pub mod pod;
 pub mod sandbox;
 
 pub use conversation::{ContentBlock, Conversation, Message, Role, ToolResultContent};
-pub use pod::{NamedHostEnv, PodAllow, PodConfig, PodLimits, PodSnapshot, PodSummary, ThreadDefaults};
+pub use pod::{
+    NamedHostEnv, PodAllow, PodConfig, PodLimits, PodSnapshot, PodSummary, ThreadDefaults,
+};
 pub use sandbox::HostEnvSpec;
 
 use serde::{Deserialize, Serialize};
@@ -147,10 +149,15 @@ pub struct ThreadBindings {
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum HostEnvBinding {
-    Named { name: String },
+    Named {
+        name: String,
+    },
     /// Reserved: ad-hoc/subagent path — not constructable from any
     /// current wire request type.
-    Inline { provider: String, spec: HostEnvSpec },
+    Inline {
+        provider: String,
+        spec: HostEnvSpec,
+    },
 }
 
 /// Client-side overrides for the bindings the pod's `thread_defaults` would

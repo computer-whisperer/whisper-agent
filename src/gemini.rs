@@ -102,9 +102,9 @@ impl GeminiClient {
     /// requests. API-key auth never uses this path — the key goes in the URL.
     async fn oauth_bearer(&self) -> Result<String, ModelError> {
         match &self.auth {
-            ClientAuth::ApiKey(_) => {
-                Err(ModelError::Transport("oauth_bearer called on api-key auth".into()))
-            }
+            ClientAuth::ApiKey(_) => Err(ModelError::Transport(
+                "oauth_bearer called on api-key auth".into(),
+            )),
             ClientAuth::GeminiCli { auth, .. } => {
                 let mut guard = auth.lock().await;
                 guard
@@ -122,7 +122,9 @@ impl GeminiClient {
     /// launch.
     async fn codex_project(&self) -> Result<String, ModelError> {
         let ClientAuth::GeminiCli { project, .. } = &self.auth else {
-            return Err(ModelError::Transport("codex_project called on non-oauth auth".into()));
+            return Err(ModelError::Transport(
+                "codex_project called on non-oauth auth".into(),
+            ));
         };
         project
             .get_or_try_init(|| async {
@@ -400,12 +402,10 @@ fn build_tool_use_name_index(messages: &[Message]) -> HashMap<String, String> {
 }
 
 fn convert_message(m: &Message, id_to_name: &HashMap<String, String>) -> Option<Content> {
-    let (role, convert): (&'static str, fn(&[ContentBlock], &HashMap<String, String>) -> Vec<Part>) =
-        match m.role {
-            Role::User => ("user", convert_user_parts),
-            Role::Assistant => ("model", convert_assistant_parts),
-        };
-    let parts = convert(&m.content, id_to_name);
+    let (role, parts) = match m.role {
+        Role::User => ("user", convert_user_parts(&m.content, id_to_name)),
+        Role::Assistant => ("model", convert_assistant_parts(&m.content, id_to_name)),
+    };
     if parts.is_empty() {
         None
     } else {
@@ -533,37 +533,37 @@ pub(crate) fn parsed_to_model_response(parsed: GenerateContentResponse) -> Model
     let candidate = parsed.candidates.into_iter().next();
     let finish_reason = candidate.as_ref().and_then(|c| c.finish_reason.clone());
 
-    if let Some(cand) = candidate {
-        if let Some(cand_content) = cand.content {
-            for part in cand_content.parts {
-                match part {
-                    Part::Text {
-                        text,
-                        thought: Some(true),
-                    } => {
-                        if !text.is_empty() {
-                            content.push(ContentBlock::Thinking {
-                                signature: None,
-                                thinking: text,
-                            });
-                        }
-                    }
-                    Part::Text { text, .. } => {
-                        if !text.is_empty() {
-                            content.push(ContentBlock::Text { text });
-                        }
-                    }
-                    Part::FunctionCall { function_call } => {
-                        saw_function_call = true;
-                        content.push(ContentBlock::ToolUse {
-                            id: next_call_id(),
-                            name: function_call.name,
-                            input: function_call.args,
+    if let Some(cand) = candidate
+        && let Some(cand_content) = cand.content
+    {
+        for part in cand_content.parts {
+            match part {
+                Part::Text {
+                    text,
+                    thought: Some(true),
+                } => {
+                    if !text.is_empty() {
+                        content.push(ContentBlock::Thinking {
+                            signature: None,
+                            thinking: text,
                         });
                     }
-                    Part::FunctionResponse { .. } => {
-                        // Models don't emit function responses — ignore if echoed.
+                }
+                Part::Text { text, .. } => {
+                    if !text.is_empty() {
+                        content.push(ContentBlock::Text { text });
                     }
+                }
+                Part::FunctionCall { function_call } => {
+                    saw_function_call = true;
+                    content.push(ContentBlock::ToolUse {
+                        id: next_call_id(),
+                        name: function_call.name,
+                        input: function_call.args,
+                    });
+                }
+                Part::FunctionResponse { .. } => {
+                    // Models don't emit function responses — ignore if echoed.
                 }
             }
         }
@@ -949,7 +949,9 @@ mod tests {
         let parsed: GenerateContentResponse = serde_json::from_str(body).unwrap();
         let r = parsed_to_model_response(parsed);
         assert_eq!(r.content.len(), 2);
-        assert!(matches!(&r.content[0], ContentBlock::Thinking { thinking, .. } if thinking == "hmm, let me think"));
+        assert!(
+            matches!(&r.content[0], ContentBlock::Thinking { thinking, .. } if thinking == "hmm, let me think")
+        );
         assert!(matches!(&r.content[1], ContentBlock::Text { text } if text == "answer"));
         assert_eq!(r.stop_reason.as_deref(), Some("end_turn"));
     }

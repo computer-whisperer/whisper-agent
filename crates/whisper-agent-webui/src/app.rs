@@ -22,9 +22,10 @@ use whisper_agent_protocol::sandbox::{
 };
 use whisper_agent_protocol::{
     ApprovalChoice, ApprovalPolicy, BackendSummary, ClientToServer, ContentBlock, Conversation,
-    HostEnvProviderInfo, Message, ModelSummary, NamedHostEnv, PodAllow, PodConfig, PodLimits, PodSummary,
-    ResourceSnapshot, ResourceStateLabel, Role, HostEnvSpec, ServerToClient, ThreadBindingsRequest,
-    ThreadConfigOverride, ThreadDefaults, ThreadStateLabel, ThreadSummary, ToolResultContent, Usage,
+    HostEnvProviderInfo, HostEnvSpec, Message, ModelSummary, NamedHostEnv, PodAllow, PodConfig,
+    PodLimits, PodSummary, ResourceSnapshot, ResourceStateLabel, Role, ServerToClient,
+    ThreadBindingsRequest, ThreadConfigOverride, ThreadDefaults, ThreadStateLabel, ThreadSummary,
+    ToolResultContent, Usage,
 };
 
 /// Events pushed into [`Inbound`]. In addition to decoded wire messages we pipe in
@@ -508,15 +509,13 @@ impl ChatApp {
     /// we fall back to the server's default pod. Returns `None` when
     /// neither is known yet (brand-new connection before PodList).
     fn compose_target_pod_id(&self) -> Option<&str> {
-        self.compose_pod_id
-            .as_deref()
-            .or_else(|| {
-                if self.server_default_pod_id.is_empty() {
-                    None
-                } else {
-                    Some(&self.server_default_pod_id)
-                }
-            })
+        self.compose_pod_id.as_deref().or_else(|| {
+            if self.server_default_pod_id.is_empty() {
+                None
+            } else {
+                Some(&self.server_default_pod_id)
+            }
+        })
     }
 
     /// Ensure the target pod's config is cached. Dispatches a GetPod
@@ -524,9 +523,7 @@ impl ChatApp {
     /// reuse the cached snapshot. Pod-config updates arrive as
     /// `PodConfigUpdated` events, which overwrite the cached copy.
     fn ensure_pod_config(&mut self, pod_id: &str) {
-        if self.pod_configs.contains_key(pod_id)
-            || self.pod_configs_requested.contains(pod_id)
-        {
+        if self.pod_configs.contains_key(pod_id) || self.pod_configs_requested.contains(pod_id) {
             return;
         }
         self.pod_configs_requested.insert(pod_id.to_string());
@@ -683,7 +680,10 @@ impl ChatApp {
                 }
                 self.recompute_order();
             }
-            ServerToClient::ThreadSnapshot { thread_id, snapshot } => {
+            ServerToClient::ThreadSnapshot {
+                thread_id,
+                snapshot,
+            } => {
                 let items = conversation_to_items(&snapshot.conversation);
                 let backend = snapshot.bindings.backend.clone();
                 let model = snapshot.config.model.clone();
@@ -714,7 +714,9 @@ impl ChatApp {
                 }
             }
             ServerToClient::ThreadBindingsChanged {
-                thread_id, bindings, ..
+                thread_id,
+                bindings,
+                ..
             } => {
                 if let Some(view) = self.tasks.get_mut(&thread_id) {
                     view.backend = bindings.backend;
@@ -779,7 +781,9 @@ impl ChatApp {
                     }
                 }
             }
-            ServerToClient::ThreadAssistantEnd { thread_id, usage, .. } => {
+            ServerToClient::ThreadAssistantEnd {
+                thread_id, usage, ..
+            } => {
                 if let Some(view) = self.tasks.get_mut(&thread_id) {
                     view.total_usage.add(&usage);
                 }
@@ -1014,7 +1018,8 @@ impl ChatApp {
                 // reflects the current pod config even when the user
                 // re-edits the pod without closing the compose form.
                 self.pod_configs_requested.remove(&snapshot.pod_id);
-                self.pod_configs.insert(snapshot.pod_id.clone(), snapshot.config);
+                self.pod_configs
+                    .insert(snapshot.pod_id.clone(), snapshot.config);
             }
         }
     }
@@ -1640,7 +1645,10 @@ impl eframe::App for ChatApp {
             });
         }
         for (thread_id, tool_name) in allowlist_revocations {
-            self.send(ClientToServer::RemoveToolAllowlistEntry { thread_id, tool_name });
+            self.send(ClientToServer::RemoveToolAllowlistEntry {
+                thread_id,
+                tool_name,
+            });
         }
 
         self.render_new_pod_modal(ctx);
@@ -1714,7 +1722,11 @@ impl ChatApp {
         thread_ids: Option<&[String]>,
     ) {
         let label = match self.pods.get(pod_id) {
-            Some(summary) => format!("{}  ({})", summary.name, thread_ids.map(|t| t.len()).unwrap_or(0)),
+            Some(summary) => format!(
+                "{}  ({})",
+                summary.name,
+                thread_ids.map(|t| t.len()).unwrap_or(0)
+            ),
             None => format!("{pod_id}  ({})", thread_ids.map(|t| t.len()).unwrap_or(0)),
         };
         let collapsed_id = format!("pod-section-{pod_id}");
@@ -1773,7 +1785,11 @@ impl ChatApp {
                     }
                 });
                 let Some(thread_ids) = thread_ids else {
-                    ui.label(RichText::new("(no threads)").italics().color(Color32::from_gray(140)));
+                    ui.label(
+                        RichText::new("(no threads)")
+                            .italics()
+                            .color(Color32::from_gray(140)),
+                    );
                     return;
                 };
                 for thread_id in thread_ids {
@@ -1945,8 +1961,7 @@ impl ChatApp {
         // Snapshot the catalogs the form needs into owned data so the
         // inner closures don't have to borrow `self`. These are small
         // (single-digit lists in practice) so the clone is cheap.
-        let backend_catalog: Vec<String> =
-            self.backends.iter().map(|b| b.name.clone()).collect();
+        let backend_catalog: Vec<String> = self.backends.iter().map(|b| b.name.clone()).collect();
         let shared_mcp_catalog: Vec<String> = self
             .resources
             .values()
@@ -1991,90 +2006,82 @@ impl ChatApp {
                 // up so clicks on the parent don't interleave with the
                 // sub-modal's edits.
                 ui.add_enabled_ui(!sub_modal_open, |ui| {
-                    egui::TopBottomPanel::bottom("pod_editor_footer")
-                        .show_inside(ui, |ui| {
-                            ui.add_space(6.0);
-                            if let Some(err) = &modal.error {
-                                ui.colored_label(Color32::from_rgb(220, 80, 80), err);
-                                ui.add_space(4.0);
-                            }
-                            ui.separator();
-                            ui.horizontal(|ui| {
-                                let save_enabled =
-                                    modal.working.is_some() && dirty && !saving;
-                                if ui
-                                    .add_enabled(save_enabled, egui::Button::new("Save"))
-                                    .clicked()
-                                {
-                                    save_clicked = true;
-                                }
-                                if ui
-                                    .add_enabled(
-                                        modal.working.is_some() && dirty && !saving,
-                                        egui::Button::new("Revert"),
-                                    )
-                                    .clicked()
-                                {
-                                    revert_clicked = true;
-                                }
-                                if ui.button("Close").clicked() {
-                                    cancel_clicked = true;
-                                }
-                                ui.with_layout(
-                                    egui::Layout::right_to_left(egui::Align::Center),
-                                    |ui| {
-                                        if saving {
-                                            ui.label(
-                                                RichText::new("saving…")
-                                                    .italics()
-                                                    .color(Color32::from_gray(160)),
-                                            );
-                                        } else if dirty {
-                                            ui.label(
-                                                RichText::new("● unsaved changes")
-                                                    .small()
-                                                    .color(Color32::from_rgb(220, 170, 90)),
-                                            );
-                                        } else if modal.working.is_some() {
-                                            ui.label(
-                                                RichText::new("✓ saved")
-                                                    .small()
-                                                    .color(Color32::from_gray(140)),
-                                            );
-                                        }
-                                    },
-                                );
-                            });
-                        });
-                    egui::TopBottomPanel::top("pod_editor_tabs")
-                        .show_inside(ui, |ui| {
+                    egui::TopBottomPanel::bottom("pod_editor_footer").show_inside(ui, |ui| {
+                        ui.add_space(6.0);
+                        if let Some(err) = &modal.error {
+                            ui.colored_label(Color32::from_rgb(220, 80, 80), err);
                             ui.add_space(4.0);
-                            ui.horizontal(|ui| {
-                                for tab in [
-                                    PodEditorTab::Allow,
-                                    PodEditorTab::Defaults,
-                                    PodEditorTab::Limits,
-                                    PodEditorTab::RawToml,
-                                ] {
-                                    let active = modal.tab == tab;
-                                    let label = if active {
-                                        RichText::new(tab.label()).strong()
-                                    } else {
-                                        RichText::new(tab.label())
-                                            .color(Color32::from_gray(170))
-                                    };
-                                    if ui
-                                        .selectable_label(active, label)
-                                        .clicked()
-                                        && !active
-                                    {
-                                        switch_to = Some(tab);
+                        }
+                        ui.separator();
+                        ui.horizontal(|ui| {
+                            let save_enabled = modal.working.is_some() && dirty && !saving;
+                            if ui
+                                .add_enabled(save_enabled, egui::Button::new("Save"))
+                                .clicked()
+                            {
+                                save_clicked = true;
+                            }
+                            if ui
+                                .add_enabled(
+                                    modal.working.is_some() && dirty && !saving,
+                                    egui::Button::new("Revert"),
+                                )
+                                .clicked()
+                            {
+                                revert_clicked = true;
+                            }
+                            if ui.button("Close").clicked() {
+                                cancel_clicked = true;
+                            }
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    if saving {
+                                        ui.label(
+                                            RichText::new("saving…")
+                                                .italics()
+                                                .color(Color32::from_gray(160)),
+                                        );
+                                    } else if dirty {
+                                        ui.label(
+                                            RichText::new("● unsaved changes")
+                                                .small()
+                                                .color(Color32::from_rgb(220, 170, 90)),
+                                        );
+                                    } else if modal.working.is_some() {
+                                        ui.label(
+                                            RichText::new("✓ saved")
+                                                .small()
+                                                .color(Color32::from_gray(140)),
+                                        );
                                     }
-                                }
-                            });
-                            ui.add_space(2.0);
-                            ui.separator();
+                                },
+                            );
                         });
+                    });
+                    egui::TopBottomPanel::top("pod_editor_tabs").show_inside(ui, |ui| {
+                        ui.add_space(4.0);
+                        ui.horizontal(|ui| {
+                            for tab in [
+                                PodEditorTab::Allow,
+                                PodEditorTab::Defaults,
+                                PodEditorTab::Limits,
+                                PodEditorTab::RawToml,
+                            ] {
+                                let active = modal.tab == tab;
+                                let label = if active {
+                                    RichText::new(tab.label()).strong()
+                                } else {
+                                    RichText::new(tab.label()).color(Color32::from_gray(170))
+                                };
+                                if ui.selectable_label(active, label).clicked() && !active {
+                                    switch_to = Some(tab);
+                                }
+                            }
+                        });
+                        ui.add_space(2.0);
+                        ui.separator();
+                    });
                     egui::CentralPanel::default().show_inside(ui, |ui| {
                         let Some(working) = modal.working.as_mut() else {
                             ui.add_space(24.0);
@@ -2100,11 +2107,7 @@ impl ChatApp {
                                     );
                                 }
                                 PodEditorTab::Defaults => {
-                                    render_pod_editor_defaults_tab(
-                                        ui,
-                                        working,
-                                        &backend_catalog,
-                                    );
+                                    render_pod_editor_defaults_tab(ui, working, &backend_catalog);
                                 }
                                 PodEditorTab::Limits => {
                                     render_pod_editor_limits_tab(ui, working);
@@ -2147,9 +2150,12 @@ impl ChatApp {
                 } else if let Some(working) = modal.working.as_mut() {
                     let name = sub.entry.name.trim().to_string();
                     // Reject duplicate names within the same allow.host_env table.
-                    let dup = working.allow.host_env.iter().enumerate().any(|(i, e)| {
-                        e.name == name && Some(i) != sub.index
-                    });
+                    let dup = working
+                        .allow
+                        .host_env
+                        .iter()
+                        .enumerate()
+                        .any(|(i, e)| e.name == name && Some(i) != sub.index);
                     if dup {
                         sub.error = Some(format!("a host env named `{name}` already exists"));
                         modal.sandbox_entry_editor = Some(sub);
@@ -2236,9 +2242,7 @@ impl ChatApp {
             }
         }
 
-        if save_clicked
-            && let Some(working) = &modal.working
-        {
+        if save_clicked && let Some(working) = &modal.working {
             let toml_text = if modal.tab == PodEditorTab::RawToml && modal.raw_dirty {
                 modal.raw_buffer.clone()
             } else {
@@ -2448,11 +2452,7 @@ fn render_resource_row(ui: &mut egui::Ui, resource: &ResourceSnapshot) {
         );
     });
     if !sub.is_empty() {
-        ui.label(
-            RichText::new(sub)
-                .color(Color32::from_gray(150))
-                .small(),
-        );
+        ui.label(RichText::new(sub).color(Color32::from_gray(150)).small());
     }
     ui.add_space(4.0);
 }
@@ -2720,10 +2720,7 @@ fn render_item(ui: &mut egui::Ui, cache: &mut CommonMarkCache, item: &DisplayIte
     // rect lands on top of the (subtle) frame fill — fine because the
     // gutter sits inside the inner margin where there's no content.
     let r = resp.response.rect;
-    let gutter_rect = egui::Rect::from_min_max(
-        r.min,
-        egui::pos2(r.min.x + GUTTER_WIDTH, r.max.y),
-    );
+    let gutter_rect = egui::Rect::from_min_max(r.min, egui::pos2(r.min.x + GUTTER_WIDTH, r.max.y));
     ui.painter().rect_filled(gutter_rect, 0.0, gutter_color);
 }
 
@@ -2731,12 +2728,7 @@ fn render_user(ui: &mut egui::Ui, cache: &mut CommonMarkCache, text: &str) {
     // Role label sits above the body rather than inline so a multi-line
     // markdown body (code block, list, blockquote) doesn't wrap awkwardly
     // around the "USER" chip the way horizontal_wrapped would force.
-    ui.label(
-        RichText::new("USER")
-            .color(COLOR_USER)
-            .strong()
-            .small(),
-    );
+    ui.label(RichText::new("USER").color(COLOR_USER).strong().small());
     render_markdown(ui, cache, ("user", text), text);
 }
 
@@ -2811,6 +2803,7 @@ fn render_system_note(ui: &mut egui::Ui, text: &str, is_error: bool) {
     ui.label(RichText::new(text).color(color).italics());
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render_tool_call(
     ui: &mut egui::Ui,
     tool_use_id: &str,
@@ -2834,12 +2827,7 @@ fn render_tool_call(
     egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), id, default_open)
         .show_header(ui, |ui| {
             ui.horizontal(|ui| {
-                ui.label(
-                    RichText::new(name)
-                        .color(COLOR_TOOL)
-                        .strong()
-                        .monospace(),
-                );
+                ui.label(RichText::new(name).color(COLOR_TOOL).strong().monospace());
                 ui.add_space(6.0);
                 ui.label(
                     RichText::new(summary)
@@ -2847,12 +2835,7 @@ fn render_tool_call(
                         .monospace(),
                 );
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.label(
-                        RichText::new(chip_text)
-                            .color(chip_color)
-                            .small()
-                            .strong(),
-                    );
+                    ui.label(RichText::new(chip_text).color(chip_color).small().strong());
                 });
             });
         })
@@ -3079,19 +3062,18 @@ fn render_pod_editor_allow_tab(
                     ui.label(&entry.name);
                     ui.label(&entry.provider);
                     ui.label(spec_type_label(&entry.spec));
-                    ui.label(
-                        RichText::new(spec_label(&entry.spec))
-                            .color(Color32::from_gray(170)),
-                    );
+                    ui.label(RichText::new(spec_label(&entry.spec)).color(Color32::from_gray(170)));
                     ui.horizontal(|ui| {
                         if ui.small_button("Edit").clicked() {
-                            *sandbox_open = Some(
-                                SandboxEntryEditorState::new_for_index(i, entry.clone()),
-                            );
+                            *sandbox_open =
+                                Some(SandboxEntryEditorState::new_for_index(i, entry.clone()));
                         }
-                        if ui.small_button(RichText::new("Delete").color(
-                            Color32::from_rgb(220, 100, 100),
-                        )).clicked() {
+                        if ui
+                            .small_button(
+                                RichText::new("Delete").color(Color32::from_rgb(220, 100, 100)),
+                            )
+                            .clicked()
+                        {
                             *sandbox_delete = Some(i);
                         }
                     });
@@ -3168,8 +3150,7 @@ fn render_pod_editor_defaults_tab(
                             ui.selectable_value(
                                 &mut working.thread_defaults.backend,
                                 name.clone(),
-                                RichText::new(name)
-                                    .color(Color32::from_rgb(220, 170, 90)),
+                                RichText::new(name).color(Color32::from_rgb(220, 170, 90)),
                             );
                         }
                     }
@@ -3222,7 +3203,9 @@ fn render_pod_editor_defaults_tab(
 
             ui.label("approval policy");
             ComboBox::from_id_salt("pod_editor_defaults_approval")
-                .selected_text(approval_policy_label(working.thread_defaults.approval_policy))
+                .selected_text(approval_policy_label(
+                    working.thread_defaults.approval_policy,
+                ))
                 .show_ui(ui, |ui| {
                     ui.selectable_value(
                         &mut working.thread_defaults.approval_policy,
@@ -3472,7 +3455,10 @@ fn render_sandbox_entry_modal(
                                     .show_ui(ui, |ui| {
                                         if ui
                                             .selectable_label(
-                                                matches!(sub.entry.spec, HostEnvSpec::Landlock { .. }),
+                                                matches!(
+                                                    sub.entry.spec,
+                                                    HostEnvSpec::Landlock { .. }
+                                                ),
                                                 "landlock",
                                             )
                                             .clicked()
@@ -3488,7 +3474,10 @@ fn render_sandbox_entry_modal(
                                         }
                                         if ui
                                             .selectable_label(
-                                                matches!(sub.entry.spec, HostEnvSpec::Container { .. }),
+                                                matches!(
+                                                    sub.entry.spec,
+                                                    HostEnvSpec::Container { .. }
+                                                ),
                                                 "container",
                                             )
                                             .clicked()
@@ -3770,7 +3759,10 @@ fn network_policy_editor(ui: &mut egui::Ui, policy: &mut NetworkPolicy, salt: &s
         if ui.radio_value(&mut variant, 0, "unrestricted").clicked() {
             *policy = NetworkPolicy::Unrestricted;
         }
-        if ui.radio_value(&mut variant, 1, "isolated (no network)").clicked() {
+        if ui
+            .radio_value(&mut variant, 1, "isolated (no network)")
+            .clicked()
+        {
             *policy = NetworkPolicy::Isolated;
         }
         if ui.radio_value(&mut variant, 2, "allow-list").clicked()
@@ -3859,18 +3851,16 @@ fn section_heading(ui: &mut egui::Ui, text: &str) {
 }
 
 fn hint(ui: &mut egui::Ui, text: &str) {
-    ui.label(
-        RichText::new(text)
-            .small()
-            .color(Color32::from_gray(160)),
-    );
+    ui.label(RichText::new(text).small().color(Color32::from_gray(160)));
 }
 
 fn approval_policy_label(p: ApprovalPolicy) -> &'static str {
     match p {
         ApprovalPolicy::AutoApproveAll => "auto — approve all tool calls",
         ApprovalPolicy::PromptPodModify => "prompt — ask before pod-config edits",
-        ApprovalPolicy::PromptDestructive => "prompt — ask before destructive or pod-config tool calls",
+        ApprovalPolicy::PromptDestructive => {
+            "prompt — ask before destructive or pod-config tool calls"
+        }
     }
 }
 

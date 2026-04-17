@@ -27,9 +27,9 @@ use futures::stream::FuturesUnordered;
 use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 use whisper_agent_protocol::{
-    BackendSummary, ClientToServer, HostEnvBinding, Message, ModelSummary, ResourceKind, HostEnvRebind,
-    ServerToClient, ThreadBindings, ThreadBindingsPatch, ThreadBindingsRequest, ThreadConfig,
-    ThreadConfigOverride, ThreadStateLabel,
+    BackendSummary, ClientToServer, HostEnvBinding, HostEnvRebind, Message, ModelSummary,
+    ResourceKind, ServerToClient, ThreadBindings, ThreadBindingsPatch, ThreadBindingsRequest,
+    ThreadConfig, ThreadConfigOverride, ThreadStateLabel,
 };
 
 use crate::audit::AuditLog;
@@ -41,9 +41,7 @@ use crate::mcp::{McpSession, ToolAnnotations, ToolDescriptor as McpTool};
 use crate::model::ModelProvider;
 use crate::persist::{LoadedState, Persister};
 use crate::pod::{Pod, PodId};
-use crate::resources::{
-    BackendId, CompleteHostEnvOutcome, McpHostId, ResourceRegistry, HostEnvId,
-};
+use crate::resources::{BackendId, CompleteHostEnvOutcome, HostEnvId, McpHostId, ResourceRegistry};
 use crate::sandbox::HostEnvProvider;
 use crate::thread::{
     ApprovalDisposition, IoResult, OpId, StepOutcome, Thread, ThreadInternalState, derive_title,
@@ -196,7 +194,11 @@ impl Scheduler {
 
         let mut resources = ResourceRegistry::new();
         for (name, entry) in &backends {
-            resources.insert_backend(name.clone(), entry.kind.clone(), entry.default_model.clone());
+            resources.insert_backend(
+                name.clone(),
+                entry.kind.clone(),
+                entry.default_model.clone(),
+            );
         }
 
         for cfg in shared_host_configs {
@@ -213,11 +215,7 @@ impl Scheduler {
                 .list_tools()
                 .await
                 .map_err(|e| anyhow::anyhow!("list_tools on shared MCP `{}`: {e}", cfg.name))?;
-            let id = resources.insert_shared_mcp_host(
-                cfg.name.clone(),
-                cfg.url.clone(),
-                session,
-            );
+            let id = resources.insert_shared_mcp_host(cfg.name.clone(), cfg.url.clone(), session);
             let annotations: HashMap<String, ToolAnnotations> = tools
                 .iter()
                 .map(|t| (t.name.clone(), t.annotations.clone()))
@@ -321,10 +319,7 @@ impl Scheduler {
     }
 
     /// Look up a host-env provider in the catalog by name.
-    pub(crate) fn host_env_provider(
-        &self,
-        name: &str,
-    ) -> Option<&Arc<dyn HostEnvProvider>> {
+    pub(crate) fn host_env_provider(&self, name: &str) -> Option<&Arc<dyn HostEnvProvider>> {
         self.host_env_registry.get(name)
     }
 
@@ -693,9 +688,9 @@ impl Scheduler {
                 let (provider, spec) = self
                     .resolve_binding(&pod_id, binding)
                     .ok_or_else(|| "rebind: binding could not be resolved".to_string())?;
-                let new_id = self.resources.pre_register_host_env(
-                    thread_id, provider, spec,
-                );
+                let new_id = self
+                    .resources
+                    .pre_register_host_env(thread_id, provider, spec);
                 self.emit_host_env_updated(&new_id);
             }
         }
@@ -753,7 +748,10 @@ impl Scheduler {
                      earlier in this conversation.*",
                 ));
             }
-            matches!(task.internal, ThreadInternalState::WaitingOnResources { .. })
+            matches!(
+                task.internal,
+                ThreadInternalState::WaitingOnResources { .. }
+            )
         };
 
         if host_env_changed {
@@ -827,9 +825,12 @@ impl Scheduler {
             if let Some(HostEnvBinding::Inline { provider, spec }) = task.bindings.host_env.clone()
                 && let Some(pod) = self.pods.get(&task.pod_id)
             {
-                let matching = pod.config.allow.host_env.iter().find(|nh| {
-                    nh.provider == provider && nh.spec == spec
-                });
+                let matching = pod
+                    .config
+                    .allow
+                    .host_env
+                    .iter()
+                    .find(|nh| nh.provider == provider && nh.spec == spec);
                 match matching {
                     Some(nh) => {
                         warn!(
@@ -888,9 +889,8 @@ impl Scheduler {
                                         replaced_with = %default_name,
                                         "loaded thread's host_env binding could not be resolved; rebinding to pod default",
                                     );
-                                    self.resources.pre_register_host_env(
-                                        &task.id, provider, spec,
-                                    );
+                                    self.resources
+                                        .pre_register_host_env(&task.id, provider, spec);
                                     task.bindings.host_env = Some(new_binding);
                                     bindings_dirty = true;
                                 }
@@ -964,7 +964,11 @@ impl Scheduler {
 
     /// Apply an inbox message. Returns the task_ids (usually 0 or 1) whose state may
     /// have advanced and need `step_until_blocked` run.
-    fn apply_input(&mut self, input: SchedulerMsg, pending_io: &mut FuturesUnordered<SchedulerFuture>) {
+    fn apply_input(
+        &mut self,
+        input: SchedulerMsg,
+        pending_io: &mut FuturesUnordered<SchedulerFuture>,
+    ) {
         match input {
             SchedulerMsg::RegisterClient { conn_id, outbound } => {
                 self.router.register_client(conn_id, outbound);
@@ -1066,7 +1070,10 @@ impl Scheduler {
                     self.step_until_blocked(&thread_id, pending_io);
                 }
             }
-            ClientToServer::RemoveToolAllowlistEntry { thread_id, tool_name } => {
+            ClientToServer::RemoveToolAllowlistEntry {
+                thread_id,
+                tool_name,
+            } => {
                 let removed = self
                     .tasks
                     .get_mut(&thread_id)
@@ -1420,12 +1427,7 @@ impl Scheduler {
                         return;
                     }
                 };
-                self.apply_pod_config_update(
-                    &pod_id,
-                    toml_text.clone(),
-                    parsed,
-                    correlation_id,
-                );
+                self.apply_pod_config_update(&pod_id, toml_text.clone(), parsed, correlation_id);
                 self.persist_pod_config(pod_id, toml_text, Some(conn_id));
             }
             ClientToServer::ArchivePod { pod_id } => {
@@ -1470,10 +1472,7 @@ impl Scheduler {
                 // stale thread_ids that prevent GC from ever marking those
                 // resources idle.
                 for thread_id in &pod.threads {
-                    let bindings = self
-                        .tasks
-                        .get(thread_id)
-                        .map(|t| t.bindings.clone());
+                    let bindings = self.tasks.get(thread_id).map(|t| t.bindings.clone());
                     self.tasks.remove(thread_id);
                     self.dirty.remove(thread_id);
                     self.provisioning_in_flight.remove(thread_id);
@@ -1613,9 +1612,10 @@ impl Scheduler {
                 let (provider, spec) = self
                     .resolve_binding(&pod_id, binding)
                     .expect("resolve_bindings_choice already validated this");
-                Some(self.resources.pre_register_host_env(
-                    &thread_id, provider, spec,
-                ))
+                Some(
+                    self.resources
+                        .pre_register_host_env(&thread_id, provider, spec),
+                )
             }
         };
         let bindings = ThreadBindings {
@@ -1827,9 +1827,9 @@ impl Scheduler {
                 }
 
                 // 2. Host-env MCP host — attach session + tools.
-                let attached =
-                    self.resources
-                        .complete_host_env_mcp(&mcp_id, mcp_url, mcp_session);
+                let attached = self
+                    .resources
+                    .complete_host_env_mcp(&mcp_id, mcp_url, mcp_session);
                 if !attached {
                     warn!(%thread_id, "host-env mcp already attached or missing — completion dropped");
                 }
@@ -1870,7 +1870,8 @@ impl Scheduler {
                 self.resources.mark_mcp_errored(&mcp_id, message.clone());
                 self.emit_mcp_host_updated(&mcp_id);
                 if matches!(phase, ProvisionPhase::HostEnv) {
-                    self.resources.mark_host_env_errored(&host_env_id, message.clone());
+                    self.resources
+                        .mark_host_env_errored(&host_env_id, message.clone());
                     self.emit_host_env_updated(&host_env_id);
                 }
                 // Fail the requesting thread.
@@ -1878,7 +1879,11 @@ impl Scheduler {
                     task.fail(phase.as_str(), message);
                     let mut events = Vec::new();
                     events.push(crate::thread::ThreadEvent::Error {
-                        message: format!("{}: {}", phase.as_str(), task.failure_detail().unwrap_or_default()),
+                        message: format!(
+                            "{}: {}",
+                            phase.as_str(),
+                            task.failure_detail().unwrap_or_default()
+                        ),
                     });
                     self.mark_dirty(&thread_id);
                     self.router.dispatch_events(&thread_id, events);
@@ -1999,7 +2004,11 @@ impl Scheduler {
 
     /// Advance `thread_id`'s state machine until it pauses, pushing new I/O to
     /// `pending_io` as requested.
-    fn step_until_blocked(&mut self, thread_id: &str, pending_io: &mut FuturesUnordered<SchedulerFuture>) {
+    fn step_until_blocked(
+        &mut self,
+        thread_id: &str,
+        pending_io: &mut FuturesUnordered<SchedulerFuture>,
+    ) {
         self.mark_dirty(thread_id);
         loop {
             let mut events = Vec::new();
@@ -2138,9 +2147,7 @@ impl Scheduler {
         let mcp_id = McpHostId::for_host_env(&sandbox_id);
         self.resources.remove_mcp_user(&mcp_id, thread_id);
         self.emit_mcp_host_updated(&mcp_id);
-        let remaining = self
-            .resources
-            .release_host_env_user(&sandbox_id, thread_id);
+        let remaining = self.resources.release_host_env_user(&sandbox_id, thread_id);
         let pinned = self
             .resources
             .host_envs
@@ -2231,9 +2238,7 @@ pub fn build_default_pod_config(
     backend_names: &[String],
     shared_host_names: &[String],
 ) -> whisper_agent_protocol::PodConfig {
-    use whisper_agent_protocol::{
-        NamedHostEnv, PodAllow, PodConfig, PodLimits, ThreadDefaults,
-    };
+    use whisper_agent_protocol::{NamedHostEnv, PodAllow, PodConfig, PodLimits, ThreadDefaults};
     const HOST_ENV_NAME: &str = "default";
     let (host_env_entries, default_host_env_name) = match default_host_env {
         Some((provider, spec)) => (

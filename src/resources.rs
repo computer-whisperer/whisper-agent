@@ -17,7 +17,7 @@ use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use whisper_agent_protocol::{ResourceSnapshot, ResourceStateLabel, HostEnvSpec};
+use whisper_agent_protocol::{HostEnvSpec, ResourceSnapshot, ResourceStateLabel};
 
 use crate::mcp::{McpSession, ToolAnnotations, ToolDescriptor};
 use crate::sandbox::HostEnvHandle;
@@ -82,9 +82,13 @@ impl BackendId {
 pub enum ResourceState {
     /// Provisioning I/O is in flight. `op_id` is the scheduler's op id for the
     /// provisioning future so the registry can correlate completions.
-    Provisioning { op_id: u64 },
+    Provisioning {
+        op_id: u64,
+    },
     Ready,
-    Errored { message: String },
+    Errored {
+        message: String,
+    },
     /// Resource has been torn down. Entry lingers briefly for inspection then
     /// is reaped on the next GC pass.
     TornDown,
@@ -95,7 +99,10 @@ impl ResourceState {
         matches!(self, ResourceState::Ready)
     }
     pub fn is_terminal(&self) -> bool {
-        matches!(self, ResourceState::Errored { .. } | ResourceState::TornDown)
+        matches!(
+            self,
+            ResourceState::Errored { .. } | ResourceState::TornDown
+        )
     }
     pub fn label(&self) -> ResourceStateLabel {
         match self {
@@ -283,9 +290,8 @@ impl ResourceRegistry {
     /// Snapshot every entry for `ListResources` responses. Order is sandboxes,
     /// then mcp hosts, then backends — stable and human-readable.
     pub fn snapshot_all(&self) -> Vec<ResourceSnapshot> {
-        let mut out: Vec<ResourceSnapshot> = Vec::with_capacity(
-            self.host_envs.len() + self.mcp_hosts.len() + self.backends.len(),
-        );
+        let mut out: Vec<ResourceSnapshot> =
+            Vec::with_capacity(self.host_envs.len() + self.mcp_hosts.len() + self.backends.len());
         let mut sandboxes: Vec<&HostEnvEntry> = self.host_envs.values().collect();
         sandboxes.sort_by(|a, b| a.id.cmp(&b.id));
         out.extend(sandboxes.into_iter().map(HostEnvEntry::to_snapshot));
@@ -669,10 +675,7 @@ impl ResourceRegistry {
             .map(|(id, _)| id.clone())
             .collect();
         for id in idle_sandboxes {
-            let handle = self
-                .host_envs
-                .get_mut(&id)
-                .and_then(|e| e.handle.take());
+            let handle = self.host_envs.get_mut(&id).and_then(|e| e.handle.take());
             if let Some(entry) = self.host_envs.get_mut(&id) {
                 entry.state = ResourceState::TornDown;
                 entry.users.clear();
@@ -804,10 +807,7 @@ mod tests {
         assert!(reg.host_envs[&id].state.is_ready());
         assert_eq!(reg.host_envs[&id].users.len(), 1);
         reg.mark_host_env_torn_down(&id);
-        assert!(matches!(
-            reg.host_envs[&id].state,
-            ResourceState::TornDown
-        ));
+        assert!(matches!(reg.host_envs[&id].state, ResourceState::TornDown));
         assert!(reg.host_envs[&id].users.is_empty());
     }
 

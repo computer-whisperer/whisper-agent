@@ -142,8 +142,9 @@ impl Auth {
         match self {
             Auth::ApiKey { value, env } => match (value.as_deref(), env.as_deref()) {
                 (Some(v), None) => Ok(v.to_string()),
-                (None, Some(var)) => std::env::var(var)
-                    .with_context(|| format!("env var `{var}` not set")),
+                (None, Some(var)) => {
+                    std::env::var(var).with_context(|| format!("env var `{var}` not set"))
+                }
                 (Some(_), Some(_)) => {
                     Err(anyhow!("auth.api_key: set exactly one of `value` or `env`"))
                 }
@@ -227,21 +228,17 @@ impl BackendConfig {
                 let key = auth.resolve_api_key().context("anthropic auth")?;
                 Ok(Arc::new(AnthropicClient::new(key)))
             }
-            BackendConfig::OpenAiChat {
-                base_url, auth, ..
-            } => {
+            BackendConfig::OpenAiChat { base_url, auth, .. } => {
                 let key = match auth {
                     Some(a) => Some(a.resolve_api_key().context("openai_chat auth")?),
                     None => None,
                 };
                 Ok(Arc::new(OpenAiChatClient::new(base_url.clone(), key)))
             }
-            BackendConfig::OpenAiResponses {
-                base_url, auth, ..
-            } => build_openai_responses(base_url.as_deref(), auth),
-            BackendConfig::Gemini {
-                base_url, auth, ..
-            } => build_gemini(base_url.as_deref(), auth),
+            BackendConfig::OpenAiResponses { base_url, auth, .. } => {
+                build_openai_responses(base_url.as_deref(), auth)
+            }
+            BackendConfig::Gemini { base_url, auth, .. } => build_gemini(base_url.as_deref(), auth),
         }
     }
 }
@@ -262,11 +259,14 @@ fn build_gemini(base_url: Option<&str>, auth: &Auth) -> Result<Arc<dyn ModelProv
             let url = base_url
                 .map(|s| s.to_string())
                 .unwrap_or_else(|| GEMINI_CODE_ASSIST_BASE.to_string());
-            Ok(Arc::new(GeminiClient::with_gemini_cli_auth(url, gemini_auth)))
+            Ok(Arc::new(GeminiClient::with_gemini_cli_auth(
+                url,
+                gemini_auth,
+            )))
         }
-        Auth::ChatgptSubscription { .. } => {
-            Err(anyhow!("gemini: auth.mode `chatgpt_subscription` not supported"))
-        }
+        Auth::ChatgptSubscription { .. } => Err(anyhow!(
+            "gemini: auth.mode `chatgpt_subscription` not supported"
+        )),
     }
 }
 
@@ -288,9 +288,9 @@ fn build_openai_responses(base_url: Option<&str>, auth: &Auth) -> Result<Arc<dyn
                 .unwrap_or_else(|| CHATGPT_CODEX_BASE.to_string());
             Ok(Arc::new(OpenAiResponsesClient::with_codex_auth(url, codex)))
         }
-        Auth::GoogleOauth { .. } => {
-            Err(anyhow!("openai_responses: auth.mode `google_oauth` not supported"))
-        }
+        Auth::GoogleOauth { .. } => Err(anyhow!(
+            "openai_responses: auth.mode `google_oauth` not supported"
+        )),
     }
 }
 

@@ -76,9 +76,7 @@ pub enum ThreadInternalState {
     /// (sandbox, primary MCP host) isn't Ready yet. The scheduler watches
     /// resource transitions and clears ids out of `needed`; when the set
     /// empties, the thread moves to `NeedsModelCall`.
-    WaitingOnResources {
-        needed: Vec<String>,
-    },
+    WaitingOnResources { needed: Vec<String> },
     /// Ready to dispatch a model call. The conversation already contains the latest
     /// user or tool_result message.
     NeedsModelCall,
@@ -111,10 +109,7 @@ pub enum ThreadInternalState {
         approvals: HashMap<String, ApprovalRecord>,
     },
     /// Terminal: unrecoverable error.
-    Failed {
-        at_phase: String,
-        message: String,
-    },
+    Failed { at_phase: String, message: String },
     /// Terminal: user-initiated cancellation. In-flight I/O may still complete; their
     /// results are discarded by the scheduler.
     Cancelled,
@@ -288,12 +283,7 @@ pub enum ThreadEvent {
 }
 
 impl Thread {
-    pub fn new(
-        id: String,
-        pod_id: String,
-        config: ThreadConfig,
-        bindings: ThreadBindings,
-    ) -> Self {
+    pub fn new(id: String, pod_id: String, config: ThreadConfig, bindings: ThreadBindings) -> Self {
         let now = Utc::now();
         Self {
             id,
@@ -1275,11 +1265,21 @@ mod tests {
     fn allowlist_short_circuits_evaluate_policy() {
         let read_only_ann = ToolAnnotations::default();
         let allowlisted = matches!(
-            evaluate_policy(ApprovalPolicy::PromptDestructive, &read_only_ann, true, false),
+            evaluate_policy(
+                ApprovalPolicy::PromptDestructive,
+                &read_only_ann,
+                true,
+                false
+            ),
             ApprovalOutcome::Auto(_)
         );
         let not_listed = matches!(
-            evaluate_policy(ApprovalPolicy::PromptDestructive, &read_only_ann, false, false),
+            evaluate_policy(
+                ApprovalPolicy::PromptDestructive,
+                &read_only_ann,
+                false,
+                false
+            ),
             ApprovalOutcome::Prompt
         );
         assert!(allowlisted, "allowlisted call must auto-resolve");

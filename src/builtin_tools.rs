@@ -85,7 +85,10 @@ pub fn annotations() -> HashMap<String, ToolAnnotations> {
 #[derive(Debug, Clone)]
 pub enum PodUpdate {
     /// A new `pod.toml` that has already been parsed and validated.
-    Config { toml_text: String, parsed: Box<PodConfig> },
+    Config {
+        toml_text: String,
+        parsed: Box<PodConfig>,
+    },
     /// New system-prompt text.
     SystemPrompt { text: String },
 }
@@ -218,7 +221,11 @@ async fn list_files(pod_dir: &Path, allowed: &[String], _args: Value) -> ToolOut
         let is_allowed = allowed.iter().any(|n| n == name);
         let access = if is_allowed { "[rw]" } else { "[--]" };
         let kind = if *is_dir { 'd' } else { 'f' };
-        let display_name = if *is_dir { format!("{name}/") } else { name.clone() };
+        let display_name = if *is_dir {
+            format!("{name}/")
+        } else {
+            name.clone()
+        };
         if *is_dir {
             out.push_str(&format!("{access}  {kind}  {:>10}  {}\n", "", display_name));
         } else {
@@ -472,11 +479,14 @@ async fn edit_file(pod_dir: &Path, allowed: &[String], args: Value) -> ToolOutco
     }
     if parsed.old_string.is_empty() {
         return no_update_error(
-            "pod_edit_file: old_string must be non-empty (use pod_write_file to create a new file)".into(),
+            "pod_edit_file: old_string must be non-empty (use pod_write_file to create a new file)"
+                .into(),
         );
     }
     if parsed.old_string == parsed.new_string {
-        return no_update_error("pod_edit_file: old_string and new_string are identical — no-op".into());
+        return no_update_error(
+            "pod_edit_file: old_string and new_string are identical — no-op".into(),
+        );
     }
     let path = pod_dir.join(&parsed.filename);
     let content = match tokio::fs::read_to_string(&path).await {
@@ -624,10 +634,7 @@ fn multi_match_hint(content: &str, old_string: &str) -> String {
 
     let total = hits.len();
     let shown = hits.len().min(MAX_SHOWN);
-    let mut out = format!(
-        "\nMatch sites ({} of {} shown):\n",
-        shown, total
-    );
+    let mut out = format!("\nMatch sites ({} of {} shown):\n", shown, total);
     for (idx, start) in hits.iter().take(MAX_SHOWN).enumerate() {
         let ctx_start = start.saturating_sub(CONTEXT);
         let ctx_end = (start + window_size + CONTEXT).min(file_lines.len());
@@ -663,10 +670,8 @@ mod tests {
 
     fn temp_dir() -> PathBuf {
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let path = std::env::temp_dir().join(format!(
-            "wa-builtin-tools-test-{}-{n}",
-            std::process::id()
-        ));
+        let path =
+            std::env::temp_dir().join(format!("wa-builtin-tools-test-{}-{n}", std::process::id()));
         std::fs::create_dir_all(&path).unwrap();
         path
     }
@@ -720,12 +725,9 @@ max_turns = 50
         let dir = temp_dir();
         let cfg = sample_config();
         // Seed the pod.toml so a later read on failure would still work.
-        tokio::fs::write(
-            dir.join("pod.toml"),
-            pod::to_toml(&cfg).unwrap(),
-        )
-        .await
-        .unwrap();
+        tokio::fs::write(dir.join("pod.toml"), pod::to_toml(&cfg).unwrap())
+            .await
+            .unwrap();
         let before = tokio::fs::read_to_string(dir.join("pod.toml"))
             .await
             .unwrap();
@@ -780,18 +782,25 @@ max_turns = 50
             }),
         )
         .await;
-        assert!(out.result.is_error, "two matches without replace_all should error");
+        assert!(
+            out.result.is_error,
+            "two matches without replace_all should error"
+        );
         let text = join_blocks(&out.result.content);
         // Multi-match error must surface both match sites with line
         // numbers so the model can disambiguate by surrounding text.
-        assert!(text.contains("Match sites"), "missing match-sites hint: {text}");
+        assert!(
+            text.contains("Match sites"),
+            "missing match-sites hint: {text}"
+        );
         assert!(text.contains("match 1"), "missing 'match 1' label: {text}");
         assert!(text.contains("match 2"), "missing 'match 2' label: {text}");
     }
 
     #[test]
     fn multi_match_hint_caps_at_three() {
-        let content = "name = \"test\"\nfoo\nname = \"test\"\nbar\nname = \"test\"\nbaz\nname = \"test\"\n";
+        let content =
+            "name = \"test\"\nfoo\nname = \"test\"\nbar\nname = \"test\"\nbaz\nname = \"test\"\n";
         let hint = multi_match_hint(content, "name = \"test\"");
         assert!(hint.contains("3 of 4 shown"));
         assert!(hint.contains("1 further match omitted"));

@@ -99,8 +99,7 @@ pub(crate) enum SchedulerCompletion {
     Provision(ProvisionCompletion),
 }
 
-pub(crate) type SchedulerFuture =
-    Pin<Box<dyn Future<Output = SchedulerCompletion> + Send>>;
+pub(crate) type SchedulerFuture = Pin<Box<dyn Future<Output = SchedulerCompletion> + Send>>;
 
 /// Build a future that executes one per-thread I/O op and yields a
 /// [`SchedulerCompletion::Io`].
@@ -125,10 +124,7 @@ pub(crate) fn build_io_future(
 /// [`SchedulerCompletion::Provision`]. Only called for threads that
 /// have a host_env binding — threads bound only to shared MCPs don't
 /// need host-env provisioning.
-pub(crate) fn provision_host_env_mcp(
-    scheduler: &Scheduler,
-    thread_id: String,
-) -> SchedulerFuture {
+pub(crate) fn provision_host_env_mcp(scheduler: &Scheduler, thread_id: String) -> SchedulerFuture {
     // Snapshot the host-env decision while we have the sync borrow.
     // The entry must exist — ensure_host_env_provisioning pre-registered
     // it before dispatching. If the entry is already Ready (dedup hit),
@@ -252,7 +248,11 @@ pub(crate) fn provision_host_env_mcp(
         // Dedup winners carry a handle; dedup losers don't. The
         // scheduler drops a None handle cleanly via the
         // AlreadyCompleted outcome.
-        let handle = host_env_handle.unwrap_or_else(|| Box::new(DedupNoopHandle { mcp_url: mcp_url.clone() }));
+        let handle = host_env_handle.unwrap_or_else(|| {
+            Box::new(DedupNoopHandle {
+                mcp_url: mcp_url.clone(),
+            })
+        });
 
         SchedulerCompletion::Provision(ProvisionCompletion {
             thread_id,
@@ -283,8 +283,7 @@ impl crate::sandbox::HostEnvHandle for DedupNoopHandle {
     }
     fn teardown(
         &mut self,
-    ) -> Pin<Box<dyn Future<Output = Result<(), crate::sandbox::HostEnvError>> + Send + '_>>
-    {
+    ) -> Pin<Box<dyn Future<Output = Result<(), crate::sandbox::HostEnvError>> + Send + '_>> {
         Box::pin(async { Ok(()) })
     }
 }
@@ -341,12 +340,11 @@ fn model_call(scheduler: &Scheduler, thread_id: String, op_id: OpId) -> Schedule
             messages: &owned_req.messages,
             cache_breakpoints: &owned_req.cache_breakpoints,
         };
-        let result = match call_with_rate_limit_retry(provider.as_ref(), &req, &thread_id, op_id)
-            .await
-        {
-            Ok(resp) => IoResult::ModelCall(Ok(resp)),
-            Err(e) => IoResult::ModelCall(Err(e.to_string())),
-        };
+        let result =
+            match call_with_rate_limit_retry(provider.as_ref(), &req, &thread_id, op_id).await {
+                Ok(resp) => IoResult::ModelCall(Ok(resp)),
+                Err(e) => IoResult::ModelCall(Err(e.to_string())),
+            };
         SchedulerCompletion::Io(IoCompletion {
             thread_id,
             op_id,
@@ -421,13 +419,9 @@ fn tool_call(
                 }
             };
             Box::pin(async move {
-                let outcome = crate::builtin_tools::dispatch(
-                    snapshot.pod_dir,
-                    snapshot.config,
-                    &name,
-                    input,
-                )
-                .await;
+                let outcome =
+                    crate::builtin_tools::dispatch(snapshot.pod_dir, snapshot.config, &name, input)
+                        .await;
                 let pod_update = outcome.pod_update;
                 let result = if outcome.result.is_error {
                     // Surface tool-level errors as Err in the task-facing

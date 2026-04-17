@@ -176,9 +176,9 @@ impl OpenAiResponsesClient {
                 RspOutputItem::Reasoning { content: parts, .. } => {
                     let text = parts
                         .into_iter()
-                        .filter_map(|p| match p {
+                        .map(|p| match p {
                             RspReasoningPart::ReasoningText { text }
-                            | RspReasoningPart::SummaryText { text } => Some(text),
+                            | RspReasoningPart::SummaryText { text } => text,
                         })
                         .collect::<Vec<_>>()
                         .join("\n\n");
@@ -266,7 +266,10 @@ impl OpenAiResponsesClient {
         // backend can gate version-locked models.
         let codex_mode = matches!(self.auth, ClientAuth::Codex(_));
         let url = if codex_mode {
-            format!("{}/models?client_version={}", self.base_url, CODEX_CLIENT_VERSION)
+            format!(
+                "{}/models?client_version={}",
+                self.base_url, CODEX_CLIENT_VERSION
+            )
         } else {
             format!("{}/models", self.base_url)
         };
@@ -741,10 +744,7 @@ mod tests {
     #[test]
     fn serializes_simple_user_message() {
         let mut items = Vec::new();
-        convert_message(
-            &Message::user_text("hello"),
-            &mut items,
-        );
+        convert_message(&Message::user_text("hello"), &mut items);
         let json = serde_json::to_value(&items).unwrap();
         assert_eq!(
             json,
@@ -757,9 +757,7 @@ mod tests {
     #[test]
     fn serializes_assistant_tool_use_plus_text() {
         let msg = Message::assistant_blocks(vec![
-            ContentBlock::Text {
-                text: "ok".into(),
-            },
+            ContentBlock::Text { text: "ok".into() },
             ContentBlock::ToolUse {
                 id: "call_1".into(),
                 name: "shell".into(),
@@ -905,7 +903,10 @@ data: {"type":"response.failed","response":{"status":"failed"},"error":{"message
             .filter(|m| m.supported_in_api && m.visibility.as_deref() == Some("list"))
             .map(|m| m.slug)
             .collect();
-        assert_eq!(kept, vec!["gpt-5.4".to_string(), "gpt-5.3-codex".to_string()]);
+        assert_eq!(
+            kept,
+            vec!["gpt-5.4".to_string(), "gpt-5.3-codex".to_string()]
+        );
     }
 
     #[test]
@@ -918,7 +919,11 @@ data: {"type":"response.failed","response":{"status":"failed"},"error":{"message
         }"#;
         let resp: RspResponse = serde_json::from_str(body).unwrap();
         assert_eq!(
-            derive_stop_reason(resp.status.as_deref(), resp.incomplete_details.as_ref(), false),
+            derive_stop_reason(
+                resp.status.as_deref(),
+                resp.incomplete_details.as_ref(),
+                false
+            ),
             Some("max_tokens".into())
         );
     }

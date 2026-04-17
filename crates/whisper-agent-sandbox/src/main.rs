@@ -26,7 +26,7 @@ use tokio::signal;
 use tokio::sync::Mutex;
 use tracing::{error, info, warn};
 use whisper_agent_protocol::sandbox::{
-    NetworkPolicy, ProvisionRequest, ProvisionResponse, HostEnvSpec, TeardownRequest,
+    HostEnvSpec, NetworkPolicy, ProvisionRequest, ProvisionResponse, TeardownRequest,
 };
 
 #[derive(Parser, Debug)]

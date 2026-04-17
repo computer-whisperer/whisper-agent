@@ -209,7 +209,11 @@ fn decode_jwt_payload<T: for<'a> Deserialize<'a>>(jwt: &str) -> Result<T> {
 
 #[derive(Deserialize, Serialize, Debug, Clone)]
 struct AuthDotJson {
-    #[serde(rename = "OPENAI_API_KEY", default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "OPENAI_API_KEY",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
     openai_api_key: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     tokens: Option<TokenData>,
@@ -303,11 +307,12 @@ mod tests {
         let parsed: AuthDotJson = serde_json::from_str(raw).unwrap();
         let round = serde_json::to_value(&parsed).unwrap();
         // The unknown `auth_mode` field should be preserved via flatten.
-        assert_eq!(round.get("auth_mode").and_then(|v| v.as_str()), Some("ChatGPT"));
         assert_eq!(
-            round
-                .get("OPENAI_API_KEY")
-                .and_then(|v| v.as_str()),
+            round.get("auth_mode").and_then(|v| v.as_str()),
+            Some("ChatGPT")
+        );
+        assert_eq!(
+            round.get("OPENAI_API_KEY").and_then(|v| v.as_str()),
             Some("sk-exchanged")
         );
     }

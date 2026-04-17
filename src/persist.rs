@@ -33,7 +33,7 @@ use chrono::Utc;
 use tokio::fs;
 use tracing::{info, warn};
 
-use crate::pod::{self, Pod, PodId, POD_TOML, THREADS_DIR};
+use crate::pod::{self, POD_TOML, Pod, PodId, THREADS_DIR};
 use crate::thread::{Thread, ThreadInternalState};
 use whisper_agent_protocol::{
     PodAllow, PodConfig, PodLimits, PodSnapshot, PodSummary, ThreadDefaults, ThreadSummary,
@@ -112,8 +112,7 @@ impl Persister {
         let pod_toml = pod_dir.join(POD_TOML);
         if !fs::try_exists(&pod_toml).await.unwrap_or(false) {
             let synthesized = synthesize_pod_config(task);
-            let toml_text =
-                pod::to_toml(&synthesized).context("encode synthesized pod.toml")?;
+            let toml_text = pod::to_toml(&synthesized).context("encode synthesized pod.toml")?;
             fs::write(&pod_toml, toml_text)
                 .await
                 .with_context(|| format!("write {}", pod_toml.display()))?;
@@ -248,7 +247,8 @@ impl Persister {
         let toml_text = fs::read_to_string(&toml_path)
             .await
             .with_context(|| format!("read {}", toml_path.display()))?;
-        let config = pod::parse_toml(&toml_text).with_context(|| format!("parse {pod_id}/pod.toml"))?;
+        let config =
+            pod::parse_toml(&toml_text).with_context(|| format!("parse {pod_id}/pod.toml"))?;
         let threads = read_thread_summaries(&pod_dir, pod_id).await;
         Ok(Some(PodSnapshot {
             pod_id: pod_id.to_string(),
@@ -354,17 +354,9 @@ async fn read_pod_summary(pod_id: &str, pod_dir: &Path) -> PodSummary {
     let (name, description, created_at) = match fs::read_to_string(&toml_path).await {
         Ok(text) => match pod::parse_toml(&text) {
             Ok(cfg) => (cfg.name, cfg.description, cfg.created_at),
-            Err(_) => (
-                pod_id.to_string(),
-                None,
-                "1970-01-01T00:00:00Z".to_string(),
-            ),
+            Err(_) => (pod_id.to_string(), None, "1970-01-01T00:00:00Z".to_string()),
         },
-        Err(_) => (
-            pod_id.to_string(),
-            None,
-            "1970-01-01T00:00:00Z".to_string(),
-        ),
+        Err(_) => (pod_id.to_string(), None, "1970-01-01T00:00:00Z".to_string()),
     };
     let thread_count = count_threads(pod_dir).await;
     PodSummary {
@@ -467,11 +459,11 @@ async fn load_one(path: &Path, pod_id: &str) -> Result<Thread> {
     // protocol expects an object (HostEnvBinding::Named|Inline) or
     // null, so we strip the legacy string here and let
     // `Scheduler::load_state` re-bind to the pod's current default.
-    let mut value: serde_json::Value = serde_json::from_slice(&bytes)
-        .with_context(|| format!("parse {}", path.display()))?;
+    let mut value: serde_json::Value =
+        serde_json::from_slice(&bytes).with_context(|| format!("parse {}", path.display()))?;
     normalize_legacy_host_env_binding(&mut value);
-    let mut task: Thread = serde_json::from_value(value)
-        .with_context(|| format!("decode {}", path.display()))?;
+    let mut task: Thread =
+        serde_json::from_value(value).with_context(|| format!("decode {}", path.display()))?;
     // Stamp pod_id from the directory we found it in. This wins over any
     // value baked into the JSON — a pod that was renamed on disk should
     // have its threads follow.
@@ -613,10 +605,7 @@ mod tests {
 
     fn temp_dir() -> PathBuf {
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let path = std::env::temp_dir().join(format!(
-            "wa-persist-test-{}-{n}",
-            std::process::id()
-        ));
+        let path = std::env::temp_dir().join(format!("wa-persist-test-{}-{n}", std::process::id()));
         std::fs::create_dir_all(&path).unwrap();
         path
     }
@@ -696,15 +685,14 @@ mod tests {
         let entries: Vec<_> = std::fs::read_dir(&dir)
             .unwrap()
             .filter_map(|e| e.ok())
-            .filter(|e| e.file_name().to_string_lossy().starts_with(".pre-pod-refactor-"))
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with(".pre-pod-refactor-")
+            })
             .collect();
         assert_eq!(entries.len(), 1, "exactly one stash dir");
-        assert!(
-            entries[0]
-                .path()
-                .join("legacy-task.json")
-                .is_file()
-        );
+        assert!(entries[0].path().join("legacy-task.json").is_file());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -726,8 +714,7 @@ mod tests {
             .join("legacy-thread.json");
         let mut value: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&json_path).unwrap()).unwrap();
-        value["bindings"]["host_env"] =
-            serde_json::Value::String("he-deadbeefcafef00d".into());
+        value["bindings"]["host_env"] = serde_json::Value::String("he-deadbeefcafef00d".into());
         std::fs::write(&json_path, serde_json::to_vec_pretty(&value).unwrap()).unwrap();
 
         let loaded = p.load_all().await.unwrap();

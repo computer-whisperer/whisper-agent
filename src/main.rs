@@ -6,7 +6,7 @@ use anyhow::{Context, Result, anyhow};
 use clap::{Parser, Subcommand};
 use tracing::info;
 use tracing_subscriber::EnvFilter;
-use whisper_agent_protocol::sandbox::{NetworkPolicy, PathAccess, HostEnvSpec};
+use whisper_agent_protocol::sandbox::{HostEnvSpec, NetworkPolicy, PathAccess};
 use whisper_agent_protocol::{ApprovalPolicy, ThreadConfig};
 
 use whisper_agent::anthropic::AnthropicClient;
@@ -59,6 +59,11 @@ struct Cli {
 }
 
 #[derive(Subcommand, Debug)]
+// Serve holds the full ServeArgs (~288 B) while Config is tiny (~24 B).
+// The enum is constructed once during CLI parsing and discarded after
+// the match, so boxing the large variant would add an alloc without
+// saving memory anywhere that matters.
+#[allow(clippy::large_enum_variant)]
 enum Command {
     /// Start the HTTP server: hosts the webui assets and drives the task scheduler.
     /// Clients subscribe to individual tasks via the multiplexed WebSocket protocol.
@@ -191,10 +196,7 @@ fn parse_host_env_provider_arg(s: &str) -> Result<(String, String), String> {
 fn resolve_config_path(explicit: Option<PathBuf>) -> Result<Option<PathBuf>> {
     if let Some(path) = explicit {
         if !path.exists() {
-            return Err(anyhow!(
-                "--config {} does not exist",
-                path.display()
-            ));
+            return Err(anyhow!("--config {} does not exist", path.display()));
         }
         return Ok(Some(path));
     }
@@ -300,61 +302,64 @@ async fn run_serve(args: ServeArgs) -> Result<()> {
     // from a TOML config; CLI --shared-mcp-host flags layer on top (CLI wins
     // on name conflict).
     let resolved_config = resolve_config_path(args.config.clone())?;
-    let (backends, default_backend, default_model, mut shared_host_map, toml_provider_entries) = match &resolved_config {
-        Some(path) => {
-            info!(config = %path.display(), "loading backend catalog");
-            let cfg = Config::load(path).await?;
-            let default_model = cfg
-                .backends
-                .get(&cfg.default_backend)
-                .ok_or_else(|| anyhow!("config: default_backend missing entry"))?
-                .default_model()
-                .map(|s| s.to_string())
-                .unwrap_or_default();
-            let mut map = HashMap::new();
-            for (name, bcfg) in &cfg.backends {
-                let provider = bcfg
-                    .build()
-                    .with_context(|| format!("build backend `{name}`"))?;
+    let (backends, default_backend, default_model, mut shared_host_map, toml_provider_entries) =
+        match &resolved_config {
+            Some(path) => {
+                info!(config = %path.display(), "loading backend catalog");
+                let cfg = Config::load(path).await?;
+                let default_model = cfg
+                    .backends
+                    .get(&cfg.default_backend)
+                    .ok_or_else(|| anyhow!("config: default_backend missing entry"))?
+                    .default_model()
+                    .map(|s| s.to_string())
+                    .unwrap_or_default();
+                let mut map = HashMap::new();
+                for (name, bcfg) in &cfg.backends {
+                    let provider = bcfg
+                        .build()
+                        .with_context(|| format!("build backend `{name}`"))?;
+                    map.insert(
+                        name.clone(),
+                        BackendEntry {
+                            provider,
+                            kind: bcfg.kind().into(),
+                            default_model: bcfg.default_model().map(|s| s.to_string()),
+                        },
+                    );
+                }
+                (
+                    map,
+                    cfg.default_backend,
+                    default_model,
+                    cfg.shared_mcp_hosts.into_iter().collect::<HashMap<_, _>>(),
+                    cfg.host_env_providers,
+                )
+            }
+            None => {
+                let key = args.anthropic_api_key.clone().ok_or_else(|| {
+                    anyhow!(
+                        "no --config provided and ANTHROPIC_API_KEY / --anthropic-api-key is unset"
+                    )
+                })?;
+                let mut map = HashMap::new();
                 map.insert(
-                    name.clone(),
+                    DEFAULT_BACKEND_NAME.into(),
                     BackendEntry {
-                        provider,
-                        kind: bcfg.kind().into(),
-                        default_model: bcfg.default_model().map(|s| s.to_string()),
+                        provider: std::sync::Arc::new(AnthropicClient::new(key)),
+                        kind: "anthropic".into(),
+                        default_model: Some(args.model.clone()),
                     },
                 );
+                (
+                    map,
+                    DEFAULT_BACKEND_NAME.into(),
+                    args.model.clone(),
+                    HashMap::new(),
+                    Vec::new(),
+                )
             }
-            (
-                map,
-                cfg.default_backend,
-                default_model,
-                cfg.shared_mcp_hosts.into_iter().collect::<HashMap<_, _>>(),
-                cfg.host_env_providers,
-            )
-        }
-        None => {
-            let key = args.anthropic_api_key.clone().ok_or_else(|| {
-                anyhow!("no --config provided and ANTHROPIC_API_KEY / --anthropic-api-key is unset")
-            })?;
-            let mut map = HashMap::new();
-            map.insert(
-                DEFAULT_BACKEND_NAME.into(),
-                BackendEntry {
-                    provider: std::sync::Arc::new(AnthropicClient::new(key)),
-                    kind: "anthropic".into(),
-                    default_model: Some(args.model.clone()),
-                },
-            );
-            (
-                map,
-                DEFAULT_BACKEND_NAME.into(),
-                args.model.clone(),
-                HashMap::new(),
-                Vec::new(),
-            )
-        }
-    };
+        };
     for (name, url) in args.shared_mcp_hosts {
         shared_host_map.insert(name, url);
     }

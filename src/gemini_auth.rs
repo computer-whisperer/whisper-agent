@@ -74,7 +74,7 @@ impl GeminiAuth {
         }
         let exp = data
             .expiry_date
-            .and_then(|ms| DateTime::<Utc>::from_timestamp_millis(ms));
+            .and_then(DateTime::<Utc>::from_timestamp_millis);
         Ok(Self { path, data, exp })
     }
 
@@ -123,7 +123,10 @@ impl GeminiAuth {
                 "gemini refresh returned {status}: {body} — run `gemini` to re-authenticate"
             ));
         }
-        let fresh: RefreshResponse = resp.json().await.context("gemini refresh: parse response")?;
+        let fresh: RefreshResponse = resp
+            .json()
+            .await
+            .context("gemini refresh: parse response")?;
 
         self.data.access_token = Some(fresh.access_token);
         // Google doesn't rotate the refresh_token on this flow, so preserve ours.
@@ -158,8 +161,8 @@ impl GeminiAuth {
 }
 
 fn default_path() -> Result<PathBuf> {
-    let home = std::env::var("HOME")
-        .context("HOME not set; cannot locate ~/.gemini/oauth_creds.json")?;
+    let home =
+        std::env::var("HOME").context("HOME not set; cannot locate ~/.gemini/oauth_creds.json")?;
     Ok(PathBuf::from(home).join(".gemini/oauth_creds.json"))
 }
 

@@ -25,6 +25,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 /// `[[allow.host_env]]` table. Provider responsibilities are clear:
 ///   * `Landlock` — spawn an MCP host inside a landlock jail.
 ///   * `Container` — spawn an MCP host inside an OCI container.
+///
 /// Specs never encode "no environment" — that's the absence of a
 /// binding, not a flavor of binding.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
@@ -198,9 +199,7 @@ impl<'de> Deserialize<'de> for NetworkPolicy {
             Bare(String),
             /// Canonical externally-tagged payload variant:
             /// `{ "allow_list": { "hosts": [...] } }`.
-            ExternallyTagged {
-                allow_list: AllowListPayload,
-            },
+            ExternallyTagged { allow_list: AllowListPayload },
             /// Legacy internally-tagged form from before the untag
             /// (`{ policy = "unrestricted" }` or
             /// `{ policy = "allow_list", hosts = [...] }`). Pre-refactor

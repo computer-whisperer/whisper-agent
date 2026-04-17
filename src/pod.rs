@@ -109,7 +109,12 @@ pub fn validate(config: &PodConfig) -> Result<(), PodConfigError> {
         }
     }
 
-    if !config.allow.backends.iter().any(|b| b == &config.thread_defaults.backend) {
+    if !config
+        .allow
+        .backends
+        .iter()
+        .any(|b| b == &config.thread_defaults.backend)
+    {
         return Err(PodConfigError::UnknownThreadDefault {
             field: "backend",
             value: config.thread_defaults.backend.clone(),
@@ -163,7 +168,7 @@ mod tests {
     use super::*;
     use whisper_agent_protocol::sandbox::{NetworkPolicy, PathAccess};
     use whisper_agent_protocol::{
-        ApprovalPolicy, NamedHostEnv, PodAllow, PodLimits, HostEnvSpec, ThreadDefaults,
+        ApprovalPolicy, HostEnvSpec, NamedHostEnv, PodAllow, PodLimits, ThreadDefaults,
     };
 
     fn sample_config() -> PodConfig {
