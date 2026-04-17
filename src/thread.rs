@@ -22,8 +22,8 @@ use std::collections::{BTreeSet, HashMap};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use whisper_agent_protocol::{
-    ApprovalChoice, ApprovalPolicy, ContentBlock, Conversation, Message, ThreadConfig, ThreadSnapshot,
-    ThreadStateLabel, ThreadSummary, ToolResultContent, Usage,
+    ApprovalChoice, ApprovalPolicy, ContentBlock, Conversation, Message, ThreadBindings,
+    ThreadConfig, ThreadSnapshot, ThreadStateLabel, ThreadSummary, ToolResultContent, Usage,
 };
 
 use crate::mcp::{CallToolResult, ToolAnnotations};
@@ -44,6 +44,12 @@ pub struct Thread {
     pub last_active: DateTime<Utc>,
     pub title: Option<String>,
     pub config: ThreadConfig,
+    /// Resource bindings — backend, sandbox, mcp host ids. Defaults to
+    /// empty for threads persisted before Phase 3d.i (where the same info
+    /// lived inline on `ThreadConfig`); the scheduler's load path
+    /// re-pre-registers each binding so the registry is consistent again.
+    #[serde(default)]
+    pub bindings: ThreadBindings,
     pub conversation: Conversation,
     pub total_usage: Usage,
     #[serde(default)]
@@ -295,7 +301,12 @@ pub enum ThreadEvent {
 }
 
 impl Thread {
-    pub fn new(id: String, pod_id: String, config: ThreadConfig) -> Self {
+    pub fn new(
+        id: String,
+        pod_id: String,
+        config: ThreadConfig,
+        bindings: ThreadBindings,
+    ) -> Self {
         let now = Utc::now();
         Self {
             id,
@@ -304,6 +315,7 @@ impl Thread {
             last_active: now,
             title: None,
             config,
+            bindings,
             conversation: Conversation::new(),
             total_usage: Usage::default(),
             archived: false,
@@ -351,6 +363,7 @@ impl Thread {
             pod_id: self.pod_id.clone(),
             title: self.title.clone(),
             config: self.config.clone(),
+            bindings: self.bindings.clone(),
             state: self.public_state(),
             conversation: self.conversation.clone(),
             total_usage: self.total_usage,
@@ -1175,17 +1188,13 @@ mod tests {
 
     fn task_with_pending_batch(tool_names: &[&str]) -> Thread {
         let cfg = ThreadConfig {
-            backend: String::new(),
             model: "test".into(),
             system_prompt: "test".into(),
-            mcp_host_url: "http://test".into(),
             max_tokens: 100,
             max_turns: 10,
             approval_policy: ApprovalPolicy::PromptDestructive,
-            sandbox: Default::default(),
-            shared_mcp_hosts: Vec::new(),
         };
-        let mut task = Thread::new("t1".into(), "t1".into(), cfg);
+        let mut task = Thread::new("t1".into(), "t1".into(), cfg, ThreadBindings::default());
         let tool_uses: Vec<ToolUseReq> = tool_names
             .iter()
             .enumerate()

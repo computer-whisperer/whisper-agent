@@ -32,7 +32,9 @@ use tokio::sync::mpsc;
 use tower_http::services::{ServeDir, ServeFile};
 use tower_http::trace::TraceLayer;
 use tracing::{error, info, warn};
-use whisper_agent_protocol::{ServerToClient, ThreadConfig, decode_from_client, encode_to_client};
+use whisper_agent_protocol::{
+    SandboxSpec, ServerToClient, ThreadConfig, decode_from_client, encode_to_client,
+};
 
 use crate::audit::AuditLog;
 use crate::persist::Persister;
@@ -59,14 +61,29 @@ pub struct ServerConfig {
     pub backends: std::collections::HashMap<String, BackendEntry>,
     /// Fallback backend for tasks that don't specify one. Must be a key in `backends`.
     pub default_backend: String,
+    /// Plain config (model, prompt, limits, policy) the synthesized default
+    /// pod's `thread_defaults` table is built from.
     pub default_task_config: ThreadConfig,
+    /// Server-level fallback MCP URL — used when a thread's bound sandbox
+    /// doesn't carry its own URL (or no sandbox is bound at all). Pods
+    /// don't model this; it's a server-level concern (where the
+    /// filesystem MCP daemon lives).
+    pub default_mcp_host_url: String,
+    /// Sandbox spec the synthesized default pod offers as its single
+    /// `[[allow.sandbox]]` entry. Threads whose `bindings.sandbox`
+    /// resolves against the default pod end up bound to this spec.
+    pub default_sandbox_spec: SandboxSpec,
+    /// Names of shared MCP hosts that should appear in the synthesized
+    /// default pod's `[allow].mcp_hosts` and `thread_defaults.mcp_hosts`.
+    /// Typically every host configured via `shared_mcp_hosts`.
+    pub default_shared_host_names: Vec<String>,
     pub audit_log_path: PathBuf,
     pub host_id: String,
     /// Pods root directory. If `None`, persistence is disabled.
     pub pods_root: Option<PathBuf>,
     pub sandbox_provider: std::sync::Arc<dyn crate::sandbox::SandboxProvider>,
     /// Catalog of shared (singleton) MCP hosts the scheduler connects to at
-    /// startup. Tasks opt in by name via `ThreadConfig.shared_mcp_hosts`.
+    /// startup. Pods opt in by name via `[allow].mcp_hosts`.
     pub shared_mcp_hosts: Vec<SharedHostConfig>,
 }
 
@@ -99,19 +116,20 @@ pub async fn serve(listen: SocketAddr, config: ServerConfig) -> anyhow::Result<(
     const DEFAULT_POD_ID: &str = "default";
     let default_pod_id: PodId = DEFAULT_POD_ID.into();
     let backend_names: Vec<String> = config.backends.keys().cloned().collect();
-    let shared_host_names: Vec<String> = config.shared_mcp_hosts.iter().map(|h| h.name.clone()).collect();
     let default_pod_config = build_default_pod_config(
         &default_pod_id,
         &config.default_task_config,
+        &config.default_backend,
+        config.default_sandbox_spec.clone(),
         &backend_names,
-        &shared_host_names,
+        &config.default_shared_host_names,
     );
     let default_pod_dir = config
         .pods_root
         .as_ref()
         .map(|root| root.join(&default_pod_id))
         .unwrap_or_else(|| PathBuf::from(format!("./{default_pod_id}")));
-    let default_mcp_host_url = config.default_task_config.mcp_host_url.clone();
+    let default_mcp_host_url = config.default_mcp_host_url.clone();
     let default_system_prompt = config.default_task_config.system_prompt.clone();
     let raw_toml = crate::pod::to_toml(&default_pod_config)
         .context("encode default pod.toml for in-memory bootstrap")?;

@@ -302,10 +302,8 @@ async fn run_serve(args: ServeArgs) -> Result<()> {
         backends,
         default_backend,
         default_task_config: ThreadConfig {
-            backend: String::new(), // empty → scheduler uses default_backend
             model: default_model,
             system_prompt: args.system_prompt,
-            mcp_host_url: args.mcp_host_url,
             max_tokens: args.max_tokens,
             max_turns: args.max_turns,
             approval_policy: if args.prompt_destructive {
@@ -313,9 +311,10 @@ async fn run_serve(args: ServeArgs) -> Result<()> {
             } else {
                 ApprovalPolicy::AutoApproveAll
             },
-            sandbox: build_default_sandbox(&args.sandbox_workspace),
-            shared_mcp_hosts: default_shared_host_names,
         },
+        default_mcp_host_url: args.mcp_host_url,
+        default_sandbox_spec: build_default_sandbox(&args.sandbox_workspace),
+        default_shared_host_names,
         audit_log_path: args.audit_log,
         host_id: "default".into(),
         pods_root,
@@ -380,15 +379,11 @@ async fn run_one_shot(args: RunArgs) -> Result<()> {
     info!(audit_log = %audit.path().display(), "audit log open");
 
     let task_config = ThreadConfig {
-        backend: backend_name.clone(),
         model: args.model.clone(),
         system_prompt: args.system_prompt,
-        mcp_host_url: args.mcp_host_url.clone(),
         max_tokens: args.max_tokens,
         max_turns: args.max_turns,
         approval_policy: ApprovalPolicy::AutoApproveAll,
-        sandbox: SandboxSpec::None,
-        shared_mcp_hosts: Vec::new(),
     };
 
     // Build the in-memory default pod from the one-shot's runtime config.
@@ -398,6 +393,8 @@ async fn run_one_shot(args: RunArgs) -> Result<()> {
     let default_pod_config = build_default_pod_config(
         "default",
         &task_config,
+        &backend_name,
+        SandboxSpec::None,
         &backend_names,
         &[],
     );
@@ -442,6 +439,7 @@ async fn run_one_shot(args: RunArgs) -> Result<()> {
                 pod_id: None,
                 initial_message: args.prompt,
                 config_override: None,
+                bindings_request: None,
             },
         })
         .map_err(|_| anyhow!("scheduler inbox closed before create_task"))?;

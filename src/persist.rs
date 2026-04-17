@@ -36,8 +36,7 @@ use tracing::{info, warn};
 use crate::pod::{self, Pod, PodId, POD_TOML, THREADS_DIR};
 use crate::thread::{Thread, ThreadInternalState};
 use whisper_agent_protocol::{
-    NamedSandboxSpec, PodAllow, PodConfig, PodLimits, PodSnapshot, PodSummary, ThreadSummary,
-    ThreadDefaults,
+    PodAllow, PodConfig, PodLimits, PodSnapshot, PodSummary, ThreadDefaults, ThreadSummary,
 };
 
 /// Result of `Persister::load_all`. Pods and threads are kept side-by-side so
@@ -516,24 +515,29 @@ async fn sweep_legacy(pods_root: &Path) -> Result<Option<PathBuf>> {
     Ok(Some(stash))
 }
 
+/// Defensive stub used by `flush` when a thread lands in a pod whose
+/// `pod.toml` is missing on disk. Phase 3d.i moved the binding-side
+/// fields off `ThreadConfig`, so we no longer have the original sandbox
+/// spec at this point — the bindings only carry the deterministic id.
+/// The stub keeps the thread persistable; the pod itself becomes
+/// effectively read-only until someone restores or rewrites pod.toml.
 fn synthesize_pod_config(task: &Thread) -> PodConfig {
-    // The synthesized config describes the task's bindings as if pods were
-    // already authoritative. Backend may be empty (the existing ThreadConfig
-    // accepts that as "use server default"); we mirror that — validation
-    // accepts a self-consistent config even with empty strings.
-    let backend = task.config.backend.clone();
-    let sandbox_name = "primary".to_string();
+    // `validate` requires `thread_defaults.backend` to appear in
+    // `allow.backends`, so derive the backend name from bindings (or fall
+    // back to the literal "default") and seed `[allow]` with just that.
+    let backend = if task.bindings.backend.is_empty() {
+        "default".to_string()
+    } else {
+        task.bindings.backend.clone()
+    };
     PodConfig {
         name: task.title.clone().unwrap_or_else(|| task.id.clone()),
-        description: None,
+        description: Some("Stub config — pod.toml was missing on disk".into()),
         created_at: task.created_at.to_rfc3339(),
         allow: PodAllow {
             backends: vec![backend.clone()],
-            mcp_hosts: task.config.shared_mcp_hosts.clone(),
-            sandbox: vec![NamedSandboxSpec {
-                name: sandbox_name.clone(),
-                spec: task.config.sandbox.clone(),
-            }],
+            mcp_hosts: Vec::new(),
+            sandbox: Vec::new(),
         },
         thread_defaults: ThreadDefaults {
             backend,
@@ -542,8 +546,8 @@ fn synthesize_pod_config(task: &Thread) -> PodConfig {
             max_tokens: task.config.max_tokens,
             max_turns: task.config.max_turns,
             approval_policy: task.config.approval_policy,
-            sandbox: sandbox_name,
-            mcp_hosts: task.config.shared_mcp_hosts.clone(),
+            sandbox: String::new(),
+            mcp_hosts: Vec::new(),
         },
         limits: PodLimits::default(),
     }
@@ -553,7 +557,7 @@ fn synthesize_pod_config(task: &Thread) -> PodConfig {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU64, Ordering};
-    use whisper_agent_protocol::{ApprovalPolicy, SandboxSpec, ThreadConfig};
+    use whisper_agent_protocol::{ApprovalPolicy, ThreadBindings, ThreadConfig};
 
     static COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -569,17 +573,19 @@ mod tests {
 
     fn sample_task(id: &str) -> Thread {
         let cfg = ThreadConfig {
-            backend: "anthropic".into(),
             model: "claude-opus-4-7".into(),
             system_prompt: "Hello.".into(),
-            mcp_host_url: "http://test".into(),
             max_tokens: 8000,
             max_turns: 50,
             approval_policy: ApprovalPolicy::PromptDestructive,
-            sandbox: SandboxSpec::None,
-            shared_mcp_hosts: vec!["fetch".into()],
         };
-        let mut task = Thread::new(id.into(), id.into(), cfg);
+        let bindings = ThreadBindings {
+            backend: "anthropic".into(),
+            sandbox: None,
+            mcp_hosts: vec![format!("mcp-primary-{id}"), "mcp-shared-fetch".into()],
+            tool_filter: None,
+        };
+        let mut task = Thread::new(id.into(), id.into(), cfg, bindings);
         task.title = Some("Sample task".into());
         task
     }

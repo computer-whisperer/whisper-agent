@@ -47,45 +47,48 @@ pub(crate) fn build_io_future(scheduler: &Scheduler, thread_id: String, req: IoR
 }
 
 fn mcp_connect(scheduler: &Scheduler, thread_id: String, op_id: OpId) -> IoFuture {
-    let task = scheduler.task(&thread_id).expect("task exists");
-    let fallback_url = task.config.mcp_host_url.clone();
-    let sandbox_spec = task.config.sandbox.clone();
+    // Phase 3d.i: the sandbox spec lives on the registry entry that
+    // `pre_register_sandbox` inserted at create_task time. Read it back via
+    // `bindings.sandbox`; if the entry is already Ready (another thread
+    // with the matching spec finished provisioning before we got here),
+    // skip provision and reuse the cached URL.
+    let fallback_url = scheduler.default_mcp_url().to_string();
     let provider = scheduler.sandbox_provider().clone();
-
-    // Phase 3b dedup: if a Ready sandbox with the same spec already exists,
-    // skip provisioning entirely — the dispatcher returns an MCP session
-    // pointing at the existing sandbox's URL and `apply_io_completion`
-    // adds the thread to the existing entry's user set.
-    let dedup_target = scheduler.find_ready_sandbox_for_spec(&sandbox_spec);
+    let action = match scheduler.sandbox_for_thread(&thread_id) {
+        Some(e) if e.state.is_ready() => SandboxAction::Skip {
+            mcp_url: e.mcp_url.clone().unwrap_or_else(|| fallback_url.clone()),
+        },
+        Some(e) => SandboxAction::Provision {
+            spec: e.spec.clone(),
+        },
+        None => SandboxAction::Skip {
+            mcp_url: fallback_url.clone(),
+        },
+    };
 
     Box::pin(async move {
-        let (mcp_url, sandbox_handle) = match dedup_target {
-            Some((_existing_id, existing_url)) => {
-                let url = if existing_url.is_empty() {
-                    fallback_url
-                } else {
-                    existing_url
-                };
-                (url, None)
+        let (mcp_url, sandbox_handle) = match action {
+            SandboxAction::Skip { mcp_url } => (mcp_url, None),
+            SandboxAction::Provision { spec } => {
+                match provider.provision(&thread_id, &spec).await {
+                    Ok(handle) => {
+                        let url = handle
+                            .mcp_url()
+                            .map(|u| u.to_string())
+                            .unwrap_or(fallback_url);
+                        (url, Some(handle))
+                    }
+                    Err(e) => {
+                        return IoCompletion {
+                            thread_id,
+                            op_id,
+                            result: IoResult::McpConnect(Err(format!(
+                                "sandbox provision failed: {e}"
+                            ))),
+                        };
+                    }
+                }
             }
-            None => match provider.provision(&thread_id, &sandbox_spec).await {
-                Ok(handle) => {
-                    let url = handle
-                        .mcp_url()
-                        .map(|u| u.to_string())
-                        .unwrap_or(fallback_url);
-                    (url, Some(handle))
-                }
-                Err(e) => {
-                    return IoCompletion {
-                        thread_id,
-                        op_id,
-                        result: IoResult::McpConnect(Err(format!(
-                            "sandbox provision failed: {e}"
-                        ))),
-                    };
-                }
-            },
         };
 
         match McpSession::connect(&mcp_url).await {
@@ -104,6 +107,20 @@ fn mcp_connect(scheduler: &Scheduler, thread_id: String, op_id: OpId) -> IoFutur
             },
         }
     })
+}
+
+/// Decision the dispatcher made about the bound sandbox before crossing
+/// into the async block. Computed against the registry while we still hold
+/// the synchronous borrow; the future itself only needs the resolved
+/// pieces.
+enum SandboxAction {
+    /// Sandbox is already Ready (or no sandbox is bound) — connect MCP at
+    /// `mcp_url` directly, no provision call.
+    Skip { mcp_url: String },
+    /// Sandbox needs provisioning; call into the provider with this spec.
+    Provision {
+        spec: whisper_agent_protocol::SandboxSpec,
+    },
 }
 
 fn list_tools(scheduler: &Scheduler, thread_id: String, op_id: OpId) -> IoFuture {

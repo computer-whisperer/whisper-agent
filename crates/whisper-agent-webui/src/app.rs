@@ -21,7 +21,8 @@ use whisper_agent_protocol::sandbox::{AccessMode, NetworkPolicy, PathAccess};
 use whisper_agent_protocol::{
     ApprovalChoice, BackendSummary, ClientToServer, ContentBlock, Conversation, Message,
     ModelSummary, PodSummary, ResourceSnapshot, ResourceStateLabel, Role, SandboxSpec,
-    ServerToClient, ThreadConfigOverride, ThreadStateLabel, ThreadSummary, ToolResultContent, Usage,
+    ServerToClient, ThreadBindingsRequest, ThreadConfigOverride, ThreadStateLabel, ThreadSummary,
+    ToolResultContent, Usage,
 };
 
 /// A user-saved sandbox configuration. Currently only encodes Landlock; future
@@ -482,7 +483,7 @@ impl ChatApp {
             }
             ServerToClient::ThreadSnapshot { thread_id, snapshot } => {
                 let items = conversation_to_items(&snapshot.conversation);
-                let backend = snapshot.config.backend.clone();
+                let backend = snapshot.bindings.backend.clone();
                 let model = snapshot.config.model.clone();
                 let failure = snapshot.failure.clone();
                 let allowlist = snapshot.tool_allowlist.clone();
@@ -751,12 +752,13 @@ impl ChatApp {
             return;
         }
         if self.composing_new || self.selected.is_none() {
-            let override_ = self.build_creation_override();
+            let (config_override, bindings_request) = self.build_creation_override();
             self.send(ClientToServer::CreateThread {
                 correlation_id: None,
                 pod_id: None,
                 initial_message: trimmed.to_string(),
-                config_override: override_,
+                config_override,
+                bindings_request,
             });
         } else if let Some(thread_id) = self.selected.clone() {
             if let Some(view) = self.tasks.get_mut(&thread_id) {
@@ -771,10 +773,14 @@ impl ChatApp {
         }
     }
 
-    /// Build a ThreadConfigOverride from the picker's current state. Only includes the
-    /// fields the user explicitly set — unset fields fall through to the server's
-    /// default_task_config on the other end.
-    fn build_creation_override(&self) -> Option<ThreadConfigOverride> {
+    /// Build the override pair for a CreateThread from the picker's current
+    /// state. Only includes the fields the user explicitly set — anything
+    /// unset falls through to the pod's `thread_defaults` on the server.
+    /// Returns `(config_override, bindings_request)`; either may be `None`
+    /// when the user didn't touch the corresponding picker.
+    fn build_creation_override(
+        &self,
+    ) -> (Option<ThreadConfigOverride>, Option<ThreadBindingsRequest>) {
         let backend = self.picker_backend.clone();
         // If the user picked a backend but didn't touch the model dropdown, pin down
         // the model explicitly so the server doesn't fall back to the DEFAULT
@@ -800,15 +806,24 @@ impl ChatApp {
             SandboxChoice::None => Some(SandboxSpec::None),
             SandboxChoice::Preset(idx) => self.presets.get(idx).map(|p| p.to_spec()),
         };
-        if backend.is_none() && model.is_none() && sandbox.is_none() {
-            return None;
-        }
-        Some(ThreadConfigOverride {
-            backend,
-            model,
-            sandbox,
-            ..Default::default()
-        })
+        let config_override = if model.is_some() {
+            Some(ThreadConfigOverride {
+                model,
+                ..Default::default()
+            })
+        } else {
+            None
+        };
+        let bindings_request = if backend.is_some() || sandbox.is_some() {
+            Some(ThreadBindingsRequest {
+                backend,
+                sandbox,
+                mcp_hosts: None,
+            })
+        } else {
+            None
+        };
+        (config_override, bindings_request)
     }
 }
 

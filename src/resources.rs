@@ -35,8 +35,8 @@ impl SandboxId {
     /// Derive a stable id from the sandbox spec. Identical specs hash to
     /// identical ids — this is how Phase 3b's dedup works: when a second
     /// thread requests a sandbox whose spec matches an existing entry,
-    /// `register_sandbox` finds the entry by id and adds the thread as a
-    /// user instead of inserting a duplicate.
+    /// `pre_register_sandbox` finds the entry by id and adds the thread as
+    /// a user instead of inserting a duplicate.
     ///
     /// Hash is `DefaultHasher` over the spec's JSON serialization. Not
     /// cryptographic; collision risk on a few-hundred-pod scale is
@@ -136,17 +136,24 @@ impl std::fmt::Debug for SandboxEntry {
     }
 }
 
-/// Outcome of `ResourceRegistry::register_sandbox`. Distinguishes a fresh
-/// insert from a dedup hit so the caller knows whether to spawn teardown
-/// of the now-redundant handle it just provisioned.
-pub enum RegisterSandboxOutcome {
-    /// New entry inserted; the passed handle is now owned by the registry.
-    Created(SandboxId),
-    /// An entry with this spec already existed; the passed handle is
-    /// returned to the caller (so it can spawn teardown). The thread has
-    /// been added to the existing entry's user set.
-    AlreadyExists {
-        id: SandboxId,
+/// Outcome of `ResourceRegistry::complete_sandbox_provisioning`. Distinguishes
+/// the happy path (entry was waiting for us to fill in the handle) from the
+/// dedup race (someone else already completed it) so the caller knows
+/// whether to spawn teardown of the now-redundant handle it provisioned.
+pub enum CompleteSandboxOutcome {
+    /// We attached the handle to a pre-registered (Provisioning) entry and
+    /// transitioned it to Ready. Registry owns the handle.
+    Completed,
+    /// Entry was already Ready when we arrived — handle is unused, caller
+    /// should tear it down. Happens when two concurrent `mcp_connect`
+    /// futures provision against the same SandboxId before either finishes.
+    AlreadyCompleted {
+        unused_handle: Option<Box<dyn SandboxHandle>>,
+    },
+    /// Entry didn't exist at all — `pre_register_sandbox` wasn't called for
+    /// this id. Treated as a programmer error by callers; the unused handle
+    /// is returned so it can be torn down rather than leaked.
+    NotPreRegistered {
         unused_handle: Option<Box<dyn SandboxHandle>>,
     },
 }
@@ -384,73 +391,76 @@ impl ResourceRegistry {
         id
     }
 
-    /// Spec-based registration. If a Ready entry with the same spec id
-    /// already exists, add this thread as a user and hand the unused
-    /// handle back to the caller so it can spawn its teardown. Otherwise
-    /// insert a fresh entry with the given handle.
+    /// Eagerly register a sandbox spec at thread-creation time, before any
+    /// provisioning future runs. Returns the deterministic
+    /// `SandboxId::for_spec(spec)`; idempotent on the id (calling twice for
+    /// the same spec just adds the user). Inserted entries land in
+    /// `Provisioning` so the dispatcher can later either complete them
+    /// (via [`Self::complete_sandbox_provisioning`]) or, if they're already
+    /// Ready from a previous thread's completion, skip the provision call
+    /// entirely.
     ///
-    /// `mcp_url` is the URL the sandbox is reachable at (from
-    /// `handle.mcp_url()` or the configured fallback) — cached on the
-    /// entry so future dedup hits don't have to consult the handle.
-    pub fn register_sandbox(
+    /// The `op_id` field on `Provisioning` is set to 0 — there's no in-flight
+    /// future yet at pre-register time. Phase 3d.ii's resolver promotes
+    /// this to a real op id when it dispatches the provision.
+    pub fn pre_register_sandbox(&mut self, thread_id: &str, spec: SandboxSpec) -> SandboxId {
+        let id = SandboxId::for_spec(&spec);
+        let now = Utc::now();
+        match self.sandboxes.get_mut(&id) {
+            Some(entry) => {
+                entry.users.insert(thread_id.to_string());
+                entry.last_used = now;
+            }
+            None => {
+                self.sandboxes.insert(
+                    id.clone(),
+                    SandboxEntry {
+                        id: id.clone(),
+                        spec,
+                        state: ResourceState::Provisioning { op_id: 0 },
+                        users: BTreeSet::from([thread_id.to_string()]),
+                        pinned: false,
+                        created_at: now,
+                        last_used: now,
+                        handle: None,
+                        mcp_url: None,
+                    },
+                );
+            }
+        }
+        id
+    }
+
+    /// Complete a previously pre-registered sandbox's provisioning by
+    /// attaching the handle and url and transitioning to Ready. Returns an
+    /// outcome that tells the caller whether the handle landed on the entry
+    /// (happy path) or was redundant (dedup race / already torn down).
+    pub fn complete_sandbox_provisioning(
         &mut self,
-        thread_id: &str,
-        spec: SandboxSpec,
+        id: &SandboxId,
         mcp_url: Option<String>,
         handle: Option<Box<dyn SandboxHandle>>,
-    ) -> RegisterSandboxOutcome {
-        let id = SandboxId::for_spec(&spec);
-        if let Some(entry) = self.sandboxes.get_mut(&id)
-            && entry.state.is_ready()
-        {
-            entry.users.insert(thread_id.to_string());
-            entry.last_used = Utc::now();
-            return RegisterSandboxOutcome::AlreadyExists {
-                id,
+    ) -> CompleteSandboxOutcome {
+        let Some(entry) = self.sandboxes.get_mut(id) else {
+            return CompleteSandboxOutcome::NotPreRegistered {
+                unused_handle: handle,
+            };
+        };
+        // Ready entries are already completed — even if their handle is
+        // None (e.g. SandboxSpec::None never produces one), a second
+        // completion would either replace a live handle (leaking the old
+        // one) or no-op pointlessly. Bounce the caller's handle back so it
+        // gets torn down rather than leaked.
+        if entry.state.is_ready() {
+            return CompleteSandboxOutcome::AlreadyCompleted {
                 unused_handle: handle,
             };
         }
-        let now = Utc::now();
-        self.sandboxes.insert(
-            id.clone(),
-            SandboxEntry {
-                id: id.clone(),
-                spec,
-                state: ResourceState::Ready,
-                users: BTreeSet::from([thread_id.to_string()]),
-                pinned: false,
-                created_at: now,
-                last_used: now,
-                handle,
-                mcp_url,
-            },
-        );
-        RegisterSandboxOutcome::Created(id)
-    }
-
-    /// Find a Ready sandbox whose spec matches; used by the dispatcher to
-    /// skip provisioning when an existing sandbox can be reused. Only
-    /// returns entries whose handle is still present — we don't want to
-    /// dedup onto a sandbox whose handle was just taken for teardown.
-    pub fn find_ready_sandbox_for_spec(
-        &self,
-        spec: &SandboxSpec,
-    ) -> Option<&SandboxEntry> {
-        let id = SandboxId::for_spec(spec);
-        self.sandboxes
-            .get(&id)
-            .filter(|e| e.state.is_ready() && e.handle.is_some())
-    }
-
-    /// Find which sandbox a given thread is currently bound to. Linear
-    /// scan over the registry — fine at the few-dozen-sandbox scale
-    /// Phase 3 targets. Phase 3d's `ThreadBindings` makes this an O(1)
-    /// thread-side lookup.
-    pub fn find_sandbox_used_by(&self, thread_id: &str) -> Option<SandboxId> {
-        self.sandboxes
-            .values()
-            .find(|e| e.users.contains(thread_id))
-            .map(|e| e.id.clone())
+        entry.state = ResourceState::Ready;
+        entry.handle = handle;
+        entry.mcp_url = mcp_url;
+        entry.last_used = Utc::now();
+        CompleteSandboxOutcome::Completed
     }
 
     /// Drop `thread_id` from the sandbox's user set and return the new
@@ -584,10 +594,9 @@ mod tests {
     #[test]
     fn sandbox_teardown_clears_users() {
         let mut reg = ResourceRegistry::new();
-        let outcome = reg.register_sandbox("t-1", SandboxSpec::None, None, None);
-        let RegisterSandboxOutcome::Created(id) = outcome else {
-            panic!("first register should be Created");
-        };
+        let id = reg.pre_register_sandbox("t-1", SandboxSpec::None);
+        let outcome = reg.complete_sandbox_provisioning(&id, None, None);
+        assert!(matches!(outcome, CompleteSandboxOutcome::Completed));
         assert!(reg.sandboxes[&id].state.is_ready());
         assert_eq!(reg.sandboxes[&id].users.len(), 1);
         reg.mark_sandbox_torn_down(&id);
@@ -599,32 +608,43 @@ mod tests {
     }
 
     #[test]
-    fn register_sandbox_dedups_by_spec() {
+    fn pre_register_sandbox_dedups_by_spec() {
         let mut reg = ResourceRegistry::new();
-        let first = reg.register_sandbox("t-1", SandboxSpec::None, None, None);
-        let second = reg.register_sandbox("t-2", SandboxSpec::None, None, None);
-        let RegisterSandboxOutcome::Created(id_a) = first else {
-            panic!("first should be Created");
-        };
-        let RegisterSandboxOutcome::AlreadyExists { id: id_b, .. } = second else {
-            panic!("second should be AlreadyExists");
-        };
+        let id_a = reg.pre_register_sandbox("t-1", SandboxSpec::None);
+        let id_b = reg.pre_register_sandbox("t-2", SandboxSpec::None);
         assert_eq!(id_a, id_b);
-        // Both threads now share the entry's user set.
+        // Both threads share the same pre-registered entry.
         assert_eq!(reg.sandboxes[&id_a].users.len(), 2);
         assert!(reg.sandboxes[&id_a].users.contains("t-1"));
         assert!(reg.sandboxes[&id_a].users.contains("t-2"));
+        // State stays Provisioning until completion runs.
+        assert!(matches!(
+            reg.sandboxes[&id_a].state,
+            ResourceState::Provisioning { .. }
+        ));
+    }
+
+    #[test]
+    fn complete_sandbox_provisioning_idempotent_on_race() {
+        let mut reg = ResourceRegistry::new();
+        let id = reg.pre_register_sandbox("t-1", SandboxSpec::None);
+        let first = reg.complete_sandbox_provisioning(&id, None, None);
+        assert!(matches!(first, CompleteSandboxOutcome::Completed));
+        // Race-loser scenario: a second concurrent provision lands after
+        // the entry already transitioned to Ready. The handle round-trips
+        // back to the caller for teardown rather than silently leaking.
+        let second = reg.complete_sandbox_provisioning(&id, None, None);
+        assert!(matches!(
+            second,
+            CompleteSandboxOutcome::AlreadyCompleted { .. }
+        ));
     }
 
     #[test]
     fn release_sandbox_user_decrements_count() {
         let mut reg = ResourceRegistry::new();
-        let RegisterSandboxOutcome::Created(id) =
-            reg.register_sandbox("t-1", SandboxSpec::None, None, None)
-        else {
-            panic!("created");
-        };
-        reg.register_sandbox("t-2", SandboxSpec::None, None, None);
+        let id = reg.pre_register_sandbox("t-1", SandboxSpec::None);
+        reg.pre_register_sandbox("t-2", SandboxSpec::None);
         assert_eq!(reg.release_sandbox_user(&id, "t-1"), 1);
         assert_eq!(reg.release_sandbox_user(&id, "t-2"), 0);
     }

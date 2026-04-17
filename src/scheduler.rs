@@ -27,8 +27,8 @@ use futures::stream::FuturesUnordered;
 use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 use whisper_agent_protocol::{
-    BackendSummary, ClientToServer, ModelSummary, ServerToClient, ThreadConfig, ThreadConfigOverride,
-    ThreadStateLabel,
+    BackendSummary, ClientToServer, ModelSummary, ServerToClient, ThreadBindings,
+    ThreadBindingsRequest, ThreadConfig, ThreadConfigOverride, ThreadStateLabel,
 };
 
 use crate::audit::AuditLog;
@@ -37,7 +37,9 @@ use crate::mcp::{McpSession, ToolAnnotations, ToolDescriptor as McpTool};
 use crate::model::ModelProvider;
 use crate::persist::{LoadedState, Persister};
 use crate::pod::{Pod, PodId};
-use crate::resources::{BackendId, McpHostId, RegisterSandboxOutcome, ResourceRegistry, SandboxId};
+use crate::resources::{
+    BackendId, CompleteSandboxOutcome, McpHostId, ResourceRegistry, SandboxId,
+};
 use crate::sandbox::SandboxProvider;
 use crate::thread::{
     ApprovalDisposition, IoResult, OpId, StepOutcome, Thread, ThreadInternalState, derive_title,
@@ -240,12 +242,6 @@ impl Scheduler {
     // event — there are no clients connected yet, and a fresh client gets the
     // full set via `ListResources`.
 
-    fn emit_sandbox_created(&self, id: &SandboxId) {
-        if let Some(snap) = self.resources.snapshot_sandbox(id) {
-            self.router
-                .broadcast_resource(ServerToClient::ResourceCreated { resource: snap });
-        }
-    }
     fn emit_sandbox_updated(&self, id: &SandboxId) {
         if let Some(snap) = self.resources.snapshot_sandbox(id) {
             self.router
@@ -271,13 +267,14 @@ impl Scheduler {
         }
     }
 
-    /// Returns the backend name the task is configured to use, falling back to the
-    /// server's default if the task left it empty. Does NOT validate existence.
+    /// Returns the backend name the thread is bound to, falling back to the
+    /// server's default if the binding's `backend` field is empty. Does NOT
+    /// validate existence.
     pub(crate) fn resolve_backend_name<'a>(&'a self, task: &'a Thread) -> &'a str {
-        if task.config.backend.is_empty() {
+        if task.bindings.backend.is_empty() {
             &self.default_backend
         } else {
-            &task.config.backend
+            &task.bindings.backend
         }
     }
 
@@ -295,26 +292,30 @@ impl Scheduler {
         &self.sandbox_provider
     }
 
-    /// Phase 3b: read-only accessor used by `io_dispatch` to skip the
-    /// provision call when an existing sandbox already matches the spec.
-    /// Returns `(SandboxId, mcp_url)` for the dedup target. Only entries
-    /// whose handle is still attached are eligible — see
-    /// `find_ready_sandbox_for_spec`.
-    pub(crate) fn find_ready_sandbox_for_spec(
-        &self,
-        spec: &whisper_agent_protocol::SandboxSpec,
-    ) -> Option<(crate::resources::SandboxId, String)> {
-        self.resources
-            .find_ready_sandbox_for_spec(spec)
-            .map(|e| (e.id.clone(), e.mcp_url.clone().unwrap_or_default()))
+    /// Server-level fallback MCP URL — used by `io_dispatch` when a thread's
+    /// bound sandbox doesn't (yet) carry its own URL.
+    pub(crate) fn default_mcp_url(&self) -> &str {
+        &self.default_mcp_host_url
     }
 
-    /// Phase 3c: build the thread's effective tool catalog by walking its
-    /// bound MCP hosts in precedence order — primary first, then each
-    /// shared host the thread allows. Tool-name collisions resolve in
-    /// favor of the earlier host (matching the prior `route_tool`
-    /// behavior). Empty when the primary hasn't completed `list_tools`
-    /// yet AND no shared hosts are bound.
+    /// Look up the registry entry for a thread's bound sandbox. Returns
+    /// `None` when the thread doesn't bind one (legacy / no-sandbox config)
+    /// or when `pre_register_sandbox` somehow wasn't called for this id.
+    pub(crate) fn sandbox_for_thread(
+        &self,
+        thread_id: &str,
+    ) -> Option<&crate::resources::SandboxEntry> {
+        let task = self.tasks.get(thread_id)?;
+        let id_str = task.bindings.sandbox.as_ref()?;
+        self.resources.sandboxes.get(&SandboxId(id_str.clone()))
+    }
+
+    /// Phase 3d.i: build the thread's effective tool catalog by walking
+    /// `task.bindings.mcp_hosts` in precedence order — primary first
+    /// (index 0), then each shared host the thread is bound to. Tool-name
+    /// collisions resolve in favor of the earlier host (matching the prior
+    /// `route_tool` behavior). Empty when the primary hasn't completed
+    /// `list_tools` yet AND no shared hosts are bound.
     pub(crate) fn tool_descriptors(&self, thread_id: &str) -> Vec<McpTool> {
         let mut out: Vec<McpTool> = Vec::new();
         let mut seen: HashSet<String> = HashSet::new();
@@ -337,14 +338,8 @@ impl Scheduler {
         let primary = self.resources.mcp_hosts.get(&primary_id)?;
         let primary_session = primary.session.clone()?;
         let mut sessions = vec![primary_session];
-        let Some(task) = self.tasks.get(thread_id) else {
-            return Some(sessions);
-        };
-        for name in &task.config.shared_mcp_hosts {
-            let id = McpHostId::shared(name);
-            if let Some(entry) = self.resources.mcp_hosts.get(&id)
-                && let Some(s) = entry.session.clone()
-            {
+        for host in self.bound_mcp_hosts(thread_id).into_iter().skip(1) {
+            if let Some(s) = host.session.clone() {
                 sessions.push(s);
             }
         }
@@ -371,26 +366,19 @@ impl Scheduler {
             .and_then(|e| e.session.clone())
     }
 
-    /// Iterate the thread's bound MCP host entries in precedence order
-    /// (primary first, then each shared host the thread allows that the
-    /// scheduler still has wired up). Internal helper for the accessors
-    /// above and `annotations_for`.
+    /// Iterate the thread's bound MCP host entries in `bindings.mcp_hosts`
+    /// order (primary first by convention; shared hosts in pod-declared
+    /// order). Skips ids that don't have a registry entry yet — the
+    /// per-thread primary is created lazily when McpConnect succeeds.
     fn bound_mcp_hosts(&self, thread_id: &str) -> Vec<&crate::resources::McpHostEntry> {
-        let mut out = Vec::new();
-        let primary_id = McpHostId::primary_for_task(thread_id);
-        if let Some(entry) = self.resources.mcp_hosts.get(&primary_id) {
-            out.push(entry);
-        }
         let Some(task) = self.tasks.get(thread_id) else {
-            return out;
+            return Vec::new();
         };
-        for name in &task.config.shared_mcp_hosts {
-            let id = McpHostId::shared(name);
-            if let Some(entry) = self.resources.mcp_hosts.get(&id) {
-                out.push(entry);
-            }
-        }
-        out
+        task.bindings
+            .mcp_hosts
+            .iter()
+            .filter_map(|raw| self.resources.mcp_hosts.get(&McpHostId(raw.clone())))
+            .collect()
     }
 
     pub fn with_persister(mut self, persister: Persister) -> Self {
@@ -409,16 +397,43 @@ impl Scheduler {
             self.pods.insert(pod.id.clone(), pod);
         }
         for task in state.threads {
-            // Phase 1a: mirror the registry registrations that create_task
-            // would have done. Per-task primary MCP + sandbox entries don't
-            // exist for persisted tasks yet — they're created lazily on the
-            // next McpConnect, same as fresh tasks.
+            // Re-pre-register the thread's sandbox so the registry knows
+            // its spec — the binding only carries the deterministic id, so
+            // we look up the matching spec by hashing each pod entry.
+            if let Some(sandbox_id_str) = task.bindings.sandbox.clone() {
+                let spec = self.pods.get(&task.pod_id).and_then(|p| {
+                    p.config.allow.sandbox.iter().find_map(|nss| {
+                        if SandboxId::for_spec(&nss.spec).0 == sandbox_id_str {
+                            Some(nss.spec.clone())
+                        } else {
+                            None
+                        }
+                    })
+                });
+                match spec {
+                    Some(s) => {
+                        self.resources.pre_register_sandbox(&task.id, s);
+                    }
+                    None => warn!(
+                        thread_id = %task.id,
+                        sandbox_id = %sandbox_id_str,
+                        "loaded thread's sandbox id has no matching spec in pod allow.sandbox; skipping pre-register",
+                    ),
+                }
+            }
+
             let backend_id = BackendId::for_name(self.resolve_backend_name(&task));
             self.resources.add_backend_user(&backend_id, &task.id);
-            for name in &task.config.shared_mcp_hosts {
-                self.resources
-                    .add_mcp_user(&McpHostId::shared(name), &task.id);
+            // bindings.mcp_hosts holds both the per-task primary id (which
+            // doesn't have a registry entry until McpConnect lands) and the
+            // shared host ids. Only the shared ones need user counts here.
+            for raw in &task.bindings.mcp_hosts {
+                if let Some(name) = raw.strip_prefix("mcp-shared-") {
+                    self.resources
+                        .add_mcp_user(&McpHostId::shared(name), &task.id);
+                }
             }
+
             // Make sure the owning pod knows about this thread. If the pod
             // wasn't in `state.pods` (shouldn't happen — load_pod walks both
             // together) we drop the thread on the floor with a warning.
@@ -485,7 +500,14 @@ impl Scheduler {
                 pod_id,
                 initial_message,
                 config_override,
-            } => match self.create_task(conn_id, correlation_id.clone(), pod_id, config_override) {
+                bindings_request,
+            } => match self.create_task(
+                conn_id,
+                correlation_id.clone(),
+                pod_id,
+                config_override,
+                bindings_request,
+            ) {
                 Ok(thread_id) => {
                     self.mark_dirty(&thread_id);
                     self.send_user_message(&thread_id, initial_message);
@@ -874,6 +896,7 @@ impl Scheduler {
         correlation_id: Option<String>,
         pod_id: Option<String>,
         config_override: Option<ThreadConfigOverride>,
+        bindings_request: Option<ThreadBindingsRequest>,
     ) -> Result<String, String> {
         // Resolve which pod this thread lands in. None routes to the
         // server's default pod.
@@ -883,21 +906,18 @@ impl Scheduler {
             .get(&pod_id)
             .ok_or_else(|| format!("unknown pod `{pod_id}`"))?;
 
-        // Build the base ThreadConfig from the pod's thread_defaults, then
-        // layer the override on top. Server-level fallback URL fills in the
-        // mcp_host_url field — pods don't model it yet.
-        let base = base_thread_config_from_pod(pod, &self.default_mcp_host_url);
-        let config = apply_override(base, config_override);
+        // Resolve the thread's plain config (model, prompts, limits, policy).
+        let base_config = base_thread_config_from_pod(pod);
+        let config = apply_config_override(base_config, config_override);
 
-        // Validate against the pod's allowlist: backend and shared MCP host
-        // names must each appear in `[allow]`. Sandbox spec validation
-        // arrives in Phase 3 with the resource resolver.
-        validate_thread_against_pod(&config, pod)?;
-
+        // Resolve the binding choices (backend / sandbox / shared MCP hosts):
+        // start from pod defaults, layer the request on top, validate every
+        // choice against the pod's `[allow]` cap.
+        let resolved = resolve_bindings_choice(pod, bindings_request)?;
         // Validate shared MCP host names against the server catalog too —
         // a name allowed by the pod but not actually wired up at the server
         // is a misconfiguration we want to surface at create-time.
-        for name in &config.shared_mcp_hosts {
+        for name in &resolved.shared_host_names {
             if !self
                 .resources
                 .mcp_hosts
@@ -910,7 +930,28 @@ impl Scheduler {
         }
 
         let thread_id = new_task_id();
-        let task = Thread::new(thread_id.clone(), pod_id.clone(), config);
+
+        // Pre-register the sandbox so the registry holds the spec from
+        // creation onward — io_dispatch reads it back at McpConnect time.
+        // The deterministic SandboxId means a second thread with the same
+        // spec just adds itself as a user to the existing entry.
+        let sandbox_id = self
+            .resources
+            .pre_register_sandbox(&thread_id, resolved.sandbox_spec.clone());
+        let primary_mcp_id = McpHostId::primary_for_task(&thread_id);
+        let mut mcp_host_ids: Vec<String> = Vec::with_capacity(1 + resolved.shared_host_names.len());
+        mcp_host_ids.push(primary_mcp_id.0.clone());
+        for name in &resolved.shared_host_names {
+            mcp_host_ids.push(McpHostId::shared(name).0);
+        }
+        let bindings = ThreadBindings {
+            backend: resolved.backend_name.clone(),
+            sandbox: Some(sandbox_id.0.clone()),
+            mcp_hosts: mcp_host_ids,
+            tool_filter: None,
+        };
+
+        let task = Thread::new(thread_id.clone(), pod_id.clone(), config, bindings);
         let summary = task.summary();
         self.tasks.insert(thread_id.clone(), task);
         // Mirror the new thread into the owning pod's `threads` set.
@@ -918,20 +959,15 @@ impl Scheduler {
             pod.threads.insert(thread_id.clone());
         }
 
-        // Phase 1a: register this task as a user of its backend and of every
-        // shared MCP host it references. Counts are added once at creation;
-        // the teardown path clears per-task entries (primary MCP + sandbox)
-        // but leaves backend/shared-host associations alone — Completed tasks
-        // keep their bindings so follow-up messages stay routable.
-        let task_ref = self
-            .tasks
-            .get(&thread_id)
-            .expect("just-inserted task is present");
-        let backend_id = BackendId::for_name(self.resolve_backend_name(task_ref));
-        let shared_names = task_ref.config.shared_mcp_hosts.clone();
+        // Register this task as a user of its backend and of every shared
+        // MCP host it references. The sandbox already counted us via
+        // `pre_register_sandbox`; the per-task primary MCP host entry
+        // doesn't exist until McpConnect succeeds (created lazily there).
+        let backend_id = BackendId::for_name(&resolved.backend_name);
         self.resources.add_backend_user(&backend_id, &thread_id);
         self.emit_backend_updated(&backend_id);
-        for name in &shared_names {
+        self.emit_sandbox_updated(&sandbox_id);
+        for name in &resolved.shared_host_names {
             let host_id = McpHostId::shared(name);
             self.resources.add_mcp_user(&host_id, &thread_id);
             self.emit_mcp_host_updated(&host_id);
@@ -1049,56 +1085,61 @@ impl Scheduler {
                 session,
                 sandbox_handle,
             } => {
-                // Phase 3c: the sessions / pool / tool_descriptors maps are
-                // gone — everything lives on the registry now. We register
-                // the per-thread primary MCP host (carrying its session)
-                // and the (possibly deduped) sandbox; tool routing
-                // accessors walk the registry on demand.
-                let sandbox_spec = self
+                // Phase 3d.i: the sandbox was pre-registered at create_task
+                // and its id lives on `task.bindings.sandbox`. We look the
+                // entry up through bindings, attach the freshly-provisioned
+                // handle (or, on a dedup hit, just observe the existing
+                // entry's url), and register the per-thread primary MCP
+                // host carrying the connected session.
+                let sandbox_id = self
                     .tasks
                     .get(&thread_id)
-                    .map(|t| t.config.sandbox.clone())
-                    .unwrap_or_default();
+                    .and_then(|t| t.bindings.sandbox.clone())
+                    .map(SandboxId);
+                let dedup_url = sandbox_id
+                    .as_ref()
+                    .and_then(|id| self.resources.sandboxes.get(id))
+                    .and_then(|e| e.mcp_url.clone());
                 let primary_url = sandbox_handle
                     .as_ref()
                     .and_then(|h| h.mcp_url().map(str::to_string))
-                    .unwrap_or_else(|| {
-                        self.tasks
-                            .get(&thread_id)
-                            .map(|t| t.config.mcp_host_url.clone())
-                            .unwrap_or_default()
-                    });
-                let primary_id =
-                    self.resources
-                        .insert_primary_mcp_host(&thread_id, primary_url.clone(), session);
-                self.emit_mcp_host_created(&primary_id);
-                let outcome = self.resources.register_sandbox(
+                    .or(dedup_url)
+                    .unwrap_or_else(|| self.default_mcp_host_url.clone());
+
+                let primary_id = self.resources.insert_primary_mcp_host(
                     &thread_id,
-                    sandbox_spec,
-                    Some(primary_url),
-                    sandbox_handle,
+                    primary_url.clone(),
+                    session,
                 );
-                match outcome {
-                    RegisterSandboxOutcome::Created(sandbox_id) => {
-                        self.emit_sandbox_created(&sandbox_id);
-                    }
-                    RegisterSandboxOutcome::AlreadyExists {
-                        id: sandbox_id,
-                        unused_handle,
-                    } => {
-                        // Dedup hit — emit Updated so subscribers see the
-                        // user count tick up. If we got here from a peek
-                        // miss followed by a race-loser provision, the
-                        // unused handle needs teardown.
-                        self.emit_sandbox_updated(&sandbox_id);
-                        if let Some(mut handle) = unused_handle {
-                            tokio::spawn(async move {
-                                if let Err(e) = handle.teardown().await {
-                                    warn!(error = %e, "teardown of dedup-loser sandbox failed");
-                                }
-                            });
+                self.emit_mcp_host_created(&primary_id);
+
+                if let (Some(id), Some(handle)) = (sandbox_id.as_ref(), sandbox_handle) {
+                    let outcome = self.resources.complete_sandbox_provisioning(
+                        id,
+                        Some(primary_url),
+                        Some(handle),
+                    );
+                    match outcome {
+                        CompleteSandboxOutcome::Completed => {
+                            self.emit_sandbox_updated(id);
+                        }
+                        CompleteSandboxOutcome::AlreadyCompleted { unused_handle }
+                        | CompleteSandboxOutcome::NotPreRegistered { unused_handle } => {
+                            self.emit_sandbox_updated(id);
+                            if let Some(mut h) = unused_handle {
+                                tokio::spawn(async move {
+                                    if let Err(e) = h.teardown().await {
+                                        warn!(error = %e, "teardown of dedup-loser sandbox failed");
+                                    }
+                                });
+                            }
                         }
                     }
+                } else if let Some(id) = sandbox_id.as_ref() {
+                    // Dedup hit — no handle came back (dispatcher reused an
+                    // existing Ready entry). Emit update so subscribers see
+                    // the user count.
+                    self.emit_sandbox_updated(id);
                 }
                 IoResult::McpConnect(Ok(()))
             }
@@ -1183,48 +1224,57 @@ impl Scheduler {
                 ThreadStateLabel::Failed | ThreadStateLabel::Cancelled
             )
         });
-        if is_terminal {
-            // Phase 3c: the per-thread primary MCP host owns its session
-            // in the registry; marking it torn down drops the session Arc
-            // and the routing accessors stop returning it. Backend and
-            // shared-host user counts are intentionally left alone — the
-            // task itself still exists in `self.tasks` and the existing
-            // code never removes terminal tasks.
-            let primary_id = McpHostId::primary_for_task(thread_id);
-            self.resources.mark_mcp_torn_down(&primary_id);
-            self.emit_mcp_host_updated(&primary_id);
+        if !is_terminal {
+            return;
+        }
+        // Phase 3c: the per-thread primary MCP host owns its session in
+        // the registry; marking it torn down drops the session Arc and
+        // the routing accessors stop returning it. Backend and
+        // shared-host user counts are intentionally left alone — the
+        // task itself still exists in `self.tasks` and the existing
+        // code never removes terminal tasks.
+        let primary_id = McpHostId::primary_for_task(thread_id);
+        self.resources.mark_mcp_torn_down(&primary_id);
+        self.emit_mcp_host_updated(&primary_id);
 
-            // Phase 3b: the sandbox is shared across threads with matching
-            // specs. Drop this thread from the user set; only tear the
-            // sandbox down when the count hits zero and it isn't pinned.
-            if let Some(sandbox_id) = self.resources.find_sandbox_used_by(thread_id) {
-                let remaining = self
-                    .resources
-                    .release_sandbox_user(&sandbox_id, thread_id);
-                let pinned = self
-                    .resources
-                    .sandboxes
-                    .get(&sandbox_id)
-                    .map(|e| e.pinned)
-                    .unwrap_or(false);
-                if remaining == 0 && !pinned {
-                    let handle = self.resources.take_sandbox_handle(&sandbox_id);
-                    self.resources.mark_sandbox_torn_down(&sandbox_id);
-                    self.emit_sandbox_updated(&sandbox_id);
-                    if let Some(mut handle) = handle {
-                        let tid = thread_id.to_string();
-                        tokio::spawn(async move {
-                            if let Err(e) = handle.teardown().await {
-                                warn!(thread_id = %tid, error = %e, "sandbox teardown failed");
-                            }
-                        });
+        // Phase 3d.i: the sandbox id lives on `task.bindings.sandbox` —
+        // O(1) lookup instead of the prior linear scan. The sandbox is
+        // shared across threads with matching specs; drop this thread from
+        // the user set and only tear it down when the count hits zero and
+        // the entry isn't pinned.
+        let Some(sandbox_id) = self
+            .tasks
+            .get(thread_id)
+            .and_then(|t| t.bindings.sandbox.clone())
+            .map(SandboxId)
+        else {
+            return;
+        };
+        let remaining = self
+            .resources
+            .release_sandbox_user(&sandbox_id, thread_id);
+        let pinned = self
+            .resources
+            .sandboxes
+            .get(&sandbox_id)
+            .map(|e| e.pinned)
+            .unwrap_or(false);
+        if remaining == 0 && !pinned {
+            let handle = self.resources.take_sandbox_handle(&sandbox_id);
+            self.resources.mark_sandbox_torn_down(&sandbox_id);
+            self.emit_sandbox_updated(&sandbox_id);
+            if let Some(mut handle) = handle {
+                let tid = thread_id.to_string();
+                tokio::spawn(async move {
+                    if let Err(e) = handle.teardown().await {
+                        warn!(thread_id = %tid, error = %e, "sandbox teardown failed");
                     }
-                } else {
-                    // Sandbox lives on for the other threads using it; the
-                    // user list changed so subscribers want a refresh.
-                    self.emit_sandbox_updated(&sandbox_id);
-                }
+                });
             }
+        } else {
+            // Sandbox lives on for the other threads using it; the user
+            // list changed so subscribers want a refresh.
+            self.emit_sandbox_updated(&sandbox_id);
         }
     }
 }
@@ -1281,13 +1331,16 @@ fn truncate(mut s: String, max: usize) -> String {
 ///
 /// The resulting `[allow]` table reflects exactly what the server has wired
 /// up at startup: every configured backend, every shared MCP host, and a
-/// single named sandbox slot pulled from `default_task_config.sandbox`. The
-/// pod isn't restrictive — it allows everything the server can do today, so
+/// single named sandbox slot carrying `sandbox_spec`. The pod isn't
+/// restrictive — it allows everything the server can do today, so
 /// `CreateThread` against the default pod has the same effective surface as
 /// the pre-pod-aware code path.
+#[allow(clippy::too_many_arguments)]
 pub fn build_default_pod_config(
     pod_id: &str,
-    defaults: &ThreadConfig,
+    config: &ThreadConfig,
+    default_backend: &str,
+    sandbox_spec: SandboxSpec,
     backend_names: &[String],
     shared_host_names: &[String],
 ) -> whisper_agent_protocol::PodConfig {
@@ -1309,105 +1362,135 @@ pub fn build_default_pod_config(
             mcp_hosts: shared_host_names.to_vec(),
             sandbox: vec![NamedSandboxSpec {
                 name: sandbox_name.clone(),
-                spec: defaults.sandbox.clone(),
+                spec: sandbox_spec,
             }],
         },
         thread_defaults: ThreadDefaults {
-            backend: defaults.backend.clone(),
-            model: defaults.model.clone(),
+            backend: default_backend.to_string(),
+            model: config.model.clone(),
             system_prompt_file: "system_prompt.md".into(),
-            max_tokens: defaults.max_tokens,
-            max_turns: defaults.max_turns,
-            approval_policy: defaults.approval_policy,
+            max_tokens: config.max_tokens,
+            max_turns: config.max_turns,
+            approval_policy: config.approval_policy,
             sandbox: sandbox_name,
-            mcp_hosts: defaults.shared_mcp_hosts.clone(),
+            mcp_hosts: shared_host_names.to_vec(),
         },
         limits: PodLimits::default(),
     }
 }
 
-/// Render the pod's `thread_defaults` into a fresh `ThreadConfig`.
-///
-/// `default_mcp_url` is the server's filesystem-MCP fallback — pods don't
-/// model it (it's where the MCP daemon lives, a server-level concern). The
-/// resolved `sandbox` field is filled by looking the named entry up in
-/// `pod.config.allow.sandbox`; if not present, defaults to `SandboxSpec::None`
-/// (matches today's behavior when no sandbox is configured).
-fn base_thread_config_from_pod(pod: &Pod, default_mcp_url: &str) -> ThreadConfig {
+/// Render the pod's `thread_defaults` (model, prompt, limits, policy) into
+/// a fresh `ThreadConfig`. Binding-side defaults (backend, sandbox, shared
+/// hosts) are produced separately by [`resolve_bindings_choice`].
+fn base_thread_config_from_pod(pod: &Pod) -> ThreadConfig {
     let defaults = &pod.config.thread_defaults;
-    let sandbox = pod
-        .config
-        .allow
-        .sandbox
-        .iter()
-        .find(|s| s.name == defaults.sandbox)
-        .map(|s| s.spec.clone())
-        .unwrap_or(SandboxSpec::None);
     ThreadConfig {
-        backend: defaults.backend.clone(),
         model: defaults.model.clone(),
         system_prompt: pod.system_prompt.clone(),
-        mcp_host_url: default_mcp_url.to_string(),
         max_tokens: defaults.max_tokens,
         max_turns: defaults.max_turns,
         approval_policy: defaults.approval_policy,
-        sandbox,
-        shared_mcp_hosts: defaults.mcp_hosts.clone(),
     }
 }
 
-/// Reject thread configs that escape the pod's `[allow]` cap.
-///
-/// Today this checks `backend` and `shared_mcp_hosts` against the pod's
-/// allowed names. Sandbox-spec validation is deferred to Phase 3 alongside
-/// the resource resolver (the resolver is the natural place to verify a
-/// requested SandboxSpec deep-equals one of `[[allow.sandbox]]`).
-fn validate_thread_against_pod(config: &ThreadConfig, pod: &Pod) -> Result<(), String> {
-    if !config.backend.is_empty()
-        && !pod.config.allow.backends.iter().any(|b| b == &config.backend)
-    {
-        return Err(format!(
-            "backend `{}` not in pod `{}`'s allow.backends ({})",
-            config.backend,
-            pod.id,
-            pod.config.allow.backends.join(", ")
-        ));
-    }
-    for name in &config.shared_mcp_hosts {
-        if !pod.config.allow.mcp_hosts.iter().any(|h| h == name) {
-            return Err(format!(
-                "shared MCP host `{name}` not in pod `{}`'s allow.mcp_hosts ({})",
-                pod.id,
-                pod.config.allow.mcp_hosts.join(", ")
-            ));
-        }
-    }
-    Ok(())
-}
-
-fn apply_override(base: ThreadConfig, ov: Option<ThreadConfigOverride>) -> ThreadConfig {
+fn apply_config_override(base: ThreadConfig, ov: Option<ThreadConfigOverride>) -> ThreadConfig {
     let Some(ov) = ov else { return base };
-    // If the override picks a different backend without specifying a model, don't
-    // inherit the model from the default backend — leave it empty so build_model_request
-    // resolves via the picked backend's default_model at call time (or passes empty to
-    // a single-model endpoint that ignores the field).
-    let backend_changed = ov.backend.as_deref().is_some_and(|b| b != base.backend);
-    let model = match ov.model {
-        Some(m) => m,
-        None if backend_changed => String::new(),
-        None => base.model.clone(),
-    };
     ThreadConfig {
-        backend: ov.backend.unwrap_or(base.backend),
-        model,
+        model: ov.model.unwrap_or(base.model),
         system_prompt: ov.system_prompt.unwrap_or(base.system_prompt),
-        mcp_host_url: ov.mcp_host_url.unwrap_or(base.mcp_host_url),
         max_tokens: ov.max_tokens.unwrap_or(base.max_tokens),
         max_turns: ov.max_turns.unwrap_or(base.max_turns),
         approval_policy: ov.approval_policy.unwrap_or(base.approval_policy),
-        sandbox: ov.sandbox.unwrap_or(base.sandbox),
-        shared_mcp_hosts: ov.shared_mcp_hosts.unwrap_or(base.shared_mcp_hosts),
     }
+}
+
+/// Resolved binding-side choices for a fresh thread: the catalog names /
+/// resolved spec the scheduler needs to wire up the registry. Validated
+/// against the pod's `[allow]` cap before construction.
+struct ResolvedBindings {
+    /// Backend catalog name. Empty string = "use server default".
+    backend_name: String,
+    /// Resolved sandbox spec (used for `pre_register_sandbox`).
+    sandbox_spec: SandboxSpec,
+    /// Catalog names of shared MCP hosts the thread is bound to.
+    shared_host_names: Vec<String>,
+}
+
+/// Layer the request on top of pod `thread_defaults`, then verify each
+/// chosen value against the pod's `[allow]` table. The sandbox path
+/// validates an inline request spec by hashing it and comparing against
+/// each `[[allow.sandbox]]` entry's id — keeps the pod's "named sandbox"
+/// model intact even when the wire carries the spec inline.
+fn resolve_bindings_choice(
+    pod: &Pod,
+    request: Option<ThreadBindingsRequest>,
+) -> Result<ResolvedBindings, String> {
+    let defaults = &pod.config.thread_defaults;
+    let allow = &pod.config.allow;
+    let request = request.unwrap_or_default();
+
+    let backend_name = request.backend.unwrap_or_else(|| defaults.backend.clone());
+    if !backend_name.is_empty() && !allow.backends.iter().any(|b| b == &backend_name) {
+        return Err(format!(
+            "backend `{}` not in pod `{}`'s allow.backends ({})",
+            backend_name,
+            pod.id,
+            allow.backends.join(", ")
+        ));
+    }
+
+    let sandbox_spec = match request.sandbox {
+        Some(spec) => {
+            let request_id = SandboxId::for_spec(&spec);
+            let allowed = allow
+                .sandbox
+                .iter()
+                .any(|nss| SandboxId::for_spec(&nss.spec) == request_id);
+            if !allowed {
+                return Err(format!(
+                    "requested sandbox spec is not in pod `{}`'s allow.sandbox",
+                    pod.id
+                ));
+            }
+            spec
+        }
+        None => {
+            if defaults.sandbox.is_empty() {
+                SandboxSpec::None
+            } else {
+                allow
+                    .sandbox
+                    .iter()
+                    .find(|nss| nss.name == defaults.sandbox)
+                    .map(|nss| nss.spec.clone())
+                    .ok_or_else(|| {
+                        format!(
+                            "pod `{}` thread_defaults.sandbox = `{}` but no matching [[allow.sandbox]] entry",
+                            pod.id, defaults.sandbox,
+                        )
+                    })?
+            }
+        }
+    };
+
+    let shared_host_names = request
+        .mcp_hosts
+        .unwrap_or_else(|| defaults.mcp_hosts.clone());
+    for name in &shared_host_names {
+        if !allow.mcp_hosts.iter().any(|h| h == name) {
+            return Err(format!(
+                "shared MCP host `{name}` not in pod `{}`'s allow.mcp_hosts ({})",
+                pod.id,
+                allow.mcp_hosts.join(", "),
+            ));
+        }
+    }
+
+    Ok(ResolvedBindings {
+        backend_name,
+        sandbox_spec,
+        shared_host_names,
+    })
 }
 
 // ---------- Run loop ----------

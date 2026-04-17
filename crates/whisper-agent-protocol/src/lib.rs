@@ -57,57 +57,89 @@ impl Usage {
     }
 }
 
-/// The per-task configuration the server holds. Clients can override pieces of it at
-/// task-creation time via [`ThreadConfigOverride`].
+/// The per-thread configuration the server holds. Carries only "what the loop
+/// looks like" — model, prompts, limits, policy. Resource-side concerns
+/// (which backend, which sandbox, which MCP hosts) live on
+/// [`ThreadBindings`]; the split was introduced in Phase 3d.i so resource
+/// lifecycles can move independently of thread config.
+///
+/// Clients can override pieces of this at thread-creation time via
+/// [`ThreadConfigOverride`]; bindings are overridden separately via
+/// [`ThreadBindingsRequest`].
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct ThreadConfig {
-    /// Name of the backend in the server's catalog. Empty string means "use the
-    /// server's default backend." Kept as `default`-able so tasks persisted before
-    /// multi-backend support still deserialize.
-    #[serde(default)]
-    pub backend: String,
     pub model: String,
     pub system_prompt: String,
-    pub mcp_host_url: String,
     pub max_tokens: u32,
     pub max_turns: u32,
     #[serde(default)]
     pub approval_policy: ApprovalPolicy,
-    #[serde(default)]
-    pub sandbox: SandboxSpec,
-    /// Names of shared MCP hosts (from the server's catalog) this task is
-    /// allowed to use. Empty list = no shared hosts; the task only sees its
-    /// own per-task primary (filesystem). The server's `default_task_config`
-    /// fills this with every configured host so fresh tasks default to full
-    /// access; persisted tasks from before this field deserialize as empty,
-    /// which is the safe default (no sudden new tool access).
-    #[serde(default)]
-    pub shared_mcp_hosts: Vec<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
 pub struct ThreadConfigOverride {
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub backend: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub system_prompt: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub mcp_host_url: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_tokens: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_turns: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub approval_policy: Option<ApprovalPolicy>,
+}
+
+/// Concrete resource bindings for a thread. Each field names an entry in
+/// the scheduler's resource registry — `backend` by catalog name, `sandbox`
+/// by `SandboxId` (content-hash of the spec), `mcp_hosts` by `McpHostId`
+/// (the ordered list the thread routes tool calls through, primary first).
+///
+/// `tool_filter`, when present, narrows the visible tool catalog to a
+/// whitelist of names — used by subagent / fork flows that want to expose
+/// less than the full surface their bound MCP hosts advertise. (Reserved;
+/// not yet honored.)
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+pub struct ThreadBindings {
+    /// Backend catalog name (e.g. `"anthropic"`). Empty string means "use the
+    /// server's default backend." Kept as a name rather than a `BackendId`
+    /// so display surfaces (UI labels, logs) don't have to strip the
+    /// `backend-` prefix.
+    #[serde(default)]
+    pub backend: String,
+    /// Bound `SandboxId` (full `sb-…` form) when the thread runs inside a
+    /// sandbox; `None` for bare-metal threads.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sandbox: Option<String>,
+    /// Bound `McpHostId`s, in routing precedence order. The primary
+    /// (per-thread filesystem) host is at index 0; shared hosts follow in
+    /// the order they were declared on the pod.
+    #[serde(default)]
+    pub mcp_hosts: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_filter: Option<Vec<String>>,
+}
+
+/// Client-side overrides for the bindings the pod's `thread_defaults` would
+/// otherwise produce. Each `Some` field replaces the corresponding default;
+/// each `None` inherits. Values are validated against the pod's `[allow]`
+/// table on the server — backends and shared MCP host names must already
+/// appear there, and an inline `sandbox` spec must hash to one in
+/// `[[allow.sandbox]]`.
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+pub struct ThreadBindingsRequest {
+    /// Backend catalog name. Empty → server default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backend: Option<String>,
+    /// Inline sandbox spec. The server hashes it and verifies the resulting
+    /// id matches one of the pod's `[[allow.sandbox]]` entries.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sandbox: Option<SandboxSpec>,
-    /// Per-task override for the shared MCP host allowlist. None = inherit
-    /// from `default_task_config`; `Some(vec)` = use exactly this set (empty
-    /// vec means "deny all shared hosts").
+    /// Catalog names of shared MCP hosts the thread should bind to. `None`
+    /// inherits the pod default; `Some(vec)` replaces exactly (empty vec
+    /// means "no shared hosts beyond the primary").
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub shared_mcp_hosts: Option<Vec<String>>,
+    pub mcp_hosts: Option<Vec<String>>,
 }
 
 /// Pattern-1 approval policy. See `docs/design_permissions.md`.
@@ -270,6 +302,11 @@ pub struct ThreadSnapshot {
     pub pod_id: String,
     pub title: Option<String>,
     pub config: ThreadConfig,
+    /// Resource bindings — backend, sandbox, mcp hosts. Defaults to empty
+    /// for snapshots from before Phase 3d.i (where binding info still lived
+    /// inline on `ThreadConfig`).
+    #[serde(default)]
+    pub bindings: ThreadBindings,
     pub state: ThreadStateLabel,
     pub conversation: Conversation,
     pub total_usage: Usage,
@@ -311,6 +348,11 @@ pub enum ClientToServer {
         initial_message: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         config_override: Option<ThreadConfigOverride>,
+        /// Override resource bindings (backend / sandbox / shared MCP hosts).
+        /// `None` inherits the pod's `thread_defaults` for every binding;
+        /// `Some` replaces just the fields it carries.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        bindings_request: Option<ThreadBindingsRequest>,
     },
     /// Append a follow-up user message to an existing task.
     SendUserMessage {
