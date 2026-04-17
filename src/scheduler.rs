@@ -1060,32 +1060,106 @@ impl Scheduler {
             ClientToServer::CreatePod {
                 correlation_id,
                 pod_id,
-                config,
+                mut config,
             } => {
-                let Some((persister, outbound)) = self.persister_and_outbound(conn_id) else {
+                // Sync work first: validate + register in-memory so a
+                // CreateThread that races behind this can find the pod.
+                // The disk write happens in the background (logged on
+                // failure); the in-memory state is what subsequent
+                // CreateThread / GetPod calls consult.
+                if let Err(e) = crate::persist::validate_pod_id(&pod_id) {
+                    self.router.send_to_client(
+                        conn_id,
+                        ServerToClient::Error {
+                            correlation_id,
+                            thread_id: None,
+                            message: format!("create_pod: {e}"),
+                        },
+                    );
                     return;
-                };
-                let broadcast = self.router.outbound_snapshot();
-                tokio::spawn(async move {
-                    match persister.create_pod(&pod_id, config).await {
-                        Ok(summary) => {
-                            let ev = ServerToClient::PodCreated {
-                                pod: summary,
-                                correlation_id,
-                            };
-                            for tx in broadcast {
-                                let _ = tx.send(ev.clone());
-                            }
-                        }
-                        Err(e) => {
-                            let _ = outbound.send(ServerToClient::Error {
+                }
+                if config.created_at.is_empty() {
+                    config.created_at = chrono::Utc::now().to_rfc3339();
+                }
+                if let Err(e) = crate::pod::validate(&config) {
+                    self.router.send_to_client(
+                        conn_id,
+                        ServerToClient::Error {
+                            correlation_id,
+                            thread_id: None,
+                            message: format!("create_pod: {e}"),
+                        },
+                    );
+                    return;
+                }
+                if self.pods.contains_key(&pod_id) {
+                    self.router.send_to_client(
+                        conn_id,
+                        ServerToClient::Error {
+                            correlation_id,
+                            thread_id: None,
+                            message: format!("create_pod: pod `{pod_id}` already exists"),
+                        },
+                    );
+                    return;
+                }
+                let raw_toml = match crate::pod::to_toml(&config) {
+                    Ok(t) => t,
+                    Err(e) => {
+                        self.router.send_to_client(
+                            conn_id,
+                            ServerToClient::Error {
                                 correlation_id,
                                 thread_id: None,
-                                message: format!("create_pod: {e}"),
-                            });
-                        }
+                                message: format!("create_pod: encode toml: {e}"),
+                            },
+                        );
+                        return;
                     }
-                });
+                };
+                let pod_dir = self
+                    .persister
+                    .as_ref()
+                    .map(|p| p.dir().join(&pod_id))
+                    .unwrap_or_else(|| std::path::PathBuf::from(&pod_id));
+                let pod = Pod::new(
+                    pod_id.clone(),
+                    pod_dir,
+                    config.clone(),
+                    raw_toml,
+                    String::new(),
+                );
+                let summary = whisper_agent_protocol::PodSummary {
+                    pod_id: pod_id.clone(),
+                    name: config.name.clone(),
+                    description: config.description.clone(),
+                    created_at: config.created_at.clone(),
+                    thread_count: 0,
+                    archived: false,
+                };
+                self.pods.insert(pod_id.clone(), pod);
+
+                // Broadcast PodCreated to every connected client.
+                let ev = ServerToClient::PodCreated {
+                    pod: summary,
+                    correlation_id,
+                };
+                for tx in self.router.outbound_snapshot() {
+                    let _ = tx.send(ev.clone());
+                }
+
+                // Disk write runs in the background. Failure logs warn —
+                // the in-memory pod stays usable but won't survive a
+                // restart. (No good story for rollback today; the user
+                // can retry by deleting and recreating.)
+                if let Some(persister) = self.persister.clone() {
+                    let pid = pod_id.clone();
+                    tokio::spawn(async move {
+                        if let Err(e) = persister.create_pod(&pid, config).await {
+                            warn!(pod_id = %pid, error = %e, "create_pod disk write failed");
+                        }
+                    });
+                }
             }
             ClientToServer::UpdatePodConfig {
                 correlation_id,

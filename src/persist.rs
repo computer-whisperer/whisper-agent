@@ -332,7 +332,7 @@ impl Persister {
 /// Reject pod ids containing path separators or other shell-hostile bits.
 /// Pod ids become directory names; we don't want `..` traversal or `/`-rooted
 /// absolute paths sneaking in via the wire.
-fn validate_pod_id(pod_id: &str) -> Result<()> {
+pub fn validate_pod_id(pod_id: &str) -> Result<()> {
     if pod_id.is_empty() {
         return Err(anyhow::anyhow!("pod_id is empty"));
     }
