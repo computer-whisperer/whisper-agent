@@ -32,7 +32,10 @@ use whisper_agent_protocol::{
 };
 
 use crate::audit::AuditLog;
-use crate::io_dispatch::{self, IoCompletion, IoFuture};
+use crate::io_dispatch::{
+    self, IoCompletion, ProvisionCompletion, ProvisionPhase, ProvisionResult, SchedulerCompletion,
+    SchedulerFuture,
+};
 use crate::mcp::{McpSession, ToolAnnotations, ToolDescriptor as McpTool};
 use crate::model::ModelProvider;
 use crate::persist::{LoadedState, Persister};
@@ -127,6 +130,12 @@ pub struct Scheduler {
     /// Tasks modified during the current scheduler-loop iteration. Flushed to the
     /// persister before the next iteration starts.
     dirty: HashSet<String>,
+    /// Thread ids whose primary-MCP provisioning future is currently in
+    /// flight (dispatched but not yet completed). Used to deduplicate
+    /// `ensure_primary_mcp_provisioning` calls across the create_task /
+    /// send_user_message paths so we don't fan out redundant provision
+    /// futures for the same thread.
+    provisioning_in_flight: HashSet<String>,
 }
 
 impl Scheduler {
@@ -204,6 +213,7 @@ impl Scheduler {
             resources,
             next_op_id: 1,
             dirty: HashSet::new(),
+            provisioning_in_flight: HashSet::new(),
         })
     }
 
@@ -246,12 +256,6 @@ impl Scheduler {
         if let Some(snap) = self.resources.snapshot_sandbox(id) {
             self.router
                 .broadcast_resource(ServerToClient::ResourceUpdated { resource: snap });
-        }
-    }
-    fn emit_mcp_host_created(&self, id: &McpHostId) {
-        if let Some(snap) = self.resources.snapshot_mcp_host(id) {
-            self.router
-                .broadcast_resource(ServerToClient::ResourceCreated { resource: snap });
         }
     }
     fn emit_mcp_host_updated(&self, id: &McpHostId) {
@@ -329,23 +333,6 @@ impl Scheduler {
         out
     }
 
-    /// Sessions for every MCP host the thread is bound to, in precedence
-    /// order. Returns `None` when the primary hasn't been provisioned yet
-    /// (mirrors the old `pool_sessions` semantics, which io_dispatch's
-    /// `ListTools` uses to detect "MCP not ready").
-    pub(crate) fn pool_sessions(&self, thread_id: &str) -> Option<Vec<Arc<McpSession>>> {
-        let primary_id = McpHostId::primary_for_task(thread_id);
-        let primary = self.resources.mcp_hosts.get(&primary_id)?;
-        let primary_session = primary.session.clone()?;
-        let mut sessions = vec![primary_session];
-        for host in self.bound_mcp_hosts(thread_id).into_iter().skip(1) {
-            if let Some(s) = host.session.clone() {
-                sessions.push(s);
-            }
-        }
-        Some(sessions)
-    }
-
     /// Resolve which MCP session should receive a tool invocation. Walks
     /// the thread's bound hosts in precedence order and returns the first
     /// host whose tool catalog includes `tool_name`. Falls back to the
@@ -379,6 +366,67 @@ impl Scheduler {
             .iter()
             .filter_map(|raw| self.resources.mcp_hosts.get(&McpHostId(raw.clone())))
             .collect()
+    }
+
+    /// Walk the thread's bindings and return every bound resource id whose
+    /// registry entry isn't yet Ready (or is missing entirely — happens
+    /// post-restart for the per-thread primary MCP). Used by
+    /// `send_user_message` to park the thread in `WaitingOnResources`
+    /// when provisioning is still in flight; backends and shared MCP
+    /// hosts (Ready from startup) drop out naturally.
+    fn pending_resources_for(&self, thread_id: &str) -> Vec<String> {
+        let Some(task) = self.tasks.get(thread_id) else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        if let Some(sb) = &task.bindings.sandbox {
+            let id = SandboxId(sb.clone());
+            match self.resources.sandboxes.get(&id) {
+                Some(e) if e.state.is_ready() => {}
+                _ => out.push(sb.clone()),
+            }
+        }
+        for raw in &task.bindings.mcp_hosts {
+            let id = McpHostId(raw.clone());
+            match self.resources.mcp_hosts.get(&id) {
+                Some(e) if e.state.is_ready() => {}
+                _ => out.push(raw.clone()),
+            }
+        }
+        out
+    }
+
+    /// Ensure a `provision_primary_mcp` future is in flight for this
+    /// thread. Called from `create_task` (always dispatches) and from
+    /// `send_user_message` (covers the post-restart case where the
+    /// loaded thread's registry entry was lost). The
+    /// `provisioning_in_flight` guard prevents double-dispatch when both
+    /// paths run for the same thread within one create+message cycle.
+    fn ensure_primary_mcp_provisioning(
+        &mut self,
+        thread_id: &str,
+        pending_io: &mut FuturesUnordered<SchedulerFuture>,
+    ) {
+        if self.provisioning_in_flight.contains(thread_id) {
+            return;
+        }
+        let primary_id = McpHostId::primary_for_task(thread_id);
+        let needs_dispatch = match self.resources.mcp_hosts.get(&primary_id) {
+            Some(entry) => !entry.state.is_ready(),
+            None => true,
+        };
+        if !needs_dispatch {
+            return;
+        }
+        // Make sure the registry has a Provisioning entry to attach to.
+        // Calling pre_register on an existing Provisioning entry is a
+        // no-op apart from touching last_used.
+        self.resources
+            .pre_register_primary_mcp_host(thread_id, self.default_mcp_host_url.clone());
+        self.emit_mcp_host_updated(&primary_id);
+        self.provisioning_in_flight.insert(thread_id.to_string());
+        let fut = io_dispatch::provision_primary_mcp(self, thread_id.to_string());
+        pending_io.push(fut);
     }
 
     pub fn with_persister(mut self, persister: Persister) -> Self {
@@ -474,7 +522,7 @@ impl Scheduler {
 
     /// Apply an inbox message. Returns the task_ids (usually 0 or 1) whose state may
     /// have advanced and need `step_until_blocked` run.
-    fn apply_input(&mut self, input: SchedulerMsg, pending_io: &mut FuturesUnordered<IoFuture>) {
+    fn apply_input(&mut self, input: SchedulerMsg, pending_io: &mut FuturesUnordered<SchedulerFuture>) {
         match input {
             SchedulerMsg::RegisterClient { conn_id, outbound } => {
                 self.router.register_client(conn_id, outbound);
@@ -492,7 +540,7 @@ impl Scheduler {
         &mut self,
         conn_id: ConnId,
         msg: ClientToServer,
-        pending_io: &mut FuturesUnordered<IoFuture>,
+        pending_io: &mut FuturesUnordered<SchedulerFuture>,
     ) {
         match msg {
             ClientToServer::CreateThread {
@@ -507,10 +555,11 @@ impl Scheduler {
                 pod_id,
                 config_override,
                 bindings_request,
+                pending_io,
             ) {
                 Ok(thread_id) => {
                     self.mark_dirty(&thread_id);
-                    self.send_user_message(&thread_id, initial_message);
+                    self.send_user_message(&thread_id, initial_message, pending_io);
                     self.step_until_blocked(&thread_id, pending_io);
                 }
                 Err(e) => {
@@ -527,7 +576,7 @@ impl Scheduler {
             },
             ClientToServer::SendUserMessage { thread_id, text } => {
                 if self.tasks.contains_key(&thread_id) {
-                    self.send_user_message(&thread_id, text);
+                    self.send_user_message(&thread_id, text, pending_io);
                     self.step_until_blocked(&thread_id, pending_io);
                 } else {
                     self.router.send_to_client(
@@ -897,6 +946,7 @@ impl Scheduler {
         pod_id: Option<String>,
         config_override: Option<ThreadConfigOverride>,
         bindings_request: Option<ThreadBindingsRequest>,
+        pending_io: &mut FuturesUnordered<SchedulerFuture>,
     ) -> Result<String, String> {
         // Resolve which pod this thread lands in. None routes to the
         // server's default pod.
@@ -961,8 +1011,9 @@ impl Scheduler {
 
         // Register this task as a user of its backend and of every shared
         // MCP host it references. The sandbox already counted us via
-        // `pre_register_sandbox`; the per-task primary MCP host entry
-        // doesn't exist until McpConnect succeeds (created lazily there).
+        // `pre_register_sandbox`. The per-task primary MCP host gets a
+        // Provisioning entry below — its session lands when the
+        // provision_primary_mcp future completes.
         let backend_id = BackendId::for_name(&resolved.backend_name);
         self.resources.add_backend_user(&backend_id, &thread_id);
         self.emit_backend_updated(&backend_id);
@@ -972,6 +1023,12 @@ impl Scheduler {
             self.resources.add_mcp_user(&host_id, &thread_id);
             self.emit_mcp_host_updated(&host_id);
         }
+        // Phase 3d.ii: kick off the resource provisioning future eagerly
+        // so the sandbox + primary MCP land in parallel with the user
+        // composing their first message. The thread itself stays in Idle
+        // until submit_user_message; if provisioning is still in flight at
+        // that point, the thread parks in WaitingOnResources.
+        self.ensure_primary_mcp_provisioning(&thread_id, pending_io);
 
         info!(thread_id = %thread_id, pod_id = %pod_id, "task created");
         // Every client gets exactly one ThreadCreated; the requester's copy carries
@@ -1004,8 +1061,18 @@ impl Scheduler {
         Ok(thread_id)
     }
 
-    fn send_user_message(&mut self, thread_id: &str, text: String) {
+    fn send_user_message(
+        &mut self,
+        thread_id: &str,
+        text: String,
+        pending_io: &mut FuturesUnordered<SchedulerFuture>,
+    ) {
         self.mark_dirty(thread_id);
+        // Post-restart: a loaded thread's primary MCP entry may not exist
+        // yet (the in-memory registry doesn't survive process restart).
+        // ensure_primary_mcp_provisioning is a no-op when create_task
+        // already dispatched in this cycle.
+        self.ensure_primary_mcp_provisioning(thread_id, pending_io);
         // Derive title on the first user message.
         let title_new = {
             let task = self.tasks.get_mut(thread_id).expect("task exists");
@@ -1025,17 +1092,15 @@ impl Scheduler {
                 });
         }
 
-        // Phase 3c: "MCP connected" and "tools listed" are now properties
-        // of the per-thread primary McpHost in the registry. The primary
-        // is created when McpConnect succeeds; its `tools` populates when
-        // ListTools succeeds.
-        let primary_id = McpHostId::primary_for_task(thread_id);
-        let primary = self.resources.mcp_hosts.get(&primary_id);
-        let mcp_connected = primary.is_some_and(|e| e.session.is_some());
-        let tools_listed = primary.is_some_and(|e| !e.tools.is_empty());
+        // Phase 3d.ii: walk the thread's bindings against the registry to
+        // figure out which resources aren't Ready yet. Anything not Ready
+        // gets carried in `WaitingOnResources { needed }`; the scheduler
+        // nudges the thread out via `clear_waiting_resource` as each
+        // resource transitions Ready (sandbox or primary MCP).
+        let pending_resources = self.pending_resources_for(thread_id);
         let new_state = {
             let task = self.tasks.get_mut(thread_id).expect("task exists");
-            task.submit_user_message(text, mcp_connected, tools_listed);
+            task.submit_user_message(text, pending_resources);
             task.public_state()
         };
         self.router
@@ -1045,7 +1110,9 @@ impl Scheduler {
             });
     }
 
-    /// Apply one I/O completion to its task and dispatch any resulting events.
+    /// Apply one per-thread I/O completion to its task and dispatch any
+    /// resulting events. Resource-provisioning completions take a
+    /// different path; see [`Self::apply_provision_completion`].
     fn apply_io_completion(&mut self, completion: IoCompletion) {
         let IoCompletion {
             thread_id,
@@ -1055,16 +1122,7 @@ impl Scheduler {
         let mut events = Vec::new();
 
         // Surface any IO-level error to the operator even if no client is subscribed.
-        // The task's own Failed state captures it for the wire, but operator-visible
-        // logs are how we catch misconfigured backends / unreachable endpoints without
-        // round-tripping through the UI.
         match &result {
-            IoResult::McpConnect(Err(e)) => {
-                warn!(%thread_id, op_id, error = %e, "mcp connect failed");
-            }
-            IoResult::ListTools(Err(e)) => {
-                warn!(%thread_id, op_id, error = %e, "list_tools failed");
-            }
             IoResult::ModelCall(Err(e)) => {
                 warn!(%thread_id, op_id, error = %e, "model call failed");
             }
@@ -1077,47 +1135,47 @@ impl Scheduler {
             _ => {}
         }
 
-        // Handle IoResult::McpConnect / ListTools specially because the
-        // session Arcs and routing map are scheduler-owned resources that
-        // get peeled off before the task sees the slim variant.
-        let result = match result {
-            IoResult::McpConnectSuccess {
-                session,
+        // Build per-tool-name annotation map so the task's approval policy can consult it.
+        let annotations = self.annotations_for(&thread_id);
+        if let Some(task) = self.tasks.get_mut(&thread_id) {
+            task.apply_io_result(op_id, result, &annotations, &mut events);
+        } else {
+            warn!(%thread_id, op_id, "io completion for unknown task");
+            return;
+        }
+        self.mark_dirty(&thread_id);
+        self.router.dispatch_events(&thread_id, events);
+        self.teardown_sandbox_if_terminal(&thread_id);
+    }
+
+    /// Apply a resource-provisioning completion. Updates the registry
+    /// (sandbox handle + primary MCP session + tool catalog), broadcasts
+    /// resource events, and nudges every thread parked in
+    /// `WaitingOnResources` whose `needed` set contained one of the now-
+    /// Ready ids. Newly-Ready threads get stepped.
+    fn apply_provision_completion(
+        &mut self,
+        completion: ProvisionCompletion,
+        pending_io: &mut FuturesUnordered<SchedulerFuture>,
+    ) {
+        let ProvisionCompletion { thread_id, result } = completion;
+        self.provisioning_in_flight.remove(&thread_id);
+        let primary_id = McpHostId::primary_for_task(&thread_id);
+        match result {
+            ProvisionResult::PrimaryMcpReady {
+                sandbox_id,
                 sandbox_handle,
+                mcp_url,
+                mcp_session,
+                tools,
             } => {
-                // Phase 3d.i: the sandbox was pre-registered at create_task
-                // and its id lives on `task.bindings.sandbox`. We look the
-                // entry up through bindings, attach the freshly-provisioned
-                // handle (or, on a dedup hit, just observe the existing
-                // entry's url), and register the per-thread primary MCP
-                // host carrying the connected session.
-                let sandbox_id = self
-                    .tasks
-                    .get(&thread_id)
-                    .and_then(|t| t.bindings.sandbox.clone())
-                    .map(SandboxId);
-                let dedup_url = sandbox_id
-                    .as_ref()
-                    .and_then(|id| self.resources.sandboxes.get(id))
-                    .and_then(|e| e.mcp_url.clone());
-                let primary_url = sandbox_handle
-                    .as_ref()
-                    .and_then(|h| h.mcp_url().map(str::to_string))
-                    .or(dedup_url)
-                    .unwrap_or_else(|| self.default_mcp_host_url.clone());
-
-                let primary_id = self.resources.insert_primary_mcp_host(
-                    &thread_id,
-                    primary_url.clone(),
-                    session,
-                );
-                self.emit_mcp_host_created(&primary_id);
-
-                if let (Some(id), Some(handle)) = (sandbox_id.as_ref(), sandbox_handle) {
+                // 1. Sandbox first — attach the handle (or recognize the
+                //    dedup race and tear ours down).
+                if let Some(id) = sandbox_id.as_ref() {
                     let outcome = self.resources.complete_sandbox_provisioning(
                         id,
-                        Some(primary_url),
-                        Some(handle),
+                        Some(mcp_url.clone()),
+                        sandbox_handle,
                     );
                     match outcome {
                         CompleteSandboxOutcome::Completed => {
@@ -1135,20 +1193,17 @@ impl Scheduler {
                             }
                         }
                     }
-                } else if let Some(id) = sandbox_id.as_ref() {
-                    // Dedup hit — no handle came back (dispatcher reused an
-                    // existing Ready entry). Emit update so subscribers see
-                    // the user count.
-                    self.emit_sandbox_updated(id);
                 }
-                IoResult::McpConnect(Ok(()))
-            }
-            IoResult::ListToolsSuccess { tools } => {
-                // Phase 3c: just the primary's tools land here — shared
-                // hosts published their catalogs at startup. Storing in
-                // the registry is enough; the per-thread effective list
-                // is built on demand by `tool_descriptors(thread_id)`.
-                let primary_id = McpHostId::primary_for_task(&thread_id);
+
+                // 2. Primary MCP host — attach the session + tools and flip
+                //    Ready. The pre-registered entry already has the user
+                //    set populated, so we don't re-add it here.
+                let attached =
+                    self.resources
+                        .complete_primary_mcp_host(&primary_id, mcp_url, mcp_session);
+                if !attached {
+                    warn!(%thread_id, "primary mcp host already attached or missing — completion dropped");
+                }
                 let annotations: HashMap<String, ToolAnnotations> = tools
                     .iter()
                     .map(|t| (t.name.clone(), t.annotations.clone()))
@@ -1156,22 +1211,58 @@ impl Scheduler {
                 self.resources
                     .populate_mcp_tools(&primary_id, tools, annotations);
                 self.emit_mcp_host_updated(&primary_id);
-                IoResult::ListTools(Ok(()))
-            }
-            other => other,
-        };
 
-        // Build per-tool-name annotation map so the task's approval policy can consult it.
-        let annotations = self.annotations_for(&thread_id);
-        if let Some(task) = self.tasks.get_mut(&thread_id) {
-            task.apply_io_result(op_id, result, &annotations, &mut events);
-        } else {
-            warn!(%thread_id, op_id, "io completion for unknown task");
-            return;
+                // 3. Nudge any threads that were waiting on these resources.
+                //    Walk both ids — sandbox can have multiple waiters via
+                //    dedup; primary MCP only has its single owner thread.
+                let mut newly_ready: Vec<String> = Vec::new();
+                let resource_ids: Vec<String> = sandbox_id
+                    .iter()
+                    .map(|id| id.0.clone())
+                    .chain(std::iter::once(primary_id.0.clone()))
+                    .collect();
+                for id in &resource_ids {
+                    for task in self.tasks.values_mut() {
+                        if task.clear_waiting_resource(id) {
+                            newly_ready.push(task.id.clone());
+                        }
+                    }
+                }
+                for id in newly_ready {
+                    self.mark_dirty(&id);
+                    self.step_until_blocked(&id, pending_io);
+                }
+            }
+            ProvisionResult::PrimaryMcpFailed {
+                phase,
+                message,
+                sandbox_id,
+            } => {
+                warn!(%thread_id, phase = phase.as_str(), error = %message, "primary mcp provisioning failed");
+                // Mark registry entries Errored so future threads observe
+                // the failure and don't endlessly retry under the same id.
+                self.resources
+                    .mark_mcp_errored(&primary_id, message.clone());
+                self.emit_mcp_host_updated(&primary_id);
+                if matches!(phase, ProvisionPhase::Sandbox)
+                    && let Some(sid) = sandbox_id.as_ref()
+                {
+                    self.resources.mark_sandbox_errored(sid, message.clone());
+                    self.emit_sandbox_updated(sid);
+                }
+                // Fail the requesting thread.
+                if let Some(task) = self.tasks.get_mut(&thread_id) {
+                    task.fail(phase.as_str(), message);
+                    let mut events = Vec::new();
+                    events.push(crate::thread::ThreadEvent::Error {
+                        message: format!("{}: {}", phase.as_str(), task.failure_detail().unwrap_or_default()),
+                    });
+                    self.mark_dirty(&thread_id);
+                    self.router.dispatch_events(&thread_id, events);
+                    self.teardown_sandbox_if_terminal(&thread_id);
+                }
+            }
         }
-        self.mark_dirty(&thread_id);
-        self.router.dispatch_events(&thread_id, events);
-        self.teardown_sandbox_if_terminal(&thread_id);
     }
 
     fn annotations_for(&self, thread_id: &str) -> HashMap<String, ToolAnnotations> {
@@ -1189,7 +1280,7 @@ impl Scheduler {
 
     /// Advance `thread_id`'s state machine until it pauses, pushing new I/O to
     /// `pending_io` as requested.
-    fn step_until_blocked(&mut self, thread_id: &str, pending_io: &mut FuturesUnordered<IoFuture>) {
+    fn step_until_blocked(&mut self, thread_id: &str, pending_io: &mut FuturesUnordered<SchedulerFuture>) {
         self.mark_dirty(thread_id);
         loop {
             let mut events = Vec::new();
@@ -1496,7 +1587,7 @@ fn resolve_bindings_choice(
 // ---------- Run loop ----------
 
 pub async fn run(mut scheduler: Scheduler, mut inbox: mpsc::UnboundedReceiver<SchedulerMsg>) {
-    let mut pending_io: FuturesUnordered<IoFuture> = FuturesUnordered::new();
+    let mut pending_io: FuturesUnordered<SchedulerFuture> = FuturesUnordered::new();
 
     info!("scheduler starting");
     loop {
@@ -1513,9 +1604,16 @@ pub async fn run(mut scheduler: Scheduler, mut inbox: mpsc::UnboundedReceiver<Sc
             }
             maybe_completion = next_completion(&mut pending_io), if !pending_io.is_empty() => {
                 if let Some(completion) = maybe_completion {
-                    let thread_id = completion.thread_id.clone();
-                    scheduler.apply_io_completion(completion);
-                    scheduler.step_until_blocked(&thread_id, &mut pending_io);
+                    match completion {
+                        SchedulerCompletion::Io(io) => {
+                            let thread_id = io.thread_id.clone();
+                            scheduler.apply_io_completion(io);
+                            scheduler.step_until_blocked(&thread_id, &mut pending_io);
+                        }
+                        SchedulerCompletion::Provision(prov) => {
+                            scheduler.apply_provision_completion(prov, &mut pending_io);
+                        }
+                    }
                 }
             }
         }
@@ -1531,6 +1629,8 @@ pub async fn run(mut scheduler: Scheduler, mut inbox: mpsc::UnboundedReceiver<Sc
     .await;
 }
 
-async fn next_completion(pending: &mut FuturesUnordered<IoFuture>) -> Option<IoCompletion> {
+async fn next_completion(
+    pending: &mut FuturesUnordered<SchedulerFuture>,
+) -> Option<SchedulerCompletion> {
     pending.next().await
 }

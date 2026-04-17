@@ -471,10 +471,7 @@ async fn load_one(path: &Path, pod_id: &str) -> Result<Thread> {
 fn is_in_flight(state: &ThreadInternalState) -> bool {
     matches!(
         state,
-        ThreadInternalState::NeedsMcpConnect
-            | ThreadInternalState::AwaitingMcpConnect { .. }
-            | ThreadInternalState::NeedsListTools
-            | ThreadInternalState::AwaitingListTools { .. }
+        ThreadInternalState::WaitingOnResources { .. }
             | ThreadInternalState::NeedsModelCall
             | ThreadInternalState::AwaitingModel { .. }
             | ThreadInternalState::AwaitingTools { .. }

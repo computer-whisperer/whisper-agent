@@ -72,15 +72,12 @@ pub enum ThreadInternalState {
     Idle,
     /// Previous loop ended on `end_turn`; accepts follow-up user messages.
     Completed,
-    /// A user message has been appended and we must connect MCP before calling the model.
-    NeedsMcpConnect,
-    AwaitingMcpConnect {
-        op_id: OpId,
-    },
-    /// MCP connected; need to list tools before issuing any model call.
-    NeedsListTools,
-    AwaitingListTools {
-        op_id: OpId,
+    /// A user message has been appended but at least one bound resource
+    /// (sandbox, primary MCP host) isn't Ready yet. The scheduler watches
+    /// resource transitions and clears ids out of `needed`; when the set
+    /// empties, the thread moves to `NeedsModelCall`.
+    WaitingOnResources {
+        needed: Vec<String>,
     },
     /// Ready to dispatch a model call. The conversation already contains the latest
     /// user or tool_result message.
@@ -177,14 +174,13 @@ pub struct ApprovalRecord {
 }
 
 /// Request for an I/O operation to be dispatched by the scheduler.
+///
+/// Phase 3d.ii: only the per-thread, state-machine-driven ops live here.
+/// Resource provisioning (sandbox + primary MCP host) is dispatched
+/// separately by the scheduler at thread-creation time and routed through
+/// [`crate::io_dispatch::SchedulerCompletion::Provision`].
 #[derive(Debug)]
 pub enum IoRequest {
-    McpConnect {
-        op_id: OpId,
-    },
-    ListTools {
-        op_id: OpId,
-    },
     ModelCall {
         op_id: OpId,
     },
@@ -196,23 +192,10 @@ pub enum IoRequest {
     },
 }
 
-/// Successful result of an I/O op. Errors are carried in-band so apply_io_result can
-/// transition the task to Failed with the right phase tag.
-///
-/// The `*Success` variants carry scheduler-owned resources (MCP session, tool list)
-/// that get peeled off in [`crate::scheduler`] before the result reaches the task
-/// state machine; the task itself only sees the slim `McpConnect` / `ListTools`
-/// boolean variants.
+/// Successful result of an I/O op. Errors are carried in-band so
+/// `apply_io_result` can transition the task to Failed with the right
+/// phase tag.
 pub enum IoResult {
-    McpConnectSuccess {
-        session: std::sync::Arc<crate::mcp::McpSession>,
-        sandbox_handle: Option<Box<dyn crate::sandbox::SandboxHandle>>,
-    },
-    McpConnect(Result<(), String>),
-    ListToolsSuccess {
-        tools: Vec<crate::mcp::ToolDescriptor>,
-    },
-    ListTools(Result<(), String>),
     ModelCall(Result<ModelResponse, String>),
     ToolCall {
         tool_use_id: String,
@@ -334,10 +317,7 @@ impl Thread {
             ThreadInternalState::Idle => ThreadStateLabel::Idle,
             ThreadInternalState::Completed => ThreadStateLabel::Completed,
             ThreadInternalState::AwaitingApproval { .. } => ThreadStateLabel::AwaitingApproval,
-            ThreadInternalState::NeedsMcpConnect
-            | ThreadInternalState::AwaitingMcpConnect { .. }
-            | ThreadInternalState::NeedsListTools
-            | ThreadInternalState::AwaitingListTools { .. }
+            ThreadInternalState::WaitingOnResources { .. }
             | ThreadInternalState::NeedsModelCall
             | ThreadInternalState::AwaitingModel { .. }
             | ThreadInternalState::AwaitingTools { .. } => ThreadStateLabel::Working,
@@ -385,19 +365,43 @@ impl Thread {
         }
     }
 
-    /// Apply a user-submitted message. Appends to the conversation and starts the
-    /// loop (or re-starts after a completed/failed cycle).
-    pub fn submit_user_message(&mut self, text: String, mcp_connected: bool, tools_listed: bool) {
+    /// Apply a user-submitted message. Appends to the conversation and starts
+    /// the loop (or re-starts after a completed/failed cycle).
+    ///
+    /// `pending_resources` is the subset of `bindings.*` ids the scheduler
+    /// hasn't observed transition to Ready yet — empty means "go straight
+    /// to NeedsModelCall." When non-empty the thread parks in
+    /// `WaitingOnResources` and the scheduler nudges it via
+    /// [`Self::clear_waiting_resource`] as each id flips Ready.
+    pub fn submit_user_message(&mut self, text: String, pending_resources: Vec<String>) {
         self.conversation.push(Message::user_text(text));
         self.turns_in_cycle = 0;
-        self.internal = if !mcp_connected {
-            ThreadInternalState::NeedsMcpConnect
-        } else if !tools_listed {
-            ThreadInternalState::NeedsListTools
-        } else {
+        self.internal = if pending_resources.is_empty() {
             ThreadInternalState::NeedsModelCall
+        } else {
+            ThreadInternalState::WaitingOnResources {
+                needed: pending_resources,
+            }
         };
         self.touch();
+    }
+
+    /// Drop a now-Ready resource id from the `WaitingOnResources` set.
+    /// Returns whether the thread is now ready to step (its `needed` set
+    /// emptied as a result). No-op for any state other than
+    /// `WaitingOnResources`.
+    pub fn clear_waiting_resource(&mut self, resource_id: &str) -> bool {
+        let ThreadInternalState::WaitingOnResources { needed } = &mut self.internal else {
+            return false;
+        };
+        needed.retain(|id| id != resource_id);
+        if needed.is_empty() {
+            self.internal = ThreadInternalState::NeedsModelCall;
+            self.touch();
+            true
+        } else {
+            false
+        }
     }
 
     pub fn cancel(&mut self) {
@@ -462,18 +466,6 @@ impl Thread {
                 self.internal = current;
                 StepOutcome::Paused
             }
-            ThreadInternalState::NeedsMcpConnect => {
-                let op_id = next_id(next_op_id);
-                self.internal = ThreadInternalState::AwaitingMcpConnect { op_id };
-                self.touch();
-                StepOutcome::DispatchIo(IoRequest::McpConnect { op_id })
-            }
-            ThreadInternalState::NeedsListTools => {
-                let op_id = next_id(next_op_id);
-                self.internal = ThreadInternalState::AwaitingListTools { op_id };
-                self.touch();
-                StepOutcome::DispatchIo(IoRequest::ListTools { op_id })
-            }
             ThreadInternalState::NeedsModelCall => {
                 if self.turns_in_cycle >= self.config.max_turns {
                     tracing::warn!(max_turns = self.config.max_turns, thread_id = %self.id, "max_turns reached");
@@ -494,11 +486,11 @@ impl Thread {
                 self.touch();
                 StepOutcome::DispatchIo(IoRequest::ModelCall { op_id })
             }
-            ThreadInternalState::AwaitingModel { .. }
-            | ThreadInternalState::AwaitingMcpConnect { .. }
-            | ThreadInternalState::AwaitingListTools { .. }
+            ThreadInternalState::WaitingOnResources { .. }
+            | ThreadInternalState::AwaitingModel { .. }
             | ThreadInternalState::AwaitingApproval { .. } => {
-                // Not stepping these — waiting on I/O or user decision.
+                // Not stepping these — waiting on resource provisioning,
+                // a model response, or a user decision.
                 self.internal = current;
                 StepOutcome::Paused
             }
@@ -586,34 +578,6 @@ impl Thread {
         }
 
         match (&self.internal, result) {
-            (
-                ThreadInternalState::AwaitingMcpConnect { op_id: expected },
-                IoResult::McpConnect(res),
-            ) if *expected == op_id => match res {
-                Ok(()) => {
-                    self.internal = ThreadInternalState::NeedsListTools;
-                }
-                Err(msg) => {
-                    events.push(ThreadEvent::Error {
-                        message: format!("mcp connect failed: {msg}"),
-                    });
-                    self.fail("mcp_connect", msg);
-                }
-            },
-            (
-                ThreadInternalState::AwaitingListTools { op_id: expected },
-                IoResult::ListTools(res),
-            ) if *expected == op_id => match res {
-                Ok(()) => {
-                    self.internal = ThreadInternalState::NeedsModelCall;
-                }
-                Err(msg) => {
-                    events.push(ThreadEvent::Error {
-                        message: format!("list_tools failed: {msg}"),
-                    });
-                    self.fail("list_tools", msg);
-                }
-            },
             (
                 ThreadInternalState::AwaitingModel {
                     op_id: expected, ..

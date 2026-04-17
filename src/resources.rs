@@ -357,29 +357,39 @@ impl ResourceRegistry {
         id
     }
 
-    /// Insert a Ready per-task primary MCP host entry. The session must already
-    /// be connected; for primaries the registry never observes a Provisioning
-    /// state in Phase 1a (that lives in the task state machine until Phase 3
-    /// moves it here).
-    pub fn insert_primary_mcp_host(
+    /// Eagerly register the per-thread primary MCP host as `Provisioning`
+    /// at thread-creation time, so the registry is the source of truth for
+    /// "is this thread's MCP ready" from create onward. The
+    /// `fallback_url` is the URL the host would connect to if its sandbox
+    /// doesn't advertise its own — replaced when the sandbox provision
+    /// completes and the actual session connects.
+    ///
+    /// Idempotent on id: re-registering for the same thread just touches
+    /// `last_used` and adds the user (which was already there) — no
+    /// state regression.
+    pub fn pre_register_primary_mcp_host(
         &mut self,
         thread_id: &str,
-        url: String,
-        session: Arc<McpSession>,
+        fallback_url: String,
     ) -> McpHostId {
         let id = McpHostId::primary_for_task(thread_id);
         let now = Utc::now();
+        if let Some(entry) = self.mcp_hosts.get_mut(&id) {
+            entry.users.insert(thread_id.to_string());
+            entry.last_used = now;
+            return id;
+        }
         self.mcp_hosts.insert(
             id.clone(),
             McpHostEntry {
                 id: id.clone(),
                 spec: McpHostSpec {
-                    url,
+                    url: fallback_url,
                     label: format!("primary:{thread_id}"),
                     per_task: true,
                 },
-                state: ResourceState::Ready,
-                session: Some(session),
+                state: ResourceState::Provisioning { op_id: 0 },
+                session: None,
                 tools: Vec::new(),
                 annotations: HashMap::new(),
                 users: BTreeSet::from([thread_id.to_string()]),
@@ -389,6 +399,47 @@ impl ResourceRegistry {
             },
         );
         id
+    }
+
+    /// Attach a connected `McpSession` to a previously pre-registered
+    /// primary entry, transitioning it to Ready. The url is updated too —
+    /// the actual sandbox-advertised URL may differ from the fallback we
+    /// pre-registered with. Returns false if the entry is missing or
+    /// already Ready (caller can drop the session and avoid double-attach).
+    pub fn complete_primary_mcp_host(
+        &mut self,
+        id: &McpHostId,
+        url: String,
+        session: Arc<McpSession>,
+    ) -> bool {
+        let Some(entry) = self.mcp_hosts.get_mut(id) else {
+            return false;
+        };
+        if entry.state.is_ready() {
+            return false;
+        }
+        entry.spec.url = url;
+        entry.session = Some(session);
+        entry.state = ResourceState::Ready;
+        entry.last_used = Utc::now();
+        true
+    }
+
+    /// Mark a primary MCP host as Errored — provisioning failed somewhere
+    /// in the chain (sandbox, MCP connect, or initial tools/list).
+    pub fn mark_mcp_errored(&mut self, id: &McpHostId, message: String) {
+        if let Some(entry) = self.mcp_hosts.get_mut(id) {
+            entry.state = ResourceState::Errored { message };
+            entry.last_used = Utc::now();
+        }
+    }
+
+    /// Mark a sandbox as Errored.
+    pub fn mark_sandbox_errored(&mut self, id: &SandboxId, message: String) {
+        if let Some(entry) = self.sandboxes.get_mut(id) {
+            entry.state = ResourceState::Errored { message };
+            entry.last_used = Utc::now();
+        }
     }
 
     /// Eagerly register a sandbox spec at thread-creation time, before any

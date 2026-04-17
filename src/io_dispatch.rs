@@ -1,14 +1,21 @@
 //! I/O future construction for the scheduler.
 //!
-//! Translates a [`task::IoRequest`] into a `Future<Output = IoCompletion>` that the
-//! scheduler can drop into its `FuturesUnordered`. The dispatcher reads scheduler-
-//! owned state (sandbox provider, backend catalog, MCP session pools) through the
-//! narrow `pub(crate)` accessors on [`Scheduler`]; it does not mutate.
+//! Two flavors of completion ride the same `FuturesUnordered`:
 //!
-//! Per-IO-type knowledge (how to provision a sandbox, how to merge tool lists across
-//! sessions, how to assemble a model request) lives here so adding a new
-//! [`IoRequest`] variant only touches this module plus the task state machine — not
-//! the scheduler's run loop or event-routing layer.
+//! - [`SchedulerCompletion::Io`] — per-thread state-machine ops (model
+//!   call, tool call). Built from a [`task::IoRequest`] the thread itself
+//!   requested via `step()`. Routed back through `Thread::apply_io_result`.
+//! - [`SchedulerCompletion::Provision`] — per-thread resource provisioning
+//!   (sandbox + primary MCP host + initial `tools/list`). Dispatched
+//!   eagerly by the scheduler at thread-creation time, *not* at the
+//!   thread's request — the resource registry owns this lifecycle now.
+//!   Routed via `Scheduler::apply_provision_completion` which updates the
+//!   registry and nudges any threads parked in `WaitingOnResources`.
+//!
+//! Per-IO-type knowledge (how to provision a sandbox, how to assemble a
+//! model request) lives here so adding a new variant only touches this
+//! module plus the consumer (thread state machine for `Io`, scheduler
+//! resource handling for `Provision`).
 
 use std::future::Future;
 use std::pin::Pin;
@@ -19,23 +26,91 @@ use tracing::debug;
 
 use crate::mcp::{McpSession, ToolDescriptor as McpTool};
 use crate::model::{CacheBreakpoint, ModelRequest, ToolSpec, default_cache_policy};
+use crate::resources::SandboxId;
+use crate::sandbox::SandboxHandle;
 use crate::scheduler::Scheduler;
 use crate::thread::{IoRequest, IoResult, OpId};
 
-/// Completion message delivered by every I/O future the scheduler dispatches.
+/// Completion message delivered by every per-thread I/O future the
+/// scheduler dispatches via `step_until_blocked`.
 pub(crate) struct IoCompletion {
     pub(crate) thread_id: String,
     pub(crate) op_id: OpId,
     pub(crate) result: IoResult,
 }
 
-pub(crate) type IoFuture = Pin<Box<dyn Future<Output = IoCompletion> + Send>>;
+/// Completion message delivered by every resource provisioning future.
+/// Carries the requesting thread (so the scheduler knows whose primary
+/// MCP entry to attach the session to) plus the resource-side payload.
+pub(crate) struct ProvisionCompletion {
+    pub(crate) thread_id: String,
+    pub(crate) result: ProvisionResult,
+}
 
-/// Build a future that executes one I/O op and yields an [`IoCompletion`].
-pub(crate) fn build_io_future(scheduler: &Scheduler, thread_id: String, req: IoRequest) -> IoFuture {
+pub(crate) enum ProvisionResult {
+    /// Sandbox + MCP connect + initial `tools/list` all completed. The
+    /// scheduler attaches everything to the registry: `sandbox_handle` to
+    /// the sandbox entry (or drops it if dedup already wrote one), and
+    /// `mcp_session` + `tools` to the per-thread primary MCP entry.
+    PrimaryMcpReady {
+        /// Bound sandbox id, when one was bound. None for threads with no
+        /// sandbox (`SandboxSpec::None` still pre-registers a sb-… entry,
+        /// so this is None only if the binding itself was None).
+        sandbox_id: Option<SandboxId>,
+        /// Provisioned sandbox handle. None on dedup hit (someone else
+        /// completed the sandbox before us) or when the spec produces no
+        /// runtime artifact (e.g. `SandboxSpec::None`).
+        sandbox_handle: Option<Box<dyn SandboxHandle>>,
+        mcp_url: String,
+        mcp_session: Arc<McpSession>,
+        tools: Vec<crate::mcp::ToolDescriptor>,
+    },
+    /// Provisioning failed somewhere in the chain (sandbox, MCP connect,
+    /// or initial `tools/list`). The carried `phase` tells the scheduler
+    /// which Errored state to mark on the affected registry entries.
+    PrimaryMcpFailed {
+        phase: ProvisionPhase,
+        message: String,
+        sandbox_id: Option<SandboxId>,
+    },
+}
+
+/// Which phase of `provision_primary_mcp` failed — drives where the
+/// scheduler marks Errored.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum ProvisionPhase {
+    Sandbox,
+    McpConnect,
+    ListTools,
+}
+
+impl ProvisionPhase {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            ProvisionPhase::Sandbox => "sandbox",
+            ProvisionPhase::McpConnect => "mcp_connect",
+            ProvisionPhase::ListTools => "list_tools",
+        }
+    }
+}
+
+/// Unified completion type the scheduler's `FuturesUnordered` carries.
+pub(crate) enum SchedulerCompletion {
+    Io(IoCompletion),
+    Provision(ProvisionCompletion),
+}
+
+pub(crate) type SchedulerFuture =
+    Pin<Box<dyn Future<Output = SchedulerCompletion> + Send>>;
+
+/// Build a future that executes one per-thread I/O op and yields a
+/// [`SchedulerCompletion::Io`].
+pub(crate) fn build_io_future(
+    scheduler: &Scheduler,
+    thread_id: String,
+    req: IoRequest,
+) -> SchedulerFuture {
     match req {
-        IoRequest::McpConnect { op_id } => mcp_connect(scheduler, thread_id, op_id),
-        IoRequest::ListTools { op_id } => list_tools(scheduler, thread_id, op_id),
         IoRequest::ModelCall { op_id } => model_call(scheduler, thread_id, op_id),
         IoRequest::ToolCall {
             op_id,
@@ -46,108 +121,125 @@ pub(crate) fn build_io_future(scheduler: &Scheduler, thread_id: String, req: IoR
     }
 }
 
-fn mcp_connect(scheduler: &Scheduler, thread_id: String, op_id: OpId) -> IoFuture {
-    // Phase 3d.i: the sandbox spec lives on the registry entry that
-    // `pre_register_sandbox` inserted at create_task time. Read it back via
-    // `bindings.sandbox`; if the entry is already Ready (another thread
-    // with the matching spec finished provisioning before we got here),
-    // skip provision and reuse the cached URL.
+/// Build a future that provisions a thread's primary MCP host (sandbox +
+/// MCP connect + initial `tools/list`) and yields a
+/// [`SchedulerCompletion::Provision`]. Called by the scheduler at
+/// thread-creation time, not from the thread's state machine.
+pub(crate) fn provision_primary_mcp(
+    scheduler: &Scheduler,
+    thread_id: String,
+) -> SchedulerFuture {
     let fallback_url = scheduler.default_mcp_url().to_string();
     let provider = scheduler.sandbox_provider().clone();
-    let action = match scheduler.sandbox_for_thread(&thread_id) {
+
+    // Snapshot the sandbox decision while we have the sync borrow. If the
+    // entry is already Ready (a sibling thread provisioned the same spec
+    // before we got here), skip provision and reuse the cached URL.
+    let sandbox_action = match scheduler.sandbox_for_thread(&thread_id) {
         Some(e) if e.state.is_ready() => SandboxAction::Skip {
             mcp_url: e.mcp_url.clone().unwrap_or_else(|| fallback_url.clone()),
+            sandbox_id: Some(e.id.clone()),
         },
         Some(e) => SandboxAction::Provision {
             spec: e.spec.clone(),
+            sandbox_id: e.id.clone(),
         },
         None => SandboxAction::Skip {
             mcp_url: fallback_url.clone(),
+            sandbox_id: None,
         },
     };
 
     Box::pin(async move {
-        let (mcp_url, sandbox_handle) = match action {
-            SandboxAction::Skip { mcp_url } => (mcp_url, None),
-            SandboxAction::Provision { spec } => {
+        // --- Phase 1: sandbox ---
+        let (mcp_url, sandbox_handle, sandbox_id) = match sandbox_action {
+            SandboxAction::Skip {
+                mcp_url,
+                sandbox_id,
+            } => (mcp_url, None, sandbox_id),
+            SandboxAction::Provision { spec, sandbox_id } => {
                 match provider.provision(&thread_id, &spec).await {
                     Ok(handle) => {
                         let url = handle
                             .mcp_url()
                             .map(|u| u.to_string())
-                            .unwrap_or(fallback_url);
-                        (url, Some(handle))
+                            .unwrap_or_else(|| fallback_url.clone());
+                        (url, Some(handle), Some(sandbox_id))
                     }
                     Err(e) => {
-                        return IoCompletion {
+                        return SchedulerCompletion::Provision(ProvisionCompletion {
                             thread_id,
-                            op_id,
-                            result: IoResult::McpConnect(Err(format!(
-                                "sandbox provision failed: {e}"
-                            ))),
-                        };
+                            result: ProvisionResult::PrimaryMcpFailed {
+                                phase: ProvisionPhase::Sandbox,
+                                message: format!("sandbox provision failed: {e}"),
+                                sandbox_id: Some(sandbox_id),
+                            },
+                        });
                     }
                 }
             }
         };
 
-        match McpSession::connect(&mcp_url).await {
-            Ok(s) => IoCompletion {
-                thread_id,
-                op_id,
-                result: IoResult::McpConnectSuccess {
-                    session: Arc::new(s),
-                    sandbox_handle,
-                },
+        // --- Phase 2: MCP connect ---
+        let session = match McpSession::connect(&mcp_url).await {
+            Ok(s) => Arc::new(s),
+            Err(e) => {
+                return SchedulerCompletion::Provision(ProvisionCompletion {
+                    thread_id,
+                    result: ProvisionResult::PrimaryMcpFailed {
+                        phase: ProvisionPhase::McpConnect,
+                        message: format!("mcp connect failed: {e}"),
+                        sandbox_id,
+                    },
+                });
+            }
+        };
+
+        // --- Phase 3: initial tools/list ---
+        let tools = match session.list_tools().await {
+            Ok(t) => t,
+            Err(e) => {
+                return SchedulerCompletion::Provision(ProvisionCompletion {
+                    thread_id,
+                    result: ProvisionResult::PrimaryMcpFailed {
+                        phase: ProvisionPhase::ListTools,
+                        message: format!("list_tools failed: {e}"),
+                        sandbox_id,
+                    },
+                });
+            }
+        };
+
+        SchedulerCompletion::Provision(ProvisionCompletion {
+            thread_id,
+            result: ProvisionResult::PrimaryMcpReady {
+                sandbox_id,
+                sandbox_handle,
+                mcp_url,
+                mcp_session: session,
+                tools,
             },
-            Err(e) => IoCompletion {
-                thread_id,
-                op_id,
-                result: IoResult::McpConnect(Err(e.to_string())),
-            },
-        }
+        })
     })
 }
 
 /// Decision the dispatcher made about the bound sandbox before crossing
-/// into the async block. Computed against the registry while we still hold
-/// the synchronous borrow; the future itself only needs the resolved
-/// pieces.
+/// into the async block.
 enum SandboxAction {
     /// Sandbox is already Ready (or no sandbox is bound) — connect MCP at
     /// `mcp_url` directly, no provision call.
-    Skip { mcp_url: String },
+    Skip {
+        mcp_url: String,
+        sandbox_id: Option<SandboxId>,
+    },
     /// Sandbox needs provisioning; call into the provider with this spec.
     Provision {
         spec: whisper_agent_protocol::SandboxSpec,
+        sandbox_id: SandboxId,
     },
 }
 
-fn list_tools(scheduler: &Scheduler, thread_id: String, op_id: OpId) -> IoFuture {
-    // Phase 3c: only the primary needs a per-thread `tools/list` — shared
-    // hosts published their catalogs at startup. The accessor returns
-    // sessions in pool order (primary first); we just need the head.
-    let sessions = scheduler
-        .pool_sessions(&thread_id)
-        .expect("primary MCP host present before ListTools");
-    let primary = sessions.into_iter().next().expect("primary present");
-    Box::pin(async move {
-        match primary.list_tools().await {
-            Ok(tools) => IoCompletion {
-                thread_id,
-                op_id,
-                result: IoResult::ListToolsSuccess { tools },
-            },
-            Err(e) => IoCompletion {
-                thread_id,
-                op_id,
-                result: IoResult::ListTools(Err(e.to_string())),
-            },
-        }
-    })
-}
-
-fn model_call(scheduler: &Scheduler, thread_id: String, op_id: OpId) -> IoFuture {
+fn model_call(scheduler: &Scheduler, thread_id: String, op_id: OpId) -> SchedulerFuture {
     let (owned_req, model_name, backend_name) = build_model_request(scheduler, &thread_id);
     let provider = match scheduler.backend(&backend_name) {
         Some(entry) => entry.provider.clone(),
@@ -156,11 +248,11 @@ fn model_call(scheduler: &Scheduler, thread_id: String, op_id: OpId) -> IoFuture
             // task transitions to Failed via the existing path.
             let msg = format!("unknown backend `{backend_name}`");
             return Box::pin(async move {
-                IoCompletion {
+                SchedulerCompletion::Io(IoCompletion {
                     thread_id,
                     op_id,
                     result: IoResult::ModelCall(Err(msg)),
-                }
+                })
             });
         }
     };
@@ -174,18 +266,15 @@ fn model_call(scheduler: &Scheduler, thread_id: String, op_id: OpId) -> IoFuture
             messages: &owned_req.messages,
             cache_breakpoints: &owned_req.cache_breakpoints,
         };
-        match provider.create_message(&req).await {
-            Ok(resp) => IoCompletion {
-                thread_id,
-                op_id,
-                result: IoResult::ModelCall(Ok(resp)),
-            },
-            Err(e) => IoCompletion {
-                thread_id,
-                op_id,
-                result: IoResult::ModelCall(Err(e.to_string())),
-            },
-        }
+        let result = match provider.create_message(&req).await {
+            Ok(resp) => IoResult::ModelCall(Ok(resp)),
+            Err(e) => IoResult::ModelCall(Err(e.to_string())),
+        };
+        SchedulerCompletion::Io(IoCompletion {
+            thread_id,
+            op_id,
+            result,
+        })
     })
 }
 
@@ -196,10 +285,10 @@ fn tool_call(
     tool_use_id: String,
     name: String,
     input: serde_json::Value,
-) -> IoFuture {
+) -> SchedulerFuture {
     // Route to whichever pool session contributed this tool. Falls back to the
     // primary if routing wasn't filled in (shouldn't happen because ToolCall
-    // always follows a successful ListTools, but we'd rather try than panic).
+    // always follows a Ready primary, but we'd rather try than panic).
     let mcp = scheduler
         .route_tool(&thread_id, &name)
         .expect("mcp pool present before ToolCall");
@@ -219,14 +308,14 @@ fn tool_call(
             }
             Err(e) => Err(e.to_string()),
         };
-        IoCompletion {
+        SchedulerCompletion::Io(IoCompletion {
             thread_id,
             op_id,
             result: IoResult::ToolCall {
                 tool_use_id,
                 result,
             },
-        }
+        })
     })
 }
 
