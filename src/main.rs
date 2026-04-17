@@ -75,6 +75,29 @@ enum Command {
     /// One-shot CLI: drive a single task through the scheduler against a
     /// hard-coded prompt and exit.
     Run(RunArgs),
+    /// Introspect the resolved config (secrets export, path discovery, ...).
+    Config(ConfigCmd),
+}
+
+#[derive(Parser, Debug)]
+struct ConfigCmd {
+    #[command(subcommand)]
+    action: ConfigAction,
+}
+
+#[derive(Subcommand, Debug)]
+enum ConfigAction {
+    /// Emit `export KEY='VALUE'` lines for every entry in the [secrets] table.
+    /// Intended for shell scripts that launch sibling daemons:
+    ///   `eval "$(whisper-agent config env)"`
+    Env(ConfigEnvArgs),
+}
+
+#[derive(Parser, Debug)]
+struct ConfigEnvArgs {
+    /// Override the config path. Same precedence as `serve --config`.
+    #[arg(long)]
+    config: Option<PathBuf>,
 }
 
 #[derive(Parser, Debug)]
@@ -284,7 +307,40 @@ async fn main() -> Result<()> {
     match cli.command {
         Command::Serve(args) => run_serve(args).await,
         Command::Run(args) => run_one_shot(args).await,
+        Command::Config(cmd) => run_config(cmd).await,
     }
+}
+
+async fn run_config(cmd: ConfigCmd) -> Result<()> {
+    match cmd.action {
+        ConfigAction::Env(args) => run_config_env(args).await,
+    }
+}
+
+async fn run_config_env(args: ConfigEnvArgs) -> Result<()> {
+    let path = resolve_config_path(args.config)?
+        .ok_or_else(|| anyhow!("no config file found (searched --config, XDG, ~/.config, cwd)"))?;
+    let cfg = Config::load(&path).await?;
+    for (key, value) in &cfg.secrets {
+        println!("export {}={}", key, shell_single_quote(value));
+    }
+    Ok(())
+}
+
+/// Wrap `s` in single quotes for safe shell eval, escaping any embedded
+/// single quotes via the standard `'\''` idiom.
+fn shell_single_quote(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('\'');
+    for ch in s.chars() {
+        if ch == '\'' {
+            out.push_str("'\\''");
+        } else {
+            out.push(ch);
+        }
+    }
+    out.push('\'');
+    out
 }
 
 async fn run_serve(args: ServeArgs) -> Result<()> {
@@ -657,4 +713,28 @@ async fn run_one_shot(args: RunArgs) -> Result<()> {
         ));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::shell_single_quote;
+
+    #[test]
+    fn quotes_plain_value() {
+        assert_eq!(shell_single_quote("abc123"), "'abc123'");
+    }
+
+    #[test]
+    fn quotes_special_characters_without_expansion() {
+        assert_eq!(
+            shell_single_quote("a $b `c` \"d\" \\e"),
+            "'a $b `c` \"d\" \\e'"
+        );
+    }
+
+    #[test]
+    fn escapes_embedded_single_quote() {
+        // The idiom: close, escaped single-quote, reopen.
+        assert_eq!(shell_single_quote("it's"), "'it'\\''s'");
+    }
 }

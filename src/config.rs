@@ -61,6 +61,12 @@ pub struct Config {
     /// `--host-env-provider name=url` flags are merged with these.
     #[serde(default)]
     pub host_env_providers: Vec<HostEnvProviderConfig>,
+    /// Ancillary secrets consumed by sibling daemons (whisper-agent-mcp-search,
+    /// etc.) rather than the server process itself. Keys are env-var names,
+    /// values are the secret strings; `whisper-agent config env` emits these
+    /// as shell `export` lines for dev scripts to source.
+    #[serde(default)]
+    pub secrets: BTreeMap<String, String>,
 }
 
 /// One catalog entry from `[[host_env_providers]]`. `name` is what
