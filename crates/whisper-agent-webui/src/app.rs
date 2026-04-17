@@ -286,6 +286,12 @@ pub struct ChatApp {
     collapsed_pods: HashSet<String>,
     /// Modal state for the "+ New pod" form. `None` = closed.
     new_pod_modal: Option<NewPodModalState>,
+    /// Pod the in-progress new-thread compose targets. `None` = the
+    /// server's default pod. Set by the per-pod "+ Thread" button in
+    /// each pod section header; cleared/reset by the global "+ New
+    /// thread" button. Only meaningful when
+    /// `composing_new || selected.is_none()`.
+    compose_pod_id: Option<String>,
 
     /// Which view the left side panel is showing.
     left_mode: LeftPanelMode,
@@ -382,6 +388,7 @@ impl ChatApp {
             pods_requested: false,
             collapsed_pods: HashSet::new(),
             new_pod_modal: None,
+            compose_pod_id: None,
             left_mode: LeftPanelMode::default(),
         }
     }
@@ -783,6 +790,7 @@ impl ChatApp {
         }
         self.selected = Some(thread_id.clone());
         self.composing_new = false;
+        self.compose_pod_id = None;
         let need_subscribe = self
             .tasks
             .get(&thread_id)
@@ -803,7 +811,7 @@ impl ChatApp {
             let (config_override, bindings_request) = self.build_creation_override();
             self.send(ClientToServer::CreateThread {
                 correlation_id: None,
-                pod_id: None,
+                pod_id: self.compose_pod_id.clone(),
                 initial_message: trimmed.to_string(),
                 config_override,
                 bindings_request,
@@ -1067,18 +1075,22 @@ impl eframe::App for ChatApp {
             });
 
         let input_enabled = matches!(self.conn_status, ConnectionStatus::Connected);
-        let hint = if self.composing_new || self.selected.is_none() {
-            if input_enabled {
-                "Describe a new task"
-            } else {
-                "(connecting)"
-            }
+        let composing = self.composing_new || self.selected.is_none();
+        // Reserve a String only when we need to interpolate a pod name
+        // into the hint; the static-string fallback is the common case.
+        let pod_hint: Option<String> = if composing && input_enabled {
+            self.compose_pod_id.as_ref().map(|pid| {
+                let display = self.pods.get(pid).map(|p| p.name.as_str()).unwrap_or(pid);
+                format!("Describe a new thread in `{display}`")
+            })
         } else {
-            if input_enabled {
-                "Message this task"
-            } else {
-                "(connecting)"
-            }
+            None
+        };
+        let hint: &str = match (composing, input_enabled, pod_hint.as_deref()) {
+            (_, false, _) => "(connecting)",
+            (true, true, Some(s)) => s,
+            (true, true, None) => "Describe a new task",
+            (false, true, _) => "Message this task",
         };
 
         let show_picker =
@@ -1311,6 +1323,7 @@ impl ChatApp {
             if ui.button("+ New thread").clicked() {
                 self.selected = None;
                 self.composing_new = true;
+                self.compose_pod_id = None;
                 self.input.clear();
             }
             if ui.button("+ New pod").clicked() {
@@ -1373,6 +1386,15 @@ impl ChatApp {
             .id_salt(&collapsed_id)
             .default_open(default_open)
             .show(ui, |ui| {
+                if ui
+                    .small_button(RichText::new("+ Thread in this pod").small())
+                    .clicked()
+                {
+                    self.selected = None;
+                    self.composing_new = true;
+                    self.compose_pod_id = Some(pod_id.to_string());
+                    self.input.clear();
+                }
                 let Some(thread_ids) = thread_ids else {
                     ui.label(RichText::new("(no threads)").italics().color(Color32::from_gray(140)));
                     return;
