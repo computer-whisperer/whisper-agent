@@ -34,6 +34,8 @@ clap = { version = "4", features = ["derive", "env"] }
 thiserror = "2"
 anyhow = "1"
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
+chrono-tz = "0.10"
+cron = "0.16"
 axum = { version = "0.8", features = ["ws"] }
 tower-http = { version = "0.6", features = ["fs", "trace"] }
 whisper-agent-protocol = { path = "crates/whisper-agent-protocol" }

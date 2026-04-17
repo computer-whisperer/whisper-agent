@@ -14,6 +14,7 @@
 //! (cron, webhook) and retention sweeping arrive in later phases.
 
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 
 use thiserror::Error;
 use tokio::fs;
@@ -35,6 +36,21 @@ pub const BEHAVIOR_STATE: &str = "state.json";
 
 pub type BehaviorId = String;
 
+/// Pre-parsed cron schedule + timezone, cached on a `Behavior` whose
+/// trigger is `TriggerSpec::Cron`. Absent for other trigger kinds and
+/// for crons whose schedule/timezone failed to parse (those surface in
+/// `Behavior::load_error`).
+///
+/// Parsing once at load time keeps the per-tick evaluation cheap — 30 s
+/// ticks over N behaviors would otherwise re-parse every cron every
+/// tick. The `Schedule` type is a parsed NFA; the `Tz` is a table
+/// lookup. Neither is cheap enough to re-do on the hot path.
+#[derive(Debug, Clone)]
+pub struct CachedCron {
+    pub schedule: cron::Schedule,
+    pub timezone: chrono_tz::Tz,
+}
+
 /// In-memory representation of a behavior. One per on-disk
 /// `<pod>/behaviors/<id>/` directory. `config` is `None` when
 /// `behavior.toml` failed to parse — `load_error` carries the reason and
@@ -51,6 +67,10 @@ pub struct Behavior {
     /// Contents of the sibling `prompt.md`. Empty when absent.
     pub prompt: String,
     pub state: BehaviorState,
+    /// Parsed cron Schedule + timezone. `Some` only when `config.trigger`
+    /// is `Cron` AND both parsed cleanly. Rebuilt by `refresh_cron` on
+    /// create / update / reload.
+    pub cron: Option<CachedCron>,
     pub load_error: Option<String>,
 }
 
@@ -108,6 +128,10 @@ pub enum BehaviorConfigError {
     Encode(#[from] toml::ser::Error),
     #[error("trigger.schedule is empty for a cron trigger")]
     EmptyCronSchedule,
+    #[error("trigger.schedule `{0}` is not a valid 5-field cron expression: {1}")]
+    BadCronSchedule(String, String),
+    #[error("trigger.timezone `{0}` is not a recognized IANA zone")]
+    BadTimezone(String),
     #[error("on_completion.days must be > 0 for {policy}")]
     ZeroRetentionDays { policy: &'static str },
 }
@@ -129,13 +153,22 @@ pub fn to_toml(cfg: &BehaviorConfig) -> Result<String, BehaviorConfigError> {
 /// Pod-allow cross-checks (e.g. `bindings.host_env` must be in the pod's
 /// `[allow.host_env]`) happen at trigger / spawn time, not here — the
 /// behavior config is loaded before its pod's cap is necessarily available.
+///
+/// Cron schedules are parsed here (via [`parse_cron_schedule`]) so a
+/// typo surfaces at write-time rather than at tick-time; the parsed
+/// `Schedule` is thrown away — callers re-parse into `CachedCron`
+/// after `validate` succeeds.
 pub fn validate(cfg: &BehaviorConfig) -> Result<(), BehaviorConfigError> {
     match &cfg.trigger {
         TriggerSpec::Manual | TriggerSpec::Webhook => {}
-        TriggerSpec::Cron { schedule, .. } => {
+        TriggerSpec::Cron {
+            schedule, timezone, ..
+        } => {
             if schedule.trim().is_empty() {
                 return Err(BehaviorConfigError::EmptyCronSchedule);
             }
+            parse_cron_schedule(schedule)?;
+            parse_timezone(timezone)?;
         }
     }
     match &cfg.on_completion {
@@ -156,6 +189,41 @@ pub fn validate(cfg: &BehaviorConfig) -> Result<(), BehaviorConfigError> {
         }
     }
     Ok(())
+}
+
+/// Parse a 5-field UNIX crontab expression (`"min hour dom mon dow"`)
+/// into a `cron::Schedule`. The underlying crate expects 6+ fields with
+/// seconds; we prepend `"0"` so fires land on the zeroth second of each
+/// minute. Empty / malformed inputs surface as `BadCronSchedule`.
+pub fn parse_cron_schedule(schedule: &str) -> Result<cron::Schedule, BehaviorConfigError> {
+    let trimmed = schedule.trim();
+    if trimmed.is_empty() {
+        return Err(BehaviorConfigError::EmptyCronSchedule);
+    }
+    let six_field = format!("0 {trimmed}");
+    cron::Schedule::from_str(&six_field)
+        .map_err(|e| BehaviorConfigError::BadCronSchedule(trimmed.to_string(), e.to_string()))
+}
+
+/// Parse an IANA timezone name into a `chrono_tz::Tz`.
+pub fn parse_timezone(tz: &str) -> Result<chrono_tz::Tz, BehaviorConfigError> {
+    chrono_tz::Tz::from_str(tz).map_err(|_| BehaviorConfigError::BadTimezone(tz.to_string()))
+}
+
+/// Build `CachedCron` from a config — `None` unless the trigger is a
+/// successfully-parseable Cron. Used by the loader and by the write-side
+/// handlers after a successful `validate`.
+pub fn cache_cron(cfg: &BehaviorConfig) -> Option<CachedCron> {
+    if let TriggerSpec::Cron {
+        schedule, timezone, ..
+    } = &cfg.trigger
+    {
+        let schedule = parse_cron_schedule(schedule).ok()?;
+        let timezone = parse_timezone(timezone).ok()?;
+        Some(CachedCron { schedule, timezone })
+    } else {
+        None
+    }
 }
 
 /// Same rules as pod ids — becomes a directory name, so no path separators
@@ -312,6 +380,7 @@ async fn load_one(dir: &Path, pod_id: &str, behavior_id: &str) -> Option<Behavio
         Ok(cfg) => (Some(cfg), None),
         Err(e) => (None, Some(e.to_string())),
     };
+    let cron = config.as_ref().and_then(cache_cron);
 
     let prompt_path = dir.join(BEHAVIOR_PROMPT);
     let prompt = fs::read_to_string(&prompt_path).await.unwrap_or_default();
@@ -344,6 +413,7 @@ async fn load_one(dir: &Path, pod_id: &str, behavior_id: &str) -> Option<Behavio
         raw_toml,
         prompt,
         state,
+        cron,
         load_error,
     })
 }
@@ -419,6 +489,56 @@ schedule = ""
 "#;
         let err = parse_toml(text).unwrap_err();
         assert!(matches!(err, BehaviorConfigError::EmptyCronSchedule));
+    }
+
+    #[test]
+    fn rejects_unparseable_cron() {
+        let text = r#"
+name = "bad"
+
+[trigger]
+kind = "cron"
+schedule = "not a cron"
+"#;
+        let err = parse_toml(text).unwrap_err();
+        assert!(matches!(err, BehaviorConfigError::BadCronSchedule(_, _)));
+    }
+
+    #[test]
+    fn rejects_unknown_timezone() {
+        let text = r#"
+name = "bad"
+
+[trigger]
+kind = "cron"
+schedule = "0 9 * * *"
+timezone = "Not/A_Zone"
+"#;
+        let err = parse_toml(text).unwrap_err();
+        assert!(matches!(err, BehaviorConfigError::BadTimezone(_)));
+    }
+
+    #[test]
+    fn caches_cron_for_cron_triggers() {
+        let cfg: BehaviorConfig = toml::from_str(
+            r#"
+name = "daily"
+
+[trigger]
+kind = "cron"
+schedule = "0 9 * * *"
+timezone = "America/Los_Angeles"
+"#,
+        )
+        .unwrap();
+        let cached = cache_cron(&cfg).expect("cron should parse");
+        assert_eq!(cached.timezone, chrono_tz::America::Los_Angeles);
+    }
+
+    #[test]
+    fn cache_cron_returns_none_for_non_cron_trigger() {
+        let cfg: BehaviorConfig = toml::from_str(r#"name = "x""#).unwrap();
+        assert!(cache_cron(&cfg).is_none());
     }
 
     #[test]

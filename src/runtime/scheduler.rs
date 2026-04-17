@@ -127,6 +127,12 @@ const TERMINAL_RETENTION_SECS: i64 = 3600;
 /// How often the GC sweep runs. Coarse — the thresholds above are minutes
 /// or hours, so a 60s tick is plenty fine-grained.
 const GC_TICK_SECS: u64 = 60;
+/// How often cron-triggered behaviors are evaluated for fire windows.
+/// 30 s means a minute-granularity cron ("0 9 * * *") fires within 30 s
+/// of its scheduled time — acceptable slop for the human-scale
+/// schedules behaviors encode. Tighter cadences (seconds, sub-minute)
+/// aren't supported by the 5-field crontab we parse.
+const CRON_TICK_SECS: u64 = 30;
 
 pub struct Scheduler {
     /// MCP host URL passed through to threads when their pod doesn't carry a
@@ -160,6 +166,11 @@ pub struct Scheduler {
     /// Tasks modified during the current scheduler-loop iteration. Flushed to the
     /// persister before the next iteration starts.
     dirty: HashSet<String>,
+    /// Behavior ids whose `state.json` needs writeback. Keyed by
+    /// `(pod_id, behavior_id)`. Serialization through this set (rather
+    /// than tokio::spawn per update) means two rapid state changes
+    /// produce exactly one disk write per iteration.
+    dirty_behaviors: HashSet<(String, String)>,
     /// Thread ids whose host-env provisioning future is currently in
     /// flight. Used to deduplicate
     /// `ensure_host_env_provisioning` calls across the create_task /
@@ -241,6 +252,7 @@ impl Scheduler {
             resources,
             next_op_id: 1,
             dirty: HashSet::new(),
+            dirty_behaviors: HashSet::new(),
             provisioning_in_flight: HashSet::new(),
         })
     }
@@ -948,9 +960,23 @@ impl Scheduler {
         }
     }
 
+    /// Mark a behavior's `state.json` for writeback at the next flush.
+    /// Mirrors `mark_dirty` for threads — the batched flush at the end
+    /// of each scheduler-loop iteration serializes writes per-behavior,
+    /// avoiding the tokio::spawn race where two quick updates could
+    /// land their disk writes out of order. No-op when no persister is
+    /// configured (the in-memory state is already up to date).
+    fn mark_behavior_dirty(&mut self, pod_id: &str, behavior_id: &str) {
+        if self.persister.is_some() {
+            self.dirty_behaviors
+                .insert((pod_id.to_string(), behavior_id.to_string()));
+        }
+    }
+
     async fn flush_dirty(&mut self) {
         let Some(persister) = &self.persister else {
             self.dirty.clear();
+            self.dirty_behaviors.clear();
             return;
         };
         let dirty = std::mem::take(&mut self.dirty);
@@ -960,6 +986,25 @@ impl Scheduler {
             };
             if let Err(e) = persister.flush(task).await {
                 error!(thread_id = %thread_id, error = %e, "persist flush failed");
+            }
+        }
+        let dirty_behaviors = std::mem::take(&mut self.dirty_behaviors);
+        for (pod_id, behavior_id) in dirty_behaviors {
+            let Some(pod) = self.pods.get(&pod_id) else {
+                continue;
+            };
+            let Some(behavior) = pod.behaviors.get(&behavior_id) else {
+                continue;
+            };
+            if let Err(e) =
+                crate::pod::behaviors::write_state(&pod.dir, &behavior_id, &behavior.state).await
+            {
+                error!(
+                    pod_id = %pod_id,
+                    behavior_id = %behavior_id,
+                    error = %e,
+                    "persist behavior state failed"
+                );
             }
         }
     }
@@ -1897,7 +1942,177 @@ impl Scheduler {
         self.mark_dirty(&thread_id);
         self.send_user_message(&thread_id, rendered_prompt, pending_io);
         self.step_until_blocked(&thread_id, pending_io);
+        // Every fire (manual or trigger-driven) advances `last_fired_at`
+        // — for cron, this is the cursor for the next evaluation; for
+        // manual, it's the "last run" timestamp the UI shows. Actual
+        // run_count / last_outcome still wait for the thread to reach
+        // terminal; those fields track completions, not fires.
+        if let Some(pod) = self.pods.get_mut(pod_id)
+            && let Some(behavior) = pod.behaviors.get_mut(behavior_id)
+        {
+            behavior.state.last_fired_at = Some(chrono::Utc::now().to_rfc3339());
+            let state = behavior.state.clone();
+            self.mark_behavior_dirty(pod_id, behavior_id);
+            self.router
+                .broadcast_task_list(ServerToClient::BehaviorStateChanged {
+                    pod_id: pod_id.to_string(),
+                    behavior_id: behavior_id.to_string(),
+                    state,
+                });
+        }
         Ok(thread_id)
+    }
+
+    /// Scan every loaded pod for cron-triggered behaviors whose next
+    /// scheduled fire has arrived, and dispatch them per their overlap
+    /// policy. Runs on the cron ticker branch (every `CRON_TICK_SECS`).
+    ///
+    /// Per-iteration cost is O(behaviors with Cron triggers): each one
+    /// is a `Schedule::after` call (cheap — pre-parsed) and one
+    /// timestamp comparison. At expected scale (≤few hundred) this is
+    /// not a hot path.
+    fn fire_due_cron_behaviors(&mut self, pending_io: &mut FuturesUnordered<SchedulerFuture>) {
+        let now = chrono::Utc::now();
+
+        // First pass: prime `last_fired_at` for any cron behavior that
+        // has never fired. This is the cursor `Schedule::after(cursor)`
+        // reads; without a stable cursor, `cron.after(now)` keeps
+        // advancing with `now` and we skip the first real fire window.
+        // Initializing to `now` means the first fire happens at the
+        // next scheduled occurrence after this tick — at most one tick
+        // late, bounded by CRON_TICK_SECS.
+        let to_prime: Vec<(String, String)> = self
+            .pods
+            .iter()
+            .flat_map(|(pid, pod)| {
+                pod.behaviors.iter().filter_map(move |(bid, b)| {
+                    if b.cron.is_some() && b.state.last_fired_at.is_none() {
+                        Some((pid.clone(), bid.clone()))
+                    } else {
+                        None
+                    }
+                })
+            })
+            .collect();
+        for (pod_id, behavior_id) in to_prime {
+            if let Some(pod) = self.pods.get_mut(&pod_id)
+                && let Some(behavior) = pod.behaviors.get_mut(&behavior_id)
+            {
+                behavior.state.last_fired_at = Some(now.to_rfc3339());
+                self.mark_behavior_dirty(&pod_id, &behavior_id);
+            }
+        }
+
+        // Second pass: collect behaviors whose next scheduled fire is
+        // now past. Done as a gather-then-dispatch because firing
+        // takes `&mut self.pods` and we can't hold an iteration borrow.
+        let mut due: Vec<(String, String, whisper_agent_protocol::Overlap)> = Vec::new();
+        for (pod_id, pod) in &self.pods {
+            if pod.archived {
+                continue;
+            }
+            for (behavior_id, behavior) in &pod.behaviors {
+                let Some(cron) = behavior.cron.as_ref() else {
+                    continue;
+                };
+                let overlap = match behavior.config.as_ref().map(|c| &c.trigger) {
+                    Some(whisper_agent_protocol::TriggerSpec::Cron { overlap, .. }) => *overlap,
+                    _ => continue,
+                };
+                let Some(cursor) = parse_rfc3339_utc(behavior.state.last_fired_at.as_deref())
+                else {
+                    // Priming pass above set this; if it's still None
+                    // something is wrong — log and skip.
+                    warn!(
+                        pod_id = %pod_id,
+                        behavior_id = %behavior_id,
+                        "cron behavior missing last_fired_at after priming; skipping tick"
+                    );
+                    continue;
+                };
+                if is_cron_due(cron, cursor, now) {
+                    due.push((pod_id.clone(), behavior_id.clone(), overlap));
+                }
+            }
+        }
+
+        for (pod_id, behavior_id, overlap) in due {
+            match overlap {
+                whisper_agent_protocol::Overlap::Allow => {
+                    self.dispatch_cron_fire(&pod_id, &behavior_id, pending_io);
+                }
+                whisper_agent_protocol::Overlap::Skip => {
+                    if self.behavior_has_inflight_run(&pod_id, &behavior_id) {
+                        tracing::debug!(
+                            pod_id = %pod_id,
+                            behavior_id = %behavior_id,
+                            "cron tick skipped: previous run still in flight"
+                        );
+                        continue;
+                    }
+                    self.dispatch_cron_fire(&pod_id, &behavior_id, pending_io);
+                }
+                whisper_agent_protocol::Overlap::QueueOne => {
+                    // Queueing semantics arrive in phase 3b. For now
+                    // treat QueueOne as Skip — same drop-on-overlap
+                    // behavior, no state in `queued_payload`.
+                    if self.behavior_has_inflight_run(&pod_id, &behavior_id) {
+                        tracing::debug!(
+                            pod_id = %pod_id,
+                            behavior_id = %behavior_id,
+                            "cron tick skipped (queue_one pending implementation)"
+                        );
+                        continue;
+                    }
+                    self.dispatch_cron_fire(&pod_id, &behavior_id, pending_io);
+                }
+            }
+        }
+    }
+
+    /// Fire one cron-triggered behavior. Logs at warn if `run_behavior`
+    /// returns an error (it shouldn't for a behavior that passed
+    /// validation; surface the error here rather than propagating up
+    /// the tick loop where a single bad behavior would halt others).
+    fn dispatch_cron_fire(
+        &mut self,
+        pod_id: &str,
+        behavior_id: &str,
+        pending_io: &mut FuturesUnordered<SchedulerFuture>,
+    ) {
+        if let Err(e) = self.run_behavior(None, None, pod_id, behavior_id, None, pending_io) {
+            warn!(
+                pod_id = %pod_id,
+                behavior_id = %behavior_id,
+                error = %e,
+                "cron-driven run_behavior failed"
+            );
+        }
+    }
+
+    /// True when the behavior's `last_thread_id` refers to a thread
+    /// that is currently present in memory AND in a non-terminal state
+    /// (`Idle`/`Working`/`AwaitingApproval`). Used by the Skip and
+    /// QueueOne overlap paths. Returns false when the behavior has
+    /// never fired, when the last thread has been evicted, or when
+    /// the last thread reached Completed/Failed/Cancelled.
+    fn behavior_has_inflight_run(&self, pod_id: &str, behavior_id: &str) -> bool {
+        let Some(pod) = self.pods.get(pod_id) else {
+            return false;
+        };
+        let Some(behavior) = pod.behaviors.get(behavior_id) else {
+            return false;
+        };
+        let Some(thread_id) = behavior.state.last_thread_id.as_ref() else {
+            return false;
+        };
+        let Some(task) = self.tasks.get(thread_id) else {
+            return false;
+        };
+        !matches!(
+            task.public_state(),
+            ThreadStateLabel::Completed | ThreadStateLabel::Failed | ThreadStateLabel::Cancelled
+        )
     }
 
     /// On-terminal hook for behavior-spawned threads. Idempotent — safe
@@ -1942,25 +2157,11 @@ impl Scheduler {
         behavior.state.last_outcome = Some(outcome);
         behavior.state.run_count = behavior.state.run_count.saturating_add(1);
         let snapshot_state = behavior.state.clone();
-        let state_path = behavior.dir.join(crate::pod::behaviors::BEHAVIOR_STATE);
 
-        // Persist asynchronously — the in-memory update already happened,
-        // so even if the write fails the UI and subsequent reads see the
-        // new value. On restart the state reverts to the last successful
-        // write; logged at warn for forensics.
-        let persist_state = snapshot_state.clone();
-        tokio::spawn(async move {
-            let payload = match serde_json::to_vec_pretty(&persist_state) {
-                Ok(b) => b,
-                Err(e) => {
-                    warn!(error = %e, "serialize behavior state");
-                    return;
-                }
-            };
-            if let Err(e) = tokio::fs::write(&state_path, payload).await {
-                warn!(path = %state_path.display(), error = %e, "write behavior state.json");
-            }
-        });
+        // Persist via the dirty set: `flush_dirty` runs once per
+        // scheduler-loop iteration and writes each dirty behavior
+        // exactly once, so rapid terminals can't race on disk.
+        self.mark_behavior_dirty(&pod_id, &origin.behavior_id);
 
         // Broadcast so every connected client sees the last-run update.
         self.router
@@ -2026,6 +2227,7 @@ impl Scheduler {
             id: behavior_id.clone(),
             pod_id: pod_id.clone(),
             dir: dir.clone(),
+            cron: crate::pod::behaviors::cache_cron(&config),
             config: Some(config.clone()),
             raw_toml,
             prompt: prompt.clone(),
@@ -2109,6 +2311,7 @@ impl Scheduler {
                 return;
             }
         };
+        behavior.cron = crate::pod::behaviors::cache_cron(&config);
         behavior.config = Some(config.clone());
         behavior.raw_toml = raw_toml;
         behavior.prompt = prompt.clone();
@@ -2898,6 +3101,44 @@ fn render_behavior_prompt(template: &str, payload: &serde_json::Value) -> String
     template.replace("{{payload}}", &payload_text)
 }
 
+/// Parse a persisted RFC-3339 timestamp back to a `DateTime<Utc>`.
+/// Returns `None` for `None` input or unparseable strings — callers
+/// treat both identically (behavior has no usable cursor).
+fn parse_rfc3339_utc(raw: Option<&str>) -> Option<chrono::DateTime<chrono::Utc>> {
+    let text = raw?;
+    chrono::DateTime::parse_from_rfc3339(text)
+        .ok()
+        .map(|dt| dt.with_timezone(&chrono::Utc))
+}
+
+/// Decide whether a cron behavior's next scheduled occurrence has
+/// arrived. `cursor` is the persisted `last_fired_at`; `now` is the
+/// evaluation time. Returns true when the next occurrence strictly
+/// after `cursor` is ≤ `now` — i.e., a scheduled fire window has
+/// opened since we last acted on this behavior.
+///
+/// The 30 s tick cadence means this can fire up to 30 s after the
+/// scheduled minute; that's acceptable slop. If a fire window is
+/// missed entirely (e.g., server down through the scheduled moment),
+/// the next `now` will be past `next_fire` and the function still
+/// returns true — on-restart catch-up is handled in phase 3c.
+fn is_cron_due(
+    cron: &crate::pod::behaviors::CachedCron,
+    cursor: chrono::DateTime<chrono::Utc>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> bool {
+    // Evaluate the schedule in its own timezone — "9am Pacific" vs
+    // "9am UTC" matters for every cron that encodes a human-scale
+    // cadence. The `after` iterator yields zoned timestamps; we
+    // convert to UTC for comparison against `now`.
+    let cursor_tz = cursor.with_timezone(&cron.timezone);
+    cron.schedule
+        .after(&cursor_tz)
+        .next()
+        .map(|next| next.with_timezone(&chrono::Utc) <= now)
+        .unwrap_or(false)
+}
+
 /// Resolved binding-side choices for a fresh thread. Validated against
 /// the pod's `[allow]` cap before construction.
 struct ResolvedBindings {
@@ -2989,9 +3230,12 @@ fn resolve_bindings_choice(
 pub async fn run(mut scheduler: Scheduler, mut inbox: mpsc::UnboundedReceiver<SchedulerMsg>) {
     let mut pending_io: FuturesUnordered<SchedulerFuture> = FuturesUnordered::new();
     let mut gc_ticker = tokio::time::interval(Duration::from_secs(GC_TICK_SECS));
-    // Skip the first immediate tick — `interval` fires at t=0 by default.
+    let mut cron_ticker = tokio::time::interval(Duration::from_secs(CRON_TICK_SECS));
+    // Skip the first immediate tick on both — `interval` fires at t=0 by default.
     gc_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     gc_ticker.tick().await;
+    cron_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    cron_ticker.tick().await;
 
     info!("scheduler starting");
     loop {
@@ -3022,6 +3266,9 @@ pub async fn run(mut scheduler: Scheduler, mut inbox: mpsc::UnboundedReceiver<Sc
             }
             _ = gc_ticker.tick() => {
                 scheduler.gc_tick();
+            }
+            _ = cron_ticker.tick() => {
+                scheduler.fire_due_cron_behaviors(&mut pending_io);
             }
         }
         scheduler.flush_dirty().await;
@@ -3125,4 +3372,80 @@ mod tests {
     // every imported item under every cfg combination.
     #[allow(dead_code)]
     fn _overlap_type_is_in_scope(_: Overlap) {}
+
+    #[test]
+    fn parse_rfc3339_utc_round_trips() {
+        let dt = chrono::DateTime::parse_from_rfc3339("2026-04-17T09:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let parsed = parse_rfc3339_utc(Some(&dt.to_rfc3339())).unwrap();
+        assert_eq!(parsed, dt);
+    }
+
+    #[test]
+    fn parse_rfc3339_utc_handles_missing_and_malformed() {
+        assert!(parse_rfc3339_utc(None).is_none());
+        assert!(parse_rfc3339_utc(Some("nope")).is_none());
+    }
+
+    #[test]
+    fn cron_not_due_before_next_occurrence() {
+        let cron = crate::pod::behaviors::CachedCron {
+            schedule: crate::pod::behaviors::parse_cron_schedule("0 9 * * *").unwrap(),
+            timezone: chrono_tz::UTC,
+        };
+        // cursor at 08:00 UTC, now at 08:30 UTC — next fire is 09:00, not yet due.
+        let cursor = chrono::DateTime::parse_from_rfc3339("2026-04-17T08:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let now = chrono::DateTime::parse_from_rfc3339("2026-04-17T08:30:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        assert!(!is_cron_due(&cron, cursor, now));
+    }
+
+    #[test]
+    fn cron_due_at_and_after_next_occurrence() {
+        let cron = crate::pod::behaviors::CachedCron {
+            schedule: crate::pod::behaviors::parse_cron_schedule("0 9 * * *").unwrap(),
+            timezone: chrono_tz::UTC,
+        };
+        let cursor = chrono::DateTime::parse_from_rfc3339("2026-04-17T08:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let at = chrono::DateTime::parse_from_rfc3339("2026-04-17T09:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let after = chrono::DateTime::parse_from_rfc3339("2026-04-17T09:30:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        assert!(is_cron_due(&cron, cursor, at));
+        assert!(is_cron_due(&cron, cursor, after));
+    }
+
+    #[test]
+    fn cron_due_honors_timezone() {
+        // 9am Pacific == 17:00 UTC (during PDT). A cursor at 16:00 UTC
+        // and now at 16:30 UTC is NOT due (it's 9:30am Pacific but
+        // previous occurrence was 9am yesterday, yielding next == today
+        // 9am, which in UTC is still an hour off). The cursor needs
+        // to be before today's 9am Pacific for is_cron_due to return
+        // true against now >= 17:00 UTC.
+        let cron = crate::pod::behaviors::CachedCron {
+            schedule: crate::pod::behaviors::parse_cron_schedule("0 9 * * *").unwrap(),
+            timezone: chrono_tz::America::Los_Angeles,
+        };
+        // Use a date in PDT (July, UTC-7).
+        let cursor = chrono::DateTime::parse_from_rfc3339("2026-07-17T15:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc); // 08:00 Pacific
+        let before = chrono::DateTime::parse_from_rfc3339("2026-07-17T15:30:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc); // 08:30 Pacific
+        let at = chrono::DateTime::parse_from_rfc3339("2026-07-17T16:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc); // 09:00 Pacific
+        assert!(!is_cron_due(&cron, cursor, before));
+        assert!(is_cron_due(&cron, cursor, at));
+    }
 }
