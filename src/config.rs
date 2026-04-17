@@ -41,6 +41,7 @@ use std::path::PathBuf;
 
 use crate::anthropic::AnthropicClient;
 use crate::codex_auth::CodexAuth;
+use crate::gemini::{GEMINI_API_BASE, GeminiClient};
 use crate::model::ModelProvider;
 use crate::openai_chat::OpenAiChatClient;
 use crate::openai_responses::{CHATGPT_CODEX_BASE, OPENAI_API_BASE, OpenAiResponsesClient};
@@ -170,6 +171,16 @@ pub enum BackendConfig {
         #[serde(default)]
         default_model: Option<String>,
     },
+    /// Google Gemini via the native `generateContent` API. API-key auth today;
+    /// gemini-cli OAuth auth follows.
+    Gemini {
+        /// Optional override; defaults to `https://generativelanguage.googleapis.com/v1beta`.
+        #[serde(default)]
+        base_url: Option<String>,
+        auth: Auth,
+        #[serde(default)]
+        default_model: Option<String>,
+    },
 }
 
 impl BackendConfig {
@@ -178,6 +189,7 @@ impl BackendConfig {
             BackendConfig::Anthropic { .. } => "anthropic",
             BackendConfig::OpenAiChat { .. } => "openai_chat",
             BackendConfig::OpenAiResponses { .. } => "openai_responses",
+            BackendConfig::Gemini { .. } => "gemini",
         }
     }
 
@@ -187,7 +199,8 @@ impl BackendConfig {
         match self {
             BackendConfig::Anthropic { default_model, .. }
             | BackendConfig::OpenAiChat { default_model, .. }
-            | BackendConfig::OpenAiResponses { default_model, .. } => default_model.as_deref(),
+            | BackendConfig::OpenAiResponses { default_model, .. }
+            | BackendConfig::Gemini { default_model, .. } => default_model.as_deref(),
         }
     }
 
@@ -210,6 +223,24 @@ impl BackendConfig {
             BackendConfig::OpenAiResponses {
                 base_url, auth, ..
             } => build_openai_responses(base_url.as_deref(), auth),
+            BackendConfig::Gemini {
+                base_url, auth, ..
+            } => build_gemini(base_url.as_deref(), auth),
+        }
+    }
+}
+
+fn build_gemini(base_url: Option<&str>, auth: &Auth) -> Result<Arc<dyn ModelProvider>> {
+    match auth {
+        Auth::ApiKey { .. } => {
+            let key = auth.resolve_api_key().context("gemini auth")?;
+            let url = base_url
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| GEMINI_API_BASE.to_string());
+            Ok(Arc::new(GeminiClient::with_api_key(url, key)))
+        }
+        Auth::ChatgptSubscription { .. } => {
+            Err(anyhow!("gemini: auth.mode `chatgpt_subscription` not supported"))
         }
     }
 }

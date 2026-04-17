@@ -7,6 +7,7 @@ pub mod anthropic;
 pub mod audit;
 pub mod codex_auth;
 pub mod config;
+pub mod gemini;
 pub mod io_dispatch;
 pub mod mcp;
 pub mod model;
