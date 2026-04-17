@@ -20,6 +20,10 @@ ciborium = "0.2"
 # `UpdatePodConfig`). `default-features = false` drops the parse-spans
 # feature we don't need, keeping the wasm bundle lean.
 toml = { version = "0.8", default-features = false, features = ["display", "parse"] }
+# `similar` powers the unified-diff renderer for edit_file / write_file
+# tool calls. Default features include `bytes` + `text`; we only need
+# the text diff API.
+similar = { version = "2", default-features = false, features = ["text"] }
 whisper-agent-protocol = { path = "../whisper-agent-protocol" }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]

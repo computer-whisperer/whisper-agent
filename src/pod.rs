@@ -82,7 +82,7 @@ pub enum PodConfigError {
         valid: String,
     },
     #[error(
-        "thread_defaults.host_env is empty but [[allow.host_env]] has entries — pick one (valid: [{valid}]) so threads don't fall back to `bare`"
+        "thread_defaults.host_env is empty but [[allow.host_env]] has entries — pick one (valid: [{valid}])"
     )]
     HostEnvDefaultRequired { valid: String },
 }
@@ -117,13 +117,14 @@ pub fn validate(config: &PodConfig) -> Result<(), PodConfigError> {
         });
     }
 
-    // Host env validation:
-    //   * empty defaults + empty allow.host_env => bare-only pod, OK.
-    //   * empty defaults + non-empty allow      => footgun: threads
-    //     would silently fall back to `bare` and try the server
-    //     fallback MCP URL. Reject.
-    //   * non-empty defaults => must reference an entry in
-    //     [[allow.host_env]].
+    // Host env validation. The pod's `allow.host_env` is authoritative;
+    // `thread_defaults.host_env` must either be empty (for pods with
+    // zero entries — threads there run with shared MCPs only) or name
+    // an entry in the allow list. An empty default on a pod that has
+    // entries is rejected to prevent a silent "no host env" fallback.
+    //   * empty defaults + empty allow => shared-only pod, OK.
+    //   * empty defaults + non-empty allow => reject.
+    //   * non-empty defaults => must reference an allow entry.
     let valid_names: Vec<&str> = config
         .allow
         .host_env
@@ -160,7 +161,7 @@ pub fn validate(config: &PodConfig) -> Result<(), PodConfigError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use whisper_agent_protocol::sandbox::{AccessMode, NetworkPolicy, PathAccess};
+    use whisper_agent_protocol::sandbox::{NetworkPolicy, PathAccess};
     use whisper_agent_protocol::{
         ApprovalPolicy, NamedHostEnv, PodAllow, PodLimits, HostEnvSpec, ThreadDefaults,
     };
@@ -178,17 +179,17 @@ mod tests {
                         name: "landlock-rw".into(),
                         provider: "landlock-laptop".into(),
                         spec: HostEnvSpec::Landlock {
-                            allowed_paths: vec![PathAccess {
-                                path: "/home/me/project".into(),
-                                mode: AccessMode::ReadWrite,
-                            }],
+                            allowed_paths: vec![PathAccess::read_write("/home/me/project")],
                             network: NetworkPolicy::Unrestricted,
                         },
                     },
                     NamedHostEnv {
-                        name: "no-isolation".into(),
-                        provider: "bare".into(),
-                        spec: HostEnvSpec::None,
+                        name: "landlock-ro".into(),
+                        provider: "landlock-laptop".into(),
+                        spec: HostEnvSpec::Landlock {
+                            allowed_paths: vec![PathAccess::read_only("/home/me/project")],
+                            network: NetworkPolicy::Isolated,
+                        },
                     },
                 ],
             },
@@ -221,8 +222,11 @@ mod tests {
         let mut cfg = sample_config();
         cfg.allow.host_env.push(NamedHostEnv {
             name: "landlock-rw".into(),
-            provider: "bare".into(),
-            spec: HostEnvSpec::None,
+            provider: "landlock-laptop".into(),
+            spec: HostEnvSpec::Landlock {
+                allowed_paths: vec![],
+                network: NetworkPolicy::Unrestricted,
+            },
         });
         let err = validate(&cfg).unwrap_err();
         assert!(matches!(err, PodConfigError::DuplicateSandboxName(_)));
@@ -265,8 +269,8 @@ mod tests {
     fn rejects_empty_default_when_allow_has_entries() {
         let mut cfg = sample_config();
         // sample_config has entries in allow.host_env; empty defaults
-        // should now be rejected to prevent the silent bare-fallback
-        // footgun.
+        // is rejected so threads can't silently land on "no host env"
+        // when the pod actually offers some.
         cfg.thread_defaults.host_env = String::new();
         let err = validate(&cfg).unwrap_err();
         assert!(
@@ -291,6 +295,8 @@ mod tests {
 
     #[test]
     fn parses_minimal_pod() {
+        // A pod with no host_env entries is valid — threads inside it
+        // run with no host-env MCP, only shared MCP hosts.
         let text = r#"
 name = "minimal"
 created_at = "2026-04-16T10:00:00Z"
@@ -298,7 +304,7 @@ created_at = "2026-04-16T10:00:00Z"
 [allow]
 backends = ["anthropic"]
 mcp_hosts = []
-sandbox = []
+host_env = []
 
 [thread_defaults]
 backend = "anthropic"

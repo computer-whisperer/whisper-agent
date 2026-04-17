@@ -64,17 +64,11 @@ pub struct ServerConfig {
     /// Plain config (model, prompt, limits, policy) the synthesized default
     /// pod's `thread_defaults` table is built from.
     pub default_task_config: ThreadConfig,
-    /// Server-level fallback MCP URL — used when a thread's bound host
-    /// env doesn't carry its own URL (or the `bare` provider is in use).
-    /// Pods don't model this; it's a server-level concern.
-    pub default_mcp_host_url: String,
-    /// Host-env spec the synthesized default pod offers as its single
-    /// `[[allow.host_env]]` entry — paired with `default_host_env_provider`.
-    pub default_host_env_spec: HostEnvSpec,
-    /// Provider name for the synthesized default pod's default host env.
-    /// Must be a key in `host_env_registry` (the always-present `bare`
-    /// works when paired with `HostEnvSpec::None`).
-    pub default_host_env_provider: String,
+    /// Host-env spec + provider pairing for the synthesized default
+    /// pod's single `[[allow.host_env]]` entry. `None` means "no host
+    /// env" — the default pod has an empty allow.host_env and threads
+    /// inside it run with no host-env MCP connection.
+    pub default_host_env: Option<(String, HostEnvSpec)>,
     /// Names of shared MCP hosts that should appear in the synthesized
     /// default pod's `[allow].mcp_hosts` and `thread_defaults.mcp_hosts`.
     /// Typically every host configured via `shared_mcp_hosts`.
@@ -83,8 +77,8 @@ pub struct ServerConfig {
     pub host_id: String,
     /// Pods root directory. If `None`, persistence is disabled.
     pub pods_root: Option<PathBuf>,
-    /// Pre-built host-env catalog (built-in `bare` + entries from
-    /// `[[host_env_providers]]` in `whisper-agent.toml`).
+    /// Host-env provider catalog. Empty registry is a valid config —
+    /// threads in such a server just have no host-env MCP connection.
     pub host_env_registry: crate::sandbox::HostEnvRegistry,
     /// Catalog of shared (singleton) MCP hosts the scheduler connects to at
     /// startup. Pods opt in by name via `[allow].mcp_hosts`.
@@ -124,8 +118,7 @@ pub async fn serve(listen: SocketAddr, config: ServerConfig) -> anyhow::Result<(
         &default_pod_id,
         &config.default_task_config,
         &config.default_backend,
-        &config.default_host_env_provider,
-        config.default_host_env_spec.clone(),
+        config.default_host_env.clone(),
         &backend_names,
         &config.default_shared_host_names,
     );
@@ -134,7 +127,6 @@ pub async fn serve(listen: SocketAddr, config: ServerConfig) -> anyhow::Result<(
         .as_ref()
         .map(|root| root.join(&default_pod_id))
         .unwrap_or_else(|| PathBuf::from(format!("./{default_pod_id}")));
-    let default_mcp_host_url = config.default_mcp_host_url.clone();
     let default_system_prompt = config.default_task_config.system_prompt.clone();
     let raw_toml = crate::pod::to_toml(&default_pod_config)
         .context("encode default pod.toml for in-memory bootstrap")?;
@@ -147,7 +139,6 @@ pub async fn serve(listen: SocketAddr, config: ServerConfig) -> anyhow::Result<(
     );
 
     let mut scheduler = Scheduler::new(
-        default_mcp_host_url,
         default_pod,
         config.host_id,
         config.backends,

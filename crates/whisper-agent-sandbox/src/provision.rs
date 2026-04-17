@@ -36,9 +36,6 @@ pub async fn provision(
     mcp_host_bin: &str,
 ) -> Result<ProvisionedSession, ProvisionError> {
     match spec {
-        HostEnvSpec::None => Err(ProvisionError::Unsupported(
-            "HostEnvSpec::None should not reach the daemon".into(),
-        )),
         HostEnvSpec::Landlock {
             allowed_paths,
             network,

@@ -55,11 +55,17 @@ impl HostEnvId {
 }
 
 impl McpHostId {
-    pub fn primary_for_task(thread_id: &str) -> Self {
-        Self(format!("mcp-primary-{thread_id}"))
-    }
+    /// Registry id for a shared MCP host. `name` is the catalog name
+    /// pod entries and thread bindings reference.
     pub fn shared(name: &str) -> Self {
         Self(format!("mcp-shared-{name}"))
+    }
+    /// Registry id for an MCP host provisioned by a host-env
+    /// provider. One-to-one with the owning `HostEnvId` — distinct
+    /// host envs produce distinct MCPs; a second thread with the
+    /// same binding dedups onto the same entry.
+    pub fn for_host_env(id: &HostEnvId) -> Self {
+        Self(format!("mcp-{}", id.0))
     }
 }
 
@@ -361,33 +367,28 @@ impl ResourceRegistry {
         id
     }
 
-    /// Eagerly register the per-thread primary MCP host as `Provisioning`
-    /// at thread-creation time, so the registry is the source of truth for
-    /// "is this thread's MCP ready" from create onward. The
-    /// `fallback_url` is the URL the host would connect to if its sandbox
-    /// doesn't advertise its own — replaced when the sandbox provision
-    /// completes and the actual session connects.
-    ///
-    /// Idempotent on id: re-registering for the same thread just touches
-    /// `last_used` and adds the user (which was already there) — no
-    /// state regression.
-    pub fn pre_register_primary_mcp_host(
+    /// Eagerly register the MCP host belonging to a host env, as
+    /// `Provisioning`. One-to-one with the [`HostEnvId`] — distinct
+    /// host envs get distinct MCP hosts, while a second thread sharing
+    /// the same binding dedups onto the existing entry (matching the
+    /// host_env dedup). Idempotent on id.
+    pub fn pre_register_host_env_mcp(
         &mut self,
+        host_env_id: &HostEnvId,
         thread_id: &str,
-        fallback_url: String,
     ) -> McpHostId {
-        let id = McpHostId::primary_for_task(thread_id);
+        let id = McpHostId::for_host_env(host_env_id);
         let now = Utc::now();
         if let Some(entry) = self.mcp_hosts.get_mut(&id) {
             // If terminal (Errored from a prior failure, or TornDown
-            // after a sandbox rebind), reset back to Provisioning so the
-            // next `provision_primary_mcp` future can complete cleanly.
+            // after a rebind), reset back to Provisioning so the next
+            // provision future can complete cleanly.
             if entry.state.is_terminal() {
                 entry.state = ResourceState::Provisioning { op_id: 0 };
                 entry.session = None;
                 entry.tools.clear();
                 entry.annotations.clear();
-                entry.spec.url = fallback_url;
+                entry.spec.url.clear();
             }
             entry.users.insert(thread_id.to_string());
             entry.last_used = now;
@@ -398,9 +399,9 @@ impl ResourceRegistry {
             McpHostEntry {
                 id: id.clone(),
                 spec: McpHostSpec {
-                    url: fallback_url,
-                    label: format!("primary:{thread_id}"),
-                    per_task: true,
+                    url: String::new(),
+                    label: format!("host_env:{}", host_env_id.0),
+                    per_task: false,
                 },
                 state: ResourceState::Provisioning { op_id: 0 },
                 session: None,
@@ -416,11 +417,10 @@ impl ResourceRegistry {
     }
 
     /// Attach a connected `McpSession` to a previously pre-registered
-    /// primary entry, transitioning it to Ready. The url is updated too —
-    /// the actual sandbox-advertised URL may differ from the fallback we
-    /// pre-registered with. Returns false if the entry is missing or
-    /// already Ready (caller can drop the session and avoid double-attach).
-    pub fn complete_primary_mcp_host(
+    /// host-env-MCP entry, transitioning it to Ready. Returns false if
+    /// the entry is missing or already Ready (caller can drop the
+    /// session and avoid double-attach).
+    pub fn complete_host_env_mcp(
         &mut self,
         id: &McpHostId,
         url: String,
@@ -517,10 +517,9 @@ impl ResourceRegistry {
                 unused_handle: handle,
             };
         };
-        // Ready entries are already completed — even if their handle is
-        // None (e.g. HostEnvSpec::None never produces one), a second
-        // completion would either replace a live handle (leaking the old
-        // one) or no-op pointlessly. Bounce the caller's handle back so it
+        // Ready entries are already completed — a second completion
+        // would either replace a live handle (leaking the old one) or
+        // no-op pointlessly. Bounce the caller's handle back so it
         // gets torn down rather than leaked.
         if entry.state.is_ready() {
             return CompleteHostEnvOutcome::AlreadyCompleted {
@@ -756,20 +755,24 @@ pub struct ReapPlan {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use whisper_agent_protocol::sandbox::PathAccess;
 
     #[test]
     fn id_constructors_are_stable() {
-        // Spec-derived sandbox ids are deterministic — same spec, same id.
-        let id1 = HostEnvId::for_provider_spec("bare", &HostEnvSpec::None);
-        let id2 = HostEnvId::for_provider_spec("bare", &HostEnvSpec::None);
+        // Spec-derived host-env ids are deterministic — same
+        // (provider, spec), same id.
+        let spec = HostEnvSpec::Landlock {
+            allowed_paths: vec![],
+            network: whisper_agent_protocol::sandbox::NetworkPolicy::Unrestricted,
+        };
+        let id1 = HostEnvId::for_provider_spec("local-landlock", &spec);
+        let id2 = HostEnvId::for_provider_spec("local-landlock", &spec);
         assert_eq!(id1, id2);
         assert!(id1.0.starts_with("he-"));
         assert_eq!(id1.0.len(), "he-".len() + 16); // he- + 16 hex chars
-        assert_eq!(
-            McpHostId::primary_for_task("t-1").0,
-            "mcp-primary-t-1"
-        );
         assert_eq!(McpHostId::shared("fetch").0, "mcp-shared-fetch");
+        let mcp_id = McpHostId::for_host_env(&id1);
+        assert_eq!(mcp_id.0, format!("mcp-{}", id1.0));
         assert_eq!(BackendId::for_name("anthropic").0, "backend-anthropic");
     }
 
@@ -788,7 +791,14 @@ mod tests {
     #[test]
     fn sandbox_teardown_clears_users() {
         let mut reg = ResourceRegistry::new();
-        let id = reg.pre_register_host_env("t-1", "bare".into(), HostEnvSpec::None);
+        let id = reg.pre_register_host_env(
+            "t-1",
+            "test-landlock".into(),
+            HostEnvSpec::Landlock {
+                allowed_paths: Vec::new(),
+                network: Default::default(),
+            },
+        );
         let outcome = reg.complete_host_env_provisioning(&id, None, None);
         assert!(matches!(outcome, CompleteHostEnvOutcome::Completed));
         assert!(reg.host_envs[&id].state.is_ready());
@@ -804,8 +814,22 @@ mod tests {
     #[test]
     fn pre_register_host_env_dedups_by_spec() {
         let mut reg = ResourceRegistry::new();
-        let id_a = reg.pre_register_host_env("t-1", "bare".into(), HostEnvSpec::None);
-        let id_b = reg.pre_register_host_env("t-2", "bare".into(), HostEnvSpec::None);
+        let id_a = reg.pre_register_host_env(
+            "t-1",
+            "test-landlock".into(),
+            HostEnvSpec::Landlock {
+                allowed_paths: Vec::new(),
+                network: Default::default(),
+            },
+        );
+        let id_b = reg.pre_register_host_env(
+            "t-2",
+            "test-landlock".into(),
+            HostEnvSpec::Landlock {
+                allowed_paths: Vec::new(),
+                network: Default::default(),
+            },
+        );
         assert_eq!(id_a, id_b);
         // Both threads share the same pre-registered entry.
         assert_eq!(reg.host_envs[&id_a].users.len(), 2);
@@ -821,7 +845,14 @@ mod tests {
     #[test]
     fn complete_host_env_provisioning_idempotent_on_race() {
         let mut reg = ResourceRegistry::new();
-        let id = reg.pre_register_host_env("t-1", "bare".into(), HostEnvSpec::None);
+        let id = reg.pre_register_host_env(
+            "t-1",
+            "test-landlock".into(),
+            HostEnvSpec::Landlock {
+                allowed_paths: Vec::new(),
+                network: Default::default(),
+            },
+        );
         let first = reg.complete_host_env_provisioning(&id, None, None);
         assert!(matches!(first, CompleteHostEnvOutcome::Completed));
         // Race-loser scenario: a second concurrent provision lands after
@@ -838,7 +869,14 @@ mod tests {
     fn reap_idle_tears_down_idle_ready_and_removes_stale_terminal() {
         let mut reg = ResourceRegistry::new();
         // Idle Ready sandbox: provision, drop the user, backdate last_used.
-        let idle_id = reg.pre_register_host_env("t-idle", "bare".into(), HostEnvSpec::None);
+        let idle_id = reg.pre_register_host_env(
+            "t-idle",
+            "test-landlock".into(),
+            HostEnvSpec::Landlock {
+                allowed_paths: Vec::new(),
+                network: Default::default(),
+            },
+        );
         let _ = reg.complete_host_env_provisioning(&idle_id, None, None);
         let _ = reg.release_host_env_user(&idle_id, "t-idle");
         assert!(reg.host_envs[&idle_id].users.is_empty());
@@ -872,13 +910,13 @@ mod tests {
             },
         );
 
-        // Long-since-torn-down sandbox: a different spec so its id
+        // Long-since-torn-down host env: a different spec so its id
         // differs from `idle_id`.
         let dead_id = reg.pre_register_host_env(
             "t-dead",
             "test-landlock".into(),
             HostEnvSpec::Landlock {
-                allowed_paths: Vec::new(),
+                allowed_paths: vec![PathAccess::read_only("/tmp/dead")],
                 network: Default::default(),
             },
         );
@@ -908,7 +946,14 @@ mod tests {
     #[test]
     fn reap_idle_skips_recently_used_and_user_held() {
         let mut reg = ResourceRegistry::new();
-        let id = reg.pre_register_host_env("t-1", "bare".into(), HostEnvSpec::None);
+        let id = reg.pre_register_host_env(
+            "t-1",
+            "test-landlock".into(),
+            HostEnvSpec::Landlock {
+                allowed_paths: Vec::new(),
+                network: Default::default(),
+            },
+        );
         let _ = reg.complete_host_env_provisioning(&id, None, None);
         // last_used is `now`; should NOT reap on the first sweep.
         let plan = reg.reap_idle(
@@ -925,8 +970,22 @@ mod tests {
     #[test]
     fn release_host_env_user_decrements_count() {
         let mut reg = ResourceRegistry::new();
-        let id = reg.pre_register_host_env("t-1", "bare".into(), HostEnvSpec::None);
-        reg.pre_register_host_env("t-2", "bare".into(), HostEnvSpec::None);
+        let id = reg.pre_register_host_env(
+            "t-1",
+            "test-landlock".into(),
+            HostEnvSpec::Landlock {
+                allowed_paths: Vec::new(),
+                network: Default::default(),
+            },
+        );
+        reg.pre_register_host_env(
+            "t-2",
+            "test-landlock".into(),
+            HostEnvSpec::Landlock {
+                allowed_paths: Vec::new(),
+                network: Default::default(),
+            },
+        );
         assert_eq!(reg.release_host_env_user(&id, "t-1"), 1);
         assert_eq!(reg.release_host_env_user(&id, "t-2"), 0);
     }

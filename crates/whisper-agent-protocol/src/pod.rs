@@ -39,20 +39,20 @@ pub struct PodAllow {
 
 /// One pod-level "host env" entry — a named (provider, spec) pair the
 /// pod's threads are allowed to bind to. The provider name resolves
-/// against the server-level catalog in `whisper-agent.toml`. The
-/// always-present built-in `"bare"` provider must be paired with
-/// `HostEnvSpec::None`; any other provider must be paired with a
-/// non-`None` spec. The server enforces both rules at pod-config
-/// validation time.
+/// against the server-level catalog in `whisper-agent.toml`. Every
+/// `HostEnvSpec` variant refers to a real provisioned environment; a
+/// pod that wants "no isolation" for its threads just declares fewer
+/// `[[allow.host_env]]` entries (or zero) — threads then run with no
+/// host-env MCP connection.
 ///
 /// TOML form:
 /// ```toml
 /// [[allow.host_env]]
 /// name = "rust-dev"
 /// provider = "landlock-laptop"
-/// type = "landlock"        # `HostEnvSpec` discriminator (still tag="type")
-/// allowed_paths = [...]
-/// network = { policy = "isolated" }
+/// type = "landlock"        # HostEnvSpec discriminator
+/// allowed_paths = ["/home/me/project:rw", "/:ro"]
+/// network = "isolated"
 /// ```
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct NamedHostEnv {

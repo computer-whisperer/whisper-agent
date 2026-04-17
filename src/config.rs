@@ -49,9 +49,10 @@ pub struct Config {
     #[serde(default)]
     pub shared_mcp_hosts: BTreeMap<String, String>,
     /// Optional `[[host_env_providers]]` table — list of named daemon
-    /// URLs the scheduler can dispatch host-env provisioning to. The
-    /// always-present built-in `bare` provider needs no entry. CLI
-    /// `--host-env-provider name=url` flags are merged with these.
+    /// URLs the scheduler can dispatch host-env provisioning to.
+    /// Empty is valid (no host envs provisionable → threads run with
+    /// only shared MCP tools). CLI `--host-env-provider name=url`
+    /// flags are merged with these.
     #[serde(default)]
     pub host_env_providers: Vec<HostEnvProviderConfig>,
 }

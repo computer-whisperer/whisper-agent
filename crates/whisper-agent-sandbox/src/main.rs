@@ -103,16 +103,6 @@ async fn handle_provision(
     info!(thread_id = %req.thread_id, "provision request");
 
     match &req.spec {
-        HostEnvSpec::None => {
-            warn!(thread_id = %req.thread_id, "provision called with HostEnvSpec::None");
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({
-                    "error": "HostEnvSpec::None does not require provisioning"
-                })),
-            )
-                .into_response();
-        }
         HostEnvSpec::Container { image, .. } => {
             info!(thread_id = %req.thread_id, %image, "container provisioning not yet implemented");
             return (

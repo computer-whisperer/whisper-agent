@@ -108,11 +108,16 @@ pub struct ThreadBindings {
     /// `backend-` prefix.
     #[serde(default)]
     pub backend: String,
-    /// Bound `HostEnvId` (full `he-…` form) when the thread is bound to
-    /// a non-bare host env; `None` for the always-built-in `bare`
-    /// provider (in-process, no isolation).
+    /// What the thread is bound to. `None` for the always-built-in
+    /// `bare` provider (in-process, no isolation). For non-bare:
+    /// either a [`HostEnvBinding::Named`] referencing a
+    /// `[[allow.host_env]]` entry by name, or a
+    /// [`HostEnvBinding::Inline`] carrying its own (provider, spec)
+    /// pair. The runtime `HostEnvId` is derived from the binding at
+    /// registry-touch time — never persisted, so the binding survives
+    /// pod edits, refactors, and `DefaultHasher` shifts.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub host_env: Option<String>,
+    pub host_env: Option<HostEnvBinding>,
     /// Bound `McpHostId`s, in routing precedence order. The primary
     /// (per-thread) host is at index 0; shared hosts follow in the
     /// order they were declared on the pod.
@@ -122,33 +127,46 @@ pub struct ThreadBindings {
     pub tool_filter: Option<Vec<String>>,
 }
 
-/// Inline (provider, spec) pair carried in `ThreadBindingsRequest` and
-/// `HostEnvRebind::Inline`. The server validates that `provider`
-/// resolves in the catalog and that the spec shape matches the
-/// provider's expectations.
+/// What a thread's `host_env` slot can hold.
+///
+/// The only shape today is [`Named`](Self::Named) — a reference to a
+/// `[[allow.host_env]]` entry in the owning pod's config. The pod
+/// owns the (provider, spec); editing the entry in `pod.toml`
+/// propagates to every thread bound to it on next provision. Pod
+/// `[allow]` is a real capability cap: every user-originated binding
+/// resolves to a named entry, nothing more.
+///
+/// [`Inline`](Self::Inline) is reserved for a future subagent /
+/// out-of-pod spawn path that needs to pin a spec the pod doesn't
+/// declare. It is **not** reachable from user-facing request types —
+/// [`ThreadBindingsRequest`] and [`HostEnvRebind`] both name entries
+/// by string only — so the wire can't sneak a spec past the pod cap.
+/// Kept as a variant (rather than collapsing the enum to
+/// `Option<String>`) so the stored-state type is stable when the
+/// subagent flow lands.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-pub struct InlineHostEnv {
-    pub provider: String,
-    #[serde(flatten)]
-    pub spec: HostEnvSpec,
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum HostEnvBinding {
+    Named { name: String },
+    /// Reserved: ad-hoc/subagent path — not constructable from any
+    /// current wire request type.
+    Inline { provider: String, spec: HostEnvSpec },
 }
 
 /// Client-side overrides for the bindings the pod's `thread_defaults` would
 /// otherwise produce. Each `Some` field replaces the corresponding default;
-/// each `None` inherits. Values are validated against the pod's `[allow]`
-/// table on the server — backends and shared MCP host names must already
-/// appear there.
+/// each `None` inherits. Every field is validated against the pod's
+/// `[allow]` table on the server; the pod cap is authoritative.
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
 pub struct ThreadBindingsRequest {
     /// Backend catalog name. Empty → server default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub backend: Option<String>,
-    /// Inline host env override. The server doesn't require this to
-    /// reference a `[[allow.host_env]]` entry by name (existing flow
-    /// for ad-hoc thread spawning), but the named provider must exist
-    /// in the catalog.
+    /// Name of a `[[allow.host_env]]` entry in the target pod. `None`
+    /// inherits the pod's `thread_defaults.host_env`. Must resolve in
+    /// the pod's allow list — the server rejects unknown names.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub host_env: Option<InlineHostEnv>,
+    pub host_env: Option<String>,
     /// Catalog names of shared MCP hosts the thread should bind to. `None`
     /// inherits the pod default; `Some(vec)` replaces exactly (empty vec
     /// means "no shared hosts beyond the primary").
@@ -169,10 +187,10 @@ pub struct ThreadBindingsRequest {
 pub struct ThreadBindingsPatch {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub backend: Option<String>,
-    /// `Some(HostEnvRebind::Inline { ... })` re-binds; `Some(Clear)`
-    /// drops the binding entirely (thread falls back to the bare
-    /// provider); `None` leaves it alone. Two layers of Option because
-    /// "set to nothing" and "leave alone" are distinct.
+    /// `Some(HostEnvRebind::Named { name })` re-binds to a named allow
+    /// entry; `Some(Clear)` drops the binding entirely (thread falls
+    /// back to the bare provider); `None` leaves it alone. Two layers
+    /// of Option because "set to nothing" and "leave alone" are distinct.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub host_env: Option<HostEnvRebind>,
     /// Replace the shared MCP host list. `Some(vec)` replaces exactly
@@ -184,22 +202,21 @@ pub struct ThreadBindingsPatch {
 #[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum HostEnvRebind {
-    /// Replace the bound host env with this inline (provider, spec) pair.
-    Inline { binding: InlineHostEnv },
+    /// Replace the bound host env with the named allow entry `name`.
+    /// Server validates the entry exists in the pod's allow list.
+    Named { name: String },
     /// Drop the host env binding entirely (thread falls back to `bare`).
     Clear,
 }
 
 /// Server-advertised entry from the host-env-provider catalog. Sent in
 /// response to `ListHostEnvProviders` so the webui's pod editor can
-/// populate its provider dropdown.
+/// populate its provider dropdown. Every entry represents a
+/// daemon-backed provider — there are no built-ins.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct HostEnvProviderInfo {
     /// User-facing catalog name (matches `NamedHostEnv.provider`).
     pub name: String,
-    /// True for the always-present built-in `"bare"` provider.
-    #[serde(default)]
-    pub builtin: bool,
 }
 
 /// Pattern-1 approval policy. See `docs/design_permissions.md`.
@@ -654,6 +671,14 @@ pub enum ServerToClient {
         tool_use_id: String,
         name: String,
         args_preview: String,
+        /// Full structured arguments. Carried so the webui can render
+        /// rich tool-specific views (e.g. unified diff for edit_file)
+        /// without having to wait for a snapshot rebuild. Optional
+        /// because the snapshot path doesn't re-emit Begin events
+        /// individually — and to give us room to add server-side size
+        /// caps later.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        args: Option<serde_json::Value>,
     },
     ThreadToolCallEnd {
         thread_id: String,

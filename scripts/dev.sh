@@ -2,13 +2,14 @@
 #
 # Dev convenience: build everything and run the whisper-agent stack.
 #
-# By default uses the sandbox daemon — each task gets its own
-# landlock-isolated MCP host, provisioned on demand. Pass --no-sandbox
-# to fall back to a single shared MCP host (old behavior).
+# The sandbox daemon is the host-env provider — each thread that binds
+# a host_env gets its own landlock-isolated MCP host, provisioned on
+# demand. No "fallback MCP"; threads without a bound host env run with
+# only shared MCP tools (web fetch / search).
 #
-# All runtime artifacts (workspace root, audit log, persisted tasks) land
-# under ./sandbox/ at the repo root. The directory is gitignored and preserved
-# across runs so task-JSON persistence survives a restart.
+# All runtime artifacts (workspace root, audit log, persisted pods/threads)
+# land under ./sandbox/ at the repo root. Gitignored; preserved across runs
+# so persistence survives a restart.
 #
 # Env overrides:
 #   SANDBOX           default: $REPO_ROOT/sandbox
@@ -16,11 +17,9 @@
 #   LISTEN_SANDBOX    default: 127.0.0.1:9810  (sandbox daemon)
 #   LISTEN_FETCH      default: 127.0.0.1:9830  (web-fetch MCP daemon)
 #   LISTEN_SEARCH     default: 127.0.0.1:9831  (web-search MCP daemon)
-#   LISTEN_MCP        default: 127.0.0.1:8800  (standalone MCP, --no-sandbox only)
 #
 # Flags:
 #   --skip-wasm       skip the wasm-pack build (use when only Rust code changed)
-#   --no-sandbox      use a single shared MCP host instead of the sandbox daemon
 #   --no-fetch        skip starting the web-fetch daemon (no `web_fetch` tool)
 #   --no-search       skip starting the web-search daemon (no `web_search` tool).
 #                     Auto-set when BRAVE_API_KEY is unset in CLOUD_KEYS.txt.
@@ -36,16 +35,13 @@ LISTEN_SERVER="${LISTEN_SERVER:-127.0.0.1:8080}"
 LISTEN_SANDBOX="${LISTEN_SANDBOX:-127.0.0.1:9810}"
 LISTEN_FETCH="${LISTEN_FETCH:-127.0.0.1:9830}"
 LISTEN_SEARCH="${LISTEN_SEARCH:-127.0.0.1:9831}"
-LISTEN_MCP="${LISTEN_MCP:-127.0.0.1:8800}"
 
 SKIP_WASM=0
-USE_SANDBOX=1
 USE_FETCH=1
 USE_SEARCH=1
 for arg in "$@"; do
     case "$arg" in
         --skip-wasm)    SKIP_WASM=1 ;;
-        --no-sandbox)   USE_SANDBOX=0 ;;
         --no-fetch)     USE_FETCH=0 ;;
         --no-search)    USE_SEARCH=0 ;;
         -h|--help)
@@ -66,8 +62,6 @@ source CLOUD_KEYS.txt
 export ANTHROPIC_API_KEY
 export BRAVE_API_KEY="${BRAVE_API_KEY:-}"
 
-# Skip the search daemon silently if no key is configured — the rest of the
-# stack works fine without it.
 if [[ "$USE_SEARCH" -eq 1 && -z "$BRAVE_API_KEY" ]]; then
     echo "==> BRAVE_API_KEY unset in CLOUD_KEYS.txt — skipping web-search daemon"
     USE_SEARCH=0
@@ -75,10 +69,7 @@ fi
 
 mkdir -p "$SANDBOX"
 
-PACKAGES="-p whisper-agent -p whisper-agent-mcp-host"
-if [[ "$USE_SANDBOX" -eq 1 ]]; then
-    PACKAGES="$PACKAGES -p whisper-agent-sandbox"
-fi
+PACKAGES="-p whisper-agent -p whisper-agent-mcp-host -p whisper-agent-sandbox"
 if [[ "$USE_FETCH" -eq 1 ]]; then
     PACKAGES="$PACKAGES -p whisper-agent-mcp-fetch"
 fi
@@ -118,7 +109,6 @@ if [[ "$USE_FETCH" -eq 1 ]]; then
         --listen "$LISTEN_FETCH" &
     CHILD_PIDS+=($!)
 
-    # Wait for fetch daemon to accept connections (cheap MCP ping).
     for _ in $(seq 1 20); do
         if curl -sf -X POST "http://$LISTEN_FETCH/mcp" \
             -H 'content-type: application/json' \
@@ -147,60 +137,28 @@ if [[ "$USE_SEARCH" -eq 1 ]]; then
     SHARED_HOST_ARGS+=(--shared-mcp-host "search=http://$LISTEN_SEARCH/mcp")
 fi
 
-if [[ "$USE_SANDBOX" -eq 1 ]]; then
-    # ---------- Sandboxed mode ----------
-    echo "==> starting whisper-agent-sandbox on $LISTEN_SANDBOX"
-    "$REPO_ROOT/target/release/whisper-agent-sandbox" \
-        --listen "$LISTEN_SANDBOX" \
-        --mcp-host-bin "$REPO_ROOT/target/release/whisper-agent-mcp-host" &
-    CHILD_PIDS+=($!)
+echo "==> starting whisper-agent-sandbox on $LISTEN_SANDBOX"
+"$REPO_ROOT/target/release/whisper-agent-sandbox" \
+    --listen "$LISTEN_SANDBOX" \
+    --mcp-host-bin "$REPO_ROOT/target/release/whisper-agent-mcp-host" &
+CHILD_PIDS+=($!)
 
-    for _ in $(seq 1 20); do
-        if curl -sf "http://$LISTEN_SANDBOX/health" > /dev/null 2>&1; then break; fi
-        sleep 0.25
-    done
+for _ in $(seq 1 20); do
+    if curl -sf "http://$LISTEN_SANDBOX/health" > /dev/null 2>&1; then break; fi
+    sleep 0.25
+done
 
-    echo "==> starting whisper-agent on $LISTEN_SERVER (host-env workspace=$SANDBOX)"
-    echo "    open http://$LISTEN_SERVER/ in a browser"
-    # `local-landlock` is the catalog name we register the local
-    # sandbox daemon under; the synthesized default pod's host env
-    # binds to it with this workspace.
-    "$REPO_ROOT/target/release/whisper-agent" serve \
-        --listen "$LISTEN_SERVER" \
-        --config "$REPO_ROOT/whisper-agent.toml" \
-        --host-env-provider "local-landlock=http://$LISTEN_SANDBOX" \
-        --default-host-env-provider "local-landlock" \
-        --default-host-env-workspace "$SANDBOX" \
-        --audit-log "$SANDBOX/audit.jsonl" \
-        --pods-root "$SANDBOX/pods" \
-        "${SHARED_HOST_ARGS[@]}"
-else
-    # ---------- Standalone MCP host mode (legacy) ----------
-    echo "==> starting whisper-agent-mcp-host on $LISTEN_MCP (workspace=$SANDBOX)"
-    "$REPO_ROOT/target/release/whisper-agent-mcp-host" \
-        --workspace-root "$SANDBOX" \
-        --listen "$LISTEN_MCP" &
-    CHILD_PIDS+=($!)
-
-    for _ in $(seq 1 20); do
-        if curl -sf -X POST "http://$LISTEN_MCP/mcp" \
-            -H 'content-type: application/json' \
-            -d '{"jsonrpc":"2.0","id":1,"method":"ping"}' > /dev/null 2>&1
-        then break; fi
-        if ! kill -0 "${CHILD_PIDS[0]}" 2>/dev/null; then
-            echo "error: whisper-agent-mcp-host exited before accepting connections" >&2
-            exit 1
-        fi
-        sleep 0.25
-    done
-
-    echo "==> starting whisper-agent on $LISTEN_SERVER"
-    echo "    open http://$LISTEN_SERVER/ in a browser"
-    "$REPO_ROOT/target/release/whisper-agent" serve \
-        --listen "$LISTEN_SERVER" \
-        --config "$REPO_ROOT/whisper-agent.toml" \
-        --mcp-host-url "http://$LISTEN_MCP/mcp" \
-        --audit-log "$SANDBOX/audit.jsonl" \
-        --pods-root "$SANDBOX/pods" \
-        "${SHARED_HOST_ARGS[@]}"
-fi
+echo "==> starting whisper-agent on $LISTEN_SERVER (host-env workspace=$SANDBOX)"
+echo "    open http://$LISTEN_SERVER/ in a browser"
+# `local-landlock` is the catalog name we register the sandbox daemon
+# under; the synthesized default pod's host env binds to it with this
+# workspace.
+"$REPO_ROOT/target/release/whisper-agent" serve \
+    --listen "$LISTEN_SERVER" \
+    --config "$REPO_ROOT/whisper-agent.toml" \
+    --host-env-provider "local-landlock=http://$LISTEN_SANDBOX" \
+    --default-host-env-provider "local-landlock" \
+    --default-host-env-workspace "$SANDBOX" \
+    --audit-log "$SANDBOX/audit.jsonl" \
+    --pods-root "$SANDBOX/pods" \
+    "${SHARED_HOST_ARGS[@]}"

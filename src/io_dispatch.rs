@@ -5,11 +5,11 @@
 //! - [`SchedulerCompletion::Io`] — per-thread state-machine ops (model
 //!   call, tool call). Built from a [`task::IoRequest`] the thread itself
 //!   requested via `step()`. Routed back through `Thread::apply_io_result`.
-//! - [`SchedulerCompletion::Provision`] — per-thread resource provisioning
-//!   (sandbox + primary MCP host + initial `tools/list`). Dispatched
-//!   eagerly by the scheduler at thread-creation time, *not* at the
-//!   thread's request — the resource registry owns this lifecycle now.
-//!   Routed via `Scheduler::apply_provision_completion` which updates the
+//! - [`SchedulerCompletion::Provision`] — per-thread host-env
+//!   provisioning (env + MCP connect + initial `tools/list`).
+//!   Dispatched eagerly by the scheduler at thread-creation time for
+//!   threads that have a host_env binding. Routed via
+//!   `Scheduler::apply_provision_completion` which updates the
 //!   registry and nudges any threads parked in `WaitingOnResources`.
 //!
 //! Per-IO-type knowledge (how to provision a sandbox, how to assemble a
@@ -39,27 +39,19 @@ pub(crate) struct IoCompletion {
     pub(crate) result: IoResult,
 }
 
-/// Completion message delivered by every resource provisioning future.
-/// Carries the requesting thread (so the scheduler knows whose primary
-/// MCP entry to attach the session to) plus the resource-side payload.
+/// Completion message delivered by every host-env provisioning future.
 pub(crate) struct ProvisionCompletion {
     pub(crate) thread_id: String,
     pub(crate) result: ProvisionResult,
 }
 
 pub(crate) enum ProvisionResult {
-    /// Host env + MCP connect + initial `tools/list` all completed. The
-    /// scheduler attaches everything to the registry: `host_env_handle`
-    /// to the host-env entry (or drops it if dedup already wrote one),
-    /// and `mcp_session` + `tools` to the per-thread primary MCP entry.
-    PrimaryMcpReady {
-        /// Bound host-env id, when one was bound. `None` for threads
-        /// using the `bare` provider (no env entry was registered).
-        host_env_id: Option<HostEnvId>,
-        /// Provisioned host-env handle. `None` on dedup hit (someone
-        /// else completed the env before us) or when the spec produces
-        /// no runtime artifact (the `bare` path).
-        host_env_handle: Option<Box<dyn HostEnvHandle>>,
+    /// Host env + MCP connect + initial `tools/list` all completed.
+    /// Both the host-env entry and the host-env MCP entry get
+    /// attached; dedup races drop redundant handles.
+    HostEnvMcpReady {
+        host_env_id: HostEnvId,
+        host_env_handle: Box<dyn HostEnvHandle>,
         mcp_url: String,
         mcp_session: Arc<McpSession>,
         tools: Vec<crate::mcp::ToolDescriptor>,
@@ -68,14 +60,14 @@ pub(crate) enum ProvisionResult {
     /// connect, or initial `tools/list`). The carried `phase` tells
     /// the scheduler which Errored state to mark on the affected
     /// registry entries.
-    PrimaryMcpFailed {
+    HostEnvMcpFailed {
         phase: ProvisionPhase,
         message: String,
-        host_env_id: Option<HostEnvId>,
+        host_env_id: HostEnvId,
     },
 }
 
-/// Which phase of `provision_primary_mcp` failed — drives where the
+/// Which phase of `provision_host_env_mcp` failed — drives where the
 /// scheduler marks Errored.
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum ProvisionPhase {
@@ -121,26 +113,27 @@ pub(crate) fn build_io_future(
     }
 }
 
-/// Build a future that provisions a thread's primary MCP host (host env +
-/// MCP connect + initial `tools/list`) and yields a
-/// [`SchedulerCompletion::Provision`]. Called by the scheduler at
-/// thread-creation time, not from the thread's state machine.
-pub(crate) fn provision_primary_mcp(
+/// Build a future that provisions a thread's host env (env + MCP
+/// connect + initial `tools/list`) and yields a
+/// [`SchedulerCompletion::Provision`]. Only called for threads that
+/// have a host_env binding — threads bound only to shared MCPs don't
+/// need host-env provisioning.
+pub(crate) fn provision_host_env_mcp(
     scheduler: &Scheduler,
     thread_id: String,
 ) -> SchedulerFuture {
-    let fallback_url = scheduler.default_mcp_url().to_string();
-
     // Snapshot the host-env decision while we have the sync borrow.
-    // Look up the entry in the registry, then resolve its provider
-    // name to an `Arc<dyn HostEnvProvider>` from the catalog. If the
-    // entry is already Ready (a sibling thread provisioned the same
-    // spec before us), skip provision and reuse the cached URL.
+    // The entry must exist — ensure_host_env_provisioning pre-registered
+    // it before dispatching. If the entry is already Ready (dedup hit),
+    // skip provision and reuse the cached URL.
     let host_env_action = match scheduler.host_env_for_thread(&thread_id) {
-        Some(e) if e.state.is_ready() => HostEnvAction::Skip {
-            mcp_url: e.mcp_url.clone().unwrap_or_else(|| fallback_url.clone()),
-            host_env_id: Some(e.id.clone()),
-        },
+        Some(e) if e.state.is_ready() => {
+            let mcp_url = e.mcp_url.clone().unwrap_or_default();
+            HostEnvAction::Skip {
+                mcp_url,
+                host_env_id: e.id.clone(),
+            }
+        }
         Some(e) => match scheduler.host_env_provider(&e.provider) {
             Some(provider) => HostEnvAction::Provision {
                 provider: provider.clone(),
@@ -152,10 +145,20 @@ pub(crate) fn provision_primary_mcp(
                 provider: e.provider.clone(),
             },
         },
-        None => HostEnvAction::Skip {
-            mcp_url: fallback_url.clone(),
-            host_env_id: None,
-        },
+        None => {
+            // Shouldn't happen: only called when
+            // ensure_host_env_provisioning saw a binding.
+            return Box::pin(async move {
+                SchedulerCompletion::Provision(ProvisionCompletion {
+                    thread_id,
+                    result: ProvisionResult::HostEnvMcpFailed {
+                        phase: ProvisionPhase::HostEnv,
+                        message: "thread has no host_env binding".into(),
+                        host_env_id: HostEnvId(String::new()),
+                    },
+                })
+            });
+        }
     };
 
     Box::pin(async move {
@@ -164,19 +167,26 @@ pub(crate) fn provision_primary_mcp(
             HostEnvAction::Skip {
                 mcp_url,
                 host_env_id,
-            } => (mcp_url, None, host_env_id),
+            } => {
+                // Dedup hit — another thread already completed the
+                // provision. Connect to the cached URL directly; we
+                // don't carry a handle (the dedup winner owns it).
+                // This path is a no-op from the registry's
+                // perspective: the entry is already Ready.
+                (mcp_url, None, host_env_id)
+            }
             HostEnvAction::UnknownProvider {
                 host_env_id,
                 provider,
             } => {
                 return SchedulerCompletion::Provision(ProvisionCompletion {
                     thread_id,
-                    result: ProvisionResult::PrimaryMcpFailed {
+                    result: ProvisionResult::HostEnvMcpFailed {
                         phase: ProvisionPhase::HostEnv,
                         message: format!(
                             "host env provider `{provider}` is not in the server catalog"
                         ),
-                        host_env_id: Some(host_env_id),
+                        host_env_id,
                     },
                 });
             }
@@ -186,19 +196,16 @@ pub(crate) fn provision_primary_mcp(
                 host_env_id,
             } => match provider.provision(&thread_id, &spec).await {
                 Ok(handle) => {
-                    let url = handle
-                        .mcp_url()
-                        .map(|u| u.to_string())
-                        .unwrap_or_else(|| fallback_url.clone());
-                    (url, Some(handle), Some(host_env_id))
+                    let url = handle.mcp_url().to_string();
+                    (url, Some(handle), host_env_id)
                 }
                 Err(e) => {
                     return SchedulerCompletion::Provision(ProvisionCompletion {
                         thread_id,
-                        result: ProvisionResult::PrimaryMcpFailed {
+                        result: ProvisionResult::HostEnvMcpFailed {
                             phase: ProvisionPhase::HostEnv,
                             message: format!("host env provision failed: {e}"),
-                            host_env_id: Some(host_env_id),
+                            host_env_id,
                         },
                     });
                 }
@@ -211,7 +218,7 @@ pub(crate) fn provision_primary_mcp(
             Err(e) => {
                 return SchedulerCompletion::Provision(ProvisionCompletion {
                     thread_id,
-                    result: ProvisionResult::PrimaryMcpFailed {
+                    result: ProvisionResult::HostEnvMcpFailed {
                         phase: ProvisionPhase::McpConnect,
                         message: format!("mcp connect failed: {e}"),
                         host_env_id,
@@ -226,7 +233,7 @@ pub(crate) fn provision_primary_mcp(
             Err(e) => {
                 return SchedulerCompletion::Provision(ProvisionCompletion {
                     thread_id,
-                    result: ProvisionResult::PrimaryMcpFailed {
+                    result: ProvisionResult::HostEnvMcpFailed {
                         phase: ProvisionPhase::ListTools,
                         message: format!("list_tools failed: {e}"),
                         host_env_id,
@@ -235,11 +242,16 @@ pub(crate) fn provision_primary_mcp(
             }
         };
 
+        // Dedup winners carry a handle; dedup losers don't. The
+        // scheduler drops a None handle cleanly via the
+        // AlreadyCompleted outcome.
+        let handle = host_env_handle.unwrap_or_else(|| Box::new(DedupNoopHandle { mcp_url: mcp_url.clone() }));
+
         SchedulerCompletion::Provision(ProvisionCompletion {
             thread_id,
-            result: ProvisionResult::PrimaryMcpReady {
+            result: ProvisionResult::HostEnvMcpReady {
                 host_env_id,
-                host_env_handle,
+                host_env_handle: handle,
                 mcp_url,
                 mcp_session: session,
                 tools,
@@ -248,14 +260,36 @@ pub(crate) fn provision_primary_mcp(
     })
 }
 
+/// Placeholder handle used when a dedup loser doesn't own the real
+/// handle but still needs to fit the `HostEnvHandle` type expected by
+/// the completion payload. `complete_host_env_provisioning` observes
+/// the `AlreadyCompleted` outcome and drops this handle without ever
+/// calling `teardown`; `mcp_url` is present only so `HostEnvHandle`'s
+/// contract holds.
+struct DedupNoopHandle {
+    mcp_url: String,
+}
+
+impl crate::sandbox::HostEnvHandle for DedupNoopHandle {
+    fn mcp_url(&self) -> &str {
+        &self.mcp_url
+    }
+    fn teardown(
+        &mut self,
+    ) -> Pin<Box<dyn Future<Output = Result<(), crate::sandbox::HostEnvError>> + Send + '_>>
+    {
+        Box::pin(async { Ok(()) })
+    }
+}
+
 /// Decision the dispatcher made about the bound host env before
 /// crossing into the async block.
 enum HostEnvAction {
-    /// Already Ready (or no env is bound) — connect MCP at `mcp_url`
-    /// directly, no provision call.
+    /// Already Ready (dedup hit) — connect MCP at `mcp_url` directly,
+    /// no provision call.
     Skip {
         mcp_url: String,
-        host_env_id: Option<HostEnvId>,
+        host_env_id: HostEnvId,
     },
     /// Needs provisioning; call into the resolved provider with this spec.
     Provision {
@@ -319,12 +353,23 @@ fn tool_call(
     name: String,
     input: serde_json::Value,
 ) -> SchedulerFuture {
-    // Route to whichever pool session contributed this tool. Falls back to the
-    // primary if routing wasn't filled in (shouldn't happen because ToolCall
-    // always follows a Ready primary, but we'd rather try than panic).
-    let mcp = scheduler
-        .route_tool(&thread_id, &name)
-        .expect("mcp pool present before ToolCall");
+    // Route to whichever bound host advertises this tool. If nothing
+    // does, the thread's model is calling a tool we never exposed —
+    // surface it as a tool-call error rather than panicking.
+    let Some(mcp) = scheduler.route_tool(&thread_id, &name) else {
+        return Box::pin(async move {
+            SchedulerCompletion::Io(IoCompletion {
+                thread_id,
+                op_id,
+                result: IoResult::ToolCall {
+                    tool_use_id,
+                    result: Err(format!(
+                        "no bound MCP host advertises tool `{name}`",
+                    )),
+                },
+            })
+        });
+    };
     Box::pin(async move {
         let result = match mcp.invoke(&name, input).await {
             Ok(mut stream) => {

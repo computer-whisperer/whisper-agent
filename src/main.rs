@@ -1,27 +1,18 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow};
 use clap::{Parser, Subcommand};
-use tokio::sync::mpsc;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
-use whisper_agent_protocol::sandbox::{AccessMode, NetworkPolicy, PathAccess, HostEnvSpec};
-use whisper_agent_protocol::{
-    ApprovalPolicy, ClientToServer, Role, ServerToClient, ThreadConfig, ThreadStateLabel,
-};
+use whisper_agent_protocol::sandbox::{NetworkPolicy, PathAccess, HostEnvSpec};
+use whisper_agent_protocol::{ApprovalPolicy, ThreadConfig};
 
 use whisper_agent::anthropic::AnthropicClient;
-use whisper_agent::audit::AuditLog;
 use whisper_agent::config::Config;
-use whisper_agent::pod::Pod;
-use whisper_agent::sandbox::{HostEnvProviderEntry, HostEnvRegistry, BARE_PROVIDER_NAME};
-use whisper_agent::scheduler::{
-    self, BackendEntry, ConnId, Scheduler, SchedulerMsg, SharedHostConfig,
-    build_default_pod_config,
-};
+use whisper_agent::sandbox::{HostEnvProviderEntry, HostEnvRegistry};
+use whisper_agent::scheduler::{BackendEntry, SharedHostConfig};
 use whisper_agent::server::{self, ServerConfig};
 
 const DEFAULT_SYSTEM_PROMPT: &str = "\
@@ -72,9 +63,6 @@ enum Command {
     /// Start the HTTP server: hosts the webui assets and drives the task scheduler.
     /// Clients subscribe to individual tasks via the multiplexed WebSocket protocol.
     Serve(ServeArgs),
-    /// One-shot CLI: drive a single task through the scheduler against a
-    /// hard-coded prompt and exit.
-    Run(RunArgs),
 }
 
 #[derive(Parser, Debug)]
@@ -96,10 +84,6 @@ struct ServeArgs {
     /// Anthropic model ID (used only when `--config` is not provided).
     #[arg(long, default_value = "claude-sonnet-4-6")]
     model: String,
-
-    /// MCP host URL (the streamable-HTTP /mcp endpoint).
-    #[arg(long, default_value = "http://127.0.0.1:8800/mcp")]
-    mcp_host_url: String,
 
     /// Path to the audit log file.
     #[arg(long, default_value = "audit.jsonl")]
@@ -132,23 +116,24 @@ struct ServeArgs {
 
     /// Register a host-env provider from the CLI: `name=url`. Each
     /// catalog entry is a `whisper-agent-sandbox`-shaped daemon.
-    /// Repeatable. The always-present built-in `bare` provider needs
-    /// no entry. Also configurable in TOML:
-    /// `[[host_env_providers]] name = "...", url = "..."`.
+    /// Repeatable. Also configurable in TOML:
+    /// `[[host_env_providers]] name = "...", url = "..."`. A server
+    /// with zero providers is valid — threads in it just have no
+    /// host-env MCP connection.
     #[arg(long = "host-env-provider", value_parser = parse_host_env_provider_arg)]
     host_env_providers: Vec<(String, String)>,
 
-    /// Convenience: name a provider from the catalog whose default
-    /// host-env spec the synthesized default pod should use. Paired
-    /// with `--default-host-env-workspace`. When omitted, the default
-    /// pod uses the `bare` provider (no isolation).
+    /// Name a provider from the catalog for the synthesized default
+    /// pod's single `[[allow.host_env]]` entry. Paired with
+    /// `--default-host-env-workspace`. When omitted, the default pod
+    /// has no host_env configured and fresh threads inside it run
+    /// without a host-env MCP (tool catalog is shared-only).
     #[arg(long)]
     default_host_env_provider: Option<String>,
 
-    /// Convenience: default the synthesized pod to a Landlock host env
-    /// rooted at this workspace. Auto-includes ~/.cargo and ~/.rustup
-    /// read-only if present. Requires --default-host-env-provider to
-    /// name a non-bare provider.
+    /// Default the synthesized pod to a Landlock host env rooted at
+    /// this workspace. Auto-includes ~/.cargo and ~/.rustup read-only
+    /// if present. Requires --default-host-env-provider.
     #[arg(long)]
     default_host_env_workspace: Option<PathBuf>,
 
@@ -185,44 +170,6 @@ fn parse_shared_host_arg(s: &str) -> Result<(String, String), String> {
     Ok((name.to_string(), url.to_string()))
 }
 
-#[derive(Parser, Debug)]
-struct RunArgs {
-    /// Anthropic API key.
-    #[arg(long, env = "ANTHROPIC_API_KEY")]
-    anthropic_api_key: String,
-
-    /// Anthropic model ID.
-    #[arg(long, default_value = "claude-sonnet-4-6")]
-    model: String,
-
-    /// MCP host URL (the streamable-HTTP /mcp endpoint).
-    #[arg(long, default_value = "http://127.0.0.1:8800/mcp")]
-    mcp_host_url: String,
-
-    /// Path to the audit log file.
-    #[arg(long, default_value = "audit.jsonl")]
-    audit_log: PathBuf,
-
-    /// Path to dump the final conversation as JSON.
-    #[arg(long)]
-    dump_conversation: Option<PathBuf>,
-
-    /// System prompt to send to the model.
-    #[arg(long, default_value = DEFAULT_SYSTEM_PROMPT)]
-    system_prompt: String,
-
-    /// Maximum number of model turns before halting.
-    #[arg(long, default_value_t = 30)]
-    max_turns: u32,
-
-    /// max_tokens parameter passed to Anthropic.
-    #[arg(long, default_value_t = 16384)]
-    max_tokens: u32,
-
-    /// The user prompt that drives the loop.
-    prompt: String,
-}
-
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -235,7 +182,6 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Command::Serve(args) => run_serve(args).await,
-        Command::Run(args) => run_one_shot(args).await,
     }
 }
 
@@ -316,10 +262,6 @@ async fn run_serve(args: ServeArgs) -> Result<()> {
     let default_shared_host_names: Vec<String> =
         shared_mcp_hosts.iter().map(|h| h.name.clone()).collect();
 
-    // Build the host-env-provider catalog: every CLI / TOML entry plus
-    // the always-built-in `bare`. Errors here are fatal — refusing to
-    // start with a misconfigured catalog is preferable to silently
-    // running with a partial one.
     let mut provider_entries: Vec<HostEnvProviderEntry> = toml_provider_entries
         .into_iter()
         .map(|p| HostEnvProviderEntry {
@@ -336,7 +278,7 @@ async fn run_serve(args: ServeArgs) -> Result<()> {
     let host_env_registry =
         HostEnvRegistry::new(provider_entries).context("build host_env provider catalog")?;
 
-    let (default_host_env_provider, default_host_env_spec) = build_default_host_env(
+    let default_host_env = build_default_host_env(
         &args.default_host_env_provider,
         &args.default_host_env_workspace,
     );
@@ -355,9 +297,7 @@ async fn run_serve(args: ServeArgs) -> Result<()> {
                 ApprovalPolicy::AutoApproveAll
             },
         },
-        default_mcp_host_url: args.mcp_host_url,
-        default_host_env_spec,
-        default_host_env_provider,
+        default_host_env,
         default_shared_host_names,
         audit_log_path: args.audit_log,
         host_id: "default".into(),
@@ -369,40 +309,32 @@ async fn run_serve(args: ServeArgs) -> Result<()> {
 }
 
 /// Resolve the synthesized default pod's `(provider, spec)` pair from
-/// CLI args. Defaults to `(bare, None)` when no provider is named —
-/// matching the previous "no isolation" behavior.
+/// CLI args. Returns `None` when no provider is named — the default
+/// pod then has no host env configured, and threads inside it run
+/// with no host-env MCP connection (only shared MCP hosts apply).
 fn build_default_host_env(
     provider: &Option<String>,
     workspace: &Option<PathBuf>,
-) -> (String, HostEnvSpec) {
-    let Some(provider) = provider else {
-        return (BARE_PROVIDER_NAME.to_string(), HostEnvSpec::None);
-    };
+) -> Option<(String, HostEnvSpec)> {
+    let provider = provider.as_deref()?;
     let Some(ws) = workspace else {
         // Provider named without a workspace: use a no-paths landlock
         // shell — the user can edit pod.toml to flesh it out.
-        return (
-            provider.clone(),
+        return Some((
+            provider.to_string(),
             HostEnvSpec::Landlock {
                 allowed_paths: Vec::new(),
                 network: NetworkPolicy::Unrestricted,
             },
-        );
+        ));
     };
-    let ws_str = ws.to_string_lossy().into_owned();
-    let mut paths = vec![PathAccess {
-        path: ws_str,
-        mode: AccessMode::ReadWrite,
-    }];
+    let mut paths = vec![PathAccess::read_write(ws.to_string_lossy().into_owned())];
     let home = std::env::var("HOME").unwrap_or_default();
     if !home.is_empty() {
         for subdir in [".cargo", ".rustup"] {
             let p = format!("{home}/{subdir}");
             if std::path::Path::new(&p).exists() {
-                paths.push(PathAccess {
-                    path: p,
-                    mode: AccessMode::ReadOnly,
-                });
+                paths.push(PathAccess::read_only(p));
             }
         }
     }
@@ -412,199 +344,12 @@ fn build_default_host_env(
         extra_ro = paths.len() - 1,
         "default host env: landlock"
     );
-    (
-        provider.clone(),
+    Some((
+        provider.to_string(),
         HostEnvSpec::Landlock {
             allowed_paths: paths,
             network: NetworkPolicy::Unrestricted,
         },
-    )
+    ))
 }
 
-async fn run_one_shot(args: RunArgs) -> Result<()> {
-    info!(model = %args.model, host = %args.mcp_host_url, "starting whisper-agent (one-shot)");
-
-    let backend_name = DEFAULT_BACKEND_NAME.to_string();
-    let mut backends = HashMap::new();
-    backends.insert(
-        backend_name.clone(),
-        BackendEntry {
-            provider: Arc::new(AnthropicClient::new(args.anthropic_api_key)),
-            kind: "anthropic".into(),
-            default_model: Some(args.model.clone()),
-        },
-    );
-
-    let audit = AuditLog::open(args.audit_log.clone())
-        .await
-        .with_context(|| format!("open audit log {}", args.audit_log.display()))?;
-    info!(audit_log = %audit.path().display(), "audit log open");
-
-    let task_config = ThreadConfig {
-        model: args.model.clone(),
-        system_prompt: args.system_prompt,
-        max_tokens: args.max_tokens,
-        max_turns: args.max_turns,
-        approval_policy: ApprovalPolicy::AutoApproveAll,
-    };
-
-    // Build the in-memory default pod from the one-shot's runtime config.
-    // Persistence is disabled in this code path (no Persister), so the
-    // pod stays in memory only — `dir` is informational.
-    let backend_names: Vec<String> = backends.keys().cloned().collect();
-    let default_pod_config = build_default_pod_config(
-        "default",
-        &task_config,
-        &backend_name,
-        BARE_PROVIDER_NAME,
-        HostEnvSpec::None,
-        &backend_names,
-        &[],
-    );
-    let raw_toml = whisper_agent::pod::to_toml(&default_pod_config)
-        .context("encode default pod.toml")?;
-    let default_pod = Pod::new(
-        "default".into(),
-        std::path::PathBuf::from("./default"),
-        default_pod_config,
-        raw_toml,
-        task_config.system_prompt.clone(),
-    );
-
-    let scheduler = Scheduler::new(
-        args.mcp_host_url,
-        default_pod,
-        "default".into(),
-        backends,
-        backend_name,
-        audit,
-        HostEnvRegistry::new(Vec::new()).context("build host_env registry for one-shot")?,
-        Vec::new(),
-    )
-    .await?;
-
-    let (inbox_tx, inbox_rx) = mpsc::unbounded_channel::<SchedulerMsg>();
-    let (outbound_tx, mut outbound_rx) = mpsc::unbounded_channel::<ServerToClient>();
-    let scheduler_handle = tokio::spawn(scheduler::run(scheduler, inbox_rx));
-
-    const CONN_ID: ConnId = 1;
-    inbox_tx
-        .send(SchedulerMsg::RegisterClient {
-            conn_id: CONN_ID,
-            outbound: outbound_tx,
-        })
-        .map_err(|_| anyhow!("scheduler inbox closed before registration"))?;
-    inbox_tx
-        .send(SchedulerMsg::ClientMessage {
-            conn_id: CONN_ID,
-            msg: ClientToServer::CreateThread {
-                correlation_id: Some("cli-one-shot".into()),
-                pod_id: None,
-                initial_message: args.prompt,
-                config_override: None,
-                bindings_request: None,
-            },
-        })
-        .map_err(|_| anyhow!("scheduler inbox closed before create_task"))?;
-
-    let mut thread_id: Option<String> = None;
-    let mut last_stop_reason: Option<String> = None;
-    let mut final_snapshot = None;
-    let mut last_error: Option<String> = None;
-
-    while let Some(event) = outbound_rx.recv().await {
-        match event {
-            ServerToClient::ThreadCreated { thread_id: tid, .. } => {
-                thread_id = Some(tid.clone());
-                inbox_tx
-                    .send(SchedulerMsg::ClientMessage {
-                        conn_id: CONN_ID,
-                        msg: ClientToServer::SubscribeToThread { thread_id: tid },
-                    })
-                    .map_err(|_| anyhow!("scheduler inbox closed"))?;
-            }
-            ServerToClient::ThreadAssistantEnd { stop_reason, .. } => {
-                last_stop_reason = stop_reason;
-            }
-            ServerToClient::Error { message, .. } => {
-                last_error = Some(message);
-            }
-            ServerToClient::ThreadStateChanged { state, .. } => {
-                if matches!(
-                    state,
-                    ThreadStateLabel::Completed | ThreadStateLabel::Failed | ThreadStateLabel::Cancelled
-                ) {
-                    // Re-subscribe to get a fresh snapshot containing the
-                    // final conversation + total_usage. SubscribeToThread is
-                    // idempotent — the scheduler always replies with a fresh
-                    // ThreadSnapshot regardless of existing membership.
-                    if let Some(tid) = &thread_id {
-                        inbox_tx
-                            .send(SchedulerMsg::ClientMessage {
-                                conn_id: CONN_ID,
-                                msg: ClientToServer::SubscribeToThread {
-                                    thread_id: tid.clone(),
-                                },
-                            })
-                            .map_err(|_| anyhow!("scheduler inbox closed"))?;
-                    }
-                }
-            }
-            ServerToClient::ThreadSnapshot { snapshot, .. } => {
-                if matches!(
-                    snapshot.state,
-                    ThreadStateLabel::Completed | ThreadStateLabel::Failed | ThreadStateLabel::Cancelled
-                ) {
-                    final_snapshot = Some(snapshot);
-                    break;
-                }
-                // Initial snapshot from our first subscribe — task still
-                // working, so wait for the terminal-state re-subscribe.
-            }
-            _ => {}
-        }
-    }
-
-    drop(inbox_tx);
-    let _ = scheduler_handle.await;
-
-    let snap = final_snapshot.ok_or_else(|| anyhow!("scheduler exited before final snapshot"))?;
-    let turns = snap
-        .conversation
-        .messages()
-        .iter()
-        .filter(|m| matches!(m.role, Role::Assistant))
-        .count();
-
-    println!();
-    println!("=== loop finished ===");
-    println!("state: {:?}", snap.state);
-    println!("turns: {turns}");
-    println!("stop_reason: {last_stop_reason:?}");
-    println!(
-        "tokens: input={} output={} cache_read={} cache_create={}",
-        snap.total_usage.input_tokens,
-        snap.total_usage.output_tokens,
-        snap.total_usage.cache_read_input_tokens,
-        snap.total_usage.cache_creation_input_tokens
-    );
-    if let Some(detail) = &snap.failure {
-        println!("failure: {detail}");
-    } else if let Some(msg) = &last_error {
-        println!("last_error: {msg}");
-    }
-
-    if let Some(path) = args.dump_conversation {
-        let serialized = serde_json::to_string_pretty(snap.conversation.messages())?;
-        tokio::fs::write(&path, serialized).await?;
-        println!("conversation dumped to {}", path.display());
-    }
-
-    if matches!(snap.state, ThreadStateLabel::Failed) {
-        return Err(anyhow!(
-            "task failed: {}",
-            snap.failure.unwrap_or_else(|| "unknown".into())
-        ));
-    }
-    Ok(())
-}

@@ -16,7 +16,6 @@ use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::rc::Rc;
 
 use egui::{Color32, ComboBox, DragValue, Grid, RichText, ScrollArea, TextEdit};
-use serde::{Deserialize, Serialize};
 use whisper_agent_protocol::sandbox::{
     AccessMode, Mount, NetworkPolicy, PathAccess, ResourceLimits,
 };
@@ -26,90 +25,6 @@ use whisper_agent_protocol::{
     ResourceSnapshot, ResourceStateLabel, Role, HostEnvSpec, ServerToClient, ThreadBindingsRequest,
     ThreadConfigOverride, ThreadDefaults, ThreadStateLabel, ThreadSummary, ToolResultContent, Usage,
 };
-
-/// A user-saved sandbox configuration. Currently only encodes Landlock; future
-/// variants (container image, resource limits) plug in alongside.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct LandlockPreset {
-    name: String,
-    /// Read-write workspace path.
-    workspace: String,
-    /// If true, the whole filesystem is granted read-only access on top of the
-    /// workspace's read-write scope. Useful for tasks that need to inspect
-    /// system files (/etc, /proc, the user's other projects) without being
-    /// able to modify them.
-    read_everywhere: bool,
-}
-
-impl LandlockPreset {
-    fn to_spec(&self) -> HostEnvSpec {
-        let mut allowed_paths = vec![PathAccess {
-            path: self.workspace.clone(),
-            mode: AccessMode::ReadWrite,
-        }];
-        if self.read_everywhere {
-            allowed_paths.push(PathAccess {
-                path: "/".into(),
-                mode: AccessMode::ReadOnly,
-            });
-        }
-        HostEnvSpec::Landlock {
-            allowed_paths,
-            network: NetworkPolicy::Unrestricted,
-        }
-    }
-}
-
-/// Selection in the new-task sandbox dropdown.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-enum SandboxChoice {
-    /// Use whatever the server configured as default.
-    #[default]
-    ServerDefault,
-    /// Explicitly no sandbox.
-    None,
-    /// Index into ChatApp::presets.
-    Preset(usize),
-}
-
-#[cfg(target_arch = "wasm32")]
-const PRESETS_STORAGE_KEY: &str = "whisper-agent.sandbox-presets";
-
-#[cfg(target_arch = "wasm32")]
-fn load_presets() -> Vec<LandlockPreset> {
-    let Some(window) = web_sys::window() else {
-        return Vec::new();
-    };
-    let Ok(Some(storage)) = window.local_storage() else {
-        return Vec::new();
-    };
-    let Ok(Some(json)) = storage.get_item(PRESETS_STORAGE_KEY) else {
-        return Vec::new();
-    };
-    serde_json::from_str(&json).unwrap_or_default()
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-fn load_presets() -> Vec<LandlockPreset> {
-    Vec::new()
-}
-
-#[cfg(target_arch = "wasm32")]
-fn save_presets(presets: &[LandlockPreset]) {
-    let Some(window) = web_sys::window() else {
-        return;
-    };
-    let Ok(Some(storage)) = window.local_storage() else {
-        return;
-    };
-    let Ok(json) = serde_json::to_string(presets) else {
-        return;
-    };
-    let _ = storage.set_item(PRESETS_STORAGE_KEY, &json);
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-fn save_presets(_presets: &[LandlockPreset]) {}
 
 /// Events pushed into [`Inbound`]. In addition to decoded wire messages we pipe in
 /// connection-level signals (open/close/error) so the UI can show a connection status
@@ -174,7 +89,18 @@ enum DisplayItem {
     ToolCall {
         tool_use_id: String,
         name: String,
-        args_preview: String,
+        /// Short header summary, e.g. for `edit_file` we render a one-line
+        /// `path` instead of dumping the JSON. Falls back to truncated
+        /// JSON when no specialized summary applies.
+        summary: String,
+        /// Pretty-printed JSON args for the expanded raw view. `None`
+        /// when the server didn't carry full args (legacy snapshot path
+        /// before the protocol change, or future size-cap rejection).
+        args_pretty: Option<String>,
+        /// Pre-computed diff payload — populated only for `edit_file` /
+        /// `write_file` tool calls when full args are available. Lets
+        /// the renderer show a unified diff inline.
+        diff: Option<DiffPayload>,
         result: Option<String>,
         is_error: bool,
     },
@@ -182,6 +108,18 @@ enum DisplayItem {
         text: String,
         is_error: bool,
     },
+}
+
+/// Pre-computed inputs for the unified-diff renderer. Built once at
+/// item-build time so the renderer doesn't have to re-parse JSON every
+/// frame. `is_creation = true` for `write_file` (no prior content;
+/// renderer shows it as all-`+` lines).
+#[derive(Clone)]
+struct DiffPayload {
+    path: String,
+    old_text: String,
+    new_text: String,
+    is_creation: bool,
 }
 
 struct TaskView {
@@ -263,12 +201,14 @@ pub struct ChatApp {
     picker_backend: Option<String>,
     /// Model chosen in the new-task picker. None = follow backend default.
     picker_model: Option<String>,
-    picker_sandbox: SandboxChoice,
-    /// User-saved sandbox presets, persisted in localStorage (WASM) or kept
-    /// in memory (native test builds).
-    presets: Vec<LandlockPreset>,
-    /// Modal state for creating a new preset. `None` = closed.
-    preset_modal: Option<PresetModalState>,
+    /// Name of the `[[allow.host_env]]` entry the compose form is
+    /// targeting for the new thread. `None` = inherit the target pod's
+    /// `thread_defaults.host_env`. Always resolves to an entry in the
+    /// pod's allow list — the webui never invents inline specs, and
+    /// the server rejects unknown names. Reset back to `None` after
+    /// every submit so the next compose starts from the pod default,
+    /// not whatever the previous thread used.
+    compose_host_env: Option<String>,
 
     // --- Resource registry (Phase 1c read-only inspector) ---
     /// Snapshot of every resource the server has reported. Keyed by resource id.
@@ -282,9 +222,11 @@ pub struct ChatApp {
     /// threads are in this pod" lives in `tasks`, not here.
     pods: HashMap<String, PodSummary>,
     pods_requested: bool,
-    /// Server's host-env-provider catalog (built-in `bare` plus any
-    /// configured entries). Populated lazily on first ListHostEnvProviders
-    /// round-trip; used by the pod editor's per-entry provider dropdown.
+    /// Server's host-env-provider catalog. Populated lazily on first
+    /// ListHostEnvProviders round-trip; used by the pod editor's
+    /// per-entry provider dropdown. Can be empty — a server started
+    /// without any `[[host_env_providers]]` entries is a valid
+    /// configuration; pods in it just can't declare host envs.
     host_env_providers: Vec<HostEnvProviderInfo>,
     host_env_providers_requested: bool,
     /// Set of pod ids the user has manually collapsed in the left panel.
@@ -320,6 +262,14 @@ pub struct ChatApp {
     /// inherits the working sandbox / shared-mcp setup instead of
     /// starting from a stub. `None` until the `GetPod` round-trip lands.
     default_pod_template: Option<PodConfig>,
+    /// Cached full `PodConfig` keyed by pod id. Populated lazily via
+    /// `GetPod` when the compose form opens — the webui needs the
+    /// pod's `allow.host_env` table to render the host-env picker
+    /// without inventing state of its own. `pod_configs_requested`
+    /// tracks in-flight fetches so we don't spam round-trips on every
+    /// repaint.
+    pod_configs: HashMap<String, PodConfig>,
+    pod_configs_requested: HashSet<String>,
 
     /// Which view the left side panel is showing.
     left_mode: LeftPanelMode,
@@ -331,22 +281,6 @@ enum LeftPanelMode {
     #[default]
     Threads,
     Resources,
-}
-
-struct PresetModalState {
-    name: String,
-    workspace: String,
-    read_everywhere: bool,
-}
-
-impl PresetModalState {
-    fn new() -> Self {
-        Self {
-            name: String::new(),
-            workspace: String::new(),
-            read_everywhere: false,
-        }
-    }
 }
 
 /// State for the per-pod config editor. The modal is tabbed: three
@@ -461,13 +395,21 @@ impl SandboxEntryEditorState {
         }
     }
 
-    fn new_for_add() -> Self {
+    fn new_for_add(default_provider: Option<&str>) -> Self {
+        // Seed with the first configured provider so the dropdown lands
+        // on a valid choice. Falls back to an empty string when no
+        // providers are configured — the "Save" button then blocks via
+        // validation until the user fixes it.
+        let provider = default_provider.unwrap_or_default().to_string();
         Self {
             index: None,
             entry: NamedHostEnv {
                 name: String::new(),
-                provider: "bare".into(),
-                spec: HostEnvSpec::None,
+                provider,
+                spec: HostEnvSpec::Landlock {
+                    allowed_paths: Vec::new(),
+                    network: NetworkPolicy::Unrestricted,
+                },
             },
             error: None,
         }
@@ -476,10 +418,10 @@ impl SandboxEntryEditorState {
 
 /// State for the "+ New pod" modal. The user picks a directory-friendly
 /// `pod_id` (immutable on disk) and a display `name` (free text). The
-/// resulting pod inherits sane defaults — every backend allowed, no
-/// shared MCP hosts (user can opt in later), no sandbox spec (defaults
-/// to bare-metal). Once a pod-config editor lands the user can tighten
-/// or extend any of these from the UI.
+/// resulting pod inherits the server default pod's shape — same
+/// backends, shared MCP hosts, and host-env allow list — so freshly
+/// created pods are immediately usable. The pod editor is the only
+/// place to tighten or extend these.
 struct NewPodModalState {
     pod_id: String,
     name: String,
@@ -532,9 +474,7 @@ impl ChatApp {
             models_requested: HashSet::new(),
             picker_backend: None,
             picker_model: None,
-            picker_sandbox: SandboxChoice::default(),
-            presets: load_presets(),
-            preset_modal: None,
+            compose_host_env: None,
             resources: HashMap::new(),
             resources_requested: false,
             pods: HashMap::new(),
@@ -549,20 +489,43 @@ impl ChatApp {
             compose_pod_id: None,
             server_default_pod_id: String::new(),
             default_pod_template: None,
+            pod_configs: HashMap::new(),
+            pod_configs_requested: HashSet::new(),
             left_mode: LeftPanelMode::default(),
         }
     }
 
-    /// First non-built-in provider name from the catalog, used as a
-    /// best-guess fallback when a flow needs *some* provider (e.g. the
-    /// per-thread compose-form's preset picker, which doesn't model a
-    /// per-preset provider yet). Returns `None` when only `bare` is
-    /// configured.
-    fn first_non_bare_provider(&self) -> Option<String> {
-        self.host_env_providers
-            .iter()
-            .find(|p| !p.builtin)
-            .map(|p| p.name.clone())
+    /// Pod the compose form currently targets. `compose_pod_id` is
+    /// `None` when the user clicked the global "+ New thread" button —
+    /// we fall back to the server's default pod. Returns `None` when
+    /// neither is known yet (brand-new connection before PodList).
+    fn compose_target_pod_id(&self) -> Option<&str> {
+        self.compose_pod_id
+            .as_deref()
+            .or_else(|| {
+                if self.server_default_pod_id.is_empty() {
+                    None
+                } else {
+                    Some(&self.server_default_pod_id)
+                }
+            })
+    }
+
+    /// Ensure the target pod's config is cached. Dispatches a GetPod
+    /// round-trip the first time a given pod is needed; later composes
+    /// reuse the cached snapshot. Pod-config updates arrive as
+    /// `PodConfigUpdated` events, which overwrite the cached copy.
+    fn ensure_pod_config(&mut self, pod_id: &str) {
+        if self.pod_configs.contains_key(pod_id)
+            || self.pod_configs_requested.contains(pod_id)
+        {
+            return;
+        }
+        self.pod_configs_requested.insert(pod_id.to_string());
+        self.send(ClientToServer::GetPod {
+            pod_id: pod_id.to_string(),
+            correlation_id: None,
+        });
     }
 
     fn next_correlation_id(&mut self) -> String {
@@ -774,15 +737,15 @@ impl ChatApp {
                 tool_use_id,
                 name,
                 args_preview,
+                args,
             } => {
                 if let Some(view) = self.tasks.get_mut(&thread_id) {
-                    view.items.push(DisplayItem::ToolCall {
+                    view.items.push(build_tool_call_item(
                         tool_use_id,
                         name,
+                        args.as_ref(),
                         args_preview,
-                        result: None,
-                        is_error: false,
-                    });
+                    ));
                 }
             }
             ServerToClient::ThreadToolCallEnd {
@@ -956,6 +919,9 @@ impl ChatApp {
                 if pod_id == self.server_default_pod_id {
                     self.default_pod_template = Some(parsed.clone());
                 }
+                // Refresh the compose-form cache so an open compose
+                // picker sees the edit immediately.
+                self.pod_configs.insert(pod_id.clone(), parsed.clone());
                 // The editor stays open across saves — refresh its
                 // baseline so subsequent edits are diffed against the
                 // newly-persisted state, not the stale one. We keep
@@ -1015,20 +981,26 @@ impl ChatApp {
             }
             ServerToClient::PodSnapshot { snapshot, .. } => {
                 // Cache the default pod's config as a template for fresh
-                // "+ New pod" creation, and populate the editor modal if
-                // it's open and waiting on this pod's text.
+                // "+ New pod" creation.
                 if snapshot.pod_id == self.server_default_pod_id {
                     self.default_pod_template = Some(snapshot.config.clone());
                 }
+                // Populate the editor modal if it's open and waiting on
+                // this pod's text.
                 if let Some(modal) = self.pod_editor_modal.as_mut()
                     && modal.pod_id == snapshot.pod_id
                     && modal.working.is_none()
                 {
                     modal.server_baseline = Some(snapshot.config.clone());
-                    modal.working = Some(snapshot.config);
-                    modal.raw_buffer = snapshot.toml_text;
+                    modal.working = Some(snapshot.config.clone());
+                    modal.raw_buffer = snapshot.toml_text.clone();
                     modal.raw_dirty = false;
                 }
+                // Update the compose-form cache so the host-env picker
+                // reflects the current pod config even when the user
+                // re-edits the pod without closing the compose form.
+                self.pod_configs_requested.remove(&snapshot.pod_id);
+                self.pod_configs.insert(snapshot.pod_id.clone(), snapshot.config);
             }
         }
     }
@@ -1091,6 +1063,9 @@ impl ChatApp {
                 config_override,
                 bindings_request,
             });
+            // Reset to "inherit" so the next compose doesn't silently
+            // reuse the previous thread's override.
+            self.compose_host_env = None;
         } else if let Some(thread_id) = self.selected.clone() {
             if let Some(view) = self.tasks.get_mut(&thread_id) {
                 view.items.push(DisplayItem::User {
@@ -1132,28 +1107,11 @@ impl ChatApp {
                         .map(|m| m.id.clone())
                 })
         });
-        // Map the per-compose host-env choice into the wire shape.
-        // `None` here means "inherit pod default"; `bare` always pairs
-        // with `HostEnvSpec::None`. The Landlock preset picker uses the
-        // first non-built-in provider from the catalog as its provider
-        // — there's no per-preset provider field today; once presets
-        // get one, this falls out.
-        let host_env: Option<whisper_agent_protocol::InlineHostEnv> = match self.picker_sandbox {
-            SandboxChoice::ServerDefault => None,
-            SandboxChoice::None => Some(whisper_agent_protocol::InlineHostEnv {
-                provider: "bare".into(),
-                spec: HostEnvSpec::None,
-            }),
-            SandboxChoice::Preset(idx) => {
-                self.presets.get(idx).and_then(|p| {
-                    let provider = self.first_non_bare_provider()?;
-                    Some(whisper_agent_protocol::InlineHostEnv {
-                        provider,
-                        spec: p.to_spec(),
-                    })
-                })
-            }
-        };
+        // Host env is always a reference by name into the target
+        // pod's `allow.host_env` table. `None` → server applies
+        // `thread_defaults.host_env`. The webui never constructs
+        // inline specs; the server rejects Inline at the wire boundary.
+        let host_env = self.compose_host_env.clone();
         let config_override = if model.is_some() {
             Some(ThreadConfigOverride {
                 model,
@@ -1244,16 +1202,14 @@ fn add_message_items(msg: &Message, out: &mut Vec<DisplayItem>) {
                         out.push(DisplayItem::AssistantText { text: text.clone() });
                     }
                     ContentBlock::ToolUse { id, name, input } => {
-                        out.push(DisplayItem::ToolCall {
-                            tool_use_id: id.clone(),
-                            name: name.clone(),
-                            args_preview: truncate(
-                                serde_json::to_string(input).unwrap_or_default(),
-                                200,
-                            ),
-                            result: None,
-                            is_error: false,
-                        });
+                        let preview =
+                            truncate(serde_json::to_string(input).unwrap_or_default(), 200);
+                        out.push(build_tool_call_item(
+                            id.clone(),
+                            name.clone(),
+                            Some(input),
+                            preview,
+                        ));
                     }
                     ContentBlock::Thinking { thinking, .. } => {
                         out.push(DisplayItem::Reasoning {
@@ -1264,6 +1220,72 @@ fn add_message_items(msg: &Message, out: &mut Vec<DisplayItem>) {
                 }
             }
         }
+    }
+}
+
+/// Build a `DisplayItem::ToolCall` from the wire shape (full input
+/// `Value` available). `args_preview` is the server-truncated string;
+/// we only fall back to it for the summary when the structured args
+/// don't have a specialized renderer.
+///
+/// Special cases:
+///   * `edit_file` / `write_file` — pull `path` for the header, and
+///     compute a `DiffPayload` so the renderer can show old vs new.
+///   * `bash` — pull `command` for the header.
+///   * everything else — use the truncated JSON preview as the summary.
+fn build_tool_call_item(
+    tool_use_id: String,
+    name: String,
+    args: Option<&serde_json::Value>,
+    args_preview: String,
+) -> DisplayItem {
+    let summary = tool_summary(&name, args, &args_preview);
+    let args_pretty = args.and_then(|v| serde_json::to_string_pretty(v).ok());
+    let diff = args.and_then(|v| extract_diff(&name, v));
+    DisplayItem::ToolCall {
+        tool_use_id,
+        name,
+        summary,
+        args_pretty,
+        diff,
+        result: None,
+        is_error: false,
+    }
+}
+
+fn tool_summary(name: &str, args: Option<&serde_json::Value>, fallback: &str) -> String {
+    let Some(v) = args else {
+        return fallback.to_string();
+    };
+    let pick = |key: &str| v.get(key).and_then(|s| s.as_str()).map(str::to_owned);
+    match name {
+        "edit_file" | "write_file" | "read_file" => pick("path").unwrap_or_else(|| fallback.into()),
+        "bash" => pick("command")
+            .map(|c| truncate(c, 120))
+            .unwrap_or_else(|| fallback.into()),
+        "grep" => pick("pattern").unwrap_or_else(|| fallback.into()),
+        "glob" => pick("pattern").unwrap_or_else(|| fallback.into()),
+        "list_dir" => pick("path").unwrap_or_else(|| ".".into()),
+        _ => fallback.to_string(),
+    }
+}
+
+fn extract_diff(name: &str, args: &serde_json::Value) -> Option<DiffPayload> {
+    let s = |key: &str| args.get(key).and_then(|v| v.as_str()).map(str::to_owned);
+    match name {
+        "edit_file" => Some(DiffPayload {
+            path: s("path")?,
+            old_text: s("old_string")?,
+            new_text: s("new_string")?,
+            is_creation: false,
+        }),
+        "write_file" => Some(DiffPayload {
+            path: s("path")?,
+            old_text: String::new(),
+            new_text: s("content")?,
+            is_creation: true,
+        }),
+        _ => None,
     }
 }
 
@@ -1387,6 +1409,9 @@ impl eframe::App for ChatApp {
 
         let show_picker =
             (self.composing_new || self.selected.is_none()) && !self.backends.is_empty();
+        if show_picker && let Some(pod_id) = self.compose_target_pod_id().map(str::to_owned) {
+            self.ensure_pod_config(&pod_id);
+        }
         let mut request_models: Option<String> = None;
         egui::TopBottomPanel::bottom("input_bar")
             .resizable(false)
@@ -1458,52 +1483,51 @@ impl eframe::App for ChatApp {
                                 }
                             });
 
-                        ui.separator();
-                        ui.label(
-                            RichText::new("host env")
-                                .small()
-                                .color(Color32::from_gray(180)),
-                        );
-                        let sandbox_label: String = match self.picker_sandbox {
-                            SandboxChoice::ServerDefault => "default".into(),
-                            SandboxChoice::None => "none".into(),
-                            SandboxChoice::Preset(idx) => self
-                                .presets
-                                .get(idx)
-                                .map(|p| p.name.clone())
-                                .unwrap_or_else(|| "(missing preset)".into()),
-                        };
-                        let mut open_modal = false;
-                        ComboBox::from_id_salt("picker_sandbox")
-                            .selected_text(sandbox_label)
-                            .show_ui(ui, |ui| {
-                                ui.selectable_value(
-                                    &mut self.picker_sandbox,
-                                    SandboxChoice::ServerDefault,
-                                    "default  (server decides)",
-                                );
-                                ui.selectable_value(
-                                    &mut self.picker_sandbox,
-                                    SandboxChoice::None,
-                                    "none  (bare metal)",
-                                );
-                                if !self.presets.is_empty() {
+                        // Host env picker: dropdown over the target
+                        // pod's `allow.host_env` entries. First row =
+                        // "inherit pod default" (the server resolves
+                        // `compose_host_env = None` to
+                        // pod.thread_defaults.host_env, which the pod
+                        // validator guarantees names one of these
+                        // entries). Hidden entirely when the pod has
+                        // no host envs (threads there run with shared
+                        // MCPs only) or when the pod config hasn't
+                        // landed yet — inheriting is a safe default.
+                        let pod_config = self
+                            .compose_target_pod_id()
+                            .and_then(|id| self.pod_configs.get(id));
+                        if let Some(pod_config) = pod_config
+                            && !pod_config.allow.host_env.is_empty()
+                        {
+                            ui.separator();
+                            ui.label(
+                                RichText::new("host env")
+                                    .small()
+                                    .color(Color32::from_gray(180)),
+                            );
+                            let default_name = &pod_config.thread_defaults.host_env;
+                            let inherit_label = format!("pod default ({default_name})");
+                            let selected_label = match &self.compose_host_env {
+                                None => inherit_label.clone(),
+                                Some(name) => name.clone(),
+                            };
+                            ComboBox::from_id_salt("picker_host_env")
+                                .selected_text(selected_label)
+                                .show_ui(ui, |ui| {
+                                    ui.selectable_value(
+                                        &mut self.compose_host_env,
+                                        None,
+                                        inherit_label,
+                                    );
                                     ui.separator();
-                                    for (i, p) in self.presets.iter().enumerate() {
+                                    for nh in &pod_config.allow.host_env {
                                         ui.selectable_value(
-                                            &mut self.picker_sandbox,
-                                            SandboxChoice::Preset(i),
-                                            &p.name,
+                                            &mut self.compose_host_env,
+                                            Some(nh.name.clone()),
+                                            &nh.name,
                                         );
                                     }
-                                }
-                                ui.separator();
-                                if ui.button("+ New preset…").clicked() {
-                                    open_modal = true;
-                                }
-                            });
-                        if open_modal && self.preset_modal.is_none() {
-                            self.preset_modal = Some(PresetModalState::new());
+                                });
                         }
                     });
                 }
@@ -1598,7 +1622,6 @@ impl eframe::App for ChatApp {
             self.send(ClientToServer::RemoveToolAllowlistEntry { thread_id, tool_name });
         }
 
-        self.render_preset_modal(ctx);
         self.render_new_pod_modal(ctx);
         self.render_pod_editor_modal(ctx);
     }
@@ -1788,93 +1811,11 @@ impl ChatApp {
         self.pod_editor_modal = Some(PodEditorModalState::new(pod_id));
     }
 
-    fn render_preset_modal(&mut self, ctx: &egui::Context) {
-        let Some(mut modal) = self.preset_modal.take() else {
-            return;
-        };
-        let mut open = true;
-        let mut save_clicked = false;
-        let mut cancel_clicked = false;
-
-        egui::Window::new("New sandbox preset")
-            .collapsible(false)
-            .resizable(false)
-            .default_width(420.0)
-            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-            .open(&mut open)
-            .show(ctx, |ui| {
-                ui.add_space(4.0);
-                ui.horizontal(|ui| {
-                    ui.label("name");
-                    ui.add(
-                        TextEdit::singleline(&mut modal.name)
-                            .hint_text("e.g. 'rust-dev'")
-                            .desired_width(f32::INFINITY),
-                    );
-                });
-                ui.add_space(4.0);
-                ui.horizontal(|ui| {
-                    ui.label("workspace");
-                    ui.add(
-                        TextEdit::singleline(&mut modal.workspace)
-                            .hint_text("/absolute/path (read-write)")
-                            .desired_width(f32::INFINITY),
-                    );
-                });
-                ui.add_space(4.0);
-                ui.checkbox(
-                    &mut modal.read_everywhere,
-                    "Read everywhere (grant read-only access to the entire filesystem)",
-                );
-                ui.add_space(4.0);
-                ui.label(
-                    RichText::new(
-                        "Sandbox uses Linux landlock. Files outside the workspace are \
-                         read-only (if 'Read everywhere' is on) or denied entirely.",
-                    )
-                    .small()
-                    .color(Color32::from_gray(160)),
-                );
-                ui.add_space(8.0);
-                ui.separator();
-                ui.horizontal(|ui| {
-                    let save_enabled =
-                        !modal.name.trim().is_empty() && !modal.workspace.trim().is_empty();
-                    if ui
-                        .add_enabled(save_enabled, egui::Button::new("Save"))
-                        .clicked()
-                    {
-                        save_clicked = true;
-                    }
-                    if ui.button("Cancel").clicked() {
-                        cancel_clicked = true;
-                    }
-                });
-            });
-
-        if save_clicked {
-            let preset = LandlockPreset {
-                name: modal.name.trim().to_string(),
-                workspace: modal.workspace.trim().to_string(),
-                read_everywhere: modal.read_everywhere,
-            };
-            self.presets.push(preset);
-            save_presets(&self.presets);
-            self.picker_sandbox = SandboxChoice::Preset(self.presets.len() - 1);
-            // Modal closes (we don't put it back).
-        } else if cancel_clicked || !open {
-            // Modal closes.
-        } else {
-            // Stay open — restore modal state.
-            self.preset_modal = Some(modal);
-        }
-    }
-
-    /// Render the "+ New pod" modal. Pod creation here is intentionally
-    /// minimal — the resulting pod allows every backend the server is
-    /// running, no shared MCP hosts, and no sandbox spec (threads inside
-    /// run bare-metal). Subsequent phases (4.iii) add a config editor for
-    /// tightening or extending the allow cap.
+    /// Render the "+ New pod" modal. The user picks an id + display
+    /// name; the new pod inherits the server default pod's config as
+    /// a template. The pod editor (opened from the per-pod "Edit"
+    /// button) is the place to change backends, shared MCP hosts, or
+    /// host envs afterwards.
     fn render_new_pod_modal(&mut self, ctx: &egui::Context) {
         let Some(mut modal) = self.new_pod_modal.take() else {
             return;
@@ -1923,9 +1864,9 @@ impl ChatApp {
                 ui.add_space(8.0);
                 ui.label(
                     RichText::new(
-                        "The new pod will allow every backend the server is running, \
-                         no shared MCP hosts, and no sandbox spec (threads run bare-metal). \
-                         A pod-config editor lands in a future update.",
+                        "The new pod inherits the server default pod's template \
+                         (backends, shared MCPs, host envs). Use the per-pod Edit \
+                         button to change any of these afterwards.",
                     )
                     .small()
                     .color(Color32::from_gray(160)),
@@ -1997,6 +1938,7 @@ impl ChatApp {
                 _ => None,
             })
             .collect();
+        let host_env_providers: Vec<HostEnvProviderInfo> = self.host_env_providers.clone();
 
         let mut open = true;
         let mut save_clicked = false;
@@ -2131,6 +2073,7 @@ impl ChatApp {
                                         working,
                                         &backend_catalog,
                                         &shared_mcp_catalog,
+                                        &host_env_providers,
                                         &mut sandbox_entry_open,
                                         &mut sandbox_entry_delete,
                                     );
@@ -2218,12 +2161,21 @@ impl ChatApp {
             && let Some(working) = modal.working.as_mut()
             && idx < working.allow.host_env.len()
         {
-            // Best-effort: also clear thread_defaults.host_env if it
-            // pointed at the deleted entry, so the form doesn't carry
-            // a now-dangling reference into the server's validator.
+            // Also fix up thread_defaults.host_env: if it pointed at
+            // the deleted entry, pick the first remaining one (or
+            // empty when the allow list is now empty — the defaults
+            // picker renders a read-only "(shared MCPs only)" in
+            // that case). Leaves the form valid by construction
+            // instead of relying on a server-side error to surface
+            // a dangling reference.
             let removed = working.allow.host_env.remove(idx);
             if working.thread_defaults.host_env == removed.name {
-                working.thread_defaults.host_env = String::new();
+                working.thread_defaults.host_env = working
+                    .allow
+                    .host_env
+                    .first()
+                    .map(|nh| nh.name.clone())
+                    .unwrap_or_default();
             }
         }
         if let Some(sub) = sandbox_entry_open {
@@ -2430,15 +2382,7 @@ fn render_resource_row(ui: &mut egui::Ui, resource: &ResourceSnapshot) {
             users,
             ..
         } => {
-            // Sub-line: "<provider> · <spec summary>". For bare entries
-            // spec_label returns "(no isolation)" which already reads
-            // fine alongside provider="bare".
-            let summary = spec_label(spec);
-            let sub = if summary.is_empty() {
-                provider.clone()
-            } else {
-                format!("{provider} · {summary}")
-            };
+            let sub = format!("{provider} · {}", spec_label(spec));
             (id.clone(), sub, *state, users.len())
         }
         ResourceSnapshot::McpHost {
@@ -2494,7 +2438,6 @@ fn render_resource_row(ui: &mut egui::Ui, resource: &ResourceSnapshot) {
 
 fn spec_label(spec: &HostEnvSpec) -> String {
     match spec {
-        HostEnvSpec::None => "no isolation".into(),
         HostEnvSpec::Container { image, .. } => format!("container: {image}"),
         HostEnvSpec::Landlock { allowed_paths, .. } => {
             format!("landlock · {} paths", allowed_paths.len())
@@ -2668,104 +2611,276 @@ fn render_allowlist_chips(
     ui.add_space(4.0);
 }
 
-fn render_item(ui: &mut egui::Ui, item: &DisplayItem) {
+// ====================================================================
+// Conversation renderer — event-log layout
+//
+// Each item draws as a full-width row with a 3px role-colored gutter on
+// the left edge. User messages get a faint background tint to mark
+// them as section breaks (they're rare relative to model output).
+// Agent text and reasoning have transparent backgrounds — the gutter
+// alone carries the role signal so the bulk of the conversation reads
+// as a quiet stream of model output, not a chat log.
+//
+// Tool calls render as collapsible rows whose header is `name summary
+// [state]`. `edit_file` / `write_file` calls expand by default and
+// show a unified diff (built into the item's `diff` payload at
+// build_tool_call_item time); other tools collapse by default with
+// the full pretty-printed JSON args + truncated result available
+// inside.
+// ====================================================================
+
+const GUTTER_WIDTH: f32 = 3.0;
+
+const COLOR_USER: Color32 = Color32::from_rgb(120, 180, 240);
+const COLOR_AGENT: Color32 = Color32::from_rgb(120, 200, 140);
+const COLOR_REASONING: Color32 = Color32::from_rgb(170, 150, 200);
+const COLOR_TOOL: Color32 = Color32::from_rgb(220, 180, 100);
+const COLOR_ERROR: Color32 = Color32::from_rgb(220, 120, 120);
+const COLOR_NEUTRAL: Color32 = Color32::from_gray(140);
+
+fn item_palette(item: &DisplayItem) -> (Color32, Color32) {
+    // (gutter color, frame fill)
     match item {
-        DisplayItem::User { text } => {
-            ui.horizontal_top(|ui| {
-                ui.label(
-                    RichText::new("you")
-                        .color(Color32::from_rgb(120, 180, 240))
-                        .strong(),
-                );
-                ui.label(text);
-            });
-        }
-        DisplayItem::AssistantText { text } => {
-            ui.horizontal_top(|ui| {
-                ui.label(
-                    RichText::new("agent")
-                        .color(Color32::from_rgb(160, 220, 160))
-                        .strong(),
-                );
-                ui.label(text);
-            });
-        }
-        DisplayItem::Reasoning { text } => {
-            ui.horizontal_top(|ui| {
-                ui.label(
-                    RichText::new("think")
-                        .color(Color32::from_rgb(180, 160, 220))
-                        .strong(),
-                );
-                let preview = text.lines().next().unwrap_or("").trim();
-                let header = if preview.len() > 80 {
-                    format!("{}…", &preview[..80])
-                } else if preview.is_empty() {
-                    "(reasoning)".to_string()
-                } else {
-                    preview.to_string()
-                };
-                // Default-collapsed: reasoning is preserved but doesn't dominate the view.
-                egui::CollapsingHeader::new(
-                    RichText::new(header)
-                        .color(Color32::from_gray(140))
-                        .italics(),
-                )
-                .id_salt(("reasoning", text.as_ptr() as usize))
-                .default_open(false)
-                .show(ui, |ui| {
-                    ui.label(RichText::new(text).color(Color32::from_gray(170)).italics());
-                });
-            });
-        }
-        DisplayItem::ToolCall {
-            name,
-            args_preview,
-            result,
-            is_error,
-            ..
-        } => {
-            ui.horizontal_top(|ui| {
-                ui.label(
-                    RichText::new("tool")
-                        .color(Color32::from_rgb(220, 180, 100))
-                        .strong(),
-                );
-                ui.vertical(|ui| {
-                    ui.label(
-                        RichText::new(format!("{name}({args_preview})"))
-                            .color(Color32::from_gray(200))
-                            .monospace(),
-                    );
-                    match result {
-                        None => {
-                            ui.label(
-                                RichText::new("running…")
-                                    .color(Color32::from_gray(140))
-                                    .italics(),
-                            );
-                        }
-                        Some(text) => {
-                            let color = if *is_error {
-                                Color32::from_rgb(220, 120, 120)
-                            } else {
-                                Color32::from_gray(180)
-                            };
-                            ui.label(RichText::new(text).color(color).monospace().small());
-                        }
-                    }
-                });
-            });
-        }
-        DisplayItem::SystemNote { text, is_error } => {
-            let color = if *is_error {
-                Color32::from_rgb(220, 120, 120)
-            } else {
-                Color32::from_gray(160)
-            };
-            ui.label(RichText::new(text).color(color).italics());
-        }
+        DisplayItem::User { .. } => (
+            COLOR_USER,
+            Color32::from_rgba_unmultiplied(120, 180, 240, 18),
+        ),
+        DisplayItem::AssistantText { .. } => (COLOR_AGENT, Color32::TRANSPARENT),
+        DisplayItem::Reasoning { .. } => (COLOR_REASONING, Color32::TRANSPARENT),
+        DisplayItem::ToolCall { is_error: true, .. } => (COLOR_ERROR, Color32::TRANSPARENT),
+        DisplayItem::ToolCall { .. } => (COLOR_TOOL, Color32::TRANSPARENT),
+        DisplayItem::SystemNote { is_error: true, .. } => (
+            COLOR_ERROR,
+            Color32::from_rgba_unmultiplied(220, 120, 120, 18),
+        ),
+        DisplayItem::SystemNote { .. } => (COLOR_NEUTRAL, Color32::TRANSPARENT),
     }
+}
+
+fn render_item(ui: &mut egui::Ui, item: &DisplayItem) {
+    let (gutter_color, fill) = item_palette(item);
+    let frame = egui::Frame::default()
+        .fill(fill)
+        .inner_margin(egui::Margin {
+            left: 12,
+            right: 8,
+            top: 4,
+            bottom: 4,
+        });
+    let resp = frame.show(ui, |ui| {
+        ui.set_min_width(ui.available_width());
+        match item {
+            DisplayItem::User { text } => render_user(ui, text),
+            DisplayItem::AssistantText { text } => render_assistant_text(ui, text),
+            DisplayItem::Reasoning { text } => render_reasoning(ui, text),
+            DisplayItem::ToolCall {
+                tool_use_id,
+                name,
+                summary,
+                args_pretty,
+                diff,
+                result,
+                is_error,
+            } => render_tool_call(
+                ui,
+                tool_use_id,
+                name,
+                summary,
+                args_pretty.as_deref(),
+                diff.as_ref(),
+                result.as_deref(),
+                *is_error,
+            ),
+            DisplayItem::SystemNote { text, is_error } => render_system_note(ui, text, *is_error),
+        }
+    });
+    // Paint the gutter into the reserved 3px on the left side of the
+    // frame's inner margin. Done after .show() returns so the painted
+    // rect lands on top of the (subtle) frame fill — fine because the
+    // gutter sits inside the inner margin where there's no content.
+    let r = resp.response.rect;
+    let gutter_rect = egui::Rect::from_min_max(
+        r.min,
+        egui::pos2(r.min.x + GUTTER_WIDTH, r.max.y),
+    );
+    ui.painter().rect_filled(gutter_rect, 0.0, gutter_color);
+}
+
+fn render_user(ui: &mut egui::Ui, text: &str) {
+    ui.horizontal_wrapped(|ui| {
+        ui.label(
+            RichText::new("USER")
+                .color(COLOR_USER)
+                .strong()
+                .small(),
+        );
+        ui.add_space(8.0);
+        ui.label(text);
+    });
+}
+
+fn render_assistant_text(ui: &mut egui::Ui, text: &str) {
+    // No role label — the gutter color carries it. This is the bulk
+    // of the conversation; we want it visually quiet.
+    ui.label(text);
+}
+
+fn render_reasoning(ui: &mut egui::Ui, text: &str) {
+    let id = ui.make_persistent_id(("reasoning", text.as_ptr() as usize));
+    let preview = text.lines().next().unwrap_or("").trim();
+    let header = if preview.is_empty() {
+        "(reasoning)".to_string()
+    } else if preview.chars().count() > 80 {
+        let mut h: String = preview.chars().take(80).collect();
+        h.push('…');
+        h
+    } else {
+        preview.to_string()
+    };
+    egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), id, false)
+        .show_header(ui, |ui| {
+            ui.label(
+                RichText::new("REASONING")
+                    .color(COLOR_REASONING)
+                    .strong()
+                    .small(),
+            );
+            ui.add_space(8.0);
+            ui.label(
+                RichText::new(header)
+                    .color(Color32::from_gray(140))
+                    .italics(),
+            );
+        })
+        .body(|ui| {
+            ui.label(RichText::new(text).color(Color32::from_gray(170)).italics());
+        });
+}
+
+fn render_system_note(ui: &mut egui::Ui, text: &str, is_error: bool) {
+    let color = if is_error { COLOR_ERROR } else { COLOR_NEUTRAL };
+    ui.label(RichText::new(text).color(color).italics());
+}
+
+fn render_tool_call(
+    ui: &mut egui::Ui,
+    tool_use_id: &str,
+    name: &str,
+    summary: &str,
+    args_pretty: Option<&str>,
+    diff: Option<&DiffPayload>,
+    result: Option<&str>,
+    is_error: bool,
+) {
+    let id = ui.make_persistent_id(("tool", tool_use_id));
+    // Default-open the diff variants — the diff itself is the
+    // interesting content, and forcing the user to click into every
+    // edit ruins the scanability of an ongoing edit session.
+    let default_open = diff.is_some();
+    let (chip_text, chip_color) = match (result, is_error) {
+        (None, _) => ("running", Color32::from_rgb(200, 180, 60)),
+        (Some(_), true) => ("error", COLOR_ERROR),
+        (Some(_), false) => ("ok", Color32::from_rgb(140, 200, 140)),
+    };
+    egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), id, default_open)
+        .show_header(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new(name)
+                        .color(COLOR_TOOL)
+                        .strong()
+                        .monospace(),
+                );
+                ui.add_space(6.0);
+                ui.label(
+                    RichText::new(summary)
+                        .color(Color32::from_gray(180))
+                        .monospace(),
+                );
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.label(
+                        RichText::new(chip_text)
+                            .color(chip_color)
+                            .small()
+                            .strong(),
+                    );
+                });
+            });
+        })
+        .body(|ui| {
+            if let Some(diff) = diff {
+                render_diff(ui, diff);
+            } else if let Some(args) = args_pretty {
+                ui.label(
+                    RichText::new(args)
+                        .color(Color32::from_gray(170))
+                        .monospace()
+                        .small(),
+                );
+            }
+            if let Some(result) = result {
+                ui.add_space(6.0);
+                ui.label(
+                    RichText::new("result")
+                        .color(Color32::from_gray(140))
+                        .small()
+                        .strong(),
+                );
+                let color = if is_error {
+                    Color32::from_rgb(220, 140, 140)
+                } else {
+                    Color32::from_gray(180)
+                };
+                ui.label(RichText::new(result).color(color).monospace().small());
+            }
+        });
+}
+
+fn render_diff(ui: &mut egui::Ui, diff: &DiffPayload) {
+    use similar::{ChangeTag, TextDiff};
+    let header = if diff.is_creation {
+        format!("(new) {}", diff.path)
+    } else {
+        diff.path.clone()
+    };
+    ui.label(
+        RichText::new(header)
+            .color(Color32::from_gray(180))
+            .monospace()
+            .small()
+            .strong(),
+    );
+    let text_diff = TextDiff::from_lines(&diff.old_text, &diff.new_text);
+    let fg_eq = Color32::from_gray(150);
+    let fg_del = Color32::from_rgb(230, 130, 130);
+    let fg_add = Color32::from_rgb(150, 220, 170);
+    egui::Frame::default()
+        .fill(Color32::from_gray(22))
+        .inner_margin(egui::Margin {
+            left: 6,
+            right: 6,
+            top: 4,
+            bottom: 4,
+        })
+        .show(ui, |ui| {
+            ui.set_min_width(ui.available_width());
+            ui.style_mut().spacing.item_spacing.y = 0.0;
+            for change in text_diff.iter_all_changes() {
+                let (prefix, color) = match change.tag() {
+                    ChangeTag::Equal => (' ', fg_eq),
+                    ChangeTag::Delete => ('-', fg_del),
+                    ChangeTag::Insert => ('+', fg_add),
+                };
+                let raw = change.value();
+                let trimmed = raw.strip_suffix('\n').unwrap_or(raw);
+                ui.label(
+                    RichText::new(format!("{prefix}{trimmed}"))
+                        .color(color)
+                        .monospace()
+                        .small(),
+                );
+            }
+        });
 }
 
 // ====================================================================
@@ -2784,6 +2899,7 @@ fn render_pod_editor_allow_tab(
     working: &mut PodConfig,
     backend_catalog: &[String],
     shared_mcp_catalog: &[String],
+    host_env_providers: &[HostEnvProviderInfo],
     sandbox_open: &mut Option<SandboxEntryEditorState>,
     sandbox_delete: &mut Option<usize>,
 ) {
@@ -2884,16 +3000,18 @@ fn render_pod_editor_allow_tab(
     hint(
         ui,
         "Each entry is a named (provider, spec) pair threads in this pod can bind \
-         to. `thread_defaults.host_env` must reference one of these by name (or be \
-         empty for bare-metal). The `bare` provider is built-in and pairs with \
-         `none` specs; everything else dispatches to a configured \
-         `[[host_env_providers]]` daemon.",
+         to. Every entry dispatches to one of the server's configured \
+         `[[host_env_providers]]` daemons. A pod with zero entries is valid — its \
+         threads run with shared MCPs only (no bash / file / edit tools).",
     );
     if working.allow.host_env.is_empty() {
         ui.label(
-            RichText::new("(no host envs — threads will run bare-metal)")
-                .italics()
-                .color(Color32::from_gray(160)),
+            RichText::new(
+                "(no host envs — threads in this pod will have shared MCP tools \
+                 only)",
+            )
+            .italics()
+            .color(Color32::from_gray(160)),
         );
     } else {
         Grid::new("pod_editor_host_envs")
@@ -2934,7 +3052,8 @@ fn render_pod_editor_allow_tab(
     }
     ui.add_space(4.0);
     if ui.button("+ Add host env").clicked() {
-        *sandbox_open = Some(SandboxEntryEditorState::new_for_add());
+        let default_provider = host_env_providers.first().map(|p| p.name.as_str());
+        *sandbox_open = Some(SandboxEntryEditorState::new_for_add(default_provider));
     }
     ui.add_space(8.0);
 }
@@ -3070,32 +3189,50 @@ fn render_pod_editor_defaults_tab(
             ui.end_row();
 
             ui.label("host env");
+            // Pods with zero allow.host_env entries don't offer a host
+            // env to their threads at all — the default is fixed at
+            // empty and there's nothing to choose. Pods with entries
+            // must pick a default from them (the server's validator
+            // rejects mismatches). There is no "(none)" escape hatch:
+            // a thread with no host env binding is a shape for pods
+            // that declare zero entries, not a fallback we let other
+            // pods silently land on.
             let sb_in_allow = working.thread_defaults.host_env.is_empty()
                 || working
                     .allow
                     .host_env
                     .iter()
                     .any(|s| s.name == working.thread_defaults.host_env);
-            ComboBox::from_id_salt("pod_editor_defaults_sandbox")
-                .selected_text(if working.thread_defaults.host_env.is_empty() {
-                    "(none — bare-metal)".to_string()
-                } else {
-                    working.thread_defaults.host_env.clone()
-                })
-                .show_ui(ui, |ui| {
-                    ui.selectable_value(
-                        &mut working.thread_defaults.host_env,
-                        String::new(),
-                        "(none — bare-metal)",
-                    );
-                    for entry in &working.allow.host_env {
-                        ui.selectable_value(
-                            &mut working.thread_defaults.host_env,
-                            entry.name.clone(),
-                            &entry.name,
-                        );
-                    }
-                });
+            if working.allow.host_env.is_empty() {
+                // Keep the value forced to empty — switching to a named
+                // entry from here is meaningless until the allow list
+                // gains one on the Allow tab.
+                working.thread_defaults.host_env.clear();
+                ui.label(
+                    RichText::new(
+                        "— (this pod has no host envs in [allow] — threads here get \
+                         shared MCPs only)",
+                    )
+                    .italics()
+                    .color(Color32::from_gray(160)),
+                );
+            } else {
+                ComboBox::from_id_salt("pod_editor_defaults_sandbox")
+                    .selected_text(if working.thread_defaults.host_env.is_empty() {
+                        "(pick one)".to_string()
+                    } else {
+                        working.thread_defaults.host_env.clone()
+                    })
+                    .show_ui(ui, |ui| {
+                        for entry in &working.allow.host_env {
+                            ui.selectable_value(
+                                &mut working.thread_defaults.host_env,
+                                entry.name.clone(),
+                                &entry.name,
+                            );
+                        }
+                    });
+            }
             ui.end_row();
             if !sb_in_allow {
                 ui.label("");
@@ -3254,16 +3391,22 @@ fn render_sandbox_entry_modal(
                                         sub.entry.provider.clone()
                                     })
                                     .show_ui(ui, |ui| {
+                                        if providers.is_empty() {
+                                            ui.label(
+                                                RichText::new(
+                                                    "no providers configured — add \
+                                                     `[[host_env_providers]]` entries to \
+                                                     whisper-agent.toml",
+                                                )
+                                                .italics()
+                                                .color(Color32::from_gray(160)),
+                                            );
+                                        }
                                         for p in providers {
-                                            let label = if p.builtin {
-                                                format!("{} (built-in)", p.name)
-                                            } else {
-                                                p.name.clone()
-                                            };
                                             ui.selectable_value(
                                                 &mut sub.entry.provider,
                                                 p.name.clone(),
-                                                label,
+                                                &p.name,
                                             );
                                         }
                                     });
@@ -3273,16 +3416,6 @@ fn render_sandbox_entry_modal(
                                 ComboBox::from_id_salt("sandbox_entry_type")
                                     .selected_text(current)
                                     .show_ui(ui, |ui| {
-                                        if ui
-                                            .selectable_label(
-                                                matches!(sub.entry.spec, HostEnvSpec::None),
-                                                "none (bare-metal)",
-                                            )
-                                            .clicked()
-                                            && !matches!(sub.entry.spec, HostEnvSpec::None)
-                                        {
-                                            sub.entry.spec = HostEnvSpec::None;
-                                        }
                                         if ui
                                             .selectable_label(
                                                 matches!(sub.entry.spec, HostEnvSpec::Landlock { .. }),
@@ -3325,16 +3458,6 @@ fn render_sandbox_entry_modal(
                         ui.separator();
                         ui.add_space(8.0);
                         match &mut sub.entry.spec {
-                            HostEnvSpec::None => {
-                                ui.label(
-                                    RichText::new(
-                                        "Bare-metal — tools execute on the host with no \
-                                         isolation beyond workspace path clamping.",
-                                    )
-                                    .italics()
-                                    .color(Color32::from_gray(160)),
-                                );
-                            }
                             HostEnvSpec::Landlock {
                                 allowed_paths,
                                 network,
@@ -3698,7 +3821,6 @@ fn approval_policy_label(p: ApprovalPolicy) -> &'static str {
 
 fn spec_type_label(spec: &HostEnvSpec) -> &'static str {
     match spec {
-        HostEnvSpec::None => "none",
         HostEnvSpec::Landlock { .. } => "landlock",
         HostEnvSpec::Container { .. } => "container",
     }

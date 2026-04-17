@@ -231,6 +231,10 @@ pub enum ThreadEvent {
         tool_use_id: String,
         name: String,
         args_preview: String,
+        /// Full tool arguments (untruncated). Used by the webui for
+        /// rich tool-specific renderers (e.g. unified diffs for
+        /// edit_file). The router forwards this onto the wire.
+        args: serde_json::Value,
     },
     ToolCallEnd {
         tool_use_id: String,
@@ -510,6 +514,7 @@ impl Thread {
                             serde_json::to_string(&next.input).unwrap_or_default(),
                             200,
                         ),
+                        args: next.input.clone(),
                     });
                     let dispatch = IoRequest::ToolCall {
                         op_id,
@@ -970,6 +975,7 @@ impl Thread {
                             serde_json::to_string(&tool_use.input).unwrap_or_default(),
                             200,
                         ),
+                        args: tool_use.input.clone(),
                     });
                     events.push(ThreadEvent::ToolCallEnd {
                         tool_use_id: tool_use.tool_use_id.clone(),

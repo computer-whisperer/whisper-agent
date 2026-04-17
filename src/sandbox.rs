@@ -1,18 +1,21 @@
 //! Host-env provisioning and lifecycle.
 //!
 //! [`HostEnvProvider`] translates a [`HostEnvSpec`] into a running
-//! execution environment with an MCP host inside it. The scheduler holds
-//! a *registry* of providers keyed by name (catalog entries from
-//! `whisper-agent.toml` plus the always-built-in `"bare"` provider).
-//! Each thread's bindings name which provider to use; the scheduler
-//! dispatches to that provider's `provision`.
+//! execution environment with an MCP host inside it. The scheduler
+//! holds a registry of providers loaded from `[[host_env_providers]]`
+//! in `whisper-agent.toml`; each pod's `[[allow.host_env]]` entry
+//! names one by name, and threads bind by name into the pod's allow
+//! list.
 //!
-//! Today's only network-attached provider implementation is
-//! [`DaemonClient`] — talks to the existing `whisper-agent-sandbox`
-//! daemon over its custom HTTP API. Authentication on that wire is
-//! intentionally absent for now (dev environment); the catalog entry
-//! struct is left extensible so adding mTLS / shared-secret auth later
-//! is purely additive.
+//! There is no built-in provider. A thread that does not bind a host
+//! env simply has no host-env MCP connection — its tool set is
+//! whatever shared MCP hosts it binds to, and nothing else.
+//!
+//! Today's only provider implementation is [`DaemonClient`] — talks
+//! to the existing `whisper-agent-sandbox` daemon over its custom
+//! HTTP API. Authentication on that wire is intentionally absent for
+//! now (dev environment); the catalog entry struct is left extensible
+//! so adding mTLS / shared-secret auth later is purely additive.
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -26,22 +29,12 @@ use whisper_agent_protocol::sandbox::{ProvisionRequest, ProvisionResponse, Teard
 
 type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
-/// Always-registered name of the in-process noop provider. Pod entries
-/// pairing this provider with `HostEnvSpec::None` mean "no isolation,
-/// thread runs bare-metal."
-pub const BARE_PROVIDER_NAME: &str = "bare";
-
 #[derive(Debug, Error)]
 pub enum HostEnvError {
     #[error("provision failed: {0}")]
     Provision(String),
     #[error("teardown failed: {0}")]
     Teardown(String),
-    #[error("provider `{provider}` does not support spec type `{spec_type}`")]
-    UnsupportedSpec {
-        provider: String,
-        spec_type: &'static str,
-    },
     #[error("unknown provider `{0}` (not in host_env_providers catalog)")]
     UnknownProvider(String),
 }
@@ -73,10 +66,10 @@ pub trait HostEnvProvider: Send + Sync {
 
 /// A running host env. Held by the scheduler for the env's lifetime.
 pub trait HostEnvHandle: Send + Sync {
-    /// MCP URL of the host inside this env, if the provider spawned
-    /// one. Returns `None` for the `bare` provider — the scheduler
-    /// then falls back to the server's `default_mcp_host_url`.
-    fn mcp_url(&self) -> Option<&str>;
+    /// MCP URL of the host inside this env. Always populated for real
+    /// providers — a host env without an MCP host would be pointless
+    /// (its whole purpose is to expose tools).
+    fn mcp_url(&self) -> &str;
 
     /// Tear down the env (stop the daemon-side session, release
     /// namespaces, etc.). Called when the env is GC'd or the bound
@@ -84,54 +77,11 @@ pub trait HostEnvHandle: Send + Sync {
     fn teardown(&mut self) -> BoxFuture<'_, Result<(), HostEnvError>>;
 }
 
-// ---------- Bare (in-process noop) ----------
-
-/// Always-registered built-in. Accepts only `HostEnvSpec::None`; any
-/// other spec is rejected with `UnsupportedSpec`. The handle holds no
-/// state; teardown is a no-op.
-pub struct BareProvider;
-
-impl HostEnvProvider for BareProvider {
-    fn provision<'a>(
-        &'a self,
-        _thread_id: &'a str,
-        spec: &'a HostEnvSpec,
-    ) -> BoxFuture<'a, Result<Box<dyn HostEnvHandle>, HostEnvError>> {
-        Box::pin(async move {
-            match spec {
-                HostEnvSpec::None => Ok(Box::new(BareHandle) as Box<dyn HostEnvHandle>),
-                HostEnvSpec::Container { .. } => Err(HostEnvError::UnsupportedSpec {
-                    provider: BARE_PROVIDER_NAME.into(),
-                    spec_type: "container",
-                }),
-                HostEnvSpec::Landlock { .. } => Err(HostEnvError::UnsupportedSpec {
-                    provider: BARE_PROVIDER_NAME.into(),
-                    spec_type: "landlock",
-                }),
-            }
-        })
-    }
-}
-
-struct BareHandle;
-
-impl HostEnvHandle for BareHandle {
-    fn mcp_url(&self) -> Option<&str> {
-        None
-    }
-
-    fn teardown(&mut self) -> BoxFuture<'_, Result<(), HostEnvError>> {
-        Box::pin(async { Ok(()) })
-    }
-}
-
 // ---------- DaemonClient ----------
 
 /// HTTP client for one configured `whisper-agent-sandbox` daemon. The
 /// catalog can hold many of these (each with its own URL); the
-/// scheduler dispatches to one by name at provision time. Today only
-/// `Container` and `Landlock` specs are valid — the daemon would
-/// reject `None`.
+/// scheduler dispatches to one by name at provision time.
 pub struct DaemonClient {
     name: String,
     http: reqwest::Client,
@@ -155,13 +105,6 @@ impl HostEnvProvider for DaemonClient {
         spec: &'a HostEnvSpec,
     ) -> BoxFuture<'a, Result<Box<dyn HostEnvHandle>, HostEnvError>> {
         Box::pin(async move {
-            if matches!(spec, HostEnvSpec::None) {
-                return Err(HostEnvError::UnsupportedSpec {
-                    provider: self.name.clone(),
-                    spec_type: "none",
-                });
-            }
-
             info!(thread_id, provider = %self.name, "requesting host env from daemon");
             let req = ProvisionRequest {
                 thread_id: thread_id.to_string(),
@@ -215,8 +158,8 @@ struct DaemonHandle {
 }
 
 impl HostEnvHandle for DaemonHandle {
-    fn mcp_url(&self) -> Option<&str> {
-        Some(&self.mcp_url)
+    fn mcp_url(&self) -> &str {
+        &self.mcp_url
     }
 
     fn teardown(&mut self) -> BoxFuture<'_, Result<(), HostEnvError>> {
@@ -248,29 +191,20 @@ impl HostEnvHandle for DaemonHandle {
 // ---------- Registry ----------
 
 /// Server-held registry of host-env providers, keyed by catalog name.
-/// `bare` is always present; other entries come from
-/// `[[host_env_providers]]` in `whisper-agent.toml`.
-#[derive(Clone)]
+/// All entries come from `[[host_env_providers]]` in
+/// `whisper-agent.toml` — there are no built-ins. A server running
+/// with zero providers simply can't provision host envs; its pods can
+/// still host threads, those threads just have no host-env MCP
+/// connection.
+#[derive(Clone, Default)]
 pub struct HostEnvRegistry {
     providers: HashMap<String, Arc<dyn HostEnvProvider>>,
 }
 
 impl HostEnvRegistry {
-    /// Build a registry from the configured catalog. Always includes a
-    /// `bare` entry; refuses if any catalog entry tries to shadow that
-    /// reserved name.
     pub fn new(catalog: Vec<HostEnvProviderEntry>) -> anyhow::Result<Self> {
         let mut providers: HashMap<String, Arc<dyn HostEnvProvider>> = HashMap::new();
-        providers.insert(
-            BARE_PROVIDER_NAME.to_string(),
-            Arc::new(BareProvider) as Arc<dyn HostEnvProvider>,
-        );
         for entry in catalog {
-            if entry.name == BARE_PROVIDER_NAME {
-                anyhow::bail!(
-                    "host_env_provider name `{BARE_PROVIDER_NAME}` is reserved for the built-in"
-                );
-            }
             if providers.contains_key(&entry.name) {
                 anyhow::bail!("duplicate host_env_provider name `{}`", entry.name);
             }
@@ -291,28 +225,15 @@ impl HostEnvRegistry {
         self.providers.contains_key(name)
     }
 
-    /// Catalog entries in deterministic order — `bare` first, then the
-    /// configured ones sorted by name. Used by `ListHostEnvProviders`
-    /// responses.
+    /// Catalog entries in deterministic order (sorted by name). Used
+    /// by `ListHostEnvProviders` responses.
     pub fn snapshot(&self) -> Vec<whisper_agent_protocol::HostEnvProviderInfo> {
         use whisper_agent_protocol::HostEnvProviderInfo;
-        let mut others: Vec<&String> = self
-            .providers
-            .keys()
-            .filter(|k| k.as_str() != BARE_PROVIDER_NAME)
-            .collect();
-        others.sort();
-        let mut out = Vec::with_capacity(self.providers.len());
-        out.push(HostEnvProviderInfo {
-            name: BARE_PROVIDER_NAME.to_string(),
-            builtin: true,
-        });
-        for name in others {
-            out.push(HostEnvProviderInfo {
-                name: name.clone(),
-                builtin: false,
-            });
-        }
-        out
+        let mut names: Vec<&String> = self.providers.keys().collect();
+        names.sort();
+        names
+            .into_iter()
+            .map(|name| HostEnvProviderInfo { name: name.clone() })
+            .collect()
     }
 }

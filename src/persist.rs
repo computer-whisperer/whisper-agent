@@ -462,8 +462,16 @@ async fn load_one(path: &Path, pod_id: &str) -> Result<Thread> {
     let bytes = fs::read(path)
         .await
         .with_context(|| format!("read {}", path.display()))?;
-    let mut task: Thread =
-        serde_json::from_slice(&bytes).with_context(|| format!("parse {}", path.display()))?;
+    // Pre-deserialize migration: older snapshots persisted
+    // `bindings.host_env` as a bare `he-...` id string. The new
+    // protocol expects an object (HostEnvBinding::Named|Inline) or
+    // null, so we strip the legacy string here and let
+    // `Scheduler::load_state` re-bind to the pod's current default.
+    let mut value: serde_json::Value = serde_json::from_slice(&bytes)
+        .with_context(|| format!("parse {}", path.display()))?;
+    normalize_legacy_host_env_binding(&mut value);
+    let mut task: Thread = serde_json::from_value(value)
+        .with_context(|| format!("decode {}", path.display()))?;
     // Stamp pod_id from the directory we found it in. This wins over any
     // value baked into the JSON — a pod that was renamed on disk should
     // have its threads follow.
@@ -472,6 +480,45 @@ async fn load_one(path: &Path, pod_id: &str) -> Result<Thread> {
         task.fail("resume", "task was in-flight at last shutdown");
     }
     Ok(task)
+}
+
+fn normalize_legacy_host_env_binding(value: &mut serde_json::Value) {
+    let Some(bindings) = value.get_mut("bindings") else {
+        return;
+    };
+    // Pre-refactor `bindings.host_env` was a bare `he-...` id string.
+    // The new shape is an object (or null); rewrite strings to null so
+    // the scheduler rebinds to the pod default on load.
+    if let Some(host_env) = bindings.get_mut("host_env")
+        && host_env.is_string()
+    {
+        *host_env = serde_json::Value::Null;
+    }
+    // Pre-refactor `bindings.mcp_hosts` contained full resource-ids:
+    // `mcp-primary-<tid>` at index 0 plus `mcp-shared-<name>` entries.
+    // New shape stores bare shared-host names; host-env MCP isn't
+    // represented here at all (it's derived from bindings.host_env).
+    // Strip the primary entry and unwrap the shared prefix.
+    if let Some(mcp_hosts) = bindings.get_mut("mcp_hosts")
+        && let Some(arr) = mcp_hosts.as_array_mut()
+    {
+        let rewritten: Vec<serde_json::Value> = arr
+            .iter()
+            .filter_map(|v| v.as_str())
+            .filter_map(|s| s.strip_prefix("mcp-shared-").map(String::from))
+            .map(serde_json::Value::String)
+            .collect();
+        // Only rewrite if anything looked legacy — avoid pointless
+        // churn on already-normalized files.
+        let already_clean = arr.iter().all(|v| {
+            v.as_str()
+                .map(|s| !s.starts_with("mcp-") && !s.is_empty())
+                .unwrap_or(false)
+        });
+        if !already_clean {
+            *arr = rewritten;
+        }
+    }
 }
 
 fn is_in_flight(state: &ThreadInternalState) -> bool {
@@ -657,6 +704,37 @@ mod tests {
                 .path()
                 .join("legacy-task.json")
                 .is_file()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn legacy_string_host_env_binding_normalized_to_none() {
+        // Pre-refactor threads persisted `bindings.host_env` as a bare
+        // `he-...` id string. The new shape is an object (or null);
+        // load_one should normalize the legacy string to null so the
+        // scheduler's load_state can re-bind to the pod's default.
+        let dir = temp_dir();
+        let p = Persister::new(dir.clone()).await.unwrap();
+        // Bootstrap a pod by flushing a normal task, then overwrite
+        // the persisted thread JSON with the legacy shape.
+        let task = sample_task("legacy-thread");
+        p.flush(&task).await.unwrap();
+        let json_path = dir
+            .join("legacy-thread")
+            .join(THREADS_DIR)
+            .join("legacy-thread.json");
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&json_path).unwrap()).unwrap();
+        value["bindings"]["host_env"] =
+            serde_json::Value::String("he-deadbeefcafef00d".into());
+        std::fs::write(&json_path, serde_json::to_vec_pretty(&value).unwrap()).unwrap();
+
+        let loaded = p.load_all().await.unwrap();
+        assert_eq!(loaded.threads.len(), 1);
+        assert!(
+            loaded.threads[0].bindings.host_env.is_none(),
+            "legacy string id should be normalized to None on load"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

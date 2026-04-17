@@ -177,6 +177,7 @@ impl ThreadEventRouter {
                     tool_use_id,
                     name,
                     args_preview,
+                    args,
                 } => {
                     self.broadcast_to_subscribers(
                         thread_id,
@@ -185,6 +186,7 @@ impl ThreadEventRouter {
                             tool_use_id,
                             name,
                             args_preview,
+                            args: Some(args),
                         },
                     );
                 }

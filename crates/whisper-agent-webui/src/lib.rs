@@ -44,6 +44,12 @@ mod web_entry {
                     canvas,
                     web_options,
                     Box::new(|cc| {
+                        // Bump everything up — egui's defaults are tuned
+                        // for native desktop, browser canvas reads small
+                        // at 1.0. 1.5 lands closer to a comfortable
+                        // reading size without pushing the layout into
+                        // tablet mode.
+                        cc.egui_ctx.set_zoom_factor(1.2);
                         let (inbound, send_fn) = open_websocket(cc.egui_ctx.clone());
                         Ok(Box::new(ChatApp::new(inbound, send_fn)))
                     }),
