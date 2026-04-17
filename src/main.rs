@@ -84,8 +84,10 @@ struct ServeArgs {
     listen: SocketAddr,
 
     /// Path to a TOML config file describing the model-backend catalog. If omitted,
-    /// the server falls back to a single-backend "anthropic" config built from
-    /// `--anthropic-api-key` + `--model`.
+    /// the server searches (in order): `$XDG_CONFIG_HOME/whisper-agent/whisper-agent.toml`,
+    /// `$HOME/.config/whisper-agent/whisper-agent.toml`, then `./whisper-agent.toml`.
+    /// If none is found, it falls back to a single-backend "anthropic" config built
+    /// from `--anthropic-api-key` + `--model`.
     #[arg(long)]
     config: Option<PathBuf>,
 
@@ -170,6 +172,52 @@ fn parse_host_env_provider_arg(s: &str) -> Result<(String, String), String> {
     parse_shared_host_arg(s)
 }
 
+/// Resolve which TOML config file to load. Precedence:
+///   1. `--config <path>` — explicit, errors if the path is missing.
+///   2. `$XDG_CONFIG_HOME/whisper-agent/whisper-agent.toml`
+///   3. `$HOME/.config/whisper-agent/whisper-agent.toml`
+///   4. `./whisper-agent.toml` (legacy dev-loop fallback).
+///
+/// Returns `None` only when no flag was given and none of the default paths
+/// exist — callers then fall through to the single-backend CLI-arg path.
+fn resolve_config_path(explicit: Option<PathBuf>) -> Result<Option<PathBuf>> {
+    if let Some(path) = explicit {
+        if !path.exists() {
+            return Err(anyhow!(
+                "--config {} does not exist",
+                path.display()
+            ));
+        }
+        return Ok(Some(path));
+    }
+
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    if let Ok(xdg) = std::env::var("XDG_CONFIG_HOME")
+        && !xdg.is_empty()
+    {
+        candidates.push(PathBuf::from(xdg).join("whisper-agent/whisper-agent.toml"));
+    }
+    if let Ok(home) = std::env::var("HOME")
+        && !home.is_empty()
+    {
+        candidates.push(PathBuf::from(home).join(".config/whisper-agent/whisper-agent.toml"));
+    }
+    candidates.push(PathBuf::from("whisper-agent.toml"));
+
+    // Dedup — when XDG_CONFIG_HOME is unset or equal to $HOME/.config the XDG
+    // and HOME paths collapse to the same file.
+    let mut seen: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+    for p in candidates {
+        if !seen.insert(p.clone()) {
+            continue;
+        }
+        if p.exists() {
+            return Ok(Some(p));
+        }
+    }
+    Ok(None)
+}
+
 /// Parse a `name=url` pair for `--shared-mcp-host`. Names must be non-empty
 /// and free of `=` so future syntax extensions stay possible.
 fn parse_shared_host_arg(s: &str) -> Result<(String, String), String> {
@@ -249,8 +297,10 @@ async fn run_serve(args: ServeArgs) -> Result<()> {
     // Resolve the backend catalog and shared-host map. Either source can come
     // from a TOML config; CLI --shared-mcp-host flags layer on top (CLI wins
     // on name conflict).
-    let (backends, default_backend, default_model, mut shared_host_map, toml_provider_entries) = match &args.config {
+    let resolved_config = resolve_config_path(args.config.clone())?;
+    let (backends, default_backend, default_model, mut shared_host_map, toml_provider_entries) = match &resolved_config {
         Some(path) => {
+            info!(config = %path.display(), "loading backend catalog");
             let cfg = Config::load(path).await?;
             let default_model = cfg
                 .backends
