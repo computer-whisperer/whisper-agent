@@ -21,10 +21,18 @@ auth = { mode = "api_key", env = "ANTHROPIC_API_KEY" }
 
 # OpenAI Responses API — the new production primitive. Stateless mode by
 # default (full input array each turn; no previous_response_id).
+#
+# Standard API key:
 # [backends.openai]
 # kind = "openai_responses"
 # default_model = "gpt-5"
 # auth = { mode = "api_key", env = "OPENAI_API_KEY" }
+#
+# ChatGPT Plus/Pro subscription (reads ~/.codex/auth.json, refreshes on demand):
+# [backends.openai-pro]
+# kind = "openai_responses"
+# default_model = "gpt-5"
+# auth = { mode = "chatgpt_subscription", source = "codex" }
 
 # Hosted llama.cpp server running Gemma-4 26B (UD-Q4_K_M). Uses the OpenAI
 # Chat Completions shape that llama.cpp exposes at /v1/chat/completions. No

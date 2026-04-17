@@ -22,32 +22,81 @@
 //! subsequent turns. Adding replay means carrying a provider-tagged opaque blob
 //! through our normalized `ContentBlock` shape, which is a separate change.
 
+use std::sync::Arc;
+
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use tokio::sync::Mutex;
 use whisper_agent_protocol::{ContentBlock, Message, Role, ToolResultContent, Usage};
 
+use crate::codex_auth::CodexAuth;
 use crate::model::{
     BoxFuture, ModelError, ModelInfo, ModelProvider, ModelRequest, ModelResponse, ToolSpec,
 };
 
 pub const OPENAI_API_BASE: &str = "https://api.openai.com/v1";
+/// ChatGPT subscription route: reachable by ChatGPT Plus/Pro OAuth access tokens,
+/// not by plain API keys. Serves the same Responses API surface at `/responses`.
+pub const CHATGPT_CODEX_BASE: &str = "https://chatgpt.com/backend-api/codex";
+
+/// Runtime auth material for a Responses-API client. The client itself is
+/// cheap and shared; [`ClientAuth`] is what differs between an API-key session
+/// and a ChatGPT-subscription session.
+pub enum ClientAuth {
+    ApiKey(String),
+    /// ChatGPT OAuth tokens, typically loaded from `~/.codex/auth.json`.
+    /// Wrapped in a mutex because refresh mutates the tokens, and the client
+    /// may be called from multiple scheduler tasks concurrently.
+    Codex(Arc<Mutex<CodexAuth>>),
+}
 
 pub struct OpenAiResponsesClient {
     http: reqwest::Client,
     base_url: String,
-    api_key: String,
+    auth: ClientAuth,
 }
 
 impl OpenAiResponsesClient {
-    /// Construct a client targeting `base_url` (typically
-    /// `https://api.openai.com/v1`). Auth is always a Bearer `api_key`; the
-    /// ChatGPT-subscription variant ships in a follow-up stage.
-    pub fn new(base_url: String, api_key: String) -> Self {
+    /// API-key flow — Bearer the key against `base_url` (typically
+    /// `https://api.openai.com/v1`).
+    pub fn with_api_key(base_url: String, api_key: String) -> Self {
+        Self::new(base_url, ClientAuth::ApiKey(api_key))
+    }
+
+    /// ChatGPT-subscription flow — Bearer the access_token from
+    /// `auth` plus a `chatgpt-account-id` header, against `base_url`
+    /// (typically [`CHATGPT_CODEX_BASE`]).
+    pub fn with_codex_auth(base_url: String, auth: CodexAuth) -> Self {
+        Self::new(base_url, ClientAuth::Codex(Arc::new(Mutex::new(auth))))
+    }
+
+    fn new(base_url: String, auth: ClientAuth) -> Self {
         let base_url = base_url.trim_end_matches('/').to_string();
         Self {
             http: reqwest::Client::new(),
             base_url,
-            api_key,
+            auth,
+        }
+    }
+
+    /// Returns Bearer token + any extra headers (e.g. chatgpt-account-id)
+    /// the current auth mode requires. For Codex auth, refreshes the token
+    /// if it's near expiry before returning.
+    async fn prepare_headers(&self) -> Result<(String, Vec<(&'static str, String)>), ModelError> {
+        match &self.auth {
+            ClientAuth::ApiKey(key) => Ok((key.clone(), Vec::new())),
+            ClientAuth::Codex(m) => {
+                let mut guard = m.lock().await;
+                guard
+                    .ensure_fresh(&self.http)
+                    .await
+                    .map_err(|e| ModelError::Transport(format!("codex auth refresh: {e}")))?;
+                let mut extras = Vec::new();
+                if let Some(acc) = guard.chatgpt_account_id() {
+                    extras.push(("chatgpt-account-id", acc.to_string()));
+                }
+                Ok((guard.access_token().to_string(), extras))
+            }
         }
     }
 
@@ -74,11 +123,12 @@ impl OpenAiResponsesClient {
         };
 
         let url = format!("{}/responses", self.base_url);
-        let resp = self
-            .http
-            .post(&url)
-            .bearer_auth(&self.api_key)
-            .json(&body)
+        let (bearer, extra_headers) = self.prepare_headers().await?;
+        let mut builder = self.http.post(&url).bearer_auth(&bearer).json(&body);
+        for (k, v) in &extra_headers {
+            builder = builder.header(*k, v);
+        }
+        let resp = builder
             .send()
             .await
             .map_err(|e| ModelError::Transport(e.to_string()))?;
@@ -184,11 +234,24 @@ impl OpenAiResponsesClient {
     }
 
     async fn do_list_models(&self) -> Result<Vec<ModelInfo>, ModelError> {
+        // ChatGPT-subscription backend doesn't expose /models — return a
+        // hardcoded list of models that route known to work under that plan,
+        // so the UI has something to pick.
+        if matches!(self.auth, ClientAuth::Codex(_)) {
+            return Ok(vec![
+                ModelInfo { id: "gpt-5".into(), display_name: None },
+                ModelInfo { id: "gpt-5-codex".into(), display_name: None },
+                ModelInfo { id: "codex-mini-latest".into(), display_name: None },
+            ]);
+        }
+
         let url = format!("{}/models", self.base_url);
-        let resp = self
-            .http
-            .get(&url)
-            .bearer_auth(&self.api_key)
+        let (bearer, extra_headers) = self.prepare_headers().await?;
+        let mut builder = self.http.get(&url).bearer_auth(&bearer);
+        for (k, v) in &extra_headers {
+            builder = builder.header(*k, v);
+        }
+        let resp = builder
             .send()
             .await
             .map_err(|e| ModelError::Transport(e.to_string()))?;

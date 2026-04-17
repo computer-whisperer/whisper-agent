@@ -4204,6 +4204,7 @@ dependencies = [
  "anyhow",
  "async-stream",
  "axum",
+ "base64",
  "chrono",
  "clap",
  "futures",

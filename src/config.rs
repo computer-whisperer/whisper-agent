@@ -37,10 +37,13 @@ use std::sync::Arc;
 use anyhow::{Context, Result, anyhow};
 use serde::Deserialize;
 
+use std::path::PathBuf;
+
 use crate::anthropic::AnthropicClient;
+use crate::codex_auth::CodexAuth;
 use crate::model::ModelProvider;
 use crate::openai_chat::OpenAiChatClient;
-use crate::openai_responses::{OPENAI_API_BASE, OpenAiResponsesClient};
+use crate::openai_responses::{CHATGPT_CODEX_BASE, OPENAI_API_BASE, OpenAiResponsesClient};
 
 #[derive(Deserialize, Debug, Clone)]
 pub struct Config {
@@ -70,13 +73,16 @@ pub struct HostEnvProviderConfig {
     pub url: String,
 }
 
-/// Backend auth configuration. Tagged by `mode`; today only `api_key` exists, but
-/// new variants (e.g. `chatgpt_subscription`) plug in by adding tags.
+/// Backend auth configuration. Tagged by `mode`; providers pick the variants
+/// they accept and error at build time on incompatible combinations (e.g.
+/// Anthropic rejects `chatgpt_subscription`).
 ///
 /// Examples:
 /// ```toml
 /// auth = { mode = "api_key", value = "sk-..." }
 /// auth = { mode = "api_key", env  = "ANTHROPIC_API_KEY" }
+/// auth = { mode = "chatgpt_subscription", source = "codex" }
+/// auth = { mode = "chatgpt_subscription", source = "codex", path = "/custom/auth.json" }
 /// ```
 #[derive(Deserialize, Debug, Clone)]
 #[serde(tag = "mode", rename_all = "snake_case")]
@@ -87,11 +93,28 @@ pub enum Auth {
         #[serde(default)]
         env: Option<String>,
     },
+    /// Use a ChatGPT subscription's OAuth tokens instead of an API key. Today
+    /// the only `source` is `codex` — we read the credentials file that the
+    /// Codex CLI maintains at `~/.codex/auth.json`.
+    ChatgptSubscription {
+        source: ChatgptSubscriptionSource,
+        /// Override the default file location for the chosen `source`.
+        #[serde(default)]
+        path: Option<PathBuf>,
+    },
+}
+
+#[derive(Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ChatgptSubscriptionSource {
+    /// `~/.codex/auth.json`, maintained by `codex login`.
+    Codex,
 }
 
 impl Auth {
     /// Resolve to the raw API key string, reading env vars as needed. Errors if the
-    /// auth entry is malformed (neither or both of `value`/`env` set, env var unset).
+    /// auth entry is malformed (neither or both of `value`/`env` set, env var unset),
+    /// or if the auth mode isn't `api_key`.
     pub fn resolve_api_key(&self) -> Result<String> {
         match self {
             Auth::ApiKey { value, env } => match (value.as_deref(), env.as_deref()) {
@@ -103,6 +126,9 @@ impl Auth {
                 }
                 (None, None) => Err(anyhow!("auth.api_key: missing `value` or `env`")),
             },
+            Auth::ChatgptSubscription { .. } => {
+                Err(anyhow!("this backend requires `auth.mode = \"api_key\"`"))
+            }
         }
     }
 }
@@ -177,13 +203,28 @@ impl BackendConfig {
             }
             BackendConfig::OpenAiResponses {
                 base_url, auth, ..
-            } => {
-                let key = auth.resolve_api_key().context("openai_responses auth")?;
-                let url = base_url
-                    .clone()
-                    .unwrap_or_else(|| OPENAI_API_BASE.to_string());
-                Ok(Arc::new(OpenAiResponsesClient::new(url, key)))
-            }
+            } => build_openai_responses(base_url.as_deref(), auth),
+        }
+    }
+}
+
+fn build_openai_responses(base_url: Option<&str>, auth: &Auth) -> Result<Arc<dyn ModelProvider>> {
+    match auth {
+        Auth::ApiKey { .. } => {
+            let key = auth.resolve_api_key().context("openai_responses auth")?;
+            let url = base_url
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| OPENAI_API_BASE.to_string());
+            Ok(Arc::new(OpenAiResponsesClient::with_api_key(url, key)))
+        }
+        Auth::ChatgptSubscription { source, path } => {
+            let ChatgptSubscriptionSource::Codex = source;
+            let codex = CodexAuth::load(path.clone())
+                .context("load codex auth.json for openai_responses subscription auth")?;
+            let url = base_url
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| CHATGPT_CODEX_BASE.to_string());
+            Ok(Arc::new(OpenAiResponsesClient::with_codex_auth(url, codex)))
         }
     }
 }
