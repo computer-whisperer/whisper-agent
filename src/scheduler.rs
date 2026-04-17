@@ -1166,32 +1166,73 @@ impl Scheduler {
                 pod_id,
                 toml_text,
             } => {
-                let Some((persister, outbound)) = self.persister_and_outbound(conn_id) else {
+                if let Err(e) = crate::persist::validate_pod_id(&pod_id) {
+                    self.router.send_to_client(
+                        conn_id,
+                        ServerToClient::Error {
+                            correlation_id,
+                            thread_id: None,
+                            message: format!("update_pod_config: {e}"),
+                        },
+                    );
                     return;
-                };
-                let broadcast = self.router.outbound_snapshot();
-                tokio::spawn(async move {
-                    match persister.update_pod_config(&pod_id, &toml_text).await {
-                        Ok(parsed) => {
-                            let ev = ServerToClient::PodConfigUpdated {
-                                pod_id,
-                                toml_text,
-                                parsed,
-                                correlation_id,
-                            };
-                            for tx in broadcast {
-                                let _ = tx.send(ev.clone());
-                            }
-                        }
-                        Err(e) => {
-                            let _ = outbound.send(ServerToClient::Error {
+                }
+                if !self.pods.contains_key(&pod_id) {
+                    self.router.send_to_client(
+                        conn_id,
+                        ServerToClient::Error {
+                            correlation_id,
+                            thread_id: None,
+                            message: format!("update_pod_config: unknown pod `{pod_id}`"),
+                        },
+                    );
+                    return;
+                }
+                let parsed = match crate::pod::parse_toml(&toml_text) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        self.router.send_to_client(
+                            conn_id,
+                            ServerToClient::Error {
                                 correlation_id,
                                 thread_id: None,
                                 message: format!("update_pod_config: {e}"),
-                            });
-                        }
+                            },
+                        );
+                        return;
                     }
-                });
+                };
+                // Refresh in-memory pod so subsequent create_task /
+                // RebindThread paths see the new config without waiting
+                // for the disk round-trip.
+                if let Some(pod) = self.pods.get_mut(&pod_id) {
+                    pod.config = parsed.clone();
+                    pod.raw_toml = toml_text.clone();
+                }
+                let ev = ServerToClient::PodConfigUpdated {
+                    pod_id: pod_id.clone(),
+                    toml_text: toml_text.clone(),
+                    parsed,
+                    correlation_id,
+                };
+                for tx in self.router.outbound_snapshot() {
+                    let _ = tx.send(ev.clone());
+                }
+                if let Some(persister) = self.persister.clone() {
+                    let outbound = self.router.outbound(conn_id);
+                    tokio::spawn(async move {
+                        if let Err(e) = persister.update_pod_config(&pod_id, &toml_text).await {
+                            warn!(pod_id = %pod_id, error = %e, "update_pod_config disk write failed");
+                            if let Some(tx) = outbound {
+                                let _ = tx.send(ServerToClient::Error {
+                                    correlation_id: None,
+                                    thread_id: None,
+                                    message: format!("update_pod_config: disk write failed: {e}"),
+                                });
+                            }
+                        }
+                    });
+                }
             }
             ClientToServer::ArchivePod { pod_id } => {
                 if let Err(e) = crate::persist::validate_pod_id(&pod_id) {

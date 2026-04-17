@@ -291,6 +291,13 @@ pub struct ChatApp {
     /// At most one pod can be armed at a time — clicking a different pod's
     /// Archive button replaces it.
     archive_armed_pod: Option<String>,
+    /// Modal state for the per-pod raw-TOML config editor. `None` = closed.
+    pod_editor_modal: Option<PodEditorModalState>,
+    /// Monotonic counter used to mint correlation_ids for in-flight
+    /// requests we want to match round-trip events to. Intentionally
+    /// not persisted — collisions across reloads aren't a problem
+    /// because every WebSocket reconnect drops in-flight state.
+    next_correlation_seq: u64,
     /// Pod the in-progress new-thread compose targets. `None` = the
     /// server's default pod. Set by the per-pod "+ Thread" button in
     /// each pod section header; cleared/reset by the global "+ New
@@ -331,6 +338,34 @@ impl PresetModalState {
             name: String::new(),
             workspace: String::new(),
             read_everywhere: false,
+        }
+    }
+}
+
+/// State for the "Edit config" modal — a raw-TOML editor for one pod's
+/// `pod.toml`. The structured form variant is deferred to a later phase;
+/// for now the user edits the text directly and the server validates on
+/// save (parse + `pod::validate`). Open the modal -> we send `GetPod`
+/// for the latest text -> populate `toml_text` when the `PodSnapshot`
+/// lands. On Save we send `UpdatePodConfig` with `pending_correlation`
+/// and wait for the matching `PodConfigUpdated` (close) or `Error`
+/// (show inline + leave the modal open so edits aren't lost).
+struct PodEditorModalState {
+    pod_id: String,
+    /// `None` until the `PodSnapshot` arrives. The editor renders a
+    /// "loading…" placeholder in the meantime.
+    toml_text: Option<String>,
+    error: Option<String>,
+    pending_correlation: Option<String>,
+}
+
+impl PodEditorModalState {
+    fn new(pod_id: String) -> Self {
+        Self {
+            pod_id,
+            toml_text: None,
+            error: None,
+            pending_correlation: None,
         }
     }
 }
@@ -403,11 +438,18 @@ impl ChatApp {
             collapsed_pods: HashSet::new(),
             new_pod_modal: None,
             archive_armed_pod: None,
+            pod_editor_modal: None,
+            next_correlation_seq: 0,
             compose_pod_id: None,
             server_default_pod_id: String::new(),
             default_pod_template: None,
             left_mode: LeftPanelMode::default(),
         }
+    }
+
+    fn next_correlation_id(&mut self) -> String {
+        self.next_correlation_seq = self.next_correlation_seq.wrapping_add(1);
+        format!("c{}", self.next_correlation_seq)
     }
 
     /// Resolve the picker-selected backend name, falling back to the server default.
@@ -687,8 +729,21 @@ impl ChatApp {
                 }
             }
             ServerToClient::Error {
-                thread_id, message, ..
+                thread_id,
+                message,
+                correlation_id,
             } => {
+                // If the editor minted this correlation, surface the error
+                // inline in the modal instead of as a global banner —
+                // failed validation should leave the user's edits intact.
+                if let Some(modal) = self.pod_editor_modal.as_mut()
+                    && correlation_id.is_some()
+                    && modal.pending_correlation == correlation_id
+                {
+                    modal.error = Some(message);
+                    modal.pending_correlation = None;
+                    return;
+                }
                 if let Some(tid) = thread_id.as_ref()
                     && let Some(view) = self.tasks.get_mut(tid)
                 {
@@ -757,16 +812,40 @@ impl ChatApp {
                 self.pods.insert(pod.pod_id.clone(), pod);
             }
             ServerToClient::PodConfigUpdated {
-                pod_id, parsed, ..
+                pod_id,
+                toml_text,
+                parsed,
+                correlation_id,
             } => {
                 // Mirror the new top-level fields (name/description) onto the
                 // summary so the left panel reflects edits without waiting
                 // for a full ListPods refresh. thread_count is unchanged by
                 // a config edit.
                 if let Some(summary) = self.pods.get_mut(&pod_id) {
-                    summary.name = parsed.name;
-                    summary.description = parsed.description;
-                    summary.created_at = parsed.created_at;
+                    summary.name = parsed.name.clone();
+                    summary.description = parsed.description.clone();
+                    summary.created_at = parsed.created_at.clone();
+                }
+                if pod_id == self.server_default_pod_id {
+                    self.default_pod_template = Some(parsed);
+                }
+                // If the editor was waiting for this update (matched by
+                // correlation_id), close it. Updates from other sources
+                // for the same pod refresh the editor's text in place
+                // instead of clobbering — but our save flow is the only
+                // one that mints a correlation, so this is the typical
+                // close-on-success path.
+                if let Some(modal) = self.pod_editor_modal.as_mut()
+                    && modal.pod_id == pod_id
+                {
+                    if modal.pending_correlation.is_some()
+                        && modal.pending_correlation == correlation_id
+                    {
+                        self.pod_editor_modal = None;
+                    } else {
+                        modal.toml_text = Some(toml_text);
+                        modal.error = None;
+                    }
                 }
             }
             ServerToClient::PodArchived { pod_id } => {
@@ -791,12 +870,16 @@ impl ChatApp {
             }
             ServerToClient::PodSnapshot { snapshot, .. } => {
                 // Cache the default pod's config as a template for fresh
-                // "+ New pod" creation. Other pods' snapshots arrive
-                // here too once the pod editor (Phase 4.iii) starts
-                // calling GetPod for them; for now we only consume the
-                // default's.
+                // "+ New pod" creation, and populate the editor modal if
+                // it's open and waiting on this pod's text.
                 if snapshot.pod_id == self.server_default_pod_id {
-                    self.default_pod_template = Some(snapshot.config);
+                    self.default_pod_template = Some(snapshot.config.clone());
+                }
+                if let Some(modal) = self.pod_editor_modal.as_mut()
+                    && modal.pod_id == snapshot.pod_id
+                    && modal.toml_text.is_none()
+                {
+                    modal.toml_text = Some(snapshot.toml_text);
                 }
             }
         }
@@ -1352,6 +1435,7 @@ impl eframe::App for ChatApp {
 
         self.render_preset_modal(ctx);
         self.render_new_pod_modal(ctx);
+        self.render_pod_editor_modal(ctx);
     }
 }
 
@@ -1430,6 +1514,7 @@ impl ChatApp {
         let mut archive_clicked = false;
         let mut archive_confirmed = false;
         let mut archive_disarm = false;
+        let mut edit_config_clicked = false;
         let header = egui::CollapsingHeader::new(RichText::new(label).strong())
             .id_salt(&collapsed_id)
             .default_open(default_open)
@@ -1443,6 +1528,12 @@ impl ChatApp {
                         self.composing_new = true;
                         self.compose_pod_id = Some(pod_id.to_string());
                         self.input.clear();
+                    }
+                    if ui
+                        .small_button(RichText::new("Edit config").small())
+                        .clicked()
+                    {
+                        edit_config_clicked = true;
                     }
                     if !is_default_pod {
                         let armed = self.archive_armed_pod.as_deref() == Some(pod_id);
@@ -1519,6 +1610,17 @@ impl ChatApp {
                 pod_id: pod_id.to_string(),
             });
         }
+        if edit_config_clicked {
+            self.open_pod_editor(pod_id.to_string());
+        }
+    }
+
+    fn open_pod_editor(&mut self, pod_id: String) {
+        self.send(ClientToServer::GetPod {
+            correlation_id: None,
+            pod_id: pod_id.clone(),
+        });
+        self.pod_editor_modal = Some(PodEditorModalState::new(pod_id));
     }
 
     fn render_preset_modal(&mut self, ctx: &egui::Context) {
@@ -1705,6 +1807,113 @@ impl ChatApp {
             // Modal closes.
         } else {
             self.new_pod_modal = Some(modal);
+        }
+    }
+
+    fn render_pod_editor_modal(&mut self, ctx: &egui::Context) {
+        let Some(mut modal) = self.pod_editor_modal.take() else {
+            return;
+        };
+        let mut open = true;
+        let mut save_clicked = false;
+        let mut cancel_clicked = false;
+        let mut revert_clicked = false;
+        let title = format!("Edit pod config — {}", modal.pod_id);
+
+        egui::Window::new(title)
+            .collapsible(false)
+            .resizable(true)
+            .default_width(640.0)
+            .default_height(520.0)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .open(&mut open)
+            .show(ctx, |ui| {
+                ui.label(
+                    RichText::new(
+                        "Raw pod.toml — server validates parse + structural rules \
+                         (sandbox names unique, thread_defaults reference allow.* entries) \
+                         on save. Validation failures keep your edits open for fixing.",
+                    )
+                    .small()
+                    .color(Color32::from_gray(160)),
+                );
+                ui.add_space(6.0);
+                match modal.toml_text.as_mut() {
+                    Some(text) => {
+                        let avail = ui.available_size();
+                        egui::ScrollArea::vertical()
+                            .max_height(avail.y - 80.0)
+                            .show(ui, |ui| {
+                                ui.add_sized(
+                                    [ui.available_width(), avail.y - 80.0],
+                                    TextEdit::multiline(text)
+                                        .code_editor()
+                                        .desired_rows(20),
+                                );
+                            });
+                    }
+                    None => {
+                        ui.add_space(20.0);
+                        ui.label(
+                            RichText::new("loading…")
+                                .italics()
+                                .color(Color32::from_gray(160)),
+                        );
+                    }
+                }
+                if let Some(err) = &modal.error {
+                    ui.add_space(6.0);
+                    ui.colored_label(Color32::from_rgb(220, 80, 80), err);
+                }
+                ui.add_space(6.0);
+                ui.separator();
+                ui.horizontal(|ui| {
+                    let saving = modal.pending_correlation.is_some();
+                    let save_enabled = modal.toml_text.is_some() && !saving;
+                    if ui
+                        .add_enabled(save_enabled, egui::Button::new("Save"))
+                        .clicked()
+                    {
+                        save_clicked = true;
+                    }
+                    if ui.button("Revert").clicked() {
+                        revert_clicked = true;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        cancel_clicked = true;
+                    }
+                    if saving {
+                        ui.label(RichText::new("saving…").italics().color(Color32::from_gray(160)));
+                    }
+                });
+            });
+
+        if save_clicked
+            && let Some(text) = modal.toml_text.clone()
+        {
+            let correlation = self.next_correlation_id();
+            modal.pending_correlation = Some(correlation.clone());
+            modal.error = None;
+            self.send(ClientToServer::UpdatePodConfig {
+                correlation_id: Some(correlation),
+                pod_id: modal.pod_id.clone(),
+                toml_text: text,
+            });
+            self.pod_editor_modal = Some(modal);
+        } else if revert_clicked {
+            // Drop local edits and re-fetch the server's current text.
+            modal.toml_text = None;
+            modal.error = None;
+            modal.pending_correlation = None;
+            self.send(ClientToServer::GetPod {
+                correlation_id: None,
+                pod_id: modal.pod_id.clone(),
+            });
+            self.pod_editor_modal = Some(modal);
+        } else if cancel_clicked || !open {
+            // Modal closes.
+        } else {
+            self.pod_editor_modal = Some(modal);
         }
     }
 
