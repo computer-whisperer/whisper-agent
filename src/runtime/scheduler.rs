@@ -133,6 +133,11 @@ const GC_TICK_SECS: u64 = 60;
 /// schedules behaviors encode. Tighter cadences (seconds, sub-minute)
 /// aren't supported by the 5-field crontab we parse.
 const CRON_TICK_SECS: u64 = 30;
+/// How often retention sweeps run. Day-granularity policies don't
+/// need sub-hour precision; an hourly tick means a thread past its
+/// retention window is swept within 60 min. Missed tick behavior
+/// (Delay) prevents bursts when the process resumes after suspension.
+const RETENTION_TICK_SECS: u64 = 3600;
 
 pub struct Scheduler {
     /// MCP host URL passed through to threads when their pod doesn't carry a
@@ -2996,6 +3001,124 @@ impl Scheduler {
         }
     }
 
+    /// One retention sweep over behavior-spawned threads. Walks every
+    /// in-memory thread with a `BehaviorOrigin`, resolves the owning
+    /// behavior's `on_completion` policy, and if the thread is in a
+    /// terminal state past the retention window, either archives or
+    /// deletes it. Interactive threads (origin is None) are never
+    /// swept — retention is a behavior-thread concern only.
+    ///
+    /// Archiving moves the JSON to `<pod>/.archived/threads/<id>.json`
+    /// (preserves the audit trail; thread is gone from every wire
+    /// surface but forensically accessible on disk). Deleting removes
+    /// the JSON and the in-memory state entirely.
+    ///
+    /// Orphan threads (behavior was deleted) are left alone — the
+    /// design explicitly preserves their audit trail.
+    ///
+    /// The sweep itself is synchronous: state mutation + broadcasts
+    /// happen inline, and the filesystem ops are spawned as detached
+    /// futures (fire-and-forget). A missed disk op on one iteration
+    /// retries on the next sweep because the in-memory thread has
+    /// already been removed and flush_dirty won't re-create the file.
+    fn retention_sweep(&mut self) {
+        use whisper_agent_protocol::RetentionPolicy;
+        let now = chrono::Utc::now();
+
+        let mut sweep: Vec<(String, String, RetentionAction)> = Vec::new();
+        for (thread_id, task) in &self.tasks {
+            let Some(origin) = task.origin.as_ref() else {
+                continue; // interactive thread — never swept
+            };
+            // Only terminal threads are candidates.
+            let terminal = matches!(
+                task.public_state(),
+                ThreadStateLabel::Completed
+                    | ThreadStateLabel::Failed
+                    | ThreadStateLabel::Cancelled
+            );
+            if !terminal {
+                continue;
+            }
+            // Resolve the behavior — orphaned threads (behavior
+            // deleted) are left alone.
+            let Some(pod) = self.pods.get(&task.pod_id) else {
+                continue;
+            };
+            let Some(behavior) = pod.behaviors.get(&origin.behavior_id) else {
+                continue;
+            };
+            let Some(policy) = behavior.config.as_ref().map(|c| &c.on_completion) else {
+                continue;
+            };
+            let days = match policy {
+                RetentionPolicy::Keep => continue,
+                RetentionPolicy::ArchiveAfterDays { days }
+                | RetentionPolicy::DeleteAfterDays { days } => *days,
+            };
+            let age = now.signed_duration_since(task.last_active);
+            if age < chrono::Duration::days(days as i64) {
+                continue;
+            }
+            let action = match policy {
+                RetentionPolicy::ArchiveAfterDays { .. } => RetentionAction::Archive,
+                RetentionPolicy::DeleteAfterDays { .. } => RetentionAction::Delete,
+                RetentionPolicy::Keep => unreachable!(),
+            };
+            sweep.push((thread_id.clone(), task.pod_id.clone(), action));
+        }
+
+        for (thread_id, pod_id, action) in sweep {
+            self.sweep_thread(&thread_id, &pod_id, action);
+        }
+    }
+
+    /// Inner helper for `retention_sweep`: removes the thread from
+    /// every in-memory surface (tasks map, pod membership, router
+    /// subscriptions, resource user sets), broadcasts `ThreadArchived`,
+    /// and spawns the disk op. Used only for behavior-spawned threads.
+    fn sweep_thread(&mut self, thread_id: &str, pod_id: &str, action: RetentionAction) {
+        let pod_dir = match self.pods.get(pod_id) {
+            Some(pod) => pod.dir.clone(),
+            None => return,
+        };
+        // Capture bindings BEFORE removing from self.tasks — we need
+        // them to release resource users.
+        let bindings = match self.tasks.get(thread_id) {
+            Some(t) => t.bindings.clone(),
+            None => return,
+        };
+        self.tasks.remove(thread_id);
+        self.dirty.remove(thread_id);
+        self.provisioning_in_flight.remove(thread_id);
+        if let Some(pod) = self.pods.get_mut(pod_id) {
+            pod.threads.remove(thread_id);
+        }
+        self.release_thread_resources(thread_id, pod_id, &bindings);
+        self.router.drop_thread(thread_id);
+        self.router
+            .broadcast_task_list(ServerToClient::ThreadArchived {
+                thread_id: thread_id.to_string(),
+            });
+
+        // Disk op is fire-and-forget. The in-memory removal is the
+        // load-bearing effect; a failed disk op logs warn and gets
+        // retried by the next sweep (the thread will no longer be in
+        // self.tasks but the JSON still exists, so nothing references
+        // it — it'll just sit on disk harmlessly until an operator
+        // cleans it up).
+        let tid = thread_id.to_string();
+        tokio::spawn(async move {
+            let result = match action {
+                RetentionAction::Archive => archive_thread_json(&pod_dir, &tid).await,
+                RetentionAction::Delete => delete_thread_json(&pod_dir, &tid).await,
+            };
+            if let Err(e) = result {
+                warn!(thread_id = %tid, error = %e, "retention sweep disk op failed");
+            }
+        });
+    }
+
     /// One GC sweep over the resource registry. Tears down idle Ready
     /// resources (sandboxes, per-thread MCP hosts) and removes terminal
     /// entries that have been retained long enough. Spawns async sandbox
@@ -3318,6 +3441,43 @@ fn is_cron_due(
         .unwrap_or(false)
 }
 
+/// Disposition the retention sweep picks for a single thread.
+/// Archive preserves the JSON under `<pod>/.archived/threads/`;
+/// Delete removes it outright. Which applies is determined by the
+/// owning behavior's `on_completion.retention` policy.
+enum RetentionAction {
+    Archive,
+    Delete,
+}
+
+/// Move `<pod>/threads/<tid>.json` to `<pod>/.archived/threads/<tid>.json`.
+/// Creates the archive subdirectory if missing. Idempotent on already-
+/// archived threads — `rename` of a nonexistent source errors, which
+/// we surface so the sweep caller can log and move on.
+async fn archive_thread_json(pod_dir: &std::path::Path, thread_id: &str) -> anyhow::Result<()> {
+    let src = pod_dir
+        .join(crate::pod::THREADS_DIR)
+        .join(format!("{thread_id}.json"));
+    let dst_dir = pod_dir.join(".archived").join(crate::pod::THREADS_DIR);
+    tokio::fs::create_dir_all(&dst_dir).await?;
+    let dst = dst_dir.join(format!("{thread_id}.json"));
+    tokio::fs::rename(&src, &dst).await?;
+    Ok(())
+}
+
+/// Remove `<pod>/threads/<tid>.json` outright. Idempotent for a
+/// missing file (returns Ok) so a racey double-delete doesn't error.
+async fn delete_thread_json(pod_dir: &std::path::Path, thread_id: &str) -> anyhow::Result<()> {
+    let path = pod_dir
+        .join(crate::pod::THREADS_DIR)
+        .join(format!("{thread_id}.json"));
+    match tokio::fs::remove_file(&path).await {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e.into()),
+    }
+}
+
 /// Count cron occurrences strictly between `cursor` (exclusive) and
 /// `now` (inclusive). Used for startup catch-up logging — informational,
 /// not load-bearing. Capped at `limit` so a cursor far in the past
@@ -3435,11 +3595,14 @@ pub async fn run(mut scheduler: Scheduler, mut inbox: mpsc::UnboundedReceiver<Sc
     let mut pending_io: FuturesUnordered<SchedulerFuture> = FuturesUnordered::new();
     let mut gc_ticker = tokio::time::interval(Duration::from_secs(GC_TICK_SECS));
     let mut cron_ticker = tokio::time::interval(Duration::from_secs(CRON_TICK_SECS));
-    // Skip the first immediate tick on both — `interval` fires at t=0 by default.
+    let mut retention_ticker = tokio::time::interval(Duration::from_secs(RETENTION_TICK_SECS));
+    // Skip the first immediate tick on all — `interval` fires at t=0 by default.
     gc_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     gc_ticker.tick().await;
     cron_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     cron_ticker.tick().await;
+    retention_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    retention_ticker.tick().await;
 
     // Apply each cron behavior's CatchUp policy to its persisted
     // cursor. Runs once at boot, before any tick evaluates for real.
@@ -3479,6 +3642,9 @@ pub async fn run(mut scheduler: Scheduler, mut inbox: mpsc::UnboundedReceiver<Sc
             }
             _ = cron_ticker.tick() => {
                 scheduler.fire_due_cron_behaviors(&mut pending_io);
+            }
+            _ = retention_ticker.tick() => {
+                scheduler.retention_sweep();
             }
         }
         scheduler.flush_dirty().await;
@@ -3631,6 +3797,47 @@ mod tests {
             .with_timezone(&chrono::Utc);
         assert!(is_cron_due(&cron, cursor, at));
         assert!(is_cron_due(&cron, cursor, after));
+    }
+
+    #[tokio::test]
+    async fn archive_moves_thread_json_into_archived_subdir() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let pod_dir =
+            std::env::temp_dir().join(format!("wa-archive-test-{}-{n}", std::process::id()));
+        let threads_dir = pod_dir.join(crate::pod::THREADS_DIR);
+        std::fs::create_dir_all(&threads_dir).unwrap();
+        let src = threads_dir.join("t-1.json");
+        std::fs::write(&src, b"{}").unwrap();
+        archive_thread_json(&pod_dir, "t-1").await.unwrap();
+        assert!(!src.exists());
+        assert!(
+            pod_dir
+                .join(".archived")
+                .join(crate::pod::THREADS_DIR)
+                .join("t-1.json")
+                .exists()
+        );
+        let _ = std::fs::remove_dir_all(&pod_dir);
+    }
+
+    #[tokio::test]
+    async fn delete_removes_thread_json_and_tolerates_missing() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let pod_dir =
+            std::env::temp_dir().join(format!("wa-delete-test-{}-{n}", std::process::id()));
+        let threads_dir = pod_dir.join(crate::pod::THREADS_DIR);
+        std::fs::create_dir_all(&threads_dir).unwrap();
+        let path = threads_dir.join("t-2.json");
+        std::fs::write(&path, b"{}").unwrap();
+        delete_thread_json(&pod_dir, "t-2").await.unwrap();
+        assert!(!path.exists());
+        // Idempotent: second call succeeds on a missing file.
+        delete_thread_json(&pod_dir, "t-2").await.unwrap();
+        let _ = std::fs::remove_dir_all(&pod_dir);
     }
 
     #[test]
