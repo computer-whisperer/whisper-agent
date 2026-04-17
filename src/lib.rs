@@ -10,6 +10,7 @@ pub mod io_dispatch;
 pub mod mcp;
 pub mod model;
 pub mod openai_chat;
+pub mod openai_responses;
 pub mod persist;
 pub mod pod;
 pub mod resources;

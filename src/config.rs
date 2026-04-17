@@ -40,6 +40,7 @@ use serde::Deserialize;
 use crate::anthropic::AnthropicClient;
 use crate::model::ModelProvider;
 use crate::openai_chat::OpenAiChatClient;
+use crate::openai_responses::{OPENAI_API_BASE, OpenAiResponsesClient};
 
 #[derive(Deserialize, Debug, Clone)]
 pub struct Config {
@@ -125,6 +126,18 @@ pub enum BackendConfig {
         #[serde(default)]
         default_model: Option<String>,
     },
+    #[serde(rename = "openai_responses")]
+    OpenAiResponses {
+        /// Optional override; defaults to `https://api.openai.com/v1`. Lets
+        /// follow-up stages point the same provider at
+        /// `https://chatgpt.com/backend-api/codex` for subscription auth, or
+        /// at an internal proxy.
+        #[serde(default)]
+        base_url: Option<String>,
+        auth: Auth,
+        #[serde(default)]
+        default_model: Option<String>,
+    },
 }
 
 impl BackendConfig {
@@ -132,6 +145,7 @@ impl BackendConfig {
         match self {
             BackendConfig::Anthropic { .. } => "anthropic",
             BackendConfig::OpenAiChat { .. } => "openai_chat",
+            BackendConfig::OpenAiResponses { .. } => "openai_responses",
         }
     }
 
@@ -140,7 +154,8 @@ impl BackendConfig {
     pub fn default_model(&self) -> Option<&str> {
         match self {
             BackendConfig::Anthropic { default_model, .. }
-            | BackendConfig::OpenAiChat { default_model, .. } => default_model.as_deref(),
+            | BackendConfig::OpenAiChat { default_model, .. }
+            | BackendConfig::OpenAiResponses { default_model, .. } => default_model.as_deref(),
         }
     }
 
@@ -159,6 +174,15 @@ impl BackendConfig {
                     None => None,
                 };
                 Ok(Arc::new(OpenAiChatClient::new(base_url.clone(), key)))
+            }
+            BackendConfig::OpenAiResponses {
+                base_url, auth, ..
+            } => {
+                let key = auth.resolve_api_key().context("openai_responses auth")?;
+                let url = base_url
+                    .clone()
+                    .unwrap_or_else(|| OPENAI_API_BASE.to_string());
+                Ok(Arc::new(OpenAiResponsesClient::new(url, key)))
             }
         }
     }
