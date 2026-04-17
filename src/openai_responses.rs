@@ -234,18 +234,23 @@ impl OpenAiResponsesClient {
     }
 
     async fn do_list_models(&self) -> Result<Vec<ModelInfo>, ModelError> {
-        // ChatGPT-subscription backend doesn't expose /models — return a
-        // hardcoded list of models that route known to work under that plan,
-        // so the UI has something to pick.
-        if matches!(self.auth, ClientAuth::Codex(_)) {
-            return Ok(vec![
-                ModelInfo { id: "gpt-5".into(), display_name: None },
-                ModelInfo { id: "gpt-5-codex".into(), display_name: None },
-                ModelInfo { id: "codex-mini-latest".into(), display_name: None },
-            ]);
-        }
+        // Both routes expose `/models`, but the response shape differs:
+        //   - api.openai.com/v1/models → `{ data: [{ id }] }`       (OpenAI standard)
+        //   - chatgpt.com/backend-api/codex/models → `{ models: [...] }` with
+        //     per-model `visibility`, `supported_in_api`, `display_name`, etc.
+        // The Codex endpoint also requires a `client_version` query param so the
+        // backend can gate version-locked models.
+        let codex_mode = matches!(self.auth, ClientAuth::Codex(_));
+        let url = if codex_mode {
+            format!(
+                "{}/models?client_version={}",
+                self.base_url,
+                env!("CARGO_PKG_VERSION")
+            )
+        } else {
+            format!("{}/models", self.base_url)
+        };
 
-        let url = format!("{}/models", self.base_url);
         let (bearer, extra_headers) = self.prepare_headers().await?;
         let mut builder = self.http.get(&url).bearer_auth(&bearer);
         for (k, v) in &extra_headers {
@@ -263,18 +268,37 @@ impl OpenAiResponsesClient {
                 body,
             });
         }
-        let parsed: RspListModelsResponse = resp
-            .json()
-            .await
-            .map_err(|e| ModelError::Transport(e.to_string()))?;
-        Ok(parsed
-            .data
-            .into_iter()
-            .map(|m| ModelInfo {
-                id: m.id,
-                display_name: None,
-            })
-            .collect())
+
+        if codex_mode {
+            let parsed: RspCodexModelsResponse = resp
+                .json()
+                .await
+                .map_err(|e| ModelError::Transport(e.to_string()))?;
+            Ok(parsed
+                .models
+                .into_iter()
+                // Mirror Codex's own picker filter: only models the backend
+                // marks as user-visible AND usable via the Responses API.
+                .filter(|m| m.supported_in_api && m.visibility.as_deref() == Some("list"))
+                .map(|m| ModelInfo {
+                    id: m.slug,
+                    display_name: m.display_name,
+                })
+                .collect())
+        } else {
+            let parsed: RspListModelsResponse = resp
+                .json()
+                .await
+                .map_err(|e| ModelError::Transport(e.to_string()))?;
+            Ok(parsed
+                .data
+                .into_iter()
+                .map(|m| ModelInfo {
+                    id: m.id,
+                    display_name: None,
+                })
+                .collect())
+        }
     }
 }
 
@@ -577,6 +601,29 @@ struct RspModel {
     id: String,
 }
 
+/// `GET chatgpt.com/backend-api/codex/models` shape. Carries a much richer per-model
+/// metadata block than api.openai.com — we grab just enough for the picker.
+#[derive(Deserialize, Debug)]
+struct RspCodexModelsResponse {
+    #[serde(default)]
+    models: Vec<RspCodexModel>,
+}
+
+#[derive(Deserialize, Debug)]
+struct RspCodexModel {
+    slug: String,
+    #[serde(default)]
+    display_name: Option<String>,
+    /// One of "list" / "hide" / (possibly others). Only `"list"` models are
+    /// user-facing; hidden entries are legacy or internal.
+    #[serde(default)]
+    visibility: Option<String>,
+    /// `false` on entries the backend exposes for telemetry but doesn't accept
+    /// create-message calls for.
+    #[serde(default)]
+    supported_in_api: bool,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -665,6 +712,26 @@ mod tests {
             ),
             Some("tool_use".into())
         );
+    }
+
+    #[test]
+    fn codex_models_response_filters_to_user_visible_api_supported() {
+        let body = r#"{
+            "models": [
+                {"slug": "gpt-5.4",             "display_name": "GPT-5.4",        "visibility": "list", "supported_in_api": true},
+                {"slug": "gpt-5.3-codex",       "display_name": "GPT-5.3 Codex",  "visibility": "list", "supported_in_api": true},
+                {"slug": "gpt-5",               "display_name": "GPT-5 (legacy)", "visibility": "hide", "supported_in_api": true},
+                {"slug": "internal-eval-only",  "display_name": null,             "visibility": "list", "supported_in_api": false}
+            ]
+        }"#;
+        let parsed: RspCodexModelsResponse = serde_json::from_str(body).unwrap();
+        let kept: Vec<String> = parsed
+            .models
+            .into_iter()
+            .filter(|m| m.supported_in_api && m.visibility.as_deref() == Some("list"))
+            .map(|m| m.slug)
+            .collect();
+        assert_eq!(kept, vec!["gpt-5.4".to_string(), "gpt-5.3-codex".to_string()]);
     }
 
     #[test]
