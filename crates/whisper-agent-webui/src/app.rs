@@ -1819,36 +1819,81 @@ impl ChatApp {
         let mut cancel_clicked = false;
         let mut revert_clicked = false;
         let title = format!("Edit pod config — {}", modal.pod_id);
+        // Cap the window so it can't grow past the visible viewport when
+        // the inner editor reports a tall desired size or when the error
+        // label appears.
+        let screen = ctx.content_rect();
+        let max_h = (screen.height() - 60.0).max(240.0);
+        let max_w = (screen.width() - 60.0).max(360.0);
 
         egui::Window::new(title)
             .collapsible(false)
             .resizable(true)
-            .default_width(640.0)
-            .default_height(520.0)
+            .default_width(640.0_f32.min(max_w))
+            .default_height(520.0_f32.min(max_h))
+            .max_width(max_w)
+            .max_height(max_h)
             .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
             .open(&mut open)
             .show(ctx, |ui| {
-                ui.label(
-                    RichText::new(
-                        "Raw pod.toml — server validates parse + structural rules \
-                         (sandbox names unique, thread_defaults reference allow.* entries) \
-                         on save. Validation failures keep your edits open for fixing.",
-                    )
-                    .small()
-                    .color(Color32::from_gray(160)),
-                );
-                ui.add_space(6.0);
-                match modal.toml_text.as_mut() {
+                // Footer first so it claims its height up-front; the
+                // central panel then fills the remaining space without
+                // pushing total content past the window's max_height.
+                egui::TopBottomPanel::bottom("pod_editor_footer")
+                    .show_inside(ui, |ui| {
+                        ui.add_space(6.0);
+                        if let Some(err) = &modal.error {
+                            ui.colored_label(Color32::from_rgb(220, 80, 80), err);
+                            ui.add_space(6.0);
+                        }
+                        ui.separator();
+                        ui.horizontal(|ui| {
+                            let saving = modal.pending_correlation.is_some();
+                            let save_enabled = modal.toml_text.is_some() && !saving;
+                            if ui
+                                .add_enabled(save_enabled, egui::Button::new("Save"))
+                                .clicked()
+                            {
+                                save_clicked = true;
+                            }
+                            if ui.button("Revert").clicked() {
+                                revert_clicked = true;
+                            }
+                            if ui.button("Cancel").clicked() {
+                                cancel_clicked = true;
+                            }
+                            if saving {
+                                ui.label(
+                                    RichText::new("saving…")
+                                        .italics()
+                                        .color(Color32::from_gray(160)),
+                                );
+                            }
+                        });
+                    });
+                egui::TopBottomPanel::top("pod_editor_header")
+                    .show_inside(ui, |ui| {
+                        ui.add_space(4.0);
+                        ui.label(
+                            RichText::new(
+                                "Raw pod.toml — server validates parse + structural rules \
+                                 (sandbox names unique, thread_defaults reference allow.* \
+                                 entries) on save. Validation failures keep your edits open \
+                                 for fixing.",
+                            )
+                            .small()
+                            .color(Color32::from_gray(160)),
+                        );
+                        ui.add_space(6.0);
+                    });
+                egui::CentralPanel::default().show_inside(ui, |ui| match modal.toml_text.as_mut() {
                     Some(text) => {
-                        let avail = ui.available_size();
                         egui::ScrollArea::vertical()
-                            .max_height(avail.y - 80.0)
+                            .auto_shrink([false, false])
                             .show(ui, |ui| {
                                 ui.add_sized(
-                                    [ui.available_width(), avail.y - 80.0],
-                                    TextEdit::multiline(text)
-                                        .code_editor()
-                                        .desired_rows(20),
+                                    ui.available_size(),
+                                    TextEdit::multiline(text).code_editor(),
                                 );
                             });
                     }
@@ -1859,31 +1904,6 @@ impl ChatApp {
                                 .italics()
                                 .color(Color32::from_gray(160)),
                         );
-                    }
-                }
-                if let Some(err) = &modal.error {
-                    ui.add_space(6.0);
-                    ui.colored_label(Color32::from_rgb(220, 80, 80), err);
-                }
-                ui.add_space(6.0);
-                ui.separator();
-                ui.horizontal(|ui| {
-                    let saving = modal.pending_correlation.is_some();
-                    let save_enabled = modal.toml_text.is_some() && !saving;
-                    if ui
-                        .add_enabled(save_enabled, egui::Button::new("Save"))
-                        .clicked()
-                    {
-                        save_clicked = true;
-                    }
-                    if ui.button("Revert").clicked() {
-                        revert_clicked = true;
-                    }
-                    if ui.button("Cancel").clicked() {
-                        cancel_clicked = true;
-                    }
-                    if saving {
-                        ui.label(RichText::new("saving…").italics().color(Color32::from_gray(160)));
                     }
                 });
             });
