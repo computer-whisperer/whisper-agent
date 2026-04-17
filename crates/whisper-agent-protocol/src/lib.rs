@@ -124,15 +124,14 @@ pub struct ThreadBindings {
 /// otherwise produce. Each `Some` field replaces the corresponding default;
 /// each `None` inherits. Values are validated against the pod's `[allow]`
 /// table on the server — backends and shared MCP host names must already
-/// appear there, and an inline `sandbox` spec must hash to one in
-/// `[[allow.sandbox]]`.
+/// appear there. Inline `sandbox` specs are accepted as-is until pod
+/// editing UI ships; see `resolve_bindings_choice` for the rationale.
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
 pub struct ThreadBindingsRequest {
     /// Backend catalog name. Empty → server default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub backend: Option<String>,
-    /// Inline sandbox spec. The server hashes it and verifies the resulting
-    /// id matches one of the pod's `[[allow.sandbox]]` entries.
+    /// Inline sandbox spec.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sandbox: Option<SandboxSpec>,
     /// Catalog names of shared MCP hosts the thread should bind to. `None`
@@ -140,6 +139,39 @@ pub struct ThreadBindingsRequest {
     /// means "no shared hosts beyond the primary").
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mcp_hosts: Option<Vec<String>>,
+}
+
+/// Mid-thread rebind patch. Applied to the live `ThreadBindings` of a
+/// running thread; each `Some` field replaces the matching binding, `None`
+/// leaves it alone. Validated against the pod's `[allow]` table — same
+/// rules as initial binding (modulo the inline-sandbox carve-out).
+///
+/// In-flight I/O against the *previous* bindings completes against its
+/// captured resources; only future ops see the new state. When the
+/// sandbox or MCP host set changes, the scheduler appends a synthetic
+/// conversation note so the model knows the execution environment shifted.
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+pub struct ThreadBindingsPatch {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backend: Option<String>,
+    /// `Some(SandboxRebind::Inline(spec))` re-binds; `Some(Clear)` drops
+    /// the binding entirely; `None` leaves it alone. Two layers of Option
+    /// because "set to nothing" and "leave alone" are distinct.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sandbox: Option<SandboxRebind>,
+    /// Replace the shared MCP host list. `Some(vec)` replaces exactly
+    /// (empty vec means "no shared hosts"); `None` leaves the current set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mcp_hosts: Option<Vec<String>>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum SandboxRebind {
+    /// Replace the bound sandbox with this inline spec.
+    Inline { spec: SandboxSpec },
+    /// Drop the sandbox binding entirely (thread runs bare-metal).
+    Clear,
 }
 
 /// Pattern-1 approval policy. See `docs/design_permissions.md`.
@@ -377,6 +409,19 @@ pub enum ClientToServer {
         thread_id: String,
         tool_name: String,
     },
+    /// Replace pieces of a running thread's resource bindings (backend,
+    /// sandbox, shared MCP hosts). The patch is validated against the
+    /// pod's `[allow]` table; on success the scheduler swaps the bindings
+    /// in place, adjusts resource refcounts, re-provisions the primary
+    /// MCP if the sandbox changed, and appends a synthetic conversation
+    /// note so the model is aware the execution environment may have
+    /// shifted. In-flight ops complete against their captured resources.
+    RebindThread {
+        thread_id: String,
+        patch: ThreadBindingsPatch,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        correlation_id: Option<String>,
+    },
     /// Cancel a task. Stubbed for now — flips state to `Cancelled` without rolling back
     /// any in-flight tool work. Proper rollback semantics are a v0.3 problem.
     CancelThread {
@@ -490,6 +535,15 @@ pub enum ServerToClient {
     },
     ThreadArchived {
         thread_id: String,
+    },
+    /// A `RebindThread` was applied (or denied — see correlation_id +
+    /// matching Error). Carries the new bindings so subscribed clients
+    /// can refresh any rendered binding info.
+    ThreadBindingsChanged {
+        thread_id: String,
+        bindings: ThreadBindings,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        correlation_id: Option<String>,
     },
 
     // --- Request / response ---

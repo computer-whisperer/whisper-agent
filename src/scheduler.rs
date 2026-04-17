@@ -27,8 +27,9 @@ use futures::stream::FuturesUnordered;
 use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 use whisper_agent_protocol::{
-    BackendSummary, ClientToServer, ModelSummary, ServerToClient, ThreadBindings,
-    ThreadBindingsRequest, ThreadConfig, ThreadConfigOverride, ThreadStateLabel,
+    BackendSummary, ClientToServer, Message, ModelSummary, SandboxRebind, ServerToClient,
+    ThreadBindings, ThreadBindingsPatch, ThreadBindingsRequest, ThreadConfig,
+    ThreadConfigOverride, ThreadStateLabel,
 };
 
 use crate::audit::AuditLog;
@@ -429,6 +430,239 @@ impl Scheduler {
         pending_io.push(fut);
     }
 
+    /// Apply a [`ThreadBindingsPatch`] to a running thread.
+    ///
+    /// Validates the patch against the pod's `[allow]` table (backend +
+    /// shared MCP host names; sandbox specs are accepted as-is — see
+    /// `resolve_bindings_choice` for why), swaps the bindings in place,
+    /// adjusts every affected resource's user count, re-provisions the
+    /// primary MCP if the sandbox changed, and appends a synthetic
+    /// conversation note when the execution environment shifted. Threads
+    /// parked in `WaitingOnResources` get a recomputed `needed` list and
+    /// transition to `NeedsModelCall` if the new set is empty.
+    fn apply_rebind(
+        &mut self,
+        thread_id: &str,
+        patch: ThreadBindingsPatch,
+        correlation_id: Option<String>,
+        pending_io: &mut FuturesUnordered<SchedulerFuture>,
+    ) -> Result<(), String> {
+        // --- Phase 1: snapshot read-only state ---
+        let (pod_id, old_bindings) = {
+            let task = self
+                .tasks
+                .get(thread_id)
+                .ok_or_else(|| format!("unknown thread `{thread_id}`"))?;
+            (task.pod_id.clone(), task.bindings.clone())
+        };
+        let pod_allow = self
+            .pods
+            .get(&pod_id)
+            .ok_or_else(|| format!("thread `{thread_id}` references unknown pod `{pod_id}`"))?
+            .config
+            .allow
+            .clone();
+
+        // --- Phase 2: compute new pieces (no mutation yet — we want
+        //              validation failures to leave the thread untouched) ---
+        let new_backend = patch
+            .backend
+            .clone()
+            .unwrap_or_else(|| old_bindings.backend.clone());
+
+        let new_shared_hosts: Vec<String> = match &patch.mcp_hosts {
+            Some(list) => list.clone(),
+            None => old_bindings
+                .mcp_hosts
+                .iter()
+                .filter_map(|raw| raw.strip_prefix("mcp-shared-").map(String::from))
+                .collect(),
+        };
+
+        let new_sandbox_id_str: Option<String> = match &patch.sandbox {
+            None => old_bindings.sandbox.clone(),
+            Some(SandboxRebind::Clear) => None,
+            Some(SandboxRebind::Inline { spec }) => Some(SandboxId::for_spec(spec).0),
+        };
+
+        // --- Phase 3: validate against pod allowlist ---
+        if !new_backend.is_empty() && !pod_allow.backends.iter().any(|b| b == &new_backend) {
+            return Err(format!(
+                "backend `{}` not in pod `{}`'s allow.backends ({})",
+                new_backend,
+                pod_id,
+                pod_allow.backends.join(", ")
+            ));
+        }
+        for name in &new_shared_hosts {
+            if !pod_allow.mcp_hosts.iter().any(|h| h == name) {
+                return Err(format!(
+                    "shared MCP host `{name}` not in pod `{}`'s allow.mcp_hosts ({})",
+                    pod_id,
+                    pod_allow.mcp_hosts.join(", "),
+                ));
+            }
+            if !self
+                .resources
+                .mcp_hosts
+                .contains_key(&McpHostId::shared(name))
+            {
+                return Err(format!(
+                    "shared MCP host `{name}` not configured on this server",
+                ));
+            }
+        }
+
+        // --- Phase 4: figure out what actually changed ---
+        let backend_changed = new_backend != old_bindings.backend;
+        let sandbox_changed = new_sandbox_id_str != old_bindings.sandbox;
+        let old_shared: HashSet<String> = old_bindings
+            .mcp_hosts
+            .iter()
+            .filter_map(|raw| raw.strip_prefix("mcp-shared-").map(String::from))
+            .collect();
+        let new_shared: HashSet<String> = new_shared_hosts.iter().cloned().collect();
+        let mcp_hosts_changed = old_shared != new_shared;
+
+        // --- Phase 5: refcount adjustments ---
+        if backend_changed {
+            let old_resolved: &str = if old_bindings.backend.is_empty() {
+                &self.default_backend
+            } else {
+                &old_bindings.backend
+            };
+            let new_resolved: &str = if new_backend.is_empty() {
+                &self.default_backend
+            } else {
+                &new_backend
+            };
+            let old_id = BackendId::for_name(old_resolved);
+            let new_id = BackendId::for_name(new_resolved);
+            self.resources.remove_backend_user(&old_id, thread_id);
+            self.resources.add_backend_user(&new_id, thread_id);
+            self.emit_backend_updated(&old_id);
+            self.emit_backend_updated(&new_id);
+        }
+
+        if sandbox_changed {
+            // Release the old sandbox; tear it down if we were the last
+            // user and the entry isn't pinned.
+            if let Some(old_id_str) = &old_bindings.sandbox {
+                let old_id = SandboxId(old_id_str.clone());
+                let remaining = self.resources.release_sandbox_user(&old_id, thread_id);
+                let pinned = self
+                    .resources
+                    .sandboxes
+                    .get(&old_id)
+                    .map(|e| e.pinned)
+                    .unwrap_or(false);
+                if remaining == 0 && !pinned {
+                    let handle = self.resources.take_sandbox_handle(&old_id);
+                    self.resources.mark_sandbox_torn_down(&old_id);
+                    self.emit_sandbox_updated(&old_id);
+                    if let Some(mut h) = handle {
+                        let tid = thread_id.to_string();
+                        tokio::spawn(async move {
+                            if let Err(e) = h.teardown().await {
+                                warn!(thread_id = %tid, error = %e, "sandbox teardown after rebind failed");
+                            }
+                        });
+                    }
+                } else {
+                    self.emit_sandbox_updated(&old_id);
+                }
+            }
+            // Pre-register the new sandbox (if any).
+            if let Some(SandboxRebind::Inline { spec }) = &patch.sandbox {
+                let new_id = self.resources.pre_register_sandbox(thread_id, spec.clone());
+                self.emit_sandbox_updated(&new_id);
+            }
+        }
+
+        if mcp_hosts_changed {
+            for name in old_shared.difference(&new_shared) {
+                let id = McpHostId::shared(name);
+                self.resources.remove_mcp_user(&id, thread_id);
+                self.emit_mcp_host_updated(&id);
+            }
+            for name in new_shared.difference(&old_shared) {
+                let id = McpHostId::shared(name);
+                self.resources.add_mcp_user(&id, thread_id);
+                self.emit_mcp_host_updated(&id);
+            }
+        }
+
+        // --- Phase 6: sandbox change → reconnect primary MCP ---
+        if sandbox_changed {
+            let primary_id = McpHostId::primary_for_task(thread_id);
+            self.resources.mark_mcp_torn_down(&primary_id);
+            self.emit_mcp_host_updated(&primary_id);
+            // Drop the in-flight guard so ensure_primary_mcp_provisioning
+            // dispatches a fresh future. The old one is still in flight;
+            // its completion will hit AlreadyCompleted on the new
+            // primary entry's state and harmlessly drop the session.
+            self.provisioning_in_flight.remove(thread_id);
+            self.ensure_primary_mcp_provisioning(thread_id, pending_io);
+        }
+
+        // --- Phase 7: swap bindings + synthetic note + recompute waiting ---
+        let primary_mcp_id = McpHostId::primary_for_task(thread_id).0;
+        let mut new_mcp_hosts: Vec<String> = vec![primary_mcp_id];
+        for name in &new_shared_hosts {
+            new_mcp_hosts.push(McpHostId::shared(name).0);
+        }
+        let new_bindings = ThreadBindings {
+            backend: new_backend,
+            sandbox: new_sandbox_id_str,
+            mcp_hosts: new_mcp_hosts,
+            tool_filter: old_bindings.tool_filter.clone(),
+        };
+
+        let env_changed = sandbox_changed || mcp_hosts_changed;
+        let was_waiting = {
+            let task = self.tasks.get_mut(thread_id).expect("checked in phase 1");
+            task.bindings = new_bindings.clone();
+            task.touch();
+            if env_changed {
+                task.conversation.push(Message::user_text(
+                    "*Note: the execution environment changed at this point. \
+                     Files, processes, and tool availability may differ from \
+                     earlier in this conversation.*",
+                ));
+            }
+            matches!(task.internal, ThreadInternalState::WaitingOnResources { .. })
+        };
+
+        let mut now_unblocked = false;
+        if was_waiting {
+            let new_needed = self.pending_resources_for(thread_id);
+            if let Some(task) = self.tasks.get_mut(thread_id)
+                && let ThreadInternalState::WaitingOnResources { needed } = &mut task.internal
+            {
+                *needed = new_needed;
+                if needed.is_empty() {
+                    task.internal = ThreadInternalState::NeedsModelCall;
+                    now_unblocked = true;
+                }
+            }
+        }
+
+        // --- Phase 8: persist + broadcast ---
+        self.mark_dirty(thread_id);
+        self.router.broadcast_to_subscribers(
+            thread_id,
+            ServerToClient::ThreadBindingsChanged {
+                thread_id: thread_id.to_string(),
+                bindings: new_bindings,
+                correlation_id,
+            },
+        );
+        if now_unblocked {
+            self.step_until_blocked(thread_id, pending_io);
+        }
+        Ok(())
+    }
+
     pub fn with_persister(mut self, persister: Persister) -> Self {
         self.persister = Some(persister);
         self
@@ -649,6 +883,25 @@ impl Scheduler {
                             message: "unknown task".into(),
                         },
                     ),
+                }
+            }
+            ClientToServer::RebindThread {
+                thread_id,
+                patch,
+                correlation_id,
+            } => {
+                if let Err(e) =
+                    self.apply_rebind(&thread_id, patch, correlation_id.clone(), pending_io)
+                {
+                    warn!(error = %e, conn_id, %thread_id, "rebind rejected");
+                    self.router.send_to_client(
+                        conn_id,
+                        ServerToClient::Error {
+                            correlation_id,
+                            thread_id: Some(thread_id),
+                            message: format!("rebind: {e}"),
+                        },
+                    );
                 }
             }
             ClientToServer::CancelThread { thread_id } => {

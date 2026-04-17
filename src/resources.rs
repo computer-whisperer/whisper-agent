@@ -375,6 +375,16 @@ impl ResourceRegistry {
         let id = McpHostId::primary_for_task(thread_id);
         let now = Utc::now();
         if let Some(entry) = self.mcp_hosts.get_mut(&id) {
+            // If terminal (Errored from a prior failure, or TornDown
+            // after a sandbox rebind), reset back to Provisioning so the
+            // next `provision_primary_mcp` future can complete cleanly.
+            if entry.state.is_terminal() {
+                entry.state = ResourceState::Provisioning { op_id: 0 };
+                entry.session = None;
+                entry.tools.clear();
+                entry.annotations.clear();
+                entry.spec.url = fallback_url;
+            }
             entry.users.insert(thread_id.to_string());
             entry.last_used = now;
             return id;

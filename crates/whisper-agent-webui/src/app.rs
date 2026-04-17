@@ -511,6 +511,13 @@ impl ChatApp {
                     view.tool_allowlist = tool_allowlist;
                 }
             }
+            ServerToClient::ThreadBindingsChanged {
+                thread_id, bindings, ..
+            } => {
+                if let Some(view) = self.tasks.get_mut(&thread_id) {
+                    view.backend = bindings.backend;
+                }
+            }
             ServerToClient::ThreadAssistantBegin { .. } => {}
             ServerToClient::ThreadAssistantText { thread_id, text } => {
                 if let Some(view) = self.tasks.get_mut(&thread_id) {
