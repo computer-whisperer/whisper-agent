@@ -1595,6 +1595,45 @@ impl Scheduler {
                     );
                 }
             }
+            ClientToServer::CreateBehavior {
+                correlation_id,
+                pod_id,
+                behavior_id,
+                config,
+                prompt,
+            } => {
+                self.handle_create_behavior(
+                    conn_id,
+                    correlation_id,
+                    pod_id,
+                    behavior_id,
+                    config,
+                    prompt,
+                );
+            }
+            ClientToServer::UpdateBehavior {
+                correlation_id,
+                pod_id,
+                behavior_id,
+                config,
+                prompt,
+            } => {
+                self.handle_update_behavior(
+                    conn_id,
+                    correlation_id,
+                    pod_id,
+                    behavior_id,
+                    config,
+                    prompt,
+                );
+            }
+            ClientToServer::DeleteBehavior {
+                correlation_id,
+                pod_id,
+                behavior_id,
+            } => {
+                self.handle_delete_behavior(conn_id, correlation_id, pod_id, behavior_id);
+            }
             ClientToServer::ListModels {
                 correlation_id,
                 backend,
@@ -1930,6 +1969,249 @@ impl Scheduler {
                 behavior_id: origin.behavior_id,
                 state: snapshot_state,
             });
+    }
+
+    /// `CreateBehavior` handler — validate ids + config, register the
+    /// new entry in-memory, broadcast `BehaviorCreated`, kick off the
+    /// disk write in the background. Mirrors the `CreatePod` shape: the
+    /// in-memory state is immediately queryable; a failing disk write
+    /// logs a warn but doesn't roll back the in-memory entry.
+    fn handle_create_behavior(
+        &mut self,
+        conn_id: ConnId,
+        correlation_id: Option<String>,
+        pod_id: String,
+        behavior_id: String,
+        config: whisper_agent_protocol::BehaviorConfig,
+        prompt: String,
+    ) {
+        if let Err(e) = crate::pod::behaviors::validate_behavior_id(&behavior_id) {
+            self.send_behavior_error(conn_id, correlation_id, "create_behavior", e);
+            return;
+        }
+        if let Err(e) = crate::pod::behaviors::validate(&config) {
+            self.send_behavior_error(conn_id, correlation_id, "create_behavior", e);
+            return;
+        }
+        let Some(pod) = self.pods.get_mut(&pod_id) else {
+            self.send_behavior_error(
+                conn_id,
+                correlation_id,
+                "create_behavior",
+                format!("unknown pod `{pod_id}`"),
+            );
+            return;
+        };
+        if pod.behaviors.contains_key(&behavior_id) {
+            self.send_behavior_error(
+                conn_id,
+                correlation_id,
+                "create_behavior",
+                format!("behavior `{behavior_id}` already exists under pod `{pod_id}`"),
+            );
+            return;
+        }
+        let raw_toml = match crate::pod::behaviors::to_toml(&config) {
+            Ok(t) => t,
+            Err(e) => {
+                self.send_behavior_error(conn_id, correlation_id, "create_behavior", e);
+                return;
+            }
+        };
+        let dir = pod
+            .dir
+            .join(crate::pod::behaviors::BEHAVIORS_DIR)
+            .join(&behavior_id);
+        let behavior = crate::pod::behaviors::Behavior {
+            id: behavior_id.clone(),
+            pod_id: pod_id.clone(),
+            dir: dir.clone(),
+            config: Some(config.clone()),
+            raw_toml,
+            prompt: prompt.clone(),
+            state: whisper_agent_protocol::BehaviorState::default(),
+            load_error: None,
+        };
+        let summary = behavior.summary();
+        pod.behaviors.insert(behavior_id.clone(), behavior);
+
+        // Broadcast to everyone; correlation_id goes only to the requester.
+        let ev = ServerToClient::BehaviorCreated {
+            correlation_id: None,
+            summary: summary.clone(),
+        };
+        self.router.broadcast_task_list_except(ev, conn_id);
+        self.router.send_to_client(
+            conn_id,
+            ServerToClient::BehaviorCreated {
+                correlation_id,
+                summary,
+            },
+        );
+
+        // Disk write runs in the background. Failure logs a warn — the
+        // in-memory entry stays usable but won't survive a restart.
+        let pod_dir = self.pods.get(&pod_id).map(|p| p.dir.clone());
+        if let Some(pod_dir) = pod_dir {
+            let bid = behavior_id;
+            tokio::spawn(async move {
+                if let Err(e) =
+                    crate::pod::behaviors::create_on_disk(&pod_dir, &bid, &config, &prompt).await
+                {
+                    warn!(behavior_id = %bid, error = %e, "create_behavior disk write failed");
+                }
+            });
+        }
+    }
+
+    /// `UpdateBehavior` handler — replace the in-memory entry's config /
+    /// prompt / raw_toml (preserving state), broadcast
+    /// `BehaviorUpdated`, disk-write in the background.
+    fn handle_update_behavior(
+        &mut self,
+        conn_id: ConnId,
+        correlation_id: Option<String>,
+        pod_id: String,
+        behavior_id: String,
+        config: whisper_agent_protocol::BehaviorConfig,
+        prompt: String,
+    ) {
+        if let Err(e) = crate::pod::behaviors::validate_behavior_id(&behavior_id) {
+            self.send_behavior_error(conn_id, correlation_id, "update_behavior", e);
+            return;
+        }
+        if let Err(e) = crate::pod::behaviors::validate(&config) {
+            self.send_behavior_error(conn_id, correlation_id, "update_behavior", e);
+            return;
+        }
+        let Some(pod) = self.pods.get_mut(&pod_id) else {
+            self.send_behavior_error(
+                conn_id,
+                correlation_id,
+                "update_behavior",
+                format!("unknown pod `{pod_id}`"),
+            );
+            return;
+        };
+        let Some(behavior) = pod.behaviors.get_mut(&behavior_id) else {
+            self.send_behavior_error(
+                conn_id,
+                correlation_id,
+                "update_behavior",
+                format!("unknown behavior `{behavior_id}` under pod `{pod_id}`"),
+            );
+            return;
+        };
+        let raw_toml = match crate::pod::behaviors::to_toml(&config) {
+            Ok(t) => t,
+            Err(e) => {
+                self.send_behavior_error(conn_id, correlation_id, "update_behavior", e);
+                return;
+            }
+        };
+        behavior.config = Some(config.clone());
+        behavior.raw_toml = raw_toml;
+        behavior.prompt = prompt.clone();
+        behavior.load_error = None;
+        let snapshot = behavior.snapshot();
+        let pod_dir = pod.dir.clone();
+
+        let ev = ServerToClient::BehaviorUpdated {
+            correlation_id: None,
+            snapshot: snapshot.clone(),
+        };
+        self.router.broadcast_task_list_except(ev, conn_id);
+        self.router.send_to_client(
+            conn_id,
+            ServerToClient::BehaviorUpdated {
+                correlation_id,
+                snapshot,
+            },
+        );
+
+        let bid = behavior_id;
+        tokio::spawn(async move {
+            if let Err(e) =
+                crate::pod::behaviors::update_on_disk(&pod_dir, &bid, &config, &prompt).await
+            {
+                warn!(behavior_id = %bid, error = %e, "update_behavior disk write failed");
+            }
+        });
+    }
+
+    /// `DeleteBehavior` handler — remove from in-memory pod, broadcast
+    /// `BehaviorDeleted`, rmdir in the background. Historical threads
+    /// that carry this behavior_id as their origin are untouched; the UI
+    /// resolves them as orphaned runs.
+    fn handle_delete_behavior(
+        &mut self,
+        conn_id: ConnId,
+        correlation_id: Option<String>,
+        pod_id: String,
+        behavior_id: String,
+    ) {
+        if let Err(e) = crate::pod::behaviors::validate_behavior_id(&behavior_id) {
+            self.send_behavior_error(conn_id, correlation_id, "delete_behavior", e);
+            return;
+        }
+        let Some(pod) = self.pods.get_mut(&pod_id) else {
+            self.send_behavior_error(
+                conn_id,
+                correlation_id,
+                "delete_behavior",
+                format!("unknown pod `{pod_id}`"),
+            );
+            return;
+        };
+        if pod.behaviors.remove(&behavior_id).is_none() {
+            self.send_behavior_error(
+                conn_id,
+                correlation_id,
+                "delete_behavior",
+                format!("unknown behavior `{behavior_id}` under pod `{pod_id}`"),
+            );
+            return;
+        }
+        let pod_dir = pod.dir.clone();
+
+        let ev = ServerToClient::BehaviorDeleted {
+            correlation_id: None,
+            pod_id: pod_id.clone(),
+            behavior_id: behavior_id.clone(),
+        };
+        self.router.broadcast_task_list_except(ev, conn_id);
+        self.router.send_to_client(
+            conn_id,
+            ServerToClient::BehaviorDeleted {
+                correlation_id,
+                pod_id,
+                behavior_id: behavior_id.clone(),
+            },
+        );
+
+        let bid = behavior_id;
+        tokio::spawn(async move {
+            if let Err(e) = crate::pod::behaviors::delete_on_disk(&pod_dir, &bid).await {
+                warn!(behavior_id = %bid, error = %e, "delete_behavior disk removal failed");
+            }
+        });
+    }
+
+    fn send_behavior_error(
+        &self,
+        conn_id: ConnId,
+        correlation_id: Option<String>,
+        op: &str,
+        err: impl std::fmt::Display,
+    ) {
+        self.router.send_to_client(
+            conn_id,
+            ServerToClient::Error {
+                correlation_id,
+                thread_id: None,
+                message: format!("{op}: {err}"),
+            },
+        );
     }
 
     fn send_user_message(

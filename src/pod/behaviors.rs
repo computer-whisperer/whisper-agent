@@ -1,15 +1,17 @@
 //! Behavior data model — in-memory `Behavior` type, TOML parsing +
-//! validation, on-disk loader.  See `docs/design_behaviors.md`.
+//! validation, on-disk loader + writer.  See `docs/design_behaviors.md`.
 //!
 //! Each pod owns a `behaviors/` subdirectory; each entry there is a
 //! self-contained `<behavior_id>/` with:
 //!   - `behavior.toml` — the `BehaviorConfig`.
-//!   - `prompt.md` — the system-prompt template for spawned threads.
+//!   - `prompt.md` — the initial user-message template spawned threads
+//!     run against. Substituted at fire time (`{{payload}}` → payload
+//!     as pretty JSON); the pod's system_prompt_file remains the
+//!     thread's system prompt.
 //!   - `state.json` — `BehaviorState` (run_count, last_fired_at, ...).
 //!
-//! Phase 1 scope: types + parser + directory loader. Write-side wire
-//! (`CreateBehavior` / `UpdateBehavior` / `DeleteBehavior`) and the
-//! trigger-driven spawn path arrive in later phases.
+//! Phases 1-2 cover: types + parser + loader + write helpers. Triggers
+//! (cron, webhook) and retention sweeping arrive in later phases.
 
 use std::path::{Path, PathBuf};
 
@@ -168,6 +170,85 @@ pub fn validate_behavior_id(id: &str) -> anyhow::Result<()> {
     if id.contains(['/', '\\', '\0']) || id == ".." {
         return Err(anyhow::anyhow!("behavior_id contains illegal characters"));
     }
+    Ok(())
+}
+
+/// Write a fresh behavior's three files to disk. Creates the
+/// `behaviors/<id>/` directory, fails if it already exists. `state.json`
+/// is seeded with a default `BehaviorState` so subsequent state updates
+/// can write-in-place.
+pub async fn create_on_disk(
+    pod_dir: &Path,
+    behavior_id: &str,
+    config: &BehaviorConfig,
+    prompt: &str,
+) -> anyhow::Result<()> {
+    let dir = pod_dir.join(BEHAVIORS_DIR).join(behavior_id);
+    if fs::try_exists(&dir).await.unwrap_or(false) {
+        return Err(anyhow::anyhow!(
+            "behavior `{behavior_id}` already exists at {}",
+            dir.display()
+        ));
+    }
+    fs::create_dir_all(&dir).await?;
+    let toml_text = to_toml(config)?;
+    fs::write(dir.join(BEHAVIOR_TOML), toml_text).await?;
+    fs::write(dir.join(BEHAVIOR_PROMPT), prompt).await?;
+    let state = BehaviorState::default();
+    let state_json = serde_json::to_vec_pretty(&state)?;
+    fs::write(dir.join(BEHAVIOR_STATE), state_json).await?;
+    Ok(())
+}
+
+/// Overwrite a behavior's `behavior.toml` + `prompt.md`. Does NOT touch
+/// `state.json` — the run history survives config edits.
+pub async fn update_on_disk(
+    pod_dir: &Path,
+    behavior_id: &str,
+    config: &BehaviorConfig,
+    prompt: &str,
+) -> anyhow::Result<()> {
+    let dir = pod_dir.join(BEHAVIORS_DIR).join(behavior_id);
+    if !fs::try_exists(&dir).await.unwrap_or(false) {
+        return Err(anyhow::anyhow!(
+            "behavior `{behavior_id}` does not exist at {}",
+            dir.display()
+        ));
+    }
+    let toml_text = to_toml(config)?;
+    fs::write(dir.join(BEHAVIOR_TOML), toml_text).await?;
+    fs::write(dir.join(BEHAVIOR_PROMPT), prompt).await?;
+    Ok(())
+}
+
+/// Remove a behavior directory entirely. Idempotent for a missing dir
+/// (returns Ok) so a racey double-delete doesn't error. Historical
+/// threads that carry this behavior_id as their origin are left alone —
+/// the UI surfaces them as orphaned runs.
+pub async fn delete_on_disk(pod_dir: &Path, behavior_id: &str) -> anyhow::Result<()> {
+    let dir = pod_dir.join(BEHAVIORS_DIR).join(behavior_id);
+    match fs::remove_dir_all(&dir).await {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Persist a behavior's `state.json` in-place. Used by the on-terminal
+/// hook when behavior state updates (run_count, last_outcome, etc.).
+/// Returns an error rather than warn-logging so the caller can choose
+/// how loudly to fail.
+pub async fn write_state(
+    pod_dir: &Path,
+    behavior_id: &str,
+    state: &BehaviorState,
+) -> anyhow::Result<()> {
+    let path = pod_dir
+        .join(BEHAVIORS_DIR)
+        .join(behavior_id)
+        .join(BEHAVIOR_STATE);
+    let bytes = serde_json::to_vec_pretty(state)?;
+    fs::write(&path, bytes).await?;
     Ok(())
 }
 
@@ -456,6 +537,127 @@ kind = "webhook"
             behaviors[0].state.last_fired_at.as_deref(),
             Some("2026-04-17T09:00:00Z")
         );
+        let _ = std::fs::remove_dir_all(&pod_dir);
+    }
+
+    #[tokio::test]
+    async fn create_writes_all_three_files_and_round_trips() {
+        let pod_dir = scratch_dir();
+        let cfg = BehaviorConfig {
+            name: "daily".into(),
+            description: None,
+            trigger: TriggerSpec::default(),
+            thread: whisper_agent_protocol::BehaviorThreadOverride::default(),
+            on_completion: RetentionPolicy::default(),
+        };
+        create_on_disk(&pod_dir, "daily", &cfg, "do the thing")
+            .await
+            .unwrap();
+        let loaded = load_behaviors_for_pod(&pod_dir, "testpod").await;
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].id, "daily");
+        assert_eq!(loaded[0].config.as_ref().unwrap().name, "daily");
+        assert_eq!(loaded[0].prompt, "do the thing");
+        assert_eq!(loaded[0].state, BehaviorState::default());
+        let _ = std::fs::remove_dir_all(&pod_dir);
+    }
+
+    #[tokio::test]
+    async fn create_rejects_collision() {
+        let pod_dir = scratch_dir();
+        let cfg = BehaviorConfig {
+            name: "x".into(),
+            description: None,
+            trigger: TriggerSpec::default(),
+            thread: whisper_agent_protocol::BehaviorThreadOverride::default(),
+            on_completion: RetentionPolicy::default(),
+        };
+        create_on_disk(&pod_dir, "x", &cfg, "").await.unwrap();
+        let err = create_on_disk(&pod_dir, "x", &cfg, "").await.unwrap_err();
+        assert!(err.to_string().contains("already exists"));
+        let _ = std::fs::remove_dir_all(&pod_dir);
+    }
+
+    #[tokio::test]
+    async fn update_preserves_state_json() {
+        let pod_dir = scratch_dir();
+        let cfg = BehaviorConfig {
+            name: "v1".into(),
+            description: None,
+            trigger: TriggerSpec::default(),
+            thread: whisper_agent_protocol::BehaviorThreadOverride::default(),
+            on_completion: RetentionPolicy::default(),
+        };
+        create_on_disk(&pod_dir, "b", &cfg, "v1-prompt")
+            .await
+            .unwrap();
+        // Simulate some accumulated state.
+        write_state(
+            &pod_dir,
+            "b",
+            &BehaviorState {
+                run_count: 17,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        let cfg2 = BehaviorConfig {
+            name: "v2".into(),
+            ..cfg
+        };
+        update_on_disk(&pod_dir, "b", &cfg2, "v2-prompt")
+            .await
+            .unwrap();
+
+        let loaded = load_behaviors_for_pod(&pod_dir, "testpod").await;
+        assert_eq!(loaded[0].config.as_ref().unwrap().name, "v2");
+        assert_eq!(loaded[0].prompt, "v2-prompt");
+        // Run history survived.
+        assert_eq!(loaded[0].state.run_count, 17);
+        let _ = std::fs::remove_dir_all(&pod_dir);
+    }
+
+    #[tokio::test]
+    async fn update_fails_on_missing() {
+        let pod_dir = scratch_dir();
+        let cfg = BehaviorConfig {
+            name: "x".into(),
+            description: None,
+            trigger: TriggerSpec::default(),
+            thread: whisper_agent_protocol::BehaviorThreadOverride::default(),
+            on_completion: RetentionPolicy::default(),
+        };
+        let err = update_on_disk(&pod_dir, "ghost", &cfg, "")
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("does not exist"));
+        let _ = std::fs::remove_dir_all(&pod_dir);
+    }
+
+    #[tokio::test]
+    async fn delete_is_idempotent_on_missing() {
+        let pod_dir = scratch_dir();
+        // No such behavior — delete succeeds silently.
+        delete_on_disk(&pod_dir, "ghost").await.unwrap();
+        let _ = std::fs::remove_dir_all(&pod_dir);
+    }
+
+    #[tokio::test]
+    async fn delete_removes_behavior_dir() {
+        let pod_dir = scratch_dir();
+        let cfg = BehaviorConfig {
+            name: "x".into(),
+            description: None,
+            trigger: TriggerSpec::default(),
+            thread: whisper_agent_protocol::BehaviorThreadOverride::default(),
+            on_completion: RetentionPolicy::default(),
+        };
+        create_on_disk(&pod_dir, "gone", &cfg, "").await.unwrap();
+        delete_on_disk(&pod_dir, "gone").await.unwrap();
+        let loaded = load_behaviors_for_pod(&pod_dir, "testpod").await;
+        assert!(loaded.is_empty());
         let _ = std::fs::remove_dir_all(&pod_dir);
     }
 }

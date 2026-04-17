@@ -626,6 +626,41 @@ pub enum ClientToServer {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         payload: Option<serde_json::Value>,
     },
+    /// Create a new behavior under the named pod. Writes
+    /// `<pod>/behaviors/<behavior_id>/{behavior.toml,prompt.md,state.json}`.
+    /// Fails on id collision; to mutate an existing behavior use
+    /// `UpdateBehavior`.
+    CreateBehavior {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        correlation_id: Option<String>,
+        pod_id: String,
+        behavior_id: String,
+        config: BehaviorConfig,
+        /// Contents of the sibling `prompt.md`. May be empty.
+        #[serde(default)]
+        prompt: String,
+    },
+    /// Replace an existing behavior's config + prompt. Does NOT reset
+    /// `state.json` — run_count / last_fired_at / etc. are
+    /// scheduler-maintained and should survive config edits.
+    UpdateBehavior {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        correlation_id: Option<String>,
+        pod_id: String,
+        behavior_id: String,
+        config: BehaviorConfig,
+        #[serde(default)]
+        prompt: String,
+    },
+    /// Remove a behavior. Idempotent-ish — unknown behavior returns an
+    /// error, but a repeated call against the same id after deletion is
+    /// a different user-level state (id was just removed).
+    DeleteBehavior {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        correlation_id: Option<String>,
+        pod_id: String,
+        behavior_id: String,
+    },
 }
 
 /// Messages the server sends to the client.
@@ -872,6 +907,31 @@ pub enum ServerToClient {
         pod_id: String,
         behavior_id: String,
         state: BehaviorState,
+    },
+    /// A new behavior was created (via `CreateBehavior`). Broadcast so
+    /// every client's pod-detail view can fold in the new entry without
+    /// a refetch.
+    BehaviorCreated {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        correlation_id: Option<String>,
+        summary: BehaviorSummary,
+    },
+    /// An existing behavior's config / prompt was replaced (via
+    /// `UpdateBehavior`). Carries the full new snapshot so clients can
+    /// drop any cached config for this behavior and re-render.
+    BehaviorUpdated {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        correlation_id: Option<String>,
+        snapshot: BehaviorSnapshot,
+    },
+    /// A behavior was deleted (via `DeleteBehavior`). Spawned threads
+    /// keep their `origin.behavior_id` — the UI resolves those as
+    /// "orphaned runs" of a now-deleted behavior.
+    BehaviorDeleted {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        correlation_id: Option<String>,
+        pod_id: String,
+        behavior_id: String,
     },
 
     Error {

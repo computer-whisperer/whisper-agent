@@ -1021,13 +1021,16 @@ impl ChatApp {
                 self.pod_configs
                     .insert(snapshot.pod_id.clone(), snapshot.config);
             }
-            // Behaviors: phase 1/2 add read-side + manual-fire wire. The
-            // UI surface (a behaviors panel in the pod detail view) is
-            // phase 5 work — until then the events arrive and are
-            // dropped. See docs/design_behaviors.md.
+            // Behaviors: phases 1-2 add read-side + manual-fire +
+            // write-side wire. The UI surface (a behaviors panel in the
+            // pod detail view) is phase 5 work — until then the events
+            // arrive and are dropped. See docs/design_behaviors.md.
             ServerToClient::BehaviorList { .. }
             | ServerToClient::BehaviorSnapshot { .. }
-            | ServerToClient::BehaviorStateChanged { .. } => {}
+            | ServerToClient::BehaviorStateChanged { .. }
+            | ServerToClient::BehaviorCreated { .. }
+            | ServerToClient::BehaviorUpdated { .. }
+            | ServerToClient::BehaviorDeleted { .. } => {}
         }
     }
 
