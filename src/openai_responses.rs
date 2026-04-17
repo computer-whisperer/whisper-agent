@@ -462,22 +462,21 @@ fn spec_to_rsp_tool(t: &ToolSpec) -> RspTool {
     }
 }
 
-/// Walk an SSE stream body and pull the `response` object out of the first
-/// `response.completed` event. The event shape (per the Responses streaming
-/// contract) is:
+/// Reassemble the final response object from the SSE stream body.
 ///
-/// ```text
-/// event: response.completed
-/// data: {"type":"response.completed","response":{...full response object...}}
-/// ```
+/// Items arrive incrementally as `response.output_item.done` events — each
+/// carrying one fully-formed message / function_call / reasoning item. The
+/// final `response.completed` event supplies the status, usage, and
+/// incomplete_details, but its embedded `response.output` array is often
+/// empty on the ChatGPT-subscription route (the server relies on the client
+/// having accumulated the items already). We merge both: completed-event
+/// metadata + accumulated items as the output.
 ///
-/// We tolerate any number of preceding `response.*.delta` / `.added` / `.done`
-/// events — those are useful for live UI streaming but we don't expose a
-/// streaming interface at the provider level, so we simply discard them.
+/// `response.failed` short-circuits to [`ModelError::Api`] so terminal
+/// server-side errors surface cleanly to the caller.
 fn extract_completed_response(body: &str) -> Result<RspResponse, ModelError> {
+    let mut items: Vec<RspOutputItem> = Vec::new();
     for line in body.lines() {
-        // SSE events may carry multiple fields per frame; Responses emits one
-        // JSON blob per `data:` line and sibling lines we can ignore.
         let Some(payload) = line.strip_prefix("data:") else {
             continue;
         };
@@ -490,15 +489,20 @@ fn extract_completed_response(body: &str) -> Result<RspResponse, ModelError> {
             Err(_) => continue, // non-event data lines are skippable
         };
         match event {
-            SseEvent::ResponseCompleted { response } => return Ok(response),
+            SseEvent::OutputItemDone { item } => items.push(item),
+            SseEvent::ResponseCompleted { mut response } => {
+                // If the server included the items inline (api.openai.com does),
+                // trust that — otherwise reuse what we accumulated.
+                if response.output.is_empty() {
+                    response.output = items;
+                }
+                return Ok(response);
+            }
             SseEvent::ResponseFailed { response, error } => {
-                // The server surfaced a terminal error via a typed event rather
-                // than an HTTP error — preserve the detail for the caller.
                 let detail = error
                     .as_ref()
                     .map(|e| e.message.clone())
                     .unwrap_or_else(|| "response.failed".to_string());
-                // Prefer the response object's status when available.
                 let status = response
                     .as_ref()
                     .and_then(|r| r.status.clone())
@@ -593,13 +597,19 @@ enum RspTool {
     },
 }
 
-/// SSE frames we care about on the streaming `/responses` route. Every frame
-/// type that isn't `response.completed` / `response.failed` collapses into
-/// `Other` and is ignored — we reconstruct the final response from the
-/// completed frame's embedded payload.
+/// SSE frames we care about on the streaming `/responses` route.
+///
+/// `output_item.done` carries one fully-formed item (message, function_call,
+/// reasoning, …) — we accumulate those. `response.completed` carries the
+/// terminal status + usage; `response.failed` carries a terminal error. Every
+/// other event (`.delta`, `.in_progress`, `.created`, …) is useful for live
+/// UI streaming but we don't expose that at the provider trait, so they
+/// collapse into `Other` and get discarded.
 #[derive(Deserialize, Debug)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum SseEvent {
+    #[serde(rename = "response.output_item.done")]
+    OutputItemDone { item: RspOutputItem },
     #[serde(rename = "response.completed")]
     ResponseCompleted { response: RspResponse },
     #[serde(rename = "response.failed")]
@@ -814,7 +824,8 @@ mod tests {
     }
 
     #[test]
-    fn extracts_final_response_from_sse_stream() {
+    fn extracts_final_response_from_sse_stream_with_inline_output() {
+        // api.openai.com inlines the full output array in response.completed.
         let stream = r#"event: response.created
 data: {"type":"response.created","response":{"id":"r_1","status":"in_progress","output":[]}}
 
@@ -828,6 +839,30 @@ data: {"type":"response.completed","response":{"id":"r_1","status":"completed","
         let r = extract_completed_response(stream).unwrap();
         assert_eq!(r.status.as_deref(), Some("completed"));
         assert_eq!(r.usage.as_ref().unwrap().output_tokens, 1);
+        assert_eq!(r.output.len(), 1);
+    }
+
+    #[test]
+    fn reconstructs_output_from_output_item_done_events() {
+        // ChatGPT-subscription path: response.completed carries an empty
+        // output array; the items arrive on response.output_item.done.
+        let stream = r#"event: response.created
+data: {"type":"response.created","response":{"id":"r_1"}}
+
+event: response.output_item.done
+data: {"type":"response.output_item.done","item":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"hello"}]}}
+
+event: response.output_item.done
+data: {"type":"response.output_item.done","item":{"type":"function_call","call_id":"c1","name":"shell","arguments":"{\"cmd\":\"ls\"}"}}
+
+event: response.completed
+data: {"type":"response.completed","response":{"id":"r_1","status":"completed","output":[],"usage":{"input_tokens":1,"output_tokens":1}}}
+
+"#;
+        let r = extract_completed_response(stream).unwrap();
+        assert_eq!(r.output.len(), 2);
+        assert!(matches!(&r.output[0], RspOutputItem::Message { .. }));
+        assert!(matches!(&r.output[1], RspOutputItem::FunctionCall { .. }));
     }
 
     #[test]
