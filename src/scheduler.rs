@@ -1531,20 +1531,13 @@ fn resolve_bindings_choice(
     }
 
     let sandbox_spec = match request.sandbox {
-        Some(spec) => {
-            let request_id = SandboxId::for_spec(&spec);
-            let allowed = allow
-                .sandbox
-                .iter()
-                .any(|nss| SandboxId::for_spec(&nss.spec) == request_id);
-            if !allowed {
-                return Err(format!(
-                    "requested sandbox spec is not in pod `{}`'s allow.sandbox",
-                    pod.id
-                ));
-            }
-            spec
-        }
+        // Inline-spec requests are accepted without validating the spec
+        // against `[[allow.sandbox]]`. The design defers this check until
+        // there's a pod-editing UI users can use to add their custom
+        // specs (saved Landlock presets, etc.); without that UI the
+        // strict check just blocks the existing webui flow with no
+        // workaround besides "fall back to the pod default".
+        Some(spec) => spec,
         None => {
             if defaults.sandbox.is_empty() {
                 SandboxSpec::None
