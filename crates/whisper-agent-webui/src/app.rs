@@ -292,6 +292,15 @@ pub struct ChatApp {
     /// thread" button. Only meaningful when
     /// `composing_new || selected.is_none()`.
     compose_pod_id: Option<String>,
+    /// Server-reported id of the pod that receives `CreateThread {
+    /// pod_id: None }`. Lifted out of `PodList` so the webui knows which
+    /// pod to clone when bootstrapping fresh pods.
+    server_default_pod_id: String,
+    /// Cached config of the server's default pod, fetched lazily after
+    /// `PodList`. Used as the template for "+ New pod" so a fresh pod
+    /// inherits the working sandbox / shared-mcp setup instead of
+    /// starting from a stub. `None` until the `GetPod` round-trip lands.
+    default_pod_template: Option<PodConfig>,
 
     /// Which view the left side panel is showing.
     left_mode: LeftPanelMode,
@@ -389,6 +398,8 @@ impl ChatApp {
             collapsed_pods: HashSet::new(),
             new_pod_modal: None,
             compose_pod_id: None,
+            server_default_pod_id: String::new(),
+            default_pod_template: None,
             left_mode: LeftPanelMode::default(),
         }
     }
@@ -719,8 +730,22 @@ impl ChatApp {
             ServerToClient::ResourceDestroyed { id, .. } => {
                 self.resources.remove(&id);
             }
-            ServerToClient::PodList { pods, .. } => {
+            ServerToClient::PodList {
+                pods,
+                default_pod_id,
+                ..
+            } => {
                 self.pods = pods.into_iter().map(|p| (p.pod_id.clone(), p)).collect();
+                // Fetch the default pod's config so "+ New pod" can clone
+                // its sandbox / shared-mcp setup. Cheap round-trip; only
+                // sent when the id changes (guarded by string equality).
+                if !default_pod_id.is_empty() && default_pod_id != self.server_default_pod_id {
+                    self.server_default_pod_id = default_pod_id.clone();
+                    self.send(ClientToServer::GetPod {
+                        correlation_id: None,
+                        pod_id: default_pod_id,
+                    });
+                }
             }
             ServerToClient::PodCreated { pod, .. } => {
                 self.pods.insert(pod.pod_id.clone(), pod);
@@ -752,9 +777,16 @@ impl ChatApp {
                     self.composing_new = true;
                 }
             }
-            // PodSnapshot is a response to GetPod, which the webui doesn't
-            // call yet (the pod editor lands in Phase 4). Drop for now.
-            ServerToClient::PodSnapshot { .. } => {}
+            ServerToClient::PodSnapshot { snapshot, .. } => {
+                // Cache the default pod's config as a template for fresh
+                // "+ New pod" creation. Other pods' snapshots arrive
+                // here too once the pod editor (Phase 4.iii) starts
+                // calling GetPod for them; for now we only consume the
+                // default's.
+                if snapshot.pod_id == self.server_default_pod_id {
+                    self.default_pod_template = Some(snapshot.config);
+                }
+            }
         }
     }
 
@@ -1622,11 +1654,20 @@ impl ChatApp {
     }
 
     /// Build a sensible default `PodConfig` for a fresh pod created from
-    /// the webui. `created_at` is left empty — the server stamps it on
-    /// CreatePod (wasm doesn't have a convenient ISO-8601 source). The
-    /// allow table reflects the server's known catalog: every backend,
-    /// no shared MCP hosts, no sandbox spec.
+    /// the webui. Clones `default_pod_template` (the server's known-good
+    /// default pod config) when available so the new pod inherits a
+    /// working sandbox + shared-MCP setup. Falls back to a minimal stub
+    /// keyed off the catalog summary when no template has arrived yet
+    /// (rare — only on first connect before the GetPod round-trip).
+    /// `created_at` is left empty; the server stamps it on CreatePod.
     fn fresh_pod_config(&self, name: String) -> PodConfig {
+        if let Some(template) = &self.default_pod_template {
+            let mut cfg = template.clone();
+            cfg.name = name;
+            cfg.description = None;
+            cfg.created_at = String::new();
+            return cfg;
+        }
         let backend_names: Vec<String> = self.backends.iter().map(|b| b.name.clone()).collect();
         let default_backend = if !self.default_backend.is_empty() {
             self.default_backend.clone()

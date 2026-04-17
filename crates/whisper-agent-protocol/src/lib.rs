@@ -677,6 +677,12 @@ pub enum ServerToClient {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         correlation_id: Option<String>,
         pods: Vec<PodSummary>,
+        /// Pod the server routes `CreateThread { pod_id: None }` to. Lets
+        /// clients clone its config when bootstrapping fresh pods, so a
+        /// "+ New pod" flow inherits a known-working sandbox + mcp host
+        /// setup instead of starting from a minimal stub.
+        #[serde(default)]
+        default_pod_id: String,
     },
     PodSnapshot {
         snapshot: PodSnapshot,

@@ -1005,12 +1005,14 @@ impl Scheduler {
                 let Some((persister, outbound)) = self.persister_and_outbound(conn_id) else {
                     return;
                 };
+                let default_pod_id = self.default_pod_id.clone();
                 tokio::spawn(async move {
                     match persister.list_pods().await {
                         Ok(pods) => {
                             let _ = outbound.send(ServerToClient::PodList {
                                 correlation_id,
                                 pods,
+                                default_pod_id,
                             });
                         }
                         Err(e) => {
