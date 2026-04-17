@@ -1,17 +1,23 @@
-# whisper-agent backend catalog.
+# whisper-agent backend catalog (example / in-repo fallback).
 #
 # Each entry is a named alias that tasks reference via TaskConfig.backend.
-# Aliases are user-chosen; `kind` selects the wire-protocol impl (anthropic or
-# openai_chat). Credentials are always looked up via env vars — no secrets here.
+# Aliases are user-chosen; `kind` selects the wire-protocol impl
+# (`anthropic`, `openai_chat`, ...). Credentials live in a per-entry
+# `auth` block, tagged by `mode`:
 #
-# Passed to the server via `--config whisper-agent.toml`.
+#   auth = { mode = "api_key", value = "sk-..." }       # inline secret
+#   auth = { mode = "api_key", env   = "MY_API_KEY" }   # env-var lookup
+#
+# The real user-facing catalog lives at ~/.config/whisper-agent/whisper-agent.toml;
+# this file stays in-repo as a non-secret template. `env`-form entries here let
+# the dev loop pick up secrets injected by the shell without committing them.
 
 default_backend = "gemma-4"
 
 [backends.anthropic]
 kind = "anthropic"
-api_key_env = "ANTHROPIC_API_KEY"
 default_model = "claude-sonnet-4-6"
+auth = { mode = "api_key", env = "ANTHROPIC_API_KEY" }
 
 # Hosted llama.cpp server running Gemma-4 26B (UD-Q4_K_M). Uses the OpenAI
 # Chat Completions shape that llama.cpp exposes at /v1/chat/completions. No

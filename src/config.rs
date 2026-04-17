@@ -5,26 +5,29 @@
 //! backend kind plus any credentials / endpoint details that kind needs. Tasks refer
 //! to entries by alias; the scheduler never touches backend-specific config directly.
 //!
-//! Example:
+//! Credentials live in a structured `auth` field per entry. The shape is a tagged
+//! union keyed by `mode`; today the only mode is `api_key`, which accepts either an
+//! inline `value` or an `env` var name:
 //!
 //! ```toml
 //! default_backend = "anthropic"
 //!
 //! [backends.anthropic]
 //! kind = "anthropic"
-//! api_key_env = "ANTHROPIC_API_KEY"
 //! default_model = "claude-sonnet-4-6"
+//! auth = { mode = "api_key", value = "sk-ant-..." }
 //!
 //! [backends.local-ollama]
 //! kind = "openai_chat"
 //! base_url = "http://localhost:11434/v1"
 //! default_model = "llama3.2"
+//! # no `auth` — local endpoints don't require credentials
 //!
 //! [backends.openai]
 //! kind = "openai_chat"
 //! base_url = "https://api.openai.com/v1"
-//! api_key_env = "OPENAI_API_KEY"
 //! default_model = "gpt-4o"
+//! auth = { mode = "api_key", env = "OPENAI_API_KEY" }
 //! ```
 
 use std::collections::BTreeMap;
@@ -66,12 +69,48 @@ pub struct HostEnvProviderConfig {
     pub url: String,
 }
 
+/// Backend auth configuration. Tagged by `mode`; today only `api_key` exists, but
+/// new variants (e.g. `chatgpt_subscription`) plug in by adding tags.
+///
+/// Examples:
+/// ```toml
+/// auth = { mode = "api_key", value = "sk-..." }
+/// auth = { mode = "api_key", env  = "ANTHROPIC_API_KEY" }
+/// ```
+#[derive(Deserialize, Debug, Clone)]
+#[serde(tag = "mode", rename_all = "snake_case")]
+pub enum Auth {
+    ApiKey {
+        #[serde(default)]
+        value: Option<String>,
+        #[serde(default)]
+        env: Option<String>,
+    },
+}
+
+impl Auth {
+    /// Resolve to the raw API key string, reading env vars as needed. Errors if the
+    /// auth entry is malformed (neither or both of `value`/`env` set, env var unset).
+    pub fn resolve_api_key(&self) -> Result<String> {
+        match self {
+            Auth::ApiKey { value, env } => match (value.as_deref(), env.as_deref()) {
+                (Some(v), None) => Ok(v.to_string()),
+                (None, Some(var)) => std::env::var(var)
+                    .with_context(|| format!("env var `{var}` not set")),
+                (Some(_), Some(_)) => {
+                    Err(anyhow!("auth.api_key: set exactly one of `value` or `env`"))
+                }
+                (None, None) => Err(anyhow!("auth.api_key: missing `value` or `env`")),
+            },
+        }
+    }
+}
+
 #[derive(Deserialize, Debug, Clone)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum BackendConfig {
     Anthropic {
-        #[serde(default)]
-        api_key_env: Option<String>,
+        auth: Auth,
         #[serde(default)]
         default_model: Option<String>,
     },
@@ -80,8 +119,9 @@ pub enum BackendConfig {
     #[serde(rename = "openai_chat")]
     OpenAiChat {
         base_url: String,
+        /// Optional — local endpoints (Ollama, LM Studio, llama.cpp) skip auth entirely.
         #[serde(default)]
-        api_key_env: Option<String>,
+        auth: Option<Auth>,
         #[serde(default)]
         default_model: Option<String>,
     },
@@ -104,27 +144,18 @@ impl BackendConfig {
         }
     }
 
-    /// Resolve any `api_key_env` lookup and construct the corresponding provider.
-    /// Returns an error if a required env var is unset.
+    /// Resolve auth material and construct the corresponding provider.
     pub fn build(&self) -> Result<Arc<dyn ModelProvider>> {
         match self {
-            BackendConfig::Anthropic {
-                api_key_env,
-                default_model: _,
-            } => {
-                let var = api_key_env.as_deref().unwrap_or("ANTHROPIC_API_KEY");
-                let key = std::env::var(var).with_context(|| format!("env var `{var}` not set"))?;
+            BackendConfig::Anthropic { auth, .. } => {
+                let key = auth.resolve_api_key().context("anthropic auth")?;
                 Ok(Arc::new(AnthropicClient::new(key)))
             }
             BackendConfig::OpenAiChat {
-                base_url,
-                api_key_env,
-                default_model: _,
+                base_url, auth, ..
             } => {
-                let key = match api_key_env {
-                    Some(var) => Some(
-                        std::env::var(var).with_context(|| format!("env var `{var}` not set"))?,
-                    ),
+                let key = match auth {
+                    Some(a) => Some(a.resolve_api_key().context("openai_chat auth")?),
                     None => None,
                 };
                 Ok(Arc::new(OpenAiChatClient::new(base_url.clone(), key)))
@@ -155,5 +186,86 @@ impl Config {
             ));
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_api_key_variants() {
+        let text = r#"
+default_backend = "cloud"
+
+[backends.cloud]
+kind = "anthropic"
+default_model = "claude-sonnet-4-6"
+auth = { mode = "api_key", value = "sk-test" }
+
+[backends.cloud-env]
+kind = "openai_chat"
+base_url = "https://api.openai.com/v1"
+auth = { mode = "api_key", env = "OPENAI_API_KEY" }
+
+[backends.local]
+kind = "openai_chat"
+base_url = "http://localhost:11434/v1"
+"#;
+        let cfg: Config = toml::from_str(text).unwrap();
+        cfg.validate().unwrap();
+
+        match cfg.backends.get("cloud").unwrap() {
+            BackendConfig::Anthropic {
+                auth: Auth::ApiKey { value, env },
+                ..
+            } => {
+                assert_eq!(value.as_deref(), Some("sk-test"));
+                assert!(env.is_none());
+            }
+            _ => panic!("wrong variant"),
+        }
+
+        match cfg.backends.get("cloud-env").unwrap() {
+            BackendConfig::OpenAiChat {
+                auth: Some(Auth::ApiKey { env, .. }),
+                ..
+            } => assert_eq!(env.as_deref(), Some("OPENAI_API_KEY")),
+            _ => panic!("wrong variant"),
+        }
+
+        match cfg.backends.get("local").unwrap() {
+            BackendConfig::OpenAiChat { auth, .. } => assert!(auth.is_none()),
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn api_key_requires_exactly_one_source() {
+        // value only
+        Auth::ApiKey {
+            value: Some("x".into()),
+            env: None,
+        }
+        .resolve_api_key()
+        .unwrap();
+        // both set → error
+        assert!(
+            Auth::ApiKey {
+                value: Some("x".into()),
+                env: Some("Y".into()),
+            }
+            .resolve_api_key()
+            .is_err()
+        );
+        // neither set → error
+        assert!(
+            Auth::ApiKey {
+                value: None,
+                env: None,
+            }
+            .resolve_api_key()
+            .is_err()
+        );
     }
 }
