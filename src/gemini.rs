@@ -200,10 +200,7 @@ impl GeminiClient {
                 let status = resp.status();
                 if !status.is_success() {
                     let body = resp.text().await.unwrap_or_default();
-                    return Err(ModelError::Api {
-                        status: status.as_u16(),
-                        body,
-                    });
+                    return Err(classify_http_error(status.as_u16(), body));
                 }
                 let parsed: GenerateContentResponse = resp
                     .json()
@@ -231,10 +228,7 @@ impl GeminiClient {
                 let status = resp.status();
                 if !status.is_success() {
                     let body = resp.text().await.unwrap_or_default();
-                    return Err(ModelError::Api {
-                        status: status.as_u16(),
-                        body,
-                    });
+                    return Err(classify_http_error(status.as_u16(), body));
                 }
                 let wrapped: CaGenerateContentResponse = resp
                     .json()
@@ -295,11 +289,28 @@ impl GeminiClient {
                     .collect())
             }
             ClientAuth::GeminiCli { .. } => {
-                // Code Assist doesn't expose a `/models` catalog, so we return a
-                // small hardcoded list of the models the free tier accepts. This
-                // mirrors what Codex's hardcoded-model fallback does — users
-                // still pick via config if they want a different id.
+                // Code Assist doesn't expose a `/models` catalog, so we mirror
+                // the set gemini-cli ships in VALID_GEMINI_MODELS. Users pick
+                // via config; `gemini-3-*-preview` variants require preview
+                // access on the account (the server returns a clear 403 if
+                // not).
                 Ok(vec![
+                    ModelInfo {
+                        id: "gemini-3-pro-preview".into(),
+                        display_name: Some("Gemini 3 Pro (preview)".into()),
+                    },
+                    ModelInfo {
+                        id: "gemini-3.1-pro-preview".into(),
+                        display_name: Some("Gemini 3.1 Pro (preview)".into()),
+                    },
+                    ModelInfo {
+                        id: "gemini-3-flash-preview".into(),
+                        display_name: Some("Gemini 3 Flash (preview)".into()),
+                    },
+                    ModelInfo {
+                        id: "gemini-3.1-flash-lite-preview".into(),
+                        display_name: Some("Gemini 3.1 Flash Lite (preview)".into()),
+                    },
                     ModelInfo {
                         id: "gemini-2.5-pro".into(),
                         display_name: Some("Gemini 2.5 Pro".into()),
@@ -307,6 +318,10 @@ impl GeminiClient {
                     ModelInfo {
                         id: "gemini-2.5-flash".into(),
                         display_name: Some("Gemini 2.5 Flash".into()),
+                    },
+                    ModelInfo {
+                        id: "gemini-2.5-flash-lite".into(),
+                        display_name: Some("Gemini 2.5 Flash Lite".into()),
                     },
                 ])
             }
@@ -594,6 +609,36 @@ fn derive_stop_reason(finish_reason: Option<&str>, saw_function_call: bool) -> O
 }
 
 // ---------- Misc helpers ----------
+
+/// Map a non-2xx HTTP response into the right ModelError flavor. 429s from
+/// Code Assist include a human-readable "reset after Ns" phrase; we pull that
+/// duration out so the dispatch layer can decide whether to wait-and-retry
+/// transparently.
+pub(crate) fn classify_http_error(status: u16, body: String) -> ModelError {
+    if status == 429 {
+        let retry_after = parse_retry_after_seconds(&body)
+            .map(std::time::Duration::from_secs)
+            .unwrap_or_else(|| std::time::Duration::from_secs(10));
+        ModelError::RateLimited { retry_after, body }
+    } else {
+        ModelError::Api { status, body }
+    }
+}
+
+/// Extract the first `N` from phrases like "Your quota will reset after 6s."
+/// — Google doesn't put this in a header, but always includes it in the
+/// error detail message. Returns None if no match is found.
+fn parse_retry_after_seconds(body: &str) -> Option<u64> {
+    const NEEDLE: &str = "reset after ";
+    let idx = body.find(NEEDLE)?;
+    let tail = &body[idx + NEEDLE.len()..];
+    let digits: String = tail.chars().take_while(|c| c.is_ascii_digit()).collect();
+    if digits.is_empty() {
+        None
+    } else {
+        digits.parse().ok()
+    }
+}
 
 /// Minimal URL-encoder for the API key (the only value we embed in a URL).
 /// Keeping it inline avoids pulling urlencoding as a direct dep.
@@ -924,6 +969,39 @@ mod tests {
             derive_stop_reason(Some("STOP"), true),
             Some("tool_use".into())
         );
+    }
+
+    #[test]
+    fn classify_429_carries_parsed_retry_after() {
+        let body = r#"{"error":{"code":429,"message":"You have exhausted your capacity on this model. Your quota will reset after 6s.","status":"RESOURCE_EXHAUSTED"}}"#;
+        match classify_http_error(429, body.to_string()) {
+            ModelError::RateLimited { retry_after, .. } => {
+                assert_eq!(retry_after, std::time::Duration::from_secs(6));
+            }
+            other => panic!("expected RateLimited, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_429_falls_back_to_default_retry_after_when_message_opaque() {
+        let body = r#"{"error":{"code":429,"message":"too many requests"}}"#;
+        match classify_http_error(429, body.to_string()) {
+            ModelError::RateLimited { retry_after, .. } => {
+                assert_eq!(retry_after, std::time::Duration::from_secs(10));
+            }
+            other => panic!("expected RateLimited, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_non_429_stays_api_error() {
+        match classify_http_error(500, "boom".into()) {
+            ModelError::Api { status, body } => {
+                assert_eq!(status, 500);
+                assert_eq!(body, "boom");
+            }
+            other => panic!("expected Api, got {other:?}"),
+        }
     }
 
     #[test]
