@@ -1460,7 +1460,7 @@ impl eframe::App for ChatApp {
 
                         ui.separator();
                         ui.label(
-                            RichText::new("sandbox")
+                            RichText::new("host env")
                                 .small()
                                 .color(Color32::from_gray(180)),
                         );
@@ -2187,7 +2187,7 @@ impl ChatApp {
                         e.name == name && Some(i) != sub.index
                     });
                     if dup {
-                        sub.error = Some(format!("a sandbox named `{name}` already exists"));
+                        sub.error = Some(format!("a host env named `{name}` already exists"));
                         modal.sandbox_entry_editor = Some(sub);
                     } else {
                         sub.entry.name = name.clone();
@@ -2360,28 +2360,28 @@ impl ChatApp {
 /// because `failure` is captured from the snapshot itself rather than derived from
 /// the per-event items list.
 fn render_resource_list(ui: &mut egui::Ui, resources: &HashMap<String, ResourceSnapshot>) {
-    let mut sandboxes: Vec<&ResourceSnapshot> = Vec::new();
+    let mut host_envs: Vec<&ResourceSnapshot> = Vec::new();
     let mut mcp_hosts: Vec<&ResourceSnapshot> = Vec::new();
     let mut backends: Vec<&ResourceSnapshot> = Vec::new();
     for r in resources.values() {
         match r {
-            ResourceSnapshot::HostEnv { .. } => sandboxes.push(r),
+            ResourceSnapshot::HostEnv { .. } => host_envs.push(r),
             ResourceSnapshot::McpHost { .. } => mcp_hosts.push(r),
             ResourceSnapshot::Backend { .. } => backends.push(r),
         }
     }
-    sandboxes.sort_by_key(|r| r.id().to_string());
+    host_envs.sort_by_key(|r| r.id().to_string());
     mcp_hosts.sort_by_key(|r| r.id().to_string());
     backends.sort_by_key(|r| r.id().to_string());
 
     ScrollArea::vertical().show(ui, |ui| {
-        egui::CollapsingHeader::new(format!("Sandboxes ({})", sandboxes.len()))
+        egui::CollapsingHeader::new(format!("Host envs ({})", host_envs.len()))
             .default_open(true)
             .show(ui, |ui| {
-                for r in &sandboxes {
+                for r in &host_envs {
                     render_resource_row(ui, r);
                 }
-                if sandboxes.is_empty() {
+                if host_envs.is_empty() {
                     ui.label(
                         RichText::new("(none)")
                             .color(Color32::from_gray(140))
@@ -2424,11 +2424,23 @@ fn render_resource_row(ui: &mut egui::Ui, resource: &ResourceSnapshot) {
     let (label, sub, state, users) = match resource {
         ResourceSnapshot::HostEnv {
             id,
+            provider,
             spec,
             state,
             users,
             ..
-        } => (id.clone(), spec_label(spec), *state, users.len()),
+        } => {
+            // Sub-line: "<provider> · <spec summary>". For bare entries
+            // spec_label returns "(no isolation)" which already reads
+            // fine alongside provider="bare".
+            let summary = spec_label(spec);
+            let sub = if summary.is_empty() {
+                provider.clone()
+            } else {
+                format!("{provider} · {summary}")
+            };
+            (id.clone(), sub, *state, users.len())
+        }
         ResourceSnapshot::McpHost {
             id,
             label,
@@ -3057,7 +3069,7 @@ fn render_pod_editor_defaults_tab(
                 });
             ui.end_row();
 
-            ui.label("sandbox");
+            ui.label("host env");
             let sb_in_allow = working.thread_defaults.host_env.is_empty()
                 || working
                     .allow
