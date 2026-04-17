@@ -125,13 +125,17 @@ impl OpenAiResponsesClient {
             },
             input,
             tools: if tools.is_empty() { None } else { Some(tools) },
-            max_output_tokens: req.max_tokens,
             store: false,
             // The ChatGPT-subscription backend refuses stream:false with
             // "Stream must be set to true". api.openai.com accepts either; we
             // always stream and reassemble so both routes share one code path.
             stream: true,
         };
+        // req.max_tokens is ignored: the ChatGPT-subscription route rejects
+        // `max_output_tokens` outright, and Codex's own client doesn't send it
+        // on either route. The backend picks an output cap per model; the
+        // scheduler's `max_turns` still bounds the overall loop.
+        let _ = req.max_tokens;
 
         let url = format!("{}/responses", self.base_url);
         let (bearer, extra_headers) = self.prepare_headers().await?;
@@ -545,7 +549,6 @@ struct RspRequest<'a> {
     input: Vec<RspItem>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tools: Option<Vec<RspTool>>,
-    max_output_tokens: u32,
     store: bool,
     stream: bool,
 }
