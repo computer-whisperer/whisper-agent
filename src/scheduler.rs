@@ -1194,27 +1194,73 @@ impl Scheduler {
                 });
             }
             ClientToServer::ArchivePod { pod_id } => {
-                let Some((persister, outbound)) = self.persister_and_outbound(conn_id) else {
+                if let Err(e) = crate::persist::validate_pod_id(&pod_id) {
+                    self.router.send_to_client(
+                        conn_id,
+                        ServerToClient::Error {
+                            correlation_id: None,
+                            thread_id: None,
+                            message: format!("archive_pod: {e}"),
+                        },
+                    );
+                    return;
+                }
+                if pod_id == self.default_pod_id {
+                    self.router.send_to_client(
+                        conn_id,
+                        ServerToClient::Error {
+                            correlation_id: None,
+                            thread_id: None,
+                            message: "archive_pod: refusing to archive the default pod".into(),
+                        },
+                    );
+                    return;
+                }
+                let Some(pod) = self.pods.remove(&pod_id) else {
+                    self.router.send_to_client(
+                        conn_id,
+                        ServerToClient::Error {
+                            correlation_id: None,
+                            thread_id: None,
+                            message: format!("archive_pod: unknown pod `{pod_id}`"),
+                        },
+                    );
                     return;
                 };
-                let broadcast = self.router.outbound_snapshot();
-                tokio::spawn(async move {
-                    match persister.archive_pod(&pod_id).await {
-                        Ok(()) => {
-                            let ev = ServerToClient::PodArchived { pod_id };
-                            for tx in broadcast {
-                                let _ = tx.send(ev.clone());
+                // Drop in-memory thread state for every thread under this pod.
+                // The pod directory is moving to .archived/, so these threads
+                // become unreachable — we'd otherwise leak entries in
+                // `tasks` / `dirty` / `provisioning_in_flight` and stale
+                // subscriptions in the router.
+                for thread_id in &pod.threads {
+                    self.tasks.remove(thread_id);
+                    self.dirty.remove(thread_id);
+                    self.provisioning_in_flight.remove(thread_id);
+                    self.router.drop_thread(thread_id);
+                }
+                // Broadcast first so every client clears its view before the
+                // disk move completes; the disk write is best-effort.
+                let ev = ServerToClient::PodArchived {
+                    pod_id: pod_id.clone(),
+                };
+                for tx in self.router.outbound_snapshot() {
+                    let _ = tx.send(ev.clone());
+                }
+                if let Some(persister) = self.persister.clone() {
+                    let outbound = self.router.outbound(conn_id);
+                    tokio::spawn(async move {
+                        if let Err(e) = persister.archive_pod(&pod_id).await {
+                            warn!(pod_id = %pod_id, error = %e, "archive_pod disk move failed");
+                            if let Some(tx) = outbound {
+                                let _ = tx.send(ServerToClient::Error {
+                                    correlation_id: None,
+                                    thread_id: None,
+                                    message: format!("archive_pod: disk move failed: {e}"),
+                                });
                             }
                         }
-                        Err(e) => {
-                            let _ = outbound.send(ServerToClient::Error {
-                                correlation_id: None,
-                                thread_id: None,
-                                message: format!("archive_pod: {e}"),
-                            });
-                        }
-                    }
-                });
+                    });
+                }
             }
             ClientToServer::ListModels {
                 correlation_id,

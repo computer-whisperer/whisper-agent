@@ -286,6 +286,11 @@ pub struct ChatApp {
     collapsed_pods: HashSet<String>,
     /// Modal state for the "+ New pod" form. `None` = closed.
     new_pod_modal: Option<NewPodModalState>,
+    /// Pod id whose "Archive" button has been clicked once and is waiting
+    /// for confirmation. Cleared by clicking elsewhere or confirming.
+    /// At most one pod can be armed at a time — clicking a different pod's
+    /// Archive button replaces it.
+    archive_armed_pod: Option<String>,
     /// Pod the in-progress new-thread compose targets. `None` = the
     /// server's default pod. Set by the per-pod "+ Thread" button in
     /// each pod section header; cleared/reset by the global "+ New
@@ -397,6 +402,7 @@ impl ChatApp {
             pods_requested: false,
             collapsed_pods: HashSet::new(),
             new_pod_modal: None,
+            archive_armed_pod: None,
             compose_pod_id: None,
             server_default_pod_id: String::new(),
             default_pod_template: None,
@@ -775,6 +781,12 @@ impl ChatApp {
                 {
                     self.selected = None;
                     self.composing_new = true;
+                }
+                if self.compose_pod_id.as_deref() == Some(pod_id.as_str()) {
+                    self.compose_pod_id = None;
+                }
+                if self.archive_armed_pod.as_deref() == Some(pod_id.as_str()) {
+                    self.archive_armed_pod = None;
                 }
             }
             ServerToClient::PodSnapshot { snapshot, .. } => {
@@ -1414,19 +1426,52 @@ impl ChatApp {
         };
         let collapsed_id = format!("pod-section-{pod_id}");
         let default_open = !self.collapsed_pods.contains(pod_id);
+        let is_default_pod = pod_id == self.server_default_pod_id;
+        let mut archive_clicked = false;
+        let mut archive_confirmed = false;
+        let mut archive_disarm = false;
         let header = egui::CollapsingHeader::new(RichText::new(label).strong())
             .id_salt(&collapsed_id)
             .default_open(default_open)
             .show(ui, |ui| {
-                if ui
-                    .small_button(RichText::new("+ Thread in this pod").small())
-                    .clicked()
-                {
-                    self.selected = None;
-                    self.composing_new = true;
-                    self.compose_pod_id = Some(pod_id.to_string());
-                    self.input.clear();
-                }
+                ui.horizontal(|ui| {
+                    if ui
+                        .small_button(RichText::new("+ Thread in this pod").small())
+                        .clicked()
+                    {
+                        self.selected = None;
+                        self.composing_new = true;
+                        self.compose_pod_id = Some(pod_id.to_string());
+                        self.input.clear();
+                    }
+                    if !is_default_pod {
+                        let armed = self.archive_armed_pod.as_deref() == Some(pod_id);
+                        if armed {
+                            if ui
+                                .small_button(
+                                    RichText::new("Confirm archive")
+                                        .small()
+                                        .color(Color32::from_rgb(220, 90, 90)),
+                                )
+                                .clicked()
+                            {
+                                archive_confirmed = true;
+                            }
+                            if ui.small_button(RichText::new("Cancel").small()).clicked() {
+                                archive_disarm = true;
+                            }
+                        } else if ui
+                            .small_button(
+                                RichText::new("Archive")
+                                    .small()
+                                    .color(Color32::from_gray(160)),
+                            )
+                            .clicked()
+                        {
+                            archive_clicked = true;
+                        }
+                    }
+                });
                 let Some(thread_ids) = thread_ids else {
                     ui.label(RichText::new("(no threads)").italics().color(Color32::from_gray(140)));
                     return;
@@ -1463,6 +1508,16 @@ impl ChatApp {
             self.collapsed_pods.insert(pod_id.to_string());
         } else {
             self.collapsed_pods.remove(pod_id);
+        }
+        if archive_clicked {
+            self.archive_armed_pod = Some(pod_id.to_string());
+        } else if archive_disarm {
+            self.archive_armed_pod = None;
+        } else if archive_confirmed {
+            self.archive_armed_pod = None;
+            self.send(ClientToServer::ArchivePod {
+                pod_id: pod_id.to_string(),
+            });
         }
     }
 

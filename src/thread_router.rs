@@ -73,6 +73,10 @@ impl ThreadEventRouter {
         }
     }
 
+    pub(crate) fn drop_thread(&mut self, thread_id: &str) {
+        self.subscriptions.remove(thread_id);
+    }
+
     // ---------- Send / broadcast ----------
 
     pub(crate) fn send_to_client(&self, conn_id: ConnId, event: ServerToClient) {
