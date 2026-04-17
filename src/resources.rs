@@ -618,6 +618,129 @@ impl ResourceRegistry {
             entry.users.clear();
         }
     }
+
+    /// Single GC sweep over the registry. Two passes:
+    ///
+    /// 1. **Idle Ready entries** — sandboxes and MCP hosts that are
+    ///    `Ready`, have no users, aren't pinned, and haven't been
+    ///    touched since `now - idle_threshold`. These are torn down:
+    ///    sandbox handles are pulled out (returned in the plan so the
+    ///    caller can spawn `handle.teardown()`), MCP sessions are
+    ///    dropped, and the entries flip to `TornDown`.
+    ///
+    /// 2. **Stale terminal entries** — sandboxes and MCP hosts in
+    ///    `Errored` or `TornDown` state whose `last_used` is older than
+    ///    `now - terminal_retention`. These are removed from the map
+    ///    entirely (the registry isn't a permanent ledger; we keep them
+    ///    around for inspection, then evict).
+    ///
+    /// Backends are intentionally never GC'd — they're pinned by
+    /// construction (cheap, no live socket).
+    ///
+    /// `now` is taken as a parameter rather than reading the clock
+    /// internally so tests can drive deterministic timestamps.
+    pub fn reap_idle(
+        &mut self,
+        now: DateTime<Utc>,
+        idle_threshold: chrono::Duration,
+        terminal_retention: chrono::Duration,
+    ) -> ReapPlan {
+        let mut plan = ReapPlan::default();
+
+        // Pass 1a: idle Ready sandboxes -> tear down.
+        let idle_sandboxes: Vec<SandboxId> = self
+            .sandboxes
+            .iter()
+            .filter(|(_, e)| {
+                e.state.is_ready()
+                    && !e.pinned
+                    && e.users.is_empty()
+                    && now.signed_duration_since(e.last_used) >= idle_threshold
+            })
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in idle_sandboxes {
+            let handle = self
+                .sandboxes
+                .get_mut(&id)
+                .and_then(|e| e.handle.take());
+            if let Some(entry) = self.sandboxes.get_mut(&id) {
+                entry.state = ResourceState::TornDown;
+                entry.users.clear();
+            }
+            plan.torn_down_sandboxes.push((id, handle));
+        }
+
+        // Pass 1b: idle Ready MCP hosts -> tear down (drop session).
+        let idle_mcp: Vec<McpHostId> = self
+            .mcp_hosts
+            .iter()
+            .filter(|(_, e)| {
+                e.state.is_ready()
+                    && !e.pinned
+                    && e.users.is_empty()
+                    && now.signed_duration_since(e.last_used) >= idle_threshold
+            })
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in idle_mcp {
+            if let Some(entry) = self.mcp_hosts.get_mut(&id) {
+                entry.state = ResourceState::TornDown;
+                entry.session = None;
+                entry.users.clear();
+            }
+            plan.torn_down_mcp_hosts.push(id);
+        }
+
+        // Pass 2: stale terminal entries -> remove.
+        let stale_sandboxes: Vec<SandboxId> = self
+            .sandboxes
+            .iter()
+            .filter(|(_, e)| {
+                e.state.is_terminal()
+                    && now.signed_duration_since(e.last_used) >= terminal_retention
+            })
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in stale_sandboxes {
+            self.sandboxes.remove(&id);
+            plan.destroyed_sandboxes.push(id);
+        }
+        let stale_mcp: Vec<McpHostId> = self
+            .mcp_hosts
+            .iter()
+            .filter(|(_, e)| {
+                e.state.is_terminal()
+                    && now.signed_duration_since(e.last_used) >= terminal_retention
+            })
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in stale_mcp {
+            self.mcp_hosts.remove(&id);
+            plan.destroyed_mcp_hosts.push(id);
+        }
+
+        plan
+    }
+}
+
+/// Result of a single `ResourceRegistry::reap_idle` sweep. The scheduler
+/// uses this to drive the side effects the registry can't do itself —
+/// spawning async sandbox teardowns and broadcasting wire events.
+#[derive(Default)]
+pub struct ReapPlan {
+    /// Idle sandbox entries that were marked `TornDown`. The handle is
+    /// `Some` for entries the registry was holding a live handle for;
+    /// the caller spawns `handle.teardown()`.
+    pub torn_down_sandboxes: Vec<(SandboxId, Option<Box<dyn SandboxHandle>>)>,
+    /// Idle MCP host entries that were marked `TornDown`. Sessions were
+    /// dropped in-place; nothing async for the caller to do, just emit
+    /// the wire update.
+    pub torn_down_mcp_hosts: Vec<McpHostId>,
+    /// Stale terminal sandbox entries removed from the registry.
+    pub destroyed_sandboxes: Vec<SandboxId>,
+    /// Stale terminal MCP host entries removed from the registry.
+    pub destroyed_mcp_hosts: Vec<McpHostId>,
 }
 
 #[cfg(test)]
@@ -699,6 +822,93 @@ mod tests {
             second,
             CompleteSandboxOutcome::AlreadyCompleted { .. }
         ));
+    }
+
+    #[test]
+    fn reap_idle_tears_down_idle_ready_and_removes_stale_terminal() {
+        let mut reg = ResourceRegistry::new();
+        // Idle Ready sandbox: provision, drop the user, backdate last_used.
+        let idle_id = reg.pre_register_sandbox("t-idle", SandboxSpec::None);
+        let _ = reg.complete_sandbox_provisioning(&idle_id, None, None);
+        let _ = reg.release_sandbox_user(&idle_id, "t-idle");
+        assert!(reg.sandboxes[&idle_id].users.is_empty());
+
+        let now = Utc::now();
+        if let Some(e) = reg.sandboxes.get_mut(&idle_id) {
+            e.last_used = now - chrono::Duration::seconds(600);
+        }
+
+        // Pinned MCP host that's idle — must NOT be reaped. Inserted
+        // directly because `insert_shared_mcp_host` wants a real
+        // `Arc<McpSession>`.
+        let pinned_id = McpHostId::shared("pinned");
+        reg.mcp_hosts.insert(
+            pinned_id.clone(),
+            McpHostEntry {
+                id: pinned_id.clone(),
+                spec: McpHostSpec {
+                    url: "http://x".into(),
+                    label: "pinned".into(),
+                    per_task: false,
+                },
+                state: ResourceState::Ready,
+                session: None,
+                tools: Vec::new(),
+                annotations: HashMap::new(),
+                users: BTreeSet::new(),
+                pinned: true,
+                created_at: now,
+                last_used: now - chrono::Duration::seconds(9999),
+            },
+        );
+
+        // Long-since-torn-down sandbox: a different spec so its id
+        // differs from `idle_id`.
+        let dead_id = reg.pre_register_sandbox(
+            "t-dead",
+            SandboxSpec::Landlock {
+                allowed_paths: Vec::new(),
+                network: Default::default(),
+            },
+        );
+        let _ = reg.complete_sandbox_provisioning(&dead_id, None, None);
+        reg.mark_sandbox_torn_down(&dead_id);
+        if let Some(e) = reg.sandboxes.get_mut(&dead_id) {
+            e.last_used = now - chrono::Duration::seconds(7200);
+        }
+
+        let plan = reg.reap_idle(
+            now,
+            chrono::Duration::seconds(300),
+            chrono::Duration::seconds(3600),
+        );
+        assert_eq!(plan.torn_down_sandboxes.len(), 1);
+        assert_eq!(plan.torn_down_sandboxes[0].0, idle_id);
+        assert!(matches!(
+            reg.sandboxes[&idle_id].state,
+            ResourceState::TornDown
+        ));
+        assert_eq!(plan.destroyed_sandboxes, vec![dead_id.clone()]);
+        assert!(!reg.sandboxes.contains_key(&dead_id));
+        assert!(plan.torn_down_mcp_hosts.is_empty());
+        assert!(reg.mcp_hosts[&pinned_id].state.is_ready());
+    }
+
+    #[test]
+    fn reap_idle_skips_recently_used_and_user_held() {
+        let mut reg = ResourceRegistry::new();
+        let id = reg.pre_register_sandbox("t-1", SandboxSpec::None);
+        let _ = reg.complete_sandbox_provisioning(&id, None, None);
+        // last_used is `now`; should NOT reap on the first sweep.
+        let plan = reg.reap_idle(
+            Utc::now(),
+            chrono::Duration::seconds(300),
+            chrono::Duration::seconds(3600),
+        );
+        assert!(plan.torn_down_sandboxes.is_empty());
+        assert!(reg.sandboxes[&id].state.is_ready());
+        // Still has its user.
+        assert_eq!(reg.sandboxes[&id].users.len(), 1);
     }
 
     #[test]

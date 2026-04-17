@@ -27,8 +27,8 @@ use futures::stream::FuturesUnordered;
 use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 use whisper_agent_protocol::{
-    BackendSummary, ClientToServer, Message, ModelSummary, SandboxRebind, ServerToClient,
-    ThreadBindings, ThreadBindingsPatch, ThreadBindingsRequest, ThreadConfig,
+    BackendSummary, ClientToServer, Message, ModelSummary, ResourceKind, SandboxRebind,
+    ServerToClient, ThreadBindings, ThreadBindingsPatch, ThreadBindingsRequest, ThreadConfig,
     ThreadConfigOverride, ThreadStateLabel,
 };
 
@@ -95,6 +95,20 @@ pub struct SharedHostConfig {
     /// MCP endpoint URL (typically `http://127.0.0.1:9830/mcp`).
     pub url: String,
 }
+
+/// How long a Ready resource can sit with zero users before the GC sweep
+/// tears it down. 5 minutes is comfortably longer than a typical
+/// "thread finishes a turn, user thinks, sends another message" gap, so
+/// active conversations don't reprovision needlessly, but short enough
+/// that abandoned threads don't keep their sandbox running forever.
+const IDLE_RESOURCE_SECS: i64 = 300;
+/// How long a TornDown / Errored resource entry lingers in the registry
+/// before GC evicts it from the map. Kept for inspection ("yes, that
+/// sandbox existed and was used by task X") for an hour after teardown.
+const TERMINAL_RETENTION_SECS: i64 = 3600;
+/// How often the GC sweep runs. Coarse — the thresholds above are minutes
+/// or hours, so a 60s tick is plenty fine-grained.
+const GC_TICK_SECS: u64 = 60;
 
 pub struct Scheduler {
     /// MCP host URL passed through to threads when their pod doesn't carry a
@@ -1271,13 +1285,22 @@ impl Scheduler {
                 // Drop in-memory thread state for every thread under this pod.
                 // The pod directory is moving to .archived/, so these threads
                 // become unreachable — we'd otherwise leak entries in
-                // `tasks` / `dirty` / `provisioning_in_flight` and stale
-                // subscriptions in the router.
+                // `tasks` / `dirty` / `provisioning_in_flight` / `router`
+                // subs, and the resource-registry user sets would carry
+                // stale thread_ids that prevent GC from ever marking those
+                // resources idle.
                 for thread_id in &pod.threads {
+                    let bindings = self
+                        .tasks
+                        .get(thread_id)
+                        .map(|t| t.bindings.clone());
                     self.tasks.remove(thread_id);
                     self.dirty.remove(thread_id);
                     self.provisioning_in_flight.remove(thread_id);
                     self.router.drop_thread(thread_id);
+                    if let Some(bindings) = bindings {
+                        self.release_thread_resources(thread_id, &bindings);
+                    }
                 }
                 // Broadcast first so every client clears its view before the
                 // disk move completes; the disk write is best-effort.
@@ -1722,6 +1745,90 @@ impl Scheduler {
     }
 
     /// If the task is in a terminal state, tear down its sandbox (if any).
+    /// Drop `thread_id` from every resource user set its bindings refer to,
+    /// and tear down the per-thread primary MCP host (its lifecycle is 1:1
+    /// with the thread). Call this whenever a thread is being removed from
+    /// `self.tasks` so resource refcounts stay honest — without it the GC
+    /// pass would never see those resources as idle.
+    ///
+    /// Sandbox teardown is intentionally NOT done here. Sandboxes are
+    /// shared across threads with matching specs; the GC pass is the
+    /// thing that decides "no users left, idle long enough, tear it down."
+    /// Eager teardown the moment a thread leaves would defeat dedup.
+    fn release_thread_resources(
+        &mut self,
+        thread_id: &str,
+        bindings: &whisper_agent_protocol::ThreadBindings,
+    ) {
+        if let Some(sandbox) = &bindings.sandbox {
+            let sid = SandboxId(sandbox.clone());
+            let _ = self.resources.release_sandbox_user(&sid, thread_id);
+            self.emit_sandbox_updated(&sid);
+        }
+        let backend_id = BackendId::for_name(&bindings.backend);
+        self.resources.remove_backend_user(&backend_id, thread_id);
+        for shared in &bindings.mcp_hosts {
+            let mid = McpHostId::shared(shared);
+            self.resources.remove_mcp_user(&mid, thread_id);
+            self.emit_mcp_host_updated(&mid);
+        }
+        let primary = McpHostId::primary_for_task(thread_id);
+        self.resources.mark_mcp_torn_down(&primary);
+        self.emit_mcp_host_updated(&primary);
+    }
+
+    /// One GC sweep over the resource registry. Tears down idle Ready
+    /// resources (sandboxes, per-thread MCP hosts) and removes terminal
+    /// entries that have been retained long enough. Spawns async sandbox
+    /// teardown futures and broadcasts `ResourceUpdated` /
+    /// `ResourceDestroyed` events for every change.
+    fn gc_tick(&mut self) {
+        let plan = self.resources.reap_idle(
+            chrono::Utc::now(),
+            chrono::Duration::seconds(IDLE_RESOURCE_SECS),
+            chrono::Duration::seconds(TERMINAL_RETENTION_SECS),
+        );
+        if plan.torn_down_sandboxes.is_empty()
+            && plan.torn_down_mcp_hosts.is_empty()
+            && plan.destroyed_sandboxes.is_empty()
+            && plan.destroyed_mcp_hosts.is_empty()
+        {
+            return;
+        }
+        for (id, handle) in plan.torn_down_sandboxes {
+            info!(sandbox_id = %id.0, "GC: tearing down idle sandbox");
+            self.emit_sandbox_updated(&id);
+            if let Some(mut h) = handle {
+                let id_str = id.0.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = h.teardown().await {
+                        warn!(sandbox_id = %id_str, error = %e, "GC sandbox teardown failed");
+                    }
+                });
+            }
+        }
+        for id in plan.torn_down_mcp_hosts {
+            info!(mcp_id = %id.0, "GC: tearing down idle MCP host");
+            self.emit_mcp_host_updated(&id);
+        }
+        for id in plan.destroyed_sandboxes {
+            info!(sandbox_id = %id.0, "GC: removing stale terminal sandbox entry");
+            self.router
+                .broadcast_resource(ServerToClient::ResourceDestroyed {
+                    id: id.0,
+                    kind: ResourceKind::Sandbox,
+                });
+        }
+        for id in plan.destroyed_mcp_hosts {
+            info!(mcp_id = %id.0, "GC: removing stale terminal MCP host entry");
+            self.router
+                .broadcast_resource(ServerToClient::ResourceDestroyed {
+                    id: id.0,
+                    kind: ResourceKind::McpHost,
+                });
+        }
+    }
+
     fn teardown_sandbox_if_terminal(&mut self, thread_id: &str) {
         // Completed is NOT terminal — the task can receive follow-up messages.
         // Only tear down on truly irreversible states.
@@ -1997,6 +2104,10 @@ fn resolve_bindings_choice(
 
 pub async fn run(mut scheduler: Scheduler, mut inbox: mpsc::UnboundedReceiver<SchedulerMsg>) {
     let mut pending_io: FuturesUnordered<SchedulerFuture> = FuturesUnordered::new();
+    let mut gc_ticker = tokio::time::interval(Duration::from_secs(GC_TICK_SECS));
+    // Skip the first immediate tick — `interval` fires at t=0 by default.
+    gc_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    gc_ticker.tick().await;
 
     info!("scheduler starting");
     loop {
@@ -2024,6 +2135,9 @@ pub async fn run(mut scheduler: Scheduler, mut inbox: mpsc::UnboundedReceiver<Sc
                         }
                     }
                 }
+            }
+            _ = gc_ticker.tick() => {
+                scheduler.gc_tick();
             }
         }
         scheduler.flush_dirty().await;
