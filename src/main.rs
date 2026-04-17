@@ -8,7 +8,7 @@ use clap::{Parser, Subcommand};
 use tokio::sync::mpsc;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
-use whisper_agent_protocol::sandbox::{AccessMode, NetworkPolicy, PathAccess, SandboxSpec};
+use whisper_agent_protocol::sandbox::{AccessMode, NetworkPolicy, PathAccess, HostEnvSpec};
 use whisper_agent_protocol::{
     ApprovalPolicy, ClientToServer, Role, ServerToClient, ThreadConfig, ThreadStateLabel,
 };
@@ -17,7 +17,7 @@ use whisper_agent::anthropic::AnthropicClient;
 use whisper_agent::audit::AuditLog;
 use whisper_agent::config::Config;
 use whisper_agent::pod::Pod;
-use whisper_agent::sandbox::{BareMetal, DaemonClient};
+use whisper_agent::sandbox::{HostEnvProviderEntry, HostEnvRegistry, BARE_PROVIDER_NAME};
 use whisper_agent::scheduler::{
     self, BackendEntry, ConnId, Scheduler, SchedulerMsg, SharedHostConfig,
     build_default_pod_config,
@@ -130,17 +130,27 @@ struct ServeArgs {
     #[arg(long)]
     prompt_destructive: bool,
 
-    /// URL of the sandbox provisioning daemon. When set, tasks with non-None
-    /// SandboxSpec will be provisioned via this daemon. When omitted, only
-    /// SandboxSpec::None is supported (bare-metal execution).
-    #[arg(long, env = "SANDBOX_DAEMON_URL")]
-    sandbox_daemon_url: Option<String>,
+    /// Register a host-env provider from the CLI: `name=url`. Each
+    /// catalog entry is a `whisper-agent-sandbox`-shaped daemon.
+    /// Repeatable. The always-present built-in `bare` provider needs
+    /// no entry. Also configurable in TOML:
+    /// `[[host_env_providers]] name = "...", url = "..."`.
+    #[arg(long = "host-env-provider", value_parser = parse_host_env_provider_arg)]
+    host_env_providers: Vec<(String, String)>,
 
-    /// Convenience: default all tasks to a Landlock sandbox with this directory
-    /// as the read-write workspace. Automatically adds ~/.cargo and ~/.rustup
-    /// as read-only if they exist. Requires --sandbox-daemon-url.
+    /// Convenience: name a provider from the catalog whose default
+    /// host-env spec the synthesized default pod should use. Paired
+    /// with `--default-host-env-workspace`. When omitted, the default
+    /// pod uses the `bare` provider (no isolation).
     #[arg(long)]
-    sandbox_workspace: Option<PathBuf>,
+    default_host_env_provider: Option<String>,
+
+    /// Convenience: default the synthesized pod to a Landlock host env
+    /// rooted at this workspace. Auto-includes ~/.cargo and ~/.rustup
+    /// read-only if present. Requires --default-host-env-provider to
+    /// name a non-bare provider.
+    #[arg(long)]
+    default_host_env_workspace: Option<PathBuf>,
 
     /// Register a singleton MCP host the scheduler should connect to at
     /// startup. Format: `name=url`. Repeatable. Tasks opt in by listing the
@@ -152,6 +162,12 @@ struct ServeArgs {
     /// Also configurable in TOML: `[shared_mcp_hosts] fetch = "http://..."`.
     #[arg(long = "shared-mcp-host", value_parser = parse_shared_host_arg)]
     shared_mcp_hosts: Vec<(String, String)>,
+}
+
+/// Parse a `name=url` pair for `--host-env-provider`. Same shape as
+/// `--shared-mcp-host`.
+fn parse_host_env_provider_arg(s: &str) -> Result<(String, String), String> {
+    parse_shared_host_arg(s)
 }
 
 /// Parse a `name=url` pair for `--shared-mcp-host`. Names must be non-empty
@@ -233,7 +249,7 @@ async fn run_serve(args: ServeArgs) -> Result<()> {
     // Resolve the backend catalog and shared-host map. Either source can come
     // from a TOML config; CLI --shared-mcp-host flags layer on top (CLI wins
     // on name conflict).
-    let (backends, default_backend, default_model, mut shared_host_map) = match &args.config {
+    let (backends, default_backend, default_model, mut shared_host_map, toml_provider_entries) = match &args.config {
         Some(path) => {
             let cfg = Config::load(path).await?;
             let default_model = cfg
@@ -262,6 +278,7 @@ async fn run_serve(args: ServeArgs) -> Result<()> {
                 cfg.default_backend,
                 default_model,
                 cfg.shared_mcp_hosts.into_iter().collect::<HashMap<_, _>>(),
+                cfg.host_env_providers,
             )
         }
         None => {
@@ -282,6 +299,7 @@ async fn run_serve(args: ServeArgs) -> Result<()> {
                 DEFAULT_BACKEND_NAME.into(),
                 args.model.clone(),
                 HashMap::new(),
+                Vec::new(),
             )
         }
     };
@@ -298,6 +316,31 @@ async fn run_serve(args: ServeArgs) -> Result<()> {
     let default_shared_host_names: Vec<String> =
         shared_mcp_hosts.iter().map(|h| h.name.clone()).collect();
 
+    // Build the host-env-provider catalog: every CLI / TOML entry plus
+    // the always-built-in `bare`. Errors here are fatal — refusing to
+    // start with a misconfigured catalog is preferable to silently
+    // running with a partial one.
+    let mut provider_entries: Vec<HostEnvProviderEntry> = toml_provider_entries
+        .into_iter()
+        .map(|p| HostEnvProviderEntry {
+            name: p.name,
+            url: p.url,
+        })
+        .collect();
+    for (name, url) in &args.host_env_providers {
+        provider_entries.push(HostEnvProviderEntry {
+            name: name.clone(),
+            url: url.clone(),
+        });
+    }
+    let host_env_registry =
+        HostEnvRegistry::new(provider_entries).context("build host_env provider catalog")?;
+
+    let (default_host_env_provider, default_host_env_spec) = build_default_host_env(
+        &args.default_host_env_provider,
+        &args.default_host_env_workspace,
+    );
+
     let server_config = ServerConfig {
         backends,
         default_backend,
@@ -313,23 +356,38 @@ async fn run_serve(args: ServeArgs) -> Result<()> {
             },
         },
         default_mcp_host_url: args.mcp_host_url,
-        default_sandbox_spec: build_default_sandbox(&args.sandbox_workspace),
+        default_host_env_spec,
+        default_host_env_provider,
         default_shared_host_names,
         audit_log_path: args.audit_log,
         host_id: "default".into(),
         pods_root,
-        sandbox_provider: match args.sandbox_daemon_url {
-            Some(url) => Arc::new(DaemonClient::new(url)),
-            None => Arc::new(BareMetal),
-        },
+        host_env_registry,
         shared_mcp_hosts,
     };
     server::serve(args.listen, server_config).await
 }
 
-fn build_default_sandbox(workspace: &Option<PathBuf>) -> SandboxSpec {
+/// Resolve the synthesized default pod's `(provider, spec)` pair from
+/// CLI args. Defaults to `(bare, None)` when no provider is named —
+/// matching the previous "no isolation" behavior.
+fn build_default_host_env(
+    provider: &Option<String>,
+    workspace: &Option<PathBuf>,
+) -> (String, HostEnvSpec) {
+    let Some(provider) = provider else {
+        return (BARE_PROVIDER_NAME.to_string(), HostEnvSpec::None);
+    };
     let Some(ws) = workspace else {
-        return SandboxSpec::None;
+        // Provider named without a workspace: use a no-paths landlock
+        // shell — the user can edit pod.toml to flesh it out.
+        return (
+            provider.clone(),
+            HostEnvSpec::Landlock {
+                allowed_paths: Vec::new(),
+                network: NetworkPolicy::Unrestricted,
+            },
+        );
     };
     let ws_str = ws.to_string_lossy().into_owned();
     let mut paths = vec![PathAccess {
@@ -349,14 +407,18 @@ fn build_default_sandbox(workspace: &Option<PathBuf>) -> SandboxSpec {
         }
     }
     info!(
+        provider = %provider,
         workspace = %paths[0].path,
         extra_ro = paths.len() - 1,
-        "default sandbox: landlock"
+        "default host env: landlock"
     );
-    SandboxSpec::Landlock {
-        allowed_paths: paths,
-        network: NetworkPolicy::Unrestricted,
-    }
+    (
+        provider.clone(),
+        HostEnvSpec::Landlock {
+            allowed_paths: paths,
+            network: NetworkPolicy::Unrestricted,
+        },
+    )
 }
 
 async fn run_one_shot(args: RunArgs) -> Result<()> {
@@ -394,7 +456,8 @@ async fn run_one_shot(args: RunArgs) -> Result<()> {
         "default",
         &task_config,
         &backend_name,
-        SandboxSpec::None,
+        BARE_PROVIDER_NAME,
+        HostEnvSpec::None,
         &backend_names,
         &[],
     );
@@ -415,7 +478,7 @@ async fn run_one_shot(args: RunArgs) -> Result<()> {
         backends,
         backend_name,
         audit,
-        Arc::new(BareMetal),
+        HostEnvRegistry::new(Vec::new()).context("build host_env registry for one-shot")?,
         Vec::new(),
     )
     .await?;

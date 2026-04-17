@@ -48,6 +48,22 @@ pub struct Config {
     /// conflict).
     #[serde(default)]
     pub shared_mcp_hosts: BTreeMap<String, String>,
+    /// Optional `[[host_env_providers]]` table — list of named daemon
+    /// URLs the scheduler can dispatch host-env provisioning to. The
+    /// always-present built-in `bare` provider needs no entry. CLI
+    /// `--host-env-provider name=url` flags are merged with these.
+    #[serde(default)]
+    pub host_env_providers: Vec<HostEnvProviderConfig>,
+}
+
+/// One catalog entry from `[[host_env_providers]]`. `name` is what
+/// pod entries reference; `url` is the daemon endpoint. Future
+/// security fields (`auth = { kind = "mtls", ... }`, etc.) plug in
+/// here without breaking compat.
+#[derive(Deserialize, Debug, Clone)]
+pub struct HostEnvProviderConfig {
+    pub name: String,
+    pub url: String,
 }
 
 #[derive(Deserialize, Debug, Clone)]

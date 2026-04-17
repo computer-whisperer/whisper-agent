@@ -1,6 +1,6 @@
 //! Pod TOML parsing, validation, and on-disk constants.
 //!
-//! The data types themselves (`PodConfig`, `PodAllow`, `NamedSandboxSpec`,
+//! The data types themselves (`PodConfig`, `PodAllow`, `NamedHostEnv`,
 //! `ThreadDefaults`, `PodLimits`) live in the protocol crate so the webui
 //! can render them directly from wire snapshots. This module owns the
 //! server-side concerns: filename constants, the TOML round-trip, and
@@ -71,7 +71,7 @@ pub enum PodConfigError {
     Parse(#[from] toml::de::Error),
     #[error("toml encode: {0}")]
     Encode(#[from] toml::ser::Error),
-    #[error("duplicate sandbox name `{0}` in [[allow.sandbox]]")]
+    #[error("duplicate sandbox name `{0}` in [[allow.host_env]]")]
     DuplicateSandboxName(String),
     #[error(
         "thread_defaults.{field} = `{value}` does not match any entry in [allow] (valid: [{valid}])"
@@ -99,7 +99,7 @@ pub fn to_toml(config: &PodConfig) -> Result<String, PodConfigError> {
 /// (e.g. when applying an `UpdatePodConfig` patch).
 pub fn validate(config: &PodConfig) -> Result<(), PodConfigError> {
     let mut seen: BTreeSet<&str> = BTreeSet::new();
-    for nss in &config.allow.sandbox {
+    for nss in &config.allow.host_env {
         if !seen.insert(nss.name.as_str()) {
             return Err(PodConfigError::DuplicateSandboxName(nss.name.clone()));
         }
@@ -113,25 +113,26 @@ pub fn validate(config: &PodConfig) -> Result<(), PodConfigError> {
         });
     }
 
-    // Sandbox: empty is valid only if pod has no allowed sandboxes (degenerate
-    // no-isolation pod). Otherwise must name an entry in [[allow.sandbox]].
-    if !config.thread_defaults.sandbox.is_empty()
+    // Host env: empty is valid only if the pod has no allowed envs
+    // (degenerate no-isolation pod). Otherwise must name an entry in
+    // [[allow.host_env]].
+    if !config.thread_defaults.host_env.is_empty()
         && !config
             .allow
-            .sandbox
+            .host_env
             .iter()
-            .any(|nss| nss.name == config.thread_defaults.sandbox)
+            .any(|nh| nh.name == config.thread_defaults.host_env)
     {
         let valid = config
             .allow
-            .sandbox
+            .host_env
             .iter()
-            .map(|nss| nss.name.as_str())
+            .map(|nh| nh.name.as_str())
             .collect::<Vec<_>>()
             .join(", ");
         return Err(PodConfigError::UnknownThreadDefault {
-            field: "sandbox",
-            value: config.thread_defaults.sandbox.clone(),
+            field: "host_env",
+            value: config.thread_defaults.host_env.clone(),
             valid,
         });
     }
@@ -154,7 +155,7 @@ mod tests {
     use super::*;
     use whisper_agent_protocol::sandbox::{AccessMode, NetworkPolicy, PathAccess};
     use whisper_agent_protocol::{
-        ApprovalPolicy, NamedSandboxSpec, PodAllow, PodLimits, SandboxSpec, ThreadDefaults,
+        ApprovalPolicy, NamedHostEnv, PodAllow, PodLimits, HostEnvSpec, ThreadDefaults,
     };
 
     fn sample_config() -> PodConfig {
@@ -165,10 +166,11 @@ mod tests {
             allow: PodAllow {
                 backends: vec!["anthropic".into(), "openai-compat".into()],
                 mcp_hosts: vec!["fetch".into(), "search".into()],
-                sandbox: vec![
-                    NamedSandboxSpec {
+                host_env: vec![
+                    NamedHostEnv {
                         name: "landlock-rw".into(),
-                        spec: SandboxSpec::Landlock {
+                        provider: "landlock-laptop".into(),
+                        spec: HostEnvSpec::Landlock {
                             allowed_paths: vec![PathAccess {
                                 path: "/home/me/project".into(),
                                 mode: AccessMode::ReadWrite,
@@ -176,9 +178,10 @@ mod tests {
                             network: NetworkPolicy::Unrestricted,
                         },
                     },
-                    NamedSandboxSpec {
+                    NamedHostEnv {
                         name: "no-isolation".into(),
-                        spec: SandboxSpec::None,
+                        provider: "bare".into(),
+                        spec: HostEnvSpec::None,
                     },
                 ],
             },
@@ -189,7 +192,7 @@ mod tests {
                 max_tokens: 32000,
                 max_turns: 100,
                 approval_policy: ApprovalPolicy::PromptDestructive,
-                sandbox: "landlock-rw".into(),
+                host_env: "landlock-rw".into(),
                 mcp_hosts: vec!["fetch".into(), "search".into()],
             },
             limits: PodLimits {
@@ -209,9 +212,10 @@ mod tests {
     #[test]
     fn detects_duplicate_sandbox_name() {
         let mut cfg = sample_config();
-        cfg.allow.sandbox.push(NamedSandboxSpec {
+        cfg.allow.host_env.push(NamedHostEnv {
             name: "landlock-rw".into(),
-            spec: SandboxSpec::None,
+            provider: "bare".into(),
+            spec: HostEnvSpec::None,
         });
         let err = validate(&cfg).unwrap_err();
         assert!(matches!(err, PodConfigError::DuplicateSandboxName(_)));
@@ -234,10 +238,10 @@ mod tests {
     #[test]
     fn rejects_unknown_default_sandbox() {
         let mut cfg = sample_config();
-        cfg.thread_defaults.sandbox = "phantom".into();
+        cfg.thread_defaults.host_env = "phantom".into();
         let err = validate(&cfg).unwrap_err();
         match err {
-            PodConfigError::UnknownThreadDefault { field, .. } => assert_eq!(field, "sandbox"),
+            PodConfigError::UnknownThreadDefault { field, .. } => assert_eq!(field, "host_env"),
             other => panic!("expected UnknownThreadDefault, got {other:?}"),
         }
     }
@@ -245,8 +249,8 @@ mod tests {
     #[test]
     fn empty_default_sandbox_ok_when_allow_is_empty() {
         let mut cfg = sample_config();
-        cfg.allow.sandbox.clear();
-        cfg.thread_defaults.sandbox = String::new();
+        cfg.allow.host_env.clear();
+        cfg.thread_defaults.host_env = String::new();
         validate(&cfg).unwrap();
     }
 

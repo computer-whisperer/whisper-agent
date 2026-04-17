@@ -26,7 +26,7 @@ use tokio::signal;
 use tokio::sync::Mutex;
 use tracing::{error, info, warn};
 use whisper_agent_protocol::sandbox::{
-    NetworkPolicy, ProvisionRequest, ProvisionResponse, SandboxSpec, TeardownRequest,
+    NetworkPolicy, ProvisionRequest, ProvisionResponse, HostEnvSpec, TeardownRequest,
 };
 
 #[derive(Parser, Debug)]
@@ -103,17 +103,17 @@ async fn handle_provision(
     info!(thread_id = %req.thread_id, "provision request");
 
     match &req.spec {
-        SandboxSpec::None => {
-            warn!(thread_id = %req.thread_id, "provision called with SandboxSpec::None");
+        HostEnvSpec::None => {
+            warn!(thread_id = %req.thread_id, "provision called with HostEnvSpec::None");
             return (
                 StatusCode::BAD_REQUEST,
                 Json(serde_json::json!({
-                    "error": "SandboxSpec::None does not require provisioning"
+                    "error": "HostEnvSpec::None does not require provisioning"
                 })),
             )
                 .into_response();
         }
-        SandboxSpec::Container { image, .. } => {
+        HostEnvSpec::Container { image, .. } => {
             info!(thread_id = %req.thread_id, %image, "container provisioning not yet implemented");
             return (
                 StatusCode::NOT_IMPLEMENTED,
@@ -123,7 +123,7 @@ async fn handle_provision(
             )
                 .into_response();
         }
-        SandboxSpec::Landlock { network, .. } => {
+        HostEnvSpec::Landlock { network, .. } => {
             if matches!(network, NetworkPolicy::AllowList { .. }) {
                 warn!(
                     thread_id = %req.thread_id,

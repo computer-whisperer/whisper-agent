@@ -13,8 +13,8 @@ pub mod pod;
 pub mod sandbox;
 
 pub use conversation::{ContentBlock, Conversation, Message, Role, ToolResultContent};
-pub use pod::{NamedSandboxSpec, PodAllow, PodConfig, PodLimits, PodSnapshot, PodSummary, ThreadDefaults};
-pub use sandbox::SandboxSpec;
+pub use pod::{NamedHostEnv, PodAllow, PodConfig, PodLimits, PodSnapshot, PodSummary, ThreadDefaults};
+pub use sandbox::HostEnvSpec;
 
 use serde::{Deserialize, Serialize};
 
@@ -92,8 +92,9 @@ pub struct ThreadConfigOverride {
 
 /// Concrete resource bindings for a thread. Each field names an entry in
 /// the scheduler's resource registry — `backend` by catalog name, `sandbox`
-/// by `SandboxId` (content-hash of the spec), `mcp_hosts` by `McpHostId`
-/// (the ordered list the thread routes tool calls through, primary first).
+/// by `HostEnvId` (content-hash of provider+spec), `mcp_hosts` by
+/// `McpHostId` (the ordered list the thread routes tool calls through,
+/// primary first).
 ///
 /// `tool_filter`, when present, narrows the visible tool catalog to a
 /// whitelist of names — used by subagent / fork flows that want to expose
@@ -107,33 +108,47 @@ pub struct ThreadBindings {
     /// `backend-` prefix.
     #[serde(default)]
     pub backend: String,
-    /// Bound `SandboxId` (full `sb-…` form) when the thread runs inside a
-    /// sandbox; `None` for bare-metal threads.
+    /// Bound `HostEnvId` (full `he-…` form) when the thread is bound to
+    /// a non-bare host env; `None` for the always-built-in `bare`
+    /// provider (in-process, no isolation).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub sandbox: Option<String>,
+    pub host_env: Option<String>,
     /// Bound `McpHostId`s, in routing precedence order. The primary
-    /// (per-thread filesystem) host is at index 0; shared hosts follow in
-    /// the order they were declared on the pod.
+    /// (per-thread) host is at index 0; shared hosts follow in the
+    /// order they were declared on the pod.
     #[serde(default)]
     pub mcp_hosts: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_filter: Option<Vec<String>>,
 }
 
+/// Inline (provider, spec) pair carried in `ThreadBindingsRequest` and
+/// `HostEnvRebind::Inline`. The server validates that `provider`
+/// resolves in the catalog and that the spec shape matches the
+/// provider's expectations.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct InlineHostEnv {
+    pub provider: String,
+    #[serde(flatten)]
+    pub spec: HostEnvSpec,
+}
+
 /// Client-side overrides for the bindings the pod's `thread_defaults` would
 /// otherwise produce. Each `Some` field replaces the corresponding default;
 /// each `None` inherits. Values are validated against the pod's `[allow]`
 /// table on the server — backends and shared MCP host names must already
-/// appear there. Inline `sandbox` specs are accepted as-is until pod
-/// editing UI ships; see `resolve_bindings_choice` for the rationale.
+/// appear there.
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
 pub struct ThreadBindingsRequest {
     /// Backend catalog name. Empty → server default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub backend: Option<String>,
-    /// Inline sandbox spec.
+    /// Inline host env override. The server doesn't require this to
+    /// reference a `[[allow.host_env]]` entry by name (existing flow
+    /// for ad-hoc thread spawning), but the named provider must exist
+    /// in the catalog.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub sandbox: Option<SandboxSpec>,
+    pub host_env: Option<InlineHostEnv>,
     /// Catalog names of shared MCP hosts the thread should bind to. `None`
     /// inherits the pod default; `Some(vec)` replaces exactly (empty vec
     /// means "no shared hosts beyond the primary").
@@ -144,21 +159,22 @@ pub struct ThreadBindingsRequest {
 /// Mid-thread rebind patch. Applied to the live `ThreadBindings` of a
 /// running thread; each `Some` field replaces the matching binding, `None`
 /// leaves it alone. Validated against the pod's `[allow]` table — same
-/// rules as initial binding (modulo the inline-sandbox carve-out).
+/// rules as initial binding.
 ///
 /// In-flight I/O against the *previous* bindings completes against its
 /// captured resources; only future ops see the new state. When the
-/// sandbox or MCP host set changes, the scheduler appends a synthetic
+/// host env or MCP host set changes, the scheduler appends a synthetic
 /// conversation note so the model knows the execution environment shifted.
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
 pub struct ThreadBindingsPatch {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub backend: Option<String>,
-    /// `Some(SandboxRebind::Inline(spec))` re-binds; `Some(Clear)` drops
-    /// the binding entirely; `None` leaves it alone. Two layers of Option
-    /// because "set to nothing" and "leave alone" are distinct.
+    /// `Some(HostEnvRebind::Inline { ... })` re-binds; `Some(Clear)`
+    /// drops the binding entirely (thread falls back to the bare
+    /// provider); `None` leaves it alone. Two layers of Option because
+    /// "set to nothing" and "leave alone" are distinct.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub sandbox: Option<SandboxRebind>,
+    pub host_env: Option<HostEnvRebind>,
     /// Replace the shared MCP host list. `Some(vec)` replaces exactly
     /// (empty vec means "no shared hosts"); `None` leaves the current set.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -167,11 +183,23 @@ pub struct ThreadBindingsPatch {
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(tag = "kind", rename_all = "snake_case")]
-pub enum SandboxRebind {
-    /// Replace the bound sandbox with this inline spec.
-    Inline { spec: SandboxSpec },
-    /// Drop the sandbox binding entirely (thread runs bare-metal).
+pub enum HostEnvRebind {
+    /// Replace the bound host env with this inline (provider, spec) pair.
+    Inline { binding: InlineHostEnv },
+    /// Drop the host env binding entirely (thread falls back to `bare`).
     Clear,
+}
+
+/// Server-advertised entry from the host-env-provider catalog. Sent in
+/// response to `ListHostEnvProviders` so the webui's pod editor can
+/// populate its provider dropdown.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct HostEnvProviderInfo {
+    /// User-facing catalog name (matches `NamedHostEnv.provider`).
+    pub name: String,
+    /// True for the always-present built-in `"bare"` provider.
+    #[serde(default)]
+    pub builtin: bool,
 }
 
 /// Pattern-1 approval policy. See `docs/design_permissions.md`.
@@ -253,12 +281,12 @@ pub enum ResourceStateLabel {
 }
 
 /// Discriminator for resource events. The resource id strings are namespaced
-/// by prefix (`sb-`, `mcp-primary-`, `mcp-shared-`, `backend-`) but carrying
+/// by prefix (`he-`, `mcp-primary-`, `mcp-shared-`, `backend-`) but carrying
 /// the kind explicitly lets clients route without prefix-parsing.
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ResourceKind {
-    Sandbox,
+    HostEnv,
     McpHost,
     Backend,
 }
@@ -270,9 +298,11 @@ pub enum ResourceKind {
 #[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ResourceSnapshot {
-    Sandbox {
+    HostEnv {
         id: String,
-        spec: SandboxSpec,
+        /// Provider name from the catalog this host env is bound to.
+        provider: String,
+        spec: HostEnvSpec,
         state: ResourceStateLabel,
         /// User ids (task ids today, thread ids after Phase 2). Sorted.
         users: Vec<String>,
@@ -312,12 +342,12 @@ pub enum ResourceSnapshot {
 impl ResourceSnapshot {
     pub fn id(&self) -> &str {
         match self {
-            Self::Sandbox { id, .. } | Self::McpHost { id, .. } | Self::Backend { id, .. } => id,
+            Self::HostEnv { id, .. } | Self::McpHost { id, .. } | Self::Backend { id, .. } => id,
         }
     }
     pub fn kind(&self) -> ResourceKind {
         match self {
-            Self::Sandbox { .. } => ResourceKind::Sandbox,
+            Self::HostEnv { .. } => ResourceKind::HostEnv,
             Self::McpHost { .. } => ResourceKind::McpHost,
             Self::Backend { .. } => ResourceKind::Backend,
         }
@@ -467,6 +497,14 @@ pub enum ClientToServer {
     /// Subsequent registry mutations are pushed unsolicited via
     /// `ResourceCreated` / `ResourceUpdated` / `ResourceDestroyed`.
     ListResources {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        correlation_id: Option<String>,
+    },
+
+    /// Snapshot of the server's host-env-provider catalog. Used by the
+    /// pod editor to populate the per-entry "provider" dropdown.
+    /// Server responds with `HostEnvProvidersList`.
+    ListHostEnvProviders {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         correlation_id: Option<String>,
     },
@@ -653,6 +691,14 @@ pub enum ServerToClient {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         correlation_id: Option<String>,
         resources: Vec<ResourceSnapshot>,
+    },
+    /// Snapshot response to `ListHostEnvProviders`. Always includes the
+    /// built-in `bare` entry; configured entries follow in catalog
+    /// declaration order.
+    HostEnvProvidersList {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        correlation_id: Option<String>,
+        providers: Vec<HostEnvProviderInfo>,
     },
     /// A new entry appeared in the registry.
     ResourceCreated {

@@ -540,7 +540,7 @@ fn synthesize_pod_config(task: &Thread) -> PodConfig {
         allow: PodAllow {
             backends: vec![backend.clone()],
             mcp_hosts: Vec::new(),
-            sandbox: Vec::new(),
+            host_env: Vec::new(),
         },
         thread_defaults: ThreadDefaults {
             backend,
@@ -549,7 +549,7 @@ fn synthesize_pod_config(task: &Thread) -> PodConfig {
             max_tokens: task.config.max_tokens,
             max_turns: task.config.max_turns,
             approval_policy: task.config.approval_policy,
-            sandbox: String::new(),
+            host_env: String::new(),
             mcp_hosts: Vec::new(),
         },
         limits: PodLimits::default(),
@@ -584,7 +584,7 @@ mod tests {
         };
         let bindings = ThreadBindings {
             backend: "anthropic".into(),
-            sandbox: None,
+            host_env: None,
             mcp_hosts: vec![format!("mcp-primary-{id}"), "mcp-shared-fetch".into()],
             tool_filter: None,
         };

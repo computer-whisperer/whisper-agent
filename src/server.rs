@@ -33,7 +33,7 @@ use tower_http::services::{ServeDir, ServeFile};
 use tower_http::trace::TraceLayer;
 use tracing::{error, info, warn};
 use whisper_agent_protocol::{
-    SandboxSpec, ServerToClient, ThreadConfig, decode_from_client, encode_to_client,
+    HostEnvSpec, ServerToClient, ThreadConfig, decode_from_client, encode_to_client,
 };
 
 use crate::audit::AuditLog;
@@ -64,15 +64,17 @@ pub struct ServerConfig {
     /// Plain config (model, prompt, limits, policy) the synthesized default
     /// pod's `thread_defaults` table is built from.
     pub default_task_config: ThreadConfig,
-    /// Server-level fallback MCP URL — used when a thread's bound sandbox
-    /// doesn't carry its own URL (or no sandbox is bound at all). Pods
-    /// don't model this; it's a server-level concern (where the
-    /// filesystem MCP daemon lives).
+    /// Server-level fallback MCP URL — used when a thread's bound host
+    /// env doesn't carry its own URL (or the `bare` provider is in use).
+    /// Pods don't model this; it's a server-level concern.
     pub default_mcp_host_url: String,
-    /// Sandbox spec the synthesized default pod offers as its single
-    /// `[[allow.sandbox]]` entry. Threads whose `bindings.sandbox`
-    /// resolves against the default pod end up bound to this spec.
-    pub default_sandbox_spec: SandboxSpec,
+    /// Host-env spec the synthesized default pod offers as its single
+    /// `[[allow.host_env]]` entry — paired with `default_host_env_provider`.
+    pub default_host_env_spec: HostEnvSpec,
+    /// Provider name for the synthesized default pod's default host env.
+    /// Must be a key in `host_env_registry` (the always-present `bare`
+    /// works when paired with `HostEnvSpec::None`).
+    pub default_host_env_provider: String,
     /// Names of shared MCP hosts that should appear in the synthesized
     /// default pod's `[allow].mcp_hosts` and `thread_defaults.mcp_hosts`.
     /// Typically every host configured via `shared_mcp_hosts`.
@@ -81,7 +83,9 @@ pub struct ServerConfig {
     pub host_id: String,
     /// Pods root directory. If `None`, persistence is disabled.
     pub pods_root: Option<PathBuf>,
-    pub sandbox_provider: std::sync::Arc<dyn crate::sandbox::SandboxProvider>,
+    /// Pre-built host-env catalog (built-in `bare` + entries from
+    /// `[[host_env_providers]]` in `whisper-agent.toml`).
+    pub host_env_registry: crate::sandbox::HostEnvRegistry,
     /// Catalog of shared (singleton) MCP hosts the scheduler connects to at
     /// startup. Pods opt in by name via `[allow].mcp_hosts`.
     pub shared_mcp_hosts: Vec<SharedHostConfig>,
@@ -120,7 +124,8 @@ pub async fn serve(listen: SocketAddr, config: ServerConfig) -> anyhow::Result<(
         &default_pod_id,
         &config.default_task_config,
         &config.default_backend,
-        config.default_sandbox_spec.clone(),
+        &config.default_host_env_provider,
+        config.default_host_env_spec.clone(),
         &backend_names,
         &config.default_shared_host_names,
     );
@@ -148,7 +153,7 @@ pub async fn serve(listen: SocketAddr, config: ServerConfig) -> anyhow::Result<(
         config.backends,
         config.default_backend,
         audit,
-        config.sandbox_provider,
+        config.host_env_registry,
         config.shared_mcp_hosts,
     )
     .await

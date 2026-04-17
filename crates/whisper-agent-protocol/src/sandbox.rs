@@ -1,8 +1,12 @@
-//! Per-task execution environment specification.
+//! Host environment specification — describes the kind of isolated
+//! execution environment a thread runs inside (the "host env" the
+//! scheduler asks a `HostEnvProvider` daemon to provision).
 //!
-//! Each task carries a [`SandboxSpec`] that declares how its MCP tools should be
-//! isolated. UI presets stamp a default spec at task-creation time — the task's
-//! spec is the source of truth at runtime.
+//! Each thread's bindings carry a `HostEnvSpec` plus the `provider` name
+//! that should be asked to provision it. The spec is the wire-level
+//! input the daemon receives in `ProvisionRequest`; it doesn't itself
+//! know which provider will fulfill it (that's resolved server-side
+//! against the catalog in `whisper-agent.toml`).
 
 use std::collections::BTreeMap;
 
@@ -11,7 +15,7 @@ use serde::{Deserialize, Serialize};
 /// Execution environment for a task's MCP tools.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default)]
 #[serde(tag = "type", rename_all = "snake_case")]
-pub enum SandboxSpec {
+pub enum HostEnvSpec {
     /// No isolation — tools execute directly on the host with workspace-level
     /// path clamping only. Matches pre-sandbox behavior.
     #[default]
@@ -104,7 +108,7 @@ pub struct ResourceLimits {
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct ProvisionRequest {
     pub thread_id: String,
-    pub spec: SandboxSpec,
+    pub spec: HostEnvSpec,
 }
 
 /// Successful provision response. The daemon has created the environment and
@@ -128,13 +132,13 @@ mod tests {
 
     #[test]
     fn none_is_default() {
-        let spec: SandboxSpec = Default::default();
-        assert_eq!(spec, SandboxSpec::None);
+        let spec: HostEnvSpec = Default::default();
+        assert_eq!(spec, HostEnvSpec::None);
     }
 
     #[test]
     fn container_spec_round_trips_through_json() {
-        let spec = SandboxSpec::Container {
+        let spec = HostEnvSpec::Container {
             image: "ghcr.io/whisper-agent/dev-rust:latest".into(),
             mounts: vec![Mount {
                 host: "/home/me/project".into(),
@@ -152,13 +156,13 @@ mod tests {
             env: BTreeMap::from([("CARGO_HOME".into(), "/workspace/.cargo".into())]),
         };
         let json = serde_json::to_string(&spec).unwrap();
-        let back: SandboxSpec = serde_json::from_str(&json).unwrap();
+        let back: HostEnvSpec = serde_json::from_str(&json).unwrap();
         assert_eq!(spec, back);
     }
 
     #[test]
     fn landlock_spec_round_trips_through_json() {
-        let spec = SandboxSpec::Landlock {
+        let spec = HostEnvSpec::Landlock {
             allowed_paths: vec![
                 PathAccess {
                     path: "/home/me/project".into(),
@@ -172,16 +176,14 @@ mod tests {
             network: NetworkPolicy::Isolated,
         };
         let json = serde_json::to_string(&spec).unwrap();
-        let back: SandboxSpec = serde_json::from_str(&json).unwrap();
+        let back: HostEnvSpec = serde_json::from_str(&json).unwrap();
         assert_eq!(spec, back);
     }
 
     #[test]
-    fn none_deserializes_from_legacy_missing_field() {
-        // Existing persisted tasks have no `sandbox` field — serde(default)
-        // on ThreadConfig must produce SandboxSpec::None.
-        let spec: SandboxSpec = serde_json::from_str(r#"{"type":"none"}"#).unwrap();
-        assert_eq!(spec, SandboxSpec::None);
+    fn none_round_trips() {
+        let spec: HostEnvSpec = serde_json::from_str(r#"{"type":"none"}"#).unwrap();
+        assert_eq!(spec, HostEnvSpec::None);
     }
 
     #[test]

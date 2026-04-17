@@ -9,7 +9,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::sandbox::SandboxSpec;
+use crate::sandbox::HostEnvSpec;
 use crate::ApprovalPolicy;
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
@@ -34,23 +34,32 @@ pub struct PodAllow {
     #[serde(default)]
     pub mcp_hosts: Vec<String>,
     #[serde(default)]
-    pub sandbox: Vec<NamedSandboxSpec>,
+    pub host_env: Vec<NamedHostEnv>,
 }
 
+/// One pod-level "host env" entry — a named (provider, spec) pair the
+/// pod's threads are allowed to bind to. The provider name resolves
+/// against the server-level catalog in `whisper-agent.toml`. The
+/// always-present built-in `"bare"` provider must be paired with
+/// `HostEnvSpec::None`; any other provider must be paired with a
+/// non-`None` spec. The server enforces both rules at pod-config
+/// validation time.
+///
+/// TOML form:
+/// ```toml
+/// [[allow.host_env]]
+/// name = "rust-dev"
+/// provider = "landlock-laptop"
+/// type = "landlock"        # `HostEnvSpec` discriminator (still tag="type")
+/// allowed_paths = [...]
+/// network = { policy = "isolated" }
+/// ```
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-pub struct NamedSandboxSpec {
+pub struct NamedHostEnv {
     pub name: String,
-    /// `SandboxSpec` is `tag = "type"` so the inner discriminant lifts to a
-    /// sibling key here. TOML form:
-    /// ```toml
-    /// [[allow.sandbox]]
-    /// name = "landlock-rw"
-    /// type = "landlock"
-    /// allowed_paths = [...]
-    /// network = { policy = "unrestricted" }
-    /// ```
+    pub provider: String,
     #[serde(flatten)]
-    pub spec: SandboxSpec,
+    pub spec: HostEnvSpec,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
@@ -63,10 +72,10 @@ pub struct ThreadDefaults {
     pub max_turns: u32,
     #[serde(default)]
     pub approval_policy: ApprovalPolicy,
-    /// Name of one of the `[[allow.sandbox]]` entries. Empty allowed only when
-    /// `[allow].sandbox` is empty.
+    /// Name of one of the `[[allow.host_env]]` entries. Empty allowed
+    /// only when `[allow].host_env` is empty.
     #[serde(default)]
-    pub sandbox: String,
+    pub host_env: String,
     #[serde(default)]
     pub mcp_hosts: Vec<String>,
 }

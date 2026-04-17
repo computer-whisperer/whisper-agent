@@ -27,7 +27,7 @@ use futures::stream::FuturesUnordered;
 use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 use whisper_agent_protocol::{
-    BackendSummary, ClientToServer, Message, ModelSummary, ResourceKind, SandboxRebind,
+    BackendSummary, ClientToServer, Message, ModelSummary, ResourceKind, HostEnvRebind,
     ServerToClient, ThreadBindings, ThreadBindingsPatch, ThreadBindingsRequest, ThreadConfig,
     ThreadConfigOverride, ThreadStateLabel,
 };
@@ -42,15 +42,15 @@ use crate::model::ModelProvider;
 use crate::persist::{LoadedState, Persister};
 use crate::pod::{Pod, PodId};
 use crate::resources::{
-    BackendId, CompleteSandboxOutcome, McpHostId, ResourceRegistry, SandboxId,
+    BackendId, CompleteHostEnvOutcome, McpHostId, ResourceRegistry, HostEnvId,
 };
-use crate::sandbox::SandboxProvider;
+use crate::sandbox::HostEnvProvider;
 use crate::thread::{
     ApprovalDisposition, IoResult, OpId, StepOutcome, Thread, ThreadInternalState, derive_title,
     new_task_id,
 };
 use crate::thread_router::ThreadEventRouter;
-use whisper_agent_protocol::SandboxSpec;
+use whisper_agent_protocol::HostEnvSpec;
 
 pub type ConnId = u64;
 
@@ -128,7 +128,9 @@ pub struct Scheduler {
     /// Fallback when a task doesn't specify a backend. Must be a key in `backends`.
     default_backend: String,
     persister: Option<Persister>,
-    sandbox_provider: Arc<dyn SandboxProvider>,
+    /// Catalog of host-env providers, keyed by name. Always contains
+    /// `bare`; configured entries arrive via `whisper-agent.toml`.
+    host_env_registry: crate::sandbox::HostEnvRegistry,
 
     tasks: HashMap<String, Thread>,
     /// Owns the connection registry, subscription map, audit log, and the
@@ -172,7 +174,7 @@ impl Scheduler {
         backends: HashMap<String, BackendEntry>,
         default_backend: String,
         audit: AuditLog,
-        sandbox_provider: Arc<dyn SandboxProvider>,
+        host_env_registry: crate::sandbox::HostEnvRegistry,
         shared_host_configs: Vec<SharedHostConfig>,
     ) -> anyhow::Result<Self> {
         assert!(
@@ -222,7 +224,7 @@ impl Scheduler {
             backends,
             default_backend,
             persister: None,
-            sandbox_provider,
+            host_env_registry,
             tasks: HashMap::new(),
             router: ThreadEventRouter::new(audit, host_id),
             resources,
@@ -267,8 +269,8 @@ impl Scheduler {
     // event — there are no clients connected yet, and a fresh client gets the
     // full set via `ListResources`.
 
-    fn emit_sandbox_updated(&self, id: &SandboxId) {
-        if let Some(snap) = self.resources.snapshot_sandbox(id) {
+    fn emit_host_env_updated(&self, id: &HostEnvId) {
+        if let Some(snap) = self.resources.snapshot_host_env(id) {
             self.router
                 .broadcast_resource(ServerToClient::ResourceUpdated { resource: snap });
         }
@@ -307,26 +309,30 @@ impl Scheduler {
         self.backends.get(name)
     }
 
-    pub(crate) fn sandbox_provider(&self) -> &Arc<dyn SandboxProvider> {
-        &self.sandbox_provider
+    /// Look up a host-env provider in the catalog by name.
+    pub(crate) fn host_env_provider(
+        &self,
+        name: &str,
+    ) -> Option<&Arc<dyn HostEnvProvider>> {
+        self.host_env_registry.get(name)
     }
 
-    /// Server-level fallback MCP URL — used by `io_dispatch` when a thread's
-    /// bound sandbox doesn't (yet) carry its own URL.
+    /// Server-level fallback MCP URL — used by `io_dispatch` when a
+    /// thread's bound host env doesn't (yet) carry its own URL.
     pub(crate) fn default_mcp_url(&self) -> &str {
         &self.default_mcp_host_url
     }
 
-    /// Look up the registry entry for a thread's bound sandbox. Returns
-    /// `None` when the thread doesn't bind one (legacy / no-sandbox config)
-    /// or when `pre_register_sandbox` somehow wasn't called for this id.
-    pub(crate) fn sandbox_for_thread(
+    /// Look up the registry entry for a thread's bound host env.
+    /// Returns `None` when the thread doesn't bind one (the `bare`
+    /// path) or when `pre_register_host_env` somehow wasn't called.
+    pub(crate) fn host_env_for_thread(
         &self,
         thread_id: &str,
-    ) -> Option<&crate::resources::SandboxEntry> {
+    ) -> Option<&crate::resources::HostEnvEntry> {
         let task = self.tasks.get(thread_id)?;
-        let id_str = task.bindings.sandbox.as_ref()?;
-        self.resources.sandboxes.get(&SandboxId(id_str.clone()))
+        let id_str = task.bindings.host_env.as_ref()?;
+        self.resources.host_envs.get(&HostEnvId(id_str.clone()))
     }
 
     /// Phase 3d.i: build the thread's effective tool catalog by walking
@@ -394,9 +400,9 @@ impl Scheduler {
             return Vec::new();
         };
         let mut out = Vec::new();
-        if let Some(sb) = &task.bindings.sandbox {
-            let id = SandboxId(sb.clone());
-            match self.resources.sandboxes.get(&id) {
+        if let Some(sb) = &task.bindings.host_env {
+            let id = HostEnvId(sb.clone());
+            match self.resources.host_envs.get(&id) {
                 Some(e) if e.state.is_ready() => {}
                 _ => out.push(sb.clone()),
             }
@@ -493,10 +499,12 @@ impl Scheduler {
                 .collect(),
         };
 
-        let new_sandbox_id_str: Option<String> = match &patch.sandbox {
-            None => old_bindings.sandbox.clone(),
-            Some(SandboxRebind::Clear) => None,
-            Some(SandboxRebind::Inline { spec }) => Some(SandboxId::for_spec(spec).0),
+        let new_host_env_id_str: Option<String> = match &patch.host_env {
+            None => old_bindings.host_env.clone(),
+            Some(HostEnvRebind::Clear) => None,
+            Some(HostEnvRebind::Inline { binding }) => Some(
+                HostEnvId::for_provider_spec(&binding.provider, &binding.spec).0,
+            ),
         };
 
         // --- Phase 3: validate against pod allowlist ---
@@ -529,7 +537,7 @@ impl Scheduler {
 
         // --- Phase 4: figure out what actually changed ---
         let backend_changed = new_backend != old_bindings.backend;
-        let sandbox_changed = new_sandbox_id_str != old_bindings.sandbox;
+        let host_env_changed = new_host_env_id_str != old_bindings.host_env;
         let old_shared: HashSet<String> = old_bindings
             .mcp_hosts
             .iter()
@@ -558,22 +566,22 @@ impl Scheduler {
             self.emit_backend_updated(&new_id);
         }
 
-        if sandbox_changed {
+        if host_env_changed {
             // Release the old sandbox; tear it down if we were the last
             // user and the entry isn't pinned.
-            if let Some(old_id_str) = &old_bindings.sandbox {
-                let old_id = SandboxId(old_id_str.clone());
-                let remaining = self.resources.release_sandbox_user(&old_id, thread_id);
+            if let Some(old_id_str) = &old_bindings.host_env {
+                let old_id = HostEnvId(old_id_str.clone());
+                let remaining = self.resources.release_host_env_user(&old_id, thread_id);
                 let pinned = self
                     .resources
-                    .sandboxes
+                    .host_envs
                     .get(&old_id)
                     .map(|e| e.pinned)
                     .unwrap_or(false);
                 if remaining == 0 && !pinned {
-                    let handle = self.resources.take_sandbox_handle(&old_id);
-                    self.resources.mark_sandbox_torn_down(&old_id);
-                    self.emit_sandbox_updated(&old_id);
+                    let handle = self.resources.take_host_env_handle(&old_id);
+                    self.resources.mark_host_env_torn_down(&old_id);
+                    self.emit_host_env_updated(&old_id);
                     if let Some(mut h) = handle {
                         let tid = thread_id.to_string();
                         tokio::spawn(async move {
@@ -583,13 +591,17 @@ impl Scheduler {
                         });
                     }
                 } else {
-                    self.emit_sandbox_updated(&old_id);
+                    self.emit_host_env_updated(&old_id);
                 }
             }
-            // Pre-register the new sandbox (if any).
-            if let Some(SandboxRebind::Inline { spec }) = &patch.sandbox {
-                let new_id = self.resources.pre_register_sandbox(thread_id, spec.clone());
-                self.emit_sandbox_updated(&new_id);
+            // Pre-register the new host env (if any).
+            if let Some(HostEnvRebind::Inline { binding }) = &patch.host_env {
+                let new_id = self.resources.pre_register_host_env(
+                    thread_id,
+                    binding.provider.clone(),
+                    binding.spec.clone(),
+                );
+                self.emit_host_env_updated(&new_id);
             }
         }
 
@@ -607,7 +619,7 @@ impl Scheduler {
         }
 
         // --- Phase 6: sandbox change → reconnect primary MCP ---
-        if sandbox_changed {
+        if host_env_changed {
             let primary_id = McpHostId::primary_for_task(thread_id);
             self.resources.mark_mcp_torn_down(&primary_id);
             self.emit_mcp_host_updated(&primary_id);
@@ -627,12 +639,12 @@ impl Scheduler {
         }
         let new_bindings = ThreadBindings {
             backend: new_backend,
-            sandbox: new_sandbox_id_str,
+            host_env: new_host_env_id_str.clone(),
             mcp_hosts: new_mcp_hosts,
             tool_filter: old_bindings.tool_filter.clone(),
         };
 
-        let env_changed = sandbox_changed || mcp_hosts_changed;
+        let env_changed = host_env_changed || mcp_hosts_changed;
         let was_waiting = {
             let task = self.tasks.get_mut(thread_id).expect("checked in phase 1");
             task.bindings = new_bindings.clone();
@@ -693,27 +705,31 @@ impl Scheduler {
             self.pods.insert(pod.id.clone(), pod);
         }
         for task in state.threads {
-            // Re-pre-register the thread's sandbox so the registry knows
-            // its spec — the binding only carries the deterministic id, so
-            // we look up the matching spec by hashing each pod entry.
-            if let Some(sandbox_id_str) = task.bindings.sandbox.clone() {
-                let spec = self.pods.get(&task.pod_id).and_then(|p| {
-                    p.config.allow.sandbox.iter().find_map(|nss| {
-                        if SandboxId::for_spec(&nss.spec).0 == sandbox_id_str {
-                            Some(nss.spec.clone())
+            // Re-pre-register the thread's host env so the registry knows
+            // its (provider, spec) — the binding only carries the
+            // deterministic id, so we look up the matching entry by
+            // hashing each pod entry's (provider, spec) pair.
+            if let Some(host_env_id_str) = task.bindings.host_env.clone() {
+                let entry = self.pods.get(&task.pod_id).and_then(|p| {
+                    p.config.allow.host_env.iter().find_map(|nh| {
+                        if HostEnvId::for_provider_spec(&nh.provider, &nh.spec).0
+                            == host_env_id_str
+                        {
+                            Some((nh.provider.clone(), nh.spec.clone()))
                         } else {
                             None
                         }
                     })
                 });
-                match spec {
-                    Some(s) => {
-                        self.resources.pre_register_sandbox(&task.id, s);
+                match entry {
+                    Some((provider, spec)) => {
+                        self.resources
+                            .pre_register_host_env(&task.id, provider, spec);
                     }
                     None => warn!(
                         thread_id = %task.id,
-                        sandbox_id = %sandbox_id_str,
-                        "loaded thread's sandbox id has no matching spec in pod allow.sandbox; skipping pre-register",
+                        host_env_id = %host_env_id_str,
+                        "loaded thread's host env id has no matching entry in pod allow.host_env; skipping pre-register",
                     ),
                 }
             }
@@ -868,7 +884,7 @@ impl Scheduler {
                 } else {
                     self.mark_dirty(&thread_id);
                     self.router.dispatch_events(&thread_id, events);
-                    self.teardown_sandbox_if_terminal(&thread_id);
+                    self.teardown_host_env_if_terminal(&thread_id);
                     self.step_until_blocked(&thread_id, pending_io);
                 }
             }
@@ -927,7 +943,7 @@ impl Scheduler {
                             thread_id: thread_id.clone(),
                             state: ThreadStateLabel::Cancelled,
                         });
-                    self.teardown_sandbox_if_terminal(&thread_id);
+                    self.teardown_host_env_if_terminal(&thread_id);
                 }
             }
             ClientToServer::ArchiveThread { thread_id } => {
@@ -1012,6 +1028,16 @@ impl Scheduler {
                     ServerToClient::ResourceList {
                         correlation_id,
                         resources,
+                    },
+                );
+            }
+            ClientToServer::ListHostEnvProviders { correlation_id } => {
+                let providers = self.host_env_registry.snapshot();
+                self.router.send_to_client(
+                    conn_id,
+                    ServerToClient::HostEnvProvidersList {
+                        correlation_id,
+                        providers,
                     },
                 );
             }
@@ -1420,13 +1446,24 @@ impl Scheduler {
 
         let thread_id = new_task_id();
 
-        // Pre-register the sandbox so the registry holds the spec from
-        // creation onward — io_dispatch reads it back at McpConnect time.
-        // The deterministic SandboxId means a second thread with the same
-        // spec just adds itself as a user to the existing entry.
-        let sandbox_id = self
-            .resources
-            .pre_register_sandbox(&thread_id, resolved.sandbox_spec.clone());
+        // Pre-register the host env so the registry holds the
+        // (provider, spec) from creation onward — io_dispatch reads it
+        // back at McpConnect time. The deterministic HostEnvId means a
+        // second thread with the same (provider, spec) just adds itself
+        // as a user to the existing entry. `bare` provider entries are
+        // not pre-registered — the thread's `bindings.host_env` stays
+        // None and io_dispatch falls back to the default MCP URL.
+        let host_env_id = if resolved.host_env_provider == crate::sandbox::BARE_PROVIDER_NAME
+            && matches!(resolved.host_env_spec, HostEnvSpec::None)
+        {
+            None
+        } else {
+            Some(self.resources.pre_register_host_env(
+                &thread_id,
+                resolved.host_env_provider.clone(),
+                resolved.host_env_spec.clone(),
+            ))
+        };
         let primary_mcp_id = McpHostId::primary_for_task(&thread_id);
         let mut mcp_host_ids: Vec<String> = Vec::with_capacity(1 + resolved.shared_host_names.len());
         mcp_host_ids.push(primary_mcp_id.0.clone());
@@ -1435,7 +1472,7 @@ impl Scheduler {
         }
         let bindings = ThreadBindings {
             backend: resolved.backend_name.clone(),
-            sandbox: Some(sandbox_id.0.clone()),
+            host_env: host_env_id.as_ref().map(|id| id.0.clone()),
             mcp_hosts: mcp_host_ids,
             tool_filter: None,
         };
@@ -1450,13 +1487,15 @@ impl Scheduler {
 
         // Register this task as a user of its backend and of every shared
         // MCP host it references. The sandbox already counted us via
-        // `pre_register_sandbox`. The per-task primary MCP host gets a
+        // `pre_register_host_env`. The per-task primary MCP host gets a
         // Provisioning entry below — its session lands when the
         // provision_primary_mcp future completes.
         let backend_id = BackendId::for_name(&resolved.backend_name);
         self.resources.add_backend_user(&backend_id, &thread_id);
         self.emit_backend_updated(&backend_id);
-        self.emit_sandbox_updated(&sandbox_id);
+        if let Some(id) = host_env_id.as_ref() {
+            self.emit_host_env_updated(id);
+        }
         for name in &resolved.shared_host_names {
             let host_id = McpHostId::shared(name);
             self.resources.add_mcp_user(&host_id, &thread_id);
@@ -1584,7 +1623,7 @@ impl Scheduler {
         }
         self.mark_dirty(&thread_id);
         self.router.dispatch_events(&thread_id, events);
-        self.teardown_sandbox_if_terminal(&thread_id);
+        self.teardown_host_env_if_terminal(&thread_id);
     }
 
     /// Apply a resource-provisioning completion. Updates the registry
@@ -1602,27 +1641,27 @@ impl Scheduler {
         let primary_id = McpHostId::primary_for_task(&thread_id);
         match result {
             ProvisionResult::PrimaryMcpReady {
-                sandbox_id,
-                sandbox_handle,
+                host_env_id,
+                host_env_handle,
                 mcp_url,
                 mcp_session,
                 tools,
             } => {
-                // 1. Sandbox first — attach the handle (or recognize the
+                // 1. Host env first — attach the handle (or recognize the
                 //    dedup race and tear ours down).
-                if let Some(id) = sandbox_id.as_ref() {
-                    let outcome = self.resources.complete_sandbox_provisioning(
+                if let Some(id) = host_env_id.as_ref() {
+                    let outcome = self.resources.complete_host_env_provisioning(
                         id,
                         Some(mcp_url.clone()),
-                        sandbox_handle,
+                        host_env_handle,
                     );
                     match outcome {
-                        CompleteSandboxOutcome::Completed => {
-                            self.emit_sandbox_updated(id);
+                        CompleteHostEnvOutcome::Completed => {
+                            self.emit_host_env_updated(id);
                         }
-                        CompleteSandboxOutcome::AlreadyCompleted { unused_handle }
-                        | CompleteSandboxOutcome::NotPreRegistered { unused_handle } => {
-                            self.emit_sandbox_updated(id);
+                        CompleteHostEnvOutcome::AlreadyCompleted { unused_handle }
+                        | CompleteHostEnvOutcome::NotPreRegistered { unused_handle } => {
+                            self.emit_host_env_updated(id);
                             if let Some(mut h) = unused_handle {
                                 tokio::spawn(async move {
                                     if let Err(e) = h.teardown().await {
@@ -1655,7 +1694,7 @@ impl Scheduler {
                 //    Walk both ids — sandbox can have multiple waiters via
                 //    dedup; primary MCP only has its single owner thread.
                 let mut newly_ready: Vec<String> = Vec::new();
-                let resource_ids: Vec<String> = sandbox_id
+                let resource_ids: Vec<String> = host_env_id
                     .iter()
                     .map(|id| id.0.clone())
                     .chain(std::iter::once(primary_id.0.clone()))
@@ -1675,7 +1714,7 @@ impl Scheduler {
             ProvisionResult::PrimaryMcpFailed {
                 phase,
                 message,
-                sandbox_id,
+                host_env_id,
             } => {
                 warn!(%thread_id, phase = phase.as_str(), error = %message, "primary mcp provisioning failed");
                 // Mark registry entries Errored so future threads observe
@@ -1683,11 +1722,11 @@ impl Scheduler {
                 self.resources
                     .mark_mcp_errored(&primary_id, message.clone());
                 self.emit_mcp_host_updated(&primary_id);
-                if matches!(phase, ProvisionPhase::Sandbox)
-                    && let Some(sid) = sandbox_id.as_ref()
+                if matches!(phase, ProvisionPhase::HostEnv)
+                    && let Some(id) = host_env_id.as_ref()
                 {
-                    self.resources.mark_sandbox_errored(sid, message.clone());
-                    self.emit_sandbox_updated(sid);
+                    self.resources.mark_host_env_errored(id, message.clone());
+                    self.emit_host_env_updated(id);
                 }
                 // Fail the requesting thread.
                 if let Some(task) = self.tasks.get_mut(&thread_id) {
@@ -1698,7 +1737,7 @@ impl Scheduler {
                     });
                     self.mark_dirty(&thread_id);
                     self.router.dispatch_events(&thread_id, events);
-                    self.teardown_sandbox_if_terminal(&thread_id);
+                    self.teardown_host_env_if_terminal(&thread_id);
                 }
             }
         }
@@ -1760,10 +1799,10 @@ impl Scheduler {
         thread_id: &str,
         bindings: &whisper_agent_protocol::ThreadBindings,
     ) {
-        if let Some(sandbox) = &bindings.sandbox {
-            let sid = SandboxId(sandbox.clone());
-            let _ = self.resources.release_sandbox_user(&sid, thread_id);
-            self.emit_sandbox_updated(&sid);
+        if let Some(sandbox) = &bindings.host_env {
+            let sid = HostEnvId(sandbox.clone());
+            let _ = self.resources.release_host_env_user(&sid, thread_id);
+            self.emit_host_env_updated(&sid);
         }
         let backend_id = BackendId::for_name(&bindings.backend);
         self.resources.remove_backend_user(&backend_id, thread_id);
@@ -1788,16 +1827,16 @@ impl Scheduler {
             chrono::Duration::seconds(IDLE_RESOURCE_SECS),
             chrono::Duration::seconds(TERMINAL_RETENTION_SECS),
         );
-        if plan.torn_down_sandboxes.is_empty()
+        if plan.torn_down_host_envs.is_empty()
             && plan.torn_down_mcp_hosts.is_empty()
-            && plan.destroyed_sandboxes.is_empty()
+            && plan.destroyed_host_envs.is_empty()
             && plan.destroyed_mcp_hosts.is_empty()
         {
             return;
         }
-        for (id, handle) in plan.torn_down_sandboxes {
+        for (id, handle) in plan.torn_down_host_envs {
             info!(sandbox_id = %id.0, "GC: tearing down idle sandbox");
-            self.emit_sandbox_updated(&id);
+            self.emit_host_env_updated(&id);
             if let Some(mut h) = handle {
                 let id_str = id.0.clone();
                 tokio::spawn(async move {
@@ -1811,12 +1850,12 @@ impl Scheduler {
             info!(mcp_id = %id.0, "GC: tearing down idle MCP host");
             self.emit_mcp_host_updated(&id);
         }
-        for id in plan.destroyed_sandboxes {
+        for id in plan.destroyed_host_envs {
             info!(sandbox_id = %id.0, "GC: removing stale terminal sandbox entry");
             self.router
                 .broadcast_resource(ServerToClient::ResourceDestroyed {
                     id: id.0,
-                    kind: ResourceKind::Sandbox,
+                    kind: ResourceKind::HostEnv,
                 });
         }
         for id in plan.destroyed_mcp_hosts {
@@ -1829,7 +1868,7 @@ impl Scheduler {
         }
     }
 
-    fn teardown_sandbox_if_terminal(&mut self, thread_id: &str) {
+    fn teardown_host_env_if_terminal(&mut self, thread_id: &str) {
         // Completed is NOT terminal — the task can receive follow-up messages.
         // Only tear down on truly irreversible states.
         let is_terminal = self.tasks.get(thread_id).is_some_and(|t| {
@@ -1851,7 +1890,7 @@ impl Scheduler {
         self.resources.mark_mcp_torn_down(&primary_id);
         self.emit_mcp_host_updated(&primary_id);
 
-        // Phase 3d.i: the sandbox id lives on `task.bindings.sandbox` —
+        // Phase 3d.i: the sandbox id lives on `task.bindings.host_env` —
         // O(1) lookup instead of the prior linear scan. The sandbox is
         // shared across threads with matching specs; drop this thread from
         // the user set and only tear it down when the count hits zero and
@@ -1859,24 +1898,24 @@ impl Scheduler {
         let Some(sandbox_id) = self
             .tasks
             .get(thread_id)
-            .and_then(|t| t.bindings.sandbox.clone())
-            .map(SandboxId)
+            .and_then(|t| t.bindings.host_env.clone())
+            .map(HostEnvId)
         else {
             return;
         };
         let remaining = self
             .resources
-            .release_sandbox_user(&sandbox_id, thread_id);
+            .release_host_env_user(&sandbox_id, thread_id);
         let pinned = self
             .resources
-            .sandboxes
+            .host_envs
             .get(&sandbox_id)
             .map(|e| e.pinned)
             .unwrap_or(false);
         if remaining == 0 && !pinned {
-            let handle = self.resources.take_sandbox_handle(&sandbox_id);
-            self.resources.mark_sandbox_torn_down(&sandbox_id);
-            self.emit_sandbox_updated(&sandbox_id);
+            let handle = self.resources.take_host_env_handle(&sandbox_id);
+            self.resources.mark_host_env_torn_down(&sandbox_id);
+            self.emit_host_env_updated(&sandbox_id);
             if let Some(mut handle) = handle {
                 let tid = thread_id.to_string();
                 tokio::spawn(async move {
@@ -1888,7 +1927,7 @@ impl Scheduler {
         } else {
             // Sandbox lives on for the other threads using it; the user
             // list changed so subscribers want a refresh.
-            self.emit_sandbox_updated(&sandbox_id);
+            self.emit_host_env_updated(&sandbox_id);
         }
     }
 }
@@ -1954,14 +1993,15 @@ pub fn build_default_pod_config(
     pod_id: &str,
     config: &ThreadConfig,
     default_backend: &str,
-    sandbox_spec: SandboxSpec,
+    default_host_env_provider: &str,
+    default_host_env_spec: HostEnvSpec,
     backend_names: &[String],
     shared_host_names: &[String],
 ) -> whisper_agent_protocol::PodConfig {
     use whisper_agent_protocol::{
-        NamedSandboxSpec, PodAllow, PodConfig, PodLimits, ThreadDefaults,
+        NamedHostEnv, PodAllow, PodConfig, PodLimits, ThreadDefaults,
     };
-    let sandbox_name = "default".to_string();
+    let host_env_name = "default".to_string();
     let now = chrono::Utc::now().to_rfc3339();
     PodConfig {
         name: pod_id.to_string(),
@@ -1974,9 +2014,10 @@ pub fn build_default_pod_config(
         allow: PodAllow {
             backends: backend_names.to_vec(),
             mcp_hosts: shared_host_names.to_vec(),
-            sandbox: vec![NamedSandboxSpec {
-                name: sandbox_name.clone(),
-                spec: sandbox_spec,
+            host_env: vec![NamedHostEnv {
+                name: host_env_name.clone(),
+                provider: default_host_env_provider.to_string(),
+                spec: default_host_env_spec,
             }],
         },
         thread_defaults: ThreadDefaults {
@@ -1986,7 +2027,7 @@ pub fn build_default_pod_config(
             max_tokens: config.max_tokens,
             max_turns: config.max_turns,
             approval_policy: config.approval_policy,
-            sandbox: sandbox_name,
+            host_env: host_env_name,
             mcp_hosts: shared_host_names.to_vec(),
         },
         limits: PodLimits::default(),
@@ -2018,23 +2059,24 @@ fn apply_config_override(base: ThreadConfig, ov: Option<ThreadConfigOverride>) -
     }
 }
 
-/// Resolved binding-side choices for a fresh thread: the catalog names /
-/// resolved spec the scheduler needs to wire up the registry. Validated
-/// against the pod's `[allow]` cap before construction.
+/// Resolved binding-side choices for a fresh thread. Validated against
+/// the pod's `[allow]` cap before construction.
 struct ResolvedBindings {
     /// Backend catalog name. Empty string = "use server default".
     backend_name: String,
-    /// Resolved sandbox spec (used for `pre_register_sandbox`).
-    sandbox_spec: SandboxSpec,
+    /// Catalog name of the host-env provider to dispatch to. Always
+    /// populated — falls back to `bare` when the pod has no host envs
+    /// configured.
+    host_env_provider: String,
+    /// Resolved host-env spec (used for `pre_register_host_env`).
+    host_env_spec: HostEnvSpec,
     /// Catalog names of shared MCP hosts the thread is bound to.
     shared_host_names: Vec<String>,
 }
 
 /// Layer the request on top of pod `thread_defaults`, then verify each
-/// chosen value against the pod's `[allow]` table. The sandbox path
-/// validates an inline request spec by hashing it and comparing against
-/// each `[[allow.sandbox]]` entry's id — keeps the pod's "named sandbox"
-/// model intact even when the wire carries the spec inline.
+/// chosen value against the pod's `[allow]` table. Inline host-env
+/// requests carry both provider + spec, so no name lookup is needed.
 fn resolve_bindings_choice(
     pod: &Pod,
     request: Option<ThreadBindingsRequest>,
@@ -2053,27 +2095,28 @@ fn resolve_bindings_choice(
         ));
     }
 
-    let sandbox_spec = match request.sandbox {
-        // Inline-spec requests are accepted without validating the spec
-        // against `[[allow.sandbox]]`. The design defers this check until
-        // there's a pod-editing UI users can use to add their custom
-        // specs (saved Landlock presets, etc.); without that UI the
-        // strict check just blocks the existing webui flow with no
-        // workaround besides "fall back to the pod default".
-        Some(spec) => spec,
+    let (host_env_provider, host_env_spec) = match request.host_env {
+        // Inline (provider, spec) override — accepted as-is for the
+        // ad-hoc-bindings flow; the server-level catalog lookup at
+        // dispatch time will still error if the provider name is
+        // unknown.
+        Some(inline) => (inline.provider, inline.spec),
         None => {
-            if defaults.sandbox.is_empty() {
-                SandboxSpec::None
+            if defaults.host_env.is_empty() {
+                (
+                    crate::sandbox::BARE_PROVIDER_NAME.to_string(),
+                    HostEnvSpec::None,
+                )
             } else {
                 allow
-                    .sandbox
+                    .host_env
                     .iter()
-                    .find(|nss| nss.name == defaults.sandbox)
-                    .map(|nss| nss.spec.clone())
+                    .find(|nh| nh.name == defaults.host_env)
+                    .map(|nh| (nh.provider.clone(), nh.spec.clone()))
                     .ok_or_else(|| {
                         format!(
-                            "pod `{}` thread_defaults.sandbox = `{}` but no matching [[allow.sandbox]] entry",
-                            pod.id, defaults.sandbox,
+                            "pod `{}` thread_defaults.host_env = `{}` but no matching [[allow.host_env]] entry",
+                            pod.id, defaults.host_env,
                         )
                     })?
             }
@@ -2095,7 +2138,8 @@ fn resolve_bindings_choice(
 
     Ok(ResolvedBindings {
         backend_name,
-        sandbox_spec,
+        host_env_provider,
+        host_env_spec,
         shared_host_names,
     })
 }

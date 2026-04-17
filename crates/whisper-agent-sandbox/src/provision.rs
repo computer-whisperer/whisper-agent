@@ -1,6 +1,6 @@
 //! Sandbox provisioning backends.
 //!
-//! Each backend takes a [`SandboxSpec`] variant and produces a running MCP host
+//! Each backend takes a [`HostEnvSpec`] variant and produces a running MCP host
 //! process inside the appropriate isolation boundary.
 
 use std::sync::atomic::{AtomicU16, Ordering};
@@ -9,7 +9,7 @@ use std::time::Duration;
 use tokio::net::TcpStream;
 use tokio::process::{Child, Command};
 use tracing::info;
-use whisper_agent_protocol::sandbox::{AccessMode, NetworkPolicy, PathAccess, SandboxSpec};
+use whisper_agent_protocol::sandbox::{AccessMode, NetworkPolicy, PathAccess, HostEnvSpec};
 
 /// Port range for spawned MCP host instances. Each provision bumps the counter.
 static NEXT_PORT: AtomicU16 = AtomicU16::new(9820);
@@ -32,18 +32,18 @@ pub enum ProvisionError {
 }
 
 pub async fn provision(
-    spec: &SandboxSpec,
+    spec: &HostEnvSpec,
     mcp_host_bin: &str,
 ) -> Result<ProvisionedSession, ProvisionError> {
     match spec {
-        SandboxSpec::None => Err(ProvisionError::Unsupported(
-            "SandboxSpec::None should not reach the daemon".into(),
+        HostEnvSpec::None => Err(ProvisionError::Unsupported(
+            "HostEnvSpec::None should not reach the daemon".into(),
         )),
-        SandboxSpec::Landlock {
+        HostEnvSpec::Landlock {
             allowed_paths,
             network,
         } => provision_landlock(allowed_paths, network, mcp_host_bin).await,
-        SandboxSpec::Container { .. } => Err(ProvisionError::Unsupported(
+        HostEnvSpec::Container { .. } => Err(ProvisionError::Unsupported(
             "container provisioning not yet implemented".into(),
         )),
     }

@@ -22,8 +22,8 @@ use whisper_agent_protocol::sandbox::{
 };
 use whisper_agent_protocol::{
     ApprovalChoice, ApprovalPolicy, BackendSummary, ClientToServer, ContentBlock, Conversation,
-    Message, ModelSummary, NamedSandboxSpec, PodAllow, PodConfig, PodLimits, PodSummary,
-    ResourceSnapshot, ResourceStateLabel, Role, SandboxSpec, ServerToClient, ThreadBindingsRequest,
+    HostEnvProviderInfo, Message, ModelSummary, NamedHostEnv, PodAllow, PodConfig, PodLimits, PodSummary,
+    ResourceSnapshot, ResourceStateLabel, Role, HostEnvSpec, ServerToClient, ThreadBindingsRequest,
     ThreadConfigOverride, ThreadDefaults, ThreadStateLabel, ThreadSummary, ToolResultContent, Usage,
 };
 
@@ -42,7 +42,7 @@ struct LandlockPreset {
 }
 
 impl LandlockPreset {
-    fn to_spec(&self) -> SandboxSpec {
+    fn to_spec(&self) -> HostEnvSpec {
         let mut allowed_paths = vec![PathAccess {
             path: self.workspace.clone(),
             mode: AccessMode::ReadWrite,
@@ -53,7 +53,7 @@ impl LandlockPreset {
                 mode: AccessMode::ReadOnly,
             });
         }
-        SandboxSpec::Landlock {
+        HostEnvSpec::Landlock {
             allowed_paths,
             network: NetworkPolicy::Unrestricted,
         }
@@ -282,6 +282,11 @@ pub struct ChatApp {
     /// threads are in this pod" lives in `tasks`, not here.
     pods: HashMap<String, PodSummary>,
     pods_requested: bool,
+    /// Server's host-env-provider catalog (built-in `bare` plus any
+    /// configured entries). Populated lazily on first ListHostEnvProviders
+    /// round-trip; used by the pod editor's per-entry provider dropdown.
+    host_env_providers: Vec<HostEnvProviderInfo>,
+    host_env_providers_requested: bool,
     /// Set of pod ids the user has manually collapsed in the left panel.
     /// Default is "all expanded"; toggling a header inverts membership.
     /// Persisted only in memory — re-expands across reloads.
@@ -348,7 +353,7 @@ impl PresetModalState {
 /// structured tabs (Allow / Defaults / Limits) edit a working
 /// `PodConfig` directly, and a fourth (Raw TOML) is the escape hatch
 /// for paste-and-go or fields the structured form doesn't cover (e.g.
-/// every `[[allow.sandbox]]` body has its own dedicated sub-modal, but
+/// every `[[allow.host_env]]` body has its own dedicated sub-modal, but
 /// power users can still hand-edit them in raw text).
 ///
 /// Lifecycle: open then issue `GetPod`; on snapshot, populate `working`
@@ -383,7 +388,7 @@ struct PodEditorModalState {
     /// `Some` means a save is currently in flight (Save button reads
     /// "saving…" and is disabled).
     pending_correlation: Option<String>,
-    /// Sub-modal state for editing one `[[allow.sandbox]]` entry.
+    /// Sub-modal state for editing one `[[allow.host_env]]` entry.
     /// `Some` means the sub-modal is open and consuming input
     /// (the parent tabs render but are non-interactive while it's up).
     sandbox_entry_editor: Option<SandboxEntryEditorState>,
@@ -432,23 +437,23 @@ impl PodEditorModalState {
     }
 }
 
-/// Sub-modal for editing one `[[allow.sandbox]]` entry. Stays in front
+/// Sub-modal for editing one `[[allow.host_env]]` entry. Stays in front
 /// of the parent pod editor; the parent's tabs render but are
 /// non-interactive while this is open. Save writes the entry back to
-/// `working.allow.sandbox` at `index` (or appends when `index` is
+/// `working.allow.host_env` at `index` (or appends when `index` is
 /// `None`).
 struct SandboxEntryEditorState {
-    /// Position in `working.allow.sandbox`. `None` for "add new".
+    /// Position in `working.allow.host_env`. `None` for "add new".
     index: Option<usize>,
     /// Working copy of the entry — applied back to `working` on save.
-    entry: NamedSandboxSpec,
+    entry: NamedHostEnv,
     /// Local validation hint (empty name, etc.). Server-side checks
     /// land later via the parent modal's pod-level Save round-trip.
     error: Option<String>,
 }
 
 impl SandboxEntryEditorState {
-    fn new_for_index(index: usize, entry: NamedSandboxSpec) -> Self {
+    fn new_for_index(index: usize, entry: NamedHostEnv) -> Self {
         Self {
             index: Some(index),
             entry,
@@ -459,9 +464,10 @@ impl SandboxEntryEditorState {
     fn new_for_add() -> Self {
         Self {
             index: None,
-            entry: NamedSandboxSpec {
+            entry: NamedHostEnv {
                 name: String::new(),
-                spec: SandboxSpec::None,
+                provider: "bare".into(),
+                spec: HostEnvSpec::None,
             },
             error: None,
         }
@@ -533,6 +539,8 @@ impl ChatApp {
             resources_requested: false,
             pods: HashMap::new(),
             pods_requested: false,
+            host_env_providers: Vec::new(),
+            host_env_providers_requested: false,
             collapsed_pods: HashSet::new(),
             new_pod_modal: None,
             archive_armed_pod: None,
@@ -543,6 +551,18 @@ impl ChatApp {
             default_pod_template: None,
             left_mode: LeftPanelMode::default(),
         }
+    }
+
+    /// First non-built-in provider name from the catalog, used as a
+    /// best-guess fallback when a flow needs *some* provider (e.g. the
+    /// per-thread compose-form's preset picker, which doesn't model a
+    /// per-preset provider yet). Returns `None` when only `bare` is
+    /// configured.
+    fn first_non_bare_provider(&self) -> Option<String> {
+        self.host_env_providers
+            .iter()
+            .find(|p| !p.builtin)
+            .map(|p| p.name.clone())
     }
 
     fn next_correlation_id(&mut self) -> String {
@@ -632,6 +652,12 @@ impl ChatApp {
                         correlation_id: None,
                     });
                     self.pods_requested = true;
+                }
+                if !self.host_env_providers_requested {
+                    self.send(ClientToServer::ListHostEnvProviders {
+                        correlation_id: None,
+                    });
+                    self.host_env_providers_requested = true;
                 }
             }
             InboundEvent::ConnectionClosed { detail } => {
@@ -889,6 +915,9 @@ impl ChatApp {
             ServerToClient::ResourceDestroyed { id, .. } => {
                 self.resources.remove(&id);
             }
+            ServerToClient::HostEnvProvidersList { providers, .. } => {
+                self.host_env_providers = providers;
+            }
             ServerToClient::PodList {
                 pods,
                 default_pod_id,
@@ -1103,10 +1132,27 @@ impl ChatApp {
                         .map(|m| m.id.clone())
                 })
         });
-        let sandbox = match self.picker_sandbox {
+        // Map the per-compose host-env choice into the wire shape.
+        // `None` here means "inherit pod default"; `bare` always pairs
+        // with `HostEnvSpec::None`. The Landlock preset picker uses the
+        // first non-built-in provider from the catalog as its provider
+        // — there's no per-preset provider field today; once presets
+        // get one, this falls out.
+        let host_env: Option<whisper_agent_protocol::InlineHostEnv> = match self.picker_sandbox {
             SandboxChoice::ServerDefault => None,
-            SandboxChoice::None => Some(SandboxSpec::None),
-            SandboxChoice::Preset(idx) => self.presets.get(idx).map(|p| p.to_spec()),
+            SandboxChoice::None => Some(whisper_agent_protocol::InlineHostEnv {
+                provider: "bare".into(),
+                spec: HostEnvSpec::None,
+            }),
+            SandboxChoice::Preset(idx) => {
+                self.presets.get(idx).and_then(|p| {
+                    let provider = self.first_non_bare_provider()?;
+                    Some(whisper_agent_protocol::InlineHostEnv {
+                        provider,
+                        spec: p.to_spec(),
+                    })
+                })
+            }
         };
         let config_override = if model.is_some() {
             Some(ThreadConfigOverride {
@@ -1116,10 +1162,10 @@ impl ChatApp {
         } else {
             None
         };
-        let bindings_request = if backend.is_some() || sandbox.is_some() {
+        let bindings_request = if backend.is_some() || host_env.is_some() {
             Some(ThreadBindingsRequest {
                 backend,
-                sandbox,
+                host_env,
                 mcp_hosts: None,
             })
         } else {
@@ -2119,15 +2165,25 @@ impl ChatApp {
             let mut sub_open = true;
             let mut sub_save = false;
             let mut sub_cancel = false;
-            render_sandbox_entry_modal(ctx, &mut sub, &mut sub_open, &mut sub_save, &mut sub_cancel);
+            render_sandbox_entry_modal(
+                ctx,
+                &mut sub,
+                &mut sub_open,
+                &mut sub_save,
+                &mut sub_cancel,
+                &self.host_env_providers,
+            );
             if sub_save {
                 if sub.entry.name.trim().is_empty() {
                     sub.error = Some("name is required".into());
                     modal.sandbox_entry_editor = Some(sub);
+                } else if sub.entry.provider.trim().is_empty() {
+                    sub.error = Some("provider is required".into());
+                    modal.sandbox_entry_editor = Some(sub);
                 } else if let Some(working) = modal.working.as_mut() {
                     let name = sub.entry.name.trim().to_string();
-                    // Reject duplicate names within the same allow.sandbox table.
-                    let dup = working.allow.sandbox.iter().enumerate().any(|(i, e)| {
+                    // Reject duplicate names within the same allow.host_env table.
+                    let dup = working.allow.host_env.iter().enumerate().any(|(i, e)| {
                         e.name == name && Some(i) != sub.index
                     });
                     if dup {
@@ -2136,10 +2192,10 @@ impl ChatApp {
                     } else {
                         sub.entry.name = name;
                         match sub.index {
-                            Some(i) if i < working.allow.sandbox.len() => {
-                                working.allow.sandbox[i] = sub.entry;
+                            Some(i) if i < working.allow.host_env.len() => {
+                                working.allow.host_env[i] = sub.entry;
                             }
-                            _ => working.allow.sandbox.push(sub.entry),
+                            _ => working.allow.host_env.push(sub.entry),
                         }
                         modal.raw_dirty = false;
                     }
@@ -2152,14 +2208,14 @@ impl ChatApp {
         }
         if let Some(idx) = sandbox_entry_delete
             && let Some(working) = modal.working.as_mut()
-            && idx < working.allow.sandbox.len()
+            && idx < working.allow.host_env.len()
         {
-            // Best-effort: also clear thread_defaults.sandbox if it
+            // Best-effort: also clear thread_defaults.host_env if it
             // pointed at the deleted entry, so the form doesn't carry
             // a now-dangling reference into the server's validator.
-            let removed = working.allow.sandbox.remove(idx);
-            if working.thread_defaults.sandbox == removed.name {
-                working.thread_defaults.sandbox = String::new();
+            let removed = working.allow.host_env.remove(idx);
+            if working.thread_defaults.host_env == removed.name {
+                working.thread_defaults.host_env = String::new();
             }
         }
         if let Some(sub) = sandbox_entry_open {
@@ -2275,7 +2331,7 @@ impl ChatApp {
             allow: PodAllow {
                 backends: backend_names,
                 mcp_hosts: Vec::new(),
-                sandbox: Vec::<NamedSandboxSpec>::new(),
+                host_env: Vec::<NamedHostEnv>::new(),
             },
             thread_defaults: ThreadDefaults {
                 backend: default_backend,
@@ -2284,7 +2340,7 @@ impl ChatApp {
                 max_tokens: 16384,
                 max_turns: 30,
                 approval_policy: ApprovalPolicy::AutoApproveAll,
-                sandbox: String::new(),
+                host_env: String::new(),
                 mcp_hosts: Vec::new(),
             },
             limits: PodLimits::default(),
@@ -2301,7 +2357,7 @@ fn render_resource_list(ui: &mut egui::Ui, resources: &HashMap<String, ResourceS
     let mut backends: Vec<&ResourceSnapshot> = Vec::new();
     for r in resources.values() {
         match r {
-            ResourceSnapshot::Sandbox { .. } => sandboxes.push(r),
+            ResourceSnapshot::HostEnv { .. } => sandboxes.push(r),
             ResourceSnapshot::McpHost { .. } => mcp_hosts.push(r),
             ResourceSnapshot::Backend { .. } => backends.push(r),
         }
@@ -2358,7 +2414,7 @@ fn render_resource_list(ui: &mut egui::Ui, resources: &HashMap<String, ResourceS
 
 fn render_resource_row(ui: &mut egui::Ui, resource: &ResourceSnapshot) {
     let (label, sub, state, users) = match resource {
-        ResourceSnapshot::Sandbox {
+        ResourceSnapshot::HostEnv {
             id,
             spec,
             state,
@@ -2416,11 +2472,11 @@ fn render_resource_row(ui: &mut egui::Ui, resource: &ResourceSnapshot) {
     ui.add_space(4.0);
 }
 
-fn spec_label(spec: &SandboxSpec) -> String {
+fn spec_label(spec: &HostEnvSpec) -> String {
     match spec {
-        SandboxSpec::None => "no isolation".into(),
-        SandboxSpec::Container { image, .. } => format!("container: {image}"),
-        SandboxSpec::Landlock { allowed_paths, .. } => {
+        HostEnvSpec::None => "no isolation".into(),
+        HostEnvSpec::Container { image, .. } => format!("container: {image}"),
+        HostEnvSpec::Landlock { allowed_paths, .. } => {
             format!("landlock · {} paths", allowed_paths.len())
         }
     }
@@ -2804,32 +2860,37 @@ fn render_pod_editor_allow_tab(
     }
 
     ui.add_space(10.0);
-    section_heading(ui, "Sandbox specs");
+    section_heading(ui, "Host environments");
     hint(
         ui,
-        "Each entry here is a named sandbox preset threads in this pod can bind to. \
-         `thread_defaults.sandbox` must reference one of these by name (or be empty).",
+        "Each entry is a named (provider, spec) pair threads in this pod can bind \
+         to. `thread_defaults.host_env` must reference one of these by name (or be \
+         empty for bare-metal). The `bare` provider is built-in and pairs with \
+         `none` specs; everything else dispatches to a configured \
+         `[[host_env_providers]]` daemon.",
     );
-    if working.allow.sandbox.is_empty() {
+    if working.allow.host_env.is_empty() {
         ui.label(
-            RichText::new("(no sandbox presets — threads will run bare-metal)")
+            RichText::new("(no host envs — threads will run bare-metal)")
                 .italics()
                 .color(Color32::from_gray(160)),
         );
     } else {
-        Grid::new("pod_editor_sandboxes")
-            .num_columns(4)
+        Grid::new("pod_editor_host_envs")
+            .num_columns(5)
             .spacing([12.0, 4.0])
             .min_col_width(100.0)
             .striped(true)
             .show(ui, |ui| {
                 ui.label(RichText::new("name").strong());
+                ui.label(RichText::new("provider").strong());
                 ui.label(RichText::new("type").strong());
                 ui.label(RichText::new("summary").strong());
                 ui.label("");
                 ui.end_row();
-                for (i, entry) in working.allow.sandbox.iter().enumerate() {
+                for (i, entry) in working.allow.host_env.iter().enumerate() {
                     ui.label(&entry.name);
+                    ui.label(&entry.provider);
                     ui.label(spec_type_label(&entry.spec));
                     ui.label(
                         RichText::new(spec_label(&entry.spec))
@@ -2852,7 +2913,7 @@ fn render_pod_editor_allow_tab(
             });
     }
     ui.add_space(4.0);
-    if ui.button("+ Add sandbox").clicked() {
+    if ui.button("+ Add host env").clicked() {
         *sandbox_open = Some(SandboxEntryEditorState::new_for_add());
     }
     ui.add_space(8.0);
@@ -2989,27 +3050,27 @@ fn render_pod_editor_defaults_tab(
             ui.end_row();
 
             ui.label("sandbox");
-            let sb_in_allow = working.thread_defaults.sandbox.is_empty()
+            let sb_in_allow = working.thread_defaults.host_env.is_empty()
                 || working
                     .allow
-                    .sandbox
+                    .host_env
                     .iter()
-                    .any(|s| s.name == working.thread_defaults.sandbox);
+                    .any(|s| s.name == working.thread_defaults.host_env);
             ComboBox::from_id_salt("pod_editor_defaults_sandbox")
-                .selected_text(if working.thread_defaults.sandbox.is_empty() {
+                .selected_text(if working.thread_defaults.host_env.is_empty() {
                     "(none — bare-metal)".to_string()
                 } else {
-                    working.thread_defaults.sandbox.clone()
+                    working.thread_defaults.host_env.clone()
                 })
                 .show_ui(ui, |ui| {
                     ui.selectable_value(
-                        &mut working.thread_defaults.sandbox,
+                        &mut working.thread_defaults.host_env,
                         String::new(),
                         "(none — bare-metal)",
                     );
-                    for entry in &working.allow.sandbox {
+                    for entry in &working.allow.host_env {
                         ui.selectable_value(
-                            &mut working.thread_defaults.sandbox,
+                            &mut working.thread_defaults.host_env,
                             entry.name.clone(),
                             &entry.name,
                         );
@@ -3020,8 +3081,8 @@ fn render_pod_editor_defaults_tab(
                 ui.label("");
                 ui.label(
                     RichText::new(format!(
-                        "`{}` is not in allow.sandbox — server will reject on save",
-                        working.thread_defaults.sandbox
+                        "`{}` is not in allow.host_env — server will reject on save",
+                        working.thread_defaults.host_env
                     ))
                     .small()
                     .color(Color32::from_rgb(220, 90, 90)),
@@ -3111,10 +3172,11 @@ fn render_sandbox_entry_modal(
     open: &mut bool,
     save: &mut bool,
     cancel: &mut bool,
+    providers: &[HostEnvProviderInfo],
 ) {
     let title = match sub.index {
-        Some(_) => "Edit sandbox spec".to_string(),
-        None => "Add sandbox spec".to_string(),
+        Some(_) => "Edit host env".to_string(),
+        None => "Add host env".to_string(),
     };
     let screen = ctx.content_rect();
     let max_h = (screen.height() - 80.0).max(280.0);
@@ -3163,6 +3225,29 @@ fn render_sandbox_entry_modal(
                                         .desired_width(f32::INFINITY),
                                 );
                                 ui.end_row();
+
+                                ui.label("provider");
+                                ComboBox::from_id_salt("sandbox_entry_provider")
+                                    .selected_text(if sub.entry.provider.is_empty() {
+                                        "(pick one)".into()
+                                    } else {
+                                        sub.entry.provider.clone()
+                                    })
+                                    .show_ui(ui, |ui| {
+                                        for p in providers {
+                                            let label = if p.builtin {
+                                                format!("{} (built-in)", p.name)
+                                            } else {
+                                                p.name.clone()
+                                            };
+                                            ui.selectable_value(
+                                                &mut sub.entry.provider,
+                                                p.name.clone(),
+                                                label,
+                                            );
+                                        }
+                                    });
+                                ui.end_row();
                                 ui.label("type");
                                 let current = spec_type_label(&sub.entry.spec);
                                 ComboBox::from_id_salt("sandbox_entry_type")
@@ -3170,42 +3255,42 @@ fn render_sandbox_entry_modal(
                                     .show_ui(ui, |ui| {
                                         if ui
                                             .selectable_label(
-                                                matches!(sub.entry.spec, SandboxSpec::None),
+                                                matches!(sub.entry.spec, HostEnvSpec::None),
                                                 "none (bare-metal)",
                                             )
                                             .clicked()
-                                            && !matches!(sub.entry.spec, SandboxSpec::None)
+                                            && !matches!(sub.entry.spec, HostEnvSpec::None)
                                         {
-                                            sub.entry.spec = SandboxSpec::None;
+                                            sub.entry.spec = HostEnvSpec::None;
                                         }
                                         if ui
                                             .selectable_label(
-                                                matches!(sub.entry.spec, SandboxSpec::Landlock { .. }),
+                                                matches!(sub.entry.spec, HostEnvSpec::Landlock { .. }),
                                                 "landlock",
                                             )
                                             .clicked()
                                             && !matches!(
                                                 sub.entry.spec,
-                                                SandboxSpec::Landlock { .. }
+                                                HostEnvSpec::Landlock { .. }
                                             )
                                         {
-                                            sub.entry.spec = SandboxSpec::Landlock {
+                                            sub.entry.spec = HostEnvSpec::Landlock {
                                                 allowed_paths: Vec::new(),
                                                 network: NetworkPolicy::default(),
                                             };
                                         }
                                         if ui
                                             .selectable_label(
-                                                matches!(sub.entry.spec, SandboxSpec::Container { .. }),
+                                                matches!(sub.entry.spec, HostEnvSpec::Container { .. }),
                                                 "container",
                                             )
                                             .clicked()
                                             && !matches!(
                                                 sub.entry.spec,
-                                                SandboxSpec::Container { .. }
+                                                HostEnvSpec::Container { .. }
                                             )
                                         {
-                                            sub.entry.spec = SandboxSpec::Container {
+                                            sub.entry.spec = HostEnvSpec::Container {
                                                 image: String::new(),
                                                 mounts: Vec::new(),
                                                 network: NetworkPolicy::default(),
@@ -3220,7 +3305,7 @@ fn render_sandbox_entry_modal(
                         ui.separator();
                         ui.add_space(8.0);
                         match &mut sub.entry.spec {
-                            SandboxSpec::None => {
+                            HostEnvSpec::None => {
                                 ui.label(
                                     RichText::new(
                                         "Bare-metal — tools execute on the host with no \
@@ -3230,13 +3315,13 @@ fn render_sandbox_entry_modal(
                                     .color(Color32::from_gray(160)),
                                 );
                             }
-                            SandboxSpec::Landlock {
+                            HostEnvSpec::Landlock {
                                 allowed_paths,
                                 network,
                             } => {
                                 render_landlock_body(ui, allowed_paths, network);
                             }
-                            SandboxSpec::Container {
+                            HostEnvSpec::Container {
                                 image,
                                 mounts,
                                 network,
@@ -3591,10 +3676,10 @@ fn approval_policy_label(p: ApprovalPolicy) -> &'static str {
     }
 }
 
-fn spec_type_label(spec: &SandboxSpec) -> &'static str {
+fn spec_type_label(spec: &HostEnvSpec) -> &'static str {
     match spec {
-        SandboxSpec::None => "none",
-        SandboxSpec::Landlock { .. } => "landlock",
-        SandboxSpec::Container { .. } => "container",
+        HostEnvSpec::None => "none",
+        HostEnvSpec::Landlock { .. } => "landlock",
+        HostEnvSpec::Container { .. } => "container",
     }
 }

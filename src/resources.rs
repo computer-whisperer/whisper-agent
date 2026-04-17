@@ -17,13 +17,13 @@ use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use whisper_agent_protocol::{ResourceSnapshot, ResourceStateLabel, SandboxSpec};
+use whisper_agent_protocol::{ResourceSnapshot, ResourceStateLabel, HostEnvSpec};
 
 use crate::mcp::{McpSession, ToolAnnotations, ToolDescriptor};
-use crate::sandbox::SandboxHandle;
+use crate::sandbox::HostEnvHandle;
 
 #[derive(Serialize, Deserialize, Debug, Clone, Hash, PartialEq, Eq, PartialOrd, Ord)]
-pub struct SandboxId(pub String);
+pub struct HostEnvId(pub String);
 
 #[derive(Serialize, Deserialize, Debug, Clone, Hash, PartialEq, Eq, PartialOrd, Ord)]
 pub struct McpHostId(pub String);
@@ -31,23 +31,26 @@ pub struct McpHostId(pub String);
 #[derive(Serialize, Deserialize, Debug, Clone, Hash, PartialEq, Eq, PartialOrd, Ord)]
 pub struct BackendId(pub String);
 
-impl SandboxId {
-    /// Derive a stable id from the sandbox spec. Identical specs hash to
-    /// identical ids — this is how Phase 3b's dedup works: when a second
-    /// thread requests a sandbox whose spec matches an existing entry,
-    /// `pre_register_sandbox` finds the entry by id and adds the thread as
-    /// a user instead of inserting a duplicate.
+impl HostEnvId {
+    /// Derive a stable id from the (provider, spec) pair. Identical
+    /// pairs hash to identical ids — this is how dedup works: when a
+    /// second thread requests a host env with matching provider+spec,
+    /// `pre_register_host_env` finds the existing entry by id and
+    /// adds the thread as a user instead of inserting a duplicate.
+    /// Two different providers handling identical-shaped specs get
+    /// distinct ids (they're independently provisioned).
     ///
-    /// Hash is `DefaultHasher` over the spec's JSON serialization. Not
+    /// Hash is `DefaultHasher` over (provider, spec_json). Not
     /// cryptographic; collision risk on a few-hundred-pod scale is
     /// negligible. The 16-hex-char width keeps ids readable in logs.
-    pub fn for_spec(spec: &SandboxSpec) -> Self {
+    pub fn for_provider_spec(provider: &str, spec: &HostEnvSpec) -> Self {
         use std::collections::hash_map::DefaultHasher;
         use std::hash::{Hash, Hasher};
         let json = serde_json::to_string(spec).unwrap_or_default();
         let mut hasher = DefaultHasher::new();
+        provider.hash(&mut hasher);
         json.hash(&mut hasher);
-        Self(format!("sb-{:016x}", hasher.finish()))
+        Self(format!("he-{:016x}", hasher.finish()))
     }
 }
 
@@ -98,63 +101,63 @@ impl ResourceState {
     }
 }
 
-pub struct SandboxEntry {
-    pub id: SandboxId,
-    pub spec: SandboxSpec,
+pub struct HostEnvEntry {
+    pub id: HostEnvId,
+    /// Catalog name of the provider that provisioned this entry.
+    pub provider: String,
+    pub spec: HostEnvSpec,
     pub state: ResourceState,
-    /// Set of task_ids (later: ThreadIds) currently using this sandbox.
+    /// Set of thread_ids currently using this host env.
     pub users: BTreeSet<String>,
     pub pinned: bool,
     pub created_at: DateTime<Utc>,
     pub last_used: DateTime<Utc>,
-    /// The provisioned sandbox itself. Owned by the registry (Phase 3a).
-    /// Taken out of the entry by `take_sandbox_handle` at teardown so the
-    /// scheduler can spawn the async teardown future without holding a
-    /// borrow. Cleared on `mark_sandbox_torn_down` when the handle has
-    /// already been retrieved.
-    pub handle: Option<Box<dyn SandboxHandle>>,
-    /// The MCP URL the sandbox advertises (or the fallback used to connect
-    /// to it when the sandbox doesn't run its own MCP). Cached on the
-    /// entry so dedup hits don't have to consult the live handle — and so
-    /// the URL stays correct even after the handle is taken for teardown.
+    /// The provisioned env's handle. Owned by the registry; taken out
+    /// at teardown via `take_host_env_handle` so the scheduler can run
+    /// the async teardown without holding a borrow.
+    pub handle: Option<Box<dyn HostEnvHandle>>,
+    /// The MCP URL the env advertises. Cached so dedup hits don't have
+    /// to consult the live handle, and so the URL stays correct even
+    /// after the handle has been taken for teardown.
     pub mcp_url: Option<String>,
 }
 
-impl std::fmt::Debug for SandboxEntry {
+impl std::fmt::Debug for HostEnvEntry {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("SandboxEntry")
+        f.debug_struct("HostEnvEntry")
             .field("id", &self.id)
+            .field("provider", &self.provider)
             .field("spec", &self.spec)
             .field("state", &self.state)
             .field("users", &self.users)
             .field("pinned", &self.pinned)
             .field("created_at", &self.created_at)
             .field("last_used", &self.last_used)
-            .field("handle", &self.handle.as_ref().map(|_| "<sandbox>"))
+            .field("handle", &self.handle.as_ref().map(|_| "<host_env>"))
             .field("mcp_url", &self.mcp_url)
             .finish()
     }
 }
 
-/// Outcome of `ResourceRegistry::complete_sandbox_provisioning`. Distinguishes
+/// Outcome of `ResourceRegistry::complete_host_env_provisioning`. Distinguishes
 /// the happy path (entry was waiting for us to fill in the handle) from the
 /// dedup race (someone else already completed it) so the caller knows
 /// whether to spawn teardown of the now-redundant handle it provisioned.
-pub enum CompleteSandboxOutcome {
+pub enum CompleteHostEnvOutcome {
     /// We attached the handle to a pre-registered (Provisioning) entry and
     /// transitioned it to Ready. Registry owns the handle.
     Completed,
     /// Entry was already Ready when we arrived — handle is unused, caller
     /// should tear it down. Happens when two concurrent `mcp_connect`
-    /// futures provision against the same SandboxId before either finishes.
+    /// futures provision against the same HostEnvId before either finishes.
     AlreadyCompleted {
-        unused_handle: Option<Box<dyn SandboxHandle>>,
+        unused_handle: Option<Box<dyn HostEnvHandle>>,
     },
-    /// Entry didn't exist at all — `pre_register_sandbox` wasn't called for
+    /// Entry didn't exist at all — `pre_register_host_env` wasn't called for
     /// this id. Treated as a programmer error by callers; the unused handle
     /// is returned so it can be torn down rather than leaked.
     NotPreRegistered {
-        unused_handle: Option<Box<dyn SandboxHandle>>,
+        unused_handle: Option<Box<dyn HostEnvHandle>>,
     },
 }
 
@@ -213,15 +216,16 @@ pub struct BackendEntry {
 /// phases when policy logic actually has work to do.
 #[derive(Default, Debug)]
 pub struct ResourceRegistry {
-    pub sandboxes: HashMap<SandboxId, SandboxEntry>,
+    pub host_envs: HashMap<HostEnvId, HostEnvEntry>,
     pub mcp_hosts: HashMap<McpHostId, McpHostEntry>,
     pub backends: HashMap<BackendId, BackendEntry>,
 }
 
-impl SandboxEntry {
+impl HostEnvEntry {
     pub fn to_snapshot(&self) -> ResourceSnapshot {
-        ResourceSnapshot::Sandbox {
+        ResourceSnapshot::HostEnv {
             id: self.id.0.clone(),
+            provider: self.provider.clone(),
             spec: self.spec.clone(),
             state: self.state.label(),
             users: self.users.iter().cloned().collect(),
@@ -274,11 +278,11 @@ impl ResourceRegistry {
     /// then mcp hosts, then backends — stable and human-readable.
     pub fn snapshot_all(&self) -> Vec<ResourceSnapshot> {
         let mut out: Vec<ResourceSnapshot> = Vec::with_capacity(
-            self.sandboxes.len() + self.mcp_hosts.len() + self.backends.len(),
+            self.host_envs.len() + self.mcp_hosts.len() + self.backends.len(),
         );
-        let mut sandboxes: Vec<&SandboxEntry> = self.sandboxes.values().collect();
+        let mut sandboxes: Vec<&HostEnvEntry> = self.host_envs.values().collect();
         sandboxes.sort_by(|a, b| a.id.cmp(&b.id));
-        out.extend(sandboxes.into_iter().map(SandboxEntry::to_snapshot));
+        out.extend(sandboxes.into_iter().map(HostEnvEntry::to_snapshot));
         let mut mcps: Vec<&McpHostEntry> = self.mcp_hosts.values().collect();
         mcps.sort_by(|a, b| a.id.cmp(&b.id));
         out.extend(mcps.into_iter().map(McpHostEntry::to_snapshot));
@@ -288,8 +292,8 @@ impl ResourceRegistry {
         out
     }
 
-    pub fn snapshot_sandbox(&self, id: &SandboxId) -> Option<ResourceSnapshot> {
-        self.sandboxes.get(id).map(SandboxEntry::to_snapshot)
+    pub fn snapshot_host_env(&self, id: &HostEnvId) -> Option<ResourceSnapshot> {
+        self.host_envs.get(id).map(HostEnvEntry::to_snapshot)
     }
     pub fn snapshot_mcp_host(&self, id: &McpHostId) -> Option<ResourceSnapshot> {
         self.mcp_hosts.get(id).map(McpHostEntry::to_snapshot)
@@ -445,8 +449,8 @@ impl ResourceRegistry {
     }
 
     /// Mark a sandbox as Errored.
-    pub fn mark_sandbox_errored(&mut self, id: &SandboxId, message: String) {
-        if let Some(entry) = self.sandboxes.get_mut(id) {
+    pub fn mark_host_env_errored(&mut self, id: &HostEnvId, message: String) {
+        if let Some(entry) = self.host_envs.get_mut(id) {
             entry.state = ResourceState::Errored { message };
             entry.last_used = Utc::now();
         }
@@ -454,29 +458,35 @@ impl ResourceRegistry {
 
     /// Eagerly register a sandbox spec at thread-creation time, before any
     /// provisioning future runs. Returns the deterministic
-    /// `SandboxId::for_spec(spec)`; idempotent on the id (calling twice for
+    /// `HostEnvId::for_provider_spec(provider, spec)`; idempotent on the id (calling twice for
     /// the same spec just adds the user). Inserted entries land in
     /// `Provisioning` so the dispatcher can later either complete them
-    /// (via [`Self::complete_sandbox_provisioning`]) or, if they're already
+    /// (via [`Self::complete_host_env_provisioning`]) or, if they're already
     /// Ready from a previous thread's completion, skip the provision call
     /// entirely.
     ///
     /// The `op_id` field on `Provisioning` is set to 0 — there's no in-flight
     /// future yet at pre-register time. Phase 3d.ii's resolver promotes
     /// this to a real op id when it dispatches the provision.
-    pub fn pre_register_sandbox(&mut self, thread_id: &str, spec: SandboxSpec) -> SandboxId {
-        let id = SandboxId::for_spec(&spec);
+    pub fn pre_register_host_env(
+        &mut self,
+        thread_id: &str,
+        provider: String,
+        spec: HostEnvSpec,
+    ) -> HostEnvId {
+        let id = HostEnvId::for_provider_spec(&provider, &spec);
         let now = Utc::now();
-        match self.sandboxes.get_mut(&id) {
+        match self.host_envs.get_mut(&id) {
             Some(entry) => {
                 entry.users.insert(thread_id.to_string());
                 entry.last_used = now;
             }
             None => {
-                self.sandboxes.insert(
+                self.host_envs.insert(
                     id.clone(),
-                    SandboxEntry {
+                    HostEnvEntry {
                         id: id.clone(),
+                        provider,
                         spec,
                         state: ResourceState::Provisioning { op_id: 0 },
                         users: BTreeSet::from([thread_id.to_string()]),
@@ -496,24 +506,24 @@ impl ResourceRegistry {
     /// attaching the handle and url and transitioning to Ready. Returns an
     /// outcome that tells the caller whether the handle landed on the entry
     /// (happy path) or was redundant (dedup race / already torn down).
-    pub fn complete_sandbox_provisioning(
+    pub fn complete_host_env_provisioning(
         &mut self,
-        id: &SandboxId,
+        id: &HostEnvId,
         mcp_url: Option<String>,
-        handle: Option<Box<dyn SandboxHandle>>,
-    ) -> CompleteSandboxOutcome {
-        let Some(entry) = self.sandboxes.get_mut(id) else {
-            return CompleteSandboxOutcome::NotPreRegistered {
+        handle: Option<Box<dyn HostEnvHandle>>,
+    ) -> CompleteHostEnvOutcome {
+        let Some(entry) = self.host_envs.get_mut(id) else {
+            return CompleteHostEnvOutcome::NotPreRegistered {
                 unused_handle: handle,
             };
         };
         // Ready entries are already completed — even if their handle is
-        // None (e.g. SandboxSpec::None never produces one), a second
+        // None (e.g. HostEnvSpec::None never produces one), a second
         // completion would either replace a live handle (leaking the old
         // one) or no-op pointlessly. Bounce the caller's handle back so it
         // gets torn down rather than leaked.
         if entry.state.is_ready() {
-            return CompleteSandboxOutcome::AlreadyCompleted {
+            return CompleteHostEnvOutcome::AlreadyCompleted {
                 unused_handle: handle,
             };
         }
@@ -521,14 +531,14 @@ impl ResourceRegistry {
         entry.handle = handle;
         entry.mcp_url = mcp_url;
         entry.last_used = Utc::now();
-        CompleteSandboxOutcome::Completed
+        CompleteHostEnvOutcome::Completed
     }
 
     /// Drop `thread_id` from the sandbox's user set and return the new
     /// user count. Caller decides whether to tear down (count == 0 and
     /// not pinned).
-    pub fn release_sandbox_user(&mut self, id: &SandboxId, thread_id: &str) -> usize {
-        let Some(entry) = self.sandboxes.get_mut(id) else {
+    pub fn release_host_env_user(&mut self, id: &HostEnvId, thread_id: &str) -> usize {
+        let Some(entry) = self.host_envs.get_mut(id) else {
             return 0;
         };
         entry.users.remove(thread_id);
@@ -539,10 +549,10 @@ impl ResourceRegistry {
     /// Pull the sandbox handle out of the registry so the caller can spawn
     /// an async teardown without holding a borrow on the registry. The
     /// entry remains in the map (with `handle: None`) so inspectors can
-    /// still see "this sandbox existed" — `mark_sandbox_torn_down` is the
+    /// still see "this sandbox existed" — `mark_host_env_torn_down` is the
     /// follow-up call that flips its state.
-    pub fn take_sandbox_handle(&mut self, id: &SandboxId) -> Option<Box<dyn SandboxHandle>> {
-        self.sandboxes
+    pub fn take_host_env_handle(&mut self, id: &HostEnvId) -> Option<Box<dyn HostEnvHandle>> {
+        self.host_envs
             .get_mut(id)
             .and_then(|entry| entry.handle.take())
     }
@@ -575,15 +585,15 @@ impl ResourceRegistry {
         }
     }
 
-    pub fn add_sandbox_user(&mut self, id: &SandboxId, user: &str) {
-        if let Some(entry) = self.sandboxes.get_mut(id) {
+    pub fn add_host_env_user(&mut self, id: &HostEnvId, user: &str) {
+        if let Some(entry) = self.host_envs.get_mut(id) {
             entry.users.insert(user.to_string());
             entry.last_used = Utc::now();
         }
     }
 
-    pub fn remove_sandbox_user(&mut self, id: &SandboxId, user: &str) {
-        if let Some(entry) = self.sandboxes.get_mut(id) {
+    pub fn remove_host_env_user(&mut self, id: &HostEnvId, user: &str) {
+        if let Some(entry) = self.host_envs.get_mut(id) {
             entry.users.remove(user);
         }
     }
@@ -604,8 +614,8 @@ impl ResourceRegistry {
     /// Mark a sandbox as torn down and drop its session/handle linkage. The
     /// entry itself stays in the map so inspectability tools can still see
     /// "this sandbox was used by task X." Phase 1b's GC pass reaps entries.
-    pub fn mark_sandbox_torn_down(&mut self, id: &SandboxId) {
-        if let Some(entry) = self.sandboxes.get_mut(id) {
+    pub fn mark_host_env_torn_down(&mut self, id: &HostEnvId) {
+        if let Some(entry) = self.host_envs.get_mut(id) {
             entry.state = ResourceState::TornDown;
             entry.users.clear();
         }
@@ -648,8 +658,8 @@ impl ResourceRegistry {
         let mut plan = ReapPlan::default();
 
         // Pass 1a: idle Ready sandboxes -> tear down.
-        let idle_sandboxes: Vec<SandboxId> = self
-            .sandboxes
+        let idle_sandboxes: Vec<HostEnvId> = self
+            .host_envs
             .iter()
             .filter(|(_, e)| {
                 e.state.is_ready()
@@ -661,14 +671,14 @@ impl ResourceRegistry {
             .collect();
         for id in idle_sandboxes {
             let handle = self
-                .sandboxes
+                .host_envs
                 .get_mut(&id)
                 .and_then(|e| e.handle.take());
-            if let Some(entry) = self.sandboxes.get_mut(&id) {
+            if let Some(entry) = self.host_envs.get_mut(&id) {
                 entry.state = ResourceState::TornDown;
                 entry.users.clear();
             }
-            plan.torn_down_sandboxes.push((id, handle));
+            plan.torn_down_host_envs.push((id, handle));
         }
 
         // Pass 1b: idle Ready MCP hosts -> tear down (drop session).
@@ -693,8 +703,8 @@ impl ResourceRegistry {
         }
 
         // Pass 2: stale terminal entries -> remove.
-        let stale_sandboxes: Vec<SandboxId> = self
-            .sandboxes
+        let stale_sandboxes: Vec<HostEnvId> = self
+            .host_envs
             .iter()
             .filter(|(_, e)| {
                 e.state.is_terminal()
@@ -703,8 +713,8 @@ impl ResourceRegistry {
             .map(|(id, _)| id.clone())
             .collect();
         for id in stale_sandboxes {
-            self.sandboxes.remove(&id);
-            plan.destroyed_sandboxes.push(id);
+            self.host_envs.remove(&id);
+            plan.destroyed_host_envs.push(id);
         }
         let stale_mcp: Vec<McpHostId> = self
             .mcp_hosts
@@ -732,13 +742,13 @@ pub struct ReapPlan {
     /// Idle sandbox entries that were marked `TornDown`. The handle is
     /// `Some` for entries the registry was holding a live handle for;
     /// the caller spawns `handle.teardown()`.
-    pub torn_down_sandboxes: Vec<(SandboxId, Option<Box<dyn SandboxHandle>>)>,
+    pub torn_down_host_envs: Vec<(HostEnvId, Option<Box<dyn HostEnvHandle>>)>,
     /// Idle MCP host entries that were marked `TornDown`. Sessions were
     /// dropped in-place; nothing async for the caller to do, just emit
     /// the wire update.
     pub torn_down_mcp_hosts: Vec<McpHostId>,
     /// Stale terminal sandbox entries removed from the registry.
-    pub destroyed_sandboxes: Vec<SandboxId>,
+    pub destroyed_host_envs: Vec<HostEnvId>,
     /// Stale terminal MCP host entries removed from the registry.
     pub destroyed_mcp_hosts: Vec<McpHostId>,
 }
@@ -750,11 +760,11 @@ mod tests {
     #[test]
     fn id_constructors_are_stable() {
         // Spec-derived sandbox ids are deterministic — same spec, same id.
-        let id1 = SandboxId::for_spec(&SandboxSpec::None);
-        let id2 = SandboxId::for_spec(&SandboxSpec::None);
+        let id1 = HostEnvId::for_provider_spec("bare", &HostEnvSpec::None);
+        let id2 = HostEnvId::for_provider_spec("bare", &HostEnvSpec::None);
         assert_eq!(id1, id2);
-        assert!(id1.0.starts_with("sb-"));
-        assert_eq!(id1.0.len(), "sb-".len() + 16); // sb- + 16 hex chars
+        assert!(id1.0.starts_with("he-"));
+        assert_eq!(id1.0.len(), "he-".len() + 16); // he- + 16 hex chars
         assert_eq!(
             McpHostId::primary_for_task("t-1").0,
             "mcp-primary-t-1"
@@ -778,49 +788,49 @@ mod tests {
     #[test]
     fn sandbox_teardown_clears_users() {
         let mut reg = ResourceRegistry::new();
-        let id = reg.pre_register_sandbox("t-1", SandboxSpec::None);
-        let outcome = reg.complete_sandbox_provisioning(&id, None, None);
-        assert!(matches!(outcome, CompleteSandboxOutcome::Completed));
-        assert!(reg.sandboxes[&id].state.is_ready());
-        assert_eq!(reg.sandboxes[&id].users.len(), 1);
-        reg.mark_sandbox_torn_down(&id);
+        let id = reg.pre_register_host_env("t-1", "bare".into(), HostEnvSpec::None);
+        let outcome = reg.complete_host_env_provisioning(&id, None, None);
+        assert!(matches!(outcome, CompleteHostEnvOutcome::Completed));
+        assert!(reg.host_envs[&id].state.is_ready());
+        assert_eq!(reg.host_envs[&id].users.len(), 1);
+        reg.mark_host_env_torn_down(&id);
         assert!(matches!(
-            reg.sandboxes[&id].state,
+            reg.host_envs[&id].state,
             ResourceState::TornDown
         ));
-        assert!(reg.sandboxes[&id].users.is_empty());
+        assert!(reg.host_envs[&id].users.is_empty());
     }
 
     #[test]
-    fn pre_register_sandbox_dedups_by_spec() {
+    fn pre_register_host_env_dedups_by_spec() {
         let mut reg = ResourceRegistry::new();
-        let id_a = reg.pre_register_sandbox("t-1", SandboxSpec::None);
-        let id_b = reg.pre_register_sandbox("t-2", SandboxSpec::None);
+        let id_a = reg.pre_register_host_env("t-1", "bare".into(), HostEnvSpec::None);
+        let id_b = reg.pre_register_host_env("t-2", "bare".into(), HostEnvSpec::None);
         assert_eq!(id_a, id_b);
         // Both threads share the same pre-registered entry.
-        assert_eq!(reg.sandboxes[&id_a].users.len(), 2);
-        assert!(reg.sandboxes[&id_a].users.contains("t-1"));
-        assert!(reg.sandboxes[&id_a].users.contains("t-2"));
+        assert_eq!(reg.host_envs[&id_a].users.len(), 2);
+        assert!(reg.host_envs[&id_a].users.contains("t-1"));
+        assert!(reg.host_envs[&id_a].users.contains("t-2"));
         // State stays Provisioning until completion runs.
         assert!(matches!(
-            reg.sandboxes[&id_a].state,
+            reg.host_envs[&id_a].state,
             ResourceState::Provisioning { .. }
         ));
     }
 
     #[test]
-    fn complete_sandbox_provisioning_idempotent_on_race() {
+    fn complete_host_env_provisioning_idempotent_on_race() {
         let mut reg = ResourceRegistry::new();
-        let id = reg.pre_register_sandbox("t-1", SandboxSpec::None);
-        let first = reg.complete_sandbox_provisioning(&id, None, None);
-        assert!(matches!(first, CompleteSandboxOutcome::Completed));
+        let id = reg.pre_register_host_env("t-1", "bare".into(), HostEnvSpec::None);
+        let first = reg.complete_host_env_provisioning(&id, None, None);
+        assert!(matches!(first, CompleteHostEnvOutcome::Completed));
         // Race-loser scenario: a second concurrent provision lands after
         // the entry already transitioned to Ready. The handle round-trips
         // back to the caller for teardown rather than silently leaking.
-        let second = reg.complete_sandbox_provisioning(&id, None, None);
+        let second = reg.complete_host_env_provisioning(&id, None, None);
         assert!(matches!(
             second,
-            CompleteSandboxOutcome::AlreadyCompleted { .. }
+            CompleteHostEnvOutcome::AlreadyCompleted { .. }
         ));
     }
 
@@ -828,13 +838,13 @@ mod tests {
     fn reap_idle_tears_down_idle_ready_and_removes_stale_terminal() {
         let mut reg = ResourceRegistry::new();
         // Idle Ready sandbox: provision, drop the user, backdate last_used.
-        let idle_id = reg.pre_register_sandbox("t-idle", SandboxSpec::None);
-        let _ = reg.complete_sandbox_provisioning(&idle_id, None, None);
-        let _ = reg.release_sandbox_user(&idle_id, "t-idle");
-        assert!(reg.sandboxes[&idle_id].users.is_empty());
+        let idle_id = reg.pre_register_host_env("t-idle", "bare".into(), HostEnvSpec::None);
+        let _ = reg.complete_host_env_provisioning(&idle_id, None, None);
+        let _ = reg.release_host_env_user(&idle_id, "t-idle");
+        assert!(reg.host_envs[&idle_id].users.is_empty());
 
         let now = Utc::now();
-        if let Some(e) = reg.sandboxes.get_mut(&idle_id) {
+        if let Some(e) = reg.host_envs.get_mut(&idle_id) {
             e.last_used = now - chrono::Duration::seconds(600);
         }
 
@@ -864,16 +874,17 @@ mod tests {
 
         // Long-since-torn-down sandbox: a different spec so its id
         // differs from `idle_id`.
-        let dead_id = reg.pre_register_sandbox(
+        let dead_id = reg.pre_register_host_env(
             "t-dead",
-            SandboxSpec::Landlock {
+            "test-landlock".into(),
+            HostEnvSpec::Landlock {
                 allowed_paths: Vec::new(),
                 network: Default::default(),
             },
         );
-        let _ = reg.complete_sandbox_provisioning(&dead_id, None, None);
-        reg.mark_sandbox_torn_down(&dead_id);
-        if let Some(e) = reg.sandboxes.get_mut(&dead_id) {
+        let _ = reg.complete_host_env_provisioning(&dead_id, None, None);
+        reg.mark_host_env_torn_down(&dead_id);
+        if let Some(e) = reg.host_envs.get_mut(&dead_id) {
             e.last_used = now - chrono::Duration::seconds(7200);
         }
 
@@ -882,14 +893,14 @@ mod tests {
             chrono::Duration::seconds(300),
             chrono::Duration::seconds(3600),
         );
-        assert_eq!(plan.torn_down_sandboxes.len(), 1);
-        assert_eq!(plan.torn_down_sandboxes[0].0, idle_id);
+        assert_eq!(plan.torn_down_host_envs.len(), 1);
+        assert_eq!(plan.torn_down_host_envs[0].0, idle_id);
         assert!(matches!(
-            reg.sandboxes[&idle_id].state,
+            reg.host_envs[&idle_id].state,
             ResourceState::TornDown
         ));
-        assert_eq!(plan.destroyed_sandboxes, vec![dead_id.clone()]);
-        assert!(!reg.sandboxes.contains_key(&dead_id));
+        assert_eq!(plan.destroyed_host_envs, vec![dead_id.clone()]);
+        assert!(!reg.host_envs.contains_key(&dead_id));
         assert!(plan.torn_down_mcp_hosts.is_empty());
         assert!(reg.mcp_hosts[&pinned_id].state.is_ready());
     }
@@ -897,27 +908,27 @@ mod tests {
     #[test]
     fn reap_idle_skips_recently_used_and_user_held() {
         let mut reg = ResourceRegistry::new();
-        let id = reg.pre_register_sandbox("t-1", SandboxSpec::None);
-        let _ = reg.complete_sandbox_provisioning(&id, None, None);
+        let id = reg.pre_register_host_env("t-1", "bare".into(), HostEnvSpec::None);
+        let _ = reg.complete_host_env_provisioning(&id, None, None);
         // last_used is `now`; should NOT reap on the first sweep.
         let plan = reg.reap_idle(
             Utc::now(),
             chrono::Duration::seconds(300),
             chrono::Duration::seconds(3600),
         );
-        assert!(plan.torn_down_sandboxes.is_empty());
-        assert!(reg.sandboxes[&id].state.is_ready());
+        assert!(plan.torn_down_host_envs.is_empty());
+        assert!(reg.host_envs[&id].state.is_ready());
         // Still has its user.
-        assert_eq!(reg.sandboxes[&id].users.len(), 1);
+        assert_eq!(reg.host_envs[&id].users.len(), 1);
     }
 
     #[test]
-    fn release_sandbox_user_decrements_count() {
+    fn release_host_env_user_decrements_count() {
         let mut reg = ResourceRegistry::new();
-        let id = reg.pre_register_sandbox("t-1", SandboxSpec::None);
-        reg.pre_register_sandbox("t-2", SandboxSpec::None);
-        assert_eq!(reg.release_sandbox_user(&id, "t-1"), 1);
-        assert_eq!(reg.release_sandbox_user(&id, "t-2"), 0);
+        let id = reg.pre_register_host_env("t-1", "bare".into(), HostEnvSpec::None);
+        reg.pre_register_host_env("t-2", "bare".into(), HostEnvSpec::None);
+        assert_eq!(reg.release_host_env_user(&id, "t-1"), 1);
+        assert_eq!(reg.release_host_env_user(&id, "t-2"), 0);
     }
 
     #[test]
