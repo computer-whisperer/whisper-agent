@@ -1177,7 +1177,7 @@ impl Scheduler {
                             state: ThreadStateLabel::Cancelled,
                         });
                     self.teardown_host_env_if_terminal(&thread_id);
-                    self.on_behavior_thread_terminal(&thread_id);
+                    self.on_behavior_thread_terminal(&thread_id, pending_io);
                 }
             }
             ClientToServer::ArchiveThread { thread_id } => {
@@ -2053,15 +2053,15 @@ impl Scheduler {
                     self.dispatch_cron_fire(&pod_id, &behavior_id, pending_io);
                 }
                 whisper_agent_protocol::Overlap::QueueOne => {
-                    // Queueing semantics arrive in phase 3b. For now
-                    // treat QueueOne as Skip — same drop-on-overlap
-                    // behavior, no state in `queued_payload`.
                     if self.behavior_has_inflight_run(&pod_id, &behavior_id) {
-                        tracing::debug!(
-                            pod_id = %pod_id,
-                            behavior_id = %behavior_id,
-                            "cron tick skipped (queue_one pending implementation)"
-                        );
+                        // Park a cron-kind payload (Null for cron — the
+                        // trigger carries no data) for consumption by
+                        // `on_behavior_thread_terminal` when the
+                        // in-flight run finishes. Overwriting an
+                        // existing queued payload is deliberate:
+                        // QueueOne semantics keep at most one pending
+                        // fire; later arrivals replace earlier.
+                        self.queue_behavior_payload(&pod_id, &behavior_id, serde_json::Value::Null);
                         continue;
                     }
                     self.dispatch_cron_fire(&pod_id, &behavior_id, pending_io);
@@ -2115,6 +2115,36 @@ impl Scheduler {
         )
     }
 
+    /// Park a payload for a behavior whose overlap policy is
+    /// `QueueOne`. Sets `state.queued_payload`, overwriting any
+    /// already-parked value (QueueOne = at most one pending; later
+    /// arrivals replace earlier). Marks the behavior dirty and
+    /// broadcasts `BehaviorStateChanged`. The queued payload is
+    /// consumed by `on_behavior_thread_terminal` when the currently
+    /// in-flight thread reaches a terminal state.
+    fn queue_behavior_payload(
+        &mut self,
+        pod_id: &str,
+        behavior_id: &str,
+        payload: serde_json::Value,
+    ) {
+        let Some(pod) = self.pods.get_mut(pod_id) else {
+            return;
+        };
+        let Some(behavior) = pod.behaviors.get_mut(behavior_id) else {
+            return;
+        };
+        behavior.state.queued_payload = Some(payload);
+        let state = behavior.state.clone();
+        self.mark_behavior_dirty(pod_id, behavior_id);
+        self.router
+            .broadcast_task_list(ServerToClient::BehaviorStateChanged {
+                pod_id: pod_id.to_string(),
+                behavior_id: behavior_id.to_string(),
+                state,
+            });
+    }
+
     /// On-terminal hook for behavior-spawned threads. Idempotent — safe
     /// to call at every teardown site; no-op when the thread either
     /// doesn't exist, has no `origin`, isn't in a terminal state, or has
@@ -2122,7 +2152,19 @@ impl Scheduler {
     /// .last_thread_id with a set outcome). The check against
     /// `last_thread_id` means interactive follow-ups on a Completed
     /// behavior thread don't double-count.
-    fn on_behavior_thread_terminal(&mut self, thread_id: &str) {
+    ///
+    /// If `state.queued_payload` is set (QueueOne overlap parked a
+    /// payload while this thread was running), consumes it and
+    /// re-fires the behavior with that payload — which is why this
+    /// takes `pending_io`. The re-fire uses the same `run_behavior`
+    /// path, so its terminal will fire this hook again with a fresh
+    /// `last_thread_id`; recursion terminates when `queued_payload`
+    /// is empty.
+    fn on_behavior_thread_terminal(
+        &mut self,
+        thread_id: &str,
+        pending_io: &mut FuturesUnordered<SchedulerFuture>,
+    ) {
         let Some(task) = self.tasks.get(thread_id) else {
             return;
         };
@@ -2156,6 +2198,10 @@ impl Scheduler {
         behavior.state.last_thread_id = Some(thread_id.to_string());
         behavior.state.last_outcome = Some(outcome);
         behavior.state.run_count = behavior.state.run_count.saturating_add(1);
+        // Take any queued payload before we broadcast — the fire below
+        // would see the old state, and we want the wire event to
+        // reflect the consumed queue.
+        let queued = behavior.state.queued_payload.take();
         let snapshot_state = behavior.state.clone();
 
         // Persist via the dirty set: `flush_dirty` runs once per
@@ -2166,10 +2212,32 @@ impl Scheduler {
         // Broadcast so every connected client sees the last-run update.
         self.router
             .broadcast_task_list(ServerToClient::BehaviorStateChanged {
-                pod_id,
-                behavior_id: origin.behavior_id,
+                pod_id: pod_id.clone(),
+                behavior_id: origin.behavior_id.clone(),
                 state: snapshot_state,
             });
+
+        // Consume the queued payload: re-fire with it. Logged at warn
+        // if the fire fails because a queued payload represents
+        // user/trigger intent that's getting dropped on the floor —
+        // surface it rather than silently swallowing.
+        if let Some(payload) = queued
+            && let Err(e) = self.run_behavior(
+                None,
+                None,
+                &pod_id,
+                &origin.behavior_id,
+                Some(payload),
+                pending_io,
+            )
+        {
+            warn!(
+                pod_id = %pod_id,
+                behavior_id = %origin.behavior_id,
+                error = %e,
+                "queued QueueOne fire failed to spawn"
+            );
+        }
     }
 
     /// `CreateBehavior` handler — validate ids + config, register the
@@ -2623,7 +2691,7 @@ impl Scheduler {
                     self.mark_dirty(&thread_id);
                     self.router.dispatch_events(&thread_id, events);
                     self.teardown_host_env_if_terminal(&thread_id);
-                    self.on_behavior_thread_terminal(&thread_id);
+                    self.on_behavior_thread_terminal(&thread_id, pending_io);
                 }
             }
         }
@@ -2775,8 +2843,9 @@ impl Scheduler {
         // threads. Idempotent (no-op when origin is None or state isn't
         // terminal). Covers every stepping path; CancelThread and the
         // failed-provisioning site don't go through here and call the
-        // hook directly.
-        self.on_behavior_thread_terminal(thread_id);
+        // hook directly. Passes `pending_io` through so the hook can
+        // re-fire on a queued QueueOne payload.
+        self.on_behavior_thread_terminal(thread_id, pending_io);
     }
 
     /// If the task is in a terminal state, tear down its sandbox (if any).
