@@ -2190,12 +2190,20 @@ impl ChatApp {
                         sub.error = Some(format!("a sandbox named `{name}` already exists"));
                         modal.sandbox_entry_editor = Some(sub);
                     } else {
-                        sub.entry.name = name;
+                        sub.entry.name = name.clone();
                         match sub.index {
                             Some(i) if i < working.allow.host_env.len() => {
                                 working.allow.host_env[i] = sub.entry;
                             }
                             _ => working.allow.host_env.push(sub.entry),
+                        }
+                        // Auto-pick the default for thread_defaults if
+                        // it's still empty — otherwise the server's
+                        // tightened validation rejects the save and the
+                        // user gets a confusing inline error before
+                        // they've even visited the Defaults tab.
+                        if working.thread_defaults.host_env.is_empty() {
+                            working.thread_defaults.host_env = name;
                         }
                         modal.raw_dirty = false;
                     }

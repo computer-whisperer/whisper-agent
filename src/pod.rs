@@ -81,6 +81,10 @@ pub enum PodConfigError {
         value: String,
         valid: String,
     },
+    #[error(
+        "thread_defaults.host_env is empty but [[allow.host_env]] has entries — pick one (valid: [{valid}]) so threads don't fall back to `bare`"
+    )]
+    HostEnvDefaultRequired { valid: String },
 }
 
 /// Parse pod.toml text, then run structural validation.
@@ -113,27 +117,30 @@ pub fn validate(config: &PodConfig) -> Result<(), PodConfigError> {
         });
     }
 
-    // Host env: empty is valid only if the pod has no allowed envs
-    // (degenerate no-isolation pod). Otherwise must name an entry in
-    // [[allow.host_env]].
-    if !config.thread_defaults.host_env.is_empty()
-        && !config
-            .allow
-            .host_env
-            .iter()
-            .any(|nh| nh.name == config.thread_defaults.host_env)
-    {
-        let valid = config
-            .allow
-            .host_env
-            .iter()
-            .map(|nh| nh.name.as_str())
-            .collect::<Vec<_>>()
-            .join(", ");
+    // Host env validation:
+    //   * empty defaults + empty allow.host_env => bare-only pod, OK.
+    //   * empty defaults + non-empty allow      => footgun: threads
+    //     would silently fall back to `bare` and try the server
+    //     fallback MCP URL. Reject.
+    //   * non-empty defaults => must reference an entry in
+    //     [[allow.host_env]].
+    let valid_names: Vec<&str> = config
+        .allow
+        .host_env
+        .iter()
+        .map(|nh| nh.name.as_str())
+        .collect();
+    if config.thread_defaults.host_env.is_empty() {
+        if !valid_names.is_empty() {
+            return Err(PodConfigError::HostEnvDefaultRequired {
+                valid: valid_names.join(", "),
+            });
+        }
+    } else if !valid_names.contains(&config.thread_defaults.host_env.as_str()) {
         return Err(PodConfigError::UnknownThreadDefault {
             field: "host_env",
             value: config.thread_defaults.host_env.clone(),
-            valid,
+            valid: valid_names.join(", "),
         });
     }
 
@@ -252,6 +259,20 @@ mod tests {
         cfg.allow.host_env.clear();
         cfg.thread_defaults.host_env = String::new();
         validate(&cfg).unwrap();
+    }
+
+    #[test]
+    fn rejects_empty_default_when_allow_has_entries() {
+        let mut cfg = sample_config();
+        // sample_config has entries in allow.host_env; empty defaults
+        // should now be rejected to prevent the silent bare-fallback
+        // footgun.
+        cfg.thread_defaults.host_env = String::new();
+        let err = validate(&cfg).unwrap_err();
+        assert!(
+            matches!(err, PodConfigError::HostEnvDefaultRequired { .. }),
+            "expected HostEnvDefaultRequired, got {err:?}"
+        );
     }
 
     #[test]
