@@ -19,10 +19,10 @@ use egui::{Color32, ComboBox, RichText, ScrollArea, TextEdit};
 use serde::{Deserialize, Serialize};
 use whisper_agent_protocol::sandbox::{AccessMode, NetworkPolicy, PathAccess};
 use whisper_agent_protocol::{
-    ApprovalChoice, BackendSummary, ClientToServer, ContentBlock, Conversation, Message,
-    ModelSummary, PodSummary, ResourceSnapshot, ResourceStateLabel, Role, SandboxSpec,
-    ServerToClient, ThreadBindingsRequest, ThreadConfigOverride, ThreadStateLabel, ThreadSummary,
-    ToolResultContent, Usage,
+    ApprovalChoice, ApprovalPolicy, BackendSummary, ClientToServer, ContentBlock, Conversation,
+    Message, ModelSummary, NamedSandboxSpec, PodAllow, PodConfig, PodLimits, PodSummary,
+    ResourceSnapshot, ResourceStateLabel, Role, SandboxSpec, ServerToClient, ThreadBindingsRequest,
+    ThreadConfigOverride, ThreadDefaults, ThreadStateLabel, ThreadSummary, ToolResultContent, Usage,
 };
 
 /// A user-saved sandbox configuration. Currently only encodes Landlock; future
@@ -284,6 +284,8 @@ pub struct ChatApp {
     /// Default is "all expanded"; toggling a header inverts membership.
     /// Persisted only in memory — re-expands across reloads.
     collapsed_pods: HashSet<String>,
+    /// Modal state for the "+ New pod" form. `None` = closed.
+    new_pod_modal: Option<NewPodModalState>,
 
     /// Which view the left side panel is showing.
     left_mode: LeftPanelMode,
@@ -311,6 +313,44 @@ impl PresetModalState {
             read_everywhere: false,
         }
     }
+}
+
+/// State for the "+ New pod" modal. The user picks a directory-friendly
+/// `pod_id` (immutable on disk) and a display `name` (free text). The
+/// resulting pod inherits sane defaults — every backend allowed, no
+/// shared MCP hosts (user can opt in later), no sandbox spec (defaults
+/// to bare-metal). Once a pod-config editor lands the user can tighten
+/// or extend any of these from the UI.
+struct NewPodModalState {
+    pod_id: String,
+    name: String,
+    error: Option<String>,
+}
+
+impl NewPodModalState {
+    fn new() -> Self {
+        Self {
+            pod_id: String::new(),
+            name: String::new(),
+            error: None,
+        }
+    }
+}
+
+/// Validate a pod_id against the rules `Persister::create_pod` will
+/// enforce server-side. Done client-side so the user sees the error
+/// inline instead of as a returned `ServerToClient::Error`.
+fn validate_pod_id_client(id: &str) -> Result<(), &'static str> {
+    if id.is_empty() {
+        return Err("pod_id is empty");
+    }
+    if id.starts_with('.') {
+        return Err("pod_id may not start with '.'");
+    }
+    if id.contains('/') || id.contains('\\') || id.contains('\0') || id == ".." {
+        return Err("pod_id contains illegal characters");
+    }
+    Ok(())
 }
 
 impl ChatApp {
@@ -341,6 +381,7 @@ impl ChatApp {
             pods: HashMap::new(),
             pods_requested: false,
             collapsed_pods: HashSet::new(),
+            new_pod_modal: None,
             left_mode: LeftPanelMode::default(),
         }
     }
@@ -1254,6 +1295,7 @@ impl eframe::App for ChatApp {
         }
 
         self.render_preset_modal(ctx);
+        self.render_new_pod_modal(ctx);
     }
 }
 
@@ -1265,11 +1307,16 @@ impl ChatApp {
     /// in practice when a thread arrives via `ThreadCreated` before the
     /// `ListPods` round-trip completes.
     fn render_thread_tree(&mut self, ui: &mut egui::Ui) {
-        if ui.button("+ New thread").clicked() {
-            self.selected = None;
-            self.composing_new = true;
-            self.input.clear();
-        }
+        ui.horizontal(|ui| {
+            if ui.button("+ New thread").clicked() {
+                self.selected = None;
+                self.composing_new = true;
+                self.input.clear();
+            }
+            if ui.button("+ New pod").clicked() {
+                self.new_pod_modal = Some(NewPodModalState::new());
+            }
+        });
         ui.separator();
 
         // Group threads by pod_id, preserving the existing newest-first
@@ -1444,6 +1491,146 @@ impl ChatApp {
         } else {
             // Stay open — restore modal state.
             self.preset_modal = Some(modal);
+        }
+    }
+
+    /// Render the "+ New pod" modal. Pod creation here is intentionally
+    /// minimal — the resulting pod allows every backend the server is
+    /// running, no shared MCP hosts, and no sandbox spec (threads inside
+    /// run bare-metal). Subsequent phases (4.iii) add a config editor for
+    /// tightening or extending the allow cap.
+    fn render_new_pod_modal(&mut self, ctx: &egui::Context) {
+        let Some(mut modal) = self.new_pod_modal.take() else {
+            return;
+        };
+        let mut open = true;
+        let mut create_clicked = false;
+        let mut cancel_clicked = false;
+
+        egui::Window::new("New pod")
+            .collapsible(false)
+            .resizable(false)
+            .default_width(420.0)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .open(&mut open)
+            .show(ctx, |ui| {
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    ui.label("pod_id");
+                    ui.add(
+                        TextEdit::singleline(&mut modal.pod_id)
+                            .hint_text("directory name (e.g. 'whisper-dev')")
+                            .desired_width(f32::INFINITY),
+                    );
+                });
+                ui.label(
+                    RichText::new(
+                        "Becomes the pod's directory name on disk; immutable after \
+                         creation. Letters, numbers, dashes, underscores.",
+                    )
+                    .small()
+                    .color(Color32::from_gray(160)),
+                );
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    ui.label("name");
+                    ui.add(
+                        TextEdit::singleline(&mut modal.name)
+                            .hint_text("display name (free text)")
+                            .desired_width(f32::INFINITY),
+                    );
+                });
+                if let Some(err) = &modal.error {
+                    ui.add_space(6.0);
+                    ui.colored_label(Color32::from_rgb(220, 80, 80), err);
+                }
+                ui.add_space(8.0);
+                ui.label(
+                    RichText::new(
+                        "The new pod will allow every backend the server is running, \
+                         no shared MCP hosts, and no sandbox spec (threads run bare-metal). \
+                         A pod-config editor lands in a future update.",
+                    )
+                    .small()
+                    .color(Color32::from_gray(160)),
+                );
+                ui.add_space(8.0);
+                ui.separator();
+                ui.horizontal(|ui| {
+                    let create_enabled = !modal.pod_id.trim().is_empty()
+                        && !modal.name.trim().is_empty()
+                        && !self.backends.is_empty();
+                    if ui
+                        .add_enabled(create_enabled, egui::Button::new("Create"))
+                        .clicked()
+                    {
+                        create_clicked = true;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        cancel_clicked = true;
+                    }
+                });
+            });
+
+        if create_clicked {
+            let pod_id = modal.pod_id.trim().to_string();
+            if let Err(msg) = validate_pod_id_client(&pod_id) {
+                modal.error = Some(msg.to_string());
+                self.new_pod_modal = Some(modal);
+                return;
+            }
+            if self.pods.contains_key(&pod_id) {
+                modal.error = Some(format!("pod `{pod_id}` already exists"));
+                self.new_pod_modal = Some(modal);
+                return;
+            }
+            let config = self.fresh_pod_config(modal.name.trim().to_string());
+            self.send(ClientToServer::CreatePod {
+                correlation_id: None,
+                pod_id,
+                config,
+            });
+            // Modal closes; PodCreated event will populate self.pods on
+            // the round-trip.
+        } else if cancel_clicked || !open {
+            // Modal closes.
+        } else {
+            self.new_pod_modal = Some(modal);
+        }
+    }
+
+    /// Build a sensible default `PodConfig` for a fresh pod created from
+    /// the webui. `created_at` is left empty — the server stamps it on
+    /// CreatePod (wasm doesn't have a convenient ISO-8601 source). The
+    /// allow table reflects the server's known catalog: every backend,
+    /// no shared MCP hosts, no sandbox spec.
+    fn fresh_pod_config(&self, name: String) -> PodConfig {
+        let backend_names: Vec<String> = self.backends.iter().map(|b| b.name.clone()).collect();
+        let default_backend = if !self.default_backend.is_empty() {
+            self.default_backend.clone()
+        } else {
+            backend_names.first().cloned().unwrap_or_default()
+        };
+        PodConfig {
+            name,
+            description: None,
+            created_at: String::new(),
+            allow: PodAllow {
+                backends: backend_names,
+                mcp_hosts: Vec::new(),
+                sandbox: Vec::<NamedSandboxSpec>::new(),
+            },
+            thread_defaults: ThreadDefaults {
+                backend: default_backend,
+                model: String::new(),
+                system_prompt_file: "system_prompt.md".into(),
+                max_tokens: 16384,
+                max_turns: 30,
+                approval_policy: ApprovalPolicy::AutoApproveAll,
+                sandbox: String::new(),
+                mcp_hosts: Vec::new(),
+            },
+            limits: PodLimits::default(),
         }
     }
 }

@@ -262,8 +262,14 @@ impl Persister {
     /// Create a fresh pod directory and write `pod.toml` from the supplied
     /// config. Fails if a pod with the same id already exists or if the
     /// config doesn't validate.
-    pub async fn create_pod(&self, pod_id: &str, config: PodConfig) -> Result<PodSummary> {
+    pub async fn create_pod(&self, pod_id: &str, mut config: PodConfig) -> Result<PodSummary> {
         validate_pod_id(pod_id)?;
+        // Stamp created_at server-side when the client left it empty —
+        // wasm clients don't always have a convenient ISO-8601 source
+        // and we know the server's clock is the authoritative one.
+        if config.created_at.is_empty() {
+            config.created_at = Utc::now().to_rfc3339();
+        }
         pod::validate(&config)?;
         let pod_dir = self.pod_dir(pod_id);
         if fs::try_exists(&pod_dir).await.unwrap_or(false) {
