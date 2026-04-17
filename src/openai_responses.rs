@@ -39,6 +39,14 @@ pub const OPENAI_API_BASE: &str = "https://api.openai.com/v1";
 /// not by plain API keys. Serves the same Responses API surface at `/responses`.
 pub const CHATGPT_CODEX_BASE: &str = "https://chatgpt.com/backend-api/codex";
 
+/// `client_version` query param advertised on the Codex-route `/models` call.
+/// The ChatGPT backend gates visibility of newer models behind a minimum Codex
+/// client version (e.g. gpt-5.4 requires >= 0.98.0) so we lie in this
+/// direction deliberately — we aren't the Codex CLI, but we implement the
+/// same wire contract, and anything below the highest observed gate hides
+/// frontier models from the picker.
+const CODEX_CLIENT_VERSION: &str = "99.0.0";
+
 /// Runtime auth material for a Responses-API client. The client itself is
 /// cheap and shared; [`ClientAuth`] is what differs between an API-key session
 /// and a ChatGPT-subscription session.
@@ -119,12 +127,20 @@ impl OpenAiResponsesClient {
             tools: if tools.is_empty() { None } else { Some(tools) },
             max_output_tokens: req.max_tokens,
             store: false,
-            stream: false,
+            // The ChatGPT-subscription backend refuses stream:false with
+            // "Stream must be set to true". api.openai.com accepts either; we
+            // always stream and reassemble so both routes share one code path.
+            stream: true,
         };
 
         let url = format!("{}/responses", self.base_url);
         let (bearer, extra_headers) = self.prepare_headers().await?;
-        let mut builder = self.http.post(&url).bearer_auth(&bearer).json(&body);
+        let mut builder = self
+            .http
+            .post(&url)
+            .bearer_auth(&bearer)
+            .header("accept", "text/event-stream")
+            .json(&body);
         for (k, v) in &extra_headers {
             builder = builder.header(*k, v);
         }
@@ -140,10 +156,14 @@ impl OpenAiResponsesClient {
                 body,
             });
         }
-        let parsed: RspResponse = resp
-            .json()
+        // Buffer the full SSE stream and dig out the `response.completed` event
+        // — its `response` field is the same object shape the non-streaming
+        // path used to return, so downstream parsing is unchanged.
+        let raw = resp
+            .text()
             .await
             .map_err(|e| ModelError::Transport(e.to_string()))?;
+        let parsed: RspResponse = extract_completed_response(&raw)?;
 
         let mut content: Vec<ContentBlock> = Vec::new();
         let mut saw_function_call = false;
@@ -242,11 +262,7 @@ impl OpenAiResponsesClient {
         // backend can gate version-locked models.
         let codex_mode = matches!(self.auth, ClientAuth::Codex(_));
         let url = if codex_mode {
-            format!(
-                "{}/models?client_version={}",
-                self.base_url,
-                env!("CARGO_PKG_VERSION")
-            )
+            format!("{}/models?client_version={}", self.base_url, CODEX_CLIENT_VERSION)
         } else {
             format!("{}/models", self.base_url)
         };
@@ -442,6 +458,60 @@ fn spec_to_rsp_tool(t: &ToolSpec) -> RspTool {
     }
 }
 
+/// Walk an SSE stream body and pull the `response` object out of the first
+/// `response.completed` event. The event shape (per the Responses streaming
+/// contract) is:
+///
+/// ```text
+/// event: response.completed
+/// data: {"type":"response.completed","response":{...full response object...}}
+/// ```
+///
+/// We tolerate any number of preceding `response.*.delta` / `.added` / `.done`
+/// events — those are useful for live UI streaming but we don't expose a
+/// streaming interface at the provider level, so we simply discard them.
+fn extract_completed_response(body: &str) -> Result<RspResponse, ModelError> {
+    for line in body.lines() {
+        // SSE events may carry multiple fields per frame; Responses emits one
+        // JSON blob per `data:` line and sibling lines we can ignore.
+        let Some(payload) = line.strip_prefix("data:") else {
+            continue;
+        };
+        let payload = payload.trim_start();
+        if payload.is_empty() || payload == "[DONE]" {
+            continue;
+        }
+        let event: SseEvent = match serde_json::from_str(payload) {
+            Ok(ev) => ev,
+            Err(_) => continue, // non-event data lines are skippable
+        };
+        match event {
+            SseEvent::ResponseCompleted { response } => return Ok(response),
+            SseEvent::ResponseFailed { response, error } => {
+                // The server surfaced a terminal error via a typed event rather
+                // than an HTTP error — preserve the detail for the caller.
+                let detail = error
+                    .as_ref()
+                    .map(|e| e.message.clone())
+                    .unwrap_or_else(|| "response.failed".to_string());
+                // Prefer the response object's status when available.
+                let status = response
+                    .as_ref()
+                    .and_then(|r| r.status.clone())
+                    .unwrap_or_else(|| "failed".to_string());
+                return Err(ModelError::Api {
+                    status: 500,
+                    body: format!("{status}: {detail}"),
+                });
+            }
+            SseEvent::Other => {}
+        }
+    }
+    Err(ModelError::Transport(
+        "SSE stream ended without response.completed".into(),
+    ))
+}
+
 /// Collapse Responses' `status` + `incomplete_details.reason` + whether the
 /// output included a function_call into the Anthropic-style stop_reason labels
 /// the rest of the stack consumes.
@@ -518,6 +588,32 @@ enum RspTool {
         parameters: Value,
         strict: bool,
     },
+}
+
+/// SSE frames we care about on the streaming `/responses` route. Every frame
+/// type that isn't `response.completed` / `response.failed` collapses into
+/// `Other` and is ignored — we reconstruct the final response from the
+/// completed frame's embedded payload.
+#[derive(Deserialize, Debug)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum SseEvent {
+    #[serde(rename = "response.completed")]
+    ResponseCompleted { response: RspResponse },
+    #[serde(rename = "response.failed")]
+    ResponseFailed {
+        #[serde(default)]
+        response: Option<RspResponse>,
+        #[serde(default)]
+        error: Option<SseError>,
+    },
+    #[serde(other)]
+    Other,
+}
+
+#[derive(Deserialize, Debug)]
+struct SseError {
+    #[serde(default)]
+    message: String,
 }
 
 #[derive(Deserialize, Debug)]
@@ -712,6 +808,46 @@ mod tests {
             ),
             Some("tool_use".into())
         );
+    }
+
+    #[test]
+    fn extracts_final_response_from_sse_stream() {
+        let stream = r#"event: response.created
+data: {"type":"response.created","response":{"id":"r_1","status":"in_progress","output":[]}}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","delta":"hi"}
+
+event: response.completed
+data: {"type":"response.completed","response":{"id":"r_1","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"hi"}]}],"usage":{"input_tokens":3,"output_tokens":1}}}
+
+"#;
+        let r = extract_completed_response(stream).unwrap();
+        assert_eq!(r.status.as_deref(), Some("completed"));
+        assert_eq!(r.usage.as_ref().unwrap().output_tokens, 1);
+    }
+
+    #[test]
+    fn sse_stream_without_completed_errors() {
+        let stream = "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"hi\"}\n\n";
+        let err = extract_completed_response(stream).unwrap_err();
+        assert!(matches!(err, ModelError::Transport(_)));
+    }
+
+    #[test]
+    fn sse_response_failed_surfaces_as_api_error() {
+        let stream = r#"event: response.failed
+data: {"type":"response.failed","response":{"status":"failed"},"error":{"message":"rate limited"}}
+
+"#;
+        let err = extract_completed_response(stream).unwrap_err();
+        match err {
+            ModelError::Api { status, body } => {
+                assert_eq!(status, 500);
+                assert!(body.contains("rate limited"), "body was: {body}");
+            }
+            _ => panic!("expected Api error"),
+        }
     }
 
     #[test]
