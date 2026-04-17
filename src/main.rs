@@ -294,7 +294,7 @@ async fn run_serve(args: ServeArgs) -> Result<()> {
             approval_policy: if args.prompt_destructive {
                 ApprovalPolicy::PromptDestructive
             } else {
-                ApprovalPolicy::AutoApproveAll
+                ApprovalPolicy::PromptPodModify
             },
         },
         default_host_env,

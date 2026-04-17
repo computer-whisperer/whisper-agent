@@ -5,6 +5,7 @@
 
 pub mod anthropic;
 pub mod audit;
+pub mod builtin_tools;
 pub mod config;
 pub mod io_dispatch;
 pub mod mcp;

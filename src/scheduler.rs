@@ -54,6 +54,24 @@ use whisper_agent_protocol::HostEnvSpec;
 
 pub type ConnId = u64;
 
+/// How `route_tool` wants a given tool invocation handled. Produced
+/// during dispatch and consumed by `io_dispatch::tool_call`.
+pub enum ToolRoute {
+    /// Handle in-process via [`crate::builtin_tools::dispatch`], scoped
+    /// to the pod's own directory.
+    Builtin { pod_id: PodId },
+    /// Forward to the named MCP session via JSON-RPC.
+    Mcp(Arc<McpSession>),
+}
+
+/// Snapshot of a pod's on-disk directory + parsed config. Cloned out of
+/// the scheduler when dispatching a builtin tool future so the future
+/// doesn't need a back-borrow of scheduler state.
+pub struct PodSnapshot {
+    pub pod_dir: std::path::PathBuf,
+    pub config: whisper_agent_protocol::PodConfig,
+}
+
 /// Messages accepted by the scheduler inbox.
 // `ClientMessage` carries a `ClientToServer` (the protocol's largest variant
 // is `CreateThread`, ~300 bytes). The other variants are tens of bytes. Boxing
@@ -357,15 +375,20 @@ impl Scheduler {
         self.resources.host_envs.get(&id)
     }
 
-    /// Phase 3d.i: build the thread's effective tool catalog by walking
-    /// `task.bindings.mcp_hosts` in precedence order — primary first
-    /// (index 0), then each shared host the thread is bound to. Tool-name
-    /// collisions resolve in favor of the earlier host (matching the prior
-    /// `route_tool` behavior). Empty when the primary hasn't completed
-    /// `list_tools` yet AND no shared hosts are bound.
+    /// Phase 3d.i: build the thread's effective tool catalog. Prepends
+    /// the builtin pod-editing tools (always available to every thread),
+    /// then walks `task.bindings.mcp_hosts` in precedence order — host-env
+    /// MCP first, then each shared host the thread is bound to. Tool-name
+    /// collisions resolve in favor of the earlier entry, so builtins win
+    /// if an MCP host tries to advertise a colliding name.
     pub(crate) fn tool_descriptors(&self, thread_id: &str) -> Vec<McpTool> {
         let mut out: Vec<McpTool> = Vec::new();
         let mut seen: HashSet<String> = HashSet::new();
+        for tool in crate::builtin_tools::descriptors() {
+            if seen.insert(tool.name.clone()) {
+                out.push(tool);
+            }
+        }
         for host in self.bound_mcp_hosts(thread_id) {
             for tool in &host.tools {
                 if seen.insert(tool.name.clone()) {
@@ -376,21 +399,35 @@ impl Scheduler {
         out
     }
 
-    /// Resolve which MCP session should receive a tool invocation. Walks
-    /// the thread's bound hosts in precedence order and returns the first
-    /// host whose tool catalog includes `tool_name`. Falls back to the
-    /// primary's session when nothing matches — defensive, since the
-    /// model shouldn't be calling tools we didn't advertise.
-    pub(crate) fn route_tool(&self, thread_id: &str, tool_name: &str) -> Option<Arc<McpSession>> {
+    /// Resolve which handler should receive a tool invocation. Builtin
+    /// tools are checked first (they always win); otherwise walks the
+    /// thread's bound MCP hosts in precedence order and returns the
+    /// first host whose tool catalog includes `tool_name`. `None` when
+    /// nothing claims the name — the model called a tool we didn't
+    /// advertise.
+    pub(crate) fn route_tool(&self, thread_id: &str, tool_name: &str) -> Option<ToolRoute> {
+        if crate::builtin_tools::is_builtin(tool_name) {
+            let pod_id = self.tasks.get(thread_id)?.pod_id.clone();
+            return Some(ToolRoute::Builtin { pod_id });
+        }
         for host in self.bound_mcp_hosts(thread_id) {
             if host.tools.iter().any(|t| t.name == tool_name)
                 && let Some(s) = host.session.clone()
             {
-                return Some(s);
+                return Some(ToolRoute::Mcp(s));
             }
         }
-        // No bound host advertised this tool — nothing to route to.
         None
+    }
+
+    /// Snapshot of a pod's on-disk dir + current config — what a builtin
+    /// tool future needs to operate without holding a scheduler borrow.
+    pub(crate) fn pod_snapshot(&self, pod_id: &str) -> Option<PodSnapshot> {
+        let pod = self.pods.get(pod_id)?;
+        Some(PodSnapshot {
+            pod_dir: pod.dir.clone(),
+            config: pod.config.clone(),
+        })
     }
 
     /// Iterate the thread's bound MCP host entries in precedence
@@ -1383,37 +1420,13 @@ impl Scheduler {
                         return;
                     }
                 };
-                // Refresh in-memory pod so subsequent create_task /
-                // RebindThread paths see the new config without waiting
-                // for the disk round-trip.
-                if let Some(pod) = self.pods.get_mut(&pod_id) {
-                    pod.config = parsed.clone();
-                    pod.raw_toml = toml_text.clone();
-                }
-                let ev = ServerToClient::PodConfigUpdated {
-                    pod_id: pod_id.clone(),
-                    toml_text: toml_text.clone(),
+                self.apply_pod_config_update(
+                    &pod_id,
+                    toml_text.clone(),
                     parsed,
                     correlation_id,
-                };
-                for tx in self.router.outbound_snapshot() {
-                    let _ = tx.send(ev.clone());
-                }
-                if let Some(persister) = self.persister.clone() {
-                    let outbound = self.router.outbound(conn_id);
-                    tokio::spawn(async move {
-                        if let Err(e) = persister.update_pod_config(&pod_id, &toml_text).await {
-                            warn!(pod_id = %pod_id, error = %e, "update_pod_config disk write failed");
-                            if let Some(tx) = outbound {
-                                let _ = tx.send(ServerToClient::Error {
-                                    correlation_id: None,
-                                    thread_id: None,
-                                    message: format!("update_pod_config: disk write failed: {e}"),
-                                });
-                            }
-                        }
-                    });
-                }
+                );
+                self.persist_pod_config(pod_id, toml_text, Some(conn_id));
             }
             ClientToServer::ArchivePod { pod_id } => {
                 if let Err(e) = crate::persist::validate_pod_id(&pod_id) {
@@ -1727,8 +1740,19 @@ impl Scheduler {
             thread_id,
             op_id,
             result,
+            pod_update,
         } = completion;
         let mut events = Vec::new();
+
+        // Builtin pod-modify tools produce a side effect when their disk
+        // write succeeds. Apply it BEFORE the task sees the tool result
+        // so subscribed clients observe PodConfigUpdated /
+        // PodSystemPromptUpdated before the ToolCallEnd that caused it —
+        // matches the "state-updates-first" ordering used by every other
+        // broadcast pair.
+        if let Some(update) = pod_update {
+            self.apply_pod_update(&thread_id, update);
+        }
 
         // Surface any IO-level error to the operator even if no client is subscribed.
         match &result {
@@ -1865,16 +1889,112 @@ impl Scheduler {
     }
 
     fn annotations_for(&self, thread_id: &str) -> HashMap<String, ToolAnnotations> {
-        let mut out = HashMap::new();
+        let mut out: HashMap<String, ToolAnnotations> = crate::builtin_tools::annotations();
         for host in self.bound_mcp_hosts(thread_id) {
             for (name, ann) in &host.annotations {
-                // First host wins on collision — matches `route_tool`'s
-                // primary-first precedence so the policy decision agrees
-                // with where the call will actually land.
+                // First-wins matches `route_tool`'s builtin-then-host
+                // precedence, so the approval decision agrees with
+                // where the call will actually land.
                 out.entry(name.clone()).or_insert_with(|| ann.clone());
             }
         }
         out
+    }
+
+    /// Apply a [`PodUpdate`] side effect produced by a builtin tool.
+    /// Dispatches to the specific apply helper based on the update
+    /// kind; both helpers handle the in-memory refresh + broadcast.
+    /// The builtin tool already wrote the change to disk — no further
+    /// persist work is needed here.
+    fn apply_pod_update(&mut self, thread_id: &str, update: crate::builtin_tools::PodUpdate) {
+        let Some(task) = self.tasks.get(thread_id) else {
+            warn!(%thread_id, "apply_pod_update: task not found");
+            return;
+        };
+        let pod_id = task.pod_id.clone();
+        match update {
+            crate::builtin_tools::PodUpdate::Config { toml_text, parsed } => {
+                self.apply_pod_config_update(&pod_id, toml_text, *parsed, None);
+            }
+            crate::builtin_tools::PodUpdate::SystemPrompt { text } => {
+                self.apply_system_prompt_update(&pod_id, text, None);
+            }
+        }
+    }
+
+    /// Refresh the in-memory pod with a validated new config + raw TOML
+    /// and broadcast `PodConfigUpdated` to every connected client. Does
+    /// NOT touch disk — callers that originate on-wire updates (the
+    /// UpdatePodConfig handler) separately invoke [`persist_pod_config`];
+    /// the builtin-tool path has already written the file before
+    /// reaching here.
+    fn apply_pod_config_update(
+        &mut self,
+        pod_id: &str,
+        toml_text: String,
+        parsed: whisper_agent_protocol::PodConfig,
+        correlation_id: Option<String>,
+    ) {
+        if let Some(pod) = self.pods.get_mut(pod_id) {
+            pod.config = parsed.clone();
+            pod.raw_toml = toml_text.clone();
+        }
+        let ev = ServerToClient::PodConfigUpdated {
+            pod_id: pod_id.to_string(),
+            toml_text,
+            parsed,
+            correlation_id,
+        };
+        for tx in self.router.outbound_snapshot() {
+            let _ = tx.send(ev.clone());
+        }
+    }
+
+    /// Refresh the in-memory pod's cached system prompt and broadcast
+    /// `PodSystemPromptUpdated`. Same split as
+    /// [`apply_pod_config_update`] — builtin-tool callers have already
+    /// written the file; wire-originated callers spawn
+    /// [`persist_system_prompt`] alongside.
+    fn apply_system_prompt_update(
+        &mut self,
+        pod_id: &str,
+        text: String,
+        correlation_id: Option<String>,
+    ) {
+        if let Some(pod) = self.pods.get_mut(pod_id) {
+            pod.system_prompt = text.clone();
+        }
+        let ev = ServerToClient::PodSystemPromptUpdated {
+            pod_id: pod_id.to_string(),
+            text,
+            correlation_id,
+        };
+        for tx in self.router.outbound_snapshot() {
+            let _ = tx.send(ev.clone());
+        }
+    }
+
+    /// Spawn a background task that flushes a new pod.toml to disk. On
+    /// failure the pod is still live in memory (the broadcast already
+    /// went out); we log and optionally surface an error to the
+    /// originating connection.
+    fn persist_pod_config(&self, pod_id: String, toml_text: String, err_conn: Option<ConnId>) {
+        let Some(persister) = self.persister.clone() else {
+            return;
+        };
+        let outbound = err_conn.and_then(|c| self.router.outbound(c));
+        tokio::spawn(async move {
+            if let Err(e) = persister.update_pod_config(&pod_id, &toml_text).await {
+                warn!(pod_id = %pod_id, error = %e, "update_pod_config disk write failed");
+                if let Some(tx) = outbound {
+                    let _ = tx.send(ServerToClient::Error {
+                        correlation_id: None,
+                        thread_id: None,
+                        message: format!("update_pod_config: disk write failed: {e}"),
+                    });
+                }
+            }
+        });
     }
 
     /// Advance `thread_id`'s state machine until it pauses, pushing new I/O to

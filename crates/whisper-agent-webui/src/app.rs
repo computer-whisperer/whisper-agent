@@ -959,6 +959,12 @@ impl ChatApp {
                     }
                 }
             }
+            ServerToClient::PodSystemPromptUpdated { .. } => {
+                // No rendered view of the prompt text today, so nothing
+                // for the UI to refresh. The event is still delivered so
+                // a future "inspect current system prompt" panel can
+                // stay in sync without polling.
+            }
             ServerToClient::PodArchived { pod_id } => {
                 self.pods.remove(&pod_id);
                 // Drop any threads we were tracking under the archived pod —
@@ -2299,7 +2305,7 @@ impl ChatApp {
                 system_prompt_file: "system_prompt.md".into(),
                 max_tokens: 16384,
                 max_turns: 30,
-                approval_policy: ApprovalPolicy::AutoApproveAll,
+                approval_policy: ApprovalPolicy::PromptPodModify,
                 host_env: String::new(),
                 mcp_hosts: Vec::new(),
             },
@@ -3182,6 +3188,11 @@ fn render_pod_editor_defaults_tab(
                     );
                     ui.selectable_value(
                         &mut working.thread_defaults.approval_policy,
+                        ApprovalPolicy::PromptPodModify,
+                        approval_policy_label(ApprovalPolicy::PromptPodModify),
+                    );
+                    ui.selectable_value(
+                        &mut working.thread_defaults.approval_policy,
                         ApprovalPolicy::PromptDestructive,
                         approval_policy_label(ApprovalPolicy::PromptDestructive),
                     );
@@ -3815,7 +3826,8 @@ fn hint(ui: &mut egui::Ui, text: &str) {
 fn approval_policy_label(p: ApprovalPolicy) -> &'static str {
     match p {
         ApprovalPolicy::AutoApproveAll => "auto — approve all tool calls",
-        ApprovalPolicy::PromptDestructive => "prompt — ask before non-readonly tool calls",
+        ApprovalPolicy::PromptPodModify => "prompt — ask before pod-config edits",
+        ApprovalPolicy::PromptDestructive => "prompt — ask before destructive or pod-config tool calls",
     }
 }
 

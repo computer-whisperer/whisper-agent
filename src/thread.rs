@@ -670,7 +670,8 @@ impl Thread {
             let empty = ToolAnnotations::default();
             let ann = tool_annotations.get(&tool_use.name).unwrap_or(&empty);
             let allowlisted = self.tool_allowlist.contains(&tool_use.name);
-            match evaluate_policy(self.config.approval_policy, ann, allowlisted) {
+            let is_pod_modify = crate::builtin_tools::is_pod_modify(&tool_use.name);
+            match evaluate_policy(self.config.approval_policy, ann, allowlisted, is_pod_modify) {
                 ApprovalOutcome::Auto(reason) => {
                     auto_reasons.insert(tool_use.tool_use_id.clone(), reason.clone());
                     dispositions.push(ApprovalDisposition::AutoApproved { reason });
@@ -1023,14 +1024,33 @@ fn evaluate_policy(
     policy: ApprovalPolicy,
     annotations: &ToolAnnotations,
     allowlisted: bool,
+    is_pod_modify: bool,
 ) -> ApprovalOutcome {
     if allowlisted {
         return ApprovalOutcome::Auto("policy:allowlist".into());
     }
+    // Read-only tools skip the prompt under every policy except
+    // AutoApproveAll (which we've already handled more broadly). The
+    // pod_read_file builtin carries read_only_hint: true, so it falls
+    // into this branch and auto-approves without needing a pod-modify
+    // check.
     match policy {
         ApprovalPolicy::AutoApproveAll => ApprovalOutcome::Auto("policy:auto_approve_all".into()),
+        ApprovalPolicy::PromptPodModify => {
+            if is_pod_modify {
+                ApprovalOutcome::Prompt
+            } else {
+                ApprovalOutcome::Auto("policy:non_pod_modify".into())
+            }
+        }
         ApprovalPolicy::PromptDestructive => {
-            if annotations.is_read_only() {
+            if is_pod_modify {
+                // Pod-modify tools prompt under PromptDestructive
+                // regardless of their annotations — the "destructive"
+                // framing extends to anything that changes the agent's
+                // own allowed capability set.
+                ApprovalOutcome::Prompt
+            } else if annotations.is_read_only() {
                 ApprovalOutcome::Auto("policy:read_only".into())
             } else {
                 ApprovalOutcome::Prompt
@@ -1255,15 +1275,43 @@ mod tests {
     fn allowlist_short_circuits_evaluate_policy() {
         let read_only_ann = ToolAnnotations::default();
         let allowlisted = matches!(
-            evaluate_policy(ApprovalPolicy::PromptDestructive, &read_only_ann, true),
+            evaluate_policy(ApprovalPolicy::PromptDestructive, &read_only_ann, true, false),
             ApprovalOutcome::Auto(_)
         );
         let not_listed = matches!(
-            evaluate_policy(ApprovalPolicy::PromptDestructive, &read_only_ann, false),
+            evaluate_policy(ApprovalPolicy::PromptDestructive, &read_only_ann, false, false),
             ApprovalOutcome::Prompt
         );
         assert!(allowlisted, "allowlisted call must auto-resolve");
         assert!(not_listed, "non-allowlisted unannotated call must prompt");
+    }
+
+    #[test]
+    fn prompt_pod_modify_auto_approves_mcp_prompts_builtin() {
+        let any_ann = ToolAnnotations {
+            destructive_hint: Some(true),
+            ..ToolAnnotations::default()
+        };
+        // MCP destructive tool under PromptPodModify: auto.
+        assert!(matches!(
+            evaluate_policy(ApprovalPolicy::PromptPodModify, &any_ann, false, false),
+            ApprovalOutcome::Auto(_)
+        ));
+        // Pod-modify tool under PromptPodModify: prompt.
+        assert!(matches!(
+            evaluate_policy(ApprovalPolicy::PromptPodModify, &any_ann, false, true),
+            ApprovalOutcome::Prompt
+        ));
+        // Pod-modify tool under PromptDestructive: also prompt.
+        assert!(matches!(
+            evaluate_policy(ApprovalPolicy::PromptDestructive, &any_ann, false, true),
+            ApprovalOutcome::Prompt
+        ));
+        // Everything is auto under AutoApproveAll.
+        assert!(matches!(
+            evaluate_policy(ApprovalPolicy::AutoApproveAll, &any_ann, false, true),
+            ApprovalOutcome::Auto(_)
+        ));
     }
 
     #[test]

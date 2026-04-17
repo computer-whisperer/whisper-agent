@@ -227,11 +227,20 @@ pub struct HostEnvProviderInfo {
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum ApprovalPolicy {
-    /// Auto-approve every tool call. Default.
-    #[default]
+    /// Auto-approve every tool call.
     AutoApproveAll,
-    /// Auto-approve tools the MCP server marked `readOnlyHint: true`; prompt the user
-    /// for everything else (destructive, open-world, or unannotated).
+    /// Auto-approve read-only and non-pod-modifying tools; prompt on the
+    /// builtin pod-editing tools (which can expand the agent's own
+    /// privileges). Default for new pods — the sandbox layer is the
+    /// primary safety boundary, but the agent's ability to edit its
+    /// own pod config is a privilege-escalation vector and gets a
+    /// distinct gate.
+    #[default]
+    PromptPodModify,
+    /// Auto-approve only tools the MCP server marked `readOnlyHint: true`;
+    /// prompt on destructive MCP tools AND on pod-modifying builtin tools.
+    /// Strictest useful policy — use when running without a sandbox or when
+    /// human-in-loop is desired for every non-trivial action.
     PromptDestructive,
 }
 
@@ -769,6 +778,16 @@ pub enum ServerToClient {
         pod_id: String,
         toml_text: String,
         parsed: PodConfig,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        correlation_id: Option<String>,
+    },
+    /// The pod's system-prompt file was rewritten (via the builtin
+    /// `pod_write_file` / `pod_edit_file` tool, or a future wire
+    /// command). Carries the full new text so subscribed clients can
+    /// refresh any rendered view of the prompt.
+    PodSystemPromptUpdated {
+        pod_id: String,
+        text: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         correlation_id: Option<String>,
     },

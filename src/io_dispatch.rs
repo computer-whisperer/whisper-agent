@@ -33,10 +33,17 @@ use crate::thread::{IoRequest, IoResult, OpId};
 
 /// Completion message delivered by every per-thread I/O future the
 /// scheduler dispatches via `step_until_blocked`.
+///
+/// `pod_update`, when set, is a side effect produced by a builtin tool
+/// (pod_write_file / pod_edit_file) that the scheduler applies to
+/// in-memory pod state after handing the tool result to the task —
+/// keeping the broadcast and on-disk write atomic from subscribers'
+/// perspective.
 pub(crate) struct IoCompletion {
     pub(crate) thread_id: String,
     pub(crate) op_id: OpId,
     pub(crate) result: IoResult,
+    pub(crate) pod_update: Option<crate::builtin_tools::PodUpdate>,
 }
 
 /// Completion message delivered by every host-env provisioning future.
@@ -319,6 +326,7 @@ fn model_call(scheduler: &Scheduler, thread_id: String, op_id: OpId) -> Schedule
                     thread_id,
                     op_id,
                     result: IoResult::ModelCall(Err(msg)),
+                    pod_update: None,
                 })
             });
         }
@@ -341,6 +349,7 @@ fn model_call(scheduler: &Scheduler, thread_id: String, op_id: OpId) -> Schedule
             thread_id,
             op_id,
             result,
+            pod_update: None,
         })
     })
 }
@@ -353,48 +362,107 @@ fn tool_call(
     name: String,
     input: serde_json::Value,
 ) -> SchedulerFuture {
-    // Route to whichever bound host advertises this tool. If nothing
-    // does, the thread's model is calling a tool we never exposed —
-    // surface it as a tool-call error rather than panicking.
-    let Some(mcp) = scheduler.route_tool(&thread_id, &name) else {
-        return Box::pin(async move {
+    use crate::scheduler::ToolRoute;
+    match scheduler.route_tool(&thread_id, &name) {
+        Some(ToolRoute::Builtin { pod_id }) => {
+            // Snapshot pod dir + config now while we have the sync
+            // borrow. If the pod has vanished between route_tool and
+            // here, surface that as a tool error (shouldn't happen in
+            // practice — pods don't drop mid-turn).
+            let snapshot = match scheduler.pod_snapshot(&pod_id) {
+                Some(s) => s,
+                None => {
+                    return Box::pin(async move {
+                        SchedulerCompletion::Io(IoCompletion {
+                            thread_id,
+                            op_id,
+                            result: IoResult::ToolCall {
+                                tool_use_id,
+                                result: Err(format!("unknown pod `{pod_id}`")),
+                            },
+                            pod_update: None,
+                        })
+                    });
+                }
+            };
+            Box::pin(async move {
+                let outcome = crate::builtin_tools::dispatch(
+                    snapshot.pod_dir,
+                    snapshot.config,
+                    &name,
+                    input,
+                )
+                .await;
+                let pod_update = outcome.pod_update;
+                let result = if outcome.result.is_error {
+                    // Surface tool-level errors as Err in the task-facing
+                    // IoResult — the approval-audit path uses the Err
+                    // variant to decide how to record the turn. Builtin
+                    // tool errors already carry a text block we can
+                    // pass through.
+                    Err(join_text(&outcome.result.content))
+                } else {
+                    Ok(outcome.result)
+                };
+                SchedulerCompletion::Io(IoCompletion {
+                    thread_id,
+                    op_id,
+                    result: IoResult::ToolCall {
+                        tool_use_id,
+                        result,
+                    },
+                    pod_update,
+                })
+            })
+        }
+        Some(ToolRoute::Mcp(mcp)) => Box::pin(async move {
+            let result = match mcp.invoke(&name, input).await {
+                Ok(mut stream) => {
+                    let mut last = None;
+                    while let Some(event) = stream.next().await {
+                        match event {
+                            crate::mcp::ToolEvent::Completed(r) => last = Some(r),
+                        }
+                    }
+                    match last {
+                        Some(r) => Ok(r),
+                        None => Err("no Completed event in tool stream".to_string()),
+                    }
+                }
+                Err(e) => Err(e.to_string()),
+            };
             SchedulerCompletion::Io(IoCompletion {
                 thread_id,
                 op_id,
                 result: IoResult::ToolCall {
                     tool_use_id,
-                    result: Err(format!(
-                        "no bound MCP host advertises tool `{name}`",
-                    )),
+                    result,
                 },
+                pod_update: None,
             })
-        });
-    };
-    Box::pin(async move {
-        let result = match mcp.invoke(&name, input).await {
-            Ok(mut stream) => {
-                let mut last = None;
-                while let Some(event) = stream.next().await {
-                    match event {
-                        crate::mcp::ToolEvent::Completed(r) => last = Some(r),
-                    }
-                }
-                match last {
-                    Some(r) => Ok(r),
-                    None => Err("no Completed event in tool stream".to_string()),
-                }
-            }
-            Err(e) => Err(e.to_string()),
-        };
-        SchedulerCompletion::Io(IoCompletion {
-            thread_id,
-            op_id,
-            result: IoResult::ToolCall {
-                tool_use_id,
-                result,
-            },
-        })
-    })
+        }),
+        None => Box::pin(async move {
+            SchedulerCompletion::Io(IoCompletion {
+                thread_id,
+                op_id,
+                result: IoResult::ToolCall {
+                    tool_use_id,
+                    result: Err(format!("no bound host advertises tool `{name}`")),
+                },
+                pod_update: None,
+            })
+        }),
+    }
+}
+
+fn join_text(blocks: &[crate::mcp::McpContentBlock]) -> String {
+    let mut out = String::new();
+    for b in blocks {
+        match b {
+            crate::mcp::McpContentBlock::Text { text } => out.push_str(text),
+        }
+    }
+    out
 }
 
 /// Owned-by-value model request payload — the dispatched future outlives the

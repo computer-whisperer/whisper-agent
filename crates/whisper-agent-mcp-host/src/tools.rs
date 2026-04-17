@@ -221,8 +221,12 @@ fn edit_file_descriptor() -> Tool {
         description: "Replace text in a file. `old_string` must match literally — no regex. \
                       By default requires exactly one match; pass `replace_all: true` to \
                       change every occurrence. If old_string isn't found, the error shows the \
-                      closest matching region of the file so you can correct the next call. \
-                      Prefer this over write_file for targeted changes."
+                      closest matching region of the file; if it matches multiple times, the \
+                      error lists each match site with line numbers so you can extend \
+                      old_string by unique surrounding text. When you extend old_string to \
+                      disambiguate, extend new_string by the same neighboring text — \
+                      extending only old_string will delete the intervening lines from the \
+                      output. Prefer this over write_file for targeted changes."
             .into(),
         input_schema: json!({
             "type": "object",
@@ -306,10 +310,12 @@ async fn edit_file(workspace: &Arc<Workspace>, args: Value) -> CallToolResult {
         ));
     }
     if found > 1 && !parsed.replace_all {
+        let hint = multi_match_hint(&content, &parsed.old_string);
         return CallToolResult::error_text(format!(
-            "edit_file({}): old_string matches {found} times. Either extend old_string with \
-             surrounding context to make it unique, or pass replace_all:true to replace every \
-             occurrence.",
+            "edit_file({}): old_string matches {found} times. Either extend old_string AND \
+             new_string with the same surrounding context to make the target unique (extend \
+             both by identical text — extending only old_string will delete the intervening \
+             lines), or pass replace_all:true to replace every occurrence.{hint}",
             parsed.path.display()
         ));
     }
@@ -373,6 +379,68 @@ fn nearest_match_hint(content: &str, old_string: &str) -> String {
         let in_window = i >= best_start && i < best_start + window_size;
         let marker = if in_window { ">" } else { " " };
         out.push_str(&format!("{marker} {:5} │ {}\n", i + 1, line));
+    }
+    out
+}
+
+/// When `old_string` appears more than once, show the first few match
+/// sites with line numbers and ±2 lines of surrounding context so the
+/// model can extend `old_string` AND `new_string` by unique neighboring
+/// text. Caps at 3 matches — the model only needs enough to tell the
+/// targets apart.
+fn multi_match_hint(content: &str, old_string: &str) -> String {
+    const CONTEXT: usize = 2;
+    const MAX_SHOWN: usize = 3;
+
+    let file_lines: Vec<&str> = content.lines().collect();
+    let old_lines: Vec<&str> = old_string.lines().collect();
+    if old_lines.is_empty() || file_lines.is_empty() {
+        return String::new();
+    }
+    let window_size = old_lines.len();
+    if window_size > file_lines.len() {
+        return String::new();
+    }
+
+    // Literal compare — match `content.matches(old_string)`'s semantics.
+    let mut hits: Vec<usize> = Vec::new();
+    for start in 0..=(file_lines.len() - window_size) {
+        if (0..window_size).all(|i| file_lines[start + i] == old_lines[i]) {
+            hits.push(start);
+        }
+    }
+    if hits.len() < 2 {
+        // When old_string starts mid-line, `content.matches` may count
+        // more hits than the line-oriented search finds. Skip the hint
+        // rather than mislead the model.
+        return String::new();
+    }
+
+    let total = hits.len();
+    let shown = hits.len().min(MAX_SHOWN);
+    let mut out = format!("\nMatch sites ({} of {} shown):\n", shown, total);
+    for (idx, start) in hits.iter().take(MAX_SHOWN).enumerate() {
+        let ctx_start = start.saturating_sub(CONTEXT);
+        let ctx_end = (start + window_size + CONTEXT).min(file_lines.len());
+        out.push_str(&format!(
+            "  match {} (lines {}-{}):\n",
+            idx + 1,
+            start + 1,
+            start + window_size,
+        ));
+        for (offset, line) in file_lines[ctx_start..ctx_end].iter().enumerate() {
+            let i = ctx_start + offset;
+            let in_window = i >= *start && i < *start + window_size;
+            let marker = if in_window { ">" } else { " " };
+            out.push_str(&format!("    {marker} {:5} │ {}\n", i + 1, line));
+        }
+    }
+    if total > MAX_SHOWN {
+        out.push_str(&format!(
+            "  ... ({} further match{} omitted)\n",
+            total - MAX_SHOWN,
+            if total - MAX_SHOWN == 1 { "" } else { "es" }
+        ));
     }
     out
 }
@@ -1303,6 +1371,24 @@ fn main() {
         let old = "fn example() {\n    unused();\n}\n";
         let hint = nearest_match_hint(content, old);
         assert!(hint.contains("No closely-matching region"));
+    }
+
+    #[test]
+    fn multi_match_hint_lists_each_site_with_context() {
+        let content = "name = \"test\"\nfoo\n\n[[section]]\nname = \"test\"\nother\n";
+        let hint = multi_match_hint(content, "name = \"test\"");
+        assert!(hint.contains("Match sites (2 of 2 shown)"));
+        assert!(hint.contains("match 1 (lines 1-1)"));
+        assert!(hint.contains("match 2 (lines 5-5)"));
+        assert!(hint.contains("[[section]]"));
+    }
+
+    #[test]
+    fn multi_match_hint_caps_at_three() {
+        let content = "x\nx\nx\nx\nx\n";
+        let hint = multi_match_hint(content, "x");
+        assert!(hint.contains("3 of 5 shown"));
+        assert!(hint.contains("2 further matches omitted"));
     }
 
     #[test]
