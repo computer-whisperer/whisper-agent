@@ -341,7 +341,9 @@ fn model_call(scheduler: &Scheduler, thread_id: String, op_id: OpId) -> Schedule
             messages: &owned_req.messages,
             cache_breakpoints: &owned_req.cache_breakpoints,
         };
-        let result = match provider.create_message(&req).await {
+        let result = match call_with_rate_limit_retry(provider.as_ref(), &req, &thread_id, op_id)
+            .await
+        {
             Ok(resp) => IoResult::ModelCall(Ok(resp)),
             Err(e) => IoResult::ModelCall(Err(e.to_string())),
         };
@@ -352,6 +354,39 @@ fn model_call(scheduler: &Scheduler, thread_id: String, op_id: OpId) -> Schedule
             pod_update: None,
         })
     })
+}
+
+/// Upper bound on how long we're willing to sleep through a single
+/// rate-limit signal before giving up. Short Code-Assist 429s (say ~6s)
+/// flow through transparently; long quota-reset waits surface as
+/// failures so the user isn't left waiting on a minutes-long sleep.
+const MAX_RATE_LIMIT_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+
+async fn call_with_rate_limit_retry(
+    provider: &dyn crate::model::ModelProvider,
+    req: &ModelRequest<'_>,
+    thread_id: &str,
+    op_id: OpId,
+) -> Result<crate::model::ModelResponse, crate::model::ModelError> {
+    match provider.create_message(req).await {
+        Ok(resp) => Ok(resp),
+        Err(crate::model::ModelError::RateLimited { retry_after, body }) => {
+            if retry_after > MAX_RATE_LIMIT_WAIT {
+                return Err(crate::model::ModelError::RateLimited { retry_after, body });
+            }
+            tracing::warn!(
+                %thread_id,
+                op_id,
+                wait_ms = retry_after.as_millis() as u64,
+                "model backend rate-limited; waiting before single retry"
+            );
+            tokio::time::sleep(retry_after).await;
+            // One retry; any further rate-limit bubbles up as a terminal
+            // failure so the thread parks rather than spinning indefinitely.
+            provider.create_message(req).await
+        }
+        Err(other) => Err(other),
+    }
 }
 
 fn tool_call(

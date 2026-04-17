@@ -22,7 +22,13 @@
 #   --skip-wasm       skip the wasm-pack build (use when only Rust code changed)
 #   --no-fetch        skip starting the web-fetch daemon (no `web_fetch` tool)
 #   --no-search       skip starting the web-search daemon (no `web_search` tool).
-#                     Auto-set when BRAVE_API_KEY is unset in CLOUD_KEYS.txt.
+#                     Auto-set when BRAVE_API_KEY is absent from whisper-agent.toml's
+#                     [secrets] table.
+#
+# Config discovery: the whisper-agent binary searches (in order)
+# $XDG_CONFIG_HOME/whisper-agent/whisper-agent.toml,
+# $HOME/.config/whisper-agent/whisper-agent.toml, then ./whisper-agent.toml.
+# This script relies on that — it does not pass `--config`.
 
 set -euo pipefail
 
@@ -52,24 +58,26 @@ for arg in "$@"; do
     esac
 done
 
-if [[ ! -f CLOUD_KEYS.txt ]]; then
-    echo "error: CLOUD_KEYS.txt not found at repo root" >&2
-    echo "       create it with a single line: ANTHROPIC_API_KEY=sk-ant-..." >&2
-    exit 1
-fi
-# shellcheck disable=SC1091
-source CLOUD_KEYS.txt
-export ANTHROPIC_API_KEY
-export BRAVE_API_KEY="${BRAVE_API_KEY:-}"
+mkdir -p "$SANDBOX"
 
-if [[ "$USE_SEARCH" -eq 1 && -z "$BRAVE_API_KEY" ]]; then
-    echo "==> BRAVE_API_KEY unset in CLOUD_KEYS.txt — skipping web-search daemon"
+# Build the main binary first so we can use `whisper-agent config env` to
+# resolve any [secrets] declared in the active whisper-agent.toml. That
+# result feeds the auto-skip decision below, so it has to happen before we
+# pick the sibling-daemon package list.
+echo "==> building whisper-agent (release)"
+cargo build --release -p whisper-agent
+
+# shellcheck disable=SC1090
+eval "$("$REPO_ROOT/target/release/whisper-agent" config env)"
+
+# Skip the search daemon silently if no key is configured — the rest of the
+# stack works fine without it.
+if [[ "$USE_SEARCH" -eq 1 && -z "${BRAVE_API_KEY:-}" ]]; then
+    echo "==> BRAVE_API_KEY absent from [secrets] — skipping web-search daemon"
     USE_SEARCH=0
 fi
 
-mkdir -p "$SANDBOX"
-
-PACKAGES="-p whisper-agent -p whisper-agent-mcp-host -p whisper-agent-sandbox"
+PACKAGES="-p whisper-agent-mcp-host -p whisper-agent-sandbox"
 if [[ "$USE_FETCH" -eq 1 ]]; then
     PACKAGES="$PACKAGES -p whisper-agent-mcp-fetch"
 fi
@@ -155,7 +163,6 @@ echo "    open http://$LISTEN_SERVER/ in a browser"
 # workspace.
 "$REPO_ROOT/target/release/whisper-agent" serve \
     --listen "$LISTEN_SERVER" \
-    --config "$REPO_ROOT/whisper-agent.toml" \
     --host-env-provider "local-landlock=http://$LISTEN_SANDBOX" \
     --default-host-env-provider "local-landlock" \
     --default-host-env-workspace "$SANDBOX" \

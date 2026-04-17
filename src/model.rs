@@ -11,6 +11,7 @@
 
 use std::future::Future;
 use std::pin::Pin;
+use std::time::Duration;
 
 use serde_json::Value;
 use thiserror::Error;
@@ -70,6 +71,13 @@ pub enum ModelError {
     Transport(String),
     #[error("api error {status}: {body}")]
     Api { status: u16, body: String },
+    /// Server signalled a short-term capacity / quota exhaustion (typically HTTP
+    /// 429). Carries the server-suggested wait before retrying along with the
+    /// raw body so the caller can show a useful message. The dispatch layer may
+    /// retry once transparently when `retry_after` is small; longer waits
+    /// surface as failures with the wait in the message.
+    #[error("rate limited: retry after {retry_after:?}: {body}")]
+    RateLimited { retry_after: Duration, body: String },
 }
 
 /// Provider-agnostic model backend. Object-safe via explicit pinned-boxed futures

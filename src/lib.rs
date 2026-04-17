@@ -6,11 +6,15 @@
 pub mod anthropic;
 pub mod audit;
 pub mod builtin_tools;
+pub mod codex_auth;
 pub mod config;
+pub mod gemini;
+pub mod gemini_auth;
 pub mod io_dispatch;
 pub mod mcp;
 pub mod model;
 pub mod openai_chat;
+pub mod openai_responses;
 pub mod persist;
 pub mod pod;
 pub mod resources;

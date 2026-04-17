@@ -63,6 +63,29 @@ enum Command {
     /// Start the HTTP server: hosts the webui assets and drives the task scheduler.
     /// Clients subscribe to individual tasks via the multiplexed WebSocket protocol.
     Serve(ServeArgs),
+    /// Introspect the resolved config (secrets export, path discovery, ...).
+    Config(ConfigCmd),
+}
+
+#[derive(Parser, Debug)]
+struct ConfigCmd {
+    #[command(subcommand)]
+    action: ConfigAction,
+}
+
+#[derive(Subcommand, Debug)]
+enum ConfigAction {
+    /// Emit `export KEY='VALUE'` lines for every entry in the [secrets] table.
+    /// Intended for shell scripts that launch sibling daemons:
+    ///   `eval "$(whisper-agent config env)"`
+    Env(ConfigEnvArgs),
+}
+
+#[derive(Parser, Debug)]
+struct ConfigEnvArgs {
+    /// Override the config path. Same precedence as `serve --config`.
+    #[arg(long)]
+    config: Option<PathBuf>,
 }
 
 #[derive(Parser, Debug)]
@@ -72,8 +95,10 @@ struct ServeArgs {
     listen: SocketAddr,
 
     /// Path to a TOML config file describing the model-backend catalog. If omitted,
-    /// the server falls back to a single-backend "anthropic" config built from
-    /// `--anthropic-api-key` + `--model`.
+    /// the server searches (in order): `$XDG_CONFIG_HOME/whisper-agent/whisper-agent.toml`,
+    /// `$HOME/.config/whisper-agent/whisper-agent.toml`, then `./whisper-agent.toml`.
+    /// If none is found, it falls back to a single-backend "anthropic" config built
+    /// from `--anthropic-api-key` + `--model`.
     #[arg(long)]
     config: Option<PathBuf>,
 
@@ -155,6 +180,52 @@ fn parse_host_env_provider_arg(s: &str) -> Result<(String, String), String> {
     parse_shared_host_arg(s)
 }
 
+/// Resolve which TOML config file to load. Precedence:
+///   1. `--config <path>` — explicit, errors if the path is missing.
+///   2. `$XDG_CONFIG_HOME/whisper-agent/whisper-agent.toml`
+///   3. `$HOME/.config/whisper-agent/whisper-agent.toml`
+///   4. `./whisper-agent.toml` (legacy dev-loop fallback).
+///
+/// Returns `None` only when no flag was given and none of the default paths
+/// exist — callers then fall through to the single-backend CLI-arg path.
+fn resolve_config_path(explicit: Option<PathBuf>) -> Result<Option<PathBuf>> {
+    if let Some(path) = explicit {
+        if !path.exists() {
+            return Err(anyhow!(
+                "--config {} does not exist",
+                path.display()
+            ));
+        }
+        return Ok(Some(path));
+    }
+
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    if let Ok(xdg) = std::env::var("XDG_CONFIG_HOME")
+        && !xdg.is_empty()
+    {
+        candidates.push(PathBuf::from(xdg).join("whisper-agent/whisper-agent.toml"));
+    }
+    if let Ok(home) = std::env::var("HOME")
+        && !home.is_empty()
+    {
+        candidates.push(PathBuf::from(home).join(".config/whisper-agent/whisper-agent.toml"));
+    }
+    candidates.push(PathBuf::from("whisper-agent.toml"));
+
+    // Dedup — when XDG_CONFIG_HOME is unset or equal to $HOME/.config the XDG
+    // and HOME paths collapse to the same file.
+    let mut seen: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+    for p in candidates {
+        if !seen.insert(p.clone()) {
+            continue;
+        }
+        if p.exists() {
+            return Ok(Some(p));
+        }
+    }
+    Ok(None)
+}
+
 /// Parse a `name=url` pair for `--shared-mcp-host`. Names must be non-empty
 /// and free of `=` so future syntax extensions stay possible.
 fn parse_shared_host_arg(s: &str) -> Result<(String, String), String> {
@@ -182,7 +253,40 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Command::Serve(args) => run_serve(args).await,
+        Command::Config(cmd) => run_config(cmd).await,
     }
+}
+
+async fn run_config(cmd: ConfigCmd) -> Result<()> {
+    match cmd.action {
+        ConfigAction::Env(args) => run_config_env(args).await,
+    }
+}
+
+async fn run_config_env(args: ConfigEnvArgs) -> Result<()> {
+    let path = resolve_config_path(args.config)?
+        .ok_or_else(|| anyhow!("no config file found (searched --config, XDG, ~/.config, cwd)"))?;
+    let cfg = Config::load(&path).await?;
+    for (key, value) in &cfg.secrets {
+        println!("export {}={}", key, shell_single_quote(value));
+    }
+    Ok(())
+}
+
+/// Wrap `s` in single quotes for safe shell eval, escaping any embedded
+/// single quotes via the standard `'\''` idiom.
+fn shell_single_quote(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('\'');
+    for ch in s.chars() {
+        if ch == '\'' {
+            out.push_str("'\\''");
+        } else {
+            out.push(ch);
+        }
+    }
+    out.push('\'');
+    out
 }
 
 async fn run_serve(args: ServeArgs) -> Result<()> {
@@ -195,8 +299,10 @@ async fn run_serve(args: ServeArgs) -> Result<()> {
     // Resolve the backend catalog and shared-host map. Either source can come
     // from a TOML config; CLI --shared-mcp-host flags layer on top (CLI wins
     // on name conflict).
-    let (backends, default_backend, default_model, mut shared_host_map, toml_provider_entries) = match &args.config {
+    let resolved_config = resolve_config_path(args.config.clone())?;
+    let (backends, default_backend, default_model, mut shared_host_map, toml_provider_entries) = match &resolved_config {
         Some(path) => {
+            info!(config = %path.display(), "loading backend catalog");
             let cfg = Config::load(path).await?;
             let default_model = cfg
                 .backends
@@ -353,3 +459,26 @@ fn build_default_host_env(
     ))
 }
 
+#[cfg(test)]
+mod tests {
+    use super::shell_single_quote;
+
+    #[test]
+    fn quotes_plain_value() {
+        assert_eq!(shell_single_quote("abc123"), "'abc123'");
+    }
+
+    #[test]
+    fn quotes_special_characters_without_expansion() {
+        assert_eq!(
+            shell_single_quote("a $b `c` \"d\" \\e"),
+            "'a $b `c` \"d\" \\e'"
+        );
+    }
+
+    #[test]
+    fn escapes_embedded_single_quote() {
+        // The idiom: close, escaped single-quote, reopen.
+        assert_eq!(shell_single_quote("it's"), "'it'\\''s'");
+    }
+}
