@@ -2115,6 +2115,116 @@ impl Scheduler {
         )
     }
 
+    /// One-time pass at scheduler startup: apply each cron behavior's
+    /// `CatchUp` policy to its persisted cursor.
+    ///
+    /// Without catch-up logic, a behavior whose `last_fired_at` is
+    /// stale enough that `cron.after(last_fired_at)` is now in the
+    /// past would fire on the very first cron tick after restart —
+    /// exactly once, because after firing the cursor advances past
+    /// `now`. That default matches `CatchUp::One` perfectly, so this
+    /// pass is structured as "tweak the cursor for the other cases":
+    ///
+    /// - `None`: advance `last_fired_at` to `now`, so the first
+    ///   tick sees `cron.after(now)` and doesn't fire.
+    /// - `One`: no-op. The first tick's natural behavior fires one.
+    /// - `All`: currently behaves like `One` but logs the count of
+    ///   missed occurrences. The design explicitly calls out this
+    ///   variant as almost never desirable; capping to one avoids
+    ///   hammering the scheduler with stale firings after extended
+    ///   downtime.
+    ///
+    /// Behaviors that have never fired (`last_fired_at == None`) are
+    /// handled by the tick-time priming pass, not here — catch-up
+    /// doesn't apply to something that hasn't happened yet.
+    fn evaluate_cron_catch_up(&mut self) {
+        let now = chrono::Utc::now();
+
+        // One shot gather of all cron behaviors with a persisted
+        // cursor that's now stale (next occurrence already past). We
+        // collect enough state to log and dispatch in a second pass,
+        // keeping the mutable iterations in the later loop.
+        struct Missed {
+            pod_id: String,
+            behavior_id: String,
+            catch_up: whisper_agent_protocol::CatchUp,
+            missed_count: u64,
+        }
+        let mut missed: Vec<Missed> = Vec::new();
+        for (pod_id, pod) in &self.pods {
+            for (behavior_id, behavior) in &pod.behaviors {
+                let Some(cron) = behavior.cron.as_ref() else {
+                    continue;
+                };
+                let Some(cursor) = parse_rfc3339_utc(behavior.state.last_fired_at.as_deref())
+                else {
+                    continue; // never fired — priming pass handles this
+                };
+                if !is_cron_due(cron, cursor, now) {
+                    continue;
+                }
+                let catch_up = match behavior.config.as_ref().map(|c| &c.trigger) {
+                    Some(whisper_agent_protocol::TriggerSpec::Cron { catch_up, .. }) => *catch_up,
+                    _ => continue,
+                };
+                // Count missed occurrences for logging only. Capped
+                // so a grossly-stale cursor (years) doesn't spin.
+                let missed_count = count_missed_occurrences(cron, cursor, now, 1000);
+                missed.push(Missed {
+                    pod_id: pod_id.clone(),
+                    behavior_id: behavior_id.clone(),
+                    catch_up,
+                    missed_count,
+                });
+            }
+        }
+
+        for m in missed {
+            match m.catch_up {
+                // Advance the cursor past all missed windows; the
+                // first tick after startup will see `cron.after(now)`
+                // and won't fire.
+                whisper_agent_protocol::CatchUp::None => {
+                    info!(
+                        pod_id = %m.pod_id,
+                        behavior_id = %m.behavior_id,
+                        missed = m.missed_count,
+                        "cron catch_up=none: suppressing missed fires, advancing cursor"
+                    );
+                    if let Some(pod) = self.pods.get_mut(&m.pod_id)
+                        && let Some(behavior) = pod.behaviors.get_mut(&m.behavior_id)
+                    {
+                        behavior.state.last_fired_at = Some(now.to_rfc3339());
+                        self.mark_behavior_dirty(&m.pod_id, &m.behavior_id);
+                    }
+                }
+                // No-op: the first tick's natural flow fires exactly
+                // once (because `is_cron_due` returns true) and then
+                // advances the cursor via `run_behavior`.
+                whisper_agent_protocol::CatchUp::One => {
+                    info!(
+                        pod_id = %m.pod_id,
+                        behavior_id = %m.behavior_id,
+                        missed = m.missed_count,
+                        "cron catch_up=one: firing once for missed window"
+                    );
+                }
+                // Currently identical to One — capped to prevent
+                // flooding. Design reserves this variant for a future
+                // case where per-occurrence catch-up is genuinely
+                // wanted; log at warn so operators notice.
+                whisper_agent_protocol::CatchUp::All => {
+                    warn!(
+                        pod_id = %m.pod_id,
+                        behavior_id = %m.behavior_id,
+                        missed = m.missed_count,
+                        "cron catch_up=all capped to 1 fire; per-occurrence replay unimplemented"
+                    );
+                }
+            }
+        }
+    }
+
     /// Park a payload for a behavior whose overlap policy is
     /// `QueueOne`. Sets `state.queued_payload`, overwriting any
     /// already-parked value (QueueOne = at most one pending; later
@@ -3208,6 +3318,31 @@ fn is_cron_due(
         .unwrap_or(false)
 }
 
+/// Count cron occurrences strictly between `cursor` (exclusive) and
+/// `now` (inclusive). Used for startup catch-up logging — informational,
+/// not load-bearing. Capped at `limit` so a cursor far in the past
+/// (e.g., years of accumulated downtime) doesn't wedge the scheduler
+/// boot; a return value equal to `limit` means "at least N."
+fn count_missed_occurrences(
+    cron: &crate::pod::behaviors::CachedCron,
+    cursor: chrono::DateTime<chrono::Utc>,
+    now: chrono::DateTime<chrono::Utc>,
+    limit: u64,
+) -> u64 {
+    let cursor_tz = cursor.with_timezone(&cron.timezone);
+    let mut count: u64 = 0;
+    for occ in cron.schedule.after(&cursor_tz) {
+        if occ.with_timezone(&chrono::Utc) > now {
+            break;
+        }
+        count += 1;
+        if count >= limit {
+            break;
+        }
+    }
+    count
+}
+
 /// Resolved binding-side choices for a fresh thread. Validated against
 /// the pod's `[allow]` cap before construction.
 struct ResolvedBindings {
@@ -3305,6 +3440,12 @@ pub async fn run(mut scheduler: Scheduler, mut inbox: mpsc::UnboundedReceiver<Sc
     gc_ticker.tick().await;
     cron_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     cron_ticker.tick().await;
+
+    // Apply each cron behavior's CatchUp policy to its persisted
+    // cursor. Runs once at boot, before any tick evaluates for real.
+    // Does not fire anything — the first `cron_ticker.tick()` handles
+    // that for the `One`/`All` cases via their natural flow.
+    scheduler.evaluate_cron_catch_up();
 
     info!("scheduler starting");
     loop {
@@ -3490,6 +3631,38 @@ mod tests {
             .with_timezone(&chrono::Utc);
         assert!(is_cron_due(&cron, cursor, at));
         assert!(is_cron_due(&cron, cursor, after));
+    }
+
+    #[test]
+    fn count_missed_counts_inclusive_of_now() {
+        let cron = crate::pod::behaviors::CachedCron {
+            schedule: crate::pod::behaviors::parse_cron_schedule("0 * * * *").unwrap(), // hourly
+            timezone: chrono_tz::UTC,
+        };
+        let cursor = chrono::DateTime::parse_from_rfc3339("2026-04-17T09:30:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let now = chrono::DateTime::parse_from_rfc3339("2026-04-17T13:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        // Occurrences in (09:30, 13:00]: 10:00, 11:00, 12:00, 13:00 = 4.
+        assert_eq!(count_missed_occurrences(&cron, cursor, now, 1000), 4);
+    }
+
+    #[test]
+    fn count_missed_respects_limit() {
+        let cron = crate::pod::behaviors::CachedCron {
+            schedule: crate::pod::behaviors::parse_cron_schedule("* * * * *").unwrap(), // minutely
+            timezone: chrono_tz::UTC,
+        };
+        let cursor = chrono::DateTime::parse_from_rfc3339("2026-04-17T09:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let now = chrono::DateTime::parse_from_rfc3339("2026-04-17T11:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        // 120 minutes worth; limit=5 must cap.
+        assert_eq!(count_missed_occurrences(&cron, cursor, now, 5), 5);
     }
 
     #[test]
