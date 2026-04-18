@@ -55,13 +55,21 @@ pub const POD_WRITE_FILE: &str = "pod_write_file";
 pub const POD_EDIT_FILE: &str = "pod_edit_file";
 pub const POD_LIST_FILES: &str = "pod_list_files";
 pub const POD_ABOUT: &str = "pod_about";
+pub const POD_RUN_BEHAVIOR: &str = "pod_run_behavior";
+pub const POD_SET_BEHAVIOR_ENABLED: &str = "pod_set_behavior_enabled";
 
 /// True if `name` is a builtin pod tool. Used by the scheduler's router
 /// to branch the tool-call dispatch path.
 pub fn is_builtin(name: &str) -> bool {
     matches!(
         name,
-        POD_READ_FILE | POD_WRITE_FILE | POD_EDIT_FILE | POD_LIST_FILES | POD_ABOUT
+        POD_READ_FILE
+            | POD_WRITE_FILE
+            | POD_EDIT_FILE
+            | POD_LIST_FILES
+            | POD_ABOUT
+            | POD_RUN_BEHAVIOR
+            | POD_SET_BEHAVIOR_ENABLED
     )
 }
 
@@ -81,6 +89,8 @@ pub fn descriptors() -> Vec<McpTool> {
         write_descriptor(),
         edit_descriptor(),
         about_descriptor(),
+        run_behavior_descriptor(),
+        set_behavior_enabled_descriptor(),
     ]
 }
 
@@ -119,11 +129,36 @@ pub enum PodUpdate {
     BehaviorPrompt { behavior_id: String, text: String },
 }
 
+/// Runtime action a builtin tool asks the scheduler to perform AFTER
+/// returning the tool result to the model. These bypass disk writes —
+/// they're for flipping runtime state (pause/resume) or kicking a
+/// behavior run. The scheduler applies one of these in the same loop
+/// iteration that consumes the tool result, keeping broadcasts and the
+/// ToolCallEnd in the same well-defined order.
+#[derive(Debug, Clone)]
+pub enum SchedulerCommand {
+    /// Manually fire a behavior. Equivalent to the UI's Run button:
+    /// bypasses the cron/paused gates (it's an explicit action). The
+    /// optional payload is substituted into `prompt.md`'s `{{payload}}`
+    /// the same way a webhook trigger's body is.
+    RunBehavior {
+        behavior_id: String,
+        payload: Option<serde_json::Value>,
+    },
+    /// Pause or resume a single behavior. Wraps the scheduler's
+    /// `SetBehaviorEnabled` handler — on pause drops any queued
+    /// payload, on resume bumps the cron cursor to now so catch-up
+    /// doesn't replay missed windows.
+    SetBehaviorEnabled { behavior_id: String, enabled: bool },
+}
+
 /// What a builtin tool handler produces: the tool result the model sees,
-/// plus an optional state update for the scheduler to apply atomically.
+/// plus optional state/command side effects the scheduler applies
+/// atomically in the same completion step.
 pub struct ToolOutcome {
     pub result: CallToolResult,
     pub pod_update: Option<PodUpdate>,
+    pub scheduler_command: Option<SchedulerCommand>,
 }
 
 /// Dispatch a builtin tool call. `pod_dir` is the pod's on-disk directory;
@@ -144,6 +179,8 @@ pub async fn dispatch(
         POD_WRITE_FILE => write_file(&pod_dir, &allowed, &behavior_ids, args).await,
         POD_EDIT_FILE => edit_file(&pod_dir, &allowed, &behavior_ids, args).await,
         POD_ABOUT => about(args),
+        POD_RUN_BEHAVIOR => run_behavior(&behavior_ids, args),
+        POD_SET_BEHAVIOR_ENABLED => set_behavior_enabled(&behavior_ids, args),
         other => no_update_error(format!("unknown builtin tool: {other}")),
     }
 }
@@ -242,6 +279,7 @@ fn no_update_error(message: String) -> ToolOutcome {
     ToolOutcome {
         result: error_result(message),
         pod_update: None,
+        scheduler_command: None,
     }
 }
 
@@ -249,6 +287,7 @@ fn no_update_text(message: String) -> ToolOutcome {
     ToolOutcome {
         result: text_result(message),
         pod_update: None,
+        scheduler_command: None,
     }
 }
 
@@ -582,6 +621,7 @@ async fn write_file(
             parsed.filename
         )),
         pod_update: Some(update),
+        scheduler_command: None,
     }
 }
 
@@ -717,6 +757,7 @@ async fn edit_file(
             if found == 1 { "" } else { "s" }
         )),
         pod_update: Some(update),
+        scheduler_command: None,
     }
 }
 
@@ -967,6 +1008,144 @@ fn about(args: Value) -> ToolOutcome {
             "unknown topic `{topic}`. Valid topics: [{}]. Call pod_about with no args for the index.",
             crate::tools::pod_about_docs::TOPIC_NAMES.join(", ")
         )),
+    }
+}
+
+// ---------- pod_run_behavior ----------
+
+fn run_behavior_descriptor() -> McpTool {
+    McpTool {
+        name: POD_RUN_BEHAVIOR.into(),
+        description: "Manually fire one of this pod's behaviors. Equivalent to the \
+                      UI's Run button — bypasses cron timers and the paused gate (an \
+                      explicit action always runs). The behavior's `prompt.md` is \
+                      substituted with the `payload` argument as `{{payload}}` the \
+                      same way a webhook body is. Use this to test a newly-written \
+                      behavior without waiting for its schedule, or to kick a \
+                      webhook behavior with a custom payload. Returns immediately \
+                      once the run is queued — the spawned thread appears on the \
+                      wire as normal."
+            .into(),
+        input_schema: json!({
+            "type": "object",
+            "properties": {
+                "behavior_id": {
+                    "type": "string",
+                    "description": "Which behavior under this pod to fire."
+                },
+                "payload": {
+                    "description": "Optional JSON payload. Omitted → null."
+                }
+            },
+            "required": ["behavior_id"]
+        }),
+        annotations: ToolAnnotations {
+            title: Some("Run a behavior".into()),
+            read_only_hint: Some(false),
+            destructive_hint: Some(false),
+            idempotent_hint: Some(false),
+            open_world_hint: Some(false),
+        },
+    }
+}
+
+#[derive(Deserialize)]
+struct RunBehaviorArgs {
+    behavior_id: String,
+    #[serde(default)]
+    payload: Option<Value>,
+}
+
+fn run_behavior(behavior_ids: &[String], args: Value) -> ToolOutcome {
+    let parsed: RunBehaviorArgs = match serde_json::from_value(args) {
+        Ok(v) => v,
+        Err(e) => return no_update_error(format!("invalid arguments: {e}")),
+    };
+    if !behavior_ids.iter().any(|i| i == &parsed.behavior_id) {
+        return no_update_error(format!(
+            "unknown behavior `{}` in this pod. Known: [{}]",
+            parsed.behavior_id,
+            behavior_ids.join(", ")
+        ));
+    }
+    ToolOutcome {
+        result: text_result(format!(
+            "queued manual run of behavior `{}`",
+            parsed.behavior_id
+        )),
+        pod_update: None,
+        scheduler_command: Some(SchedulerCommand::RunBehavior {
+            behavior_id: parsed.behavior_id,
+            payload: parsed.payload,
+        }),
+    }
+}
+
+// ---------- pod_set_behavior_enabled ----------
+
+fn set_behavior_enabled_descriptor() -> McpTool {
+    McpTool {
+        name: POD_SET_BEHAVIOR_ENABLED.into(),
+        description: "Pause or resume one of this pod's automatic-trigger behaviors. \
+                      Paused behaviors skip cron ticks, return 503 on webhook POSTs, \
+                      and do not catch up at startup. Manual `pod_run_behavior` still \
+                      works while paused — it's always an explicit action. Pausing \
+                      drops any `queue_one` payload the behavior had parked; resuming \
+                      bumps a cron behavior's cursor to now so catch-up doesn't \
+                      replay windows missed during the pause."
+            .into(),
+        input_schema: json!({
+            "type": "object",
+            "properties": {
+                "behavior_id": {
+                    "type": "string",
+                    "description": "Which behavior to pause or resume."
+                },
+                "enabled": {
+                    "type": "boolean",
+                    "description": "`true` to resume, `false` to pause."
+                }
+            },
+            "required": ["behavior_id", "enabled"]
+        }),
+        annotations: ToolAnnotations {
+            title: Some("Pause/resume a behavior".into()),
+            read_only_hint: Some(false),
+            destructive_hint: Some(false),
+            idempotent_hint: Some(true),
+            open_world_hint: Some(false),
+        },
+    }
+}
+
+#[derive(Deserialize)]
+struct SetBehaviorEnabledArgs {
+    behavior_id: String,
+    enabled: bool,
+}
+
+fn set_behavior_enabled(behavior_ids: &[String], args: Value) -> ToolOutcome {
+    let parsed: SetBehaviorEnabledArgs = match serde_json::from_value(args) {
+        Ok(v) => v,
+        Err(e) => return no_update_error(format!("invalid arguments: {e}")),
+    };
+    if !behavior_ids.iter().any(|i| i == &parsed.behavior_id) {
+        return no_update_error(format!(
+            "unknown behavior `{}` in this pod. Known: [{}]",
+            parsed.behavior_id,
+            behavior_ids.join(", ")
+        ));
+    }
+    ToolOutcome {
+        result: text_result(format!(
+            "behavior `{}` set to enabled={}",
+            parsed.behavior_id, parsed.enabled
+        )),
+        pod_update: None,
+        scheduler_command: Some(SchedulerCommand::SetBehaviorEnabled {
+            behavior_id: parsed.behavior_id,
+            enabled: parsed.enabled,
+        }),
     }
 }
 
@@ -1412,6 +1591,113 @@ schedule = "0 9 * * *"
             text.contains("Five-field UNIX crontab"),
             "cron topic body not returned: {text}"
         );
+    }
+
+    // ---------- orchestration tool coverage ----------
+
+    #[tokio::test]
+    async fn run_behavior_rejects_unknown_id() {
+        let dir = temp_dir();
+        let cfg = sample_config();
+        let out = dispatch(
+            dir.clone(),
+            cfg,
+            vec!["real".to_string()],
+            POD_RUN_BEHAVIOR,
+            json!({ "behavior_id": "ghost" }),
+        )
+        .await;
+        assert!(out.result.is_error);
+        assert!(out.scheduler_command.is_none());
+        let text = join_blocks(&out.result.content);
+        assert!(text.contains("unknown behavior"), "wrong error: {text}");
+    }
+
+    #[tokio::test]
+    async fn run_behavior_emits_scheduler_command() {
+        let dir = temp_dir();
+        let cfg = sample_config();
+        let out = dispatch(
+            dir.clone(),
+            cfg,
+            vec!["daily".to_string()],
+            POD_RUN_BEHAVIOR,
+            json!({ "behavior_id": "daily", "payload": {"foo": 1} }),
+        )
+        .await;
+        assert!(!out.result.is_error);
+        match out.scheduler_command {
+            Some(SchedulerCommand::RunBehavior {
+                behavior_id,
+                payload,
+            }) => {
+                assert_eq!(behavior_id, "daily");
+                assert_eq!(payload, Some(json!({ "foo": 1 })));
+            }
+            other => panic!("expected RunBehavior command, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn run_behavior_defaults_payload_to_none() {
+        let dir = temp_dir();
+        let cfg = sample_config();
+        let out = dispatch(
+            dir.clone(),
+            cfg,
+            vec!["daily".to_string()],
+            POD_RUN_BEHAVIOR,
+            json!({ "behavior_id": "daily" }),
+        )
+        .await;
+        assert!(!out.result.is_error);
+        match out.scheduler_command {
+            Some(SchedulerCommand::RunBehavior { payload, .. }) => {
+                assert_eq!(payload, None);
+            }
+            other => panic!("expected RunBehavior command, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn set_behavior_enabled_emits_scheduler_command() {
+        let dir = temp_dir();
+        let cfg = sample_config();
+        let out = dispatch(
+            dir.clone(),
+            cfg,
+            vec!["daily".to_string()],
+            POD_SET_BEHAVIOR_ENABLED,
+            json!({ "behavior_id": "daily", "enabled": false }),
+        )
+        .await;
+        assert!(!out.result.is_error);
+        match out.scheduler_command {
+            Some(SchedulerCommand::SetBehaviorEnabled {
+                behavior_id,
+                enabled,
+            }) => {
+                assert_eq!(behavior_id, "daily");
+                assert!(!enabled);
+            }
+            other => panic!("expected SetBehaviorEnabled command, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn set_behavior_enabled_rejects_unknown_id() {
+        let dir = temp_dir();
+        let cfg = sample_config();
+        let out = dispatch(
+            dir.clone(),
+            cfg,
+            vec![],
+            POD_SET_BEHAVIOR_ENABLED,
+            json!({ "behavior_id": "ghost", "enabled": true }),
+        )
+        .await;
+        assert!(out.result.is_error);
+        assert!(out.scheduler_command.is_none());
     }
 
     #[tokio::test]

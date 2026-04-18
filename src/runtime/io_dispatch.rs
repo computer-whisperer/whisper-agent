@@ -39,11 +39,16 @@ use crate::tools::sandbox::HostEnvHandle;
 /// in-memory pod state after handing the tool result to the task —
 /// keeping the broadcast and on-disk write atomic from subscribers'
 /// perspective.
+///
+/// `scheduler_command`, when set, is a runtime action the tool wants
+/// the scheduler to perform (pause / run a behavior). Applied in the
+/// same completion step as `pod_update`, with scheduler access.
 pub(crate) struct IoCompletion {
     pub(crate) thread_id: String,
     pub(crate) op_id: OpId,
     pub(crate) result: IoResult,
     pub(crate) pod_update: Option<crate::tools::builtin_tools::PodUpdate>,
+    pub(crate) scheduler_command: Option<crate::tools::builtin_tools::SchedulerCommand>,
 }
 
 /// Completion message delivered by every host-env provisioning future.
@@ -327,6 +332,7 @@ fn model_call(scheduler: &Scheduler, thread_id: String, op_id: OpId) -> Schedule
                     op_id,
                     result: IoResult::ModelCall(Err(msg)),
                     pod_update: None,
+                    scheduler_command: None,
                 })
             });
         }
@@ -351,6 +357,7 @@ fn model_call(scheduler: &Scheduler, thread_id: String, op_id: OpId) -> Schedule
             op_id,
             result,
             pod_update: None,
+            scheduler_command: None,
         })
     })
 }
@@ -415,6 +422,7 @@ fn tool_call(
                                 result: Err(format!("unknown pod `{pod_id}`")),
                             },
                             pod_update: None,
+                            scheduler_command: None,
                         })
                     });
                 }
@@ -429,6 +437,7 @@ fn tool_call(
                 )
                 .await;
                 let pod_update = outcome.pod_update;
+                let scheduler_command = outcome.scheduler_command;
                 let result = if outcome.result.is_error {
                     // Surface tool-level errors as Err in the task-facing
                     // IoResult — the approval-audit path uses the Err
@@ -447,6 +456,7 @@ fn tool_call(
                         result,
                     },
                     pod_update,
+                    scheduler_command,
                 })
             })
         }
@@ -474,6 +484,7 @@ fn tool_call(
                     result,
                 },
                 pod_update: None,
+                scheduler_command: None,
             })
         }),
         None => Box::pin(async move {
@@ -485,6 +496,7 @@ fn tool_call(
                     result: Err(format!("no bound host advertises tool `{name}`")),
                 },
                 pod_update: None,
+                scheduler_command: None,
             })
         }),
     }

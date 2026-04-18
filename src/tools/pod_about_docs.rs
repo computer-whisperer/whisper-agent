@@ -317,11 +317,12 @@ default for anything firing more often than daily.
 
 const SELF_MOD: &str = "# Self-modification
 
-You have five builtin tools that all target files in THIS pod's
-directory. They live outside your workspace; `read_file` /
-`write_file` / `list_dir` / `bash` cannot see them — only these can.
+You have seven builtin tools that target either files or runtime
+state in THIS pod. File targets live outside your workspace;
+`read_file` / `write_file` / `list_dir` / `bash` cannot see them —
+only these can.
 
-## The surface
+## File tools (declarative config)
 
 - `pod_list_files` — walk the pod dir, including per-behavior
   subdirs. `[rw]` entries are reachable via the tools below;
@@ -331,6 +332,17 @@ directory. They live outside your workspace; `read_file` /
 - `pod_edit_file` — literal-substring replace (single match by
   default, `replace_all` to change every occurrence).
 - `pod_about` — this tool.
+
+## Orchestration tools (runtime state)
+
+- `pod_run_behavior` — manually fire a behavior, bypassing
+  cron/paused gates. Good for testing a new behavior without
+  waiting for its schedule, or for kicking a webhook behavior with
+  a custom payload.
+- `pod_set_behavior_enabled` — pause or resume an individual
+  behavior. Paused behaviors skip cron ticks, 503 webhook POSTs,
+  and don't catch up at startup — but `pod_run_behavior` still
+  works (explicit actions always run).
 
 ## What you can write
 

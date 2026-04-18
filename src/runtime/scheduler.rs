@@ -2982,12 +2982,17 @@ impl Scheduler {
     /// Apply one per-thread I/O completion to its task and dispatch any
     /// resulting events. Resource-provisioning completions take a
     /// different path; see [`Self::apply_provision_completion`].
-    fn apply_io_completion(&mut self, completion: IoCompletion) {
+    fn apply_io_completion(
+        &mut self,
+        completion: IoCompletion,
+        pending_io: &mut FuturesUnordered<SchedulerFuture>,
+    ) {
         let IoCompletion {
             thread_id,
             op_id,
             result,
             pod_update,
+            scheduler_command,
         } = completion;
         let mut events = Vec::new();
 
@@ -2999,6 +3004,9 @@ impl Scheduler {
         // broadcast pair.
         if let Some(update) = pod_update {
             self.apply_pod_update(&thread_id, update);
+        }
+        if let Some(command) = scheduler_command {
+            self.apply_scheduler_command(&thread_id, command, pending_io);
         }
 
         // Surface any IO-level error to the operator even if no client is subscribed.
@@ -3248,6 +3256,48 @@ impl Scheduler {
             };
             for tx in self.router.outbound_snapshot() {
                 let _ = tx.send(ev.clone());
+            }
+        }
+    }
+
+    /// Apply a [`crate::tools::builtin_tools::SchedulerCommand`] produced
+    /// by a builtin orchestration tool (pod_run_behavior /
+    /// pod_set_behavior_enabled). Routes through the same handlers
+    /// that serve the equivalent wire messages, so behavior broadcast
+    /// shape matches exactly.
+    fn apply_scheduler_command(
+        &mut self,
+        thread_id: &str,
+        command: crate::tools::builtin_tools::SchedulerCommand,
+        pending_io: &mut FuturesUnordered<SchedulerFuture>,
+    ) {
+        let Some(task) = self.tasks.get(thread_id) else {
+            warn!(%thread_id, "apply_scheduler_command: task not found");
+            return;
+        };
+        let pod_id = task.pod_id.clone();
+        match command {
+            crate::tools::builtin_tools::SchedulerCommand::RunBehavior {
+                behavior_id,
+                payload,
+            } => {
+                if let Err(e) =
+                    self.run_behavior(None, None, &pod_id, &behavior_id, payload, pending_io)
+                {
+                    warn!(%pod_id, %behavior_id, error = %e,
+                        "tool-initiated run_behavior failed to spawn");
+                }
+            }
+            crate::tools::builtin_tools::SchedulerCommand::SetBehaviorEnabled {
+                behavior_id,
+                enabled,
+            } => {
+                // conn_id = 0 is fine here — the handler only uses it
+                // for error-reply routing, and our validation already
+                // rejected unknown-behavior cases at the tool layer.
+                // Any lookup failure here logs via warn through
+                // send_behavior_error; see handle_set_behavior_enabled.
+                self.handle_set_behavior_enabled(0, None, pod_id, behavior_id, enabled);
             }
         }
     }
@@ -4082,7 +4132,7 @@ pub async fn run(mut scheduler: Scheduler, mut inbox: mpsc::UnboundedReceiver<Sc
                     match completion {
                         SchedulerCompletion::Io(io) => {
                             let thread_id = io.thread_id.clone();
-                            scheduler.apply_io_completion(io);
+                            scheduler.apply_io_completion(io, &mut pending_io);
                             scheduler.step_until_blocked(&thread_id, &mut pending_io);
                         }
                         SchedulerCompletion::Provision(prov) => {
