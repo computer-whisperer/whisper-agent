@@ -45,8 +45,8 @@ Produce a compact summary of this conversation that preserves every detail neede
 2. Key technical concepts — the domain, frameworks, APIs, and architectural choices shaping the work.
 3. Files and code — everything you examined, modified, or created, with enough detail (paths, functions, snippets) that the next turn could resume edits.
 4. Errors and fixes — problems hit and how they were resolved.
-5. All user messages that are not tool results — in order, so the next session has the user's own words.
-6. Current work — what you were doing immediately before this summary request. Include direct quotes from the latest user message.
+5. All user messages from the ORIGINAL conversation, in order, verbatim — so the next session has the user's own words. DO NOT include this compaction instruction you are responding to; it is harness scaffolding, not a user message.
+6. Current work — what you were doing immediately before this summary request. Include direct quotes from the most recent original user message (not from this compaction instruction).
 7. Pending and next step — what's still open. If a next step is clear from the most recent exchange, name it and quote the user verbatim; otherwise note that the conversation concluded.
 
 Do not preface your response. Do not call tools. End after the closing </summary> tag.";
