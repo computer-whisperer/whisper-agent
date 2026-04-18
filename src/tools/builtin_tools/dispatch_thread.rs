@@ -24,12 +24,16 @@ pub(super) fn descriptor() -> McpTool {
                       conversation, tool surface, and state — spawned with \
                       `prompt` as its first user message. `sync=true` parks \
                       this tool call until the child's terminal state and \
-                      returns its final assistant text; `sync=false` returns \
-                      immediately with the child's id and runs the child \
-                      detached in the background. Use this to delegate \
-                      bounded, well-scoped sub-work (research passes, \
-                      exploratory searches, one-shot generators) so the main \
-                      thread's context stays focused. `config_override` and \
+                      returns its final assistant text as the tool result. \
+                      `sync=false` returns immediately with the child's id; \
+                      the child runs in parallel while you continue, and \
+                      when it terminates its final assistant text is \
+                      delivered to you as a fresh user message on a new \
+                      turn (bracketed with `[dispatched thread … \
+                      completed]`). Use this to delegate bounded, well- \
+                      scoped sub-work (research passes, exploratory \
+                      searches, one-shot generators) so the main thread's \
+                      context stays focused. `config_override` and \
                       `bindings_override` are the same shape the \
                       `create_thread` wire command accepts — omit them to \
                       inherit this thread's pod defaults."
@@ -44,8 +48,10 @@ pub(super) fn descriptor() -> McpTool {
                 "sync": {
                     "type": "boolean",
                     "description": "True: park this tool call until the child terminates \
-                                    and return its final assistant text. False: return \
-                                    immediately with the child's id; child runs detached."
+                                    and return its final assistant text as the tool \
+                                    result. False: return immediately with the child's \
+                                    id; the child's final text arrives later as a fresh \
+                                    user message on a new turn."
                 },
                 "config_override": {
                     "type": "object",

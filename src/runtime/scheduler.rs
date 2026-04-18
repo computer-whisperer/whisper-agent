@@ -1600,11 +1600,17 @@ impl Scheduler {
         self.maybe_auto_compact(thread_id, pending_io);
         // Dispatched-child terminal-state fan-out: if this thread is
         // a dispatched child with a waiting parent, deliver the
-        // parent's tool result. If this thread was the parent of
+        // parent's tool result (sync) or stash the text for an async
+        // user-message injection. If this thread was the parent of
         // other dispatched children, cancel them — their result has
         // no consumer anymore.
         self.resolve_pending_dispatch(thread_id, pending_io);
         self.cascade_cancel_dispatched_children(thread_id, pending_io);
+        // If this thread is a parent with async deliveries whose
+        // children already terminated earlier, flush any that can
+        // now land — the thread may have just stepped into an idle
+        // state that accepts new user messages. No-op otherwise.
+        self.flush_ready_async_deliveries(thread_id, pending_io);
     }
 
     /// If the task is in a terminal state, tear down its sandbox (if any).
