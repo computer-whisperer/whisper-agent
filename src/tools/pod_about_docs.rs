@@ -317,7 +317,7 @@ default for anything firing more often than daily.
 
 const SELF_MOD: &str = "# Self-modification
 
-You have seven builtin tools that target either files or runtime
+You have eight builtin tools that target either files or runtime
 state in THIS pod. File targets live outside your workspace;
 `read_file` / `write_file` / `list_dir` / `bash` cannot see them —
 only these can.
@@ -331,6 +331,10 @@ only these can.
 - `pod_write_file` — full overwrite or create.
 - `pod_edit_file` — literal-substring replace (single match by
   default, `replace_all` to change every occurrence).
+- `pod_grep` — literal-substring search across the whole pod tree
+  (including threads/, behaviors/state.json, etc.). Useful for
+  locating which thread logged a tool name or error before pulling
+  the full file. Dotfiles and `.archived/` are skipped.
 - `pod_about` — this tool.
 
 ## Orchestration tools (runtime state)
