@@ -1477,12 +1477,25 @@ impl Scheduler {
                     .as_ref()
                     .map(|p| p.dir().join(&pod_id))
                     .unwrap_or_else(|| std::path::PathBuf::from(&pod_id));
+                // Inherit the default pod's system prompt so the new
+                // pod's threads have a working prompt out of the box —
+                // otherwise a newly-created pod runs with an empty
+                // system prompt until the user hand-writes one, and
+                // Anthropic in particular 400s when cache_control
+                // lands on an empty system block. Matches the
+                // expectation set by the "+ New pod" UX, which clones
+                // the default pod's `thread_defaults` template.
+                let system_prompt = self
+                    .pods
+                    .get(&self.default_pod_id)
+                    .map(|p| p.system_prompt.clone())
+                    .unwrap_or_default();
                 let pod = Pod::new(
                     pod_id.clone(),
                     pod_dir,
                     config.clone(),
                     raw_toml,
-                    String::new(),
+                    system_prompt.clone(),
                 );
                 let summary = whisper_agent_protocol::PodSummary {
                     pod_id: pod_id.clone(),
@@ -1509,8 +1522,9 @@ impl Scheduler {
                 // can retry by deleting and recreating.)
                 if let Some(persister) = self.persister.clone() {
                     let pid = pod_id.clone();
+                    let prompt = system_prompt.clone();
                     tokio::spawn(async move {
-                        if let Err(e) = persister.create_pod(&pid, config).await {
+                        if let Err(e) = persister.create_pod(&pid, config, &prompt).await {
                             warn!(pod_id = %pid, error = %e, "create_pod disk write failed");
                         }
                     });

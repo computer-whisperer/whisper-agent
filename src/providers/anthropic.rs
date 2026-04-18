@@ -152,15 +152,25 @@ fn build_request_body<'a>(req: &'a ModelRequest<'a>) -> CreateMessageRequest<'a>
         })
         .collect();
 
-    let system = vec![SystemBlock {
-        kind: "text",
-        text: req.system_prompt.to_string(),
-        cache_control: if cache_system {
-            Some(CacheControl::ephemeral_1h())
-        } else {
-            None
-        },
-    }];
+    // Empty system prompt → omit the system field entirely. Anthropic
+    // accepts this, and it also sidesteps a hard constraint: the API
+    // rejects `cache_control` on empty text blocks with a 400. A pod
+    // whose `system_prompt_file` is missing (or not-yet-written) lands
+    // here with an empty string; silently dropping the block is the
+    // right move — there's nothing to cache anyway.
+    let system = if req.system_prompt.is_empty() {
+        Vec::new()
+    } else {
+        vec![SystemBlock {
+            kind: "text",
+            text: req.system_prompt.to_string(),
+            cache_control: if cache_system {
+                Some(CacheControl::ephemeral_1h())
+            } else {
+                None
+            },
+        }]
+    };
 
     let mut tools: Vec<AnthropicTool> = req.tools.iter().map(spec_to_anthropic_tool).collect();
     if cache_tools && let Some(last) = tools.last_mut() {
@@ -210,6 +220,7 @@ fn message_to_value(m: &Message, cache_last_block: bool) -> Value {
 struct CreateMessageRequest<'a> {
     model: &'a str,
     max_tokens: u32,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     system: Vec<SystemBlock>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     tools: Vec<AnthropicTool>,
@@ -337,6 +348,35 @@ mod tests {
         let body = build_request_body(&req);
         let v = serde_json::to_value(&body).unwrap();
         // No cache_control anywhere.
+        assert!(!v.to_string().contains("cache_control"));
+    }
+
+    #[test]
+    fn empty_system_prompt_omits_system_field_and_cache_control() {
+        // Regression: a pod whose system_prompt_file is missing loads
+        // with an empty system prompt. The scheduler still emits the
+        // AfterSystem breakpoint by default; Anthropic 400s on
+        // cache_control over an empty text block. Adapter must drop
+        // the system block entirely in that case.
+        let tools = make_tools();
+        let messages = make_messages();
+        let req = ModelRequest {
+            model: "claude-opus-4-6",
+            max_tokens: 1024,
+            system_prompt: "",
+            tools: &tools,
+            messages: &messages,
+            cache_breakpoints: &[CacheBreakpoint::AfterSystem],
+        };
+        let body = build_request_body(&req);
+        let v = serde_json::to_value(&body).unwrap();
+        // `system` should be omitted entirely (skip_serializing_if).
+        assert!(
+            v.get("system").is_none(),
+            "expected no `system` field, got {}",
+            v
+        );
+        // And definitely no cache_control anywhere.
         assert!(!v.to_string().contains("cache_control"));
     }
 

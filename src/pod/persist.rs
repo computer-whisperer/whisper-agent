@@ -269,7 +269,20 @@ impl Persister {
     /// Create a fresh pod directory and write `pod.toml` from the supplied
     /// config. Fails if a pod with the same id already exists or if the
     /// config doesn't validate.
-    pub async fn create_pod(&self, pod_id: &str, mut config: PodConfig) -> Result<PodSummary> {
+    /// Create a fresh pod directory, write `pod.toml` from the supplied
+    /// config, and seed the sibling `system_prompt_file` with
+    /// `system_prompt`. An empty `system_prompt` skips the prompt-file
+    /// write (caller is responsible for ensuring the prompt exists
+    /// before any thread fires — otherwise the pod runs with no system
+    /// prompt, which providers handle heterogeneously: Anthropic
+    /// rejects cache_control over empty system blocks, OpenAI accepts
+    /// empty, etc.). An empty `system_prompt_file` field skips it too.
+    pub async fn create_pod(
+        &self,
+        pod_id: &str,
+        mut config: PodConfig,
+        system_prompt: &str,
+    ) -> Result<PodSummary> {
         validate_pod_id(pod_id)?;
         // Stamp created_at server-side when the client left it empty —
         // wasm clients don't always have a convenient ISO-8601 source
@@ -289,6 +302,12 @@ impl Persister {
         fs::write(pod_dir.join(POD_TOML), &toml_text)
             .await
             .with_context(|| format!("write {pod_id}/pod.toml"))?;
+        let prompt_file = config.thread_defaults.system_prompt_file.as_str();
+        if !prompt_file.is_empty() && !system_prompt.is_empty() {
+            fs::write(pod_dir.join(prompt_file), system_prompt)
+                .await
+                .with_context(|| format!("write {pod_id}/{prompt_file}"))?;
+        }
         Ok(PodSummary {
             pod_id: pod_id.to_string(),
             name: config.name,
@@ -620,6 +639,30 @@ mod tests {
         path
     }
 
+    fn sample_pod_config() -> PodConfig {
+        PodConfig {
+            name: "sample".into(),
+            description: None,
+            created_at: "2026-04-17T10:00:00Z".into(),
+            allow: PodAllow {
+                backends: vec!["anthropic".into()],
+                mcp_hosts: Vec::new(),
+                host_env: Vec::new(),
+            },
+            thread_defaults: ThreadDefaults {
+                backend: "anthropic".into(),
+                model: "claude-sonnet-4-6".into(),
+                system_prompt_file: "system_prompt.md".into(),
+                max_tokens: 8000,
+                max_turns: 30,
+                approval_policy: ApprovalPolicy::PromptPodModify,
+                host_env: String::new(),
+                mcp_hosts: Vec::new(),
+            },
+            limits: PodLimits::default(),
+        }
+    }
+
     fn sample_task(id: &str) -> Thread {
         let cfg = ThreadConfig {
             model: "claude-opus-4-7".into(),
@@ -680,6 +723,37 @@ mod tests {
         p.flush(&task).await.unwrap();
         let after = std::fs::read_to_string(&pod_toml).unwrap();
         assert_eq!(after, edited);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn create_pod_writes_system_prompt_when_non_empty() {
+        let dir = temp_dir();
+        let p = Persister::new(dir.clone()).await.unwrap();
+        let cfg = sample_pod_config();
+        let prompt_name = cfg.thread_defaults.system_prompt_file.clone();
+        p.create_pod("fresh", cfg, "you are helpful").await.unwrap();
+        let pod_dir = dir.join("fresh");
+        assert!(pod_dir.join(POD_TOML).is_file());
+        assert!(pod_dir.join(&prompt_name).is_file());
+        let body = std::fs::read_to_string(pod_dir.join(&prompt_name)).unwrap();
+        assert_eq!(body, "you are helpful");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn create_pod_skips_prompt_file_when_empty() {
+        let dir = temp_dir();
+        let p = Persister::new(dir.clone()).await.unwrap();
+        let cfg = sample_pod_config();
+        let prompt_name = cfg.thread_defaults.system_prompt_file.clone();
+        p.create_pod("noprompt", cfg, "").await.unwrap();
+        let pod_dir = dir.join("noprompt");
+        assert!(pod_dir.join(POD_TOML).is_file());
+        assert!(
+            !pod_dir.join(&prompt_name).exists(),
+            "empty prompt should skip the file"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
