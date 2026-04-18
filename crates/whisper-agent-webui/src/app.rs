@@ -1788,10 +1788,10 @@ fn truncate(mut s: String, max: usize) -> String {
 }
 
 impl eframe::App for ChatApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.drain_inbound();
 
-        egui::TopBottomPanel::top("status_bar").show(ctx, |ui| {
+        egui::Panel::top("status_bar").show_inside(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.heading("whisper-agent");
                 ui.separator();
@@ -1834,10 +1834,10 @@ impl eframe::App for ChatApp {
             });
         });
 
-        egui::SidePanel::left("task_list")
+        egui::Panel::left("task_list")
             .resizable(true)
-            .default_width(220.0)
-            .show(ctx, |ui| {
+            .default_size(220.0)
+            .show_inside(ui, |ui| {
                 ui.add_space(4.0);
                 ui.horizontal(|ui| {
                     if ui
@@ -1888,9 +1888,9 @@ impl eframe::App for ChatApp {
             self.ensure_pod_config(&pod_id);
         }
         let mut request_models: Option<String> = None;
-        egui::TopBottomPanel::bottom("input_bar")
+        egui::Panel::bottom("input_bar")
             .resizable(false)
-            .show(ctx, |ui| {
+            .show_inside(ui, |ui| {
                 if show_picker {
                     ui.add_space(4.0);
                     ui.horizontal(|ui| {
@@ -2048,7 +2048,7 @@ impl eframe::App for ChatApp {
         let selected = self.selected.clone();
         let tasks = &mut self.tasks;
         let md_cache = &mut self.md_cache;
-        egui::CentralPanel::default().show(ctx, |ui| match selected {
+        egui::CentralPanel::default().show_inside(ui, |ui| match selected {
             None => {
                 ui.vertical_centered(|ui| {
                     ui.add_space(60.0);
@@ -2108,10 +2108,11 @@ impl eframe::App for ChatApp {
             });
         }
 
-        self.render_new_pod_modal(ctx);
-        self.render_pod_editor_modal(ctx);
-        self.render_new_behavior_modal(ctx);
-        self.render_behavior_editor_modal(ctx);
+        let ctx = ui.ctx().clone();
+        self.render_new_pod_modal(&ctx);
+        self.render_pod_editor_modal(&ctx);
+        self.render_new_behavior_modal(&ctx);
+        self.render_behavior_editor_modal(&ctx);
     }
 }
 
@@ -3076,7 +3077,7 @@ impl ChatApp {
                 // up so clicks on the parent don't interleave with the
                 // sub-modal's edits.
                 ui.add_enabled_ui(!sub_modal_open, |ui| {
-                    egui::TopBottomPanel::bottom("pod_editor_footer").show_inside(ui, |ui| {
+                    egui::Panel::bottom("pod_editor_footer").show_inside(ui, |ui| {
                         let actions = crate::editor::render_footer(
                             ui,
                             modal.error.as_deref(),
@@ -3088,7 +3089,7 @@ impl ChatApp {
                         revert_clicked = actions.revert;
                         cancel_clicked = actions.close;
                     });
-                    egui::TopBottomPanel::top("pod_editor_tabs").show_inside(ui, |ui| {
+                    egui::Panel::top("pod_editor_tabs").show_inside(ui, |ui| {
                         ui.add_space(4.0);
                         ui.horizontal(|ui| {
                             for tab in [
@@ -3376,7 +3377,7 @@ impl ChatApp {
             .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
             .open(&mut open)
             .show(ctx, |ui| {
-                egui::TopBottomPanel::bottom("behavior_editor_footer").show_inside(ui, |ui| {
+                egui::Panel::bottom("behavior_editor_footer").show_inside(ui, |ui| {
                     let actions = crate::editor::render_footer(
                         ui,
                         modal.error.as_deref(),
@@ -3388,7 +3389,7 @@ impl ChatApp {
                     revert_clicked = actions.revert;
                     close_clicked = actions.close;
                 });
-                egui::TopBottomPanel::top("behavior_editor_tabs").show_inside(ui, |ui| {
+                egui::Panel::top("behavior_editor_tabs").show_inside(ui, |ui| {
                     ui.add_space(4.0);
                     ui.horizontal(|ui| {
                         for tab in [
@@ -5379,7 +5380,7 @@ fn render_sandbox_entry_modal(
         .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
         .open(open)
         .show(ctx, |ui| {
-            egui::TopBottomPanel::bottom("sandbox_entry_footer").show_inside(ui, |ui| {
+            egui::Panel::bottom("sandbox_entry_footer").show_inside(ui, |ui| {
                 ui.add_space(6.0);
                 if let Some(err) = &sub.error {
                     ui.colored_label(Color32::from_rgb(220, 80, 80), err);

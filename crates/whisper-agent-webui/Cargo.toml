@@ -9,17 +9,18 @@ license.workspace = true
 crate-type = ["cdylib"]
 
 [dependencies]
-eframe = { version = "0.33", default-features = false, features = ["default_fonts", "glow", "x11", "wayland"] }
-egui = "0.33"
+eframe = { version = "0.34", default-features = false, features = ["default_fonts", "glow", "x11", "wayland"] }
+egui = "0.34"
 log = "0.4"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 ciborium = "0.2"
 # `toml` lets the structured pod-config editor round-trip its working
 # `PodConfig` with the server (server expects raw TOML in
-# `UpdatePodConfig`). `default-features = false` drops the parse-spans
-# feature we don't need, keeping the wasm bundle lean.
-toml = { version = "1", default-features = false, features = ["display", "parse"] }
+# `UpdatePodConfig`). `default-features = false` drops toml 1.x's
+# `std` feature (we only need `serde`-driven from_str / to_string_pretty),
+# keeping the wasm bundle lean.
+toml = { version = "1", default-features = false, features = ["display", "parse", "serde"] }
 # `similar` powers the unified-diff renderer for edit_file / write_file
 # tool calls. Default features include `bytes` + `text`; we only need
 # the text diff API.
@@ -28,7 +29,7 @@ similar = { version = "2", default-features = false, features = ["text"] }
 # only: no `load-images` (don't fetch network resources from rendered
 # output) and no syntect-backed `better_syntax_highlighting` (keeps
 # the wasm bundle small — plain monospace on code blocks reads fine).
-egui_commonmark = { version = "0.22", default-features = false, features = ["pulldown_cmark"] }
+egui_commonmark = { version = "0.23", default-features = false, features = ["pulldown_cmark"] }
 # Cron + tz for the behavior-editor "next N fires" preview. Mirror the
 # server's parsers so what the editor shows matches what the scheduler
 # will fire. chrono's default features include `clock` + `wasmbind`,
