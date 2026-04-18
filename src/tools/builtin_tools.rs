@@ -260,4 +260,3 @@ pub async fn dispatch(
         other => no_update_error(format!("unknown builtin tool: {other}")),
     }
 }
-

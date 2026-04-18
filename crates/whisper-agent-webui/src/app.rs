@@ -16,12 +16,11 @@ mod editor_render;
 
 use self::chat_render::render_item;
 use self::editor_render::{
-    approval_policy_label, behavior_summary_from_snapshot, hint,
-    render_behavior_editor_prompt_tab, render_behavior_editor_raw_tab,
-    render_behavior_editor_retention_tab, render_behavior_editor_thread_tab,
-    render_behavior_editor_trigger_tab, render_pod_editor_allow_tab,
-    render_pod_editor_defaults_tab, render_pod_editor_limits_tab, render_pod_editor_raw_tab,
-    render_sandbox_entry_modal, section_heading,
+    approval_policy_label, behavior_summary_from_snapshot, hint, render_behavior_editor_prompt_tab,
+    render_behavior_editor_raw_tab, render_behavior_editor_retention_tab,
+    render_behavior_editor_thread_tab, render_behavior_editor_trigger_tab,
+    render_pod_editor_allow_tab, render_pod_editor_defaults_tab, render_pod_editor_limits_tab,
+    render_pod_editor_raw_tab, render_sandbox_entry_modal, section_heading,
 };
 
 use std::cell::RefCell;
@@ -4039,4 +4038,3 @@ fn render_allowlist_chips(
     });
     ui.add_space(4.0);
 }
-

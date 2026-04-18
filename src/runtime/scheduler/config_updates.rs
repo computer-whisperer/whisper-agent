@@ -241,7 +241,12 @@ impl Scheduler {
     /// failure the pod is still live in memory (the broadcast already
     /// went out); we log and optionally surface an error to the
     /// originating connection.
-    pub(super) fn persist_pod_config(&self, pod_id: String, toml_text: String, err_conn: Option<ConnId>) {
+    pub(super) fn persist_pod_config(
+        &self,
+        pod_id: String,
+        toml_text: String,
+        err_conn: Option<ConnId>,
+    ) {
         let Some(persister) = self.persister.clone() else {
             return;
         };

@@ -1113,7 +1113,6 @@ impl Scheduler {
         }
     }
 
-
     /// Spawn a fresh thread under `pod_id`. `requester` identifies the
     /// connection that asked for it, if any; trigger-driven spawns
     /// (behaviors, cron, etc.) pass `None`. `origin` stamps behavior
@@ -1255,7 +1254,6 @@ impl Scheduler {
         }
         Ok(thread_id)
     }
-
 
     fn send_user_message(
         &mut self,
@@ -1911,4 +1909,3 @@ async fn next_completion(
 ) -> Option<SchedulerCompletion> {
     pending.next().await
 }
-

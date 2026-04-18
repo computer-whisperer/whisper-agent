@@ -944,7 +944,6 @@ mod tests {
     use super::super::{dispatch, is_pod_modify, join_blocks, sample_config, temp_dir};
     use super::*;
 
-
     #[tokio::test]
     async fn read_file_whitelists_filename() {
         let dir = temp_dir();

@@ -3,7 +3,9 @@
 //! translation rules (what a pod default is, how an override layers on
 //! top) are readable without the surrounding lifecycle noise.
 
-use whisper_agent_protocol::{HostEnvSpec, ThreadBindingsRequest, ThreadConfig, ThreadConfigOverride};
+use whisper_agent_protocol::{
+    HostEnvSpec, ThreadBindingsRequest, ThreadConfig, ThreadConfigOverride,
+};
 
 use crate::pod::Pod;
 

@@ -9,7 +9,6 @@ use super::{POD_LIST_THREADS, ToolOutcome, no_update_error, no_update_text};
 use crate::pod;
 use crate::tools::mcp::{ToolAnnotations, ToolDescriptor as McpTool};
 
-
 /// Max thread entries returned by a single `pod_list_threads` call. The
 /// caller can override via `limit`; this is the ceiling past which we
 /// refuse to grow even if `limit` is larger. Keeps the output bounded
@@ -366,7 +365,6 @@ fn any_filter_set(args: &ListThreadsArgs) -> bool {
 mod tests {
     use super::super::{dispatch, join_blocks, sample_config, temp_dir};
     use super::*;
-
 
     /// Build a minimal thread JSON blob matching the `Thread` on-disk
     /// shape that `pod_list_threads` parses. Only the fields the list

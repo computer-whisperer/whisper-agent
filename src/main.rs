@@ -398,11 +398,8 @@ async fn run_serve(args: ServeArgs) -> Result<()> {
     let default_shared_host_names: Vec<String> =
         shared_mcp_hosts.iter().map(|h| h.name.clone()).collect();
 
-    let cli_token_files: HashMap<String, PathBuf> = args
-        .host_env_provider_tokens
-        .iter()
-        .cloned()
-        .collect();
+    let cli_token_files: HashMap<String, PathBuf> =
+        args.host_env_provider_tokens.iter().cloned().collect();
     let mut provider_entries: Vec<HostEnvProviderEntry> = toml_provider_entries
         .into_iter()
         .map(|p| HostEnvProviderEntry {

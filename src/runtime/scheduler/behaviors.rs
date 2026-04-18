@@ -163,7 +163,10 @@ impl Scheduler {
     /// is a `Schedule::after` call (cheap — pre-parsed) and one
     /// timestamp comparison. At expected scale (≤few hundred) this is
     /// not a hot path.
-    pub(super) fn fire_due_cron_behaviors(&mut self, pending_io: &mut FuturesUnordered<SchedulerFuture>) {
+    pub(super) fn fire_due_cron_behaviors(
+        &mut self,
+        pending_io: &mut FuturesUnordered<SchedulerFuture>,
+    ) {
         let now = chrono::Utc::now();
 
         // First pass: prime `last_fired_at` for any cron behavior that

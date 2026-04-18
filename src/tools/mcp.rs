@@ -127,10 +127,7 @@ impl McpSession {
     /// the `initialize` handshake. `bearer`, when set, is presented as
     /// `Authorization: Bearer <token>` on every subsequent request —
     /// per-sandbox MCP hosts issue this token at provision time.
-    pub async fn connect(
-        url: impl Into<String>,
-        bearer: Option<String>,
-    ) -> Result<Self, McpError> {
+    pub async fn connect(url: impl Into<String>, bearer: Option<String>) -> Result<Self, McpError> {
         let session = Self {
             http: reqwest::Client::new(),
             url: url.into(),

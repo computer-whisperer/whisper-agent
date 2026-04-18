@@ -1055,7 +1055,11 @@ pub(super) fn render_behavior_editor_prompt_tab(ui: &mut egui::Ui, prompt: &mut 
     );
 }
 
-pub(super) fn render_behavior_editor_raw_tab(ui: &mut egui::Ui, raw: &mut String, dirty: &mut bool) {
+pub(super) fn render_behavior_editor_raw_tab(
+    ui: &mut egui::Ui,
+    raw: &mut String,
+    dirty: &mut bool,
+) {
     crate::editor::render_raw_toml_tab(
         ui,
         "Raw behavior.toml. Edits here override the structured tabs on save. \

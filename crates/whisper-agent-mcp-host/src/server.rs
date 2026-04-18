@@ -49,7 +49,10 @@ pub fn router(state: AppState) -> Router {
 
 /// Extract the bearer token from an Authorization header, if present.
 fn bearer_token(headers: &HeaderMap) -> Option<&str> {
-    let h = headers.get(axum::http::header::AUTHORIZATION)?.to_str().ok()?;
+    let h = headers
+        .get(axum::http::header::AUTHORIZATION)?
+        .to_str()
+        .ok()?;
     h.strip_prefix("Bearer ")
 }
 
