@@ -259,6 +259,14 @@ pub struct ChatApp {
     /// threads are in this pod" lives in `tasks`, not here.
     pods: HashMap<String, PodSummary>,
     pods_requested: bool,
+    /// Pod ids whose behavior catalog has already been requested via
+    /// `ListBehaviors`. `PodSnapshot.behaviors` also populates the
+    /// cache (when the pod editor runs `GetPod`), but bare
+    /// `PodList` doesn't carry behaviors — so on startup the pod
+    /// section shows empty until we fire one `ListBehaviors` per
+    /// known pod. Guarded by this set so we don't re-request on
+    /// every `PodList` refresh.
+    behaviors_requested: HashSet<String>,
     /// Server's host-env-provider catalog. Populated lazily on first
     /// ListHostEnvProviders round-trip; used by the pod editor's
     /// per-entry provider dropdown. Can be empty — a server started
@@ -675,6 +683,7 @@ impl ChatApp {
             resources_requested: false,
             pods: HashMap::new(),
             pods_requested: false,
+            behaviors_requested: HashSet::new(),
             host_env_providers: Vec::new(),
             host_env_providers_requested: false,
             collapsed_pods: HashSet::new(),
@@ -1132,9 +1141,20 @@ impl ChatApp {
                         pod_id: default_pod_id,
                     });
                 }
+                // PodList summaries don't carry behavior catalogs —
+                // fire one ListBehaviors per pod we haven't seen yet
+                // so the pod sections render pre-existing behaviors on
+                // first connect. `behaviors_requested` dedups so a
+                // PodList refresh doesn't re-request.
+                let pod_ids: Vec<String> = self.pods.keys().cloned().collect();
+                for pid in pod_ids {
+                    self.ensure_behaviors_fetched(&pid);
+                }
             }
             ServerToClient::PodCreated { pod, .. } => {
+                let pod_id = pod.pod_id.clone();
                 self.pods.insert(pod.pod_id.clone(), pod);
+                self.ensure_behaviors_fetched(&pod_id);
             }
             ServerToClient::PodConfigUpdated {
                 pod_id,
@@ -2192,6 +2212,23 @@ impl ChatApp {
             pod_id: pod_id.clone(),
         });
         self.pod_editor_modal = Some(PodEditorModalState::new(pod_id));
+    }
+
+    /// Fire a `ListBehaviors` for `pod_id` iff we haven't already.
+    /// Called on pod discovery (PodList / PodCreated) so the pod
+    /// section shows pre-existing behaviors without waiting for the
+    /// user to open the pod editor. `PodSnapshot` (from GetPod) also
+    /// populates the cache when the editor is opened; the dedup
+    /// guard means both paths stay consistent.
+    fn ensure_behaviors_fetched(&mut self, pod_id: &str) {
+        if self.behaviors_requested.contains(pod_id) {
+            return;
+        }
+        self.behaviors_requested.insert(pod_id.to_string());
+        self.send(ClientToServer::ListBehaviors {
+            correlation_id: None,
+            pod_id: pod_id.to_string(),
+        });
     }
 
     fn open_behavior_editor(&mut self, pod_id: String, behavior_id: String) {
