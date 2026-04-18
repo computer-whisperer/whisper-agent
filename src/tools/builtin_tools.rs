@@ -218,6 +218,63 @@ fn parse_behavior_path(filename: &str) -> Option<(&str, &str)> {
     Some((id, suffix))
 }
 
+/// Return the thread id for a path like `threads/<id>.json`, or None.
+fn parse_thread_path(filename: &str) -> Option<&str> {
+    let rest = filename.strip_prefix(&format!("{}/", pod::THREADS_DIR))?;
+    if rest.contains('/') || rest.starts_with('.') {
+        return None;
+    }
+    let id = rest.strip_suffix(".json")?;
+    if id.is_empty() {
+        return None;
+    }
+    Some(id)
+}
+
+/// Pattern-based check: a file that is readable but NOT writable via
+/// the pod_*_file tools. Runtime / observability data — thread JSONs,
+/// pod_state.json, per-behavior state.json. These aren't in the rw
+/// allowlist because they encode runtime state the scheduler owns;
+/// letting the agent edit them would bypass that ownership.
+fn is_readonly_path(filename: &str) -> bool {
+    if filename == pod::POD_STATE_JSON {
+        return true;
+    }
+    if parse_thread_path(filename).is_some() {
+        return true;
+    }
+    if let Some((id, suffix)) = parse_behavior_path(filename)
+        && suffix == crate::pod::behaviors::BEHAVIOR_STATE
+        && pod::behaviors::validate_behavior_id(id).is_ok()
+    {
+        return true;
+    }
+    false
+}
+
+/// Access level a filename resolves to under the current pod snapshot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Access {
+    /// Reachable via pod_read_file / pod_write_file / pod_edit_file.
+    Rw,
+    /// Reachable via pod_read_file only.
+    Ro,
+    /// Not reachable.
+    None,
+}
+
+/// Classify `filename` for list output. Purely pattern-based on the
+/// existing rw allowlist plus `is_readonly_path` — does NOT touch disk.
+fn access_for(filename: &str, rw_allowed: &[String]) -> Access {
+    if rw_allowed.iter().any(|n| n == filename) {
+        Access::Rw
+    } else if is_readonly_path(filename) {
+        Access::Ro
+    } else {
+        Access::None
+    }
+}
+
 /// Kind of write a behavior path resolves to — drives whether the tool
 /// handler creates the directory + seeds state.json, and whether the
 /// scheduler emits `BehaviorCreated` or `BehaviorUpdated`.
@@ -273,9 +330,25 @@ fn validate_filename(
         }
         return classify_behavior_write(id, suffix, behavior_ids).map(|_| ());
     }
+    // Read-only: thread JSONs, pod_state.json, per-behavior state.json.
+    // Writes to these paths fall through to the error message — the
+    // handler's caller won't misdirect a user.
+    if !for_write && is_readonly_path(filename) {
+        return Ok(());
+    }
+    if for_write && is_readonly_path(filename) {
+        return Err(format!(
+            "filename `{filename}` is read-only (runtime state owned by \
+             the scheduler). Use `pod_set_behavior_enabled` / \
+             `pod_run_behavior` for runtime transitions."
+        ));
+    }
     Err(format!(
-        "filename `{filename}` is not in this pod's allowlist. Allowed: [{}]",
-        allowed.join(", ")
+        "filename `{filename}` is not in this pod's allowlist. Allowed rw: [{}]. \
+         Read-only patterns: `pod_state.json`, `{}/<id>.json`, `{BEHAVIORS_DIR}/<id>/{}`.",
+        allowed.join(", "),
+        pod::THREADS_DIR,
+        crate::pod::behaviors::BEHAVIOR_STATE,
     ))
 }
 
@@ -301,13 +374,15 @@ fn list_descriptor() -> McpTool {
     McpTool {
         name: POD_LIST_FILES.into(),
         description: "List the contents of this pod's directory, including its \
-                      `behaviors/<id>/` subdirectories. Each entry is tagged `[rw]` \
-                      if it is reachable via `pod_read_file` / `pod_write_file` / \
-                      `pod_edit_file`, or `[--]` otherwise (e.g. `threads/` and per-\
-                      behavior `state.json`). Pod files live OUTSIDE your workspace \
-                      and are reachable ONLY through the `pod_*_file` tools — not \
-                      `list_dir` or `bash`. Use this before editing to see which \
-                      config files and behaviors exist."
+                      `behaviors/<id>/` subdirectories and a summary of the \
+                      `threads/` dir. Entries are tagged by access: `[rw]` = \
+                      readable and writable (the rw config files), `[r-]` = \
+                      read-only (runtime state: `pod_state.json`, per-behavior \
+                      `state.json`, `threads/<id>.json`), `[--]` = not reachable. \
+                      Pod files live OUTSIDE your workspace and are reachable \
+                      ONLY through the `pod_*_file` tools — not `list_dir` or \
+                      `bash`. Call this before editing to see which config files \
+                      and behaviors exist."
             .into(),
         input_schema: json!({
             "type": "object",
@@ -322,6 +397,11 @@ fn list_descriptor() -> McpTool {
         },
     }
 }
+
+/// Maximum number of thread entries listed individually before
+/// `list_files` falls back to a count-only summary. Pods with a long
+/// run history would otherwise blow the tool output size.
+const THREADS_LIST_CAP: usize = 30;
 
 async fn list_files(pod_dir: &Path, allowed: &[String], _args: Value) -> ToolOutcome {
     let mut out = String::new();
@@ -355,6 +435,43 @@ async fn list_files(pod_dir: &Path, allowed: &[String], _args: Value) -> ToolOut
             {
                 return no_update_error(e);
             }
+        }
+    }
+
+    // `threads/` section: summarize if busy, enumerate if small.
+    let threads_dir = pod_dir.join(pod::THREADS_DIR);
+    if tokio::fs::try_exists(&threads_dir).await.unwrap_or(false) {
+        let mut read = match tokio::fs::read_dir(&threads_dir).await {
+            Ok(r) => r,
+            Err(e) => return no_update_error(format!("list {}/: {e}", pod::THREADS_DIR)),
+        };
+        let mut entries: Vec<(String, u64)> = Vec::new();
+        while let Ok(Some(entry)) = read.next_entry().await {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name.starts_with('.') || !name.ends_with(".json") {
+                continue;
+            }
+            let size = entry.metadata().await.map(|m| m.len()).unwrap_or(0);
+            entries.push((name, size));
+        }
+        entries.sort_by(|a, b| a.0.cmp(&b.0));
+        let total = entries.len();
+        out.push_str(&format!(
+            "\n-- {}/ (read-only; {} thread file{}) --\n",
+            pod::THREADS_DIR,
+            total,
+            if total == 1 { "" } else { "s" }
+        ));
+        let show = total.min(THREADS_LIST_CAP);
+        for (name, size) in entries.iter().take(show) {
+            out.push_str(&format!("[r-]  f  {size:>10}  {name}\n"));
+        }
+        if total > show {
+            out.push_str(&format!(
+                "...and {} more; use pod_grep to search, or pod_read_file(\"{}/<id>.json\") directly\n",
+                total - show,
+                pod::THREADS_DIR,
+            ));
         }
     }
 
@@ -419,20 +536,22 @@ async fn list_one_dir(
             Err(e) => return Err(format!("list {} iter: {e}", dir.display())),
         }
     }
+    // Sort: rw files first, then ro files, then dirs, then unreachable.
+    // Within each group, name-sorted.
     entries.sort_by(|a, b| {
         let a_full = format!("{path_prefix}{}", a.0);
         let b_full = format!("{path_prefix}{}", b.0);
-        let a_allowed = allowed.iter().any(|n| n == &a_full);
-        let b_allowed = allowed.iter().any(|n| n == &b_full);
-        b_allowed
-            .cmp(&a_allowed)
-            .then_with(|| b.1.cmp(&a.1))
-            .then_with(|| a.0.cmp(&b.0))
+        let a_rank = access_rank(access_for(&a_full, allowed), a.1);
+        let b_rank = access_rank(access_for(&b_full, allowed), b.1);
+        a_rank.cmp(&b_rank).then_with(|| a.0.cmp(&b.0))
     });
     for (name, is_dir, size) in &entries {
         let full = format!("{path_prefix}{name}");
-        let is_allowed = allowed.iter().any(|n| n == &full);
-        let access = if is_allowed { "[rw]" } else { "[--]" };
+        let tag = match access_for(&full, allowed) {
+            Access::Rw => "[rw]",
+            Access::Ro => "[r-]",
+            Access::None => "[--]",
+        };
         let kind = if *is_dir { 'd' } else { 'f' };
         let display = if *is_dir {
             format!("{name}/")
@@ -440,12 +559,22 @@ async fn list_one_dir(
             name.clone()
         };
         if *is_dir {
-            out.push_str(&format!("{access}  {kind}  {:>10}  {}\n", "", display));
+            out.push_str(&format!("{tag}  {kind}  {:>10}  {}\n", "", display));
         } else {
-            out.push_str(&format!("{access}  {kind}  {size:>10}  {}\n", display));
+            out.push_str(&format!("{tag}  {kind}  {size:>10}  {}\n", display));
         }
     }
     Ok(())
+}
+
+/// Small integer used to sort list entries. Lower ranks print first.
+fn access_rank(access: Access, is_dir: bool) -> u8 {
+    match (access, is_dir) {
+        (Access::Rw, _) => 0,
+        (Access::Ro, _) => 1,
+        (Access::None, true) => 2,
+        (Access::None, false) => 3,
+    }
 }
 
 // ---------- read ----------
@@ -453,16 +582,19 @@ async fn list_one_dir(
 fn read_descriptor() -> McpTool {
     McpTool {
         name: POD_READ_FILE.into(),
-        description: "Read one of this pod's configuration files: `pod.toml`, the \
-                      pod-level system-prompt file, or any existing behavior's \
-                      `behaviors/<id>/behavior.toml` or `behaviors/<id>/prompt.md`. \
-                      These files live OUTSIDE your workspace — they are the pod's \
-                      definition, held by the agent host, and are reachable ONLY \
-                      through the `pod_*_file` tools. Do not look for them via \
-                      `read_file`, `list_dir`, or `bash` (those operate on the \
-                      workspace and will not find pod.toml). With no line options, \
-                      returns the whole file. Use `offset`/`limit` to target a line \
-                      range for large files."
+        description: "Read one of this pod's files: any rw config (`pod.toml`, \
+                      system-prompt file, `behaviors/<id>/behavior.toml` or \
+                      `prompt.md`) or any read-only runtime file (`pod_state.json`, \
+                      `behaviors/<id>/state.json`, `threads/<id>.json`). Thread \
+                      JSONs carry the full message history of a run that spawned \
+                      from this pod. These files live OUTSIDE your workspace — \
+                      reach them ONLY through the `pod_*_file` tools, not \
+                      `read_file`/`list_dir`/`bash`. Without `offset`/`limit`, \
+                      returns the whole file if it fits within 500 lines; longer \
+                      files (typical for thread JSONs) are auto-truncated to the \
+                      first 500 lines with a note. Use `offset`/`limit` to page \
+                      or target a specific range. For searching across many \
+                      files, `pod_grep` is usually a better starting point."
             .into(),
         input_schema: json!({
             "type": "object",
@@ -502,6 +634,12 @@ struct ReadArgs {
     limit: Option<u32>,
 }
 
+/// Default line cap when the caller supplies neither `offset` nor
+/// `limit` — keeps `pod_read_file("threads/abc.json")` on a multi-
+/// thousand-line thread from filling the agent's context before it
+/// knew to ask for a range.
+const READ_DEFAULT_LINE_CAP: usize = 500;
+
 async fn read_file(
     pod_dir: &Path,
     allowed: &[String],
@@ -520,13 +658,26 @@ async fn read_file(
         Ok(s) => s,
         Err(e) => return no_update_error(format!("read {}: {e}", parsed.filename)),
     };
-    if parsed.offset.is_none() && parsed.limit.is_none() {
-        return no_update_text(content);
-    }
-    let offset = parsed.offset.unwrap_or(1).max(1) as usize;
-    let limit = parsed.limit.map(|n| n as usize).unwrap_or(usize::MAX);
+    let offset_supplied = parsed.offset.is_some();
+    let limit_supplied = parsed.limit.is_some();
     let lines: Vec<&str> = content.lines().collect();
     let total = lines.len();
+
+    // Small file and no explicit slicing → whole file, preserve original
+    // text (trailing newline is lost by `.lines()`).
+    if !offset_supplied && !limit_supplied && total <= READ_DEFAULT_LINE_CAP {
+        return no_update_text(content);
+    }
+
+    let offset = parsed.offset.unwrap_or(1).max(1) as usize;
+    // When neither offset nor limit is supplied on a large file, cap
+    // at READ_DEFAULT_LINE_CAP. When the caller supplied `limit`,
+    // honor it. When the caller supplied only `offset`, cap from
+    // there — avoids a surprise when paging past the default.
+    let limit = parsed
+        .limit
+        .map(|n| n as usize)
+        .unwrap_or(READ_DEFAULT_LINE_CAP);
     let start = (offset - 1).min(total);
     let end = start.saturating_add(limit).min(total);
     let mut out = lines[start..end].join("\n");
@@ -534,9 +685,14 @@ async fn read_file(
         out.push('\n');
     }
     if end < total {
-        out.push_str(&format!(
-            "\n[showing lines {offset}-{end} of {total}; pass offset/limit to see more]\n"
-        ));
+        let note = if !offset_supplied && !limit_supplied {
+            format!(
+                "\n[showing first {READ_DEFAULT_LINE_CAP} of {total} lines; pass offset/limit to see more]\n"
+            )
+        } else {
+            format!("\n[showing lines {offset}-{end} of {total}; pass offset/limit to see more]\n")
+        };
+        out.push_str(&note);
     }
     no_update_text(out)
 }
@@ -1845,6 +2001,134 @@ schedule = "0 9 * * *"
         );
     }
 
+    // ---------- read-only access coverage ----------
+
+    #[tokio::test]
+    async fn read_file_accepts_thread_json() {
+        let dir = temp_dir();
+        let cfg = sample_config();
+        tokio::fs::create_dir_all(dir.join("threads"))
+            .await
+            .unwrap();
+        tokio::fs::write(dir.join("threads").join("abc.json"), "{\"id\": \"abc\"}\n")
+            .await
+            .unwrap();
+        let out = dispatch(
+            dir.clone(),
+            cfg,
+            vec![],
+            POD_READ_FILE,
+            json!({ "filename": "threads/abc.json" }),
+        )
+        .await;
+        assert!(!out.result.is_error, "unexpected error: {:?}", out.result);
+        let text = join_blocks(&out.result.content);
+        assert!(text.contains("\"id\""), "unexpected body: {text}");
+    }
+
+    #[tokio::test]
+    async fn write_to_readonly_path_rejected() {
+        let dir = temp_dir();
+        let cfg = sample_config();
+        tokio::fs::create_dir_all(dir.join("threads"))
+            .await
+            .unwrap();
+        tokio::fs::write(dir.join("threads").join("abc.json"), "{}")
+            .await
+            .unwrap();
+        let out = dispatch(
+            dir.clone(),
+            cfg,
+            vec![],
+            POD_WRITE_FILE,
+            json!({ "filename": "threads/abc.json", "content": "{}" }),
+        )
+        .await;
+        assert!(out.result.is_error);
+        let text = join_blocks(&out.result.content);
+        assert!(
+            text.contains("read-only"),
+            "expected read-only error: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn read_file_applies_default_line_cap_on_large_files() {
+        let dir = temp_dir();
+        let cfg = sample_config();
+        tokio::fs::create_dir_all(dir.join("threads"))
+            .await
+            .unwrap();
+        let mut body = String::new();
+        for i in 0..READ_DEFAULT_LINE_CAP + 100 {
+            body.push_str(&format!("line {i}\n"));
+        }
+        tokio::fs::write(dir.join("threads").join("big.json"), &body)
+            .await
+            .unwrap();
+        // No offset/limit — should truncate and mention it.
+        let out = dispatch(
+            dir.clone(),
+            cfg.clone(),
+            vec![],
+            POD_READ_FILE,
+            json!({ "filename": "threads/big.json" }),
+        )
+        .await;
+        assert!(!out.result.is_error);
+        let text = join_blocks(&out.result.content);
+        let line_count = text.lines().filter(|l| l.starts_with("line ")).count();
+        assert_eq!(line_count, READ_DEFAULT_LINE_CAP);
+        assert!(
+            text.contains("showing first") && text.contains("of "),
+            "missing truncation note: {text}"
+        );
+        // Explicit limit overrides the default.
+        let out = dispatch(
+            dir.clone(),
+            cfg,
+            vec![],
+            POD_READ_FILE,
+            json!({ "filename": "threads/big.json", "limit": 5 }),
+        )
+        .await;
+        assert!(!out.result.is_error);
+        let text = join_blocks(&out.result.content);
+        let line_count = text.lines().filter(|l| l.starts_with("line ")).count();
+        assert_eq!(line_count, 5);
+    }
+
+    #[tokio::test]
+    async fn list_files_surfaces_threads_dir() {
+        let dir = temp_dir();
+        let cfg = sample_config();
+        tokio::fs::write(dir.join("pod.toml"), pod::to_toml(&cfg).unwrap())
+            .await
+            .unwrap();
+        tokio::fs::create_dir_all(dir.join("threads"))
+            .await
+            .unwrap();
+        for id in ["a", "b", "c"] {
+            tokio::fs::write(dir.join("threads").join(format!("{id}.json")), "{}")
+                .await
+                .unwrap();
+        }
+        let out = dispatch(dir.clone(), cfg, vec![], POD_LIST_FILES, json!({})).await;
+        assert!(!out.result.is_error);
+        let text = join_blocks(&out.result.content);
+        assert!(
+            text.contains("threads/ (read-only"),
+            "missing threads section: {text}"
+        );
+        assert!(text.contains("3 thread file"), "missing count: {text}");
+        for id in ["a", "b", "c"] {
+            assert!(
+                text.contains(&format!("{id}.json")),
+                "missing thread {id}.json in listing: {text}"
+            );
+        }
+    }
+
     // ---------- pod_grep coverage ----------
 
     #[tokio::test]
@@ -2254,13 +2538,13 @@ schedule = "0 9 * * *"
             text.contains("behavior.toml") && text.contains("prompt.md"),
             "missing behavior files: {text}"
         );
-        // state.json listed but not writable.
+        // state.json listed as read-only (runtime state).
         let state_line = text
             .lines()
             .find(|l| l.contains("state.json"))
             .expect("state.json missing from listing");
         assert!(
-            state_line.starts_with("[--]"),
+            state_line.starts_with("[r-]"),
             "state.json should be read-only, got: {state_line}"
         );
     }

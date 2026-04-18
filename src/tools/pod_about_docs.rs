@@ -348,16 +348,21 @@ only these can.
   and don't catch up at startup — but `pod_run_behavior` still
   works (explicit actions always run).
 
-## What you can write
+## Access by path
 
-| Path                              | Writable? | Validation                          |
-|-----------------------------------|-----------|-------------------------------------|
-| `pod.toml`                        | yes       | TOML + pod schema before disk       |
-| pod-level system prompt file      | yes       | none (plain text)                   |
-| `behaviors/<id>/behavior.toml`    | yes       | TOML + behavior schema before disk  |
-| `behaviors/<id>/prompt.md`        | yes       | none (plain text)                   |
-| `behaviors/<id>/state.json`       | no        | runtime state, not config           |
-| `pod_state.json`, `threads/`, etc.| no        | runtime state, not config           |
+| Path                              | Access | Notes                                    |
+|-----------------------------------|--------|------------------------------------------|
+| `pod.toml`                        | rw     | TOML + pod schema validated before disk  |
+| pod-level system prompt file      | rw     | plain text                               |
+| `behaviors/<id>/behavior.toml`    | rw     | TOML + behavior schema validated         |
+| `behaviors/<id>/prompt.md`        | rw     | plain text                               |
+| `pod_state.json`                  | r-     | runtime state, scheduler-owned           |
+| `behaviors/<id>/state.json`       | r-     | runtime state, scheduler-owned           |
+| `threads/<id>.json`               | r-     | full message history of a spawned thread |
+| other (e.g. `.archived/`)         | --     | not reachable through these tools        |
+
+`pod_list_files` tags each entry with `[rw]`, `[r-]`, or `[--]` so
+this table matches what you'll see live.
 
 ## Creating a new behavior
 
