@@ -23,6 +23,8 @@
 //! [`crate::runtime::scheduler::Scheduler::apply_pod_config_update`] and
 //! [`crate::runtime::scheduler::Scheduler::apply_behavior_config_update`].
 
+mod about;
+mod behavior_control;
 mod grep;
 
 use std::collections::HashMap;
@@ -139,9 +141,9 @@ pub fn descriptors() -> Vec<McpTool> {
         edit_descriptor(),
         grep::descriptor(),
         list_threads_descriptor(),
-        about_descriptor(),
-        run_behavior_descriptor(),
-        set_behavior_enabled_descriptor(),
+        about::descriptor(),
+        behavior_control::run_behavior_descriptor(),
+        behavior_control::set_behavior_enabled_descriptor(),
     ]
 }
 
@@ -231,9 +233,9 @@ pub async fn dispatch(
         POD_EDIT_FILE => edit_file(&pod_dir, &allowed, &behavior_ids, args).await,
         POD_GREP => grep::run(&pod_dir, args).await,
         POD_LIST_THREADS => list_threads(&pod_dir, args).await,
-        POD_ABOUT => about(args),
-        POD_RUN_BEHAVIOR => run_behavior(&behavior_ids, args),
-        POD_SET_BEHAVIOR_ENABLED => set_behavior_enabled(&behavior_ids, args),
+        POD_ABOUT => about::run(args),
+        POD_RUN_BEHAVIOR => behavior_control::run_behavior(&behavior_ids, args),
+        POD_SET_BEHAVIOR_ENABLED => behavior_control::set_behavior_enabled(&behavior_ids, args),
         other => no_update_error(format!("unknown builtin tool: {other}")),
     }
 }
@@ -1526,198 +1528,6 @@ fn any_filter_set(args: &ListThreadsArgs) -> bool {
         || args.max_turns.is_some()
 }
 
-// ---------- pod_about ----------
-
-fn about_descriptor() -> McpTool {
-    McpTool {
-        name: POD_ABOUT.into(),
-        description: "Read documentation about the pod-agent system you run inside: \
-                      schemas for pod.toml and behavior.toml, trigger variants, cron \
-                      syntax, retention policies, and how self-modification works via \
-                      the pod_*_file tools. Call with no arguments (or \
-                      `topic: \"index\"`) for the list of topics, then call again \
-                      with a specific topic name. Use this BEFORE writing a new \
-                      behavior.toml or pod.toml if you haven't recently — the schemas \
-                      may have fields you don't remember."
-            .into(),
-        input_schema: json!({
-            "type": "object",
-            "properties": {
-                "topic": {
-                    "type": "string",
-                    "description": "Topic to read. Omit or pass \"index\" for the topic list."
-                }
-            }
-        }),
-        annotations: ToolAnnotations {
-            title: Some("Pod/behavior reference".into()),
-            read_only_hint: Some(true),
-            destructive_hint: Some(false),
-            idempotent_hint: Some(true),
-            open_world_hint: Some(false),
-        },
-    }
-}
-
-#[derive(Deserialize, Default)]
-struct AboutArgs {
-    #[serde(default)]
-    topic: Option<String>,
-}
-
-fn about(args: Value) -> ToolOutcome {
-    let parsed: AboutArgs = match serde_json::from_value(args) {
-        Ok(v) => v,
-        Err(e) => return no_update_error(format!("invalid arguments: {e}")),
-    };
-    let topic = parsed.topic.as_deref().unwrap_or("index");
-    match crate::tools::pod_about_docs::topic(topic) {
-        Some(text) => no_update_text(text.to_string()),
-        None => no_update_error(format!(
-            "unknown topic `{topic}`. Valid topics: [{}]. Call pod_about with no args for the index.",
-            crate::tools::pod_about_docs::TOPIC_NAMES.join(", ")
-        )),
-    }
-}
-
-// ---------- pod_run_behavior ----------
-
-fn run_behavior_descriptor() -> McpTool {
-    McpTool {
-        name: POD_RUN_BEHAVIOR.into(),
-        description: "Manually fire one of this pod's behaviors. Equivalent to the \
-                      UI's Run button — bypasses cron timers and the paused gate (an \
-                      explicit action always runs). The behavior's `prompt.md` is \
-                      substituted with the `payload` argument as `{{payload}}` the \
-                      same way a webhook body is. Use this to test a newly-written \
-                      behavior without waiting for its schedule, or to kick a \
-                      webhook behavior with a custom payload. Returns immediately \
-                      once the run is queued — the spawned thread appears on the \
-                      wire as normal."
-            .into(),
-        input_schema: json!({
-            "type": "object",
-            "properties": {
-                "behavior_id": {
-                    "type": "string",
-                    "description": "Which behavior under this pod to fire."
-                },
-                "payload": {
-                    "description": "Optional JSON payload. Omitted → null."
-                }
-            },
-            "required": ["behavior_id"]
-        }),
-        annotations: ToolAnnotations {
-            title: Some("Run a behavior".into()),
-            read_only_hint: Some(false),
-            destructive_hint: Some(false),
-            idempotent_hint: Some(false),
-            open_world_hint: Some(false),
-        },
-    }
-}
-
-#[derive(Deserialize)]
-struct RunBehaviorArgs {
-    behavior_id: String,
-    #[serde(default)]
-    payload: Option<Value>,
-}
-
-fn run_behavior(behavior_ids: &[String], args: Value) -> ToolOutcome {
-    let parsed: RunBehaviorArgs = match serde_json::from_value(args) {
-        Ok(v) => v,
-        Err(e) => return no_update_error(format!("invalid arguments: {e}")),
-    };
-    if !behavior_ids.iter().any(|i| i == &parsed.behavior_id) {
-        return no_update_error(format!(
-            "unknown behavior `{}` in this pod. Known: [{}]",
-            parsed.behavior_id,
-            behavior_ids.join(", ")
-        ));
-    }
-    ToolOutcome {
-        result: text_result(format!(
-            "queued manual run of behavior `{}`",
-            parsed.behavior_id
-        )),
-        pod_update: None,
-        scheduler_command: Some(SchedulerCommand::RunBehavior {
-            behavior_id: parsed.behavior_id,
-            payload: parsed.payload,
-        }),
-    }
-}
-
-// ---------- pod_set_behavior_enabled ----------
-
-fn set_behavior_enabled_descriptor() -> McpTool {
-    McpTool {
-        name: POD_SET_BEHAVIOR_ENABLED.into(),
-        description: "Pause or resume one of this pod's automatic-trigger behaviors. \
-                      Paused behaviors skip cron ticks, return 503 on webhook POSTs, \
-                      and do not catch up at startup. Manual `pod_run_behavior` still \
-                      works while paused — it's always an explicit action. Pausing \
-                      drops any `queue_one` payload the behavior had parked; resuming \
-                      bumps a cron behavior's cursor to now so catch-up doesn't \
-                      replay windows missed during the pause."
-            .into(),
-        input_schema: json!({
-            "type": "object",
-            "properties": {
-                "behavior_id": {
-                    "type": "string",
-                    "description": "Which behavior to pause or resume."
-                },
-                "enabled": {
-                    "type": "boolean",
-                    "description": "`true` to resume, `false` to pause."
-                }
-            },
-            "required": ["behavior_id", "enabled"]
-        }),
-        annotations: ToolAnnotations {
-            title: Some("Pause/resume a behavior".into()),
-            read_only_hint: Some(false),
-            destructive_hint: Some(false),
-            idempotent_hint: Some(true),
-            open_world_hint: Some(false),
-        },
-    }
-}
-
-#[derive(Deserialize)]
-struct SetBehaviorEnabledArgs {
-    behavior_id: String,
-    enabled: bool,
-}
-
-fn set_behavior_enabled(behavior_ids: &[String], args: Value) -> ToolOutcome {
-    let parsed: SetBehaviorEnabledArgs = match serde_json::from_value(args) {
-        Ok(v) => v,
-        Err(e) => return no_update_error(format!("invalid arguments: {e}")),
-    };
-    if !behavior_ids.iter().any(|i| i == &parsed.behavior_id) {
-        return no_update_error(format!(
-            "unknown behavior `{}` in this pod. Known: [{}]",
-            parsed.behavior_id,
-            behavior_ids.join(", ")
-        ));
-    }
-    ToolOutcome {
-        result: text_result(format!(
-            "behavior `{}` set to enabled={}",
-            parsed.behavior_id, parsed.enabled
-        )),
-        pod_update: None,
-        scheduler_command: Some(SchedulerCommand::SetBehaviorEnabled {
-            behavior_id: parsed.behavior_id,
-            enabled: parsed.enabled,
-        }),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2088,40 +1898,6 @@ schedule = "0 9 * * *"
             }
             other => panic!("expected BehaviorPrompt update, got {other:?}"),
         }
-    }
-
-    #[tokio::test]
-    async fn about_returns_index_by_default() {
-        let dir = temp_dir();
-        let cfg = sample_config();
-        let out = dispatch(dir.clone(), cfg.clone(), vec![], POD_ABOUT, json!({})).await;
-        assert!(!out.result.is_error);
-        let text = join_blocks(&out.result.content);
-        assert!(text.contains("pod.toml"), "index missing pod.toml: {text}");
-        assert!(
-            text.contains("behavior.toml"),
-            "index missing behavior.toml: {text}"
-        );
-    }
-
-    #[tokio::test]
-    async fn about_returns_requested_topic() {
-        let dir = temp_dir();
-        let cfg = sample_config();
-        let out = dispatch(
-            dir.clone(),
-            cfg,
-            vec![],
-            POD_ABOUT,
-            json!({ "topic": "cron" }),
-        )
-        .await;
-        assert!(!out.result.is_error);
-        let text = join_blocks(&out.result.content);
-        assert!(
-            text.contains("Five-field UNIX crontab"),
-            "cron topic body not returned: {text}"
-        );
     }
 
     // ---------- pod_list_threads coverage ----------
@@ -2523,133 +2299,6 @@ schedule = "0 9 * * *"
                 "missing thread {id}.json in listing: {text}"
             );
         }
-    }
-
-    // ---------- orchestration tool coverage ----------
-
-    #[tokio::test]
-    async fn run_behavior_rejects_unknown_id() {
-        let dir = temp_dir();
-        let cfg = sample_config();
-        let out = dispatch(
-            dir.clone(),
-            cfg,
-            vec!["real".to_string()],
-            POD_RUN_BEHAVIOR,
-            json!({ "behavior_id": "ghost" }),
-        )
-        .await;
-        assert!(out.result.is_error);
-        assert!(out.scheduler_command.is_none());
-        let text = join_blocks(&out.result.content);
-        assert!(text.contains("unknown behavior"), "wrong error: {text}");
-    }
-
-    #[tokio::test]
-    async fn run_behavior_emits_scheduler_command() {
-        let dir = temp_dir();
-        let cfg = sample_config();
-        let out = dispatch(
-            dir.clone(),
-            cfg,
-            vec!["daily".to_string()],
-            POD_RUN_BEHAVIOR,
-            json!({ "behavior_id": "daily", "payload": {"foo": 1} }),
-        )
-        .await;
-        assert!(!out.result.is_error);
-        match out.scheduler_command {
-            Some(SchedulerCommand::RunBehavior {
-                behavior_id,
-                payload,
-            }) => {
-                assert_eq!(behavior_id, "daily");
-                assert_eq!(payload, Some(json!({ "foo": 1 })));
-            }
-            other => panic!("expected RunBehavior command, got {other:?}"),
-        }
-    }
-
-    #[tokio::test]
-    async fn run_behavior_defaults_payload_to_none() {
-        let dir = temp_dir();
-        let cfg = sample_config();
-        let out = dispatch(
-            dir.clone(),
-            cfg,
-            vec!["daily".to_string()],
-            POD_RUN_BEHAVIOR,
-            json!({ "behavior_id": "daily" }),
-        )
-        .await;
-        assert!(!out.result.is_error);
-        match out.scheduler_command {
-            Some(SchedulerCommand::RunBehavior { payload, .. }) => {
-                assert_eq!(payload, None);
-            }
-            other => panic!("expected RunBehavior command, got {other:?}"),
-        }
-    }
-
-    #[tokio::test]
-    async fn set_behavior_enabled_emits_scheduler_command() {
-        let dir = temp_dir();
-        let cfg = sample_config();
-        let out = dispatch(
-            dir.clone(),
-            cfg,
-            vec!["daily".to_string()],
-            POD_SET_BEHAVIOR_ENABLED,
-            json!({ "behavior_id": "daily", "enabled": false }),
-        )
-        .await;
-        assert!(!out.result.is_error);
-        match out.scheduler_command {
-            Some(SchedulerCommand::SetBehaviorEnabled {
-                behavior_id,
-                enabled,
-            }) => {
-                assert_eq!(behavior_id, "daily");
-                assert!(!enabled);
-            }
-            other => panic!("expected SetBehaviorEnabled command, got {other:?}"),
-        }
-    }
-
-    #[tokio::test]
-    async fn set_behavior_enabled_rejects_unknown_id() {
-        let dir = temp_dir();
-        let cfg = sample_config();
-        let out = dispatch(
-            dir.clone(),
-            cfg,
-            vec![],
-            POD_SET_BEHAVIOR_ENABLED,
-            json!({ "behavior_id": "ghost", "enabled": true }),
-        )
-        .await;
-        assert!(out.result.is_error);
-        assert!(out.scheduler_command.is_none());
-    }
-
-    #[tokio::test]
-    async fn about_rejects_unknown_topic() {
-        let dir = temp_dir();
-        let cfg = sample_config();
-        let out = dispatch(
-            dir.clone(),
-            cfg,
-            vec![],
-            POD_ABOUT,
-            json!({ "topic": "nonsense" }),
-        )
-        .await;
-        assert!(out.result.is_error);
-        let text = join_blocks(&out.result.content);
-        assert!(
-            text.contains("unknown topic") && text.contains("Valid topics"),
-            "bad error: {text}"
-        );
     }
 
     #[tokio::test]
