@@ -21,11 +21,11 @@ use whisper_agent_protocol::sandbox::{
     AccessMode, Mount, NetworkPolicy, PathAccess, ResourceLimits,
 };
 use whisper_agent_protocol::{
-    ApprovalChoice, ApprovalPolicy, BackendSummary, BehaviorConfig,
+    ApprovalChoice, ApprovalPolicy, BackendSummary, BehaviorConfig, BehaviorOrigin,
     BehaviorSnapshot as BehaviorSnapshotProto, BehaviorSummary, BehaviorThreadOverride, CatchUp,
-    ClientToServer, ContentBlock, Conversation, HostEnvProviderInfo, HostEnvSpec, Message,
-    ModelSummary, NamedHostEnv, Overlap, PodAllow, PodConfig, PodLimits, PodSummary,
-    ResourceSnapshot, ResourceStateLabel, RetentionPolicy, Role, ServerToClient,
+    ClientToServer, ContentBlock, Conversation, HostEnvBinding, HostEnvProviderInfo, HostEnvSpec,
+    Message, ModelSummary, NamedHostEnv, Overlap, PodAllow, PodConfig, PodLimits, PodSummary,
+    ResourceSnapshot, ResourceStateLabel, RetentionPolicy, Role, ServerToClient, ThreadBindings,
     ThreadBindingsRequest, ThreadConfigOverride, ThreadDefaults, ThreadStateLabel, ThreadSummary,
     ToolResultContent, TriggerSpec, Usage,
 };
@@ -147,6 +147,28 @@ struct TaskView {
     /// Tool names this task has approved-and-remembered. Mirrors
     /// `ThreadSnapshot.tool_allowlist`; refreshed by `ThreadAllowlistUpdated`.
     tool_allowlist: Vec<String>,
+    /// Extra snapshot-carried fields the context inspector renders.
+    /// Populated on `ThreadSnapshot`; kept in sync via the per-field
+    /// update events (`ThreadBindingsChanged`, etc). Small enough to
+    /// hold per-view rather than shipping an extra request when the
+    /// inspector opens.
+    inspector: ThreadInspector,
+}
+
+/// Everything the thread-context inspector surfaces that isn't
+/// already on `TaskView` (backend, model, failure, allowlist, usage,
+/// summary). Split into its own struct so `TaskView` stays readable
+/// at a glance — the inspector fields are a handful of seldom-changing
+/// reference values, not per-turn state.
+#[derive(Clone, Default)]
+struct ThreadInspector {
+    system_prompt: String,
+    max_tokens: u32,
+    max_turns: u32,
+    approval_policy: Option<ApprovalPolicy>,
+    bindings: ThreadBindings,
+    origin: Option<BehaviorOrigin>,
+    created_at: String,
 }
 
 struct PendingApproval {
@@ -162,6 +184,8 @@ struct PendingApproval {
 
 impl TaskView {
     fn new(summary: ThreadSummary) -> Self {
+        let created_at = summary.created_at.clone();
+        let origin = summary.origin.clone();
         Self {
             summary,
             items: Vec::new(),
@@ -172,6 +196,15 @@ impl TaskView {
             model: String::new(),
             failure: None,
             tool_allowlist: Vec::new(),
+            inspector: ThreadInspector {
+                system_prompt: String::new(),
+                max_tokens: 0,
+                max_turns: 0,
+                approval_policy: None,
+                bindings: ThreadBindings::default(),
+                origin,
+                created_at,
+            },
         }
     }
 }
@@ -848,12 +881,22 @@ impl ChatApp {
                 let model = snapshot.config.model.clone();
                 let failure = snapshot.failure.clone();
                 let allowlist = snapshot.tool_allowlist.clone();
+                let inspector = ThreadInspector {
+                    system_prompt: snapshot.config.system_prompt.clone(),
+                    max_tokens: snapshot.config.max_tokens,
+                    max_turns: snapshot.config.max_turns,
+                    approval_policy: Some(snapshot.config.approval_policy),
+                    bindings: snapshot.bindings.clone(),
+                    origin: snapshot.origin.clone(),
+                    created_at: snapshot.created_at.clone(),
+                };
                 let view = self
                     .tasks
                     .entry(thread_id.clone())
                     .or_insert_with(|| TaskView::new(snapshot_summary(&snapshot)));
                 view.summary.state = snapshot.state;
                 view.summary.title = snapshot.title;
+                view.summary.origin = snapshot.origin.clone();
                 view.total_usage = snapshot.total_usage;
                 view.items = items;
                 view.subscribed = true;
@@ -861,6 +904,7 @@ impl ChatApp {
                 view.model = model;
                 view.failure = failure;
                 view.tool_allowlist = allowlist;
+                view.inspector = inspector;
                 // Pending-approval events that follow the snapshot will re-seed this.
                 view.pending_approvals.clear();
             }
@@ -878,7 +922,8 @@ impl ChatApp {
                 ..
             } => {
                 if let Some(view) = self.tasks.get_mut(&thread_id) {
-                    view.backend = bindings.backend;
+                    view.backend = bindings.backend.clone();
+                    view.inspector.bindings = bindings;
                 }
             }
             ServerToClient::ThreadAssistantBegin { .. } => {}
@@ -1908,6 +1953,7 @@ impl eframe::App for ChatApp {
                     );
                 }
                 Some(view) => {
+                    render_thread_context_inspector(ui, &thread_id, view);
                     render_failure_banner(ui, view);
                     render_allowlist_chips(ui, &thread_id, view, &mut allowlist_revocations);
                     render_approval_banner(ui, &thread_id, view, &mut pending_decisions);
@@ -3258,6 +3304,164 @@ fn resource_state_chip(state: ResourceStateLabel) -> (&'static str, Color32) {
         ResourceStateLabel::Errored => ("errored", Color32::from_rgb(200, 110, 110)),
         ResourceStateLabel::TornDown => ("torn down", Color32::from_gray(140)),
     }
+}
+
+/// Collapsible inspector at the top of the thread view. Surfaces
+/// everything a snapshot carries that isn't already visible as a
+/// conversation item: pod/thread identity, timestamps, bindings,
+/// sampling caps, approval policy, trigger origin, and the full
+/// system prompt. Collapsed by default — most sessions never open
+/// it. egui's `CollapsingHeader` persists open/closed state by
+/// `id_salt` so flipping the arrow survives repaints.
+fn render_thread_context_inspector(ui: &mut egui::Ui, thread_id: &str, view: &TaskView) {
+    let salt = format!("thread-context-{thread_id}");
+    egui::CollapsingHeader::new(
+        RichText::new("Thread context")
+            .small()
+            .color(Color32::from_gray(180)),
+    )
+    .id_salt(salt)
+    .default_open(false)
+    .show(ui, |ui| {
+        let inspector = &view.inspector;
+        Grid::new(format!("thread-context-grid-{thread_id}"))
+            .num_columns(2)
+            .min_col_width(120.0)
+            .spacing([12.0, 4.0])
+            .show(ui, |ui| {
+                kv_row(ui, "thread_id", thread_id);
+                kv_row(ui, "pod_id", &view.summary.pod_id);
+                kv_row(ui, "state", state_chip(view.summary.state).0);
+                if let Some(title) = view.summary.title.as_deref() {
+                    kv_row(ui, "title", title);
+                }
+                if !inspector.created_at.is_empty() {
+                    kv_row(ui, "created_at", &inspector.created_at);
+                }
+                if !view.summary.last_active.is_empty() {
+                    kv_row(ui, "last_active", &view.summary.last_active);
+                }
+                let backend_val = if view.backend.is_empty() {
+                    "(server default)".to_string()
+                } else {
+                    view.backend.clone()
+                };
+                let model_val = if view.model.is_empty() {
+                    "(backend default)".to_string()
+                } else {
+                    view.model.clone()
+                };
+                kv_row(ui, "backend", &backend_val);
+                kv_row(ui, "model", &model_val);
+                if inspector.max_tokens > 0 {
+                    kv_row(ui, "max_tokens", &inspector.max_tokens.to_string());
+                }
+                if inspector.max_turns > 0 {
+                    kv_row(ui, "max_turns", &inspector.max_turns.to_string());
+                }
+                if let Some(policy) = inspector.approval_policy {
+                    kv_row(ui, "approval_policy", approval_policy_label(policy));
+                }
+                let host_env_label = match &inspector.bindings.host_env {
+                    Some(HostEnvBinding::Named { name }) => name.clone(),
+                    Some(HostEnvBinding::Inline { provider, .. }) => {
+                        format!("(inline, provider = {provider})")
+                    }
+                    None => "(none — shared MCPs only)".to_string(),
+                };
+                kv_row(ui, "host_env", &host_env_label);
+                let mcp_label = if inspector.bindings.mcp_hosts.is_empty() {
+                    "(none)".to_string()
+                } else {
+                    inspector.bindings.mcp_hosts.join(", ")
+                };
+                kv_row(ui, "mcp_hosts", &mcp_label);
+                kv_row(
+                    ui,
+                    "total_usage_in",
+                    &view.total_usage.input_tokens.to_string(),
+                );
+                kv_row(
+                    ui,
+                    "total_usage_out",
+                    &view.total_usage.output_tokens.to_string(),
+                );
+                if view.total_usage.cache_read_input_tokens > 0
+                    || view.total_usage.cache_creation_input_tokens > 0
+                {
+                    kv_row(
+                        ui,
+                        "cache (read/write)",
+                        &format!(
+                            "{}/{}",
+                            view.total_usage.cache_read_input_tokens,
+                            view.total_usage.cache_creation_input_tokens
+                        ),
+                    );
+                }
+                if !view.tool_allowlist.is_empty() {
+                    kv_row(ui, "tool_allowlist", &view.tool_allowlist.join(", "));
+                }
+            });
+
+        if let Some(origin) = inspector.origin.as_ref() {
+            ui.add_space(6.0);
+            section_heading(ui, "Trigger origin");
+            Grid::new(format!("thread-origin-grid-{thread_id}"))
+                .num_columns(2)
+                .min_col_width(120.0)
+                .spacing([12.0, 4.0])
+                .show(ui, |ui| {
+                    kv_row(ui, "behavior_id", &origin.behavior_id);
+                    kv_row(ui, "fired_at", &origin.fired_at);
+                    if !origin.trigger_payload.is_null() {
+                        let payload_text = serde_json::to_string_pretty(&origin.trigger_payload)
+                            .unwrap_or_default();
+                        ui.label("trigger_payload");
+                        ui.add(
+                            TextEdit::multiline(&mut payload_text.as_str())
+                                .code_editor()
+                                .desired_rows(payload_text.lines().count().clamp(1, 8) as usize)
+                                .desired_width(f32::INFINITY),
+                        );
+                        ui.end_row();
+                    }
+                });
+        }
+
+        ui.add_space(6.0);
+        section_heading(ui, "System prompt");
+        if inspector.system_prompt.is_empty() {
+            ui.label(
+                RichText::new("(empty — model runs with no system prompt)")
+                    .italics()
+                    .color(Color32::from_gray(160)),
+            );
+        } else {
+            // Read-only: users edit the prompt via the pod editor's
+            // system_prompt_file, not here. Sized to fit a few lines of
+            // content up to a reasonable cap so very long prompts
+            // don't eat the whole viewport.
+            let mut prompt = inspector.system_prompt.as_str();
+            let line_count = inspector.system_prompt.lines().count().clamp(3, 20);
+            ui.add_sized(
+                [ui.available_width(), 0.0],
+                TextEdit::multiline(&mut prompt)
+                    .code_editor()
+                    .desired_rows(line_count)
+                    .interactive(false),
+            );
+        }
+    });
+    ui.add_space(6.0);
+}
+
+/// Render one row of the inspector's key-value grid. Keys right-aligned
+/// in a muted tone, values left-aligned as plain text.
+fn kv_row(ui: &mut egui::Ui, key: &str, value: &str) {
+    ui.label(RichText::new(key).small().color(Color32::from_gray(160)));
+    ui.label(RichText::new(value).small());
+    ui.end_row();
 }
 
 fn render_failure_banner(ui: &mut egui::Ui, view: &TaskView) {
