@@ -7,4 +7,5 @@
 
 pub mod builtin_tools;
 pub mod mcp;
+pub mod pod_about_docs;
 pub mod sandbox;

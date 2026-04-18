@@ -54,13 +54,14 @@ pub const POD_READ_FILE: &str = "pod_read_file";
 pub const POD_WRITE_FILE: &str = "pod_write_file";
 pub const POD_EDIT_FILE: &str = "pod_edit_file";
 pub const POD_LIST_FILES: &str = "pod_list_files";
+pub const POD_ABOUT: &str = "pod_about";
 
 /// True if `name` is a builtin pod tool. Used by the scheduler's router
 /// to branch the tool-call dispatch path.
 pub fn is_builtin(name: &str) -> bool {
     matches!(
         name,
-        POD_READ_FILE | POD_WRITE_FILE | POD_EDIT_FILE | POD_LIST_FILES
+        POD_READ_FILE | POD_WRITE_FILE | POD_EDIT_FILE | POD_LIST_FILES | POD_ABOUT
     )
 }
 
@@ -79,6 +80,7 @@ pub fn descriptors() -> Vec<McpTool> {
         read_descriptor(),
         write_descriptor(),
         edit_descriptor(),
+        about_descriptor(),
     ]
 }
 
@@ -141,6 +143,7 @@ pub async fn dispatch(
         POD_READ_FILE => read_file(&pod_dir, &allowed, &behavior_ids, args).await,
         POD_WRITE_FILE => write_file(&pod_dir, &allowed, &behavior_ids, args).await,
         POD_EDIT_FILE => edit_file(&pod_dir, &allowed, &behavior_ids, args).await,
+        POD_ABOUT => about(args),
         other => no_update_error(format!("unknown builtin tool: {other}")),
     }
 }
@@ -913,6 +916,60 @@ fn multi_match_hint(content: &str, old_string: &str) -> String {
     out
 }
 
+// ---------- pod_about ----------
+
+fn about_descriptor() -> McpTool {
+    McpTool {
+        name: POD_ABOUT.into(),
+        description: "Read documentation about the pod-agent system you run inside: \
+                      schemas for pod.toml and behavior.toml, trigger variants, cron \
+                      syntax, retention policies, and how self-modification works via \
+                      the pod_*_file tools. Call with no arguments (or \
+                      `topic: \"index\"`) for the list of topics, then call again \
+                      with a specific topic name. Use this BEFORE writing a new \
+                      behavior.toml or pod.toml if you haven't recently — the schemas \
+                      may have fields you don't remember."
+            .into(),
+        input_schema: json!({
+            "type": "object",
+            "properties": {
+                "topic": {
+                    "type": "string",
+                    "description": "Topic to read. Omit or pass \"index\" for the topic list."
+                }
+            }
+        }),
+        annotations: ToolAnnotations {
+            title: Some("Pod/behavior reference".into()),
+            read_only_hint: Some(true),
+            destructive_hint: Some(false),
+            idempotent_hint: Some(true),
+            open_world_hint: Some(false),
+        },
+    }
+}
+
+#[derive(Deserialize, Default)]
+struct AboutArgs {
+    #[serde(default)]
+    topic: Option<String>,
+}
+
+fn about(args: Value) -> ToolOutcome {
+    let parsed: AboutArgs = match serde_json::from_value(args) {
+        Ok(v) => v,
+        Err(e) => return no_update_error(format!("invalid arguments: {e}")),
+    };
+    let topic = parsed.topic.as_deref().unwrap_or("index");
+    match crate::tools::pod_about_docs::topic(topic) {
+        Some(text) => no_update_text(text.to_string()),
+        None => no_update_error(format!(
+            "unknown topic `{topic}`. Valid topics: [{}]. Call pod_about with no args for the index.",
+            crate::tools::pod_about_docs::TOPIC_NAMES.join(", ")
+        )),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1321,6 +1378,60 @@ schedule = "0 9 * * *"
             }
             other => panic!("expected BehaviorPrompt update, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn about_returns_index_by_default() {
+        let dir = temp_dir();
+        let cfg = sample_config();
+        let out = dispatch(dir.clone(), cfg.clone(), vec![], POD_ABOUT, json!({})).await;
+        assert!(!out.result.is_error);
+        let text = join_blocks(&out.result.content);
+        assert!(text.contains("pod.toml"), "index missing pod.toml: {text}");
+        assert!(
+            text.contains("behavior.toml"),
+            "index missing behavior.toml: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn about_returns_requested_topic() {
+        let dir = temp_dir();
+        let cfg = sample_config();
+        let out = dispatch(
+            dir.clone(),
+            cfg,
+            vec![],
+            POD_ABOUT,
+            json!({ "topic": "cron" }),
+        )
+        .await;
+        assert!(!out.result.is_error);
+        let text = join_blocks(&out.result.content);
+        assert!(
+            text.contains("Five-field UNIX crontab"),
+            "cron topic body not returned: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn about_rejects_unknown_topic() {
+        let dir = temp_dir();
+        let cfg = sample_config();
+        let out = dispatch(
+            dir.clone(),
+            cfg,
+            vec![],
+            POD_ABOUT,
+            json!({ "topic": "nonsense" }),
+        )
+        .await;
+        assert!(out.result.is_error);
+        let text = join_blocks(&out.result.content);
+        assert!(
+            text.contains("unknown topic") && text.contains("Valid topics"),
+            "bad error: {text}"
+        );
     }
 
     #[tokio::test]
