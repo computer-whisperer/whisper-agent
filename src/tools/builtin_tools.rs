@@ -8,20 +8,30 @@
 //!     failure the file is untouched and the tool returns an error.
 //!   * The file named by `thread_defaults.system_prompt_file` — allowed
 //!     whenever non-empty. No structural validation (plain text).
-//!   * Future: Lua files (add their names here when support lands).
+//!   * `behaviors/<id>/behavior.toml` — parsed + validated by
+//!     [`crate::pod::behaviors::parse_toml`]. Writing to a new `<id>`
+//!     creates the behavior directory and seeds `state.json` with a
+//!     default `BehaviorState`.
+//!   * `behaviors/<id>/prompt.md` — plain text; the initial user-message
+//!     template fired threads run against. Only writable for ids that
+//!     already have a `behavior.toml` (the agent must create the
+//!     behavior first).
 //!
 //! Successful writes emit a [`PodUpdate`] so the scheduler can refresh
 //! in-memory pod state and broadcast the change to subscribers in the
-//! same step as the disk write. See [`crate::runtime::scheduler::Scheduler::apply_pod_config_update`].
+//! same step as the disk write. See
+//! [`crate::runtime::scheduler::Scheduler::apply_pod_config_update`] and
+//! [`crate::runtime::scheduler::Scheduler::apply_behavior_config_update`].
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 use serde_json::{Value, json};
-use whisper_agent_protocol::PodConfig;
+use whisper_agent_protocol::{BehaviorConfig, BehaviorState, PodConfig};
 
 use crate::pod;
+use crate::pod::behaviors::{BEHAVIOR_PROMPT, BEHAVIOR_STATE, BEHAVIOR_TOML, BEHAVIORS_DIR};
 use crate::tools::mcp::{
     CallToolResult, McpContentBlock, ToolAnnotations, ToolDescriptor as McpTool,
 };
@@ -93,6 +103,18 @@ pub enum PodUpdate {
     },
     /// New system-prompt text.
     SystemPrompt { text: String },
+    /// A new or updated `behaviors/<id>/behavior.toml`. Parsed and
+    /// validated before emission. The scheduler decides whether this is
+    /// a create or an update by looking at its in-memory pod state.
+    BehaviorConfig {
+        behavior_id: String,
+        toml_text: String,
+        parsed: Box<BehaviorConfig>,
+    },
+    /// New text for a behavior's `prompt.md`. Only valid when the
+    /// behavior already exists in-memory (see module docs); the tool
+    /// handler rejects prompt writes for unknown ids.
+    BehaviorPrompt { behavior_id: String, text: String },
 }
 
 /// What a builtin tool handler produces: the tool result the model sees,
@@ -103,42 +125,114 @@ pub struct ToolOutcome {
 }
 
 /// Dispatch a builtin tool call. `pod_dir` is the pod's on-disk directory;
-/// `pod_config` is the current in-memory config (used to derive the
-/// filename whitelist and to validate writes).
+/// `pod_config` is the current in-memory config; `behavior_ids` lists
+/// the behaviors currently registered (used to derive the dynamic slice
+/// of the allowlist and to distinguish create vs update on write).
 pub async fn dispatch(
     pod_dir: PathBuf,
     pod_config: PodConfig,
+    behavior_ids: Vec<String>,
     tool_name: &str,
     args: Value,
 ) -> ToolOutcome {
-    let allowed = allowed_filenames(&pod_config);
+    let allowed = allowed_filenames(&pod_config, &behavior_ids);
     match tool_name {
         POD_LIST_FILES => list_files(&pod_dir, &allowed, args).await,
-        POD_READ_FILE => read_file(&pod_dir, &allowed, args).await,
-        POD_WRITE_FILE => write_file(&pod_dir, &allowed, args).await,
-        POD_EDIT_FILE => edit_file(&pod_dir, &allowed, args).await,
+        POD_READ_FILE => read_file(&pod_dir, &allowed, &behavior_ids, args).await,
+        POD_WRITE_FILE => write_file(&pod_dir, &allowed, &behavior_ids, args).await,
+        POD_EDIT_FILE => edit_file(&pod_dir, &allowed, &behavior_ids, args).await,
         other => no_update_error(format!("unknown builtin tool: {other}")),
     }
 }
 
-fn allowed_filenames(cfg: &PodConfig) -> Vec<String> {
+/// Every filename reachable by `pod_read_file` / `pod_write_file` /
+/// `pod_edit_file`. Built from the current pod config plus every
+/// behavior id in memory. Writes to `behaviors/<new-id>/behavior.toml`
+/// are additionally allowed (for create-new) — see [`validate_filename`].
+fn allowed_filenames(cfg: &PodConfig, behavior_ids: &[String]) -> Vec<String> {
     let mut out = vec![pod::POD_TOML.to_string()];
     let prompt = &cfg.thread_defaults.system_prompt_file;
     if !prompt.is_empty() && prompt != pod::POD_TOML {
         out.push(prompt.clone());
     }
+    for id in behavior_ids {
+        out.push(format!("{BEHAVIORS_DIR}/{id}/{BEHAVIOR_TOML}"));
+        out.push(format!("{BEHAVIORS_DIR}/{id}/{BEHAVIOR_PROMPT}"));
+    }
     out
 }
 
-fn validate_filename(filename: &str, allowed: &[String]) -> Result<(), String> {
-    if allowed.iter().any(|n| n == filename) {
-        Ok(())
-    } else {
-        Err(format!(
-            "filename `{filename}` is not in this pod's allowlist. Allowed: [{}]",
-            allowed.join(", ")
-        ))
+/// Split `behaviors/<id>/<suffix>` into `(id, suffix)` when `filename`
+/// matches that shape. The id and suffix must each be a single path
+/// component (no nested subdirs).
+fn parse_behavior_path(filename: &str) -> Option<(&str, &str)> {
+    let rest = filename.strip_prefix(&format!("{BEHAVIORS_DIR}/"))?;
+    let (id, suffix) = rest.split_once('/')?;
+    if id.is_empty() || suffix.is_empty() || suffix.contains('/') {
+        return None;
     }
+    Some((id, suffix))
+}
+
+/// Kind of write a behavior path resolves to — drives whether the tool
+/// handler creates the directory + seeds state.json, and whether the
+/// scheduler emits `BehaviorCreated` or `BehaviorUpdated`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BehaviorWrite {
+    /// `behavior.toml` for an id not yet in memory — triggers mkdir and
+    /// state.json seeding.
+    CreateConfig,
+    /// `behavior.toml` for an existing id — content replace only.
+    UpdateConfig,
+    /// `prompt.md` for an existing id — content replace only.
+    UpdatePrompt,
+}
+
+/// Classify a `behaviors/<id>/<suffix>` write.  Returns `Err` with a
+/// helpful message when the write would produce an incoherent state
+/// (prompt-before-toml on a new id, or an unknown suffix).
+fn classify_behavior_write(
+    id: &str,
+    suffix: &str,
+    behavior_ids: &[String],
+) -> Result<BehaviorWrite, String> {
+    let exists = behavior_ids.iter().any(|i| i == id);
+    match (suffix, exists) {
+        (BEHAVIOR_TOML, false) => Ok(BehaviorWrite::CreateConfig),
+        (BEHAVIOR_TOML, true) => Ok(BehaviorWrite::UpdateConfig),
+        (BEHAVIOR_PROMPT, true) => Ok(BehaviorWrite::UpdatePrompt),
+        (BEHAVIOR_PROMPT, false) => Err(format!(
+            "behavior `{id}` does not exist yet — create it first by writing \
+             `{BEHAVIORS_DIR}/{id}/{BEHAVIOR_TOML}` before its `{BEHAVIOR_PROMPT}`"
+        )),
+        (other, _) => Err(format!(
+            "unknown behavior filename suffix `{other}` for behavior `{id}`"
+        )),
+    }
+}
+
+fn validate_filename(
+    filename: &str,
+    allowed: &[String],
+    behavior_ids: &[String],
+    for_write: bool,
+) -> Result<(), String> {
+    if allowed.iter().any(|n| n == filename) {
+        return Ok(());
+    }
+    // Create-new: writing `behaviors/<new-id>/behavior.toml` is
+    // legitimate even though the id is absent from `allowed`. Reads /
+    // edits against an unknown id fall through to the error below.
+    if for_write && let Some((id, suffix)) = parse_behavior_path(filename) {
+        if let Err(e) = pod::behaviors::validate_behavior_id(id) {
+            return Err(format!("behavior id `{id}`: {e}"));
+        }
+        return classify_behavior_write(id, suffix, behavior_ids).map(|_| ());
+    }
+    Err(format!(
+        "filename `{filename}` is not in this pod's allowlist. Allowed: [{}]",
+        allowed.join(", ")
+    ))
 }
 
 fn no_update_error(message: String) -> ToolOutcome {
@@ -160,14 +254,14 @@ fn no_update_text(message: String) -> ToolOutcome {
 fn list_descriptor() -> McpTool {
     McpTool {
         name: POD_LIST_FILES.into(),
-        description: "List the contents of this pod's directory. Each entry is \
-                      tagged `[rw]` if it is reachable via `pod_read_file` / \
-                      `pod_write_file` / `pod_edit_file`, or `[--]` otherwise \
-                      (e.g. the internal `threads/` subdirectory). Pod files live \
-                      OUTSIDE your workspace and are reachable ONLY through the \
-                      `pod_*_file` tools — not `list_dir` or `bash`. Use this \
-                      before editing to see which config files exist and how \
-                      large they are."
+        description: "List the contents of this pod's directory, including its \
+                      `behaviors/<id>/` subdirectories. Each entry is tagged `[rw]` \
+                      if it is reachable via `pod_read_file` / `pod_write_file` / \
+                      `pod_edit_file`, or `[--]` otherwise (e.g. `threads/` and per-\
+                      behavior `state.json`). Pod files live OUTSIDE your workspace \
+                      and are reachable ONLY through the `pod_*_file` tools — not \
+                      `list_dir` or `bash`. Use this before editing to see which \
+                      config files and behaviors exist."
             .into(),
         input_schema: json!({
             "type": "object",
@@ -184,18 +278,88 @@ fn list_descriptor() -> McpTool {
 }
 
 async fn list_files(pod_dir: &Path, allowed: &[String], _args: Value) -> ToolOutcome {
-    let mut read = match tokio::fs::read_dir(pod_dir).await {
-        Ok(r) => r,
-        Err(e) => return no_update_error(format!("list pod dir: {e}")),
-    };
-    // Collect (name, is_dir, size) then sort: allowed files first,
-    // then directories, then other files — each group name-sorted.
+    let mut out = String::new();
+    if let Err(e) = list_one_dir(pod_dir, "", allowed, &mut out).await {
+        return no_update_error(e);
+    }
+
+    // Each known behavior gets its own nested section — the agent sees
+    // `behavior.toml`, `prompt.md`, and the read-only `state.json` together.
+    let behaviors_dir = pod_dir.join(BEHAVIORS_DIR);
+    if tokio::fs::try_exists(&behaviors_dir).await.unwrap_or(false) {
+        let mut read = match tokio::fs::read_dir(&behaviors_dir).await {
+            Ok(r) => r,
+            Err(e) => return no_update_error(format!("list {BEHAVIORS_DIR}/: {e}")),
+        };
+        let mut ids: Vec<String> = Vec::new();
+        while let Ok(Some(entry)) = read.next_entry().await {
+            if let Ok(ft) = entry.file_type().await
+                && ft.is_dir()
+                && let Some(name) = entry.file_name().to_str()
+                && !name.starts_with('.')
+            {
+                ids.push(name.to_string());
+            }
+        }
+        ids.sort();
+        for id in ids {
+            let prefix = format!("{BEHAVIORS_DIR}/{id}/");
+            out.push_str(&format!("\n-- {prefix} --\n"));
+            if let Err(e) = list_one_dir(&behaviors_dir.join(&id), &prefix, allowed, &mut out).await
+            {
+                return no_update_error(e);
+            }
+        }
+    }
+
+    // Mention whitelisted-but-absent top-level filenames so the agent
+    // knows a write will create them. Behavior files are covered by the
+    // per-id section above, so skip any entry with a path separator.
+    let absent: Vec<&String> = allowed
+        .iter()
+        .filter(|a| !a.contains('/'))
+        .filter(|a| {
+            let rel_path = pod_dir.join(a);
+            !rel_path.exists()
+        })
+        .collect();
+    if !absent.is_empty() {
+        out.push_str(
+            "\nTop-level allowlist entries not yet present (pod_write_file will create):\n",
+        );
+        for name in absent {
+            out.push_str(&format!("  {name}\n"));
+        }
+    }
+    out.push_str(&format!(
+        "\nCreate a new behavior with:\n  pod_write_file(\"{BEHAVIORS_DIR}/<new-id>/{BEHAVIOR_TOML}\", ...)\n  pod_write_file(\"{BEHAVIORS_DIR}/<new-id>/{BEHAVIOR_PROMPT}\", ...)\n"
+    ));
+
+    no_update_text(out)
+}
+
+/// List the immediate contents of `dir`, each entry prefixed with
+/// `path_prefix` when checking `allowed` and when printing. Entries are
+/// sorted: allowed files first, then directories, then other files —
+/// each group name-sorted. Skips hidden (dot) entries.
+async fn list_one_dir(
+    dir: &Path,
+    path_prefix: &str,
+    allowed: &[String],
+    out: &mut String,
+) -> Result<(), String> {
+    let mut read = tokio::fs::read_dir(dir)
+        .await
+        .map_err(|e| format!("list {}: {e}", dir.display()))?;
     let mut entries: Vec<(String, bool, u64)> = Vec::new();
     loop {
         match read.next_entry().await {
             Ok(None) => break,
             Ok(Some(entry)) => {
                 let name = entry.file_name().to_string_lossy().into_owned();
+                if name.starts_with('.') {
+                    continue;
+                }
                 let (is_dir, size) = match entry.file_type().await {
                     Ok(ft) if ft.is_dir() => (true, 0),
                     Ok(_) => {
@@ -206,51 +370,36 @@ async fn list_files(pod_dir: &Path, allowed: &[String], _args: Value) -> ToolOut
                 };
                 entries.push((name, is_dir, size));
             }
-            Err(e) => return no_update_error(format!("list pod dir iter: {e}")),
+            Err(e) => return Err(format!("list {} iter: {e}", dir.display())),
         }
     }
     entries.sort_by(|a, b| {
-        let a_allowed = allowed.iter().any(|n| n == &a.0);
-        let b_allowed = allowed.iter().any(|n| n == &b.0);
+        let a_full = format!("{path_prefix}{}", a.0);
+        let b_full = format!("{path_prefix}{}", b.0);
+        let a_allowed = allowed.iter().any(|n| n == &a_full);
+        let b_allowed = allowed.iter().any(|n| n == &b_full);
         b_allowed
             .cmp(&a_allowed)
             .then_with(|| b.1.cmp(&a.1))
             .then_with(|| a.0.cmp(&b.0))
     });
-
-    let mut out = String::new();
     for (name, is_dir, size) in &entries {
-        let is_allowed = allowed.iter().any(|n| n == name);
+        let full = format!("{path_prefix}{name}");
+        let is_allowed = allowed.iter().any(|n| n == &full);
         let access = if is_allowed { "[rw]" } else { "[--]" };
         let kind = if *is_dir { 'd' } else { 'f' };
-        let display_name = if *is_dir {
+        let display = if *is_dir {
             format!("{name}/")
         } else {
             name.clone()
         };
         if *is_dir {
-            out.push_str(&format!("{access}  {kind}  {:>10}  {}\n", "", display_name));
+            out.push_str(&format!("{access}  {kind}  {:>10}  {}\n", "", display));
         } else {
-            out.push_str(&format!("{access}  {kind}  {size:>10}  {}\n", display_name));
+            out.push_str(&format!("{access}  {kind}  {size:>10}  {}\n", display));
         }
     }
-    // Mention whitelisted-but-absent files so the agent knows a write
-    // will create them rather than targeting something that already
-    // exists elsewhere.
-    let absent: Vec<&String> = allowed
-        .iter()
-        .filter(|a| !entries.iter().any(|(n, _, _)| n == *a))
-        .collect();
-    if !absent.is_empty() {
-        out.push_str("\nAllowed filenames not yet present (pod_write_file will create):\n");
-        for name in absent {
-            out.push_str(&format!("  {name}\n"));
-        }
-    }
-    if out.is_empty() {
-        out.push_str("(pod directory is empty)\n");
-    }
-    no_update_text(out)
+    Ok(())
 }
 
 // ---------- read ----------
@@ -258,12 +407,14 @@ async fn list_files(pod_dir: &Path, allowed: &[String], _args: Value) -> ToolOut
 fn read_descriptor() -> McpTool {
     McpTool {
         name: POD_READ_FILE.into(),
-        description: "Read one of this pod's configuration files (pod.toml or the \
-                      system-prompt file). These files live OUTSIDE your workspace — \
-                      they are the pod's definition, held by the agent host, and are \
-                      reachable ONLY through the `pod_*_file` tools. Do not look for \
-                      them via `read_file`, `list_dir`, or `bash` (those operate on \
-                      the workspace and will not find pod.toml). With no line options, \
+        description: "Read one of this pod's configuration files: `pod.toml`, the \
+                      pod-level system-prompt file, or any existing behavior's \
+                      `behaviors/<id>/behavior.toml` or `behaviors/<id>/prompt.md`. \
+                      These files live OUTSIDE your workspace — they are the pod's \
+                      definition, held by the agent host, and are reachable ONLY \
+                      through the `pod_*_file` tools. Do not look for them via \
+                      `read_file`, `list_dir`, or `bash` (those operate on the \
+                      workspace and will not find pod.toml). With no line options, \
                       returns the whole file. Use `offset`/`limit` to target a line \
                       range for large files."
             .into(),
@@ -305,12 +456,17 @@ struct ReadArgs {
     limit: Option<u32>,
 }
 
-async fn read_file(pod_dir: &Path, allowed: &[String], args: Value) -> ToolOutcome {
+async fn read_file(
+    pod_dir: &Path,
+    allowed: &[String],
+    behavior_ids: &[String],
+    args: Value,
+) -> ToolOutcome {
     let parsed: ReadArgs = match serde_json::from_value(args) {
         Ok(v) => v,
         Err(e) => return no_update_error(format!("invalid arguments: {e}")),
     };
-    if let Err(e) = validate_filename(&parsed.filename, allowed) {
+    if let Err(e) = validate_filename(&parsed.filename, allowed, behavior_ids, false) {
         return no_update_error(e);
     }
     let path = pod_dir.join(&parsed.filename);
@@ -344,14 +500,20 @@ async fn read_file(pod_dir: &Path, allowed: &[String], args: Value) -> ToolOutco
 fn write_descriptor() -> McpTool {
     McpTool {
         name: POD_WRITE_FILE.into(),
-        description: "Fully overwrite one of this pod's configuration files \
-                      (pod.toml or the system-prompt file). These files live OUTSIDE \
+        description: "Fully overwrite (or create) one of this pod's configuration \
+                      files: `pod.toml`, the pod-level system-prompt file, or any \
+                      `behaviors/<id>/behavior.toml` / `behaviors/<id>/prompt.md`. \
+                      Writing `behaviors/<new-id>/behavior.toml` creates a new \
+                      behavior — the directory is mkdir'd and `state.json` is seeded \
+                      with defaults. A behavior's `prompt.md` may only be written \
+                      after its `behavior.toml` exists. These files live OUTSIDE \
                       your workspace and are reachable ONLY through the `pod_*_file` \
-                      tools — not `write_file` or `bash`. For `pod.toml` the new text \
-                      is parsed and validated before landing on disk; invalid TOML or \
-                      schema violations are returned as tool errors and the on-disk \
-                      file is untouched. Prefer `pod_edit_file` for targeted changes \
-                      — this is for full rewrites only."
+                      tools — not `write_file` or `bash`. Structured files \
+                      (`pod.toml`, `behavior.toml`) are parsed and validated before \
+                      landing on disk; invalid TOML or schema violations return a \
+                      tool error and the on-disk file is untouched. Prefer \
+                      `pod_edit_file` for targeted changes — this is for full \
+                      rewrites and creates."
             .into(),
         input_schema: json!({
             "type": "object",
@@ -383,21 +545,32 @@ struct WriteArgs {
     content: String,
 }
 
-async fn write_file(pod_dir: &Path, allowed: &[String], args: Value) -> ToolOutcome {
+async fn write_file(
+    pod_dir: &Path,
+    allowed: &[String],
+    behavior_ids: &[String],
+    args: Value,
+) -> ToolOutcome {
     let parsed: WriteArgs = match serde_json::from_value(args) {
         Ok(v) => v,
         Err(e) => return no_update_error(format!("invalid arguments: {e}")),
     };
-    if let Err(e) = validate_filename(&parsed.filename, allowed) {
+    if let Err(e) = validate_filename(&parsed.filename, allowed, behavior_ids, true) {
         return no_update_error(e);
     }
     let update = match prepare_update(&parsed.filename, &parsed.content) {
         Ok(u) => u,
         Err(e) => return no_update_error(e),
     };
+    if let Err(e) = prepare_behavior_dir(pod_dir, &parsed.filename, behavior_ids).await {
+        return no_update_error(e);
+    }
     let path = pod_dir.join(&parsed.filename);
     if let Err(e) = tokio::fs::write(&path, parsed.content.as_bytes()).await {
         return no_update_error(format!("write {}: {e}", parsed.filename));
+    }
+    if let Err(e) = seed_behavior_state_if_needed(pod_dir, &update).await {
+        return no_update_error(e);
     }
     ToolOutcome {
         result: text_result(format!(
@@ -414,19 +587,24 @@ async fn write_file(pod_dir: &Path, allowed: &[String], args: Value) -> ToolOutc
 fn edit_descriptor() -> McpTool {
     McpTool {
         name: POD_EDIT_FILE.into(),
-        description: "Replace a literal substring in one of this pod's config files. \
-                      These files live OUTSIDE your workspace and are reachable ONLY \
-                      through the `pod_*_file` tools — not `edit_file` or `bash`. \
-                      `old_string` must match literally (no regex) and by default \
-                      must occur exactly once; pass `replace_all: true` to change \
-                      every occurrence. If old_string isn't found, the error shows \
-                      the closest matching region; if it matches multiple times, the \
+        description: "Replace a literal substring in one of this pod's config files \
+                      (`pod.toml`, system-prompt file, or any existing \
+                      `behaviors/<id>/behavior.toml` / `behaviors/<id>/prompt.md`). \
+                      Use `pod_write_file` to create a new behavior — this tool \
+                      requires the target file to already exist. These files live \
+                      OUTSIDE your workspace and are reachable ONLY through the \
+                      `pod_*_file` tools — not `edit_file` or `bash`. `old_string` \
+                      must match literally (no regex) and by default must occur \
+                      exactly once; pass `replace_all: true` to change every \
+                      occurrence. If old_string isn't found, the error shows the \
+                      closest matching region; if it matches multiple times, the \
                       error lists each match site with line numbers. When extending \
                       `old_string` with surrounding context to disambiguate a \
                       multi-match, extend `new_string` by the same neighboring text \
                       — extending only `old_string` will delete the intervening \
-                      lines from the output. For `pod.toml` the resulting text is \
-                      parsed and validated before landing on disk."
+                      lines from the output. For structured files (`pod.toml`, \
+                      `behavior.toml`) the resulting text is parsed and validated \
+                      before landing on disk."
             .into(),
         input_schema: json!({
             "type": "object",
@@ -471,12 +649,20 @@ struct EditArgs {
     replace_all: bool,
 }
 
-async fn edit_file(pod_dir: &Path, allowed: &[String], args: Value) -> ToolOutcome {
+async fn edit_file(
+    pod_dir: &Path,
+    allowed: &[String],
+    behavior_ids: &[String],
+    args: Value,
+) -> ToolOutcome {
     let parsed: EditArgs = match serde_json::from_value(args) {
         Ok(v) => v,
         Err(e) => return no_update_error(format!("invalid arguments: {e}")),
     };
-    if let Err(e) = validate_filename(&parsed.filename, allowed) {
+    // Edits target an existing file — always treat as non-create for
+    // filename validation so a path like `behaviors/<new-id>/prompt.md`
+    // is rejected with the right error.
+    if let Err(e) = validate_filename(&parsed.filename, allowed, behavior_ids, false) {
         return no_update_error(e);
     }
     if parsed.old_string.is_empty() {
@@ -532,20 +718,84 @@ async fn edit_file(pod_dir: &Path, allowed: &[String], args: Value) -> ToolOutco
 }
 
 /// Decide what kind of [`PodUpdate`] a successful write produces.
-/// For `pod.toml` we parse + validate here — failure becomes a tool error
-/// BEFORE any disk write, so partial state is never reached.
+/// For structured files (pod.toml, behavior.toml) we parse + validate
+/// here — failure becomes a tool error BEFORE any disk write, so partial
+/// state is never reached.
 fn prepare_update(filename: &str, content: &str) -> Result<PodUpdate, String> {
     if filename == pod::POD_TOML {
         let parsed = pod::parse_toml(content).map_err(|e| format!("pod.toml: {e}"))?;
-        Ok(PodUpdate::Config {
+        return Ok(PodUpdate::Config {
             toml_text: content.to_string(),
             parsed: Box::new(parsed),
-        })
-    } else {
-        Ok(PodUpdate::SystemPrompt {
-            text: content.to_string(),
-        })
+        });
     }
+    if let Some((id, suffix)) = parse_behavior_path(filename) {
+        return match suffix {
+            BEHAVIOR_TOML => {
+                let parsed = pod::behaviors::parse_toml(content)
+                    .map_err(|e| format!("{BEHAVIORS_DIR}/{id}/{BEHAVIOR_TOML}: {e}"))?;
+                Ok(PodUpdate::BehaviorConfig {
+                    behavior_id: id.to_string(),
+                    toml_text: content.to_string(),
+                    parsed: Box::new(parsed),
+                })
+            }
+            BEHAVIOR_PROMPT => Ok(PodUpdate::BehaviorPrompt {
+                behavior_id: id.to_string(),
+                text: content.to_string(),
+            }),
+            other => Err(format!(
+                "unknown behavior filename suffix `{other}` for behavior `{id}`"
+            )),
+        };
+    }
+    Ok(PodUpdate::SystemPrompt {
+        text: content.to_string(),
+    })
+}
+
+/// Create `behaviors/<id>/` on disk when the write targets a not-yet-
+/// existent behavior. No-op for all other writes. Runs after content
+/// validation so a bad behavior.toml doesn't leave an empty dir behind.
+async fn prepare_behavior_dir(
+    pod_dir: &Path,
+    filename: &str,
+    behavior_ids: &[String],
+) -> Result<(), String> {
+    let Some((id, _)) = parse_behavior_path(filename) else {
+        return Ok(());
+    };
+    if behavior_ids.iter().any(|i| i == id) {
+        return Ok(());
+    }
+    let dir = pod_dir.join(BEHAVIORS_DIR).join(id);
+    tokio::fs::create_dir_all(&dir)
+        .await
+        .map_err(|e| format!("mkdir {}: {e}", dir.display()))
+}
+
+/// Write a default `state.json` next to a newly created `behavior.toml`
+/// when one isn't already on disk. Idempotent — a later update to an
+/// existing behavior never overwrites an accumulated state.
+async fn seed_behavior_state_if_needed(pod_dir: &Path, update: &PodUpdate) -> Result<(), String> {
+    let behavior_id = match update {
+        PodUpdate::BehaviorConfig { behavior_id, .. } => behavior_id,
+        _ => return Ok(()),
+    };
+    let state_path = pod_dir
+        .join(BEHAVIORS_DIR)
+        .join(behavior_id)
+        .join(BEHAVIOR_STATE);
+    match tokio::fs::try_exists(&state_path).await {
+        Ok(true) => return Ok(()),
+        Ok(false) => {}
+        Err(e) => return Err(format!("stat {}: {e}", state_path.display())),
+    }
+    let bytes = serde_json::to_vec_pretty(&BehaviorState::default())
+        .map_err(|e| format!("serialize default BehaviorState: {e}"))?;
+    tokio::fs::write(&state_path, bytes)
+        .await
+        .map_err(|e| format!("seed {}: {e}", state_path.display()))
 }
 
 // ---------- nearest_match_hint ----------
@@ -706,6 +956,7 @@ max_turns = 50
         let out = dispatch(
             dir.clone(),
             cfg.clone(),
+            vec![],
             POD_READ_FILE,
             json!({ "filename": "secrets.env" }),
         )
@@ -715,6 +966,7 @@ max_turns = 50
         let ok = dispatch(
             dir.clone(),
             cfg,
+            vec![],
             POD_READ_FILE,
             json!({ "filename": "pod.toml" }),
         )
@@ -736,6 +988,7 @@ max_turns = 50
         let out = dispatch(
             dir.clone(),
             cfg.clone(),
+            vec![],
             POD_WRITE_FILE,
             json!({ "filename": "pod.toml", "content": "name = \"broken\" # no thread_defaults" }),
         )
@@ -755,6 +1008,7 @@ max_turns = 50
         let out = dispatch(
             dir.clone(),
             cfg,
+            vec![],
             POD_WRITE_FILE,
             json!({ "filename": "system_prompt.md", "content": "You are helpful." }),
         )
@@ -776,6 +1030,7 @@ max_turns = 50
         let out = dispatch(
             dir.clone(),
             cfg,
+            vec![],
             POD_EDIT_FILE,
             json!({
                 "filename": "system_prompt.md",
@@ -827,6 +1082,7 @@ max_turns = 50
         let out = dispatch(
             dir.clone(),
             cfg,
+            vec![],
             POD_EDIT_FILE,
             json!({
                 "filename": "system_prompt.md",
@@ -862,7 +1118,7 @@ max_turns = 50
             .unwrap();
         tokio::fs::create_dir(dir.join("threads")).await.unwrap();
 
-        let out = dispatch(dir.clone(), cfg, POD_LIST_FILES, json!({})).await;
+        let out = dispatch(dir.clone(), cfg, vec![], POD_LIST_FILES, json!({})).await;
         assert!(!out.result.is_error);
         let text = join_blocks(&out.result.content);
         assert!(text.contains("[rw]"), "missing rw marker: {text}");
@@ -872,6 +1128,257 @@ max_turns = 50
         assert!(
             text.contains("not yet present") && text.contains("system_prompt.md"),
             "missing absent-file note: {text}"
+        );
+    }
+
+    // ---------- behavior-write coverage ----------
+
+    #[test]
+    fn parse_behavior_path_recognizes_valid_shapes() {
+        assert_eq!(
+            parse_behavior_path("behaviors/nightly/behavior.toml"),
+            Some(("nightly", "behavior.toml"))
+        );
+        assert_eq!(
+            parse_behavior_path("behaviors/x/prompt.md"),
+            Some(("x", "prompt.md"))
+        );
+        assert_eq!(parse_behavior_path("pod.toml"), None);
+        assert_eq!(parse_behavior_path("behaviors/x"), None);
+        // Nested suffix isn't a valid behavior file.
+        assert_eq!(parse_behavior_path("behaviors/x/nested/file"), None);
+    }
+
+    #[tokio::test]
+    async fn create_new_behavior_via_write_file() {
+        let dir = temp_dir();
+        let cfg = sample_config();
+        let body = r#"name = "Nightly"
+
+[trigger]
+kind = "cron"
+schedule = "0 9 * * *"
+"#;
+        let out = dispatch(
+            dir.clone(),
+            cfg,
+            vec![],
+            POD_WRITE_FILE,
+            json!({
+                "filename": "behaviors/nightly/behavior.toml",
+                "content": body,
+            }),
+        )
+        .await;
+        assert!(!out.result.is_error, "write failed: {:?}", out.result);
+
+        // Emits a BehaviorConfig PodUpdate with the parsed config.
+        match out.pod_update {
+            Some(PodUpdate::BehaviorConfig {
+                behavior_id,
+                parsed,
+                ..
+            }) => {
+                assert_eq!(behavior_id, "nightly");
+                assert_eq!(parsed.name, "Nightly");
+            }
+            other => panic!("expected BehaviorConfig update, got {other:?}"),
+        }
+
+        // Directory + behavior.toml + default state.json on disk.
+        let behavior_dir = dir.join("behaviors").join("nightly");
+        assert!(behavior_dir.join("behavior.toml").exists());
+        let state_json = tokio::fs::read_to_string(behavior_dir.join("state.json"))
+            .await
+            .unwrap();
+        let state: whisper_agent_protocol::BehaviorState =
+            serde_json::from_str(&state_json).unwrap();
+        assert_eq!(state, whisper_agent_protocol::BehaviorState::default());
+    }
+
+    #[tokio::test]
+    async fn prompt_before_behavior_toml_is_rejected() {
+        let dir = temp_dir();
+        let cfg = sample_config();
+        let out = dispatch(
+            dir.clone(),
+            cfg,
+            vec![],
+            POD_WRITE_FILE,
+            json!({
+                "filename": "behaviors/ghost/prompt.md",
+                "content": "hello",
+            }),
+        )
+        .await;
+        assert!(
+            out.result.is_error,
+            "prompt.md without behavior.toml must error"
+        );
+        let text = join_blocks(&out.result.content);
+        assert!(
+            text.contains("does not exist yet"),
+            "missing explanatory error: {text}"
+        );
+        // Nothing hit disk.
+        assert!(!dir.join("behaviors").join("ghost").exists());
+    }
+
+    #[tokio::test]
+    async fn invalid_behavior_toml_leaves_disk_untouched_and_no_state_seeded() {
+        let dir = temp_dir();
+        let cfg = sample_config();
+        let out = dispatch(
+            dir.clone(),
+            cfg,
+            vec![],
+            POD_WRITE_FILE,
+            json!({
+                "filename": "behaviors/bad/behavior.toml",
+                // missing required `name` field
+                "content": "description = \"oops\"\n",
+            }),
+        )
+        .await;
+        assert!(out.result.is_error, "invalid TOML must error");
+        assert!(out.pod_update.is_none());
+        // Validation errors must not leave an orphan directory behind.
+        assert!(!dir.join("behaviors").join("bad").exists());
+    }
+
+    #[tokio::test]
+    async fn update_existing_behavior_keeps_state_json() {
+        let dir = temp_dir();
+        let cfg = sample_config();
+
+        // Seed a behavior on disk.
+        let behavior_dir = dir.join("behaviors").join("daily");
+        tokio::fs::create_dir_all(&behavior_dir).await.unwrap();
+        tokio::fs::write(behavior_dir.join("behavior.toml"), r#"name = "v1""#)
+            .await
+            .unwrap();
+        let state = whisper_agent_protocol::BehaviorState {
+            run_count: 42,
+            ..Default::default()
+        };
+        tokio::fs::write(
+            behavior_dir.join("state.json"),
+            serde_json::to_vec_pretty(&state).unwrap(),
+        )
+        .await
+        .unwrap();
+
+        let out = dispatch(
+            dir.clone(),
+            cfg,
+            vec!["daily".to_string()],
+            POD_WRITE_FILE,
+            json!({
+                "filename": "behaviors/daily/behavior.toml",
+                "content": "name = \"v2\"\n",
+            }),
+        )
+        .await;
+        assert!(!out.result.is_error);
+
+        // state.json must still carry its run_count.
+        let state_json = tokio::fs::read_to_string(behavior_dir.join("state.json"))
+            .await
+            .unwrap();
+        let state: whisper_agent_protocol::BehaviorState =
+            serde_json::from_str(&state_json).unwrap();
+        assert_eq!(state.run_count, 42);
+    }
+
+    #[tokio::test]
+    async fn prompt_md_update_emits_behavior_prompt_update() {
+        let dir = temp_dir();
+        let cfg = sample_config();
+
+        // Seed a behavior on disk so `behaviors/daily/prompt.md` is in the allowlist.
+        let behavior_dir = dir.join("behaviors").join("daily");
+        tokio::fs::create_dir_all(&behavior_dir).await.unwrap();
+        tokio::fs::write(behavior_dir.join("behavior.toml"), r#"name = "d""#)
+            .await
+            .unwrap();
+
+        let out = dispatch(
+            dir.clone(),
+            cfg,
+            vec!["daily".to_string()],
+            POD_WRITE_FILE,
+            json!({
+                "filename": "behaviors/daily/prompt.md",
+                "content": "do the thing",
+            }),
+        )
+        .await;
+        assert!(!out.result.is_error);
+        match out.pod_update {
+            Some(PodUpdate::BehaviorPrompt { behavior_id, text }) => {
+                assert_eq!(behavior_id, "daily");
+                assert_eq!(text, "do the thing");
+            }
+            other => panic!("expected BehaviorPrompt update, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn list_files_shows_behavior_sections() {
+        let dir = temp_dir();
+        let cfg = sample_config();
+        tokio::fs::write(dir.join("pod.toml"), pod::to_toml(&cfg).unwrap())
+            .await
+            .unwrap();
+
+        // Two behaviors on disk, one with prompt.md + state.json.
+        let a = dir.join("behaviors").join("alpha");
+        tokio::fs::create_dir_all(&a).await.unwrap();
+        tokio::fs::write(a.join("behavior.toml"), r#"name = "A""#)
+            .await
+            .unwrap();
+        tokio::fs::write(a.join("prompt.md"), "do alpha")
+            .await
+            .unwrap();
+        tokio::fs::write(a.join("state.json"), r#"{"run_count": 3}"#)
+            .await
+            .unwrap();
+        let b = dir.join("behaviors").join("beta");
+        tokio::fs::create_dir_all(&b).await.unwrap();
+        tokio::fs::write(b.join("behavior.toml"), r#"name = "B""#)
+            .await
+            .unwrap();
+
+        let out = dispatch(
+            dir.clone(),
+            cfg,
+            vec!["alpha".to_string(), "beta".to_string()],
+            POD_LIST_FILES,
+            json!({}),
+        )
+        .await;
+        assert!(!out.result.is_error);
+        let text = join_blocks(&out.result.content);
+        assert!(
+            text.contains("behaviors/alpha/"),
+            "missing alpha section: {text}"
+        );
+        assert!(
+            text.contains("behaviors/beta/"),
+            "missing beta section: {text}"
+        );
+        assert!(
+            text.contains("behavior.toml") && text.contains("prompt.md"),
+            "missing behavior files: {text}"
+        );
+        // state.json listed but not writable.
+        let state_line = text
+            .lines()
+            .find(|l| l.contains("state.json"))
+            .expect("state.json missing from listing");
+        assert!(
+            state_line.starts_with("[--]"),
+            "state.json should be read-only, got: {state_line}"
         );
     }
 }

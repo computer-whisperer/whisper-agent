@@ -423,6 +423,7 @@ fn tool_call(
                 let outcome = crate::tools::builtin_tools::dispatch(
                     snapshot.pod_dir,
                     snapshot.config,
+                    snapshot.behavior_ids,
                     &name,
                     input,
                 )

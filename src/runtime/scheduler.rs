@@ -64,12 +64,17 @@ pub enum ToolRoute {
     Mcp(Arc<McpSession>),
 }
 
-/// Snapshot of a pod's on-disk directory + parsed config. Cloned out of
-/// the scheduler when dispatching a builtin tool future so the future
-/// doesn't need a back-borrow of scheduler state.
+/// Snapshot of a pod's on-disk directory + parsed config + behavior ids.
+/// Cloned out of the scheduler when dispatching a builtin tool future so
+/// the future doesn't need a back-borrow of scheduler state.
 pub struct PodSnapshot {
     pub pod_dir: std::path::PathBuf,
     pub config: whisper_agent_protocol::PodConfig,
+    /// Ids of the behaviors currently registered in-memory. Used by the
+    /// builtin file tools to build the dynamic allowlist (each id
+    /// contributes `behaviors/<id>/behavior.toml` and `prompt.md`) and
+    /// to decide whether a write targets a create vs an update.
+    pub behavior_ids: Vec<String>,
 }
 
 /// Messages accepted by the scheduler inbox.
@@ -484,6 +489,7 @@ impl Scheduler {
         Some(PodSnapshot {
             pod_dir: pod.dir.clone(),
             config: pod.config.clone(),
+            behavior_ids: pod.behaviors.keys().cloned().collect(),
         })
     }
 
@@ -3150,7 +3156,7 @@ impl Scheduler {
 
     /// Apply a [`PodUpdate`] side effect produced by a builtin tool.
     /// Dispatches to the specific apply helper based on the update
-    /// kind; both helpers handle the in-memory refresh + broadcast.
+    /// kind; each helper handles the in-memory refresh + broadcast.
     /// The builtin tool already wrote the change to disk — no further
     /// persist work is needed here.
     fn apply_pod_update(
@@ -3170,6 +3176,104 @@ impl Scheduler {
             crate::tools::builtin_tools::PodUpdate::SystemPrompt { text } => {
                 self.apply_system_prompt_update(&pod_id, text, None);
             }
+            crate::tools::builtin_tools::PodUpdate::BehaviorConfig {
+                behavior_id,
+                toml_text,
+                parsed,
+            } => {
+                self.apply_behavior_config_update(&pod_id, behavior_id, toml_text, *parsed);
+            }
+            crate::tools::builtin_tools::PodUpdate::BehaviorPrompt { behavior_id, text } => {
+                self.apply_behavior_prompt_update(&pod_id, behavior_id, text);
+            }
+        }
+    }
+
+    /// Refresh (or insert) an in-memory behavior from a successful
+    /// `behavior.toml` write, then broadcast `BehaviorCreated` or
+    /// `BehaviorUpdated` to every connected client. The builtin tool
+    /// has already validated the config and written it to disk (plus
+    /// seeded `state.json` on create) before we get here.
+    fn apply_behavior_config_update(
+        &mut self,
+        pod_id: &str,
+        behavior_id: String,
+        toml_text: String,
+        parsed: whisper_agent_protocol::BehaviorConfig,
+    ) {
+        let Some(pod) = self.pods.get_mut(pod_id) else {
+            warn!(%pod_id, %behavior_id, "apply_behavior_config_update: unknown pod");
+            return;
+        };
+        let cron = crate::pod::behaviors::cache_cron(&parsed);
+        let is_create = !pod.behaviors.contains_key(&behavior_id);
+        if is_create {
+            let dir = pod
+                .dir
+                .join(crate::pod::behaviors::BEHAVIORS_DIR)
+                .join(&behavior_id);
+            let behavior = crate::pod::behaviors::Behavior {
+                id: behavior_id.clone(),
+                pod_id: pod_id.to_string(),
+                dir,
+                cron,
+                config: Some(parsed),
+                raw_toml: toml_text,
+                prompt: String::new(),
+                state: whisper_agent_protocol::BehaviorState::default(),
+                load_error: None,
+            };
+            let summary = behavior.summary();
+            pod.behaviors.insert(behavior_id.clone(), behavior);
+            let ev = ServerToClient::BehaviorCreated {
+                correlation_id: None,
+                summary,
+            };
+            for tx in self.router.outbound_snapshot() {
+                let _ = tx.send(ev.clone());
+            }
+        } else {
+            let behavior = pod
+                .behaviors
+                .get_mut(&behavior_id)
+                .expect("contains_key above");
+            behavior.cron = cron;
+            behavior.config = Some(parsed);
+            behavior.raw_toml = toml_text;
+            behavior.load_error = None;
+            let snapshot = behavior.snapshot();
+            let ev = ServerToClient::BehaviorUpdated {
+                correlation_id: None,
+                snapshot,
+            };
+            for tx in self.router.outbound_snapshot() {
+                let _ = tx.send(ev.clone());
+            }
+        }
+    }
+
+    /// Refresh an in-memory behavior's `prompt` field from a successful
+    /// `prompt.md` write and broadcast `BehaviorUpdated`. The tool
+    /// layer rejects prompt writes for unknown ids, so we don't expect
+    /// to reach here without an existing behavior — a missing entry
+    /// logs a warn and drops the broadcast.
+    fn apply_behavior_prompt_update(&mut self, pod_id: &str, behavior_id: String, text: String) {
+        let Some(pod) = self.pods.get_mut(pod_id) else {
+            warn!(%pod_id, %behavior_id, "apply_behavior_prompt_update: unknown pod");
+            return;
+        };
+        let Some(behavior) = pod.behaviors.get_mut(&behavior_id) else {
+            warn!(%pod_id, %behavior_id, "apply_behavior_prompt_update: unknown behavior");
+            return;
+        };
+        behavior.prompt = text;
+        let snapshot = behavior.snapshot();
+        let ev = ServerToClient::BehaviorUpdated {
+            correlation_id: None,
+            snapshot,
+        };
+        for tx in self.router.outbound_snapshot() {
+            let _ = tx.send(ev.clone());
         }
     }
 
