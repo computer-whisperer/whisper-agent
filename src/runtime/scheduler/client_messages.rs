@@ -42,6 +42,7 @@ impl Scheduler {
                 config_override,
                 bindings_request,
                 None,
+                None,
                 pending_io,
             ) {
                 Ok(thread_id) => {
@@ -171,6 +172,13 @@ impl Scheduler {
                         });
                     self.teardown_host_env_if_terminal(&thread_id);
                     self.on_behavior_thread_terminal(&thread_id, pending_io);
+                    // If the cancelled thread is either a dispatched
+                    // child (parent is waiting on its final text) or a
+                    // parent of still-running dispatched children, run
+                    // the dispatch-lifecycle hooks. These are idempotent
+                    // no-ops otherwise.
+                    self.resolve_pending_dispatch(&thread_id, pending_io);
+                    self.cascade_cancel_dispatched_children(&thread_id, pending_io);
                 }
             }
             ClientToServer::ArchiveThread { thread_id } => {

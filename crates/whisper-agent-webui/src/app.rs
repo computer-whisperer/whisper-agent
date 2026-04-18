@@ -1641,6 +1641,7 @@ fn snapshot_summary(s: &whisper_agent_protocol::ThreadSnapshot) -> ThreadSummary
         last_active: s.last_active.clone(),
         origin: s.origin.clone(),
         continued_from: s.continued_from.clone(),
+        dispatched_by: s.dispatched_by.clone(),
     }
 }
 
@@ -2667,6 +2668,12 @@ impl ChatApp {
     /// Render the interactive-threads subsection under a pod. "Interactive"
     /// here means threads the user created directly (no behavior origin).
     /// Skipped entirely when the pod has no such threads.
+    ///
+    /// Dispatched-thread children (`dispatched_by.is_some()`) are
+    /// grouped under their parent in DFS order so the nesting is
+    /// visible in the sidebar day one. Orphaned children whose parent
+    /// isn't in the current interactive set fall back to top-level
+    /// with a `dispatched_by` prefix marker.
     fn render_interactive_threads(
         &mut self,
         ui: &mut egui::Ui,
@@ -2678,14 +2685,20 @@ impl ChatApp {
         }
         ui.add_space(4.0);
         sidebar_subsection_header(ui, format!("Interactive  ({})", interactive.len()));
+        // Reorder the flat list into DFS-by-dispatch: each root is
+        // followed by its dispatched children (transitively). Returned
+        // as Vec<(thread_id, depth)>; depth 0 = root, 1 = first-level
+        // child, etc. Threads outside the interactive set (e.g. lost
+        // parent) are treated as roots so nothing gets dropped.
+        let ordered = self.order_interactive_with_dispatch_nesting(interactive);
         let expanded = self.expanded_interactive_pods.contains(pod_id);
         let shown = if expanded {
-            interactive.len()
+            ordered.len()
         } else {
-            interactive.len().min(THREAD_ROW_PREVIEW_COUNT)
+            ordered.len().min(THREAD_ROW_PREVIEW_COUNT)
         };
         let mut clicked: Option<String> = None;
-        for tid in &interactive[..shown] {
+        for (tid, depth) in &ordered[..shown] {
             let Some(view) = self.tasks.get(tid) else {
                 continue;
             };
@@ -2696,29 +2709,38 @@ impl ChatApp {
                 .clone()
                 .unwrap_or_else(|| tid[..tid.len().min(14)].to_string());
             let (chip, chip_color) = state_chip(view.summary.state);
-            // Prefix a small arrow marker on continuation threads so
-            // the list tier reflects the compaction chain at a glance.
+            // Prefix: continuation (`↩`) and/or dispatched (`↳`)
+            // markers; the two are orthogonal — a continuation of a
+            // dispatched thread carries both flags. Depth indent
+            // visualizes the dispatch chain for nested dispatches.
+            let indent: String = "  ".repeat(*depth);
+            let dispatch_marker = if view.summary.dispatched_by.is_some() {
+                "↳ "
+            } else {
+                ""
+            };
             let continuation_marker = if view.summary.continued_from.is_some() {
                 "↩ "
             } else {
                 ""
             };
-            let text = RichText::new(format!("{continuation_marker}{title}  [{chip}]")).color(
-                if is_selected {
-                    Color32::WHITE
-                } else {
-                    chip_color
-                },
-            );
+            let text = RichText::new(format!(
+                "{indent}{dispatch_marker}{continuation_marker}{title}  [{chip}]"
+            ))
+            .color(if is_selected {
+                Color32::WHITE
+            } else {
+                chip_color
+            });
             let row = add_sidebar_thread_row(ui, is_selected, text);
             if row.clicked() {
                 clicked = Some(tid.clone());
             }
         }
-        let hidden = interactive.len().saturating_sub(shown);
+        let hidden = ordered.len().saturating_sub(shown);
         let toggle = if hidden > 0 {
             sidebar_button(ui, RichText::new(format!("Show {hidden} more")), true).clicked()
-        } else if expanded && interactive.len() > THREAD_ROW_PREVIEW_COUNT {
+        } else if expanded && ordered.len() > THREAD_ROW_PREVIEW_COUNT {
             sidebar_button(ui, RichText::new("Show less"), true).clicked()
         } else {
             false
@@ -2733,6 +2755,69 @@ impl ChatApp {
         if let Some(tid) = clicked {
             self.select_task(tid);
         }
+    }
+
+    /// Reorder a flat list of interactive thread ids into DFS-nested
+    /// order by `dispatched_by`: each root is followed by its
+    /// dispatched children (recursively). Children whose parent isn't
+    /// in `flat` are promoted to roots so nothing is lost; cycles
+    /// (shouldn't happen — the scheduler enforces a depth cap) are
+    /// broken by a visited set. Returns `(thread_id, depth)` pairs.
+    fn order_interactive_with_dispatch_nesting(&self, flat: &[String]) -> Vec<(String, usize)> {
+        use std::collections::HashMap;
+        let in_set: std::collections::HashSet<&str> = flat.iter().map(|s| s.as_str()).collect();
+        // parent_id → ordered list of direct children. The newest-first
+        // order of `flat` is preserved within each sibling bucket
+        // because we walk `flat` in order and push_back.
+        let mut children_of: HashMap<String, Vec<String>> = HashMap::new();
+        let mut roots: Vec<String> = Vec::new();
+        for tid in flat {
+            let view = match self.tasks.get(tid) {
+                Some(v) => v,
+                None => continue,
+            };
+            match &view.summary.dispatched_by {
+                Some(parent) if in_set.contains(parent.as_str()) => {
+                    children_of
+                        .entry(parent.clone())
+                        .or_default()
+                        .push(tid.clone());
+                }
+                _ => roots.push(tid.clone()),
+            }
+        }
+        let mut out: Vec<(String, usize)> = Vec::with_capacity(flat.len());
+        let mut visited: std::collections::HashSet<String> = std::collections::HashSet::new();
+        fn dfs(
+            id: &str,
+            depth: usize,
+            children_of: &HashMap<String, Vec<String>>,
+            visited: &mut std::collections::HashSet<String>,
+            out: &mut Vec<(String, usize)>,
+        ) {
+            if !visited.insert(id.to_string()) {
+                return;
+            }
+            out.push((id.to_string(), depth));
+            if let Some(kids) = children_of.get(id) {
+                for child in kids {
+                    dfs(child, depth + 1, children_of, visited, out);
+                }
+            }
+        }
+        for root in &roots {
+            dfs(root, 0, &children_of, &mut visited, &mut out);
+        }
+        // Safety net: any thread we didn't visit (because its parent
+        // was in the set but the chain was broken somewhere) gets
+        // appended at depth 0 so it remains visible.
+        for tid in flat {
+            if !visited.contains(tid) {
+                out.push((tid.clone(), 0));
+                visited.insert(tid.clone());
+            }
+        }
+        out
     }
 
     fn apply_behavior_row_actions(&mut self, pod_id: &str, actions: Vec<BehaviorRowAction>) {

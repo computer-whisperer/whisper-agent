@@ -318,6 +318,12 @@ pub struct ThreadSummary {
     /// badge "continued from …" without fetching the full snapshot.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub continued_from: Option<String>,
+    /// When this thread was spawned by a parent thread's `dispatch_thread`
+    /// tool call, the id of the parent. `None` for top-level threads.
+    /// Exposed on the list tier so the UI can nest dispatched children
+    /// under their parent in the sidebar without fetching the full snapshot.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dispatched_by: Option<String>,
 }
 
 /// Entry in a `BackendsList` response.
@@ -469,6 +475,10 @@ pub struct ThreadSnapshot {
     /// `None` for threads that weren't created by compaction.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub continued_from: Option<String>,
+    /// Parent thread id when this thread was spawned by a
+    /// `dispatch_thread` tool call. `None` for top-level threads.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dispatched_by: Option<String>,
 }
 
 // ---------- Wire enums ----------

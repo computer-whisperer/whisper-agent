@@ -82,6 +82,20 @@ pub struct Thread {
     /// completes.
     #[serde(default)]
     pub compacting: bool,
+    /// Parent thread id when this thread was spawned by a parent's
+    /// `dispatch_thread` tool call. `None` for top-level threads. Set
+    /// once at spawn; never mutated afterward. Distinct from the
+    /// transient "return my final message to this tool_use_id" mapping,
+    /// which lives in scheduler state (not here) so it doesn't outlive
+    /// the single tool call that produced it.
+    #[serde(default)]
+    pub dispatched_by: Option<String>,
+    /// Dispatch nesting depth. Top-level threads are 0; each
+    /// `dispatch_thread` call spawns a child at `parent.depth + 1`. The
+    /// scheduler refuses to spawn past a fixed cap so a buggy agent
+    /// can't recursively dispatch itself into the ground.
+    #[serde(default)]
+    pub dispatch_depth: u32,
     pub internal: ThreadInternalState,
 }
 
@@ -321,6 +335,8 @@ impl Thread {
             origin: None,
             continued_from: None,
             compacting: false,
+            dispatched_by: None,
+            dispatch_depth: 0,
             internal: ThreadInternalState::Idle,
         }
     }
@@ -339,6 +355,15 @@ impl Thread {
     /// `/compact` — never mutated after construction.
     pub fn with_continued_from(mut self, predecessor_id: String) -> Self {
         self.continued_from = Some(predecessor_id);
+        self
+    }
+
+    /// Stamp the dispatch parent + depth. Called by the scheduler when
+    /// spawning a thread from a `dispatch_thread` tool call — never
+    /// mutated after construction.
+    pub fn with_dispatched_by(mut self, parent_id: String, parent_depth: u32) -> Self {
+        self.dispatched_by = Some(parent_id);
+        self.dispatch_depth = parent_depth.saturating_add(1);
         self
     }
 
@@ -370,6 +395,7 @@ impl Thread {
             last_active: self.last_active.to_rfc3339(),
             origin: self.origin.clone(),
             continued_from: self.continued_from.clone(),
+            dispatched_by: self.dispatched_by.clone(),
         }
     }
 
@@ -389,6 +415,7 @@ impl Thread {
             tool_allowlist: self.tool_allowlist.iter().cloned().collect(),
             origin: self.origin.clone(),
             continued_from: self.continued_from.clone(),
+            dispatched_by: self.dispatched_by.clone(),
         }
     }
 

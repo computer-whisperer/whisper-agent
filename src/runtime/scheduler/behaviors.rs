@@ -129,6 +129,7 @@ impl Scheduler {
             config_override,
             bindings_request,
             Some(origin),
+            None,
             pending_io,
         )?;
         self.mark_dirty(&thread_id);

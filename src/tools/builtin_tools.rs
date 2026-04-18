@@ -25,6 +25,7 @@
 
 mod about;
 mod behavior_control;
+pub mod dispatch_thread;
 mod filesystem;
 mod grep;
 mod list_threads;
@@ -127,6 +128,7 @@ pub const POD_LIST_THREADS: &str = "pod_list_threads";
 pub const POD_ABOUT: &str = "pod_about";
 pub const POD_RUN_BEHAVIOR: &str = "pod_run_behavior";
 pub const POD_SET_BEHAVIOR_ENABLED: &str = "pod_set_behavior_enabled";
+pub const DISPATCH_THREAD: &str = "dispatch_thread";
 
 /// True if `name` is a builtin pod tool. Used by the scheduler's router
 /// to branch the tool-call dispatch path.
@@ -142,6 +144,7 @@ pub fn is_builtin(name: &str) -> bool {
             | POD_ABOUT
             | POD_RUN_BEHAVIOR
             | POD_SET_BEHAVIOR_ENABLED
+            | DISPATCH_THREAD
     )
 }
 
@@ -165,6 +168,7 @@ pub fn descriptors() -> Vec<McpTool> {
         about::descriptor(),
         behavior_control::run_behavior_descriptor(),
         behavior_control::set_behavior_enabled_descriptor(),
+        dispatch_thread::descriptor(),
     ]
 }
 
@@ -257,6 +261,11 @@ pub async fn dispatch(
         POD_ABOUT => about::run(args),
         POD_RUN_BEHAVIOR => behavior_control::run_behavior(&behavior_ids, args),
         POD_SET_BEHAVIOR_ENABLED => behavior_control::set_behavior_enabled(&behavior_ids, args),
+        DISPATCH_THREAD => no_update_error(
+            "dispatch_thread must be intercepted at the scheduler layer \
+             (io_dispatch::tool_call); reaching this arm is a bug"
+                .into(),
+        ),
         other => no_update_error(format!("unknown builtin tool: {other}")),
     }
 }

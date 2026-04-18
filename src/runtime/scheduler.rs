@@ -23,6 +23,7 @@ mod bindings;
 mod client_messages;
 mod compaction;
 mod config_updates;
+mod dispatch;
 mod retention;
 mod thread_config;
 mod triggers;
@@ -245,6 +246,16 @@ pub struct Scheduler {
     /// send_user_message paths so we don't fan out redundant provision
     /// futures for the same thread.
     provisioning_in_flight: HashSet<String>,
+    /// Parents waiting on a dispatched child's final assistant text.
+    /// Keyed by the child's thread id. Populated synchronously when a
+    /// `dispatch_thread` sync call spawns a child, drained by
+    /// `resolve_pending_dispatch` when the child reaches a terminal
+    /// state (or by `cascade_cancel_dispatched_children` when the
+    /// parent itself terminates before the child does). Transient —
+    /// not persisted across restart: a restart mid-sync-dispatch
+    /// orphans the parent the same way it orphans an in-flight MCP
+    /// tool call, and the user must cancel the parent to recover.
+    pending_dispatches: HashMap<String, dispatch::PendingDispatch>,
 }
 
 impl Scheduler {
@@ -325,6 +336,7 @@ impl Scheduler {
             dirty: HashSet::new(),
             dirty_behaviors: HashSet::new(),
             provisioning_in_flight: HashSet::new(),
+            pending_dispatches: HashMap::new(),
         })
     }
 
@@ -1127,6 +1139,12 @@ impl Scheduler {
         config_override: Option<ThreadConfigOverride>,
         bindings_request: Option<ThreadBindingsRequest>,
         origin: Option<whisper_agent_protocol::BehaviorOrigin>,
+        // Optional dispatch lineage: (parent_thread_id, parent_depth).
+        // When provided, the new thread is stamped before the
+        // ThreadCreated broadcast fires so subscribers see lineage on
+        // arrival and the sidebar's dispatch-nesting view renders
+        // correctly without a second patch event.
+        dispatched_by_parent: Option<(String, u32)>,
         pending_io: &mut FuturesUnordered<SchedulerFuture>,
     ) -> Result<String, String> {
         // Resolve which pod this thread lands in. None routes to the
@@ -1191,6 +1209,9 @@ impl Scheduler {
         let mut task = Thread::new(thread_id.clone(), pod_id.clone(), config, bindings);
         if let Some(origin) = origin {
             task = task.with_origin(origin);
+        }
+        if let Some((parent_id, parent_depth)) = dispatched_by_parent {
+            task = task.with_dispatched_by(parent_id, parent_depth);
         }
         let summary = task.summary();
         self.tasks.insert(thread_id.clone(), task);
@@ -1511,9 +1532,48 @@ impl Scheduler {
 
             match outcome {
                 StepOutcome::DispatchIo(req) => {
+                    // `dispatch_thread` needs live mutable scheduler
+                    // state (to spawn the child and register the
+                    // return-plumbing side-map), so we intercept it
+                    // here before falling through to the generic
+                    // `io_dispatch` path. The intercept produces the
+                    // same shape of `SchedulerFuture` as normal tool
+                    // calls — the parent is parked on a oneshot
+                    // receiver, no extra scheduler state beyond
+                    // `pending_dispatches`.
+                    let fut = match req {
+                        crate::runtime::thread::IoRequest::ToolCall {
+                            op_id,
+                            tool_use_id,
+                            name,
+                            input,
+                        } => {
+                            if let Some(fut) = self.try_intercept_dispatch_thread(
+                                thread_id,
+                                op_id,
+                                &tool_use_id,
+                                &name,
+                                input.clone(),
+                                pending_io,
+                            ) {
+                                fut
+                            } else {
+                                io_dispatch::build_io_future(
+                                    self,
+                                    thread_id.to_string(),
+                                    crate::runtime::thread::IoRequest::ToolCall {
+                                        op_id,
+                                        tool_use_id,
+                                        name,
+                                        input,
+                                    },
+                                )
+                            }
+                        }
+                        other => io_dispatch::build_io_future(self, thread_id.to_string(), other),
+                    };
                     // Push the future but keep stepping — `AwaitingTools` dispatches all
                     // N tool calls in parallel before pausing.
-                    let fut = io_dispatch::build_io_future(self, thread_id.to_string(), req);
                     pending_io.push(fut);
                 }
                 StepOutcome::Continue => continue,
@@ -1538,6 +1598,13 @@ impl Scheduler {
         // already-compacted gate inside the hook keeps the just-
         // -finalized parent from retriggering.
         self.maybe_auto_compact(thread_id, pending_io);
+        // Dispatched-child terminal-state fan-out: if this thread is
+        // a dispatched child with a waiting parent, deliver the
+        // parent's tool result. If this thread was the parent of
+        // other dispatched children, cancel them — their result has
+        // no consumer anymore.
+        self.resolve_pending_dispatch(thread_id, pending_io);
+        self.cascade_cancel_dispatched_children(thread_id, pending_io);
     }
 
     /// If the task is in a terminal state, tear down its sandbox (if any).

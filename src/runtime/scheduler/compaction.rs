@@ -236,6 +236,7 @@ impl Scheduler {
             config_override,
             bindings_request,
             old_origin,
+            None,
             pending_io,
         ) {
             Ok(id) => id,
@@ -299,7 +300,7 @@ impl Scheduler {
 
 /// Walk backward through the conversation to find the most recent
 /// assistant message and concatenate all its text blocks.
-fn extract_last_assistant_text(task: &crate::runtime::thread::Thread) -> String {
+pub(super) fn extract_last_assistant_text(task: &crate::runtime::thread::Thread) -> String {
     for msg in task.conversation.messages().iter().rev() {
         if msg.role == Role::Assistant {
             let mut out = String::new();
