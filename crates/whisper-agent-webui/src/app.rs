@@ -21,11 +21,13 @@ use whisper_agent_protocol::sandbox::{
     AccessMode, Mount, NetworkPolicy, PathAccess, ResourceLimits,
 };
 use whisper_agent_protocol::{
-    ApprovalChoice, ApprovalPolicy, BackendSummary, ClientToServer, ContentBlock, Conversation,
-    HostEnvProviderInfo, HostEnvSpec, Message, ModelSummary, NamedHostEnv, PodAllow, PodConfig,
-    PodLimits, PodSummary, ResourceSnapshot, ResourceStateLabel, Role, ServerToClient,
+    ApprovalChoice, ApprovalPolicy, BackendSummary, BehaviorConfig,
+    BehaviorSnapshot as BehaviorSnapshotProto, BehaviorSummary, BehaviorThreadOverride, CatchUp,
+    ClientToServer, ContentBlock, Conversation, HostEnvProviderInfo, HostEnvSpec, Message,
+    ModelSummary, NamedHostEnv, Overlap, PodAllow, PodConfig, PodLimits, PodSummary,
+    ResourceSnapshot, ResourceStateLabel, RetentionPolicy, Role, ServerToClient,
     ThreadBindingsRequest, ThreadConfigOverride, ThreadDefaults, ThreadStateLabel, ThreadSummary,
-    ToolResultContent, Usage,
+    ToolResultContent, TriggerSpec, Usage,
 };
 
 /// Events pushed into [`Inbound`]. In addition to decoded wire messages we pipe in
@@ -244,6 +246,20 @@ pub struct ChatApp {
     archive_armed_pod: Option<String>,
     /// Modal state for the per-pod raw-TOML config editor. `None` = closed.
     pod_editor_modal: Option<PodEditorModalState>,
+    /// Per-pod cache of behavior summaries. Populated from PodSnapshot
+    /// (which inlines a behavior list) and refreshed by
+    /// BehaviorCreated / Updated / Deleted / StateChanged events.
+    /// Lives here rather than under `pods` because the PodSummary wire
+    /// type deliberately stays lightweight.
+    behaviors_by_pod: HashMap<String, Vec<BehaviorSummary>>,
+    /// Per-(pod,behavior) id whose delete button has been clicked once
+    /// and is waiting for confirmation. Two-click UX mirrors the pod
+    /// archive button.
+    delete_armed_behavior: Option<(String, String)>,
+    /// Modal state for the per-behavior editor. `None` = closed.
+    behavior_editor_modal: Option<BehaviorEditorModalState>,
+    /// Modal state for the "+ New behavior" form. `None` = closed.
+    new_behavior_modal: Option<NewBehaviorModalState>,
     /// Monotonic counter used to mint correlation_ids for in-flight
     /// requests we want to match round-trip events to. Intentionally
     /// not persisted — collisions across reloads aren't a problem
@@ -446,6 +462,129 @@ impl NewPodModalState {
     }
 }
 
+/// State for the per-behavior editor modal. Edits two things in
+/// parallel: the `behavior.toml` (via structured tabs or a raw tab)
+/// and the sibling `prompt.md` (via its own Prompt tab). A save ships
+/// both together through `UpdateBehavior`; state.json is
+/// scheduler-maintained and not touched here.
+///
+/// Lifecycle: open → issue `GetBehavior` → on snapshot, populate
+/// `working_config` + `working_prompt` + baselines → user edits →
+/// Save serializes working (or raw_buffer if raw is dirty) + prompt,
+/// ships `UpdateBehavior` with a correlation_id → `BehaviorUpdated`
+/// or `Error` resolves the correlation.
+struct BehaviorEditorModalState {
+    pod_id: String,
+    behavior_id: String,
+    /// Parsed working copy. `None` until the snapshot lands.
+    working_config: Option<BehaviorConfig>,
+    /// Working prompt text. Empty until snapshot lands or when the
+    /// behavior has no prompt.
+    working_prompt: String,
+    /// Server-known baselines for Revert + dirty detection.
+    baseline_config: Option<BehaviorConfig>,
+    baseline_prompt: String,
+    /// Raw TOML tab backing buffer. Regenerated from working_config on
+    /// tab entry unless raw_dirty says there's an unsaved raw edit.
+    raw_buffer: String,
+    raw_dirty: bool,
+    tab: BehaviorEditorTab,
+    error: Option<String>,
+    pending_correlation: Option<String>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BehaviorEditorTab {
+    Trigger,
+    Thread,
+    Retention,
+    Prompt,
+    RawToml,
+}
+
+impl BehaviorEditorTab {
+    fn label(self) -> &'static str {
+        match self {
+            BehaviorEditorTab::Trigger => "Trigger",
+            BehaviorEditorTab::Thread => "Thread",
+            BehaviorEditorTab::Retention => "Retention",
+            BehaviorEditorTab::Prompt => "Prompt",
+            BehaviorEditorTab::RawToml => "Raw TOML",
+        }
+    }
+}
+
+impl BehaviorEditorModalState {
+    fn new(pod_id: String, behavior_id: String) -> Self {
+        Self {
+            pod_id,
+            behavior_id,
+            working_config: None,
+            working_prompt: String::new(),
+            baseline_config: None,
+            baseline_prompt: String::new(),
+            raw_buffer: String::new(),
+            raw_dirty: false,
+            tab: BehaviorEditorTab::Trigger,
+            error: None,
+            pending_correlation: None,
+        }
+    }
+
+    /// True when anything — structured config, prompt, or raw buffer —
+    /// has diverged from the server-known baseline.
+    fn is_dirty(&self) -> bool {
+        let config_dirty = match (&self.working_config, &self.baseline_config) {
+            (Some(w), Some(b)) => w != b || self.raw_dirty,
+            _ => false,
+        };
+        let prompt_dirty =
+            self.baseline_config.is_some() && self.working_prompt != self.baseline_prompt;
+        config_dirty || prompt_dirty
+    }
+}
+
+/// State for the "+ New behavior" dialog. Two fields: the
+/// directory-friendly `behavior_id` (immutable on disk) and the
+/// display `name` (free text). On Save we send a `CreateBehavior`
+/// with a minimal Manual-triggered stub; the editor modal opens
+/// automatically on the `BehaviorCreated` round-trip so the user can
+/// fill in trigger / thread / prompt details immediately.
+struct NewBehaviorModalState {
+    pod_id: String,
+    behavior_id: String,
+    name: String,
+    error: Option<String>,
+    /// In-flight create correlation_id. The editor opens when we
+    /// receive the matching `BehaviorCreated`.
+    pending_correlation: Option<String>,
+}
+
+impl NewBehaviorModalState {
+    fn new(pod_id: String) -> Self {
+        Self {
+            pod_id,
+            behavior_id: String::new(),
+            name: String::new(),
+            error: None,
+            pending_correlation: None,
+        }
+    }
+}
+
+/// Deferred action produced by the behavior-row render closure.
+/// Collected during rendering and replayed by the enclosing pod
+/// section once the render closure returns — keeps mutating state
+/// (opening modals, sending wire messages) out of the nested borrow.
+enum BehaviorRowAction {
+    New,
+    Edit { pod_id: String, behavior_id: String },
+    Run { pod_id: String, behavior_id: String },
+    ArmDelete { pod_id: String, behavior_id: String },
+    DisarmDelete,
+    ConfirmDelete { pod_id: String, behavior_id: String },
+}
+
 /// Validate a pod_id against the rules `Persister::create_pod` will
 /// enforce server-side. Done client-side so the user sees the error
 /// inline instead of as a returned `ServerToClient::Error`.
@@ -458,6 +597,22 @@ fn validate_pod_id_client(id: &str) -> Result<(), &'static str> {
     }
     if id.contains('/') || id.contains('\\') || id.contains('\0') || id == ".." {
         return Err("pod_id contains illegal characters");
+    }
+    Ok(())
+}
+
+/// Same rules as `validate_pod_id_client` — behavior ids become
+/// directory names under `<pod>/behaviors/`, so the constraint set is
+/// identical.
+fn validate_behavior_id_client(id: &str) -> Result<(), &'static str> {
+    if id.is_empty() {
+        return Err("behavior_id is empty");
+    }
+    if id.starts_with('.') {
+        return Err("behavior_id may not start with '.'");
+    }
+    if id.contains('/') || id.contains('\\') || id.contains('\0') || id == ".." {
+        return Err("behavior_id contains illegal characters");
     }
     Ok(())
 }
@@ -493,6 +648,10 @@ impl ChatApp {
             new_pod_modal: None,
             archive_armed_pod: None,
             pod_editor_modal: None,
+            behaviors_by_pod: HashMap::new(),
+            delete_armed_behavior: None,
+            behavior_editor_modal: None,
+            new_behavior_modal: None,
             next_correlation_seq: 0,
             compose_pod_id: None,
             server_default_pod_id: String::new(),
@@ -832,10 +991,29 @@ impl ChatApp {
                 message,
                 correlation_id,
             } => {
-                // If the editor minted this correlation, surface the error
-                // inline in the modal instead of as a global banner —
-                // failed validation should leave the user's edits intact.
+                // If the pod editor minted this correlation, surface the
+                // error inline in the modal instead of as a global banner
+                // — failed validation should leave the user's edits
+                // intact.
                 if let Some(modal) = self.pod_editor_modal.as_mut()
+                    && correlation_id.is_some()
+                    && modal.pending_correlation == correlation_id
+                {
+                    modal.error = Some(message);
+                    modal.pending_correlation = None;
+                    return;
+                }
+                // Behavior editor pending save.
+                if let Some(modal) = self.behavior_editor_modal.as_mut()
+                    && correlation_id.is_some()
+                    && modal.pending_correlation == correlation_id
+                {
+                    modal.error = Some(message);
+                    modal.pending_correlation = None;
+                    return;
+                }
+                // "+ New behavior" pending create.
+                if let Some(modal) = self.new_behavior_modal.as_mut()
                     && correlation_id.is_some()
                     && modal.pending_correlation == correlation_id
                 {
@@ -1018,19 +1196,126 @@ impl ChatApp {
                 // reflects the current pod config even when the user
                 // re-edits the pod without closing the compose form.
                 self.pod_configs_requested.remove(&snapshot.pod_id);
+                // Pod snapshots inline the behavior catalog so the
+                // behaviors panel renders without an extra round trip
+                // after opening a pod's detail view.
+                self.behaviors_by_pod
+                    .insert(snapshot.pod_id.clone(), snapshot.behaviors);
                 self.pod_configs
                     .insert(snapshot.pod_id.clone(), snapshot.config);
             }
-            // Behaviors: phases 1-2 add read-side + manual-fire +
-            // write-side wire. The UI surface (a behaviors panel in the
-            // pod detail view) is phase 5 work — until then the events
-            // arrive and are dropped. See docs/design_behaviors.md.
-            ServerToClient::BehaviorList { .. }
-            | ServerToClient::BehaviorSnapshot { .. }
-            | ServerToClient::BehaviorStateChanged { .. }
-            | ServerToClient::BehaviorCreated { .. }
-            | ServerToClient::BehaviorUpdated { .. }
-            | ServerToClient::BehaviorDeleted { .. } => {}
+            ServerToClient::BehaviorList {
+                pod_id, behaviors, ..
+            } => {
+                self.behaviors_by_pod.insert(pod_id, behaviors);
+            }
+            ServerToClient::BehaviorSnapshot {
+                correlation_id,
+                snapshot,
+            } => {
+                self.apply_behavior_snapshot(correlation_id, snapshot);
+            }
+            ServerToClient::BehaviorStateChanged {
+                pod_id,
+                behavior_id,
+                state,
+            } => {
+                if let Some(list) = self.behaviors_by_pod.get_mut(&pod_id)
+                    && let Some(row) = list.iter_mut().find(|b| b.behavior_id == behavior_id)
+                {
+                    row.run_count = state.run_count;
+                    row.last_fired_at = state.last_fired_at.clone();
+                }
+            }
+            ServerToClient::BehaviorCreated {
+                correlation_id,
+                summary,
+            } => {
+                let list = self
+                    .behaviors_by_pod
+                    .entry(summary.pod_id.clone())
+                    .or_default();
+                if let Some(existing) = list
+                    .iter_mut()
+                    .find(|b| b.behavior_id == summary.behavior_id)
+                {
+                    *existing = summary.clone();
+                } else {
+                    list.push(summary.clone());
+                    list.sort_by(|a, b| a.behavior_id.cmp(&b.behavior_id));
+                }
+                // If the creation was initiated from the "+ New behavior"
+                // modal, close that and open the editor for the new one.
+                if let Some(new_modal) = &self.new_behavior_modal
+                    && new_modal.pending_correlation == correlation_id
+                    && correlation_id.is_some()
+                {
+                    let pod_id = summary.pod_id.clone();
+                    let behavior_id = summary.behavior_id.clone();
+                    self.new_behavior_modal = None;
+                    self.open_behavior_editor(pod_id, behavior_id);
+                }
+            }
+            ServerToClient::BehaviorUpdated {
+                correlation_id,
+                snapshot,
+            } => {
+                if let Some(list) = self.behaviors_by_pod.get_mut(&snapshot.pod_id) {
+                    let summary = behavior_summary_from_snapshot(&snapshot);
+                    if let Some(existing) = list
+                        .iter_mut()
+                        .find(|b| b.behavior_id == snapshot.behavior_id)
+                    {
+                        *existing = summary;
+                    } else {
+                        list.push(summary);
+                    }
+                }
+                // If this update matches our in-flight save, reset the
+                // editor's baseline so dirty flips back to clean.
+                if let Some(modal) = self.behavior_editor_modal.as_mut()
+                    && modal.pod_id == snapshot.pod_id
+                    && modal.behavior_id == snapshot.behavior_id
+                    && (modal.pending_correlation.is_some()
+                        && modal.pending_correlation == correlation_id)
+                {
+                    if let Some(config) = &snapshot.config {
+                        modal.baseline_config = Some(config.clone());
+                        // Keep the user's working state — they may have
+                        // edited further during the round-trip. But if
+                        // they haven't, align working with baseline so
+                        // raw_buffer regenerates cleanly on next Raw
+                        // tab entry.
+                        if modal.working_config.as_ref() == modal.baseline_config.as_ref() {
+                            modal.raw_buffer = snapshot.toml_text.clone();
+                            modal.raw_dirty = false;
+                        }
+                    }
+                    modal.baseline_prompt = snapshot.prompt.clone();
+                    modal.pending_correlation = None;
+                    modal.error = None;
+                }
+            }
+            ServerToClient::BehaviorDeleted {
+                pod_id,
+                behavior_id,
+                ..
+            } => {
+                if let Some(list) = self.behaviors_by_pod.get_mut(&pod_id) {
+                    list.retain(|b| b.behavior_id != behavior_id);
+                }
+                if self.delete_armed_behavior.as_ref()
+                    == Some(&(pod_id.clone(), behavior_id.clone()))
+                {
+                    self.delete_armed_behavior = None;
+                }
+                if let Some(modal) = &self.behavior_editor_modal
+                    && modal.pod_id == pod_id
+                    && modal.behavior_id == behavior_id
+                {
+                    self.behavior_editor_modal = None;
+                }
+            }
         }
     }
 
@@ -1664,6 +1949,8 @@ impl eframe::App for ChatApp {
 
         self.render_new_pod_modal(ctx);
         self.render_pod_editor_modal(ctx);
+        self.render_new_behavior_modal(ctx);
+        self.render_behavior_editor_modal(ctx);
     }
 }
 
@@ -1747,6 +2034,7 @@ impl ChatApp {
         let mut archive_confirmed = false;
         let mut archive_disarm = false;
         let mut edit_config_clicked = false;
+        let mut behavior_actions: Vec<BehaviorRowAction> = Vec::new();
         let header = egui::CollapsingHeader::new(RichText::new(label).strong())
             .id_salt(&collapsed_id)
             .default_open(default_open)
@@ -1795,40 +2083,40 @@ impl ChatApp {
                         }
                     }
                 });
-                let Some(thread_ids) = thread_ids else {
+                if let Some(thread_ids) = thread_ids {
+                    for thread_id in thread_ids {
+                        let Some(view) = self.tasks.get(thread_id) else {
+                            continue;
+                        };
+                        let is_selected = self.selected.as_deref() == Some(thread_id.as_str());
+                        let title =
+                            view.summary.title.clone().unwrap_or_else(|| {
+                                thread_id[..thread_id.len().min(14)].to_string()
+                            });
+                        let (chip, chip_color) = state_chip(view.summary.state);
+                        let row = ui.add_sized(
+                            [ui.available_width(), 0.0],
+                            egui::Button::selectable(
+                                is_selected,
+                                RichText::new(format!("{title}  [{chip}]")).color(if is_selected {
+                                    Color32::WHITE
+                                } else {
+                                    chip_color
+                                }),
+                            ),
+                        );
+                        if row.clicked() {
+                            self.select_task(thread_id.clone());
+                        }
+                    }
+                } else {
                     ui.label(
                         RichText::new("(no threads)")
                             .italics()
                             .color(Color32::from_gray(140)),
                     );
-                    return;
-                };
-                for thread_id in thread_ids {
-                    let Some(view) = self.tasks.get(thread_id) else {
-                        continue;
-                    };
-                    let is_selected = self.selected.as_deref() == Some(thread_id.as_str());
-                    let title = view
-                        .summary
-                        .title
-                        .clone()
-                        .unwrap_or_else(|| thread_id[..thread_id.len().min(14)].to_string());
-                    let (chip, chip_color) = state_chip(view.summary.state);
-                    let row = ui.add_sized(
-                        [ui.available_width(), 0.0],
-                        egui::Button::selectable(
-                            is_selected,
-                            RichText::new(format!("{title}  [{chip}]")).color(if is_selected {
-                                Color32::WHITE
-                            } else {
-                                chip_color
-                            }),
-                        ),
-                    );
-                    if row.clicked() {
-                        self.select_task(thread_id.clone());
-                    }
                 }
+                self.render_behaviors_panel(ui, pod_id, &mut behavior_actions);
             });
         // Track collapse state so it persists across renders.
         if header.fully_closed() {
@@ -1849,6 +2137,7 @@ impl ChatApp {
         if edit_config_clicked {
             self.open_pod_editor(pod_id.to_string());
         }
+        self.apply_behavior_row_actions(pod_id, behavior_actions);
     }
 
     fn open_pod_editor(&mut self, pod_id: String) {
@@ -1857,6 +2146,234 @@ impl ChatApp {
             pod_id: pod_id.clone(),
         });
         self.pod_editor_modal = Some(PodEditorModalState::new(pod_id));
+    }
+
+    fn open_behavior_editor(&mut self, pod_id: String, behavior_id: String) {
+        self.send(ClientToServer::GetBehavior {
+            correlation_id: None,
+            pod_id: pod_id.clone(),
+            behavior_id: behavior_id.clone(),
+        });
+        self.behavior_editor_modal = Some(BehaviorEditorModalState::new(pod_id, behavior_id));
+    }
+
+    /// Render the behaviors sub-section of a pod header. Produces
+    /// `BehaviorRowAction` tokens in `actions` for the enclosing
+    /// `render_pod_section` to act on after the closure returns — keeps
+    /// mutating state (sending wire messages, opening modals) out of
+    /// the rendering closure where the egui borrow graph is ugly.
+    fn render_behaviors_panel(
+        &self,
+        ui: &mut egui::Ui,
+        pod_id: &str,
+        actions: &mut Vec<BehaviorRowAction>,
+    ) {
+        ui.add_space(4.0);
+        ui.separator();
+        ui.horizontal(|ui| {
+            ui.label(
+                RichText::new("Behaviors")
+                    .small()
+                    .color(Color32::from_gray(180)),
+            );
+            if ui.small_button(RichText::new("+ New").small()).clicked() {
+                actions.push(BehaviorRowAction::New);
+            }
+        });
+        let behaviors = match self.behaviors_by_pod.get(pod_id) {
+            Some(list) if !list.is_empty() => list,
+            _ => {
+                ui.label(
+                    RichText::new("  (none)")
+                        .small()
+                        .italics()
+                        .color(Color32::from_gray(140)),
+                );
+                return;
+            }
+        };
+        for row in behaviors {
+            self.render_behavior_row(ui, row, actions);
+        }
+    }
+
+    fn render_behavior_row(
+        &self,
+        ui: &mut egui::Ui,
+        row: &BehaviorSummary,
+        actions: &mut Vec<BehaviorRowAction>,
+    ) {
+        ui.horizontal(|ui| {
+            let label_text = match &row.trigger_kind {
+                Some(kind) => format!("{}  [{}]", row.name, kind),
+                None => format!("{}  [errored]", row.name),
+            };
+            let color = if row.load_error.is_some() {
+                Color32::from_rgb(220, 120, 120)
+            } else {
+                Color32::from_gray(210)
+            };
+            ui.label(RichText::new(label_text).small().color(color));
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let armed = self
+                    .delete_armed_behavior
+                    .as_ref()
+                    .map(|(p, b)| p == &row.pod_id && b == &row.behavior_id)
+                    .unwrap_or(false);
+                if armed {
+                    if ui
+                        .small_button(
+                            RichText::new("Confirm")
+                                .small()
+                                .color(Color32::from_rgb(220, 90, 90)),
+                        )
+                        .clicked()
+                    {
+                        actions.push(BehaviorRowAction::ConfirmDelete {
+                            pod_id: row.pod_id.clone(),
+                            behavior_id: row.behavior_id.clone(),
+                        });
+                    }
+                    if ui.small_button(RichText::new("Cancel").small()).clicked() {
+                        actions.push(BehaviorRowAction::DisarmDelete);
+                    }
+                } else {
+                    if ui
+                        .small_button(
+                            RichText::new("Delete")
+                                .small()
+                                .color(Color32::from_gray(160)),
+                        )
+                        .clicked()
+                    {
+                        actions.push(BehaviorRowAction::ArmDelete {
+                            pod_id: row.pod_id.clone(),
+                            behavior_id: row.behavior_id.clone(),
+                        });
+                    }
+                    if ui.small_button(RichText::new("Edit").small()).clicked() {
+                        actions.push(BehaviorRowAction::Edit {
+                            pod_id: row.pod_id.clone(),
+                            behavior_id: row.behavior_id.clone(),
+                        });
+                    }
+                    // Errored behaviors can't be run — disable Run until
+                    // the user fixes the config.
+                    let run_enabled = row.load_error.is_none();
+                    if ui
+                        .add_enabled(run_enabled, egui::Button::new(RichText::new("Run").small()))
+                        .clicked()
+                    {
+                        actions.push(BehaviorRowAction::Run {
+                            pod_id: row.pod_id.clone(),
+                            behavior_id: row.behavior_id.clone(),
+                        });
+                    }
+                }
+            });
+        });
+        if let Some(err) = &row.load_error {
+            ui.label(
+                RichText::new(format!("  ⚠ {err}"))
+                    .small()
+                    .color(Color32::from_rgb(200, 120, 120)),
+            );
+        } else if let Some(last) = &row.last_fired_at {
+            ui.label(
+                RichText::new(format!("  last fired: {last}"))
+                    .small()
+                    .color(Color32::from_gray(140)),
+            );
+        }
+    }
+
+    fn apply_behavior_row_actions(&mut self, pod_id: &str, actions: Vec<BehaviorRowAction>) {
+        for action in actions {
+            match action {
+                BehaviorRowAction::New => {
+                    self.new_behavior_modal = Some(NewBehaviorModalState::new(pod_id.to_string()));
+                }
+                BehaviorRowAction::Edit {
+                    pod_id,
+                    behavior_id,
+                } => {
+                    self.open_behavior_editor(pod_id, behavior_id);
+                }
+                BehaviorRowAction::Run {
+                    pod_id,
+                    behavior_id,
+                } => {
+                    self.send(ClientToServer::RunBehavior {
+                        correlation_id: None,
+                        pod_id,
+                        behavior_id,
+                        payload: None,
+                    });
+                }
+                BehaviorRowAction::ArmDelete {
+                    pod_id,
+                    behavior_id,
+                } => {
+                    self.delete_armed_behavior = Some((pod_id, behavior_id));
+                }
+                BehaviorRowAction::DisarmDelete => {
+                    self.delete_armed_behavior = None;
+                }
+                BehaviorRowAction::ConfirmDelete {
+                    pod_id,
+                    behavior_id,
+                } => {
+                    self.delete_armed_behavior = None;
+                    self.send(ClientToServer::DeleteBehavior {
+                        correlation_id: None,
+                        pod_id,
+                        behavior_id,
+                    });
+                }
+            }
+        }
+    }
+
+    /// Populate the behavior editor modal from a `BehaviorSnapshot`
+    /// event. Also updates the per-pod summary cache with the latest
+    /// summary-shaped view of the same data. Called on initial load
+    /// (correlation_id None) and after a successful Update.
+    fn apply_behavior_snapshot(
+        &mut self,
+        _correlation_id: Option<String>,
+        snapshot: BehaviorSnapshotProto,
+    ) {
+        // Refresh the list-cached summary so the pod detail view
+        // stays in sync with the latest config.
+        if let Some(list) = self.behaviors_by_pod.get_mut(&snapshot.pod_id) {
+            let summary = behavior_summary_from_snapshot(&snapshot);
+            if let Some(existing) = list
+                .iter_mut()
+                .find(|b| b.behavior_id == snapshot.behavior_id)
+            {
+                *existing = summary;
+            } else {
+                list.push(summary);
+                list.sort_by(|a, b| a.behavior_id.cmp(&b.behavior_id));
+            }
+        }
+        // If the editor is open for this behavior and hasn't loaded
+        // yet, populate it. `working.is_none()` is the load gate —
+        // subsequent updates (from a successful Save round-trip) are
+        // applied via the `BehaviorUpdated` handler instead.
+        if let Some(modal) = self.behavior_editor_modal.as_mut()
+            && modal.pod_id == snapshot.pod_id
+            && modal.behavior_id == snapshot.behavior_id
+            && modal.working_config.is_none()
+        {
+            modal.working_config = snapshot.config.clone();
+            modal.baseline_config = snapshot.config.clone();
+            modal.working_prompt = snapshot.prompt.clone();
+            modal.baseline_prompt = snapshot.prompt.clone();
+            modal.raw_buffer = snapshot.toml_text.clone();
+            modal.raw_dirty = false;
+            modal.error = snapshot.load_error.clone();
+        }
     }
 
     /// Render the "+ New pod" modal. The user picks an id + display
@@ -1961,6 +2478,125 @@ impl ChatApp {
             // Modal closes.
         } else {
             self.new_pod_modal = Some(modal);
+        }
+    }
+
+    fn render_new_behavior_modal(&mut self, ctx: &egui::Context) {
+        let Some(mut modal) = self.new_behavior_modal.take() else {
+            return;
+        };
+        let mut open = true;
+        let mut create_clicked = false;
+        let mut cancel_clicked = false;
+        let saving = modal.pending_correlation.is_some();
+
+        egui::Window::new(format!("New behavior — {}", modal.pod_id))
+            .collapsible(false)
+            .resizable(false)
+            .default_width(420.0)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .open(&mut open)
+            .show(ctx, |ui| {
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    ui.label("behavior_id");
+                    ui.add(
+                        TextEdit::singleline(&mut modal.behavior_id)
+                            .hint_text("directory name (e.g. 'daily-ci-check')")
+                            .desired_width(f32::INFINITY),
+                    );
+                });
+                hint(
+                    ui,
+                    "Becomes the behavior's directory name under the pod; \
+                     immutable after creation.",
+                );
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    ui.label("name");
+                    ui.add(
+                        TextEdit::singleline(&mut modal.name)
+                            .hint_text("display name (free text)")
+                            .desired_width(f32::INFINITY),
+                    );
+                });
+                if let Some(err) = &modal.error {
+                    ui.add_space(6.0);
+                    ui.colored_label(Color32::from_rgb(220, 80, 80), err);
+                }
+                ui.add_space(8.0);
+                hint(
+                    ui,
+                    "Starts as a manually-triggered behavior with an empty \
+                     prompt. Edit in the full editor to add a trigger, \
+                     override thread settings, or write the prompt.",
+                );
+                ui.add_space(8.0);
+                ui.separator();
+                ui.horizontal(|ui| {
+                    let enabled = !modal.behavior_id.trim().is_empty()
+                        && !modal.name.trim().is_empty()
+                        && !saving;
+                    if ui
+                        .add_enabled(enabled, egui::Button::new("Create"))
+                        .clicked()
+                    {
+                        create_clicked = true;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        cancel_clicked = true;
+                    }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if saving {
+                            ui.label(
+                                RichText::new("creating…")
+                                    .italics()
+                                    .color(Color32::from_gray(160)),
+                            );
+                        }
+                    });
+                });
+            });
+
+        if create_clicked {
+            let behavior_id = modal.behavior_id.trim().to_string();
+            if let Err(msg) = validate_behavior_id_client(&behavior_id) {
+                modal.error = Some(msg.to_string());
+                self.new_behavior_modal = Some(modal);
+                return;
+            }
+            let existing = self
+                .behaviors_by_pod
+                .get(&modal.pod_id)
+                .map(|list| list.iter().any(|b| b.behavior_id == behavior_id))
+                .unwrap_or(false);
+            if existing {
+                modal.error = Some(format!("behavior `{behavior_id}` already exists"));
+                self.new_behavior_modal = Some(modal);
+                return;
+            }
+            let correlation = self.next_correlation_id();
+            let config = BehaviorConfig {
+                name: modal.name.trim().to_string(),
+                description: None,
+                trigger: TriggerSpec::Manual,
+                thread: BehaviorThreadOverride::default(),
+                on_completion: RetentionPolicy::default(),
+            };
+            modal.pending_correlation = Some(correlation.clone());
+            modal.error = None;
+            self.send(ClientToServer::CreateBehavior {
+                correlation_id: Some(correlation),
+                pod_id: modal.pod_id.clone(),
+                behavior_id,
+                config,
+                prompt: String::new(),
+            });
+            self.new_behavior_modal = Some(modal);
+        } else if cancel_clicked || !open {
+            // Modal closes.
+        } else {
+            self.new_behavior_modal = Some(modal);
         }
     }
 
@@ -2242,6 +2878,198 @@ impl ChatApp {
             // Modal closes (drop modal).
         } else {
             self.pod_editor_modal = Some(modal);
+        }
+    }
+
+    /// Per-behavior editor modal. Structured tabs edit a working
+    /// `BehaviorConfig` + prompt; Raw TOML is the escape hatch for the
+    /// config (prompt has its own tab, not raw-TOML-editable). Save
+    /// ships both through `UpdateBehavior`.
+    fn render_behavior_editor_modal(&mut self, ctx: &egui::Context) {
+        let Some(mut modal) = self.behavior_editor_modal.take() else {
+            return;
+        };
+        let backend_catalog: Vec<String> = self.backends.iter().map(|b| b.name.clone()).collect();
+        let pod_host_env_names: Vec<String> = self
+            .pod_configs
+            .get(&modal.pod_id)
+            .map(|cfg| cfg.allow.host_env.iter().map(|h| h.name.clone()).collect())
+            .unwrap_or_default();
+        let pod_mcp_host_names: Vec<String> = self
+            .pod_configs
+            .get(&modal.pod_id)
+            .map(|cfg| cfg.allow.mcp_hosts.clone())
+            .unwrap_or_default();
+
+        let mut save_clicked = false;
+        let mut revert_clicked = false;
+        let mut close_clicked = false;
+        let mut switch_to: Option<BehaviorEditorTab> = None;
+        let mut open = true;
+
+        let title = format!("Edit behavior — {}/{}", modal.pod_id, modal.behavior_id);
+        let screen = ctx.content_rect();
+        let max_h = (screen.height() - 60.0).max(280.0);
+        let max_w = (screen.width() - 60.0).max(420.0);
+        let dirty = modal.is_dirty();
+        let saving = modal.pending_correlation.is_some();
+        let has_data = modal.working_config.is_some();
+
+        egui::Window::new(title)
+            .collapsible(false)
+            .resizable(true)
+            .default_width(720.0_f32.min(max_w))
+            .default_height(560.0_f32.min(max_h))
+            .max_width(max_w)
+            .max_height(max_h)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .open(&mut open)
+            .show(ctx, |ui| {
+                egui::TopBottomPanel::bottom("behavior_editor_footer").show_inside(ui, |ui| {
+                    let actions = crate::editor::render_footer(
+                        ui,
+                        modal.error.as_deref(),
+                        has_data,
+                        dirty,
+                        saving,
+                    );
+                    save_clicked = actions.save;
+                    revert_clicked = actions.revert;
+                    close_clicked = actions.close;
+                });
+                egui::TopBottomPanel::top("behavior_editor_tabs").show_inside(ui, |ui| {
+                    ui.add_space(4.0);
+                    ui.horizontal(|ui| {
+                        for tab in [
+                            BehaviorEditorTab::Trigger,
+                            BehaviorEditorTab::Thread,
+                            BehaviorEditorTab::Retention,
+                            BehaviorEditorTab::Prompt,
+                            BehaviorEditorTab::RawToml,
+                        ] {
+                            let active = modal.tab == tab;
+                            let label = if active {
+                                RichText::new(tab.label()).strong()
+                            } else {
+                                RichText::new(tab.label()).color(Color32::from_gray(170))
+                            };
+                            if ui.selectable_label(active, label).clicked() && !active {
+                                switch_to = Some(tab);
+                            }
+                        }
+                    });
+                    ui.add_space(2.0);
+                    ui.separator();
+                });
+                egui::CentralPanel::default().show_inside(ui, |ui| {
+                    if modal.working_config.is_none() && modal.error.is_none() {
+                        ui.add_space(24.0);
+                        ui.label(
+                            RichText::new("loading behavior…")
+                                .italics()
+                                .color(Color32::from_gray(160)),
+                        );
+                        return;
+                    }
+                    egui::ScrollArea::vertical()
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| match modal.tab {
+                            BehaviorEditorTab::Trigger => {
+                                if let Some(cfg) = modal.working_config.as_mut() {
+                                    render_behavior_editor_trigger_tab(ui, cfg);
+                                }
+                            }
+                            BehaviorEditorTab::Thread => {
+                                if let Some(cfg) = modal.working_config.as_mut() {
+                                    render_behavior_editor_thread_tab(
+                                        ui,
+                                        cfg,
+                                        &backend_catalog,
+                                        &pod_host_env_names,
+                                        &pod_mcp_host_names,
+                                    );
+                                }
+                            }
+                            BehaviorEditorTab::Retention => {
+                                if let Some(cfg) = modal.working_config.as_mut() {
+                                    render_behavior_editor_retention_tab(ui, cfg);
+                                }
+                            }
+                            BehaviorEditorTab::Prompt => {
+                                render_behavior_editor_prompt_tab(ui, &mut modal.working_prompt);
+                            }
+                            BehaviorEditorTab::RawToml => {
+                                render_behavior_editor_raw_tab(
+                                    ui,
+                                    &mut modal.raw_buffer,
+                                    &mut modal.raw_dirty,
+                                );
+                            }
+                        });
+                });
+            });
+
+        // Tab switch (post-show so no UI borrow).
+        if let Some(target) = switch_to {
+            let leaving_raw =
+                modal.tab == BehaviorEditorTab::RawToml && target != BehaviorEditorTab::RawToml;
+            let entering_raw = target == BehaviorEditorTab::RawToml;
+            match crate::editor::sync_on_tab_switch::<BehaviorConfig>(
+                leaving_raw,
+                entering_raw,
+                &mut modal.working_config,
+                &mut modal.raw_buffer,
+                &mut modal.raw_dirty,
+            ) {
+                Ok(()) => {
+                    modal.tab = target;
+                    modal.error = None;
+                }
+                Err(msg) => modal.error = Some(msg),
+            }
+        }
+
+        if save_clicked && let Some(working) = &modal.working_config {
+            // If the raw tab has pending edits, reparse it and use
+            // that; otherwise serialize from working. Matches the pod
+            // editor's precedence.
+            let config = if modal.tab == BehaviorEditorTab::RawToml && modal.raw_dirty {
+                match toml::from_str::<BehaviorConfig>(&modal.raw_buffer) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        modal.error = Some(format!("raw TOML doesn't parse: {e}"));
+                        self.behavior_editor_modal = Some(modal);
+                        return;
+                    }
+                }
+            } else {
+                working.clone()
+            };
+            let correlation = self.next_correlation_id();
+            modal.pending_correlation = Some(correlation.clone());
+            modal.error = None;
+            self.send(ClientToServer::UpdateBehavior {
+                correlation_id: Some(correlation),
+                pod_id: modal.pod_id.clone(),
+                behavior_id: modal.behavior_id.clone(),
+                config,
+                prompt: modal.working_prompt.clone(),
+            });
+            self.behavior_editor_modal = Some(modal);
+        } else if revert_clicked {
+            if let Some(baseline) = &modal.baseline_config {
+                modal.working_config = Some(baseline.clone());
+                modal.raw_buffer = toml::to_string_pretty(baseline).unwrap_or_default();
+                modal.raw_dirty = false;
+            }
+            modal.working_prompt = modal.baseline_prompt.clone();
+            modal.error = None;
+            modal.pending_correlation = None;
+            self.behavior_editor_modal = Some(modal);
+        } else if close_clicked || !open {
+            // Modal closes.
+        } else {
+            self.behavior_editor_modal = Some(modal);
         }
     }
 
@@ -3310,6 +4138,519 @@ fn render_pod_editor_raw_tab(ui: &mut egui::Ui, raw: &mut String, dirty: &mut bo
     );
 }
 
+fn render_behavior_editor_trigger_tab(ui: &mut egui::Ui, cfg: &mut BehaviorConfig) {
+    ui.add_space(4.0);
+    section_heading(ui, "Identity");
+    Grid::new("behavior_editor_identity")
+        .num_columns(2)
+        .min_col_width(110.0)
+        .spacing([12.0, 6.0])
+        .show(ui, |ui| {
+            ui.label("name");
+            ui.add(
+                TextEdit::singleline(&mut cfg.name)
+                    .hint_text("display name")
+                    .desired_width(f32::INFINITY),
+            );
+            ui.end_row();
+            ui.label("description");
+            let mut desc = cfg.description.clone().unwrap_or_default();
+            let resp = ui.add(
+                TextEdit::multiline(&mut desc)
+                    .hint_text("optional — shown in the behaviors list")
+                    .desired_rows(2)
+                    .desired_width(f32::INFINITY),
+            );
+            if resp.changed() {
+                cfg.description = if desc.trim().is_empty() {
+                    None
+                } else {
+                    Some(desc)
+                };
+            }
+            ui.end_row();
+        });
+
+    ui.add_space(10.0);
+    section_heading(ui, "Trigger");
+    hint(
+        ui,
+        "Manual behaviors fire only when you click Run. Cron behaviors \
+         fire on a schedule in their configured timezone. Webhook \
+         behaviors fire on HTTP POST to the endpoint shown below.",
+    );
+
+    let current_kind = match &cfg.trigger {
+        TriggerSpec::Manual => "manual",
+        TriggerSpec::Cron { .. } => "cron",
+        TriggerSpec::Webhook { .. } => "webhook",
+    };
+    ui.horizontal(|ui| {
+        for kind in ["manual", "cron", "webhook"] {
+            let active = kind == current_kind;
+            if ui.selectable_label(active, kind).clicked() && !active {
+                cfg.trigger = match kind {
+                    "manual" => TriggerSpec::Manual,
+                    "cron" => TriggerSpec::Cron {
+                        schedule: "0 9 * * *".into(),
+                        timezone: "UTC".into(),
+                        overlap: Overlap::Skip,
+                        catch_up: CatchUp::One,
+                    },
+                    "webhook" => TriggerSpec::Webhook {
+                        overlap: Overlap::Skip,
+                    },
+                    _ => unreachable!(),
+                };
+            }
+        }
+    });
+
+    ui.add_space(8.0);
+    match &mut cfg.trigger {
+        TriggerSpec::Manual => {
+            hint(
+                ui,
+                "No further configuration. Use RunBehavior (or the Run \
+                 button in the list) to fire.",
+            );
+        }
+        TriggerSpec::Cron {
+            schedule,
+            timezone,
+            overlap,
+            catch_up,
+        } => {
+            Grid::new("behavior_editor_cron")
+                .num_columns(2)
+                .min_col_width(110.0)
+                .spacing([12.0, 6.0])
+                .show(ui, |ui| {
+                    ui.label("schedule");
+                    ui.add(
+                        TextEdit::singleline(schedule)
+                            .hint_text("5-field crontab (e.g. '0 9 * * *')")
+                            .desired_width(f32::INFINITY),
+                    );
+                    ui.end_row();
+                    ui.label("timezone");
+                    ui.add(
+                        TextEdit::singleline(timezone)
+                            .hint_text("IANA zone (e.g. 'America/Los_Angeles')")
+                            .desired_width(f32::INFINITY),
+                    );
+                    ui.end_row();
+                    ui.label("overlap");
+                    render_overlap_picker(ui, overlap);
+                    ui.end_row();
+                    ui.label("catch_up");
+                    render_catch_up_picker(ui, catch_up);
+                    ui.end_row();
+                });
+        }
+        TriggerSpec::Webhook { overlap } => {
+            Grid::new("behavior_editor_webhook")
+                .num_columns(2)
+                .min_col_width(110.0)
+                .spacing([12.0, 6.0])
+                .show(ui, |ui| {
+                    ui.label("overlap");
+                    render_overlap_picker(ui, overlap);
+                    ui.end_row();
+                });
+            ui.add_space(6.0);
+            hint(
+                ui,
+                "POST endpoint (relative to this server): \
+                 /triggers/<pod_id>/<behavior_id>. Empty body → Null \
+                 payload. Non-empty bodies must be valid JSON.",
+            );
+        }
+    }
+}
+
+fn render_overlap_picker(ui: &mut egui::Ui, overlap: &mut Overlap) {
+    ui.horizontal(|ui| {
+        for (label, value, tip) in [
+            (
+                "skip",
+                Overlap::Skip,
+                "drop the fire if the previous run is still in flight",
+            ),
+            (
+                "queue_one",
+                Overlap::QueueOne,
+                "park one pending payload; fire when the previous run finishes",
+            ),
+            (
+                "allow",
+                Overlap::Allow,
+                "always fire, concurrent runs are OK",
+            ),
+        ] {
+            let active = *overlap == value;
+            if ui
+                .selectable_label(active, label)
+                .on_hover_text(tip)
+                .clicked()
+                && !active
+            {
+                *overlap = value;
+            }
+        }
+    });
+}
+
+fn render_catch_up_picker(ui: &mut egui::Ui, catch_up: &mut CatchUp) {
+    ui.horizontal(|ui| {
+        for (label, value, tip) in [
+            (
+                "none",
+                CatchUp::None,
+                "on server restart, skip missed fires silently",
+            ),
+            (
+                "one",
+                CatchUp::One,
+                "on server restart, fire once for missed windows",
+            ),
+            (
+                "all",
+                CatchUp::All,
+                "reserved — currently capped to one fire, logs a warning",
+            ),
+        ] {
+            let active = *catch_up == value;
+            if ui
+                .selectable_label(active, label)
+                .on_hover_text(tip)
+                .clicked()
+                && !active
+            {
+                *catch_up = value;
+            }
+        }
+    });
+}
+
+fn render_behavior_editor_thread_tab(
+    ui: &mut egui::Ui,
+    cfg: &mut BehaviorConfig,
+    backend_catalog: &[String],
+    pod_host_env_names: &[String],
+    pod_mcp_host_names: &[String],
+) {
+    ui.add_space(4.0);
+    section_heading(ui, "Thread overrides");
+    hint(
+        ui,
+        "Every field is optional. Unset fields inherit from the pod's \
+         thread_defaults at fire time. Bindings must resolve against \
+         the pod's [allow] table — set too aggressively, the server \
+         rejects the save.",
+    );
+    ui.add_space(4.0);
+
+    Grid::new("behavior_editor_thread_plain")
+        .num_columns(2)
+        .min_col_width(140.0)
+        .spacing([12.0, 6.0])
+        .show(ui, |ui| {
+            ui.label("model");
+            let mut model_set = cfg.thread.model.is_some();
+            let mut model_val = cfg.thread.model.clone().unwrap_or_default();
+            ui.horizontal(|ui| {
+                if ui.checkbox(&mut model_set, "override").changed() {
+                    cfg.thread.model = if model_set {
+                        Some(model_val.clone())
+                    } else {
+                        None
+                    };
+                }
+                if ui
+                    .add_enabled(
+                        model_set,
+                        TextEdit::singleline(&mut model_val)
+                            .hint_text("backend-defined model id")
+                            .desired_width(f32::INFINITY),
+                    )
+                    .changed()
+                    && model_set
+                {
+                    cfg.thread.model = Some(model_val);
+                }
+            });
+            ui.end_row();
+
+            render_optional_u32_row(
+                ui,
+                "max_tokens",
+                &mut cfg.thread.max_tokens,
+                1,
+                u32::MAX,
+                16384,
+            );
+            render_optional_u32_row(ui, "max_turns", &mut cfg.thread.max_turns, 1, 500, 30);
+
+            ui.label("approval_policy");
+            let mut ap_set = cfg.thread.approval_policy.is_some();
+            let mut ap_val = cfg.thread.approval_policy.unwrap_or_default();
+            ui.horizontal(|ui| {
+                if ui.checkbox(&mut ap_set, "override").changed() {
+                    cfg.thread.approval_policy = if ap_set { Some(ap_val) } else { None };
+                }
+                ui.add_enabled_ui(ap_set, |ui| {
+                    egui::ComboBox::from_id_salt("behavior_approval_policy")
+                        .selected_text(approval_policy_label(ap_val))
+                        .show_ui(ui, |ui| {
+                            for policy in [
+                                ApprovalPolicy::AutoApproveAll,
+                                ApprovalPolicy::PromptPodModify,
+                                ApprovalPolicy::PromptDestructive,
+                            ] {
+                                if ui
+                                    .selectable_label(
+                                        ap_val == policy,
+                                        approval_policy_label(policy),
+                                    )
+                                    .clicked()
+                                {
+                                    ap_val = policy;
+                                }
+                            }
+                        });
+                });
+                if ap_set {
+                    cfg.thread.approval_policy = Some(ap_val);
+                }
+            });
+            ui.end_row();
+        });
+
+    ui.add_space(10.0);
+    section_heading(ui, "Binding overrides");
+    hint(
+        ui,
+        "Each `Some` replaces the corresponding pod default at fire \
+         time. The pod's [allow] table is authoritative — the server \
+         rejects saves whose bindings fall outside it.",
+    );
+    ui.add_space(4.0);
+    render_optional_string_picker(
+        ui,
+        "backend",
+        &mut cfg.thread.bindings.backend,
+        backend_catalog,
+        "(inherit pod default)",
+    );
+    render_optional_string_picker(
+        ui,
+        "host_env",
+        &mut cfg.thread.bindings.host_env,
+        pod_host_env_names,
+        "(inherit pod default)",
+    );
+
+    ui.add_space(6.0);
+    ui.label("mcp_hosts");
+    let mut mcp_set = cfg.thread.bindings.mcp_hosts.is_some();
+    if ui
+        .checkbox(&mut mcp_set, "override pod default mcp_hosts")
+        .changed()
+    {
+        cfg.thread.bindings.mcp_hosts = if mcp_set { Some(Vec::new()) } else { None };
+    }
+    if let Some(selected) = cfg.thread.bindings.mcp_hosts.as_mut() {
+        if pod_mcp_host_names.is_empty() {
+            ui.label(
+                RichText::new("(pod declares no shared MCP hosts)")
+                    .italics()
+                    .color(Color32::from_gray(160)),
+            );
+        } else {
+            ui.horizontal_wrapped(|ui| {
+                for name in pod_mcp_host_names {
+                    let mut on = selected.iter().any(|n| n == name);
+                    if ui.checkbox(&mut on, name).changed() {
+                        if on {
+                            selected.push(name.clone());
+                        } else {
+                            selected.retain(|n| n != name);
+                        }
+                    }
+                }
+            });
+        }
+    }
+}
+
+/// Shared helper: optional-u32 field with an "override" checkbox +
+/// DragValue. Used for max_tokens / max_turns.
+fn render_optional_u32_row(
+    ui: &mut egui::Ui,
+    label: &str,
+    field: &mut Option<u32>,
+    min: u32,
+    max: u32,
+    default_if_enabled: u32,
+) {
+    ui.label(label);
+    let mut on = field.is_some();
+    let mut value = field.unwrap_or(default_if_enabled);
+    ui.horizontal(|ui| {
+        if ui.checkbox(&mut on, "override").changed() {
+            *field = if on { Some(value) } else { None };
+        }
+        ui.add_enabled_ui(on, |ui| {
+            if ui
+                .add(egui::DragValue::new(&mut value).range(min..=max).speed(1.0))
+                .changed()
+                && on
+            {
+                *field = Some(value);
+            }
+        });
+    });
+    ui.end_row();
+}
+
+/// Optional-string picker with override toggle + ComboBox of valid
+/// choices. Used for backend and host_env binding overrides.
+fn render_optional_string_picker(
+    ui: &mut egui::Ui,
+    label: &str,
+    field: &mut Option<String>,
+    choices: &[String],
+    inherit_placeholder: &str,
+) {
+    ui.horizontal(|ui| {
+        ui.label(label);
+        let mut on = field.is_some();
+        let mut value = field.clone().unwrap_or_default();
+        if ui.checkbox(&mut on, "override").changed() {
+            *field = if on {
+                Some(choices.first().cloned().unwrap_or_default())
+            } else {
+                None
+            };
+            if let Some(v) = field {
+                value = v.clone();
+            }
+        }
+        if on {
+            egui::ComboBox::from_id_salt(format!("behavior_picker_{label}"))
+                .selected_text(if value.is_empty() {
+                    "(pick one)"
+                } else {
+                    value.as_str()
+                })
+                .show_ui(ui, |ui| {
+                    for choice in choices {
+                        if ui.selectable_label(&value == choice, choice).clicked() {
+                            value = choice.clone();
+                        }
+                    }
+                });
+            *field = Some(value);
+        } else {
+            ui.label(
+                RichText::new(inherit_placeholder)
+                    .italics()
+                    .color(Color32::from_gray(160)),
+            );
+        }
+    });
+}
+
+fn render_behavior_editor_retention_tab(ui: &mut egui::Ui, cfg: &mut BehaviorConfig) {
+    ui.add_space(4.0);
+    section_heading(ui, "On completion");
+    hint(
+        ui,
+        "What to do with a thread this behavior spawned once it \
+         reaches a terminal state. Applies only to behavior-spawned \
+         threads — interactive threads always Keep. Sweep runs hourly.",
+    );
+    ui.add_space(6.0);
+
+    let current_kind = match &cfg.on_completion {
+        RetentionPolicy::Keep => "keep",
+        RetentionPolicy::ArchiveAfterDays { .. } => "archive_after_days",
+        RetentionPolicy::DeleteAfterDays { .. } => "delete_after_days",
+    };
+    ui.horizontal(|ui| {
+        for (label, tip) in [
+            ("keep", "never sweep — retains the thread JSON forever"),
+            (
+                "archive_after_days",
+                "move the JSON to <pod>/.archived/threads/ after N days",
+            ),
+            (
+                "delete_after_days",
+                "rm the JSON after N days; no forensic copy",
+            ),
+        ] {
+            let active = label == current_kind;
+            if ui
+                .selectable_label(active, label)
+                .on_hover_text(tip)
+                .clicked()
+                && !active
+            {
+                cfg.on_completion = match label {
+                    "keep" => RetentionPolicy::Keep,
+                    "archive_after_days" => RetentionPolicy::ArchiveAfterDays { days: 30 },
+                    "delete_after_days" => RetentionPolicy::DeleteAfterDays { days: 30 },
+                    _ => unreachable!(),
+                };
+            }
+        }
+    });
+    ui.add_space(8.0);
+    match &mut cfg.on_completion {
+        RetentionPolicy::Keep => {}
+        RetentionPolicy::ArchiveAfterDays { days } | RetentionPolicy::DeleteAfterDays { days } => {
+            Grid::new("behavior_editor_retention")
+                .num_columns(2)
+                .min_col_width(110.0)
+                .spacing([12.0, 6.0])
+                .show(ui, |ui| {
+                    ui.label("days");
+                    ui.add(egui::DragValue::new(days).range(1..=3650).speed(1.0));
+                    ui.end_row();
+                });
+        }
+    }
+}
+
+fn render_behavior_editor_prompt_tab(ui: &mut egui::Ui, prompt: &mut String) {
+    ui.add_space(4.0);
+    hint(
+        ui,
+        "prompt.md — delivered as the initial user message when the \
+         behavior fires. `{{payload}}` is substituted with the \
+         trigger payload (pretty JSON; empty for Null payloads). The \
+         pod's system_prompt_file remains the thread's system prompt.",
+    );
+    ui.add_space(4.0);
+    ui.add_sized(
+        [ui.available_width(), ui.available_height().max(180.0)],
+        TextEdit::multiline(prompt).desired_rows(12),
+    );
+}
+
+fn render_behavior_editor_raw_tab(ui: &mut egui::Ui, raw: &mut String, dirty: &mut bool) {
+    crate::editor::render_raw_toml_tab(
+        ui,
+        "Raw behavior.toml. Edits here override the structured tabs on save. \
+         Prompt text is edited in the Prompt tab, not here. Switching back \
+         to a structured tab tries to parse this text first; a parse error \
+         keeps you here so the edit isn't lost.",
+        raw,
+        dirty,
+    );
+}
+
 fn render_sandbox_entry_modal(
     ctx: &egui::Context,
     sub: &mut SandboxEntryEditorState,
@@ -3802,6 +5143,39 @@ fn section_heading(ui: &mut egui::Ui, text: &str) {
 
 fn hint(ui: &mut egui::Ui, text: &str) {
     ui.label(RichText::new(text).small().color(Color32::from_gray(160)));
+}
+
+/// Convert a `BehaviorSnapshot` into the equivalent `BehaviorSummary`
+/// shape the list cache holds. Mirrors the server-side
+/// `Behavior::summary` but stays client-local because the list cache
+/// is a client concern.
+fn behavior_summary_from_snapshot(snapshot: &BehaviorSnapshotProto) -> BehaviorSummary {
+    let (name, description, trigger_kind) = match &snapshot.config {
+        Some(cfg) => (
+            cfg.name.clone(),
+            cfg.description.clone(),
+            Some(trigger_kind_label(&cfg.trigger).to_string()),
+        ),
+        None => (snapshot.behavior_id.clone(), None, None),
+    };
+    BehaviorSummary {
+        behavior_id: snapshot.behavior_id.clone(),
+        pod_id: snapshot.pod_id.clone(),
+        name,
+        description,
+        trigger_kind,
+        run_count: snapshot.state.run_count,
+        last_fired_at: snapshot.state.last_fired_at.clone(),
+        load_error: snapshot.load_error.clone(),
+    }
+}
+
+fn trigger_kind_label(trigger: &TriggerSpec) -> &'static str {
+    match trigger {
+        TriggerSpec::Manual => "manual",
+        TriggerSpec::Cron { .. } => "cron",
+        TriggerSpec::Webhook { .. } => "webhook",
+    }
 }
 
 fn approval_policy_label(p: ApprovalPolicy) -> &'static str {
