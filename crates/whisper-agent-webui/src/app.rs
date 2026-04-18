@@ -2705,6 +2705,18 @@ impl ChatApp {
             })
             .collect();
         let host_env_providers: Vec<HostEnvProviderInfo> = self.host_env_providers.clone();
+        // Snapshot model lists so the Defaults tab's model combo can
+        // render without borrowing `self`. Dedup-guarded fetches for
+        // the currently-selected backend fire every frame — egui
+        // repaints rapidly, and `request_models_for` short-circuits
+        // on the second visit.
+        if let Some(w) = modal.working.as_ref()
+            && !w.thread_defaults.backend.is_empty()
+        {
+            let b = w.thread_defaults.backend.clone();
+            self.request_models_for(&b);
+        }
+        let models_by_backend = self.models_by_backend.clone();
 
         let mut open = true;
         let mut save_clicked = false;
@@ -2796,7 +2808,12 @@ impl ChatApp {
                                     );
                                 }
                                 PodEditorTab::Defaults => {
-                                    render_pod_editor_defaults_tab(ui, working, &backend_catalog);
+                                    render_pod_editor_defaults_tab(
+                                        ui,
+                                        working,
+                                        &backend_catalog,
+                                        &models_by_backend,
+                                    );
                                 }
                                 PodEditorTab::Limits => {
                                     render_pod_editor_limits_tab(ui, working);
@@ -2983,6 +3000,29 @@ impl ChatApp {
             .get(&modal.pod_id)
             .map(|cfg| cfg.allow.mcp_hosts.clone())
             .unwrap_or_default();
+        // Pod's default backend — used as the "effective" backend when
+        // the behavior doesn't override `bindings.backend`. The model
+        // combo reads it to decide which catalog entry's model list to
+        // show. Empty when the pod config hasn't landed yet; in that
+        // case the combo renders a "(pick a backend first)" hint.
+        let pod_default_backend: String = self
+            .pod_configs
+            .get(&modal.pod_id)
+            .map(|cfg| cfg.thread_defaults.backend.clone())
+            .unwrap_or_default();
+        // Fire ListModels for whichever backend the model combo is
+        // about to show against. Dedup-guarded, so running every frame
+        // costs a HashSet lookup after the first fetch.
+        let effective_backend_for_models = modal
+            .working_config
+            .as_ref()
+            .and_then(|c| c.thread.bindings.backend.clone())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| pod_default_backend.clone());
+        if !effective_backend_for_models.is_empty() {
+            self.request_models_for(&effective_backend_for_models);
+        }
+        let models_by_backend = self.models_by_backend.clone();
 
         let mut save_clicked = false;
         let mut revert_clicked = false;
@@ -3070,6 +3110,8 @@ impl ChatApp {
                                         &backend_catalog,
                                         &pod_host_env_names,
                                         &pod_mcp_host_names,
+                                        &models_by_backend,
+                                        &pod_default_backend,
                                     );
                                 }
                             }
@@ -4119,6 +4161,7 @@ fn render_pod_editor_defaults_tab(
     ui: &mut egui::Ui,
     working: &mut PodConfig,
     backend_catalog: &[String],
+    models_by_backend: &HashMap<String, Vec<ModelSummary>>,
 ) {
     ui.add_space(4.0);
     hint(
@@ -4196,10 +4239,12 @@ fn render_pod_editor_defaults_tab(
             }
 
             ui.label("model");
-            ui.add(
-                TextEdit::singleline(&mut working.thread_defaults.model)
-                    .hint_text("e.g. claude-sonnet-4-6")
-                    .desired_width(f32::INFINITY),
+            render_model_combo(
+                ui,
+                "pod_editor_defaults_model",
+                &working.thread_defaults.backend,
+                &mut working.thread_defaults.model,
+                models_by_backend,
             );
             ui.end_row();
 
@@ -4462,25 +4507,36 @@ fn render_behavior_editor_trigger_tab(ui: &mut egui::Ui, cfg: &mut BehaviorConfi
             overlap,
             catch_up,
         } => {
-            Grid::new("behavior_editor_cron")
+            let schedule_valid = crate::cron_preview::parse_schedule(schedule).is_ok();
+            let tz_valid = crate::cron_preview::parse_tz(timezone).is_ok();
+
+            ui.label("schedule");
+            let mut sched_edit = TextEdit::singleline(schedule)
+                .hint_text("5-field crontab (e.g. '0 9 * * *')")
+                .desired_width(f32::INFINITY);
+            if !schedule_valid {
+                sched_edit = sched_edit.text_color(egui::Color32::from_rgb(220, 80, 80));
+            }
+            ui.add(sched_edit);
+            crate::cron_preview::render_schedule_presets(ui, schedule);
+
+            ui.add_space(6.0);
+            ui.label("timezone");
+            let mut tz_edit = TextEdit::singleline(timezone)
+                .hint_text("IANA zone (e.g. 'America/Los_Angeles')")
+                .desired_width(f32::INFINITY);
+            if !tz_valid {
+                tz_edit = tz_edit.text_color(egui::Color32::from_rgb(220, 80, 80));
+            }
+            ui.add(tz_edit);
+            crate::cron_preview::render_tz_presets(ui, timezone);
+
+            ui.add_space(8.0);
+            Grid::new("behavior_editor_cron_opts")
                 .num_columns(2)
                 .min_col_width(110.0)
                 .spacing([12.0, 6.0])
                 .show(ui, |ui| {
-                    ui.label("schedule");
-                    ui.add(
-                        TextEdit::singleline(schedule)
-                            .hint_text("5-field crontab (e.g. '0 9 * * *')")
-                            .desired_width(f32::INFINITY),
-                    );
-                    ui.end_row();
-                    ui.label("timezone");
-                    ui.add(
-                        TextEdit::singleline(timezone)
-                            .hint_text("IANA zone (e.g. 'America/Los_Angeles')")
-                            .desired_width(f32::INFINITY),
-                    );
-                    ui.end_row();
                     ui.label("overlap");
                     render_overlap_picker(ui, overlap);
                     ui.end_row();
@@ -4488,6 +4544,9 @@ fn render_behavior_editor_trigger_tab(ui: &mut egui::Ui, cfg: &mut BehaviorConfi
                     render_catch_up_picker(ui, catch_up);
                     ui.end_row();
                 });
+
+            ui.add_space(10.0);
+            crate::cron_preview::render_preview(ui, schedule, timezone);
         }
         TriggerSpec::Webhook { overlap } => {
             Grid::new("behavior_editor_webhook")
@@ -4580,6 +4639,8 @@ fn render_behavior_editor_thread_tab(
     backend_catalog: &[String],
     pod_host_env_names: &[String],
     pod_mcp_host_names: &[String],
+    models_by_backend: &HashMap<String, Vec<ModelSummary>>,
+    pod_default_backend: &str,
 ) {
     ui.add_space(4.0);
     section_heading(ui, "Thread overrides");
@@ -4600,6 +4661,16 @@ fn render_behavior_editor_thread_tab(
             ui.label("model");
             let mut model_set = cfg.thread.model.is_some();
             let mut model_val = cfg.thread.model.clone().unwrap_or_default();
+            // Effective backend for the model combo: the binding
+            // override if set, else the pod default. An empty result
+            // shows up as "(pick a backend first)" inside the combo.
+            let effective_backend = cfg
+                .thread
+                .bindings
+                .backend
+                .as_deref()
+                .filter(|s| !s.is_empty())
+                .unwrap_or(pod_default_backend);
             ui.horizontal(|ui| {
                 if ui.checkbox(&mut model_set, "override").changed() {
                     cfg.thread.model = if model_set {
@@ -4608,16 +4679,16 @@ fn render_behavior_editor_thread_tab(
                         None
                     };
                 }
-                if ui
-                    .add_enabled(
-                        model_set,
-                        TextEdit::singleline(&mut model_val)
-                            .hint_text("backend-defined model id")
-                            .desired_width(f32::INFINITY),
-                    )
-                    .changed()
-                    && model_set
-                {
+                ui.add_enabled_ui(model_set, |ui| {
+                    render_model_combo(
+                        ui,
+                        "behavior_thread_model",
+                        effective_backend,
+                        &mut model_val,
+                        models_by_backend,
+                    );
+                });
+                if model_set {
                     cfg.thread.model = Some(model_val);
                 }
             });
@@ -4753,6 +4824,68 @@ fn render_optional_u32_row(
         });
     });
     ui.end_row();
+}
+
+/// ComboBox over the models cached for `backend`. Writes the chosen
+/// id into `current` on click. `selected_text` echoes `current` as-is
+/// so a value hand-edited in Raw TOML (or inherited from an old
+/// config) shows up in the header even if it isn't in the catalog.
+///
+/// `backend` empty → hint; list absent → "(loading…)"; list empty →
+/// note that the backend returned nothing. Callers must independently
+/// fire `ChatApp::request_models_for(backend)` to populate the cache;
+/// this widget only reads from it.
+fn render_model_combo(
+    ui: &mut egui::Ui,
+    id_salt: &str,
+    backend: &str,
+    current: &mut String,
+    models_by_backend: &HashMap<String, Vec<ModelSummary>>,
+) {
+    ComboBox::from_id_salt(id_salt)
+        .width(280.0)
+        .selected_text(if current.is_empty() {
+            "(pick a model)".to_string()
+        } else {
+            current.clone()
+        })
+        .show_ui(ui, |ui| {
+            if backend.is_empty() {
+                ui.label(
+                    RichText::new("(pick a backend first)")
+                        .italics()
+                        .color(Color32::from_gray(160)),
+                );
+                return;
+            }
+            match models_by_backend.get(backend) {
+                None => {
+                    ui.label(
+                        RichText::new("(loading models…)")
+                            .italics()
+                            .color(Color32::from_gray(160)),
+                    );
+                }
+                Some(list) if list.is_empty() => {
+                    ui.label(
+                        RichText::new("(backend returned no models)")
+                            .italics()
+                            .color(Color32::from_gray(160)),
+                    );
+                }
+                Some(list) => {
+                    for m in list {
+                        let label = match &m.display_name {
+                            Some(d) => format!("{}  ({})", m.id, d),
+                            None => m.id.clone(),
+                        };
+                        if ui.selectable_label(*current == m.id, label).clicked() {
+                            *current = m.id.clone();
+                        }
+                    }
+                }
+            }
+        });
 }
 
 /// Optional-string picker with override toggle + ComboBox of valid

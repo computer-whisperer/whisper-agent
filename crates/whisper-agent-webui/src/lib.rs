@@ -5,6 +5,7 @@
 //! and hands both to the [`ChatApp`].
 
 mod app;
+mod cron_preview;
 mod editor;
 
 pub use app::ChatApp;

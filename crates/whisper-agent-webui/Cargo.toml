@@ -29,6 +29,13 @@ similar = { version = "2", default-features = false, features = ["text"] }
 # output) and no syntect-backed `better_syntax_highlighting` (keeps
 # the wasm bundle small — plain monospace on code blocks reads fine).
 egui_commonmark = { version = "0.22", default-features = false, features = ["pulldown_cmark"] }
+# Cron + tz for the behavior-editor "next N fires" preview. Mirror the
+# server's parsers so what the editor shows matches what the scheduler
+# will fire. chrono's default features include `clock` + `wasmbind`,
+# so `Utc::now()` routes through `js_sys::Date::now()` on wasm32.
+cron = "0.16"
+chrono = "0.4"
+chrono-tz = "0.10"
 whisper-agent-protocol = { path = "../whisper-agent-protocol" }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
