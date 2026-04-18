@@ -20,7 +20,7 @@ pub use behavior::{
 };
 pub use conversation::{ContentBlock, Conversation, Message, Role, ToolResultContent};
 pub use pod::{
-    NamedHostEnv, PodAllow, PodConfig, PodLimits, PodSnapshot, PodSummary, ThreadDefaults,
+    NamedHostEnv, PodAllow, PodConfig, PodLimits, PodSnapshot, PodState, PodSummary, ThreadDefaults,
 };
 pub use sandbox::HostEnvSpec;
 
@@ -661,6 +661,26 @@ pub enum ClientToServer {
         pod_id: String,
         behavior_id: String,
     },
+    /// Pause / resume a single behavior. `enabled = false` gates the
+    /// cron tick, the webhook endpoint, and startup catch-up for this
+    /// behavior; any `QueueOne`-parked payload is dropped on pause.
+    /// Manual `RunBehavior` continues to work regardless.
+    SetBehaviorEnabled {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        correlation_id: Option<String>,
+        pod_id: String,
+        behavior_id: String,
+        enabled: bool,
+    },
+    /// Pod-level master switch for automatic behaviors. Overrides every
+    /// behavior in the pod while set — individual `enabled` flags are
+    /// still tracked and resume when the pod is re-enabled.
+    SetPodBehaviorsEnabled {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        correlation_id: Option<String>,
+        pod_id: String,
+        enabled: bool,
+    },
 }
 
 /// Messages the server sends to the client.
@@ -932,6 +952,17 @@ pub enum ServerToClient {
         correlation_id: Option<String>,
         pod_id: String,
         behavior_id: String,
+    },
+    /// Pod-level `behaviors_enabled` flag changed (via
+    /// `SetPodBehaviorsEnabled`). Individual `BehaviorStateChanged`
+    /// events still fire for per-behavior edits; this one covers the
+    /// pod-wide toggle so clients can badge the pod header without
+    /// inspecting every behavior.
+    PodBehaviorsEnabledChanged {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        correlation_id: Option<String>,
+        pod_id: String,
+        enabled: bool,
     },
 
     Error {

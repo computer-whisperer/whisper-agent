@@ -156,8 +156,15 @@ pub enum RetentionPolicy {
 /// Persistent trigger-firing state. Written to `<pod>/behaviors/<id>/state.json`.
 /// Maintained by the scheduler as triggers fire; load-only in phase 1
 /// (nothing fires yet, nothing writes it).
-#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub struct BehaviorState {
+    /// Automatic-trigger gate: when false, cron ticks skip this
+    /// behavior, webhook POSTs return 503, and startup catch-up
+    /// ignores it. Manual `RunBehavior` (the UI Run button) always
+    /// works regardless — it's an explicit user action. Default `true`
+    /// so legacy state.json files without the field behave as always.
+    #[serde(default = "enabled_default")]
+    pub enabled: bool,
     #[serde(default)]
     pub run_count: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -168,9 +175,26 @@ pub struct BehaviorState {
     pub last_outcome: Option<BehaviorOutcome>,
     /// `QueueOne` overlap policy parks a payload here when a fire arrives
     /// while the previous run is in flight. The next on-completion hook
-    /// consumes it.
+    /// consumes it. Dropped when the behavior is paused.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub queued_payload: Option<Value>,
+}
+
+fn enabled_default() -> bool {
+    true
+}
+
+impl Default for BehaviorState {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            run_count: 0,
+            last_fired_at: None,
+            last_thread_id: None,
+            last_outcome: None,
+            queued_payload: None,
+        }
+    }
 }
 
 /// Terminal outcome of the last behavior-spawned thread. Feeds into UI
@@ -220,6 +244,10 @@ pub struct BehaviorSummary {
     /// `None` when the behavior failed to load.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trigger_kind: Option<String>,
+    /// Mirrors `BehaviorState.enabled`. Carried on the summary so list
+    /// views can badge paused rows without a separate round-trip.
+    #[serde(default = "enabled_default")]
+    pub enabled: bool,
     #[serde(default)]
     pub run_count: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]

@@ -34,10 +34,11 @@ use tokio::fs;
 use tracing::{info, warn};
 
 use crate::pod::behaviors::{self as pod_behaviors};
-use crate::pod::{self, POD_TOML, Pod, PodId, THREADS_DIR};
+use crate::pod::{self, POD_STATE_JSON, POD_TOML, Pod, PodId, THREADS_DIR};
 use crate::runtime::thread::{Thread, ThreadInternalState};
 use whisper_agent_protocol::{
-    PodAllow, PodConfig, PodLimits, PodSnapshot, PodSummary, ThreadDefaults, ThreadSummary,
+    PodAllow, PodConfig, PodLimits, PodSnapshot, PodState, PodSummary, ThreadDefaults,
+    ThreadSummary,
 };
 
 /// Result of `Persister::load_all`. Pods and threads are kept side-by-side so
@@ -315,6 +316,7 @@ impl Persister {
             created_at: config.created_at,
             thread_count: 0,
             archived: false,
+            behaviors_enabled: true,
         })
     }
 
@@ -355,6 +357,35 @@ impl Persister {
     }
 }
 
+/// Load `pod_state.json` from a pod directory. Missing file or parse
+/// errors both fall back to `PodState::default()` — the flag is
+/// operational, not authoritative, so a corrupt file shouldn't wedge
+/// the pod on load.
+pub async fn load_pod_state(pod_dir: &Path) -> PodState {
+    let path = pod_dir.join(POD_STATE_JSON);
+    match fs::read(&path).await {
+        Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_else(|e| {
+            warn!(path = %path.display(), error = %e, "pod_state.json parse failed; defaulting");
+            PodState::default()
+        }),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => PodState::default(),
+        Err(e) => {
+            warn!(path = %path.display(), error = %e, "pod_state.json read failed; defaulting");
+            PodState::default()
+        }
+    }
+}
+
+/// Write `pod_state.json`. Overwrites unconditionally.
+pub async fn write_pod_state(pod_dir: &Path, state: &PodState) -> Result<()> {
+    let path = pod_dir.join(POD_STATE_JSON);
+    let json = serde_json::to_vec_pretty(state)?;
+    fs::write(&path, json)
+        .await
+        .with_context(|| format!("write {}", path.display()))?;
+    Ok(())
+}
+
 /// Reject pod ids containing path separators or other shell-hostile bits.
 /// Pod ids become directory names; we don't want `..` traversal or `/`-rooted
 /// absolute paths sneaking in via the wire.
@@ -385,6 +416,7 @@ async fn read_pod_summary(pod_id: &str, pod_dir: &Path) -> PodSummary {
         Err(_) => (pod_id.to_string(), None, "1970-01-01T00:00:00Z".to_string()),
     };
     let thread_count = count_threads(pod_dir).await;
+    let state = load_pod_state(pod_dir).await;
     PodSummary {
         pod_id: pod_id.to_string(),
         name,
@@ -392,6 +424,7 @@ async fn read_pod_summary(pod_id: &str, pod_dir: &Path) -> PodSummary {
         created_at,
         thread_count,
         archived: false,
+        behaviors_enabled: state.behaviors_enabled,
     }
 }
 
@@ -470,6 +503,7 @@ async fn load_pod(pod_dir: &Path, pod_id: &str) -> Result<(Pod, Vec<Thread>)> {
         raw_toml,
         system_prompt,
     );
+    pod.state = load_pod_state(pod_dir).await;
     for t in &threads {
         pod.threads.insert(t.id.clone());
     }

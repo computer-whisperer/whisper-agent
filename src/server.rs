@@ -285,6 +285,7 @@ async fn webhook_trigger_handler(
                 TriggerFireError::NotWebhookTrigger(_) | TriggerFireError::BehaviorLoadError(_) => {
                     StatusCode::CONFLICT
                 }
+                TriggerFireError::Paused => StatusCode::SERVICE_UNAVAILABLE,
             };
             (status, err.to_string()).into_response()
         }

@@ -117,6 +117,9 @@ pub enum TriggerFireError {
     NotWebhookTrigger(&'static str),
     /// Behavior is present but its `behavior.toml` failed to parse.
     BehaviorLoadError(String),
+    /// Behavior or its pod is paused. Webhook handler maps this to a
+    /// 503 so the caller knows to retry after resume.
+    Paused,
 }
 
 impl std::fmt::Display for TriggerFireError {
@@ -128,6 +131,7 @@ impl std::fmt::Display for TriggerFireError {
                 write!(f, "behavior is {kind}-triggered, not webhook")
             }
             Self::BehaviorLoadError(msg) => write!(f, "behavior load error: {msg}"),
+            Self::Paused => write!(f, "behavior or pod is paused"),
         }
     }
 }
@@ -1098,16 +1102,35 @@ impl Scheduler {
         payload: serde_json::Value,
         pending_io: &mut FuturesUnordered<SchedulerFuture>,
     ) -> Result<(), TriggerFireError> {
-        let behavior = self
-            .pods
-            .get(pod_id)
-            .ok_or(TriggerFireError::UnknownPod)?
+        let pod = self.pods.get(pod_id).ok_or(TriggerFireError::UnknownPod)?;
+        let behavior = pod
             .behaviors
             .get(behavior_id)
             .ok_or(TriggerFireError::UnknownBehavior)?;
+        if !pod.state.behaviors_enabled || !behavior.state.enabled {
+            return Err(TriggerFireError::Paused);
+        }
         let overlap = validate_webhook_target(behavior)?;
         self.fire_trigger(pod_id, behavior_id, payload, overlap, "webhook", pending_io);
         Ok(())
+    }
+
+    /// True when automatic triggers for this behavior should be
+    /// suppressed — either the behavior itself or its pod is paused.
+    /// Manual `RunBehavior` bypasses this check; it never calls here.
+    /// Unknown pod/behavior returns `true` (fail-closed) so a race
+    /// against a concurrent delete can't re-fire a dying behavior.
+    fn behavior_auto_paused(&self, pod_id: &str, behavior_id: &str) -> bool {
+        let Some(pod) = self.pods.get(pod_id) else {
+            return true;
+        };
+        if !pod.state.behaviors_enabled {
+            return true;
+        }
+        let Some(behavior) = pod.behaviors.get(behavior_id) else {
+            return true;
+        };
+        !behavior.state.enabled
     }
 
     fn apply_client_message(
@@ -1504,6 +1527,7 @@ impl Scheduler {
                     created_at: config.created_at.clone(),
                     thread_count: 0,
                     archived: false,
+                    behaviors_enabled: true,
                 };
                 self.pods.insert(pod_id.clone(), pod);
 
@@ -1773,6 +1797,27 @@ impl Scheduler {
                 behavior_id,
             } => {
                 self.handle_delete_behavior(conn_id, correlation_id, pod_id, behavior_id);
+            }
+            ClientToServer::SetBehaviorEnabled {
+                correlation_id,
+                pod_id,
+                behavior_id,
+                enabled,
+            } => {
+                self.handle_set_behavior_enabled(
+                    conn_id,
+                    correlation_id,
+                    pod_id,
+                    behavior_id,
+                    enabled,
+                );
+            }
+            ClientToServer::SetPodBehaviorsEnabled {
+                correlation_id,
+                pod_id,
+                enabled,
+            } => {
+                self.handle_set_pod_behaviors_enabled(conn_id, correlation_id, pod_id, enabled);
             }
             ClientToServer::ListModels {
                 correlation_id,
@@ -2089,6 +2134,10 @@ impl Scheduler {
                 })
             })
             .collect();
+        // Priming is cheap state-initialization; it runs even for
+        // paused behaviors so the moment they resume, we don't prime
+        // the cursor to a stale time. The actual fire-decision pass
+        // below honors the pause gate.
         for (pod_id, behavior_id) in to_prime {
             if let Some(pod) = self.pods.get_mut(&pod_id)
                 && let Some(behavior) = pod.behaviors.get_mut(&behavior_id)
@@ -2103,10 +2152,13 @@ impl Scheduler {
         // takes `&mut self.pods` and we can't hold an iteration borrow.
         let mut due: Vec<(String, String, whisper_agent_protocol::Overlap)> = Vec::new();
         for (pod_id, pod) in &self.pods {
-            if pod.archived {
+            if pod.archived || !pod.state.behaviors_enabled {
                 continue;
             }
             for (behavior_id, behavior) in &pod.behaviors {
+                if !behavior.state.enabled {
+                    continue;
+                }
                 let Some(cron) = behavior.cron.as_ref() else {
                     continue;
                 };
@@ -2263,7 +2315,13 @@ impl Scheduler {
         }
         let mut missed: Vec<Missed> = Vec::new();
         for (pod_id, pod) in &self.pods {
+            if !pod.state.behaviors_enabled {
+                continue;
+            }
             for (behavior_id, behavior) in &pod.behaviors {
+                if !behavior.state.enabled {
+                    continue;
+                }
                 let Some(cron) = behavior.cron.as_ref() else {
                     continue;
                 };
@@ -2441,23 +2499,32 @@ impl Scheduler {
         // Consume the queued payload: re-fire with it. Logged at warn
         // if the fire fails because a queued payload represents
         // user/trigger intent that's getting dropped on the floor —
-        // surface it rather than silently swallowing.
-        if let Some(payload) = queued
-            && let Err(e) = self.run_behavior(
+        // surface it rather than silently swallowing. Drop the
+        // payload entirely when the behavior or its pod is now
+        // paused: pause means "no automatic fires", and the queued
+        // payload was itself an automatic arrival.
+        if let Some(payload) = queued {
+            if self.behavior_auto_paused(&pod_id, &origin.behavior_id) {
+                tracing::debug!(
+                    pod_id = %pod_id,
+                    behavior_id = %origin.behavior_id,
+                    "dropping queued QueueOne payload: behavior/pod paused"
+                );
+            } else if let Err(e) = self.run_behavior(
                 None,
                 None,
                 &pod_id,
                 &origin.behavior_id,
                 Some(payload),
                 pending_io,
-            )
-        {
-            warn!(
-                pod_id = %pod_id,
-                behavior_id = %origin.behavior_id,
-                error = %e,
-                "queued QueueOne fire failed to spawn"
-            );
+            ) {
+                warn!(
+                    pod_id = %pod_id,
+                    behavior_id = %origin.behavior_id,
+                    error = %e,
+                    "queued QueueOne fire failed to spawn"
+                );
+            }
         }
     }
 
@@ -2685,6 +2752,156 @@ impl Scheduler {
         tokio::spawn(async move {
             if let Err(e) = crate::pod::behaviors::delete_on_disk(&pod_dir, &bid).await {
                 warn!(behavior_id = %bid, error = %e, "delete_behavior disk removal failed");
+            }
+        });
+    }
+
+    /// `SetBehaviorEnabled` handler. Pause / resume a single
+    /// behavior, mutating its `state.enabled` flag. On pause we also
+    /// drop any `QueueOne`-parked payload (pause means "no automatic
+    /// fires", and the queued payload was itself an automatic
+    /// arrival). On resume, if the behavior is cron-triggered we
+    /// bump `last_fired_at` to `now` so the scheduler doesn't
+    /// catch-up-fire for windows missed while paused.
+    fn handle_set_behavior_enabled(
+        &mut self,
+        conn_id: ConnId,
+        correlation_id: Option<String>,
+        pod_id: String,
+        behavior_id: String,
+        enabled: bool,
+    ) {
+        let Some(pod) = self.pods.get_mut(&pod_id) else {
+            self.send_behavior_error(
+                conn_id,
+                correlation_id,
+                "set_behavior_enabled",
+                format!("unknown pod `{pod_id}`"),
+            );
+            return;
+        };
+        let Some(behavior) = pod.behaviors.get_mut(&behavior_id) else {
+            self.send_behavior_error(
+                conn_id,
+                correlation_id,
+                "set_behavior_enabled",
+                format!("unknown behavior `{behavior_id}` under pod `{pod_id}`"),
+            );
+            return;
+        };
+        // `BehaviorStateChanged` has no correlation_id field — the
+        // broadcast-to-all covers the initiator too. correlation_id
+        // is only threaded through the error paths above.
+        let _ = correlation_id;
+        if behavior.state.enabled == enabled {
+            return;
+        }
+        behavior.state.enabled = enabled;
+        if !enabled {
+            behavior.state.queued_payload = None;
+        } else if behavior.cron.is_some() {
+            behavior.state.last_fired_at = Some(chrono::Utc::now().to_rfc3339());
+        }
+        let snapshot_state = behavior.state.clone();
+        self.mark_behavior_dirty(&pod_id, &behavior_id);
+        self.router
+            .broadcast_task_list(ServerToClient::BehaviorStateChanged {
+                pod_id,
+                behavior_id,
+                state: snapshot_state,
+            });
+    }
+
+    /// `SetPodBehaviorsEnabled` handler. Flip the pod's master switch
+    /// for automatic behavior triggers. Pause clears every per-
+    /// behavior queued payload (same pause-semantics as the single-
+    /// behavior handler). Resume bumps every cron behavior's cursor
+    /// to `now` so catch-up doesn't replay missed windows.
+    fn handle_set_pod_behaviors_enabled(
+        &mut self,
+        conn_id: ConnId,
+        correlation_id: Option<String>,
+        pod_id: String,
+        enabled: bool,
+    ) {
+        let Some(pod) = self.pods.get_mut(&pod_id) else {
+            self.send_behavior_error(
+                conn_id,
+                correlation_id,
+                "set_pod_behaviors_enabled",
+                format!("unknown pod `{pod_id}`"),
+            );
+            return;
+        };
+        if pod.state.behaviors_enabled == enabled {
+            self.router.send_to_client(
+                conn_id,
+                ServerToClient::PodBehaviorsEnabledChanged {
+                    correlation_id,
+                    pod_id,
+                    enabled,
+                },
+            );
+            return;
+        }
+        pod.state.behaviors_enabled = enabled;
+        let pod_state_snapshot = pod.state.clone();
+        let pod_dir = pod.dir.clone();
+        // Touch every behavior: drop queued payload on pause, bump
+        // cron cursor on resume. Collect the ids first so we can
+        // broadcast after releasing the &mut pod borrow.
+        let mut changed_behaviors: Vec<(String, whisper_agent_protocol::BehaviorState)> =
+            Vec::new();
+        let now_rfc = chrono::Utc::now().to_rfc3339();
+        for (bid, behavior) in pod.behaviors.iter_mut() {
+            let mut changed = false;
+            if !enabled && behavior.state.queued_payload.is_some() {
+                behavior.state.queued_payload = None;
+                changed = true;
+            }
+            if enabled && behavior.cron.is_some() && behavior.state.enabled {
+                behavior.state.last_fired_at = Some(now_rfc.clone());
+                changed = true;
+            }
+            if changed {
+                changed_behaviors.push((bid.clone(), behavior.state.clone()));
+            }
+        }
+        for (bid, _) in &changed_behaviors {
+            self.mark_behavior_dirty(&pod_id, bid);
+        }
+        let ev = ServerToClient::PodBehaviorsEnabledChanged {
+            correlation_id: None,
+            pod_id: pod_id.clone(),
+            enabled,
+        };
+        self.router.broadcast_task_list_except(ev, conn_id);
+        self.router.send_to_client(
+            conn_id,
+            ServerToClient::PodBehaviorsEnabledChanged {
+                correlation_id,
+                pod_id: pod_id.clone(),
+                enabled,
+            },
+        );
+        for (bid, state) in changed_behaviors {
+            self.router
+                .broadcast_task_list(ServerToClient::BehaviorStateChanged {
+                    pod_id: pod_id.clone(),
+                    behavior_id: bid,
+                    state,
+                });
+        }
+        // Persist pod_state.json. Background write; failure warns.
+        tokio::spawn(async move {
+            if let Err(e) =
+                crate::pod::persist::write_pod_state(&pod_dir, &pod_state_snapshot).await
+            {
+                warn!(
+                    pod_dir = %pod_dir.display(),
+                    error = %e,
+                    "write pod_state.json failed"
+                );
             }
         });
     }

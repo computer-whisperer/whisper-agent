@@ -619,11 +619,28 @@ impl NewBehaviorModalState {
 /// (opening modals, sending wire messages) out of the nested borrow.
 enum BehaviorRowAction {
     New,
-    Edit { pod_id: String, behavior_id: String },
-    Run { pod_id: String, behavior_id: String },
-    ArmDelete { pod_id: String, behavior_id: String },
+    Edit {
+        pod_id: String,
+        behavior_id: String,
+    },
+    Run {
+        pod_id: String,
+        behavior_id: String,
+    },
+    ArmDelete {
+        pod_id: String,
+        behavior_id: String,
+    },
     DisarmDelete,
-    ConfirmDelete { pod_id: String, behavior_id: String },
+    ConfirmDelete {
+        pod_id: String,
+        behavior_id: String,
+    },
+    SetEnabled {
+        pod_id: String,
+        behavior_id: String,
+        enabled: bool,
+    },
 }
 
 /// Validate a pod_id against the rules `Persister::create_pod` will
@@ -1290,6 +1307,16 @@ impl ChatApp {
                 {
                     row.run_count = state.run_count;
                     row.last_fired_at = state.last_fired_at.clone();
+                    row.enabled = state.enabled;
+                }
+            }
+            ServerToClient::PodBehaviorsEnabledChanged {
+                correlation_id: _,
+                pod_id,
+                enabled,
+            } => {
+                if let Some(pod) = self.pods.get_mut(&pod_id) {
+                    pod.behaviors_enabled = enabled;
                 }
             }
             ServerToClient::BehaviorCreated {
@@ -2085,13 +2112,19 @@ impl ChatApp {
         pod_id: &str,
         thread_ids: Option<&[String]>,
     ) {
-        let label = match self.pods.get(pod_id) {
-            Some(summary) => format!(
-                "{}  ({})",
-                summary.name,
-                thread_ids.map(|t| t.len()).unwrap_or(0)
+        let (label, pod_behaviors_enabled) = match self.pods.get(pod_id) {
+            Some(summary) => (
+                format!(
+                    "{}  ({})",
+                    summary.name,
+                    thread_ids.map(|t| t.len()).unwrap_or(0)
+                ),
+                summary.behaviors_enabled,
             ),
-            None => format!("{pod_id}  ({})", thread_ids.map(|t| t.len()).unwrap_or(0)),
+            None => (
+                format!("{pod_id}  ({})", thread_ids.map(|t| t.len()).unwrap_or(0)),
+                true,
+            ),
         };
         let collapsed_id = format!("pod-section-{pod_id}");
         let default_open = !self.collapsed_pods.contains(pod_id);
@@ -2100,6 +2133,7 @@ impl ChatApp {
         let mut archive_confirmed = false;
         let mut archive_disarm = false;
         let mut edit_config_clicked = false;
+        let mut toggle_pod_behaviors_to: Option<bool> = None;
         let mut behavior_actions: Vec<BehaviorRowAction> = Vec::new();
         let header = egui::CollapsingHeader::new(RichText::new(label).strong())
             .id_salt(&collapsed_id)
@@ -2120,6 +2154,24 @@ impl ChatApp {
                         .clicked()
                     {
                         edit_config_clicked = true;
+                    }
+                    let pod_pause_label = if pod_behaviors_enabled {
+                        "Pause behaviors"
+                    } else {
+                        "Resume behaviors"
+                    };
+                    if ui
+                        .small_button(RichText::new(pod_pause_label).small())
+                        .clicked()
+                    {
+                        toggle_pod_behaviors_to = Some(!pod_behaviors_enabled);
+                    }
+                    if !pod_behaviors_enabled {
+                        ui.label(
+                            RichText::new("paused")
+                                .small()
+                                .color(Color32::from_rgb(220, 170, 90)),
+                        );
                     }
                     if !is_default_pod {
                         let armed = self.archive_armed_pod.as_deref() == Some(pod_id);
@@ -2202,6 +2254,13 @@ impl ChatApp {
         }
         if edit_config_clicked {
             self.open_pod_editor(pod_id.to_string());
+        }
+        if let Some(enabled) = toggle_pod_behaviors_to {
+            self.send(ClientToServer::SetPodBehaviorsEnabled {
+                correlation_id: None,
+                pod_id: pod_id.to_string(),
+                enabled,
+            });
         }
         self.apply_behavior_row_actions(pod_id, behavior_actions);
     }
@@ -2293,10 +2352,19 @@ impl ChatApp {
             };
             let color = if row.load_error.is_some() {
                 Color32::from_rgb(220, 120, 120)
+            } else if !row.enabled {
+                Color32::from_gray(130)
             } else {
                 Color32::from_gray(210)
             };
             ui.label(RichText::new(label_text).small().color(color));
+            if !row.enabled {
+                ui.label(
+                    RichText::new("paused")
+                        .small()
+                        .color(Color32::from_rgb(220, 170, 90)),
+                );
+            }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 let armed = self
                     .delete_armed_behavior
@@ -2350,6 +2418,17 @@ impl ChatApp {
                         actions.push(BehaviorRowAction::Run {
                             pod_id: row.pod_id.clone(),
                             behavior_id: row.behavior_id.clone(),
+                        });
+                    }
+                    let pause_label = if row.enabled { "Pause" } else { "Resume" };
+                    if ui
+                        .small_button(RichText::new(pause_label).small())
+                        .clicked()
+                    {
+                        actions.push(BehaviorRowAction::SetEnabled {
+                            pod_id: row.pod_id.clone(),
+                            behavior_id: row.behavior_id.clone(),
+                            enabled: !row.enabled,
                         });
                     }
                 }
@@ -2411,6 +2490,18 @@ impl ChatApp {
                         correlation_id: None,
                         pod_id,
                         behavior_id,
+                    });
+                }
+                BehaviorRowAction::SetEnabled {
+                    pod_id,
+                    behavior_id,
+                    enabled,
+                } => {
+                    self.send(ClientToServer::SetBehaviorEnabled {
+                        correlation_id: None,
+                        pod_id,
+                        behavior_id,
+                        enabled,
                     });
                 }
             }
@@ -5538,6 +5629,7 @@ fn behavior_summary_from_snapshot(snapshot: &BehaviorSnapshotProto) -> BehaviorS
         name,
         description,
         trigger_kind,
+        enabled: snapshot.state.enabled,
         run_count: snapshot.state.run_count,
         last_fired_at: snapshot.state.last_fired_at.clone(),
         load_error: snapshot.load_error.clone(),

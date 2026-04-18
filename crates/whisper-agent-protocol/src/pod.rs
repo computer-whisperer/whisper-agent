@@ -108,6 +108,37 @@ pub struct PodSummary {
     pub created_at: String,
     pub thread_count: u32,
     pub archived: bool,
+    /// Mirrors `PodState.behaviors_enabled`. When false, every
+    /// behavior in the pod is gated off regardless of its individual
+    /// `BehaviorState.enabled`. Carried here so the pod list can badge
+    /// without fetching the full pod state.
+    #[serde(default = "pod_behaviors_enabled_default")]
+    pub behaviors_enabled: bool,
+}
+
+fn pod_behaviors_enabled_default() -> bool {
+    true
+}
+
+/// Per-pod operational state (not config). Written to
+/// `<pod>/pod_state.json`. Kept out of `pod.toml` so operational
+/// toggles like pause/resume don't touch version-controlled config.
+/// Absent file ⇒ all fields at their defaults.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct PodState {
+    /// Master switch for automatic behavior triggers (cron + webhook)
+    /// across this pod. Manual `RunBehavior` always works. Default
+    /// `true` so a pod without a state file behaves normally.
+    #[serde(default = "pod_behaviors_enabled_default")]
+    pub behaviors_enabled: bool,
+}
+
+impl Default for PodState {
+    fn default() -> Self {
+        Self {
+            behaviors_enabled: true,
+        }
+    }
 }
 
 /// Full pod state delivered in response to `GetPod`. Carries both the parsed

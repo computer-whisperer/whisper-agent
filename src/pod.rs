@@ -26,7 +26,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
 use thiserror::Error;
-use whisper_agent_protocol::PodConfig;
+use whisper_agent_protocol::{PodConfig, PodState};
 
 use crate::pod::behaviors::{Behavior, BehaviorId};
 
@@ -37,6 +37,10 @@ pub type ThreadId = String;
 pub const POD_TOML: &str = "pod.toml";
 /// Subdirectory under the pod that holds per-thread JSON files.
 pub const THREADS_DIR: &str = "threads";
+/// Filename of the per-pod operational state (pause flag, etc.).
+/// Kept out of `pod.toml` so pause/resume doesn't touch
+/// version-controlled config.
+pub const POD_STATE_JSON: &str = "pod_state.json";
 
 /// In-memory representation of a pod the scheduler is currently tracking.
 ///
@@ -62,6 +66,9 @@ pub struct Pod {
     /// has no behaviors subdirectory. Keyed by behavior id (== directory
     /// name); sorted iteration matches on-disk lexical order.
     pub behaviors: BTreeMap<BehaviorId, Behavior>,
+    /// Operational state persisted to `<pod>/pod_state.json`. Defaults
+    /// to enabled when the file is absent.
+    pub state: PodState,
     pub archived: bool,
 }
 
@@ -81,6 +88,7 @@ impl Pod {
             system_prompt,
             threads: BTreeSet::new(),
             behaviors: BTreeMap::new(),
+            state: PodState::default(),
             archived: false,
         }
     }

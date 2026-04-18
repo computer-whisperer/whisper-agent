@@ -90,6 +90,7 @@ impl Behavior {
             name,
             description,
             trigger_kind,
+            enabled: self.state.enabled,
             run_count: self.state.run_count,
             last_fired_at: self.state.last_fired_at.clone(),
             load_error: self.load_error.clone(),
