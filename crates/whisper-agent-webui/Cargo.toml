@@ -19,7 +19,7 @@ ciborium = "0.2"
 # `PodConfig` with the server (server expects raw TOML in
 # `UpdatePodConfig`). `default-features = false` drops the parse-spans
 # feature we don't need, keeping the wasm bundle lean.
-toml = { version = "0.8", default-features = false, features = ["display", "parse"] }
+toml = { version = "1", default-features = false, features = ["display", "parse"] }
 # `similar` powers the unified-diff renderer for edit_file / write_file
 # tool calls. Default features include `bytes` + `text`; we only need
 # the text diff API.

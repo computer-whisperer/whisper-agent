@@ -39,5 +39,5 @@ cron = "0.16"
 axum = { version = "0.8", features = ["ws"] }
 tower-http = { version = "0.6", features = ["fs", "trace"] }
 whisper-agent-protocol = { path = "crates/whisper-agent-protocol" }
-toml = "0.8"
+toml = "1"
 base64 = "0.22"
