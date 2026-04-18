@@ -66,6 +66,54 @@ impl ConnectionStatus {
     }
 }
 
+/// How many thread rows to show under each sidebar subsection (interactive
+/// threads and each behavior bucket) before the "Show N more" affordance
+/// collapses the tail. Keeps long-running behavior pods from drowning the
+/// sidebar in repeated rows.
+const THREAD_ROW_PREVIEW_COUNT: usize = 3;
+
+// Shared palette for the sidebar. Named so the hierarchy is explicit and
+// so the panel's tone doesn't drift as new rows/captions are added.
+const SIDEBAR_SUBSECTION_COLOR: Color32 = Color32::from_gray(200);
+const SIDEBAR_BODY_COLOR: Color32 = Color32::from_gray(210);
+const SIDEBAR_MUTED_COLOR: Color32 = Color32::from_gray(150);
+const SIDEBAR_DIM_COLOR: Color32 = Color32::from_gray(130);
+const SIDEBAR_DANGER_COLOR: Color32 = Color32::from_rgb(220, 90, 90);
+const SIDEBAR_WARNING_COLOR: Color32 = Color32::from_rgb(220, 170, 90);
+const SIDEBAR_ERROR_TEXT_COLOR: Color32 = Color32::from_rgb(220, 120, 120);
+
+/// Small-bold subsection header under a pod section ("Interactive",
+/// "Behaviors", "Deleted behaviors").
+fn sidebar_subsection_header(ui: &mut egui::Ui, text: impl Into<String>) {
+    ui.label(
+        RichText::new(text.into())
+            .small()
+            .strong()
+            .color(SIDEBAR_SUBSECTION_COLOR),
+    );
+}
+
+/// Compact sidebar button with uniform padding, optionally disabled.
+/// Wraps `add_enabled` so the enabled-vs-disabled variants share the
+/// same `Button::small()` frame.
+fn sidebar_button(ui: &mut egui::Ui, text: RichText, enabled: bool) -> egui::Response {
+    ui.add_enabled(enabled, egui::Button::new(text.small()).small())
+}
+
+/// Full-width, left-aligned selectable row for the sidebar thread list.
+/// `ui.add_sized(...)` would wrap the widget in
+/// `Layout::centered_and_justified`, which centers the button's text;
+/// cross-justifying a top-down-left layout keeps the rounded highlight
+/// full-width while the button reads `ui.layout()` to left-align its
+/// label.
+fn add_sidebar_thread_row(ui: &mut egui::Ui, selected: bool, text: RichText) -> egui::Response {
+    let layout = egui::Layout::top_down(egui::Align::LEFT).with_cross_justify(true);
+    ui.allocate_ui_with_layout(egui::Vec2::new(ui.available_width(), 0.0), layout, |ui| {
+        ui.add(egui::Button::selectable(selected, text.small()))
+    })
+    .inner
+}
+
 fn state_chip(state: ThreadStateLabel) -> (&'static str, Color32) {
     match state {
         ThreadStateLabel::Idle => ("idle", Color32::from_gray(160)),
@@ -278,6 +326,13 @@ pub struct ChatApp {
     /// Default is "all expanded"; toggling a header inverts membership.
     /// Persisted only in memory — re-expands across reloads.
     collapsed_pods: HashSet<String>,
+    /// Pod ids whose interactive-threads subsection is expanded past the
+    /// default preview count. Absence = show the first
+    /// `THREAD_ROW_PREVIEW_COUNT` rows with a "Show N more" affordance.
+    expanded_interactive_pods: HashSet<String>,
+    /// `(pod_id, behavior_id)` pairs whose thread list is expanded past
+    /// the default preview count. Absence = preview mode.
+    expanded_behavior_threads: HashSet<(String, String)>,
     /// Modal state for the "+ New pod" form. `None` = closed.
     new_pod_modal: Option<NewPodModalState>,
     /// Pod id whose "Archive" button has been clicked once and is waiting
@@ -641,6 +696,17 @@ enum BehaviorRowAction {
         behavior_id: String,
         enabled: bool,
     },
+    /// User clicked a thread row nested under a behavior bucket.
+    SelectThread {
+        thread_id: String,
+    },
+    /// User clicked the "Show N more" / "Show less" affordance under a
+    /// behavior bucket. Toggles membership in
+    /// `AppState::expanded_behavior_threads`.
+    ToggleExpandThreads {
+        pod_id: String,
+        behavior_id: String,
+    },
 }
 
 /// Validate a pod_id against the rules `Persister::create_pod` will
@@ -704,6 +770,8 @@ impl ChatApp {
             host_env_providers: Vec::new(),
             host_env_providers_requested: false,
             collapsed_pods: HashSet::new(),
+            expanded_interactive_pods: HashSet::new(),
+            expanded_behavior_threads: HashSet::new(),
             new_pod_modal: None,
             archive_armed_pod: None,
             pod_editor_modal: None,
@@ -2055,6 +2123,14 @@ impl ChatApp {
     /// in practice when a thread arrives via `ThreadCreated` before the
     /// `ListPods` round-trip completes.
     fn render_thread_tree(&mut self, ui: &mut egui::Ui) {
+        // Scale the sidebar's Small text style up so subsection headers,
+        // thread rows, and sub-buttons read at a comfortable size while
+        // pod-name headings (TextStyle::Body) stay at their default. The
+        // mutation is scoped to this ui via Arc COW.
+        if let Some(small) = ui.style_mut().text_styles.get_mut(&egui::TextStyle::Small) {
+            small.size *= 1.2;
+        }
+
         ui.horizontal(|ui| {
             if ui.button("+ New thread").clicked() {
                 self.selected = None;
@@ -2140,19 +2216,13 @@ impl ChatApp {
             .default_open(default_open)
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
-                    if ui
-                        .small_button(RichText::new("+ Thread in this pod").small())
-                        .clicked()
-                    {
+                    if sidebar_button(ui, RichText::new("+ Thread in this pod"), true).clicked() {
                         self.selected = None;
                         self.composing_new = true;
                         self.compose_pod_id = Some(pod_id.to_string());
                         self.input.clear();
                     }
-                    if ui
-                        .small_button(RichText::new("Edit config").small())
-                        .clicked()
-                    {
+                    if sidebar_button(ui, RichText::new("Edit config"), true).clicked() {
                         edit_config_clicked = true;
                     }
                     let pod_pause_label = if pod_behaviors_enabled {
@@ -2160,81 +2230,69 @@ impl ChatApp {
                     } else {
                         "Resume behaviors"
                     };
-                    if ui
-                        .small_button(RichText::new(pod_pause_label).small())
-                        .clicked()
-                    {
+                    if sidebar_button(ui, RichText::new(pod_pause_label), true).clicked() {
                         toggle_pod_behaviors_to = Some(!pod_behaviors_enabled);
                     }
                     if !pod_behaviors_enabled {
-                        ui.label(
-                            RichText::new("paused")
-                                .small()
-                                .color(Color32::from_rgb(220, 170, 90)),
-                        );
+                        ui.label(RichText::new("paused").small().color(SIDEBAR_WARNING_COLOR));
                     }
                     if !is_default_pod {
                         let armed = self.archive_armed_pod.as_deref() == Some(pod_id);
                         if armed {
-                            if ui
-                                .small_button(
-                                    RichText::new("Confirm archive")
-                                        .small()
-                                        .color(Color32::from_rgb(220, 90, 90)),
-                                )
-                                .clicked()
+                            if sidebar_button(
+                                ui,
+                                RichText::new("Confirm archive").color(SIDEBAR_DANGER_COLOR),
+                                true,
+                            )
+                            .clicked()
                             {
                                 archive_confirmed = true;
                             }
-                            if ui.small_button(RichText::new("Cancel").small()).clicked() {
+                            if sidebar_button(ui, RichText::new("Cancel"), true).clicked() {
                                 archive_disarm = true;
                             }
-                        } else if ui
-                            .small_button(
-                                RichText::new("Archive")
-                                    .small()
-                                    .color(Color32::from_gray(160)),
-                            )
-                            .clicked()
+                        } else if sidebar_button(
+                            ui,
+                            RichText::new("Archive").color(SIDEBAR_MUTED_COLOR),
+                            true,
+                        )
+                        .clicked()
                         {
                             archive_clicked = true;
                         }
                     }
                 });
+                // Partition the pod's threads into interactive (origin=None)
+                // vs. per-behavior buckets. Each `thread_ids` slice is already
+                // newest-first (inherits task_order), so the per-bucket Vecs
+                // land newest-first too.
+                let mut interactive: Vec<String> = Vec::new();
+                let mut by_behavior: HashMap<String, Vec<String>> = HashMap::new();
                 if let Some(thread_ids) = thread_ids {
-                    for thread_id in thread_ids {
-                        let Some(view) = self.tasks.get(thread_id) else {
+                    for tid in thread_ids {
+                        let Some(view) = self.tasks.get(tid) else {
                             continue;
                         };
-                        let is_selected = self.selected.as_deref() == Some(thread_id.as_str());
-                        let title =
-                            view.summary.title.clone().unwrap_or_else(|| {
-                                thread_id[..thread_id.len().min(14)].to_string()
-                            });
-                        let (chip, chip_color) = state_chip(view.summary.state);
-                        let row = ui.add_sized(
-                            [ui.available_width(), 0.0],
-                            egui::Button::selectable(
-                                is_selected,
-                                RichText::new(format!("{title}  [{chip}]")).color(if is_selected {
-                                    Color32::WHITE
-                                } else {
-                                    chip_color
-                                }),
-                            ),
-                        );
-                        if row.clicked() {
-                            self.select_task(thread_id.clone());
+                        match &view.summary.origin {
+                            None => interactive.push(tid.clone()),
+                            Some(origin) => by_behavior
+                                .entry(origin.behavior_id.clone())
+                                .or_default()
+                                .push(tid.clone()),
                         }
                     }
-                } else {
+                }
+                let has_any_threads = !interactive.is_empty() || !by_behavior.is_empty();
+                self.render_interactive_threads(ui, pod_id, &interactive);
+                self.render_behaviors_panel(ui, pod_id, &by_behavior, &mut behavior_actions);
+                if !has_any_threads {
                     ui.label(
                         RichText::new("(no threads)")
+                            .small()
                             .italics()
-                            .color(Color32::from_gray(140)),
+                            .color(SIDEBAR_MUTED_COLOR),
                     );
                 }
-                self.render_behaviors_panel(ui, pod_id, &mut behavior_actions);
             });
         // Track collapse state so it persists across renders.
         if header.fully_closed() {
@@ -2299,43 +2357,70 @@ impl ChatApp {
         self.behavior_editor_modal = Some(BehaviorEditorModalState::new(pod_id, behavior_id));
     }
 
-    /// Render the behaviors sub-section of a pod header. Produces
+    /// Render the behaviors sub-section of a pod header, with each
+    /// behavior's recent threads nested underneath its row. Produces
     /// `BehaviorRowAction` tokens in `actions` for the enclosing
     /// `render_pod_section` to act on after the closure returns — keeps
     /// mutating state (sending wire messages, opening modals) out of
     /// the rendering closure where the egui borrow graph is ugly.
+    ///
+    /// `threads_by_behavior` is keyed by `behavior_id`; any entry whose
+    /// key is not in `behaviors_by_pod[pod_id]` is rendered as an
+    /// orphan bucket under "Deleted behaviors" — threads spawned by a
+    /// behavior that was later removed still deserve to be visible and
+    /// selectable.
     fn render_behaviors_panel(
         &self,
         ui: &mut egui::Ui,
         pod_id: &str,
+        threads_by_behavior: &HashMap<String, Vec<String>>,
         actions: &mut Vec<BehaviorRowAction>,
     ) {
         ui.add_space(4.0);
         ui.separator();
         ui.horizontal(|ui| {
-            ui.label(
-                RichText::new("Behaviors")
-                    .small()
-                    .color(Color32::from_gray(180)),
-            );
-            if ui.small_button(RichText::new("+ New").small()).clicked() {
+            sidebar_subsection_header(ui, "Behaviors");
+            if sidebar_button(ui, RichText::new("+ New"), true).clicked() {
                 actions.push(BehaviorRowAction::New);
             }
         });
-        let behaviors = match self.behaviors_by_pod.get(pod_id) {
-            Some(list) if !list.is_empty() => list,
-            _ => {
-                ui.label(
-                    RichText::new("  (none)")
-                        .small()
-                        .italics()
-                        .color(Color32::from_gray(140)),
-                );
-                return;
-            }
-        };
+        let empty: Vec<BehaviorSummary> = Vec::new();
+        let behaviors = self.behaviors_by_pod.get(pod_id).unwrap_or(&empty);
+        if behaviors.is_empty() && threads_by_behavior.is_empty() {
+            ui.label(
+                RichText::new("  (none)")
+                    .small()
+                    .italics()
+                    .color(SIDEBAR_MUTED_COLOR),
+            );
+            return;
+        }
         for row in behaviors {
-            self.render_behavior_row(ui, row, actions);
+            let threads = threads_by_behavior
+                .get(&row.behavior_id)
+                .map(|v| v.as_slice())
+                .unwrap_or(&[]);
+            self.render_behavior_row(ui, row, threads, actions);
+        }
+        // Orphan threads: behavior_id present in threads_by_behavior but not
+        // in the known behaviors list. Typically means the behavior was
+        // deleted while its spawned threads are still around.
+        let known: HashSet<&str> = behaviors.iter().map(|b| b.behavior_id.as_str()).collect();
+        let mut orphan_ids: Vec<&String> = threads_by_behavior
+            .keys()
+            .filter(|k| !known.contains(k.as_str()))
+            .collect();
+        orphan_ids.sort();
+        if !orphan_ids.is_empty() {
+            ui.add_space(2.0);
+            sidebar_subsection_header(ui, "Deleted behaviors");
+            for behavior_id in orphan_ids {
+                let threads = threads_by_behavior
+                    .get(behavior_id)
+                    .map(|v| v.as_slice())
+                    .unwrap_or(&[]);
+                self.render_orphan_behavior_threads(ui, pod_id, behavior_id, threads, actions);
+            }
         }
     }
 
@@ -2343,6 +2428,7 @@ impl ChatApp {
         &self,
         ui: &mut egui::Ui,
         row: &BehaviorSummary,
+        threads: &[String],
         actions: &mut Vec<BehaviorRowAction>,
     ) {
         ui.horizontal(|ui| {
@@ -2351,19 +2437,15 @@ impl ChatApp {
                 None => format!("{}  [errored]", row.name),
             };
             let color = if row.load_error.is_some() {
-                Color32::from_rgb(220, 120, 120)
+                SIDEBAR_ERROR_TEXT_COLOR
             } else if !row.enabled {
-                Color32::from_gray(130)
+                SIDEBAR_DIM_COLOR
             } else {
-                Color32::from_gray(210)
+                SIDEBAR_BODY_COLOR
             };
-            ui.label(RichText::new(label_text).small().color(color));
+            ui.label(RichText::new(label_text).small().strong().color(color));
             if !row.enabled {
-                ui.label(
-                    RichText::new("paused")
-                        .small()
-                        .color(Color32::from_rgb(220, 170, 90)),
-                );
+                ui.label(RichText::new("paused").small().color(SIDEBAR_WARNING_COLOR));
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 let armed = self
@@ -2372,29 +2454,23 @@ impl ChatApp {
                     .map(|(p, b)| p == &row.pod_id && b == &row.behavior_id)
                     .unwrap_or(false);
                 if armed {
-                    if ui
-                        .small_button(
-                            RichText::new("Confirm")
-                                .small()
-                                .color(Color32::from_rgb(220, 90, 90)),
-                        )
-                        .clicked()
+                    if sidebar_button(
+                        ui,
+                        RichText::new("Confirm").color(SIDEBAR_DANGER_COLOR),
+                        true,
+                    )
+                    .clicked()
                     {
                         actions.push(BehaviorRowAction::ConfirmDelete {
                             pod_id: row.pod_id.clone(),
                             behavior_id: row.behavior_id.clone(),
                         });
                     }
-                    if ui.small_button(RichText::new("Cancel").small()).clicked() {
+                    if sidebar_button(ui, RichText::new("Cancel"), true).clicked() {
                         actions.push(BehaviorRowAction::DisarmDelete);
                     }
                 } else {
-                    if ui
-                        .small_button(
-                            RichText::new("Delete")
-                                .small()
-                                .color(Color32::from_gray(160)),
-                        )
+                    if sidebar_button(ui, RichText::new("Delete").color(SIDEBAR_MUTED_COLOR), true)
                         .clicked()
                     {
                         actions.push(BehaviorRowAction::ArmDelete {
@@ -2402,7 +2478,7 @@ impl ChatApp {
                             behavior_id: row.behavior_id.clone(),
                         });
                     }
-                    if ui.small_button(RichText::new("Edit").small()).clicked() {
+                    if sidebar_button(ui, RichText::new("Edit"), true).clicked() {
                         actions.push(BehaviorRowAction::Edit {
                             pod_id: row.pod_id.clone(),
                             behavior_id: row.behavior_id.clone(),
@@ -2411,20 +2487,14 @@ impl ChatApp {
                     // Errored behaviors can't be run — disable Run until
                     // the user fixes the config.
                     let run_enabled = row.load_error.is_none();
-                    if ui
-                        .add_enabled(run_enabled, egui::Button::new(RichText::new("Run").small()))
-                        .clicked()
-                    {
+                    if sidebar_button(ui, RichText::new("Run"), run_enabled).clicked() {
                         actions.push(BehaviorRowAction::Run {
                             pod_id: row.pod_id.clone(),
                             behavior_id: row.behavior_id.clone(),
                         });
                     }
                     let pause_label = if row.enabled { "Pause" } else { "Resume" };
-                    if ui
-                        .small_button(RichText::new(pause_label).small())
-                        .clicked()
-                    {
+                    if sidebar_button(ui, RichText::new(pause_label), true).clicked() {
                         actions.push(BehaviorRowAction::SetEnabled {
                             pod_id: row.pod_id.clone(),
                             behavior_id: row.behavior_id.clone(),
@@ -2438,14 +2508,169 @@ impl ChatApp {
             ui.label(
                 RichText::new(format!("  ⚠ {err}"))
                     .small()
-                    .color(Color32::from_rgb(200, 120, 120)),
+                    .color(SIDEBAR_ERROR_TEXT_COLOR),
             );
         } else if let Some(last) = &row.last_fired_at {
             ui.label(
                 RichText::new(format!("  last fired: {last}"))
                     .small()
-                    .color(Color32::from_gray(140)),
+                    .color(SIDEBAR_MUTED_COLOR),
             );
+        }
+        if !threads.is_empty() {
+            self.render_nested_thread_list(ui, &row.pod_id, &row.behavior_id, threads, actions);
+        }
+    }
+
+    /// Render threads spawned by a behavior whose config is no longer in
+    /// `behaviors_by_pod` — usually because the behavior was deleted.
+    /// Still selectable so the user can archive/review the surviving
+    /// thread rows.
+    fn render_orphan_behavior_threads(
+        &self,
+        ui: &mut egui::Ui,
+        pod_id: &str,
+        behavior_id: &str,
+        threads: &[String],
+        actions: &mut Vec<BehaviorRowAction>,
+    ) {
+        ui.label(
+            RichText::new(format!("  {behavior_id}  ({})", threads.len()))
+                .small()
+                .italics()
+                .color(SIDEBAR_MUTED_COLOR),
+        );
+        self.render_nested_thread_list(ui, pod_id, behavior_id, threads, actions);
+    }
+
+    /// Shared renderer for a behavior's (or orphan bucket's) recent
+    /// threads. Shows the first `THREAD_ROW_PREVIEW_COUNT` rows by default
+    /// with a "Show N more" toggle; when expanded, reveals the full list
+    /// with a "Show less" toggle.
+    fn render_nested_thread_list(
+        &self,
+        ui: &mut egui::Ui,
+        pod_id: &str,
+        behavior_id: &str,
+        threads: &[String],
+        actions: &mut Vec<BehaviorRowAction>,
+    ) {
+        let key = (pod_id.to_string(), behavior_id.to_string());
+        let expanded = self.expanded_behavior_threads.contains(&key);
+        let shown = if expanded {
+            threads.len()
+        } else {
+            threads.len().min(THREAD_ROW_PREVIEW_COUNT)
+        };
+        for tid in &threads[..shown] {
+            self.render_nested_thread_button(ui, tid, actions);
+        }
+        let hidden = threads.len().saturating_sub(shown);
+        let toggle_clicked = if hidden > 0 {
+            sidebar_button(ui, RichText::new(format!("Show {hidden} more")), true).clicked()
+        } else if expanded && threads.len() > THREAD_ROW_PREVIEW_COUNT {
+            sidebar_button(ui, RichText::new("Show less"), true).clicked()
+        } else {
+            false
+        };
+        if toggle_clicked {
+            actions.push(BehaviorRowAction::ToggleExpandThreads {
+                pod_id: pod_id.to_string(),
+                behavior_id: behavior_id.to_string(),
+            });
+        }
+    }
+
+    /// Render one nested-thread button, emitting a `SelectThread` action
+    /// on click. Used under both real and orphan behavior buckets.
+    fn render_nested_thread_button(
+        &self,
+        ui: &mut egui::Ui,
+        thread_id: &str,
+        actions: &mut Vec<BehaviorRowAction>,
+    ) {
+        let Some(view) = self.tasks.get(thread_id) else {
+            return;
+        };
+        let is_selected = self.selected.as_deref() == Some(thread_id);
+        let title = view
+            .summary
+            .title
+            .clone()
+            .unwrap_or_else(|| thread_id[..thread_id.len().min(14)].to_string());
+        let (chip, chip_color) = state_chip(view.summary.state);
+        let text = RichText::new(format!("{title}  [{chip}]")).color(if is_selected {
+            Color32::WHITE
+        } else {
+            chip_color
+        });
+        let row = add_sidebar_thread_row(ui, is_selected, text);
+        if row.clicked() {
+            actions.push(BehaviorRowAction::SelectThread {
+                thread_id: thread_id.to_string(),
+            });
+        }
+    }
+
+    /// Render the interactive-threads subsection under a pod. "Interactive"
+    /// here means threads the user created directly (no behavior origin).
+    /// Skipped entirely when the pod has no such threads.
+    fn render_interactive_threads(
+        &mut self,
+        ui: &mut egui::Ui,
+        pod_id: &str,
+        interactive: &[String],
+    ) {
+        if interactive.is_empty() {
+            return;
+        }
+        ui.add_space(4.0);
+        sidebar_subsection_header(ui, format!("Interactive  ({})", interactive.len()));
+        let expanded = self.expanded_interactive_pods.contains(pod_id);
+        let shown = if expanded {
+            interactive.len()
+        } else {
+            interactive.len().min(THREAD_ROW_PREVIEW_COUNT)
+        };
+        let mut clicked: Option<String> = None;
+        for tid in &interactive[..shown] {
+            let Some(view) = self.tasks.get(tid) else {
+                continue;
+            };
+            let is_selected = self.selected.as_deref() == Some(tid.as_str());
+            let title = view
+                .summary
+                .title
+                .clone()
+                .unwrap_or_else(|| tid[..tid.len().min(14)].to_string());
+            let (chip, chip_color) = state_chip(view.summary.state);
+            let text = RichText::new(format!("{title}  [{chip}]")).color(if is_selected {
+                Color32::WHITE
+            } else {
+                chip_color
+            });
+            let row = add_sidebar_thread_row(ui, is_selected, text);
+            if row.clicked() {
+                clicked = Some(tid.clone());
+            }
+        }
+        let hidden = interactive.len().saturating_sub(shown);
+        let toggle = if hidden > 0 {
+            sidebar_button(ui, RichText::new(format!("Show {hidden} more")), true).clicked()
+        } else if expanded && interactive.len() > THREAD_ROW_PREVIEW_COUNT {
+            sidebar_button(ui, RichText::new("Show less"), true).clicked()
+        } else {
+            false
+        };
+        if toggle {
+            if expanded {
+                self.expanded_interactive_pods.remove(pod_id);
+            } else {
+                self.expanded_interactive_pods.insert(pod_id.to_string());
+            }
+        }
+        if let Some(tid) = clicked {
+            self.select_task(tid);
         }
     }
 
@@ -2503,6 +2728,18 @@ impl ChatApp {
                         behavior_id,
                         enabled,
                     });
+                }
+                BehaviorRowAction::SelectThread { thread_id } => {
+                    self.select_task(thread_id);
+                }
+                BehaviorRowAction::ToggleExpandThreads {
+                    pod_id,
+                    behavior_id,
+                } => {
+                    let key = (pod_id, behavior_id);
+                    if !self.expanded_behavior_threads.remove(&key) {
+                        self.expanded_behavior_threads.insert(key);
+                    }
                 }
             }
         }
