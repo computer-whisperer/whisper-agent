@@ -317,7 +317,7 @@ default for anything firing more often than daily.
 
 const SELF_MOD: &str = "# Self-modification
 
-You have eight builtin tools that target either files or runtime
+You have nine builtin tools that target either files or runtime
 state in THIS pod. File targets live outside your workspace;
 `read_file` / `write_file` / `list_dir` / `bash` cannot see them —
 only these can.
@@ -325,9 +325,10 @@ only these can.
 ## File tools (declarative config)
 
 - `pod_list_files` — walk the pod dir, including per-behavior
-  subdirs. `[rw]` entries are reachable via the tools below;
-  `[--]` entries (state.json, threads/) are read-only.
-- `pod_read_file` — whole file or a line range.
+  subdirs and a summary of `threads/`. Entries tagged `[rw]` /
+  `[r-]` / `[--]` by access level.
+- `pod_read_file` — whole file or a line range (default cap: 500
+  lines when no offset/limit supplied).
 - `pod_write_file` — full overwrite or create.
 - `pod_edit_file` — literal-substring replace (single match by
   default, `replace_all` to change every occurrence).
@@ -335,6 +336,10 @@ only these can.
   (including threads/, behaviors/state.json, etc.). Useful for
   locating which thread logged a tool name or error before pulling
   the full file. Dotfiles and `.archived/` are skipped.
+- `pod_list_threads` — structured query over threads with
+  behavior/state/since/turn-count filters. Returns a one-line
+  summary per hit. Sorted newest-first. Use before `pod_read_file`
+  when you want \"the most recent run of behavior X\" or similar.
 - `pod_about` — this tool.
 
 ## Orchestration tools (runtime state)
