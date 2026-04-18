@@ -7,6 +7,48 @@ version = "0.1.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 
+# Shared dependency specs. Consumers inherit with `{ workspace = true }`
+# and may add extra features per-crate. Deps with divergent
+# `default-features` across crates (toml, chrono) are intentionally left
+# out — they stay inline.
+[workspace.dependencies]
+# Async runtime. Workspace features are the subset every consumer
+# needs; each crate adds its own (fs, io-util, net, process, sync,
+# io-std) on top.
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "time"] }
+
+# Serde ecosystem
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+ciborium = "0.2"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# CLI — crates that read env vars add `env` on top.
+clap = { version = "4", features = ["derive"] }
+
+# Errors
+thiserror = "2"
+anyhow = "1"
+
+# HTTP server / client
+axum = "0.8"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+
+# Time
+chrono-tz = "0.10"
+cron = "0.16"
+
+# Misc utilities
+url = "2"
+subtle = "2"
+
+# Internal crates
+whisper-agent-protocol = { path = "crates/whisper-agent-protocol" }
+whisper-agent-mcp-proto = { path = "crates/whisper-agent-mcp-proto" }
+
 [package]
 name = "whisper-agent"
 description = "Server-resident agent loop that reaches into managed POSIX hosts via MCP"
@@ -22,22 +64,22 @@ name = "whisper-agent"
 path = "src/main.rs"
 
 [dependencies]
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "fs", "io-util", "time", "signal", "sync", "net"] }
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-reqwest = { version = "0.12", features = ["json", "stream", "rustls-tls"], default-features = false }
+tokio = { workspace = true, features = ["fs", "io-util", "sync", "net"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+reqwest = { workspace = true, features = ["json", "stream"] }
 futures = "0.3"
 async-stream = "0.3"
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-clap = { version = "4", features = ["derive", "env"] }
-thiserror = "2"
-anyhow = "1"
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+clap = { workspace = true, features = ["env"] }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
-chrono-tz = "0.10"
-cron = "0.16"
-axum = { version = "0.8", features = ["ws"] }
+chrono-tz = { workspace = true }
+cron = { workspace = true }
+axum = { workspace = true, features = ["ws"] }
 tower-http = { version = "0.6", features = ["fs", "trace"] }
-whisper-agent-protocol = { path = "crates/whisper-agent-protocol" }
+whisper-agent-protocol = { workspace = true }
 toml = "1"
 base64 = "0.22"

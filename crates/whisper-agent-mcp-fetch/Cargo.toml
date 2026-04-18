@@ -10,16 +10,16 @@ name = "whisper-agent-mcp-fetch"
 path = "src/main.rs"
 
 [dependencies]
-axum = "0.8"
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal", "time"] }
-reqwest = { version = "0.12", features = ["rustls-tls"], default-features = false }
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-clap = { version = "4", features = ["derive"] }
-thiserror = "2"
-anyhow = "1"
-url = "2"
+axum = { workspace = true }
+tokio = { workspace = true, features = ["net"] }
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+clap = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+url = { workspace = true }
 html2text = "0.16"
-whisper-agent-mcp-proto = { path = "../whisper-agent-mcp-proto" }
+whisper-agent-mcp-proto = { workspace = true }

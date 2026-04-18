@@ -12,14 +12,15 @@ crate-type = ["cdylib"]
 eframe = { version = "0.34", default-features = false, features = ["default_fonts", "glow", "x11", "wayland"] }
 egui = "0.34"
 log = "0.4"
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-ciborium = "0.2"
+serde = { workspace = true }
+serde_json = { workspace = true }
+ciborium = { workspace = true }
 # `toml` lets the structured pod-config editor round-trip its working
 # `PodConfig` with the server (server expects raw TOML in
 # `UpdatePodConfig`). `default-features = false` drops toml 1.x's
 # `std` feature (we only need `serde`-driven from_str / to_string_pretty),
-# keeping the wasm bundle lean.
+# keeping the wasm bundle lean. Kept inline (not workspace) because the
+# server crate wants toml's default features.
 toml = { version = "1", default-features = false, features = ["display", "parse", "serde"] }
 # `similar` powers the unified-diff renderer for edit_file / write_file
 # tool calls. Default features include `bytes` + `text`; we only need
@@ -34,10 +35,12 @@ egui_commonmark = { version = "0.23", default-features = false, features = ["pul
 # server's parsers so what the editor shows matches what the scheduler
 # will fire. chrono's default features include `clock` + `wasmbind`,
 # so `Utc::now()` routes through `js_sys::Date::now()` on wasm32.
-cron = "0.16"
+# chrono is kept inline (not workspace) because it needs its default
+# features here, while the server crate opts out of them.
+cron = { workspace = true }
 chrono = "0.4"
-chrono-tz = "0.10"
-whisper-agent-protocol = { path = "../whisper-agent-protocol" }
+chrono-tz = { workspace = true }
+whisper-agent-protocol = { workspace = true }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 wasm-bindgen = "0.2"

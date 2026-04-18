@@ -10,16 +10,16 @@ name = "whisper-agent-sandbox"
 path = "src/main.rs"
 
 [dependencies]
-whisper-agent-protocol = { path = "../whisper-agent-protocol" }
-axum = "0.8"
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "process", "fs", "io-util", "net", "signal", "time"] }
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-clap = { version = "4", features = ["derive"] }
-thiserror = "2"
-anyhow = "1"
+whisper-agent-protocol = { workspace = true }
+axum = { workspace = true }
+tokio = { workspace = true, features = ["process", "fs", "io-util", "net"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+clap = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
 landlock = "0.4"
 rand = "0.9"
-subtle = "2"
+subtle = { workspace = true }
