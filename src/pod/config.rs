@@ -75,13 +75,18 @@ pub struct Config {
 }
 
 /// One catalog entry from `[[host_env_providers]]`. `name` is what
-/// pod entries reference; `url` is the daemon endpoint. Future
-/// security fields (`auth = { kind = "mtls", ... }`, etc.) plug in
-/// here without breaking compat.
+/// pod entries reference; `url` is the daemon endpoint; `token_file`
+/// (optional) points at a file whose single-line contents are the
+/// pre-shared bearer the daemon's `--control-token-file` loaded.
+/// Future security fields (`tls = { ca = "...", client_cert = "..." }`,
+/// etc.) plug in here without breaking compat — TOML deserialize
+/// ignores unknown keys by default.
 #[derive(Deserialize, Debug, Clone)]
 pub struct HostEnvProviderConfig {
     pub name: String,
     pub url: String,
+    #[serde(default)]
+    pub token_file: Option<std::path::PathBuf>,
 }
 
 /// Backend auth configuration. Tagged by `mode`; providers pick the variants

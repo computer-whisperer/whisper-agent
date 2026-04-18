@@ -133,6 +133,10 @@ pub struct HostEnvEntry {
     /// to consult the live handle, and so the URL stays correct even
     /// after the handle has been taken for teardown.
     pub mcp_url: Option<String>,
+    /// Per-sandbox bearer the provider issued at provision time.
+    /// Cached for the same reason as `mcp_url` — dedup hits need it
+    /// to open their own `McpSession` against the cached URL.
+    pub mcp_token: Option<String>,
 }
 
 impl std::fmt::Debug for HostEnvEntry {
@@ -501,6 +505,7 @@ impl ResourceRegistry {
                         last_used: now,
                         handle: None,
                         mcp_url: None,
+                        mcp_token: None,
                     },
                 );
             }
@@ -516,6 +521,7 @@ impl ResourceRegistry {
         &mut self,
         id: &HostEnvId,
         mcp_url: Option<String>,
+        mcp_token: Option<String>,
         handle: Option<Box<dyn HostEnvHandle>>,
     ) -> CompleteHostEnvOutcome {
         let Some(entry) = self.host_envs.get_mut(id) else {
@@ -535,6 +541,7 @@ impl ResourceRegistry {
         entry.state = ResourceState::Ready;
         entry.handle = handle;
         entry.mcp_url = mcp_url;
+        entry.mcp_token = mcp_token;
         entry.last_used = Utc::now();
         CompleteHostEnvOutcome::Completed
     }
@@ -802,7 +809,7 @@ mod tests {
                 network: Default::default(),
             },
         );
-        let outcome = reg.complete_host_env_provisioning(&id, None, None);
+        let outcome = reg.complete_host_env_provisioning(&id, None, None, None);
         assert!(matches!(outcome, CompleteHostEnvOutcome::Completed));
         assert!(reg.host_envs[&id].state.is_ready());
         assert_eq!(reg.host_envs[&id].users.len(), 1);
@@ -853,12 +860,12 @@ mod tests {
                 network: Default::default(),
             },
         );
-        let first = reg.complete_host_env_provisioning(&id, None, None);
+        let first = reg.complete_host_env_provisioning(&id, None, None, None);
         assert!(matches!(first, CompleteHostEnvOutcome::Completed));
         // Race-loser scenario: a second concurrent provision lands after
         // the entry already transitioned to Ready. The handle round-trips
         // back to the caller for teardown rather than silently leaking.
-        let second = reg.complete_host_env_provisioning(&id, None, None);
+        let second = reg.complete_host_env_provisioning(&id, None, None, None);
         assert!(matches!(
             second,
             CompleteHostEnvOutcome::AlreadyCompleted { .. }
@@ -877,7 +884,7 @@ mod tests {
                 network: Default::default(),
             },
         );
-        let _ = reg.complete_host_env_provisioning(&idle_id, None, None);
+        let _ = reg.complete_host_env_provisioning(&idle_id, None, None, None);
         let _ = reg.release_host_env_user(&idle_id, "t-idle");
         assert!(reg.host_envs[&idle_id].users.is_empty());
 
@@ -920,7 +927,7 @@ mod tests {
                 network: Default::default(),
             },
         );
-        let _ = reg.complete_host_env_provisioning(&dead_id, None, None);
+        let _ = reg.complete_host_env_provisioning(&dead_id, None, None, None);
         reg.mark_host_env_torn_down(&dead_id);
         if let Some(e) = reg.host_envs.get_mut(&dead_id) {
             e.last_used = now - chrono::Duration::seconds(7200);
@@ -954,7 +961,7 @@ mod tests {
                 network: Default::default(),
             },
         );
-        let _ = reg.complete_host_env_provisioning(&id, None, None);
+        let _ = reg.complete_host_env_provisioning(&id, None, None, None);
         // last_used is `now`; should NOT reap on the first sweep.
         let plan = reg.reap_idle(
             Utc::now(),

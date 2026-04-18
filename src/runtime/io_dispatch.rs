@@ -65,6 +65,7 @@ pub(crate) enum ProvisionResult {
         host_env_id: HostEnvId,
         host_env_handle: Box<dyn HostEnvHandle>,
         mcp_url: String,
+        mcp_token: Option<String>,
         mcp_session: Arc<McpSession>,
         tools: Vec<crate::tools::mcp::ToolDescriptor>,
     },
@@ -137,8 +138,10 @@ pub(crate) fn provision_host_env_mcp(scheduler: &Scheduler, thread_id: String) -
     let host_env_action = match scheduler.host_env_for_thread(&thread_id) {
         Some(e) if e.state.is_ready() => {
             let mcp_url = e.mcp_url.clone().unwrap_or_default();
+            let mcp_token = e.mcp_token.clone();
             HostEnvAction::Skip {
                 mcp_url,
+                mcp_token,
                 host_env_id: e.id.clone(),
             }
         }
@@ -171,9 +174,10 @@ pub(crate) fn provision_host_env_mcp(scheduler: &Scheduler, thread_id: String) -
 
     Box::pin(async move {
         // --- Phase 1: host env ---
-        let (mcp_url, host_env_handle, host_env_id) = match host_env_action {
+        let (mcp_url, mcp_token, host_env_handle, host_env_id) = match host_env_action {
             HostEnvAction::Skip {
                 mcp_url,
+                mcp_token,
                 host_env_id,
             } => {
                 // Dedup hit — another thread already completed the
@@ -181,7 +185,7 @@ pub(crate) fn provision_host_env_mcp(scheduler: &Scheduler, thread_id: String) -
                 // don't carry a handle (the dedup winner owns it).
                 // This path is a no-op from the registry's
                 // perspective: the entry is already Ready.
-                (mcp_url, None, host_env_id)
+                (mcp_url, mcp_token, None, host_env_id)
             }
             HostEnvAction::UnknownProvider {
                 host_env_id,
@@ -205,7 +209,8 @@ pub(crate) fn provision_host_env_mcp(scheduler: &Scheduler, thread_id: String) -
             } => match provider.provision(&thread_id, &spec).await {
                 Ok(handle) => {
                     let url = handle.mcp_url().to_string();
-                    (url, Some(handle), host_env_id)
+                    let tok = handle.mcp_token().map(|s| s.to_string());
+                    (url, tok, Some(handle), host_env_id)
                 }
                 Err(e) => {
                     return SchedulerCompletion::Provision(ProvisionCompletion {
@@ -221,7 +226,7 @@ pub(crate) fn provision_host_env_mcp(scheduler: &Scheduler, thread_id: String) -
         };
 
         // --- Phase 2: MCP connect ---
-        let session = match McpSession::connect(&mcp_url).await {
+        let session = match McpSession::connect(&mcp_url, mcp_token.clone()).await {
             Ok(s) => Arc::new(s),
             Err(e) => {
                 return SchedulerCompletion::Provision(ProvisionCompletion {
@@ -265,6 +270,7 @@ pub(crate) fn provision_host_env_mcp(scheduler: &Scheduler, thread_id: String) -
                 host_env_id,
                 host_env_handle: handle,
                 mcp_url,
+                mcp_token,
                 mcp_session: session,
                 tools,
             },
@@ -286,6 +292,12 @@ impl crate::tools::sandbox::HostEnvHandle for DedupNoopHandle {
     fn mcp_url(&self) -> &str {
         &self.mcp_url
     }
+    fn mcp_token(&self) -> Option<&str> {
+        // The dedup loser is handed the registry-cached token by the
+        // scheduler at completion time; the noop handle itself never
+        // holds one (and is dropped unused).
+        None
+    }
     fn teardown(
         &mut self,
     ) -> Pin<Box<dyn Future<Output = Result<(), crate::tools::sandbox::HostEnvError>> + Send + '_>>
@@ -298,9 +310,12 @@ impl crate::tools::sandbox::HostEnvHandle for DedupNoopHandle {
 /// crossing into the async block.
 enum HostEnvAction {
     /// Already Ready (dedup hit) — connect MCP at `mcp_url` directly,
-    /// no provision call.
+    /// no provision call. `mcp_token` is the same per-sandbox bearer
+    /// the original provisioner received; a dedup hit needs it to
+    /// authenticate its own MCP session against the shared host.
     Skip {
         mcp_url: String,
+        mcp_token: Option<String>,
         host_env_id: HostEnvId,
     },
     /// Needs provisioning; call into the resolved provider with this spec.

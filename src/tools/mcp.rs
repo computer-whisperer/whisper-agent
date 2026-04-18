@@ -115,15 +115,26 @@ struct JsonRpcErrorObj {
 pub struct McpSession {
     http: reqwest::Client,
     url: String,
+    /// Bearer token attached as `Authorization: Bearer <token>` on
+    /// every request. `None` when the server was configured for
+    /// anonymous access (dev / shared-host loopback usage).
+    bearer: Option<String>,
     next_id: AtomicU64,
 }
 
 impl McpSession {
-    /// Open a session against the given MCP server URL and complete the `initialize` handshake.
-    pub async fn connect(url: impl Into<String>) -> Result<Self, McpError> {
+    /// Open a session against the given MCP server URL and complete
+    /// the `initialize` handshake. `bearer`, when set, is presented as
+    /// `Authorization: Bearer <token>` on every subsequent request —
+    /// per-sandbox MCP hosts issue this token at provision time.
+    pub async fn connect(
+        url: impl Into<String>,
+        bearer: Option<String>,
+    ) -> Result<Self, McpError> {
         let session = Self {
             http: reqwest::Client::new(),
             url: url.into(),
+            bearer,
             next_id: AtomicU64::new(1),
         };
         session.initialize().await?;
@@ -190,7 +201,11 @@ impl McpSession {
             params,
         };
         debug!(method, "rpc out");
-        let resp = self.http.post(&self.url).json(&req).send().await?;
+        let mut builder = self.http.post(&self.url).json(&req);
+        if let Some(tok) = &self.bearer {
+            builder = builder.bearer_auth(tok);
+        }
+        let resp = builder.send().await?;
         let status = resp.status();
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
@@ -218,7 +233,11 @@ impl McpSession {
             "method": method,
             "params": params,
         });
-        let resp = self.http.post(&self.url).json(&body).send().await?;
+        let mut builder = self.http.post(&self.url).json(&body);
+        if let Some(tok) = &self.bearer {
+            builder = builder.bearer_auth(tok);
+        }
+        let resp = builder.send().await?;
         let status = resp.status();
         if !status.is_success() && status.as_u16() != 202 {
             let body = resp.text().await.unwrap_or_default();

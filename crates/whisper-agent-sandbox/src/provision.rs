@@ -6,6 +6,8 @@
 use std::sync::atomic::{AtomicU16, Ordering};
 use std::time::Duration;
 
+use rand::RngCore;
+use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 use tokio::process::{Child, Command};
 use tracing::info;
@@ -17,6 +19,27 @@ static NEXT_PORT: AtomicU16 = AtomicU16::new(9820);
 pub struct ProvisionedSession {
     pub child: Child,
     pub mcp_url: String,
+    /// Per-sandbox bearer the scheduler must present on every `/mcp`
+    /// request. Generated per provision (never reused), passed to the
+    /// MCP host once via stdin, then returned in `ProvisionResponse`.
+    pub mcp_token: String,
+}
+
+/// Generate a fresh 256-bit random token, hex-encoded. One token per
+/// provision — never stored, never logged, only handed to the one
+/// scheduler that requested this sandbox.
+fn generate_mcp_token() -> String {
+    // `rand::rng()` is a CSPRNG seeded from OS entropy — fine for
+    // ephemeral session secrets and doesn't drag the app into the
+    // fallible `TryRngCore` API that `OsRng` now requires in rand 0.9.
+    let mut bytes = [0u8; 32];
+    rand::rng().fill_bytes(&mut bytes);
+    let mut s = String::with_capacity(64);
+    for b in bytes {
+        use std::fmt::Write;
+        let _ = write!(&mut s, "{b:02x}");
+    }
+    s
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -94,14 +117,20 @@ async fn provision_landlock(
     let allowed_paths_owned: Vec<PathAccess> = allowed_paths.to_vec();
     let network_owned = network.clone();
 
+    let mcp_token = generate_mcp_token();
+
     let mut cmd = Command::new(mcp_host_bin);
     cmd.args([
         "--listen",
         &listen_addr,
         "--workspace-root",
         &workspace_root,
+        "--token-stdin",
     ]);
-    cmd.stdin(std::process::Stdio::null());
+    // stdin is piped so we can hand the MCP host its per-sandbox bearer
+    // without exposing it in argv or the environment (both readable via
+    // /proc/<pid>/... under the same uid).
+    cmd.stdin(std::process::Stdio::piped());
     cmd.stdout(std::process::Stdio::inherit());
     cmd.stderr(std::process::Stdio::inherit());
     cmd.kill_on_drop(true);
@@ -114,16 +143,41 @@ async fn provision_landlock(
         });
     }
 
-    let child = cmd
+    let mut child = cmd
         .spawn()
         .map_err(|e| ProvisionError::Spawn(e.to_string()))?;
+
+    // Write the token + newline and close stdin so the child's
+    // `read_line` returns. Dropping the handle is what closes the pipe.
+    {
+        let mut stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| ProvisionError::Spawn("child stdin not captured".into()))?;
+        stdin
+            .write_all(mcp_token.as_bytes())
+            .await
+            .map_err(|e| ProvisionError::Spawn(format!("writing token to child stdin: {e}")))?;
+        stdin
+            .write_all(b"\n")
+            .await
+            .map_err(|e| ProvisionError::Spawn(format!("writing token to child stdin: {e}")))?;
+        stdin
+            .shutdown()
+            .await
+            .map_err(|e| ProvisionError::Spawn(format!("closing child stdin: {e}")))?;
+    }
 
     wait_for_ready(&listen_addr, 10).await?;
 
     let mcp_url = format!("http://{listen_addr}/mcp");
     info!(%mcp_url, "MCP host ready");
 
-    Ok(ProvisionedSession { child, mcp_url })
+    Ok(ProvisionedSession {
+        child,
+        mcp_url,
+        mcp_token,
+    })
 }
 
 fn apply_landlock(

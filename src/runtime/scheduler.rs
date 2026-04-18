@@ -269,7 +269,10 @@ impl Scheduler {
 
         for cfg in shared_host_configs {
             info!(name = %cfg.name, url = %cfg.url, "connecting to shared MCP host");
-            let session = Arc::new(McpSession::connect(&cfg.url).await.map_err(|e| {
+            // Shared hosts use anonymous MCP access today; adding auth
+            // here is a separate change with its own config shape
+            // (they're long-lived endpoints, not per-sandbox).
+            let session = Arc::new(McpSession::connect(&cfg.url, None).await.map_err(|e| {
                 anyhow::anyhow!("shared MCP host `{}` ({}): {e}", cfg.name, cfg.url)
             })?);
             // Phase 3c: list tools at startup so per-thread routing can
@@ -3053,6 +3056,7 @@ impl Scheduler {
                 host_env_id,
                 host_env_handle,
                 mcp_url,
+                mcp_token,
                 mcp_session,
                 tools,
             } => {
@@ -3062,6 +3066,7 @@ impl Scheduler {
                 let outcome = self.resources.complete_host_env_provisioning(
                     &host_env_id,
                     Some(mcp_url.clone()),
+                    mcp_token,
                     Some(host_env_handle),
                 );
                 match outcome {

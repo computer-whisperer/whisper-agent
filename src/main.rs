@@ -153,6 +153,14 @@ struct ServeArgs {
     #[arg(long = "host-env-provider", value_parser = parse_host_env_provider_arg)]
     host_env_providers: Vec<(String, String)>,
 
+    /// Attach a control-plane bearer token file to a CLI-registered
+    /// provider. Format: `name=path`. Repeatable. Pairs with
+    /// `--host-env-provider` by name. TOML-registered providers use
+    /// the `token_file` key on their `[[host_env_providers]]` entry
+    /// instead.
+    #[arg(long = "host-env-provider-token", value_parser = parse_host_env_provider_token_arg)]
+    host_env_provider_tokens: Vec<(String, PathBuf)>,
+
     /// Name a provider from the catalog for the synthesized default
     /// pod's single `[[allow.host_env]]` entry. Paired with
     /// `--default-host-env-workspace`. When omitted, the default pod
@@ -183,6 +191,23 @@ struct ServeArgs {
 /// `--shared-mcp-host`.
 fn parse_host_env_provider_arg(s: &str) -> Result<(String, String), String> {
     parse_shared_host_arg(s)
+}
+
+/// Parse a `name=path` pair for `--host-env-provider-token`. The path
+/// is intentionally not checked for existence here — the token file
+/// is read at registry construction, which is where the clearer error
+/// lives.
+fn parse_host_env_provider_token_arg(s: &str) -> Result<(String, PathBuf), String> {
+    let (name, path) = s
+        .split_once('=')
+        .ok_or_else(|| "expected `name=path`".to_string())?;
+    if name.is_empty() {
+        return Err("name must be non-empty".into());
+    }
+    if path.is_empty() {
+        return Err("path must be non-empty".into());
+    }
+    Ok((name.to_string(), PathBuf::from(path)))
 }
 
 /// Resolve which TOML config file to load. Precedence:
@@ -373,18 +398,36 @@ async fn run_serve(args: ServeArgs) -> Result<()> {
     let default_shared_host_names: Vec<String> =
         shared_mcp_hosts.iter().map(|h| h.name.clone()).collect();
 
+    let cli_token_files: HashMap<String, PathBuf> = args
+        .host_env_provider_tokens
+        .iter()
+        .cloned()
+        .collect();
     let mut provider_entries: Vec<HostEnvProviderEntry> = toml_provider_entries
         .into_iter()
         .map(|p| HostEnvProviderEntry {
             name: p.name,
             url: p.url,
+            token_file: p.token_file,
         })
         .collect();
     for (name, url) in &args.host_env_providers {
         provider_entries.push(HostEnvProviderEntry {
             name: name.clone(),
             url: url.clone(),
+            token_file: cli_token_files.get(name).cloned(),
         });
+    }
+    // Warn about CLI token flags that don't match any registered provider,
+    // so typos don't silently disable auth.
+    for name in cli_token_files.keys() {
+        let known_from_cli = args.host_env_providers.iter().any(|(n, _)| n == name);
+        let known_from_toml = provider_entries.iter().any(|e| &e.name == name);
+        if !known_from_cli && !known_from_toml {
+            anyhow::bail!(
+                "--host-env-provider-token names provider `{name}` but no provider by that name is registered"
+            );
+        }
     }
     let host_env_registry =
         HostEnvRegistry::new(provider_entries).context("build host_env provider catalog")?;

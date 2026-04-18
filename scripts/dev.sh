@@ -60,6 +60,18 @@ done
 
 mkdir -p "$SANDBOX"
 
+# Pre-shared control-plane bearer between whisper-agent and the sandbox daemon.
+# Generated on first run, preserved across restarts so running processes keep
+# authenticating. Rotate by deleting the file and restarting.
+SANDBOX_TOKEN_FILE="$SANDBOX/sandbox-control-token"
+if [[ ! -s "$SANDBOX_TOKEN_FILE" ]]; then
+    echo "==> generating sandbox control token at $SANDBOX_TOKEN_FILE"
+    umask 077
+    head -c 32 /dev/urandom | od -An -vtx1 | tr -d ' \n' > "$SANDBOX_TOKEN_FILE"
+    echo >> "$SANDBOX_TOKEN_FILE"
+    chmod 600 "$SANDBOX_TOKEN_FILE"
+fi
+
 # Build the main binary first so we can use `whisper-agent config env` to
 # resolve any [secrets] declared in the active whisper-agent.toml. That
 # result feeds the auto-skip decision below, so it has to happen before we
@@ -148,7 +160,8 @@ fi
 echo "==> starting whisper-agent-sandbox on $LISTEN_SANDBOX"
 "$REPO_ROOT/target/release/whisper-agent-sandbox" \
     --listen "$LISTEN_SANDBOX" \
-    --mcp-host-bin "$REPO_ROOT/target/release/whisper-agent-mcp-host" &
+    --mcp-host-bin "$REPO_ROOT/target/release/whisper-agent-mcp-host" \
+    --control-token-file "$SANDBOX_TOKEN_FILE" &
 CHILD_PIDS+=($!)
 
 for _ in $(seq 1 20); do
@@ -164,6 +177,7 @@ echo "    open http://$LISTEN_SERVER/ in a browser"
 "$REPO_ROOT/target/release/whisper-agent" serve \
     --listen "$LISTEN_SERVER" \
     --host-env-provider "local-landlock=http://$LISTEN_SANDBOX" \
+    --host-env-provider-token "local-landlock=$SANDBOX_TOKEN_FILE" \
     --default-host-env-provider "local-landlock" \
     --default-host-env-workspace "$SANDBOX" \
     --audit-log "$SANDBOX/audit.jsonl" \

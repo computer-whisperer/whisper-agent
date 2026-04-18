@@ -3,17 +3,24 @@
 //! Streamable-HTTP allows the server to respond with either a single JSON body or an SSE
 //! stream. For MVP we always respond with JSON since none of the tools stream output yet.
 //! No GET endpoint, no `Mcp-Session-Id` enforcement: the server is stateless across requests.
+//!
+//! Auth: when `AppState::expected_token` is `Some`, every request must present
+//! `Authorization: Bearer <token>` matching it (constant-time compared). The token
+//! is a per-sandbox secret the dispatcher hands the MCP host on stdin at startup,
+//! then returns to the scheduler in the provision response — it scopes what any
+//! local process with TCP reach can actually drive on the MCP wire.
 
 use std::sync::Arc;
 
 use axum::{
     Json, Router,
     extract::State,
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::post,
 };
 use serde_json::{Value, json};
+use subtle::ConstantTimeEq;
 use tracing::{debug, warn};
 
 use whisper_agent_mcp_proto::{
@@ -28,6 +35,10 @@ use crate::workspace::Workspace;
 #[derive(Clone)]
 pub struct AppState {
     pub workspace: Arc<Workspace>,
+    /// When `Some`, every `/mcp` request must present this token as
+    /// `Authorization: Bearer <token>`. `None` means auth is explicitly
+    /// disabled (`--no-auth`).
+    pub expected_token: Option<Arc<String>>,
 }
 
 pub fn router(state: AppState) -> Router {
@@ -36,7 +47,23 @@ pub fn router(state: AppState) -> Router {
         .with_state(state)
 }
 
-async fn handle_post(State(state): State<AppState>, Json(req): Json<JsonRpcRequest>) -> Response {
+/// Extract the bearer token from an Authorization header, if present.
+fn bearer_token(headers: &HeaderMap) -> Option<&str> {
+    let h = headers.get(axum::http::header::AUTHORIZATION)?.to_str().ok()?;
+    h.strip_prefix("Bearer ")
+}
+
+async fn handle_post(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<JsonRpcRequest>,
+) -> Response {
+    if let Some(expected) = &state.expected_token {
+        let presented = bearer_token(&headers).unwrap_or("");
+        if presented.as_bytes().ct_eq(expected.as_bytes()).unwrap_u8() != 1 {
+            return (StatusCode::UNAUTHORIZED, "missing or invalid bearer token").into_response();
+        }
+    }
     debug!(method = %req.method, "rpc");
 
     if req.jsonrpc != "2.0" {

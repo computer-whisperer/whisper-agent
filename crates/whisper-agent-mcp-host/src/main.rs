@@ -2,8 +2,9 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use anyhow::Context;
+use anyhow::{Context, anyhow};
 use clap::Parser;
+use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::net::TcpListener;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
@@ -27,6 +28,24 @@ struct Args {
     /// Workspace root. All file operations are confined to this directory.
     #[arg(long)]
     workspace_root: PathBuf,
+
+    /// Read a bearer token from a single line on stdin at startup; every
+    /// request to `/mcp` must then present it as `Authorization: Bearer
+    /// <token>`. The launching process (typically
+    /// whisper-agent-sandbox) writes the token once and closes stdin.
+    /// Stdin is used so the token never appears in argv or the
+    /// environment, both of which are readable via `/proc/<pid>/...`
+    /// under the same uid.
+    #[arg(long, conflicts_with = "no_auth")]
+    token_stdin: bool,
+
+    /// Run with no authentication — any caller that can reach the
+    /// listen address can invoke tools. Explicit opt-in so a
+    /// misconfiguration cannot silently leave the server unauthenticated.
+    /// Intended only for one-off local dev; real deployments use
+    /// `--token-stdin`.
+    #[arg(long, conflicts_with = "token_stdin")]
+    no_auth: bool,
 }
 
 #[tokio::main]
@@ -38,18 +57,48 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let args = Args::parse();
+    if !args.token_stdin && !args.no_auth {
+        return Err(anyhow!(
+            "must pass exactly one of --token-stdin or --no-auth"
+        ));
+    }
+
+    let expected_token = if args.token_stdin {
+        let mut reader = BufReader::new(tokio::io::stdin());
+        let mut line = String::new();
+        let n = reader
+            .read_line(&mut line)
+            .await
+            .context("reading token from stdin")?;
+        if n == 0 {
+            return Err(anyhow!("stdin closed before a token was read"));
+        }
+        let token = line.trim().to_string();
+        if token.is_empty() {
+            return Err(anyhow!("stdin supplied an empty token"));
+        }
+        Some(token)
+    } else {
+        None
+    };
+
     let workspace = Workspace::new(&args.workspace_root)
         .with_context(|| format!("invalid workspace root {:?}", args.workspace_root))?;
 
     let state = server::AppState {
         workspace: Arc::new(workspace),
+        expected_token: expected_token.map(Arc::new),
     };
     let app = server::router(state);
 
     let listener = TcpListener::bind(args.listen)
         .await
         .with_context(|| format!("failed to bind {}", args.listen))?;
-    info!(addr = %args.listen, root = %args.workspace_root.display(), "whisper-agent-mcp-host listening");
+    if args.no_auth {
+        info!(addr = %args.listen, root = %args.workspace_root.display(), "whisper-agent-mcp-host listening (NO AUTH)");
+    } else {
+        info!(addr = %args.listen, root = %args.workspace_root.display(), "whisper-agent-mcp-host listening (bearer auth)");
+    }
 
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
