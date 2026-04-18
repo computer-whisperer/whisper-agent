@@ -2018,57 +2018,16 @@ impl ChatApp {
                 // sub-modal's edits.
                 ui.add_enabled_ui(!sub_modal_open, |ui| {
                     egui::TopBottomPanel::bottom("pod_editor_footer").show_inside(ui, |ui| {
-                        ui.add_space(6.0);
-                        if let Some(err) = &modal.error {
-                            ui.colored_label(Color32::from_rgb(220, 80, 80), err);
-                            ui.add_space(4.0);
-                        }
-                        ui.separator();
-                        ui.horizontal(|ui| {
-                            let save_enabled = modal.working.is_some() && dirty && !saving;
-                            if ui
-                                .add_enabled(save_enabled, egui::Button::new("Save"))
-                                .clicked()
-                            {
-                                save_clicked = true;
-                            }
-                            if ui
-                                .add_enabled(
-                                    modal.working.is_some() && dirty && !saving,
-                                    egui::Button::new("Revert"),
-                                )
-                                .clicked()
-                            {
-                                revert_clicked = true;
-                            }
-                            if ui.button("Close").clicked() {
-                                cancel_clicked = true;
-                            }
-                            ui.with_layout(
-                                egui::Layout::right_to_left(egui::Align::Center),
-                                |ui| {
-                                    if saving {
-                                        ui.label(
-                                            RichText::new("saving…")
-                                                .italics()
-                                                .color(Color32::from_gray(160)),
-                                        );
-                                    } else if dirty {
-                                        ui.label(
-                                            RichText::new("● unsaved changes")
-                                                .small()
-                                                .color(Color32::from_rgb(220, 170, 90)),
-                                        );
-                                    } else if modal.working.is_some() {
-                                        ui.label(
-                                            RichText::new("✓ saved")
-                                                .small()
-                                                .color(Color32::from_gray(140)),
-                                        );
-                                    }
-                                },
-                            );
-                        });
+                        let actions = crate::editor::render_footer(
+                            ui,
+                            modal.error.as_deref(),
+                            modal.working.is_some(),
+                            dirty,
+                            saving,
+                        );
+                        save_clicked = actions.save;
+                        revert_clicked = actions.revert;
+                        cancel_clicked = actions.close;
                     });
                     egui::TopBottomPanel::top("pod_editor_tabs").show_inside(ui, |ui| {
                         ui.add_space(4.0);
@@ -2223,33 +2182,20 @@ impl ChatApp {
         // Tab switch happens after the inner closure so we can do the
         // raw->structured reparse without holding any UI borrows.
         if let Some(target) = switch_to {
-            if modal.tab == PodEditorTab::RawToml && target != PodEditorTab::RawToml {
-                if modal.raw_dirty {
-                    match toml::from_str::<PodConfig>(&modal.raw_buffer) {
-                        Ok(parsed) => {
-                            modal.working = Some(parsed);
-                            modal.raw_dirty = false;
-                            modal.error = None;
-                            modal.tab = target;
-                        }
-                        Err(e) => {
-                            modal.error = Some(format!(
-                                "raw TOML doesn't parse — fix it or click Revert: {e}"
-                            ));
-                        }
-                    }
-                } else {
+            let leaving_raw = modal.tab == PodEditorTab::RawToml && target != PodEditorTab::RawToml;
+            let entering_raw = target == PodEditorTab::RawToml;
+            match crate::editor::sync_on_tab_switch::<PodConfig>(
+                leaving_raw,
+                entering_raw,
+                &mut modal.working,
+                &mut modal.raw_buffer,
+                &mut modal.raw_dirty,
+            ) {
+                Ok(()) => {
                     modal.tab = target;
+                    modal.error = None;
                 }
-            } else {
-                if target == PodEditorTab::RawToml
-                    && let Some(working) = &modal.working
-                    && !modal.raw_dirty
-                {
-                    modal.raw_buffer = toml::to_string_pretty(working).unwrap_or_default();
-                }
-                modal.tab = target;
-                modal.error = None;
+                Err(msg) => modal.error = Some(msg),
             }
         }
 
@@ -3354,21 +3300,14 @@ fn render_pod_editor_limits_tab(ui: &mut egui::Ui, working: &mut PodConfig) {
 }
 
 fn render_pod_editor_raw_tab(ui: &mut egui::Ui, raw: &mut String, dirty: &mut bool) {
-    ui.add_space(4.0);
-    hint(
+    crate::editor::render_raw_toml_tab(
         ui,
         "Raw pod.toml. Edits here override the structured tabs on save. \
          Switching back to a structured tab tries to parse this text first; \
          a parse error keeps you here so the edit isn't lost.",
+        raw,
+        dirty,
     );
-    ui.add_space(4.0);
-    let resp = ui.add_sized(
-        [ui.available_width(), ui.available_height().max(180.0)],
-        TextEdit::multiline(raw).code_editor(),
-    );
-    if resp.changed() {
-        *dirty = true;
-    }
 }
 
 fn render_sandbox_entry_modal(
