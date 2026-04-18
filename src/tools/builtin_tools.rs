@@ -465,7 +465,7 @@ async fn list_files(pod_dir: &Path, allowed: &[String], _args: Value) -> ToolOut
             let mtime = meta.modified().unwrap_or(std::time::UNIX_EPOCH);
             entries.push((name, meta.len(), mtime));
         }
-        entries.sort_by(|a, b| b.2.cmp(&a.2)); // newest first
+        entries.sort_by_key(|e| std::cmp::Reverse(e.2)); // newest first
         let total = entries.len();
         out.push_str(&format!(
             "\n-- {}/ (read-only; {} thread file{}; newest first) --\n",
@@ -1514,7 +1514,7 @@ async fn list_threads(pod_dir: &Path, args: Value) -> ToolOutcome {
         let mtime = meta.modified().unwrap_or(std::time::UNIX_EPOCH);
         candidates.push((entry.path(), mtime));
     }
-    candidates.sort_by(|a, b| b.1.cmp(&a.1));
+    candidates.sort_by_key(|c| std::cmp::Reverse(c.1));
 
     let total_candidates = candidates.len();
     let mut scanned = 0usize;
