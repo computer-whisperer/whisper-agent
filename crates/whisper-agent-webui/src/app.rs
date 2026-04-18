@@ -1030,11 +1030,19 @@ impl ChatApp {
                     view.inspector.bindings = bindings;
                 }
             }
-            ServerToClient::ThreadCompacted { .. } => {
-                // The continuation thread arrives as its own
-                // `ThreadCreated`; the old thread's state change to
-                // Completed arrives on its own; nothing to do here
-                // until the UI grows a dedicated "compacted" badge.
+            ServerToClient::ThreadCompacted {
+                thread_id,
+                new_thread_id,
+                ..
+            } => {
+                // The continuation thread already arrived via its own
+                // `ThreadCreated` event with `continued_from = None`
+                // in the summary — the linkage stamp happens on the
+                // server after `create_task` returns. Patch it in
+                // now so the list tier reflects the ancestor.
+                if let Some(view) = self.tasks.get_mut(&new_thread_id) {
+                    view.summary.continued_from = Some(thread_id);
+                }
             }
             ServerToClient::ThreadAssistantBegin { .. } => {}
             ServerToClient::ThreadAssistantText { thread_id, text } => {
@@ -2032,8 +2040,34 @@ impl eframe::App for ChatApp {
                             });
                         }
                         if ui.button("Archive").clicked() {
-                            self.send(ClientToServer::ArchiveThread { thread_id });
+                            self.send(ClientToServer::ArchiveThread {
+                                thread_id: thread_id.clone(),
+                            });
                         }
+                        // Compact is only meaningful on idle/completed
+                        // threads (the server rejects mid-turn
+                        // compaction); gate with `input_enabled` so
+                        // the user sees a disabled affordance rather
+                        // than a rejection error. Per-thread
+                        // `compaction.enabled = false` still round-
+                        // trips to a server error if clicked — acceptable
+                        // for v1 since the default ships enabled.
+                        ui.add_enabled_ui(input_enabled, |ui| {
+                            if ui
+                                .button("Compact")
+                                .on_hover_text(
+                                    "Summarize the conversation into a new thread. The \
+                                     current thread stays as history; a fresh thread \
+                                     seeded with the summary becomes the active one.",
+                                )
+                                .clicked()
+                            {
+                                self.send(ClientToServer::CompactThread {
+                                    thread_id,
+                                    correlation_id: None,
+                                });
+                            }
+                        });
                         ui.separator();
                     }
                     ui.add_enabled_ui(input_enabled, |ui| {
@@ -2662,11 +2696,20 @@ impl ChatApp {
                 .clone()
                 .unwrap_or_else(|| tid[..tid.len().min(14)].to_string());
             let (chip, chip_color) = state_chip(view.summary.state);
-            let text = RichText::new(format!("{title}  [{chip}]")).color(if is_selected {
-                Color32::WHITE
+            // Prefix a small arrow marker on continuation threads so
+            // the list tier reflects the compaction chain at a glance.
+            let continuation_marker = if view.summary.continued_from.is_some() {
+                "↩ "
             } else {
-                chip_color
-            });
+                ""
+            };
+            let text = RichText::new(format!("{continuation_marker}{title}  [{chip}]")).color(
+                if is_selected {
+                    Color32::WHITE
+                } else {
+                    chip_color
+                },
+            );
             let row = add_sidebar_thread_row(ui, is_selected, text);
             if row.clicked() {
                 clicked = Some(tid.clone());

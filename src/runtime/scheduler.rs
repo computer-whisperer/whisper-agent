@@ -1533,6 +1533,11 @@ impl Scheduler {
         // compacted-then-continued behavior thread records the
         // Completed outcome on its original thread first.
         self.finalize_pending_compaction(thread_id, pending_io);
+        // Then check whether this (or a freshly spawned continuation)
+        // has crossed its auto-compaction token threshold. The
+        // already-compacted gate inside the hook keeps the just-
+        // -finalized parent from retriggering.
+        self.maybe_auto_compact(thread_id, pending_io);
     }
 
     /// If the task is in a terminal state, tear down its sandbox (if any).

@@ -94,6 +94,63 @@ impl Scheduler {
         Ok(())
     }
 
+    /// Auto-trigger hook. Checks whether the given thread has crossed
+    /// its compaction `token_threshold` and, if so, kicks off a
+    /// compaction by the same path as `begin_compaction`.
+    ///
+    /// No-ops when:
+    ///   - the thread has no threshold configured,
+    ///   - compaction is disabled,
+    ///   - the thread is already mid-compaction,
+    ///   - the thread has already been compacted once (detected by
+    ///     the existence of a sibling thread with
+    ///     `continued_from == Some(thread_id)`), or
+    ///   - the thread isn't at a clean turn boundary.
+    ///
+    /// Fires from `step_until_blocked` after the finalize hook, so
+    /// trigger-cycle ordering is: finalize the old compaction first,
+    /// then consider a fresh auto-trigger. A freshly compacted parent
+    /// will be gated off by the child-thread check.
+    pub(super) fn maybe_auto_compact(
+        &mut self,
+        thread_id: &str,
+        pending_io: &mut FuturesUnordered<SchedulerFuture>,
+    ) {
+        let task = match self.tasks.get(thread_id) {
+            Some(t) => t,
+            None => return,
+        };
+        let Some(threshold) = task.config.compaction.token_threshold else {
+            return;
+        };
+        if !task.config.compaction.enabled
+            || task.compacting
+            || !task.is_idle()
+            || task.total_usage.input_tokens <= threshold
+        {
+            return;
+        }
+        // Already compacted once: a continuation thread exists
+        // pointing back at us. Scan is O(tasks) but only runs when
+        // every cheaper gate above has passed.
+        let already_compacted = self
+            .tasks
+            .values()
+            .any(|t| t.continued_from.as_deref() == Some(thread_id));
+        if already_compacted {
+            return;
+        }
+        debug!(
+            %thread_id,
+            input_tokens = task.total_usage.input_tokens,
+            threshold,
+            "auto-compaction threshold crossed — triggering"
+        );
+        if let Err(e) = self.begin_compaction(thread_id, None, pending_io) {
+            warn!(%thread_id, error = %e, "auto-compaction failed to begin");
+        }
+    }
+
     /// Hook called after `step_until_blocked` returns. When the given
     /// thread is mid-compaction and has reached `Completed`, parse the
     /// `<summary>` from its most recent assistant message, spawn a
