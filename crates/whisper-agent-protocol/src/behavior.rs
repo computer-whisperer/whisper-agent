@@ -59,7 +59,14 @@ pub enum TriggerSpec {
     /// Fires on HTTP POST to `/triggers/<pod>/<behavior>`; the request body
     /// becomes the trigger payload. v1 has no auth / no path customization;
     /// the path is derived from pod_id + behavior_id.
-    Webhook,
+    Webhook {
+        /// Overlap behavior when a POST arrives while the previous run
+        /// is still in flight. Matches Cron's semantics: Skip drops,
+        /// QueueOne parks at most one (overwriting any existing queued
+        /// payload), Allow spawns concurrent runs.
+        #[serde(default)]
+        overlap: Overlap,
+    },
 }
 
 fn default_timezone() -> String {

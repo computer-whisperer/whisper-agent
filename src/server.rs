@@ -25,12 +25,14 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use anyhow::Context;
 use axum::{
     Router,
+    body::Bytes,
     extract::{
-        State,
+        Path, State,
         ws::{Message, WebSocket, WebSocketUpgrade},
     },
+    http::StatusCode,
     response::IntoResponse,
-    routing::get,
+    routing::{get, post},
 };
 use futures::{SinkExt, StreamExt};
 use tokio::net::TcpListener;
@@ -46,7 +48,8 @@ use crate::pod::persist::Persister;
 use crate::pod::{Pod, PodId};
 use crate::runtime::audit::AuditLog;
 use crate::runtime::scheduler::{
-    BackendEntry, ConnId, Scheduler, SchedulerMsg, SharedHostConfig, build_default_pod_config,
+    BackendEntry, ConnId, Scheduler, SchedulerMsg, SharedHostConfig, TriggerFireError,
+    build_default_pod_config,
 };
 
 const WEBUI_PKG_DIR: &str = concat!(
@@ -196,6 +199,10 @@ pub async fn serve(listen: SocketAddr, config: ServerConfig) -> anyhow::Result<(
     let app = Router::new()
         .route("/health", get(|| async { "ok" }))
         .route("/ws", get(ws_handler))
+        .route(
+            "/triggers/{pod_id}/{behavior_id}",
+            post(webhook_trigger_handler),
+        )
         .nest_service("/pkg", ServeDir::new(WEBUI_PKG_DIR))
         .nest_service("/assets", ServeDir::new(WEBUI_ASSETS_DIR))
         .route_service("/index.html", ServeFile::new(WEBUI_INDEX))
@@ -218,6 +225,75 @@ pub async fn serve(listen: SocketAddr, config: ServerConfig) -> anyhow::Result<(
 
 async fn ws_handler(State(state): State<AppState>, ws: WebSocketUpgrade) -> impl IntoResponse {
     ws.on_upgrade(move |socket| handle_ws_session(socket, state))
+}
+
+/// Webhook trigger delivery. `POST /triggers/{pod_id}/{behavior_id}`
+/// with a JSON body (or empty body → Null payload). Minimal v1:
+/// no auth, no signature verification — suitable only for loopback
+/// or trusted-network use. When remote exposure becomes a real
+/// requirement, add HMAC validation here before pushing to the
+/// scheduler (the design sketch in `docs/design_behaviors.md` lists
+/// a `webhook_secret` shape we can bolt onto the `Webhook` variant).
+///
+/// Response semantics:
+///   - 202 Accepted: trigger dispatched (thread spawned OR payload
+///     queued OR skipped per overlap policy — all three are
+///     successful deliveries from the sender's perspective).
+///   - 400 Bad Request: body is non-empty and not valid JSON.
+///   - 404 Not Found: pod or behavior doesn't exist.
+///   - 409 Conflict: behavior exists but isn't webhook-triggered, or
+///     has a `behavior.toml` load error.
+///   - 503 Service Unavailable: scheduler inbox closed (shutting down).
+async fn webhook_trigger_handler(
+    State(state): State<AppState>,
+    Path((pod_id, behavior_id)): Path<(String, String)>,
+    body: Bytes,
+) -> axum::response::Response {
+    let payload = if body.is_empty() {
+        serde_json::Value::Null
+    } else {
+        match serde_json::from_slice::<serde_json::Value>(&body) {
+            Ok(v) => v,
+            Err(e) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    format!("body must be valid JSON: {e}"),
+                )
+                    .into_response();
+            }
+        }
+    };
+
+    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+    let msg = SchedulerMsg::TriggerFired {
+        pod_id,
+        behavior_id,
+        payload,
+        reply: reply_tx,
+    };
+    if state.inbox.send(msg).is_err() {
+        return (StatusCode::SERVICE_UNAVAILABLE, "scheduler inbox closed").into_response();
+    }
+
+    match reply_rx.await {
+        Ok(Ok(())) => StatusCode::ACCEPTED.into_response(),
+        Ok(Err(err)) => {
+            let status = match &err {
+                TriggerFireError::UnknownPod | TriggerFireError::UnknownBehavior => {
+                    StatusCode::NOT_FOUND
+                }
+                TriggerFireError::NotWebhookTrigger(_) | TriggerFireError::BehaviorLoadError(_) => {
+                    StatusCode::CONFLICT
+                }
+            };
+            (status, err.to_string()).into_response()
+        }
+        Err(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "scheduler dropped trigger request",
+        )
+            .into_response(),
+    }
 }
 
 async fn handle_ws_session(socket: WebSocket, state: AppState) {

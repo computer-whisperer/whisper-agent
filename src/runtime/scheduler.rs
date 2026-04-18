@@ -91,6 +91,45 @@ pub enum SchedulerMsg {
     UnregisterClient {
         conn_id: ConnId,
     },
+    /// An external trigger fired (webhook today; future event sources
+    /// route here too). The scheduler validates the target is an
+    /// actually-webhook-triggered behavior, then dispatches via the
+    /// shared `fire_trigger` path. `reply` receives the validation
+    /// outcome so the HTTP handler can map it to the right status.
+    TriggerFired {
+        pod_id: String,
+        behavior_id: String,
+        payload: serde_json::Value,
+        reply: tokio::sync::oneshot::Sender<Result<(), TriggerFireError>>,
+    },
+}
+
+/// Per-fire validation result surfaced back to whatever transport
+/// delivered the trigger (today: the `/triggers/...` HTTP handler).
+/// Successful fires — whether they spawn a thread or queue a payload
+/// — return `Ok(())`; this enum enumerates only the reject cases.
+#[derive(Debug, Clone)]
+pub enum TriggerFireError {
+    UnknownPod,
+    UnknownBehavior,
+    /// Behavior exists but isn't webhook-triggered. Holds the actual
+    /// trigger kind ("manual" / "cron") for a descriptive error.
+    NotWebhookTrigger(&'static str),
+    /// Behavior is present but its `behavior.toml` failed to parse.
+    BehaviorLoadError(String),
+}
+
+impl std::fmt::Display for TriggerFireError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnknownPod => write!(f, "unknown pod"),
+            Self::UnknownBehavior => write!(f, "unknown behavior"),
+            Self::NotWebhookTrigger(kind) => {
+                write!(f, "behavior is {kind}-triggered, not webhook")
+            }
+            Self::BehaviorLoadError(msg) => write!(f, "behavior load error: {msg}"),
+        }
+    }
 }
 
 /// Entry in the scheduler's backend catalog.
@@ -1031,7 +1070,44 @@ impl Scheduler {
             SchedulerMsg::ClientMessage { conn_id, msg } => {
                 self.apply_client_message(conn_id, msg, pending_io);
             }
+            SchedulerMsg::TriggerFired {
+                pod_id,
+                behavior_id,
+                payload,
+                reply,
+            } => {
+                let result =
+                    self.handle_webhook_trigger(&pod_id, &behavior_id, payload, pending_io);
+                // Ignore send errors — the HTTP handler may have given up
+                // (client disconnect / timeout). The fire already happened
+                // if it was going to; nothing to clean up.
+                let _ = reply.send(result);
+            }
         }
+    }
+
+    /// Validate a webhook-delivered trigger and dispatch it through
+    /// the shared `fire_trigger` path. Returns `Ok` on successful
+    /// dispatch (including overlap-queued and overlap-skipped cases
+    /// — those aren't sender errors). Returns `Err` only when the
+    /// behavior itself can't service the trigger.
+    fn handle_webhook_trigger(
+        &mut self,
+        pod_id: &str,
+        behavior_id: &str,
+        payload: serde_json::Value,
+        pending_io: &mut FuturesUnordered<SchedulerFuture>,
+    ) -> Result<(), TriggerFireError> {
+        let behavior = self
+            .pods
+            .get(pod_id)
+            .ok_or(TriggerFireError::UnknownPod)?
+            .behaviors
+            .get(behavior_id)
+            .ok_or(TriggerFireError::UnknownBehavior)?;
+        let overlap = validate_webhook_target(behavior)?;
+        self.fire_trigger(pod_id, behavior_id, payload, overlap, "webhook", pending_io);
+        Ok(())
     }
 
     fn apply_client_message(
@@ -2042,55 +2118,71 @@ impl Scheduler {
         }
 
         for (pod_id, behavior_id, overlap) in due {
-            match overlap {
-                whisper_agent_protocol::Overlap::Allow => {
-                    self.dispatch_cron_fire(&pod_id, &behavior_id, pending_io);
-                }
-                whisper_agent_protocol::Overlap::Skip => {
-                    if self.behavior_has_inflight_run(&pod_id, &behavior_id) {
-                        tracing::debug!(
-                            pod_id = %pod_id,
-                            behavior_id = %behavior_id,
-                            "cron tick skipped: previous run still in flight"
-                        );
-                        continue;
-                    }
-                    self.dispatch_cron_fire(&pod_id, &behavior_id, pending_io);
-                }
-                whisper_agent_protocol::Overlap::QueueOne => {
-                    if self.behavior_has_inflight_run(&pod_id, &behavior_id) {
-                        // Park a cron-kind payload (Null for cron — the
-                        // trigger carries no data) for consumption by
-                        // `on_behavior_thread_terminal` when the
-                        // in-flight run finishes. Overwriting an
-                        // existing queued payload is deliberate:
-                        // QueueOne semantics keep at most one pending
-                        // fire; later arrivals replace earlier.
-                        self.queue_behavior_payload(&pod_id, &behavior_id, serde_json::Value::Null);
-                        continue;
-                    }
-                    self.dispatch_cron_fire(&pod_id, &behavior_id, pending_io);
-                }
-            }
+            // Cron fires carry no payload (the trigger itself has no
+            // data to transmit); downstream `fire_trigger` still takes
+            // a payload for uniformity with webhook delivery.
+            self.fire_trigger(
+                &pod_id,
+                &behavior_id,
+                serde_json::Value::Null,
+                overlap,
+                "cron",
+                pending_io,
+            );
         }
     }
 
-    /// Fire one cron-triggered behavior. Logs at warn if `run_behavior`
-    /// returns an error (it shouldn't for a behavior that passed
-    /// validation; surface the error here rather than propagating up
-    /// the tick loop where a single bad behavior would halt others).
-    fn dispatch_cron_fire(
+    /// Apply overlap policy and dispatch a trigger-driven behavior run.
+    /// Shared by the cron ticker and the webhook handler; any future
+    /// event-source trigger (slack, imap, file-watch) calls this too.
+    ///
+    /// `source` is a short tag used only in log lines — the behavior's
+    /// trigger variant is the source of truth for overlap; this string
+    /// just makes warn-logs readable.
+    fn fire_trigger(
         &mut self,
         pod_id: &str,
         behavior_id: &str,
+        payload: serde_json::Value,
+        overlap: whisper_agent_protocol::Overlap,
+        source: &'static str,
         pending_io: &mut FuturesUnordered<SchedulerFuture>,
     ) {
-        if let Err(e) = self.run_behavior(None, None, pod_id, behavior_id, None, pending_io) {
+        use whisper_agent_protocol::Overlap;
+        let inflight = matches!(overlap, Overlap::Skip | Overlap::QueueOne)
+            && self.behavior_has_inflight_run(pod_id, behavior_id);
+        if inflight {
+            match overlap {
+                Overlap::Skip => {
+                    tracing::debug!(
+                        %source,
+                        pod_id = %pod_id,
+                        behavior_id = %behavior_id,
+                        "trigger fire skipped: previous run still in flight"
+                    );
+                    return;
+                }
+                Overlap::QueueOne => {
+                    // Park the payload for consumption by the
+                    // on-terminal hook. Overwriting an existing queued
+                    // payload is deliberate — QueueOne keeps at most
+                    // one pending; later arrivals replace earlier.
+                    self.queue_behavior_payload(pod_id, behavior_id, payload);
+                    return;
+                }
+                Overlap::Allow => unreachable!("excluded from `inflight` check"),
+            }
+        }
+        // Allow branch, or Skip/QueueOne with no in-flight run: fire now.
+        if let Err(e) =
+            self.run_behavior(None, None, pod_id, behavior_id, Some(payload), pending_io)
+        {
             warn!(
+                %source,
                 pod_id = %pod_id,
                 behavior_id = %behavior_id,
                 error = %e,
-                "cron-driven run_behavior failed"
+                "trigger-driven run_behavior failed"
             );
         }
     }
@@ -3441,6 +3533,33 @@ fn is_cron_due(
         .unwrap_or(false)
 }
 
+/// Validate that a behavior can service a webhook trigger: must be
+/// loaded cleanly AND its trigger kind must be `Webhook`. Returns
+/// the `Overlap` policy on success so callers can hand it to
+/// `fire_trigger` without re-matching. Pure function — easier to
+/// test than the full `handle_webhook_trigger` flow, which needs a
+/// live scheduler.
+fn validate_webhook_target(
+    behavior: &crate::pod::behaviors::Behavior,
+) -> Result<whisper_agent_protocol::Overlap, TriggerFireError> {
+    if let Some(err) = &behavior.load_error {
+        return Err(TriggerFireError::BehaviorLoadError(err.clone()));
+    }
+    let cfg = behavior
+        .config
+        .as_ref()
+        .ok_or_else(|| TriggerFireError::BehaviorLoadError("no parsed config".into()))?;
+    match &cfg.trigger {
+        whisper_agent_protocol::TriggerSpec::Webhook { overlap } => Ok(*overlap),
+        whisper_agent_protocol::TriggerSpec::Manual => {
+            Err(TriggerFireError::NotWebhookTrigger("manual"))
+        }
+        whisper_agent_protocol::TriggerSpec::Cron { .. } => {
+            Err(TriggerFireError::NotWebhookTrigger("cron"))
+        }
+    }
+}
+
 /// Disposition the retention sweep picks for a single thread.
 /// Archive preserves the JSON under `<pod>/.archived/threads/`;
 /// Delete removes it outright. Which applies is determined by the
@@ -3797,6 +3916,71 @@ mod tests {
             .with_timezone(&chrono::Utc);
         assert!(is_cron_due(&cron, cursor, at));
         assert!(is_cron_due(&cron, cursor, after));
+    }
+
+    #[test]
+    fn validate_webhook_accepts_webhook_behaviors() {
+        let behavior = behavior_fixture(
+            Some(whisper_agent_protocol::TriggerSpec::Webhook {
+                overlap: Overlap::QueueOne,
+            }),
+            None,
+        );
+        let overlap = validate_webhook_target(&behavior).unwrap();
+        assert_eq!(overlap, Overlap::QueueOne);
+    }
+
+    #[test]
+    fn validate_webhook_rejects_manual_trigger() {
+        let behavior = behavior_fixture(Some(whisper_agent_protocol::TriggerSpec::Manual), None);
+        let err = validate_webhook_target(&behavior).unwrap_err();
+        assert!(matches!(err, TriggerFireError::NotWebhookTrigger("manual")));
+    }
+
+    #[test]
+    fn validate_webhook_rejects_cron_trigger() {
+        let behavior = behavior_fixture(
+            Some(whisper_agent_protocol::TriggerSpec::Cron {
+                schedule: "0 9 * * *".into(),
+                timezone: "UTC".into(),
+                overlap: Overlap::Skip,
+                catch_up: whisper_agent_protocol::CatchUp::One,
+            }),
+            None,
+        );
+        let err = validate_webhook_target(&behavior).unwrap_err();
+        assert!(matches!(err, TriggerFireError::NotWebhookTrigger("cron")));
+    }
+
+    #[test]
+    fn validate_webhook_surfaces_load_error() {
+        let behavior = behavior_fixture(None, Some("toml parse: bad".into()));
+        let err = validate_webhook_target(&behavior).unwrap_err();
+        assert!(matches!(err, TriggerFireError::BehaviorLoadError(_)));
+    }
+
+    fn behavior_fixture(
+        trigger: Option<whisper_agent_protocol::TriggerSpec>,
+        load_error: Option<String>,
+    ) -> crate::pod::behaviors::Behavior {
+        let config = trigger.map(|t| whisper_agent_protocol::BehaviorConfig {
+            name: "t".into(),
+            description: None,
+            trigger: t,
+            thread: whisper_agent_protocol::BehaviorThreadOverride::default(),
+            on_completion: whisper_agent_protocol::RetentionPolicy::default(),
+        });
+        crate::pod::behaviors::Behavior {
+            id: "b".into(),
+            pod_id: "p".into(),
+            dir: std::path::PathBuf::from("/tmp"),
+            config,
+            raw_toml: String::new(),
+            prompt: String::new(),
+            state: whisper_agent_protocol::BehaviorState::default(),
+            cron: None,
+            load_error,
+        }
     }
 
     #[tokio::test]

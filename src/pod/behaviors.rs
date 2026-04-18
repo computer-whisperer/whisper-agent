@@ -116,7 +116,7 @@ pub fn trigger_kind(trigger: &TriggerSpec) -> &'static str {
     match trigger {
         TriggerSpec::Manual => "manual",
         TriggerSpec::Cron { .. } => "cron",
-        TriggerSpec::Webhook => "webhook",
+        TriggerSpec::Webhook { .. } => "webhook",
     }
 }
 
@@ -160,7 +160,7 @@ pub fn to_toml(cfg: &BehaviorConfig) -> Result<String, BehaviorConfigError> {
 /// after `validate` succeeds.
 pub fn validate(cfg: &BehaviorConfig) -> Result<(), BehaviorConfigError> {
     match &cfg.trigger {
-        TriggerSpec::Manual | TriggerSpec::Webhook => {}
+        TriggerSpec::Manual | TriggerSpec::Webhook { .. } => {}
         TriggerSpec::Cron {
             schedule, timezone, ..
         } => {
@@ -492,6 +492,45 @@ schedule = ""
     }
 
     #[test]
+    fn webhook_defaults_overlap_to_skip() {
+        let cfg: BehaviorConfig = toml::from_str(
+            r#"
+name = "on-push"
+
+[trigger]
+kind = "webhook"
+"#,
+        )
+        .unwrap();
+        match cfg.trigger {
+            TriggerSpec::Webhook { overlap } => {
+                assert_eq!(overlap, Overlap::Skip);
+            }
+            _ => panic!("expected Webhook"),
+        }
+    }
+
+    #[test]
+    fn webhook_accepts_overlap_override() {
+        let cfg: BehaviorConfig = toml::from_str(
+            r#"
+name = "on-push"
+
+[trigger]
+kind = "webhook"
+overlap = "queue_one"
+"#,
+        )
+        .unwrap();
+        match cfg.trigger {
+            TriggerSpec::Webhook { overlap } => {
+                assert_eq!(overlap, Overlap::QueueOne);
+            }
+            _ => panic!("expected Webhook"),
+        }
+    }
+
+    #[test]
     fn rejects_unparseable_cron() {
         let text = r#"
 name = "bad"
@@ -605,7 +644,7 @@ kind = "webhook"
         assert_eq!(behaviors[1].prompt, "");
         assert!(matches!(
             behaviors[1].config.as_ref().unwrap().trigger,
-            TriggerSpec::Webhook
+            TriggerSpec::Webhook { .. }
         ));
         let _ = std::fs::remove_dir_all(&pod_dir);
     }
