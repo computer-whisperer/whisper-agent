@@ -20,7 +20,8 @@ pub use behavior::{
 };
 pub use conversation::{ContentBlock, Conversation, Message, Role, ToolResultContent};
 pub use pod::{
-    NamedHostEnv, PodAllow, PodConfig, PodLimits, PodSnapshot, PodState, PodSummary, ThreadDefaults,
+    CompactionConfig, NamedHostEnv, PodAllow, PodConfig, PodLimits, PodSnapshot, PodState,
+    PodSummary, ThreadDefaults,
 };
 pub use sandbox::HostEnvSpec;
 
@@ -82,6 +83,11 @@ pub struct ThreadConfig {
     pub max_turns: u32,
     #[serde(default)]
     pub approval_policy: ApprovalPolicy,
+    /// Policy for compacting an overlong thread into a continuation.
+    /// Inherits from the pod's `thread_defaults.compaction`; per-thread
+    /// overrides come in via [`ThreadConfigOverride.compaction`].
+    #[serde(default)]
+    pub compaction: CompactionConfig,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
@@ -96,6 +102,26 @@ pub struct ThreadConfigOverride {
     pub max_turns: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub approval_policy: Option<ApprovalPolicy>,
+    /// Per-field compaction override. Fields left `None` inherit from
+    /// the pod's defaults; any set field replaces it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compaction: Option<CompactionConfigOverride>,
+}
+
+/// Per-thread compaction override. Shape mirrors [`CompactionConfig`] but
+/// every field is `Option` — `None` means "inherit from the pod default."
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+pub struct CompactionConfigOverride {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_file: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary_regex: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_threshold: Option<Option<u32>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub continuation_template: Option<String>,
 }
 
 /// Concrete resource bindings for a thread. Each field names an entry in
@@ -286,6 +312,12 @@ pub struct ThreadSummary {
     /// without fetching the full snapshot.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub origin: Option<BehaviorOrigin>,
+    /// When this thread was spawned as the continuation of a compacted
+    /// thread, the id of that ancestor. `None` for threads that weren't
+    /// created by compaction. Exposed on the list tier so the UI can
+    /// badge "continued from …" without fetching the full snapshot.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub continued_from: Option<String>,
 }
 
 /// Entry in a `BackendsList` response.
@@ -433,6 +465,10 @@ pub struct ThreadSnapshot {
     /// but payload-size concerns may trim it there later).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub origin: Option<BehaviorOrigin>,
+    /// Ancestor thread id when this thread is a compaction continuation.
+    /// `None` for threads that weren't created by compaction.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub continued_from: Option<String>,
 }
 
 // ---------- Wire enums ----------
@@ -510,6 +546,17 @@ pub enum ClientToServer {
     /// Archive (hide) a task. It remains on disk but drops off the broadcast list.
     ArchiveThread {
         thread_id: String,
+    },
+    /// Manually compact `thread_id`. Appends the thread's configured
+    /// compaction prompt as a final user message; on turn completion,
+    /// the scheduler spawns a new thread seeded with the extracted
+    /// summary and sends `ThreadCompacted` linking the two. Rejected
+    /// when the thread is mid-turn or its config has
+    /// `compaction.enabled = false`.
+    CompactThread {
+        thread_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        correlation_id: Option<String>,
     },
 
     // --- Observation ---
@@ -718,6 +765,22 @@ pub enum ServerToClient {
     ThreadBindingsChanged {
         thread_id: String,
         bindings: ThreadBindings,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        correlation_id: Option<String>,
+    },
+    /// Compaction finished on `thread_id`: the scheduler spawned
+    /// `new_thread_id` seeded with the extracted summary, and
+    /// `new_thread_id.continued_from == thread_id`. The original thread
+    /// is left in-place (Completed) so clients can still render its
+    /// history — a deliberate choice to preserve the compaction
+    /// boundary as a historical artifact rather than rewrite the past.
+    /// `summary_text` is the body that was extracted and used to seed
+    /// the continuation; clients may render it inline without having
+    /// to re-parse the old thread.
+    ThreadCompacted {
+        thread_id: String,
+        new_thread_id: String,
+        summary_text: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         correlation_id: Option<String>,
     },

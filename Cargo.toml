@@ -44,6 +44,7 @@ cron = "0.16"
 # Misc utilities
 url = "2"
 subtle = "2"
+regex = "1"
 
 # Internal crates
 whisper-agent-protocol = { path = "crates/whisper-agent-protocol" }
@@ -83,3 +84,4 @@ tower-http = { version = "0.6", features = ["fs", "trace"] }
 whisper-agent-protocol = { workspace = true }
 toml = "1"
 base64 = "0.22"
+regex = { workspace = true }

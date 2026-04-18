@@ -1030,6 +1030,12 @@ impl ChatApp {
                     view.inspector.bindings = bindings;
                 }
             }
+            ServerToClient::ThreadCompacted { .. } => {
+                // The continuation thread arrives as its own
+                // `ThreadCreated`; the old thread's state change to
+                // Completed arrives on its own; nothing to do here
+                // until the UI grows a dedicated "compacted" badge.
+            }
             ServerToClient::ThreadAssistantBegin { .. } => {}
             ServerToClient::ThreadAssistantText { thread_id, text } => {
                 if let Some(view) = self.tasks.get_mut(&thread_id) {
@@ -1626,6 +1632,7 @@ fn snapshot_summary(s: &whisper_agent_protocol::ThreadSnapshot) -> ThreadSummary
         created_at: s.created_at.clone(),
         last_active: s.last_active.clone(),
         origin: s.origin.clone(),
+        continued_from: s.continued_from.clone(),
     }
 }
 
@@ -3576,6 +3583,7 @@ impl ChatApp {
                 approval_policy: ApprovalPolicy::PromptPodModify,
                 host_env: String::new(),
                 mcp_hosts: Vec::new(),
+                compaction: Default::default(),
             },
             limits: PodLimits::default(),
         }

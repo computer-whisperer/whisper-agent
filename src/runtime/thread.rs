@@ -68,6 +68,20 @@ pub struct Thread {
     /// this on spawn and the on-completion hook reads it back.
     #[serde(default)]
     pub origin: Option<BehaviorOrigin>,
+    /// When this thread was spawned as the continuation of a compacted
+    /// thread, the id of that ancestor. Set once at spawn; never
+    /// mutated afterward. `None` for threads that weren't created by
+    /// compaction.
+    #[serde(default)]
+    pub continued_from: Option<String>,
+    /// True between the moment a `/compact` command has appended the
+    /// compaction prompt and the scheduler has finalized the
+    /// continuation. Kept on the thread rather than a side-map so the
+    /// flag survives process restart: a compaction in flight during
+    /// shutdown finalizes on the next startup when the model turn
+    /// completes.
+    #[serde(default)]
+    pub compacting: bool,
     pub internal: ThreadInternalState,
 }
 
@@ -305,6 +319,8 @@ impl Thread {
             turns_in_cycle: 0,
             tool_allowlist: BTreeSet::new(),
             origin: None,
+            continued_from: None,
+            compacting: false,
             internal: ThreadInternalState::Idle,
         }
     }
@@ -315,6 +331,14 @@ impl Thread {
     /// knows which behavior this thread belongs to.
     pub fn with_origin(mut self, origin: BehaviorOrigin) -> Self {
         self.origin = Some(origin);
+        self
+    }
+
+    /// Stamp the compaction-continuation ancestor. Called by the
+    /// scheduler when spawning the continuation thread produced by
+    /// `/compact` — never mutated after construction.
+    pub fn with_continued_from(mut self, predecessor_id: String) -> Self {
+        self.continued_from = Some(predecessor_id);
         self
     }
 
@@ -345,6 +369,7 @@ impl Thread {
             created_at: self.created_at.to_rfc3339(),
             last_active: self.last_active.to_rfc3339(),
             origin: self.origin.clone(),
+            continued_from: self.continued_from.clone(),
         }
     }
 
@@ -363,6 +388,7 @@ impl Thread {
             failure: self.failure_detail(),
             tool_allowlist: self.tool_allowlist.iter().cloned().collect(),
             origin: self.origin.clone(),
+            continued_from: self.continued_from.clone(),
         }
     }
 
@@ -1191,6 +1217,7 @@ mod tests {
             max_tokens: 100,
             max_turns: 10,
             approval_policy: ApprovalPolicy::PromptDestructive,
+            compaction: Default::default(),
         };
         let mut task = Thread::new("t1".into(), "t1".into(), cfg, ThreadBindings::default());
         let tool_uses: Vec<ToolUseReq> = tool_names

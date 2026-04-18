@@ -4,7 +4,7 @@
 //! top) are readable without the surrounding lifecycle noise.
 
 use whisper_agent_protocol::{
-    HostEnvSpec, ThreadBindingsRequest, ThreadConfig, ThreadConfigOverride,
+    CompactionConfig, HostEnvSpec, ThreadBindingsRequest, ThreadConfig, ThreadConfigOverride,
 };
 
 use crate::pod::Pod;
@@ -62,6 +62,7 @@ pub fn build_default_pod_config(
             approval_policy: config.approval_policy,
             host_env: default_host_env_name,
             mcp_hosts: shared_host_names.to_vec(),
+            compaction: CompactionConfig::default(),
         },
         limits: PodLimits::default(),
     }
@@ -78,6 +79,7 @@ pub(super) fn base_thread_config_from_pod(pod: &Pod) -> ThreadConfig {
         max_tokens: defaults.max_tokens,
         max_turns: defaults.max_turns,
         approval_policy: defaults.approval_policy,
+        compaction: defaults.compaction.clone(),
     }
 }
 
@@ -86,12 +88,34 @@ pub(super) fn apply_config_override(
     ov: Option<ThreadConfigOverride>,
 ) -> ThreadConfig {
     let Some(ov) = ov else { return base };
+    let compaction = apply_compaction_override(base.compaction, ov.compaction);
     ThreadConfig {
         model: ov.model.unwrap_or(base.model),
         system_prompt: ov.system_prompt.unwrap_or(base.system_prompt),
         max_tokens: ov.max_tokens.unwrap_or(base.max_tokens),
         max_turns: ov.max_turns.unwrap_or(base.max_turns),
         approval_policy: ov.approval_policy.unwrap_or(base.approval_policy),
+        compaction,
+    }
+}
+
+/// Layer a partial `CompactionConfigOverride` on top of a pod-inherited
+/// base. `None` fields on the override inherit; `Some(_)` fields replace.
+/// `token_threshold` is `Option<Option<u32>>` so it can be explicitly
+/// cleared to `None` as well as explicitly set.
+fn apply_compaction_override(
+    base: CompactionConfig,
+    ov: Option<whisper_agent_protocol::CompactionConfigOverride>,
+) -> CompactionConfig {
+    let Some(ov) = ov else { return base };
+    CompactionConfig {
+        enabled: ov.enabled.unwrap_or(base.enabled),
+        prompt_file: ov.prompt_file.unwrap_or(base.prompt_file),
+        summary_regex: ov.summary_regex.unwrap_or(base.summary_regex),
+        token_threshold: ov.token_threshold.unwrap_or(base.token_threshold),
+        continuation_template: ov
+            .continuation_template
+            .unwrap_or(base.continuation_template),
     }
 }
 
@@ -113,6 +137,7 @@ pub(super) fn behavior_override_to_requests(
             max_tokens: ov.max_tokens,
             max_turns: ov.max_turns,
             approval_policy: ov.approval_policy,
+            compaction: None, // behaviors inherit pod compaction policy
         })
     } else {
         None

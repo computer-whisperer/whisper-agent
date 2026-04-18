@@ -21,6 +21,7 @@
 mod behaviors;
 mod bindings;
 mod client_messages;
+mod compaction;
 mod config_updates;
 mod retention;
 mod thread_config;
@@ -1526,6 +1527,12 @@ impl Scheduler {
         // hook directly. Passes `pending_io` through so the hook can
         // re-fire on a queued QueueOne payload.
         self.on_behavior_thread_terminal(thread_id, pending_io);
+        // If the thread was mid-compaction and has just reached
+        // Completed, parse the summary and spawn a continuation.
+        // No-op otherwise. Runs after the behavior hook so a
+        // compacted-then-continued behavior thread records the
+        // Completed outcome on its original thread first.
+        self.finalize_pending_compaction(thread_id, pending_io);
     }
 
     /// If the task is in a terminal state, tear down its sandbox (if any).

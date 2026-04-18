@@ -653,6 +653,7 @@ fn synthesize_pod_config(task: &Thread) -> PodConfig {
             approval_policy: task.config.approval_policy,
             host_env: String::new(),
             mcp_hosts: Vec::new(),
+            compaction: task.config.compaction.clone(),
         },
         limits: PodLimits::default(),
     }
@@ -692,6 +693,7 @@ mod tests {
                 approval_policy: ApprovalPolicy::PromptPodModify,
                 host_env: String::new(),
                 mcp_hosts: Vec::new(),
+                compaction: Default::default(),
             },
             limits: PodLimits::default(),
         }
@@ -704,6 +706,7 @@ mod tests {
             max_tokens: 8000,
             max_turns: 50,
             approval_policy: ApprovalPolicy::PromptDestructive,
+            compaction: Default::default(),
         };
         let bindings = ThreadBindings {
             backend: "anthropic".into(),

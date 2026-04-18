@@ -447,6 +447,7 @@ async fn run_serve(args: ServeArgs) -> Result<()> {
             } else {
                 ApprovalPolicy::PromptPodModify
             },
+            compaction: Default::default(),
         },
         default_host_env,
         default_shared_host_names,

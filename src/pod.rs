@@ -236,6 +236,7 @@ mod tests {
                 approval_policy: ApprovalPolicy::PromptDestructive,
                 host_env: "landlock-rw".into(),
                 mcp_hosts: vec!["fetch".into(), "search".into()],
+                compaction: Default::default(),
             },
             limits: PodLimits {
                 max_concurrent_threads: 10,

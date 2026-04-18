@@ -182,6 +182,24 @@ impl Scheduler {
                         .broadcast_task_list(ServerToClient::ThreadArchived { thread_id });
                 }
             }
+            ClientToServer::CompactThread {
+                thread_id,
+                correlation_id,
+            } => {
+                if let Err(e) =
+                    self.begin_compaction(&thread_id, correlation_id.clone(), pending_io)
+                {
+                    warn!(error = %e, conn_id, %thread_id, "begin_compaction rejected");
+                    self.router.send_to_client(
+                        conn_id,
+                        ServerToClient::Error {
+                            correlation_id,
+                            thread_id: Some(thread_id),
+                            message: format!("compact_thread: {e}"),
+                        },
+                    );
+                }
+            }
             ClientToServer::SubscribeToThread { thread_id } => {
                 if let Some(task) = self.tasks.get(&thread_id) {
                     self.router.subscribe(conn_id, &thread_id);

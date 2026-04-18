@@ -78,6 +78,76 @@ pub struct ThreadDefaults {
     pub host_env: String,
     #[serde(default)]
     pub mcp_hosts: Vec<String>,
+    /// Compaction defaults threads in this pod inherit. Threads
+    /// override via [`crate::ThreadConfigOverride.compaction`].
+    #[serde(default)]
+    pub compaction: CompactionConfig,
+}
+
+/// Policy for compacting an overlong thread into a fresh continuation.
+///
+/// Compaction appends the `prompt_file` text (or the built-in default
+/// when empty) to the running thread as a final user message, lets the
+/// model generate a single summary response bounded by `<summary>…</summary>`,
+/// then spawns a new thread seeded with `continuation_template` with
+/// `{{summary}}` substituted in. The new thread's
+/// [`crate::ThreadSummary.continued_from`] points back at the old one so
+/// clients can render the chain.
+///
+/// Identical shape on both sides of the inheritance chain
+/// (`ThreadDefaults` / `ThreadConfig`); [`CompactionConfigOverride`]
+/// carries the same fields as `Option`s for per-thread partial overrides.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct CompactionConfig {
+    /// Master switch. When false, `/compact` is rejected and
+    /// `token_threshold` auto-triggers are skipped.
+    #[serde(default = "compaction_enabled_default")]
+    pub enabled: bool,
+    /// Path to the compaction-instruction file, relative to the pod
+    /// directory. Empty ⇒ use the built-in default prompt.
+    #[serde(default)]
+    pub prompt_file: String,
+    /// Regex that extracts the summary body from the model's response.
+    /// Group 1 is the summary text. Default matches `<summary>…</summary>`
+    /// with leading/trailing whitespace trimmed.
+    #[serde(default = "default_summary_regex")]
+    pub summary_regex: String,
+    /// Auto-compact once the thread's accumulated input tokens exceed
+    /// this. `None` ⇒ manual-only. (Auto-trigger lands in a follow-up
+    /// commit; the field is already on the wire so pods can declare it.)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_threshold: Option<u32>,
+    /// Template for the seed message on the continuation thread.
+    /// `{{summary}}` substitutes for the extracted summary body.
+    #[serde(default = "default_continuation_template")]
+    pub continuation_template: String,
+}
+
+fn compaction_enabled_default() -> bool {
+    true
+}
+
+fn default_summary_regex() -> String {
+    r"(?s)<summary>\s*(.*?)\s*</summary>".to_string()
+}
+
+fn default_continuation_template() -> String {
+    "This thread continues a previous conversation that was compacted for context. \
+     The summary below covers the earlier portion; use it as your working context.\n\n\
+     {{summary}}"
+        .to_string()
+}
+
+impl Default for CompactionConfig {
+    fn default() -> Self {
+        Self {
+            enabled: compaction_enabled_default(),
+            prompt_file: String::new(),
+            summary_regex: default_summary_regex(),
+            token_threshold: None,
+            continuation_template: default_continuation_template(),
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]

@@ -4508,6 +4508,7 @@ dependencies = [
  "clap",
  "cron",
  "futures",
+ "regex",
  "reqwest",
  "serde",
  "serde_json",
