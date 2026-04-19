@@ -16,8 +16,20 @@ use tracing::warn;
 use whisper_agent_protocol::{BackendSummary, ClientToServer, ModelSummary, ServerToClient};
 
 use super::{ConnId, Scheduler, pending_approvals_of};
+use crate::functions::RejectReason;
 use crate::pod::Pod;
 use crate::runtime::io_dispatch::SchedulerFuture;
+
+/// Extract a user-facing detail string from a `RejectReason`. Surfaces
+/// on WS error frames when a Function fails to register.
+fn reject_reason_detail(r: &RejectReason) -> &str {
+    match r {
+        RejectReason::ScopeDenied { detail }
+        | RejectReason::PreconditionFailed { detail }
+        | RejectReason::InvalidSpec { detail }
+        | RejectReason::ResourceBusy { detail } => detail,
+    }
+}
 
 impl Scheduler {
     pub(super) fn apply_client_message(
@@ -177,7 +189,7 @@ impl Scheduler {
                     correlation_id: None,
                 };
                 match self.register_function(spec, scope, caller) {
-                    Ok(fn_id) => self.execute_function(fn_id, pending_io),
+                    Ok(fn_id) => self.launch_function(fn_id, pending_io),
                     Err(e) => {
                         warn!(error = ?e, conn_id, thread_id, "CancelThread rejected");
                         // Pre-migration the handler silently ignored
@@ -195,18 +207,29 @@ impl Scheduler {
                 thread_id,
                 correlation_id,
             } => {
-                if let Err(e) =
-                    self.begin_compaction(&thread_id, correlation_id.clone(), pending_io)
-                {
-                    warn!(error = %e, conn_id, %thread_id, "begin_compaction rejected");
-                    self.router.send_to_client(
-                        conn_id,
-                        ServerToClient::Error {
-                            correlation_id,
-                            thread_id: Some(thread_id),
-                            message: format!("compact_thread: {e}"),
-                        },
-                    );
+                // Route through the Function registry — same path as
+                // auto-compact takes with its SchedulerInternal caller.
+                let spec = crate::functions::Function::CompactThread {
+                    thread_id: thread_id.clone(),
+                };
+                let scope = self.ws_client_scope();
+                let caller = crate::functions::CallerLink::WsClient {
+                    conn_id,
+                    correlation_id: correlation_id.clone(),
+                };
+                match self.register_function(spec, scope, caller) {
+                    Ok(fn_id) => self.launch_function(fn_id, pending_io),
+                    Err(e) => {
+                        warn!(error = ?e, conn_id, %thread_id, "compact_thread rejected");
+                        self.router.send_to_client(
+                            conn_id,
+                            ServerToClient::Error {
+                                correlation_id,
+                                thread_id: Some(thread_id),
+                                message: format!("compact_thread: {}", reject_reason_detail(&e)),
+                            },
+                        );
+                    }
                 }
             }
             ClientToServer::SetThreadDraft { thread_id, text } => {

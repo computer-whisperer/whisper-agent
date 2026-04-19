@@ -1,17 +1,19 @@
-//! Function registry on the scheduler — Phase 2's first concrete
-//! consumer of the types from `crate::functions`.
+//! Function registry on the scheduler.
 //!
 //! The registry is the scheduler's source of truth for in-flight
-//! caller-initiated operations. Each entry is an [`ActiveFunction`] —
+//! caller-initiated operations. Each entry is an `ActiveFunctionEntry` —
 //! spec + scope + caller-link. `register_function` is the synchronous
-//! accept/deny path; per-variant `execute_*` methods run the actual work
-//! and produce the terminal.
+//! accept/deny path; per-variant `launch_*` methods run the actual work
+//! (which may complete inline for sync variants, or span many scheduler
+//! ticks for async variants), and `complete_function` removes the entry
+//! and emits the terminal.
 //!
-//! Today the only variant wired through is `Function::CancelThread`,
-//! which is synchronous (state flip + cascade hooks). Subsequent commits
-//! will add `CompactThread` (async, uses in-flight flags),
-//! `BuiltinToolCall` / `McpToolUse` (async, approval path), and the
-//! thread-lifecycle variants.
+//! Currently wired:
+//!
+//! - `Function::CancelThread` — synchronous; launch completes inline.
+//! - `Function::CompactThread` — asynchronous; launches the compaction
+//!   turn and stays in the registry until `finalize_pending_compaction`
+//!   fires `complete_function`.
 
 use futures::stream::FuturesUnordered;
 use tracing::{debug, warn};
@@ -19,7 +21,7 @@ use whisper_agent_protocol::{ServerToClient, ThreadStateLabel};
 
 use super::Scheduler;
 use crate::functions::{
-    CallerLink, Function, FunctionId, FunctionOutcome, FunctionTerminal, InternalOriginator,
+    CallerLink, Function, FunctionId, FunctionOutcome, FunctionTerminal, InFlightOps,
     RejectReason,
 };
 use crate::permission::{PermissionScope, ThreadOp};
@@ -27,13 +29,14 @@ use crate::runtime::io_dispatch::SchedulerFuture;
 
 /// Server-owned runtime state of an in-flight Function.
 ///
-/// Phase 2 shape: minimal — enough to support the synchronous
-/// `CancelThread` variant. Async Functions will grow progress/terminal
-/// channels and a cancel handle as they land.
+/// Phase-2/3 shape: minimal — enough to support synchronous variants
+/// (CancelThread) and multi-tick async variants that carry only a
+/// thread_id (CompactThread). Full progress/terminal channels land when
+/// the tool-call variants migrate in Commit 4.
 #[derive(Debug)]
-// Fields are written at registration and read by later variants + the
-// cancel-by-thread sweep; silence early dead-code until those consumers
-// land in Commits 3+.
+// Fields are written at registration and read by variant launch/complete
+// paths + the cancel-by-thread sweep; silence early dead-code until
+// those consumers land in Commit 4+.
 #[allow(dead_code)]
 pub struct ActiveFunctionEntry {
     pub id: FunctionId,
@@ -57,12 +60,17 @@ impl Scheduler {
         PermissionScope::allow_all()
     }
 
-    /// Synchronous accept-or-deny registration. On accept the `ActiveFunctionEntry`
-    /// enters the registry in Pending state and its `FunctionId` is returned.
-    ///
-    /// This is the one place scope + variant preconditions are checked.
-    /// Anything that requires awaiting I/O happens later, in the variant's
-    /// execute path, through the caller-link delivery channel.
+    /// Full-trust scope for scheduler-internal callers (auto-compact,
+    /// cron fires). These originate from the server's own timers /
+    /// state machine; there's no caller identity to narrow against.
+    pub(super) fn internal_scope(&self) -> PermissionScope {
+        PermissionScope::allow_all()
+    }
+
+    /// Synchronous accept-or-deny registration. On accept the
+    /// `ActiveFunctionEntry` enters the registry and its `FunctionId` is
+    /// returned. Anything that requires awaiting I/O happens later, in
+    /// the variant's launch path.
     pub(super) fn register_function(
         &mut self,
         spec: Function,
@@ -86,8 +94,8 @@ impl Scheduler {
         Ok(id)
     }
 
-    /// Variant-specific scope + precondition check. Called synchronously from
-    /// `register_function` before admission.
+    /// Variant-specific scope + precondition check. Called synchronously
+    /// from `register_function` before admission.
     fn variant_precondition_check(
         &self,
         spec: &Function,
@@ -100,10 +108,32 @@ impl Scheduler {
                         detail: format!("unknown thread {thread_id}"),
                     }
                 })?;
-                let disp = scope.thread_op(&task.pod_id, ThreadOp::Cancel);
-                if !disp.admits() {
-                    return Err(RejectReason::ScopeDenied {
-                        detail: format!("thread {thread_id} cancel denied by scope"),
+                admission_check(scope.thread_op(&task.pod_id, ThreadOp::Cancel), || {
+                    format!("thread {thread_id} cancel denied by scope")
+                })
+            }
+            Function::CompactThread { thread_id } => {
+                let task = self.tasks.get(thread_id).ok_or_else(|| {
+                    RejectReason::PreconditionFailed {
+                        detail: format!("unknown thread {thread_id}"),
+                    }
+                })?;
+                admission_check(scope.thread_op(&task.pod_id, ThreadOp::Compact), || {
+                    format!("thread {thread_id} compact denied by scope")
+                })?;
+                if !task.config.compaction.enabled {
+                    return Err(RejectReason::PreconditionFailed {
+                        detail: "compaction is disabled on this thread".into(),
+                    });
+                }
+                if task.in_flight.contains(InFlightOps::COMPACTING) {
+                    return Err(RejectReason::ResourceBusy {
+                        detail: "compaction already in progress".into(),
+                    });
+                }
+                if !task.is_idle() {
+                    return Err(RejectReason::PreconditionFailed {
+                        detail: "thread is not at a clean turn boundary".into(),
                     });
                 }
                 Ok(())
@@ -117,57 +147,89 @@ impl Scheduler {
         }
     }
 
-    /// Pop an admitted Function from the registry and execute it. For
-    /// Phase 2's synchronous `CancelThread`, execution runs inline during
-    /// this call — terminal fires before we return. Async variants
-    /// landing later will keep the Function in the registry until their
-    /// future completes.
-    pub(super) fn execute_function(
+    /// Launch an admitted Function. For synchronous variants this also
+    /// emits the terminal (via `complete_function`) before returning;
+    /// async variants return with the entry still in `active_functions`
+    /// and complete later (e.g., when a subsequent scheduler tick fires
+    /// the completion hook).
+    pub(super) fn launch_function(
         &mut self,
         id: FunctionId,
         pending_io: &mut FuturesUnordered<SchedulerFuture>,
     ) {
-        let entry = match self.active_functions.remove(&id) {
-            Some(e) => e,
+        let spec = match self.active_functions.get(&id) {
+            Some(e) => e.spec.clone(),
             None => {
-                warn!(function_id = id, "execute_function: no such entry");
+                warn!(function_id = id, "launch_function: no such entry");
                 return;
             }
         };
-        let caller_tag = entry.caller.audit_tag();
-        let outcome = match entry.spec {
+        match spec {
             Function::CancelThread { thread_id } => {
                 self.execute_cancel_thread(&thread_id, pending_io);
-                FunctionOutcome::Success(FunctionTerminal::CancelThread)
+                self.complete_function(
+                    id,
+                    FunctionOutcome::Success(FunctionTerminal::CancelThread),
+                );
+            }
+            Function::CompactThread { thread_id } => {
+                self.launch_compact_thread(&thread_id, pending_io);
+                // Function stays in the registry until
+                // `finalize_pending_compaction` calls `complete_function`.
             }
             _ => {
-                // Variants that passed registration but aren't executable
+                // Variants that passed registration but aren't launchable
                 // yet — shouldn't hit this path because
                 // `variant_precondition_check` rejects them, but belt &
                 // suspenders.
-                FunctionOutcome::Error(crate::functions::FunctionError {
-                    kind: crate::functions::FunctionErrorKind::Execution,
-                    detail: "variant not yet implemented".into(),
-                })
+                self.complete_function(
+                    id,
+                    FunctionOutcome::Error(crate::functions::FunctionError {
+                        kind: crate::functions::FunctionErrorKind::Execution,
+                        detail: "variant not yet implemented".into(),
+                    }),
+                );
             }
+        }
+    }
+
+    /// Remove the entry from `active_functions` and log/audit the
+    /// terminal. Caller-link routing of the terminal payload is a no-op
+    /// for Phase-2/3 operations whose caller-surfaces don't require a
+    /// direct reply (CancelThread emits nothing; CompactThread's client
+    /// UX is covered by the existing `ThreadCompacted` broadcast).
+    /// Terminal routing over the WS wire lands with the tool-call
+    /// variants in Commit 4.
+    pub(super) fn complete_function(&mut self, id: FunctionId, outcome: FunctionOutcome) {
+        let Some(entry) = self.active_functions.remove(&id) else {
+            warn!(function_id = id, "complete_function: no such entry");
+            return;
         };
         debug!(
             function_id = id,
-            caller = %caller_tag,
+            caller = %entry.caller.audit_tag(),
             outcome = ?outcome,
             "Function terminal"
         );
-        // Caller-link routing of the terminal is a no-op for Phase 2's
-        // CancelThread (no wire-level correlation_id, no delivery
-        // surface). Real routing lands with variants whose callers need
-        // direct replies.
+    }
+
+    /// Find the FunctionId of the in-flight `CompactThread` targeting
+    /// `thread_id`, if any. Linear scan; `active_functions` stays small
+    /// enough that a scan is fine at the expected scale.
+    pub(super) fn find_compact_function_for(&self, thread_id: &str) -> Option<FunctionId> {
+        self.active_functions.iter().find_map(|(id, entry)| {
+            match &entry.spec {
+                Function::CompactThread { thread_id: t } if t == thread_id => Some(*id),
+                _ => None,
+            }
+        })
     }
 
     /// Cancel a thread by id: flip its state, broadcast, and run the
     /// existing lifecycle cascade (host-env teardown, behavior terminal
     /// hook, dispatch resolution, child cancellation). Equivalent to the
     /// pre-migration `ClientToServer::CancelThread` handler body; called
-    /// by `Function::CancelThread`'s execution path.
+    /// by `Function::CancelThread`'s launch path.
     fn execute_cancel_thread(
         &mut self,
         thread_id: &str,
@@ -188,8 +250,8 @@ impl Scheduler {
             });
         self.teardown_host_env_if_terminal(thread_id);
         self.on_behavior_thread_terminal(thread_id, pending_io);
-        // If the cancelled thread is either a dispatched child (parent is
-        // waiting on its final text) or a parent of still-running
+        // If the cancelled thread is either a dispatched child (parent
+        // is waiting on its final text) or a parent of still-running
         // dispatched children, run the dispatch-lifecycle hooks. These
         // are idempotent no-ops otherwise.
         self.resolve_pending_dispatch(thread_id, pending_io);
@@ -197,8 +259,17 @@ impl Scheduler {
     }
 }
 
-// `_` prefix silences the unused warning for `InternalOriginator` — it's
-// imported so later variants can construct scheduler-internal caller-links
-// without touching this file.
-#[allow(dead_code)]
-fn _keep_internal_originator_in_scope(_x: InternalOriginator) {}
+/// Translate a scope-check `Disposition` into a `Result`. Phase-2/3
+/// callers are happy with "admit ⇒ run, deny ⇒ reject"; the prompt flow
+/// required for `AllowWithPrompt` lands in Commit 4 alongside the
+/// tool-call variants that actually have a prompt UX.
+fn admission_check(
+    disp: crate::permission::Disposition,
+    detail: impl FnOnce() -> String,
+) -> Result<(), RejectReason> {
+    if disp.admits() {
+        Ok(())
+    } else {
+        Err(RejectReason::ScopeDenied { detail: detail() })
+    }
+}

@@ -51,61 +51,75 @@ Produce a compact summary of this conversation that preserves every detail neede
 
 Do not preface your response. Do not call tools. End after the closing </summary> tag.";
 
-/// Entry point for `ClientToServer::CompactThread`. Validates the
-/// request, resolves the thread's compaction prompt, flips
-/// `compacting = true`, and appends the prompt as a user message —
-/// the same path as `SendUserMessage`, reusing its state transitions
-/// and broadcasts. The finalize (summary parse + continuation spawn)
-/// fires later via [`Scheduler::finalize_pending_compaction`] when the
-/// model turn completes.
+/// Execution body for `Function::CompactThread`. Called by the Function
+/// registry's `launch_function` after the synchronous precondition
+/// check has already verified `compaction.enabled`, idle state, and
+/// the `COMPACTING` in-flight bit being unset.
+///
+/// Resolves the thread's compaction prompt, flips the `COMPACTING`
+/// bit, and appends the prompt as a user message — the same path as
+/// `SendUserMessage`, reusing its state transitions and broadcasts.
+/// The Function stays in `active_functions` until
+/// [`Scheduler::finalize_pending_compaction`] fires `complete_function`
+/// when the model turn completes.
 impl Scheduler {
-    pub(super) fn begin_compaction(
+    pub(super) fn launch_compact_thread(
         &mut self,
         thread_id: &str,
-        _correlation_id: Option<String>,
         pending_io: &mut FuturesUnordered<SchedulerFuture>,
-    ) -> Result<(), String> {
-        let task = self
-            .tasks
-            .get(thread_id)
-            .ok_or_else(|| "unknown task".to_string())?;
-        if !task.config.compaction.enabled {
-            return Err("compaction is disabled on this thread".into());
-        }
-        if task.compacting {
-            return Err("compaction already in progress".into());
-        }
-        if !task.is_idle() {
-            return Err("thread is not at a clean turn boundary".into());
-        }
+    ) {
+        let Some(task) = self.tasks.get(thread_id) else {
+            // Precondition already checked existence; defensive.
+            return;
+        };
         let pod_id = task.pod_id.clone();
         let prompt_file = task.config.compaction.prompt_file.clone();
-        let prompt_text = self.resolve_compaction_prompt(&pod_id, &prompt_file)?;
+        let prompt_text = match self.resolve_compaction_prompt(&pod_id, &prompt_file) {
+            Ok(s) => s,
+            Err(e) => {
+                warn!(%thread_id, error = %e, "compact launch: prompt resolution failed");
+                // Without the prompt the Function can't proceed. Treat
+                // as an execution error and complete immediately.
+                if let Some(id) = self.find_compact_function_for(thread_id) {
+                    self.complete_function(
+                        id,
+                        crate::functions::FunctionOutcome::Error(
+                            crate::functions::FunctionError {
+                                kind: crate::functions::FunctionErrorKind::BadInput,
+                                detail: format!("compaction prompt resolution failed: {e}"),
+                            },
+                        ),
+                    );
+                }
+                return;
+            }
+        };
 
         // Flip the flag first so the finalize hook can see it when the
         // turn completes below.
         if let Some(task) = self.tasks.get_mut(thread_id) {
-            task.compacting = true;
+            task.in_flight
+                .insert(crate::functions::InFlightOps::COMPACTING);
         }
         // Reuse send_user_message so title/state broadcasts and dirty
         // tracking run the same as any user follow-up.
         self.send_user_message(thread_id, prompt_text, pending_io);
         self.step_until_blocked(thread_id, pending_io);
-        Ok(())
     }
 
     /// Auto-trigger hook. Checks whether the given thread has crossed
-    /// its compaction `token_threshold` and, if so, kicks off a
-    /// compaction by the same path as `begin_compaction`.
+    /// its compaction `token_threshold` and, if so, registers a
+    /// `Function::CompactThread` with a `SchedulerInternal(AutoCompact)`
+    /// caller-link.
     ///
     /// No-ops when:
     ///   - the thread has no threshold configured,
-    ///   - compaction is disabled,
-    ///   - the thread is already mid-compaction,
     ///   - the thread has already been compacted once (detected by
     ///     the existence of a sibling thread with
     ///     `continued_from == Some(thread_id)`), or
-    ///   - the thread isn't at a clean turn boundary.
+    ///   - `register_function` rejects (e.g., already compacting, not
+    ///     idle — the precondition checks inside the Function registry
+    ///     cover the same conditions the old `begin_compaction` did).
     ///
     /// Fires from `step_until_blocked` after the finalize hook, so
     /// trigger-cycle ordering is: finalize the old compaction first,
@@ -123,16 +137,12 @@ impl Scheduler {
         let Some(threshold) = task.config.compaction.token_threshold else {
             return;
         };
-        if !task.config.compaction.enabled
-            || task.compacting
-            || !task.is_idle()
-            || task.total_usage.input_tokens <= threshold
-        {
+        if task.total_usage.input_tokens <= threshold {
             return;
         }
         // Already compacted once: a continuation thread exists
         // pointing back at us. Scan is O(tasks) but only runs when
-        // every cheaper gate above has passed.
+        // the cheaper threshold check has passed.
         let already_compacted = self
             .tasks
             .values()
@@ -146,8 +156,25 @@ impl Scheduler {
             threshold,
             "auto-compaction threshold crossed — triggering"
         );
-        if let Err(e) = self.begin_compaction(thread_id, None, pending_io) {
-            warn!(%thread_id, error = %e, "auto-compaction failed to begin");
+        let spec = crate::functions::Function::CompactThread {
+            thread_id: thread_id.to_string(),
+        };
+        let scope = self.internal_scope();
+        let caller = crate::functions::CallerLink::SchedulerInternal(
+            crate::functions::InternalOriginator::AutoCompact {
+                thread_id: thread_id.to_string(),
+            },
+        );
+        match self.register_function(spec, scope, caller) {
+            Ok(fn_id) => self.launch_function(fn_id, pending_io),
+            Err(e) => {
+                // All reject reasons here are benign — the state
+                // machine caught up and the compaction is either
+                // already running, not admissible, or disabled. Log
+                // at debug rather than warn since auto-compact is
+                // inherently racy with other turn activity.
+                debug!(%thread_id, error = ?e, "auto-compaction skipped");
+            }
         }
     }
 
@@ -168,7 +195,10 @@ impl Scheduler {
             Some(t) => t,
             None => return,
         };
-        if !task.compacting {
+        if !task
+            .in_flight
+            .contains(crate::functions::InFlightOps::COMPACTING)
+        {
             return;
         }
         if !matches!(
@@ -194,9 +224,16 @@ impl Scheduler {
         // Always clear the flag so a failed parse doesn't re-trigger
         // the finalize on every subsequent step.
         if let Some(task) = self.tasks.get_mut(thread_id) {
-            task.compacting = false;
+            task.in_flight
+                .remove(crate::functions::InFlightOps::COMPACTING);
             self.mark_dirty(thread_id);
         }
+
+        // Locate the in-flight CompactThread Function so we can emit
+        // its terminal. There should always be exactly one when the
+        // compacting flag is set — the flag is a 1:1 mirror of the
+        // registered Function today.
+        let compact_fn_id = self.find_compact_function_for(thread_id);
 
         let Some(summary_text) = extract_summary(&regex_src, &assistant_text) else {
             warn!(
@@ -204,6 +241,15 @@ impl Scheduler {
                 "compaction finalize: failed to extract <summary> from assistant response — \
                  leaving thread Completed without spawning continuation"
             );
+            if let Some(id) = compact_fn_id {
+                self.complete_function(
+                    id,
+                    crate::functions::FunctionOutcome::Error(crate::functions::FunctionError {
+                        kind: crate::functions::FunctionErrorKind::Execution,
+                        detail: "summary extraction failed".into(),
+                    }),
+                );
+            }
             return;
         };
 
@@ -245,6 +291,17 @@ impl Scheduler {
                     %thread_id, error = %e,
                     "compaction finalize: create_task for continuation failed"
                 );
+                if let Some(id) = compact_fn_id {
+                    self.complete_function(
+                        id,
+                        crate::functions::FunctionOutcome::Error(
+                            crate::functions::FunctionError {
+                                kind: crate::functions::FunctionErrorKind::Execution,
+                                detail: format!("continuation create_task failed: {e}"),
+                            },
+                        ),
+                    );
+                }
                 return;
             }
         };
@@ -272,6 +329,23 @@ impl Scheduler {
         let seed_text = render_continuation_template(&continuation_template, &summary_text);
         self.send_user_message(&new_thread_id, seed_text, pending_io);
         self.step_until_blocked(&new_thread_id, pending_io);
+
+        // Emit the CompactThread Function's success terminal. The
+        // client's visible UX already happened via the
+        // `ThreadCompacted` broadcast above; this is the registry-
+        // bookkeeping side of completion.
+        if let Some(id) = compact_fn_id {
+            self.complete_function(
+                id,
+                crate::functions::FunctionOutcome::Success(
+                    crate::functions::FunctionTerminal::CompactThread(
+                        crate::functions::CompactThreadTerminal {
+                            continuation_thread_id: new_thread_id.clone(),
+                        },
+                    ),
+                ),
+            );
+        }
 
         debug!(
             old = %thread_id, new = %new_thread_id, summary_bytes = summary_text.len(),

@@ -27,6 +27,7 @@ use whisper_agent_protocol::{
     ToolResultContent, TurnEntry, TurnLog, Usage,
 };
 
+use crate::functions::InFlightOps;
 use crate::providers::model::ModelResponse;
 use crate::tools::mcp::{CallToolResult, ToolAnnotations};
 
@@ -79,14 +80,18 @@ pub struct Thread {
     /// compaction.
     #[serde(default)]
     pub continued_from: Option<String>,
-    /// True between the moment a `/compact` command has appended the
-    /// compaction prompt and the scheduler has finalized the
-    /// continuation. Kept on the thread rather than a side-map so the
-    /// flag survives process restart: a compaction in flight during
-    /// shutdown finalizes on the next startup when the model turn
-    /// completes.
+    /// In-flight Function flags — e.g., `COMPACTING` is set between the
+    /// moment a `/compact` command has appended the compaction prompt
+    /// and the scheduler has finalized the continuation.
+    ///
+    /// Persisted so a compaction in flight during shutdown finalizes on
+    /// the next startup when the model turn completes. Future restart
+    /// semantics may clear non-resumable bits — see the "Restart note"
+    /// in `docs/design_functions.md` — but today `COMPACTING` is
+    /// genuinely resumable (the appended user message survives; the
+    /// finalize logic is idempotent).
     #[serde(default)]
-    pub compacting: bool,
+    pub in_flight: InFlightOps,
     /// Parent thread id when this thread was spawned by a parent's
     /// `dispatch_thread` tool call. `None` for top-level threads. Set
     /// once at spawn; never mutated afterward. Distinct from the
@@ -339,7 +344,7 @@ impl Thread {
             tool_allowlist: BTreeSet::new(),
             origin: None,
             continued_from: None,
-            compacting: false,
+            in_flight: InFlightOps::empty(),
             dispatched_by: None,
             dispatch_depth: 0,
             draft: String::new(),
@@ -398,7 +403,7 @@ impl Thread {
                 return Err("cannot fork a thread that is mid-turn".into());
             }
         }
-        if self.compacting {
+        if self.in_flight.contains(InFlightOps::COMPACTING) {
             return Err("cannot fork a thread while compaction is in flight".into());
         }
         let messages = self.conversation.messages();
@@ -443,7 +448,7 @@ impl Thread {
             tool_allowlist: self.tool_allowlist.clone(),
             origin: None,
             continued_from: None,
-            compacting: false,
+            in_flight: InFlightOps::empty(),
             dispatched_by: None,
             dispatch_depth: 0,
             // Client seeds the new thread's draft with the forked-from
@@ -1615,7 +1620,7 @@ mod tests {
     #[test]
     fn fork_rejects_during_compaction() {
         let mut src = thread_with_two_turns();
-        src.compacting = true;
+        src.in_flight.insert(InFlightOps::COMPACTING);
         assert!(src.fork_from("new".into(), 2).is_err());
     }
 }
