@@ -596,39 +596,56 @@ These questions remain for later — not blockers for starting implementation, b
 
 ## Implementation staging
 
-Broken into five commits. Old code paths keep working until their operation's migration commit lands; the tree compiles and the server runs at every commit boundary.
+Six commits. Infrastructure lands alongside the first operation that uses it rather than as standalone plumbing — each commit removes more code than it adds (or at least makes the addition load-bearing for a concrete simplification). Old code paths keep working until their operation's migration commit lands; the tree compiles and the server runs at every commit boundary.
 
-**Commit 1 — Foundation.**
+**Commit 1 — Type scaffolding.**
 
-- New types: `PermissionScope` / `AllowMap` / `Disposition` / `PodsScope`, `Function` enum (variants declared, bodies stubbed), `FunctionId`, `ActiveFunction`, `FunctionOutcome` / `FunctionTerminal` / `ProgressEvent`, `CallerLink` / `InternalOriginator`, `RejectReason`, `InFlightOps`.
-- Pod.toml schema rewritten to express the new permission model directly; `pods/` wiped (no migration).
-- Pod-config-load produces scopes; threads gain `effective_scope` derived from pod scope + bindings.
-- Scheduler gains `active_functions: HashMap<FunctionId, ActiveFunction>`, `register(...)` path (synchronous scope + precondition check), progress/terminal channel scaffolding, delivery router handling `WsClient` and `ThreadToolCall` (stubs for `Lua`, `SchedulerInternal`).
-- Server attaches `CallerLink::WsClient` + hardcoded full-trust scope to inbound WS messages at the session boundary.
-- No operations migrated. Old code paths untouched. Unit tests for scope narrowing and registration.
+New types only, no existing code touched:
 
-If this single commit gets too large in practice, split along the natural seam: permission model first, Function registry second.
+- `src/permission/` — `PermissionScope`, `AllowMap`, `Disposition`, `PodsScope`, `PodOps`, per-layer op enums. Narrowing composition + unit tests.
+- `src/functions/` — `Function` spec enum (variants declared, bodies stubbed), `FunctionId`, `ActiveFunction`-adjacent types (`FunctionOutcome`, `FunctionTerminal`, `ProgressEvent`), `CallerLink` with closed `InternalOriginator`, `RejectReason`, `InFlightOps` bitflags.
 
-**Commit 2 — Simple state operations.**
+No pod.toml changes, no scheduler changes, no `ApprovalPolicy` changes. Types exist and are tested in isolation.
 
-- Migrate `CancelThread` and `CompactThread`.
-- CancelThread exercises the cancel-by-thread sweep end-to-end; CompactThread introduces the first `InFlightOps` flag user (COMPACTING) and wires auto-compact via `SchedulerInternal(AutoCompact { .. })`.
-- Old code paths for both operations removed.
+**Commit 2 — `CancelThread` migration + scheduler infrastructure.**
 
-**Commit 3 — Tool invocation and approval.**
+First operation migrated; scheduler infrastructure lands alongside it as load-bearing support:
 
-- Migrate `BuiltinToolCall` and `McpToolUse`.
-- Brings in: scope check returning `Disposition`, `ApprovalRequest` progress-event flow with decision routing, `ProgressEvent::Content(ContentBlock)` for streaming tool output, thread-event wire extension for `ContentBlock`, tool-pool curation layer for model callers.
-- Heaviest commit. Splittable if needed (builtin first, MCP second) along the streaming boundary.
+- Scheduler gains `active_functions: HashMap<FunctionId, ActiveFunction>`, synchronous `register(spec, scope, caller) -> Result<FunctionId, RejectReason>`, terminal routing back through the caller-link.
+- WS session attaches `CallerLink::WsClient { conn_id, correlation_id }` + hardcoded full-trust `PermissionScope` to inbound messages.
+- `CancelThread` implemented as a Function: state flip + cancel-by-thread sweep (using `CallerLink::targets_thread`). Existing `ClientToServer::CancelThread` handler removed.
 
-**Commit 4 — Thread lifecycle and behavior operations.**
+**Commit 3 — `CompactThread` migration + in-flight flags + auto-compact.**
 
-- Migrate `CreateThread` (collapsing interactive / behavior-spawned / model-dispatched paths via ParentLink + WaitMode), `RunBehavior` (folding `fire_trigger` and `run_behavior`), and `RebindThread`.
+- `Thread.in_flight: InFlightOps` field added with `COMPACTING` bit wired.
+- `CompactThread` migrated; precondition checks the bit.
+- Auto-compact path rewired to register a Function with `CallerLink::SchedulerInternal(AutoCompact { .. })`.
+- Old compaction code path removed.
+
+**Commit 4 — Tool invocation + approval + pod.toml rewrite.**
+
+Heaviest commit — this is where the new scope model starts paying off:
+
+- `BuiltinToolCall` and `McpToolUse` migrated as Functions.
+- Scope check returns `Disposition`; `AllowWithPrompt` tags the `ActiveFunction` with a prompt-required flag.
+- `ApprovalRequest` progress-event flow with decision routing back into the Function; `ApprovalDecision` messages route to `FunctionId`.
+- `ProgressEvent::Content(ContentBlock)` for streaming tool output; thread-event wire protocol extended to carry `ContentBlock`.
+- Tool-pool curation layer for model callers — pod.toml defines the pool, thread derives a model-facing view.
+- **Pod.toml schema rewritten** to express the new permission model: `[allow.tools]` with `default` + `overrides` replaces `thread_defaults.approval_policy`. Existing `pods/` directories wiped (no migration).
+- `ApprovalPolicy` enum removed from protocol crate; per-thread `tool_allowlist` becomes per-tool `Allow` overrides on the thread's scope.
+
+Splittable if the diff gets unwieldy (builtin first, then MCP).
+
+**Commit 5 — Thread lifecycle + behavior operations.**
+
+- `CreateThread` migrated (collapsing interactive / behavior-spawned / model-dispatched paths via `ParentLink` + `WaitMode`).
+- `RunBehavior` migrated (folding `fire_trigger` and `run_behavior`).
+- `RebindThread` migrated.
 - After this commit, every caller-visible operation is a Function.
 
-**Commit 5 — Cleanup.**
+**Commit 6 — Cleanup.**
 
-- Remove superseded types: old `ApprovalPolicy` enum, per-thread `tool_allowlist`, parallel pre-Function dispatch paths.
+- Remove any superseded types and parallel pre-Function dispatch paths still present.
 - Update `design_pod_thread_scheduler.md` and `design_permissions.md` to reference the Function model.
 - Prune any "Open questions" items resolved during implementation.
 
