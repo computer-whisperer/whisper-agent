@@ -154,6 +154,12 @@ impl Conversation {
         self.messages.len()
     }
 
+    /// Drop every message at or after `at`. Delegates to
+    /// [`Vec::truncate`], so `at >= self.len()` is a no-op.
+    pub fn truncate(&mut self, at: usize) {
+        self.messages.truncate(at);
+    }
+
     /// In-place migration for threads persisted before `Role::ToolResult`
     /// existed: tool results used to ride inside `Role::User` messages
     /// as `ContentBlock::ToolResult` blocks. After adding the new role

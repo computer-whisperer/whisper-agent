@@ -18,8 +18,27 @@
 
 use egui::{Color32, RichText};
 use egui_commonmark::{CommonMarkCache, CommonMarkViewer};
+use whisper_agent_protocol::Usage;
 
 use super::{DiffPayload, DisplayItem, FusedToolResult};
+
+/// Side-channel actions a rendered chat row can emit in the frame
+/// it's drawn. The caller pairs events with the current `thread_id`
+/// (which `render_item` doesn't see) and turns them into wire
+/// messages or modal-state changes. Kept as an enum so future
+/// hover-revealed row controls (retry, copy, drop) slot in without
+/// widening `render_item`'s signature again.
+#[derive(Debug)]
+pub(super) enum ChatItemEvent {
+    /// The "fork from here" button on a `User` row was clicked.
+    /// `msg_index` is the absolute index into
+    /// `Conversation.messages()` that the new thread should truncate
+    /// at (exclusive). `seed_text` is the original user-message body
+    /// — the caller pre-fills it as the new thread's draft so the
+    /// user lands on the compose box ready to edit rather than
+    /// retyping from scratch.
+    ForkRequested { msg_index: usize, seed_text: String },
+}
 
 const GUTTER_WIDTH: f32 = 3.0;
 
@@ -51,10 +70,18 @@ fn item_palette(item: &DisplayItem) -> (Color32, Color32) {
             Color32::from_rgba_unmultiplied(220, 120, 120, 18),
         ),
         DisplayItem::SystemNote { .. } => (COLOR_NEUTRAL, Color32::TRANSPARENT),
+        // No gutter for stats — it's a dim diagnostic footer, not a
+        // semantic role. Rendered inline at low emphasis so it doesn't
+        // compete with conversation content.
+        DisplayItem::TurnStats { .. } => (Color32::TRANSPARENT, Color32::TRANSPARENT),
     }
 }
 
-pub(super) fn render_item(ui: &mut egui::Ui, cache: &mut CommonMarkCache, item: &DisplayItem) {
+pub(super) fn render_item(
+    ui: &mut egui::Ui,
+    cache: &mut CommonMarkCache,
+    item: &DisplayItem,
+) -> Option<ChatItemEvent> {
     let (gutter_color, fill) = item_palette(item);
     let frame = egui::Frame::default()
         .fill(fill)
@@ -64,10 +91,33 @@ pub(super) fn render_item(ui: &mut egui::Ui, cache: &mut CommonMarkCache, item: 
             top: 4,
             bottom: 4,
         });
+    let mut event: Option<ChatItemEvent> = None;
+    // Hover state lags by one frame: we need to know "is this row
+    // hovered" before drawing the button, but the row's final rect
+    // isn't known until after. egui memory stashes last frame's
+    // answer; the one-frame lag is imperceptible.
+    let row_hover_id = if let DisplayItem::User { msg_index, .. } = item {
+        Some(ui.make_persistent_id(("chat-row-hover", "user", *msg_index)))
+    } else {
+        None
+    };
+    let hovered_prev_frame = row_hover_id
+        .map(|id| {
+            ui.ctx()
+                .memory(|m| m.data.get_temp::<bool>(id).unwrap_or(false))
+        })
+        .unwrap_or(false);
     let resp = frame.show(ui, |ui| {
         ui.set_min_width(ui.available_width());
         match item {
-            DisplayItem::User { text } => render_user(ui, cache, text),
+            DisplayItem::User { text, msg_index } => {
+                if render_user(ui, cache, text, hovered_prev_frame) {
+                    event = Some(ChatItemEvent::ForkRequested {
+                        msg_index: *msg_index,
+                        seed_text: text.clone(),
+                    });
+                }
+            }
             DisplayItem::AssistantText { text } => render_assistant_text(ui, cache, text),
             DisplayItem::Reasoning { text } => render_reasoning(ui, cache, text),
             DisplayItem::ToolCall {
@@ -93,6 +143,7 @@ pub(super) fn render_item(ui: &mut egui::Ui, cache: &mut CommonMarkCache, item: 
                 is_error,
             } => render_tool_result(ui, tool_use_id, name, text, *is_error),
             DisplayItem::SystemNote { text, is_error } => render_system_note(ui, text, *is_error),
+            DisplayItem::TurnStats { usage } => render_turn_stats(ui, usage),
         }
     });
     // Paint the gutter into the reserved 3px on the left side of the
@@ -102,14 +153,56 @@ pub(super) fn render_item(ui: &mut egui::Ui, cache: &mut CommonMarkCache, item: 
     let r = resp.response.rect;
     let gutter_rect = egui::Rect::from_min_max(r.min, egui::pos2(r.min.x + GUTTER_WIDTH, r.max.y));
     ui.painter().rect_filled(gutter_rect, 0.0, gutter_color);
+
+    // Persist hover for next frame; repaint on the edge so the
+    // button transitions don't wait for an unrelated event.
+    if let Some(id) = row_hover_id {
+        let hovered_now = resp.response.contains_pointer();
+        if hovered_now != hovered_prev_frame {
+            ui.ctx().memory_mut(|m| m.data.insert_temp(id, hovered_now));
+            ui.ctx().request_repaint();
+        }
+    }
+
+    event
 }
 
-fn render_user(ui: &mut egui::Ui, cache: &mut CommonMarkCache, text: &str) {
+/// Returns `true` when the user clicked the hover-reveal "fork" button on
+/// this row. `row_hovered` controls whether the button is drawn — when
+/// false we don't reserve space for it, so non-hovered rows stay visually
+/// quiet.
+fn render_user(
+    ui: &mut egui::Ui,
+    cache: &mut CommonMarkCache,
+    text: &str,
+    row_hovered: bool,
+) -> bool {
     // Role label sits above the body rather than inline so a multi-line
     // markdown body (code block, list, blockquote) doesn't wrap awkwardly
     // around the "USER" chip the way horizontal_wrapped would force.
-    ui.label(RichText::new("USER").color(COLOR_USER).strong().small());
+    let mut fork_clicked = false;
+    ui.horizontal(|ui| {
+        ui.label(RichText::new("USER").color(COLOR_USER).strong().small());
+        if row_hovered {
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let btn = egui::Button::new(
+                    RichText::new("⑂ fork")
+                        .color(Color32::from_gray(160))
+                        .small(),
+                )
+                .frame(false);
+                if ui
+                    .add(btn)
+                    .on_hover_text("Fork a new thread starting from this message")
+                    .clicked()
+                {
+                    fork_clicked = true;
+                }
+            });
+        }
+    });
     render_markdown(ui, cache, ("user", text), text);
+    fork_clicked
 }
 
 fn render_assistant_text(ui: &mut egui::Ui, cache: &mut CommonMarkCache, text: &str) {
@@ -181,6 +274,51 @@ const INLINE_CODE_BG: Color32 = Color32::from_rgba_premultiplied(47, 50, 56, 80)
 fn render_system_note(ui: &mut egui::Ui, text: &str, is_error: bool) {
     let color = if is_error { COLOR_ERROR } else { COLOR_NEUTRAL };
     ui.label(RichText::new(text).color(color).italics());
+}
+
+/// Per-turn diagnostic footer. Format: `tokens in 12,345 · cached
+/// 11,204 · created 0 · out 287`. "cached" counts are shown only
+/// when non-zero so turns that bypass the cache (first turn, cache
+/// miss) don't carry visually-empty columns. Small, dim, no gutter —
+/// this is auxiliary information, not conversation.
+fn render_turn_stats(ui: &mut egui::Ui, usage: &Usage) {
+    let mut parts: Vec<String> = Vec::with_capacity(4);
+    parts.push(format!("in {}", fmt_count(usage.input_tokens)));
+    if usage.cache_read_input_tokens > 0 {
+        parts.push(format!(
+            "cached {}",
+            fmt_count(usage.cache_read_input_tokens)
+        ));
+    }
+    if usage.cache_creation_input_tokens > 0 {
+        parts.push(format!(
+            "created {}",
+            fmt_count(usage.cache_creation_input_tokens)
+        ));
+    }
+    parts.push(format!("out {}", fmt_count(usage.output_tokens)));
+    let text = parts.join(" · ");
+    ui.label(
+        RichText::new(text)
+            .color(Color32::from_gray(110))
+            .monospace()
+            .small(),
+    );
+}
+
+/// Render `12345` as `12,345`. Cheap enough per-frame that a dedicated
+/// helper is fine; keeps the format consistent across all four columns.
+fn fmt_count(n: u32) -> String {
+    let s = n.to_string();
+    let mut out = String::with_capacity(s.len() + s.len() / 3);
+    let bytes = s.as_bytes();
+    for (i, b) in bytes.iter().enumerate() {
+        if i > 0 && (bytes.len() - i) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(*b as char);
+    }
+    out
 }
 
 #[allow(clippy::too_many_arguments)]

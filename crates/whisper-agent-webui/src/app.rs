@@ -14,7 +14,7 @@
 mod chat_render;
 mod editor_render;
 
-use self::chat_render::render_item;
+use self::chat_render::{ChatItemEvent, render_item};
 use self::editor_render::{
     approval_policy_label, behavior_summary_from_snapshot, hint, render_behavior_editor_prompt_tab,
     render_behavior_editor_raw_tab, render_behavior_editor_retention_tab,
@@ -26,6 +26,7 @@ use self::editor_render::{
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::rc::Rc;
+use std::time::Duration;
 
 use egui::{Color32, ComboBox, Grid, RichText, ScrollArea, TextEdit};
 use egui_commonmark::CommonMarkCache;
@@ -37,7 +38,7 @@ use whisper_agent_protocol::{
     Message, ModelSummary, NamedHostEnv, PodAllow, PodConfig, PodLimits, PodSummary,
     ResourceSnapshot, ResourceStateLabel, RetentionPolicy, Role, ServerToClient, ThreadBindings,
     ThreadBindingsRequest, ThreadConfigOverride, ThreadDefaults, ThreadStateLabel, ThreadSummary,
-    ToolResultContent, TriggerSpec, Usage,
+    ToolResultContent, TriggerSpec, TurnLog, Usage,
 };
 
 /// Events pushed into [`Inbound`]. In addition to decoded wire messages we pipe in
@@ -81,6 +82,9 @@ impl ConnectionStatus {
 /// collapses the tail. Keeps long-running behavior pods from drowning the
 /// sidebar in repeated rows.
 const THREAD_ROW_PREVIEW_COUNT: usize = 3;
+/// Idle time after the last keystroke before a `SetThreadDraft`
+/// flushes. Thread-switch and submit flush immediately regardless.
+const DRAFT_DEBOUNCE: Duration = Duration::from_millis(500);
 
 // Shared palette for the sidebar. Named so the hierarchy is explicit and
 // so the panel's tone doesn't drift as new rows/captions are added.
@@ -138,6 +142,11 @@ fn state_chip(state: ThreadStateLabel) -> (&'static str, Color32) {
 enum DisplayItem {
     User {
         text: String,
+        /// Absolute index into the server's `Conversation.messages()`
+        /// — `DisplayItem` positions don't map 1:1 (TurnStats,
+        /// multi-row assistant turns) so the fork action needs the
+        /// real index to send to the server.
+        msg_index: usize,
     },
     AssistantText {
         text: String,
@@ -190,6 +199,15 @@ enum DisplayItem {
         text: String,
         is_error: bool,
     },
+    /// Per-LLM-call diagnostic footer, emitted once at the end of
+    /// every assistant turn. Sourced live from `ThreadAssistantEnd`
+    /// and from `ThreadSnapshot.turn_log` on replay. Rendered as a
+    /// compact gray one-liner showing input/output tokens and cache
+    /// hit/miss counts — the primary use case is diagnosing why a
+    /// cache breakpoint missed when we expected a hit.
+    TurnStats {
+        usage: Usage,
+    },
 }
 
 /// Pre-computed inputs for the unified-diff renderer. Built once at
@@ -240,6 +258,19 @@ struct TaskView {
     /// hold per-view rather than shipping an extra request when the
     /// inspector opens.
     inspector: ThreadInspector,
+    /// Running count of `Message`s in the server's `Conversation` for
+    /// this thread. Tracks the absolute message index at which the
+    /// *next* append will land, so `DisplayItem::User.msg_index`
+    /// stamps can stay in step with the server's conversation view.
+    /// Seeded from `ThreadSnapshot.conversation.len()`; bumped by each
+    /// event that appends a message (`ThreadUserMessage`,
+    /// `ThreadToolResultMessage`, `ThreadAssistantEnd`).
+    conv_message_count: usize,
+    /// Server-confirmed draft. Authoritative for re-populating the
+    /// compose box when the user switches back to this thread; when
+    /// this thread *is* selected, `ChatApp.input` leads and this
+    /// field tracks whatever the server last acknowledged.
+    draft: String,
 }
 
 /// Everything the thread-context inspector surfaces that isn't
@@ -292,6 +323,8 @@ impl TaskView {
                 origin,
                 created_at,
             },
+            conv_message_count: 0,
+            draft: String::new(),
         }
     }
 }
@@ -395,6 +428,19 @@ pub struct ChatApp {
     behavior_editor_modal: Option<BehaviorEditorModalState>,
     /// Modal state for the "+ New behavior" form. `None` = closed.
     new_behavior_modal: Option<NewBehaviorModalState>,
+    /// Modal state for the "fork thread from here" confirm dialog.
+    /// Opened by the hover-reveal button on a user-message row;
+    /// closed on confirm / cancel / ESC.
+    fork_modal: Option<ForkModalState>,
+    /// Egui-clock timestamp (seconds since app start) of the last
+    /// `input` change not yet debounce-flushed as `SetThreadDraft`.
+    /// `f64` instead of [`std::time::Instant`] because `Instant::now()`
+    /// panics on wasm32 — the webui's primary target.
+    last_input_change_at: Option<f64>,
+    /// `(correlation_id, seed_text)` for an outstanding fork: the
+    /// matching `ThreadCreated` triggers a `SetThreadDraft` carrying
+    /// `seed_text` against the new thread id.
+    pending_fork_seed: Option<(String, String)>,
     /// Monotonic counter used to mint correlation_ids for in-flight
     /// requests we want to match round-trip events to. Intentionally
     /// not persisted — collisions across reloads aren't a problem
@@ -573,6 +619,18 @@ impl SandboxEntryEditorState {
             error: None,
         }
     }
+}
+
+/// Confirm dialog for "fork from this message". Default to
+/// archive-on: a fork usually means "try a different branch," and
+/// the original is noise in the sidebar from then on.
+struct ForkModalState {
+    thread_id: String,
+    from_message_index: usize,
+    archive_original: bool,
+    /// Captured at click time so `confirm` can seed the new thread's
+    /// draft with the original prompt for in-place editing.
+    seed_text: String,
 }
 
 /// State for the "+ New pod" modal. The user picks a directory-friendly
@@ -811,6 +869,9 @@ impl ChatApp {
             collapsed_pods: HashSet::new(),
             expanded_interactive_pods: HashSet::new(),
             expanded_behavior_threads: HashSet::new(),
+            fork_modal: None,
+            last_input_change_at: None,
+            pending_fork_seed: None,
             new_pod_modal: None,
             archive_armed_pod: None,
             pod_editor_modal: None,
@@ -970,11 +1031,35 @@ impl ChatApp {
             ServerToClient::ThreadCreated {
                 thread_id,
                 summary,
-                correlation_id: _,
+                correlation_id,
             } => {
                 self.upsert_task(summary);
                 self.recompute_order();
-                // Auto-select newly created tasks.
+                // Fork-seed handoff: if this `ThreadCreated` carries
+                // the correlation_id we stamped on the outbound
+                // `ForkThread`, the server's `fork_task` just minted
+                // this id. Issue a `SetThreadDraft` so the new
+                // thread's persisted draft holds the forked-from
+                // user-message text. Do this *before* `select_task`,
+                // which triggers a `SubscribeToThread` whose snapshot
+                // will then include the just-written draft.
+                let seed_match = self
+                    .pending_fork_seed
+                    .as_ref()
+                    .is_some_and(|(cid, _)| correlation_id.as_deref() == Some(cid.as_str()));
+                if seed_match && let Some((_, text)) = self.pending_fork_seed.take() {
+                    self.send(ClientToServer::SetThreadDraft {
+                        thread_id: thread_id.clone(),
+                        text: text.clone(),
+                    });
+                    // Mirror into the local cache: `select_task` below
+                    // loads `self.input` from `view.draft`, and the
+                    // snapshot with the server-side draft may not have
+                    // landed yet.
+                    if let Some(view) = self.tasks.get_mut(&thread_id) {
+                        view.draft = text;
+                    }
+                }
                 if self.selected.as_deref() != Some(&thread_id) {
                     self.select_task(thread_id);
                 }
@@ -1009,7 +1094,7 @@ impl ChatApp {
                 thread_id,
                 snapshot,
             } => {
-                let items = conversation_to_items(&snapshot.conversation);
+                let items = conversation_to_items(&snapshot.conversation, &snapshot.turn_log);
                 let backend = snapshot.bindings.backend.clone();
                 let model = snapshot.config.model.clone();
                 let failure = snapshot.failure.clone();
@@ -1038,8 +1123,36 @@ impl ChatApp {
                 view.failure = failure;
                 view.tool_allowlist = allowlist;
                 view.inspector = inspector;
+                view.conv_message_count = snapshot.conversation.len();
+                view.draft = snapshot.draft.clone();
+                // Sync compose box from the just-arrived snapshot
+                // when we're looking at this thread and haven't
+                // started typing yet. Existing `input` content wins
+                // — a user who switched back before the snapshot
+                // landed shouldn't have their typing clobbered.
+                if self.selected.as_deref() == Some(&thread_id) && self.input.is_empty() {
+                    self.input = snapshot.draft;
+                    self.last_input_change_at = None;
+                }
                 // Pending-approval events that follow the snapshot will re-seed this.
                 view.pending_approvals.clear();
+            }
+            ServerToClient::ThreadDraftUpdated { thread_id, text } => {
+                // Skip redundant echoes (reconnect + resubscribe can
+                // replay a draft we already have) so a same-text
+                // update doesn't stomp the cursor on a selected
+                // thread.
+                let same = self.tasks.get(&thread_id).is_some_and(|v| v.draft == text);
+                if same {
+                    return;
+                }
+                if let Some(view) = self.tasks.get_mut(&thread_id) {
+                    view.draft = text.clone();
+                }
+                if self.selected.as_deref() == Some(&thread_id) {
+                    self.input = text;
+                    self.last_input_change_at = None;
+                }
             }
             ServerToClient::ThreadAllowlistUpdated {
                 thread_id,
@@ -1082,7 +1195,9 @@ impl ChatApp {
                 // behavior-trigger prompts). Async dispatch callbacks
                 // travel a distinct event (`ThreadToolResultMessage`).
                 if let Some(view) = self.tasks.get_mut(&thread_id) {
-                    view.items.push(DisplayItem::User { text });
+                    let msg_index = view.conv_message_count;
+                    view.conv_message_count += 1;
+                    view.items.push(DisplayItem::User { text, msg_index });
                 }
             }
             ServerToClient::ThreadToolResultMessage { thread_id, text } => {
@@ -1097,6 +1212,7 @@ impl ChatApp {
                 // assistant turn) arrive expanded while immediately-
                 // -following results stay collapsed.
                 if let Some(view) = self.tasks.get_mut(&thread_id) {
+                    view.conv_message_count += 1;
                     push_tool_result_from_text(&mut view.items, &text);
                 }
             }
@@ -1151,6 +1267,8 @@ impl ChatApp {
             } => {
                 if let Some(view) = self.tasks.get_mut(&thread_id) {
                     view.total_usage.add(&usage);
+                    view.conv_message_count += 1;
+                    view.items.push(DisplayItem::TurnStats { usage });
                 }
             }
             ServerToClient::ThreadLoopComplete { .. } => {}
@@ -1576,9 +1694,18 @@ impl ChatApp {
         if self.selected.as_deref() == Some(&thread_id) {
             return;
         }
+        // Flush before switching so a mid-debounce switch can't lose
+        // the tail of what the user just typed.
+        self.flush_pending_draft();
         self.selected = Some(thread_id.clone());
         self.composing_new = false;
         self.compose_pod_id = None;
+        self.input = self
+            .tasks
+            .get(&thread_id)
+            .map(|v| v.draft.clone())
+            .unwrap_or_default();
+        self.last_input_change_at = None;
         let need_subscribe = self
             .tasks
             .get(&thread_id)
@@ -1589,8 +1716,43 @@ impl ChatApp {
         }
     }
 
+    /// Send `SetThreadDraft` if the compose box has diverged from
+    /// the selected thread's cached draft. Called on thread switch
+    /// and when the debounce window expires.
+    fn flush_pending_draft(&mut self) {
+        self.last_input_change_at = None;
+        let Some(thread_id) = self.selected.clone() else {
+            return;
+        };
+        let Some(view) = self.tasks.get_mut(&thread_id) else {
+            return;
+        };
+        if view.draft == self.input {
+            return;
+        }
+        view.draft = self.input.clone();
+        self.send(ClientToServer::SetThreadDraft {
+            thread_id,
+            text: self.input.clone(),
+        });
+    }
+
     fn submit(&mut self) {
         let text = std::mem::take(&mut self.input);
+        // Clear the persisted draft server-side. `CreateThread` has no
+        // existing thread to target, so this only runs on follow-ups.
+        if let Some(thread_id) = self.selected.clone()
+            && !self.composing_new
+            && let Some(view) = self.tasks.get_mut(&thread_id)
+            && !view.draft.is_empty()
+        {
+            view.draft.clear();
+            self.send(ClientToServer::SetThreadDraft {
+                thread_id,
+                text: String::new(),
+            });
+        }
+        self.last_input_change_at = None;
         let trimmed = text.trim();
         if trimmed.is_empty() {
             return;
@@ -1688,20 +1850,36 @@ fn snapshot_summary(s: &whisper_agent_protocol::ThreadSnapshot) -> ThreadSummary
     }
 }
 
-fn conversation_to_items(conv: &Conversation) -> Vec<DisplayItem> {
+fn conversation_to_items(conv: &Conversation, turn_log: &TurnLog) -> Vec<DisplayItem> {
+    // Interleave a `DisplayItem::TurnStats` after each Assistant-role
+    // message, pulled in order from `turn_log.entries`. The runtime
+    // pushes exactly one entry per `integrate_model_response`, so entry
+    // N corresponds to the Nth Assistant message. Extra entries (never
+    // expected) are dropped; a short log (older threads, or
+    // mid-migration) leaves trailing turns without a stats row rather
+    // than crashing.
     let mut items = Vec::new();
-    for msg in conv.messages() {
-        add_message_items(msg, &mut items);
+    let mut entry_iter = turn_log.entries.iter();
+    for (msg_index, msg) in conv.messages().iter().enumerate() {
+        add_message_items(msg, msg_index, &mut items);
+        if msg.role == Role::Assistant
+            && let Some(entry) = entry_iter.next()
+        {
+            items.push(DisplayItem::TurnStats { usage: entry.usage });
+        }
     }
     items
 }
 
-fn add_message_items(msg: &Message, out: &mut Vec<DisplayItem>) {
+fn add_message_items(msg: &Message, msg_index: usize, out: &mut Vec<DisplayItem>) {
     match msg.role {
         Role::User => {
             for block in &msg.content {
                 if let ContentBlock::Text { text } = block {
-                    out.push(DisplayItem::User { text: text.clone() });
+                    out.push(DisplayItem::User {
+                        text: text.clone(),
+                        msg_index,
+                    });
                 }
             }
         }
@@ -2231,6 +2409,9 @@ impl eframe::App for ChatApp {
                             [ui.available_width(), 28.0],
                             TextEdit::singleline(&mut self.input).hint_text(hint),
                         );
+                        if response.changed() {
+                            self.last_input_change_at = Some(ui.input(|i| i.time));
+                        }
                         let enter_pressed =
                             response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
                         if (send_pressed || enter_pressed) && input_enabled {
@@ -2247,6 +2428,9 @@ impl eframe::App for ChatApp {
 
         let mut pending_decisions: Vec<(String, String, ApprovalChoice, bool)> = Vec::new();
         let mut allowlist_revocations: Vec<(String, String)> = Vec::new();
+        // (msg_index, seed_text) — paired with `selected` after the
+        // render closure since render_item doesn't see thread_id.
+        let mut fork_request: Option<(usize, String)> = None;
         // Pre-split borrows: the closure needs `&mut self.tasks` (via
         // get_mut) and `&mut self.md_cache` simultaneously. Destructuring
         // up front lets the closure capture each field independently
@@ -2254,7 +2438,7 @@ impl eframe::App for ChatApp {
         let selected = self.selected.clone();
         let tasks = &mut self.tasks;
         let md_cache = &mut self.md_cache;
-        egui::CentralPanel::default().show_inside(ui, |ui| match selected {
+        egui::CentralPanel::default().show_inside(ui, |ui| match selected.clone() {
             None => {
                 ui.vertical_centered(|ui| {
                     ui.add_space(60.0);
@@ -2289,7 +2473,16 @@ impl eframe::App for ChatApp {
                             });
                         } else {
                             for item in &view.items {
-                                render_item(ui, md_cache, item);
+                                if let Some(event) = render_item(ui, md_cache, item) {
+                                    match event {
+                                        ChatItemEvent::ForkRequested {
+                                            msg_index,
+                                            seed_text,
+                                        } => {
+                                            fork_request = Some((msg_index, seed_text));
+                                        }
+                                    }
+                                }
                                 ui.add_space(6.0);
                             }
                         }
@@ -2297,6 +2490,17 @@ impl eframe::App for ChatApp {
                 }
             },
         });
+        if let (Some((msg_index, seed_text)), Some(thread_id)) = (fork_request, selected.clone()) {
+            // Archive-by-default: fork is almost always "I want to try
+            // something different from here"; the original typically
+            // becomes noise in the sidebar. User can untick.
+            self.fork_modal = Some(ForkModalState {
+                thread_id,
+                from_message_index: msg_index,
+                archive_original: true,
+                seed_text,
+            });
+        }
 
         // Submit any approval decisions that were clicked this frame.
         for (thread_id, approval_id, decision, remember) in pending_decisions {
@@ -2315,10 +2519,24 @@ impl eframe::App for ChatApp {
         }
 
         let ctx = ui.ctx().clone();
+        self.render_fork_modal(&ctx);
         self.render_new_pod_modal(&ctx);
         self.render_pod_editor_modal(&ctx);
         self.render_new_behavior_modal(&ctx);
         self.render_behavior_editor_modal(&ctx);
+
+        // Draft debounce tick. Schedule a repaint at the deadline so
+        // the flush fires even if nothing else is driving frames.
+        if let Some(changed_at) = self.last_input_change_at {
+            let now = ctx.input(|i| i.time);
+            let elapsed_secs = (now - changed_at).max(0.0);
+            let debounce_secs = DRAFT_DEBOUNCE.as_secs_f64();
+            if elapsed_secs >= debounce_secs {
+                self.flush_pending_draft();
+            } else {
+                ctx.request_repaint_after(Duration::from_secs_f64(debounce_secs - elapsed_secs));
+            }
+        }
     }
 }
 
@@ -3084,6 +3302,79 @@ impl ChatApp {
             modal.raw_buffer = snapshot.toml_text.clone();
             modal.raw_dirty = false;
             modal.error = snapshot.load_error.clone();
+        }
+    }
+
+    /// Render the fork-from-here confirm dialog. On confirm, fires
+    /// `ForkThread` with a correlation_id the `ThreadCreated`
+    /// handler matches against `pending_fork_seed` to seed the new
+    /// thread's draft.
+    fn render_fork_modal(&mut self, ctx: &egui::Context) {
+        let Some(mut modal) = self.fork_modal.take() else {
+            return;
+        };
+        let mut open = true;
+        let mut confirm_clicked = false;
+        let mut cancel_clicked = false;
+
+        egui::Window::new("Fork from this message")
+            .collapsible(false)
+            .resizable(false)
+            .default_width(380.0)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .open(&mut open)
+            .show(ctx, |ui| {
+                ui.add_space(4.0);
+                ui.label(
+                    RichText::new(
+                        "Forks this thread at the selected user message. The new \
+                         thread shares the pod, bindings, config, and tool allowlist, \
+                         and starts with the conversation up to (but not including) \
+                         that message — ready for you to retype the prompt.",
+                    )
+                    .color(Color32::from_gray(190))
+                    .small(),
+                );
+                ui.add_space(8.0);
+                ui.checkbox(&mut modal.archive_original, "Archive the original thread");
+                ui.add_space(4.0);
+                ui.label(
+                    RichText::new(
+                        "Archived threads drop off the sidebar list but stay on disk; \
+                         they're still readable from the server's pod directory.",
+                    )
+                    .color(Color32::from_gray(140))
+                    .small(),
+                );
+                ui.add_space(10.0);
+                ui.separator();
+                ui.horizontal(|ui| {
+                    if ui.button("Fork").clicked() {
+                        confirm_clicked = true;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        cancel_clicked = true;
+                    }
+                });
+            });
+
+        if confirm_clicked {
+            // The new thread id is minted server-side, so the seed
+            // text has to ride the correlation_id into the
+            // `ThreadCreated` handler rather than the `ForkThread`
+            // payload itself.
+            let correlation_id = self.next_correlation_id();
+            self.pending_fork_seed = Some((correlation_id.clone(), modal.seed_text.clone()));
+            self.send(ClientToServer::ForkThread {
+                thread_id: modal.thread_id.clone(),
+                from_message_index: modal.from_message_index,
+                archive_original: modal.archive_original,
+                correlation_id: Some(correlation_id),
+            });
+        } else if cancel_clicked || !open {
+            // Dropped.
+        } else {
+            self.fork_modal = Some(modal);
         }
     }
 
@@ -4359,7 +4650,7 @@ mod tests {
 
     #[test]
     fn snapshot_rebuild_fuses_sync_result_into_tool_call() {
-        let items = conversation_to_items(&conv_with_tool_call());
+        let items = conversation_to_items(&conv_with_tool_call(), &TurnLog::default());
         // The matching sync tool_result should fuse into the ToolCall
         // (populate its `result` slot) rather than producing a
         // standalone ToolResult row.
@@ -4400,7 +4691,7 @@ mod tests {
         let val: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         let conv: Conversation =
             serde_json::from_value(val.get("conversation").unwrap().clone()).unwrap();
-        let items = conversation_to_items(&conv);
+        let items = conversation_to_items(&conv, &TurnLog::default());
         let tool_call_count = items
             .iter()
             .filter(|i| matches!(i, DisplayItem::ToolCall { .. }))
@@ -4414,6 +4705,7 @@ mod tests {
                 DisplayItem::ToolCall { .. } => "tool_call",
                 DisplayItem::ToolResult { .. } => "tool_result",
                 DisplayItem::SystemNote { .. } => "system_note",
+                DisplayItem::TurnStats { .. } => "turn_stats",
             })
             .collect();
         assert!(
@@ -4479,7 +4771,7 @@ mod tests {
              <usage><total_tokens>10</total_tokens><tool_uses>0</tool_uses><duration_ms>5</duration_ms></usage>\n\
              </dispatched-thread-notification>",
         ));
-        let items = conversation_to_items(&conv);
+        let items = conversation_to_items(&conv, &TurnLog::default());
         // The initial sync ack fuses into the ToolCall (no intervening
         // turn at the time it lands); the async XML callback arrives
         // after an assistant turn and pushes a standalone row.

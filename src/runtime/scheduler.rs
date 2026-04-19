@@ -1179,26 +1179,6 @@ impl Scheduler {
         }
 
         let thread_id = new_task_id();
-
-        // Pre-register the host env so the registry holds the
-        // Pre-register the host env (if any). The deterministic
-        // HostEnvId means a second thread with the same (provider,
-        // spec) just joins the existing entry as a user. No binding
-        // → no pre-register, no provisioning, no host-env MCP. The
-        // thread's tool set in that case is just the shared MCPs it
-        // bound to.
-        let host_env_id = match resolved.host_env.as_ref() {
-            None => None,
-            Some(binding) => {
-                let (provider, spec) = self
-                    .resolve_binding(&pod_id, binding)
-                    .expect("resolve_bindings_choice already validated this");
-                Some(
-                    self.resources
-                        .pre_register_host_env(&thread_id, provider, spec),
-                )
-            }
-        };
         let bindings = ThreadBindings {
             backend: resolved.backend_name.clone(),
             host_env: resolved.host_env.clone(),
@@ -1213,39 +1193,74 @@ impl Scheduler {
         if let Some((parent_id, parent_depth)) = dispatched_by_parent {
             task = task.with_dispatched_by(parent_id, parent_depth);
         }
+
+        let thread_id = self.register_new_task(task, requester, correlation_id, pending_io);
+        info!(thread_id = %thread_id, pod_id = %pod_id, "task created");
+        Ok(thread_id)
+    }
+
+    /// Shared tail for freshly-constructed threads (minted by
+    /// `create_task`, `fork_task`, etc). Pre-registers the host env
+    /// if `task.bindings.host_env` is set, inserts `task` into the
+    /// scheduler map and the owning pod's `threads` set, takes up
+    /// backend / shared-MCP resource slots, kicks off host-env
+    /// provisioning, and broadcasts `ThreadCreated` (routing the
+    /// correlation_id only to the requester). The caller must
+    /// finalize `task.bindings` / origin / dispatch lineage before
+    /// calling — this function never mutates those.
+    ///
+    /// Returns the thread id. Safe to call with a `requester` of
+    /// `None` (trigger-driven spawns from behaviors / cron): falls
+    /// back to a single uncorrelated broadcast reaching every
+    /// client.
+    fn register_new_task(
+        &mut self,
+        task: Thread,
+        requester: Option<ConnId>,
+        correlation_id: Option<String>,
+        pending_io: &mut FuturesUnordered<SchedulerFuture>,
+    ) -> String {
+        let thread_id = task.id.clone();
+        let pod_id = task.pod_id.clone();
+
+        // Deterministic `HostEnvId` means a second thread with the
+        // same (provider, spec) joins the existing entry as a user.
+        // No binding → no pre-register; tools come from shared MCPs
+        // alone.
+        let host_env_id = match task.bindings.host_env.as_ref() {
+            None => None,
+            Some(binding) => {
+                let (provider, spec) = self
+                    .resolve_binding(&pod_id, binding)
+                    .expect("caller already validated this binding");
+                Some(
+                    self.resources
+                        .pre_register_host_env(&thread_id, provider, spec),
+                )
+            }
+        };
+
+        let backend_name = task.bindings.backend.clone();
+        let shared_hosts = task.bindings.mcp_hosts.clone();
         let summary = task.summary();
         self.tasks.insert(thread_id.clone(), task);
-        // Mirror the new thread into the owning pod's `threads` set.
         if let Some(pod) = self.pods.get_mut(&pod_id) {
             pod.threads.insert(thread_id.clone());
         }
 
-        // Register this task as a user of its backend and of every
-        // shared MCP host it references. pre_register_host_env
-        // already counted us as a host-env user.
-        let backend_id = BackendId::for_name(&resolved.backend_name);
+        let backend_id = BackendId::for_name(&backend_name);
         self.resources.add_backend_user(&backend_id, &thread_id);
         self.emit_backend_updated(&backend_id);
         if let Some(id) = host_env_id.as_ref() {
             self.emit_host_env_updated(id);
         }
-        for name in &resolved.shared_host_names {
+        for name in &shared_hosts {
             let host_id = McpHostId::shared(name);
             self.resources.add_mcp_user(&host_id, &thread_id);
             self.emit_mcp_host_updated(&host_id);
         }
-        // Kick off host-env provisioning if the thread has a host_env
-        // binding. No-op for threads bound only to shared MCPs.
         self.ensure_host_env_provisioning(&thread_id, pending_io);
 
-        info!(thread_id = %thread_id, pod_id = %pod_id, "task created");
-        // Every client gets exactly one ThreadCreated. When there's a
-        // requester AND a correlation_id, the requester's copy carries the
-        // correlation_id so they can match it against their request;
-        // otherwise we broadcast one uncorrelated event to everyone.
-        // Trigger-driven spawns (behaviors, cron) arrive with requester=None
-        // and fall through to the plain broadcast path — no one is
-        // "waiting" on a correlated ack.
         match (requester, correlation_id) {
             (Some(conn), Some(cid)) => {
                 self.router.broadcast_task_list_except(
@@ -1274,7 +1289,82 @@ impl Scheduler {
                     });
             }
         }
-        Ok(thread_id)
+        thread_id
+    }
+
+    /// Fork a thread at a prefix boundary. Mirrors the resource-wiring
+    /// tail of [`Self::create_task`] but against bindings copied from
+    /// the source thread rather than re-resolved from pod defaults +
+    /// a patch. The new thread's [`ThreadBindings`] are a verbatim
+    /// clone of the source's, so every backend / host_env / shared
+    /// MCP registration follows from those fields directly.
+    ///
+    /// Returns the new thread id on success. Failures before
+    /// insertion leave no partial registration: the source thread is
+    /// untouched and no resource refcounts move.
+    fn fork_task(
+        &mut self,
+        requester: Option<ConnId>,
+        correlation_id: Option<String>,
+        source_thread_id: &str,
+        from_message_index: usize,
+        pending_io: &mut FuturesUnordered<SchedulerFuture>,
+    ) -> Result<String, String> {
+        let new_id = crate::runtime::thread::new_task_id();
+        let task = {
+            let source = self
+                .tasks
+                .get(source_thread_id)
+                .ok_or_else(|| format!("unknown thread `{source_thread_id}`"))?;
+            source.fork_from(new_id.clone(), from_message_index)?
+        };
+        let pod_id = task.pod_id.clone();
+        if !self.pods.contains_key(&pod_id) {
+            return Err(format!("unknown pod `{pod_id}`"));
+        }
+        // Pre-validate the host_env binding before handing the task
+        // off to `register_new_task` (which `.expect()`s that the
+        // binding resolves). A Named binding can dangle if the entry
+        // was removed from the pod's allow list after the source
+        // thread was created; fail cleanly without touching
+        // resources or the task map.
+        if let Some(binding) = task.bindings.host_env.as_ref()
+            && self.resolve_binding(&pod_id, binding).is_none()
+        {
+            return Err(
+                "source thread's host_env binding no longer resolves in the pod's allow list"
+                    .into(),
+            );
+        }
+
+        let new_id = self.register_new_task(task, requester, correlation_id, pending_io);
+        self.mark_dirty(&new_id);
+        info!(
+            new_thread_id = %new_id,
+            source_thread_id = %source_thread_id,
+            pod_id = %pod_id,
+            from_message_index,
+            "thread forked"
+        );
+        Ok(new_id)
+    }
+
+    /// Archive `thread_id`: flip the persisted `archived` flag, touch
+    /// last_active, mark dirty for the next flush, and broadcast
+    /// `ThreadArchived` so clients can drop the thread off their
+    /// sidebars. Silent no-op when the thread is unknown — matches
+    /// the existing `ArchiveThread` dispatch semantics.
+    pub(crate) fn archive_thread(&mut self, thread_id: &str) {
+        let Some(task) = self.tasks.get_mut(thread_id) else {
+            return;
+        };
+        task.archived = true;
+        task.touch();
+        self.mark_dirty(thread_id);
+        self.router
+            .broadcast_task_list(ServerToClient::ThreadArchived {
+                thread_id: thread_id.to_string(),
+            });
     }
 
     fn send_user_message(

@@ -66,6 +66,31 @@ impl Usage {
     }
 }
 
+/// Diagnostic log of per-LLM-call metadata. Grows by one [`TurnEntry`]
+/// on every assistant turn (i.e. every `integrate_model_response` in
+/// the runtime). Distinct from [`Usage`] aggregated in
+/// `ThreadSnapshot::total_usage`: `total_usage` is the running sum,
+/// `turn_log` preserves the per-call shape so cache hit/miss rates can
+/// be audited after the fact.
+///
+/// Entry count matches the number of `Role::Assistant` messages in
+/// the conversation in temporal order — the runtime pushes exactly
+/// one entry per model response. Threads that pre-date this log load
+/// with `entries: []` via `#[serde(default)]`.
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+pub struct TurnLog {
+    pub entries: Vec<TurnEntry>,
+}
+
+/// One LLM call's diagnostic record. Only `usage` today; additional
+/// fields (model actually used, latency, cache-breakpoint layout at
+/// call time, retries) can grow here without touching callers that
+/// just read `usage`.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct TurnEntry {
+    pub usage: Usage,
+}
+
 /// The per-thread configuration the server holds. Carries only "what the loop
 /// looks like" — model, prompts, limits, policy. Resource-side concerns
 /// (which backend, which sandbox, which MCP hosts) live on
@@ -455,6 +480,17 @@ pub struct ThreadSnapshot {
     pub state: ThreadStateLabel,
     pub conversation: Conversation,
     pub total_usage: Usage,
+    /// Per-turn usage log, parallel to the `Role::Assistant` messages
+    /// in `conversation`. `#[serde(default)]` so threads persisted
+    /// before this field was added load with an empty log.
+    #[serde(default)]
+    pub turn_log: TurnLog,
+    /// User's in-progress compose-box contents for this thread.
+    /// Opaque to the server; mutated via `SetThreadDraft` and
+    /// echoed via `ThreadDraftUpdated`. Persists on disk so
+    /// partial prompts survive reopen. Empty = no draft.
+    #[serde(default)]
+    pub draft: String,
     pub created_at: String,
     pub last_active: String,
     /// Reason the task entered the `Failed` state, if any. Populated from the task's
@@ -567,6 +603,37 @@ pub enum ClientToServer {
         thread_id: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         correlation_id: Option<String>,
+    },
+    /// Fork `thread_id` at `from_message_index` into a new thread in
+    /// the same pod. The new thread's conversation is the prefix
+    /// `[0..from_message_index)`; bindings, config, and tool
+    /// allowlist carry over; total_usage is recomputed from the
+    /// truncated turn_log; dispatch lineage / behavior origin do
+    /// not propagate.
+    ///
+    /// `from_message_index` must point at a `Role::User` message
+    /// (v1 keeps tool_use / tool_result atomicity trivial).
+    /// Rejected mid-turn (working / awaiting approval / compacting).
+    ///
+    /// `archive_original` additionally flips the source's
+    /// `archived` flag. Announcement rides the standard
+    /// `ThreadCreated` broadcast; the requester gets a correlated
+    /// copy so it can subscribe to the new thread id.
+    ForkThread {
+        thread_id: String,
+        from_message_index: usize,
+        #[serde(default)]
+        archive_original: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        correlation_id: Option<String>,
+    },
+    /// Replace the server-side draft for `thread_id`. Broadcasts
+    /// `ThreadDraftUpdated` to every subscriber except the sender
+    /// — the sender already has the text locally, and echoing it
+    /// back would yank the cursor mid-type. Empty `text` = clear.
+    SetThreadDraft {
+        thread_id: String,
+        text: String,
     },
 
     // --- Observation ---
@@ -768,6 +835,13 @@ pub enum ServerToClient {
     },
     ThreadArchived {
         thread_id: String,
+    },
+    /// `Thread.draft` for `thread_id` changed. Fanout excludes the
+    /// connection that issued the originating `SetThreadDraft` so
+    /// the sender's live cursor isn't disrupted by its own echo.
+    ThreadDraftUpdated {
+        thread_id: String,
+        text: String,
     },
     /// A `RebindThread` was applied (or denied — see correlation_id +
     /// matching Error). Carries the new bindings so subscribed clients

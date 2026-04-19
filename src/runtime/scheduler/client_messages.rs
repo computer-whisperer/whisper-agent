@@ -182,13 +182,7 @@ impl Scheduler {
                 }
             }
             ClientToServer::ArchiveThread { thread_id } => {
-                if let Some(task) = self.tasks.get_mut(&thread_id) {
-                    task.archived = true;
-                    task.touch();
-                    self.mark_dirty(&thread_id);
-                    self.router
-                        .broadcast_task_list(ServerToClient::ThreadArchived { thread_id });
-                }
+                self.archive_thread(&thread_id);
             }
             ClientToServer::CompactThread {
                 thread_id,
@@ -208,6 +202,64 @@ impl Scheduler {
                     );
                 }
             }
+            ClientToServer::SetThreadDraft { thread_id, text } => {
+                if let Some(task) = self.tasks.get_mut(&thread_id) {
+                    // Guard against no-op writes — keeps disk idle
+                    // under keystroke-level traffic and avoids
+                    // broadcast echo loops when two clients converge.
+                    if task.draft != text {
+                        task.draft = text.clone();
+                        task.touch();
+                        self.mark_dirty(&thread_id);
+                        self.router.broadcast_to_subscribers_except(
+                            &thread_id,
+                            ServerToClient::ThreadDraftUpdated {
+                                thread_id: thread_id.clone(),
+                                text,
+                            },
+                            conn_id,
+                        );
+                    }
+                } else {
+                    self.router.send_to_client(
+                        conn_id,
+                        ServerToClient::Error {
+                            correlation_id: None,
+                            thread_id: Some(thread_id),
+                            message: "unknown task".into(),
+                        },
+                    );
+                }
+            }
+            ClientToServer::ForkThread {
+                thread_id,
+                from_message_index,
+                archive_original,
+                correlation_id,
+            } => match self.fork_task(
+                Some(conn_id),
+                correlation_id.clone(),
+                &thread_id,
+                from_message_index,
+                pending_io,
+            ) {
+                Ok(_) => {
+                    if archive_original {
+                        self.archive_thread(&thread_id);
+                    }
+                }
+                Err(e) => {
+                    warn!(error = %e, conn_id, %thread_id, "fork_task rejected");
+                    self.router.send_to_client(
+                        conn_id,
+                        ServerToClient::Error {
+                            correlation_id,
+                            thread_id: Some(thread_id),
+                            message: format!("fork_thread: {e}"),
+                        },
+                    );
+                }
+            },
             ClientToServer::SubscribeToThread { thread_id } => {
                 if let Some(task) = self.tasks.get(&thread_id) {
                     self.router.subscribe(conn_id, &thread_id);

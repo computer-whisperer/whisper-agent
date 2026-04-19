@@ -19,8 +19,7 @@ use egui::{FontData, FontDefinitions, FontFamily};
 // `.ttf` / `.otf` bytes are embedded into the wasm binary. The CJK
 // OTF is ~16 MB raw (~5 MB gzipped) and dominates the bundle — a
 // deliberate trade-off for out-of-the-box CJK rendering.
-static NOTO_SYMBOLS2: &[u8] =
-    include_bytes!("../assets/fonts/NotoSansSymbols2-Regular.ttf");
+static NOTO_SYMBOLS2: &[u8] = include_bytes!("../assets/fonts/NotoSansSymbols2-Regular.ttf");
 static NOTO_MATH: &[u8] = include_bytes!("../assets/fonts/NotoSansMath-Regular.ttf");
 static NOTO_CJK_SC: &[u8] = include_bytes!("../assets/fonts/NotoSansCJKsc-Regular.otf");
 

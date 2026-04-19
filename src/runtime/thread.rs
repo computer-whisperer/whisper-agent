@@ -22,9 +22,9 @@ use std::collections::{BTreeSet, HashMap};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use whisper_agent_protocol::{
-    ApprovalChoice, ApprovalPolicy, BehaviorOrigin, ContentBlock, Conversation, Message,
+    ApprovalChoice, ApprovalPolicy, BehaviorOrigin, ContentBlock, Conversation, Message, Role,
     ThreadBindings, ThreadConfig, ThreadSnapshot, ThreadStateLabel, ThreadSummary,
-    ToolResultContent, Usage,
+    ToolResultContent, TurnEntry, TurnLog, Usage,
 };
 
 use crate::providers::model::ModelResponse;
@@ -53,6 +53,11 @@ pub struct Thread {
     pub bindings: ThreadBindings,
     pub conversation: Conversation,
     pub total_usage: Usage,
+    /// Per-turn diagnostic log — one entry per assistant turn, in
+    /// order. `#[serde(default)]` so threads persisted before this
+    /// field existed load with an empty log.
+    #[serde(default)]
+    pub turn_log: TurnLog,
     #[serde(default)]
     pub archived: bool,
     /// Turns issued in the current user-message cycle; resets on user message.
@@ -96,6 +101,13 @@ pub struct Thread {
     /// can't recursively dispatch itself into the ground.
     #[serde(default)]
     pub dispatch_depth: u32,
+    /// User's in-progress compose-box contents for this thread.
+    /// Persisted so a partially-typed prompt survives reopening the
+    /// thread or restarting the server. Mutated via `SetThreadDraft`
+    /// wire messages and surfaced to subscribers via
+    /// `ThreadDraftUpdated`. Empty string is the "no draft" state.
+    #[serde(default)]
+    pub draft: String,
     pub internal: ThreadInternalState,
 }
 
@@ -329,6 +341,7 @@ impl Thread {
             bindings,
             conversation: Conversation::new(),
             total_usage: Usage::default(),
+            turn_log: TurnLog::default(),
             archived: false,
             turns_in_cycle: 0,
             tool_allowlist: BTreeSet::new(),
@@ -337,6 +350,7 @@ impl Thread {
             compacting: false,
             dispatched_by: None,
             dispatch_depth: 0,
+            draft: String::new(),
             internal: ThreadInternalState::Idle,
         }
     }
@@ -369,6 +383,84 @@ impl Thread {
 
     pub fn touch(&mut self) {
         self.last_active = Utc::now();
+    }
+
+    /// Build a new thread by rewinding `self` to message index
+    /// `from_message_index` (exclusive). Carries pod_id, config,
+    /// bindings, and tool_allowlist over verbatim; resets per-run
+    /// state (title, origin, lineage, cycle counter, compaction flag).
+    ///
+    /// Rejects mid-turn sources (working, awaiting approval,
+    /// compacting) — the in-flight operation has no meaning in the
+    /// derived conversation. Rejects non-user-role indices —
+    /// truncating at a tool_use / tool_result boundary leaves an
+    /// unanswered tool call, which the user-role restriction sidesteps
+    /// in v1.
+    pub fn fork_from(&self, new_id: String, from_message_index: usize) -> Result<Thread, String> {
+        match &self.internal {
+            ThreadInternalState::Idle
+            | ThreadInternalState::Completed
+            | ThreadInternalState::Cancelled
+            | ThreadInternalState::Failed { .. } => {}
+            _ => {
+                return Err("cannot fork a thread that is mid-turn".into());
+            }
+        }
+        if self.compacting {
+            return Err("cannot fork a thread while compaction is in flight".into());
+        }
+        let messages = self.conversation.messages();
+        if from_message_index >= messages.len() {
+            return Err(format!(
+                "fork index {from_message_index} out of bounds (conversation has {} messages)",
+                messages.len()
+            ));
+        }
+        if messages[from_message_index].role != Role::User {
+            return Err(format!(
+                "fork index {from_message_index} is not a user-role message"
+            ));
+        }
+        let mut conversation = self.conversation.clone();
+        conversation.truncate(from_message_index);
+        let assistant_turns = conversation
+            .messages()
+            .iter()
+            .filter(|m| m.role == Role::Assistant)
+            .count();
+        let mut turn_log = self.turn_log.clone();
+        turn_log.entries.truncate(assistant_turns);
+        let mut total_usage = Usage::default();
+        for entry in &turn_log.entries {
+            total_usage.add(&entry.usage);
+        }
+        let now = Utc::now();
+        Ok(Thread {
+            id: new_id,
+            pod_id: self.pod_id.clone(),
+            created_at: now,
+            last_active: now,
+            title: None,
+            config: self.config.clone(),
+            bindings: self.bindings.clone(),
+            conversation,
+            total_usage,
+            turn_log,
+            archived: false,
+            turns_in_cycle: 0,
+            tool_allowlist: self.tool_allowlist.clone(),
+            origin: None,
+            continued_from: None,
+            compacting: false,
+            dispatched_by: None,
+            dispatch_depth: 0,
+            // Client seeds the new thread's draft with the forked-from
+            // user-message text via a follow-up `SetThreadDraft`; the
+            // source's in-progress draft would be the wrong thing to
+            // carry over.
+            draft: String::new(),
+            internal: ThreadInternalState::Idle,
+        })
     }
 
     pub fn public_state(&self) -> ThreadStateLabel {
@@ -409,6 +501,8 @@ impl Thread {
             state: self.public_state(),
             conversation: self.conversation.clone(),
             total_usage: self.total_usage,
+            turn_log: self.turn_log.clone(),
+            draft: self.draft.clone(),
             created_at: self.created_at.to_rfc3339(),
             last_active: self.last_active.to_rfc3339(),
             failure: self.failure_detail(),
@@ -709,6 +803,7 @@ impl Thread {
             usage,
         } = response;
         self.total_usage.add(&usage);
+        self.turn_log.entries.push(TurnEntry { usage });
         for block in &assistant_blocks {
             match block {
                 ContentBlock::Text { text } => {
@@ -1413,5 +1508,128 @@ mod tests {
         assert!(task.remove_from_allowlist("edit_file"));
         assert!(!task.remove_from_allowlist("edit_file"));
         assert!(!task.remove_from_allowlist("never_added"));
+    }
+
+    fn base_config_for_fork() -> ThreadConfig {
+        ThreadConfig {
+            model: "test".into(),
+            system_prompt: "test".into(),
+            max_tokens: 100,
+            max_turns: 10,
+            approval_policy: ApprovalPolicy::PromptDestructive,
+            compaction: Default::default(),
+        }
+    }
+
+    fn thread_with_two_turns() -> Thread {
+        let mut task = Thread::new(
+            "src".into(),
+            "pod".into(),
+            base_config_for_fork(),
+            ThreadBindings::default(),
+        );
+        // [user, assistant, user, assistant] — two complete turns.
+        task.conversation.push(Message::user_text("hi"));
+        task.conversation
+            .push(Message::assistant_blocks(vec![ContentBlock::Text {
+                text: "hello".into(),
+            }]));
+        task.conversation.push(Message::user_text("again"));
+        task.conversation
+            .push(Message::assistant_blocks(vec![ContentBlock::Text {
+                text: "hi again".into(),
+            }]));
+        task.turn_log.entries.push(TurnEntry {
+            usage: Usage {
+                input_tokens: 10,
+                output_tokens: 2,
+                ..Usage::default()
+            },
+        });
+        task.turn_log.entries.push(TurnEntry {
+            usage: Usage {
+                input_tokens: 20,
+                output_tokens: 4,
+                ..Usage::default()
+            },
+        });
+        task.total_usage = Usage {
+            input_tokens: 30,
+            output_tokens: 6,
+            ..Usage::default()
+        };
+        task.tool_allowlist.insert("edit_file".into());
+        task.internal = ThreadInternalState::Idle;
+        task
+    }
+
+    #[test]
+    fn fork_from_prefix_keeps_first_turn() {
+        let src = thread_with_two_turns();
+        let forked = src.fork_from("new".into(), 2).unwrap();
+        // Prefix [user, assistant] survives; second user/assistant pair gone.
+        assert_eq!(forked.conversation.len(), 2);
+        assert_eq!(forked.turn_log.entries.len(), 1);
+        assert_eq!(forked.total_usage.input_tokens, 10);
+        assert_eq!(forked.total_usage.output_tokens, 2);
+        assert!(forked.tool_allowlist.contains("edit_file"));
+        assert_eq!(forked.id, "new");
+        assert_eq!(forked.pod_id, "pod");
+        assert!(!forked.archived);
+        assert_eq!(forked.turns_in_cycle, 0);
+        assert!(forked.title.is_none());
+        // The draft is the client's unsaved typing buffer on the
+        // source thread — not meaningful on the new thread. The
+        // client seeds it explicitly with the forked-from message
+        // text after receiving `ThreadCreated`, so the runtime
+        // starts the fork with an empty draft regardless of what
+        // the source had.
+        assert_eq!(forked.draft, "");
+    }
+
+    #[test]
+    fn fork_drops_source_draft() {
+        let mut src = thread_with_two_turns();
+        src.draft = "leftover typing from source".into();
+        let forked = src.fork_from("new".into(), 2).unwrap();
+        assert_eq!(forked.draft, "");
+    }
+
+    #[test]
+    fn fork_from_index_zero_empties_conversation() {
+        let src = thread_with_two_turns();
+        let forked = src.fork_from("new".into(), 0).unwrap();
+        assert!(forked.conversation.is_empty());
+        assert!(forked.turn_log.entries.is_empty());
+        assert_eq!(forked.total_usage.input_tokens, 0);
+    }
+
+    #[test]
+    fn fork_rejects_non_user_index() {
+        let src = thread_with_two_turns();
+        // Index 1 is an assistant message.
+        assert!(src.fork_from("new".into(), 1).is_err());
+    }
+
+    #[test]
+    fn fork_rejects_out_of_bounds() {
+        let src = thread_with_two_turns();
+        // Conversation has 4 messages; index 4 is past the end. (v1 also rejects
+        // == len since there'd be no user boundary to fork from.)
+        assert!(src.fork_from("new".into(), 4).is_err());
+    }
+
+    #[test]
+    fn fork_rejects_mid_turn() {
+        let mut src = thread_with_two_turns();
+        src.internal = ThreadInternalState::NeedsModelCall;
+        assert!(src.fork_from("new".into(), 2).is_err());
+    }
+
+    #[test]
+    fn fork_rejects_during_compaction() {
+        let mut src = thread_with_two_turns();
+        src.compacting = true;
+        assert!(src.fork_from("new".into(), 2).is_err());
     }
 }

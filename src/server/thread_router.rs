@@ -128,6 +128,28 @@ impl ThreadEventRouter {
         }
     }
 
+    /// [`broadcast_to_subscribers`] skipping `skip`. For events
+    /// that echo a sender's own mutation where the echo would
+    /// disrupt local state (e.g. `ThreadDraftUpdated`).
+    pub(crate) fn broadcast_to_subscribers_except(
+        &self,
+        thread_id: &str,
+        event: ServerToClient,
+        skip: ConnId,
+    ) {
+        let Some(subs) = self.subscriptions.get(thread_id) else {
+            return;
+        };
+        for conn_id in subs {
+            if *conn_id == skip {
+                continue;
+            }
+            if let Some(tx) = self.clients.get(conn_id) {
+                let _ = tx.send(event.clone());
+            }
+        }
+    }
+
     /// Clone of a connection's outbound channel for code that needs to send
     /// from a detached `tokio::spawn` (currently only the `ListModels` handler,
     /// which round-trips through the backend before responding).
