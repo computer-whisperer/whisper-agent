@@ -84,6 +84,12 @@ pub struct CallToolResult {
 
 #[derive(Debug)]
 pub enum ToolEvent {
+    /// Streaming content fragment — text chunk, image, or structured
+    /// payload produced mid-call. The MVP transport (single-shot HTTP
+    /// JSON response) never emits these; they're here so consumers
+    /// handle streaming uniformly once the SSE transport + MCP
+    /// `notifications/progress` path lands for tools like bash.
+    Content(McpContentBlock),
     /// Final outcome of a tool call. The MVP transport delivers exactly one of these per call.
     Completed(CallToolResult),
 }

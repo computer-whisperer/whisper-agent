@@ -172,6 +172,12 @@ enum DisplayItem {
         /// `write_file` tool calls when full args are available. Lets
         /// the renderer show a unified diff inline.
         diff: Option<DiffPayload>,
+        /// Streaming output accumulated from `ThreadToolCallContent`
+        /// events while the call is in flight. Empty until the first
+        /// content chunk arrives. Discarded once the final `result`
+        /// lands — the persisted `ToolResult` content block is the
+        /// source of truth for replay.
+        streaming_output: String,
         /// Fused tool response. Populated by `push_tool_result` when
         /// the matching tool_result arrives without an intervening
         /// `User`/`AssistantText` boundary — the common case for sync
@@ -1248,6 +1254,15 @@ impl ChatApp {
                     ));
                 }
             }
+            ServerToClient::ThreadToolCallContent {
+                thread_id,
+                tool_use_id,
+                block,
+            } => {
+                if let Some(view) = self.tasks.get_mut(&thread_id) {
+                    append_streaming_output(&mut view.items, &tool_use_id, &block);
+                }
+            }
             ServerToClient::ThreadToolCallEnd {
                 thread_id,
                 tool_use_id,
@@ -1966,6 +1981,35 @@ fn push_tool_result_from_text(items: &mut Vec<DisplayItem>, text: &str) {
 /// standalone `DisplayItem::ToolResult` at the tail. This covers the
 /// distant async-callback case where the originating call lives
 /// several turns earlier.
+/// Append a streaming `ContentBlock` to the matching in-flight tool
+/// call's `streaming_output` buffer. Only text blocks have a natural
+/// inline rendering today; future non-text block kinds will show as
+/// placeholders.
+fn append_streaming_output(
+    items: &mut [DisplayItem],
+    tool_use_id: &str,
+    block: &ContentBlock,
+) {
+    for item in items.iter_mut().rev() {
+        match item {
+            DisplayItem::ToolCall {
+                tool_use_id: id,
+                streaming_output,
+                result: None,
+                ..
+            } if id == tool_use_id => {
+                match block {
+                    ContentBlock::Text { text } => streaming_output.push_str(text),
+                    _ => streaming_output.push_str("[non-text content]"),
+                }
+                return;
+            }
+            DisplayItem::User { .. } | DisplayItem::AssistantText { .. } => return,
+            _ => continue,
+        }
+    }
+}
+
 fn push_tool_result(
     items: &mut Vec<DisplayItem>,
     tool_use_id: String,
@@ -2080,6 +2124,7 @@ fn build_tool_call_item(
         summary,
         args_pretty,
         diff,
+        streaming_output: String::new(),
         result: None,
     }
 }

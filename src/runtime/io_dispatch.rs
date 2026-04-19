@@ -576,33 +576,49 @@ fn tool_call(
                 })
             })
         }
-        Some(ToolRoute::Mcp { session: mcp, .. }) => Box::pin(async move {
-            let result = match mcp.invoke(&name, input).await {
-                Ok(mut stream) => {
-                    let mut last = None;
-                    while let Some(event) = stream.next().await {
-                        match event {
-                            crate::tools::mcp::ToolEvent::Completed(r) => last = Some(r),
+        Some(ToolRoute::Mcp { session: mcp, .. }) => {
+            let stream_tx = scheduler.stream_sender();
+            let stream_thread_id = thread_id.clone();
+            let stream_tool_use_id = tool_use_id.clone();
+            Box::pin(async move {
+                let result = match mcp.invoke(&name, input).await {
+                    Ok(mut stream) => {
+                        let mut last = None;
+                        while let Some(event) = stream.next().await {
+                            match event {
+                                crate::tools::mcp::ToolEvent::Content(block) => {
+                                    let wire_block = mcp_block_to_wire(&block);
+                                    let _ = stream_tx.send(StreamUpdate {
+                                        thread_id: stream_thread_id.clone(),
+                                        event: ServerToClient::ThreadToolCallContent {
+                                            thread_id: stream_thread_id.clone(),
+                                            tool_use_id: stream_tool_use_id.clone(),
+                                            block: wire_block,
+                                        },
+                                    });
+                                }
+                                crate::tools::mcp::ToolEvent::Completed(r) => last = Some(r),
+                            }
+                        }
+                        match last {
+                            Some(r) => Ok(r),
+                            None => Err("no Completed event in tool stream".to_string()),
                         }
                     }
-                    match last {
-                        Some(r) => Ok(r),
-                        None => Err("no Completed event in tool stream".to_string()),
-                    }
-                }
-                Err(e) => Err(e.to_string()),
-            };
-            SchedulerCompletion::Io(IoCompletion {
-                thread_id,
-                op_id,
-                result: IoResult::ToolCall {
-                    tool_use_id,
-                    result,
-                },
-                pod_update: None,
-                scheduler_command: None,
+                    Err(e) => Err(e.to_string()),
+                };
+                SchedulerCompletion::Io(IoCompletion {
+                    thread_id,
+                    op_id,
+                    result: IoResult::ToolCall {
+                        tool_use_id,
+                        result,
+                    },
+                    pod_update: None,
+                    scheduler_command: None,
+                })
             })
-        }),
+        }
         None => Box::pin(async move {
             SchedulerCompletion::Io(IoCompletion {
                 thread_id,
@@ -615,6 +631,18 @@ fn tool_call(
                 scheduler_command: None,
             })
         }),
+    }
+}
+
+/// Translate an MCP transport content block into the protocol's
+/// conversational `ContentBlock` shape. The transport today only carries
+/// `Text`; additional MCP content types (image, audio, resource) map to
+/// equivalents here as they're added to both sides.
+fn mcp_block_to_wire(b: &crate::tools::mcp::McpContentBlock) -> whisper_agent_protocol::ContentBlock {
+    match b {
+        crate::tools::mcp::McpContentBlock::Text { text } => {
+            whisper_agent_protocol::ContentBlock::Text { text: text.clone() }
+        }
     }
 }
 

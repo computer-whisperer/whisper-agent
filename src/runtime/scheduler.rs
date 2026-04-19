@@ -515,22 +515,41 @@ impl Scheduler {
         self.resources.host_envs.get(&id)
     }
 
-    /// Phase 3d.i: build the thread's effective tool catalog. Prepends
-    /// the builtin pod-editing tools (always available to every thread),
-    /// then walks `task.bindings.mcp_hosts` in precedence order — host-env
-    /// MCP first, then each shared host the thread is bound to. Tool-name
-    /// collisions resolve in favor of the earlier entry, so builtins win
-    /// if an MCP host tries to advertise a colliding name.
+    /// Build the thread's effective tool catalog — the model-facing
+    /// pool. Prepends the builtin pod-editing tools (always available
+    /// to every thread), then walks `task.bindings.mcp_hosts` in
+    /// precedence order — host-env MCP first, then each shared host
+    /// the thread is bound to. Tool-name collisions resolve in favor
+    /// of the earlier entry, so builtins win if an MCP host tries to
+    /// advertise a colliding name.
+    ///
+    /// Tools whose scope disposition is `Deny` for this thread are
+    /// omitted entirely — no point advertising a tool to the model that
+    /// will be synthesize-denied on call. `Allow` and `AllowWithPrompt`
+    /// both surface; the approval layer handles the latter at dispatch
+    /// time.
     pub(crate) fn tool_descriptors(&self, thread_id: &str) -> Vec<McpTool> {
+        let scope_denies = |name: &str| -> bool {
+            self.tasks
+                .get(thread_id)
+                .map(|t| !t.tools_scope.disposition(&name.to_string()).admits())
+                .unwrap_or(false)
+        };
         let mut out: Vec<McpTool> = Vec::new();
         let mut seen: HashSet<String> = HashSet::new();
         for tool in crate::tools::builtin_tools::descriptors() {
+            if scope_denies(&tool.name) {
+                continue;
+            }
             if seen.insert(tool.name.clone()) {
                 out.push(tool);
             }
         }
         for host in self.bound_mcp_hosts(thread_id) {
             for tool in &host.tools {
+                if scope_denies(&tool.name) {
+                    continue;
+                }
                 if seen.insert(tool.name.clone()) {
                     out.push(tool.clone());
                 }

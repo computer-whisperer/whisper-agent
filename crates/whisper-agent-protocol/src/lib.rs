@@ -949,6 +949,18 @@ pub enum ServerToClient {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         args: Option<serde_json::Value>,
     },
+    /// Streaming content fragment emitted while a tool call is in flight.
+    /// Lands between `ThreadToolCallBegin` and `ThreadToolCallEnd`. Each
+    /// event carries one `ContentBlock` — for the MVP bash-style MCP tool
+    /// this is a `ContentBlock::Text` chunk of stdout/stderr, but the
+    /// shape admits images / structured content without further wire
+    /// changes. Streaming-decorative: the final integrated tool result
+    /// still arrives in the conversation via the snapshot path.
+    ThreadToolCallContent {
+        thread_id: String,
+        tool_use_id: String,
+        block: ContentBlock,
+    },
     ThreadToolCallEnd {
         thread_id: String,
         tool_use_id: String,

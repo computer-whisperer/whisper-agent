@@ -271,11 +271,12 @@ pub struct ToolResult {
     pub is_error: bool,
 }
 
-/// Multimodal content carrier. Interim alias of `serde_json::Value` until
-/// the existing `ContentBlock` type in the protocol crate is wired in
-/// during Phase 2's MCP tool migration (where streaming content actually
-/// appears).
-pub type ContentBlock = serde_json::Value;
+/// Multimodal content carrier. Re-exports the conversational
+/// `ContentBlock` from the protocol crate — streaming tool output
+/// (`ProgressEvent::Content`), persisted tool results, and model output
+/// all use the same type so no translation is needed at the
+/// caller-link / wire boundary.
+pub type ContentBlock = whisper_agent_protocol::ContentBlock;
 
 /// Overall Function result. Orthogonal to per-variant `FunctionTerminal`.
 #[derive(Debug, Clone, PartialEq)]

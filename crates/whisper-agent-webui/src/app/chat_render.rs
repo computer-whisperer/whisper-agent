@@ -126,6 +126,7 @@ pub(super) fn render_item(
                 summary,
                 args_pretty,
                 diff,
+                streaming_output,
                 result,
             } => render_tool_call(
                 ui,
@@ -134,6 +135,7 @@ pub(super) fn render_item(
                 summary,
                 args_pretty.as_deref(),
                 diff.as_ref(),
+                streaming_output,
                 result.as_ref(),
             ),
             DisplayItem::ToolResult {
@@ -329,6 +331,7 @@ fn render_tool_call(
     summary: &str,
     args_pretty: Option<&str>,
     diff: Option<&DiffPayload>,
+    streaming_output: &str,
     result: Option<&FusedToolResult>,
 ) {
     let id = ui.make_persistent_id(("tool", tool_use_id));
@@ -337,7 +340,10 @@ fn render_tool_call(
     // result. A fused result — the common case for sync calls and
     // async dispatch acks — is rendered in the body alongside the
     // args/diff, avoiding a second chat row.
-    let default_open = false;
+    // Auto-expand while content is streaming so the user can see bash-
+    // style output scroll without clicking through. Collapses back to
+    // default-closed once the final result lands.
+    let default_open = result.is_none() && !streaming_output.is_empty();
     let (chip_text, chip_color) = match result {
         None => ("running", Color32::from_rgb(200, 180, 60)),
         Some(FusedToolResult { is_error: true, .. }) => ("error", COLOR_ERROR),
@@ -402,6 +408,20 @@ fn render_tool_call(
                     Color32::from_gray(180)
                 };
                 ui.label(RichText::new(text).color(color).monospace().small());
+            } else if !streaming_output.is_empty() {
+                ui.add_space(6.0);
+                ui.label(
+                    RichText::new("output")
+                        .color(Color32::from_gray(140))
+                        .small()
+                        .strong(),
+                );
+                ui.label(
+                    RichText::new(streaming_output)
+                        .color(Color32::from_gray(180))
+                        .monospace()
+                        .small(),
+                );
             }
         });
 }
