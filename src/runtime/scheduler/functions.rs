@@ -574,26 +574,42 @@ impl Scheduler {
             status,
             &body,
         );
-        let parent_can_accept = self
-            .tasks
-            .get(parent_thread_id)
-            .map(|t| {
-                matches!(
-                    t.public_state(),
-                    ThreadStateLabel::Idle | ThreadStateLabel::Completed
-                )
-            })
-            .unwrap_or(false);
-        if !parent_can_accept {
-            // Parent is either gone or still working; for now we drop
-            // the delivery. Holding it in a queue would require
-            // re-introducing the pending_dispatches-style stashing
-            // that the Function-model rewrite removed.
+        let Some(parent) = self.tasks.get_mut(parent_thread_id) else {
+            // Parent gone — drop silently.
+            return;
+        };
+        let parent_state = parent.public_state();
+        let parent_terminal = matches!(
+            parent_state,
+            ThreadStateLabel::Failed | ThreadStateLabel::Cancelled
+        );
+        if parent_terminal {
             debug!(
                 parent = %parent_thread_id,
                 child = %child_thread_id,
-                "dispatch async follow-up: parent not idle; dropping delivery"
+                state = ?parent_state,
+                "dispatch async follow-up: parent in terminal state; dropping delivery"
             );
+            return;
+        }
+        let parent_can_accept = matches!(
+            parent_state,
+            ThreadStateLabel::Idle | ThreadStateLabel::Completed
+        );
+        if !parent_can_accept {
+            // Parent is mid-turn; queue the notification on the
+            // parent's state. `drain_pending_tool_result_followups`
+            // (called from `step_until_blocked` when the parent
+            // reaches an idle boundary) injects each queued entry as
+            // a fresh user message.
+            debug!(
+                parent = %parent_thread_id,
+                child = %child_thread_id,
+                state = ?parent_state,
+                "dispatch async follow-up: parent busy; queueing for next idle boundary"
+            );
+            parent.pending_tool_result_followups.push(notification);
+            self.mark_dirty(parent_thread_id);
             return;
         }
         debug!(
@@ -604,6 +620,7 @@ impl Scheduler {
         self.send_tool_result_text(parent_thread_id, notification, pending_io);
         self.step_until_blocked(parent_thread_id, pending_io);
     }
+
 
     /// Find the FunctionId of the in-flight `CompactThread` targeting
     /// `thread_id`, if any. Linear scan; `active_functions` stays small
@@ -617,16 +634,26 @@ impl Scheduler {
         })
     }
 
-    /// Find the FunctionId of the in-flight tool call for this
-    /// `(thread_id, tool_use_id)` pair. The caller-link identifies the
-    /// pairing uniquely — each tool_use_id admits exactly one Function
-    /// entry at a time.
+    /// Find the FunctionId of the in-flight tool-call Function (i.e.,
+    /// `BuiltinToolCall` / `McpToolUse`) for this `(thread_id,
+    /// tool_use_id)` pair. Restricted to tool-call specs on purpose —
+    /// `dispatch_thread` shares the same caller-link shape via
+    /// `Function::CreateThread`, but its terminal is driven by the
+    /// child thread's lifecycle, not by a tool-IO completion. Matching
+    /// it here would race the child and complete the Function twice.
     pub(super) fn find_tool_function_for(
         &self,
         thread_id: &str,
         tool_use_id: &str,
     ) -> Option<FunctionId> {
         self.active_functions.iter().find_map(|(id, entry)| {
+            let is_tool_variant = matches!(
+                entry.spec,
+                Function::BuiltinToolCall { .. } | Function::McpToolUse { .. }
+            );
+            if !is_tool_variant {
+                return None;
+            }
             if let CallerLink::ThreadToolCall {
                 thread_id: t,
                 tool_use_id: u,
@@ -640,20 +667,19 @@ impl Scheduler {
         })
     }
 
-    /// Register a tool-call Function and return what to do with the
-    /// pending IoRequest. Called from `step_until_blocked` when
-    /// processing a DispatchIo(ToolCall).
-    ///
-    /// The returned `ToolDispatchDecision` tells the caller whether to:
-    /// - Push the original IO future (Allow),
-    /// - Defer it pending approval (AllowWithPrompt — the IoRequest
-    ///   is buffered in the Function entry),
-    /// - Synthesize a denial completion (Deny).
+    /// Single entry point for tool-use dispatch. Recognizes the
+    /// `dispatch_thread` pool-alias and routes it to
+    /// `Function::CreateThread`; every other tool name maps to
+    /// `Function::BuiltinToolCall` / `Function::McpToolUse` via
+    /// `route_tool`. Handles admission (tool disposition +
+    /// registration preconditions), registers the Function, and
+    /// pushes the appropriate IO future into `pending_io`.
     pub(super) fn register_tool_function(
         &mut self,
         thread_id: &str,
         io_request: crate::runtime::thread::IoRequest,
-    ) -> ToolDispatchDecision {
+        pending_io: &mut FuturesUnordered<SchedulerFuture>,
+    ) {
         use super::ToolRoute;
         let crate::runtime::thread::IoRequest::ToolCall {
             op_id,
@@ -664,8 +690,37 @@ impl Scheduler {
         else {
             // register_tool_function is only ever called with
             // ToolCall. ModelCall takes a different path.
-            return ToolDispatchDecision::PushImmediately;
+            return;
         };
+
+        let Some(scope) = self.thread_scope(thread_id) else {
+            // Unknown thread — defensive; upstream route_tool checks
+            // will surface the error.
+            let fut = crate::runtime::io_dispatch::build_io_future(
+                self,
+                thread_id.to_string(),
+                io_request,
+            );
+            pending_io.push(fut);
+            return;
+        };
+        let disposition = scope.tool(&name);
+
+        // `dispatch_thread` is a model-facing alias for
+        // `Function::CreateThread`. Deny stops at the tool layer;
+        // Allow / AllowWithPrompt proceed with the CreateThread spec.
+        if name == crate::tools::builtin_tools::DISPATCH_THREAD {
+            self.register_dispatch_thread_tool(
+                thread_id,
+                op_id,
+                tool_use_id,
+                input,
+                scope,
+                disposition,
+                pending_io,
+            );
+            return;
+        }
 
         let spec = match self.route_tool(thread_id, &name) {
             Some(ToolRoute::Builtin { .. }) => Function::BuiltinToolCall {
@@ -681,18 +736,15 @@ impl Scheduler {
                 // No route — the thread's turn will surface this as a
                 // tool-not-found error when the IO future runs. Let it
                 // through.
-                return ToolDispatchDecision::PushImmediately;
+                let fut = crate::runtime::io_dispatch::build_io_future(
+                    self,
+                    thread_id.to_string(),
+                    io_request,
+                );
+                pending_io.push(fut);
+                return;
             }
         };
-
-        let Some(scope) = self.thread_scope(thread_id) else {
-            return ToolDispatchDecision::PushImmediately;
-        };
-
-        // Snapshot the disposition before registering — register_function
-        // will reject on Deny, but we want to distinguish Allow vs
-        // AllowWithPrompt for the dispatch decision.
-        let disposition = scope.tool(&name);
 
         let caller = CallerLink::ThreadToolCall {
             thread_id: thread_id.to_string(),
@@ -701,15 +753,19 @@ impl Scheduler {
 
         match disposition {
             crate::permission::Disposition::Allow => {
-                // Fast path — just register and let the caller push the IO.
                 let _ = self.register_function(spec, scope, caller);
-                ToolDispatchDecision::PushImmediately
+                let fut = crate::runtime::io_dispatch::build_io_future(
+                    self,
+                    thread_id.to_string(),
+                    io_request,
+                );
+                pending_io.push(fut);
             }
             crate::permission::Disposition::AllowWithPrompt => {
                 // Register the Function with the IoRequest buffered.
                 // Emit a PendingApproval event so the UI can prompt.
-                // The caller skips pushing; approval resolution later
-                // will rebuild the future from the buffered IoRequest.
+                // Approval resolution later rebuilds the future from
+                // the buffered IoRequest.
                 match self.register_function(spec, scope, caller) {
                     Ok(fn_id) => {
                         if let Some(entry) = self.active_functions.get_mut(&fn_id) {
@@ -723,14 +779,18 @@ impl Scheduler {
                             &name,
                             &input,
                         );
-                        ToolDispatchDecision::WaitingApproval
                     }
                     Err(e) => {
                         tracing::warn!(
                             %thread_id, %tool_use_id, %name, error = ?e,
                             "AllowWithPrompt tool registration unexpectedly rejected"
                         );
-                        ToolDispatchDecision::PushImmediately
+                        let fut = crate::runtime::io_dispatch::build_io_future(
+                            self,
+                            thread_id.to_string(),
+                            io_request,
+                        );
+                        pending_io.push(fut);
                     }
                 }
             }
@@ -739,11 +799,183 @@ impl Scheduler {
                 // Synthesize a ToolCall completion future that fires
                 // with an IoResult::Err so the thread integrates the
                 // denial as a tool_result and continues its turn.
-                let _ = op_id; // op_id is embedded in the IoRequest used below
-                ToolDispatchDecision::SynthesizeDenial {
-                    synthetic: make_denial_future(thread_id.to_string(), tool_use_id, op_id, name),
-                }
+                pending_io.push(make_denial_future(
+                    thread_id.to_string(),
+                    tool_use_id,
+                    op_id,
+                    name,
+                ));
             }
+        }
+    }
+
+    /// `dispatch_thread`-specific registration path. Parses the tool
+    /// args into a `Function::CreateThread` spec with
+    /// `wait_mode: ThreadTerminal`, picks a `FunctionDelivery` based
+    /// on `args.sync`, registers + launches the Function, and pushes
+    /// the parent-facing tool-call future (oneshot-awaiting for sync
+    /// or immediate ack for async). `AllowWithPrompt` for
+    /// `dispatch_thread` is not yet supported — treated as Allow with
+    /// a warn log. The common case today is `Allow`; approval
+    /// integration for Function-spawning tool aliases can land when
+    /// there's a concrete use case.
+    #[allow(clippy::too_many_arguments)]
+    fn register_dispatch_thread_tool(
+        &mut self,
+        parent_thread_id: &str,
+        op_id: crate::runtime::thread::OpId,
+        tool_use_id: String,
+        input: serde_json::Value,
+        scope: PermissionScope,
+        disposition: crate::permission::Disposition,
+        pending_io: &mut FuturesUnordered<SchedulerFuture>,
+    ) {
+        if matches!(disposition, crate::permission::Disposition::Deny) {
+            pending_io.push(make_denial_future(
+                parent_thread_id.to_string(),
+                tool_use_id,
+                op_id,
+                crate::tools::builtin_tools::DISPATCH_THREAD.to_string(),
+            ));
+            return;
+        }
+        if matches!(disposition, crate::permission::Disposition::AllowWithPrompt) {
+            tracing::warn!(
+                parent = %parent_thread_id, %tool_use_id,
+                "dispatch_thread has AllowWithPrompt disposition; approval integration \
+                 for Function-spawning aliases is not yet implemented — proceeding as Allow"
+            );
+        }
+
+        let args = match crate::tools::builtin_tools::dispatch_thread::parse_args(input) {
+            Ok(a) => a,
+            Err(e) => {
+                pending_io.push(immediate_tool_error(
+                    parent_thread_id.to_string(),
+                    op_id,
+                    tool_use_id,
+                    e,
+                ));
+                return;
+            }
+        };
+
+        // Parent's pod is the target; ParentLink carries the lineage.
+        let pod_id = self.tasks.get(parent_thread_id).map(|t| t.pod_id.clone());
+        let spec = Function::CreateThread {
+            pod_id,
+            initial_message: Some(args.prompt.clone()),
+            parent: Some(crate::functions::ParentLink {
+                thread_id: parent_thread_id.to_string(),
+                tool_use_id: tool_use_id.clone(),
+            }),
+            wait_mode: crate::functions::WaitMode::ThreadTerminal,
+            config_override: args.config_override,
+            bindings_request: args.bindings_override,
+        };
+        let caller = CallerLink::ThreadToolCall {
+            thread_id: parent_thread_id.to_string(),
+            tool_use_id: tool_use_id.clone(),
+        };
+
+        if args.sync {
+            let (tx, rx) = tokio::sync::oneshot::channel::<Result<String, String>>();
+            let delivery = FunctionDelivery::ToolResultChannel(tx);
+            let fn_id = match self.register_function_with_delivery(spec, scope, caller, delivery)
+            {
+                Ok(id) => id,
+                Err(e) => {
+                    pending_io.push(immediate_tool_error(
+                        parent_thread_id.to_string(),
+                        op_id,
+                        tool_use_id,
+                        format!(
+                            "dispatch_thread: {}",
+                            super::client_messages::reject_reason_detail(&e)
+                        ),
+                    ));
+                    return;
+                }
+            };
+            self.launch_function(fn_id, pending_io);
+            let parent_id = parent_thread_id.to_string();
+            pending_io.push(Box::pin(async move {
+                let result = match rx.await {
+                    Ok(Ok(text)) => Ok(crate::tools::mcp::CallToolResult {
+                        content: vec![crate::tools::mcp::McpContentBlock::Text { text }],
+                        is_error: false,
+                    }),
+                    Ok(Err(msg)) => Err(msg),
+                    Err(_) => Err(
+                        "dispatch_thread: Function terminated without delivering a result"
+                            .to_string(),
+                    ),
+                };
+                crate::runtime::io_dispatch::SchedulerCompletion::Io(
+                    crate::runtime::io_dispatch::IoCompletion {
+                        thread_id: parent_id,
+                        op_id,
+                        result: crate::runtime::thread::IoResult::ToolCall {
+                            tool_use_id,
+                            result,
+                        },
+                        pod_update: None,
+                        scheduler_command: None,
+                    },
+                )
+            }));
+        } else {
+            let delivery = FunctionDelivery::ToolResultFollowup {
+                parent_thread_id: parent_thread_id.to_string(),
+                parent_tool_use_id: tool_use_id.clone(),
+            };
+            let fn_id = match self.register_function_with_delivery(spec, scope, caller, delivery)
+            {
+                Ok(id) => id,
+                Err(e) => {
+                    pending_io.push(immediate_tool_error(
+                        parent_thread_id.to_string(),
+                        op_id,
+                        tool_use_id,
+                        format!(
+                            "dispatch_thread: {}",
+                            super::client_messages::reject_reason_detail(&e)
+                        ),
+                    ));
+                    return;
+                }
+            };
+            self.launch_function(fn_id, pending_io);
+            let child_id = self
+                .active_functions
+                .get(&fn_id)
+                .and_then(|e| e.awaiting_child_thread_id.clone())
+                .unwrap_or_default();
+            let ack = format!(
+                "Dispatched child thread `{child_id}` in the background. Its final result will \
+                 be delivered as a fresh user message once the child terminates; you can \
+                 continue working in the meantime."
+            );
+            let parent_id = parent_thread_id.to_string();
+            pending_io.push(Box::pin(async move {
+                crate::runtime::io_dispatch::SchedulerCompletion::Io(
+                    crate::runtime::io_dispatch::IoCompletion {
+                        thread_id: parent_id,
+                        op_id,
+                        result: crate::runtime::thread::IoResult::ToolCall {
+                            tool_use_id,
+                            result: Ok(crate::tools::mcp::CallToolResult {
+                                content: vec![crate::tools::mcp::McpContentBlock::Text {
+                                    text: ack,
+                                }],
+                                is_error: false,
+                            }),
+                        },
+                        pod_update: None,
+                        scheduler_command: None,
+                    },
+                )
+            }));
         }
     }
 
@@ -920,8 +1152,10 @@ impl Scheduler {
                     content: Vec::new(),
                     is_error: call.is_error,
                 };
-                // Pick the matching terminal variant from the Function
-                // we just completed.
+                // `find_tool_function_for` already filtered to
+                // BuiltinToolCall / McpToolUse specs, so this match is
+                // exhaustive for reachable inputs. A non-tool spec
+                // here is a bug in upstream filtering; debug_assert.
                 let terminal = match self.active_functions.get(&fn_id).map(|e| &e.spec) {
                     Some(Function::BuiltinToolCall { .. }) => {
                         FunctionTerminal::BuiltinToolCall(terminal_payload)
@@ -929,7 +1163,13 @@ impl Scheduler {
                     Some(Function::McpToolUse { .. }) => {
                         FunctionTerminal::McpToolUse(terminal_payload)
                     }
-                    _ => FunctionTerminal::BuiltinToolCall(terminal_payload), // defensive
+                    other => {
+                        debug_assert!(
+                            false,
+                            "complete_tool_function matched non-tool Function spec: {other:?}"
+                        );
+                        FunctionTerminal::BuiltinToolCall(terminal_payload)
+                    }
                 };
                 FunctionOutcome::Success(terminal)
             }
@@ -1301,21 +1541,30 @@ fn admission_check(
     }
 }
 
-/// What the scheduler should do with a tool-call IoRequest after
-/// registering a Function for it. See `register_tool_function`.
-pub(super) enum ToolDispatchDecision {
-    /// Scope admits the call with `Allow`. Caller pushes the original
-    /// IO future.
-    PushImmediately,
-    /// Scope admits the call with `AllowWithPrompt`. A PendingApproval
-    /// event was emitted; the IoRequest is buffered in the Function
-    /// entry. Caller does nothing — the future lands in pending_io
-    /// only after `resolve_tool_approval` sees the user's decision.
-    WaitingApproval,
-    /// Scope denied the call. Caller pushes the synthetic denial
-    /// future, which fires immediately with an IoResult::Err so the
-    /// thread integrates a denied tool_result and continues.
-    SynthesizeDenial { synthetic: SchedulerFuture },
+/// Build a future that immediately fires with a tool-error
+/// `IoCompletion`. Used for dispatch_thread arg-parse errors and
+/// register_function rejections — the thread integrates the error as
+/// a tool_result and continues its turn.
+fn immediate_tool_error(
+    parent_thread_id: String,
+    op_id: crate::runtime::thread::OpId,
+    tool_use_id: String,
+    message: String,
+) -> SchedulerFuture {
+    Box::pin(async move {
+        crate::runtime::io_dispatch::SchedulerCompletion::Io(
+            crate::runtime::io_dispatch::IoCompletion {
+                thread_id: parent_thread_id,
+                op_id,
+                result: crate::runtime::thread::IoResult::ToolCall {
+                    tool_use_id,
+                    result: Err(message),
+                },
+                pod_update: None,
+                scheduler_command: None,
+            },
+        )
+    })
 }
 
 /// Build a future that immediately fires with a tool-denial completion.

@@ -1765,62 +1765,14 @@ impl Scheduler {
 
             match outcome {
                 StepOutcome::DispatchIo(req) => {
-                    // `dispatch_thread` needs live mutable scheduler
-                    // state (to spawn the child and register the
-                    // return-plumbing side-map), so we intercept it
-                    // here before falling through to the generic
-                    // `io_dispatch` path. The intercept produces the
-                    // same shape of `SchedulerFuture` as normal tool
-                    // calls — the parent is parked on a oneshot
-                    // receiver, no extra scheduler state beyond
-                    // `pending_dispatches`.
                     match req {
-                        crate::runtime::thread::IoRequest::ToolCall {
-                            op_id,
-                            tool_use_id,
-                            name,
-                            input,
-                        } => {
-                            if let Some(fut) = self.try_intercept_dispatch_thread(
-                                thread_id,
-                                op_id,
-                                &tool_use_id,
-                                &name,
-                                input.clone(),
-                                pending_io,
-                            ) {
-                                // dispatch_thread — falls through the Function
-                                // path; CreateThread Function lands in Phase 5.
-                                pending_io.push(fut);
-                            } else {
-                                // Tool Function registers + decides dispatch
-                                // based on scope disposition.
-                                use self::functions::ToolDispatchDecision;
-                                let io_request = crate::runtime::thread::IoRequest::ToolCall {
-                                    op_id,
-                                    tool_use_id,
-                                    name,
-                                    input,
-                                };
-                                match self.register_tool_function(thread_id, io_request.clone()) {
-                                    ToolDispatchDecision::PushImmediately => {
-                                        let fut = io_dispatch::build_io_future(
-                                            self,
-                                            thread_id.to_string(),
-                                            io_request,
-                                        );
-                                        pending_io.push(fut);
-                                    }
-                                    ToolDispatchDecision::WaitingApproval => {
-                                        // IO deferred inside the Function;
-                                        // pushes to pending_io when approval
-                                        // arrives.
-                                    }
-                                    ToolDispatchDecision::SynthesizeDenial { synthetic } => {
-                                        pending_io.push(synthetic);
-                                    }
-                                }
-                            }
+                        req @ crate::runtime::thread::IoRequest::ToolCall { .. } => {
+                            // Single-entry dispatch:
+                            // `register_tool_function` handles the tool-
+                            // pool alias check (dispatch_thread →
+                            // Function::CreateThread), normal tool
+                            // routing, admission, and future-pushing.
+                            self.register_tool_function(thread_id, req, pending_io);
                         }
                         other => {
                             let fut = io_dispatch::build_io_future(
@@ -1833,7 +1785,29 @@ impl Scheduler {
                     };
                 }
                 StepOutcome::Continue => continue,
-                StepOutcome::Paused => break,
+                StepOutcome::Paused => {
+                    // Idle turn boundary. If this thread has queued
+                    // `<dispatched-thread-notification>` envelopes
+                    // waiting for an idle parent (async dispatch
+                    // follow-ups), inject the first one as a user
+                    // message and re-enter the step loop — it will
+                    // kick a fresh turn. Remaining follow-ups wait
+                    // for the next boundary.
+                    let has_followup = self
+                        .tasks
+                        .get(thread_id)
+                        .map(|t| !t.pending_tool_result_followups.is_empty())
+                        .unwrap_or(false);
+                    if has_followup
+                        && let Some(task) = self.tasks.get_mut(thread_id)
+                    {
+                        let notification = task.pending_tool_result_followups.remove(0);
+                        self.mark_dirty(thread_id);
+                        self.send_tool_result_text(thread_id, notification, pending_io);
+                        continue;
+                    }
+                    break;
+                }
             }
         }
         // Catch Completed/Failed/Cancelled transitions for behavior-spawned

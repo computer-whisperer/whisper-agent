@@ -100,6 +100,17 @@ pub struct Thread {
     /// finalize logic is idempotent).
     #[serde(default)]
     pub in_flight: InFlightOps,
+    /// Rendered `<dispatched-thread-notification>` envelopes queued
+    /// for injection as fresh user messages once this thread reaches
+    /// an idle turn boundary. Populated by
+    /// `Scheduler::deliver_async_followup` when a dispatched child
+    /// terminates while the parent is still Working; drained during
+    /// `step_until_blocked` when the parent hits Idle/Completed.
+    /// Transient — not persisted; a restart mid-delivery drops the
+    /// queued follow-up (same lifecycle guarantee as other in-flight
+    /// Function state).
+    #[serde(default, skip)]
+    pub pending_tool_result_followups: Vec<String>,
     /// Parent thread id when this thread was spawned by a parent's
     /// `dispatch_thread` tool call. `None` for top-level threads. Set
     /// once at spawn; never mutated afterward. Distinct from the
@@ -314,6 +325,7 @@ impl Thread {
             origin: None,
             continued_from: None,
             in_flight: InFlightOps::empty(),
+            pending_tool_result_followups: Vec::new(),
             dispatched_by: None,
             dispatch_depth: 0,
             draft: String::new(),
@@ -419,6 +431,7 @@ impl Thread {
             origin: None,
             continued_from: None,
             in_flight: InFlightOps::empty(),
+            pending_tool_result_followups: Vec::new(),
             dispatched_by: None,
             dispatch_depth: 0,
             // Client seeds the new thread's draft with the forked-from
