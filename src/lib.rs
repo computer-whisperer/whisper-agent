@@ -3,6 +3,8 @@
 //! Canonical conversation types live in the `whisper-agent-protocol` crate so the webui
 //! can render them from wire snapshots without a server round-trip per event.
 
+pub mod functions;
+pub mod permission;
 pub mod pod;
 pub mod providers;
 pub mod runtime;

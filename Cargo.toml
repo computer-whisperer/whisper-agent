@@ -85,3 +85,4 @@ whisper-agent-protocol = { workspace = true }
 toml = "1"
 base64 = "0.22"
 regex = { workspace = true }
+bitflags = { version = "2", features = ["serde"] }
