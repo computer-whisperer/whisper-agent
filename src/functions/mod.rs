@@ -543,9 +543,7 @@ mod tests {
     // Phase 2 consumption but not exercised in Phase 1a tests.
     #[test]
     fn types_construct_without_warnings() {
-        let _ = RejectReason::ScopeDenied {
-            detail: "x".into(),
-        };
+        let _ = RejectReason::ScopeDenied { detail: "x".into() };
         let _ = FunctionOutcome::Cancelled(CancelReason::UserDenied);
         let _ = ProgressEvent::Status(StatusKind::Starting);
         let _ = Function::CancelThread {

@@ -128,9 +128,7 @@ fn apply_compaction_override(
 pub(super) fn behavior_override_to_requests(
     ov: &whisper_agent_protocol::BehaviorThreadOverride,
 ) -> (Option<ThreadConfigOverride>, Option<ThreadBindingsRequest>) {
-    let config_override = if ov.model.is_some()
-        || ov.max_tokens.is_some()
-        || ov.max_turns.is_some()
+    let config_override = if ov.model.is_some() || ov.max_tokens.is_some() || ov.max_turns.is_some()
     {
         Some(ThreadConfigOverride {
             model: ov.model.clone(),

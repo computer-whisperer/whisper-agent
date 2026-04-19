@@ -351,9 +351,7 @@ pub(super) fn render_pod_editor_defaults_tab(
             if override_count == 0 {
                 ui.label("(none)");
             } else {
-                ui.label(format!(
-                    "{override_count} tool(s) — edit via raw TOML"
-                ));
+                ui.label(format!("{override_count} tool(s) — edit via raw TOML"));
             }
             ui.end_row();
 
@@ -1587,7 +1585,6 @@ pub(super) fn trigger_kind_label(trigger: &TriggerSpec) -> &'static str {
         TriggerSpec::Webhook { .. } => "webhook",
     }
 }
-
 
 pub(super) fn spec_type_label(spec: &HostEnvSpec) -> &'static str {
     match spec {

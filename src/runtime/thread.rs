@@ -915,7 +915,6 @@ impl Thread {
             approvals,
         };
     }
-
 }
 
 /// `step()` pops from the back; feed it in reverse so the original order is preserved.

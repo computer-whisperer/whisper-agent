@@ -638,7 +638,9 @@ fn tool_call(
 /// conversational `ContentBlock` shape. The transport today only carries
 /// `Text`; additional MCP content types (image, audio, resource) map to
 /// equivalents here as they're added to both sides.
-fn mcp_block_to_wire(b: &crate::tools::mcp::McpContentBlock) -> whisper_agent_protocol::ContentBlock {
+fn mcp_block_to_wire(
+    b: &crate::tools::mcp::McpContentBlock,
+) -> whisper_agent_protocol::ContentBlock {
     match b {
         crate::tools::mcp::McpContentBlock::Text { text } => {
             whisper_agent_protocol::ContentBlock::Text { text: text.clone() }

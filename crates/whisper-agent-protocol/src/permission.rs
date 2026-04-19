@@ -91,8 +91,11 @@ impl<T: Ord + Clone> AllowMap<T> {
     /// the map small.
     pub fn narrow(&self, other: &Self) -> Self {
         let default = self.default.narrow(other.default);
-        let all_keys: std::collections::BTreeSet<&T> =
-            self.overrides.keys().chain(other.overrides.keys()).collect();
+        let all_keys: std::collections::BTreeSet<&T> = self
+            .overrides
+            .keys()
+            .chain(other.overrides.keys())
+            .collect();
         let mut overrides = BTreeMap::new();
         for k in all_keys {
             let merged = self.disposition(k).narrow(other.disposition(k));

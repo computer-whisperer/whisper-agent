@@ -25,9 +25,7 @@ pub use whisper_agent_protocol::permission::{AllowMap, Disposition};
 // ---------------------------------------------------------------------------
 
 /// Thread-level operations a pod scope may admit.
-#[derive(
-    Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash,
-)]
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[serde(rename_all = "snake_case")]
 pub enum ThreadOp {
     Create,
@@ -40,9 +38,7 @@ pub enum ThreadOp {
 }
 
 /// Behavior-level operations a pod scope may admit.
-#[derive(
-    Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash,
-)]
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[serde(rename_all = "snake_case")]
 pub enum BehaviorOp {
     Create,
@@ -52,9 +48,7 @@ pub enum BehaviorOp {
 }
 
 /// Pod-config-level operations a pod scope may admit.
-#[derive(
-    Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash,
-)]
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[serde(rename_all = "snake_case")]
 pub enum PodConfigOp {
     Read,
@@ -148,10 +142,7 @@ impl PodsScope {
             (Self::All { ops: a }, Self::All { ops: b }) => Self::All { ops: a.narrow(b) },
             (Self::All { ops: a }, Self::Per { pods: b })
             | (Self::Per { pods: b }, Self::All { ops: a }) => {
-                let pods = b
-                    .iter()
-                    .map(|(k, v)| (k.clone(), v.narrow(a)))
-                    .collect();
+                let pods = b.iter().map(|(k, v)| (k.clone(), v.narrow(a))).collect();
                 Self::Per { pods }
             }
             (Self::Per { pods: a }, Self::Per { pods: b }) => {
@@ -391,10 +382,7 @@ mod tests {
     fn permission_scope_allow_all_admits_everything() {
         let s = PermissionScope::allow_all();
         assert_eq!(s.tool("bash"), Disposition::Allow);
-        assert_eq!(
-            s.thread_op("any-pod", ThreadOp::Create),
-            Disposition::Allow
-        );
+        assert_eq!(s.thread_op("any-pod", ThreadOp::Create), Disposition::Allow);
     }
 
     #[test]

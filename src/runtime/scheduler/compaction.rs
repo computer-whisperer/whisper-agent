@@ -83,12 +83,10 @@ impl Scheduler {
                 if let Some(id) = self.find_compact_function_for(thread_id) {
                     self.complete_function(
                         id,
-                        crate::functions::FunctionOutcome::Error(
-                            crate::functions::FunctionError {
-                                kind: crate::functions::FunctionErrorKind::BadInput,
-                                detail: format!("compaction prompt resolution failed: {e}"),
-                            },
-                        ),
+                        crate::functions::FunctionOutcome::Error(crate::functions::FunctionError {
+                            kind: crate::functions::FunctionErrorKind::BadInput,
+                            detail: format!("compaction prompt resolution failed: {e}"),
+                        }),
                         pending_io,
                     );
                 }
@@ -295,12 +293,10 @@ impl Scheduler {
                 if let Some(id) = compact_fn_id {
                     self.complete_function(
                         id,
-                        crate::functions::FunctionOutcome::Error(
-                            crate::functions::FunctionError {
-                                kind: crate::functions::FunctionErrorKind::Execution,
-                                detail: format!("continuation create_task failed: {e}"),
-                            },
-                        ),
+                        crate::functions::FunctionOutcome::Error(crate::functions::FunctionError {
+                            kind: crate::functions::FunctionErrorKind::Execution,
+                            detail: format!("continuation create_task failed: {e}"),
+                        }),
                         pending_io,
                     );
                 }

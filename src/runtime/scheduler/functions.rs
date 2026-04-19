@@ -22,8 +22,7 @@ use whisper_agent_protocol::{ServerToClient, ThreadStateLabel};
 
 use super::Scheduler;
 use crate::functions::{
-    CallerLink, Function, FunctionId, FunctionOutcome, FunctionTerminal, InFlightOps,
-    RejectReason,
+    CallerLink, Function, FunctionId, FunctionOutcome, FunctionTerminal, InFlightOps, RejectReason,
 };
 use crate::permission::{BehaviorOp, PermissionScope, ThreadOp};
 use crate::runtime::io_dispatch::SchedulerFuture;
@@ -189,21 +188,23 @@ impl Scheduler {
     ) -> Result<(), RejectReason> {
         match spec {
             Function::CancelThread { thread_id } => {
-                let task = self.tasks.get(thread_id).ok_or_else(|| {
-                    RejectReason::PreconditionFailed {
-                        detail: format!("unknown thread {thread_id}"),
-                    }
-                })?;
+                let task =
+                    self.tasks
+                        .get(thread_id)
+                        .ok_or_else(|| RejectReason::PreconditionFailed {
+                            detail: format!("unknown thread {thread_id}"),
+                        })?;
                 admission_check(scope.thread_op(&task.pod_id, ThreadOp::Cancel), || {
                     format!("thread {thread_id} cancel denied by scope")
                 })
             }
             Function::CompactThread { thread_id } => {
-                let task = self.tasks.get(thread_id).ok_or_else(|| {
-                    RejectReason::PreconditionFailed {
-                        detail: format!("unknown thread {thread_id}"),
-                    }
-                })?;
+                let task =
+                    self.tasks
+                        .get(thread_id)
+                        .ok_or_else(|| RejectReason::PreconditionFailed {
+                            detail: format!("unknown thread {thread_id}"),
+                        })?;
                 admission_check(scope.thread_op(&task.pod_id, ThreadOp::Compact), || {
                     format!("thread {thread_id} compact denied by scope")
                 })?;
@@ -224,10 +225,10 @@ impl Scheduler {
                 }
                 Ok(())
             }
-            Function::CreateThread {
-                pod_id, parent, ..
-            } => {
-                let effective_pod = pod_id.clone().unwrap_or_else(|| self.default_pod_id.clone());
+            Function::CreateThread { pod_id, parent, .. } => {
+                let effective_pod = pod_id
+                    .clone()
+                    .unwrap_or_else(|| self.default_pod_id.clone());
                 if !self.pods.contains_key(&effective_pod) {
                     return Err(RejectReason::PreconditionFailed {
                         detail: format!("unknown pod `{effective_pod}`"),
@@ -257,16 +258,15 @@ impl Scheduler {
                 behavior_id,
                 ..
             } => {
-                let pod = self.pods.get(pod_id).ok_or_else(|| {
-                    RejectReason::PreconditionFailed {
-                        detail: format!("unknown pod `{pod_id}`"),
-                    }
-                })?;
+                let pod =
+                    self.pods
+                        .get(pod_id)
+                        .ok_or_else(|| RejectReason::PreconditionFailed {
+                            detail: format!("unknown pod `{pod_id}`"),
+                        })?;
                 let behavior = pod.behaviors.get(behavior_id).ok_or_else(|| {
                     RejectReason::PreconditionFailed {
-                        detail: format!(
-                            "unknown behavior `{behavior_id}` under pod `{pod_id}`"
-                        ),
+                        detail: format!("unknown behavior `{behavior_id}` under pod `{pod_id}`"),
                     }
                 })?;
                 if let Some(err) = &behavior.load_error {
@@ -284,11 +284,12 @@ impl Scheduler {
                 })
             }
             Function::RebindThread { thread_id, .. } => {
-                let task = self.tasks.get(thread_id).ok_or_else(|| {
-                    RejectReason::PreconditionFailed {
-                        detail: format!("unknown thread {thread_id}"),
-                    }
-                })?;
+                let task =
+                    self.tasks
+                        .get(thread_id)
+                        .ok_or_else(|| RejectReason::PreconditionFailed {
+                            detail: format!("unknown thread {thread_id}"),
+                        })?;
                 admission_check(scope.thread_op(&task.pod_id, ThreadOp::Rebind), || {
                     format!("thread {thread_id} rebind denied by scope")
                 })
@@ -474,20 +475,24 @@ impl Scheduler {
             outcome = ?outcome,
             "Function terminal"
         );
-        let wire_error_for_ws_client =
-            if let (FunctionOutcome::Error(err), CallerLink::WsClient { conn_id, correlation_id }) =
-                (&outcome, &entry.caller)
-            {
-                let thread_id = entry.spec.primary_thread_id().map(str::to_string);
-                Some((
-                    *conn_id,
-                    correlation_id.clone(),
-                    thread_id,
-                    err.detail.clone(),
-                ))
-            } else {
-                None
-            };
+        let wire_error_for_ws_client = if let (
+            FunctionOutcome::Error(err),
+            CallerLink::WsClient {
+                conn_id,
+                correlation_id,
+            },
+        ) = (&outcome, &entry.caller)
+        {
+            let thread_id = entry.spec.primary_thread_id().map(str::to_string);
+            Some((
+                *conn_id,
+                correlation_id.clone(),
+                thread_id,
+                err.detail.clone(),
+            ))
+        } else {
+            None
+        };
         if let Some((conn_id, correlation_id, thread_id, message)) = wire_error_for_ws_client {
             self.router.send_to_client(
                 conn_id,
@@ -621,17 +626,16 @@ impl Scheduler {
         self.step_until_blocked(parent_thread_id, pending_io);
     }
 
-
     /// Find the FunctionId of the in-flight `CompactThread` targeting
     /// `thread_id`, if any. Linear scan; `active_functions` stays small
     /// enough that a scan is fine at the expected scale.
     pub(super) fn find_compact_function_for(&self, thread_id: &str) -> Option<FunctionId> {
-        self.active_functions.iter().find_map(|(id, entry)| {
-            match &entry.spec {
+        self.active_functions
+            .iter()
+            .find_map(|(id, entry)| match &entry.spec {
                 Function::CompactThread { thread_id: t } if t == thread_id => Some(*id),
                 _ => None,
-            }
-        })
+            })
     }
 
     /// Find the FunctionId of the in-flight tool-call Function (i.e.,
@@ -881,8 +885,7 @@ impl Scheduler {
         if args.sync {
             let (tx, rx) = tokio::sync::oneshot::channel::<Result<String, String>>();
             let delivery = FunctionDelivery::ToolResultChannel(tx);
-            let fn_id = match self.register_function_with_delivery(spec, scope, caller, delivery)
-            {
+            let fn_id = match self.register_function_with_delivery(spec, scope, caller, delivery) {
                 Ok(id) => id,
                 Err(e) => {
                     pending_io.push(immediate_tool_error(
@@ -929,8 +932,7 @@ impl Scheduler {
                 parent_thread_id: parent_thread_id.to_string(),
                 parent_tool_use_id: tool_use_id.clone(),
             };
-            let fn_id = match self.register_function_with_delivery(spec, scope, caller, delivery)
-            {
+            let fn_id = match self.register_function_with_delivery(spec, scope, caller, delivery) {
                 Ok(id) => id,
                 Err(e) => {
                     pending_io.push(immediate_tool_error(
@@ -1071,10 +1073,9 @@ impl Scheduler {
                     if let Some(task) = self.tasks.get_mut(thread_id) {
                         task.tools_scope.set_allow(tool_name.clone());
                         task.tool_allowlist.insert(tool_name.clone());
-                        let allowlist_ev =
-                            crate::runtime::thread::ThreadEvent::AllowlistChanged {
-                                allowlist: task.tool_allowlist.iter().cloned().collect(),
-                            };
+                        let allowlist_ev = crate::runtime::thread::ThreadEvent::AllowlistChanged {
+                            allowlist: task.tool_allowlist.iter().cloned().collect(),
+                        };
                         self.router.dispatch_events(thread_id, vec![allowlist_ev]);
                     }
                 }
@@ -1097,12 +1098,8 @@ impl Scheduler {
                 else {
                     return false;
                 };
-                let synthetic = make_denial_future(
-                    thread_id.to_string(),
-                    tool_use_id.clone(),
-                    op_id,
-                    name,
-                );
+                let synthetic =
+                    make_denial_future(thread_id.to_string(), tool_use_id.clone(), op_id, name);
                 pending_io.push(synthetic);
                 self.complete_function(
                     fn_id,
@@ -1313,12 +1310,12 @@ impl Scheduler {
         let matches: Vec<FunctionId> = self
             .active_functions
             .iter()
-            .filter_map(|(fn_id, entry)| {
-                match entry.awaiting_child_thread_id.as_deref() {
+            .filter_map(
+                |(fn_id, entry)| match entry.awaiting_child_thread_id.as_deref() {
                     Some(t) if t == thread_id => Some(*fn_id),
                     _ => None,
-                }
-            })
+                },
+            )
             .collect();
         if matches.is_empty() {
             return;
@@ -1339,8 +1336,7 @@ impl Scheduler {
         let state = task.public_state();
         let outcome = match state {
             ThreadStateLabel::Completed => {
-                let text =
-                    crate::runtime::scheduler::compaction::extract_last_assistant_text(task);
+                let text = crate::runtime::scheduler::compaction::extract_last_assistant_text(task);
                 FunctionOutcome::Success(FunctionTerminal::CreateThread(
                     crate::functions::CreateThreadTerminal {
                         thread_id: thread_id.to_string(),
@@ -1360,9 +1356,9 @@ impl Scheduler {
                     detail,
                 })
             }
-            ThreadStateLabel::Cancelled => FunctionOutcome::Cancelled(
-                crate::functions::CancelReason::ExplicitCancel,
-            ),
+            ThreadStateLabel::Cancelled => {
+                FunctionOutcome::Cancelled(crate::functions::CancelReason::ExplicitCancel)
+            }
             // Not terminal — shouldn't happen (caller only invokes this
             // on terminal transitions), but be defensive.
             _ => return,
@@ -1399,9 +1395,7 @@ impl Scheduler {
             .filter_map(|(fn_id, entry)| match &entry.caller {
                 CallerLink::ThreadToolCall {
                     thread_id: parent, ..
-                } if parent == thread_id => {
-                    Some((*fn_id, entry.awaiting_child_thread_id.clone()))
-                }
+                } if parent == thread_id => Some((*fn_id, entry.awaiting_child_thread_id.clone())),
                 _ => None,
             })
             .collect();
@@ -1423,12 +1417,11 @@ impl Scheduler {
                 } else {
                     child.cancel();
                     self.mark_dirty(child_id);
-                    self.router.broadcast_task_list(
-                        ServerToClient::ThreadStateChanged {
+                    self.router
+                        .broadcast_task_list(ServerToClient::ThreadStateChanged {
                             thread_id: child_id.clone(),
                             state: ThreadStateLabel::Cancelled,
-                        },
-                    );
+                        });
                     warn!(
                         parent = %thread_id, child = %child_id,
                         "parent terminated; cascading cancel to dispatched child"
@@ -1510,17 +1503,13 @@ fn outcome_to_sync_tool_result(outcome: &FunctionOutcome) -> Result<String, Stri
                 .unwrap_or_default();
             Ok(text)
         }
-        FunctionOutcome::Success(_) => Err(
-            "dispatch_thread Function terminated with non-CreateThread payload".to_string(),
-        ),
-        FunctionOutcome::Error(err) => Err(format!(
-            "dispatched child failed: {}",
-            err.detail
-        )),
-        FunctionOutcome::Cancelled(reason) => Err(format!(
-            "dispatched child cancelled ({:?})",
-            reason
-        )),
+        FunctionOutcome::Success(_) => {
+            Err("dispatch_thread Function terminated with non-CreateThread payload".to_string())
+        }
+        FunctionOutcome::Error(err) => Err(format!("dispatched child failed: {}", err.detail)),
+        FunctionOutcome::Cancelled(reason) => {
+            Err(format!("dispatched child cancelled ({:?})", reason))
+        }
     }
 }
 

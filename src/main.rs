@@ -6,8 +6,8 @@ use anyhow::{Context, Result, anyhow};
 use clap::{Parser, Subcommand};
 use tracing::info;
 use tracing_subscriber::EnvFilter;
-use whisper_agent_protocol::sandbox::{HostEnvSpec, NetworkPolicy, PathAccess};
 use whisper_agent_protocol::ThreadConfig;
+use whisper_agent_protocol::sandbox::{HostEnvSpec, NetworkPolicy, PathAccess};
 
 use whisper_agent::pod::config::Config;
 use whisper_agent::providers::anthropic::AnthropicClient;

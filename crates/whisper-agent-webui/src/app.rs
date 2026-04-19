@@ -1984,11 +1984,7 @@ fn push_tool_result_from_text(items: &mut Vec<DisplayItem>, text: &str) {
 /// call's `streaming_output` buffer. Only text blocks have a natural
 /// inline rendering today; future non-text block kinds will show as
 /// placeholders.
-fn append_streaming_output(
-    items: &mut [DisplayItem],
-    tool_use_id: &str,
-    block: &ContentBlock,
-) {
+fn append_streaming_output(items: &mut [DisplayItem], tool_use_id: &str, block: &ContentBlock) {
     for item in items.iter_mut().rev() {
         match item {
             DisplayItem::ToolCall {

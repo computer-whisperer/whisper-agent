@@ -275,8 +275,7 @@ pub struct Scheduler {
     ///
     /// Phase 2 wires only `Function::CancelThread` through this registry;
     /// later commits migrate the rest.
-    active_functions:
-        HashMap<crate::functions::FunctionId, functions::ActiveFunctionEntry>,
+    active_functions: HashMap<crate::functions::FunctionId, functions::ActiveFunctionEntry>,
     /// Monotonic counter for assigning `FunctionId`s at registration time.
     next_function_id: crate::functions::FunctionId,
 }
@@ -1591,14 +1590,16 @@ impl Scheduler {
         // the thread (which consumes it by move). The snapshot lets us
         // close out the matching `ActiveFunctionEntry` after the
         // thread has integrated the result.
-        let tool_result_snapshot: Option<(String, Result<crate::tools::mcp::CallToolResult, String>)> =
-            match &result {
-                IoResult::ToolCall {
-                    tool_use_id,
-                    result: tc_result,
-                } => Some((tool_use_id.clone(), tc_result.clone())),
-                _ => None,
-            };
+        let tool_result_snapshot: Option<(
+            String,
+            Result<crate::tools::mcp::CallToolResult, String>,
+        )> = match &result {
+            IoResult::ToolCall {
+                tool_use_id,
+                result: tc_result,
+            } => Some((tool_use_id.clone(), tc_result.clone())),
+            _ => None,
+        };
         if let Some(task) = self.tasks.get_mut(&thread_id) {
             task.apply_io_result(op_id, result, &annotations, &mut events);
         } else {
@@ -1775,11 +1776,8 @@ impl Scheduler {
                             self.register_tool_function(thread_id, req, pending_io);
                         }
                         other => {
-                            let fut = io_dispatch::build_io_future(
-                                self,
-                                thread_id.to_string(),
-                                other,
-                            );
+                            let fut =
+                                io_dispatch::build_io_future(self, thread_id.to_string(), other);
                             pending_io.push(fut);
                         }
                     };
@@ -1798,9 +1796,7 @@ impl Scheduler {
                         .get(thread_id)
                         .map(|t| !t.pending_tool_result_followups.is_empty())
                         .unwrap_or(false);
-                    if has_followup
-                        && let Some(task) = self.tasks.get_mut(thread_id)
-                    {
+                    if has_followup && let Some(task) = self.tasks.get_mut(thread_id) {
                         let notification = task.pending_tool_result_followups.remove(0);
                         self.mark_dirty(thread_id);
                         self.send_tool_result_text(thread_id, notification, pending_io);
@@ -2119,12 +2115,7 @@ pub(super) fn pending_approvals_of(scheduler: &Scheduler, task: &Thread) -> Vec<
         let Some(io_req) = &entry.pending_approval_io else {
             continue;
         };
-        let crate::runtime::thread::IoRequest::ToolCall {
-            name,
-            input,
-            ..
-        } = io_req
-        else {
+        let crate::runtime::thread::IoRequest::ToolCall { name, input, .. } = io_req else {
             continue;
         };
         let approval_id = format!("ap-{tool_use_id}");
@@ -2136,10 +2127,7 @@ pub(super) fn pending_approvals_of(scheduler: &Scheduler, task: &Thread) -> Vec<
             approval_id,
             tool_use_id: tool_use_id.clone(),
             name: name.clone(),
-            args_preview: truncate(
-                serde_json::to_string(input).unwrap_or_default(),
-                200,
-            ),
+            args_preview: truncate(serde_json::to_string(input).unwrap_or_default(), 200),
             destructive: ann.is_destructive(),
             read_only: ann.is_read_only(),
         });
