@@ -762,22 +762,32 @@ impl Scheduler {
                 behavior_id,
                 payload,
             } => {
-                if let Err(e) = self.run_behavior(
-                    Some(conn_id),
-                    correlation_id.clone(),
-                    &pod_id,
-                    &behavior_id,
-                    payload,
-                    pending_io,
-                ) {
-                    self.router.send_to_client(
-                        conn_id,
-                        ServerToClient::Error {
-                            correlation_id,
-                            thread_id: None,
-                            message: format!("run_behavior: {e}"),
-                        },
-                    );
+                // Manual runs bypass overlap policy entirely — the
+                // button in the UI is an explicit user action. Route
+                // through the Function registry with a WsClient
+                // caller-link so errors flow back to the originator.
+                let spec = crate::functions::Function::RunBehavior {
+                    pod_id: pod_id.clone(),
+                    behavior_id: behavior_id.clone(),
+                    payload: payload.unwrap_or(serde_json::Value::Null),
+                };
+                let scope = self.ws_client_scope();
+                let caller = crate::functions::CallerLink::WsClient {
+                    conn_id,
+                    correlation_id: correlation_id.clone(),
+                };
+                match self.register_function(spec, scope, caller) {
+                    Ok(fn_id) => self.launch_function(fn_id, pending_io),
+                    Err(e) => {
+                        self.router.send_to_client(
+                            conn_id,
+                            ServerToClient::Error {
+                                correlation_id,
+                                thread_id: None,
+                                message: format!("run_behavior: {}", reject_reason_detail(&e)),
+                            },
+                        );
+                    }
                 }
             }
             ClientToServer::CreateBehavior {

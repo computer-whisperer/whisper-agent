@@ -44,7 +44,14 @@ impl Scheduler {
             return Err(TriggerFireError::Paused);
         }
         let overlap = validate_webhook_target(behavior)?;
-        self.fire_trigger(pod_id, behavior_id, payload, overlap, "webhook", pending_io);
+        self.fire_trigger(
+            pod_id,
+            behavior_id,
+            payload,
+            overlap,
+            crate::functions::TriggerSource::Webhook,
+            pending_io,
+        );
         Ok(())
     }
 
@@ -248,7 +255,7 @@ impl Scheduler {
                 &behavior_id,
                 serde_json::Value::Null,
                 overlap,
-                "cron",
+                crate::functions::TriggerSource::Cron,
                 pending_io,
             );
         }
@@ -267,7 +274,7 @@ impl Scheduler {
         behavior_id: &str,
         payload: serde_json::Value,
         overlap: whisper_agent_protocol::Overlap,
-        source: &'static str,
+        source: crate::functions::TriggerSource,
         pending_io: &mut FuturesUnordered<SchedulerFuture>,
     ) {
         use whisper_agent_protocol::Overlap;
@@ -277,7 +284,7 @@ impl Scheduler {
             match overlap {
                 Overlap::Skip => {
                     tracing::debug!(
-                        %source,
+                        source = %source.as_str(),
                         pod_id = %pod_id,
                         behavior_id = %behavior_id,
                         "trigger fire skipped: previous run still in flight"
@@ -295,17 +302,46 @@ impl Scheduler {
                 Overlap::Allow => unreachable!("excluded from `inflight` check"),
             }
         }
-        // Allow branch, or Skip/QueueOne with no in-flight run: fire now.
-        if let Err(e) =
-            self.run_behavior(None, None, pod_id, behavior_id, Some(payload), pending_io)
-        {
-            warn!(
-                %source,
+        // Allow branch, or Skip/QueueOne with no in-flight run: route
+        // through the Function registry with a SchedulerInternal
+        // caller-link tagged by trigger source.
+        self.register_and_launch_behavior_fire(pod_id, behavior_id, payload, source, pending_io);
+    }
+
+    /// Register a `Function::RunBehavior` with a
+    /// `SchedulerInternal(BehaviorFire)` caller-link and launch it.
+    /// Shared by `fire_trigger` (cron / webhook) and the
+    /// on-terminal QueueOne replay path.
+    pub(super) fn register_and_launch_behavior_fire(
+        &mut self,
+        pod_id: &str,
+        behavior_id: &str,
+        payload: serde_json::Value,
+        source: crate::functions::TriggerSource,
+        pending_io: &mut FuturesUnordered<SchedulerFuture>,
+    ) {
+        let spec = crate::functions::Function::RunBehavior {
+            pod_id: pod_id.to_string(),
+            behavior_id: behavior_id.to_string(),
+            payload,
+        };
+        let scope = self.internal_scope();
+        let caller = crate::functions::CallerLink::SchedulerInternal(
+            crate::functions::InternalOriginator::BehaviorFire {
+                pod_id: pod_id.to_string(),
+                behavior_id: behavior_id.to_string(),
+                source,
+            },
+        );
+        match self.register_function(spec, scope, caller) {
+            Ok(fn_id) => self.launch_function(fn_id, pending_io),
+            Err(e) => warn!(
+                source = %source.as_str(),
                 pod_id = %pod_id,
                 behavior_id = %behavior_id,
-                error = %e,
-                "trigger-driven run_behavior failed"
-            );
+                error = ?e,
+                "trigger-driven RunBehavior rejected at registration"
+            ),
         }
     }
 
@@ -566,19 +602,13 @@ impl Scheduler {
                     behavior_id = %origin.behavior_id,
                     "dropping queued QueueOne payload: behavior/pod paused"
                 );
-            } else if let Err(e) = self.run_behavior(
-                None,
-                None,
-                &pod_id,
-                &origin.behavior_id,
-                Some(payload),
-                pending_io,
-            ) {
-                warn!(
-                    pod_id = %pod_id,
-                    behavior_id = %origin.behavior_id,
-                    error = %e,
-                    "queued QueueOne fire failed to spawn"
+            } else {
+                self.register_and_launch_behavior_fire(
+                    &pod_id,
+                    &origin.behavior_id,
+                    payload,
+                    crate::functions::TriggerSource::QueuedReplay,
+                    pending_io,
                 );
             }
         }

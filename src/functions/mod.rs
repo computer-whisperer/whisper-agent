@@ -173,17 +173,42 @@ pub enum CallerLink {
 /// hatches.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InternalOriginator {
-    CronFire {
+    /// Trigger-driven `RunBehavior` fire (cron, webhook, queued replay,
+    /// or tool-call cascade). `source` captures which path originated
+    /// the fire for audit / logging.
+    BehaviorFire {
         pod_id: PodId,
         behavior_id: BehaviorId,
-        /// Unix epoch millis when the cron tick fired. Concrete timestamp
-        /// type bound here to avoid pulling chrono into the scheduler-
-        /// facing enum.
-        fired_at_ms: i64,
+        source: TriggerSource,
     },
     AutoCompact {
         thread_id: ThreadId,
     },
+}
+
+/// Which trigger surface initiated a behavior fire. Stored on
+/// `InternalOriginator::BehaviorFire` for audit/logging; doesn't affect
+/// execution semantics (overlap policy is already applied at the
+/// caller).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TriggerSource {
+    Cron,
+    Webhook,
+    /// QueueOne-queued payload replayed on the previous run's terminal.
+    QueuedReplay,
+    /// Builtin-tool cascade (e.g. `pod_run_behavior`).
+    ToolCall,
+}
+
+impl TriggerSource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Cron => "cron",
+            Self::Webhook => "webhook",
+            Self::QueuedReplay => "queued_replay",
+            Self::ToolCall => "tool_call",
+        }
+    }
 }
 
 impl CallerLink {
@@ -201,7 +226,7 @@ impl CallerLink {
             Self::ThreadToolCall { thread_id, .. } => thread_id == id,
             Self::SchedulerInternal(orig) => match orig {
                 InternalOriginator::AutoCompact { thread_id } => thread_id == id,
-                InternalOriginator::CronFire { .. } => false,
+                InternalOriginator::BehaviorFire { .. } => false,
             },
             Self::WsClient { .. } | Self::Lua { .. } => false,
         }
@@ -218,11 +243,11 @@ impl CallerLink {
             } => format!("thread:{thread_id}/tool:{tool_use_id}"),
             Self::Lua { hook_id, .. } => format!("lua:{hook_id}"),
             Self::SchedulerInternal(o) => match o {
-                InternalOriginator::CronFire {
+                InternalOriginator::BehaviorFire {
                     pod_id,
                     behavior_id,
-                    ..
-                } => format!("cron:{pod_id}/{behavior_id}"),
+                    source,
+                } => format!("behavior_fire:{}:{pod_id}/{behavior_id}", source.as_str()),
                 InternalOriginator::AutoCompact { thread_id } => {
                     format!("auto_compact:{thread_id}")
                 }
@@ -472,10 +497,10 @@ mod tests {
         };
         assert!(!ws.targets_thread("t1"));
 
-        let cron = CallerLink::SchedulerInternal(InternalOriginator::CronFire {
+        let cron = CallerLink::SchedulerInternal(InternalOriginator::BehaviorFire {
             pod_id: "p".into(),
             behavior_id: "b".into(),
-            fired_at_ms: 0,
+            source: TriggerSource::Cron,
         });
         assert!(!cron.targets_thread("t1"));
     }

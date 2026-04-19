@@ -139,12 +139,13 @@ impl Scheduler {
                 behavior_id,
                 payload,
             } => {
-                if let Err(e) =
-                    self.run_behavior(None, None, &pod_id, &behavior_id, payload, pending_io)
-                {
-                    warn!(%pod_id, %behavior_id, error = %e,
-                        "tool-initiated run_behavior failed to spawn");
-                }
+                self.register_and_launch_behavior_fire(
+                    &pod_id,
+                    &behavior_id,
+                    payload.unwrap_or(serde_json::Value::Null),
+                    crate::functions::TriggerSource::ToolCall,
+                    pending_io,
+                );
             }
             crate::tools::builtin_tools::SchedulerCommand::SetBehaviorEnabled {
                 behavior_id,

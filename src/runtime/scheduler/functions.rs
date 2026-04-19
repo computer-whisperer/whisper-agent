@@ -24,7 +24,7 @@ use crate::functions::{
     CallerLink, Function, FunctionId, FunctionOutcome, FunctionTerminal, InFlightOps,
     RejectReason,
 };
-use crate::permission::{PermissionScope, ThreadOp};
+use crate::permission::{BehaviorOp, PermissionScope, ThreadOp};
 use crate::runtime::io_dispatch::SchedulerFuture;
 
 /// Server-owned runtime state of an in-flight Function.
@@ -148,6 +148,37 @@ impl Scheduler {
                 }
                 Ok(())
             }
+            Function::RunBehavior {
+                pod_id,
+                behavior_id,
+                ..
+            } => {
+                let pod = self.pods.get(pod_id).ok_or_else(|| {
+                    RejectReason::PreconditionFailed {
+                        detail: format!("unknown pod `{pod_id}`"),
+                    }
+                })?;
+                let behavior = pod.behaviors.get(behavior_id).ok_or_else(|| {
+                    RejectReason::PreconditionFailed {
+                        detail: format!(
+                            "unknown behavior `{behavior_id}` under pod `{pod_id}`"
+                        ),
+                    }
+                })?;
+                if let Some(err) = &behavior.load_error {
+                    return Err(RejectReason::PreconditionFailed {
+                        detail: format!("behavior `{behavior_id}` failed to load: {err}"),
+                    });
+                }
+                if behavior.config.is_none() {
+                    return Err(RejectReason::PreconditionFailed {
+                        detail: format!("behavior `{behavior_id}` has no parsed config"),
+                    });
+                }
+                admission_check(scope.behavior_op(pod_id, BehaviorOp::Run), || {
+                    format!("behavior {behavior_id} run denied by scope")
+                })
+            }
             Function::RebindThread { thread_id, .. } => {
                 let task = self.tasks.get(thread_id).ok_or_else(|| {
                     RejectReason::PreconditionFailed {
@@ -210,6 +241,47 @@ impl Scheduler {
                 self.launch_compact_thread(&thread_id, pending_io);
                 // Function stays in the registry until
                 // `finalize_pending_compaction` calls `complete_function`.
+            }
+            Function::RunBehavior {
+                pod_id,
+                behavior_id,
+                payload,
+            } => {
+                // Pull requester + correlation_id from the caller-link
+                // so `create_task` routes `ThreadCreated` broadcasts the
+                // same way interactive / trigger-driven paths used to.
+                let (requester, correlation_id) = match self.active_functions.get(&id) {
+                    Some(entry) => match &entry.caller {
+                        CallerLink::WsClient {
+                            conn_id,
+                            correlation_id,
+                        } => (Some(*conn_id), correlation_id.clone()),
+                        _ => (None, None),
+                    },
+                    None => (None, None),
+                };
+                match self.run_behavior(
+                    requester,
+                    correlation_id,
+                    &pod_id,
+                    &behavior_id,
+                    Some(payload),
+                    pending_io,
+                ) {
+                    Ok(thread_id) => self.complete_function(
+                        id,
+                        FunctionOutcome::Success(FunctionTerminal::RunBehavior(
+                            crate::functions::RunBehaviorTerminal { thread_id },
+                        )),
+                    ),
+                    Err(e) => self.complete_function(
+                        id,
+                        FunctionOutcome::Error(crate::functions::FunctionError {
+                            kind: crate::functions::FunctionErrorKind::Execution,
+                            detail: e,
+                        }),
+                    ),
+                }
             }
             Function::RebindThread { thread_id, patch } => {
                 // Pull correlation_id from the caller-link so the
