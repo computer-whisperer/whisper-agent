@@ -4291,3 +4291,100 @@ fn render_allowlist_chips(
     });
     ui.add_space(4.0);
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use whisper_agent_protocol::{ContentBlock, Conversation, Message, ToolResultContent};
+
+    fn conv_with_tool_call() -> Conversation {
+        let mut conv = Conversation::new();
+        conv.push(Message::user_text("hi"));
+        conv.push(Message::assistant_blocks(vec![
+            ContentBlock::Text {
+                text: "running a tool".into(),
+            },
+            ContentBlock::ToolUse {
+                id: "tu-1".into(),
+                name: "bash".into(),
+                input: serde_json::json!({ "command": "ls" }),
+            },
+        ]));
+        conv.push(Message::tool_result_blocks(vec![
+            ContentBlock::ToolResult {
+                tool_use_id: "tu-1".into(),
+                content: ToolResultContent::Text("file1\nfile2\n".into()),
+                is_error: false,
+            },
+        ]));
+        conv
+    }
+
+    #[test]
+    fn snapshot_rebuild_backfills_sync_tool_result() {
+        let items = conversation_to_items(&conv_with_tool_call());
+        let tool_call = items
+            .iter()
+            .find_map(|i| match i {
+                DisplayItem::ToolCall {
+                    tool_use_id,
+                    result,
+                    ..
+                } if tool_use_id == "tu-1" => Some(result.clone()),
+                _ => None,
+            })
+            .expect("tool call item present");
+        assert_eq!(
+            tool_call.as_deref(),
+            Some("file1\nfile2\n"),
+            "sync tool result should backfill the ToolCall.result slot"
+        );
+    }
+
+    #[test]
+    fn snapshot_rebuild_backfills_async_xml_callback_into_tool_call() {
+        let mut conv = Conversation::new();
+        conv.push(Message::user_text("dispatch async"));
+        conv.push(Message::assistant_blocks(vec![ContentBlock::ToolUse {
+            id: "tu-async".into(),
+            name: "dispatch_thread".into(),
+            input: serde_json::json!({ "prompt": "go", "sync": false }),
+        }]));
+        // Initial ack — Role::ToolResult + structured ToolResult block.
+        conv.push(Message::tool_result_blocks(vec![
+            ContentBlock::ToolResult {
+                tool_use_id: "tu-async".into(),
+                content: ToolResultContent::Text("Dispatched task-X".into()),
+                is_error: false,
+            },
+        ]));
+        // Later: async callback — Role::ToolResult + Text block carrying
+        // the <dispatched-thread-notification> XML envelope.
+        conv.push(Message::tool_result_text(
+            "<dispatched-thread-notification>\n  <thread-id>task-X</thread-id>\n  \
+             <tool-use-id>tu-async</tool-use-id>\n  <status>completed</status>\n  \
+             <summary>done</summary>\n  <result>the real final answer with &lt;code&gt; in it</result>\n  \
+             <usage><total_tokens>10</total_tokens><tool_uses>0</tool_uses><duration_ms>5</duration_ms></usage>\n\
+             </dispatched-thread-notification>",
+        ));
+        let items = conversation_to_items(&conv);
+        let tool_call = items
+            .iter()
+            .find_map(|i| match i {
+                DisplayItem::ToolCall {
+                    tool_use_id,
+                    result,
+                    is_error,
+                    ..
+                } if tool_use_id == "tu-async" => Some((result.clone(), *is_error)),
+                _ => None,
+            })
+            .expect("tool call item present");
+        assert_eq!(
+            tool_call.0.as_deref(),
+            Some("the real final answer with <code> in it"),
+            "async callback should overwrite the initial ack with the unescaped <result>"
+        );
+        assert!(!tool_call.1);
+    }
+}

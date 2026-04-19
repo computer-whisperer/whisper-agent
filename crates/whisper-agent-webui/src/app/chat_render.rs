@@ -198,17 +198,34 @@ fn render_tool_call(
     };
     egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), id, default_open)
         .show_header(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.label(RichText::new(name).color(COLOR_TOOL).strong().monospace());
-                ui.add_space(6.0);
-                ui.label(
-                    RichText::new(summary)
-                        .color(Color32::from_gray(180))
-                        .monospace(),
-                );
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.label(RichText::new(chip_text).color(chip_color).small().strong());
+            ui.vertical(|ui| {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(name).color(COLOR_TOOL).strong().monospace());
+                    ui.add_space(6.0);
+                    ui.label(
+                        RichText::new(summary)
+                            .color(Color32::from_gray(180))
+                            .monospace(),
+                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.label(RichText::new(chip_text).color(chip_color).small().strong());
+                    });
                 });
+                // Collapsed-state result preview: keep the outcome
+                // visible without forcing the user to expand every
+                // row. One-line truncation; full body rendered below
+                // when expanded.
+                if let Some(body) = result {
+                    let preview = first_line_preview(body, 120);
+                    if !preview.is_empty() {
+                        let color = if is_error {
+                            Color32::from_rgb(220, 140, 140)
+                        } else {
+                            Color32::from_gray(150)
+                        };
+                        ui.label(RichText::new(preview).color(color).monospace().small());
+                    }
+                }
             });
         })
         .body(|ui| {
@@ -238,6 +255,24 @@ fn render_tool_call(
                 ui.label(RichText::new(result).color(color).monospace().small());
             }
         });
+}
+
+/// Pull a short preview of a tool-call result for the collapsed
+/// header row. Grabs the first non-empty line and truncates at
+/// `max_chars` code points (not bytes) so multibyte content (code
+/// with non-ASCII identifiers, emoji in test output) doesn't break
+/// the boundary. Returns an empty string if `body` has no visible
+/// content.
+fn first_line_preview(body: &str, max_chars: usize) -> String {
+    let line = body.lines().find(|l| !l.trim().is_empty()).unwrap_or("");
+    let line = line.trim_end();
+    if line.chars().count() > max_chars {
+        let mut out: String = line.chars().take(max_chars).collect();
+        out.push('…');
+        out
+    } else {
+        line.to_string()
+    }
 }
 
 fn render_diff(ui: &mut egui::Ui, diff: &DiffPayload) {
