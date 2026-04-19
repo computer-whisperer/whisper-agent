@@ -167,18 +167,32 @@ impl Scheduler {
                 patch,
                 correlation_id,
             } => {
-                if let Err(e) =
-                    self.apply_rebind(&thread_id, patch, correlation_id.clone(), pending_io)
-                {
-                    warn!(error = %e, conn_id, %thread_id, "rebind rejected");
-                    self.router.send_to_client(
-                        conn_id,
-                        ServerToClient::Error {
-                            correlation_id,
-                            thread_id: Some(thread_id),
-                            message: format!("rebind: {e}"),
-                        },
-                    );
+                // Route through the Function registry. Validation
+                // errors inside apply_rebind surface as an Error
+                // terminal, which complete_function routes back to
+                // the originating conn_id + correlation_id.
+                let spec = crate::functions::Function::RebindThread {
+                    thread_id: thread_id.clone(),
+                    patch,
+                };
+                let scope = self.ws_client_scope();
+                let caller = crate::functions::CallerLink::WsClient {
+                    conn_id,
+                    correlation_id: correlation_id.clone(),
+                };
+                match self.register_function(spec, scope, caller) {
+                    Ok(fn_id) => self.launch_function(fn_id, pending_io),
+                    Err(e) => {
+                        warn!(error = ?e, conn_id, %thread_id, "rebind_thread rejected");
+                        self.router.send_to_client(
+                            conn_id,
+                            ServerToClient::Error {
+                                correlation_id,
+                                thread_id: Some(thread_id),
+                                message: format!("rebind: {}", reject_reason_detail(&e)),
+                            },
+                        );
+                    }
                 }
             }
             ClientToServer::CancelThread { thread_id } => {

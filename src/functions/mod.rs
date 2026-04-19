@@ -17,6 +17,7 @@
 
 use bitflags::bitflags;
 use serde::{Deserialize, Serialize};
+use whisper_agent_protocol::ThreadBindingsPatch;
 
 use crate::permission::{HostName, PodId, ToolName};
 
@@ -81,7 +82,7 @@ pub enum Function {
     },
     RebindThread {
         thread_id: ThreadId,
-        patch: serde_json::Value,
+        patch: ThreadBindingsPatch,
     },
     CancelThread {
         thread_id: ThreadId,
@@ -100,6 +101,24 @@ pub enum Function {
         name: ToolName,
         args: serde_json::Value,
     },
+}
+
+impl Function {
+    /// Thread id this Function primarily targets, if any. Used for
+    /// error-event routing (the wire `Error` shape carries an optional
+    /// `thread_id` so clients can scope failures). Returns `None` for
+    /// variants whose work isn't bound to a single thread.
+    pub fn primary_thread_id(&self) -> Option<&str> {
+        match self {
+            Self::CompactThread { thread_id }
+            | Self::RebindThread { thread_id, .. }
+            | Self::CancelThread { thread_id } => Some(thread_id),
+            Self::CreateThread { .. }
+            | Self::RunBehavior { .. }
+            | Self::BuiltinToolCall { .. }
+            | Self::McpToolUse { .. } => None,
+        }
+    }
 }
 
 /// Sync vs async dispatch for `CreateThread`. Meaningful primarily when

@@ -696,7 +696,7 @@ impl Scheduler {
     /// conversation note when the execution environment shifted. Threads
     /// parked in `WaitingOnResources` get a recomputed `needed` list and
     /// transition to `NeedsModelCall` if the new set is empty.
-    fn apply_rebind(
+    pub(super) fn apply_rebind(
         &mut self,
         thread_id: &str,
         patch: ThreadBindingsPatch,

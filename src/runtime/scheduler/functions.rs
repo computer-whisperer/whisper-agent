@@ -148,6 +148,20 @@ impl Scheduler {
                 }
                 Ok(())
             }
+            Function::RebindThread { thread_id, .. } => {
+                let task = self.tasks.get(thread_id).ok_or_else(|| {
+                    RejectReason::PreconditionFailed {
+                        detail: format!("unknown thread {thread_id}"),
+                    }
+                })?;
+                admission_check(scope.thread_op(&task.pod_id, ThreadOp::Rebind), || {
+                    format!("thread {thread_id} rebind denied by scope")
+                })
+                // Full validation (pod allowlist, MCP-host existence)
+                // happens inside `apply_rebind` at launch; errors there
+                // surface as a Function Error terminal routed through
+                // the caller-link.
+            }
             Function::BuiltinToolCall { name, .. } => {
                 // Scope rubber-stamps for Phase 4b: the thread's
                 // `tools_scope`-based evaluate path in `Thread::step`
@@ -197,6 +211,34 @@ impl Scheduler {
                 // Function stays in the registry until
                 // `finalize_pending_compaction` calls `complete_function`.
             }
+            Function::RebindThread { thread_id, patch } => {
+                // Pull correlation_id from the caller-link so the
+                // ThreadBindingsChanged broadcast still tags its
+                // originator. WS caller is the only current source;
+                // other variants pass `None`.
+                let correlation_id = match self.active_functions.get(&id) {
+                    Some(entry) => match &entry.caller {
+                        CallerLink::WsClient { correlation_id, .. } => correlation_id.clone(),
+                        _ => None,
+                    },
+                    None => None,
+                };
+                match self.apply_rebind(&thread_id, patch, correlation_id, pending_io) {
+                    Ok(()) => self.complete_function(
+                        id,
+                        FunctionOutcome::Success(FunctionTerminal::RebindThread(
+                            crate::functions::RebindThreadTerminal::default(),
+                        )),
+                    ),
+                    Err(e) => self.complete_function(
+                        id,
+                        FunctionOutcome::Error(crate::functions::FunctionError {
+                            kind: crate::functions::FunctionErrorKind::Execution,
+                            detail: e,
+                        }),
+                    ),
+                }
+            }
             Function::BuiltinToolCall { .. } | Function::McpToolUse { .. } => {
                 // The tool call's actual work is pumped by the existing
                 // IO-future mechanism in `build_io_future`; the Function
@@ -227,12 +269,12 @@ impl Scheduler {
     }
 
     /// Remove the entry from `active_functions` and log/audit the
-    /// terminal. Caller-link routing of the terminal payload is a no-op
-    /// for Phase-2/3 operations whose caller-surfaces don't require a
-    /// direct reply (CancelThread emits nothing; CompactThread's client
-    /// UX is covered by the existing `ThreadCompacted` broadcast).
-    /// Terminal routing over the WS wire lands with the tool-call
-    /// variants in Commit 4.
+    /// terminal. Error terminals for `WsClient` callers with a
+    /// correlation_id surface as `ServerToClient::Error` so the
+    /// originating client can match the failure to its request;
+    /// successful terminals for most variants rely on variant-specific
+    /// broadcasts (ThreadBindingsChanged, ThreadCompacted, etc.) and
+    /// have no direct per-client reply.
     pub(super) fn complete_function(&mut self, id: FunctionId, outcome: FunctionOutcome) {
         let Some(entry) = self.active_functions.remove(&id) else {
             warn!(function_id = id, "complete_function: no such entry");
@@ -244,6 +286,24 @@ impl Scheduler {
             outcome = ?outcome,
             "Function terminal"
         );
+        if let (
+            FunctionOutcome::Error(err),
+            CallerLink::WsClient {
+                conn_id,
+                correlation_id,
+            },
+        ) = (&outcome, &entry.caller)
+        {
+            let thread_id = entry.spec.primary_thread_id().map(str::to_string);
+            self.router.send_to_client(
+                *conn_id,
+                ServerToClient::Error {
+                    correlation_id: correlation_id.clone(),
+                    thread_id,
+                    message: err.detail.clone(),
+                },
+            );
+        }
     }
 
     /// Find the FunctionId of the in-flight `CompactThread` targeting

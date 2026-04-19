@@ -248,7 +248,7 @@ pub struct ThreadBindingsRequest {
 /// captured resources; only future ops see the new state. When the
 /// host env or MCP host set changes, the scheduler appends a synthetic
 /// conversation note so the model knows the execution environment shifted.
-#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
 pub struct ThreadBindingsPatch {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub backend: Option<String>,
@@ -264,7 +264,7 @@ pub struct ThreadBindingsPatch {
     pub mcp_hosts: Option<Vec<String>>,
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum HostEnvRebind {
     /// Replace the bound host env with the named allow entry `name`.
