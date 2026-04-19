@@ -198,34 +198,38 @@ fn render_tool_call(
     };
     egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), id, default_open)
         .show_header(ui, |ui| {
-            ui.vertical(|ui| {
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new(name).color(COLOR_TOOL).strong().monospace());
-                    ui.add_space(6.0);
-                    ui.label(
-                        RichText::new(summary)
-                            .color(Color32::from_gray(180))
-                            .monospace(),
-                    );
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.label(RichText::new(chip_text).color(chip_color).small().strong());
-                    });
-                });
-                // Collapsed-state result preview: keep the outcome
-                // visible without forcing the user to expand every
-                // row. One-line truncation; full body rendered below
-                // when expanded.
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(name).color(COLOR_TOOL).strong().monospace());
+                ui.add_space(6.0);
+                ui.label(
+                    RichText::new(summary)
+                        .color(Color32::from_gray(180))
+                        .monospace(),
+                );
+                // Inline result preview keeps the outcome visible
+                // while the row stays collapsed; truncated to one
+                // short line so it doesn't overflow. Full result
+                // rendered in the collapsed body when expanded.
                 if let Some(body) = result {
-                    let preview = first_line_preview(body, 120);
+                    let preview = first_line_preview(body, 80);
                     if !preview.is_empty() {
-                        let color = if is_error {
+                        ui.add_space(8.0);
+                        let preview_color = if is_error {
                             Color32::from_rgb(220, 140, 140)
                         } else {
                             Color32::from_gray(150)
                         };
-                        ui.label(RichText::new(preview).color(color).monospace().small());
+                        ui.label(
+                            RichText::new(preview)
+                                .color(preview_color)
+                                .monospace()
+                                .small(),
+                        );
                     }
                 }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.label(RichText::new(chip_text).color(chip_color).small().strong());
+                });
             });
         })
         .body(|ui| {

@@ -4342,6 +4342,59 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_rebuild_of_real_file_shows_tool_calls() {
+        // Regression-style fixture: parse the real persisted thread
+        // the user reported as missing tool calls in the webui and
+        // assert that add_message_items produces ToolCall items for
+        // every assistant tool_use in the file.
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../sandbox/pods/workspace/threads/task-18a79d4b2206aa08.json");
+        let Ok(bytes) = std::fs::read(&path) else {
+            eprintln!("skipping: fixture {:?} not available in this env", path);
+            return;
+        };
+        let val: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let conv: Conversation =
+            serde_json::from_value(val.get("conversation").unwrap().clone()).unwrap();
+        let items = conversation_to_items(&conv);
+        let tool_call_count = items
+            .iter()
+            .filter(|i| matches!(i, DisplayItem::ToolCall { .. }))
+            .count();
+        let roles_debug: Vec<&'static str> = items
+            .iter()
+            .map(|i| match i {
+                DisplayItem::User { .. } => "user",
+                DisplayItem::AssistantText { .. } => "assistant_text",
+                DisplayItem::Reasoning { .. } => "reasoning",
+                DisplayItem::ToolCall { .. } => "tool_call",
+                DisplayItem::SystemNote { .. } => "system_note",
+            })
+            .collect();
+        assert!(
+            tool_call_count > 0,
+            "expected at least one ToolCall item, got items={roles_debug:?}"
+        );
+        // Every tool_use in the real file should land with a
+        // populated result by the end of the walk — either from a
+        // sync tool_result block or from the async XML callback
+        // rerouting into the matching call.
+        for item in &items {
+            if let DisplayItem::ToolCall {
+                tool_use_id,
+                result,
+                ..
+            } = item
+            {
+                assert!(
+                    result.is_some(),
+                    "ToolCall {tool_use_id} should have a result backfilled"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn snapshot_rebuild_backfills_async_xml_callback_into_tool_call() {
         let mut conv = Conversation::new();
         conv.push(Message::user_text("dispatch async"));
