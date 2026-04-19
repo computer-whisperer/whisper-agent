@@ -24,6 +24,7 @@ mod client_messages;
 mod compaction;
 mod config_updates;
 mod dispatch;
+mod functions;
 mod retention;
 mod thread_config;
 mod triggers;
@@ -273,6 +274,17 @@ pub struct Scheduler {
     /// model deltas today, MCP tool-output chunks tomorrow). The receiver
     /// lives on the scheduler's run loop.
     stream_tx: mpsc::UnboundedSender<StreamUpdate>,
+
+    /// In-flight Function registry. Populated synchronously by
+    /// `register_function`; each entry is removed when its Function
+    /// terminates (success / error / cancel). Non-persistent.
+    ///
+    /// Phase 2 wires only `Function::CancelThread` through this registry;
+    /// later commits migrate the rest.
+    active_functions:
+        HashMap<crate::functions::FunctionId, functions::ActiveFunctionEntry>,
+    /// Monotonic counter for assigning `FunctionId`s at registration time.
+    next_function_id: crate::functions::FunctionId,
 }
 
 impl Scheduler {
@@ -357,6 +369,8 @@ impl Scheduler {
                 provisioning_in_flight: HashSet::new(),
                 pending_dispatches: HashMap::new(),
                 stream_tx,
+                active_functions: HashMap::new(),
+                next_function_id: 1,
             },
             stream_rx,
         ))

@@ -40,8 +40,9 @@ pub type ToolUseId = String;
 pub type BehaviorId = String;
 
 /// Correlation handle supplied by WS clients so they can match responses
-/// to their original requests. Zero is valid for fire-and-forget.
-pub type CorrelationId = u64;
+/// to their original requests. `None` for fire-and-forget. Matches the
+/// existing wire-protocol type in `whisper-agent-protocol`.
+pub type CorrelationId = Option<String>;
 
 pub type ConnId = u64;
 
@@ -447,7 +448,7 @@ mod tests {
     fn caller_link_targets_thread_ignores_unrelated_variants() {
         let ws = CallerLink::WsClient {
             conn_id: 42,
-            correlation_id: 1,
+            correlation_id: Some("req-1".into()),
         };
         assert!(!ws.targets_thread("t1"));
 
@@ -463,7 +464,7 @@ mod tests {
     fn caller_link_audit_tag_stable_per_variant() {
         let ws = CallerLink::WsClient {
             conn_id: 5,
-            correlation_id: 7,
+            correlation_id: Some("req-7".into()),
         };
         assert_eq!(ws.audit_tag(), "ws:5");
 

@@ -13,9 +13,7 @@
 
 use futures::stream::FuturesUnordered;
 use tracing::warn;
-use whisper_agent_protocol::{
-    BackendSummary, ClientToServer, ModelSummary, ServerToClient, ThreadStateLabel,
-};
+use whisper_agent_protocol::{BackendSummary, ClientToServer, ModelSummary, ServerToClient};
 
 use super::{ConnId, Scheduler, pending_approvals_of};
 use crate::pod::Pod;
@@ -162,23 +160,32 @@ impl Scheduler {
                 }
             }
             ClientToServer::CancelThread { thread_id } => {
-                if let Some(task) = self.tasks.get_mut(&thread_id) {
-                    task.cancel();
-                    self.mark_dirty(&thread_id);
-                    self.router
-                        .broadcast_task_list(ServerToClient::ThreadStateChanged {
-                            thread_id: thread_id.clone(),
-                            state: ThreadStateLabel::Cancelled,
-                        });
-                    self.teardown_host_env_if_terminal(&thread_id);
-                    self.on_behavior_thread_terminal(&thread_id, pending_io);
-                    // If the cancelled thread is either a dispatched
-                    // child (parent is waiting on its final text) or a
-                    // parent of still-running dispatched children, run
-                    // the dispatch-lifecycle hooks. These are idempotent
-                    // no-ops otherwise.
-                    self.resolve_pending_dispatch(&thread_id, pending_io);
-                    self.cascade_cancel_dispatched_children(&thread_id, pending_io);
+                // Route through the Function registry. See
+                // `src/runtime/scheduler/functions.rs` and
+                // `docs/design_functions.md`. CancelThread is the first
+                // operation migrated (Phase 2).
+                let spec = crate::functions::Function::CancelThread {
+                    thread_id: thread_id.clone(),
+                };
+                let scope = self.ws_client_scope();
+                let caller = crate::functions::CallerLink::WsClient {
+                    conn_id,
+                    // CancelThread has no correlation_id on the wire —
+                    // it produces no direct reply (the visible effect is
+                    // the broadcast ThreadStateChanged). `None` is
+                    // correct per the CorrelationId contract.
+                    correlation_id: None,
+                };
+                match self.register_function(spec, scope, caller) {
+                    Ok(fn_id) => self.execute_function(fn_id, pending_io),
+                    Err(e) => {
+                        warn!(error = ?e, conn_id, thread_id, "CancelThread rejected");
+                        // Pre-migration the handler silently ignored
+                        // unknown thread ids; preserve that UX by
+                        // dropping PreconditionFailed without an error
+                        // event. Scope-denied would be surfaced here
+                        // once per-identity scopes land.
+                    }
                 }
             }
             ClientToServer::ArchiveThread { thread_id } => {
