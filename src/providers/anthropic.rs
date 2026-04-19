@@ -466,10 +466,13 @@ mod tests {
     }
 
     #[test]
-    fn full_policy_caches_system_tools_and_trailing_user_messages() {
+    fn full_policy_caches_system_and_last_user_side_message_only() {
+        // Mirrors Claude Code: one cache_control on the system block, one on the
+        // last user-side message. Tools and earlier messages ride the implicit
+        // prefix extension — no cache_control on them.
         let tools = make_tools();
         let messages = make_messages();
-        let breakpoints = crate::providers::model::default_cache_policy(&messages, 2);
+        let breakpoints = crate::providers::model::default_cache_policy(&messages);
         let req = ModelRequest {
             model: "claude-opus-4-6",
             max_tokens: 1024,
@@ -480,14 +483,13 @@ mod tests {
         };
         let body = build_request_body(&req);
         let v = serde_json::to_value(&body).unwrap();
-        // system + tools both cached.
         assert!(v["system"][0]["cache_control"].is_object());
-        assert!(v["tools"].as_array().unwrap().last().unwrap()["cache_control"].is_object());
-        // The two user messages (indices 0 and 2) both carry cache_control on
-        // their final content block.
+        for t in v["tools"].as_array().unwrap() {
+            assert!(t.get("cache_control").is_none());
+        }
         let msgs = v["messages"].as_array().unwrap();
-        assert!(msgs[0]["content"][0]["cache_control"].is_object());
-        assert!(msgs[1]["content"][0].get("cache_control").is_none()); // assistant
+        assert!(msgs[0]["content"][0].get("cache_control").is_none());
+        assert!(msgs[1]["content"][0].get("cache_control").is_none());
         assert!(msgs[2]["content"][0]["cache_control"].is_object());
     }
 }

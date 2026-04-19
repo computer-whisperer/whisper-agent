@@ -561,7 +561,7 @@ fn build_model_request(
         task.config.model.clone()
     };
     let max_tokens = task.config.max_tokens;
-    let cache_breakpoints = default_cache_policy(&messages, 2);
+    let cache_breakpoints = default_cache_policy(&messages);
     (
         OwnedModelRequest {
             model: model.clone(),

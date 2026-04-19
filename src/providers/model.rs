@@ -91,29 +91,95 @@ pub trait ModelProvider: Send + Sync {
     fn list_models<'a>(&'a self) -> BoxFuture<'a, Result<Vec<ModelInfo>, ModelError>>;
 }
 
-/// Default cache policy: cache the (byte-stable) system prompt and tool declarations,
-/// then cache through the most recent user-role messages — up to `max_trailing_user`
-/// of them — so each turn's tool_results become a rolling checkpoint without
-/// exceeding Anthropic's 4-marker cap. Pass `max_trailing_user = 2` to leave headroom
-/// for the two fixed markers.
-pub fn default_cache_policy(
-    messages: &[Message],
-    max_trailing_user: usize,
-) -> Vec<CacheBreakpoint> {
-    let mut out = vec![CacheBreakpoint::AfterSystem, CacheBreakpoint::AfterTools];
-    if max_trailing_user == 0 {
-        return out;
-    }
-    // Walk back through the messages picking the most recent user-role entries —
-    // those are where tool_results live, and each is a natural cache boundary.
-    let user_indices: Vec<usize> = messages
+/// Default cache policy — mirrors Claude Code's observed wire behavior: one
+/// breakpoint on the system prompt (stable) plus one rolling breakpoint on the
+/// most recent user-side message (where fresh input lands each turn). Tools sit
+/// between the two and ride the prefix implicitly — the server extends the cached
+/// prefix forward on each turn as long as tool declarations are byte-stable.
+///
+/// Keeping the total at two markers is intentional: extra breakpoints each
+/// create separate cache entries with their own write multipliers (1.25× for 5m,
+/// 2× for 1h), and the redundancy only pays off if the longer entry TTLs out
+/// mid-session — unlikely at 1h. Two markers is also well under Anthropic's 4-cap.
+///
+/// "User-side" is `Role::User` or `Role::ToolResult` — anything non-assistant.
+/// Tool results are where fresh input lands on tool-loop turns; filtering them
+/// out stalls the rolling checkpoint on the last human-typed message.
+pub fn default_cache_policy(messages: &[Message]) -> Vec<CacheBreakpoint> {
+    let mut out = vec![CacheBreakpoint::AfterSystem];
+    if let Some(last) = messages
         .iter()
         .enumerate()
-        .filter(|(_, m)| matches!(m.role, whisper_agent_protocol::Role::User))
+        .rfind(|(_, m)| !matches!(m.role, whisper_agent_protocol::Role::Assistant))
         .map(|(i, _)| i)
-        .collect();
-    for &i in user_indices.iter().rev().take(max_trailing_user) {
-        out.push(CacheBreakpoint::AfterMessage(i));
+    {
+        out.push(CacheBreakpoint::AfterMessage(last));
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use whisper_agent_protocol::{ContentBlock, Message, ToolResultContent};
+
+    fn tr(id: &str, text: &str) -> Message {
+        Message::tool_result_blocks(vec![ContentBlock::ToolResult {
+            tool_use_id: id.into(),
+            content: ToolResultContent::Text(text.into()),
+            is_error: false,
+        }])
+    }
+
+    #[test]
+    fn rolling_breakpoint_tracks_last_tool_result() {
+        // Agentic loop: one user prompt followed by several assistant/tool_result
+        // cycles. The rolling breakpoint must land on the last user-side message
+        // (the trailing tool_result at index 6), not stall on the initial user
+        // text at index 0.
+        let msgs = vec![
+            Message::user_text("start"),
+            Message::assistant_blocks(vec![ContentBlock::Text { text: "a".into() }]),
+            tr("t1", "r1"),
+            Message::assistant_blocks(vec![ContentBlock::Text { text: "b".into() }]),
+            tr("t2", "r2"),
+            Message::assistant_blocks(vec![ContentBlock::Text { text: "c".into() }]),
+            tr("t3", "r3"),
+        ];
+        let bps = default_cache_policy(&msgs);
+        assert_eq!(
+            bps,
+            vec![
+                CacheBreakpoint::AfterSystem,
+                CacheBreakpoint::AfterMessage(6)
+            ]
+        );
+    }
+
+    #[test]
+    fn empty_conversation_yields_system_marker_only() {
+        // No messages (ScheduleWakeup from a fresh thread, seeded systems, etc.) —
+        // nothing to anchor a rolling breakpoint on, so only the system marker.
+        let bps = default_cache_policy(&[]);
+        assert_eq!(bps, vec![CacheBreakpoint::AfterSystem]);
+    }
+
+    #[test]
+    fn trailing_assistant_message_is_not_a_breakpoint() {
+        // Trailing assistant message (shouldn't normally happen at dispatch
+        // time, but the policy must handle it gracefully): walk back past it
+        // to the nearest user-side anchor.
+        let msgs = vec![
+            Message::user_text("hi"),
+            Message::assistant_blocks(vec![ContentBlock::Text { text: "hey".into() }]),
+        ];
+        let bps = default_cache_policy(&msgs);
+        assert_eq!(
+            bps,
+            vec![
+                CacheBreakpoint::AfterSystem,
+                CacheBreakpoint::AfterMessage(0)
+            ]
+        );
+    }
 }
