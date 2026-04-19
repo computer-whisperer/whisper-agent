@@ -593,7 +593,8 @@ impl Thread {
                     StepOutcome::DispatchIo(dispatch)
                 } else if pending_io.is_empty() {
                     // All tool calls done — append ToolResult blocks and loop back.
-                    self.conversation.push(Message::user_blocks(completed));
+                    self.conversation
+                        .push(Message::tool_result_blocks(completed));
                     self.internal = ThreadInternalState::NeedsModelCall;
                     self.touch();
                     StepOutcome::Continue

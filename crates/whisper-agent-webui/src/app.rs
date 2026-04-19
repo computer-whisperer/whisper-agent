@@ -1044,6 +1044,18 @@ impl ChatApp {
                     view.summary.continued_from = Some(thread_id);
                 }
             }
+            ServerToClient::ThreadUserMessage { thread_id, text } => {
+                // User-role message appended to the conversation.
+                // Fires for both user-typed follow-ups (the webui used
+                // to add these optimistically; that's now removed so
+                // the server echo is the single source of truth) and
+                // server-injected text (dispatch_thread async
+                // notifications, compaction continuation seeds,
+                // behavior-trigger prompts).
+                if let Some(view) = self.tasks.get_mut(&thread_id) {
+                    view.items.push(DisplayItem::User { text });
+                }
+            }
             ServerToClient::ThreadAssistantBegin { .. } => {}
             ServerToClient::ThreadAssistantText { thread_id, text } => {
                 if let Some(view) = self.tasks.get_mut(&thread_id) {
@@ -1565,11 +1577,11 @@ impl ChatApp {
             // reuse the previous thread's override.
             self.compose_host_env = None;
         } else if let Some(thread_id) = self.selected.clone() {
-            if let Some(view) = self.tasks.get_mut(&thread_id) {
-                view.items.push(DisplayItem::User {
-                    text: trimmed.to_string(),
-                });
-            }
+            // Don't add optimistically — the server echoes every
+            // user-role append via `ThreadUserMessage`, so adding
+            // here would double the message. Server-local echo
+            // latency is negligible; the extra round-trip is a
+            // millisecond at most.
             self.send(ClientToServer::SendUserMessage {
                 thread_id,
                 text: trimmed.to_string(),
@@ -1655,7 +1667,13 @@ fn conversation_to_items(conv: &Conversation) -> Vec<DisplayItem> {
 
 fn add_message_items(msg: &Message, out: &mut Vec<DisplayItem>) {
     match msg.role {
-        Role::User => {
+        Role::User | Role::ToolResult => {
+            // Both roles share a per-block pass. Role::User messages
+            // carry user-typed / server-injected text; Role::ToolResult
+            // messages carry only tool_result blocks. Keeping a single
+            // block-level match here means either role is robust if
+            // it happens to contain the other's block type (e.g.
+            // hand-edited JSON from before the role split).
             for block in &msg.content {
                 match block {
                     ContentBlock::Text { text } => {

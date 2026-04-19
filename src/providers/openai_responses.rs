@@ -342,7 +342,13 @@ impl ModelProvider for OpenAiResponsesClient {
 
 fn convert_message(m: &Message, out: &mut Vec<RspItem>) {
     match m.role {
-        Role::User => convert_user_message(&m.content, out),
+        // Responses wants tool results as standalone
+        // `function_call_output` items, which `convert_user_message`
+        // already emits per-block. A `Role::ToolResult` message with
+        // only tool_result blocks routes through the same path and
+        // produces only function_call_output items — exactly what
+        // Responses expects.
+        Role::User | Role::ToolResult => convert_user_message(&m.content, out),
         Role::Assistant => convert_assistant_message(&m.content, out),
     }
 }

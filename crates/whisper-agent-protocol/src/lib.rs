@@ -807,6 +807,18 @@ pub enum ServerToClient {
     },
 
     // --- Per-task turn tier (only to subscribers of `thread_id`) ---
+    /// A user-role message was appended to the thread's conversation.
+    /// Fires both for user-typed follow-ups (via `SendUserMessage`) and
+    /// for server-injected messages — behavior-trigger prompts,
+    /// compaction continuation seeds, `dispatch_thread` async
+    /// notification callbacks. Subscribers that are already rendering
+    /// the thread append this to their local view; a webui that just
+    /// sent a `SendUserMessage` receives its own echo and should not
+    /// dedupe optimistically (the wire echo is the source of truth).
+    ThreadUserMessage {
+        thread_id: String,
+        text: String,
+    },
     ThreadAssistantBegin {
         thread_id: String,
         turn: u32,

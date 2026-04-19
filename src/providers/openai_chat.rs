@@ -202,7 +202,15 @@ impl ModelProvider for OpenAiChatClient {
 
 fn convert_message(m: &Message, out: &mut Vec<OaMessage>) {
     match m.role {
-        Role::User => convert_user_message(&m.content, out),
+        // OpenAI chat splits user and tool-result into separate wire
+        // messages with different roles (`user` vs `tool`). Both of
+        // our in-memory roles currently go through the same builder —
+        // `convert_user_message` inspects each content block and
+        // emits `role: "user"` for text blocks and `role: "tool"`
+        // for tool_result blocks, so a `Role::ToolResult` message
+        // with only tool_result blocks produces only `tool` messages
+        // on the wire, which is exactly what OpenAI wants.
+        Role::User | Role::ToolResult => convert_user_message(&m.content, out),
         Role::Assistant => convert_assistant_message(&m.content, out),
     }
 }

@@ -403,7 +403,12 @@ fn build_tool_use_name_index(messages: &[Message]) -> HashMap<String, String> {
 
 fn convert_message(m: &Message, id_to_name: &HashMap<String, String>) -> Option<Content> {
     let (role, parts) = match m.role {
-        Role::User => ("user", convert_user_parts(&m.content, id_to_name)),
+        // Gemini has no `tool` role on the wire — function responses
+        // ride inside a `user`-role Content with FunctionResponse
+        // parts. `Role::ToolResult` uses the same part-builder as
+        // `Role::User`; `convert_user_parts` already knows how to
+        // turn `ContentBlock::ToolResult` into a FunctionResponse.
+        Role::User | Role::ToolResult => ("user", convert_user_parts(&m.content, id_to_name)),
         Role::Assistant => ("model", convert_assistant_parts(&m.content, id_to_name)),
     };
     if parts.is_empty() {

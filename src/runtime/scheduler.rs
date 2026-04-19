@@ -1317,9 +1317,19 @@ impl Scheduler {
         let pending_resources = self.pending_resources_for(thread_id);
         let new_state = {
             let task = self.tasks.get_mut(thread_id).expect("task exists");
-            task.submit_user_message(text, pending_resources);
+            task.submit_user_message(text.clone(), pending_resources);
             task.public_state()
         };
+        // Emit the user message to subscribers BEFORE the state change
+        // so the conversation view lands in order: user message first,
+        // then the state flips to Working for the model turn it kicks.
+        self.router.broadcast_to_subscribers(
+            thread_id,
+            ServerToClient::ThreadUserMessage {
+                thread_id: thread_id.to_string(),
+                text,
+            },
+        );
         self.router
             .broadcast_task_list(ServerToClient::ThreadStateChanged {
                 thread_id: thread_id.to_string(),

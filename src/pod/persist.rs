@@ -531,6 +531,12 @@ async fn load_one(path: &Path, pod_id: &str) -> Result<Thread> {
     // value baked into the JSON — a pod that was renamed on disk should
     // have its threads follow.
     task.pod_id = pod_id.to_string();
+    // Pre-Role::ToolResult snapshots carried tool results inside user-
+    // role messages. Split them out into their own role so downstream
+    // code (provider adapters, webui renderer, event emitters) can
+    // treat "user message" and "tool finished" as distinct concepts.
+    // Idempotent — a no-op for already-migrated threads.
+    task.conversation.normalize_legacy_tool_result_role();
     if is_in_flight(&task.internal) {
         task.fail("resume", "task was in-flight at last shutdown");
     }
