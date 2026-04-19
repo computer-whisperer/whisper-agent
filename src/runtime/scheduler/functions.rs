@@ -1376,9 +1376,8 @@ impl Scheduler {
     /// this terminating parent thread via `ThreadToolCall` and cancel
     /// them. For Functions awaiting a child (sync dispatch), also
     /// cancel the child thread — its result has no consumer anymore.
-    /// Mirrors the pre-migration `cascade_cancel_dispatched_children`
-    /// behavior but keyed off the Function registry instead of the
-    /// pending_dispatches side-map.
+    /// Recursively processes the cancelled child's post-terminal
+    /// lifecycle so nested dispatches cascade transitively.
     pub(super) fn cascade_cancel_caller_gone(
         &mut self,
         thread_id: &str,

@@ -148,9 +148,11 @@ pub fn is_builtin(name: &str) -> bool {
     )
 }
 
-/// True if `name` is a builtin tool that modifies the pod. Used by
-/// `evaluate_policy` so `ApprovalPolicy::PromptPodModify` can gate these
-/// specifically without prompting on every MCP tool.
+/// True if `name` is a builtin tool that modifies the pod. Pod-editing
+/// tools are a privilege-escalation vector; a pod that wants to gate
+/// them without prompting on every MCP tool sets `AllowWithPrompt` on
+/// these names in its `[allow.tools]` overrides while keeping the
+/// default `Allow`.
 pub fn is_pod_modify(name: &str) -> bool {
     matches!(name, POD_WRITE_FILE | POD_EDIT_FILE)
 }

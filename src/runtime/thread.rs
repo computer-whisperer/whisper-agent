@@ -14,8 +14,8 @@
 //! The internal [`ThreadInternalState`] has finer distinctions than the public
 //! [`ThreadStateLabel`] — the wire collapses them via [`Thread::public_state`]. This
 //! indirection is the point of having a state machine: we can split a phase into
-//! sub-phases (e.g. add `AwaitingApproval` between tool dispatch and execution) without
-//! touching the wire.
+//! sub-phases (e.g. `NeedsModelCall` vs `AwaitingModelCall`) without touching
+//! the wire.
 
 use std::collections::{BTreeSet, HashMap};
 
@@ -815,8 +815,7 @@ impl Thread {
         // `src/runtime/scheduler/functions.rs`). Every tool_use emerges
         // from here as AutoApproved; the scheduler either dispatches
         // it, defers it pending a user prompt, or synthesizes a denial
-        // depending on the pod's tool-scope disposition. The thread no
-        // longer enters the `AwaitingApproval` state.
+        // depending on the pod's tool-scope disposition.
         let _ = tool_annotations; // Consulted scheduler-side now.
         // Approvals are recorded for audit at the scheduler-side
         // Function layer; here we mark each call as "scheduler-gated"

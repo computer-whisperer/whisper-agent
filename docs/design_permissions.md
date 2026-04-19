@@ -10,18 +10,21 @@ Permission decisions in agentic systems separate cleanly into three patterns. Th
 
 ### Pattern 1 — Pre-execution client-side approval *(implemented)*
 
-The harness decides *before* invoking a tool whether to prompt the user. This is our primary line of defense for interactive threads.
+The scheduler's Function registry decides *before* invoking a tool whether to prompt the user. This is our primary line of defense for interactive threads.
 
-Inputs to the decision:
+Every tool_use emitted by the model registers a `Function::BuiltinToolCall` or `Function::McpToolUse` (or for `dispatch_thread`, a `Function::CreateThread` via its pool-alias path). The Function's scope-check is a per-tool `Disposition`:
 
-- **Tool annotations** from the MCP server: `readOnlyHint`, `destructiveHint`, `idempotentHint`, `openWorldHint`. Carried on `ToolAnnotations` in `src/tools/mcp.rs`.
-- **Thread's `ApprovalPolicy`** (`crates/whisper-agent-protocol/src/lib.rs`):
-  - `AutoApproveAll` — auto-approve every call. Appropriate for unattended threads where the sandbox is the safety boundary.
-  - `PromptPodModify` *(default for new pods)* — auto-approve read-only and non-pod-modifying tools; prompt on the builtin pod-editing tools. The sandbox bounds blast radius for everything else; self-modification of the pod's own config gets a distinct gate because it's a privilege-escalation vector.
-  - `PromptDestructive` — auto-approve only tools the MCP server marked `readOnlyHint: true`; prompt on destructive MCP tools *and* pod-modifying builtins. Strictest useful policy, for sandbox-free or human-in-the-loop configurations.
-- **Per-thread `tool_allowlist`**. When the user approves a call with "remember," the tool name is added to the thread's allowlist and future calls to that name skip the prompt. Persisted with the thread.
+- `Allow` — admit; push the IO future immediately.
+- `AllowWithPrompt` — admit, but buffer the IO and emit a `PendingApproval` wire event. User's decision resolves through `resolve_tool_approval` — approve pushes the buffered IO future; reject synthesizes a tool-result error and completes the Function with `Cancelled(UserDenied)`.
+- `Deny` — refuse registration; the thread sees a tool-result error and continues.
 
-If the user denies, the tool call is never dispatched — the model receives a synthesized `tool_result` saying it was denied and continues from there. The state-machine variant `AwaitingApproval` handles the pause; `ApprovalDisposition` tracks per-call outcome (`AutoApproved | Pending | UserApproved | UserRejected`).
+Inputs to the disposition:
+
+- **Tool annotations** from the MCP server (`readOnlyHint`, `destructiveHint`, `idempotentHint`, `openWorldHint`) — carried on `ToolAnnotations` in `src/tools/mcp.rs` and surfaced in the `PendingApproval` wire event for client rendering.
+- **Pod's `[allow.tools]` table** — `AllowMap<String>` with a `default` Disposition plus per-tool overrides. Replaces the old `ApprovalPolicy` preset enum: pods now declare exactly which disposition applies by default and which tools override.
+- **Per-thread `tool_allowlist`** — when the user approves a call with "remember," the tool's disposition on the thread's `tools_scope` narrows to `Allow`. Future calls to that name skip the prompt. Persisted with the thread.
+
+Pre-Function-model references to `ApprovalPolicy` / `AwaitingApproval` / `ApprovalDisposition` were removed during the Function-registry migration — see `docs/design_functions.md`. The scheduler's `register_tool_function` is the single dispatch entry point; the thread has no separate approval state.
 
 ### Pattern 2 — Server-initiated mid-execution elicitation *(deferred)*
 
@@ -46,7 +49,7 @@ Pattern 1 is one layer. The others are **sandboxing** and **audit**.
 
 **Sandboxing** is the load-bearing safety boundary for unattended work. Each thread binds to a `host_env` — a named (provider, spec) pair declared in the pod's `[[allow.host_env]]` table. The provider (today: `local-landlock`, via `whisper-agent-sandbox`) provisions the host-env for the thread and spawns the MCP host inside it, scoped to the allowed paths and network policy. Tools running inside can't escape the landlock ruleset regardless of what they're asked to do. See [sandbox architecture memory](../) for the layering rationale: per-task `SandboxSpec`, `SandboxBackend` trait, provisioned below the MCP layer because MCP's roots (advisory `file://` URIs) don't carry an image, mount mode, or network policy — real isolation has to come from below.
 
-This is why `AutoApproveAll` is a sensible default for autonomous behaviors: the sandbox bounds blast radius regardless of what the model decides to do. For interactive use where the sandbox is relaxed, `PromptPodModify` gives a second line of defense around self-modification.
+This is why an all-`Allow` default `[allow.tools]` is sensible for autonomous behaviors: the sandbox bounds blast radius regardless of what the model decides to do. For interactive use where the sandbox is relaxed, per-tool `AllowWithPrompt` overrides — typically on the builtin pod-editing tools and any destructive MCP tools — give a second line of defense around privilege-escalation vectors.
 
 **Audit.** Every tool call writes one line to a JSONL audit log (`src/runtime/audit.rs`). Shape:
 
@@ -83,13 +86,13 @@ Pattern 1 surfaces as:
 - `ApprovalResolved { approval_id, decision, decided_by_conn }` events when a decision lands.
 - `AllowlistChanged { allowlist }` when the thread's allowlist changes (via remember-yes or explicit revoke).
 
-The pod config carries `thread_defaults.approval_policy` (a `PodConfig` field); per-thread overrides live in `ThreadConfig`.
+The pod config carries `[allow.tools]` as an `AllowMap<String>` (default + per-tool overrides); each thread snapshots the pod's tools map into its own `tools_scope` at creation, which it narrows further via remember-approvals. See `docs/design_functions.md` for the full scope-composition model.
 
 ## Open questions
 
 - **Approval UX surfaces.** Web dashboard today. Future: mobile push, Slack DM, terminal pager. Different threads want different channels; the harness would need a pluggable approval-channel abstraction. No concrete need yet.
 - **Approval lifetime granularity.** Today: "approve this one call" vs. "approve for this thread" (the remember toggle). No "approve for N minutes" or "remember always for this identity" — waiting for a use case.
-- **Policy DSL vs. Rust code.** Approval policy is a closed enum today; extending to something declarative is premature until there's a non-engineer who needs to edit policies.
+- **Policy DSL vs. Rust code.** `AllowMap<Disposition>` is declarative enough for the current shape (default + per-tool overrides); a richer policy grammar (conditionals on args, time-of-day, etc.) is premature until there's a non-engineer who needs to edit policies.
 - **Reaction to denial.** When a user denies, the synthesized `tool_result` carries the user's message. Is that the right framing? Does the model retry, give up, ask for clarification? Empirically it mostly gives up cleanly, but the right denial payload is underexplored.
 - **Audit log retention.** Local JSONL, no rotation, no retention policy. Fine at current scale; revisit when log volume or durability becomes a concrete concern.
 

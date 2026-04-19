@@ -44,8 +44,6 @@ pub enum ThreadStateLabel {
     Idle,
     /// Model call or tool call in flight.
     Working,
-    /// Paused waiting for a human approval decision.
-    AwaitingApproval,
     /// Turn finished with `end_turn`; open for follow-ups or archive.
     Completed,
     /// Terminally failed. `detail` in the last event gives the reason.

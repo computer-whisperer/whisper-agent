@@ -132,7 +132,6 @@ fn state_chip(state: ThreadStateLabel) -> (&'static str, Color32) {
     match state {
         ThreadStateLabel::Idle => ("idle", Color32::from_gray(160)),
         ThreadStateLabel::Working => ("working", Color32::from_rgb(120, 180, 240)),
-        ThreadStateLabel::AwaitingApproval => ("approval", Color32::from_rgb(240, 180, 90)),
         ThreadStateLabel::Completed => ("completed", Color32::from_rgb(120, 200, 140)),
         ThreadStateLabel::Failed => ("failed", Color32::from_rgb(220, 110, 110)),
         ThreadStateLabel::Cancelled => ("cancelled", Color32::from_rgb(180, 140, 140)),

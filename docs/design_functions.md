@@ -43,11 +43,11 @@ Anything caller-initiated, asynchronous, and worth auditing as a single unit of 
 `CreateThread` is deliberately the *only* thread-creation Function. Interactive create, behavior-spawned create, and model-dispatched sub-agent are the same Function with different argument shapes:
 
 - Interactive: no `parent`, client-chosen bindings, `wait_mode: ThreadCreated`, interactive subscriber on the resulting thread.
-- Behavior-spawned: no `parent`, bindings derived from behavior config, `wait_mode: ThreadCreated`, no interactive subscriber.
-- Model dispatch (sync): `parent: Some(ParentLink { thread_id, tool_use_id })`, `wait_mode: ThreadTerminal`, bindings inherited or explicitly narrowed.
-- Model dispatch (async): `parent: Some(ParentLink { thread_id, tool_use_id })`, `wait_mode: ThreadCreated`, bindings inherited or explicitly narrowed.
+- Behavior-spawned: routed through `Function::RunBehavior` (which internally uses `create_task`) rather than `Function::CreateThread` — behaviors carry provenance (`BehaviorOrigin`, terminal hook for `BehaviorStateChanged` + queued-payload replay) that's orthogonal to `CreateThread`.
+- Model dispatch (sync): `parent: Some(ParentLink { thread_id, tool_use_id })`, `wait_mode: ThreadTerminal`, `FunctionDelivery::ToolResultChannel(tx)` — parent parks on this Function's terminal via the oneshot.
+- Model dispatch (async): `parent: Some(ParentLink { thread_id, tool_use_id })`, `wait_mode: ThreadTerminal`, `FunctionDelivery::ToolResultFollowup { parent_thread_id, parent_tool_use_id }` — the parent's tool-call IO future returns an immediate "Dispatched task-X" ack, and when the Function terminates its final text is rendered as a `<dispatched-thread-notification>` envelope and injected as a fresh user message on the parent (queued if the parent is mid-turn; drained at the next idle boundary).
 
-One Function, parameterized. The tool-pool layer (see below) is what restricts the model's `dispatch_thread` tool to a subset of these fields; the underlying Function still accepts the full range.
+One Function, parameterized. Sync and async dispatch share the same lifecycle (Function holds until the child terminates); the difference is purely the delivery tag on the `ActiveFunctionEntry` — same caller-link, same terminal, different routing rule. The tool-pool layer (see below) is what maps the model's `dispatch_thread` call to this Function; the underlying Function still accepts the full range of CreateThread arguments.
 
 ## Core concepts
 
@@ -76,10 +76,15 @@ enum Function {
 
 enum WaitMode {
     /// Function terminates as soon as the thread exists and is seeded.
-    /// Used by interactive create, behavior fire, async dispatch.
+    /// Used by interactive create — the caller only wants to know
+    /// the thread is up.
     ThreadCreated,
-    /// Function terminates only when the created thread reaches terminal.
-    /// Used by sync dispatch — parent parks on this Function's terminal.
+    /// Function terminates only when the created thread reaches its
+    /// own terminal state, and the terminal payload carries the
+    /// child's final text. Used by both sync and async dispatch; the
+    /// difference is the `FunctionDelivery` tag on the registry
+    /// entry — sync parks the parent on a oneshot, async delivers
+    /// via user-message follow-up.
     ThreadTerminal,
 }
 
@@ -592,9 +597,9 @@ These questions remain for later — not blockers for starting implementation, b
 - **Exact error taxonomy inside `RejectReason` and `FunctionError`.** Start with the sketch; let real call sites tell us which distinctions matter.
 - **Auxiliary indexes on `active_functions`.** HashMap-by-id is enough for v1. If profiling shows scan-heavy cancel-propagation or thread-filter workloads, add indexes then.
 - **Auto-deny timeout for `AllowWithPrompt` without a delivery surface.** Policy committed (auto-deny with `NoApprovalPath`), but the concrete timeout duration and how the caller-link router signals "no delivery surface" is a per-caller-type implementation detail.
-- **`AllowMap` default-override merge edge cases.** The narrowing rule is "more restrictive disposition wins per item"; first implementation should have unit tests for all combinations of `{default, override-present, override-absent}` on both sides.
+- **Approval integration for Function-spawning tool aliases.** `dispatch_thread` is a pool alias for `Function::CreateThread`. Today the implementation treats its `AllowWithPrompt` disposition as `Allow` with a warn log — buffering the pre-launch state for a Function-creating tool takes more plumbing than the current `pending_approval_io: IoRequest` buffer supports. When a concrete use case for prompting before dispatch lands, extend the buffering to cover Function specs (not just IO requests).
 
-## Implementation staging
+## Implementation staging *(landed; retained for historical context)*
 
 Six commits. Infrastructure lands alongside the first operation that uses it rather than as standalone plumbing — each commit removes more code than it adds (or at least makes the addition load-bearing for a concrete simplification). Old code paths keep working until their operation's migration commit lands; the tree compiles and the server runs at every commit boundary.
 
@@ -622,33 +627,29 @@ First operation migrated; scheduler infrastructure lands alongside it as load-be
 - Auto-compact path rewired to register a Function with `CallerLink::SchedulerInternal(AutoCompact { .. })`.
 - Old compaction code path removed.
 
-**Commit 4 — Tool invocation + approval + pod.toml rewrite.**
-
-Heaviest commit — this is where the new scope model starts paying off:
+**Commit 4 — Tool invocation + approval + pod.toml rewrite.** Landed in four sub-commits (4a/4b/4c/4d).
 
 - `BuiltinToolCall` and `McpToolUse` migrated as Functions.
-- Scope check returns `Disposition`; `AllowWithPrompt` tags the `ActiveFunction` with a prompt-required flag.
-- `ApprovalRequest` progress-event flow with decision routing back into the Function; `ApprovalDecision` messages route to `FunctionId`.
-- `ProgressEvent::Content(ContentBlock)` for streaming tool output; thread-event wire protocol extended to carry `ContentBlock`.
-- Tool-pool curation layer for model callers — pod.toml defines the pool, thread derives a model-facing view.
-- **Pod.toml schema rewritten** to express the new permission model: `[allow.tools]` with `default` + `overrides` replaces `thread_defaults.approval_policy`. Existing `pods/` directories wiped (no migration).
-- `ApprovalPolicy` enum removed from protocol crate; per-thread `tool_allowlist` becomes per-tool `Allow` overrides on the thread's scope.
+- Scope check returns `Disposition`; `AllowWithPrompt` buffers the IO request on the entry.
+- `ApprovalDecision` wire messages route to the Function via `resolve_tool_approval`.
+- `ProgressEvent::Content(ContentBlock)` for streaming tool output; `ServerToClient::ThreadToolCallContent` extends the wire to carry `ContentBlock` between Begin and End events.
+- Tool-pool filtering: `Scheduler::tool_descriptors()` drops `Deny`-disposition tools from the model-facing list.
+- **Pod.toml schema rewritten**: `[allow.tools]` with `default` + `overrides` replaces `thread_defaults.approval_policy`.
+- `ApprovalPolicy` enum removed; per-thread `tool_allowlist` narrows the thread's `tools_scope` via per-tool `Allow` overrides.
 
-Splittable if the diff gets unwieldy (builtin first, then MCP).
+**Commit 5 — Thread lifecycle + behavior operations.** Landed in three sub-commits (5a/5b/5c) + a follow-up rework.
 
-**Commit 5 — Thread lifecycle + behavior operations.**
-
-- `CreateThread` migrated (collapsing interactive / behavior-spawned / model-dispatched paths via `ParentLink` + `WaitMode`).
-- `RunBehavior` migrated (folding `fire_trigger` and `run_behavior`).
-- `RebindThread` migrated.
-- After this commit, every caller-visible operation is a Function.
+- `RebindThread` migrated (5a).
+- `RunBehavior` migrated — folded cron / webhook / manual / tool-initiated fires under the registry with a `TriggerSource` tag on the caller-link (5b).
+- `CreateThread` unified under the Function registry (5c). Dispatched children (sync + async) go through the same Function lifecycle with `FunctionDelivery::ToolResultChannel` / `ToolResultFollowup` as the differentiator. Follow-up (9203680) collapsed `dispatch_thread` into a tool-pool alias handled by the single tool-dispatch entry point — no intercept.
+- `pending_dispatches` side-map and its companion methods (`resolve_pending_dispatch`, `flush_ready_async_deliveries`, `cascade_cancel_dispatched_children`) deleted.
 
 **Commit 6 — Cleanup.**
 
-- Remove any superseded types and parallel pre-Function dispatch paths still present.
-- Update `design_pod_thread_scheduler.md` and `design_permissions.md` to reference the Function model.
-- Prune any "Open questions" items resolved during implementation.
+- `ThreadStateLabel::AwaitingApproval` removed (protocol + webui + docs).
+- `design_pod_thread_scheduler.md` and `design_permissions.md` updated to reference the Function model.
+- Stale comments and resolved open-questions pruned.
 
 ## Status
 
-Design complete enough to build against. Phase 1 has not started. As implementation surfaces issues, amend the relevant sections in place; don't let the "open questions" list grow while the body calcifies around stale assumptions.
+Migration complete through Commit 6. The Function registry is the authoritative surface for every caller-initiated scheduler operation. As new operations land (lua hooks, further caller surfaces), they add Function variants rather than parallel dispatch paths.

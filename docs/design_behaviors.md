@@ -16,7 +16,7 @@ The common structure: a prompt + thread configuration that is spawned on a trigg
 
 What the existing pod/thread abstraction already supports:
 - `Completed` as a stable terminal state for the thread state machine.
-- `ApprovalPolicy::AutoApproveAll` so unattended threads don't wedge on prompts.
+- `[allow.tools]` with default `Allow` (or per-tool overrides) so unattended threads don't wedge on prompts.
 - Sandbox + pod `[allow]` as the load-bearing safety boundary — the appropriate primitive for unattended runs, where no human is watching approvals anyway.
 - Per-thread binding overrides (narrower than the pod default) so an autonomous thread can run with a tighter tool surface than interactive work.
 

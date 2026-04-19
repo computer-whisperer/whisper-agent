@@ -170,7 +170,6 @@ enum ThreadInternalState {
     WaitingOnResources { needed: Vec<String> },
     NeedsModelCall,
     AwaitingModel       { op_id, started_at },
-    AwaitingApproval    { tool_uses, dispositions },
     AwaitingTools       { pending_dispatch, pending_io, completed, approvals },
     Completed,                                // end_turn reached; accepts follow-ups
     Failed              { at_phase, message },
@@ -178,7 +177,7 @@ enum ThreadInternalState {
 }
 ```
 
-The internal state is collapsed to a public `ThreadStateLabel` on the wire (`Idle | Working | AwaitingApproval | Completed | Failed | Cancelled`). Clients never see the fine-grained distinctions; that stability is the point of the split. See `src/runtime/thread.rs::public_state`.
+The internal state is collapsed to a public `ThreadStateLabel` on the wire (`Idle | Working | Completed | Failed | Cancelled`). Clients never see the fine-grained distinctions; that stability is the point of the split. See `src/runtime/thread.rs::public_state`. Approval prompting no longer has its own state — the scheduler's Function registry holds the pending approval with the buffered IO request (see `docs/design_functions.md`).
 
 Sub-agent / fork / compact kinds: not built. There's no `ThreadKind` enum, no `parent: Option<ThreadId>`. When those features land they'll introduce the types they need; we're not pre-committing to an enum shape without the features to validate it.
 

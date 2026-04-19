@@ -346,11 +346,11 @@ impl Scheduler {
     }
 
     /// True when the behavior's `last_thread_id` refers to a thread
-    /// that is currently present in memory AND in a non-terminal state
-    /// (`Idle`/`Working`/`AwaitingApproval`). Used by the Skip and
-    /// QueueOne overlap paths. Returns false when the behavior has
-    /// never fired, when the last thread has been evicted, or when
-    /// the last thread reached Completed/Failed/Cancelled.
+    /// that is currently present in memory AND in a non-terminal
+    /// state (`Idle`/`Working`). Used by the Skip and QueueOne
+    /// overlap paths. Returns false when the behavior has never
+    /// fired, when the last thread has been evicted, or when the
+    /// last thread reached Completed/Failed/Cancelled.
     pub(super) fn behavior_has_inflight_run(&self, pod_id: &str, behavior_id: &str) -> bool {
         let Some(pod) = self.pods.get(pod_id) else {
             return false;
