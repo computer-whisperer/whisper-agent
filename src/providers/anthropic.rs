@@ -757,6 +757,10 @@ struct MessageStartEnvelope {
     usage: AnthropicUsage,
 }
 
+// Variant names mirror the wire tags Anthropic emits (text_delta,
+// input_json_delta, etc.) — the "Delta" postfix is intentional parity
+// with the on-the-wire names, not a naming smell.
+#[allow(clippy::enum_variant_names)]
 #[derive(Deserialize, Debug)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum AnthropicDelta {

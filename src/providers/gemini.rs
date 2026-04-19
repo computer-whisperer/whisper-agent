@@ -815,10 +815,10 @@ impl GeminiStreamState {
         // Capture finish_reason + usage opportunistically. They typically
         // arrive on the same terminal chunk, but either can slip earlier
         // (e.g. usage on a progress chunk) — keep the latest value we see.
-        if let Some(cand) = chunk.candidates.iter().next() {
-            if let Some(fr) = cand.finish_reason.as_deref() {
-                self.stop_reason = Some(fr.to_string());
-            }
+        if let Some(cand) = chunk.candidates.first()
+            && let Some(fr) = cand.finish_reason.as_deref()
+        {
+            self.stop_reason = Some(fr.to_string());
         }
         if let Some(u) = chunk.usage_metadata {
             self.usage = Some(Usage {

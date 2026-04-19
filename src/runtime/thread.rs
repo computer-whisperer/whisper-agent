@@ -1011,7 +1011,6 @@ fn truncate(mut s: String, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::BTreeMap;
 
     #[test]
     fn truncate_handles_multibyte_boundary() {

@@ -662,10 +662,10 @@ impl Scheduler {
                 thread_id: t,
                 tool_use_id: u,
             } = &entry.caller
+                && t == thread_id
+                && u == tool_use_id
             {
-                if t == thread_id && u == tool_use_id {
-                    return Some(*id);
-                }
+                return Some(*id);
             }
             None
         })
@@ -1069,15 +1069,13 @@ impl Scheduler {
                 // "Remember this approval" narrows the thread's
                 // tools_scope so future calls to this tool skip the
                 // prompt.
-                if remember {
-                    if let Some(task) = self.tasks.get_mut(thread_id) {
-                        task.tools_scope.set_allow(tool_name.clone());
-                        task.tool_allowlist.insert(tool_name.clone());
-                        let allowlist_ev = crate::runtime::thread::ThreadEvent::AllowlistChanged {
-                            allowlist: task.tool_allowlist.iter().cloned().collect(),
-                        };
-                        self.router.dispatch_events(thread_id, vec![allowlist_ev]);
-                    }
+                if remember && let Some(task) = self.tasks.get_mut(thread_id) {
+                    task.tools_scope.set_allow(tool_name.clone());
+                    task.tool_allowlist.insert(tool_name.clone());
+                    let allowlist_ev = crate::runtime::thread::ThreadEvent::AllowlistChanged {
+                        allowlist: task.tool_allowlist.iter().cloned().collect(),
+                    };
+                    self.router.dispatch_events(thread_id, vec![allowlist_ev]);
                 }
                 let fut = crate::runtime::io_dispatch::build_io_future(
                     self,
