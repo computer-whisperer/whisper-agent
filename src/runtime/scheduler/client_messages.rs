@@ -22,7 +22,7 @@ use crate::runtime::io_dispatch::SchedulerFuture;
 
 /// Extract a user-facing detail string from a `RejectReason`. Surfaces
 /// on WS error frames when a Function fails to register.
-fn reject_reason_detail(r: &RejectReason) -> &str {
+pub(super) fn reject_reason_detail(r: &RejectReason) -> &str {
     match r {
         RejectReason::ScopeDenied { detail }
         | RejectReason::PreconditionFailed { detail }
@@ -45,33 +45,35 @@ impl Scheduler {
                 initial_message,
                 config_override,
                 bindings_request,
-            } => match self.create_task(
-                Some(conn_id),
-                correlation_id.clone(),
-                pod_id,
-                config_override,
-                bindings_request,
-                None,
-                None,
-                pending_io,
-            ) {
-                Ok(thread_id) => {
-                    self.mark_dirty(&thread_id);
-                    self.send_user_message(&thread_id, initial_message, pending_io);
-                    self.step_until_blocked(&thread_id, pending_io);
+            } => {
+                let spec = crate::functions::Function::CreateThread {
+                    pod_id,
+                    initial_message: Some(initial_message),
+                    parent: None,
+                    wait_mode: crate::functions::WaitMode::ThreadCreated,
+                    config_override,
+                    bindings_request,
+                };
+                let scope = self.ws_client_scope();
+                let caller = crate::functions::CallerLink::WsClient {
+                    conn_id,
+                    correlation_id: correlation_id.clone(),
+                };
+                match self.register_function(spec, scope, caller) {
+                    Ok(fn_id) => self.launch_function(fn_id, pending_io),
+                    Err(e) => {
+                        warn!(error = ?e, conn_id, "create_thread rejected");
+                        self.router.send_to_client(
+                            conn_id,
+                            ServerToClient::Error {
+                                correlation_id,
+                                thread_id: None,
+                                message: format!("create_thread: {}", reject_reason_detail(&e)),
+                            },
+                        );
+                    }
                 }
-                Err(e) => {
-                    warn!(error = %e, conn_id, "create_task rejected");
-                    self.router.send_to_client(
-                        conn_id,
-                        ServerToClient::Error {
-                            correlation_id,
-                            thread_id: None,
-                            message: format!("create_task: {e}"),
-                        },
-                    );
-                }
-            },
+            }
             ClientToServer::SendUserMessage { thread_id, text } => {
                 if self.tasks.contains_key(&thread_id) {
                     self.send_user_message(&thread_id, text, pending_io);

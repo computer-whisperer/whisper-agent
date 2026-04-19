@@ -17,7 +17,7 @@
 
 use bitflags::bitflags;
 use serde::{Deserialize, Serialize};
-use whisper_agent_protocol::ThreadBindingsPatch;
+use whisper_agent_protocol::{ThreadBindingsPatch, ThreadBindingsRequest, ThreadConfigOverride};
 
 use crate::permission::{HostName, PodId, ToolName};
 
@@ -64,18 +64,22 @@ pub type HookId = String;
 /// Closed enum by design: the scheduler match-and-mutates without dynamic
 /// dispatch, and every caller-visible operation is visible in one place.
 /// MCP tools are the one open set, collapsed to `McpToolUse`.
-#[derive(Debug, Clone, PartialEq)]
+///
+/// The size delta between `CreateThread` (carries typed config /
+/// bindings) and the simpler variants is real but intentional — the
+/// spec lives in the registry, not on a hot path, and a closed-enum
+/// allocation is the right trade for pattern-match ergonomics.
+#[derive(Debug, Clone)]
+#[allow(clippy::large_enum_variant)]
 pub enum Function {
     CreateThread {
-        pod_id: PodId,
+        /// `None` routes to the server's default pod.
+        pod_id: Option<PodId>,
         initial_message: Option<String>,
         parent: Option<ParentLink>,
         wait_mode: WaitMode,
-        // Thread config / bindings carried as opaque serde_json::Value for now;
-        // the typed shapes live in the protocol crate and will plug in when
-        // CreateThread gets migrated (Phase 2).
-        config_override: Option<serde_json::Value>,
-        bindings_request: Option<serde_json::Value>,
+        config_override: Option<ThreadConfigOverride>,
+        bindings_request: Option<ThreadBindingsRequest>,
     },
     CompactThread {
         thread_id: ThreadId,

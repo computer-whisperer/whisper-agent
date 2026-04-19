@@ -263,16 +263,6 @@ pub struct Scheduler {
     /// send_user_message paths so we don't fan out redundant provision
     /// futures for the same thread.
     provisioning_in_flight: HashSet<String>,
-    /// Parents waiting on a dispatched child's final assistant text.
-    /// Keyed by the child's thread id. Populated synchronously when a
-    /// `dispatch_thread` sync call spawns a child, drained by
-    /// `resolve_pending_dispatch` when the child reaches a terminal
-    /// state (or by `cascade_cancel_dispatched_children` when the
-    /// parent itself terminates before the child does). Transient —
-    /// not persisted across restart: a restart mid-sync-dispatch
-    /// orphans the parent the same way it orphans an in-flight MCP
-    /// tool call, and the user must cancel the parent to recover.
-    pending_dispatches: HashMap<String, dispatch::PendingDispatch>,
     /// Sender half of the stream-update channel; cloned and handed to each
     /// dispatched I/O future that wants to push interim events (streaming
     /// model deltas today, MCP tool-output chunks tomorrow). The receiver
@@ -371,7 +361,6 @@ impl Scheduler {
                 dirty: HashSet::new(),
                 dirty_behaviors: HashSet::new(),
                 provisioning_in_flight: HashSet::new(),
-                pending_dispatches: HashMap::new(),
                 stream_tx,
                 active_functions: HashMap::new(),
                 next_function_id: 1,
@@ -1201,7 +1190,7 @@ impl Scheduler {
     /// (behaviors, cron, etc.) pass `None`. `origin` stamps behavior
     /// provenance on the thread; `None` for interactive work.
     #[allow(clippy::too_many_arguments)]
-    fn create_task(
+    pub(super) fn create_task(
         &mut self,
         requester: Option<ConnId>,
         correlation_id: Option<String>,
@@ -1624,7 +1613,7 @@ impl Scheduler {
         // or a dispatch_thread intercept (no Function registered at
         // this layer — CreateThread Function lands in Phase 5).
         if let Some((tool_use_id, tc_result)) = tool_result_snapshot {
-            self.complete_tool_function(&thread_id, &tool_use_id, &tc_result);
+            self.complete_tool_function(&thread_id, &tool_use_id, &tc_result, pending_io);
         }
     }
 
@@ -1866,18 +1855,14 @@ impl Scheduler {
         // -finalized parent from retriggering.
         self.maybe_auto_compact(thread_id, pending_io);
         // Dispatched-child terminal-state fan-out: if this thread is
-        // a dispatched child with a waiting parent, deliver the
-        // parent's tool result (sync) or stash the text for an async
-        // user-message injection. If this thread was the parent of
-        // other dispatched children, cancel them — their result has
-        // no consumer anymore.
-        self.resolve_pending_dispatch(thread_id, pending_io);
-        self.cascade_cancel_dispatched_children(thread_id, pending_io);
-        // If this thread is a parent with async deliveries whose
-        // children already terminated earlier, flush any that can
-        // now land — the thread may have just stepped into an idle
-        // state that accepts new user messages. No-op otherwise.
-        self.flush_ready_async_deliveries(thread_id, pending_io);
+        // a child awaited by a `Function::CreateThread{ThreadTerminal}`,
+        // fire that Function's terminal — the delivery tag on the
+        // entry routes the final text back to the parent (sync
+        // oneshot or async follow-up message). If this thread is a
+        // parent and has just died, cancel any Functions still
+        // targeting it as their `ThreadToolCall` caller.
+        self.complete_functions_awaiting_thread(thread_id, pending_io);
+        self.cascade_cancel_caller_gone(thread_id, pending_io);
     }
 
     /// If the task is in a terminal state, tear down its sandbox (if any).

@@ -16,6 +16,7 @@
 //!   fires `complete_function`.
 
 use futures::stream::FuturesUnordered;
+use tokio::sync::oneshot;
 use tracing::{debug, warn};
 use whisper_agent_protocol::{ServerToClient, ThreadStateLabel};
 
@@ -26,6 +27,12 @@ use crate::functions::{
 };
 use crate::permission::{BehaviorOp, PermissionScope, ThreadOp};
 use crate::runtime::io_dispatch::SchedulerFuture;
+
+/// Compile-in cap on `dispatch_thread` nesting depth. A dispatched
+/// child's own `dispatch_thread` call would be depth 2; we allow a
+/// few levels for legitimate delegation chains and refuse past this
+/// so a buggy agent can't recursively dispatch itself into OOM.
+pub(super) const MAX_DISPATCH_DEPTH: u32 = 4;
 
 /// Server-owned runtime state of an in-flight Function.
 ///
@@ -52,6 +59,59 @@ pub struct ActiveFunctionEntry {
     /// `None` for Functions that aren't pending approval (synchronous
     /// variants, already-approved tool calls, etc.).
     pub pending_approval_io: Option<crate::runtime::thread::IoRequest>,
+    /// For `Function::CreateThread { wait_mode: ThreadTerminal, .. }`:
+    /// the child thread whose terminal completes this Function. The
+    /// scheduler's thread-terminal hook reads this to decide which
+    /// Functions to fire.
+    pub awaiting_child_thread_id: Option<String>,
+    /// How the terminal is delivered to the caller. Set at
+    /// registration; consumed by `complete_function`.
+    pub delivery: FunctionDelivery,
+}
+
+/// How the terminal of an in-flight Function gets delivered back to
+/// its caller beyond the default wire-Error routing in
+/// `complete_function`. Most variants use `None`; dispatch-driven
+/// tool calls populate one of the tool-result variants so the
+/// parent's tool_use_id eventually sees the child's result.
+pub enum FunctionDelivery {
+    /// Default — no variant-specific delivery. Errors for `WsClient`
+    /// callers still produce a wire `Error`; successful terminals
+    /// rely on variant-level broadcasts (`ThreadCompacted`,
+    /// `ThreadBindingsChanged`, etc.).
+    None,
+    /// Sync tool-call parking: fire this oneshot with the terminal's
+    /// final text (`Ok` on Success, `Err` on Error/Cancelled). The
+    /// parent's tool-call SchedulerFuture awaits the receiver and
+    /// converts the result into an `IoResult::ToolCall` — normal tool
+    /// result delivery.
+    ToolResultChannel(oneshot::Sender<Result<String, String>>),
+    /// Async tool-call follow-up: render a
+    /// `<dispatched-thread-notification>` envelope from the terminal
+    /// and inject it as a fresh user message on the parent thread.
+    /// The parent's tool call already returned a synthetic ack, so
+    /// there's no parked oneshot to fire.
+    ToolResultFollowup {
+        parent_thread_id: String,
+        parent_tool_use_id: String,
+    },
+}
+
+impl std::fmt::Debug for FunctionDelivery {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::None => write!(f, "None"),
+            Self::ToolResultChannel(_) => write!(f, "ToolResultChannel(<sender>)"),
+            Self::ToolResultFollowup {
+                parent_thread_id,
+                parent_tool_use_id,
+            } => f
+                .debug_struct("ToolResultFollowup")
+                .field("parent_thread_id", parent_thread_id)
+                .field("parent_tool_use_id", parent_tool_use_id)
+                .finish(),
+        }
+    }
 }
 
 impl Scheduler {
@@ -86,6 +146,20 @@ impl Scheduler {
         scope: PermissionScope,
         caller: CallerLink,
     ) -> Result<FunctionId, RejectReason> {
+        self.register_function_with_delivery(spec, scope, caller, FunctionDelivery::None)
+    }
+
+    /// Full registration shape used by callers that need to attach a
+    /// non-default terminal delivery (dispatch_thread's sync oneshot or
+    /// async follow-up). Most callers use `register_function` and get
+    /// `FunctionDelivery::None`.
+    pub(super) fn register_function_with_delivery(
+        &mut self,
+        spec: Function,
+        scope: PermissionScope,
+        caller: CallerLink,
+        delivery: FunctionDelivery,
+    ) -> Result<FunctionId, RejectReason> {
         self.variant_precondition_check(&spec, &scope)?;
         let id = self.next_function_id();
         let entry = ActiveFunctionEntry {
@@ -94,6 +168,8 @@ impl Scheduler {
             scope,
             caller,
             pending_approval_io: None,
+            awaiting_child_thread_id: None,
+            delivery,
         };
         debug!(
             function_id = id,
@@ -147,6 +223,34 @@ impl Scheduler {
                     });
                 }
                 Ok(())
+            }
+            Function::CreateThread {
+                pod_id, parent, ..
+            } => {
+                let effective_pod = pod_id.clone().unwrap_or_else(|| self.default_pod_id.clone());
+                if !self.pods.contains_key(&effective_pod) {
+                    return Err(RejectReason::PreconditionFailed {
+                        detail: format!("unknown pod `{effective_pod}`"),
+                    });
+                }
+                if let Some(link) = parent {
+                    let parent_task = self.tasks.get(&link.thread_id).ok_or_else(|| {
+                        RejectReason::PreconditionFailed {
+                            detail: format!("unknown parent thread `{}`", link.thread_id),
+                        }
+                    })?;
+                    if parent_task.dispatch_depth >= MAX_DISPATCH_DEPTH {
+                        return Err(RejectReason::PreconditionFailed {
+                            detail: format!(
+                                "dispatch_thread nesting cap reached (parent depth {}, max {})",
+                                parent_task.dispatch_depth, MAX_DISPATCH_DEPTH
+                            ),
+                        });
+                    }
+                }
+                admission_check(scope.thread_op(&effective_pod, ThreadOp::Create), || {
+                    format!("thread create in pod {effective_pod} denied by scope")
+                })
             }
             Function::RunBehavior {
                 pod_id,
@@ -203,12 +307,6 @@ impl Scheduler {
             Function::McpToolUse { name, .. } => {
                 admission_check(scope.tool(name), || format!("tool {name} denied by scope"))
             }
-            // Other variants are declared but not yet consumed; they'll
-            // get their precondition logic as they're migrated in later
-            // commits.
-            _ => Err(RejectReason::InvalidSpec {
-                detail: "Function variant not yet implemented".into(),
-            }),
         }
     }
 
@@ -235,12 +333,32 @@ impl Scheduler {
                 self.complete_function(
                     id,
                     FunctionOutcome::Success(FunctionTerminal::CancelThread),
+                    pending_io,
                 );
             }
             Function::CompactThread { thread_id } => {
                 self.launch_compact_thread(&thread_id, pending_io);
                 // Function stays in the registry until
                 // `finalize_pending_compaction` calls `complete_function`.
+            }
+            Function::CreateThread {
+                pod_id,
+                initial_message,
+                parent,
+                wait_mode,
+                config_override,
+                bindings_request,
+            } => {
+                self.launch_create_thread(
+                    id,
+                    pod_id,
+                    initial_message,
+                    parent,
+                    wait_mode,
+                    config_override,
+                    bindings_request,
+                    pending_io,
+                );
             }
             Function::RunBehavior {
                 pod_id,
@@ -273,6 +391,7 @@ impl Scheduler {
                         FunctionOutcome::Success(FunctionTerminal::RunBehavior(
                             crate::functions::RunBehaviorTerminal { thread_id },
                         )),
+                        pending_io,
                     ),
                     Err(e) => self.complete_function(
                         id,
@@ -280,6 +399,7 @@ impl Scheduler {
                             kind: crate::functions::FunctionErrorKind::Execution,
                             detail: e,
                         }),
+                        pending_io,
                     ),
                 }
             }
@@ -301,6 +421,7 @@ impl Scheduler {
                         FunctionOutcome::Success(FunctionTerminal::RebindThread(
                             crate::functions::RebindThreadTerminal::default(),
                         )),
+                        pending_io,
                     ),
                     Err(e) => self.complete_function(
                         id,
@@ -308,6 +429,7 @@ impl Scheduler {
                             kind: crate::functions::FunctionErrorKind::Execution,
                             detail: e,
                         }),
+                        pending_io,
                     ),
                 }
             }
@@ -324,30 +446,24 @@ impl Scheduler {
                 // (ThreadToolCall { thread_id, tool_use_id }) and calls
                 // `complete_function`.
             }
-            _ => {
-                // Variants that passed registration but aren't launchable
-                // yet — shouldn't hit this path because
-                // `variant_precondition_check` rejects them, but belt &
-                // suspenders.
-                self.complete_function(
-                    id,
-                    FunctionOutcome::Error(crate::functions::FunctionError {
-                        kind: crate::functions::FunctionErrorKind::Execution,
-                        detail: "variant not yet implemented".into(),
-                    }),
-                );
-            }
         }
     }
 
     /// Remove the entry from `active_functions` and log/audit the
-    /// terminal. Error terminals for `WsClient` callers with a
-    /// correlation_id surface as `ServerToClient::Error` so the
-    /// originating client can match the failure to its request;
-    /// successful terminals for most variants rely on variant-specific
-    /// broadcasts (ThreadBindingsChanged, ThreadCompacted, etc.) and
-    /// have no direct per-client reply.
-    pub(super) fn complete_function(&mut self, id: FunctionId, outcome: FunctionOutcome) {
+    /// terminal, then run any caller-specific delivery. Error
+    /// terminals for `WsClient` callers with a correlation_id surface
+    /// as `ServerToClient::Error`. Terminals with
+    /// `FunctionDelivery::ToolResultChannel` fire the parked oneshot
+    /// so the parent's parked tool-call SchedulerFuture resumes;
+    /// `ToolResultFollowup` renders the terminal text as a
+    /// `<dispatched-thread-notification>` envelope and injects it as
+    /// a user message on the parent.
+    pub(super) fn complete_function(
+        &mut self,
+        id: FunctionId,
+        outcome: FunctionOutcome,
+        pending_io: &mut FuturesUnordered<SchedulerFuture>,
+    ) {
         let Some(entry) = self.active_functions.remove(&id) else {
             warn!(function_id = id, "complete_function: no such entry");
             return;
@@ -358,24 +474,135 @@ impl Scheduler {
             outcome = ?outcome,
             "Function terminal"
         );
-        if let (
-            FunctionOutcome::Error(err),
-            CallerLink::WsClient {
-                conn_id,
-                correlation_id,
-            },
-        ) = (&outcome, &entry.caller)
-        {
-            let thread_id = entry.spec.primary_thread_id().map(str::to_string);
-            self.router.send_to_client(
-                *conn_id,
-                ServerToClient::Error {
-                    correlation_id: correlation_id.clone(),
+        let wire_error_for_ws_client =
+            if let (FunctionOutcome::Error(err), CallerLink::WsClient { conn_id, correlation_id }) =
+                (&outcome, &entry.caller)
+            {
+                let thread_id = entry.spec.primary_thread_id().map(str::to_string);
+                Some((
+                    *conn_id,
+                    correlation_id.clone(),
                     thread_id,
-                    message: err.detail.clone(),
+                    err.detail.clone(),
+                ))
+            } else {
+                None
+            };
+        if let Some((conn_id, correlation_id, thread_id, message)) = wire_error_for_ws_client {
+            self.router.send_to_client(
+                conn_id,
+                ServerToClient::Error {
+                    correlation_id,
+                    thread_id,
+                    message,
                 },
             );
         }
+
+        match entry.delivery {
+            FunctionDelivery::None => {}
+            FunctionDelivery::ToolResultChannel(sender) => {
+                let msg = outcome_to_sync_tool_result(&outcome);
+                // send() fails only if the receiver has been dropped
+                // — e.g. the parent already terminated. Nothing to do
+                // in that case; the cascade-cancel handled the parent
+                // side.
+                let _ = sender.send(msg);
+            }
+            FunctionDelivery::ToolResultFollowup {
+                parent_thread_id,
+                parent_tool_use_id,
+            } => {
+                self.deliver_async_followup(
+                    &parent_thread_id,
+                    &parent_tool_use_id,
+                    &entry.spec,
+                    &outcome,
+                    pending_io,
+                );
+            }
+        }
+    }
+
+    /// Render a `<dispatched-thread-notification>` envelope from the
+    /// completed Function's terminal and inject it as a fresh user
+    /// message on the parent thread. No-op if the parent can't
+    /// currently accept one (parent gone, in a terminal state of its
+    /// own). The Function spec's `CreateThread`-variant carries the
+    /// child thread id; the terminal carries its final text.
+    fn deliver_async_followup(
+        &mut self,
+        parent_thread_id: &str,
+        parent_tool_use_id: &str,
+        spec: &Function,
+        outcome: &FunctionOutcome,
+        pending_io: &mut FuturesUnordered<SchedulerFuture>,
+    ) {
+        let child_thread_id = match spec {
+            Function::CreateThread { .. } => match outcome {
+                FunctionOutcome::Success(FunctionTerminal::CreateThread(term)) => {
+                    term.thread_id.clone()
+                }
+                _ => return,
+            },
+            _ => return,
+        };
+        let Some(child_task) = self.tasks.get(&child_thread_id) else {
+            return;
+        };
+        let (status, body) = match outcome {
+            FunctionOutcome::Success(FunctionTerminal::CreateThread(term)) => (
+                crate::runtime::scheduler::dispatch::DispatchStatus::Completed,
+                term.final_result
+                    .as_ref()
+                    .and_then(|s| s.final_text.clone())
+                    .unwrap_or_default(),
+            ),
+            FunctionOutcome::Error(err) => (
+                crate::runtime::scheduler::dispatch::DispatchStatus::Failed,
+                format!("child failed: {}", err.detail),
+            ),
+            FunctionOutcome::Cancelled(_) => (
+                crate::runtime::scheduler::dispatch::DispatchStatus::Cancelled,
+                String::new(),
+            ),
+            FunctionOutcome::Success(_) => return,
+        };
+        let notification = crate::runtime::scheduler::dispatch::render_dispatch_notification(
+            child_task,
+            parent_tool_use_id,
+            status,
+            &body,
+        );
+        let parent_can_accept = self
+            .tasks
+            .get(parent_thread_id)
+            .map(|t| {
+                matches!(
+                    t.public_state(),
+                    ThreadStateLabel::Idle | ThreadStateLabel::Completed
+                )
+            })
+            .unwrap_or(false);
+        if !parent_can_accept {
+            // Parent is either gone or still working; for now we drop
+            // the delivery. Holding it in a queue would require
+            // re-introducing the pending_dispatches-style stashing
+            // that the Function-model rewrite removed.
+            debug!(
+                parent = %parent_thread_id,
+                child = %child_thread_id,
+                "dispatch async follow-up: parent not idle; dropping delivery"
+            );
+            return;
+        }
+        debug!(
+            parent = %parent_thread_id,
+            child = %child_thread_id,
+            "dispatch async follow-up: injecting notification as user message"
+        );
+        self.send_tool_result_text(parent_thread_id, notification, pending_io);
+        self.step_until_blocked(parent_thread_id, pending_io);
     }
 
     /// Find the FunctionId of the in-flight `CompactThread` targeting
@@ -648,6 +875,7 @@ impl Scheduler {
                 self.complete_function(
                     fn_id,
                     FunctionOutcome::Cancelled(crate::functions::CancelReason::UserDenied),
+                    pending_io,
                 );
                 true
             }
@@ -675,6 +903,7 @@ impl Scheduler {
         thread_id: &str,
         tool_use_id: &str,
         result: &Result<crate::tools::mcp::CallToolResult, String>,
+        pending_io: &mut FuturesUnordered<SchedulerFuture>,
     ) {
         let Some(fn_id) = self.find_tool_function_for(thread_id, tool_use_id) else {
             return;
@@ -709,7 +938,289 @@ impl Scheduler {
                 detail: e.clone(),
             }),
         };
-        self.complete_function(fn_id, outcome);
+        self.complete_function(fn_id, outcome, pending_io);
+    }
+
+    /// Launch body for `Function::CreateThread`. Creates the thread via
+    /// `create_task`, seeds the initial message, steps the thread. For
+    /// `WaitMode::ThreadCreated` the Function completes immediately with
+    /// a `CreateThreadTerminal { thread_id, final_result: None }` — the
+    /// caller only cared that the thread exists. For
+    /// `WaitMode::ThreadTerminal` the Function stays in the registry
+    /// with `awaiting_child_thread_id = Some(child)`; the scheduler's
+    /// thread-terminal hook fires `complete_function` once the child
+    /// reaches Completed/Failed/Cancelled.
+    #[allow(clippy::too_many_arguments)]
+    fn launch_create_thread(
+        &mut self,
+        id: FunctionId,
+        pod_id: Option<crate::permission::PodId>,
+        initial_message: Option<String>,
+        parent: Option<crate::functions::ParentLink>,
+        wait_mode: crate::functions::WaitMode,
+        config_override: Option<whisper_agent_protocol::ThreadConfigOverride>,
+        bindings_request: Option<whisper_agent_protocol::ThreadBindingsRequest>,
+        pending_io: &mut FuturesUnordered<SchedulerFuture>,
+    ) {
+        // Pull requester + correlation_id from the caller-link so
+        // `create_task` routes `ThreadCreated` broadcasts the same way
+        // the pre-migration interactive handler did.
+        let (requester, correlation_id) = match self.active_functions.get(&id) {
+            Some(entry) => match &entry.caller {
+                CallerLink::WsClient {
+                    conn_id,
+                    correlation_id,
+                } => (Some(*conn_id), correlation_id.clone()),
+                _ => (None, None),
+            },
+            None => (None, None),
+        };
+        // Parent lineage is derivable from the spec + parent thread
+        // state: depth = parent.dispatch_depth + 1 (capped by the
+        // precondition check).
+        let dispatch_lineage = match &parent {
+            Some(link) => self
+                .tasks
+                .get(&link.thread_id)
+                .map(|t| (link.thread_id.clone(), t.dispatch_depth)),
+            None => None,
+        };
+        let create_result = self.create_task(
+            requester,
+            correlation_id,
+            pod_id,
+            config_override,
+            bindings_request,
+            None,
+            dispatch_lineage,
+            pending_io,
+        );
+        let thread_id = match create_result {
+            Ok(id) => id,
+            Err(e) => {
+                self.complete_function(
+                    id,
+                    FunctionOutcome::Error(crate::functions::FunctionError {
+                        kind: crate::functions::FunctionErrorKind::Execution,
+                        detail: e,
+                    }),
+                    pending_io,
+                );
+                return;
+            }
+        };
+        self.mark_dirty(&thread_id);
+        if let Some(text) = initial_message {
+            self.send_user_message(&thread_id, text, pending_io);
+        }
+        self.step_until_blocked(&thread_id, pending_io);
+
+        match wait_mode {
+            crate::functions::WaitMode::ThreadCreated => {
+                self.complete_function(
+                    id,
+                    FunctionOutcome::Success(FunctionTerminal::CreateThread(
+                        crate::functions::CreateThreadTerminal {
+                            thread_id,
+                            final_result: None,
+                        },
+                    )),
+                    pending_io,
+                );
+            }
+            crate::functions::WaitMode::ThreadTerminal => {
+                // Stash the child id; the thread-terminal hook will
+                // call `complete_function` when the child finishes.
+                if let Some(entry) = self.active_functions.get_mut(&id) {
+                    entry.awaiting_child_thread_id = Some(thread_id.clone());
+                }
+                // Edge case: step_until_blocked may have driven the
+                // child all the way to terminal already (zero-turn
+                // response, immediate error, etc.). Fire the terminal
+                // hook now so we don't park indefinitely waiting for a
+                // signal that has already passed.
+                let terminal = self
+                    .tasks
+                    .get(&thread_id)
+                    .map(|t| {
+                        matches!(
+                            t.public_state(),
+                            ThreadStateLabel::Completed
+                                | ThreadStateLabel::Failed
+                                | ThreadStateLabel::Cancelled
+                        )
+                    })
+                    .unwrap_or(false);
+                if terminal {
+                    self.complete_functions_awaiting_thread(&thread_id, pending_io);
+                }
+            }
+        }
+    }
+
+    /// Thread-terminal hook that closes out any Function waiting on
+    /// this thread as its "await child" completion signal. Walks the
+    /// active_functions registry; for each entry with
+    /// `awaiting_child_thread_id == Some(thread_id)`, builds the
+    /// terminal payload from the thread's final state and calls
+    /// `complete_function`. The thread's state drives Success vs
+    /// Error vs Cancelled.
+    pub(super) fn complete_functions_awaiting_thread(
+        &mut self,
+        thread_id: &str,
+        pending_io: &mut FuturesUnordered<SchedulerFuture>,
+    ) {
+        let matches: Vec<FunctionId> = self
+            .active_functions
+            .iter()
+            .filter_map(|(fn_id, entry)| {
+                match entry.awaiting_child_thread_id.as_deref() {
+                    Some(t) if t == thread_id => Some(*fn_id),
+                    _ => None,
+                }
+            })
+            .collect();
+        if matches.is_empty() {
+            return;
+        }
+        let Some(task) = self.tasks.get(thread_id) else {
+            // Thread vanished — complete each Function with a
+            // CallerGone cancel so the caller-link routing still
+            // delivers something.
+            for fn_id in matches {
+                self.complete_function(
+                    fn_id,
+                    FunctionOutcome::Cancelled(crate::functions::CancelReason::CallerGone),
+                    pending_io,
+                );
+            }
+            return;
+        };
+        let state = task.public_state();
+        let outcome = match state {
+            ThreadStateLabel::Completed => {
+                let text =
+                    crate::runtime::scheduler::compaction::extract_last_assistant_text(task);
+                FunctionOutcome::Success(FunctionTerminal::CreateThread(
+                    crate::functions::CreateThreadTerminal {
+                        thread_id: thread_id.to_string(),
+                        final_result: Some(crate::functions::ThreadTerminalSummary {
+                            state: "completed".into(),
+                            final_text: Some(text),
+                        }),
+                    },
+                ))
+            }
+            ThreadStateLabel::Failed => {
+                let detail = task
+                    .failure_detail()
+                    .unwrap_or_else(|| "child thread failed".into());
+                FunctionOutcome::Error(crate::functions::FunctionError {
+                    kind: crate::functions::FunctionErrorKind::Execution,
+                    detail,
+                })
+            }
+            ThreadStateLabel::Cancelled => FunctionOutcome::Cancelled(
+                crate::functions::CancelReason::ExplicitCancel,
+            ),
+            // Not terminal — shouldn't happen (caller only invokes this
+            // on terminal transitions), but be defensive.
+            _ => return,
+        };
+        for fn_id in matches {
+            self.complete_function(fn_id, outcome.clone(), pending_io);
+        }
+    }
+
+    /// Walk `active_functions` for entries whose `CallerLink` targets
+    /// this terminating parent thread via `ThreadToolCall` and cancel
+    /// them. For Functions awaiting a child (sync dispatch), also
+    /// cancel the child thread — its result has no consumer anymore.
+    /// Mirrors the pre-migration `cascade_cancel_dispatched_children`
+    /// behavior but keyed off the Function registry instead of the
+    /// pending_dispatches side-map.
+    pub(super) fn cascade_cancel_caller_gone(
+        &mut self,
+        thread_id: &str,
+        pending_io: &mut FuturesUnordered<SchedulerFuture>,
+    ) {
+        let Some(parent_task) = self.tasks.get(thread_id) else {
+            return;
+        };
+        let parent_dead = matches!(
+            parent_task.public_state(),
+            ThreadStateLabel::Failed | ThreadStateLabel::Cancelled
+        );
+        if !parent_dead {
+            return;
+        }
+        let targeted: Vec<(FunctionId, Option<String>)> = self
+            .active_functions
+            .iter()
+            .filter_map(|(fn_id, entry)| match &entry.caller {
+                CallerLink::ThreadToolCall {
+                    thread_id: parent, ..
+                } if parent == thread_id => {
+                    Some((*fn_id, entry.awaiting_child_thread_id.clone()))
+                }
+                _ => None,
+            })
+            .collect();
+        for (fn_id, awaiting_child) in targeted {
+            // Cancel the awaited child (if any) so its result has no
+            // dangling consumer, and run the child's own post-terminal
+            // lifecycle so nested dispatches cascade transitively.
+            let newly_cancelled_child = if let Some(child_id) = &awaiting_child
+                && let Some(child) = self.tasks.get_mut(child_id)
+            {
+                let already_terminal = matches!(
+                    child.public_state(),
+                    ThreadStateLabel::Completed
+                        | ThreadStateLabel::Failed
+                        | ThreadStateLabel::Cancelled
+                );
+                if already_terminal {
+                    None
+                } else {
+                    child.cancel();
+                    self.mark_dirty(child_id);
+                    self.router.broadcast_task_list(
+                        ServerToClient::ThreadStateChanged {
+                            thread_id: child_id.clone(),
+                            state: ThreadStateLabel::Cancelled,
+                        },
+                    );
+                    warn!(
+                        parent = %thread_id, child = %child_id,
+                        "parent terminated; cascading cancel to dispatched child"
+                    );
+                    self.teardown_host_env_if_terminal(child_id);
+                    self.on_behavior_thread_terminal(child_id, pending_io);
+                    Some(child_id.clone())
+                }
+            } else {
+                None
+            };
+            // Clear the awaiting link before completing so the child's
+            // own terminal processing (below) doesn't re-fire this
+            // Function after we've cancelled it.
+            if let Some(entry) = self.active_functions.get_mut(&fn_id) {
+                entry.awaiting_child_thread_id = None;
+            }
+            self.complete_function(
+                fn_id,
+                FunctionOutcome::Cancelled(crate::functions::CancelReason::CallerGone),
+                pending_io,
+            );
+            // Transitive cascade: the now-cancelled child may itself
+            // be a parent of further dispatched children / awaiting
+            // Functions. Recursion terminates at threads with no
+            // registered Functions targeting them.
+            if let Some(child_id) = newly_cancelled_child {
+                self.complete_functions_awaiting_thread(&child_id, pending_io);
+                self.cascade_cancel_caller_gone(&child_id, pending_io);
+            }
+        }
     }
 
     /// Cancel a thread by id: flip its state, broadcast, and run the
@@ -737,12 +1248,40 @@ impl Scheduler {
             });
         self.teardown_host_env_if_terminal(thread_id);
         self.on_behavior_thread_terminal(thread_id, pending_io);
-        // If the cancelled thread is either a dispatched child (parent
-        // is waiting on its final text) or a parent of still-running
-        // dispatched children, run the dispatch-lifecycle hooks. These
-        // are idempotent no-ops otherwise.
-        self.resolve_pending_dispatch(thread_id, pending_io);
-        self.cascade_cancel_dispatched_children(thread_id, pending_io);
+        // Function-registry lifecycle: if this cancelled thread is a
+        // child awaited by a `Function::CreateThread{ThreadTerminal}`,
+        // fire that Function's terminal. If this thread is itself a
+        // parent with registered Functions pointing back at it, cancel
+        // them via caller-gone cascade.
+        self.complete_functions_awaiting_thread(thread_id, pending_io);
+        self.cascade_cancel_caller_gone(thread_id, pending_io);
+    }
+}
+
+/// Convert a Function terminal outcome to the Result payload a sync
+/// `dispatch_thread` caller expects: `Ok(final_text)` for a successful
+/// CreateThread terminal; `Err(message)` for error or cancelled.
+fn outcome_to_sync_tool_result(outcome: &FunctionOutcome) -> Result<String, String> {
+    match outcome {
+        FunctionOutcome::Success(FunctionTerminal::CreateThread(term)) => {
+            let text = term
+                .final_result
+                .as_ref()
+                .and_then(|s| s.final_text.clone())
+                .unwrap_or_default();
+            Ok(text)
+        }
+        FunctionOutcome::Success(_) => Err(
+            "dispatch_thread Function terminated with non-CreateThread payload".to_string(),
+        ),
+        FunctionOutcome::Error(err) => Err(format!(
+            "dispatched child failed: {}",
+            err.detail
+        )),
+        FunctionOutcome::Cancelled(reason) => Err(format!(
+            "dispatched child cancelled ({:?})",
+            reason
+        )),
     }
 }
 

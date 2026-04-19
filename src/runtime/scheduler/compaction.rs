@@ -89,6 +89,7 @@ impl Scheduler {
                                 detail: format!("compaction prompt resolution failed: {e}"),
                             },
                         ),
+                        pending_io,
                     );
                 }
                 return;
@@ -248,6 +249,7 @@ impl Scheduler {
                         kind: crate::functions::FunctionErrorKind::Execution,
                         detail: "summary extraction failed".into(),
                     }),
+                    pending_io,
                 );
             }
             return;
@@ -299,6 +301,7 @@ impl Scheduler {
                                 detail: format!("continuation create_task failed: {e}"),
                             },
                         ),
+                        pending_io,
                     );
                 }
                 return;
@@ -343,6 +346,7 @@ impl Scheduler {
                         },
                     ),
                 ),
+                pending_io,
             );
         }
 
