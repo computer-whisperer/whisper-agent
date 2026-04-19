@@ -26,6 +26,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use async_stream::try_stream;
+use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::{Mutex, OnceCell};
@@ -35,7 +37,8 @@ use whisper_agent_protocol::{
 
 use crate::providers::gemini_auth::GeminiAuth;
 use crate::providers::model::{
-    BoxFuture, ModelError, ModelInfo, ModelProvider, ModelRequest, ModelResponse, ToolSpec,
+    BoxFuture, BoxStream, ModelError, ModelEvent, ModelInfo, ModelProvider, ModelRequest,
+    ModelResponse, ToolSpec,
 };
 
 pub const GEMINI_API_BASE: &str = "https://generativelanguage.googleapis.com/v1beta";
@@ -253,6 +256,92 @@ impl GeminiClient {
         }
     }
 
+    fn do_create_message_streaming<'a>(
+        &'a self,
+        req: &'a ModelRequest<'a>,
+    ) -> BoxStream<'a, Result<ModelEvent, ModelError>> {
+        Box::pin(try_stream! {
+            let inner = build_gemini_request(req);
+            let resp = match &self.auth {
+                ClientAuth::ApiKey(key) => {
+                    let url = format!(
+                        "{}/models/{}:streamGenerateContent?alt=sse&key={}",
+                        self.base_url,
+                        req.model,
+                        urlencode(key)
+                    );
+                    self.http
+                        .post(&url)
+                        .json(&inner)
+                        .send()
+                        .await
+                        .map_err(|e| ModelError::Transport(e.to_string()))?
+                }
+                ClientAuth::GeminiCli { .. } => {
+                    let project = self.codex_project().await?;
+                    let bearer = self.oauth_bearer().await?;
+                    let envelope = CaGenerateContentRequest {
+                        model: req.model,
+                        project,
+                        request: inner,
+                    };
+                    // The Code Assist backend uses `alt=sse` as a query arg on
+                    // the same `streamGenerateContent` verb — envelope shape
+                    // is identical to the unary path.
+                    let url = format!("{}:streamGenerateContent?alt=sse", self.base_url);
+                    self.http
+                        .post(&url)
+                        .bearer_auth(&bearer)
+                        .json(&envelope)
+                        .send()
+                        .await
+                        .map_err(|e| ModelError::Transport(e.to_string()))?
+                }
+            };
+            let status = resp.status();
+            if !status.is_success() {
+                let err_body = resp.text().await.unwrap_or_default();
+                Err(classify_http_error(status.as_u16(), err_body))?;
+                return;
+            }
+            let codex_mode = matches!(self.auth, ClientAuth::GeminiCli { .. });
+            let mut bytes = resp.bytes_stream();
+            let mut sse_buf: Vec<u8> = Vec::new();
+            let mut state = GeminiStreamState::default();
+            while let Some(chunk) = bytes.next().await {
+                let chunk = chunk.map_err(|e| ModelError::Transport(e.to_string()))?;
+                sse_buf.extend_from_slice(&chunk);
+                while let Some(event_payload) = take_sse_event(&mut sse_buf) {
+                    let Some(raw) = parse_sse_data(&event_payload) else {
+                        continue;
+                    };
+                    // Code Assist wraps each chunk in `{response: {...}}`; the
+                    // public API sends the bare GenerateContentResponse.
+                    let parsed: GenerateContentResponse = if codex_mode {
+                        let wrapped: CaGenerateContentResponse = serde_json::from_str(&raw)
+                            .map_err(|e| ModelError::Transport(e.to_string()))?;
+                        match wrapped.response {
+                            Some(r) => r,
+                            None => continue, // empty wrapper — skip
+                        }
+                    } else {
+                        serde_json::from_str(&raw)
+                            .map_err(|e| ModelError::Transport(e.to_string()))?
+                    };
+                    for out in state.consume(parsed) {
+                        yield out;
+                    }
+                }
+            }
+            // Gemini doesn't emit a dedicated terminator event — the HTTP
+            // stream closes once the final chunk is delivered. Flush any
+            // remaining accumulated state as the terminal Completed.
+            for out in state.finish() {
+                yield out;
+            }
+        })
+    }
+
     async fn do_list_models(&self) -> Result<Vec<ModelInfo>, ModelError> {
         match &self.auth {
             ClientAuth::ApiKey(key) => {
@@ -344,6 +433,13 @@ impl ModelProvider for GeminiClient {
         req: &'a ModelRequest<'a>,
     ) -> BoxFuture<'a, Result<ModelResponse, ModelError>> {
         Box::pin(self.do_create_message(req))
+    }
+
+    fn create_message_streaming<'a>(
+        &'a self,
+        req: &'a ModelRequest<'a>,
+    ) -> BoxStream<'a, Result<ModelEvent, ModelError>> {
+        self.do_create_message_streaming(req)
     }
 
     fn list_models<'a>(&'a self) -> BoxFuture<'a, Result<Vec<ModelInfo>, ModelError>> {
@@ -654,6 +750,191 @@ fn derive_stop_reason(finish_reason: Option<&str>, saw_function_call: bool) -> O
         Some("MAX_TOKENS") => Some("max_tokens".into()),
         Some(other) => Some(other.to_lowercase()),
         None => None,
+    }
+}
+
+// ---------- Streaming SSE parse + state machine ----------
+
+/// Pull one complete SSE event (terminated by a blank line) out of `buf`.
+fn take_sse_event(buf: &mut Vec<u8>) -> Option<Vec<u8>> {
+    let end = (0..buf.len().saturating_sub(1))
+        .find(|&i| &buf[i..i + 2] == b"\n\n")
+        .map(|i| i + 2)
+        .or_else(|| {
+            (0..buf.len().saturating_sub(3))
+                .find(|&i| &buf[i..i + 4] == b"\r\n\r\n")
+                .map(|i| i + 4)
+        })?;
+    let event = buf[..end].to_vec();
+    buf.drain(..end);
+    Some(event)
+}
+
+/// Extract the concatenated `data:` payload from a single SSE event.
+fn parse_sse_data(event: &[u8]) -> Option<String> {
+    let text = std::str::from_utf8(event).ok()?;
+    let mut data = String::new();
+    for line in text.lines() {
+        if let Some(rest) = line.strip_prefix("data:") {
+            if !data.is_empty() {
+                data.push('\n');
+            }
+            data.push_str(rest.strip_prefix(' ').unwrap_or(rest));
+        }
+    }
+    if data.is_empty() { None } else { Some(data) }
+}
+
+/// Currently-open block in a Gemini stream. Unlike Anthropic's explicit
+/// content_block_start/stop, Gemini leaves block boundaries implicit — we
+/// infer them by tracking whether the last part was text (and its
+/// thought:true flag) vs something else (functionCall, end of stream).
+#[derive(Debug)]
+enum GeminiOpenBlock {
+    Text(String),
+    Thinking(String),
+}
+
+/// Running state for one Gemini streaming call. Each SSE chunk is a full
+/// `GenerateContentResponse` with a handful of new `parts` — the state
+/// machine folds them into text / thinking accumulators, emits deltas as
+/// they arrive, and assembles the final content list for `Completed`.
+#[derive(Default)]
+struct GeminiStreamState {
+    open: Option<GeminiOpenBlock>,
+    content: Vec<ContentBlock>,
+    stop_reason: Option<String>,
+    saw_function_call: bool,
+    usage: Option<Usage>,
+}
+
+impl GeminiStreamState {
+    fn consume(&mut self, chunk: GenerateContentResponse) -> Vec<ModelEvent> {
+        let mut out = Vec::new();
+
+        // Capture finish_reason + usage opportunistically. They typically
+        // arrive on the same terminal chunk, but either can slip earlier
+        // (e.g. usage on a progress chunk) — keep the latest value we see.
+        if let Some(cand) = chunk.candidates.iter().next() {
+            if let Some(fr) = cand.finish_reason.as_deref() {
+                self.stop_reason = Some(fr.to_string());
+            }
+        }
+        if let Some(u) = chunk.usage_metadata {
+            self.usage = Some(Usage {
+                input_tokens: u.prompt_token_count.unwrap_or(0),
+                output_tokens: u.candidates_token_count.unwrap_or(0)
+                    + u.thoughts_token_count.unwrap_or(0),
+                cache_read_input_tokens: u.cached_content_token_count.unwrap_or(0),
+                cache_creation_input_tokens: 0,
+            });
+        }
+
+        let candidate = chunk.candidates.into_iter().next();
+        let Some(cand) = candidate else {
+            return out;
+        };
+        let Some(cand_content) = cand.content else {
+            return out;
+        };
+
+        for part in cand_content.parts {
+            match part {
+                Part::Text {
+                    text,
+                    thought: Some(true),
+                } => {
+                    if !self.matches_open_thinking() {
+                        self.close_open();
+                        self.open = Some(GeminiOpenBlock::Thinking(String::new()));
+                    }
+                    if let Some(GeminiOpenBlock::Thinking(buf)) = &mut self.open {
+                        buf.push_str(&text);
+                    }
+                    if !text.is_empty() {
+                        out.push(ModelEvent::ThinkingDelta { text });
+                    }
+                }
+                Part::Text { text, .. } => {
+                    if !self.matches_open_text() {
+                        self.close_open();
+                        self.open = Some(GeminiOpenBlock::Text(String::new()));
+                    }
+                    if let Some(GeminiOpenBlock::Text(buf)) = &mut self.open {
+                        buf.push_str(&text);
+                    }
+                    if !text.is_empty() {
+                        out.push(ModelEvent::TextDelta { text });
+                    }
+                }
+                Part::FunctionCall {
+                    function_call,
+                    thought_signature,
+                } => {
+                    self.close_open();
+                    self.saw_function_call = true;
+                    let replay = thought_signature.map(|sig| ProviderReplay {
+                        provider: PROVIDER_TAG.into(),
+                        data: serde_json::json!({"thought_signature": sig}),
+                    });
+                    let id = next_call_id();
+                    out.push(ModelEvent::ToolCall {
+                        id: id.clone(),
+                        name: function_call.name.clone(),
+                        input: function_call.args.clone(),
+                    });
+                    self.content.push(ContentBlock::ToolUse {
+                        id,
+                        name: function_call.name,
+                        input: function_call.args,
+                        replay,
+                    });
+                }
+                Part::FunctionResponse { .. } => {
+                    // Models don't emit function responses — ignore if
+                    // echoed back to us.
+                }
+            }
+        }
+        out
+    }
+
+    fn matches_open_text(&self) -> bool {
+        matches!(self.open, Some(GeminiOpenBlock::Text(_)))
+    }
+
+    fn matches_open_thinking(&self) -> bool {
+        matches!(self.open, Some(GeminiOpenBlock::Thinking(_)))
+    }
+
+    fn close_open(&mut self) {
+        match self.open.take() {
+            Some(GeminiOpenBlock::Text(text)) if !text.is_empty() => {
+                self.content.push(ContentBlock::Text { text });
+            }
+            Some(GeminiOpenBlock::Thinking(text)) if !text.is_empty() => {
+                // Gemini's thought_signature rides on the sibling
+                // functionCall part, not here — leave replay None.
+                self.content.push(ContentBlock::Thinking {
+                    replay: None,
+                    thinking: text,
+                });
+            }
+            _ => {}
+        }
+    }
+
+    /// Flush remaining open block and emit the terminal `Completed`. The
+    /// Gemini stream has no explicit terminator event — the HTTP body just
+    /// closes — so the caller invokes this once `bytes_stream()` drains.
+    fn finish(mut self) -> Vec<ModelEvent> {
+        self.close_open();
+        let stop_reason = derive_stop_reason(self.stop_reason.as_deref(), self.saw_function_call);
+        vec![ModelEvent::Completed {
+            content: self.content,
+            stop_reason,
+            usage: self.usage.unwrap_or_default(),
+        }]
     }
 }
 
@@ -1146,5 +1427,106 @@ mod tests {
         assert_eq!(urlencode("abcXYZ-_.~"), "abcXYZ-_.~");
         assert_eq!(urlencode("a b"), "a%20b");
         assert_eq!(urlencode("k=v&q"), "k%3Dv%26q");
+    }
+
+    // ---------- Streaming state machine ----------
+
+    fn feed_chunks(chunks: &[&str]) -> Vec<ModelEvent> {
+        let mut state = GeminiStreamState::default();
+        let mut out = Vec::new();
+        for raw in chunks {
+            let parsed: GenerateContentResponse = serde_json::from_str(raw).unwrap();
+            out.extend(state.consume(parsed));
+        }
+        out.extend(state.finish());
+        out
+    }
+
+    #[test]
+    fn text_parts_across_chunks_produce_deltas_and_single_text_block() {
+        // Each streaming chunk is a full GenerateContentResponse carrying
+        // incremental text. Consecutive text parts with the same thought
+        // flag join into one block.
+        let chunks = [
+            r#"{"candidates":[{"content":{"role":"model","parts":[{"text":"hello "}]}}]}"#,
+            r#"{"candidates":[{"content":{"role":"model","parts":[{"text":"world"}]}}]}"#,
+            r#"{"candidates":[{"content":{"role":"model","parts":[]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":5,"candidatesTokenCount":2}}"#,
+        ];
+        let evs = feed_chunks(&chunks);
+        let deltas: Vec<&str> = evs
+            .iter()
+            .filter_map(|e| match e {
+                ModelEvent::TextDelta { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(deltas, vec!["hello ", "world"]);
+        match evs.last().unwrap() {
+            ModelEvent::Completed {
+                content,
+                stop_reason,
+                usage,
+            } => {
+                assert_eq!(content.len(), 1);
+                assert!(
+                    matches!(&content[0], ContentBlock::Text { text } if text == "hello world")
+                );
+                assert_eq!(stop_reason.as_deref(), Some("end_turn"));
+                assert_eq!(usage.input_tokens, 5);
+                assert_eq!(usage.output_tokens, 2);
+            }
+            _ => panic!("last event must be Completed"),
+        }
+    }
+
+    #[test]
+    fn thought_then_function_call_produces_distinct_blocks_with_replay() {
+        // Thinking prose streams as thought:true text parts; the
+        // subsequent functionCall part carries thought_signature and
+        // should land on ToolUse.replay (not Thinking).
+        let chunks = [
+            r#"{"candidates":[{"content":{"role":"model","parts":[{"text":"planning","thought":true}]}}]}"#,
+            r#"{"candidates":[{"content":{"role":"model","parts":[{"functionCall":{"name":"shell","args":{"cmd":"ls"}},"thoughtSignature":"sig-blob"}]},"finishReason":"STOP"}]}"#,
+        ];
+        let evs = feed_chunks(&chunks);
+        // First event: ThinkingDelta.
+        assert!(matches!(&evs[0], ModelEvent::ThinkingDelta { text } if text == "planning"));
+        // Second event: ToolCall (function_call assembles fully in one chunk).
+        match &evs[1] {
+            ModelEvent::ToolCall { name, input, .. } => {
+                assert_eq!(name, "shell");
+                assert_eq!(input, &serde_json::json!({"cmd": "ls"}));
+            }
+            _ => panic!("expected ToolCall second"),
+        }
+        // Terminal Completed carries both blocks; thought_signature on the
+        // ToolUse.replay.
+        match evs.last().unwrap() {
+            ModelEvent::Completed {
+                content,
+                stop_reason,
+                ..
+            } => {
+                assert_eq!(content.len(), 2);
+                match &content[0] {
+                    ContentBlock::Thinking { replay, thinking } => {
+                        assert_eq!(thinking, "planning");
+                        assert!(replay.is_none()); // signature rides on ToolUse
+                    }
+                    _ => panic!("expected Thinking first"),
+                }
+                match &content[1] {
+                    ContentBlock::ToolUse { replay, name, .. } => {
+                        assert_eq!(name, "shell");
+                        let r = replay.as_ref().expect("thought_signature must surface");
+                        assert_eq!(r.provider, "gemini");
+                        assert_eq!(r.data, serde_json::json!({"thought_signature": "sig-blob"}));
+                    }
+                    _ => panic!("expected ToolUse second"),
+                }
+                assert_eq!(stop_reason.as_deref(), Some("tool_use"));
+            }
+            _ => panic!("expected Completed"),
+        }
     }
 }

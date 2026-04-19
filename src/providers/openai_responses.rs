@@ -27,6 +27,8 @@
 
 use std::sync::Arc;
 
+use async_stream::try_stream;
+use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::Mutex;
@@ -36,7 +38,8 @@ use whisper_agent_protocol::{
 
 use crate::providers::codex_auth::CodexAuth;
 use crate::providers::model::{
-    BoxFuture, ModelError, ModelInfo, ModelProvider, ModelRequest, ModelResponse, ToolSpec,
+    BoxFuture, BoxStream, ModelError, ModelEvent, ModelInfo, ModelProvider, ModelRequest,
+    ModelResponse, ToolSpec,
 };
 
 pub const OPENAI_API_BASE: &str = "https://api.openai.com/v1";
@@ -118,7 +121,12 @@ impl OpenAiResponsesClient {
         }
     }
 
-    async fn do_create_message(&self, req: &ModelRequest<'_>) -> Result<ModelResponse, ModelError> {
+    /// Build + send the Responses request, returning the live HTTP response
+    /// for the caller to consume either as a buffered body or an SSE byte
+    /// stream. Consolidates body construction, header/auth setup, and the
+    /// error-status early return so both the streaming and buffered paths
+    /// share one code path up through "first byte".
+    async fn send_request(&self, req: &ModelRequest<'_>) -> Result<reqwest::Response, ModelError> {
         let mut input: Vec<RspItem> = Vec::new();
         for m in req.messages {
             convert_message(m, &mut input);
@@ -171,138 +179,69 @@ impl OpenAiResponsesClient {
                 body,
             });
         }
+        Ok(resp)
+    }
+
+    async fn do_create_message(&self, req: &ModelRequest<'_>) -> Result<ModelResponse, ModelError> {
+        let resp = self.send_request(req).await?;
         // Buffer the full SSE stream and dig out the `response.completed` event
-        // — its `response` field is the same object shape the non-streaming
-        // path used to return, so downstream parsing is unchanged.
+        // — its `response` field has the status / usage / incomplete_details
+        // bits we still need even when using the streaming assembly.
         let raw = resp
             .text()
             .await
             .map_err(|e| ModelError::Transport(e.to_string()))?;
         let parsed: RspResponse = extract_completed_response(&raw)?;
-
-        let mut content: Vec<ContentBlock> = Vec::new();
-        let mut saw_function_call = false;
-        for item in parsed.output {
-            match item {
-                RspOutputItem::Reasoning {
-                    id,
-                    encrypted_content,
-                    summary,
-                    content: inline_content,
-                } => {
-                    // Visible prose: concatenate every text-ish part in the
-                    // order the server emitted them. `summary` holds the
-                    // short gist the API returns by default; `content`
-                    // appears on older model variants. Both are safe to
-                    // merge.
-                    let text = summary
-                        .iter()
-                        .chain(inline_content.iter())
-                        .map(|p| match p {
-                            RspReasoningPart::ReasoningText { text }
-                            | RspReasoningPart::SummaryText { text } => text.as_str(),
-                        })
-                        .filter(|s| !s.is_empty())
-                        .collect::<Vec<_>>()
-                        .join("\n\n");
-                    // Replay payload: echo the reasoning item back verbatim
-                    // on the next turn. We pack exactly the fields the
-                    // server expects — id + encrypted_content + summary.
-                    // Skip if none of the replay-relevant fields are
-                    // populated (older models without encrypted_content
-                    // just can't resume reasoning across turns).
-                    let mut replay_data = serde_json::Map::new();
-                    if let Some(id) = &id {
-                        replay_data.insert("id".into(), Value::String(id.clone()));
-                    }
-                    if let Some(ec) = &encrypted_content {
-                        replay_data.insert("encrypted_content".into(), Value::String(ec.clone()));
-                    }
-                    if !summary.is_empty() {
-                        replay_data.insert(
-                            "summary".into(),
-                            serde_json::to_value(&summary).unwrap_or(Value::Null),
-                        );
-                    }
-                    let replay = (!replay_data.is_empty()).then(|| ProviderReplay {
-                        provider: PROVIDER_TAG.into(),
-                        data: Value::Object(replay_data),
-                    });
-                    // Drop entirely if there's nothing to show AND nothing
-                    // to replay — an empty Thinking block is pure noise.
-                    if replay.is_some() || !text.trim().is_empty() {
-                        content.push(ContentBlock::Thinking {
-                            replay,
-                            thinking: text,
-                        });
-                    }
-                }
-                RspOutputItem::Message { content: parts, .. } => {
-                    for part in parts {
-                        match part {
-                            RspOutputMessagePart::OutputText { text } => {
-                                if !text.is_empty() {
-                                    content.push(ContentBlock::Text { text });
-                                }
-                            }
-                            RspOutputMessagePart::Refusal { refusal } => {
-                                content.push(ContentBlock::Text {
-                                    text: format!("[refusal] {refusal}"),
-                                });
-                            }
-                        }
-                    }
-                }
-                RspOutputItem::FunctionCall {
-                    call_id,
-                    name,
-                    arguments,
-                    ..
-                } => {
-                    saw_function_call = true;
-                    let input_val: Value = if arguments.is_empty() {
-                        Value::Object(Default::default())
-                    } else {
-                        serde_json::from_str(&arguments).map_err(|e| {
-                            ModelError::Transport(format!(
-                                "function_call arguments not valid JSON: {e}"
-                            ))
-                        })?
-                    };
-                    content.push(ContentBlock::ToolUse {
-                        id: call_id,
-                        name,
-                        input: input_val,
-                        replay: None,
-                    });
-                }
-                RspOutputItem::Other => {}
-            }
-        }
-
-        let stop_reason = derive_stop_reason(
-            parsed.status.as_deref(),
-            parsed.incomplete_details.as_ref(),
-            saw_function_call,
-        );
-
-        let usage = parsed
-            .usage
-            .map(|u| Usage {
-                input_tokens: u.input_tokens,
-                output_tokens: u.output_tokens,
-                cache_read_input_tokens: u
-                    .input_tokens_details
-                    .and_then(|d| d.cached_tokens)
-                    .unwrap_or(0),
-                cache_creation_input_tokens: 0,
-            })
-            .unwrap_or_default();
-
+        let (content, stop_reason, usage) = finalize_response(
+            parsed.output,
+            parsed.status,
+            parsed.incomplete_details,
+            parsed.usage,
+        )?;
         Ok(ModelResponse {
             content,
             stop_reason,
             usage,
+        })
+    }
+
+    fn do_create_message_streaming<'a>(
+        &'a self,
+        req: &'a ModelRequest<'a>,
+    ) -> BoxStream<'a, Result<ModelEvent, ModelError>> {
+        Box::pin(try_stream! {
+            let resp = self.send_request(req).await?;
+            let mut bytes = resp.bytes_stream();
+            let mut sse_buf: Vec<u8> = Vec::new();
+            let mut state = RspStreamState::default();
+            while let Some(chunk) = bytes.next().await {
+                let chunk = chunk.map_err(|e| ModelError::Transport(e.to_string()))?;
+                sse_buf.extend_from_slice(&chunk);
+                while let Some(event_payload) = take_sse_event(&mut sse_buf) {
+                    let Some(raw) = parse_sse_data(&event_payload) else {
+                        continue;
+                    };
+                    if raw == "[DONE]" {
+                        continue;
+                    }
+                    let ev: RspStreamEvent = match serde_json::from_str(&raw) {
+                        Ok(ev) => ev,
+                        // Unknown event shape — skip rather than fail. New
+                        // event types land in the Responses API from time to
+                        // time; we don't want to hard-error on them.
+                        Err(_) => continue,
+                    };
+                    for out in state.consume(ev)? {
+                        yield out;
+                    }
+                    if state.done {
+                        return;
+                    }
+                }
+            }
+            Err(ModelError::Transport(
+                "SSE stream ended without response.completed".into(),
+            ))?;
         })
     }
 
@@ -380,6 +319,13 @@ impl ModelProvider for OpenAiResponsesClient {
         req: &'a ModelRequest<'a>,
     ) -> BoxFuture<'a, Result<ModelResponse, ModelError>> {
         Box::pin(self.do_create_message(req))
+    }
+
+    fn create_message_streaming<'a>(
+        &'a self,
+        req: &'a ModelRequest<'a>,
+    ) -> BoxStream<'a, Result<ModelEvent, ModelError>> {
+        self.do_create_message_streaming(req)
     }
 
     fn list_models<'a>(&'a self) -> BoxFuture<'a, Result<Vec<ModelInfo>, ModelError>> {
@@ -652,6 +598,298 @@ fn derive_stop_reason(
         Some(other) => Some(other.to_string()),
         None => None,
     }
+}
+
+// ---------- Streaming SSE parse + state machine ----------
+
+/// Pull one complete SSE event (terminated by a blank line) out of `buf`.
+/// Returns `None` until enough bytes are buffered. Mirrors the Anthropic
+/// adapter's helper — same SSE framing, so we could consolidate later, but
+/// each adapter has its own rules for how to interpret the data payload.
+fn take_sse_event(buf: &mut Vec<u8>) -> Option<Vec<u8>> {
+    let end = (0..buf.len().saturating_sub(1))
+        .find(|&i| &buf[i..i + 2] == b"\n\n")
+        .map(|i| i + 2)
+        .or_else(|| {
+            (0..buf.len().saturating_sub(3))
+                .find(|&i| &buf[i..i + 4] == b"\r\n\r\n")
+                .map(|i| i + 4)
+        })?;
+    let event = buf[..end].to_vec();
+    buf.drain(..end);
+    Some(event)
+}
+
+/// Extract the concatenated `data:` payload from a single SSE event.
+fn parse_sse_data(event: &[u8]) -> Option<String> {
+    let text = std::str::from_utf8(event).ok()?;
+    let mut data = String::new();
+    for line in text.lines() {
+        if let Some(rest) = line.strip_prefix("data:") {
+            if !data.is_empty() {
+                data.push('\n');
+            }
+            data.push_str(rest.strip_prefix(' ').unwrap_or(rest));
+        }
+    }
+    if data.is_empty() { None } else { Some(data) }
+}
+
+/// Responses SSE events we actually consume. Delta events drive live
+/// broadcasting; `output_item.done` accumulates fully-formed items for the
+/// final `Completed`; `response.completed` closes the stream with usage +
+/// status. Unknown events collapse to `Other` so new server-side event
+/// types don't break the stream.
+#[derive(Deserialize, Debug)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum RspStreamEvent {
+    /// Live text fragment. Emitted repeatedly during a message block.
+    #[serde(rename = "response.output_text.delta")]
+    OutputTextDelta {
+        #[serde(default)]
+        delta: String,
+    },
+    /// Live reasoning-summary fragment (the default visible prose on
+    /// reasoning models).
+    #[serde(rename = "response.reasoning_summary_text.delta")]
+    ReasoningSummaryTextDelta {
+        #[serde(default)]
+        delta: String,
+    },
+    /// Live reasoning-text fragment (older path; some model variants emit
+    /// this instead of the summary track).
+    #[serde(rename = "response.reasoning_text.delta")]
+    ReasoningTextDelta {
+        #[serde(default)]
+        delta: String,
+    },
+    /// A fully-formed output item — message, function_call, reasoning.
+    /// Accumulated into the final Completed's `content`.
+    #[serde(rename = "response.output_item.done")]
+    OutputItemDone { item: RspOutputItem },
+    /// Terminal success. Carries `usage` and `status`. The embedded
+    /// `response.output` array may be empty (ChatGPT-subscription path),
+    /// in which case we rely on accumulated `output_item.done`s.
+    #[serde(rename = "response.completed")]
+    ResponseCompleted { response: RspResponse },
+    /// Terminal failure.
+    #[serde(rename = "response.failed")]
+    ResponseFailed {
+        #[serde(default)]
+        response: Option<RspResponse>,
+        #[serde(default)]
+        error: Option<SseError>,
+    },
+    #[serde(other)]
+    Other,
+}
+
+/// Running state for one Responses streaming call — accumulates full
+/// content blocks for the terminal `Completed` event while delta events
+/// fly through to the consumer live.
+#[derive(Default)]
+struct RspStreamState {
+    items: Vec<RspOutputItem>,
+    done: bool,
+}
+
+impl RspStreamState {
+    fn consume(&mut self, event: RspStreamEvent) -> Result<Vec<ModelEvent>, ModelError> {
+        let mut out = Vec::new();
+        match event {
+            RspStreamEvent::OutputTextDelta { delta } => {
+                if !delta.is_empty() {
+                    out.push(ModelEvent::TextDelta { text: delta });
+                }
+            }
+            RspStreamEvent::ReasoningSummaryTextDelta { delta }
+            | RspStreamEvent::ReasoningTextDelta { delta } => {
+                if !delta.is_empty() {
+                    out.push(ModelEvent::ThinkingDelta { text: delta });
+                }
+            }
+            RspStreamEvent::OutputItemDone { item } => {
+                // Emit a ToolCall event for function_call items so the
+                // downstream consumer (the scheduler) has symmetric
+                // coverage with the Anthropic adapter. Message /
+                // reasoning items already streamed as deltas.
+                if let RspOutputItem::FunctionCall {
+                    call_id,
+                    name,
+                    arguments,
+                } = &item
+                {
+                    let input: Value = if arguments.is_empty() {
+                        Value::Object(Default::default())
+                    } else {
+                        serde_json::from_str(arguments).map_err(|e| {
+                            ModelError::Transport(format!(
+                                "function_call arguments not valid JSON: {e}"
+                            ))
+                        })?
+                    };
+                    out.push(ModelEvent::ToolCall {
+                        id: call_id.clone(),
+                        name: name.clone(),
+                        input,
+                    });
+                }
+                self.items.push(item);
+            }
+            RspStreamEvent::ResponseCompleted { response } => {
+                // The server sometimes inlines the full output here (api.openai.com)
+                // and sometimes sends it piecemeal via output_item.done
+                // (ChatGPT-subscription). Prefer the inline list when present.
+                let items = if response.output.is_empty() {
+                    std::mem::take(&mut self.items)
+                } else {
+                    response.output
+                };
+                let (content, stop_reason, usage) = finalize_response(
+                    items,
+                    response.status,
+                    response.incomplete_details,
+                    response.usage,
+                )?;
+                out.push(ModelEvent::Completed {
+                    content,
+                    stop_reason,
+                    usage,
+                });
+                self.done = true;
+            }
+            RspStreamEvent::ResponseFailed { response, error } => {
+                let detail = error
+                    .as_ref()
+                    .map(|e| e.message.clone())
+                    .unwrap_or_else(|| "response.failed".to_string());
+                let status = response
+                    .as_ref()
+                    .and_then(|r| r.status.clone())
+                    .unwrap_or_else(|| "failed".to_string());
+                return Err(ModelError::Api {
+                    status: 500,
+                    body: format!("{status}: {detail}"),
+                });
+            }
+            RspStreamEvent::Other => {}
+        }
+        Ok(out)
+    }
+}
+
+/// Translate a finished item list + terminal metadata into the normalized
+/// content blocks + stop_reason + usage that `ModelEvent::Completed` and
+/// `do_create_message` both want.
+fn finalize_response(
+    items: Vec<RspOutputItem>,
+    status: Option<String>,
+    incomplete_details: Option<RspIncompleteDetails>,
+    usage: Option<RspUsage>,
+) -> Result<(Vec<ContentBlock>, Option<String>, Usage), ModelError> {
+    let mut content: Vec<ContentBlock> = Vec::new();
+    let mut saw_function_call = false;
+    for item in items {
+        match item {
+            RspOutputItem::Reasoning {
+                id,
+                encrypted_content,
+                summary,
+                content: inline_content,
+            } => {
+                let text = summary
+                    .iter()
+                    .chain(inline_content.iter())
+                    .map(|p| match p {
+                        RspReasoningPart::ReasoningText { text }
+                        | RspReasoningPart::SummaryText { text } => text.as_str(),
+                    })
+                    .filter(|s| !s.is_empty())
+                    .collect::<Vec<_>>()
+                    .join("\n\n");
+                let mut replay_data = serde_json::Map::new();
+                if let Some(id) = &id {
+                    replay_data.insert("id".into(), Value::String(id.clone()));
+                }
+                if let Some(ec) = &encrypted_content {
+                    replay_data.insert("encrypted_content".into(), Value::String(ec.clone()));
+                }
+                if !summary.is_empty() {
+                    replay_data.insert(
+                        "summary".into(),
+                        serde_json::to_value(&summary).unwrap_or(Value::Null),
+                    );
+                }
+                let replay = (!replay_data.is_empty()).then(|| ProviderReplay {
+                    provider: PROVIDER_TAG.into(),
+                    data: Value::Object(replay_data),
+                });
+                if replay.is_some() || !text.trim().is_empty() {
+                    content.push(ContentBlock::Thinking {
+                        replay,
+                        thinking: text,
+                    });
+                }
+            }
+            RspOutputItem::Message { content: parts, .. } => {
+                for part in parts {
+                    match part {
+                        RspOutputMessagePart::OutputText { text } => {
+                            if !text.is_empty() {
+                                content.push(ContentBlock::Text { text });
+                            }
+                        }
+                        RspOutputMessagePart::Refusal { refusal } => {
+                            content.push(ContentBlock::Text {
+                                text: format!("[refusal] {refusal}"),
+                            });
+                        }
+                    }
+                }
+            }
+            RspOutputItem::FunctionCall {
+                call_id,
+                name,
+                arguments,
+                ..
+            } => {
+                saw_function_call = true;
+                let input_val: Value = if arguments.is_empty() {
+                    Value::Object(Default::default())
+                } else {
+                    serde_json::from_str(&arguments).map_err(|e| {
+                        ModelError::Transport(format!(
+                            "function_call arguments not valid JSON: {e}"
+                        ))
+                    })?
+                };
+                content.push(ContentBlock::ToolUse {
+                    id: call_id,
+                    name,
+                    input: input_val,
+                    replay: None,
+                });
+            }
+            RspOutputItem::Other => {}
+        }
+    }
+    let stop_reason = derive_stop_reason(
+        status.as_deref(),
+        incomplete_details.as_ref(),
+        saw_function_call,
+    );
+    let usage = usage
+        .map(|u| Usage {
+            input_tokens: u.input_tokens,
+            output_tokens: u.output_tokens,
+            cache_read_input_tokens: u
+                .input_tokens_details
+                .and_then(|d| d.cached_tokens)
+                .unwrap_or(0),
+            cache_creation_input_tokens: 0,
+        })
+        .unwrap_or_default();
+    Ok((content, stop_reason, usage))
 }
 
 // ---------- Wire types (private to this module) ----------
@@ -1155,6 +1393,104 @@ data: {"type":"response.failed","response":{"status":"failed"},"error":{"message
                 assert_eq!(summary.len(), 1);
             }
             _ => panic!("expected Reasoning"),
+        }
+    }
+
+    // ---------- Streaming state machine ----------
+
+    fn feed_events(events: &[&str]) -> (Vec<ModelEvent>, RspStreamState) {
+        let mut state = RspStreamState::default();
+        let mut out = Vec::new();
+        for ev_json in events {
+            let ev: RspStreamEvent = serde_json::from_str(ev_json).unwrap();
+            out.extend(state.consume(ev).unwrap());
+        }
+        (out, state)
+    }
+
+    #[test]
+    fn output_text_delta_emits_textdelta() {
+        let events = [
+            r#"{"type":"response.output_text.delta","delta":"hello "}"#,
+            r#"{"type":"response.output_text.delta","delta":"world"}"#,
+            r#"{"type":"response.output_item.done","item":{"type":"message","content":[{"type":"output_text","text":"hello world"}]}}"#,
+            r#"{"type":"response.completed","response":{"status":"completed","output":[],"usage":{"input_tokens":3,"output_tokens":2}}}"#,
+        ];
+        let (evs, _) = feed_events(&events);
+        let deltas: Vec<&str> = evs
+            .iter()
+            .filter_map(|e| match e {
+                ModelEvent::TextDelta { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(deltas, vec!["hello ", "world"]);
+        match evs.last().unwrap() {
+            ModelEvent::Completed {
+                content,
+                stop_reason,
+                usage,
+            } => {
+                assert_eq!(content.len(), 1);
+                assert!(
+                    matches!(&content[0], ContentBlock::Text { text } if text == "hello world")
+                );
+                assert_eq!(stop_reason.as_deref(), Some("end_turn"));
+                assert_eq!(usage.input_tokens, 3);
+                assert_eq!(usage.output_tokens, 2);
+            }
+            _ => panic!("last event must be Completed"),
+        }
+    }
+
+    #[test]
+    fn reasoning_summary_delta_emits_thinkingdelta_and_replay_survives() {
+        let events = [
+            r#"{"type":"response.reasoning_summary_text.delta","delta":"planning"}"#,
+            r#"{"type":"response.output_item.done","item":{"type":"reasoning","id":"rs_1","encrypted_content":"ec","summary":[{"type":"summary_text","text":"planning"}]}}"#,
+            r#"{"type":"response.completed","response":{"status":"completed","output":[]}}"#,
+        ];
+        let (evs, _) = feed_events(&events);
+        assert!(matches!(&evs[0], ModelEvent::ThinkingDelta { text } if text == "planning"));
+        match evs.last().unwrap() {
+            ModelEvent::Completed { content, .. } => match &content[0] {
+                ContentBlock::Thinking { replay, thinking } => {
+                    assert_eq!(thinking, "planning");
+                    let r = replay.as_ref().expect("reasoning must carry replay");
+                    assert_eq!(r.provider, "openai_responses");
+                    assert_eq!(r.data["encrypted_content"], "ec");
+                    assert_eq!(r.data["id"], "rs_1");
+                }
+                _ => panic!("expected Thinking"),
+            },
+            _ => panic!("expected Completed"),
+        }
+    }
+
+    #[test]
+    fn function_call_item_emits_toolcall_once_assembled() {
+        // OpenAI's function_call item arrives fully-formed as
+        // output_item.done — no partial-JSON streaming exposed.
+        let events = [
+            r#"{"type":"response.output_item.done","item":{"type":"function_call","call_id":"c1","name":"shell","arguments":"{\"cmd\":\"ls\"}"}}"#,
+            r#"{"type":"response.completed","response":{"status":"completed","output":[]}}"#,
+        ];
+        let (evs, _) = feed_events(&events);
+        let tool_calls: Vec<_> = evs
+            .iter()
+            .filter_map(|e| match e {
+                ModelEvent::ToolCall { name, input, .. } => Some((name.as_str(), input.clone())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(tool_calls.len(), 1);
+        assert_eq!(tool_calls[0].0, "shell");
+        assert_eq!(tool_calls[0].1, serde_json::json!({"cmd": "ls"}));
+        match evs.last().unwrap() {
+            ModelEvent::Completed { stop_reason, .. } => {
+                assert_eq!(stop_reason.as_deref(), Some("tool_use"));
+            }
+            _ => panic!("expected Completed"),
         }
     }
 }
