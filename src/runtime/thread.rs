@@ -451,6 +451,25 @@ impl Thread {
         self.touch();
     }
 
+    /// Append a tool-output text message and transition the thread
+    /// toward its next model call. Same state transition as
+    /// [`Self::submit_user_message`] — the only difference is the
+    /// appended message's `Role` (`ToolResult` instead of `User`) so
+    /// clients and adapters can classify the append without content-
+    /// block inspection.
+    pub fn submit_tool_result_text(&mut self, text: String, pending_resources: Vec<String>) {
+        self.conversation.push(Message::tool_result_text(text));
+        self.turns_in_cycle = 0;
+        self.internal = if pending_resources.is_empty() {
+            ThreadInternalState::NeedsModelCall
+        } else {
+            ThreadInternalState::WaitingOnResources {
+                needed: pending_resources,
+            }
+        };
+        self.touch();
+    }
+
     /// Drop a now-Ready resource id from the `WaitingOnResources` set.
     /// Returns whether the thread is now ready to step (its `needed` set
     /// emptied as a result). No-op for any state other than

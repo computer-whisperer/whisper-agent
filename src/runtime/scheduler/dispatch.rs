@@ -454,7 +454,7 @@ impl Scheduler {
                 parent = %parent_thread_id, child = %child_id,
                 "dispatch_thread: flushing async delivery as user message"
             );
-            self.send_user_message(parent_thread_id, text, pending_io);
+            self.send_tool_result_text(parent_thread_id, text, pending_io);
             // Step the parent so the new user message actually kicks
             // a model call instead of sitting idle. Subsequent
             // deliveries in this loop will find the parent in a

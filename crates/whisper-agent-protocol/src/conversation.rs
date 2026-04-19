@@ -69,6 +69,24 @@ impl Message {
             content: blocks,
         }
     }
+
+    /// Construct a tool-output message carrying unstructured text —
+    /// used for async tool-call callbacks that can't bind to the
+    /// original `tool_use_id` (the initial synchronous ack already
+    /// consumed it). The role still marks the message as tool output
+    /// so clients can render it distinctly from user-typed text and
+    /// the webui can reroute the payload back to the originating
+    /// tool-call item. On the wire, provider adapters fold
+    /// `Role::ToolResult` back to their native user-role shape
+    /// (Anthropic: `user`; OpenAI chat / responses: `user` for text
+    /// content), so the model sees it as a normal follow-up user
+    /// turn.
+    pub fn tool_result_text(text: impl Into<String>) -> Self {
+        Self {
+            role: Role::ToolResult,
+            content: vec![ContentBlock::Text { text: text.into() }],
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]

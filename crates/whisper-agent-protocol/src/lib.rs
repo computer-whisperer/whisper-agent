@@ -819,6 +819,22 @@ pub enum ServerToClient {
         thread_id: String,
         text: String,
     },
+    /// A `Role::ToolResult` text message was appended to the
+    /// conversation. Fires for async `dispatch_thread` callbacks
+    /// (where the child's final result can't bind to the original
+    /// tool_use_id because the sync ack already consumed it) and any
+    /// future server-injected tool-output text. Distinct from
+    /// `ThreadUserMessage` so the webui can render it as a tool
+    /// output (parse the dispatched-thread-notification envelope,
+    /// route the inner `<result>` into the originating tool call's
+    /// result slot, collapsed by default) rather than as a plain
+    /// user turn. Structured `ToolResult` content blocks (the normal
+    /// synchronous tool-call result path) continue to flow through
+    /// `ThreadToolCallEnd` unchanged.
+    ThreadToolResultMessage {
+        thread_id: String,
+        text: String,
+    },
     ThreadAssistantBegin {
         thread_id: String,
         turn: u32,

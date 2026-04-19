@@ -1337,6 +1337,47 @@ impl Scheduler {
             });
     }
 
+    /// Append a `Role::ToolResult` + text message to `thread_id`'s
+    /// conversation and kick the model turn, same shape as
+    /// [`Self::send_user_message`] but broadcasts a
+    /// `ThreadToolResultMessage` event so clients can render it as
+    /// tool output rather than user input. Used for async
+    /// `dispatch_thread` callbacks (and any future server-injected
+    /// tool output) — the originating `tool_use_id` has already been
+    /// consumed by the synchronous ack, so the callback can't bind
+    /// to it structurally; the role carries the intent and the webui
+    /// parses the embedded XML envelope to reattach the payload to
+    /// the right tool-call item.
+    pub(super) fn send_tool_result_text(
+        &mut self,
+        thread_id: &str,
+        text: String,
+        pending_io: &mut FuturesUnordered<SchedulerFuture>,
+    ) {
+        self.mark_dirty(thread_id);
+        self.ensure_host_env_provisioning(thread_id, pending_io);
+        // Deliberately don't derive a title from this text — a
+        // machine-rendered notification isn't a useful thread title.
+        let pending_resources = self.pending_resources_for(thread_id);
+        let new_state = {
+            let task = self.tasks.get_mut(thread_id).expect("task exists");
+            task.submit_tool_result_text(text.clone(), pending_resources);
+            task.public_state()
+        };
+        self.router.broadcast_to_subscribers(
+            thread_id,
+            ServerToClient::ThreadToolResultMessage {
+                thread_id: thread_id.to_string(),
+                text,
+            },
+        );
+        self.router
+            .broadcast_task_list(ServerToClient::ThreadStateChanged {
+                thread_id: thread_id.to_string(),
+                state: new_state,
+            });
+    }
+
     /// Apply one per-thread I/O completion to its task and dispatch any
     /// resulting events. Resource-provisioning completions take a
     /// different path; see [`Self::apply_provision_completion`].

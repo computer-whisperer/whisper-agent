@@ -1049,11 +1049,26 @@ impl ChatApp {
                 // Fires for both user-typed follow-ups (the webui used
                 // to add these optimistically; that's now removed so
                 // the server echo is the single source of truth) and
-                // server-injected text (dispatch_thread async
-                // notifications, compaction continuation seeds,
-                // behavior-trigger prompts).
+                // server-injected text (compaction continuation seeds,
+                // behavior-trigger prompts). Async dispatch callbacks
+                // travel a distinct event (`ThreadToolResultMessage`).
                 if let Some(view) = self.tasks.get_mut(&thread_id) {
                     view.items.push(DisplayItem::User { text });
+                }
+            }
+            ServerToClient::ThreadToolResultMessage { thread_id, text } => {
+                // Tool-output text appended to the conversation. For
+                // async `dispatch_thread` callbacks the payload is a
+                // `<dispatched-thread-notification>` envelope — parse
+                // out the originating tool_use_id and route the inner
+                // `<result>` into that tool call's result slot so it
+                // renders identically to a sync dispatch (collapsed
+                // by default, linked to the tool-call item). If the
+                // parse fails or the matching tool call isn't in the
+                // current view, fall back to a system-note row that
+                // at least keeps the text visible.
+                if let Some(view) = self.tasks.get_mut(&thread_id) {
+                    apply_tool_result_text(&mut view.items, &text);
                 }
             }
             ServerToClient::ThreadAssistantBegin { .. } => {}
@@ -1667,17 +1682,25 @@ fn conversation_to_items(conv: &Conversation) -> Vec<DisplayItem> {
 
 fn add_message_items(msg: &Message, out: &mut Vec<DisplayItem>) {
     match msg.role {
-        Role::User | Role::ToolResult => {
-            // Both roles share a per-block pass. Role::User messages
-            // carry user-typed / server-injected text; Role::ToolResult
-            // messages carry only tool_result blocks. Keeping a single
-            // block-level match here means either role is robust if
-            // it happens to contain the other's block type (e.g.
-            // hand-edited JSON from before the role split).
+        Role::User => {
+            for block in &msg.content {
+                if let ContentBlock::Text { text } = block {
+                    out.push(DisplayItem::User { text: text.clone() });
+                }
+            }
+        }
+        Role::ToolResult => {
+            // Role::ToolResult carries either structured ToolResult
+            // content blocks (sync tool-call results) or plain text
+            // (async `dispatch_thread` callbacks). The first backfill
+            // into their originating tool-call item; the second runs
+            // through the XML-aware `apply_tool_result_text` helper
+            // so async callbacks also land on the originating tool
+            // call rather than rendering as a standalone blob.
             for block in &msg.content {
                 match block {
                     ContentBlock::Text { text } => {
-                        out.push(DisplayItem::User { text: text.clone() })
+                        apply_tool_result_text(out, text);
                     }
                     ContentBlock::ToolResult {
                         tool_use_id,
@@ -1685,7 +1708,6 @@ fn add_message_items(msg: &Message, out: &mut Vec<DisplayItem>) {
                         is_error,
                     } => {
                         let text = tool_result_text(content);
-                        // Backfill the result onto a matching ToolCall item, or push a system note.
                         let mut matched = false;
                         for existing in out.iter_mut().rev() {
                             if let DisplayItem::ToolCall {
@@ -1740,6 +1762,83 @@ fn add_message_items(msg: &Message, out: &mut Vec<DisplayItem>) {
             }
         }
     }
+}
+
+/// Apply a `Role::ToolResult` + text payload to the current display
+/// item stream. For `dispatch_thread` async callbacks the payload is
+/// a `<dispatched-thread-notification>` envelope — we extract the
+/// original `tool-use-id` and the inner `<result>` and backfill the
+/// matching tool-call item so the rendering is identical to sync
+/// dispatch (collapsed by default, linked to the tool call). Any
+/// other shape (parse failure, unrecognized envelope, missing tool
+/// call) falls back to a `SystemNote` row so the text stays visible
+/// and the operator can see what the server injected.
+fn apply_tool_result_text(items: &mut Vec<DisplayItem>, text: &str) {
+    if let Some((tool_use_id, result_body, is_error)) = parse_dispatch_notification(text) {
+        for existing in items.iter_mut().rev() {
+            if let DisplayItem::ToolCall {
+                tool_use_id: id,
+                result,
+                is_error: err,
+                ..
+            } = existing
+                && id == &tool_use_id
+            {
+                *result = Some(result_body);
+                *err = is_error;
+                return;
+            }
+        }
+        // Envelope parsed but no matching tool-call item — surface
+        // the text as a system note so it isn't invisible.
+        items.push(DisplayItem::SystemNote {
+            text: format!("[orphaned dispatch notification {tool_use_id}]: {result_body}"),
+            is_error,
+        });
+        return;
+    }
+    // Not a recognized envelope — keep the text visible.
+    items.push(DisplayItem::SystemNote {
+        text: text.to_string(),
+        is_error: false,
+    });
+}
+
+/// Parse a `<dispatched-thread-notification>` XML envelope emitted by
+/// the server's async dispatch flush. Returns `(tool_use_id, result,
+/// is_error)` on a match. Deliberately string-based rather than a
+/// full XML parser — our envelope is a fixed shape, tiny, and the
+/// server XML-escapes its fields, so a tag-bounded scan is enough.
+/// Returns `None` on any structural mismatch so the caller falls
+/// back to a generic display.
+fn parse_dispatch_notification(text: &str) -> Option<(String, String, bool)> {
+    if !text
+        .trim_start()
+        .starts_with("<dispatched-thread-notification>")
+    {
+        return None;
+    }
+    let tool_use_id = extract_tagged_value(text, "tool-use-id")?;
+    let result = extract_tagged_value(text, "result").unwrap_or_default();
+    let status = extract_tagged_value(text, "status").unwrap_or_default();
+    let is_error = matches!(status.as_str(), "failed" | "cancelled");
+    // Unescape the XML-escaped <result> body so diffs / code show
+    // through correctly rather than as `&lt;T&gt;`.
+    Some((tool_use_id, unescape_xml(&result), is_error))
+}
+
+fn extract_tagged_value(text: &str, tag: &str) -> Option<String> {
+    let open = format!("<{tag}>");
+    let close = format!("</{tag}>");
+    let start = text.find(&open)? + open.len();
+    let end_rel = text[start..].find(&close)?;
+    Some(text[start..start + end_rel].to_string())
+}
+
+fn unescape_xml(s: &str) -> String {
+    s.replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&amp;", "&")
 }
 
 /// Build a `DisplayItem::ToolCall` from the wire shape (full input
