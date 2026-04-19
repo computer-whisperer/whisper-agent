@@ -198,6 +198,17 @@ fn build_request_body<'a>(req: &'a ModelRequest<'a>) -> CreateMessageRequest<'a>
 /// hierarchy in this module just to add one optional field.
 fn message_to_value(m: &Message, cache_last_block: bool) -> Value {
     let mut v = serde_json::to_value(m).expect("Message is serializable");
+    // Role translation on the way out: our internal model has
+    // `Role::ToolResult` as a distinct role, but Anthropic's wire
+    // format only accepts `user` and `assistant` and expects tool
+    // results inside user-role messages with `tool_result` content
+    // blocks. Our content blocks are already in that shape — just
+    // rewrite the role.
+    if let Some(role) = v.get_mut("role")
+        && role.as_str() == Some("tool_result")
+    {
+        *role = Value::String("user".into());
+    }
     if !cache_last_block {
         return v;
     }
