@@ -10,12 +10,8 @@
 //! Tool calls and tool results each render as their own collapsible
 //! row at the position they landed in the conversation. Tool-call
 //! headers read `name summary`; tool-result headers read `name
-//! preview [status]`. All tool calls collapse by default. Tool
-//! results default to collapsed when they immediately follow their
-//! call (dense, expected); they default to expanded when separated
-//! from their call by an assistant or user turn (typically an async
-//! `dispatch_thread` callback) so the operator sees the fresh
-//! content without clicking.
+//! preview [status]`. Both default to collapsed; click the toggle
+//! to expand and see the full args / diff / result.
 
 use egui::{Color32, RichText};
 use egui_commonmark::{CommonMarkCache, CommonMarkViewer};
@@ -86,8 +82,7 @@ pub(super) fn render_item(ui: &mut egui::Ui, cache: &mut CommonMarkCache, item: 
                 name,
                 text,
                 is_error,
-                default_open,
-            } => render_tool_result(ui, tool_use_id, name, text, *is_error, *default_open),
+            } => render_tool_result(ui, tool_use_id, name, text, *is_error),
             DisplayItem::SystemNote { text, is_error } => render_system_note(ui, text, *is_error),
         }
     });
@@ -219,20 +214,17 @@ fn render_tool_call(
         });
 }
 
-/// Render a tool-result row. Proximity to the originating tool call
-/// drives the default-open state: results immediately following
-/// their call default-collapsed (dense, expected, quiet); results
-/// arriving after an intervening assistant/user turn default-
-/// expanded so the operator sees the new content. Header shows
-/// `name summary [status]`; expanded body shows the full result
-/// text.
+/// Render a tool-result row. Always default-collapsed — the row
+/// renders as a one-line `name preview [status]` header; clicking
+/// expands to show the full result text. Matches the treatment of
+/// tool calls and reasoning rows so the chat stream stays quiet
+/// by default.
 fn render_tool_result(
     ui: &mut egui::Ui,
     tool_use_id: &str,
     name: &str,
     text: &str,
     is_error: bool,
-    default_open: bool,
 ) {
     // Hash the result text into the persistent id so multiple
     // ToolResult rows that share a tool_use_id (sync ack + later
@@ -251,7 +243,7 @@ fn render_tool_result(
         ("ok", Color32::from_rgb(140, 200, 140))
     };
     let label = if name.is_empty() { "tool_result" } else { name };
-    egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), id, default_open)
+    egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), id, false)
         .show_header(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.label(RichText::new(label).color(COLOR_TOOL).strong().monospace());
