@@ -21,8 +21,18 @@
 //!   assistant text and fires the sender.
 //!
 //! - Async case: the future resolves immediately with a text result
-//!   carrying the child's id. The child runs detached; nothing is
-//!   registered in `pending_dispatches`.
+//!   carrying the child's id so the parent can continue. A separate
+//!   entry keyed by the same child id is also stashed in
+//!   `pending_dispatches`, recording the parent's original tool_use_id
+//!   so the eventual notification can echo it back for correlation.
+//!   When the child reaches terminal, `resolve_pending_dispatch`
+//!   renders a `<dispatched-thread-notification>` XML envelope (shape
+//!   mirrors Claude Code's `<task-notification>` for
+//!   `Agent run_in_background: true`) and hands it to
+//!   [`Scheduler::flush_ready_async_deliveries`], which injects it as
+//!   a fresh user message on the parent's conversation once the
+//!   parent is idle enough to accept one — kicking a new turn so the
+//!   LLM sees the sub-result.
 //!
 //! - Cancellation cascade: when any thread reaches terminal while it
 //!   still has dispatched-child senders keyed to it as a parent,
@@ -74,21 +84,28 @@ pub(super) struct PendingDispatch {
 /// - [`Async`] — async: the parent's dispatch_thread tool call already
 ///   returned an immediate "Dispatched task-X" ack, so there's no
 ///   parked tool result to fill. Instead, when the child terminates
-///   we inject the final text as a fresh **user** message on the
-///   parent's conversation (if the parent can accept one), which
-///   kicks a new turn. Matches the "MCP returns a message, LLM gets
-///   another turn" pattern — async is the same routing as sync, just
-///   delivered via a new turn rather than the tool-result slot.
-///   `pending_text` is `None` until the child terminates; once set,
-///   the delivery is flushed to the parent the next time the parent
-///   reaches an idle-enough state (`Thread::is_idle`). A parent that
+///   we render a `<dispatched-thread-notification>` XML envelope and
+///   inject it as a fresh **user** message on the parent's
+///   conversation (if the parent can accept one), which kicks a new
+///   turn. Matches the "MCP returns a message, LLM gets another turn"
+///   pattern, and the envelope shape mirrors Claude Code's own
+///   `<task-notification>` for `Agent run_in_background: true`:
+///   task/tool_use id stamps for correlation, a short summary, the
+///   full child final text inline, and a usage block. A parent that
 ///   ends up Failed or Cancelled before flush drops the delivery.
+///
+/// `parent_tool_use_id` is stashed so the rendered notification can
+/// echo it back for the model's correlation. `pending_notification` is
+/// `None` until the child terminates; once set, it's the fully-
+/// rendered XML envelope, ready to be sent as a user message by
+/// [`Scheduler::flush_ready_async_deliveries`].
 pub(super) enum DispatchDelivery {
     ToolResult {
         sender: oneshot::Sender<Result<String, String>>,
     },
     Async {
-        pending_text: Option<String>,
+        parent_tool_use_id: String,
+        pending_notification: Option<String>,
     },
 }
 
@@ -184,7 +201,10 @@ impl Scheduler {
                 child_id.clone(),
                 PendingDispatch {
                     parent_thread_id: parent_id.clone(),
-                    delivery: DispatchDelivery::Async { pending_text: None },
+                    delivery: DispatchDelivery::Async {
+                        parent_tool_use_id: tool_use_id.clone(),
+                        pending_notification: None,
+                    },
                 },
             );
             None
@@ -252,9 +272,18 @@ impl Scheduler {
         thread_id: &str,
         pending_io: &mut FuturesUnordered<SchedulerFuture>,
     ) {
-        if !self.pending_dispatches.contains_key(thread_id) {
-            return;
-        }
+        // Grab the parent_tool_use_id for async rendering BEFORE we
+        // re-borrow `self.tasks`. Sync entries don't have one; we only
+        // need it for the Async render path.
+        let parent_tool_use_id = match self.pending_dispatches.get(thread_id) {
+            Some(pd) => match &pd.delivery {
+                DispatchDelivery::Async {
+                    parent_tool_use_id, ..
+                } => Some(parent_tool_use_id.clone()),
+                DispatchDelivery::ToolResult { .. } => None,
+            },
+            None => return,
+        };
         let Some(task) = self.tasks.get(thread_id) else {
             // Thread vanished — drop the pending entry. For sync, the
             // receiver gets a RecvError which the future maps to a
@@ -263,15 +292,52 @@ impl Scheduler {
             return;
         };
         let state = task.public_state();
-        let msg = match state {
-            ThreadStateLabel::Completed => Ok(extract_last_assistant_text(task)),
-            ThreadStateLabel::Failed => Err(format!(
-                "dispatched child `{thread_id}` failed: {}",
-                task.failure_detail()
-                    .unwrap_or_else(|| "unknown error".into())
-            )),
+        // Sync uses Result<text, err_msg> to drive the oneshot; async
+        // renders a richer XML notification envelope from the same
+        // child state. Both branches compute what they need from `task`
+        // before re-borrowing `self.pending_dispatches` mutably. The
+        // render helper no-ops gracefully when `parent_tool_use_id`
+        // is None (sync path), so a bad borrow here can only produce
+        // an empty string, never bad data.
+        let parent_tool_use_id_ref = parent_tool_use_id.as_deref().unwrap_or("");
+        let (sync_msg, async_notification) = match state {
+            ThreadStateLabel::Completed => {
+                let text = extract_last_assistant_text(task);
+                let notification = render_dispatch_notification(
+                    task,
+                    parent_tool_use_id_ref,
+                    DispatchStatus::Completed,
+                    &text,
+                );
+                (Ok(text), notification)
+            }
+            ThreadStateLabel::Failed => {
+                let detail = task
+                    .failure_detail()
+                    .unwrap_or_else(|| "unknown error".into());
+                let body = format!("child failed: {detail}");
+                let notification = render_dispatch_notification(
+                    task,
+                    parent_tool_use_id_ref,
+                    DispatchStatus::Failed,
+                    &body,
+                );
+                (
+                    Err(format!("dispatched child `{thread_id}` failed: {detail}")),
+                    notification,
+                )
+            }
             ThreadStateLabel::Cancelled => {
-                Err(format!("dispatched child `{thread_id}` was cancelled"))
+                let notification = render_dispatch_notification(
+                    task,
+                    parent_tool_use_id_ref,
+                    DispatchStatus::Cancelled,
+                    "",
+                );
+                (
+                    Err(format!("dispatched child `{thread_id}` was cancelled")),
+                    notification,
+                )
             }
             // Not terminal — leave the entry in place, wait for the
             // next step that pushes this thread to terminal.
@@ -294,22 +360,14 @@ impl Scheduler {
                     // send() only fails when the receiver has been
                     // dropped — i.e. the parent already terminated. Not
                     // a scheduler-level error; nothing to deliver to.
-                    let _ = sender.send(msg);
+                    let _ = sender.send(sync_msg);
                 }
             }
-            DispatchDelivery::Async { pending_text } => {
-                // Stash the final text (or the error text) on the
-                // entry; the flush hook will inject it as a user
-                // message once the parent is idle enough. An async
-                // dispatch surfaces child failures as a human-readable
-                // note rather than an error tool result — the parent's
-                // dispatch_thread call already closed out with the
-                // "dispatched" ack, so there's no error channel per se.
-                let text = match msg {
-                    Ok(t) => format!("[dispatched thread `{thread_id}` completed]\n{t}"),
-                    Err(e) => format!("[dispatched thread `{thread_id}` ended] {e}"),
-                };
-                *pending_text = Some(text);
+            DispatchDelivery::Async {
+                pending_notification,
+                ..
+            } => {
+                *pending_notification = Some(async_notification);
                 // Try flushing now — if the parent happens to already
                 // be idle, we don't want to wait for its next step to
                 // notice. Common case: parent already Completed before
@@ -345,7 +403,8 @@ impl Scheduler {
                 }
                 match &pd.delivery {
                     DispatchDelivery::Async {
-                        pending_text: Some(text),
+                        pending_notification: Some(text),
+                        ..
                     } => Some((child_id.clone(), text.clone())),
                     _ => None,
                 }
@@ -515,4 +574,110 @@ fn immediate_err(
             scheduler_command: None,
         })
     })
+}
+
+#[derive(Debug, Clone, Copy)]
+enum DispatchStatus {
+    Completed,
+    Failed,
+    Cancelled,
+}
+
+impl DispatchStatus {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Completed => "completed",
+            Self::Failed => "failed",
+            Self::Cancelled => "cancelled",
+        }
+    }
+}
+
+/// Render the `<dispatched-thread-notification>` envelope for the
+/// async delivery path. Shape mirrors Claude Code's `<task-notification>`:
+/// stamps (thread-id + original parent tool_use_id) for correlation,
+/// a short summary, the child's final `<result>` inline (XML-escaped),
+/// and a `<usage>` block. The resulting string is injected as the text
+/// content of a fresh user message on the parent's conversation.
+fn render_dispatch_notification(
+    task: &crate::runtime::thread::Thread,
+    parent_tool_use_id: &str,
+    status: DispatchStatus,
+    body: &str,
+) -> String {
+    let title = task.title.as_deref().unwrap_or(task.id.as_str());
+    let summary = format!("dispatched thread \"{}\" {}", title, status.as_str());
+    let total_tokens = task
+        .total_usage
+        .input_tokens
+        .saturating_add(task.total_usage.output_tokens);
+    let tool_uses = count_tool_uses(&task.conversation);
+    let duration_ms = (task.last_active - task.created_at)
+        .num_milliseconds()
+        .max(0);
+    let mut out = String::new();
+    out.push_str("<dispatched-thread-notification>\n");
+    out.push_str(&format!(
+        "  <thread-id>{}</thread-id>\n",
+        escape_xml(&task.id)
+    ));
+    out.push_str(&format!(
+        "  <tool-use-id>{}</tool-use-id>\n",
+        escape_xml(parent_tool_use_id)
+    ));
+    out.push_str(&format!("  <status>{}</status>\n", status.as_str()));
+    out.push_str(&format!("  <summary>{}</summary>\n", escape_xml(&summary)));
+    out.push_str(&format!("  <result>{}</result>\n", escape_xml(body)));
+    out.push_str(&format!(
+        "  <usage><total_tokens>{total_tokens}</total_tokens><tool_uses>{tool_uses}</tool_uses><duration_ms>{duration_ms}</duration_ms></usage>\n"
+    ));
+    out.push_str("</dispatched-thread-notification>");
+    out
+}
+
+fn count_tool_uses(conv: &whisper_agent_protocol::Conversation) -> u32 {
+    use whisper_agent_protocol::{ContentBlock, Role};
+    let mut n: u32 = 0;
+    for msg in conv.messages() {
+        if msg.role != Role::Assistant {
+            continue;
+        }
+        for block in &msg.content {
+            if matches!(block, ContentBlock::ToolUse { .. }) {
+                n = n.saturating_add(1);
+            }
+        }
+    }
+    n
+}
+
+fn escape_xml(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn escape_xml_handles_angle_and_amp() {
+        assert_eq!(escape_xml("<T>&"), "&lt;T&gt;&amp;");
+        assert_eq!(escape_xml("plain"), "plain");
+    }
+
+    #[test]
+    fn dispatch_status_str() {
+        assert_eq!(DispatchStatus::Completed.as_str(), "completed");
+        assert_eq!(DispatchStatus::Failed.as_str(), "failed");
+        assert_eq!(DispatchStatus::Cancelled.as_str(), "cancelled");
+    }
 }
