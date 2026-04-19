@@ -7,7 +7,7 @@ use clap::{Parser, Subcommand};
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 use whisper_agent_protocol::sandbox::{HostEnvSpec, NetworkPolicy, PathAccess};
-use whisper_agent_protocol::{ApprovalPolicy, ThreadConfig};
+use whisper_agent_protocol::ThreadConfig;
 
 use whisper_agent::pod::config::Config;
 use whisper_agent::providers::anthropic::AnthropicClient;
@@ -139,9 +139,12 @@ struct ServeArgs {
     #[arg(long, default_value_t = 16384)]
     max_tokens: u32,
 
-    /// Prompt the user before running non-read-only tool calls. Default is to
-    /// auto-approve everything — the sandbox layer is the safety boundary.
-    #[arg(long)]
+    /// Deprecated — the `--prompt-destructive` flag previously selected
+    /// an `ApprovalPolicy` preset. Approval policy is now expressed per-pod
+    /// as `[allow.tools]` in pod.toml (default disposition + per-tool
+    /// overrides). Set this flag on the command line and it's ignored.
+    #[arg(long, hide = true)]
+    #[allow(dead_code)]
     prompt_destructive: bool,
 
     /// Register a host-env provider from the CLI: `name=url`. Each
@@ -442,11 +445,6 @@ async fn run_serve(args: ServeArgs) -> Result<()> {
             system_prompt: args.system_prompt,
             max_tokens: args.max_tokens,
             max_turns: args.max_turns,
-            approval_policy: if args.prompt_destructive {
-                ApprovalPolicy::PromptDestructive
-            } else {
-                ApprovalPolicy::PromptPodModify
-            },
             compaction: Default::default(),
         },
         default_host_env,

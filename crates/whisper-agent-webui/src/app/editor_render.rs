@@ -18,10 +18,18 @@ use whisper_agent_protocol::sandbox::{
     AccessMode, Mount, NetworkPolicy, PathAccess, ResourceLimits,
 };
 use whisper_agent_protocol::{
-    ApprovalPolicy, BehaviorConfig, BehaviorSnapshot as BehaviorSnapshotProto, BehaviorSummary,
-    CatchUp, HostEnvProviderInfo, HostEnvSpec, ModelSummary, Overlap, PodConfig, RetentionPolicy,
-    TriggerSpec,
+    BehaviorConfig, BehaviorSnapshot as BehaviorSnapshotProto, BehaviorSummary, CatchUp,
+    Disposition, HostEnvProviderInfo, HostEnvSpec, ModelSummary, Overlap, PodConfig,
+    RetentionPolicy, TriggerSpec,
 };
+
+fn disposition_label(d: Disposition) -> &'static str {
+    match d {
+        Disposition::Allow => "allow",
+        Disposition::AllowWithPrompt => "allow with prompt",
+        Disposition::Deny => "deny",
+    }
+}
 
 use super::{SandboxEntryEditorState, spec_label};
 
@@ -314,28 +322,39 @@ pub(super) fn render_pod_editor_defaults_tab(
             );
             ui.end_row();
 
-            ui.label("approval policy");
-            ComboBox::from_id_salt("pod_editor_defaults_approval")
-                .selected_text(approval_policy_label(
-                    working.thread_defaults.approval_policy,
-                ))
+            ui.label("tool gate default");
+            ComboBox::from_id_salt("pod_editor_tools_default")
+                .selected_text(disposition_label(working.allow.tools.default))
                 .show_ui(ui, |ui| {
                     ui.selectable_value(
-                        &mut working.thread_defaults.approval_policy,
-                        ApprovalPolicy::AutoApproveAll,
-                        approval_policy_label(ApprovalPolicy::AutoApproveAll),
+                        &mut working.allow.tools.default,
+                        Disposition::Allow,
+                        disposition_label(Disposition::Allow),
                     );
                     ui.selectable_value(
-                        &mut working.thread_defaults.approval_policy,
-                        ApprovalPolicy::PromptPodModify,
-                        approval_policy_label(ApprovalPolicy::PromptPodModify),
+                        &mut working.allow.tools.default,
+                        Disposition::AllowWithPrompt,
+                        disposition_label(Disposition::AllowWithPrompt),
                     );
                     ui.selectable_value(
-                        &mut working.thread_defaults.approval_policy,
-                        ApprovalPolicy::PromptDestructive,
-                        approval_policy_label(ApprovalPolicy::PromptDestructive),
+                        &mut working.allow.tools.default,
+                        Disposition::Deny,
+                        disposition_label(Disposition::Deny),
                     );
                 });
+            ui.end_row();
+
+            // Per-tool override count — full per-tool editor is deferred.
+            // Edit overrides via the raw-toml tab for now.
+            let override_count = working.allow.tools.overrides.len();
+            ui.label("tool overrides");
+            if override_count == 0 {
+                ui.label("(none)");
+            } else {
+                ui.label(format!(
+                    "{override_count} tool(s) — edit via raw TOML"
+                ));
+            }
             ui.end_row();
 
             ui.label("host env");
@@ -746,39 +765,9 @@ pub(super) fn render_behavior_editor_thread_tab(
             );
             render_optional_u32_row(ui, "max_turns", &mut cfg.thread.max_turns, 1, 500, 30);
 
-            ui.label("approval_policy");
-            let mut ap_set = cfg.thread.approval_policy.is_some();
-            let mut ap_val = cfg.thread.approval_policy.unwrap_or_default();
-            ui.horizontal(|ui| {
-                if ui.checkbox(&mut ap_set, "override").changed() {
-                    cfg.thread.approval_policy = if ap_set { Some(ap_val) } else { None };
-                }
-                ui.add_enabled_ui(ap_set, |ui| {
-                    egui::ComboBox::from_id_salt("behavior_approval_policy")
-                        .selected_text(approval_policy_label(ap_val))
-                        .show_ui(ui, |ui| {
-                            for policy in [
-                                ApprovalPolicy::AutoApproveAll,
-                                ApprovalPolicy::PromptPodModify,
-                                ApprovalPolicy::PromptDestructive,
-                            ] {
-                                if ui
-                                    .selectable_label(
-                                        ap_val == policy,
-                                        approval_policy_label(policy),
-                                    )
-                                    .clicked()
-                                {
-                                    ap_val = policy;
-                                }
-                            }
-                        });
-                });
-                if ap_set {
-                    cfg.thread.approval_policy = Some(ap_val);
-                }
-            });
-            ui.end_row();
+            // approval_policy row removed — tool gate now lives at pod
+            // level as `allow.tools` (edited on the Allow tab). Behavior
+            // threads inherit the pod's tool gate.
         });
 
     ui.add_space(10.0);
@@ -1599,15 +1588,6 @@ pub(super) fn trigger_kind_label(trigger: &TriggerSpec) -> &'static str {
     }
 }
 
-pub(super) fn approval_policy_label(p: ApprovalPolicy) -> &'static str {
-    match p {
-        ApprovalPolicy::AutoApproveAll => "auto — approve all tool calls",
-        ApprovalPolicy::PromptPodModify => "prompt — ask before pod-config edits",
-        ApprovalPolicy::PromptDestructive => {
-            "prompt — ask before destructive or pod-config tool calls"
-        }
-    }
-}
 
 pub(super) fn spec_type_label(spec: &HostEnvSpec) -> &'static str {
     match spec {

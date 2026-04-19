@@ -262,7 +262,6 @@ impl Scheduler {
             system_prompt: Some(old_config.system_prompt.clone()),
             max_tokens: Some(old_config.max_tokens),
             max_turns: Some(old_config.max_turns),
-            approval_policy: Some(old_config.approval_policy),
             compaction: None, // inherit pod's compaction defaults again
         });
         let bindings_request = Some(whisper_agent_protocol::ThreadBindingsRequest {

@@ -22,8 +22,8 @@ use std::collections::{BTreeSet, HashMap};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use whisper_agent_protocol::{
-    ApprovalChoice, ApprovalPolicy, BehaviorOrigin, ContentBlock, Conversation, Message, Role,
-    ThreadBindings, ThreadConfig, ThreadSnapshot, ThreadStateLabel, ThreadSummary,
+    AllowMap, ApprovalChoice, BehaviorOrigin, ContentBlock, Conversation, Disposition, Message,
+    Role, ThreadBindings, ThreadConfig, ThreadSnapshot, ThreadStateLabel, ThreadSummary,
     ToolResultContent, TurnEntry, TurnLog, Usage,
 };
 
@@ -64,9 +64,17 @@ pub struct Thread {
     /// Turns issued in the current user-message cycle; resets on user message.
     #[serde(default)]
     pub turns_in_cycle: u32,
-    /// Per-task "always allow" set keyed by tool name. Calls to a name in this
-    /// set bypass the approval prompt regardless of `approval_policy`. Persisted
-    /// with the task, so the allowlist survives restart.
+    /// Snapshot of the pod's tool gate (`PodAllow.tools`) at thread-
+    /// creation time. Consulted at approval-check time. Stored on the
+    /// thread rather than looked up from the pod so mid-flight edits to
+    /// the pod's allow table don't retroactively change a thread's
+    /// active scope — rebind is the explicit path for that.
+    #[serde(default = "AllowMap::allow_all")]
+    pub tools_scope: AllowMap<String>,
+    /// Per-thread "always allow" set keyed by tool name. Calls to a
+    /// name in this set bypass a `AllowWithPrompt` disposition from
+    /// `tools_scope` — the "remember this approval" action adds a name
+    /// here. Persisted with the thread.
     #[serde(default)]
     pub tool_allowlist: BTreeSet<String>,
     /// Provenance stamp for threads spawned by a behavior trigger. `None`
@@ -326,7 +334,13 @@ pub enum ThreadEvent {
 }
 
 impl Thread {
-    pub fn new(id: String, pod_id: String, config: ThreadConfig, bindings: ThreadBindings) -> Self {
+    pub fn new(
+        id: String,
+        pod_id: String,
+        config: ThreadConfig,
+        bindings: ThreadBindings,
+        tools_scope: AllowMap<String>,
+    ) -> Self {
         let now = Utc::now();
         Self {
             id,
@@ -341,6 +355,7 @@ impl Thread {
             turn_log: TurnLog::default(),
             archived: false,
             turns_in_cycle: 0,
+            tools_scope,
             tool_allowlist: BTreeSet::new(),
             origin: None,
             continued_from: None,
@@ -445,6 +460,7 @@ impl Thread {
             turn_log,
             archived: false,
             turns_in_cycle: 0,
+            tools_scope: self.tools_scope.clone(),
             tool_allowlist: self.tool_allowlist.clone(),
             origin: None,
             continued_from: None,
@@ -829,16 +845,19 @@ impl Thread {
             return;
         }
 
-        // Evaluate approval policy for each tool_use.
+        // Evaluate approval disposition for each tool_use. Consults the
+        // thread's `tools_scope` (snapshot of the pod's `allow.tools`)
+        // and the thread's `tool_allowlist` (per-tool remember-approval
+        // overrides). Tool annotations are retained for the
+        // PendingApproval event's destructive/read_only hints.
         let mut dispositions: Vec<ApprovalDisposition> = Vec::with_capacity(tool_uses.len());
         let mut auto_reasons: HashMap<String, String> = HashMap::new();
         let mut any_pending = false;
         for tool_use in &tool_uses {
             let empty = ToolAnnotations::default();
             let ann = tool_annotations.get(&tool_use.name).unwrap_or(&empty);
-            let allowlisted = self.tool_allowlist.contains(&tool_use.name);
-            let is_pod_modify = crate::tools::builtin_tools::is_pod_modify(&tool_use.name);
-            match evaluate_policy(self.config.approval_policy, ann, allowlisted, is_pod_modify) {
+            match evaluate_scope_disposition(&self.tools_scope, &self.tool_allowlist, &tool_use.name)
+            {
                 ApprovalOutcome::Auto(reason) => {
                     auto_reasons.insert(tool_use.tool_use_id.clone(), reason.clone());
                     dispositions.push(ApprovalDisposition::AutoApproved { reason });
@@ -1187,42 +1206,36 @@ enum ApprovalOutcome {
     Prompt,
 }
 
-fn evaluate_policy(
-    policy: ApprovalPolicy,
-    annotations: &ToolAnnotations,
-    allowlisted: bool,
-    is_pod_modify: bool,
+/// Translate a scope `Disposition` into the thread's approval outcome,
+/// layering the per-tool remember-approval allowlist on top.
+///
+/// Interim Phase-4a behavior: a tool in the thread's `tool_allowlist`
+/// upgrades an `AllowWithPrompt` disposition to `Allow`. A pod-level
+/// `Deny` cannot be overridden by the allowlist — deny wins.
+/// A `Deny` tool reaches this path only because the Phase-2 migration
+/// of tool calls to Functions hasn't landed yet (where `Deny` would be
+/// rejected at registration); here we treat it as a prompt so the user
+/// can explicitly refuse, which is the safe fallback.
+fn evaluate_scope_disposition(
+    tools_scope: &AllowMap<String>,
+    tool_allowlist: &BTreeSet<String>,
+    tool_name: &str,
 ) -> ApprovalOutcome {
-    if allowlisted {
-        return ApprovalOutcome::Auto("policy:allowlist".into());
-    }
-    // Read-only tools skip the prompt under every policy except
-    // AutoApproveAll (which we've already handled more broadly). The
-    // pod_read_file builtin carries read_only_hint: true, so it falls
-    // into this branch and auto-approves without needing a pod-modify
-    // check.
-    match policy {
-        ApprovalPolicy::AutoApproveAll => ApprovalOutcome::Auto("policy:auto_approve_all".into()),
-        ApprovalPolicy::PromptPodModify => {
-            if is_pod_modify {
-                ApprovalOutcome::Prompt
+    let base = tools_scope.disposition(&tool_name.to_string());
+    let final_disp = match base {
+        Disposition::AllowWithPrompt if tool_allowlist.contains(tool_name) => Disposition::Allow,
+        other => other,
+    };
+    match final_disp {
+        Disposition::Allow => {
+            let reason = if tool_allowlist.contains(tool_name) {
+                "policy:allowlist".into()
             } else {
-                ApprovalOutcome::Auto("policy:non_pod_modify".into())
-            }
+                "policy:scope_allow".into()
+            };
+            ApprovalOutcome::Auto(reason)
         }
-        ApprovalPolicy::PromptDestructive => {
-            if is_pod_modify {
-                // Pod-modify tools prompt under PromptDestructive
-                // regardless of their annotations — the "destructive"
-                // framing extends to anything that changes the agent's
-                // own allowed capability set.
-                ApprovalOutcome::Prompt
-            } else if annotations.is_read_only() {
-                ApprovalOutcome::Auto("policy:read_only".into())
-            } else {
-                ApprovalOutcome::Prompt
-            }
-        }
+        Disposition::AllowWithPrompt | Disposition::Deny => ApprovalOutcome::Prompt,
     }
 }
 
@@ -1320,7 +1333,7 @@ fn truncate(mut s: String, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use whisper_agent_protocol::ApprovalPolicy;
+    use std::collections::BTreeMap;
 
     #[test]
     fn truncate_handles_multibyte_boundary() {
@@ -1349,10 +1362,15 @@ mod tests {
             system_prompt: "test".into(),
             max_tokens: 100,
             max_turns: 10,
-            approval_policy: ApprovalPolicy::PromptDestructive,
             compaction: Default::default(),
         };
-        let mut task = Thread::new("t1".into(), "t1".into(), cfg, ThreadBindings::default());
+        let mut task = Thread::new(
+            "t1".into(),
+            "t1".into(),
+            cfg,
+            ThreadBindings::default(),
+            AllowMap::allow_all(),
+        );
         let tool_uses: Vec<ToolUseReq> = tool_names
             .iter()
             .enumerate()
@@ -1440,54 +1458,49 @@ mod tests {
     }
 
     #[test]
-    fn allowlist_short_circuits_evaluate_policy() {
-        let read_only_ann = ToolAnnotations::default();
-        let allowlisted = matches!(
-            evaluate_policy(
-                ApprovalPolicy::PromptDestructive,
-                &read_only_ann,
-                true,
-                false
-            ),
+    fn scope_disposition_allow_auto_approves() {
+        let scope = AllowMap::allow_all();
+        let allowlist = BTreeSet::new();
+        assert!(matches!(
+            evaluate_scope_disposition(&scope, &allowlist, "edit_file"),
             ApprovalOutcome::Auto(_)
-        );
-        let not_listed = matches!(
-            evaluate_policy(
-                ApprovalPolicy::PromptDestructive,
-                &read_only_ann,
-                false,
-                false
-            ),
-            ApprovalOutcome::Prompt
-        );
-        assert!(allowlisted, "allowlisted call must auto-resolve");
-        assert!(not_listed, "non-allowlisted unannotated call must prompt");
+        ));
     }
 
     #[test]
-    fn prompt_pod_modify_auto_approves_mcp_prompts_builtin() {
-        let any_ann = ToolAnnotations {
-            destructive_hint: Some(true),
-            ..ToolAnnotations::default()
+    fn scope_disposition_allow_with_prompt_prompts_unless_allowlisted() {
+        let scope = AllowMap {
+            default: Disposition::AllowWithPrompt,
+            overrides: BTreeMap::new(),
         };
-        // MCP destructive tool under PromptPodModify: auto.
+        let empty = BTreeSet::new();
         assert!(matches!(
-            evaluate_policy(ApprovalPolicy::PromptPodModify, &any_ann, false, false),
+            evaluate_scope_disposition(&scope, &empty, "edit_file"),
+            ApprovalOutcome::Prompt
+        ));
+        let mut with_listed = BTreeSet::new();
+        with_listed.insert("edit_file".to_string());
+        assert!(matches!(
+            evaluate_scope_disposition(&scope, &with_listed, "edit_file"),
             ApprovalOutcome::Auto(_)
         ));
-        // Pod-modify tool under PromptPodModify: prompt.
+    }
+
+    #[test]
+    fn scope_disposition_per_tool_override_wins_over_default() {
+        let scope = AllowMap {
+            default: Disposition::Allow,
+            overrides: [("bash".to_string(), Disposition::AllowWithPrompt)]
+                .into_iter()
+                .collect(),
+        };
+        let allowlist = BTreeSet::new();
         assert!(matches!(
-            evaluate_policy(ApprovalPolicy::PromptPodModify, &any_ann, false, true),
+            evaluate_scope_disposition(&scope, &allowlist, "bash"),
             ApprovalOutcome::Prompt
         ));
-        // Pod-modify tool under PromptDestructive: also prompt.
         assert!(matches!(
-            evaluate_policy(ApprovalPolicy::PromptDestructive, &any_ann, false, true),
-            ApprovalOutcome::Prompt
-        ));
-        // Everything is auto under AutoApproveAll.
-        assert!(matches!(
-            evaluate_policy(ApprovalPolicy::AutoApproveAll, &any_ann, false, true),
+            evaluate_scope_disposition(&scope, &allowlist, "read_file"),
             ApprovalOutcome::Auto(_)
         ));
     }
@@ -1507,7 +1520,6 @@ mod tests {
             system_prompt: "test".into(),
             max_tokens: 100,
             max_turns: 10,
-            approval_policy: ApprovalPolicy::PromptDestructive,
             compaction: Default::default(),
         }
     }
@@ -1518,6 +1530,7 @@ mod tests {
             "pod".into(),
             base_config_for_fork(),
             ThreadBindings::default(),
+            AllowMap::allow_all(),
         );
         // [user, assistant, user, assistant] — two complete turns.
         task.conversation.push(Message::user_text("hi"));

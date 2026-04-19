@@ -9,7 +9,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::ApprovalPolicy;
+use crate::permission::AllowMap;
 use crate::sandbox::HostEnvSpec;
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
@@ -35,6 +35,14 @@ pub struct PodAllow {
     pub mcp_hosts: Vec<String>,
     #[serde(default)]
     pub host_env: Vec<NamedHostEnv>,
+    /// Tool gate — default disposition for unlisted tools plus per-tool
+    /// overrides. Replaces the old `thread_defaults.approval_policy`
+    /// preset enum; threads in the pod inherit this map as their
+    /// effective tool scope, which they narrow with their own
+    /// remember-approval entries. When omitted, defaults to `allow_all`
+    /// (matches the old `AutoApproveAll` preset).
+    #[serde(default = "AllowMap::allow_all")]
+    pub tools: AllowMap<String>,
 }
 
 /// One pod-level "host env" entry — a named (provider, spec) pair the
@@ -70,8 +78,6 @@ pub struct ThreadDefaults {
     pub system_prompt_file: String,
     pub max_tokens: u32,
     pub max_turns: u32,
-    #[serde(default)]
-    pub approval_policy: ApprovalPolicy,
     /// Name of one of the `[[allow.host_env]]` entries. Empty allowed
     /// only when `[allow].host_env` is empty.
     #[serde(default)]

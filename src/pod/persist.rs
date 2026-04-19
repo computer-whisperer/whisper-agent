@@ -649,6 +649,7 @@ fn synthesize_pod_config(task: &Thread) -> PodConfig {
             backends: vec![backend.clone()],
             mcp_hosts: Vec::new(),
             host_env: Vec::new(),
+            tools: whisper_agent_protocol::AllowMap::allow_all(),
         },
         thread_defaults: ThreadDefaults {
             backend,
@@ -656,7 +657,6 @@ fn synthesize_pod_config(task: &Thread) -> PodConfig {
             system_prompt_file: "system_prompt.md".into(),
             max_tokens: task.config.max_tokens,
             max_turns: task.config.max_turns,
-            approval_policy: task.config.approval_policy,
             host_env: String::new(),
             mcp_hosts: Vec::new(),
             compaction: task.config.compaction.clone(),
@@ -669,7 +669,7 @@ fn synthesize_pod_config(task: &Thread) -> PodConfig {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU64, Ordering};
-    use whisper_agent_protocol::{ApprovalPolicy, ThreadBindings, ThreadConfig};
+    use whisper_agent_protocol::{AllowMap, ThreadBindings, ThreadConfig};
 
     static COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -689,6 +689,7 @@ mod tests {
                 backends: vec!["anthropic".into()],
                 mcp_hosts: Vec::new(),
                 host_env: Vec::new(),
+                tools: AllowMap::allow_all(),
             },
             thread_defaults: ThreadDefaults {
                 backend: "anthropic".into(),
@@ -696,7 +697,6 @@ mod tests {
                 system_prompt_file: "system_prompt.md".into(),
                 max_tokens: 8000,
                 max_turns: 30,
-                approval_policy: ApprovalPolicy::PromptPodModify,
                 host_env: String::new(),
                 mcp_hosts: Vec::new(),
                 compaction: Default::default(),
@@ -711,7 +711,6 @@ mod tests {
             system_prompt: "Hello.".into(),
             max_tokens: 8000,
             max_turns: 50,
-            approval_policy: ApprovalPolicy::PromptDestructive,
             compaction: Default::default(),
         };
         let bindings = ThreadBindings {
@@ -720,7 +719,7 @@ mod tests {
             mcp_hosts: vec![format!("mcp-primary-{id}"), "mcp-shared-fetch".into()],
             tool_filter: None,
         };
-        let mut task = Thread::new(id.into(), id.into(), cfg, bindings);
+        let mut task = Thread::new(id.into(), id.into(), cfg, bindings, AllowMap::allow_all());
         task.title = Some("Sample task".into());
         task
     }

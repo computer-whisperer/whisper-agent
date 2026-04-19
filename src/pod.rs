@@ -197,7 +197,7 @@ mod tests {
     use super::*;
     use whisper_agent_protocol::sandbox::{NetworkPolicy, PathAccess};
     use whisper_agent_protocol::{
-        ApprovalPolicy, HostEnvSpec, NamedHostEnv, PodAllow, PodLimits, ThreadDefaults,
+        AllowMap, Disposition, HostEnvSpec, NamedHostEnv, PodAllow, PodLimits, ThreadDefaults,
     };
 
     fn sample_config() -> PodConfig {
@@ -226,6 +226,12 @@ mod tests {
                         },
                     },
                 ],
+                tools: AllowMap {
+                    default: Disposition::Allow,
+                    overrides: [("bash".to_string(), Disposition::AllowWithPrompt)]
+                        .into_iter()
+                        .collect(),
+                },
             },
             thread_defaults: ThreadDefaults {
                 backend: "anthropic".into(),
@@ -233,7 +239,6 @@ mod tests {
                 system_prompt_file: "system_prompt.md".into(),
                 max_tokens: 32000,
                 max_turns: 100,
-                approval_policy: ApprovalPolicy::PromptDestructive,
                 host_env: "landlock-rw".into(),
                 mcp_hosts: vec!["fetch".into(), "search".into()],
                 compaction: Default::default(),

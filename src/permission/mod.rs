@@ -10,130 +10,15 @@
 //!
 //! See `docs/design_functions.md` for the full design rationale.
 //!
-//! **Status: Phase 1a — types only.** Declared here but not yet consumed by
-//! pod/thread/scheduler code. Wiring follows in Phase 1b.
+//! `Disposition` and `AllowMap<T>` are re-exported from
+//! `whisper-agent-protocol::permission` so server and webui share the
+//! canonical wire shapes; everything else lives here.
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
-// ---------------------------------------------------------------------------
-// Disposition
-// ---------------------------------------------------------------------------
-
-/// What the scope admits for a given item.
-///
-/// The derive-order `Allow < AllowWithPrompt < Deny` is the
-/// restrictiveness ordering used by narrowing composition — the *more*
-/// restrictive disposition wins when two scopes intersect.
-#[derive(
-    Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default,
-)]
-#[serde(rename_all = "snake_case")]
-pub enum Disposition {
-    #[default]
-    Allow,
-    AllowWithPrompt,
-    Deny,
-}
-
-impl Disposition {
-    /// Combine two dispositions under narrowing composition: more
-    /// restrictive wins. `narrow(Allow, AllowWithPrompt) == AllowWithPrompt`.
-    pub fn narrow(self, other: Self) -> Self {
-        self.max(other)
-    }
-
-    /// Does this disposition admit the operation at all (with or without
-    /// prompting)? `true` for `Allow` and `AllowWithPrompt`, `false` for
-    /// `Deny`.
-    pub fn admits(self) -> bool {
-        !matches!(self, Self::Deny)
-    }
-
-    /// Does this disposition require user prompting before the operation
-    /// proceeds? Only `AllowWithPrompt`. `Deny` does not prompt — it
-    /// rejects at registration.
-    pub fn requires_prompt(self) -> bool {
-        matches!(self, Self::AllowWithPrompt)
-    }
-}
-
-// ---------------------------------------------------------------------------
-// AllowMap
-// ---------------------------------------------------------------------------
-
-/// Per-item disposition with a default for unlisted items.
-///
-/// Narrowing composition picks the more restrictive disposition per item:
-/// for any `k`, the result's disposition is
-/// `narrow(self.disposition(k), other.disposition(k))`.
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-pub struct AllowMap<T: Ord + Clone> {
-    pub default: Disposition,
-    #[serde(default = "BTreeMap::new", skip_serializing_if = "BTreeMap::is_empty")]
-    pub overrides: BTreeMap<T, Disposition>,
-}
-
-impl<T: Ord + Clone> AllowMap<T> {
-    /// All items admitted with `Allow` (no prompts, no denies).
-    pub fn allow_all() -> Self {
-        Self {
-            default: Disposition::Allow,
-            overrides: BTreeMap::new(),
-        }
-    }
-
-    /// All items denied.
-    pub fn deny_all() -> Self {
-        Self {
-            default: Disposition::Deny,
-            overrides: BTreeMap::new(),
-        }
-    }
-
-    /// Disposition for `item`: override if present, otherwise default.
-    pub fn disposition(&self, item: &T) -> Disposition {
-        self.overrides
-            .get(item)
-            .copied()
-            .unwrap_or(self.default)
-    }
-
-    /// Narrow `self` with `other`: more-restrictive disposition wins per item.
-    ///
-    /// Post-narrow default is `narrow(self.default, other.default)`. Overrides
-    /// that equal the post-narrow default are elided to keep the map small.
-    pub fn narrow(&self, other: &Self) -> Self {
-        let default = self.default.narrow(other.default);
-        let all_keys: BTreeSet<&T> = self.overrides.keys().chain(other.overrides.keys()).collect();
-        let mut overrides = BTreeMap::new();
-        for k in all_keys {
-            let merged = self.disposition(k).narrow(other.disposition(k));
-            if merged != default {
-                overrides.insert(k.clone(), merged);
-            }
-        }
-        Self { default, overrides }
-    }
-
-    /// Upgrade a specific item's disposition to `Allow`, ignoring whatever
-    /// the underlying default/override said. Used for per-tool
-    /// remember-approval overrides.
-    pub fn set_allow(&mut self, item: T) {
-        if self.default == Disposition::Allow {
-            self.overrides.remove(&item);
-        } else {
-            self.overrides.insert(item, Disposition::Allow);
-        }
-    }
-}
-
-impl<T: Ord + Clone> Default for AllowMap<T> {
-    fn default() -> Self {
-        Self::deny_all()
-    }
-}
+pub use whisper_agent_protocol::permission::{AllowMap, Disposition};
 
 // ---------------------------------------------------------------------------
 // Per-pod operation enumerations
@@ -425,113 +310,9 @@ impl PermissionScope {
 mod tests {
     use super::*;
 
-    #[test]
-    fn disposition_ordering_is_restrictiveness() {
-        assert!(Disposition::Allow < Disposition::AllowWithPrompt);
-        assert!(Disposition::AllowWithPrompt < Disposition::Deny);
-    }
-
-    #[test]
-    fn disposition_narrow_picks_more_restrictive() {
-        use Disposition::*;
-        assert_eq!(Allow.narrow(Allow), Allow);
-        assert_eq!(Allow.narrow(AllowWithPrompt), AllowWithPrompt);
-        assert_eq!(AllowWithPrompt.narrow(Allow), AllowWithPrompt);
-        assert_eq!(AllowWithPrompt.narrow(Deny), Deny);
-        assert_eq!(Deny.narrow(Allow), Deny);
-    }
-
-    #[test]
-    fn allowmap_disposition_uses_override_when_present() {
-        let mut m: AllowMap<String> = AllowMap::allow_all();
-        m.overrides.insert("bash".into(), Disposition::AllowWithPrompt);
-        assert_eq!(m.disposition(&"bash".into()), Disposition::AllowWithPrompt);
-        assert_eq!(m.disposition(&"read_file".into()), Disposition::Allow);
-    }
-
-    #[test]
-    fn allowmap_narrow_intersects_per_item() {
-        use Disposition::*;
-        let a: AllowMap<String> = AllowMap {
-            default: Allow,
-            overrides: [("bash".to_string(), AllowWithPrompt)]
-                .into_iter()
-                .collect(),
-        };
-        let b: AllowMap<String> = AllowMap {
-            default: AllowWithPrompt,
-            overrides: [("bash".to_string(), Deny)].into_iter().collect(),
-        };
-        let r = a.narrow(&b);
-        assert_eq!(r.default, AllowWithPrompt);
-        assert_eq!(r.disposition(&"bash".to_string()), Deny);
-        assert_eq!(r.disposition(&"read_file".to_string()), AllowWithPrompt);
-    }
-
-    #[test]
-    fn allowmap_narrow_missing_key_falls_back_to_default() {
-        use Disposition::*;
-        let a: AllowMap<String> = AllowMap::allow_all();
-        let b: AllowMap<String> = AllowMap {
-            default: Allow,
-            overrides: [("bash".to_string(), AllowWithPrompt)]
-                .into_iter()
-                .collect(),
-        };
-        let r = a.narrow(&b);
-        assert_eq!(r.default, Allow);
-        assert_eq!(r.disposition(&"bash".to_string()), AllowWithPrompt);
-        assert_eq!(r.disposition(&"anything_else".to_string()), Allow);
-    }
-
-    #[test]
-    fn allowmap_elides_redundant_overrides() {
-        // After narrowing, overrides that equal the post-narrow default
-        // should be dropped.
-        use Disposition::*;
-        let a: AllowMap<String> = AllowMap {
-            default: Allow,
-            overrides: [("bash".to_string(), AllowWithPrompt)]
-                .into_iter()
-                .collect(),
-        };
-        let b: AllowMap<String> = AllowMap {
-            default: AllowWithPrompt,
-            overrides: BTreeMap::new(),
-        };
-        let r = a.narrow(&b);
-        // Default becomes AllowWithPrompt; bash was AllowWithPrompt, which
-        // equals the new default, so the override is elided.
-        assert_eq!(r.default, AllowWithPrompt);
-        assert!(r.overrides.is_empty());
-    }
-
-    #[test]
-    fn allowmap_set_allow_upgrades_item() {
-        use Disposition::*;
-        let mut m: AllowMap<String> = AllowMap {
-            default: Allow,
-            overrides: [("bash".to_string(), AllowWithPrompt)]
-                .into_iter()
-                .collect(),
-        };
-        m.set_allow("bash".to_string());
-        // set_allow on a default-Allow map just removes the override.
-        assert!(m.overrides.is_empty());
-        assert_eq!(m.disposition(&"bash".to_string()), Allow);
-    }
-
-    #[test]
-    fn allowmap_set_allow_inserts_override_when_default_is_not_allow() {
-        use Disposition::*;
-        let mut m: AllowMap<String> = AllowMap {
-            default: AllowWithPrompt,
-            overrides: BTreeMap::new(),
-        };
-        m.set_allow("bash".to_string());
-        assert_eq!(m.disposition(&"bash".to_string()), Allow);
-        assert_eq!(m.disposition(&"other".to_string()), AllowWithPrompt);
-    }
+    // Disposition / AllowMap tests live in `whisper-agent-protocol::permission`
+    // — the types are owned there. These tests cover only the main-crate
+    // types (PodsScope, PermissionScope, etc.).
 
     #[test]
     fn pods_scope_all_admits_any_pod() {

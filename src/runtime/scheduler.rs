@@ -1230,7 +1230,21 @@ impl Scheduler {
             tool_filter: None,
         };
 
-        let mut task = Thread::new(thread_id.clone(), pod_id.clone(), config, bindings);
+        // Snapshot the pod's tool-scope into the thread; mid-flight
+        // edits to the pod's allow.tools won't retroactively change
+        // the thread's active scope (rebind is the explicit path).
+        let tools_scope = self
+            .pods
+            .get(&pod_id)
+            .map(|p| p.config.allow.tools.clone())
+            .unwrap_or_else(whisper_agent_protocol::AllowMap::allow_all);
+        let mut task = Thread::new(
+            thread_id.clone(),
+            pod_id.clone(),
+            config,
+            bindings,
+            tools_scope,
+        );
         if let Some(origin) = origin {
             task = task.with_origin(origin);
         }

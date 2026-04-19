@@ -4,7 +4,8 @@
 //! top) are readable without the surrounding lifecycle noise.
 
 use whisper_agent_protocol::{
-    CompactionConfig, HostEnvSpec, ThreadBindingsRequest, ThreadConfig, ThreadConfigOverride,
+    AllowMap, CompactionConfig, HostEnvSpec, ThreadBindingsRequest, ThreadConfig,
+    ThreadConfigOverride,
 };
 
 use crate::pod::Pod;
@@ -52,6 +53,10 @@ pub fn build_default_pod_config(
             backends: backend_names.to_vec(),
             mcp_hosts: shared_host_names.to_vec(),
             host_env: host_env_entries,
+            // Default pod starts with the equivalent of the old
+            // AutoApproveAll preset — every tool admitted without a
+            // prompt. Real pods tighten this by editing pod.toml.
+            tools: AllowMap::allow_all(),
         },
         thread_defaults: ThreadDefaults {
             backend: default_backend.to_string(),
@@ -59,7 +64,6 @@ pub fn build_default_pod_config(
             system_prompt_file: "system_prompt.md".into(),
             max_tokens: config.max_tokens,
             max_turns: config.max_turns,
-            approval_policy: config.approval_policy,
             host_env: default_host_env_name,
             mcp_hosts: shared_host_names.to_vec(),
             compaction: CompactionConfig::default(),
@@ -78,7 +82,6 @@ pub(super) fn base_thread_config_from_pod(pod: &Pod) -> ThreadConfig {
         system_prompt: pod.system_prompt.clone(),
         max_tokens: defaults.max_tokens,
         max_turns: defaults.max_turns,
-        approval_policy: defaults.approval_policy,
         compaction: defaults.compaction.clone(),
     }
 }
@@ -94,7 +97,6 @@ pub(super) fn apply_config_override(
         system_prompt: ov.system_prompt.unwrap_or(base.system_prompt),
         max_tokens: ov.max_tokens.unwrap_or(base.max_tokens),
         max_turns: ov.max_turns.unwrap_or(base.max_turns),
-        approval_policy: ov.approval_policy.unwrap_or(base.approval_policy),
         compaction,
     }
 }
@@ -129,14 +131,12 @@ pub(super) fn behavior_override_to_requests(
     let config_override = if ov.model.is_some()
         || ov.max_tokens.is_some()
         || ov.max_turns.is_some()
-        || ov.approval_policy.is_some()
     {
         Some(ThreadConfigOverride {
             model: ov.model.clone(),
             system_prompt: None, // behaviors inherit pod system_prompt
             max_tokens: ov.max_tokens,
             max_turns: ov.max_turns,
-            approval_policy: ov.approval_policy,
             compaction: None, // behaviors inherit pod compaction policy
         })
     } else {
@@ -203,7 +203,6 @@ mod tests {
             model: Some("sonnet-4-6".into()),
             max_tokens: Some(8192),
             max_turns: Some(20),
-            approval_policy: Some(whisper_agent_protocol::ApprovalPolicy::AutoApproveAll),
             bindings: BehaviorBindingsOverride {
                 backend: Some("anthropic".into()),
                 host_env: Some("readonly".into()),
@@ -215,10 +214,6 @@ mod tests {
         assert_eq!(cfg.model.as_deref(), Some("sonnet-4-6"));
         assert_eq!(cfg.max_tokens, Some(8192));
         assert_eq!(cfg.max_turns, Some(20));
-        assert!(matches!(
-            cfg.approval_policy,
-            Some(whisper_agent_protocol::ApprovalPolicy::AutoApproveAll)
-        ));
         // Behaviors never override system_prompt — pod default is authoritative.
         assert!(cfg.system_prompt.is_none());
         let b = bindings.expect("bindings_request populated");

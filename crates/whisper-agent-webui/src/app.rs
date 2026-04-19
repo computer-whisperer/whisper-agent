@@ -16,7 +16,7 @@ mod editor_render;
 
 use self::chat_render::{ChatItemEvent, render_item};
 use self::editor_render::{
-    approval_policy_label, behavior_summary_from_snapshot, hint, render_behavior_editor_prompt_tab,
+    behavior_summary_from_snapshot, hint, render_behavior_editor_prompt_tab,
     render_behavior_editor_raw_tab, render_behavior_editor_retention_tab,
     render_behavior_editor_thread_tab, render_behavior_editor_trigger_tab,
     render_pod_editor_allow_tab, render_pod_editor_defaults_tab, render_pod_editor_limits_tab,
@@ -32,7 +32,7 @@ use egui::{Color32, ComboBox, Grid, RichText, ScrollArea, TextEdit};
 use egui_commonmark::CommonMarkCache;
 use whisper_agent_protocol::sandbox::NetworkPolicy;
 use whisper_agent_protocol::{
-    ApprovalChoice, ApprovalPolicy, BackendSummary, BehaviorConfig, BehaviorOrigin,
+    AllowMap, ApprovalChoice, BackendSummary, BehaviorConfig, BehaviorOrigin,
     BehaviorSnapshot as BehaviorSnapshotProto, BehaviorSummary, BehaviorThreadOverride,
     ClientToServer, ContentBlock, Conversation, HostEnvBinding, HostEnvProviderInfo, HostEnvSpec,
     Message, ModelSummary, NamedHostEnv, PodAllow, PodConfig, PodLimits, PodSummary,
@@ -283,7 +283,6 @@ struct ThreadInspector {
     system_prompt: String,
     max_tokens: u32,
     max_turns: u32,
-    approval_policy: Option<ApprovalPolicy>,
     bindings: ThreadBindings,
     origin: Option<BehaviorOrigin>,
     created_at: String,
@@ -318,7 +317,6 @@ impl TaskView {
                 system_prompt: String::new(),
                 max_tokens: 0,
                 max_turns: 0,
-                approval_policy: None,
                 bindings: ThreadBindings::default(),
                 origin,
                 created_at,
@@ -1103,7 +1101,6 @@ impl ChatApp {
                     system_prompt: snapshot.config.system_prompt.clone(),
                     max_tokens: snapshot.config.max_tokens,
                     max_turns: snapshot.config.max_turns,
-                    approval_policy: Some(snapshot.config.approval_policy),
                     bindings: snapshot.bindings.clone(),
                     origin: snapshot.origin.clone(),
                     created_at: snapshot.created_at.clone(),
@@ -4147,6 +4144,7 @@ impl ChatApp {
                 backends: backend_names,
                 mcp_hosts: Vec::new(),
                 host_env: Vec::<NamedHostEnv>::new(),
+                tools: AllowMap::allow_all(),
             },
             thread_defaults: ThreadDefaults {
                 backend: default_backend,
@@ -4154,7 +4152,6 @@ impl ChatApp {
                 system_prompt_file: "system_prompt.md".into(),
                 max_tokens: 16384,
                 max_turns: 30,
-                approval_policy: ApprovalPolicy::PromptPodModify,
                 host_env: String::new(),
                 mcp_hosts: Vec::new(),
                 compaction: Default::default(),
@@ -4358,9 +4355,6 @@ fn render_thread_context_inspector(ui: &mut egui::Ui, thread_id: &str, view: &Ta
                 }
                 if inspector.max_turns > 0 {
                     kv_row(ui, "max_turns", &inspector.max_turns.to_string());
-                }
-                if let Some(policy) = inspector.approval_policy {
-                    kv_row(ui, "approval_policy", approval_policy_label(policy));
                 }
                 let host_env_label = match &inspector.bindings.host_env {
                     Some(HostEnvBinding::Named { name }) => name.clone(),

@@ -10,8 +10,11 @@
 
 pub mod behavior;
 pub mod conversation;
+pub mod permission;
 pub mod pod;
 pub mod sandbox;
+
+pub use permission::{AllowMap, Disposition};
 
 pub use behavior::{
     BehaviorBindingsOverride, BehaviorConfig, BehaviorOrigin, BehaviorOutcome, BehaviorSnapshot,
@@ -108,8 +111,6 @@ pub struct ThreadConfig {
     pub system_prompt: String,
     pub max_tokens: u32,
     pub max_turns: u32,
-    #[serde(default)]
-    pub approval_policy: ApprovalPolicy,
     /// Policy for compacting an overlong thread into a continuation.
     /// Inherits from the pod's `thread_defaults.compaction`; per-thread
     /// overrides come in via [`ThreadConfigOverride.compaction`].
@@ -127,8 +128,6 @@ pub struct ThreadConfigOverride {
     pub max_tokens: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_turns: Option<u32>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub approval_policy: Option<ApprovalPolicy>,
     /// Per-field compaction override. Fields left `None` inherit from
     /// the pod's defaults; any set field replaces it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -283,31 +282,6 @@ pub enum HostEnvRebind {
 pub struct HostEnvProviderInfo {
     /// User-facing catalog name (matches `NamedHostEnv.provider`).
     pub name: String,
-}
-
-/// Pattern-1 approval policy. See `docs/design_permissions.md`.
-///
-/// Default is `AutoApproveAll` because the sandbox layer (landlock /
-/// containers) is the primary safety boundary. Opt into `PromptDestructive`
-/// when running without a sandbox or when human-in-loop is desired.
-#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
-#[serde(rename_all = "snake_case")]
-pub enum ApprovalPolicy {
-    /// Auto-approve every tool call.
-    AutoApproveAll,
-    /// Auto-approve read-only and non-pod-modifying tools; prompt on the
-    /// builtin pod-editing tools (which can expand the agent's own
-    /// privileges). Default for new pods — the sandbox layer is the
-    /// primary safety boundary, but the agent's ability to edit its
-    /// own pod config is a privilege-escalation vector and gets a
-    /// distinct gate.
-    #[default]
-    PromptPodModify,
-    /// Auto-approve only tools the MCP server marked `readOnlyHint: true`;
-    /// prompt on destructive MCP tools AND on pod-modifying builtin tools.
-    /// Strictest useful policy — use when running without a sandbox or when
-    /// human-in-loop is desired for every non-trivial action.
-    PromptDestructive,
 }
 
 /// User's decision on a pending approval.

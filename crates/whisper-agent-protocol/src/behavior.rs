@@ -8,8 +8,6 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::ApprovalPolicy;
-
 /// Parsed `behavior.toml`. Round-trips through TOML; every field is
 /// covered by a serde default so hand-written files can omit
 /// everything but `name`.
@@ -117,8 +115,6 @@ pub struct BehaviorThreadOverride {
     pub max_tokens: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_turns: Option<u32>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub approval_policy: Option<ApprovalPolicy>,
     #[serde(default)]
     pub bindings: BehaviorBindingsOverride,
 }
