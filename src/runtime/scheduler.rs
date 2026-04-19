@@ -61,8 +61,7 @@ use crate::runtime::io_dispatch::{
     SchedulerFuture,
 };
 use crate::runtime::thread::{
-    ApprovalDisposition, IoResult, OpId, StepOutcome, Thread, ThreadInternalState, derive_title,
-    new_task_id,
+    IoResult, OpId, StepOutcome, Thread, ThreadInternalState, derive_title, new_task_id,
 };
 use crate::server::thread_router::ThreadEventRouter;
 use crate::tools::mcp::{McpSession, ToolAnnotations, ToolDescriptor as McpTool};
@@ -1767,7 +1766,7 @@ impl Scheduler {
                     // calls — the parent is parked on a oneshot
                     // receiver, no extra scheduler state beyond
                     // `pending_dispatches`.
-                    let fut = match req {
+                    match req {
                         crate::runtime::thread::IoRequest::ToolCall {
                             op_id,
                             tool_use_id,
@@ -1782,41 +1781,48 @@ impl Scheduler {
                                 input.clone(),
                                 pending_io,
                             ) {
-                                // dispatch_thread is destined to become a
-                                // CreateThread Function (Phase 5). Don't
-                                // register a BuiltinToolCall entry for it
-                                // — that'd shadow the eventual
-                                // CreateThread Function.
-                                fut
+                                // dispatch_thread — falls through the Function
+                                // path; CreateThread Function lands in Phase 5.
+                                pending_io.push(fut);
                             } else {
-                                // Register a tool-call Function entry
-                                // that shadows the in-flight work. The
-                                // IO future is still the executor;
-                                // `apply_io_completion` closes out the
-                                // Function when the result lands.
-                                self.register_tool_function(
-                                    thread_id,
-                                    &tool_use_id,
-                                    &name,
-                                    input.clone(),
-                                );
-                                io_dispatch::build_io_future(
-                                    self,
-                                    thread_id.to_string(),
-                                    crate::runtime::thread::IoRequest::ToolCall {
-                                        op_id,
-                                        tool_use_id,
-                                        name,
-                                        input,
-                                    },
-                                )
+                                // Tool Function registers + decides dispatch
+                                // based on scope disposition.
+                                use self::functions::ToolDispatchDecision;
+                                let io_request = crate::runtime::thread::IoRequest::ToolCall {
+                                    op_id,
+                                    tool_use_id,
+                                    name,
+                                    input,
+                                };
+                                match self.register_tool_function(thread_id, io_request.clone()) {
+                                    ToolDispatchDecision::PushImmediately => {
+                                        let fut = io_dispatch::build_io_future(
+                                            self,
+                                            thread_id.to_string(),
+                                            io_request,
+                                        );
+                                        pending_io.push(fut);
+                                    }
+                                    ToolDispatchDecision::WaitingApproval => {
+                                        // IO deferred inside the Function;
+                                        // pushes to pending_io when approval
+                                        // arrives.
+                                    }
+                                    ToolDispatchDecision::SynthesizeDenial { synthetic } => {
+                                        pending_io.push(synthetic);
+                                    }
+                                }
                             }
                         }
-                        other => io_dispatch::build_io_future(self, thread_id.to_string(), other),
+                        other => {
+                            let fut = io_dispatch::build_io_future(
+                                self,
+                                thread_id.to_string(),
+                                other,
+                            );
+                            pending_io.push(fut);
+                        }
                     };
-                    // Push the future but keep stepping — `AwaitingTools` dispatches all
-                    // N tool calls in parallel before pausing.
-                    pending_io.push(fut);
                 }
                 StepOutcome::Continue => continue,
                 StepOutcome::Paused => break,
@@ -2114,37 +2120,51 @@ impl Scheduler {
     }
 }
 
-/// Build the `ThreadPendingApproval` events that a newly-subscribed client needs to
-/// render the approval UI. Returns empty if the task isn't in AwaitingApproval.
-pub(super) fn pending_approvals_of(task: &Thread) -> Vec<ServerToClient> {
-    let ThreadInternalState::AwaitingApproval {
-        tool_uses,
-        dispositions,
-    } = &task.internal
-    else {
-        return Vec::new();
-    };
+/// Build the `ThreadPendingApproval` events that a newly-subscribed
+/// client needs to render the approval UI. Scans the Function registry
+/// for tool-call entries on this thread that are waiting on approval.
+pub(super) fn pending_approvals_of(scheduler: &Scheduler, task: &Thread) -> Vec<ServerToClient> {
     let mut out = Vec::new();
-    for (tool_use, disposition) in tool_uses.iter().zip(dispositions.iter()) {
-        if let ApprovalDisposition::Pending {
-            approval_id,
-            destructive,
-            read_only,
-        } = disposition
-        {
-            out.push(ServerToClient::ThreadPendingApproval {
-                thread_id: task.id.clone(),
-                approval_id: approval_id.clone(),
-                tool_use_id: tool_use.tool_use_id.clone(),
-                name: tool_use.name.clone(),
-                args_preview: truncate(
-                    serde_json::to_string(&tool_use.input).unwrap_or_default(),
-                    200,
-                ),
-                destructive: *destructive,
-                read_only: *read_only,
-            });
+    for entry in scheduler.active_functions.values() {
+        // Only tool-call Functions on this thread that are paused
+        // awaiting an approval decision contribute to the snapshot.
+        let crate::functions::CallerLink::ThreadToolCall {
+            thread_id,
+            tool_use_id,
+        } = &entry.caller
+        else {
+            continue;
+        };
+        if thread_id != &task.id {
+            continue;
         }
+        let Some(io_req) = &entry.pending_approval_io else {
+            continue;
+        };
+        let crate::runtime::thread::IoRequest::ToolCall {
+            name,
+            input,
+            ..
+        } = io_req
+        else {
+            continue;
+        };
+        let approval_id = format!("ap-{tool_use_id}");
+        let annotations = scheduler.annotations_for(&task.id);
+        let empty = ToolAnnotations::default();
+        let ann = annotations.get(name).unwrap_or(&empty);
+        out.push(ServerToClient::ThreadPendingApproval {
+            thread_id: task.id.clone(),
+            approval_id,
+            tool_use_id: tool_use_id.clone(),
+            name: name.clone(),
+            args_preview: truncate(
+                serde_json::to_string(input).unwrap_or_default(),
+                200,
+            ),
+            destructive: ann.is_destructive(),
+            read_only: ann.is_read_only(),
+        });
     }
     out
 }

@@ -43,6 +43,15 @@ pub struct ActiveFunctionEntry {
     pub spec: Function,
     pub scope: PermissionScope,
     pub caller: CallerLink,
+    /// For tool-call Functions whose scope disposition is
+    /// `AllowWithPrompt`: the IoRequest is buffered here while we
+    /// wait for the user's approval. When the `ApprovalDecision`
+    /// arrives, the scheduler rebuilds the future from this request
+    /// (for approve) or synthesizes a denial (for reject).
+    ///
+    /// `None` for Functions that aren't pending approval (synchronous
+    /// variants, already-approved tool calls, etc.).
+    pub pending_approval_io: Option<crate::runtime::thread::IoRequest>,
 }
 
 impl Scheduler {
@@ -84,6 +93,7 @@ impl Scheduler {
             spec,
             scope,
             caller,
+            pending_approval_io: None,
         };
         debug!(
             function_id = id,
@@ -271,49 +281,243 @@ impl Scheduler {
         })
     }
 
-    /// Register a tool-call Function for a builtin or MCP tool a
-    /// thread's model turn wants to invoke. Called from
-    /// `step_until_blocked` when processing a DispatchIo(ToolCall).
-    /// Returns the new FunctionId, or None if registration was
-    /// rejected (scope denied the tool name).
+    /// Register a tool-call Function and return what to do with the
+    /// pending IoRequest. Called from `step_until_blocked` when
+    /// processing a DispatchIo(ToolCall).
+    ///
+    /// The returned `ToolDispatchDecision` tells the caller whether to:
+    /// - Push the original IO future (Allow),
+    /// - Defer it pending approval (AllowWithPrompt — the IoRequest
+    ///   is buffered in the Function entry),
+    /// - Synthesize a denial completion (Deny).
     pub(super) fn register_tool_function(
         &mut self,
         thread_id: &str,
-        tool_use_id: &str,
-        name: &str,
-        input: serde_json::Value,
-    ) -> Option<FunctionId> {
+        io_request: crate::runtime::thread::IoRequest,
+    ) -> ToolDispatchDecision {
         use super::ToolRoute;
-        let spec = match self.route_tool(thread_id, name) {
+        let crate::runtime::thread::IoRequest::ToolCall {
+            op_id,
+            tool_use_id,
+            name,
+            input,
+        } = io_request.clone()
+        else {
+            // register_tool_function is only ever called with
+            // ToolCall. ModelCall takes a different path.
+            return ToolDispatchDecision::PushImmediately;
+        };
+
+        let spec = match self.route_tool(thread_id, &name) {
             Some(ToolRoute::Builtin { .. }) => Function::BuiltinToolCall {
-                name: name.to_string(),
-                args: input,
+                name: name.clone(),
+                args: input.clone(),
             },
             Some(ToolRoute::Mcp { host, .. }) => Function::McpToolUse {
                 host: host.clone(),
-                name: name.to_string(),
-                args: input,
+                name: name.clone(),
+                args: input.clone(),
             },
             None => {
                 // No route — the thread's turn will surface this as a
-                // tool-not-found error when the IO future runs. Don't
-                // register a Function for an unresolvable tool.
-                return None;
+                // tool-not-found error when the IO future runs. Let it
+                // through.
+                return ToolDispatchDecision::PushImmediately;
             }
         };
-        let scope = self.thread_scope(thread_id)?;
+
+        let Some(scope) = self.thread_scope(thread_id) else {
+            return ToolDispatchDecision::PushImmediately;
+        };
+
+        // Snapshot the disposition before registering — register_function
+        // will reject on Deny, but we want to distinguish Allow vs
+        // AllowWithPrompt for the dispatch decision.
+        let disposition = scope.tool(&name);
+
         let caller = CallerLink::ThreadToolCall {
             thread_id: thread_id.to_string(),
-            tool_use_id: tool_use_id.to_string(),
+            tool_use_id: tool_use_id.clone(),
         };
-        match self.register_function(spec, scope, caller) {
-            Ok(fn_id) => Some(fn_id),
-            Err(e) => {
-                tracing::warn!(
-                    %thread_id, %tool_use_id, %name, error = ?e,
-                    "tool Function rejected at registration"
+
+        match disposition {
+            crate::permission::Disposition::Allow => {
+                // Fast path — just register and let the caller push the IO.
+                let _ = self.register_function(spec, scope, caller);
+                ToolDispatchDecision::PushImmediately
+            }
+            crate::permission::Disposition::AllowWithPrompt => {
+                // Register the Function with the IoRequest buffered.
+                // Emit a PendingApproval event so the UI can prompt.
+                // The caller skips pushing; approval resolution later
+                // will rebuild the future from the buffered IoRequest.
+                match self.register_function(spec, scope, caller) {
+                    Ok(fn_id) => {
+                        if let Some(entry) = self.active_functions.get_mut(&fn_id) {
+                            entry.pending_approval_io = Some(io_request);
+                        }
+                        let approval_id = format!("ap-{tool_use_id}");
+                        self.emit_pending_approval(
+                            thread_id,
+                            &approval_id,
+                            &tool_use_id,
+                            &name,
+                            &input,
+                        );
+                        ToolDispatchDecision::WaitingApproval
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            %thread_id, %tool_use_id, %name, error = ?e,
+                            "AllowWithPrompt tool registration unexpectedly rejected"
+                        );
+                        ToolDispatchDecision::PushImmediately
+                    }
+                }
+            }
+            crate::permission::Disposition::Deny => {
+                // Reject — don't register the Function at all.
+                // Synthesize a ToolCall completion future that fires
+                // with an IoResult::Err so the thread integrates the
+                // denial as a tool_result and continues its turn.
+                let _ = op_id; // op_id is embedded in the IoRequest used below
+                ToolDispatchDecision::SynthesizeDenial {
+                    synthetic: make_denial_future(thread_id.to_string(), tool_use_id, op_id, name),
+                }
+            }
+        }
+    }
+
+    /// Emit a `ThreadEvent::PendingApproval` into the thread's event
+    /// stream. Called from the scheduler-side approval path, replacing
+    /// the old thread-side emission (which happened inside
+    /// `Thread::step` before the approval move).
+    fn emit_pending_approval(
+        &mut self,
+        thread_id: &str,
+        approval_id: &str,
+        tool_use_id: &str,
+        name: &str,
+        input: &serde_json::Value,
+    ) {
+        let annotations = self.annotations_for(thread_id);
+        let empty = crate::tools::mcp::ToolAnnotations::default();
+        let ann = annotations.get(name).unwrap_or(&empty);
+        let args_preview = {
+            let s = serde_json::to_string(input).unwrap_or_default();
+            if s.len() > 200 {
+                let mut i = 200;
+                while !s.is_char_boundary(i) && i > 0 {
+                    i -= 1;
+                }
+                format!("{}…", &s[..i])
+            } else {
+                s
+            }
+        };
+        let ev = crate::runtime::thread::ThreadEvent::PendingApproval {
+            approval_id: approval_id.to_string(),
+            tool_use_id: tool_use_id.to_string(),
+            name: name.to_string(),
+            args_preview,
+            destructive: ann.is_destructive(),
+            read_only: ann.is_read_only(),
+        };
+        self.router.dispatch_events(thread_id, vec![ev]);
+    }
+
+    /// Resolve a pending-approval Function given the client's
+    /// `ApprovalDecision`. Routes the decision to the Function whose
+    /// caller-link matches `(thread_id, approval_id's tool_use_id)`.
+    ///
+    /// - Approve: build and push the buffered IO future; narrow the
+    ///   thread's `tools_scope` to Allow for this tool if `remember`.
+    /// - Reject: complete the Function with `Cancelled(UserDenied)`
+    ///   and push a synthetic denial so the thread integrates a
+    ///   denied tool_result and continues.
+    pub(super) fn resolve_tool_approval(
+        &mut self,
+        thread_id: &str,
+        approval_id: &str,
+        decision: whisper_agent_protocol::ApprovalChoice,
+        remember: bool,
+        pending_io: &mut futures::stream::FuturesUnordered<SchedulerFuture>,
+    ) -> bool {
+        // approval_id format is "ap-{tool_use_id}" — see emit_pending_approval.
+        let tool_use_id = approval_id.strip_prefix("ap-").unwrap_or(approval_id);
+        let Some(fn_id) = self.find_tool_function_for(thread_id, tool_use_id) else {
+            return false;
+        };
+        let Some(entry) = self.active_functions.get_mut(&fn_id) else {
+            return false;
+        };
+        let Some(io_request) = entry.pending_approval_io.take() else {
+            // Function exists but isn't pending approval — caller sent
+            // a stale decision. Ignore.
+            return false;
+        };
+        let tool_name = match &entry.spec {
+            Function::BuiltinToolCall { name, .. } | Function::McpToolUse { name, .. } => {
+                name.clone()
+            }
+            _ => String::new(),
+        };
+
+        // Emit the ApprovalResolved event into the thread's event stream.
+        let resolved_ev = crate::runtime::thread::ThreadEvent::ApprovalResolved {
+            approval_id: approval_id.to_string(),
+            decision,
+            decided_by_conn: None,
+        };
+        self.router.dispatch_events(thread_id, vec![resolved_ev]);
+
+        match decision {
+            whisper_agent_protocol::ApprovalChoice::Approve => {
+                // "Remember this approval" narrows the thread's
+                // tools_scope so future calls to this tool skip the
+                // prompt.
+                if remember {
+                    if let Some(task) = self.tasks.get_mut(thread_id) {
+                        task.tools_scope.set_allow(tool_name.clone());
+                        task.tool_allowlist.insert(tool_name.clone());
+                        let allowlist_ev =
+                            crate::runtime::thread::ThreadEvent::AllowlistChanged {
+                                allowlist: task.tool_allowlist.iter().cloned().collect(),
+                            };
+                        self.router.dispatch_events(thread_id, vec![allowlist_ev]);
+                    }
+                }
+                let fut = crate::runtime::io_dispatch::build_io_future(
+                    self,
+                    thread_id.to_string(),
+                    io_request,
                 );
-                None
+                pending_io.push(fut);
+                true
+            }
+            whisper_agent_protocol::ApprovalChoice::Reject => {
+                // Synthesize a denial and complete the Function.
+                let crate::runtime::thread::IoRequest::ToolCall {
+                    op_id,
+                    tool_use_id,
+                    name,
+                    ..
+                } = io_request
+                else {
+                    return false;
+                };
+                let synthetic = make_denial_future(
+                    thread_id.to_string(),
+                    tool_use_id.clone(),
+                    op_id,
+                    name,
+                );
+                pending_io.push(synthetic);
+                self.complete_function(
+                    fn_id,
+                    FunctionOutcome::Cancelled(crate::functions::CancelReason::UserDenied),
+                );
+                true
             }
         }
     }
@@ -410,10 +614,11 @@ impl Scheduler {
     }
 }
 
-/// Translate a scope-check `Disposition` into a `Result`. Phase-2/3
-/// callers are happy with "admit ⇒ run, deny ⇒ reject"; the prompt flow
-/// required for `AllowWithPrompt` lands in Commit 4 alongside the
-/// tool-call variants that actually have a prompt UX.
+/// Translate a scope-check `Disposition` into a `Result`. `Deny` rejects;
+/// `Allow` and `AllowWithPrompt` both admit. The prompt dimension is
+/// handled per-variant by the caller (tool Functions buffer the IO
+/// request and emit a PendingApproval event; other variants treat
+/// AllowWithPrompt as admit-and-proceed since they have no prompt UX).
 fn admission_check(
     disp: crate::permission::Disposition,
     detail: impl FnOnce() -> String,
@@ -423,4 +628,48 @@ fn admission_check(
     } else {
         Err(RejectReason::ScopeDenied { detail: detail() })
     }
+}
+
+/// What the scheduler should do with a tool-call IoRequest after
+/// registering a Function for it. See `register_tool_function`.
+pub(super) enum ToolDispatchDecision {
+    /// Scope admits the call with `Allow`. Caller pushes the original
+    /// IO future.
+    PushImmediately,
+    /// Scope admits the call with `AllowWithPrompt`. A PendingApproval
+    /// event was emitted; the IoRequest is buffered in the Function
+    /// entry. Caller does nothing — the future lands in pending_io
+    /// only after `resolve_tool_approval` sees the user's decision.
+    WaitingApproval,
+    /// Scope denied the call. Caller pushes the synthetic denial
+    /// future, which fires immediately with an IoResult::Err so the
+    /// thread integrates a denied tool_result and continues.
+    SynthesizeDenial { synthetic: SchedulerFuture },
+}
+
+/// Build a future that immediately fires with a tool-denial completion.
+/// Used when scope evaluation returns `Deny` and the thread needs to
+/// see the denial as a regular tool-result error.
+fn make_denial_future(
+    thread_id: String,
+    tool_use_id: String,
+    op_id: crate::runtime::thread::OpId,
+    tool_name: String,
+) -> SchedulerFuture {
+    Box::pin(async move {
+        crate::runtime::io_dispatch::SchedulerCompletion::Io(
+            crate::runtime::io_dispatch::IoCompletion {
+                thread_id,
+                op_id,
+                result: crate::runtime::thread::IoResult::ToolCall {
+                    tool_use_id,
+                    result: Err(format!(
+                        "tool `{tool_name}` denied by scope (disposition: deny)"
+                    )),
+                },
+                pod_update: None,
+                scheduler_command: None,
+            },
+        )
+    })
 }

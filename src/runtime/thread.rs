@@ -22,8 +22,8 @@ use std::collections::{BTreeSet, HashMap};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use whisper_agent_protocol::{
-    AllowMap, ApprovalChoice, BehaviorOrigin, ContentBlock, Conversation, Disposition, Message,
-    Role, ThreadBindings, ThreadConfig, ThreadSnapshot, ThreadStateLabel, ThreadSummary,
+    AllowMap, ApprovalChoice, BehaviorOrigin, ContentBlock, Conversation, Message, Role,
+    ThreadBindings, ThreadConfig, ThreadSnapshot, ThreadStateLabel, ThreadSummary,
     ToolResultContent, TurnEntry, TurnLog, Usage,
 };
 
@@ -143,14 +143,6 @@ pub enum ThreadInternalState {
         op_id: OpId,
         started_at: DateTime<Utc>,
     },
-    /// Model responded with tool_uses; at least one needs user approval before we can
-    /// dispatch. `dispositions` is parallel to `tool_uses`. On every ApprovalDecision the
-    /// corresponding entry transitions Pending → UserApproved / UserRejected; once none
-    /// remain Pending the task moves to `AwaitingTools`.
-    AwaitingApproval {
-        tool_uses: Vec<ToolUseReq>,
-        dispositions: Vec<ApprovalDisposition>,
-    },
     /// Model responded with tool_uses. Each entry in `pending_dispatch` still needs to
     /// be fired at MCP; `pending_io` maps op_ids of in-flight tool calls to their
     /// tool_use_ids; `completed` accumulates ToolResult blocks as they return. A tool
@@ -181,44 +173,6 @@ pub struct ToolUseReq {
     pub input: serde_json::Value,
 }
 
-/// Per-tool-call approval state carried by [`ThreadInternalState::AwaitingApproval`].
-/// Parallel to the tool_uses vector; each entry is always in one of these four states.
-#[derive(Serialize, Deserialize, Debug, Clone)]
-#[serde(tag = "status", rename_all = "snake_case")]
-pub enum ApprovalDisposition {
-    /// Policy or allowlist auto-approved this call. `reason` becomes the
-    /// `who_decided` field on the audit log entry — `policy:read_only`,
-    /// `policy:auto_approve_all`, or `policy:allowlist`.
-    AutoApproved {
-        #[serde(default)]
-        reason: String,
-    },
-    /// Awaiting a user decision keyed by `approval_id`.
-    Pending {
-        approval_id: String,
-        destructive: bool,
-        read_only: bool,
-    },
-    /// User approved.
-    UserApproved {
-        approval_id: String,
-        decided_by_conn: Option<u64>,
-    },
-    /// User rejected. `message` is the text we'll surface to the model as the
-    /// synthesized tool_result when we leave the approval phase.
-    UserRejected {
-        approval_id: String,
-        decided_by_conn: Option<u64>,
-        message: String,
-    },
-}
-
-impl ApprovalDisposition {
-    fn is_pending(&self) -> bool {
-        matches!(self, ApprovalDisposition::Pending { .. })
-    }
-}
-
 /// Decision record threaded from an approval outcome into the dispatch phase so the
 /// audit log captures who said yes (or that policy auto-approved).
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -233,7 +187,7 @@ pub struct ApprovalRecord {
 /// Resource provisioning (sandbox + primary MCP host) is dispatched
 /// separately by the scheduler at thread-creation time and routed through
 /// [`crate::runtime::io_dispatch::SchedulerCompletion::Provision`].
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum IoRequest {
     ModelCall {
         op_id: OpId,
@@ -480,7 +434,6 @@ impl Thread {
         match &self.internal {
             ThreadInternalState::Idle => ThreadStateLabel::Idle,
             ThreadInternalState::Completed => ThreadStateLabel::Completed,
-            ThreadInternalState::AwaitingApproval { .. } => ThreadStateLabel::AwaitingApproval,
             ThreadInternalState::WaitingOnResources { .. }
             | ThreadInternalState::NeedsModelCall
             | ThreadInternalState::AwaitingModel { .. }
@@ -678,10 +631,9 @@ impl Thread {
                 StepOutcome::DispatchIo(IoRequest::ModelCall { op_id })
             }
             ThreadInternalState::WaitingOnResources { .. }
-            | ThreadInternalState::AwaitingModel { .. }
-            | ThreadInternalState::AwaitingApproval { .. } => {
-                // Not stepping these — waiting on resource provisioning,
-                // a model response, or a user decision.
+            | ThreadInternalState::AwaitingModel { .. } => {
+                // Not stepping these — waiting on resource provisioning
+                // or a model response.
                 self.internal = current;
                 StepOutcome::Paused
             }
@@ -845,75 +797,35 @@ impl Thread {
             return;
         }
 
-        // Evaluate approval disposition for each tool_use. Consults the
-        // thread's `tools_scope` (snapshot of the pod's `allow.tools`)
-        // and the thread's `tool_allowlist` (per-tool remember-approval
-        // overrides). Tool annotations are retained for the
-        // PendingApproval event's destructive/read_only hints.
-        let mut dispositions: Vec<ApprovalDisposition> = Vec::with_capacity(tool_uses.len());
-        let mut auto_reasons: HashMap<String, String> = HashMap::new();
-        let mut any_pending = false;
-        for tool_use in &tool_uses {
-            let empty = ToolAnnotations::default();
-            let ann = tool_annotations.get(&tool_use.name).unwrap_or(&empty);
-            match evaluate_scope_disposition(&self.tools_scope, &self.tool_allowlist, &tool_use.name)
-            {
-                ApprovalOutcome::Auto(reason) => {
-                    auto_reasons.insert(tool_use.tool_use_id.clone(), reason.clone());
-                    dispositions.push(ApprovalDisposition::AutoApproved { reason });
-                }
-                ApprovalOutcome::Prompt => {
-                    any_pending = true;
-                    let approval_id = format!("ap-{}", tool_use.tool_use_id);
-                    events.push(ThreadEvent::PendingApproval {
-                        approval_id: approval_id.clone(),
-                        tool_use_id: tool_use.tool_use_id.clone(),
-                        name: tool_use.name.clone(),
-                        args_preview: truncate(
-                            serde_json::to_string(&tool_use.input).unwrap_or_default(),
-                            200,
-                        ),
-                        destructive: ann.is_destructive(),
-                        read_only: ann.is_read_only(),
-                    });
-                    dispositions.push(ApprovalDisposition::Pending {
-                        approval_id,
-                        destructive: ann.is_destructive(),
-                        read_only: ann.is_read_only(),
-                    });
-                }
-            }
-        }
-
-        if any_pending {
-            self.internal = ThreadInternalState::AwaitingApproval {
-                tool_uses,
-                dispositions,
-            };
-        } else {
-            // Every tool auto-approved — record why so the audit log reflects it.
-            let approvals: HashMap<String, ApprovalRecord> = tool_uses
-                .iter()
-                .map(|tu| {
-                    let reason = auto_reasons
-                        .remove(&tu.tool_use_id)
-                        .unwrap_or_else(|| "policy:auto".into());
-                    (
-                        tu.tool_use_id.clone(),
-                        ApprovalRecord {
-                            decision: "auto".into(),
-                            who_decided: reason,
-                        },
-                    )
-                })
-                .collect();
-            self.internal = ThreadInternalState::AwaitingTools {
-                pending_dispatch: make_dispatch_order(tool_uses),
-                pending_io: HashMap::new(),
-                completed: Vec::new(),
-                approvals,
-            };
-        }
+        // Approval evaluation has moved to the scheduler's Function
+        // registry (see `register_tool_function` in
+        // `src/runtime/scheduler/functions.rs`). Every tool_use emerges
+        // from here as AutoApproved; the scheduler either dispatches
+        // it, defers it pending a user prompt, or synthesizes a denial
+        // depending on the pod's tool-scope disposition. The thread no
+        // longer enters the `AwaitingApproval` state.
+        let _ = tool_annotations; // Consulted scheduler-side now.
+        // Approvals are recorded for audit at the scheduler-side
+        // Function layer; here we mark each call as "scheduler-gated"
+        // in the thread's approvals map so the audit path stays uniform.
+        let approvals: HashMap<String, ApprovalRecord> = tool_uses
+            .iter()
+            .map(|tu| {
+                (
+                    tu.tool_use_id.clone(),
+                    ApprovalRecord {
+                        decision: "auto".into(),
+                        who_decided: "scheduler_gated".into(),
+                    },
+                )
+            })
+            .collect();
+        self.internal = ThreadInternalState::AwaitingTools {
+            pending_dispatch: make_dispatch_order(tool_uses),
+            pending_io: HashMap::new(),
+            completed: Vec::new(),
+            approvals,
+        };
     }
 
     fn integrate_tool_result(
@@ -992,251 +904,6 @@ impl Thread {
         };
     }
 
-    /// Apply a user's approval decision. Finds the pending entry by `approval_id`,
-    /// transitions it to `UserApproved`/`UserRejected`, and if every disposition is
-    /// now resolved, moves the task into `AwaitingTools` (with synthesized denial
-    /// tool_results for rejected calls).
-    ///
-    /// When `remember` is true and the decision is `Approve`, the resolved tool's
-    /// name is added to the per-task allowlist. Any other still-pending approvals
-    /// for the same tool name in the current batch are auto-resolved as approved
-    /// (with reason `policy:allowlist`) and emit their own `ApprovalResolved`
-    /// events so connected clients dismiss them.
-    pub fn apply_approval_decision(
-        &mut self,
-        approval_id: &str,
-        decision: ApprovalChoice,
-        remember: bool,
-        decided_by_conn: Option<u64>,
-        events: &mut Vec<ThreadEvent>,
-    ) {
-        let prev_public = self.public_state();
-        self.apply_approval_decision_inner(
-            approval_id,
-            decision,
-            remember,
-            decided_by_conn,
-            events,
-        );
-        let new_public = self.public_state();
-        if prev_public != new_public {
-            events.push(ThreadEvent::StateChanged { state: new_public });
-        }
-    }
-
-    fn apply_approval_decision_inner(
-        &mut self,
-        approval_id: &str,
-        decision: ApprovalChoice,
-        remember: bool,
-        decided_by_conn: Option<u64>,
-        events: &mut Vec<ThreadEvent>,
-    ) {
-        self.touch();
-        let ThreadInternalState::AwaitingApproval {
-            tool_uses,
-            dispositions,
-        } = &mut self.internal
-        else {
-            tracing::warn!(
-                thread_id = %self.id,
-                approval_id,
-                "approval decision received but task not awaiting approval"
-            );
-            return;
-        };
-
-        let Some(idx) = dispositions.iter().position(|d| {
-            matches!(d, ApprovalDisposition::Pending { approval_id: aid, .. } if aid == approval_id)
-        }) else {
-            tracing::warn!(
-                thread_id = %self.id,
-                approval_id,
-                "approval_id not pending — duplicate decision?"
-            );
-            return;
-        };
-
-        // If the user said "always allow", grow the allowlist before resolving the
-        // cascade so the matching dispositions transition through the allowlist
-        // path rather than a one-off user-approval.
-        let resolved_tool_name = tool_uses[idx].name.clone();
-        let mut allowlist_added = false;
-        if remember && decision == ApprovalChoice::Approve {
-            allowlist_added = self.tool_allowlist.insert(resolved_tool_name.clone());
-        }
-
-        dispositions[idx] = match decision {
-            ApprovalChoice::Approve => ApprovalDisposition::UserApproved {
-                approval_id: approval_id.to_string(),
-                decided_by_conn,
-            },
-            ApprovalChoice::Reject => ApprovalDisposition::UserRejected {
-                approval_id: approval_id.to_string(),
-                decided_by_conn,
-                message: "Denied by user.".to_string(),
-            },
-        };
-        events.push(ThreadEvent::ApprovalResolved {
-            approval_id: approval_id.to_string(),
-            decision,
-            decided_by_conn,
-        });
-
-        // Cascade-resolve other pending approvals for the same tool now that it's
-        // been allowlisted.
-        if allowlist_added {
-            for (i, tool_use) in tool_uses.iter().enumerate() {
-                if tool_use.name != resolved_tool_name {
-                    continue;
-                }
-                let ApprovalDisposition::Pending {
-                    approval_id: aid, ..
-                } = &dispositions[i]
-                else {
-                    continue;
-                };
-                let aid = aid.clone();
-                dispositions[i] = ApprovalDisposition::AutoApproved {
-                    reason: "policy:allowlist".into(),
-                };
-                events.push(ThreadEvent::ApprovalResolved {
-                    approval_id: aid,
-                    decision: ApprovalChoice::Approve,
-                    decided_by_conn,
-                });
-            }
-            events.push(ThreadEvent::AllowlistChanged {
-                allowlist: self.tool_allowlist.iter().cloned().collect(),
-            });
-        }
-
-        if dispositions.iter().any(|d| d.is_pending()) {
-            return; // more approvals outstanding
-        }
-
-        // Every disposition resolved — transition to AwaitingTools. Approved calls go
-        // into pending_dispatch; rejected calls are synthesized as denial tool_results
-        // in `completed` and also emit audit entries recording the rejection.
-        let tool_uses = std::mem::take(tool_uses);
-        let dispositions = std::mem::take(dispositions);
-        let mut pending_dispatch = Vec::new();
-        let mut completed = Vec::new();
-        let mut approvals: HashMap<String, ApprovalRecord> = HashMap::new();
-        for (tool_use, disposition) in tool_uses.into_iter().zip(dispositions) {
-            match disposition {
-                ApprovalDisposition::AutoApproved { reason } => {
-                    approvals.insert(
-                        tool_use.tool_use_id.clone(),
-                        ApprovalRecord {
-                            decision: "auto".into(),
-                            who_decided: reason,
-                        },
-                    );
-                    pending_dispatch.push(tool_use);
-                }
-                ApprovalDisposition::UserApproved {
-                    decided_by_conn: conn,
-                    ..
-                } => {
-                    approvals.insert(
-                        tool_use.tool_use_id.clone(),
-                        ApprovalRecord {
-                            decision: "approve".into(),
-                            who_decided: who_string(conn),
-                        },
-                    );
-                    pending_dispatch.push(tool_use);
-                }
-                ApprovalDisposition::UserRejected {
-                    decided_by_conn: conn,
-                    message,
-                    ..
-                } => {
-                    // Emit synthetic ToolCallBegin/End so subscribed clients see the
-                    // rejected call in their chat view alongside approved/executed ones.
-                    events.push(ThreadEvent::ToolCallBegin {
-                        tool_use_id: tool_use.tool_use_id.clone(),
-                        name: tool_use.name.clone(),
-                        args_preview: truncate(
-                            serde_json::to_string(&tool_use.input).unwrap_or_default(),
-                            200,
-                        ),
-                        args: tool_use.input.clone(),
-                    });
-                    events.push(ThreadEvent::ToolCallEnd {
-                        tool_use_id: tool_use.tool_use_id.clone(),
-                        result_preview: message.clone(),
-                        is_error: true,
-                    });
-                    events.push(ThreadEvent::AuditToolCall {
-                        tool_name: tool_use.name.clone(),
-                        args: tool_use.input.clone(),
-                        is_error: true,
-                        error_message: Some(message.clone()),
-                        decision: "reject".into(),
-                        who_decided: who_string(conn),
-                    });
-                    completed.push(ContentBlock::ToolResult {
-                        tool_use_id: tool_use.tool_use_id,
-                        content: ToolResultContent::Text(message),
-                        is_error: true,
-                    });
-                }
-                ApprovalDisposition::Pending { .. } => unreachable!("checked above"),
-            }
-        }
-        self.internal = ThreadInternalState::AwaitingTools {
-            pending_dispatch: reverse_for_pop(pending_dispatch),
-            pending_io: HashMap::new(),
-            completed,
-            approvals,
-        };
-    }
-}
-
-fn who_string(conn: Option<u64>) -> String {
-    conn.map(|c| format!("user:{c}"))
-        .unwrap_or_else(|| "user".into())
-}
-
-enum ApprovalOutcome {
-    /// Auto-approved; the carried string becomes `who_decided` in the audit log.
-    Auto(String),
-    Prompt,
-}
-
-/// Translate a scope `Disposition` into the thread's approval outcome,
-/// layering the per-tool remember-approval allowlist on top.
-///
-/// Interim Phase-4a behavior: a tool in the thread's `tool_allowlist`
-/// upgrades an `AllowWithPrompt` disposition to `Allow`. A pod-level
-/// `Deny` cannot be overridden by the allowlist — deny wins.
-/// A `Deny` tool reaches this path only because the Phase-2 migration
-/// of tool calls to Functions hasn't landed yet (where `Deny` would be
-/// rejected at registration); here we treat it as a prompt so the user
-/// can explicitly refuse, which is the safe fallback.
-fn evaluate_scope_disposition(
-    tools_scope: &AllowMap<String>,
-    tool_allowlist: &BTreeSet<String>,
-    tool_name: &str,
-) -> ApprovalOutcome {
-    let base = tools_scope.disposition(&tool_name.to_string());
-    let final_disp = match base {
-        Disposition::AllowWithPrompt if tool_allowlist.contains(tool_name) => Disposition::Allow,
-        other => other,
-    };
-    match final_disp {
-        Disposition::Allow => {
-            let reason = if tool_allowlist.contains(tool_name) {
-                "policy:allowlist".into()
-            } else {
-                "policy:scope_allow".into()
-            };
-            ApprovalOutcome::Auto(reason)
-        }
-        Disposition::AllowWithPrompt | Disposition::Deny => ApprovalOutcome::Prompt,
-    }
 }
 
 /// `step()` pops from the back; feed it in reverse so the original order is preserved.
@@ -1356,7 +1023,12 @@ mod tests {
         assert_eq!(truncate("abcdefghij".into(), 4), "abcd…");
     }
 
-    fn task_with_pending_batch(tool_names: &[&str]) -> Thread {
+    // Approval-flow tests moved to the scheduler-side Function
+    // registry in Phase 4c; Thread no longer owns that path. Unit tests
+    // covering the scheduler's register_tool_function + resolve_tool_approval
+    // arrive with later scheduler-integration-test work.
+
+    fn basic_thread() -> Thread {
         let cfg = ThreadConfig {
             model: "test".into(),
             system_prompt: "test".into(),
@@ -1364,150 +1036,18 @@ mod tests {
             max_turns: 10,
             compaction: Default::default(),
         };
-        let mut task = Thread::new(
+        Thread::new(
             "t1".into(),
             "t1".into(),
             cfg,
             ThreadBindings::default(),
             AllowMap::allow_all(),
-        );
-        let tool_uses: Vec<ToolUseReq> = tool_names
-            .iter()
-            .enumerate()
-            .map(|(i, name)| ToolUseReq {
-                tool_use_id: format!("tu-{i}"),
-                name: (*name).into(),
-                input: serde_json::Value::Null,
-            })
-            .collect();
-        let dispositions = tool_uses
-            .iter()
-            .map(|tu| ApprovalDisposition::Pending {
-                approval_id: format!("ap-{}", tu.tool_use_id),
-                destructive: false,
-                read_only: false,
-            })
-            .collect();
-        task.internal = ThreadInternalState::AwaitingApproval {
-            tool_uses,
-            dispositions,
-        };
-        task
-    }
-
-    #[test]
-    fn always_allow_adds_to_allowlist_and_emits_event() {
-        let mut task = task_with_pending_batch(&["edit_file"]);
-        let mut events = Vec::new();
-        task.apply_approval_decision(
-            "ap-tu-0",
-            ApprovalChoice::Approve,
-            true,
-            Some(7),
-            &mut events,
-        );
-
-        assert!(task.tool_allowlist.contains("edit_file"));
-        assert!(events.iter().any(|e| matches!(e,
-            ThreadEvent::AllowlistChanged { allowlist } if allowlist == &vec!["edit_file".to_string()]
-        )));
-    }
-
-    #[test]
-    fn always_allow_cascades_other_pending_for_same_tool() {
-        let mut task = task_with_pending_batch(&["edit_file", "edit_file", "read_file"]);
-        let mut events = Vec::new();
-        task.apply_approval_decision(
-            "ap-tu-0",
-            ApprovalChoice::Approve,
-            true,
-            Some(1),
-            &mut events,
-        );
-
-        // edit_file batch (3 pending: 1 directly resolved + 1 cascaded; read_file still pending)
-        let resolved: Vec<&str> = events
-            .iter()
-            .filter_map(|e| match e {
-                ThreadEvent::ApprovalResolved { approval_id, .. } => Some(approval_id.as_str()),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(resolved, vec!["ap-tu-0", "ap-tu-1"]);
-
-        // read_file should still be pending — task should not have transitioned out
-        // of AwaitingApproval.
-        assert!(matches!(
-            task.internal,
-            ThreadInternalState::AwaitingApproval { .. }
-        ));
-    }
-
-    #[test]
-    fn approve_without_remember_does_not_touch_allowlist() {
-        let mut task = task_with_pending_batch(&["edit_file"]);
-        let mut events = Vec::new();
-        task.apply_approval_decision("ap-tu-0", ApprovalChoice::Approve, false, None, &mut events);
-
-        assert!(task.tool_allowlist.is_empty());
-        assert!(
-            !events
-                .iter()
-                .any(|e| matches!(e, ThreadEvent::AllowlistChanged { .. }))
-        );
-    }
-
-    #[test]
-    fn scope_disposition_allow_auto_approves() {
-        let scope = AllowMap::allow_all();
-        let allowlist = BTreeSet::new();
-        assert!(matches!(
-            evaluate_scope_disposition(&scope, &allowlist, "edit_file"),
-            ApprovalOutcome::Auto(_)
-        ));
-    }
-
-    #[test]
-    fn scope_disposition_allow_with_prompt_prompts_unless_allowlisted() {
-        let scope = AllowMap {
-            default: Disposition::AllowWithPrompt,
-            overrides: BTreeMap::new(),
-        };
-        let empty = BTreeSet::new();
-        assert!(matches!(
-            evaluate_scope_disposition(&scope, &empty, "edit_file"),
-            ApprovalOutcome::Prompt
-        ));
-        let mut with_listed = BTreeSet::new();
-        with_listed.insert("edit_file".to_string());
-        assert!(matches!(
-            evaluate_scope_disposition(&scope, &with_listed, "edit_file"),
-            ApprovalOutcome::Auto(_)
-        ));
-    }
-
-    #[test]
-    fn scope_disposition_per_tool_override_wins_over_default() {
-        let scope = AllowMap {
-            default: Disposition::Allow,
-            overrides: [("bash".to_string(), Disposition::AllowWithPrompt)]
-                .into_iter()
-                .collect(),
-        };
-        let allowlist = BTreeSet::new();
-        assert!(matches!(
-            evaluate_scope_disposition(&scope, &allowlist, "bash"),
-            ApprovalOutcome::Prompt
-        ));
-        assert!(matches!(
-            evaluate_scope_disposition(&scope, &allowlist, "read_file"),
-            ApprovalOutcome::Auto(_)
-        ));
+        )
     }
 
     #[test]
     fn remove_from_allowlist_returns_true_only_when_present() {
-        let mut task = task_with_pending_batch(&["edit_file"]);
+        let mut task = basic_thread();
         task.tool_allowlist.insert("edit_file".into());
         assert!(task.remove_from_allowlist("edit_file"));
         assert!(!task.remove_from_allowlist("edit_file"));

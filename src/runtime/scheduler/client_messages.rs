@@ -93,20 +93,7 @@ impl Scheduler {
                 decision,
                 remember,
             } => {
-                let mut events = Vec::new();
-                let known = if let Some(task) = self.tasks.get_mut(&thread_id) {
-                    task.apply_approval_decision(
-                        &approval_id,
-                        decision,
-                        remember,
-                        Some(conn_id),
-                        &mut events,
-                    );
-                    true
-                } else {
-                    false
-                };
-                if !known {
+                if !self.tasks.contains_key(&thread_id) {
                     self.router.send_to_client(
                         conn_id,
                         ServerToClient::Error {
@@ -115,11 +102,34 @@ impl Scheduler {
                             message: "unknown task".into(),
                         },
                     );
-                } else {
+                    return;
+                }
+                // Approval now routes to the tool-call Function whose
+                // caller-link matches (thread_id, approval_id's
+                // tool_use_id). The Function either pushes the
+                // deferred IO future (Approve) or synthesizes a denial
+                // (Reject); thread-side state is unchanged until the
+                // synthetic or real completion lands.
+                let resolved = self.resolve_tool_approval(
+                    &thread_id,
+                    &approval_id,
+                    decision,
+                    remember,
+                    pending_io,
+                );
+                if resolved {
                     self.mark_dirty(&thread_id);
-                    self.router.dispatch_events(&thread_id, events);
-                    self.teardown_host_env_if_terminal(&thread_id);
                     self.step_until_blocked(&thread_id, pending_io);
+                } else {
+                    // Stale or duplicate decision — no Function was
+                    // waiting on this approval id. Ignore silently;
+                    // the UI shouldn't surface this as an error
+                    // because race conditions can produce benign
+                    // duplicates.
+                    warn!(
+                        %thread_id, %approval_id,
+                        "ApprovalDecision for unknown or already-resolved approval"
+                    );
                 }
             }
             ClientToServer::RemoveToolAllowlistEntry {
@@ -297,7 +307,7 @@ impl Scheduler {
                     // Rehydrate any still-pending approvals so the newly-subscribed
                     // client can render the approval UI. The snapshot itself doesn't
                     // carry approval state.
-                    let pending = pending_approvals_of(task);
+                    let pending = pending_approvals_of(self, task);
                     self.router.send_to_client(
                         conn_id,
                         ServerToClient::ThreadSnapshot {
