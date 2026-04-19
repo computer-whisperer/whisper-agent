@@ -23,10 +23,13 @@ use std::sync::Arc;
 
 use futures::StreamExt;
 use tracing::debug;
+use whisper_agent_protocol::ServerToClient;
 
 use crate::pod::resources::HostEnvId;
-use crate::providers::model::{CacheBreakpoint, ModelRequest, ToolSpec, default_cache_policy};
-use crate::runtime::scheduler::Scheduler;
+use crate::providers::model::{
+    CacheBreakpoint, ModelEvent, ModelRequest, ToolSpec, default_cache_policy,
+};
+use crate::runtime::scheduler::{Scheduler, StreamUpdate};
 use crate::runtime::thread::{IoRequest, IoResult, OpId};
 use crate::tools::mcp::{McpSession, ToolDescriptor as McpTool};
 use crate::tools::sandbox::HostEnvHandle;
@@ -352,8 +355,9 @@ fn model_call(scheduler: &Scheduler, thread_id: String, op_id: OpId) -> Schedule
             });
         }
     };
+    let stream_tx = scheduler.stream_sender();
     Box::pin(async move {
-        debug!(%thread_id, op_id, backend = %backend_name, model = %model_name, "dispatching model call");
+        debug!(%thread_id, op_id, backend = %backend_name, model = %model_name, "dispatching streaming model call");
         let req = ModelRequest {
             model: &owned_req.model,
             max_tokens: owned_req.max_tokens,
@@ -363,7 +367,9 @@ fn model_call(scheduler: &Scheduler, thread_id: String, op_id: OpId) -> Schedule
             cache_breakpoints: &owned_req.cache_breakpoints,
         };
         let result =
-            match call_with_rate_limit_retry(provider.as_ref(), &req, &thread_id, op_id).await {
+            match stream_with_rate_limit_retry(provider.as_ref(), &req, &thread_id, &stream_tx)
+                .await
+            {
                 Ok(resp) => IoResult::ModelCall(Ok(resp)),
                 Err(e) => IoResult::ModelCall(Err(e.to_string())),
             };
@@ -383,31 +389,126 @@ fn model_call(scheduler: &Scheduler, thread_id: String, op_id: OpId) -> Schedule
 /// failures so the user isn't left waiting on a minutes-long sleep.
 const MAX_RATE_LIMIT_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
 
-async fn call_with_rate_limit_retry(
+/// Drive a streaming model call to completion, pushing live deltas into
+/// `stream_tx` as they arrive and returning the assembled `ModelResponse`.
+///
+/// Rate-limit retry only applies when the *first* stream item is the
+/// RateLimited error — once any delta has been broadcast, a mid-stream
+/// failure is terminal (we can't un-send events to subscribers).
+async fn stream_with_rate_limit_retry(
     provider: &dyn crate::providers::model::ModelProvider,
     req: &ModelRequest<'_>,
     thread_id: &str,
-    op_id: OpId,
+    stream_tx: &tokio::sync::mpsc::UnboundedSender<StreamUpdate>,
 ) -> Result<crate::providers::model::ModelResponse, crate::providers::model::ModelError> {
-    match provider.create_message(req).await {
+    match consume_stream(provider, req, thread_id, stream_tx).await {
         Ok(resp) => Ok(resp),
-        Err(crate::providers::model::ModelError::RateLimited { retry_after, body }) => {
-            if retry_after > MAX_RATE_LIMIT_WAIT {
-                return Err(crate::providers::model::ModelError::RateLimited { retry_after, body });
-            }
+        Err(FirstEventError::RateLimited {
+            retry_after,
+            body: _,
+        }) if retry_after <= MAX_RATE_LIMIT_WAIT => {
             tracing::warn!(
                 %thread_id,
-                op_id,
                 wait_ms = retry_after.as_millis() as u64,
-                "model backend rate-limited; waiting before single retry"
+                "model backend rate-limited on first event; waiting before single retry"
             );
             tokio::time::sleep(retry_after).await;
-            // One retry; any further rate-limit bubbles up as a terminal
-            // failure so the thread parks rather than spinning indefinitely.
-            provider.create_message(req).await
+            match consume_stream(provider, req, thread_id, stream_tx).await {
+                Ok(resp) => Ok(resp),
+                Err(e) => Err(e.into_model_error()),
+            }
         }
-        Err(other) => Err(other),
+        Err(e) => Err(e.into_model_error()),
     }
+}
+
+/// Error shape that distinguishes "error before any delta was emitted"
+/// (safe to retry) from "error after streaming started" (terminal). The
+/// `RateLimited` variant preserves the retry hint so the caller can
+/// decide whether to sleep and try again.
+enum FirstEventError {
+    /// First item was `Err(RateLimited {..})` — retryable.
+    RateLimited {
+        retry_after: std::time::Duration,
+        body: String,
+    },
+    /// Any other error, or mid-stream failure — terminal.
+    Fatal(crate::providers::model::ModelError),
+}
+
+impl FirstEventError {
+    fn into_model_error(self) -> crate::providers::model::ModelError {
+        match self {
+            FirstEventError::RateLimited { retry_after, body } => {
+                crate::providers::model::ModelError::RateLimited { retry_after, body }
+            }
+            FirstEventError::Fatal(e) => e,
+        }
+    }
+}
+
+async fn consume_stream(
+    provider: &dyn crate::providers::model::ModelProvider,
+    req: &ModelRequest<'_>,
+    thread_id: &str,
+    stream_tx: &tokio::sync::mpsc::UnboundedSender<StreamUpdate>,
+) -> Result<crate::providers::model::ModelResponse, FirstEventError> {
+    let mut stream = provider.create_message_streaming(req);
+    let mut any_delta_emitted = false;
+    while let Some(event) = stream.next().await {
+        match event {
+            Ok(ModelEvent::TextDelta { text }) => {
+                any_delta_emitted = true;
+                let _ = stream_tx.send(StreamUpdate {
+                    thread_id: thread_id.to_string(),
+                    event: ServerToClient::ThreadAssistantTextDelta {
+                        thread_id: thread_id.to_string(),
+                        delta: text,
+                    },
+                });
+            }
+            Ok(ModelEvent::ThinkingDelta { text }) => {
+                any_delta_emitted = true;
+                let _ = stream_tx.send(StreamUpdate {
+                    thread_id: thread_id.to_string(),
+                    event: ServerToClient::ThreadAssistantReasoningDelta {
+                        thread_id: thread_id.to_string(),
+                        delta: text,
+                    },
+                });
+            }
+            Ok(ModelEvent::ToolCall { .. }) => {
+                // ToolCall events aren't broadcast as wire deltas — the
+                // thread state machine emits ThreadToolCallBegin when
+                // it actually dispatches each tool (after approval
+                // evaluation). Letting the event through before that
+                // would duplicate the tool-call row in the webui.
+                any_delta_emitted = true;
+            }
+            Ok(ModelEvent::Completed {
+                content,
+                stop_reason,
+                usage,
+            }) => {
+                return Ok(crate::providers::model::ModelResponse {
+                    content,
+                    stop_reason,
+                    usage,
+                });
+            }
+            Err(crate::providers::model::ModelError::RateLimited { retry_after, body })
+                if !any_delta_emitted =>
+            {
+                return Err(FirstEventError::RateLimited { retry_after, body });
+            }
+            Err(e) => return Err(FirstEventError::Fatal(e)),
+        }
+    }
+    Err(FirstEventError::Fatal(
+        crate::providers::model::ModelError::Transport(
+            "model stream ended without Completed event".into(),
+        ),
+    ))
 }
 
 fn tool_call(

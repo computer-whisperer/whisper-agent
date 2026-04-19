@@ -915,23 +915,20 @@ pub enum ServerToClient {
         thread_id: String,
         turn: u32,
     },
-    /// A complete text block emitted by the assistant. Always emitted at turn-end so
-    /// clients reconnecting mid-stream see consistent state once the turn settles.
-    ThreadAssistantText {
-        thread_id: String,
-        text: String,
-    },
-    /// Chain-of-thought block emitted by the assistant — Anthropic
-    /// extended-thinking, OpenAI-compat `reasoning_content`, or inline
-    /// `<think>...</think>`. Order-preserved with `ThreadAssistantText` so the
-    /// client can render reasoning, replies, and tool-calls in the order the
-    /// model emitted them.
-    ThreadAssistantReasoning {
-        thread_id: String,
-        text: String,
-    },
-    /// Streaming text partial (reserved — not emitted until SSE streaming lands).
+    /// Streaming text fragment. Emitted repeatedly during a turn as the model
+    /// produces text. Non-streaming backends synthesize a single delta
+    /// carrying the full block so clients only ever handle one event type.
+    /// Reconstruct full blocks by concatenating consecutive deltas until the
+    /// next non-text event (ReasoningDelta, ToolCallBegin, AssistantEnd).
     ThreadAssistantTextDelta {
+        thread_id: String,
+        delta: String,
+    },
+    /// Streaming chain-of-thought fragment — Anthropic extended-thinking,
+    /// OpenAI Responses `reasoning`, Gemini `thought:true` text. Same
+    /// accumulation rule as [`ThreadAssistantTextDelta`] but opens a
+    /// separate, visually-distinct block.
+    ThreadAssistantReasoningDelta {
         thread_id: String,
         delta: String,
     },

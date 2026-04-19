@@ -147,7 +147,7 @@ pub async fn serve(listen: SocketAddr, config: ServerConfig) -> anyhow::Result<(
         default_system_prompt.clone(),
     );
 
-    let mut scheduler = Scheduler::new(
+    let (mut scheduler, stream_rx) = Scheduler::new(
         default_pod,
         config.host_id,
         config.backends,
@@ -189,7 +189,9 @@ pub async fn serve(listen: SocketAddr, config: ServerConfig) -> anyhow::Result<(
     }
 
     let (inbox_tx, inbox_rx) = mpsc::unbounded_channel::<SchedulerMsg>();
-    let scheduler_handle = tokio::spawn(crate::runtime::scheduler::run(scheduler, inbox_rx));
+    let scheduler_handle = tokio::spawn(crate::runtime::scheduler::run(
+        scheduler, inbox_rx, stream_rx,
+    ));
 
     let state = AppState {
         inbox: inbox_tx.clone(),

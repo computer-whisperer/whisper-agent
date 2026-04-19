@@ -177,24 +177,6 @@ impl ThreadEventRouter {
                         },
                     );
                 }
-                ThreadEvent::AssistantText { text } => {
-                    self.broadcast_to_subscribers(
-                        thread_id,
-                        ServerToClient::ThreadAssistantText {
-                            thread_id: thread_id.to_string(),
-                            text,
-                        },
-                    );
-                }
-                ThreadEvent::AssistantReasoning { text } => {
-                    self.broadcast_to_subscribers(
-                        thread_id,
-                        ServerToClient::ThreadAssistantReasoning {
-                            thread_id: thread_id.to_string(),
-                            text,
-                        },
-                    );
-                }
                 ThreadEvent::ToolCallBegin {
                     tool_use_id,
                     name,

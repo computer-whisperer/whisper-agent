@@ -1217,22 +1217,21 @@ impl ChatApp {
                 }
             }
             ServerToClient::ThreadAssistantBegin { .. } => {}
-            ServerToClient::ThreadAssistantText { thread_id, text } => {
-                if let Some(view) = self.tasks.get_mut(&thread_id) {
-                    view.items.push(DisplayItem::AssistantText { text });
-                }
-            }
-            ServerToClient::ThreadAssistantReasoning { thread_id, text } => {
-                if let Some(view) = self.tasks.get_mut(&thread_id) {
-                    view.items.push(DisplayItem::Reasoning { text });
-                }
-            }
             ServerToClient::ThreadAssistantTextDelta { thread_id, delta } => {
                 if let Some(view) = self.tasks.get_mut(&thread_id) {
                     if let Some(DisplayItem::AssistantText { text }) = view.items.last_mut() {
                         text.push_str(&delta);
                     } else {
                         view.items.push(DisplayItem::AssistantText { text: delta });
+                    }
+                }
+            }
+            ServerToClient::ThreadAssistantReasoningDelta { thread_id, delta } => {
+                if let Some(view) = self.tasks.get_mut(&thread_id) {
+                    if let Some(DisplayItem::Reasoning { text }) = view.items.last_mut() {
+                        text.push_str(&delta);
+                    } else {
+                        view.items.push(DisplayItem::Reasoning { text: delta });
                     }
                 }
             }

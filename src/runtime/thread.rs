@@ -260,14 +260,6 @@ pub enum ThreadEvent {
     AssistantBegin {
         turn: u32,
     },
-    AssistantText {
-        text: String,
-    },
-    /// Chain-of-thought block. Emitted in the same order as text/tool-use
-    /// blocks so the client can interleave them faithfully.
-    AssistantReasoning {
-        text: String,
-    },
     ToolCallBegin {
         tool_use_id: String,
         name: String,
@@ -804,19 +796,11 @@ impl Thread {
         } = response;
         self.total_usage.add(&usage);
         self.turn_log.entries.push(TurnEntry { usage });
-        for block in &assistant_blocks {
-            match block {
-                ContentBlock::Text { text } => {
-                    events.push(ThreadEvent::AssistantText { text: text.clone() });
-                }
-                ContentBlock::Thinking { thinking, .. } => {
-                    events.push(ThreadEvent::AssistantReasoning {
-                        text: thinking.clone(),
-                    });
-                }
-                _ => {}
-            }
-        }
+        // Text and thinking blocks are NOT emitted as events here — the
+        // scheduler's streaming consumer broadcasts them via
+        // `ThreadAssistantTextDelta` / `ThreadAssistantReasoningDelta` during
+        // the model call, and the assembled blocks are preserved on the
+        // `Message` we push to `self.conversation` below for snapshot replay.
         let tool_uses: Vec<ToolUseReq> = assistant_blocks
             .iter()
             .filter_map(|b| match b {

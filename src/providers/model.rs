@@ -13,7 +13,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::time::Duration;
 
-use futures::stream::{self, Stream, StreamExt};
+use futures::stream::{Stream, StreamExt};
 use serde_json::Value;
 use thiserror::Error;
 use whisper_agent_protocol::{ContentBlock, Message, Usage};
@@ -129,22 +129,44 @@ pub trait ModelProvider: Send + Sync {
 
     /// Streaming variant. Returns a stream of [`ModelEvent`]s ending in a
     /// single `Completed` event. The default implementation buffers on top of
-    /// `create_message` — adapters override to emit real SSE deltas as they
-    /// arrive. Callers that only need the final response can ignore every
-    /// event except `Completed` (or use [`buffer_stream`] to collect).
+    /// `create_message` and synthesizes one delta per text/thinking block
+    /// plus one `ToolCall` per tool_use, so consumers only need to handle
+    /// the streaming shape. Adapters override to emit real SSE deltas as
+    /// bytes arrive.
     fn create_message_streaming<'a>(
         &'a self,
         req: &'a ModelRequest<'a>,
     ) -> BoxStream<'a, Result<ModelEvent, ModelError>> {
-        Box::pin(stream::once(async move {
-            self.create_message(req)
-                .await
-                .map(|resp| ModelEvent::Completed {
-                    content: resp.content,
-                    stop_reason: resp.stop_reason,
-                    usage: resp.usage,
-                })
-        }))
+        Box::pin(async_stream::try_stream! {
+            let resp = self.create_message(req).await?;
+            // Synthesize per-block events so a non-streaming backend
+            // flows through the same consumer code path as a streaming
+            // one. Callers that only care about Completed still get the
+            // canonical assembled content there.
+            for block in &resp.content {
+                match block {
+                    ContentBlock::Text { text } if !text.is_empty() => {
+                        yield ModelEvent::TextDelta { text: text.clone() };
+                    }
+                    ContentBlock::Thinking { thinking, .. } if !thinking.is_empty() => {
+                        yield ModelEvent::ThinkingDelta { text: thinking.clone() };
+                    }
+                    ContentBlock::ToolUse { id, name, input, .. } => {
+                        yield ModelEvent::ToolCall {
+                            id: id.clone(),
+                            name: name.clone(),
+                            input: input.clone(),
+                        };
+                    }
+                    _ => {}
+                }
+            }
+            yield ModelEvent::Completed {
+                content: resp.content,
+                stop_reason: resp.stop_reason,
+                usage: resp.usage,
+            };
+        })
     }
 
     fn list_models<'a>(&'a self) -> BoxFuture<'a, Result<Vec<ModelInfo>, ModelError>>;

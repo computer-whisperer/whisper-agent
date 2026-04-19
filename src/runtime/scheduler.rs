@@ -203,6 +203,18 @@ const CRON_TICK_SECS: u64 = 30;
 /// (Delay) prevents bursts when the process resumes after suspension.
 const RETENTION_TICK_SECS: u64 = 3600;
 
+/// Interim event a dispatched I/O task pushes back to the scheduler for
+/// immediate fan-out to subscribers. Distinct from the per-task I/O
+/// *completion* (which flows via `FuturesUnordered`): an `StreamUpdate`
+/// carries a pre-shaped wire event the scheduler just forwards to
+/// subscribers of `thread_id`. Model-call streaming deltas ride this
+/// channel today; future MCP tool-output streaming plugs into the same
+/// path (the tool-call future clones the sender on dispatch).
+pub struct StreamUpdate {
+    pub thread_id: String,
+    pub event: ServerToClient,
+}
+
 pub struct Scheduler {
     /// MCP host URL passed through to threads when their pod doesn't carry a
     /// Pod the scheduler picks when `CreateThread` doesn't name one. Always
@@ -256,6 +268,11 @@ pub struct Scheduler {
     /// orphans the parent the same way it orphans an in-flight MCP
     /// tool call, and the user must cancel the parent to recover.
     pending_dispatches: HashMap<String, dispatch::PendingDispatch>,
+    /// Sender half of the stream-update channel; cloned and handed to each
+    /// dispatched I/O future that wants to push interim events (streaming
+    /// model deltas today, MCP tool-output chunks tomorrow). The receiver
+    /// lives on the scheduler's run loop.
+    stream_tx: mpsc::UnboundedSender<StreamUpdate>,
 }
 
 impl Scheduler {
@@ -278,7 +295,7 @@ impl Scheduler {
         audit: AuditLog,
         host_env_registry: crate::tools::sandbox::HostEnvRegistry,
         shared_host_configs: Vec<SharedHostConfig>,
-    ) -> anyhow::Result<Self> {
+    ) -> anyhow::Result<(Self, mpsc::UnboundedReceiver<StreamUpdate>)> {
         assert!(
             backends.contains_key(&default_backend),
             "default_backend must be in backends"
@@ -322,22 +339,35 @@ impl Scheduler {
         let mut pods = HashMap::new();
         pods.insert(default_pod_id.clone(), default_pod);
 
-        Ok(Self {
-            default_pod_id,
-            pods,
-            backends,
-            default_backend,
-            persister: None,
-            host_env_registry,
-            tasks: HashMap::new(),
-            router: ThreadEventRouter::new(audit, host_id),
-            resources,
-            next_op_id: 1,
-            dirty: HashSet::new(),
-            dirty_behaviors: HashSet::new(),
-            provisioning_in_flight: HashSet::new(),
-            pending_dispatches: HashMap::new(),
-        })
+        let (stream_tx, stream_rx) = mpsc::unbounded_channel();
+        Ok((
+            Self {
+                default_pod_id,
+                pods,
+                backends,
+                default_backend,
+                persister: None,
+                host_env_registry,
+                tasks: HashMap::new(),
+                router: ThreadEventRouter::new(audit, host_id),
+                resources,
+                next_op_id: 1,
+                dirty: HashSet::new(),
+                dirty_behaviors: HashSet::new(),
+                provisioning_in_flight: HashSet::new(),
+                pending_dispatches: HashMap::new(),
+                stream_tx,
+            },
+            stream_rx,
+        ))
+    }
+
+    /// Clone of the stream-update sender. Dispatched I/O futures grab one
+    /// of these at dispatch time and push interim events through it; the
+    /// scheduler's `run` loop forwards anything the receiver gets to the
+    /// router.
+    pub(crate) fn stream_sender(&self) -> mpsc::UnboundedSender<StreamUpdate> {
+        self.stream_tx.clone()
     }
 
     /// Read-only access to the Phase 1a shadow registry. Currently only used by
@@ -2062,7 +2092,11 @@ fn truncate(mut s: String, max: usize) -> String {
 
 // ---------- Run loop ----------
 
-pub async fn run(mut scheduler: Scheduler, mut inbox: mpsc::UnboundedReceiver<SchedulerMsg>) {
+pub async fn run(
+    mut scheduler: Scheduler,
+    mut inbox: mpsc::UnboundedReceiver<SchedulerMsg>,
+    mut stream_rx: mpsc::UnboundedReceiver<StreamUpdate>,
+) {
     let mut pending_io: FuturesUnordered<SchedulerFuture> = FuturesUnordered::new();
     let mut gc_ticker = tokio::time::interval(Duration::from_secs(GC_TICK_SECS));
     let mut cron_ticker = tokio::time::interval(Duration::from_secs(CRON_TICK_SECS));
@@ -2107,6 +2141,13 @@ pub async fn run(mut scheduler: Scheduler, mut inbox: mpsc::UnboundedReceiver<Sc
                         }
                     }
                 }
+            }
+            Some(update) = stream_rx.recv() => {
+                // Fire-and-forget fan-out: the router handles "no
+                // subscribers" gracefully (drops the event), so an
+                // unsubscribed thread's deltas cost us nothing beyond
+                // the channel push.
+                scheduler.router.broadcast_to_subscribers(&update.thread_id, update.event);
             }
             _ = gc_ticker.tick() => {
                 scheduler.gc_tick();
