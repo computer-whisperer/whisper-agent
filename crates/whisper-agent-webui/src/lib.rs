@@ -7,6 +7,8 @@
 mod app;
 mod cron_preview;
 mod editor;
+#[cfg(target_arch = "wasm32")]
+mod fonts;
 
 pub use app::ChatApp;
 
@@ -52,6 +54,7 @@ mod web_entry {
                         // reading size without pushing the layout into
                         // tablet mode.
                         cc.egui_ctx.set_zoom_factor(1.2);
+                        super::fonts::install(&cc.egui_ctx);
                         let (inbound, send_fn) = open_websocket(cc.egui_ctx.clone());
                         Ok(Box::new(ChatApp::new(inbound, send_fn)))
                     }),
