@@ -7,16 +7,19 @@
 //! alone carries the role signal so the bulk of the conversation reads
 //! as a quiet stream of model output, not a chat log.
 //!
-//! Tool calls and tool results each render as their own collapsible
-//! row at the position they landed in the conversation. Tool-call
-//! headers read `name summary`; tool-result headers read `name
-//! preview [status]`. Both default to collapsed; click the toggle
-//! to expand and see the full args / diff / result.
+//! Tool calls render as a collapsible row that fuses the call and
+//! its immediate result into one entry — `name summary preview
+//! [status]` in the collapsed header, args/diff + full result in
+//! the expanded body. Results that arrive "distant" from their
+//! call (separated by an assistant or user turn — typically an
+//! async `dispatch_thread` callback) render as their own standalone
+//! row instead, so chronology stays intact. Both kinds default to
+//! collapsed.
 
 use egui::{Color32, RichText};
 use egui_commonmark::{CommonMarkCache, CommonMarkViewer};
 
-use super::{DiffPayload, DisplayItem};
+use super::{DiffPayload, DisplayItem, FusedToolResult};
 
 const GUTTER_WIDTH: f32 = 3.0;
 
@@ -36,6 +39,10 @@ fn item_palette(item: &DisplayItem) -> (Color32, Color32) {
         ),
         DisplayItem::AssistantText { .. } => (COLOR_AGENT, Color32::TRANSPARENT),
         DisplayItem::Reasoning { .. } => (COLOR_REASONING, Color32::TRANSPARENT),
+        DisplayItem::ToolCall {
+            result: Some(FusedToolResult { is_error: true, .. }),
+            ..
+        } => (COLOR_ERROR, Color32::TRANSPARENT),
         DisplayItem::ToolCall { .. } => (COLOR_TOOL, Color32::TRANSPARENT),
         DisplayItem::ToolResult { is_error: true, .. } => (COLOR_ERROR, Color32::TRANSPARENT),
         DisplayItem::ToolResult { .. } => (COLOR_TOOL, Color32::TRANSPARENT),
@@ -69,6 +76,7 @@ pub(super) fn render_item(ui: &mut egui::Ui, cache: &mut CommonMarkCache, item: 
                 summary,
                 args_pretty,
                 diff,
+                result,
             } => render_tool_call(
                 ui,
                 tool_use_id,
@@ -76,6 +84,7 @@ pub(super) fn render_item(ui: &mut egui::Ui, cache: &mut CommonMarkCache, item: 
                 summary,
                 args_pretty.as_deref(),
                 diff.as_ref(),
+                result.as_ref(),
             ),
             DisplayItem::ToolResult {
                 tool_use_id,
@@ -174,6 +183,7 @@ fn render_system_note(ui: &mut egui::Ui, text: &str, is_error: bool) {
     ui.label(RichText::new(text).color(color).italics());
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render_tool_call(
     ui: &mut egui::Ui,
     tool_use_id: &str,
@@ -181,13 +191,20 @@ fn render_tool_call(
     summary: &str,
     args_pretty: Option<&str>,
     diff: Option<&DiffPayload>,
+    result: Option<&FusedToolResult>,
 ) {
     let id = ui.make_persistent_id(("tool", tool_use_id));
-    // Default-collapsed: chat stream reads as a sequence of
-    // `name summary` headers, expandable for args / diff. The
-    // matching result lands as its own `DisplayItem::ToolResult`
-    // row, not inside this body.
+    // Default-collapsed. Chat stream reads as a sequence of one-line
+    // `name summary [status]` headers; expand to see args / diff /
+    // result. A fused result — the common case for sync calls and
+    // async dispatch acks — is rendered in the body alongside the
+    // args/diff, avoiding a second chat row.
     let default_open = false;
+    let (chip_text, chip_color) = match result {
+        None => ("running", Color32::from_rgb(200, 180, 60)),
+        Some(FusedToolResult { is_error: true, .. }) => ("error", COLOR_ERROR),
+        Some(_) => ("ok", Color32::from_rgb(140, 200, 140)),
+    };
     egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), id, default_open)
         .show_header(ui, |ui| {
             ui.horizontal(|ui| {
@@ -198,6 +215,28 @@ fn render_tool_call(
                         .color(Color32::from_gray(180))
                         .monospace(),
                 );
+                // One-line result preview in the collapsed header so
+                // the outcome is visible without expanding.
+                if let Some(FusedToolResult { text, is_error }) = result {
+                    let preview = first_line_preview(text, 80);
+                    if !preview.is_empty() {
+                        ui.add_space(8.0);
+                        let preview_color = if *is_error {
+                            Color32::from_rgb(220, 140, 140)
+                        } else {
+                            Color32::from_gray(150)
+                        };
+                        ui.label(
+                            RichText::new(preview)
+                                .color(preview_color)
+                                .monospace()
+                                .small(),
+                        );
+                    }
+                }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.label(RichText::new(chip_text).color(chip_color).small().strong());
+                });
             });
         })
         .body(|ui| {
@@ -210,6 +249,21 @@ fn render_tool_call(
                         .monospace()
                         .small(),
                 );
+            }
+            if let Some(FusedToolResult { text, is_error }) = result {
+                ui.add_space(6.0);
+                ui.label(
+                    RichText::new("result")
+                        .color(Color32::from_gray(140))
+                        .small()
+                        .strong(),
+                );
+                let color = if *is_error {
+                    Color32::from_rgb(220, 140, 140)
+                } else {
+                    Color32::from_gray(180)
+                };
+                ui.label(RichText::new(text).color(color).monospace().small());
             }
         });
 }

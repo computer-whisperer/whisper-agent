@@ -163,12 +163,20 @@ enum DisplayItem {
         /// `write_file` tool calls when full args are available. Lets
         /// the renderer show a unified diff inline.
         diff: Option<DiffPayload>,
+        /// Fused tool response. Populated by `push_tool_result` when
+        /// the matching tool_result arrives without an intervening
+        /// `User`/`AssistantText` boundary — the common case for sync
+        /// calls and for the initial ack of an async `dispatch_thread`.
+        /// `None` while the call is still in flight. When populated,
+        /// the render shows a status chip + one-line preview in the
+        /// header and the full text in the expanded body.
+        result: Option<FusedToolResult>,
     },
-    /// Tool response — rendered as its own chat row at the position
-    /// where it landed in the conversation. Always default-
-    /// collapsed; click to expand. Matches the "quiet log" treatment
-    /// of tool calls and reasoning — the chat stream stays scannable,
-    /// and the operator opens individual rows to see full content.
+    /// Standalone tool response — rendered as its own chat row when
+    /// the result is "distant" from its call (separated by at least
+    /// one assistant or user turn). Typical source: async
+    /// `dispatch_thread` callback landing after the conversation has
+    /// moved on. Always default-collapsed.
     ToolResult {
         tool_use_id: String,
         /// Best-effort tool name, looked up from the matching
@@ -194,6 +202,15 @@ struct DiffPayload {
     old_text: String,
     new_text: String,
     is_creation: bool,
+}
+
+/// Tool result fused onto its originating `DisplayItem::ToolCall`.
+/// Rendered as the expanded body's result section and as a one-line
+/// preview + status chip in the collapsed header.
+#[derive(Clone)]
+pub(crate) struct FusedToolResult {
+    pub text: String,
+    pub is_error: bool,
 }
 
 struct TaskView {
@@ -1760,16 +1777,51 @@ fn push_tool_result_from_text(items: &mut Vec<DisplayItem>, text: &str) {
     });
 }
 
-/// Push a `DisplayItem::ToolResult` at the tail of `items`, deriving
-/// the tool name from the most-recent matching `DisplayItem::ToolCall`
-/// so the row's header can label itself with the tool that produced
-/// the result. The row always default-collapses at render time.
+/// Route a tool_result payload onto the items stream.
+///
+/// If the matching `DisplayItem::ToolCall` can be found walking
+/// backward without crossing a `User` / `AssistantText` boundary, the
+/// result is fused onto that call (set the call's `result` slot). The
+/// common case — sync tool calls and the initial ack of an async
+/// `dispatch_thread` — renders as a single combined row instead of
+/// two stacked rows, cutting chat-log noise.
+///
+/// Otherwise (boundary crossed, or no matching call in view) push a
+/// standalone `DisplayItem::ToolResult` at the tail. This covers the
+/// distant async-callback case where the originating call lives
+/// several turns earlier.
 fn push_tool_result(
     items: &mut Vec<DisplayItem>,
     tool_use_id: String,
     text: String,
     is_error: bool,
 ) {
+    for item in items.iter_mut().rev() {
+        match item {
+            DisplayItem::ToolCall {
+                tool_use_id: id,
+                result,
+                ..
+            } if id == &tool_use_id => {
+                // Fuse only if the call doesn't already have a
+                // result. A second arriving result for the same
+                // tool_use_id is unusual but can happen (error
+                // retries, protocol quirks); fall through to the
+                // standalone-row path so the newer data isn't lost
+                // silently.
+                if result.is_none() {
+                    *result = Some(FusedToolResult { text, is_error });
+                    return;
+                }
+                break;
+            }
+            // Crossing an assistant/user turn means the result is
+            // chronologically separated from its call — push as a
+            // standalone row at its arrival position.
+            DisplayItem::User { .. } | DisplayItem::AssistantText { .. } => break,
+            _ => continue,
+        }
+    }
     let name = items
         .iter()
         .rev()
@@ -1852,6 +1904,7 @@ fn build_tool_call_item(
         summary,
         args_pretty,
         diff,
+        result: None,
     }
 }
 
@@ -4305,33 +4358,31 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_rebuild_emits_sync_tool_result_row() {
+    fn snapshot_rebuild_fuses_sync_result_into_tool_call() {
         let items = conversation_to_items(&conv_with_tool_call());
-        // Tool call item still appears at its original position.
-        let has_tool_call = items.iter().any(|i| {
-            matches!(
-                i,
-                DisplayItem::ToolCall { tool_use_id, .. } if tool_use_id == "tu-1"
-            )
-        });
-        assert!(has_tool_call, "tool call row should be present");
-        // Tool result lands as its own row, immediately after the
-        // call, carrying the tool name and default-collapsed.
-        let result = items
+        // The matching sync tool_result should fuse into the ToolCall
+        // (populate its `result` slot) rather than producing a
+        // standalone ToolResult row.
+        let fused = items
             .iter()
             .find_map(|i| match i {
-                DisplayItem::ToolResult {
+                DisplayItem::ToolCall {
                     tool_use_id,
-                    name,
-                    text,
-                    is_error,
-                } if tool_use_id == "tu-1" => Some((name.clone(), text.clone(), *is_error)),
+                    result,
+                    ..
+                } if tool_use_id == "tu-1" => result.as_ref().map(|r| (r.text.clone(), r.is_error)),
                 _ => None,
             })
-            .expect("tool result row should be present");
-        assert_eq!(result.0, "bash", "tool_result inherits the call's name");
-        assert_eq!(result.1, "file1\nfile2\n");
-        assert!(!result.2);
+            .expect("ToolCall with fused result should be present");
+        assert_eq!(fused.0, "file1\nfile2\n");
+        assert!(!fused.1);
+        let standalone = items.iter().any(
+            |i| matches!(i, DisplayItem::ToolResult { tool_use_id, .. } if tool_use_id == "tu-1"),
+        );
+        assert!(
+            !standalone,
+            "sync result should not also appear as a standalone ToolResult row"
+        );
     }
 
     #[test]
@@ -4369,37 +4420,33 @@ mod tests {
             tool_call_count > 0,
             "expected at least one ToolCall item, got items={roles_debug:?}"
         );
-        // Every tool_use in the real file should land with a
-        // matching `DisplayItem::ToolResult` row produced by the
-        // walk — either from a sync tool_result block or from an
-        // async XML callback.
-        use std::collections::HashSet;
-        let mut call_ids: HashSet<String> = HashSet::new();
-        let mut result_ids: HashSet<String> = HashSet::new();
+        // Every ToolCall should have a fused result (the 4 sync
+        // tool_result messages land on their originating calls
+        // directly via the fusion walk).
         for item in &items {
-            match item {
-                DisplayItem::ToolCall { tool_use_id, .. } => {
-                    call_ids.insert(tool_use_id.clone());
-                }
-                DisplayItem::ToolResult { tool_use_id, .. } => {
-                    result_ids.insert(tool_use_id.clone());
-                }
-                _ => {}
+            if let DisplayItem::ToolCall {
+                tool_use_id,
+                result,
+                ..
+            } = item
+            {
+                assert!(
+                    result.is_some(),
+                    "expected fused result on ToolCall {tool_use_id}"
+                );
             }
         }
-        assert_eq!(
-            call_ids, result_ids,
-            "every tool call in the real file should have a matching ToolResult row"
-        );
-        // The real file has 4 sync tool_results and 2 async XML
-        // callbacks (bound to two of the same tool_use_ids — async
-        // dispatch emits an initial ack plus a later callback). Six
-        // rows total.
-        let tool_results = items
+        // The 2 async XML callbacks (msg 10/12) land after an
+        // intervening assistant turn, so they push standalone
+        // ToolResult rows.
+        let standalone_count = items
             .iter()
             .filter(|i| matches!(i, DisplayItem::ToolResult { .. }))
             .count();
-        assert_eq!(tool_results, 6, "expected 6 tool_result rows");
+        assert_eq!(
+            standalone_count, 2,
+            "expected 2 standalone ToolResult rows for the async callbacks"
+        );
     }
 
     #[test]
@@ -4433,7 +4480,22 @@ mod tests {
              </dispatched-thread-notification>",
         ));
         let items = conversation_to_items(&conv);
-        let results: Vec<String> = items
+        // The initial sync ack fuses into the ToolCall (no intervening
+        // turn at the time it lands); the async XML callback arrives
+        // after an assistant turn and pushes a standalone row.
+        let fused = items
+            .iter()
+            .find_map(|i| match i {
+                DisplayItem::ToolCall {
+                    tool_use_id,
+                    result,
+                    ..
+                } if tool_use_id == "tu-async" => result.as_ref().map(|r| r.text.clone()),
+                _ => None,
+            })
+            .expect("ToolCall should have the sync ack fused onto it");
+        assert_eq!(fused, "Dispatched task-X");
+        let standalone: Vec<String> = items
             .iter()
             .filter_map(|i| match i {
                 DisplayItem::ToolResult {
@@ -4442,8 +4504,11 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(results.len(), 2, "expected ack row + async callback row");
-        assert_eq!(results[0], "Dispatched task-X");
-        assert_eq!(results[1], "the real final answer with <code> in it");
+        assert_eq!(
+            standalone.len(),
+            1,
+            "expected only the async callback as a standalone row"
+        );
+        assert_eq!(standalone[0], "the real final answer with <code> in it");
     }
 }
