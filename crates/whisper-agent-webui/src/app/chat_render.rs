@@ -234,7 +234,17 @@ fn render_tool_result(
     is_error: bool,
     default_open: bool,
 ) {
-    let id = ui.make_persistent_id(("tool_result", tool_use_id));
+    // Hash the result text into the persistent id so multiple
+    // ToolResult rows that share a tool_use_id (sync ack + later
+    // async callback for the same `dispatch_thread` call) get
+    // distinct collapsing states — otherwise egui treats them as
+    // the same widget and clicking one toggles the other.
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut hasher = DefaultHasher::new();
+    tool_use_id.hash(&mut hasher);
+    text.hash(&mut hasher);
+    let id = ui.make_persistent_id(("tool_result", hasher.finish()));
     let (chip_text, chip_color) = if is_error {
         ("error", COLOR_ERROR)
     } else {
