@@ -480,33 +480,34 @@ impl Scheduler {
         }
     }
 
-    /// Terminal-state hook: if `thread_id` was a parent of any
-    /// outstanding dispatched children, cancel those children and drop
-    /// their senders. The parent's tool call is no longer going to
-    /// consume the result, so keeping the child running is wasted
-    /// compute.
+    /// Terminal-state hook: if `thread_id` is a parent that's truly
+    /// dead (Failed or Cancelled), cancel its outstanding dispatched
+    /// children and drop the pending entries. `Completed` is NOT
+    /// dead — parents sit in `Completed` between turns and are still
+    /// capable of receiving new user messages (including the async
+    /// flush a dispatched child is eventually going to produce). A
+    /// parent in `Completed` with a pending `Async` entry is the
+    /// normal waiting-for-async-callback state, not an orphan.
+    ///
+    /// Sync (`ToolResult`) entries reaching this hook with the parent
+    /// still in `Completed` are also fine — they simply mean the sync
+    /// child is still running; resolving happens in
+    /// `resolve_pending_dispatch` on the child's terminal, not here.
     pub(super) fn cascade_cancel_dispatched_children(
         &mut self,
         thread_id: &str,
         pending_io: &mut FuturesUnordered<SchedulerFuture>,
     ) {
-        // Only cascade when this thread has actually reached terminal;
-        // an interim park on a parent shouldn't evict children.
         let Some(task) = self.tasks.get(thread_id) else {
             return;
         };
-        let terminal = matches!(
+        let dead = matches!(
             task.public_state(),
-            ThreadStateLabel::Completed | ThreadStateLabel::Failed | ThreadStateLabel::Cancelled
+            ThreadStateLabel::Failed | ThreadStateLabel::Cancelled
         );
-        if !terminal {
+        if !dead {
             return;
         }
-        // A terminal parent with pending dispatches means sync
-        // dispatches whose parent died before the child did — odd but
-        // possible (parent Cancelled mid-wait, parent Failed on some
-        // unrelated op, parent Completed without consuming the pending
-        // tool result). Walk the map and evict.
         let orphaned_children: Vec<String> = self
             .pending_dispatches
             .iter()
