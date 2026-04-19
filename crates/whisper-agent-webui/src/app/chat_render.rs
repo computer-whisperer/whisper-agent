@@ -7,13 +7,15 @@
 //! alone carries the role signal so the bulk of the conversation reads
 //! as a quiet stream of model output, not a chat log.
 //!
-//! Tool calls render as collapsible rows whose header is `name summary
-//! [state]`. All tool calls collapse by default to keep the chat
-//! stream scannable even during busy edit sessions. Clicking expands
-//! the body: a unified diff for `edit_file` / `write_file` (built
-//! into the item's `diff` payload at build_tool_call_item time), or
-//! the full pretty-printed JSON args for other tools, followed by
-//! the truncated result.
+//! Tool calls and tool results each render as their own collapsible
+//! row at the position they landed in the conversation. Tool-call
+//! headers read `name summary`; tool-result headers read `name
+//! preview [status]`. All tool calls collapse by default. Tool
+//! results default to collapsed when they immediately follow their
+//! call (dense, expected); they default to expanded when separated
+//! from their call by an assistant or user turn (typically an async
+//! `dispatch_thread` callback) so the operator sees the fresh
+//! content without clicking.
 
 use egui::{Color32, RichText};
 use egui_commonmark::{CommonMarkCache, CommonMarkViewer};
@@ -38,8 +40,9 @@ fn item_palette(item: &DisplayItem) -> (Color32, Color32) {
         ),
         DisplayItem::AssistantText { .. } => (COLOR_AGENT, Color32::TRANSPARENT),
         DisplayItem::Reasoning { .. } => (COLOR_REASONING, Color32::TRANSPARENT),
-        DisplayItem::ToolCall { is_error: true, .. } => (COLOR_ERROR, Color32::TRANSPARENT),
         DisplayItem::ToolCall { .. } => (COLOR_TOOL, Color32::TRANSPARENT),
+        DisplayItem::ToolResult { is_error: true, .. } => (COLOR_ERROR, Color32::TRANSPARENT),
+        DisplayItem::ToolResult { .. } => (COLOR_TOOL, Color32::TRANSPARENT),
         DisplayItem::SystemNote { is_error: true, .. } => (
             COLOR_ERROR,
             Color32::from_rgba_unmultiplied(220, 120, 120, 18),
@@ -70,8 +73,6 @@ pub(super) fn render_item(ui: &mut egui::Ui, cache: &mut CommonMarkCache, item: 
                 summary,
                 args_pretty,
                 diff,
-                result,
-                is_error,
             } => render_tool_call(
                 ui,
                 tool_use_id,
@@ -79,9 +80,14 @@ pub(super) fn render_item(ui: &mut egui::Ui, cache: &mut CommonMarkCache, item: 
                 summary,
                 args_pretty.as_deref(),
                 diff.as_ref(),
-                result.as_deref(),
-                *is_error,
             ),
+            DisplayItem::ToolResult {
+                tool_use_id,
+                name,
+                text,
+                is_error,
+                default_open,
+            } => render_tool_result(ui, tool_use_id, name, text, *is_error, *default_open),
             DisplayItem::SystemNote { text, is_error } => render_system_note(ui, text, *is_error),
         }
     });
@@ -173,7 +179,6 @@ fn render_system_note(ui: &mut egui::Ui, text: &str, is_error: bool) {
     ui.label(RichText::new(text).color(color).italics());
 }
 
-#[allow(clippy::too_many_arguments)]
 fn render_tool_call(
     ui: &mut egui::Ui,
     tool_use_id: &str,
@@ -181,21 +186,13 @@ fn render_tool_call(
     summary: &str,
     args_pretty: Option<&str>,
     diff: Option<&DiffPayload>,
-    result: Option<&str>,
-    is_error: bool,
 ) {
     let id = ui.make_persistent_id(("tool", tool_use_id));
-    // Default-collapsed for every tool call. The chat stream reads
-    // as a sequence of headers (name + one-line summary + status
-    // chip); clicking expands args / diff / result. Keeps the view
-    // scannable during busy edit sessions and aligns with the
-    // reasoning-block default.
+    // Default-collapsed: chat stream reads as a sequence of
+    // `name summary` headers, expandable for args / diff. The
+    // matching result lands as its own `DisplayItem::ToolResult`
+    // row, not inside this body.
     let default_open = false;
-    let (chip_text, chip_color) = match (result, is_error) {
-        (None, _) => ("running", Color32::from_rgb(200, 180, 60)),
-        (Some(_), true) => ("error", COLOR_ERROR),
-        (Some(_), false) => ("ok", Color32::from_rgb(140, 200, 140)),
-    };
     egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), id, default_open)
         .show_header(ui, |ui| {
             ui.horizontal(|ui| {
@@ -206,30 +203,6 @@ fn render_tool_call(
                         .color(Color32::from_gray(180))
                         .monospace(),
                 );
-                // Inline result preview keeps the outcome visible
-                // while the row stays collapsed; truncated to one
-                // short line so it doesn't overflow. Full result
-                // rendered in the collapsed body when expanded.
-                if let Some(body) = result {
-                    let preview = first_line_preview(body, 80);
-                    if !preview.is_empty() {
-                        ui.add_space(8.0);
-                        let preview_color = if is_error {
-                            Color32::from_rgb(220, 140, 140)
-                        } else {
-                            Color32::from_gray(150)
-                        };
-                        ui.label(
-                            RichText::new(preview)
-                                .color(preview_color)
-                                .monospace()
-                                .small(),
-                        );
-                    }
-                }
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.label(RichText::new(chip_text).color(chip_color).small().strong());
-                });
             });
         })
         .body(|ui| {
@@ -243,21 +216,62 @@ fn render_tool_call(
                         .small(),
                 );
             }
-            if let Some(result) = result {
+        });
+}
+
+/// Render a tool-result row. Proximity to the originating tool call
+/// drives the default-open state: results immediately following
+/// their call default-collapsed (dense, expected, quiet); results
+/// arriving after an intervening assistant/user turn default-
+/// expanded so the operator sees the new content. Header shows
+/// `name summary [status]`; expanded body shows the full result
+/// text.
+fn render_tool_result(
+    ui: &mut egui::Ui,
+    tool_use_id: &str,
+    name: &str,
+    text: &str,
+    is_error: bool,
+    default_open: bool,
+) {
+    let id = ui.make_persistent_id(("tool_result", tool_use_id));
+    let (chip_text, chip_color) = if is_error {
+        ("error", COLOR_ERROR)
+    } else {
+        ("ok", Color32::from_rgb(140, 200, 140))
+    };
+    let label = if name.is_empty() { "tool_result" } else { name };
+    egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), id, default_open)
+        .show_header(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(label).color(COLOR_TOOL).strong().monospace());
                 ui.add_space(6.0);
-                ui.label(
-                    RichText::new("result")
-                        .color(Color32::from_gray(140))
-                        .small()
-                        .strong(),
-                );
-                let color = if is_error {
-                    Color32::from_rgb(220, 140, 140)
-                } else {
-                    Color32::from_gray(180)
-                };
-                ui.label(RichText::new(result).color(color).monospace().small());
-            }
+                let preview = first_line_preview(text, 120);
+                if !preview.is_empty() {
+                    let preview_color = if is_error {
+                        Color32::from_rgb(220, 140, 140)
+                    } else {
+                        Color32::from_gray(150)
+                    };
+                    ui.label(
+                        RichText::new(preview)
+                            .color(preview_color)
+                            .monospace()
+                            .small(),
+                    );
+                }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.label(RichText::new(chip_text).color(chip_color).small().strong());
+                });
+            });
+        })
+        .body(|ui| {
+            let color = if is_error {
+                Color32::from_rgb(220, 140, 140)
+            } else {
+                Color32::from_gray(180)
+            };
+            ui.label(RichText::new(text).color(color).monospace().small());
         });
 }
 

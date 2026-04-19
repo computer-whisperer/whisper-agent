@@ -163,8 +163,24 @@ enum DisplayItem {
         /// `write_file` tool calls when full args are available. Lets
         /// the renderer show a unified diff inline.
         diff: Option<DiffPayload>,
-        result: Option<String>,
+    },
+    /// Tool response — rendered as its own chat row at the position
+    /// where it landed in the conversation. Tool results that
+    /// immediately follow their call default to collapsed (dense and
+    /// expected); results separated from the originating call by an
+    /// assistant or user message (async dispatch_thread callbacks,
+    /// anything that landed after intervening turns) default to
+    /// expanded so the operator sees the new content without
+    /// clicking.
+    ToolResult {
+        tool_use_id: String,
+        /// Best-effort tool name, looked up from the matching
+        /// `DisplayItem::ToolCall` when available. Empty string if
+        /// the call isn't in the current view (orphan result).
+        name: String,
+        text: String,
         is_error: bool,
+        default_open: bool,
     },
     SystemNote {
         text: String,
@@ -1057,18 +1073,18 @@ impl ChatApp {
                 }
             }
             ServerToClient::ThreadToolResultMessage { thread_id, text } => {
-                // Tool-output text appended to the conversation. For
-                // async `dispatch_thread` callbacks the payload is a
-                // `<dispatched-thread-notification>` envelope — parse
-                // out the originating tool_use_id and route the inner
-                // `<result>` into that tool call's result slot so it
-                // renders identically to a sync dispatch (collapsed
-                // by default, linked to the tool-call item). If the
-                // parse fails or the matching tool call isn't in the
-                // current view, fall back to a system-note row that
-                // at least keeps the text visible.
+                // Tool-output text appended to the conversation —
+                // typically an async `dispatch_thread` callback
+                // (XML envelope carrying the child's final result).
+                // Pushed as its own `DisplayItem::ToolResult` row at
+                // the chronological position where it landed; the
+                // default-open check is based on proximity to the
+                // matching tool call in the items list so async
+                // callbacks (separated from their call by an
+                // assistant turn) arrive expanded while immediately-
+                // -following results stay collapsed.
                 if let Some(view) = self.tasks.get_mut(&thread_id) {
-                    apply_tool_result_text(&mut view.items, &text);
+                    push_tool_result_from_text(&mut view.items, &text);
                 }
             }
             ServerToClient::ThreadAssistantBegin { .. } => {}
@@ -1114,20 +1130,7 @@ impl ChatApp {
                 is_error,
             } => {
                 if let Some(view) = self.tasks.get_mut(&thread_id) {
-                    for item in view.items.iter_mut().rev() {
-                        if let DisplayItem::ToolCall {
-                            tool_use_id: id,
-                            result,
-                            is_error: err,
-                            ..
-                        } = item
-                            && id == &tool_use_id
-                        {
-                            *result = Some(result_preview);
-                            *err = is_error;
-                            break;
-                        }
-                    }
+                    push_tool_result(&mut view.items, tool_use_id, result_preview, is_error);
                 }
             }
             ServerToClient::ThreadAssistantEnd {
@@ -1691,16 +1694,18 @@ fn add_message_items(msg: &Message, out: &mut Vec<DisplayItem>) {
         }
         Role::ToolResult => {
             // Role::ToolResult carries either structured ToolResult
-            // content blocks (sync tool-call results) or plain text
-            // (async `dispatch_thread` callbacks). The first backfill
-            // into their originating tool-call item; the second runs
-            // through the XML-aware `apply_tool_result_text` helper
-            // so async callbacks also land on the originating tool
-            // call rather than rendering as a standalone blob.
+            // content blocks (synchronous tool-call results) or plain
+            // text (async `dispatch_thread` callbacks). Both get
+            // rendered as their own chat row at their chronological
+            // position — no fusion into earlier tool-call items —
+            // so the operator can see each tool response where it
+            // actually landed in the conversation. Proximity to the
+            // matching tool-call item drives the default-collapsed
+            // behavior.
             for block in &msg.content {
                 match block {
                     ContentBlock::Text { text } => {
-                        apply_tool_result_text(out, text);
+                        push_tool_result_from_text(out, text);
                     }
                     ContentBlock::ToolResult {
                         tool_use_id,
@@ -1708,29 +1713,7 @@ fn add_message_items(msg: &Message, out: &mut Vec<DisplayItem>) {
                         is_error,
                     } => {
                         let text = tool_result_text(content);
-                        let mut matched = false;
-                        for existing in out.iter_mut().rev() {
-                            if let DisplayItem::ToolCall {
-                                tool_use_id: id,
-                                result,
-                                is_error: err,
-                                ..
-                            } = existing
-                                && id == tool_use_id
-                                && result.is_none()
-                            {
-                                *result = Some(text.clone());
-                                *err = *is_error;
-                                matched = true;
-                                break;
-                            }
-                        }
-                        if !matched {
-                            out.push(DisplayItem::SystemNote {
-                                text: format!("[orphaned tool_result {tool_use_id}]: {text}"),
-                                is_error: *is_error,
-                            });
-                        }
+                        push_tool_result(out, tool_use_id.clone(), text, *is_error);
                     }
                     _ => {}
                 }
@@ -1764,43 +1747,65 @@ fn add_message_items(msg: &Message, out: &mut Vec<DisplayItem>) {
     }
 }
 
-/// Apply a `Role::ToolResult` + text payload to the current display
-/// item stream. For `dispatch_thread` async callbacks the payload is
-/// a `<dispatched-thread-notification>` envelope — we extract the
-/// original `tool-use-id` and the inner `<result>` and backfill the
-/// matching tool-call item so the rendering is identical to sync
-/// dispatch (collapsed by default, linked to the tool call). Any
-/// other shape (parse failure, unrecognized envelope, missing tool
-/// call) falls back to a `SystemNote` row so the text stays visible
-/// and the operator can see what the server injected.
-fn apply_tool_result_text(items: &mut Vec<DisplayItem>, text: &str) {
+/// Push a `DisplayItem::ToolResult` row built from a text payload.
+/// For `dispatch_thread` async callbacks the payload is a
+/// `<dispatched-thread-notification>` XML envelope — we extract the
+/// originating `tool-use-id`, the inner `<result>`, and the `<status>`
+/// to drive `is_error`. Any other shape falls back to a `SystemNote`
+/// row so unknown text stays visible.
+fn push_tool_result_from_text(items: &mut Vec<DisplayItem>, text: &str) {
     if let Some((tool_use_id, result_body, is_error)) = parse_dispatch_notification(text) {
-        for existing in items.iter_mut().rev() {
-            if let DisplayItem::ToolCall {
-                tool_use_id: id,
-                result,
-                is_error: err,
-                ..
-            } = existing
-                && id == &tool_use_id
-            {
-                *result = Some(result_body);
-                *err = is_error;
-                return;
-            }
-        }
-        // Envelope parsed but no matching tool-call item — surface
-        // the text as a system note so it isn't invisible.
-        items.push(DisplayItem::SystemNote {
-            text: format!("[orphaned dispatch notification {tool_use_id}]: {result_body}"),
-            is_error,
-        });
+        push_tool_result(items, tool_use_id, result_body, is_error);
         return;
     }
-    // Not a recognized envelope — keep the text visible.
     items.push(DisplayItem::SystemNote {
         text: text.to_string(),
         is_error: false,
+    });
+}
+
+/// Push a `DisplayItem::ToolResult` at the tail of `items`, deriving
+/// the tool name from the most-recent matching `DisplayItem::ToolCall`
+/// and the default-open state from proximity to that call.
+///
+/// Proximity rule: walk backward over the items; if we find a matching
+/// `DisplayItem::ToolCall` before crossing a `DisplayItem::User` or
+/// `DisplayItem::AssistantText` boundary, this is an "immediately-
+/// following" result — default-collapsed. Otherwise the result is
+/// "distant" (async callback, or separated by user intervention) and
+/// defaults to expanded so the operator sees the new content.
+fn push_tool_result(
+    items: &mut Vec<DisplayItem>,
+    tool_use_id: String,
+    text: String,
+    is_error: bool,
+) {
+    let mut name = String::new();
+    let mut immediate = false;
+    for existing in items.iter().rev() {
+        match existing {
+            DisplayItem::ToolCall {
+                tool_use_id: id,
+                name: n,
+                ..
+            } if id == &tool_use_id => {
+                name = n.clone();
+                immediate = true;
+                break;
+            }
+            // Crossing either a user message or an assistant text row
+            // means the tool_result lands in a new conversational
+            // "section" relative to its call — treat as distant.
+            DisplayItem::User { .. } | DisplayItem::AssistantText { .. } => break,
+            _ => continue,
+        }
+    }
+    items.push(DisplayItem::ToolResult {
+        tool_use_id,
+        name,
+        text,
+        is_error,
+        default_open: !immediate,
     });
 }
 
@@ -1866,8 +1871,6 @@ fn build_tool_call_item(
         summary,
         args_pretty,
         diff,
-        result: None,
-        is_error: false,
     }
 }
 
@@ -4321,23 +4324,39 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_rebuild_backfills_sync_tool_result() {
+    fn snapshot_rebuild_emits_sync_tool_result_row() {
         let items = conversation_to_items(&conv_with_tool_call());
-        let tool_call = items
+        // Tool call item still appears at its original position.
+        let has_tool_call = items.iter().any(|i| {
+            matches!(
+                i,
+                DisplayItem::ToolCall { tool_use_id, .. } if tool_use_id == "tu-1"
+            )
+        });
+        assert!(has_tool_call, "tool call row should be present");
+        // Tool result lands as its own row, immediately after the
+        // call, carrying the tool name and default-collapsed.
+        let result = items
             .iter()
             .find_map(|i| match i {
-                DisplayItem::ToolCall {
+                DisplayItem::ToolResult {
                     tool_use_id,
-                    result,
-                    ..
-                } if tool_use_id == "tu-1" => Some(result.clone()),
+                    name,
+                    text,
+                    is_error,
+                    default_open,
+                } if tool_use_id == "tu-1" => {
+                    Some((name.clone(), text.clone(), *is_error, *default_open))
+                }
                 _ => None,
             })
-            .expect("tool call item present");
-        assert_eq!(
-            tool_call.as_deref(),
-            Some("file1\nfile2\n"),
-            "sync tool result should backfill the ToolCall.result slot"
+            .expect("tool result row should be present");
+        assert_eq!(result.0, "bash", "tool_result inherits the call's name");
+        assert_eq!(result.1, "file1\nfile2\n");
+        assert!(!result.2);
+        assert!(
+            !result.3,
+            "result immediately following its call defaults to collapsed"
         );
     }
 
@@ -4368,6 +4387,7 @@ mod tests {
                 DisplayItem::AssistantText { .. } => "assistant_text",
                 DisplayItem::Reasoning { .. } => "reasoning",
                 DisplayItem::ToolCall { .. } => "tool_call",
+                DisplayItem::ToolResult { .. } => "tool_result",
                 DisplayItem::SystemNote { .. } => "system_note",
             })
             .collect();
@@ -4376,26 +4396,31 @@ mod tests {
             "expected at least one ToolCall item, got items={roles_debug:?}"
         );
         // Every tool_use in the real file should land with a
-        // populated result by the end of the walk — either from a
-        // sync tool_result block or from the async XML callback
-        // rerouting into the matching call.
+        // matching `DisplayItem::ToolResult` row produced by the
+        // walk — either from a sync tool_result block or from an
+        // async XML callback.
+        use std::collections::HashSet;
+        let mut call_ids: HashSet<String> = HashSet::new();
+        let mut result_ids: HashSet<String> = HashSet::new();
         for item in &items {
-            if let DisplayItem::ToolCall {
-                tool_use_id,
-                result,
-                ..
-            } = item
-            {
-                assert!(
-                    result.is_some(),
-                    "ToolCall {tool_use_id} should have a result backfilled"
-                );
+            match item {
+                DisplayItem::ToolCall { tool_use_id, .. } => {
+                    call_ids.insert(tool_use_id.clone());
+                }
+                DisplayItem::ToolResult { tool_use_id, .. } => {
+                    result_ids.insert(tool_use_id.clone());
+                }
+                _ => {}
             }
         }
+        assert_eq!(
+            call_ids, result_ids,
+            "every tool call in the real file should have a matching ToolResult row"
+        );
     }
 
     #[test]
-    fn snapshot_rebuild_backfills_async_xml_callback_into_tool_call() {
+    fn snapshot_rebuild_emits_async_xml_callback_as_distant_row() {
         let mut conv = Conversation::new();
         conv.push(Message::user_text("dispatch async"));
         conv.push(Message::assistant_blocks(vec![ContentBlock::ToolUse {
@@ -4411,6 +4436,12 @@ mod tests {
                 is_error: false,
             },
         ]));
+        // Intervening assistant turn — separates the async callback
+        // from its originating call, which should flip the
+        // default-open rule.
+        conv.push(Message::assistant_blocks(vec![ContentBlock::Text {
+            text: "waiting for the dispatched thread".into(),
+        }]));
         // Later: async callback — Role::ToolResult + Text block carrying
         // the <dispatched-thread-notification> XML envelope.
         conv.push(Message::tool_result_text(
@@ -4421,23 +4452,28 @@ mod tests {
              </dispatched-thread-notification>",
         ));
         let items = conversation_to_items(&conv);
-        let tool_call = items
+        // Two tool_result rows for the same tool_use_id: the initial
+        // sync ack (immediate, collapsed) and the async callback
+        // (distant, expanded).
+        let results: Vec<(String, bool)> = items
             .iter()
-            .find_map(|i| match i {
-                DisplayItem::ToolCall {
+            .filter_map(|i| match i {
+                DisplayItem::ToolResult {
                     tool_use_id,
-                    result,
-                    is_error,
+                    text,
+                    default_open,
                     ..
-                } if tool_use_id == "tu-async" => Some((result.clone(), *is_error)),
+                } if tool_use_id == "tu-async" => Some((text.clone(), *default_open)),
                 _ => None,
             })
-            .expect("tool call item present");
-        assert_eq!(
-            tool_call.0.as_deref(),
-            Some("the real final answer with <code> in it"),
-            "async callback should overwrite the initial ack with the unescaped <result>"
+            .collect();
+        assert_eq!(results.len(), 2, "expected ack row + async callback row");
+        assert_eq!(results[0].0, "Dispatched task-X");
+        assert!(!results[0].1, "sync ack defaults to collapsed (immediate)");
+        assert_eq!(results[1].0, "the real final answer with <code> in it");
+        assert!(
+            results[1].1,
+            "async callback after intervening turn defaults to expanded"
         );
-        assert!(!tool_call.1);
     }
 }
