@@ -29,7 +29,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::{Mutex, OnceCell};
-use whisper_agent_protocol::{ContentBlock, Message, Role, ToolResultContent, Usage};
+use whisper_agent_protocol::{
+    ContentBlock, Message, ProviderReplay, Role, ToolResultContent, Usage,
+};
 
 use crate::providers::gemini_auth::GeminiAuth;
 use crate::providers::model::{
@@ -41,6 +43,11 @@ pub const GEMINI_API_BASE: &str = "https://generativelanguage.googleapis.com/v1b
 /// plain AI Studio API key. Serves the same `generateContent` primitive
 /// wrapped in a `{model, project, request, user_prompt_id}` envelope.
 pub const GEMINI_CODE_ASSIST_BASE: &str = "https://cloudcode-pa.googleapis.com/v1internal";
+
+/// Identifier stored on [`ProviderReplay::provider`] for blobs minted by this
+/// backend. Used on outbound to filter out replay data tagged for a different
+/// provider (e.g. an Anthropic `signature` would be meaningless here).
+const PROVIDER_TAG: &str = "gemini";
 
 /// Prefix for the opaque call_id we synthesize for each Gemini `functionCall`
 /// part. Gemini doesn't emit an id; the scheduler requires one to pair
@@ -473,23 +480,49 @@ fn convert_assistant_parts(
                     thought: None,
                 });
             }
-            ContentBlock::ToolUse { id: _, name, input } => {
+            ContentBlock::ToolUse {
+                id: _,
+                name,
+                input,
+                replay,
+            } => {
                 // We drop the id when serializing: Gemini's wire format has no
                 // call_id on functionCall. The id we generated on the inbound
                 // side lives in our scheduler log so the eventual tool_result
                 // can be paired; Gemini itself pairs by function name.
+                //
+                // If the stored replay came from a Gemini turn, echo its
+                // thought_signature on the functionCall part — this is how
+                // Gemini carries chain-of-thought across the tool-result
+                // boundary. Blobs tagged for a different backend are dropped
+                // to avoid cross-provider signature contamination.
+                let thought_signature = replay
+                    .as_ref()
+                    .filter(|r| r.provider == PROVIDER_TAG)
+                    .and_then(|r| r.data.get("thought_signature"))
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
                 parts.push(Part::FunctionCall {
                     function_call: FunctionCall {
                         name: name.clone(),
                         args: input.clone(),
                     },
+                    thought_signature,
                 });
             }
-            ContentBlock::Thinking { .. } => {
-                // Reasoning replay requires carrying Gemini's `thoughtSignature`
-                // or `thought` part through our normalized ContentBlock, which
-                // isn't wired up yet. Drop on outbound to avoid cross-provider
-                // signature contamination.
+            ContentBlock::Thinking { thinking, replay } => {
+                // Thought-summary text goes back as a `thought:true` text part
+                // — Gemini accepts its own `thought:true` text parts on
+                // assistant turns and uses them (together with the
+                // thought_signature on the following functionCall) to resume
+                // chain-of-thought. Replay data tagged for a different backend
+                // (e.g. Anthropic `signature`) is dropped; the prose is still
+                // useful so the text itself stays.
+                let _ = replay; // Gemini's signature rides on ToolUse, not here.
+                parts.push(Part::Text {
+                    text: thinking.clone(),
+                    thought: Some(true),
+                });
             }
             ContentBlock::ToolResult { .. } => {
                 // Not valid on an assistant turn.
@@ -548,8 +581,11 @@ pub(crate) fn parsed_to_model_response(parsed: GenerateContentResponse) -> Model
                     thought: Some(true),
                 } => {
                     if !text.is_empty() {
+                        // Gemini's signature rides on the subsequent
+                        // functionCall part, so Thinking blocks don't carry
+                        // replay data here — it lands on the ToolUse below.
                         content.push(ContentBlock::Thinking {
-                            signature: None,
+                            replay: None,
                             thinking: text,
                         });
                     }
@@ -559,12 +595,20 @@ pub(crate) fn parsed_to_model_response(parsed: GenerateContentResponse) -> Model
                         content.push(ContentBlock::Text { text });
                     }
                 }
-                Part::FunctionCall { function_call } => {
+                Part::FunctionCall {
+                    function_call,
+                    thought_signature,
+                } => {
                     saw_function_call = true;
+                    let replay = thought_signature.map(|sig| ProviderReplay {
+                        provider: PROVIDER_TAG.into(),
+                        data: serde_json::json!({"thought_signature": sig}),
+                    });
                     content.push(ContentBlock::ToolUse {
                         id: next_call_id(),
                         name: function_call.name,
                         input: function_call.args,
+                        replay,
                     });
                 }
                 Part::FunctionResponse { .. } => {
@@ -691,6 +735,16 @@ pub(crate) enum Part {
     FunctionCall {
         #[serde(rename = "functionCall")]
         function_call: FunctionCall,
+        /// Server-signed reasoning blob attached to function-call parts on
+        /// thinking-capable models. Must be echoed back on the assistant
+        /// turn's functionCall for chain-of-thought to resume after the
+        /// corresponding tool_result. `camelCase` on the wire.
+        #[serde(
+            rename = "thoughtSignature",
+            default,
+            skip_serializing_if = "Option::is_none"
+        )]
+        thought_signature: Option<String>,
     },
     FunctionResponse {
         #[serde(rename = "functionResponse")]
@@ -874,6 +928,7 @@ mod tests {
                 id: "gemini-call-0".into(),
                 name: "shell".into(),
                 input: serde_json::json!({"cmd": "ls"}),
+                replay: None,
             },
         ])];
         let body = build_gemini_request(&req(&msgs, &[], "x"));
@@ -897,6 +952,7 @@ mod tests {
                 id: "gemini-call-0".into(),
                 name: "shell".into(),
                 input: serde_json::json!({}),
+                replay: None,
             }]),
             Message::user_blocks(vec![ContentBlock::ToolResult {
                 tool_use_id: "gemini-call-0".into(),
@@ -959,6 +1015,80 @@ mod tests {
         );
         assert!(matches!(&r.content[1], ContentBlock::Text { text } if text == "answer"));
         assert_eq!(r.stop_reason.as_deref(), Some("end_turn"));
+    }
+
+    #[test]
+    fn parses_thought_signature_into_toolu_replay() {
+        // A functionCall part carries thoughtSignature as a sibling field
+        // on Gemini's wire. Inbound, that blob must land on the ToolUse
+        // block's replay (tagged "gemini"), not on the Thinking block.
+        let body = r#"{
+            "candidates": [{
+                "content": {"role": "model", "parts": [
+                    {"text": "planning the shell call", "thought": true},
+                    {
+                        "functionCall": {"name": "shell", "args": {"cmd": "ls"}},
+                        "thoughtSignature": "sig-blob"
+                    }
+                ]},
+                "finishReason": "STOP"
+            }]
+        }"#;
+        let parsed: GenerateContentResponse = serde_json::from_str(body).unwrap();
+        let r = parsed_to_model_response(parsed);
+        assert_eq!(r.content.len(), 2);
+        // Thinking part — signature is NOT here.
+        match &r.content[0] {
+            ContentBlock::Thinking { replay, thinking } => {
+                assert_eq!(thinking, "planning the shell call");
+                assert!(replay.is_none());
+            }
+            _ => panic!("expected Thinking"),
+        }
+        // ToolUse part — signature lives HERE, tagged "gemini".
+        match &r.content[1] {
+            ContentBlock::ToolUse { replay, name, .. } => {
+                assert_eq!(name, "shell");
+                let r = replay.as_ref().expect("signature should populate replay");
+                assert_eq!(r.provider, "gemini");
+                assert_eq!(r.data, serde_json::json!({"thought_signature": "sig-blob"}));
+            }
+            _ => panic!("expected ToolUse"),
+        }
+    }
+
+    #[test]
+    fn outbound_echoes_gemini_thought_signature_and_strips_foreign() {
+        // Round-trip: a ToolUse carrying a gemini-tagged replay must put
+        // thoughtSignature back on the wire as a sibling of functionCall.
+        // A foreign-provider replay must be dropped silently.
+        let msgs = vec![Message::assistant_blocks(vec![
+            ContentBlock::ToolUse {
+                id: "gemini-call-0".into(),
+                name: "shell".into(),
+                input: serde_json::json!({"cmd": "ls"}),
+                replay: Some(ProviderReplay {
+                    provider: "gemini".into(),
+                    data: serde_json::json!({"thought_signature": "sig-blob"}),
+                }),
+            },
+            ContentBlock::ToolUse {
+                id: "gemini-call-1".into(),
+                name: "shell".into(),
+                input: serde_json::json!({"cmd": "pwd"}),
+                replay: Some(ProviderReplay {
+                    provider: "anthropic".into(),
+                    data: serde_json::json!({"signature": "anth-blob"}),
+                }),
+            },
+        ])];
+        let body = build_gemini_request(&req(&msgs, &[], "x"));
+        let v = serde_json::to_value(&body).unwrap();
+        let parts = &v["contents"][0]["parts"];
+        // Native blob echoed.
+        assert_eq!(parts[0]["thoughtSignature"], "sig-blob");
+        // Foreign blob stripped.
+        assert!(parts[1].get("thoughtSignature").is_none());
     }
 
     #[test]

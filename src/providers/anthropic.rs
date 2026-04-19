@@ -15,7 +15,7 @@ use std::collections::HashSet;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use whisper_agent_protocol::{ContentBlock, Message, Usage};
+use whisper_agent_protocol::{ContentBlock, Message, ProviderReplay, ToolResultContent, Usage};
 
 use crate::providers::model::{
     BoxFuture, CacheBreakpoint, ModelError, ModelInfo, ModelProvider, ModelRequest, ModelResponse,
@@ -27,6 +27,11 @@ const MODELS_URL: &str = "https://api.anthropic.com/v1/models";
 const ANTHROPIC_VERSION: &str = "2023-06-01";
 const EXTENDED_CACHE_BETA: &str = "extended-cache-ttl-2025-04-11";
 const CACHE_TTL_1H: &str = "1h";
+
+/// Identifier stored on [`ProviderReplay::provider`] for blobs minted by this
+/// backend. Anthropic `Thinking` blocks carry their opaque `signature` here on
+/// inbound and have it re-extracted on outbound so the wire stays clean.
+const PROVIDER_TAG: &str = "anthropic";
 
 pub struct AnthropicClient {
     http: reqwest::Client,
@@ -67,7 +72,7 @@ impl AnthropicClient {
             .await
             .map_err(|e| ModelError::Transport(e.to_string()))?;
         Ok(ModelResponse {
-            content: parsed.content,
+            content: parsed.content.into_iter().map(wire_to_block).collect(),
             stop_reason: parsed.stop_reason,
             usage: Usage {
                 input_tokens: parsed.usage.input_tokens,
@@ -193,21 +198,28 @@ fn build_request_body<'a>(req: &'a ModelRequest<'a>) -> CreateMessageRequest<'a>
     }
 }
 
-/// Serialize a message and optionally patch `cache_control` onto its final content
-/// block. Using `serde_json::Value` here avoids duplicating the full [`ContentBlock`]
-/// hierarchy in this module just to add one optional field.
+/// Serialize a message and optionally patch `cache_control` onto its final
+/// content block.
+///
+/// Beyond the serde derive, we also fix up two things the wire expects:
+/// - `Role::ToolResult` → `user` on the role field (Anthropic only accepts
+///   `user` and `assistant`).
+/// - `Thinking.replay` → wire-level `signature` field when the block was
+///   minted by this backend; stripped otherwise (a blob tagged for another
+///   provider is meaningless and the server 400s on unknown fields).
 fn message_to_value(m: &Message, cache_last_block: bool) -> Value {
     let mut v = serde_json::to_value(m).expect("Message is serializable");
-    // Role translation on the way out: our internal model has
-    // `Role::ToolResult` as a distinct role, but Anthropic's wire
-    // format only accepts `user` and `assistant` and expects tool
-    // results inside user-role messages with `tool_result` content
-    // blocks. Our content blocks are already in that shape — just
-    // rewrite the role.
     if let Some(role) = v.get_mut("role")
         && role.as_str() == Some("tool_result")
     {
         *role = Value::String("user".into());
+    }
+    if let Some(content) = v.get_mut("content").and_then(|c| c.as_array_mut()) {
+        for block in content.iter_mut() {
+            if let Some(obj) = block.as_object_mut() {
+                fold_replay_to_wire(obj);
+            }
+        }
     }
     if !cache_last_block {
         return v;
@@ -223,6 +235,28 @@ fn message_to_value(m: &Message, cache_last_block: bool) -> Value {
         serde_json::json!({"type": "ephemeral", "ttl": CACHE_TTL_1H}),
     );
     v
+}
+
+/// Translate a serialized content block from our normalized shape into
+/// Anthropic's wire shape. For `thinking` blocks, extract the `signature`
+/// out of `replay.data` when the replay was minted by this backend. For all
+/// blocks, drop the `replay` field — Anthropic doesn't accept it on the wire.
+fn fold_replay_to_wire(obj: &mut serde_json::Map<String, Value>) {
+    let is_thinking = obj.get("type").and_then(Value::as_str) == Some("thinking");
+    let replay = obj.remove("replay");
+    if !is_thinking {
+        return;
+    }
+    let Some(replay) = replay else { return };
+    let Some(provider) = replay.get("provider").and_then(Value::as_str) else {
+        return;
+    };
+    if provider != PROVIDER_TAG {
+        return;
+    }
+    if let Some(sig) = replay.get("data").and_then(|d| d.get("signature")) {
+        obj.insert("signature".into(), sig.clone());
+    }
 }
 
 // ---------- Wire types (private to this module) ----------
@@ -279,13 +313,76 @@ struct MessageResponse {
     id: String,
     #[allow(dead_code)]
     role: String,
-    content: Vec<ContentBlock>,
+    content: Vec<AnthropicWireBlock>,
     #[allow(dead_code)]
     model: String,
     stop_reason: Option<String>,
     #[allow(dead_code)]
     stop_sequence: Option<String>,
     usage: AnthropicUsage,
+}
+
+/// Anthropic's wire-level content block shape. Mirrors the JSON the API emits
+/// 1:1 — the `signature` field on `thinking` lives here at the top of the
+/// block, not nested inside a `replay` container like our normalized
+/// [`ContentBlock`] uses. Translation happens in [`wire_to_block`].
+#[derive(Deserialize, Debug)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum AnthropicWireBlock {
+    Text {
+        text: String,
+    },
+    ToolUse {
+        id: String,
+        name: String,
+        input: Value,
+    },
+    ToolResult {
+        tool_use_id: String,
+        content: ToolResultContent,
+        #[serde(default)]
+        is_error: bool,
+    },
+    Thinking {
+        thinking: String,
+        #[serde(default)]
+        signature: Option<String>,
+    },
+}
+
+/// Fold the Anthropic-shaped `signature` into our provider-tagged
+/// [`ProviderReplay`] so the block can round-trip through the conversation
+/// store and other backends (which will strip the replay on outbound since
+/// the provider tag won't match).
+fn wire_to_block(w: AnthropicWireBlock) -> ContentBlock {
+    match w {
+        AnthropicWireBlock::Text { text } => ContentBlock::Text { text },
+        AnthropicWireBlock::ToolUse { id, name, input } => ContentBlock::ToolUse {
+            id,
+            name,
+            input,
+            replay: None,
+        },
+        AnthropicWireBlock::ToolResult {
+            tool_use_id,
+            content,
+            is_error,
+        } => ContentBlock::ToolResult {
+            tool_use_id,
+            content,
+            is_error,
+        },
+        AnthropicWireBlock::Thinking {
+            thinking,
+            signature,
+        } => {
+            let replay = signature.map(|s| ProviderReplay {
+                provider: PROVIDER_TAG.into(),
+                data: serde_json::json!({"signature": s}),
+            });
+            ContentBlock::Thinking { replay, thinking }
+        }
+    }
 }
 
 #[derive(Deserialize, Debug, Clone, Copy, Default)]
@@ -491,5 +588,88 @@ mod tests {
         assert!(msgs[0]["content"][0].get("cache_control").is_none());
         assert!(msgs[1]["content"][0].get("cache_control").is_none());
         assert!(msgs[2]["content"][0]["cache_control"].is_object());
+    }
+
+    // ---------- Reasoning replay ----------
+
+    #[test]
+    fn anthropic_thinking_inbound_captures_signature_as_replay() {
+        let wire = json!({
+            "type": "thinking",
+            "thinking": "let me think",
+            "signature": "sig-blob-base64"
+        });
+        let parsed: AnthropicWireBlock = serde_json::from_value(wire).unwrap();
+        let block = wire_to_block(parsed);
+        match block {
+            ContentBlock::Thinking { replay, thinking } => {
+                assert_eq!(thinking, "let me think");
+                let r = replay.expect("signature should surface as replay");
+                assert_eq!(r.provider, "anthropic");
+                assert_eq!(r.data, json!({"signature": "sig-blob-base64"}));
+            }
+            _ => panic!("expected Thinking"),
+        }
+    }
+
+    #[test]
+    fn anthropic_outbound_puts_replay_back_as_signature() {
+        // Round-trip: an anthropic-tagged Thinking block should serialize as
+        // the wire shape with `signature` at the top of the block, and no
+        // stray `replay` leaking through.
+        let msg = Message::assistant_blocks(vec![ContentBlock::Thinking {
+            replay: Some(ProviderReplay {
+                provider: "anthropic".into(),
+                data: json!({"signature": "sig-blob"}),
+            }),
+            thinking: "let me think".into(),
+        }]);
+        let v = message_to_value(&msg, false);
+        let block = &v["content"][0];
+        assert_eq!(block["type"], "thinking");
+        assert_eq!(block["thinking"], "let me think");
+        assert_eq!(block["signature"], "sig-blob");
+        assert!(block.get("replay").is_none());
+    }
+
+    #[test]
+    fn anthropic_outbound_strips_foreign_provider_replay() {
+        // A Thinking block minted by a different backend (user switched
+        // models mid-thread) must not leak its opaque blob to Anthropic —
+        // both the `replay` field and any pretend-`signature` must be
+        // absent from the wire body.
+        let msg = Message::assistant_blocks(vec![ContentBlock::Thinking {
+            replay: Some(ProviderReplay {
+                provider: "openai_responses".into(),
+                data: json!({"encrypted_content": "opaque"}),
+            }),
+            thinking: "prior reasoning".into(),
+        }]);
+        let v = message_to_value(&msg, false);
+        let block = &v["content"][0];
+        assert_eq!(block["type"], "thinking");
+        assert_eq!(block["thinking"], "prior reasoning");
+        assert!(block.get("replay").is_none());
+        assert!(block.get("signature").is_none());
+    }
+
+    #[test]
+    fn anthropic_outbound_strips_replay_from_tool_use() {
+        // Replay on ToolUse (Gemini puts its thoughtSignature there) never
+        // maps to anything on Anthropic's wire. Drop silently.
+        let msg = Message::assistant_blocks(vec![ContentBlock::ToolUse {
+            id: "toolu_1".into(),
+            name: "bash".into(),
+            input: json!({"cmd": "ls"}),
+            replay: Some(ProviderReplay {
+                provider: "gemini".into(),
+                data: json!({"thought_signature": "gemini-blob"}),
+            }),
+        }]);
+        let v = message_to_value(&msg, false);
+        let block = &v["content"][0];
+        assert_eq!(block["type"], "tool_use");
+        assert!(block.get("replay").is_none());
+        assert!(block.get("thought_signature").is_none());
     }
 }

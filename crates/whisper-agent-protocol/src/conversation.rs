@@ -99,6 +99,12 @@ pub enum ContentBlock {
         id: String,
         name: String,
         input: Value,
+        /// Provider-tagged opaque blob carried forward for reasoning
+        /// replay — e.g. Gemini attaches `thoughtSignature` to the
+        /// `functionCall` part so chain-of-thought resumes across the
+        /// tool_result boundary. `None` for providers that don't use it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        replay: Option<ProviderReplay>,
     },
     ToolResult {
         tool_use_id: String,
@@ -107,10 +113,39 @@ pub enum ContentBlock {
         is_error: bool,
     },
     Thinking {
-        #[serde(skip_serializing_if = "Option::is_none")]
-        signature: Option<String>,
+        /// Provider-tagged opaque blob carried forward for reasoning
+        /// replay — Anthropic's `signature`, OpenAI Responses'
+        /// `encrypted_content` plus item id. `None` when the provider
+        /// doesn't supply reasoning-continuation data (or when the block
+        /// came from a provider that scopes it elsewhere, like Gemini,
+        /// which attaches its signature to `ToolUse` instead).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        replay: Option<ProviderReplay>,
         thinking: String,
     },
+}
+
+/// Opaque provider-specific data echoed back into later requests so the
+/// server can resume its chain-of-thought across turns.
+///
+/// Cross-provider safety: adapters must strip (or drop) blocks whose
+/// `provider` tag doesn't match the current backend — a signature minted
+/// by Anthropic is meaningless (and potentially an error) to Gemini.
+/// The scheduler keeps the block in conversation state so switching back
+/// to the original backend later still has the replay data available.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct ProviderReplay {
+    /// Backend that produced this blob. Match against the adapter's own
+    /// identifier (`"anthropic"`, `"openai_responses"`, `"gemini"`) on
+    /// outbound to decide whether to echo or drop.
+    pub provider: String,
+    /// Provider-defined payload. Each adapter chooses its own shape —
+    /// Anthropic uses `{"signature": "..."}`, Gemini uses
+    /// `{"thought_signature": "..."}`, OpenAI Responses carries the
+    /// whole `reasoning` item (`{"id": "...", "encrypted_content":
+    /// "...", "summary": [...]}`) so the echoed-back item matches the
+    /// server's expected shape exactly.
+    pub data: Value,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -247,6 +282,7 @@ mod tests {
             id: "u1".into(),
             name: "t".into(),
             input: serde_json::Value::Null,
+            replay: None,
         }]));
         // Legacy shape: tool result under Role::User.
         conv.push(Message {

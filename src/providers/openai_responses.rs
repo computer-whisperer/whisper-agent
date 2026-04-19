@@ -16,18 +16,23 @@
 //! matches the scheduler's replay model — the scheduler is the source of truth
 //! for conversation state.
 //!
-//! Reasoning replay is *not* round-tripped in this first cut. Reasoning items
-//! returned by the model surface as [`ContentBlock::Thinking`] for the log, but
-//! `encrypted_content` is not requested and reasoning items are not emitted on
-//! subsequent turns. Adding replay means carrying a provider-tagged opaque blob
-//! through our normalized `ContentBlock` shape, which is a separate change.
+//! Reasoning replay: requests `include: ["reasoning.encrypted_content"]` so
+//! the server returns `encrypted_content` on each `reasoning` item. Inbound,
+//! the reasoning item's `id`, `encrypted_content`, and `summary` parts get
+//! stashed into [`ContentBlock::Thinking::replay`] (tagged `openai_responses`).
+//! Outbound, assistant `Thinking` blocks whose replay came from this backend
+//! are echoed back as full `reasoning` items in `input` so the server can
+//! resume its chain-of-thought. Blocks tagged for a different backend are
+//! dropped — their opaque blob is meaningless here.
 
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::Mutex;
-use whisper_agent_protocol::{ContentBlock, Message, Role, ToolResultContent, Usage};
+use whisper_agent_protocol::{
+    ContentBlock, Message, ProviderReplay, Role, ToolResultContent, Usage,
+};
 
 use crate::providers::codex_auth::CodexAuth;
 use crate::providers::model::{
@@ -35,6 +40,11 @@ use crate::providers::model::{
 };
 
 pub const OPENAI_API_BASE: &str = "https://api.openai.com/v1";
+
+/// Identifier stored on [`ProviderReplay::provider`] for blobs minted by this
+/// backend. Used on outbound to filter out replay data tagged for a different
+/// provider.
+const PROVIDER_TAG: &str = "openai_responses";
 /// ChatGPT subscription route: reachable by ChatGPT Plus/Pro OAuth access tokens,
 /// not by plain API keys. Serves the same Responses API surface at `/responses`.
 pub const CHATGPT_CODEX_BASE: &str = "https://chatgpt.com/backend-api/codex";
@@ -125,6 +135,7 @@ impl OpenAiResponsesClient {
             },
             input,
             tools: if tools.is_empty() { None } else { Some(tools) },
+            include: REQUEST_INCLUDES,
             store: false,
             // The ChatGPT-subscription backend refuses stream:false with
             // "Stream must be set to true". api.openai.com accepts either; we
@@ -173,18 +184,55 @@ impl OpenAiResponsesClient {
         let mut saw_function_call = false;
         for item in parsed.output {
             match item {
-                RspOutputItem::Reasoning { content: parts, .. } => {
-                    let text = parts
-                        .into_iter()
+                RspOutputItem::Reasoning {
+                    id,
+                    encrypted_content,
+                    summary,
+                    content: inline_content,
+                } => {
+                    // Visible prose: concatenate every text-ish part in the
+                    // order the server emitted them. `summary` holds the
+                    // short gist the API returns by default; `content`
+                    // appears on older model variants. Both are safe to
+                    // merge.
+                    let text = summary
+                        .iter()
+                        .chain(inline_content.iter())
                         .map(|p| match p {
                             RspReasoningPart::ReasoningText { text }
-                            | RspReasoningPart::SummaryText { text } => text,
+                            | RspReasoningPart::SummaryText { text } => text.as_str(),
                         })
+                        .filter(|s| !s.is_empty())
                         .collect::<Vec<_>>()
                         .join("\n\n");
-                    if !text.trim().is_empty() {
+                    // Replay payload: echo the reasoning item back verbatim
+                    // on the next turn. We pack exactly the fields the
+                    // server expects — id + encrypted_content + summary.
+                    // Skip if none of the replay-relevant fields are
+                    // populated (older models without encrypted_content
+                    // just can't resume reasoning across turns).
+                    let mut replay_data = serde_json::Map::new();
+                    if let Some(id) = &id {
+                        replay_data.insert("id".into(), Value::String(id.clone()));
+                    }
+                    if let Some(ec) = &encrypted_content {
+                        replay_data.insert("encrypted_content".into(), Value::String(ec.clone()));
+                    }
+                    if !summary.is_empty() {
+                        replay_data.insert(
+                            "summary".into(),
+                            serde_json::to_value(&summary).unwrap_or(Value::Null),
+                        );
+                    }
+                    let replay = (!replay_data.is_empty()).then(|| ProviderReplay {
+                        provider: PROVIDER_TAG.into(),
+                        data: Value::Object(replay_data),
+                    });
+                    // Drop entirely if there's nothing to show AND nothing
+                    // to replay — an empty Thinking block is pure noise.
+                    if replay.is_some() || !text.trim().is_empty() {
                         content.push(ContentBlock::Thinking {
-                            signature: None,
+                            replay,
                             thinking: text,
                         });
                     }
@@ -225,6 +273,7 @@ impl OpenAiResponsesClient {
                         id: call_id,
                         name,
                         input: input_val,
+                        replay: None,
                     });
                 }
                 RspOutputItem::Other => {}
@@ -407,7 +456,9 @@ fn convert_assistant_message(blocks: &[ContentBlock], out: &mut Vec<RspItem>) {
                 }
                 text_accum.push_str(text);
             }
-            ContentBlock::ToolUse { id, name, input } => {
+            ContentBlock::ToolUse {
+                id, name, input, ..
+            } => {
                 if !text_accum.is_empty() {
                     out.push(RspItem::Message {
                         role: "assistant",
@@ -422,9 +473,29 @@ fn convert_assistant_message(blocks: &[ContentBlock], out: &mut Vec<RspItem>) {
                     arguments: serde_json::to_string(input).unwrap_or_else(|_| "{}".into()),
                 });
             }
-            ContentBlock::Thinking { .. } => {
-                // Reasoning replay needs provider-tagged encrypted_content, which
-                // we don't carry yet — drop silently on outbound.
+            ContentBlock::Thinking {
+                thinking: _,
+                replay,
+            } => {
+                // Reasoning replay: if the block was minted by *this*
+                // backend, echo the reasoning item back into `input` so
+                // the server resumes its chain-of-thought. A block tagged
+                // for a different provider is dropped — its opaque blob
+                // is meaningless here (and potentially error-inducing).
+                // Without replay data there's nothing the server can do
+                // with our textual summary alone, so dropping is also the
+                // right move.
+                if let Some(item) = thinking_to_reasoning_item(replay.as_ref()) {
+                    if !text_accum.is_empty() {
+                        out.push(RspItem::Message {
+                            role: "assistant",
+                            content: vec![RspInputMessagePart::OutputText {
+                                text: std::mem::take(&mut text_accum),
+                            }],
+                        });
+                    }
+                    out.push(item);
+                }
             }
             ContentBlock::ToolResult { .. } => {
                 // ToolResult doesn't belong on an assistant message.
@@ -437,6 +508,37 @@ fn convert_assistant_message(blocks: &[ContentBlock], out: &mut Vec<RspItem>) {
             content: vec![RspInputMessagePart::OutputText { text: text_accum }],
         });
     }
+}
+
+/// Build an outbound `reasoning` input item from a stored [`ProviderReplay`].
+/// Returns `None` when the blob was minted by a different provider or lacks
+/// any replay-relevant fields — in either case there's nothing to echo.
+fn thinking_to_reasoning_item(replay: Option<&ProviderReplay>) -> Option<RspItem> {
+    let r = replay?;
+    if r.provider != PROVIDER_TAG {
+        return None;
+    }
+    let obj = r.data.as_object()?;
+    let id = obj.get("id").and_then(|v| v.as_str()).map(String::from);
+    let encrypted_content = obj
+        .get("encrypted_content")
+        .and_then(|v| v.as_str())
+        .map(String::from);
+    let summary = obj
+        .get("summary")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .map(Value::Array)
+        .and_then(|v| serde_json::from_value::<Vec<RspReasoningPart>>(v).ok())
+        .unwrap_or_default();
+    if id.is_none() && encrypted_content.is_none() && summary.is_empty() {
+        return None;
+    }
+    Some(RspItem::Reasoning {
+        id,
+        encrypted_content,
+        summary,
+    })
 }
 
 fn tool_result_as_text(content: &ToolResultContent, is_error: bool) -> String {
@@ -562,9 +664,19 @@ struct RspRequest<'a> {
     input: Vec<RspItem>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tools: Option<Vec<RspTool>>,
+    /// Extra fields to request back from the server. We set
+    /// `reasoning.encrypted_content` so reasoning items come back with the
+    /// opaque blob we need to echo them on subsequent turns.
+    #[serde(skip_serializing_if = "<[&str]>::is_empty")]
+    include: &'static [&'static str],
     store: bool,
     stream: bool,
 }
+
+/// Wire value for [`RspRequest::include`]. Constant because we always want the
+/// same set — the overhead of echoing the blob back is negligible vs. the
+/// alternative of re-reasoning from scratch every turn.
+const REQUEST_INCLUDES: &[&str] = &["reasoning.encrypted_content"];
 
 /// One element of the `input` array. Outbound only — serialization shape must
 /// exactly match what the API expects.
@@ -585,6 +697,17 @@ enum RspItem {
     FunctionCallOutput {
         call_id: String,
         output: String,
+    },
+    /// Replay item for chain-of-thought continuity. Echoed into `input` on
+    /// turns that follow a reasoning-model response so the server can
+    /// resume its internal reasoning state.
+    Reasoning {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        encrypted_content: Option<String>,
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        summary: Vec<RspReasoningPart>,
     },
 }
 
@@ -673,6 +796,15 @@ enum RspOutputItem {
     },
     Reasoning {
         #[serde(default)]
+        id: Option<String>,
+        #[serde(default)]
+        encrypted_content: Option<String>,
+        /// Returned by default. Short gist the API surfaces to clients.
+        #[serde(default)]
+        summary: Vec<RspReasoningPart>,
+        /// Legacy / model-variant path for reasoning prose. Older turns
+        /// surface text here instead of `summary`; both can be present.
+        #[serde(default)]
         content: Vec<RspReasoningPart>,
     },
     #[serde(other)]
@@ -686,7 +818,10 @@ enum RspOutputMessagePart {
     Refusal { refusal: String },
 }
 
-#[derive(Deserialize, Debug)]
+/// Reasoning prose carrier. Appears inbound as [`RspOutputItem::Reasoning`]'s
+/// `summary` / `content` fields and outbound inside [`RspItem::Reasoning`]'s
+/// `summary` field when we echo a stored reasoning item back into `input`.
+#[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum RspReasoningPart {
     ReasoningText { text: String },
@@ -768,6 +903,7 @@ mod tests {
                 id: "call_1".into(),
                 name: "shell".into(),
                 input: serde_json::json!({"cmd": "ls"}),
+                replay: None,
             },
         ]);
         let mut items = Vec::new();
@@ -932,5 +1068,93 @@ data: {"type":"response.failed","response":{"status":"failed"},"error":{"message
             ),
             Some("max_tokens".into())
         );
+    }
+
+    // ---------- Reasoning replay ----------
+
+    #[test]
+    fn request_body_includes_encrypted_content_flag() {
+        // `include: ["reasoning.encrypted_content"]` is what tells the server
+        // to return the opaque blob we need to echo back on later turns.
+        // Verify it's always present on the wire body.
+        let body = RspRequest {
+            model: "gpt-5",
+            instructions: None,
+            input: Vec::new(),
+            tools: None,
+            include: REQUEST_INCLUDES,
+            store: false,
+            stream: true,
+        };
+        let v = serde_json::to_value(&body).unwrap();
+        assert_eq!(
+            v["include"],
+            serde_json::json!(["reasoning.encrypted_content"])
+        );
+    }
+
+    #[test]
+    fn thinking_to_reasoning_item_only_echoes_matching_provider() {
+        // Foreign-provider replay → dropped (can't ship an Anthropic blob
+        // to OpenAI).
+        let foreign = ProviderReplay {
+            provider: "anthropic".into(),
+            data: serde_json::json!({"signature": "sig"}),
+        };
+        assert!(thinking_to_reasoning_item(Some(&foreign)).is_none());
+
+        // Matching provider → emitted as Reasoning item carrying id +
+        // encrypted_content (matches what the server originally sent).
+        let native = ProviderReplay {
+            provider: "openai_responses".into(),
+            data: serde_json::json!({
+                "id": "rs_1",
+                "encrypted_content": "ec-blob",
+                "summary": [{"type": "summary_text", "text": "short gist"}]
+            }),
+        };
+        let item = thinking_to_reasoning_item(Some(&native)).expect("should echo");
+        let v = serde_json::to_value(&item).unwrap();
+        assert_eq!(v["type"], "reasoning");
+        assert_eq!(v["id"], "rs_1");
+        assert_eq!(v["encrypted_content"], "ec-blob");
+        assert_eq!(v["summary"][0]["type"], "summary_text");
+    }
+
+    #[test]
+    fn thinking_to_reasoning_item_no_data_returns_none() {
+        // Replay with empty data object has nothing to echo — drop.
+        let native = ProviderReplay {
+            provider: "openai_responses".into(),
+            data: serde_json::json!({}),
+        };
+        assert!(thinking_to_reasoning_item(Some(&native)).is_none());
+    }
+
+    #[test]
+    fn parses_reasoning_item_and_preserves_replay() {
+        // Inbound: a reasoning item with id + encrypted_content + summary
+        // parses into a Thinking block whose replay carries all three so
+        // the next turn can echo the full item back.
+        let wire = serde_json::json!({
+            "type": "reasoning",
+            "id": "rs_1",
+            "encrypted_content": "ec-blob",
+            "summary": [{"type": "summary_text", "text": "hi"}]
+        });
+        let item: RspOutputItem = serde_json::from_value(wire).unwrap();
+        match item {
+            RspOutputItem::Reasoning {
+                id,
+                encrypted_content,
+                summary,
+                ..
+            } => {
+                assert_eq!(id.as_deref(), Some("rs_1"));
+                assert_eq!(encrypted_content.as_deref(), Some("ec-blob"));
+                assert_eq!(summary.len(), 1);
+            }
+            _ => panic!("expected Reasoning"),
+        }
     }
 }

@@ -1916,7 +1916,9 @@ fn add_message_items(msg: &Message, msg_index: usize, out: &mut Vec<DisplayItem>
                     ContentBlock::Text { text } => {
                         out.push(DisplayItem::AssistantText { text: text.clone() });
                     }
-                    ContentBlock::ToolUse { id, name, input } => {
+                    ContentBlock::ToolUse {
+                        id, name, input, ..
+                    } => {
                         let preview =
                             truncate(serde_json::to_string(input).unwrap_or_default(), 200);
                         out.push(build_tool_call_item(
@@ -4636,6 +4638,7 @@ mod tests {
                 id: "tu-1".into(),
                 name: "bash".into(),
                 input: serde_json::json!({ "command": "ls" }),
+                replay: None,
             },
         ]));
         conv.push(Message::tool_result_blocks(vec![
@@ -4753,6 +4756,7 @@ mod tests {
             id: "tu-async".into(),
             name: "dispatch_thread".into(),
             input: serde_json::json!({ "prompt": "go", "sync": false }),
+            replay: None,
         }]));
         conv.push(Message::tool_result_blocks(vec![
             ContentBlock::ToolResult {

@@ -820,7 +820,9 @@ impl Thread {
         let tool_uses: Vec<ToolUseReq> = assistant_blocks
             .iter()
             .filter_map(|b| match b {
-                ContentBlock::ToolUse { id, name, input } => Some(ToolUseReq {
+                ContentBlock::ToolUse {
+                    id, name, input, ..
+                } => Some(ToolUseReq {
                     tool_use_id: id.clone(),
                     name: name.clone(),
                     input: input.clone(),

@@ -18,7 +18,9 @@ pub use behavior::{
     BehaviorState, BehaviorSummary, BehaviorThreadOverride, CatchUp, Overlap, RetentionPolicy,
     TriggerSpec,
 };
-pub use conversation::{ContentBlock, Conversation, Message, Role, ToolResultContent};
+pub use conversation::{
+    ContentBlock, Conversation, Message, ProviderReplay, Role, ToolResultContent,
+};
 pub use pod::{
     CompactionConfig, NamedHostEnv, PodAllow, PodConfig, PodLimits, PodSnapshot, PodState,
     PodSummary, ThreadDefaults,

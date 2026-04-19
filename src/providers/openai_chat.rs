@@ -130,6 +130,7 @@ impl OpenAiChatClient {
                     id: tc.id,
                     name: tc.function.name,
                     input,
+                    replay: None,
                 });
             }
         }
@@ -288,7 +289,9 @@ fn convert_assistant_message(blocks: &[ContentBlock], out: &mut Vec<OaMessage>) 
                 }
                 reasoning_accum.push_str(thinking);
             }
-            ContentBlock::ToolUse { id, name, input } => {
+            ContentBlock::ToolUse {
+                id, name, input, ..
+            } => {
                 tool_calls.push(OaToolCall {
                     id: id.clone(),
                     kind: "function".into(),
@@ -385,7 +388,7 @@ fn push_reasoning_content(reasoning: Option<String>, out: &mut Vec<ContentBlock>
         && !r.trim().is_empty()
     {
         out.push(ContentBlock::Thinking {
-            signature: None,
+            replay: None,
             thinking: r,
         });
     }
@@ -448,7 +451,7 @@ fn push_text_if_nonblank(s: &str, out: &mut Vec<ContentBlock>) {
 fn push_thinking_if_nonblank(s: &str, out: &mut Vec<ContentBlock>) {
     if !s.trim().is_empty() {
         out.push(ContentBlock::Thinking {
-            signature: None,
+            replay: None,
             thinking: s.to_string(),
         });
     }
@@ -624,6 +627,7 @@ mod tests {
                 id: "toolu_1".into(),
                 name: "read_file".into(),
                 input: serde_json::json!({"path": "foo.txt"}),
+                replay: None,
             },
         ];
         let mut out = Vec::new();
@@ -683,6 +687,7 @@ mod tests {
             id: "toolu_1".into(),
             name: "bash".into(),
             input: serde_json::json!({"command": "ls"}),
+            replay: None,
         }];
         let mut out = Vec::new();
         convert_assistant_message(&blocks, &mut out);
@@ -709,12 +714,9 @@ mod tests {
         push_reasoning_content(Some("let me think...\nthe answer is 42".into()), &mut out);
         assert_eq!(out.len(), 1);
         match &out[0] {
-            ContentBlock::Thinking {
-                thinking,
-                signature,
-            } => {
+            ContentBlock::Thinking { thinking, replay } => {
                 assert_eq!(thinking, "let me think...\nthe answer is 42");
-                assert!(signature.is_none());
+                assert!(replay.is_none());
             }
             _ => panic!("expected Thinking block"),
         }
@@ -813,7 +815,7 @@ mod tests {
     fn thinking_block_in_assistant_emits_reasoning_content_field() {
         let blocks = vec![
             ContentBlock::Thinking {
-                signature: None,
+                replay: None,
                 thinking: "I should look at foo.txt first".into(),
             },
             ContentBlock::Text {
@@ -823,6 +825,7 @@ mod tests {
                 id: "toolu_1".into(),
                 name: "read_file".into(),
                 input: serde_json::json!({"path": "foo.txt"}),
+                replay: None,
             },
         ];
         let mut out = Vec::new();
@@ -845,11 +848,11 @@ mod tests {
     fn multiple_thinking_blocks_concatenate_with_blank_line() {
         let blocks = vec![
             ContentBlock::Thinking {
-                signature: None,
+                replay: None,
                 thinking: "first thought".into(),
             },
             ContentBlock::Thinking {
-                signature: None,
+                replay: None,
                 thinking: "second thought".into(),
             },
             ContentBlock::Text {
