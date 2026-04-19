@@ -13,13 +13,15 @@
 
 use std::collections::HashSet;
 
+use async_stream::try_stream;
+use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use whisper_agent_protocol::{ContentBlock, Message, ProviderReplay, ToolResultContent, Usage};
 
 use crate::providers::model::{
-    BoxFuture, CacheBreakpoint, ModelError, ModelInfo, ModelProvider, ModelRequest, ModelResponse,
-    ToolSpec,
+    BoxFuture, BoxStream, CacheBreakpoint, ModelError, ModelEvent, ModelInfo, ModelProvider,
+    ModelRequest, ModelResponse, ToolSpec,
 };
 
 const API_URL: &str = "https://api.anthropic.com/v1/messages";
@@ -83,6 +85,65 @@ impl AnthropicClient {
         })
     }
 
+    fn do_create_message_streaming<'a>(
+        &'a self,
+        req: &'a ModelRequest<'a>,
+    ) -> BoxStream<'a, Result<ModelEvent, ModelError>> {
+        let mut body = build_request_body(req);
+        body.stream = true;
+        let http = self.http.clone();
+        let api_key = self.api_key.clone();
+        Box::pin(try_stream! {
+            let resp = http
+                .post(API_URL)
+                .header("x-api-key", &api_key)
+                .header("anthropic-version", ANTHROPIC_VERSION)
+                .header("anthropic-beta", EXTENDED_CACHE_BETA)
+                .header("content-type", "application/json")
+                .header("accept", "text/event-stream")
+                .json(&body)
+                .send()
+                .await
+                .map_err(|e| ModelError::Transport(e.to_string()))?;
+            let status = resp.status();
+            if !status.is_success() {
+                let err_body = resp.text().await.unwrap_or_default();
+                Err(ModelError::Api { status: status.as_u16(), body: err_body })?;
+                return;
+            }
+            let mut bytes = resp.bytes_stream();
+            let mut sse_buf: Vec<u8> = Vec::new();
+            let mut state = StreamState::default();
+            while let Some(chunk) = bytes.next().await {
+                let chunk = chunk.map_err(|e| ModelError::Transport(e.to_string()))?;
+                sse_buf.extend_from_slice(&chunk);
+                while let Some(event_payload) = take_sse_event(&mut sse_buf) {
+                    let Some(raw) = parse_sse_data(&event_payload) else {
+                        continue;
+                    };
+                    let ev: AnthropicStreamEvent = match serde_json::from_str(&raw) {
+                        Ok(ev) => ev,
+                        // Skip unknown event shapes rather than terminating
+                        // the stream — the server may add new event types.
+                        Err(_) => continue,
+                    };
+                    for out in state.consume(ev)? {
+                        yield out;
+                    }
+                    if state.done {
+                        return;
+                    }
+                }
+            }
+            // The server closed the stream without sending message_stop —
+            // treat as transport failure so the scheduler can decide
+            // whether to retry.
+            Err(ModelError::Transport(
+                "SSE stream ended without message_stop".into(),
+            ))?;
+        })
+    }
+
     async fn do_list_models(&self) -> Result<Vec<ModelInfo>, ModelError> {
         let resp = self
             .http
@@ -121,6 +182,13 @@ impl ModelProvider for AnthropicClient {
         req: &'a ModelRequest<'a>,
     ) -> BoxFuture<'a, Result<ModelResponse, ModelError>> {
         Box::pin(self.do_create_message(req))
+    }
+
+    fn create_message_streaming<'a>(
+        &'a self,
+        req: &'a ModelRequest<'a>,
+    ) -> BoxStream<'a, Result<ModelEvent, ModelError>> {
+        self.do_create_message_streaming(req)
     }
 
     fn list_models<'a>(&'a self) -> BoxFuture<'a, Result<Vec<ModelInfo>, ModelError>> {
@@ -195,6 +263,7 @@ fn build_request_body<'a>(req: &'a ModelRequest<'a>) -> CreateMessageRequest<'a>
         system,
         tools,
         messages,
+        stream: false,
     }
 }
 
@@ -270,6 +339,10 @@ struct CreateMessageRequest<'a> {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     tools: Vec<AnthropicTool>,
     messages: Vec<Value>,
+    /// Only emitted on the streaming path. The batch path leaves this at
+    /// `false` so the server returns a single JSON body.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    stream: bool,
 }
 
 #[derive(Serialize, Debug, Clone)]
@@ -387,7 +460,11 @@ fn wire_to_block(w: AnthropicWireBlock) -> ContentBlock {
 
 #[derive(Deserialize, Debug, Clone, Copy, Default)]
 struct AnthropicUsage {
+    #[serde(default)]
     input_tokens: u32,
+    /// Absent on `message_start` in practice — the server fills it in on
+    /// the terminal `message_delta`. Default to 0 so streaming parses cleanly.
+    #[serde(default)]
     output_tokens: u32,
     #[serde(default)]
     cache_creation_input_tokens: u32,
@@ -404,6 +481,307 @@ struct ListModelsResponse {
 struct AnthropicModelInfo {
     id: String,
     display_name: String,
+}
+
+// ---------- Streaming SSE parse + state machine ----------
+
+/// Pull one complete SSE event (terminated by a blank line, i.e. `\n\n` or
+/// `\r\n\r\n`) out of `buf` and return its raw bytes (including the blank
+/// line terminator). Returns `None` when no complete event is buffered yet.
+/// Implemented as a byte scan so chunk boundaries in the middle of a line
+/// don't confuse us.
+fn take_sse_event(buf: &mut Vec<u8>) -> Option<Vec<u8>> {
+    // Look for `\n\n` or `\r\n\r\n`. SSE spec allows either but Anthropic
+    // consistently uses `\n\n`.
+    let end = (0..buf.len().saturating_sub(1))
+        .find(|&i| &buf[i..i + 2] == b"\n\n")
+        .map(|i| i + 2)
+        .or_else(|| {
+            (0..buf.len().saturating_sub(3))
+                .find(|&i| &buf[i..i + 4] == b"\r\n\r\n")
+                .map(|i| i + 4)
+        })?;
+    let event = buf[..end].to_vec();
+    buf.drain(..end);
+    Some(event)
+}
+
+/// Extract the concatenated `data:` payload from a single SSE event. The
+/// SSE spec allows multiple `data:` lines per event to be joined with
+/// newlines; we honour that even though Anthropic sends one per event.
+/// `event:` lines are discarded — Anthropic's JSON payload always carries
+/// the `type` so they'd be redundant anyway.
+fn parse_sse_data(event: &[u8]) -> Option<String> {
+    let text = std::str::from_utf8(event).ok()?;
+    let mut data = String::new();
+    for line in text.lines() {
+        if let Some(rest) = line.strip_prefix("data:") {
+            if !data.is_empty() {
+                data.push('\n');
+            }
+            data.push_str(rest.strip_prefix(' ').unwrap_or(rest));
+        }
+    }
+    if data.is_empty() { None } else { Some(data) }
+}
+
+/// Discriminator for the currently-open content block, so we know how to
+/// interpret the deltas that follow its `content_block_start`.
+#[derive(Debug)]
+enum OpenBlock {
+    Text {
+        text: String,
+    },
+    Thinking {
+        thinking: String,
+        signature: Option<String>,
+    },
+    ToolUse {
+        id: String,
+        name: String,
+        args_json: String,
+    },
+    /// A block type we don't model (e.g. `server_tool_use`). Deltas are
+    /// ignored; the block is dropped at `content_block_stop`.
+    Other,
+}
+
+/// Running state for one Anthropic streaming call. Tracks the currently-open
+/// content block, accumulates deltas until each block closes, and collects
+/// the final content list for the terminal [`ModelEvent::Completed`].
+#[derive(Default)]
+struct StreamState {
+    open: Option<OpenBlock>,
+    content: Vec<ContentBlock>,
+    input_tokens: u32,
+    output_tokens: u32,
+    cache_read_input_tokens: u32,
+    cache_creation_input_tokens: u32,
+    stop_reason: Option<String>,
+    /// Set when we've emitted `Completed`; callers stop pulling the stream
+    /// after this so a stray `message_stop` (which we tolerate) doesn't
+    /// emit a second Completed.
+    done: bool,
+}
+
+impl StreamState {
+    /// Fold one SSE event into the running state, returning any [`ModelEvent`]s
+    /// that should be emitted to the consumer. Most events either yield zero
+    /// or one event; `message_stop` yields the terminal `Completed`.
+    fn consume(&mut self, event: AnthropicStreamEvent) -> Result<Vec<ModelEvent>, ModelError> {
+        let mut out = Vec::new();
+        match event {
+            AnthropicStreamEvent::MessageStart { message } => {
+                self.input_tokens = message.usage.input_tokens;
+                self.cache_read_input_tokens = message.usage.cache_read_input_tokens;
+                self.cache_creation_input_tokens = message.usage.cache_creation_input_tokens;
+            }
+            AnthropicStreamEvent::ContentBlockStart { content_block, .. } => {
+                self.open = Some(match content_block {
+                    AnthropicWireBlock::Text { text } => OpenBlock::Text { text },
+                    AnthropicWireBlock::Thinking {
+                        thinking,
+                        signature,
+                    } => OpenBlock::Thinking {
+                        thinking,
+                        signature,
+                    },
+                    AnthropicWireBlock::ToolUse { id, name, input: _ } => OpenBlock::ToolUse {
+                        id,
+                        name,
+                        args_json: String::new(),
+                    },
+                    // Tool-result blocks don't appear on assistant turns;
+                    // anything else (server_tool_use, etc.) we treat as
+                    // opaque and drop.
+                    AnthropicWireBlock::ToolResult { .. } => OpenBlock::Other,
+                });
+            }
+            AnthropicStreamEvent::ContentBlockDelta { delta, .. } => {
+                match (&mut self.open, delta) {
+                    (Some(OpenBlock::Text { text }), AnthropicDelta::TextDelta { text: chunk }) => {
+                        text.push_str(&chunk);
+                        out.push(ModelEvent::TextDelta { text: chunk });
+                    }
+                    (
+                        Some(OpenBlock::Thinking { thinking, .. }),
+                        AnthropicDelta::ThinkingDelta { thinking: chunk },
+                    ) => {
+                        thinking.push_str(&chunk);
+                        out.push(ModelEvent::ThinkingDelta { text: chunk });
+                    }
+                    (
+                        Some(OpenBlock::Thinking { signature, .. }),
+                        AnthropicDelta::SignatureDelta {
+                            signature: sig_chunk,
+                        },
+                    ) => {
+                        // Signature arrives as a separate delta type at the
+                        // end of a thinking block. Accumulate silently — the
+                        // consumer sees it when `Completed` lands.
+                        signature
+                            .get_or_insert_with(String::new)
+                            .push_str(&sig_chunk);
+                    }
+                    (
+                        Some(OpenBlock::ToolUse { args_json, .. }),
+                        AnthropicDelta::InputJsonDelta {
+                            partial_json: chunk,
+                        },
+                    ) => {
+                        args_json.push_str(&chunk);
+                        // Per design: no live tool-arg streaming — wait until
+                        // content_block_stop so we emit a single ToolCall with
+                        // fully-parsed input.
+                    }
+                    _ => {} // mismatched delta for current block — drop.
+                }
+            }
+            AnthropicStreamEvent::ContentBlockStop { .. } => match self.open.take() {
+                Some(OpenBlock::Text { text }) => {
+                    self.content.push(ContentBlock::Text { text });
+                }
+                Some(OpenBlock::Thinking {
+                    thinking,
+                    signature,
+                }) => {
+                    let replay = signature.map(|s| ProviderReplay {
+                        provider: PROVIDER_TAG.into(),
+                        data: serde_json::json!({"signature": s}),
+                    });
+                    self.content
+                        .push(ContentBlock::Thinking { replay, thinking });
+                }
+                Some(OpenBlock::ToolUse {
+                    id,
+                    name,
+                    args_json,
+                }) => {
+                    let input: Value = if args_json.is_empty() {
+                        Value::Object(Default::default())
+                    } else {
+                        serde_json::from_str(&args_json).map_err(|e| {
+                            ModelError::Transport(format!(
+                                "tool_use input_json_delta didn't parse: {e}"
+                            ))
+                        })?
+                    };
+                    out.push(ModelEvent::ToolCall {
+                        id: id.clone(),
+                        name: name.clone(),
+                        input: input.clone(),
+                    });
+                    self.content.push(ContentBlock::ToolUse {
+                        id,
+                        name,
+                        input,
+                        replay: None,
+                    });
+                }
+                Some(OpenBlock::Other) | None => {}
+            },
+            AnthropicStreamEvent::MessageDelta { delta, usage } => {
+                if let Some(sr) = delta.stop_reason {
+                    self.stop_reason = Some(sr);
+                }
+                // message_delta carries the final output_tokens on
+                // `usage.output_tokens`; input_tokens were set at
+                // message_start and don't change.
+                if let Some(u) = usage
+                    && let Some(ot) = u.output_tokens
+                {
+                    self.output_tokens = ot;
+                }
+            }
+            AnthropicStreamEvent::MessageStop => {
+                out.push(ModelEvent::Completed {
+                    content: std::mem::take(&mut self.content),
+                    stop_reason: self.stop_reason.take(),
+                    usage: Usage {
+                        input_tokens: self.input_tokens,
+                        output_tokens: self.output_tokens,
+                        cache_read_input_tokens: self.cache_read_input_tokens,
+                        cache_creation_input_tokens: self.cache_creation_input_tokens,
+                    },
+                });
+                self.done = true;
+            }
+            AnthropicStreamEvent::Ping | AnthropicStreamEvent::Other => {}
+            AnthropicStreamEvent::Error { error } => {
+                Err(ModelError::Api {
+                    status: 500,
+                    body: error.message,
+                })?;
+            }
+        }
+        Ok(out)
+    }
+}
+
+#[derive(Deserialize, Debug)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum AnthropicStreamEvent {
+    MessageStart {
+        message: MessageStartEnvelope,
+    },
+    ContentBlockStart {
+        #[allow(dead_code)]
+        index: usize,
+        content_block: AnthropicWireBlock,
+    },
+    ContentBlockDelta {
+        #[allow(dead_code)]
+        index: usize,
+        delta: AnthropicDelta,
+    },
+    ContentBlockStop {
+        #[allow(dead_code)]
+        index: usize,
+    },
+    MessageDelta {
+        delta: MessageDeltaPayload,
+        #[serde(default)]
+        usage: Option<MessageDeltaUsage>,
+    },
+    MessageStop,
+    Ping,
+    Error {
+        error: AnthropicStreamError,
+    },
+    #[serde(other)]
+    Other,
+}
+
+#[derive(Deserialize, Debug)]
+struct MessageStartEnvelope {
+    usage: AnthropicUsage,
+}
+
+#[derive(Deserialize, Debug)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum AnthropicDelta {
+    TextDelta { text: String },
+    InputJsonDelta { partial_json: String },
+    ThinkingDelta { thinking: String },
+    SignatureDelta { signature: String },
+}
+
+#[derive(Deserialize, Debug)]
+struct MessageDeltaPayload {
+    #[serde(default)]
+    stop_reason: Option<String>,
+}
+
+#[derive(Deserialize, Debug)]
+struct MessageDeltaUsage {
+    #[serde(default)]
+    output_tokens: Option<u32>,
+}
+
+#[derive(Deserialize, Debug)]
+struct AnthropicStreamError {
+    #[serde(default)]
+    message: String,
 }
 
 #[cfg(test)]
@@ -671,5 +1049,149 @@ mod tests {
         assert_eq!(block["type"], "tool_use");
         assert!(block.get("replay").is_none());
         assert!(block.get("thought_signature").is_none());
+    }
+
+    // ---------- SSE parsing ----------
+
+    #[test]
+    fn take_sse_event_yields_whole_events_only() {
+        // Half an event waiting for more bytes — should not yield.
+        let mut buf = b"event: ping\ndata: {\"type\":\"ping\"}".to_vec();
+        assert!(take_sse_event(&mut buf).is_none());
+        // Complete the terminator — now yield exactly the first event
+        // (buffer preserved for subsequent calls).
+        buf.extend_from_slice(b"\n\nevent: done\ndata: {\"type\":\"message_stop\"}\n\n");
+        let first = take_sse_event(&mut buf).expect("first event");
+        assert!(std::str::from_utf8(&first).unwrap().contains("ping"));
+        let second = take_sse_event(&mut buf).expect("second event");
+        assert!(
+            std::str::from_utf8(&second)
+                .unwrap()
+                .contains("message_stop")
+        );
+        assert!(take_sse_event(&mut buf).is_none());
+    }
+
+    #[test]
+    fn parse_sse_data_joins_multi_line_data_fields() {
+        let ev = b"event: x\ndata: line one\ndata: line two\n\n";
+        assert_eq!(parse_sse_data(ev).as_deref(), Some("line one\nline two"));
+    }
+
+    // ---------- Streaming state machine ----------
+
+    fn feed_events(events: &[&str]) -> (Vec<ModelEvent>, StreamState) {
+        let mut state = StreamState::default();
+        let mut out = Vec::new();
+        for ev_json in events {
+            let ev: AnthropicStreamEvent = serde_json::from_str(ev_json).unwrap();
+            out.extend(state.consume(ev).unwrap());
+        }
+        (out, state)
+    }
+
+    #[test]
+    fn text_block_emits_deltas_and_final_completed() {
+        let events = [
+            r#"{"type":"message_start","message":{"usage":{"input_tokens":5,"output_tokens":0}}}"#,
+            r#"{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#,
+            r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hello "}}"#,
+            r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"world"}}"#,
+            r#"{"type":"content_block_stop","index":0}"#,
+            r#"{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":2}}"#,
+            r#"{"type":"message_stop"}"#,
+        ];
+        let (evs, _) = feed_events(&events);
+        let deltas: Vec<&str> = evs
+            .iter()
+            .filter_map(|e| match e {
+                ModelEvent::TextDelta { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(deltas, vec!["hello ", "world"]);
+        // Completed is last, with full content and usage.
+        match evs.last().unwrap() {
+            ModelEvent::Completed {
+                content,
+                stop_reason,
+                usage,
+            } => {
+                assert_eq!(content.len(), 1);
+                assert!(
+                    matches!(&content[0], ContentBlock::Text { text } if text == "hello world")
+                );
+                assert_eq!(stop_reason.as_deref(), Some("end_turn"));
+                assert_eq!(usage.input_tokens, 5);
+                assert_eq!(usage.output_tokens, 2);
+            }
+            _ => panic!("last event must be Completed"),
+        }
+    }
+
+    #[test]
+    fn tool_use_emits_single_toolcall_after_args_assembled() {
+        // Args stream in as fragments; ToolCall event only fires after
+        // content_block_stop with the fully-parsed input.
+        let events = [
+            r#"{"type":"message_start","message":{"usage":{"input_tokens":1,"output_tokens":0}}}"#,
+            r#"{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_1","name":"bash","input":{}}}"#,
+            r#"{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"cmd\":"}}"#,
+            r#"{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"\"ls\"}"}}"#,
+            r#"{"type":"content_block_stop","index":0}"#,
+            r#"{"type":"message_delta","delta":{"stop_reason":"tool_use"}}"#,
+            r#"{"type":"message_stop"}"#,
+        ];
+        let (evs, _) = feed_events(&events);
+        // No TextDelta or anything other than ToolCall + Completed.
+        assert_eq!(evs.len(), 2);
+        match &evs[0] {
+            ModelEvent::ToolCall { id, name, input } => {
+                assert_eq!(id, "toolu_1");
+                assert_eq!(name, "bash");
+                assert_eq!(input, &json!({"cmd": "ls"}));
+            }
+            _ => panic!("expected ToolCall first"),
+        }
+        match &evs[1] {
+            ModelEvent::Completed {
+                content,
+                stop_reason,
+                ..
+            } => {
+                assert_eq!(content.len(), 1);
+                assert!(
+                    matches!(&content[0], ContentBlock::ToolUse { name, .. } if name == "bash")
+                );
+                assert_eq!(stop_reason.as_deref(), Some("tool_use"));
+            }
+            _ => panic!("expected Completed second"),
+        }
+    }
+
+    #[test]
+    fn thinking_block_captures_signature_into_replay_at_block_stop() {
+        let events = [
+            r#"{"type":"message_start","message":{"usage":{"input_tokens":1}}}"#,
+            r#"{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}"#,
+            r#"{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"hmm"}}"#,
+            r#"{"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"sig-blob"}}"#,
+            r#"{"type":"content_block_stop","index":0}"#,
+            r#"{"type":"message_delta","delta":{"stop_reason":"end_turn"}}"#,
+            r#"{"type":"message_stop"}"#,
+        ];
+        let (evs, _) = feed_events(&events);
+        match evs.last().unwrap() {
+            ModelEvent::Completed { content, .. } => match &content[0] {
+                ContentBlock::Thinking { replay, thinking } => {
+                    assert_eq!(thinking, "hmm");
+                    let r = replay.as_ref().expect("signature should fold into replay");
+                    assert_eq!(r.provider, "anthropic");
+                    assert_eq!(r.data, json!({"signature": "sig-blob"}));
+                }
+                _ => panic!("expected Thinking block"),
+            },
+            _ => panic!("expected Completed"),
+        }
     }
 }

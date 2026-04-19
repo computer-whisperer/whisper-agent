@@ -13,11 +13,13 @@ use std::future::Future;
 use std::pin::Pin;
 use std::time::Duration;
 
+use futures::stream::{self, Stream, StreamExt};
 use serde_json::Value;
 use thiserror::Error;
 use whisper_agent_protocol::{ContentBlock, Message, Usage};
 
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+pub type BoxStream<'a, T> = Pin<Box<dyn Stream<Item = T> + Send + 'a>>;
 
 pub struct ModelRequest<'a> {
     pub model: &'a str,
@@ -80,6 +82,43 @@ pub enum ModelError {
     RateLimited { retry_after: Duration, body: String },
 }
 
+/// Incremental event emitted from a streaming model call. Intended for live UI
+/// updates; the canonical, assembled turn content lands in the terminal
+/// [`ModelEvent::Completed`] event.
+///
+/// Streams are `Stream<Item = Result<ModelEvent, ModelError>>`. A terminal
+/// error ends the stream without a `Completed`. On success, `Completed` is
+/// always the last event — the scheduler persists from its `content`, not
+/// from reassembling deltas.
+///
+/// Tool calls arrive as a single `ToolCall` event with fully-assembled args,
+/// not a begin/delta/end trio — live partial-JSON rendering isn't worth the
+/// webui complexity. Text and thinking *are* emitted as deltas because
+/// character-by-character streaming is the user-visible win.
+#[derive(Debug, Clone)]
+pub enum ModelEvent {
+    /// Append to the current assistant text block (open a new one if the last
+    /// emitted event wasn't also a `TextDelta`).
+    TextDelta { text: String },
+    /// Append to the current assistant thinking block.
+    ThinkingDelta { text: String },
+    /// A fully-formed tool call. Emitted once per call, after the model has
+    /// streamed its full argument JSON and the adapter has parsed it.
+    ToolCall {
+        id: String,
+        name: String,
+        input: Value,
+    },
+    /// Terminal event. `content` is the assistant-turn content block list the
+    /// scheduler should persist. Deltas emitted before this are strictly for
+    /// broadcast; the canonical state comes from here.
+    Completed {
+        content: Vec<ContentBlock>,
+        stop_reason: Option<String>,
+        usage: Usage,
+    },
+}
+
 /// Provider-agnostic model backend. Object-safe via explicit pinned-boxed futures
 /// (native `async fn in trait` isn't dyn-safe with `Send` bound without extra crates).
 pub trait ModelProvider: Send + Sync {
@@ -88,7 +127,57 @@ pub trait ModelProvider: Send + Sync {
         req: &'a ModelRequest<'a>,
     ) -> BoxFuture<'a, Result<ModelResponse, ModelError>>;
 
+    /// Streaming variant. Returns a stream of [`ModelEvent`]s ending in a
+    /// single `Completed` event. The default implementation buffers on top of
+    /// `create_message` — adapters override to emit real SSE deltas as they
+    /// arrive. Callers that only need the final response can ignore every
+    /// event except `Completed` (or use [`buffer_stream`] to collect).
+    fn create_message_streaming<'a>(
+        &'a self,
+        req: &'a ModelRequest<'a>,
+    ) -> BoxStream<'a, Result<ModelEvent, ModelError>> {
+        Box::pin(stream::once(async move {
+            self.create_message(req)
+                .await
+                .map(|resp| ModelEvent::Completed {
+                    content: resp.content,
+                    stop_reason: resp.stop_reason,
+                    usage: resp.usage,
+                })
+        }))
+    }
+
     fn list_models<'a>(&'a self) -> BoxFuture<'a, Result<Vec<ModelInfo>, ModelError>>;
+}
+
+/// Drain a `create_message_streaming` stream into a single [`ModelResponse`]
+/// — use this when a caller needs batch semantics on top of a streaming
+/// provider. Returns the first error if the stream terminates early.
+pub async fn buffer_stream<'a>(
+    mut stream: BoxStream<'a, Result<ModelEvent, ModelError>>,
+) -> Result<ModelResponse, ModelError> {
+    while let Some(ev) = stream.next().await {
+        match ev? {
+            ModelEvent::Completed {
+                content,
+                stop_reason,
+                usage,
+            } => {
+                return Ok(ModelResponse {
+                    content,
+                    stop_reason,
+                    usage,
+                });
+            }
+            // Deltas are discarded — the canonical content arrives in
+            // `Completed`. A caller that wants them should consume the
+            // stream directly instead of using this helper.
+            _ => continue,
+        }
+    }
+    Err(ModelError::Transport(
+        "model stream ended without Completed event".into(),
+    ))
 }
 
 /// Default cache policy — mirrors Claude Code's observed wire behavior: one
