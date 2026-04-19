@@ -8,11 +8,12 @@
 //! as a quiet stream of model output, not a chat log.
 //!
 //! Tool calls render as collapsible rows whose header is `name summary
-//! [state]`. `edit_file` / `write_file` calls expand by default and
-//! show a unified diff (built into the item's `diff` payload at
-//! build_tool_call_item time); other tools collapse by default with
-//! the full pretty-printed JSON args + truncated result available
-//! inside.
+//! [state]`. All tool calls collapse by default to keep the chat
+//! stream scannable even during busy edit sessions. Clicking expands
+//! the body: a unified diff for `edit_file` / `write_file` (built
+//! into the item's `diff` payload at build_tool_call_item time), or
+//! the full pretty-printed JSON args for other tools, followed by
+//! the truncated result.
 
 use egui::{Color32, RichText};
 use egui_commonmark::{CommonMarkCache, CommonMarkViewer};
@@ -184,10 +185,12 @@ fn render_tool_call(
     is_error: bool,
 ) {
     let id = ui.make_persistent_id(("tool", tool_use_id));
-    // Default-open the diff variants — the diff itself is the
-    // interesting content, and forcing the user to click into every
-    // edit ruins the scanability of an ongoing edit session.
-    let default_open = diff.is_some();
+    // Default-collapsed for every tool call. The chat stream reads
+    // as a sequence of headers (name + one-line summary + status
+    // chip); clicking expands args / diff / result. Keeps the view
+    // scannable during busy edit sessions and aligns with the
+    // reasoning-block default.
+    let default_open = false;
     let (chip_text, chip_color) = match (result, is_error) {
         (None, _) => ("running", Color32::from_rgb(200, 180, 60)),
         (Some(_), true) => ("error", COLOR_ERROR),
