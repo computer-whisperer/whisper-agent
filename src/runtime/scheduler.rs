@@ -77,8 +77,13 @@ pub enum ToolRoute {
     /// Handle in-process via [`crate::tools::builtin_tools::dispatch`], scoped
     /// to the pod's own directory.
     Builtin { pod_id: PodId },
-    /// Forward to the named MCP session via JSON-RPC.
-    Mcp(Arc<McpSession>),
+    /// Forward to the named MCP session via JSON-RPC. `host` is the
+    /// scheduler-side host name (used as the `host:` field on the
+    /// `Function::McpToolUse` spec).
+    Mcp {
+        session: Arc<McpSession>,
+        host: String,
+    },
 }
 
 /// Snapshot of a pod's on-disk directory + parsed config + behavior ids.
@@ -550,7 +555,10 @@ impl Scheduler {
             if host.tools.iter().any(|t| t.name == tool_name)
                 && let Some(s) = host.session.clone()
             {
-                return Some(ToolRoute::Mcp(s));
+                return Some(ToolRoute::Mcp {
+                    session: s,
+                    host: host.id.0.clone(),
+                });
             }
         }
         None
@@ -1572,6 +1580,18 @@ impl Scheduler {
 
         // Build per-tool-name annotation map so the task's approval policy can consult it.
         let annotations = self.annotations_for(&thread_id);
+        // Snapshot the tool-call outcome before handing the result to
+        // the thread (which consumes it by move). The snapshot lets us
+        // close out the matching `ActiveFunctionEntry` after the
+        // thread has integrated the result.
+        let tool_result_snapshot: Option<(String, Result<crate::tools::mcp::CallToolResult, String>)> =
+            match &result {
+                IoResult::ToolCall {
+                    tool_use_id,
+                    result: tc_result,
+                } => Some((tool_use_id.clone(), tc_result.clone())),
+                _ => None,
+            };
         if let Some(task) = self.tasks.get_mut(&thread_id) {
             task.apply_io_result(op_id, result, &annotations, &mut events);
         } else {
@@ -1581,6 +1601,13 @@ impl Scheduler {
         self.mark_dirty(&thread_id);
         self.router.dispatch_events(&thread_id, events);
         self.teardown_host_env_if_terminal(&thread_id);
+        // Close out the tool-call Function entry, if any. No-op when
+        // the completion is a model call (ModelCall isn't a Function)
+        // or a dispatch_thread intercept (no Function registered at
+        // this layer — CreateThread Function lands in Phase 5).
+        if let Some((tool_use_id, tc_result)) = tool_result_snapshot {
+            self.complete_tool_function(&thread_id, &tool_use_id, &tc_result);
+        }
     }
 
     /// Apply a resource-provisioning completion. Updates the registry
@@ -1755,8 +1782,24 @@ impl Scheduler {
                                 input.clone(),
                                 pending_io,
                             ) {
+                                // dispatch_thread is destined to become a
+                                // CreateThread Function (Phase 5). Don't
+                                // register a BuiltinToolCall entry for it
+                                // — that'd shadow the eventual
+                                // CreateThread Function.
                                 fut
                             } else {
+                                // Register a tool-call Function entry
+                                // that shadows the in-flight work. The
+                                // IO future is still the executor;
+                                // `apply_io_completion` closes out the
+                                // Function when the result lands.
+                                self.register_tool_function(
+                                    thread_id,
+                                    &tool_use_id,
+                                    &name,
+                                    input.clone(),
+                                );
                                 io_dispatch::build_io_future(
                                     self,
                                     thread_id.to_string(),

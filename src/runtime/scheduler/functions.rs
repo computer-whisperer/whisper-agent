@@ -138,6 +138,16 @@ impl Scheduler {
                 }
                 Ok(())
             }
+            Function::BuiltinToolCall { name, .. } => {
+                // Scope rubber-stamps for Phase 4b: the thread's
+                // `tools_scope`-based evaluate path in `Thread::step`
+                // already gated this call. Phase 4c moves that
+                // evaluation here and removes the thread-side check.
+                admission_check(scope.tool(name), || format!("tool {name} denied by scope"))
+            }
+            Function::McpToolUse { name, .. } => {
+                admission_check(scope.tool(name), || format!("tool {name} denied by scope"))
+            }
             // Other variants are declared but not yet consumed; they'll
             // get their precondition logic as they're migrated in later
             // commits.
@@ -176,6 +186,19 @@ impl Scheduler {
                 self.launch_compact_thread(&thread_id, pending_io);
                 // Function stays in the registry until
                 // `finalize_pending_compaction` calls `complete_function`.
+            }
+            Function::BuiltinToolCall { .. } | Function::McpToolUse { .. } => {
+                // The tool call's actual work is pumped by the existing
+                // IO-future mechanism in `build_io_future`; the Function
+                // just records the call in the registry. Phase 4b keeps
+                // this wrap-only shape — Phase 4c moves approval
+                // evaluation into launch, Phase 4d moves the dispatch
+                // itself into the Function's future.
+                //
+                // The Function stays admitted until
+                // `apply_io_completion` locates it by caller-link
+                // (ThreadToolCall { thread_id, tool_use_id }) and calls
+                // `complete_function`.
             }
             _ => {
                 // Variants that passed registration but aren't launchable
@@ -223,6 +246,134 @@ impl Scheduler {
                 _ => None,
             }
         })
+    }
+
+    /// Find the FunctionId of the in-flight tool call for this
+    /// `(thread_id, tool_use_id)` pair. The caller-link identifies the
+    /// pairing uniquely — each tool_use_id admits exactly one Function
+    /// entry at a time.
+    pub(super) fn find_tool_function_for(
+        &self,
+        thread_id: &str,
+        tool_use_id: &str,
+    ) -> Option<FunctionId> {
+        self.active_functions.iter().find_map(|(id, entry)| {
+            if let CallerLink::ThreadToolCall {
+                thread_id: t,
+                tool_use_id: u,
+            } = &entry.caller
+            {
+                if t == thread_id && u == tool_use_id {
+                    return Some(*id);
+                }
+            }
+            None
+        })
+    }
+
+    /// Register a tool-call Function for a builtin or MCP tool a
+    /// thread's model turn wants to invoke. Called from
+    /// `step_until_blocked` when processing a DispatchIo(ToolCall).
+    /// Returns the new FunctionId, or None if registration was
+    /// rejected (scope denied the tool name).
+    pub(super) fn register_tool_function(
+        &mut self,
+        thread_id: &str,
+        tool_use_id: &str,
+        name: &str,
+        input: serde_json::Value,
+    ) -> Option<FunctionId> {
+        use super::ToolRoute;
+        let spec = match self.route_tool(thread_id, name) {
+            Some(ToolRoute::Builtin { .. }) => Function::BuiltinToolCall {
+                name: name.to_string(),
+                args: input,
+            },
+            Some(ToolRoute::Mcp { host, .. }) => Function::McpToolUse {
+                host: host.clone(),
+                name: name.to_string(),
+                args: input,
+            },
+            None => {
+                // No route — the thread's turn will surface this as a
+                // tool-not-found error when the IO future runs. Don't
+                // register a Function for an unresolvable tool.
+                return None;
+            }
+        };
+        let scope = self.thread_scope(thread_id)?;
+        let caller = CallerLink::ThreadToolCall {
+            thread_id: thread_id.to_string(),
+            tool_use_id: tool_use_id.to_string(),
+        };
+        match self.register_function(spec, scope, caller) {
+            Ok(fn_id) => Some(fn_id),
+            Err(e) => {
+                tracing::warn!(
+                    %thread_id, %tool_use_id, %name, error = ?e,
+                    "tool Function rejected at registration"
+                );
+                None
+            }
+        }
+    }
+
+    /// Build a best-effort PermissionScope from the thread's current
+    /// state. Phase 4b: only `tools_scope` is populated meaningfully;
+    /// other fields rubber-stamp. Future commits extend this to cover
+    /// bindings and pod-level operations as they start being gated at
+    /// registration.
+    pub(super) fn thread_scope(&self, thread_id: &str) -> Option<PermissionScope> {
+        let task = self.tasks.get(thread_id)?;
+        let mut scope = PermissionScope::allow_all();
+        scope.tools = task.tools_scope.clone();
+        Some(scope)
+    }
+
+    /// Complete the tool-call Function for `(thread_id, tool_use_id)`
+    /// with `result`. No-op if no such Function is registered — e.g.,
+    /// the dispatch-thread intercept path doesn't register a Function
+    /// at this layer (CreateThread Function lands in Phase 5).
+    pub(super) fn complete_tool_function(
+        &mut self,
+        thread_id: &str,
+        tool_use_id: &str,
+        result: &Result<crate::tools::mcp::CallToolResult, String>,
+    ) {
+        let Some(fn_id) = self.find_tool_function_for(thread_id, tool_use_id) else {
+            return;
+        };
+        let outcome = match result {
+            Ok(call) => {
+                let terminal_payload = crate::functions::ToolResult {
+                    // Phase 4b: terminal payload is minimal — the
+                    // actual tool-result content is already integrated
+                    // into the thread's conversation via
+                    // `apply_io_result`. Phase 4d fills this out when
+                    // streaming + caller-link routing to non-thread
+                    // callers (lua, WS-direct) needs the payload here.
+                    content: Vec::new(),
+                    is_error: call.is_error,
+                };
+                // Pick the matching terminal variant from the Function
+                // we just completed.
+                let terminal = match self.active_functions.get(&fn_id).map(|e| &e.spec) {
+                    Some(Function::BuiltinToolCall { .. }) => {
+                        FunctionTerminal::BuiltinToolCall(terminal_payload)
+                    }
+                    Some(Function::McpToolUse { .. }) => {
+                        FunctionTerminal::McpToolUse(terminal_payload)
+                    }
+                    _ => FunctionTerminal::BuiltinToolCall(terminal_payload), // defensive
+                };
+                FunctionOutcome::Success(terminal)
+            }
+            Err(e) => FunctionOutcome::Error(crate::functions::FunctionError {
+                kind: crate::functions::FunctionErrorKind::Execution,
+                detail: e.clone(),
+            }),
+        };
+        self.complete_function(fn_id, outcome);
     }
 
     /// Cancel a thread by id: flip its state, broadcast, and run the

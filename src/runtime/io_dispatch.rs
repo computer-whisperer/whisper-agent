@@ -576,7 +576,7 @@ fn tool_call(
                 })
             })
         }
-        Some(ToolRoute::Mcp(mcp)) => Box::pin(async move {
+        Some(ToolRoute::Mcp { session: mcp, .. }) => Box::pin(async move {
             let result = match mcp.invoke(&name, input).await {
                 Ok(mut stream) => {
                     let mut last = None;

@@ -75,7 +75,7 @@ pub enum McpContentBlock {
     Text { text: String },
 }
 
-#[derive(Deserialize, Debug)]
+#[derive(Deserialize, Debug, Clone)]
 pub struct CallToolResult {
     pub content: Vec<McpContentBlock>,
     #[serde(default, rename = "isError")]
