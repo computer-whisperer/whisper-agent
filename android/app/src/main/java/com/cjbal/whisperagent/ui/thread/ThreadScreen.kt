@@ -31,10 +31,12 @@ import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.font.FontStyle
@@ -79,12 +81,39 @@ fun ThreadScreen(
                 .filter { it.role != Role.System && it.role != Role.Tools }
 
             val listState = rememberLazyListState()
-            // Auto-scroll to the newest message whenever the count changes.
-            // Doesn't fire on intra-message streaming deltas yet — good enough
-            // for v1, revisit when streaming delta reducer lands.
-            LaunchedEffect(messages.size, snapshot?.threadId) {
-                if (messages.isNotEmpty()) {
-                    listState.animateScrollToItem(messages.size - 1)
+
+            // Follow the tail of the conversation as long as the user hasn't
+            // scrolled up to read. When they scroll back to the bottom, follow
+            // resumes.
+            var followBottom by remember(snapshot?.threadId) { mutableStateOf(true) }
+            LaunchedEffect(listState) {
+                snapshotFlow {
+                    val info = listState.layoutInfo
+                    val lastVisible = info.visibleItemsInfo.lastOrNull()
+                    lastVisible == null || lastVisible.index >= info.totalItemsCount - 1
+                }.collect { atBottom -> followBottom = atBottom }
+            }
+
+            // Re-scroll whenever either the message count OR the total content
+            // length of the last message changes — the latter catches streaming
+            // text / reasoning deltas that extend a trailing block in place.
+            val contentMarker by remember(snapshot) {
+                derivedStateOf {
+                    val last = messages.lastOrNull()
+                    val lastLen = last?.content?.sumOf { block ->
+                        when (block) {
+                            is ContentBlock.Text -> block.text.length
+                            is ContentBlock.Thinking -> block.thinking.length
+                            is ContentBlock.ToolResult -> block.previewText?.length ?: 0
+                            else -> 0
+                        }
+                    } ?: 0
+                    messages.size to lastLen
+                }
+            }
+            LaunchedEffect(contentMarker) {
+                if (followBottom && messages.isNotEmpty()) {
+                    listState.scrollToItem(messages.size - 1)
                 }
             }
 
