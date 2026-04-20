@@ -43,3 +43,11 @@ anyhow = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 url = { workspace = true }
+
+# Persisted login credentials live as TOML under the user's XDG config
+# dir. `serde` is the standard derive path; `toml` handles the wire
+# format. No `directories`/`dirs` dep — we resolve XDG manually in
+# `config.rs` (Linux-only for now, matches the eframe x11/wayland
+# features above).
+serde = { workspace = true }
+toml = "1"

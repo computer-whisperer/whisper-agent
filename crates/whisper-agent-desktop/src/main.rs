@@ -6,12 +6,26 @@
 //! unchanged from the browser webui — same CBOR frames over the same
 //! `/ws` endpoint.
 //!
+//! Two phases:
+//!   - `Login`: egui form collects server URL + token. Submission
+//!     writes to `$XDG_CONFIG_HOME/whisper-agent/desktop.toml` (if
+//!     "Remember" is checked) and transitions to `Connected`.
+//!   - `Connected`: spawns the ws task and wraps `ChatApp` in a
+//!     `DesktopApp` that drains the inbound tokio channel each frame.
+//!
+//! CLI flags still override config. If both `--server` and a token
+//! source are supplied (or loaded from config), the login screen is
+//! skipped.
+//!
 //! Threading:
-//!   - main thread: eframe window + `ChatApp::update`
+//!   - main thread: eframe window + render
 //!   - tokio pool: `ws_loop` reads/writes frames
 //!   - bridge: two `tokio::sync::mpsc` unbounded channels, plus a
 //!     `OnceLock<egui::Context>` the WS task uses to `request_repaint`
 //!     when a frame arrives so the UI wakes without polling.
+
+mod config;
+mod login;
 
 use std::collections::VecDeque;
 use std::rc::Rc;
@@ -20,6 +34,7 @@ use std::{cell::RefCell, path::PathBuf};
 
 use anyhow::{Context, Result, anyhow};
 use clap::Parser;
+use eframe::App as _;
 use futures::{SinkExt, StreamExt};
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::{
@@ -32,6 +47,8 @@ use tracing_subscriber::EnvFilter;
 use whisper_agent_protocol::{ClientToServer, decode_from_server, encode_to_server};
 use whisper_agent_webui::{ChatApp, Inbound, InboundEvent, SendFn};
 
+use crate::login::{LoginForm, Submission};
+
 #[derive(Parser, Debug)]
 #[command(
     version,
@@ -41,11 +58,13 @@ struct Args {
     /// Base URL of a running whisper-agent server, e.g. `https://host:8443`
     /// or `http://127.0.0.1:8080`. The client appends `/ws` to derive the
     /// websocket endpoint, swapping the scheme to `ws`/`wss` as needed.
+    /// Overrides the value saved in the config file.
     #[arg(long)]
-    server: String,
+    server: Option<String>,
 
     /// Bearer token for the server's `[[auth.clients]]` gate. Required for
     /// non-loopback servers; loopback servers accept any value (or none).
+    /// Overrides the value saved in the config file.
     #[arg(long, env = "WA_TOKEN", conflicts_with = "token_file")]
     token: Option<String>,
 
@@ -54,6 +73,11 @@ struct Args {
     /// `--token`; mutually exclusive.
     #[arg(long)]
     token_file: Option<PathBuf>,
+
+    /// Force the login screen even when CLI flags or saved config
+    /// would otherwise auto-connect. Useful for changing servers.
+    #[arg(long)]
+    login: bool,
 }
 
 fn main() -> Result<()> {
@@ -75,43 +99,28 @@ fn main() -> Result<()> {
         .ok();
 
     let args = Args::parse();
-    let token = resolve_token(&args)?;
-    let ws_url = derive_ws_url(&args.server).context("derive websocket URL from --server")?;
-    info!(url = %ws_url, "connecting");
+    let cli_token = resolve_cli_token(&args)?;
+    let saved = config::load().unwrap_or_else(|e| {
+        warn!("could not load saved config: {e:#}");
+        config::Config::default()
+    });
 
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .context("build tokio runtime")?;
+    // CLI overrides saved config for this session. An empty saved
+    // field is treated as missing.
+    let initial_server = args.server.clone().or_else(|| non_empty(saved.server));
+    let initial_token = cli_token.or_else(|| non_empty(saved.token));
 
-    let (inbound_tx, inbound_rx) = mpsc::unbounded_channel::<InboundEvent>();
-    let (outbound_tx, outbound_rx) = mpsc::unbounded_channel::<ClientToServer>();
+    let rt = Arc::new(
+        tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .context("build tokio runtime")?,
+    );
 
     // The WS task needs a handle to the egui context so it can wake the
     // UI when a frame arrives. `run_native` hands us the context inside
     // the app-creator closure; we drop it into this OnceLock from there.
     let ctx_holder: Arc<OnceLock<egui::Context>> = Arc::new(OnceLock::new());
-    let ctx_for_task = ctx_holder.clone();
-
-    rt.spawn(async move {
-        match ws_loop(ws_url, token, outbound_rx, inbound_tx, ctx_for_task).await {
-            Ok(()) => info!("ws loop exited"),
-            Err(e) => error!("ws loop error: {e:#}"),
-        }
-    });
-
-    // Shared Rc<RefCell<VecDeque>> the WS-bridged events land in. Both
-    // `DesktopApp` (pushes from the tokio channel) and `ChatApp` (drains
-    // during render) hold clones.
-    let inbound_shared: Inbound = Rc::new(RefCell::new(VecDeque::new()));
-    let inbound_for_app = inbound_shared.clone();
-    let inbound_for_desktop = inbound_shared;
-
-    let send_fn: SendFn = Box::new(move |msg: ClientToServer| {
-        if let Err(e) = outbound_tx.send(msg) {
-            warn!("outbound channel closed: {e}");
-        }
-    });
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -120,23 +129,151 @@ fn main() -> Result<()> {
         ..Default::default()
     };
 
+    let rt_for_creator = rt.clone();
+    let ctx_for_creator = ctx_holder.clone();
     eframe::run_native(
         "whisper-agent",
         options,
         Box::new(move |cc| {
-            let _ = ctx_holder.set(cc.egui_ctx.clone());
+            let _ = ctx_for_creator.set(cc.egui_ctx.clone());
             cc.egui_ctx.set_zoom_factor(1.1);
-            let chat_app = ChatApp::new(inbound_for_app, send_fn);
-            Ok(Box::new(DesktopApp {
-                inner: chat_app,
-                inbound_rx,
-                inbound_sink: inbound_for_desktop,
-            }) as Box<dyn eframe::App>)
+
+            let mut root = RootApp::new(rt_for_creator, ctx_for_creator);
+            // Skip the login form when both values are known AND the
+            // user didn't pass `--login`. Any other combination lands
+            // on the form, prefilled with whatever we do have.
+            match (args.login, initial_server, initial_token) {
+                (false, Some(server), Some(token)) => root.start_connection(server, token),
+                (_, server, token) => {
+                    root.phase = Phase::Login(LoginForm::new(server, token));
+                }
+            }
+
+            Ok(Box::new(root) as Box<dyn eframe::App>)
         }),
     )
     .map_err(|e| anyhow!("eframe: {e}"))?;
 
     Ok(())
+}
+
+fn non_empty(s: Option<String>) -> Option<String> {
+    s.filter(|v| !v.trim().is_empty())
+}
+
+/// Top-level eframe app: owns the tokio runtime and the egui context
+/// handle, and switches between the login form and the connected chat
+/// UI. Only one ws task runs at a time (in the Connected phase).
+struct RootApp {
+    rt: Arc<tokio::runtime::Runtime>,
+    ctx_holder: Arc<OnceLock<egui::Context>>,
+    phase: Phase,
+}
+
+enum Phase {
+    Login(LoginForm),
+    // ChatApp is ~4KB and LoginForm is ~80B; box the large arm to
+    // keep the enum itself small (clippy::large_enum_variant).
+    Connected(Box<DesktopApp>),
+}
+
+impl RootApp {
+    fn new(rt: Arc<tokio::runtime::Runtime>, ctx_holder: Arc<OnceLock<egui::Context>>) -> Self {
+        // `phase` is overwritten by the caller before run_native actually
+        // runs a frame, so this placeholder never renders.
+        Self {
+            rt,
+            ctx_holder,
+            phase: Phase::Login(LoginForm::new(None, None)),
+        }
+    }
+
+    /// Spawn the ws task for `(server, token)` and transition to the
+    /// connected phase. `token` may be empty — we only attach the
+    /// Authorization header when it's non-empty.
+    fn start_connection(&mut self, server: String, token: String) {
+        let ws_url = match derive_ws_url(&server) {
+            Ok(u) => u,
+            Err(e) => {
+                let mut form = LoginForm::new(Some(server), non_empty(Some(token)));
+                form.set_error(format!("invalid server URL: {e:#}"));
+                self.phase = Phase::Login(form);
+                return;
+            }
+        };
+        info!(url = %ws_url, "connecting");
+
+        let (inbound_tx, inbound_rx) = mpsc::unbounded_channel::<InboundEvent>();
+        let (outbound_tx, outbound_rx) = mpsc::unbounded_channel::<ClientToServer>();
+
+        let ctx_for_task = self.ctx_holder.clone();
+        let token_for_task = if token.is_empty() { None } else { Some(token) };
+        self.rt.spawn(async move {
+            match ws_loop(
+                ws_url,
+                token_for_task,
+                outbound_rx,
+                inbound_tx,
+                ctx_for_task,
+            )
+            .await
+            {
+                Ok(()) => info!("ws loop exited"),
+                Err(e) => error!("ws loop error: {e:#}"),
+            }
+        });
+
+        // Shared Rc<RefCell<VecDeque>> the WS-bridged events land in. Both
+        // `DesktopApp` (pushes from the tokio channel) and `ChatApp` (drains
+        // during render) hold clones.
+        let inbound_shared: Inbound = Rc::new(RefCell::new(VecDeque::new()));
+        let inbound_for_app = inbound_shared.clone();
+        let inbound_for_desktop = inbound_shared;
+
+        let send_fn: SendFn = Box::new(move |msg: ClientToServer| {
+            if let Err(e) = outbound_tx.send(msg) {
+                warn!("outbound channel closed: {e}");
+            }
+        });
+
+        let chat_app = ChatApp::new(inbound_for_app, send_fn);
+        self.phase = Phase::Connected(Box::new(DesktopApp {
+            inner: chat_app,
+            inbound_rx,
+            inbound_sink: inbound_for_desktop,
+        }));
+    }
+}
+
+impl eframe::App for RootApp {
+    fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
+        let submission = match &mut self.phase {
+            Phase::Login(form) => form.show(ui),
+            Phase::Connected(app) => {
+                app.ui(ui, frame);
+                None
+            }
+        };
+        if let Some(Submission {
+            server,
+            token,
+            remember,
+        }) = submission
+        {
+            if remember {
+                let cfg = config::Config {
+                    server: Some(server.clone()),
+                    token: (!token.is_empty()).then(|| token.clone()),
+                };
+                if let Err(e) = config::save(&cfg) {
+                    warn!("could not save config: {e:#}");
+                } else if let Ok(p) = config::path() {
+                    info!("saved login to {}", p.display());
+                }
+            }
+            self.start_connection(server, token);
+        }
+    }
 }
 
 /// Wraps `ChatApp` with the cross-thread bridge: drains the tokio channel
@@ -148,7 +285,7 @@ struct DesktopApp {
     inbound_sink: Inbound,
 }
 
-impl eframe::App for DesktopApp {
+impl DesktopApp {
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         while let Ok(event) = self.inbound_rx.try_recv() {
             self.inbound_sink.borrow_mut().push_back(event);
@@ -243,7 +380,10 @@ fn request_repaint(ctx: &Arc<OnceLock<egui::Context>>) {
     }
 }
 
-fn resolve_token(args: &Args) -> Result<Option<String>> {
+/// Load the bearer token from whichever CLI source the user picked.
+/// Returns `None` when neither `--token` nor `--token-file` was given;
+/// the caller then falls back to saved config.
+fn resolve_cli_token(args: &Args) -> Result<Option<String>> {
     if let Some(tok) = &args.token {
         return Ok(Some(tok.clone()));
     }
