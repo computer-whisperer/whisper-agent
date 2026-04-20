@@ -128,17 +128,23 @@ pub(crate) fn build_io_future(
     }
 }
 
-/// Build a future that provisions a thread's host env (env + MCP
-/// connect + initial `tools/list`) and yields a
-/// [`SchedulerCompletion::Provision`]. Only called for threads that
-/// have a host_env binding — threads bound only to shared MCPs don't
-/// need host-env provisioning.
-pub(crate) fn provision_host_env_mcp(scheduler: &Scheduler, thread_id: String) -> SchedulerFuture {
+/// Build a future that provisions a specific `host_env_id` (env +
+/// MCP connect + initial `tools/list`) and yields a
+/// [`SchedulerCompletion::Provision`]. Called once per (thread, id)
+/// pair; threads with multiple host-env bindings get one future per
+/// binding. `thread_id` is carried through only so the completion
+/// can be tied back to who originally dispatched — the per-id guard
+/// deduplicates across threads sharing the same binding.
+pub(crate) fn provision_host_env_mcp(
+    scheduler: &Scheduler,
+    thread_id: String,
+    host_env_id: HostEnvId,
+) -> SchedulerFuture {
     // Snapshot the host-env decision while we have the sync borrow.
     // The entry must exist — ensure_host_env_provisioning pre-registered
     // it before dispatching. If the entry is already Ready (dedup hit),
     // skip provision and reuse the cached URL.
-    let host_env_action = match scheduler.host_env_for_thread(&thread_id) {
+    let host_env_action = match scheduler.resources().host_envs.get(&host_env_id) {
         Some(e) if e.state.is_ready() => {
             let mcp_url = e.mcp_url.clone().unwrap_or_default();
             let mcp_token = e.mcp_token.clone();
@@ -167,8 +173,8 @@ pub(crate) fn provision_host_env_mcp(scheduler: &Scheduler, thread_id: String) -
                     thread_id,
                     result: ProvisionResult::HostEnvMcpFailed {
                         phase: ProvisionPhase::HostEnv,
-                        message: "thread has no host_env binding".into(),
-                        host_env_id: HostEnvId(String::new()),
+                        message: "host_env id not registered at dispatch time".into(),
+                        host_env_id,
                     },
                 })
             });

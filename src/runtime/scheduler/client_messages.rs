@@ -744,15 +744,17 @@ impl Scheduler {
                 // Drop in-memory thread state for every thread under this pod.
                 // The pod directory is moving to .archived/, so these threads
                 // become unreachable — we'd otherwise leak entries in
-                // `tasks` / `dirty` / `provisioning_in_flight` / `router`
-                // subs, and the resource-registry user sets would carry
-                // stale thread_ids that prevent GC from ever marking those
-                // resources idle.
+                // `tasks` / `dirty` / `router` subs, and the
+                // resource-registry user sets would carry stale thread_ids
+                // that prevent GC from ever marking those resources idle.
+                // The per-HostEnvId provisioning guard doesn't need
+                // clearing here — it's shared across threads on the same
+                // deduped id and the in-flight future will clear itself on
+                // completion.
                 for thread_id in &pod.threads {
                     let bindings = self.tasks.get(thread_id).map(|t| t.bindings.clone());
                     self.tasks.remove(thread_id);
                     self.dirty.remove(thread_id);
-                    self.provisioning_in_flight.remove(thread_id);
                     self.router.drop_thread(thread_id);
                     if let Some(bindings) = bindings {
                         self.release_thread_resources(thread_id, &pod_id, &bindings);

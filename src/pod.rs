@@ -375,14 +375,15 @@ max_turns = 50
         let text = to_toml(&cfg).unwrap();
         // Swap the new list-shape back to the legacy bare-string form
         // to simulate a file written by the old code.
-        let legacy_text = text.replace(
-            "host_env = [\"landlock-rw\"]",
-            "host_env = \"landlock-rw\"",
-        );
+        let legacy_text =
+            text.replace("host_env = [\"landlock-rw\"]", "host_env = \"landlock-rw\"");
         assert_ne!(text, legacy_text, "replacement must have landed");
         let parsed = parse_toml(&legacy_text).unwrap();
         cfg.thread_defaults.host_env = vec!["landlock-rw".into()];
-        assert_eq!(parsed.thread_defaults.host_env, cfg.thread_defaults.host_env);
+        assert_eq!(
+            parsed.thread_defaults.host_env,
+            cfg.thread_defaults.host_env
+        );
     }
 
     #[test]
