@@ -24,7 +24,8 @@ post_install() {
     /var/lib/whisper-agent/sandbox-control-token   (mode 0600)
 
   Edit /etc/whisper-agent/sandbox.env to change the listen address
-  (default: [::]:9810, dual-stack).
+  (default: [::]:9820, dual-stack — leaves 9810 free for the in-tree
+  dev harness at scripts/dev.sh).
 
   Enable and start the sandbox daemon:
     systemctl enable --now whisper-agent-sandbox.service

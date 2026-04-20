@@ -13,7 +13,7 @@ Group=whisper-agent
 # sample at /etc/whisper-agent/sandbox.env populated with the
 # defaults.
 EnvironmentFile=-/etc/whisper-agent/sandbox.env
-Environment=WHISPER_AGENT_SANDBOX_LISTEN=[::]:9810
+Environment=WHISPER_AGENT_SANDBOX_LISTEN=[::]:9820
 
 # systemd creates /var/lib/whisper-agent (mode 0750, owned by the
 # service user) before ExecStartPre fires, so the helper can drop the
