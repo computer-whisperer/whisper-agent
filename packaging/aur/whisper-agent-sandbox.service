@@ -1,0 +1,69 @@
+[Unit]
+Description=whisper-agent sandbox daemon (per-thread landlock-isolated MCP hosts)
+Documentation=https://github.com/computer-whisperer/whisper-agent
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=whisper-agent
+Group=whisper-agent
+
+# Tunables (LISTEN address etc.). Optional; the unit ships with a
+# sample at /etc/whisper-agent/sandbox.env populated with the
+# defaults.
+EnvironmentFile=-/etc/whisper-agent/sandbox.env
+Environment=WHISPER_AGENT_SANDBOX_LISTEN=[::]:9810
+
+# systemd creates /var/lib/whisper-agent (mode 0750, owned by the
+# service user) before ExecStartPre fires, so the helper can drop the
+# control token there without a separate tmpfiles.d entry.
+StateDirectory=whisper-agent
+StateDirectoryMode=0750
+
+# Generate the control-plane bearer token on first start. Idempotent:
+# the helper no-ops when the file is already populated. Rotate by
+# deleting the file and restarting; remote whisper-agent servers
+# holding the old token will then fail auth and need re-provisioning.
+ExecStartPre=/usr/lib/whisper-agent/ensure-control-token /var/lib/whisper-agent/sandbox-control-token
+
+ExecStart=/usr/bin/whisper-agent-sandbox \
+    --listen ${WHISPER_AGENT_SANDBOX_LISTEN} \
+    --mcp-host-bin /usr/bin/whisper-agent-mcp-host \
+    --control-token-file /var/lib/whisper-agent/sandbox-control-token
+
+Restart=on-failure
+RestartSec=5
+
+# --- Hardening ---------------------------------------------------------
+# The sandbox daemon and the mcp-host children it spawns are unprivileged:
+# landlock applies user-mode restrictions, no caps required. Drop them all.
+CapabilityBoundingSet=
+AmbientCapabilities=
+NoNewPrivileges=yes
+
+# Filesystem isolation. ReadWritePaths grants back the state dir.
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/lib/whisper-agent
+PrivateTmp=yes
+
+# Kernel surface: nothing the daemon needs.
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+
+# Process surface
+LockPersonality=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+
+[Install]
+WantedBy=multi-user.target

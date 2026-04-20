@@ -1,0 +1,66 @@
+_create_user() {
+    getent group whisper-agent >/dev/null || \
+        groupadd --system whisper-agent
+    getent passwd whisper-agent >/dev/null || \
+        useradd --system \
+                --gid whisper-agent \
+                --no-create-home \
+                --home-dir /var/lib/whisper-agent \
+                --shell /usr/bin/nologin \
+                whisper-agent
+}
+
+post_install() {
+    _create_user
+
+    cat <<MSG
+==> whisper-agent-host installed.
+
+  This package ships the host-side daemons:
+    /usr/bin/whisper-agent-sandbox    landlock-isolated MCP host provisioner
+    /usr/bin/whisper-agent-mcp-host   the per-thread MCP server (spawned by sandbox)
+
+  The control-plane bearer token is auto-generated on first start at:
+    /var/lib/whisper-agent/sandbox-control-token   (mode 0600)
+
+  Edit /etc/whisper-agent/sandbox.env to change the listen address
+  (default: [::]:9810, dual-stack).
+
+  Enable and start the sandbox daemon:
+    systemctl enable --now whisper-agent-sandbox.service
+
+  After first start, copy the control token to your whisper-agent
+  server (e.g. into the kubernetes secret it mounts as
+  --host-env-provider-token name=path) so the server can authenticate.
+MSG
+}
+
+post_upgrade() {
+    _create_user
+
+    if systemctl is-active --quiet whisper-agent-sandbox.service 2>/dev/null; then
+        echo "==> restart whisper-agent-sandbox.service to pick up new binaries"
+    fi
+}
+
+pre_remove() {
+    if systemctl is-active --quiet whisper-agent-sandbox.service 2>/dev/null; then
+        systemctl stop whisper-agent-sandbox.service
+    fi
+    if systemctl is-enabled --quiet whisper-agent-sandbox.service 2>/dev/null; then
+        systemctl disable whisper-agent-sandbox.service
+    fi
+}
+
+post_remove() {
+    cat <<MSG
+==> whisper-agent-host removed.
+
+  The 'whisper-agent' system user and the runtime data directory
+  /var/lib/whisper-agent/ were preserved (sandbox-control-token,
+  pods/, audit.jsonl). Remove them manually if no longer needed:
+
+    userdel whisper-agent
+    rm -rf /var/lib/whisper-agent
+MSG
+}
