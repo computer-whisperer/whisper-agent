@@ -4,8 +4,11 @@
 //! [`builtin_tools`] is the in-process tool surface that lets a task
 //! edit its own pod configuration. [`sandbox`] provisions the host-env
 //! jails that MCP hosts and other subprocesses run inside.
+//! [`host_env_catalog`] is the durable store sandbox provider entries
+//! persist into across restarts.
 
 pub mod builtin_tools;
+pub mod host_env_catalog;
 pub mod mcp;
 pub mod pod_about_docs;
 pub mod sandbox;

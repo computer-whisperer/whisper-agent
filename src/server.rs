@@ -119,6 +119,12 @@ pub struct ServerConfig {
     /// Host-env provider catalog. Empty registry is a valid config —
     /// threads in such a server just have no host-env MCP connection.
     pub host_env_registry: crate::tools::sandbox::HostEnvRegistry,
+    /// Durable backing store for `host_env_registry`. The scheduler
+    /// owns it; every runtime add/update/remove command mutates the
+    /// registry and writes the store through. A fresh server with no
+    /// prior state starts with an empty store sitting at
+    /// `<pods_root>/../host_env_providers.toml`.
+    pub host_env_catalog: crate::tools::host_env_catalog::CatalogStore,
     /// Catalog of shared (singleton) MCP hosts the scheduler connects to at
     /// startup. Pods opt in by name via `[allow].mcp_hosts`.
     pub shared_mcp_hosts: Vec<SharedHostConfig>,
@@ -192,6 +198,7 @@ pub async fn serve(listen: SocketAddr, config: ServerConfig) -> anyhow::Result<(
         config.default_backend,
         audit,
         config.host_env_registry,
+        config.host_env_catalog,
         config.shared_mcp_hosts,
     )
     .await

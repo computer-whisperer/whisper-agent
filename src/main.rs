@@ -13,7 +13,8 @@ use whisper_agent::pod::config::Config;
 use whisper_agent::providers::anthropic::AnthropicClient;
 use whisper_agent::runtime::scheduler::{BackendEntry, SharedHostConfig};
 use whisper_agent::server::{self, ServerConfig};
-use whisper_agent::tools::sandbox::{HostEnvProviderEntry, HostEnvRegistry};
+use whisper_agent::tools::host_env_catalog::{self, CatalogStore, new_seeded_entry};
+use whisper_agent::tools::sandbox::{self, HostEnvRegistry};
 
 // Seed for a fresh default pod's `system_prompt.md`. A neutral
 // general-assistant baseline — domain-specific pods should clone the
@@ -417,34 +418,77 @@ async fn run_serve(args: ServeArgs) -> Result<()> {
 
     let cli_token_files: HashMap<String, PathBuf> =
         args.host_env_provider_tokens.iter().cloned().collect();
-    let mut provider_entries: Vec<HostEnvProviderEntry> = toml_provider_entries
-        .into_iter()
-        .map(|p| HostEnvProviderEntry {
-            name: p.name,
-            url: p.url,
-            token_file: p.token_file,
-        })
-        .collect();
-    for (name, url) in &args.host_env_providers {
-        provider_entries.push(HostEnvProviderEntry {
-            name: name.clone(),
-            url: url.clone(),
-            token_file: cli_token_files.get(name).cloned(),
-        });
-    }
-    // Warn about CLI token flags that don't match any registered provider,
-    // so typos don't silently disable auth.
+
+    // Reject CLI `--host-env-provider-token` flags that match no
+    // provider the server will know about, so typos don't silently
+    // disable auth. A name is valid if it appears in CLI providers OR
+    // TOML-seed entries; the persistent catalog may also hold it, but
+    // we can't check that until we load the catalog below.
     for name in cli_token_files.keys() {
         let known_from_cli = args.host_env_providers.iter().any(|(n, _)| n == name);
-        let known_from_toml = provider_entries.iter().any(|e| &e.name == name);
+        let known_from_toml = toml_provider_entries.iter().any(|e| &e.name == name);
+        // Deferred: may also match a catalog entry loaded below.
         if !known_from_cli && !known_from_toml {
+            // Fall through — catalog load may vindicate it. Collect
+            // names we should recheck after load.
+            let _ = name;
+        }
+    }
+
+    // Load (or initialize) the durable catalog and apply TOML seed
+    // entries `insert-if-missing`. CLI `--host-env-provider` flags are
+    // applied later as a runtime overlay — they don't write to the
+    // catalog, per the "catalog is the source of truth, CLI is a
+    // dev-loop convenience" design.
+    let catalog_path = pods_root
+        .as_deref()
+        .map(host_env_catalog::default_path_for_pods_root)
+        .unwrap_or_else(|| PathBuf::from(host_env_catalog::CATALOG_FILENAME));
+    let mut catalog = CatalogStore::load(catalog_path).context("load host-env catalog")?;
+
+    let now = chrono::Utc::now();
+    for entry in &toml_provider_entries {
+        let token = match &entry.token_file {
+            Some(path) => Some(sandbox::read_token_file(&entry.name, path)?),
+            None => None,
+        };
+        let inserted = catalog.insert_if_missing(new_seeded_entry(
+            entry.name.clone(),
+            entry.url.clone(),
+            token,
+            now,
+        ))?;
+        host_env_catalog::log_seed_result(&entry.name, inserted);
+    }
+
+    // Build the live registry from the catalog, then overlay CLI
+    // providers on top (last-write-wins since CLI is explicit intent).
+    let mut host_env_registry = HostEnvRegistry::new();
+    for entry in catalog.entries() {
+        host_env_registry.insert_or_replace(
+            entry.name.clone(),
+            entry.url.clone(),
+            entry.token.clone(),
+        );
+    }
+    for (name, url) in &args.host_env_providers {
+        let token = match cli_token_files.get(name) {
+            Some(path) => Some(sandbox::read_token_file(name, path)?),
+            None => None,
+        };
+        host_env_registry.insert_or_replace(name.clone(), url.clone(), token);
+    }
+    // Re-check token flags against the final registry (which includes
+    // both catalog and CLI providers) so a token flag for a
+    // catalog-only provider is valid.
+    for name in cli_token_files.keys() {
+        let matches_cli = args.host_env_providers.iter().any(|(n, _)| n == name);
+        if !matches_cli && !host_env_registry.contains(name) {
             anyhow::bail!(
-                "--host-env-provider-token names provider `{name}` but no provider by that name is registered"
+                "--host-env-provider-token names provider `{name}` but no provider by that name is registered (catalog or CLI)"
             );
         }
     }
-    let host_env_registry =
-        HostEnvRegistry::new(provider_entries).context("build host_env provider catalog")?;
 
     let default_host_env = build_default_host_env(
         &args.default_host_env_provider,
@@ -490,6 +534,7 @@ async fn run_serve(args: ServeArgs) -> Result<()> {
         host_id: "default".into(),
         pods_root,
         host_env_registry,
+        host_env_catalog: catalog,
         shared_mcp_hosts,
         tls,
         auth_clients,

@@ -221,61 +221,74 @@ impl HostEnvHandle for DaemonHandle {
 // ---------- Registry ----------
 
 /// Server-held registry of host-env providers, keyed by catalog name.
-/// All entries come from `[[host_env_providers]]` in
-/// `whisper-agent.toml` — there are no built-ins. A server running
-/// with zero providers simply can't provision host envs; its pods can
-/// still host threads, those threads just have no host-env MCP
-/// connection.
+/// Entries are hydrated on startup from the durable catalog store (and
+/// any CLI overlay), then mutated at runtime via scheduler commands.
+/// A server running with zero providers simply can't provision host
+/// envs; its pods can still host threads, those threads just have no
+/// host-env MCP connection.
 #[derive(Clone, Default)]
 pub struct HostEnvRegistry {
-    providers: HashMap<String, Arc<dyn HostEnvProvider>>,
+    providers: HashMap<String, RegistryEntry>,
+}
+
+/// Per-provider live state the registry tracks. `url` and `token` are
+/// surfaced alongside the provider handle so `ListHostEnvProviders`
+/// can report them without dereffing into the trait object.
+#[derive(Clone)]
+pub struct RegistryEntry {
+    pub url: String,
+    /// `None` means the provider intentionally runs anonymous —
+    /// requests will 401 against any daemon that expects a control
+    /// token, which the caller is responsible for being aware of.
+    pub token: Option<String>,
+    pub provider: Arc<dyn HostEnvProvider>,
 }
 
 impl HostEnvRegistry {
-    pub fn new(catalog: Vec<HostEnvProviderEntry>) -> anyhow::Result<Self> {
-        let mut providers: HashMap<String, Arc<dyn HostEnvProvider>> = HashMap::new();
-        for entry in catalog {
-            if providers.contains_key(&entry.name) {
-                anyhow::bail!("duplicate host_env_provider name `{}`", entry.name);
-            }
-            let control_token = match &entry.token_file {
-                Some(path) => {
-                    let raw = std::fs::read_to_string(path).map_err(|e| {
-                        anyhow::anyhow!(
-                            "host_env_provider `{}`: reading token_file {}: {e}",
-                            entry.name,
-                            path.display()
-                        )
-                    })?;
-                    let tok = raw.trim().to_string();
-                    if tok.is_empty() {
-                        anyhow::bail!(
-                            "host_env_provider `{}`: token_file {} is empty after trim",
-                            entry.name,
-                            path.display()
-                        );
-                    }
-                    Some(tok)
-                }
-                None => {
-                    warn!(
-                        provider = %entry.name,
-                        "host_env_provider has no token_file — requests will be anonymous \
-                         and will be rejected by any daemon running with --control-token-file"
-                    );
-                    None
-                }
-            };
-            providers.insert(
-                entry.name.clone(),
-                Arc::new(DaemonClient::new(entry.name, entry.url, control_token))
-                    as Arc<dyn HostEnvProvider>,
-            );
+    /// Empty registry. Callers seed it with `insert` / `insert_or_replace`.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Insert a new provider. Errors if the name is already present —
+    /// callers that want last-write-wins use `insert_or_replace`.
+    pub fn insert(
+        &mut self,
+        name: String,
+        url: String,
+        token: Option<String>,
+    ) -> anyhow::Result<()> {
+        if self.providers.contains_key(&name) {
+            anyhow::bail!("host-env provider `{name}` already registered");
         }
-        Ok(Self { providers })
+        self.providers
+            .insert(name.clone(), build_entry(name, url, token));
+        Ok(())
+    }
+
+    /// Insert a provider, replacing any existing entry with the same
+    /// name. Used by the CLI-overlay path (where operators explicitly
+    /// want their flag to win over a catalog entry) and by
+    /// `update_provider`.
+    pub fn insert_or_replace(&mut self, name: String, url: String, token: Option<String>) {
+        self.providers
+            .insert(name.clone(), build_entry(name, url, token));
+    }
+
+    /// Remove a provider by name. Returns whether the name was known.
+    /// Existing `Arc<dyn HostEnvProvider>` clones keep working — removal
+    /// only prevents future `get` lookups from finding this name. The
+    /// live `DaemonHandle`s that already hold their own `http` client +
+    /// URL + session id can still `teardown` after removal.
+    pub fn remove(&mut self, name: &str) -> bool {
+        self.providers.remove(name).is_some()
     }
 
     pub fn get(&self, name: &str) -> Option<&Arc<dyn HostEnvProvider>> {
+        self.providers.get(name).map(|e| &e.provider)
+    }
+
+    pub fn entry(&self, name: &str) -> Option<&RegistryEntry> {
         self.providers.get(name)
     }
 
@@ -283,15 +296,180 @@ impl HostEnvRegistry {
         self.providers.contains_key(name)
     }
 
-    /// Catalog entries in deterministic order (sorted by name). Used
-    /// by `ListHostEnvProviders` responses.
-    pub fn snapshot(&self) -> Vec<whisper_agent_protocol::HostEnvProviderInfo> {
-        use whisper_agent_protocol::HostEnvProviderInfo;
-        let mut names: Vec<&String> = self.providers.keys().collect();
+    pub fn len(&self) -> usize {
+        self.providers.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.providers.is_empty()
+    }
+
+    /// Names in sorted order. Stable output keeps logs and protocol
+    /// snapshots deterministic.
+    pub fn names(&self) -> Vec<String> {
+        let mut names: Vec<String> = self.providers.keys().cloned().collect();
         names.sort();
         names
+    }
+
+    /// Catalog entries in deterministic order (sorted by name). Used
+    /// by `ListHostEnvProviders` responses. The caller supplies an
+    /// `origin_for` closure that maps a provider name to its origin —
+    /// the registry itself doesn't know whether an entry came from the
+    /// catalog (`Seeded` / `Manual`) or a CLI overlay
+    /// (`RuntimeOverlay`), so the scheduler threads that in.
+    pub fn snapshot<F>(&self, origin_for: F) -> Vec<whisper_agent_protocol::HostEnvProviderInfo>
+    where
+        F: Fn(&str) -> whisper_agent_protocol::HostEnvProviderOrigin,
+    {
+        use whisper_agent_protocol::HostEnvProviderInfo;
+        self.names()
             .into_iter()
-            .map(|name| HostEnvProviderInfo { name: name.clone() })
+            .map(|name| {
+                let entry = self
+                    .providers
+                    .get(&name)
+                    .expect("name came from self.names()");
+                HostEnvProviderInfo {
+                    origin: origin_for(&name),
+                    has_token: entry.token.is_some(),
+                    url: entry.url.clone(),
+                    name,
+                }
+            })
             .collect()
+    }
+}
+
+fn build_entry(name: String, url: String, token: Option<String>) -> RegistryEntry {
+    if token.is_none() {
+        warn!(
+            provider = %name,
+            "host-env provider registered without a control token — requests will be anonymous \
+             and will be rejected by any daemon running with --control-token-file"
+        );
+    }
+    RegistryEntry {
+        url: url.clone(),
+        token: token.clone(),
+        provider: Arc::new(DaemonClient::new(name, url, token)) as Arc<dyn HostEnvProvider>,
+    }
+}
+
+/// Read a token from disk: trim, reject empty. Extracted so CLI-overlay
+/// and TOML-seed paths share one code path for the `token_file` shape.
+pub fn read_token_file(provider_name: &str, path: &std::path::Path) -> anyhow::Result<String> {
+    let raw = std::fs::read_to_string(path).map_err(|e| {
+        anyhow::anyhow!(
+            "host-env provider `{provider_name}`: reading token_file {}: {e}",
+            path.display()
+        )
+    })?;
+    let tok = raw.trim().to_string();
+    if tok.is_empty() {
+        anyhow::bail!(
+            "host-env provider `{provider_name}`: token_file {} is empty after trim",
+            path.display()
+        );
+    }
+    Ok(tok)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use whisper_agent_protocol::HostEnvProviderOrigin;
+
+    #[test]
+    fn empty_registry_is_empty() {
+        let r = HostEnvRegistry::new();
+        assert!(r.is_empty());
+        assert_eq!(r.len(), 0);
+        assert!(!r.contains("x"));
+        assert!(r.get("x").is_none());
+    }
+
+    #[test]
+    fn insert_rejects_duplicate() {
+        let mut r = HostEnvRegistry::new();
+        r.insert("a".into(), "http://a".into(), Some("t".into()))
+            .unwrap();
+        let err = r.insert("a".into(), "http://a2".into(), None).unwrap_err();
+        assert!(format!("{err}").contains("already registered"));
+    }
+
+    #[test]
+    fn insert_or_replace_overwrites() {
+        let mut r = HostEnvRegistry::new();
+        r.insert("a".into(), "http://a".into(), Some("t1".into()))
+            .unwrap();
+        r.insert_or_replace("a".into(), "http://a2".into(), Some("t2".into()));
+        let entry = r.entry("a").unwrap();
+        assert_eq!(entry.url, "http://a2");
+        assert_eq!(entry.token.as_deref(), Some("t2"));
+    }
+
+    #[test]
+    fn remove_is_idempotent() {
+        let mut r = HostEnvRegistry::new();
+        r.insert("a".into(), "http://a".into(), None).unwrap();
+        assert!(r.remove("a"));
+        assert!(!r.remove("a"));
+        assert!(!r.contains("a"));
+    }
+
+    #[test]
+    fn names_sorted() {
+        let mut r = HostEnvRegistry::new();
+        r.insert("c".into(), "http://c".into(), None).unwrap();
+        r.insert("a".into(), "http://a".into(), None).unwrap();
+        r.insert("b".into(), "http://b".into(), None).unwrap();
+        assert_eq!(r.names(), vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn snapshot_classifies_origins_via_closure() {
+        let mut r = HostEnvRegistry::new();
+        r.insert("seeded".into(), "http://s".into(), Some("t".into()))
+            .unwrap();
+        r.insert("manual".into(), "http://m".into(), None).unwrap();
+        r.insert("overlay".into(), "http://o".into(), None).unwrap();
+        let snap = r.snapshot(|name| match name {
+            "seeded" => HostEnvProviderOrigin::Seeded,
+            "manual" => HostEnvProviderOrigin::Manual,
+            _ => HostEnvProviderOrigin::RuntimeOverlay,
+        });
+        assert_eq!(snap.len(), 3);
+        let by_name: std::collections::HashMap<_, _> =
+            snap.iter().map(|p| (p.name.as_str(), p)).collect();
+        assert_eq!(by_name["seeded"].origin, HostEnvProviderOrigin::Seeded);
+        assert!(by_name["seeded"].has_token);
+        assert_eq!(by_name["manual"].origin, HostEnvProviderOrigin::Manual);
+        assert!(!by_name["manual"].has_token);
+        assert_eq!(
+            by_name["overlay"].origin,
+            HostEnvProviderOrigin::RuntimeOverlay
+        );
+        assert_eq!(by_name["overlay"].url, "http://o");
+    }
+
+    #[test]
+    fn read_token_file_rejects_empty_after_trim() {
+        let dir = std::env::temp_dir().join(format!("wa-token-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("empty");
+        std::fs::write(&path, "   \n\n").unwrap();
+        let err = read_token_file("x", &path).unwrap_err();
+        assert!(format!("{err}").contains("empty after trim"));
+    }
+
+    #[test]
+    fn read_token_file_trims() {
+        let dir = std::env::temp_dir().join(format!("wa-token2-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("good");
+        std::fs::write(&path, "  secret\n").unwrap();
+        let tok = read_token_file("x", &path).unwrap();
+        assert_eq!(tok, "secret");
     }
 }

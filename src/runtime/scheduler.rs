@@ -248,11 +248,17 @@ pub struct Scheduler {
     /// Fallback when a task doesn't specify a backend. Must be a key in `backends`.
     default_backend: String,
     persister: Option<Persister>,
-    /// Catalog of host-env providers, keyed by name. Empty when the
-    /// server was started without any `[[host_env_providers]]` entries
-    /// — threads in such a server can still run, just without any
-    /// host-env MCP (so their tool catalog is shared-only).
+    /// Live catalog of host-env providers, keyed by name. Empty when
+    /// the server was started without any catalog entries or TOML-seed
+    /// `[[host_env_providers]]` — threads in such a server can still
+    /// run, just without any host-env MCP (so their tool catalog is
+    /// shared-only). Mutated at runtime via `AddHostEnvProvider` /
+    /// `UpdateHostEnvProvider` / `RemoveHostEnvProvider` commands.
     host_env_registry: crate::tools::sandbox::HostEnvRegistry,
+    /// Durable backing store mirroring the registry minus any CLI-only
+    /// runtime-overlay providers. Add/update/remove commands write
+    /// through here so the catalog survives restart.
+    host_env_catalog: crate::tools::host_env_catalog::CatalogStore,
 
     tasks: HashMap<String, Thread>,
     /// Owns the connection registry, subscription map, audit log, and the
@@ -315,6 +321,7 @@ impl Scheduler {
         default_backend: String,
         audit: AuditLog,
         host_env_registry: crate::tools::sandbox::HostEnvRegistry,
+        host_env_catalog: crate::tools::host_env_catalog::CatalogStore,
         shared_host_configs: Vec<SharedHostConfig>,
     ) -> anyhow::Result<(Self, mpsc::UnboundedReceiver<StreamUpdate>)> {
         assert!(
@@ -369,6 +376,7 @@ impl Scheduler {
                 default_backend,
                 persister: None,
                 host_env_registry,
+                host_env_catalog,
                 tasks: HashMap::new(),
                 router: ThreadEventRouter::new(audit, host_id),
                 resources,
@@ -470,6 +478,157 @@ impl Scheduler {
     /// Look up a host-env provider in the catalog by name.
     pub(crate) fn host_env_provider(&self, name: &str) -> Option<&Arc<dyn HostEnvProvider>> {
         self.host_env_registry.get(name)
+    }
+
+    /// Classify a registered provider's origin for protocol output.
+    /// Anything in the registry but absent from the durable catalog is
+    /// a `RuntimeOverlay` (CLI-flag provided); anything in the catalog
+    /// reports the catalog's stored origin.
+    fn host_env_provider_origin(
+        &self,
+        name: &str,
+    ) -> whisper_agent_protocol::HostEnvProviderOrigin {
+        use crate::tools::host_env_catalog::CatalogOrigin;
+        use whisper_agent_protocol::HostEnvProviderOrigin;
+        match self.host_env_catalog.get(name).map(|e| e.origin) {
+            Some(CatalogOrigin::Seeded) => HostEnvProviderOrigin::Seeded,
+            Some(CatalogOrigin::Manual) => HostEnvProviderOrigin::Manual,
+            None => HostEnvProviderOrigin::RuntimeOverlay,
+        }
+    }
+
+    /// Snapshot the registry for `ListHostEnvProviders`. Entries appear
+    /// in name-sorted order (via `HostEnvRegistry::snapshot`).
+    pub(crate) fn host_env_provider_snapshot(
+        &self,
+    ) -> Vec<whisper_agent_protocol::HostEnvProviderInfo> {
+        self.host_env_registry
+            .snapshot(|name| self.host_env_provider_origin(name))
+    }
+
+    /// Pod IDs whose `[[allow.host_env]]` references the given
+    /// provider name. Used by the remove path to refuse removal while
+    /// any loaded pod binding would be orphaned. Archived pods aren't
+    /// loaded into `self.pods` and therefore aren't checked — that's
+    /// intentional: archived pods are already unreachable.
+    fn pods_referencing_host_env_provider(&self, name: &str) -> Vec<String> {
+        let mut refs: Vec<String> = self
+            .pods
+            .iter()
+            .filter(|(_, pod)| {
+                pod.config
+                    .allow
+                    .host_env
+                    .iter()
+                    .any(|entry| entry.provider == name)
+            })
+            .map(|(id, _)| id.to_string())
+            .collect();
+        refs.sort();
+        refs
+    }
+
+    /// Add a provider to the durable catalog and the live registry.
+    /// Returns the canonical snapshot on success so the caller can
+    /// echo it back to clients.
+    pub(crate) fn add_host_env_provider(
+        &mut self,
+        name: String,
+        url: String,
+        token: Option<String>,
+    ) -> anyhow::Result<whisper_agent_protocol::HostEnvProviderInfo> {
+        if name.is_empty() {
+            anyhow::bail!("provider name must be non-empty");
+        }
+        if url.is_empty() {
+            anyhow::bail!("provider url must be non-empty");
+        }
+        if self.host_env_registry.contains(&name) {
+            anyhow::bail!(
+                "provider `{name}` already registered (as {})",
+                match self.host_env_provider_origin(&name) {
+                    whisper_agent_protocol::HostEnvProviderOrigin::Seeded => "seeded",
+                    whisper_agent_protocol::HostEnvProviderOrigin::Manual => "manual",
+                    whisper_agent_protocol::HostEnvProviderOrigin::RuntimeOverlay =>
+                        "runtime-overlay (CLI --host-env-provider flag)",
+                }
+            );
+        }
+        let now = chrono::Utc::now();
+        self.host_env_catalog
+            .insert(crate::tools::host_env_catalog::new_manual_entry(
+                name.clone(),
+                url.clone(),
+                token.clone(),
+                now,
+            ))?;
+        self.host_env_registry
+            .insert_or_replace(name.clone(), url.clone(), token.clone());
+        Ok(whisper_agent_protocol::HostEnvProviderInfo {
+            name,
+            url,
+            origin: whisper_agent_protocol::HostEnvProviderOrigin::Manual,
+            has_token: token.is_some(),
+        })
+    }
+
+    /// Replace `url` and `token` on an existing catalog entry. Refuses
+    /// runtime-overlay entries (they're not in the catalog to edit).
+    pub(crate) fn update_host_env_provider(
+        &mut self,
+        name: String,
+        url: String,
+        token: Option<String>,
+    ) -> anyhow::Result<whisper_agent_protocol::HostEnvProviderInfo> {
+        if url.is_empty() {
+            anyhow::bail!("provider url must be non-empty");
+        }
+        if !self.host_env_catalog.contains(&name) {
+            if self.host_env_registry.contains(&name) {
+                anyhow::bail!(
+                    "provider `{name}` is a runtime-overlay from a CLI flag and can't be updated at runtime; remove the --host-env-provider flag and restart to manage it here"
+                );
+            }
+            anyhow::bail!("provider `{name}` not in catalog");
+        }
+        let now = chrono::Utc::now();
+        self.host_env_catalog
+            .update(&name, url.clone(), token.clone(), now)?;
+        self.host_env_registry
+            .insert_or_replace(name.clone(), url.clone(), token.clone());
+        Ok(whisper_agent_protocol::HostEnvProviderInfo {
+            origin: self.host_env_provider_origin(&name),
+            has_token: token.is_some(),
+            url,
+            name,
+        })
+    }
+
+    /// Remove a provider from the catalog and live registry. Refuses
+    /// with a listing of referencing pod IDs if any loaded pod's
+    /// `[[allow.host_env]]` still names this provider. Also refuses
+    /// runtime-overlay entries (not in the catalog). Existing live
+    /// host-env handles already provisioned against the provider keep
+    /// working until GC'd — the handle cached the URL and http client.
+    pub(crate) fn remove_host_env_provider(&mut self, name: &str) -> anyhow::Result<()> {
+        if !self.host_env_catalog.contains(name) {
+            if self.host_env_registry.contains(name) {
+                anyhow::bail!(
+                    "provider `{name}` is a runtime-overlay from a CLI flag; remove the flag and restart to unregister"
+                );
+            }
+            anyhow::bail!("provider `{name}` not in catalog");
+        }
+        let refs = self.pods_referencing_host_env_provider(name);
+        if !refs.is_empty() {
+            anyhow::bail!(
+                "provider `{name}` is referenced by pod `[[allow.host_env]]` in: [{}]. Edit those pods first",
+                refs.join(", ")
+            );
+        }
+        self.host_env_catalog.remove(name)?;
+        self.host_env_registry.remove(name);
+        Ok(())
     }
 
     /// Resolve a [`HostEnvBinding`] into the (provider, spec) pair the

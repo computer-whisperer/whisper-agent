@@ -393,7 +393,7 @@ impl Scheduler {
                 );
             }
             ClientToServer::ListHostEnvProviders { correlation_id } => {
-                let providers = self.host_env_registry.snapshot();
+                let providers = self.host_env_provider_snapshot();
                 self.router.send_to_client(
                     conn_id,
                     ServerToClient::HostEnvProvidersList {
@@ -402,6 +402,82 @@ impl Scheduler {
                     },
                 );
             }
+            ClientToServer::AddHostEnvProvider {
+                correlation_id,
+                name,
+                url,
+                token,
+            } => match self.add_host_env_provider(name, url, token) {
+                Ok(provider) => {
+                    self.router.send_to_client(
+                        conn_id,
+                        ServerToClient::HostEnvProviderAdded {
+                            correlation_id,
+                            provider,
+                        },
+                    );
+                }
+                Err(e) => {
+                    self.router.send_to_client(
+                        conn_id,
+                        ServerToClient::Error {
+                            correlation_id,
+                            thread_id: None,
+                            message: format!("add_host_env_provider: {e}"),
+                        },
+                    );
+                }
+            },
+            ClientToServer::UpdateHostEnvProvider {
+                correlation_id,
+                name,
+                url,
+                token,
+            } => match self.update_host_env_provider(name, url, token) {
+                Ok(provider) => {
+                    self.router.send_to_client(
+                        conn_id,
+                        ServerToClient::HostEnvProviderUpdated {
+                            correlation_id,
+                            provider,
+                        },
+                    );
+                }
+                Err(e) => {
+                    self.router.send_to_client(
+                        conn_id,
+                        ServerToClient::Error {
+                            correlation_id,
+                            thread_id: None,
+                            message: format!("update_host_env_provider: {e}"),
+                        },
+                    );
+                }
+            },
+            ClientToServer::RemoveHostEnvProvider {
+                correlation_id,
+                name,
+            } => match self.remove_host_env_provider(&name) {
+                Ok(()) => {
+                    self.router.send_to_client(
+                        conn_id,
+                        ServerToClient::HostEnvProviderRemoved {
+                            correlation_id,
+                            name,
+                        },
+                    );
+                }
+                Err(e) => {
+                    self.router.send_to_client(
+                        conn_id,
+                        ServerToClient::Error {
+                            correlation_id,
+                            thread_id: None,
+                            message: format!("remove_host_env_provider: {e}"),
+                        },
+                    );
+                }
+            },
             ClientToServer::ListPods { correlation_id } => {
                 let Some((persister, outbound)) = self.persister_and_outbound(conn_id) else {
                     return;

@@ -335,6 +335,32 @@ pub struct ThreadBindingsPatch {
 pub struct HostEnvProviderInfo {
     /// User-facing catalog name (matches `NamedHostEnv.provider`).
     pub name: String,
+    /// Daemon URL the scheduler talks to for provision / teardown.
+    /// Included so a WebUI management panel can display it; clients
+    /// that only need the name (pod-editor dropdown) can ignore it.
+    pub url: String,
+    /// How this entry entered the catalog. `Seeded` entries were
+    /// imported from `whisper-agent.toml`'s `[[host_env_providers]]`
+    /// table on startup; `Manual` entries were added at runtime
+    /// (WebUI / RPC). `RuntimeOverlay` entries come from CLI flags
+    /// and are not persisted — they live only for this server run.
+    pub origin: HostEnvProviderOrigin,
+    /// Whether the entry carries a control-plane bearer token.
+    /// The token itself is never sent over the wire; clients get a
+    /// boolean so the UI can show "authenticated" / "anonymous"
+    /// status without exposing the secret.
+    pub has_token: bool,
+}
+
+/// Provenance enum for `HostEnvProviderInfo.origin`. Mirrors the
+/// server's internal `CatalogOrigin` plus a `RuntimeOverlay` variant
+/// for CLI-provided entries that never land in the durable catalog.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum HostEnvProviderOrigin {
+    Seeded,
+    Manual,
+    RuntimeOverlay,
 }
 
 /// User's decision on a pending approval.
@@ -774,6 +800,54 @@ pub enum ClientToServer {
         correlation_id: Option<String>,
     },
 
+    /// Register a new host-env provider with the durable catalog. The
+    /// server validates the name (non-empty, not already in use) and
+    /// persists the entry to `host_env_providers.toml` before
+    /// responding. Responds with `HostEnvProviderAdded` on success or
+    /// `Error` on validation failure.
+    AddHostEnvProvider {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        correlation_id: Option<String>,
+        name: String,
+        url: String,
+        /// Control-plane bearer the daemon expects. Omit for dev
+        /// daemons running without `--control-token-file`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        token: Option<String>,
+    },
+
+    /// Replace url / token on an existing catalog entry. Origin and
+    /// created_at are preserved. Responds with `HostEnvProviderUpdated`
+    /// or `Error` (unknown name, or the entry is a `RuntimeOverlay`
+    /// that can't be persisted).
+    UpdateHostEnvProvider {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        correlation_id: Option<String>,
+        name: String,
+        url: String,
+        /// When `None`, the existing token is cleared. To keep the
+        /// existing token, clients must read it from — wait, they
+        /// can't; tokens are never sent to the client. So: clients
+        /// that don't intend to change the token must omit the field
+        /// entirely (it'd still be `None` on the wire), which means
+        /// "clear it". The UI should make this distinction obvious;
+        /// a three-way toggle (keep / set / clear) is the natural
+        /// shape, but until we need it we keep the wire simple.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        token: Option<String>,
+    },
+
+    /// Remove a provider from the catalog. Refused if any loaded pod's
+    /// `[[allow.host_env]]` table references the name — the response
+    /// is an `Error` listing the referencing pods so the operator can
+    /// edit them first. Responds with `HostEnvProviderRemoved` on
+    /// success.
+    RemoveHostEnvProvider {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        correlation_id: Option<String>,
+        name: String,
+    },
+
     // --- Pod registry (Phase 2d.i — wire surface only; the scheduler
     //     becomes pod-aware in 2d.iii). ---
     /// Walk `<pods_root>/` and return every non-archived pod's summary.
@@ -1171,13 +1245,33 @@ pub enum ServerToClient {
         correlation_id: Option<String>,
         resources: Vec<ResourceSnapshot>,
     },
-    /// Snapshot response to `ListHostEnvProviders`. Always includes the
-    /// built-in `bare` entry; configured entries follow in catalog
-    /// declaration order.
+    /// Snapshot response to `ListHostEnvProviders`. Entries appear in
+    /// name-sorted order; no built-ins.
     HostEnvProvidersList {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         correlation_id: Option<String>,
         providers: Vec<HostEnvProviderInfo>,
+    },
+    /// Successful response to `AddHostEnvProvider`. Carries the
+    /// canonicalized entry so the client can update its local view
+    /// without re-fetching the whole list.
+    HostEnvProviderAdded {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        correlation_id: Option<String>,
+        provider: HostEnvProviderInfo,
+    },
+    /// Successful response to `UpdateHostEnvProvider`.
+    HostEnvProviderUpdated {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        correlation_id: Option<String>,
+        provider: HostEnvProviderInfo,
+    },
+    /// Successful response to `RemoveHostEnvProvider`. The name is
+    /// echoed so clients can identify which local entry to drop.
+    HostEnvProviderRemoved {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        correlation_id: Option<String>,
+        name: String,
     },
     /// A new entry appeared in the registry.
     ResourceCreated {

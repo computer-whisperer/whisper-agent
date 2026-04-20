@@ -2189,6 +2189,22 @@ impl ChatApp {
             ServerToClient::FunctionEnded { function_id, .. } => {
                 self.active_functions.remove(&function_id);
             }
+            ServerToClient::HostEnvProviderAdded { provider, .. }
+            | ServerToClient::HostEnvProviderUpdated { provider, .. } => {
+                if let Some(existing) = self
+                    .host_env_providers
+                    .iter_mut()
+                    .find(|p| p.name == provider.name)
+                {
+                    *existing = provider;
+                } else {
+                    self.host_env_providers.push(provider);
+                    self.host_env_providers.sort_by(|a, b| a.name.cmp(&b.name));
+                }
+            }
+            ServerToClient::HostEnvProviderRemoved { name, .. } => {
+                self.host_env_providers.retain(|p| p.name != name);
+            }
         }
     }
 
