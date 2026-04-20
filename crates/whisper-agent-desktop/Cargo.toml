@@ -1,0 +1,40 @@
+[package]
+name = "whisper-agent-desktop"
+description = "Native desktop client for whisper-agent (egui + tokio-tungstenite)"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "whisper-agent-desktop"
+path = "src/main.rs"
+
+[dependencies]
+# UI layer — platform-agnostic egui code lives in this crate. We depend
+# on it as an `rlib` (the other `crate-type` is `cdylib` for the browser
+# wasm build). The wasm-only transport module is gated out on native.
+whisper-agent-webui = { path = "../whisper-agent-webui" }
+whisper-agent-protocol = { workspace = true }
+
+# Native egui runtime. Match the webui crate's feature set so the window
+# picks up the same rendering backend (glow) and clipboard integrations.
+eframe = { version = "0.34", default-features = false, features = ["default_fonts", "glow", "x11", "wayland"] }
+egui = "0.34"
+
+# Tokio hosts the WS task on a background thread; the UI runs on main.
+# `rt-multi-thread` keeps the runtime out of the way of any blocking
+# calls the WS layer might do transitively; `sync` gives us the mpsc
+# channels that bridge the two threads.
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync"] }
+# Native WebSocket client. `rustls-tls-native-roots` loads the OS trust
+# store so `wss://` works out of the box without bundling our own CA
+# set. Matches the rustls stack the server uses.
+tokio-tungstenite = { version = "0.29", default-features = false, features = ["connect", "handshake", "rustls-tls-native-roots"] }
+# `sink.send` / `stream.next` over the tungstenite split.
+futures = "0.3"
+
+clap = { workspace = true, features = ["env"] }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+url = { workspace = true }
