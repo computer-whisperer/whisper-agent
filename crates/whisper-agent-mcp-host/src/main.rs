@@ -98,9 +98,9 @@ async fn main() -> anyhow::Result<()> {
         .await
         .with_context(|| format!("failed to bind {}", args.listen))?;
     if args.no_auth {
-        info!(addr = %args.listen, root = %args.workspace_root.display(), "whisper-agent-mcp-host listening (NO AUTH)");
+        info!(version = env!("CARGO_PKG_VERSION"), addr = %args.listen, root = %args.workspace_root.display(), "whisper-agent-mcp-host listening (NO AUTH)");
     } else {
-        info!(addr = %args.listen, root = %args.workspace_root.display(), "whisper-agent-mcp-host listening (bearer auth)");
+        info!(version = env!("CARGO_PKG_VERSION"), addr = %args.listen, root = %args.workspace_root.display(), "whisper-agent-mcp-host listening (bearer auth)");
     }
 
     axum::serve(listener, app)

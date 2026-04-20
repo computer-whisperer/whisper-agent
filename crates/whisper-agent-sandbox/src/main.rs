@@ -42,7 +42,11 @@ use whisper_agent_protocol::sandbox::{
 };
 
 #[derive(Parser, Debug)]
-#[command(name = "whisper-agent-sandbox", about = "Sandbox provisioning daemon")]
+#[command(
+    name = "whisper-agent-sandbox",
+    version,
+    about = "Sandbox provisioning daemon"
+)]
 struct Args {
     /// Address to listen on. Defaults to dual-stack (`[::]:9810`); the
     /// daemon is reachable on both IPv6 and IPv4 (via v4-mapped) so a
@@ -141,9 +145,9 @@ async fn main() -> anyhow::Result<()> {
         .with_state(state.clone());
 
     if state.control_token.is_some() {
-        info!(%listen, "sandbox daemon starting (bearer auth)");
+        info!(version = env!("CARGO_PKG_VERSION"), %listen, "sandbox daemon starting (bearer auth)");
     } else {
-        warn!(%listen, "sandbox daemon starting (NO AUTH — --no-auth was set)");
+        warn!(version = env!("CARGO_PKG_VERSION"), %listen, "sandbox daemon starting (NO AUTH — --no-auth was set)");
     }
 
     let listener = tokio::net::TcpListener::bind(listen)

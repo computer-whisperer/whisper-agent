@@ -264,6 +264,7 @@ pub async fn serve(listen: SocketAddr, config: ServerConfig) -> anyhow::Result<(
                         )
                     })?;
             info!(
+                version = env!("CARGO_PKG_VERSION"),
                 addr = %listen,
                 cert = %tls.cert_path.display(),
                 "whisper-agent server listening (open https://{listen}/ in a browser)"
@@ -276,7 +277,11 @@ pub async fn serve(listen: SocketAddr, config: ServerConfig) -> anyhow::Result<(
             let listener = TcpListener::bind(listen)
                 .await
                 .with_context(|| format!("bind {listen}"))?;
-            info!(addr = %listen, "whisper-agent server listening (open http://{listen}/ in a browser)");
+            info!(
+                version = env!("CARGO_PKG_VERSION"),
+                addr = %listen,
+                "whisper-agent server listening (open http://{listen}/ in a browser)"
+            );
             axum::serve(listener, app).await
         }
     };

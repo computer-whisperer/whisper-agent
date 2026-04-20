@@ -79,6 +79,7 @@ async fn main() -> anyhow::Result<()> {
         .await
         .with_context(|| format!("failed to bind {}", args.listen))?;
     info!(
+        version = env!("CARGO_PKG_VERSION"),
         addr = %args.listen,
         max_response_bytes = args.max_response_bytes,
         timeout_s = args.request_timeout_seconds,
