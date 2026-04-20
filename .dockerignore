@@ -1,0 +1,32 @@
+# Build artifacts — recreated inside the image
+target/
+**/target/
+
+# wasm-pack output — regenerated in the builder stage so a stale local
+# pkg/ never leaks into the image
+crates/whisper-agent-webui/pkg/
+
+# Dev runtime artifacts (defaults from scripts/dev.sh and the bare CLI
+# fallbacks in main.rs)
+sandbox/
+audit.jsonl
+conversation.json
+tasks/
+pods/
+
+# Local secrets
+CLOUD_KEYS.txt
+
+# VCS metadata + per-workspace tooling state
+.git/
+.github/
+.gitignore
+.gitattributes
+.claude/
+
+# Docs and per-image packaging not consumed at build time
+README.md
+LICENSE-MIT
+LICENSE-APACHE
+docs/
+packaging/aur/
