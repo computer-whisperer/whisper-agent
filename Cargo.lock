@@ -4744,6 +4744,7 @@ dependencies = [
  "eframe",
  "egui",
  "futures",
+ "rustls",
  "tokio",
  "tokio-tungstenite",
  "tracing",

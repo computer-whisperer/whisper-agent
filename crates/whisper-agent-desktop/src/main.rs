@@ -64,6 +64,16 @@ fn main() -> Result<()> {
         )
         .init();
 
+    // Pin rustls's process-level CryptoProvider before any TLS code
+    // runs. tokio-tungstenite's `rustls-tls-native-roots` pulls rustls
+    // in with both `ring` and `aws-lc-rs` reachable from transitive
+    // deps, so rustls refuses to auto-pick and panics on first TLS
+    // use. `.ok()` swallows the "already installed" error in case some
+    // library beat us to it.
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .ok();
+
     let args = Args::parse();
     let token = resolve_token(&args)?;
     let ws_url = derive_ws_url(&args.server).context("derive websocket URL from --server")?;
