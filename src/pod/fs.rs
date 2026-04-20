@@ -6,6 +6,27 @@
 use crate::pod;
 use crate::pod::behaviors::{BEHAVIOR_STATE, BEHAVIORS_DIR, validate_behavior_id};
 
+/// Pod-relative directory name holding the agent's persistent memory
+/// index + per-memory files. Siblings of `behaviors/` and `threads/`.
+pub const MEMORY_DIR: &str = "memory";
+/// Filename of the index that lists every individual memory file.
+/// Auto-injected into each thread's conversation log at creation time.
+pub const MEMORY_INDEX: &str = "MEMORY.md";
+
+/// Return the filename (basename + extension, single path component) when
+/// `filename` matches `memory/<name>.md`. Nested subdirs or non-`.md`
+/// suffixes return `None` — memory is intentionally flat.
+pub fn parse_memory_path(filename: &str) -> Option<&str> {
+    let rest = filename.strip_prefix(&format!("{MEMORY_DIR}/"))?;
+    if rest.is_empty() || rest.contains('/') || rest.starts_with('.') {
+        return None;
+    }
+    if !rest.ends_with(".md") {
+        return None;
+    }
+    Some(rest)
+}
+
 /// Split `behaviors/<id>/<suffix>` into `(id, suffix)` when `filename`
 /// matches that shape. Both parts must be a single path component — nested
 /// subdirs return `None`.

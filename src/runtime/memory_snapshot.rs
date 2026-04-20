@@ -25,9 +25,7 @@ use std::path::Path;
 use chrono::{DateTime, Utc};
 use whisper_agent_protocol::{ContentBlock, Message, Role};
 
-/// Pod-relative path to the memory directory and its index file.
-pub const MEMORY_DIR: &str = "memory";
-pub const MEMORY_INDEX: &str = "MEMORY.md";
+use crate::pod::fs::{MEMORY_DIR, MEMORY_INDEX};
 
 /// Construct the memory-index snapshot `Message` for a freshly-created
 /// thread, reading `<pod_dir>/memory/MEMORY.md` at call time and

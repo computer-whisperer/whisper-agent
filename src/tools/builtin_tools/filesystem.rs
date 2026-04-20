@@ -18,20 +18,28 @@ use super::{
 };
 use crate::pod;
 use crate::pod::behaviors::{BEHAVIOR_PROMPT, BEHAVIOR_STATE, BEHAVIOR_TOML, BEHAVIORS_DIR};
-use crate::pod::fs::{is_readonly_path, parse_behavior_path};
+use crate::pod::fs::{
+    MEMORY_DIR, MEMORY_INDEX, is_readonly_path, parse_behavior_path, parse_memory_path,
+};
 use crate::tools::mcp::{ToolAnnotations, ToolDescriptor as McpTool};
 use whisper_agent_protocol::{BehaviorState, PodConfig};
 
 /// Every filename reachable by `pod_read_file` / `pod_write_file` /
 /// `pod_edit_file`. Built from the current pod config plus every
-/// behavior id in memory. Writes to `behaviors/<new-id>/behavior.toml`
-/// are additionally allowed (for create-new) — see [`validate_filename`].
+/// behavior id in memory. Pattern-based writes (not enumerated here but
+/// accepted by [`validate_filename`]):
+/// - `{BEHAVIORS_DIR}/<new-id>/{BEHAVIOR_TOML}` — create-new behavior.
+/// - `{MEMORY_DIR}/<name>.md` — memory files. Memory is a flat
+///   directory of markdown files the agent manages itself; only the
+///   top-level `{MEMORY_INDEX}` is enumerated (so the `list_files`
+///   "absent top-level allowlist entries" hint mentions it).
 pub(super) fn allowed_filenames(cfg: &PodConfig, behavior_ids: &[String]) -> Vec<String> {
     let mut out = vec![pod::POD_TOML.to_string()];
     let prompt = &cfg.thread_defaults.system_prompt_file;
     if !prompt.is_empty() && prompt != pod::POD_TOML {
         out.push(prompt.clone());
     }
+    out.push(format!("{MEMORY_DIR}/{MEMORY_INDEX}"));
     for id in behavior_ids {
         out.push(format!("{BEHAVIORS_DIR}/{id}/{BEHAVIOR_TOML}"));
         out.push(format!("{BEHAVIORS_DIR}/{id}/{BEHAVIOR_PROMPT}"));
@@ -53,7 +61,7 @@ enum Access {
 /// Classify `filename` for list output. Purely pattern-based on the
 /// existing rw allowlist plus `is_readonly_path` — does NOT touch disk.
 fn access_for(filename: &str, rw_allowed: &[String]) -> Access {
-    if rw_allowed.iter().any(|n| n == filename) {
+    if rw_allowed.iter().any(|n| n == filename) || parse_memory_path(filename).is_some() {
         Access::Rw
     } else if is_readonly_path(filename) {
         Access::Ro
@@ -108,6 +116,12 @@ fn validate_filename(
     if allowed.iter().any(|n| n == filename) {
         return Ok(());
     }
+    // Memory files (`memory/<name>.md`): a flat directory of markdown
+    // the agent manages itself. Read and write both allowed once the
+    // pattern matches — no per-file allowlist bookkeeping.
+    if parse_memory_path(filename).is_some() {
+        return Ok(());
+    }
     // Create-new: writing `behaviors/<new-id>/behavior.toml` is
     // legitimate even though the id is absent from `allowed`. Reads /
     // edits against an unknown id fall through to the error below.
@@ -132,6 +146,7 @@ fn validate_filename(
     }
     Err(format!(
         "filename `{filename}` is not in this pod's allowlist. Allowed rw: [{}]. \
+         Pattern-based rw: `{MEMORY_DIR}/<name>.md`. \
          Read-only patterns: `pod_state.json`, `{}/<id>.json`, `{BEHAVIORS_DIR}/<id>/{BEHAVIOR_STATE}`.",
         allowed.join(", "),
         pod::THREADS_DIR,
@@ -144,15 +159,16 @@ pub(super) fn list_descriptor() -> McpTool {
     McpTool {
         name: POD_LIST_FILES.into(),
         description: "List the contents of this pod's directory, including its \
-                      `behaviors/<id>/` subdirectories and a summary of the \
-                      `threads/` dir. Entries are tagged by access: `[rw]` = \
-                      readable and writable (the rw config files), `[r-]` = \
-                      read-only (runtime state: `pod_state.json`, per-behavior \
-                      `state.json`, `threads/<id>.json`), `[--]` = not reachable. \
-                      Pod files live OUTSIDE your workspace and are reachable \
-                      ONLY through the `pod_*_file` tools — not `list_dir` or \
-                      `bash`. Call this before editing to see which config files \
-                      and behaviors exist."
+                      `behaviors/<id>/` subdirectories, the `memory/` dir, and a \
+                      summary of the `threads/` dir. Entries are tagged by access: \
+                      `[rw]` = readable and writable (config files + \
+                      `memory/<name>.md`), `[r-]` = read-only (runtime state: \
+                      `pod_state.json`, per-behavior `state.json`, \
+                      `threads/<id>.json`), `[--]` = not reachable. Pod files \
+                      live OUTSIDE your workspace and are reachable ONLY through \
+                      the `pod_*_file` tools — not `list_dir` or `bash`. Call \
+                      this before editing to see which config files, behaviors, \
+                      and memory files exist."
             .into(),
         input_schema: json!({
             "type": "object",
@@ -206,6 +222,27 @@ pub(super) async fn list_files(pod_dir: &Path, allowed: &[String], _args: Value)
                 return no_update_error(e);
             }
         }
+    }
+
+    // `memory/` section: flat directory of agent-managed markdown
+    // files. Always show even when empty — absence of MEMORY.md is a
+    // nudge to start using the memory system. Entries inherit the rw
+    // classification from the `memory/<name>.md` pattern (see
+    // `access_for`), so no per-file allowlist bookkeeping is needed.
+    let memory_dir = pod_dir.join(MEMORY_DIR);
+    out.push_str(&format!("\n-- {MEMORY_DIR}/ --\n"));
+    if tokio::fs::try_exists(&memory_dir).await.unwrap_or(false) {
+        if let Err(e) =
+            list_one_dir(&memory_dir, &format!("{MEMORY_DIR}/"), allowed, &mut out).await
+        {
+            return no_update_error(e);
+        }
+    } else {
+        out.push_str(&format!(
+            "(empty — no memories yet. Write `{MEMORY_DIR}/{MEMORY_INDEX}` \
+             to create the index; write `{MEMORY_DIR}/<name>.md` to add \
+             individual memory files.)\n"
+        ));
     }
 
     // `threads/` section: show the N most-recently-modified entries.
@@ -360,7 +397,8 @@ pub(super) fn read_descriptor() -> McpTool {
         name: POD_READ_FILE.into(),
         description: "Read one of this pod's files: any rw config (`pod.toml`, \
                       system-prompt file, `behaviors/<id>/behavior.toml` or \
-                      `prompt.md`) or any read-only runtime file (`pod_state.json`, \
+                      `prompt.md`, or any `memory/<name>.md`) or any read-only \
+                      runtime file (`pod_state.json`, \
                       `behaviors/<id>/state.json`, `threads/<id>.json`). Thread \
                       JSONs carry the full message history of a run that spawned \
                       from this pod. These files live OUTSIDE your workspace — \
@@ -479,19 +517,23 @@ pub(super) fn write_descriptor() -> McpTool {
     McpTool {
         name: POD_WRITE_FILE.into(),
         description: "Fully overwrite (or create) one of this pod's configuration \
-                      files: `pod.toml`, the pod-level system-prompt file, or any \
-                      `behaviors/<id>/behavior.toml` / `behaviors/<id>/prompt.md`. \
-                      Writing `behaviors/<new-id>/behavior.toml` creates a new \
-                      behavior — the directory is mkdir'd and `state.json` is seeded \
-                      with defaults. A behavior's `prompt.md` may only be written \
-                      after its `behavior.toml` exists. These files live OUTSIDE \
-                      your workspace and are reachable ONLY through the `pod_*_file` \
+                      files: `pod.toml`, the pod-level system-prompt file, any \
+                      `behaviors/<id>/behavior.toml` / `behaviors/<id>/prompt.md`, \
+                      or any `memory/<name>.md` (the agent's persistent memory — \
+                      flat directory, use this to add or overwrite a memory file \
+                      and the `memory/MEMORY.md` index). Writing \
+                      `behaviors/<new-id>/behavior.toml` creates a new behavior — \
+                      the directory is mkdir'd and `state.json` is seeded with \
+                      defaults. A behavior's `prompt.md` may only be written after \
+                      its `behavior.toml` exists. The `memory/` directory is \
+                      created on first write. These files live OUTSIDE your \
+                      workspace and are reachable ONLY through the `pod_*_file` \
                       tools — not `write_file` or `bash`. Structured files \
                       (`pod.toml`, `behavior.toml`) are parsed and validated before \
                       landing on disk; invalid TOML or schema violations return a \
-                      tool error and the on-disk file is untouched. Prefer \
-                      `pod_edit_file` for targeted changes — this is for full \
-                      rewrites and creates."
+                      tool error and the on-disk file is untouched. Memory files \
+                      are opaque text — no validation. Prefer `pod_edit_file` for \
+                      targeted changes — this is for full rewrites and creates."
             .into(),
         input_schema: json!({
             "type": "object",
@@ -536,6 +578,29 @@ pub(super) async fn write_file(
     if let Err(e) = validate_filename(&parsed.filename, allowed, behavior_ids, true) {
         return no_update_error(e);
     }
+    // Memory write: flat directory of agent-managed markdown. No
+    // structured parsing, no scheduler-side update — the memory
+    // snapshot is re-read from disk at thread creation time, and the
+    // current thread's injected block is frozen for cache stability.
+    // Mkdir the memory/ dir on first write.
+    if parse_memory_path(&parsed.filename).is_some() {
+        if let Err(e) = prepare_memory_dir(pod_dir).await {
+            return no_update_error(e);
+        }
+        let path = pod_dir.join(&parsed.filename);
+        if let Err(e) = tokio::fs::write(&path, parsed.content.as_bytes()).await {
+            return no_update_error(format!("write {}: {e}", parsed.filename));
+        }
+        return ToolOutcome {
+            result: text_result(format!(
+                "wrote {} bytes to {}",
+                parsed.content.len(),
+                parsed.filename
+            )),
+            pod_update: None,
+            scheduler_command: None,
+        };
+    }
     let update = match prepare_update(&parsed.filename, &parsed.content) {
         Ok(u) => u,
         Err(e) => return no_update_error(e),
@@ -567,9 +632,10 @@ pub(super) fn edit_descriptor() -> McpTool {
     McpTool {
         name: POD_EDIT_FILE.into(),
         description: "Replace a literal substring in one of this pod's config files \
-                      (`pod.toml`, system-prompt file, or any existing \
-                      `behaviors/<id>/behavior.toml` / `behaviors/<id>/prompt.md`). \
-                      Use `pod_write_file` to create a new behavior — this tool \
+                      (`pod.toml`, system-prompt file, any existing \
+                      `behaviors/<id>/behavior.toml` / `behaviors/<id>/prompt.md`, \
+                      or any existing `memory/<name>.md`). \
+                      Use `pod_write_file` to create a new behavior or memory file — this tool \
                       requires the target file to already exist. These files live \
                       OUTSIDE your workspace and are reachable ONLY through the \
                       `pod_*_file` tools — not `edit_file` or `bash`. `old_string` \
@@ -679,9 +745,17 @@ pub(super) async fn edit_file(
         ));
     }
     let new_content = content.replace(&parsed.old_string, &parsed.new_string);
-    let update = match prepare_update(&parsed.filename, &new_content) {
-        Ok(u) => u,
-        Err(e) => return no_update_error(e),
+    // Memory files are opaque text — no parse / validate / scheduler
+    // update. Other config files route through `prepare_update` for
+    // structural validation and to emit a PodUpdate for the scheduler
+    // to broadcast.
+    let update = if parse_memory_path(&parsed.filename).is_some() {
+        None
+    } else {
+        Some(match prepare_update(&parsed.filename, &new_content) {
+            Ok(u) => u,
+            Err(e) => return no_update_error(e),
+        })
     };
     if let Err(e) = tokio::fs::write(&path, new_content.as_bytes()).await {
         return no_update_error(format!("write {}: {e}", parsed.filename));
@@ -692,7 +766,7 @@ pub(super) async fn edit_file(
             parsed.filename,
             if found == 1 { "" } else { "s" }
         )),
-        pod_update: Some(update),
+        pod_update: update,
         scheduler_command: None,
     }
 }
@@ -749,6 +823,17 @@ async fn prepare_behavior_dir(
         return Ok(());
     }
     let dir = pod_dir.join(BEHAVIORS_DIR).join(id);
+    tokio::fs::create_dir_all(&dir)
+        .await
+        .map_err(|e| format!("mkdir {}: {e}", dir.display()))
+}
+
+/// Create the pod's `memory/` directory if it doesn't already exist.
+/// Called on every memory write (idempotent — `create_dir_all` no-ops
+/// when the dir exists). Analogous to `prepare_behavior_dir` but
+/// memory is a single flat dir rather than per-id subdirs.
+async fn prepare_memory_dir(pod_dir: &Path) -> Result<(), String> {
+    let dir = pod_dir.join(MEMORY_DIR);
     tokio::fs::create_dir_all(&dir)
         .await
         .map_err(|e| format!("mkdir {}: {e}", dir.display()))
@@ -1071,6 +1156,181 @@ mod tests {
         assert!(
             text.contains("not yet present") && text.contains("system_prompt.md"),
             "missing absent-file note: {text}"
+        );
+    }
+
+    // ---------- memory-write coverage ----------
+
+    #[test]
+    fn parse_memory_path_accepts_flat_md_names() {
+        assert_eq!(parse_memory_path("memory/MEMORY.md"), Some("MEMORY.md"));
+        assert_eq!(
+            parse_memory_path("memory/user_role.md"),
+            Some("user_role.md")
+        );
+        // Nested subdirs, dotfiles, non-md extensions, empty names — all rejected.
+        assert_eq!(parse_memory_path("memory/"), None);
+        assert_eq!(parse_memory_path("memory/.hidden.md"), None);
+        assert_eq!(parse_memory_path("memory/notes.txt"), None);
+        assert_eq!(parse_memory_path("memory/sub/file.md"), None);
+        assert_eq!(parse_memory_path("not_memory/file.md"), None);
+    }
+
+    #[tokio::test]
+    async fn write_memory_file_creates_dir_and_emits_no_pod_update() {
+        let dir = temp_dir();
+        let cfg = sample_config();
+        let out = dispatch(
+            dir.clone(),
+            cfg,
+            vec![],
+            POD_WRITE_FILE,
+            json!({
+                "filename": "memory/user_role.md",
+                "content": "---\nname: user role\ntype: user\n---\nengineer on the pod refactor\n",
+            }),
+        )
+        .await;
+        assert!(
+            !out.result.is_error,
+            "memory write failed: {:?}",
+            out.result
+        );
+        // Memory files carry no PodUpdate — the scheduler has nothing
+        // to refresh and nothing to broadcast for per-memory writes.
+        assert!(
+            out.pod_update.is_none(),
+            "memory write must not emit a PodUpdate: {:?}",
+            out.pod_update
+        );
+        // Directory was mkdir'd and the file landed there.
+        let file = dir.join(MEMORY_DIR).join("user_role.md");
+        assert!(file.exists(), "expected {} on disk", file.display());
+        let on_disk = tokio::fs::read_to_string(&file).await.unwrap();
+        assert!(on_disk.contains("engineer on the pod refactor"));
+    }
+
+    #[tokio::test]
+    async fn write_memory_index_creates_index_file() {
+        // `memory/MEMORY.md` is the only memory path explicitly in the
+        // allowlist (so the absent-entries hint surfaces it); it still
+        // routes through the same flat-dir write path.
+        let dir = temp_dir();
+        let cfg = sample_config();
+        let out = dispatch(
+            dir.clone(),
+            cfg,
+            vec![],
+            POD_WRITE_FILE,
+            json!({
+                "filename": "memory/MEMORY.md",
+                "content": "- [user role](user_role.md) — engineer on the pod refactor\n",
+            }),
+        )
+        .await;
+        assert!(!out.result.is_error);
+        assert!(out.pod_update.is_none());
+        let on_disk = tokio::fs::read_to_string(dir.join(MEMORY_DIR).join(MEMORY_INDEX))
+            .await
+            .unwrap();
+        assert!(on_disk.contains("- [user role]"));
+    }
+
+    #[tokio::test]
+    async fn memory_writes_reject_nested_subdirs_and_non_md() {
+        let dir = temp_dir();
+        let cfg = sample_config();
+        for bad in ["memory/sub/file.md", "memory/notes.txt", "memory/.rc.md"] {
+            let out = dispatch(
+                dir.clone(),
+                cfg.clone(),
+                vec![],
+                POD_WRITE_FILE,
+                json!({ "filename": bad, "content": "x" }),
+            )
+            .await;
+            assert!(
+                out.result.is_error,
+                "expected error for filename `{bad}`, got ok: {:?}",
+                out.result
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn edit_memory_file_skips_structural_update() {
+        // Edits to a memory file replace content and emit no PodUpdate
+        // (structured-file parse path is skipped for opaque memory md).
+        let dir = temp_dir();
+        let memory_dir = dir.join(MEMORY_DIR);
+        tokio::fs::create_dir_all(&memory_dir).await.unwrap();
+        tokio::fs::write(memory_dir.join("notes.md"), "before\n")
+            .await
+            .unwrap();
+        let cfg = sample_config();
+        let out = dispatch(
+            dir.clone(),
+            cfg,
+            vec![],
+            POD_EDIT_FILE,
+            json!({
+                "filename": "memory/notes.md",
+                "old_string": "before",
+                "new_string": "after",
+            }),
+        )
+        .await;
+        assert!(!out.result.is_error, "edit failed: {:?}", out.result);
+        assert!(
+            out.pod_update.is_none(),
+            "memory edit must not emit a PodUpdate"
+        );
+        let on_disk = tokio::fs::read_to_string(memory_dir.join("notes.md"))
+            .await
+            .unwrap();
+        assert_eq!(on_disk, "after\n");
+    }
+
+    #[tokio::test]
+    async fn list_files_shows_memory_section_even_when_empty() {
+        // The `memory/` section prints even when the dir doesn't exist
+        // so the agent sees the path to start from.
+        let dir = temp_dir();
+        tokio::fs::write(dir.join("pod.toml"), "name = \"t\"")
+            .await
+            .unwrap();
+        let cfg = sample_config();
+        let out = dispatch(dir.clone(), cfg, vec![], POD_LIST_FILES, json!({})).await;
+        assert!(!out.result.is_error);
+        let text = join_blocks(&out.result.content);
+        assert!(
+            text.contains("-- memory/ --"),
+            "missing memory section header: {text}"
+        );
+        assert!(
+            text.contains("empty") && text.contains("no memories yet"),
+            "missing empty-state nudge: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_files_marks_memory_entries_as_rw() {
+        let dir = temp_dir();
+        tokio::fs::create_dir_all(dir.join(MEMORY_DIR))
+            .await
+            .unwrap();
+        tokio::fs::write(dir.join(MEMORY_DIR).join("foo.md"), "x")
+            .await
+            .unwrap();
+        let cfg = sample_config();
+        let out = dispatch(dir.clone(), cfg, vec![], POD_LIST_FILES, json!({})).await;
+        assert!(!out.result.is_error);
+        let text = join_blocks(&out.result.content);
+        assert!(text.contains("-- memory/ --"), "missing memory section");
+        // Every memory/<name>.md entry is rw by pattern.
+        assert!(
+            text.contains("[rw]") && text.contains("foo.md"),
+            "memory entry not tagged rw: {text}"
         );
     }
 
