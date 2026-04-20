@@ -77,11 +77,27 @@ pub enum ToolRoute {
     Builtin { pod_id: PodId },
     /// Forward to the named MCP session via JSON-RPC. `host` is the
     /// scheduler-side host name (used as the `host:` field on the
-    /// `Function::McpToolUse` spec).
+    /// `Function::McpToolUse` spec). `real_name` is the name the MCP
+    /// host advertises server-side — equal to the public tool name for
+    /// shared MCPs, and the public name minus the `{env_name}_` prefix
+    /// for host-env MCPs (so the wire call is untainted by the model-
+    /// facing prefix that disambiguates across multiple host envs).
     Mcp {
         session: Arc<McpSession>,
         host: String,
+        real_name: String,
     },
+}
+
+/// An MCP host entry the scheduler is routing a specific thread's tool
+/// call through, paired with the prefix the model sees on every tool
+/// this MCP advertises. `prefix: Some(name)` means the model sees
+/// `{name}_{tool}` and the MCP receives the bare `tool`; `prefix: None`
+/// is pass-through (shared MCPs and — by convention — the reserved
+/// Inline host-env path).
+struct BoundMcp<'a> {
+    entry: &'a crate::pod::resources::McpHostEntry,
+    prefix: Option<&'a str>,
 }
 
 /// Snapshot of a pod's on-disk directory + parsed config + behavior ids.
@@ -499,18 +515,22 @@ impl Scheduler {
     }
 
     /// Build the thread's effective tool catalog — the model-facing
-    /// pool. Prepends the builtin pod-editing tools (always available
-    /// to every thread), then walks `task.bindings.mcp_hosts` in
-    /// precedence order — host-env MCP first, then each shared host
-    /// the thread is bound to. Tool-name collisions resolve in favor
-    /// of the earlier entry, so builtins win if an MCP host tries to
-    /// advertise a colliding name.
+    /// pool. Prepends the builtin pod-editing tools, then every host-env
+    /// MCP's tools (prefixed `{env_name}_`), then each shared MCP host
+    /// in pod-declared order (unprefixed). The prefix scheme keeps
+    /// host-env tools addressable independently even when two envs
+    /// advertise the same bare name — `c-dtop_write_file` vs
+    /// `c-srv3_write_file` coexist on the wire. Builtins and shared
+    /// MCPs live in a single flat namespace because they're already
+    /// unique by construction (builtins are `pod_*`, shared MCPs are
+    /// singletons per server).
     ///
     /// Tools whose scope disposition is `Deny` for this thread are
     /// omitted entirely — no point advertising a tool to the model that
     /// will be synthesize-denied on call. `Allow` and `AllowWithPrompt`
     /// both surface; the approval layer handles the latter at dispatch
-    /// time.
+    /// time. Scope evaluation uses the *prefixed* name so policies can
+    /// target a specific env's tool without touching the others.
     pub(crate) fn tool_descriptors(&self, thread_id: &str) -> Vec<McpTool> {
         let scope_denies = |name: &str| -> bool {
             self.tasks
@@ -528,37 +548,73 @@ impl Scheduler {
                 out.push(tool);
             }
         }
-        for host in self.bound_mcp_hosts(thread_id) {
-            for tool in &host.tools {
-                if scope_denies(&tool.name) {
+        for bound in self.bound_mcp_hosts(thread_id) {
+            for tool in &bound.entry.tools {
+                let public_name = match bound.prefix {
+                    Some(prefix) => format!("{prefix}_{}", tool.name),
+                    None => tool.name.clone(),
+                };
+                if scope_denies(&public_name) {
                     continue;
                 }
-                if seen.insert(tool.name.clone()) {
-                    out.push(tool.clone());
+                if seen.insert(public_name.clone()) {
+                    let mut renamed = tool.clone();
+                    renamed.name = public_name;
+                    out.push(renamed);
                 }
             }
         }
         out
     }
 
-    /// Resolve which handler should receive a tool invocation. Builtin
-    /// tools are checked first (they always win); otherwise walks the
-    /// thread's bound MCP hosts in precedence order and returns the
-    /// first host whose tool catalog includes `tool_name`. `None` when
-    /// nothing claims the name — the model called a tool we didn't
-    /// advertise.
+    /// Resolve which handler should receive a tool invocation.
+    /// Routing order:
+    ///
+    /// 1. **Builtin**: exact name match against the builtin list
+    ///    (`pod_*`, `dispatch_thread`). Always wins — builtins live
+    ///    in the top-level namespace.
+    /// 2. **Host-env MCP**: for every bound host-env entry with
+    ///    prefix `P`, if `tool_name` starts with `P_`, strip the
+    ///    prefix and match the remainder against that MCP's tool
+    ///    catalog. Order follows `bindings.host_env` declaration
+    ///    order so ambiguous prefix collisions between envs are
+    ///    deterministic (first-declared wins).
+    /// 3. **Shared MCP**: walk each shared host (unprefixed) and
+    ///    match `tool_name` exactly.
+    ///
+    /// Returns the real tool name on `Mcp` routes (the prefix is
+    /// stripped) so the MCP wire call carries the server-side name
+    /// the host expects. `None` when nothing claims the name.
     pub(crate) fn route_tool(&self, thread_id: &str, tool_name: &str) -> Option<ToolRoute> {
         if crate::tools::builtin_tools::is_builtin(tool_name) {
             let pod_id = self.tasks.get(thread_id)?.pod_id.clone();
             return Some(ToolRoute::Builtin { pod_id });
         }
-        for host in self.bound_mcp_hosts(thread_id) {
-            if host.tools.iter().any(|t| t.name == tool_name)
-                && let Some(s) = host.session.clone()
+        for bound in self.bound_mcp_hosts(thread_id) {
+            let Some(prefix) = bound.prefix else {
+                // Shared MCP — match by exact name.
+                if bound.entry.tools.iter().any(|t| t.name == tool_name)
+                    && let Some(session) = bound.entry.session.clone()
+                {
+                    return Some(ToolRoute::Mcp {
+                        session,
+                        host: bound.entry.id.0.clone(),
+                        real_name: tool_name.to_string(),
+                    });
+                }
+                continue;
+            };
+            let expected = format!("{prefix}_");
+            let Some(stripped) = tool_name.strip_prefix(&expected) else {
+                continue;
+            };
+            if bound.entry.tools.iter().any(|t| t.name == stripped)
+                && let Some(session) = bound.entry.session.clone()
             {
                 return Some(ToolRoute::Mcp {
-                    session: s,
-                    host: host.id.0.clone(),
+                    session,
+                    host: bound.entry.id.0.clone(),
+                    real_name: stripped.to_string(),
                 });
             }
         }
@@ -578,25 +634,41 @@ impl Scheduler {
 
     /// Iterate the thread's bound MCP host entries in precedence
     /// order: every bound host-env MCP first (in the thread's
-    /// `bindings.host_env` declaration order), then each shared MCP
-    /// host in pod-declared order. Skips ids whose entry isn't yet in
+    /// `bindings.host_env` declaration order, each carrying the env's
+    /// name as its tool-prefix), then each shared MCP host in pod-
+    /// declared order (no prefix). Skips ids whose entry isn't yet in
     /// the registry (host-env MCP is created when provisioning
-    /// dispatches; shared entries exist from startup).
-    fn bound_mcp_hosts(&self, thread_id: &str) -> Vec<&crate::pod::resources::McpHostEntry> {
+    /// dispatches; shared entries exist from startup). `Inline` host-
+    /// env bindings don't carry a stable short name and are
+    /// therefore prefix-less too — in practice they're reserved for a
+    /// future subagent path and don't reach this code today.
+    fn bound_mcp_hosts(&self, thread_id: &str) -> Vec<BoundMcp<'_>> {
         let mut out = Vec::new();
-        for he_id in self.host_env_ids_for_thread(thread_id) {
-            let mcp_id = McpHostId::for_host_env(&he_id);
-            if let Some(entry) = self.resources.mcp_hosts.get(&mcp_id) {
-                out.push(entry);
-            }
-        }
         let Some(task) = self.tasks.get(thread_id) else {
             return out;
         };
+        for binding in &task.bindings.host_env {
+            let Some((provider, spec)) = self.resolve_binding(&task.pod_id, binding) else {
+                continue;
+            };
+            let he_id = HostEnvId::for_provider_spec(&provider, &spec);
+            let mcp_id = McpHostId::for_host_env(&he_id);
+            let Some(entry) = self.resources.mcp_hosts.get(&mcp_id) else {
+                continue;
+            };
+            let prefix = match binding {
+                HostEnvBinding::Named { name } => Some(name.as_str()),
+                HostEnvBinding::Inline { .. } => None,
+            };
+            out.push(BoundMcp { entry, prefix });
+        }
         for name in &task.bindings.mcp_hosts {
             let id = McpHostId::shared(name);
             if let Some(entry) = self.resources.mcp_hosts.get(&id) {
-                out.push(entry);
+                out.push(BoundMcp {
+                    entry,
+                    prefix: None,
+                });
             }
         }
         out
@@ -2056,12 +2128,20 @@ impl Scheduler {
 
     fn annotations_for(&self, thread_id: &str) -> HashMap<String, ToolAnnotations> {
         let mut out: HashMap<String, ToolAnnotations> = crate::tools::builtin_tools::annotations();
-        for host in self.bound_mcp_hosts(thread_id) {
-            for (name, ann) in &host.annotations {
+        for bound in self.bound_mcp_hosts(thread_id) {
+            for (name, ann) in &bound.entry.annotations {
+                // Annotations are keyed by the *public* tool name so
+                // approval lookups match what the model called. For
+                // host-env MCPs that's `{env_prefix}_{name}`; shared
+                // MCPs and builtins use the bare name.
+                let public_name = match bound.prefix {
+                    Some(prefix) => format!("{prefix}_{name}"),
+                    None => name.clone(),
+                };
                 // First-wins matches `route_tool`'s builtin-then-host
                 // precedence, so the approval decision agrees with
                 // where the call will actually land.
-                out.entry(name.clone()).or_insert_with(|| ann.clone());
+                out.entry(public_name).or_insert_with(|| ann.clone());
             }
         }
         out

@@ -115,6 +115,42 @@ pub enum PodConfigError {
         "thread_defaults.host_env is empty but [[allow.host_env]] has entries — pick one (valid: [{valid}])"
     )]
     HostEnvDefaultRequired { valid: String },
+    #[error("invalid [[allow.host_env]] name `{name}`: {reason}")]
+    InvalidHostEnvName { name: String, reason: String },
+}
+
+/// Validate a `[[allow.host_env]]` entry's name. Names are used as tool-
+/// name prefixes presented to the model (`{env_name}_{tool_name}`), so
+/// they must (a) stay ambiguous-free — no embedded underscore, since
+/// the separator is a single underscore — and (b) not shadow a builtin
+/// tool's own prefix (see [`builtin_tools::reserved_env_name_prefixes`]).
+pub fn validate_host_env_name(name: &str) -> Result<(), String> {
+    if name.is_empty() {
+        return Err("name must be non-empty".into());
+    }
+    if name.len() > 32 {
+        return Err(format!("name is {} chars (max 32)", name.len()));
+    }
+    let first = name.chars().next().expect("non-empty");
+    if !(first.is_ascii_lowercase() || first.is_ascii_digit()) {
+        return Err("name must start with a lowercase ASCII letter or digit".into());
+    }
+    for ch in name.chars() {
+        if !(ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '-') {
+            return Err(format!(
+                "name contains `{ch}`; only lowercase a-z, 0-9, and `-` are allowed \
+                 (underscore is the prefix separator in `{{name}}_{{tool}}` — bare names cannot contain it)"
+            ));
+        }
+    }
+    let reserved = crate::tools::builtin_tools::reserved_env_name_prefixes();
+    if reserved.contains(&name) {
+        return Err(format!(
+            "name `{name}` collides with a builtin tool prefix (reserved: [{}])",
+            reserved.join(", ")
+        ));
+    }
+    Ok(())
 }
 
 /// Parse pod.toml text, then run structural validation.
@@ -136,6 +172,12 @@ pub fn validate(config: &PodConfig) -> Result<(), PodConfigError> {
     for nss in &config.allow.host_env {
         if !seen.insert(nss.name.as_str()) {
             return Err(PodConfigError::DuplicateSandboxName(nss.name.clone()));
+        }
+        if let Err(reason) = validate_host_env_name(&nss.name) {
+            return Err(PodConfigError::InvalidHostEnvName {
+                name: nss.name.clone(),
+                reason,
+            });
         }
     }
 
@@ -390,5 +432,50 @@ max_turns = 50
     fn unparseable_toml_returns_parse_error() {
         let err = parse_toml("not = valid {toml").unwrap_err();
         assert!(matches!(err, PodConfigError::Parse(_)));
+    }
+
+    #[test]
+    fn host_env_names_validate_on_pod_save() {
+        let mut cfg = sample_config();
+        // Underscore is the tool-name prefix separator — reject so
+        // `{env_name}_{tool}` parses unambiguously.
+        cfg.allow.host_env[0].name = "my_env".into();
+        let err = validate(&cfg).unwrap_err();
+        assert!(
+            matches!(err, PodConfigError::InvalidHostEnvName { .. }),
+            "underscore should be rejected: {err:?}"
+        );
+        // Uppercase letters are not allowed (lowercase-only convention
+        // keeps prefixes terminal-friendly and visually consistent).
+        cfg.allow.host_env[0].name = "MyEnv".into();
+        assert!(matches!(
+            validate(&cfg).unwrap_err(),
+            PodConfigError::InvalidHostEnvName { .. }
+        ));
+        // `pod` is a reserved prefix — collides with the builtin
+        // `pod_*` tool namespace.
+        cfg.allow.host_env[0].name = "pod".into();
+        assert!(matches!(
+            validate(&cfg).unwrap_err(),
+            PodConfigError::InvalidHostEnvName { .. }
+        ));
+        // Short lowercase-alphanum-dash is fine.
+        cfg.allow.host_env[0].name = "c-dtop".into();
+        cfg.thread_defaults.host_env = vec!["c-dtop".into()];
+        cfg.allow.host_env[1].name = "c-srv3".into();
+        validate(&cfg).unwrap();
+    }
+
+    #[test]
+    fn reserved_env_name_prefixes_include_pod_and_dispatch() {
+        let reserved = crate::tools::builtin_tools::reserved_env_name_prefixes();
+        assert!(
+            reserved.contains(&"pod"),
+            "pod must be reserved: {reserved:?}"
+        );
+        assert!(
+            reserved.contains(&"dispatch"),
+            "dispatch must be reserved: {reserved:?}"
+        );
     }
 }

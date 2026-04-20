@@ -148,6 +148,36 @@ pub fn is_builtin(name: &str) -> bool {
     )
 }
 
+/// Env-name prefixes that would shadow a builtin tool after host-env
+/// tool-name prefixing (`{env_name}_{tool_name}`). Returned as the
+/// sorted, deduplicated set of everything up to the first underscore
+/// in every builtin name — so adding a new builtin automatically
+/// expands the reserved set without bespoke bookkeeping.
+///
+/// Used by the pod validator to reject `[[allow.host_env]]` entries
+/// whose name would collide with a builtin prefix.
+pub fn reserved_env_name_prefixes() -> Vec<&'static str> {
+    const BUILTINS: &[&str] = &[
+        POD_READ_FILE,
+        POD_WRITE_FILE,
+        POD_EDIT_FILE,
+        POD_LIST_FILES,
+        POD_GREP,
+        POD_LIST_THREADS,
+        POD_ABOUT,
+        POD_RUN_BEHAVIOR,
+        POD_SET_BEHAVIOR_ENABLED,
+        DISPATCH_THREAD,
+    ];
+    let mut out: Vec<&'static str> = BUILTINS
+        .iter()
+        .map(|n| n.split_once('_').map(|(p, _)| p).unwrap_or(*n))
+        .collect();
+    out.sort();
+    out.dedup();
+    out
+}
+
 /// True if `name` is a builtin tool that modifies the pod. Pod-editing
 /// tools are a privilege-escalation vector; a pod that wants to gate
 /// them without prompting on every MCP tool sets `AllowWithPrompt` on

@@ -582,12 +582,19 @@ fn tool_call(
                 })
             })
         }
-        Some(ToolRoute::Mcp { session: mcp, .. }) => {
+        Some(ToolRoute::Mcp {
+            session: mcp,
+            real_name,
+            ..
+        }) => {
             let stream_tx = scheduler.stream_sender();
             let stream_thread_id = thread_id.clone();
             let stream_tool_use_id = tool_use_id.clone();
             Box::pin(async move {
-                let result = match mcp.invoke(&name, input).await {
+                // `real_name` is the tool name the MCP host advertises
+                // server-side — the public name the model called minus
+                // any `{env_name}_` prefix route_tool stripped off.
+                let result = match mcp.invoke(&real_name, input).await {
                     Ok(mut stream) => {
                         let mut last = None;
                         while let Some(event) = stream.next().await {
