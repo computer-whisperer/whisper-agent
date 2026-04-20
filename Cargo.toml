@@ -3,7 +3,8 @@ members = ["crates/*"]
 resolver = "3"
 
 [workspace.package]
-version = "0.1.0"
+# Each crate declares its own `version` so components can be bumped
+# independently. `edition` and `license` stay shared.
 edition = "2024"
 license = "MIT OR Apache-2.0"
 
@@ -53,7 +54,7 @@ whisper-agent-mcp-proto = { path = "crates/whisper-agent-mcp-proto" }
 [package]
 name = "whisper-agent"
 description = "Server-resident agent loop that reaches into managed POSIX hosts via MCP"
-version.workspace = true
+version = "0.1.0"
 edition.workspace = true
 license.workspace = true
 
