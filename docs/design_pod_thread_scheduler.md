@@ -74,7 +74,9 @@ backends  = ["anthropic", "openai"]      # references to server-catalog backends
 mcp_hosts = ["fetch", "search"]          # references to server-catalog shared hosts
 
 # Host-env entries are named (provider, spec) pairs. The provider name
-# resolves against [[host_env_providers]] in the server config; the
+# resolves against the server's durable provider catalog
+# (`host_env_providers.toml` alongside the pods dir, seeded from
+# `[[host_env_providers]]` in the server config on first boot). The
 # spec is TOML-inline because it's project-specific.
 [[allow.host_env]]
 name = "default"
@@ -199,7 +201,7 @@ Tasks-as-data discipline: thread mutation happens *only* through `thread.step()`
 
 ## Server catalog
 
-Pod TOMLs reference backends, MCP hosts, and host-env providers *by name*. Names are defined in the server's top-level TOML (today: the file the `whisper-agent serve` command points at — typically `whisper-agent.toml`):
+Pod TOMLs reference backends, MCP hosts, and host-env providers *by name*. Backends and shared MCP hosts are declared in the server's top-level TOML (the file the `whisper-agent serve` command points at — typically `whisper-agent.toml`):
 
 ```toml
 default_backend = "anthropic"
@@ -218,25 +220,31 @@ default_model = "llama3.2"
 fetch  = "http://127.0.0.1:9831/mcp"
 search = "http://127.0.0.1:9832/mcp"
 
-[[host_env_providers]]
+[[host_env_providers]]   # seed-only; see below
 name = "local-landlock"
 url  = "http://127.0.0.1:9840"
 ```
 
-The catalog defines what the server *can* run. A pod's `[allow]` table picks a subset. Threads bind to specific entries.
+**Host-env providers** are durable runtime state, not configuration. They live in `<pods_root>/../host_env_providers.toml` (0600, inline token), managed at runtime through the WebUI's Providers tab or the `Add/Update/RemoveHostEnvProvider` RPCs. `[[host_env_providers]]` in the server TOML is imported *insert-if-missing* on every boot — it seeds a fresh install but doesn't clobber entries added or edited through the runtime surface. The server also accepts `--host-env-provider name=url` CLI flags that layer on top as a non-persisted runtime overlay (useful for dev loops).
+
+Removing a provider is refused while any loaded pod's `[[allow.host_env]]` still names it — pods have to be edited first so the bindings don't dangle.
+
+The scheduler periodically probes each provider's daemon (`GET /health`, 30 s cadence) and reports reachability (`Unknown | Reachable | Unreachable { since, last_error }`) through the same Providers surface; transport failures during real provision / tool-call traffic opportunistically update the same state.
+
+The catalogs together define what the server *can* run. A pod's `[allow]` table picks a subset. Threads bind to specific entries.
 
 A pod that references a catalog entry the server doesn't know warns at load time; the missing entry is excluded from the effective `[allow]`.
 
 ## Resource registries
 
-Three flat `HashMap`s in the scheduler's `ResourceRegistry` (`src/pod/resources.rs`): `BackendEntry`, `McpHostEntry`, `HostEnvEntry`. Each carries a `ResourceState` (`Provisioning | Ready | Errored | TornDown`), a refcount (threads currently bound), and a `pinned` flag.
+Three flat `HashMap`s in the scheduler's `ResourceRegistry` (`src/pod/resources.rs`): `BackendEntry`, `McpHostEntry`, `HostEnvEntry`. Each carries a `ResourceState` (`Provisioning | Ready | Errored | Lost | TornDown`), a refcount (threads currently bound), and a `pinned` flag. `Errored` means provisioning never succeeded; `Lost` means an entry was Ready but a later transport failure (daemon restarted or powered off) invalidated its session — the cached handle is dropped without a teardown RPC, the current tool call fails cleanly, and the next thread arriving with the same `(provider, spec)` triggers a fresh provision.
 
 Two behaviors at the resolver layer:
 
 - **Pod allowlist enforcement.** When a thread requests a binding, the resolver verifies the requested resource (or the spec to auto-provision) is in the pod's `[allow]` table. Not allowed → request rejected with a wire error.
 - **Spec dedup across pods.** Two pods with identical inline host-env specs share the same provisioned sandbox in the registry. Spec equality (via `HostEnvId::for_provider_spec`) is the dedup key, not the pod boundary.
 
-GC: refcount + idle timeout + pin. Ready resources with zero users for 5 minutes are torn down. Torn-down / errored entries linger for an hour for inspection ("yes, that host-env existed and failed because…") then evict. Backends never GC — they're cheap handles.
+GC: refcount + idle timeout + pin. Ready resources with zero users for 5 minutes are torn down. Torn-down / errored / lost entries linger for an hour for inspection ("yes, that host-env existed and failed because…") then evict. Backends never GC — they're cheap handles.
 
 ## Auto-provisioning
 

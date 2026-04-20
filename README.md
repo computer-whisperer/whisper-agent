@@ -69,7 +69,7 @@ The TOML file declares:
 - a `[backends.<name>]` table per LLM endpoint (Anthropic, OpenAI Chat, OpenAI Responses, Gemini, openai-compatible)
 - `[secrets]` — exported into the environment for sibling daemons via `whisper-agent config env`
 - `[shared_mcp_hosts]` — named shared-MCP daemon URLs
-- `[[host_env_providers]]` — sandbox-daemon catalog entries (with optional `token_file`)
+- `[[host_env_providers]]` — sandbox-daemon seed entries (with optional `token_file`); imported once into the durable runtime catalog at `<pods_root>/../host_env_providers.toml`, after which the WebUI's Providers tab is the source of truth for add / update / remove
 
 ## Documentation
 
