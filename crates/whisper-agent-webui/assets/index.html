@@ -23,14 +23,32 @@
 <body>
     <canvas id="the_canvas_id"></canvas>
     <script type="module">
-        import init from '/pkg/whisper_agent_webui.js';
-        init().catch(err => {
-            console.error('failed to initialize whisper-agent-webui:', err);
-            document.body.innerHTML =
-                '<pre style="color:#fff;padding:1em;">webui failed to start. ' +
-                'Did you run `wasm-pack build crates/whisper-agent-webui --target web`?\n\n' +
-                String(err) + '</pre>';
-        });
+        // Probe the auth gate before fetching the wasm bundle. On 401
+        // (no/expired session cookie, or non-loopback client without
+        // auth configured) bounce to the login page so the user can
+        // paste a token. On 204 the cookie is good (or we're loopback
+        // and bypass applies); proceed to load the app.
+        (async () => {
+            try {
+                const r = await fetch('/auth/check', { credentials: 'same-origin' });
+                if (r.status === 401) {
+                    window.location.replace('/login.html');
+                    return;
+                }
+            } catch (err) {
+                // Network error — let init() proceed; the WS will surface
+                // the same failure with the existing reconnect indicator.
+                console.warn('auth probe failed:', err);
+            }
+            const init = (await import('/pkg/whisper_agent_webui.js')).default;
+            init().catch(err => {
+                console.error('failed to initialize whisper-agent-webui:', err);
+                document.body.innerHTML =
+                    '<pre style="color:#fff;padding:1em;">webui failed to start. ' +
+                    'Did you run `wasm-pack build crates/whisper-agent-webui --target web`?\n\n' +
+                    String(err) + '</pre>';
+            });
+        })();
     </script>
 </body>
 </html>

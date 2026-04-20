@@ -1,0 +1,100 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>whisper-agent — log in</title>
+    <style>
+        html, body {
+            margin: 0;
+            padding: 0;
+            height: 100%;
+            background: #1c1c1c;
+            color: #ddd;
+            font-family: system-ui, sans-serif;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+        .box {
+            background: #2a2a2a;
+            padding: 2em;
+            border-radius: 8px;
+            min-width: 320px;
+            box-shadow: 0 4px 16px rgba(0, 0, 0, 0.4);
+        }
+        h1 {
+            margin: 0 0 1em 0;
+            font-size: 1.3em;
+            font-weight: 500;
+        }
+        input[type=password] {
+            width: 100%;
+            padding: 0.6em;
+            background: #1c1c1c;
+            color: #ddd;
+            border: 1px solid #444;
+            border-radius: 4px;
+            box-sizing: border-box;
+            font-family: inherit;
+            font-size: 1em;
+        }
+        button {
+            margin-top: 1em;
+            width: 100%;
+            padding: 0.6em;
+            background: #3a6ea5;
+            color: #fff;
+            border: 0;
+            border-radius: 4px;
+            cursor: pointer;
+            font-family: inherit;
+            font-size: 1em;
+        }
+        button:hover { background: #4880c0; }
+        button:disabled { background: #444; cursor: default; }
+        .err {
+            margin-top: 1em;
+            color: #d77;
+            font-size: 0.9em;
+            min-height: 1em;
+        }
+    </style>
+</head>
+<body>
+    <form class="box" id="login">
+        <h1>whisper-agent</h1>
+        <input type="password" id="token" placeholder="client token" autofocus required />
+        <button type="submit" id="submit">log in</button>
+        <div class="err" id="err"></div>
+    </form>
+    <script type="module">
+        const form = document.getElementById('login');
+        const tokenEl = document.getElementById('token');
+        const submitEl = document.getElementById('submit');
+        const errEl = document.getElementById('err');
+        form.addEventListener('submit', async (e) => {
+            e.preventDefault();
+            errEl.textContent = '';
+            submitEl.disabled = true;
+            try {
+                const r = await fetch('/auth/login', {
+                    method: 'POST',
+                    headers: { 'content-type': 'application/json' },
+                    body: JSON.stringify({ token: tokenEl.value }),
+                    credentials: 'same-origin',
+                });
+                if (r.ok) {
+                    window.location.replace('/');
+                    return;
+                }
+                errEl.textContent = r.status === 401 ? 'invalid token' : `error: ${r.status}`;
+            } catch (err) {
+                errEl.textContent = `network error: ${err}`;
+            } finally {
+                submitEl.disabled = false;
+            }
+        });
+    </script>
+</body>
+</html>

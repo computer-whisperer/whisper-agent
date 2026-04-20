@@ -338,64 +338,70 @@ async fn run_serve(args: ServeArgs) -> Result<()> {
     // from a TOML config; CLI --shared-mcp-host flags layer on top (CLI wins
     // on name conflict).
     let resolved_config = resolve_config_path(args.config.clone())?;
-    let (backends, default_backend, default_model, mut shared_host_map, toml_provider_entries) =
-        match &resolved_config {
-            Some(path) => {
-                info!(config = %path.display(), "loading backend catalog");
-                let cfg = Config::load(path).await?;
-                let default_model = cfg
-                    .backends
-                    .get(&cfg.default_backend)
-                    .ok_or_else(|| anyhow!("config: default_backend missing entry"))?
-                    .default_model()
-                    .map(|s| s.to_string())
-                    .unwrap_or_default();
-                let mut map = HashMap::new();
-                for (name, bcfg) in &cfg.backends {
-                    let provider = bcfg
-                        .build()
-                        .with_context(|| format!("build backend `{name}`"))?;
-                    map.insert(
-                        name.clone(),
-                        BackendEntry {
-                            provider,
-                            kind: bcfg.kind().into(),
-                            default_model: bcfg.default_model().map(|s| s.to_string()),
-                        },
-                    );
-                }
-                (
-                    map,
-                    cfg.default_backend,
-                    default_model,
-                    cfg.shared_mcp_hosts.into_iter().collect::<HashMap<_, _>>(),
-                    cfg.host_env_providers,
-                )
-            }
-            None => {
-                let key = args.anthropic_api_key.clone().ok_or_else(|| {
-                    anyhow!(
-                        "no --config provided and ANTHROPIC_API_KEY / --anthropic-api-key is unset"
-                    )
-                })?;
-                let mut map = HashMap::new();
+    let (
+        backends,
+        default_backend,
+        default_model,
+        mut shared_host_map,
+        toml_provider_entries,
+        auth_clients,
+    ) = match &resolved_config {
+        Some(path) => {
+            info!(config = %path.display(), "loading backend catalog");
+            let cfg = Config::load(path).await?;
+            let default_model = cfg
+                .backends
+                .get(&cfg.default_backend)
+                .ok_or_else(|| anyhow!("config: default_backend missing entry"))?
+                .default_model()
+                .map(|s| s.to_string())
+                .unwrap_or_default();
+            let mut map = HashMap::new();
+            for (name, bcfg) in &cfg.backends {
+                let provider = bcfg
+                    .build()
+                    .with_context(|| format!("build backend `{name}`"))?;
                 map.insert(
-                    DEFAULT_BACKEND_NAME.into(),
+                    name.clone(),
                     BackendEntry {
-                        provider: std::sync::Arc::new(AnthropicClient::new(key)),
-                        kind: "anthropic".into(),
-                        default_model: Some(args.model.clone()),
+                        provider,
+                        kind: bcfg.kind().into(),
+                        default_model: bcfg.default_model().map(|s| s.to_string()),
                     },
                 );
-                (
-                    map,
-                    DEFAULT_BACKEND_NAME.into(),
-                    args.model.clone(),
-                    HashMap::new(),
-                    Vec::new(),
-                )
             }
-        };
+            (
+                map,
+                cfg.default_backend,
+                default_model,
+                cfg.shared_mcp_hosts.into_iter().collect::<HashMap<_, _>>(),
+                cfg.host_env_providers,
+                cfg.auth.clients,
+            )
+        }
+        None => {
+            let key = args.anthropic_api_key.clone().ok_or_else(|| {
+                anyhow!("no --config provided and ANTHROPIC_API_KEY / --anthropic-api-key is unset")
+            })?;
+            let mut map = HashMap::new();
+            map.insert(
+                DEFAULT_BACKEND_NAME.into(),
+                BackendEntry {
+                    provider: std::sync::Arc::new(AnthropicClient::new(key)),
+                    kind: "anthropic".into(),
+                    default_model: Some(args.model.clone()),
+                },
+            );
+            (
+                map,
+                DEFAULT_BACKEND_NAME.into(),
+                args.model.clone(),
+                HashMap::new(),
+                Vec::new(),
+                Vec::new(),
+            )
+        }
+    };
     for (name, url) in args.shared_mcp_hosts {
         shared_host_map.insert(name, url);
     }
@@ -455,6 +461,19 @@ async fn run_serve(args: ServeArgs) -> Result<()> {
         _ => None,
     };
 
+    // If the listen address is reachable beyond loopback and tokens are
+    // configured, refuse to start without TLS. Auth secrets across the
+    // wire in cleartext is a footgun we'd rather hard-fail on than warn
+    // about. Wildcard binds (0.0.0.0, ::) are conservatively treated as
+    // non-loopback because they accept both.
+    if !auth_clients.is_empty() && !args.listen.ip().is_loopback() && tls.is_none() {
+        return Err(anyhow!(
+            "[[auth.clients]] is configured and --listen {} is not loopback, but no --tls-cert/--tls-key was provided; \
+             refusing to send tokens over plain HTTP",
+            args.listen
+        ));
+    }
+
     let server_config = ServerConfig {
         backends,
         default_backend,
@@ -473,6 +492,7 @@ async fn run_serve(args: ServeArgs) -> Result<()> {
         host_env_registry,
         shared_mcp_hosts,
         tls,
+        auth_clients,
     };
     server::serve(args.listen, server_config).await
 }

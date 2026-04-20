@@ -15,6 +15,7 @@
 //! `ThreadEvent → ServerToClient` translation that the scheduler hands off
 //! after each step.
 
+mod auth;
 pub mod thread_router;
 
 use std::net::SocketAddr;
@@ -31,9 +32,13 @@ use axum::{
         ws::{Message, WebSocket, WebSocketUpgrade},
     },
     http::{StatusCode, header},
+    middleware,
     response::{IntoResponse, Response},
     routing::{get, post},
 };
+
+use crate::pod::config::AuthClient;
+use crate::server::auth::AuthState;
 use futures::{SinkExt, StreamExt};
 use rust_embed::RustEmbed;
 use tokio::net::TcpListener;
@@ -121,6 +126,12 @@ pub struct ServerConfig {
     /// listen address. The cert and key are PEM-encoded files; cert
     /// chains with intermediates are supported.
     pub tls: Option<TlsConfig>,
+    /// Configured client-auth tokens. Empty means "loopback only" — see
+    /// `auth::require_auth` for the gating policy. The list contains full
+    /// `AuthClient` entries (name + token) so we can log which device
+    /// names are registered at startup; the runtime gate only consults
+    /// the tokens.
+    pub auth_clients: Vec<AuthClient>,
 }
 
 /// Paths to the PEM-encoded cert chain and private key. Loaded from
@@ -225,9 +236,43 @@ pub async fn serve(listen: SocketAddr, config: ServerConfig) -> anyhow::Result<(
         next_conn_id: Arc::new(AtomicU64::new(1)),
     };
 
+    let auth_state = Arc::new(AuthState::new(
+        config
+            .auth_clients
+            .iter()
+            .map(|c| c.token.clone())
+            .collect(),
+    ));
+    if config.auth_clients.is_empty() {
+        info!(
+            "client auth disabled (no [[auth.clients]] in config) — non-loopback connections will be rejected"
+        );
+    } else {
+        let names: Vec<&str> = config
+            .auth_clients
+            .iter()
+            .map(|c| c.name.as_str())
+            .collect();
+        info!(clients = ?names, "client auth enabled");
+    }
+
+    // route_layer applies only to routes registered before it. The /ws and
+    // /auth/check routes go through the gate; /auth/login (the way you
+    // acquire a session) stays open, as do /health (k8s probe), the
+    // webhook trigger surface (separate per-trigger-secret story TBD),
+    // and the static webui assets.
     let app = Router::new()
-        .route("/health", get(|| async { "ok" }))
         .route("/ws", get(ws_handler))
+        .route("/auth/check", get(auth::handle_check))
+        .route_layer(middleware::from_fn_with_state(
+            auth_state.clone(),
+            auth::require_auth,
+        ))
+        .route("/health", get(|| async { "ok" }))
+        .route(
+            "/auth/login",
+            post(auth::handle_login).with_state(auth_state),
+        )
         .route(
             "/triggers/{pod_id}/{behavior_id}",
             post(webhook_trigger_handler),
@@ -247,6 +292,10 @@ pub async fn serve(listen: SocketAddr, config: ServerConfig) -> anyhow::Result<(
         .route(
             "/index.html",
             get(|| async { serve_embedded::<WebuiAssets>("index.html") }),
+        )
+        .route(
+            "/login.html",
+            get(|| async { serve_embedded::<WebuiAssets>("login.html") }),
         )
         .layer(TraceLayer::new_for_http())
         .with_state(state);
@@ -270,7 +319,7 @@ pub async fn serve(listen: SocketAddr, config: ServerConfig) -> anyhow::Result<(
                 "whisper-agent server listening (open https://{listen}/ in a browser)"
             );
             axum_server::bind_rustls(listen, rustls)
-                .serve(app.into_make_service())
+                .serve(app.into_make_service_with_connect_info::<SocketAddr>())
                 .await
         }
         None => {
@@ -282,7 +331,11 @@ pub async fn serve(listen: SocketAddr, config: ServerConfig) -> anyhow::Result<(
                 addr = %listen,
                 "whisper-agent server listening (open http://{listen}/ in a browser)"
             );
-            axum::serve(listener, app).await
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await
         }
     };
 

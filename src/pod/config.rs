@@ -72,6 +72,30 @@ pub struct Config {
     /// as shell `export` lines for dev scripts to source.
     #[serde(default)]
     pub secrets: BTreeMap<String, String>,
+    /// Per-client bearer tokens for non-loopback HTTP/WS access. Loopback
+    /// connections always bypass auth. When this list is empty, non-loopback
+    /// connections are rejected outright.
+    #[serde(default)]
+    pub auth: AuthConfig,
+}
+
+/// Client-auth section. Tokens are stored in cleartext alongside other
+/// credentials in `whisper-agent.toml` (e.g. provider API keys). The server
+/// presents these to bearer-token comparisons (`Authorization: Bearer <tok>`
+/// for native clients, `wa_session=<tok>` cookie for browser).
+#[derive(Deserialize, Debug, Clone, Default)]
+pub struct AuthConfig {
+    #[serde(default)]
+    pub clients: Vec<AuthClient>,
+}
+
+/// One entry from `[[auth.clients]]`. `name` is descriptive (used to identify
+/// a device for revocation by editing the file); `token` is the opaque bearer
+/// string. Suggested generator: `openssl rand -base64 32`.
+#[derive(Deserialize, Debug, Clone)]
+pub struct AuthClient {
+    pub name: String,
+    pub token: String,
 }
 
 /// One catalog entry from `[[host_env_providers]]`. `name` is what
@@ -322,6 +346,27 @@ impl Config {
                 self.default_backend
             ));
         }
+        let mut names: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        let mut tokens: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        for client in &self.auth.clients {
+            let name = client.name.trim();
+            if name.is_empty() {
+                return Err(anyhow!("config: auth.clients entry has empty name"));
+            }
+            if client.token.is_empty() {
+                return Err(anyhow!(
+                    "config: auth.clients entry `{name}` has empty token"
+                ));
+            }
+            if !names.insert(name) {
+                return Err(anyhow!("config: auth.clients has duplicate name `{name}`"));
+            }
+            if !tokens.insert(&client.token) {
+                return Err(anyhow!(
+                    "config: auth.clients entry `{name}` reuses a token from another entry"
+                ));
+            }
+        }
         Ok(())
     }
 }
@@ -375,6 +420,91 @@ base_url = "http://localhost:11434/v1"
             BackendConfig::OpenAiChat { auth, .. } => assert!(auth.is_none()),
             _ => panic!("wrong variant"),
         }
+    }
+
+    #[test]
+    fn parses_auth_clients_section() {
+        let text = r#"
+default_backend = "cloud"
+
+[backends.cloud]
+kind = "anthropic"
+auth = { mode = "api_key", value = "sk-test" }
+
+[[auth.clients]]
+name = "desktop-laptop"
+token = "wsk_aaa"
+
+[[auth.clients]]
+name = "phone"
+token = "wsk_bbb"
+"#;
+        let cfg: Config = toml::from_str(text).unwrap();
+        cfg.validate().unwrap();
+        assert_eq!(cfg.auth.clients.len(), 2);
+        assert_eq!(cfg.auth.clients[0].name, "desktop-laptop");
+        assert_eq!(cfg.auth.clients[1].token, "wsk_bbb");
+    }
+
+    #[test]
+    fn auth_clients_section_is_optional() {
+        let text = r#"
+default_backend = "cloud"
+
+[backends.cloud]
+kind = "anthropic"
+auth = { mode = "api_key", value = "sk-test" }
+"#;
+        let cfg: Config = toml::from_str(text).unwrap();
+        cfg.validate().unwrap();
+        assert!(cfg.auth.clients.is_empty());
+    }
+
+    #[test]
+    fn auth_clients_validation_rejects_collisions() {
+        let base = r#"
+default_backend = "cloud"
+
+[backends.cloud]
+kind = "anthropic"
+auth = { mode = "api_key", value = "sk-test" }
+"#;
+
+        let dup_name = format!(
+            "{base}\n[[auth.clients]]\nname = \"x\"\ntoken = \"a\"\n[[auth.clients]]\nname = \"x\"\ntoken = \"b\"\n"
+        );
+        assert!(
+            toml::from_str::<Config>(&dup_name)
+                .unwrap()
+                .validate()
+                .is_err()
+        );
+
+        let dup_token = format!(
+            "{base}\n[[auth.clients]]\nname = \"x\"\ntoken = \"a\"\n[[auth.clients]]\nname = \"y\"\ntoken = \"a\"\n"
+        );
+        assert!(
+            toml::from_str::<Config>(&dup_token)
+                .unwrap()
+                .validate()
+                .is_err()
+        );
+
+        let empty_name = format!("{base}\n[[auth.clients]]\nname = \"\"\ntoken = \"a\"\n");
+        assert!(
+            toml::from_str::<Config>(&empty_name)
+                .unwrap()
+                .validate()
+                .is_err()
+        );
+
+        let empty_token = format!("{base}\n[[auth.clients]]\nname = \"x\"\ntoken = \"\"\n");
+        assert!(
+            toml::from_str::<Config>(&empty_token)
+                .unwrap()
+                .validate()
+                .is_err()
+        );
     }
 
     #[test]
