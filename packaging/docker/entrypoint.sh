@@ -19,6 +19,14 @@
 #   WHISPER_AGENT_LISTEN          [::]:8080
 #   WHISPER_AGENT_LISTEN_FETCH    127.0.0.1:9830
 #   WHISPER_AGENT_LISTEN_SEARCH   127.0.0.1:9831
+#   WHISPER_AGENT_TLS_CERT        — when set together with TLS_KEY,
+#   WHISPER_AGENT_TLS_KEY           the agent serves HTTPS instead of
+#                                   HTTP on $WHISPER_AGENT_LISTEN.
+#                                   Standard k8s pattern: mount the
+#                                   `kubernetes.io/tls` secret at
+#                                   /tlsconfig and set the env vars to
+#                                   /tlsconfig/tls.crt and
+#                                   /tlsconfig/tls.key.
 #
 # Extra args passed to this script flow through to `whisper-agent
 # serve`, so the orchestrator can append flags like
@@ -49,6 +57,16 @@ fi
 eval "$(whisper-agent config env --config "$CONFIG")"
 
 EXTRA_ARGS=()
+
+# TLS: enable HTTPS if both env vars are set. Mismatched (only one
+# set) is a config error — fail loudly rather than silently downgrade.
+if [[ -n "${WHISPER_AGENT_TLS_CERT:-}" || -n "${WHISPER_AGENT_TLS_KEY:-}" ]]; then
+    if [[ -z "${WHISPER_AGENT_TLS_CERT:-}" || -z "${WHISPER_AGENT_TLS_KEY:-}" ]]; then
+        echo "entrypoint: WHISPER_AGENT_TLS_CERT and WHISPER_AGENT_TLS_KEY must be set together" >&2
+        exit 2
+    fi
+    EXTRA_ARGS+=(--tls-cert "$WHISPER_AGENT_TLS_CERT" --tls-key "$WHISPER_AGENT_TLS_KEY")
+fi
 
 # Web fetch: no API key required, always start.
 echo "entrypoint: starting whisper-agent-mcp-fetch on $LISTEN_FETCH"

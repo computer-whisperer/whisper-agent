@@ -117,6 +117,18 @@ pub struct ServerConfig {
     /// Catalog of shared (singleton) MCP hosts the scheduler connects to at
     /// startup. Pods opt in by name via `[allow].mcp_hosts`.
     pub shared_mcp_hosts: Vec<SharedHostConfig>,
+    /// When set, the server speaks HTTPS instead of plain HTTP on the
+    /// listen address. The cert and key are PEM-encoded files; cert
+    /// chains with intermediates are supported.
+    pub tls: Option<TlsConfig>,
+}
+
+/// Paths to the PEM-encoded cert chain and private key. Loaded from
+/// disk at server startup; rotation requires a process restart (the
+/// server does not currently watch the files for changes).
+pub struct TlsConfig {
+    pub cert_path: PathBuf,
+    pub key_path: PathBuf,
 }
 
 #[derive(Clone)]
@@ -239,11 +251,35 @@ pub async fn serve(listen: SocketAddr, config: ServerConfig) -> anyhow::Result<(
         .layer(TraceLayer::new_for_http())
         .with_state(state);
 
-    let listener = TcpListener::bind(listen)
-        .await
-        .with_context(|| format!("bind {listen}"))?;
-    info!(addr = %listen, "whisper-agent server listening (open http://{listen}/ in a browser)");
-    let serve_result = axum::serve(listener, app).await;
+    let serve_result = match config.tls {
+        Some(tls) => {
+            let rustls =
+                axum_server::tls_rustls::RustlsConfig::from_pem_file(&tls.cert_path, &tls.key_path)
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "load tls cert={} key={}",
+                            tls.cert_path.display(),
+                            tls.key_path.display()
+                        )
+                    })?;
+            info!(
+                addr = %listen,
+                cert = %tls.cert_path.display(),
+                "whisper-agent server listening (open https://{listen}/ in a browser)"
+            );
+            axum_server::bind_rustls(listen, rustls)
+                .serve(app.into_make_service())
+                .await
+        }
+        None => {
+            let listener = TcpListener::bind(listen)
+                .await
+                .with_context(|| format!("bind {listen}"))?;
+            info!(addr = %listen, "whisper-agent server listening (open http://{listen}/ in a browser)");
+            axum::serve(listener, app).await
+        }
+    };
 
     // Shutdown: drop the inbox sender so the scheduler exits, then await it.
     drop(inbox_tx);
