@@ -30,14 +30,14 @@ use axum::{
         Path, State,
         ws::{Message, WebSocket, WebSocketUpgrade},
     },
-    http::StatusCode,
-    response::IntoResponse,
+    http::{StatusCode, header},
+    response::{IntoResponse, Response},
     routing::{get, post},
 };
 use futures::{SinkExt, StreamExt};
+use rust_embed::RustEmbed;
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
-use tower_http::services::{ServeDir, ServeFile};
 use tower_http::trace::TraceLayer;
 use tracing::{error, info, warn};
 use whisper_agent_protocol::{
@@ -52,18 +52,38 @@ use crate::runtime::scheduler::{
     build_default_pod_config,
 };
 
-const WEBUI_PKG_DIR: &str = concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/crates/whisper-agent-webui/pkg"
-);
-const WEBUI_ASSETS_DIR: &str = concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/crates/whisper-agent-webui/assets"
-);
-const WEBUI_INDEX: &str = concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/crates/whisper-agent-webui/assets/index.html"
-);
+// Webui assets baked into the release binary by `rust-embed`. In debug
+// builds the macro reads from disk on each request (so `cargo run`
+// picks up edits to assets/ and fresh wasm-pack output without a
+// rebuild); in release builds the file bodies are embedded at compile
+// time. The asset folders must exist when cargo compiles this crate —
+// `scripts/dev.sh` and the Dockerfile both run wasm-pack before the
+// release cargo build, populating `crates/whisper-agent-webui/pkg/`.
+#[derive(RustEmbed)]
+#[folder = "crates/whisper-agent-webui/pkg/"]
+struct WebuiPkg;
+
+#[derive(RustEmbed)]
+#[folder = "crates/whisper-agent-webui/assets/"]
+struct WebuiAssets;
+
+/// Look up `path` in an embedded asset folder and return it with a
+/// content-type guessed from its extension. 404s if the file isn't in
+/// the embed (in debug builds, that includes "the file isn't on disk
+/// at the configured folder right now").
+fn serve_embedded<E: RustEmbed>(path: &str) -> Response {
+    match E::get(path) {
+        Some(file) => {
+            let mime = mime_guess::from_path(path).first_or_octet_stream();
+            (
+                [(header::CONTENT_TYPE, mime.as_ref().to_string())],
+                file.data.into_owned(),
+            )
+                .into_response()
+        }
+        None => StatusCode::NOT_FOUND.into_response(),
+    }
+}
 
 pub struct ServerConfig {
     /// Named backends the scheduler can dispatch model calls to.
@@ -106,16 +126,6 @@ struct AppState {
 }
 
 pub async fn serve(listen: SocketAddr, config: ServerConfig) -> anyhow::Result<()> {
-    let pkg_path = PathBuf::from(WEBUI_PKG_DIR);
-    if !pkg_path.exists() {
-        warn!(
-            path = %pkg_path.display(),
-            "webui pkg/ dir does not exist; build it with: \
-             RUSTFLAGS='--cfg getrandom_backend=\"wasm_js\"' \
-             wasm-pack build crates/whisper-agent-webui --target web"
-        );
-    }
-
     let audit = AuditLog::open(config.audit_log_path.clone())
         .await
         .with_context(|| format!("open audit log {}", config.audit_log_path.display()))?;
@@ -210,10 +220,22 @@ pub async fn serve(listen: SocketAddr, config: ServerConfig) -> anyhow::Result<(
             "/triggers/{pod_id}/{behavior_id}",
             post(webhook_trigger_handler),
         )
-        .nest_service("/pkg", ServeDir::new(WEBUI_PKG_DIR))
-        .nest_service("/assets", ServeDir::new(WEBUI_ASSETS_DIR))
-        .route_service("/index.html", ServeFile::new(WEBUI_INDEX))
-        .route_service("/", ServeFile::new(WEBUI_INDEX))
+        .route(
+            "/pkg/{*path}",
+            get(|Path(p): Path<String>| async move { serve_embedded::<WebuiPkg>(&p) }),
+        )
+        .route(
+            "/assets/{*path}",
+            get(|Path(p): Path<String>| async move { serve_embedded::<WebuiAssets>(&p) }),
+        )
+        .route(
+            "/",
+            get(|| async { serve_embedded::<WebuiAssets>("index.html") }),
+        )
+        .route(
+            "/index.html",
+            get(|| async { serve_embedded::<WebuiAssets>("index.html") }),
+        )
         .layer(TraceLayer::new_for_http())
         .with_state(state);
 

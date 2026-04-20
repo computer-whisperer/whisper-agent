@@ -80,7 +80,13 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "serd
 chrono-tz = { workspace = true }
 cron = { workspace = true }
 axum = { workspace = true, features = ["ws"] }
-tower-http = { version = "0.6", features = ["fs", "trace"] }
+tower-http = { version = "0.6", features = ["trace"] }
+# `rust-embed` bakes the webui pkg/ + assets/ trees into the release
+# binary. In debug builds (default features) it reads from disk, so
+# `cargo run` in this repo still picks up live edits to assets and
+# wasm-pack output without a rebuild.
+rust-embed = "8"
+mime_guess = "2"
 whisper-agent-protocol = { workspace = true }
 toml = "1"
 base64 = "0.22"
