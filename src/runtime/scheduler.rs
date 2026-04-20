@@ -42,7 +42,7 @@ use std::time::Duration;
 use futures::StreamExt;
 use futures::stream::FuturesUnordered;
 use tokio::sync::mpsc;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 use whisper_agent_protocol::{
     ClientToServer, HostEnvBinding, Message, ResourceKind, ServerToClient, ThreadBindings,
     ThreadBindingsPatch, ThreadBindingsRequest, ThreadConfigOverride, ThreadStateLabel,
@@ -572,12 +572,30 @@ impl Scheduler {
             observed_at,
             result,
         } = probe;
+        // Log transitions at WARN / INFO, repeats at DEBUG. With the
+        // 30s probe tick a permanently-down daemon would otherwise
+        // spam WARN every tick forever; operators want the first edge
+        // + the recovery, not a ticker in the journal.
         let changed = match result {
-            Ok(()) => self.host_env_registry.mark_reachable(&name, observed_at),
+            Ok(()) => {
+                let changed = self.host_env_registry.mark_reachable(&name, observed_at);
+                if changed {
+                    info!(provider = %name, "host-env provider probe recovered");
+                } else {
+                    debug!(provider = %name, "host-env provider probe ok");
+                }
+                changed
+            }
             Err(msg) => {
-                warn!(provider = %name, error = %msg, "host-env provider probe failed");
-                self.host_env_registry
-                    .mark_unreachable(&name, observed_at, msg)
+                let changed =
+                    self.host_env_registry
+                        .mark_unreachable(&name, observed_at, msg.clone());
+                if changed {
+                    warn!(provider = %name, error = %msg, "host-env provider probe failed");
+                } else {
+                    debug!(provider = %name, error = %msg, "host-env provider probe still failing");
+                }
+                changed
             }
         };
         if changed && let Some(info) = self.host_env_provider_info(&name) {

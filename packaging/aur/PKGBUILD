@@ -17,7 +17,7 @@
 #   5. Push to AUR (separate `aur:whisper-agent-host` git remote).
 
 pkgname=whisper-agent-host
-pkgver=0.2.1
+pkgver=0.2.2
 pkgrel=1
 pkgdesc="Host-side sandbox daemon for whisper-agent (landlock-isolated per-thread MCP hosts)"
 arch=('x86_64' 'aarch64')

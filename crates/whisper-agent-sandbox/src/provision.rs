@@ -4,15 +4,22 @@
 //! process inside the appropriate isolation boundary.
 
 use std::net::{IpAddr, SocketAddr};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU16, Ordering};
 use std::time::Duration;
 
 use rand::RngCore;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::process::{Child, Command};
+use tokio::sync::Mutex;
 use tracing::info;
 use whisper_agent_protocol::sandbox::{AccessMode, HostEnvSpec, NetworkPolicy, PathAccess};
+
+/// How much of the child's stderr we retain and surface to callers
+/// when it dies or times out. 4 KiB is enough to catch a typical
+/// `anyhow!` chain without letting a chatty child bloat memory.
+const STDERR_TAIL_BYTES: usize = 4096;
 
 /// Port range for spawned MCP host instances. Each provision bumps the
 /// counter. Starts well above the sibling daemon ports (sandbox 9810/9820,
@@ -52,10 +59,41 @@ pub enum ProvisionError {
     NoWorkspaceRoot,
     #[error("spawn failed: {0}")]
     Spawn(String),
-    #[error("MCP host failed to become ready within {0}s")]
-    StartupTimeout(u64),
+    /// MCP host exited before it bound its listen socket. `code` is the
+    /// process exit code (`None` for signal-killed). `stderr_tail` is
+    /// everything the child printed to stderr up to the point of
+    /// failure (truncated to the last `STDERR_TAIL_BYTES`) so the
+    /// daemon's 500 response surfaces the real cause instead of a
+    /// generic timeout.
+    #[error(
+        "MCP host exited before becoming ready (exit_code={code:?}){}",
+        format_stderr_suffix(stderr_tail)
+    )]
+    ChildExited {
+        code: Option<i32>,
+        stderr_tail: String,
+    },
+    /// Deadline hit before child bound its listen socket. Treated as a
+    /// distinct failure mode from `ChildExited` because the child is
+    /// still alive (we kill it) and the cause may be external
+    /// (blocking syscall, wedged filesystem) rather than a clean error
+    /// path. `stderr_tail` carries whatever the child wrote in the
+    /// interim in case it's still informative.
+    #[error(
+        "MCP host failed to become ready within {seconds}s{}",
+        format_stderr_suffix(stderr_tail)
+    )]
+    StartupTimeout { seconds: u64, stderr_tail: String },
     #[error("unsupported: {0}")]
     Unsupported(String),
+}
+
+fn format_stderr_suffix(tail: &str) -> String {
+    if tail.is_empty() {
+        String::new()
+    } else {
+        format!(": {tail}")
+    }
 }
 
 pub async fn provision(
@@ -144,7 +182,10 @@ async fn provision_landlock(
     // /proc/<pid>/... under the same uid).
     cmd.stdin(std::process::Stdio::piped());
     cmd.stdout(std::process::Stdio::inherit());
-    cmd.stderr(std::process::Stdio::inherit());
+    // stderr is piped so we can grab a tail on startup failure. The
+    // spawned drainer below tees to the daemon's own stderr so
+    // journalctl still shows the child's output at runtime.
+    cmd.stderr(std::process::Stdio::piped());
     cmd.kill_on_drop(true);
 
     unsafe {
@@ -180,16 +221,72 @@ async fn provision_landlock(
             .map_err(|e| ProvisionError::Spawn(format!("closing child stdin: {e}")))?;
     }
 
-    wait_for_ready(&listen_addr, 10).await?;
+    // Start draining stderr in the background: tee to the daemon's own
+    // stderr (so journalctl keeps showing live child output) and also
+    // retain the last STDERR_TAIL_BYTES in a shared buffer for error
+    // reporting. Drops naturally when the child exits and closes the
+    // pipe.
+    let stderr_tail: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+    if let Some(pipe) = child.stderr.take() {
+        let tail = stderr_tail.clone();
+        tokio::spawn(drain_stderr(pipe, tail));
+    }
 
-    let mcp_url = format!("http://{listen_addr}/mcp");
-    info!(%mcp_url, "MCP host ready");
+    match wait_for_ready_or_exit(&listen_addr, 10, &mut child).await {
+        WaitOutcome::Listening => {
+            let mcp_url = format!("http://{listen_addr}/mcp");
+            info!(%mcp_url, "MCP host ready");
+            Ok(ProvisionedSession {
+                child,
+                mcp_url,
+                mcp_token,
+            })
+        }
+        WaitOutcome::Exited { code } => Err(ProvisionError::ChildExited {
+            code,
+            stderr_tail: read_tail(&stderr_tail).await,
+        }),
+        WaitOutcome::Timeout { seconds } => {
+            // Child is still running and not responding — kill it so
+            // we don't leak the process, then surface whatever stderr
+            // did accumulate (may be empty for a hung child).
+            let _ = child.kill().await;
+            Err(ProvisionError::StartupTimeout {
+                seconds,
+                stderr_tail: read_tail(&stderr_tail).await,
+            })
+        }
+    }
+}
 
-    Ok(ProvisionedSession {
-        child,
-        mcp_url,
-        mcp_token,
-    })
+async fn drain_stderr(mut pipe: tokio::process::ChildStderr, tail: Arc<Mutex<Vec<u8>>>) {
+    let mut real = tokio::io::stderr();
+    let mut chunk = [0u8; 4096];
+    loop {
+        match pipe.read(&mut chunk).await {
+            Ok(0) => break,
+            Ok(n) => {
+                let bytes = &chunk[..n];
+                // Tee to the daemon's own stderr: journalctl keeps the
+                // user-visible stream, even after startup succeeds.
+                let _ = real.write_all(bytes).await;
+                let _ = real.flush().await;
+                // Retain a bounded tail for error reporting.
+                let mut buf = tail.lock().await;
+                buf.extend_from_slice(bytes);
+                if buf.len() > STDERR_TAIL_BYTES {
+                    let drop_n = buf.len() - STDERR_TAIL_BYTES;
+                    buf.drain(..drop_n);
+                }
+            }
+            Err(_) => break,
+        }
+    }
+}
+
+async fn read_tail(buf: &Arc<Mutex<Vec<u8>>>) -> String {
+    let b = buf.lock().await;
+    String::from_utf8_lossy(&b).trim().to_string()
 }
 
 fn apply_landlock(
@@ -257,17 +354,91 @@ fn apply_landlock(
     Ok(())
 }
 
-/// Poll until a TCP connection to `addr` succeeds, or give up after
-/// `timeout_secs`.
-async fn wait_for_ready(addr: &str, timeout_secs: u64) -> Result<(), ProvisionError> {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_secs);
-    loop {
-        if tokio::time::Instant::now() >= deadline {
-            return Err(ProvisionError::StartupTimeout(timeout_secs));
+enum WaitOutcome {
+    /// Child bound the listen port — TCP connect succeeded.
+    Listening,
+    /// Child exited before binding. Surface with stderr tail so the
+    /// operator sees the real reason (bad config, missing path, etc.)
+    /// rather than a generic timeout.
+    Exited { code: Option<i32> },
+    /// Neither happened within the deadline. Child is still running;
+    /// caller is expected to kill it.
+    Timeout { seconds: u64 },
+}
+
+/// Poll TCP connect on `addr` until it succeeds, the child exits, or
+/// the deadline is hit — whichever comes first. Distinguishing the
+/// three outcomes is what lets the caller surface "your pod spec
+/// pointed at a nonexistent path" instead of "timeout waiting for
+/// readiness".
+async fn wait_for_ready_or_exit(addr: &str, timeout_secs: u64, child: &mut Child) -> WaitOutcome {
+    let connect_loop = async {
+        loop {
+            if TcpStream::connect(addr).await.is_ok() {
+                return WaitOutcome::Listening;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
         }
-        match TcpStream::connect(addr).await {
-            Ok(_) => return Ok(()),
-            Err(_) => tokio::time::sleep(Duration::from_millis(50)).await,
-        }
+    };
+    let exit_watch = async {
+        let code = child.wait().await.ok().and_then(|s| s.code());
+        WaitOutcome::Exited { code }
+    };
+    let deadline = tokio::time::sleep(Duration::from_secs(timeout_secs));
+
+    tokio::select! {
+        outcome = connect_loop => outcome,
+        outcome = exit_watch => outcome,
+        _ = deadline => WaitOutcome::Timeout { seconds: timeout_secs },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn child_exited_error_includes_stderr_tail() {
+        let err = ProvisionError::ChildExited {
+            code: Some(1),
+            stderr_tail: "Error: invalid workspace root \"/tmp/xyz\"".into(),
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("exit_code=Some(1)"), "got: {msg}");
+        assert!(msg.contains("invalid workspace root"), "got: {msg}");
+    }
+
+    #[test]
+    fn child_exited_without_stderr_has_no_dangling_colon() {
+        let err = ProvisionError::ChildExited {
+            code: Some(137),
+            stderr_tail: String::new(),
+        };
+        let msg = err.to_string();
+        assert!(!msg.ends_with(": "), "got: {msg}");
+        assert!(!msg.ends_with(':'), "got: {msg}");
+    }
+
+    #[test]
+    fn startup_timeout_includes_partial_stderr() {
+        let err = ProvisionError::StartupTimeout {
+            seconds: 10,
+            stderr_tail: "warning: still initializing".into(),
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("within 10s"), "got: {msg}");
+        assert!(msg.contains("still initializing"), "got: {msg}");
+    }
+
+    #[test]
+    fn startup_timeout_without_stderr_is_clean() {
+        let err = ProvisionError::StartupTimeout {
+            seconds: 10,
+            stderr_tail: String::new(),
+        };
+        assert_eq!(
+            err.to_string(),
+            "MCP host failed to become ready within 10s"
+        );
     }
 }
