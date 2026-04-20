@@ -350,6 +350,30 @@ pub struct HostEnvProviderInfo {
     /// boolean so the UI can show "authenticated" / "anonymous"
     /// status without exposing the secret.
     pub has_token: bool,
+    /// Last-known daemon liveness for this provider. Updated from
+    /// both periodic probes (on a background timer) and opportunistic
+    /// signals (provision success / connect-fail). `Unknown` means
+    /// the probe hasn't run yet — fresh registrations start here.
+    #[serde(default)]
+    pub reachability: HostEnvReachability,
+}
+
+/// Daemon-liveness status carried on `HostEnvProviderInfo`. Times are
+/// RFC-3339 strings so the protocol crate can stay chrono-free.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum HostEnvReachability {
+    /// No probe has completed yet. Also the state on boot before the
+    /// first tick fires.
+    #[default]
+    Unknown,
+    /// Last probe or provision succeeded. `at` is the observation time.
+    Reachable { at: String },
+    /// Last probe failed. `since` is the first failed observation
+    /// after the last `Reachable`, or first failure at all if we've
+    /// never seen it. `last_error` carries the most recent failure
+    /// message for operator display.
+    Unreachable { since: String, last_error: String },
 }
 
 /// Provenance enum for `HostEnvProviderInfo.origin`. Mirrors the

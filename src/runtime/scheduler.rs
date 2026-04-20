@@ -222,6 +222,11 @@ const CRON_TICK_SECS: u64 = 30;
 /// retention window is swept within 60 min. Missed tick behavior
 /// (Delay) prevents bursts when the process resumes after suspension.
 const RETENTION_TICK_SECS: u64 = 3600;
+/// How often host-env provider reachability is probed. 30 s means a
+/// daemon outage is visible in the WebUI within 30 s of the daemon
+/// going down. Also bounds how stale the reachability indicator can
+/// be when nothing else is exercising the provider.
+const HOST_ENV_PROBE_TICK_SECS: u64 = 30;
 
 /// Interim event a dispatched I/O task pushes back to the scheduler for
 /// immediate fan-out to subscribers. Distinct from the per-task I/O
@@ -506,6 +511,85 @@ impl Scheduler {
             .snapshot(|name| self.host_env_provider_origin(name))
     }
 
+    /// Build a single `HostEnvProviderInfo` from the live registry
+    /// state, with its origin classified. Returns `None` when the
+    /// name isn't in the registry. Used by the Add/Update response
+    /// paths so the wire record always reflects what the registry
+    /// actually holds (including reachability, which is live state).
+    pub(crate) fn host_env_provider_info(
+        &self,
+        name: &str,
+    ) -> Option<whisper_agent_protocol::HostEnvProviderInfo> {
+        let entry = self.host_env_registry.entry(name)?;
+        Some(whisper_agent_protocol::HostEnvProviderInfo {
+            name: name.to_string(),
+            url: entry.url.clone(),
+            origin: self.host_env_provider_origin(name),
+            has_token: entry.token.is_some(),
+            reachability: entry.reachability.clone(),
+        })
+    }
+
+    /// Enumerate one reachability-probe future per registered
+    /// provider. Each future resolves to a `SchedulerCompletion::Probe`
+    /// the run loop feeds back into `apply_probe_completion`. Clones
+    /// the `Arc<dyn HostEnvProvider>` so the probe future is
+    /// self-contained — the registry can mutate concurrently without
+    /// invalidating in-flight probes.
+    pub(crate) fn spawn_reachability_probes(
+        &self,
+    ) -> Vec<crate::runtime::io_dispatch::SchedulerFuture> {
+        use crate::runtime::io_dispatch::{ProbeCompletion, SchedulerCompletion};
+        let mut futs: Vec<crate::runtime::io_dispatch::SchedulerFuture> = Vec::new();
+        for name in self.host_env_registry.names() {
+            let Some(entry) = self.host_env_registry.entry(&name) else {
+                continue;
+            };
+            let provider = entry.provider.clone();
+            let name_owned = name.clone();
+            futs.push(Box::pin(async move {
+                let result = provider.probe().await.map_err(|e| e.to_string());
+                SchedulerCompletion::Probe(ProbeCompletion {
+                    name: name_owned,
+                    observed_at: chrono::Utc::now(),
+                    result,
+                })
+            }));
+        }
+        futs
+    }
+
+    /// Update the registry entry's reachability from a probe result
+    /// and emit a `HostEnvProviderUpdated` push if the state actually
+    /// changed. The "changed?" gate matters — a reachable daemon
+    /// would otherwise generate a push every probe tick.
+    pub(crate) fn apply_probe_completion(
+        &mut self,
+        probe: crate::runtime::io_dispatch::ProbeCompletion,
+    ) {
+        let crate::runtime::io_dispatch::ProbeCompletion {
+            name,
+            observed_at,
+            result,
+        } = probe;
+        let changed = match result {
+            Ok(()) => self.host_env_registry.mark_reachable(&name, observed_at),
+            Err(msg) => {
+                warn!(provider = %name, error = %msg, "host-env provider probe failed");
+                self.host_env_registry
+                    .mark_unreachable(&name, observed_at, msg)
+            }
+        };
+        if changed && let Some(info) = self.host_env_provider_info(&name) {
+            self.router.broadcast_resource(
+                whisper_agent_protocol::ServerToClient::HostEnvProviderUpdated {
+                    correlation_id: None,
+                    provider: info,
+                },
+            );
+        }
+    }
+
     /// Pod IDs whose `[[allow.host_env]]` references the given
     /// provider name. Used by the remove path to refuse removal while
     /// any loaded pod binding would be orphaned. Archived pods aren't
@@ -563,13 +647,8 @@ impl Scheduler {
                 now,
             ))?;
         self.host_env_registry
-            .insert_or_replace(name.clone(), url.clone(), token.clone());
-        Ok(whisper_agent_protocol::HostEnvProviderInfo {
-            name,
-            url,
-            origin: whisper_agent_protocol::HostEnvProviderOrigin::Manual,
-            has_token: token.is_some(),
-        })
+            .insert_or_replace(name.clone(), url, token);
+        Ok(self.host_env_provider_info(&name).expect("just inserted"))
     }
 
     /// Replace `url` and `token` on an existing catalog entry. Refuses
@@ -595,13 +674,8 @@ impl Scheduler {
         self.host_env_catalog
             .update(&name, url.clone(), token.clone(), now)?;
         self.host_env_registry
-            .insert_or_replace(name.clone(), url.clone(), token.clone());
-        Ok(whisper_agent_protocol::HostEnvProviderInfo {
-            origin: self.host_env_provider_origin(&name),
-            has_token: token.is_some(),
-            url,
-            name,
-        })
+            .insert_or_replace(name.clone(), url, token);
+        Ok(self.host_env_provider_info(&name).expect("just updated"))
     }
 
     /// Remove a provider from the catalog and live registry. Refuses
@@ -2156,6 +2230,45 @@ impl Scheduler {
             ProvisionResult::HostEnvMcpFailed { host_env_id, .. } => host_env_id.clone(),
         };
         self.provisioning_in_flight.remove(&completed_id);
+        // Opportunistic reachability: if the provision reached (or
+        // went past) the HostEnv phase, the daemon responded, so the
+        // provider is live; if it failed at the HostEnv phase, the
+        // daemon is unreachable or rejecting control-plane requests.
+        // Later phase failures (McpConnect, ListTools) imply the
+        // daemon *is* reachable — the sandbox came up — so we still
+        // report Reachable. We look up the provider name through the
+        // host_env_id's entry in `resources`.
+        let provider_name = self
+            .resources
+            .host_envs
+            .get(&completed_id)
+            .map(|e| e.provider.clone());
+        if let Some(provider_name) = provider_name {
+            let now = chrono::Utc::now();
+            let changed = match &result {
+                ProvisionResult::HostEnvMcpReady { .. } => {
+                    self.host_env_registry.mark_reachable(&provider_name, now)
+                }
+                ProvisionResult::HostEnvMcpFailed {
+                    phase: ProvisionPhase::HostEnv,
+                    message,
+                    ..
+                } => self
+                    .host_env_registry
+                    .mark_unreachable(&provider_name, now, message.clone()),
+                ProvisionResult::HostEnvMcpFailed { .. } => {
+                    self.host_env_registry.mark_reachable(&provider_name, now)
+                }
+            };
+            if changed && let Some(info) = self.host_env_provider_info(&provider_name) {
+                self.router.broadcast_resource(
+                    whisper_agent_protocol::ServerToClient::HostEnvProviderUpdated {
+                        correlation_id: None,
+                        provider: info,
+                    },
+                );
+            }
+        }
         match result {
             ProvisionResult::HostEnvMcpReady {
                 host_env_id,
@@ -2752,6 +2865,7 @@ pub async fn run(
     let mut gc_ticker = tokio::time::interval(Duration::from_secs(GC_TICK_SECS));
     let mut cron_ticker = tokio::time::interval(Duration::from_secs(CRON_TICK_SECS));
     let mut retention_ticker = tokio::time::interval(Duration::from_secs(RETENTION_TICK_SECS));
+    let mut probe_ticker = tokio::time::interval(Duration::from_secs(HOST_ENV_PROBE_TICK_SECS));
     // Skip the first immediate tick on all — `interval` fires at t=0 by default.
     gc_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     gc_ticker.tick().await;
@@ -2759,6 +2873,12 @@ pub async fn run(
     cron_ticker.tick().await;
     retention_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     retention_ticker.tick().await;
+    // Probe ticker differs: we *want* the first tick to fire immediately
+    // so reachability transitions from Unknown to Reachable/Unreachable
+    // as soon as the server is up, instead of staring at Unknown for
+    // 30 s. MissedTickBehavior::Skip prevents thundering-herd bursts
+    // after the process suspends and resumes (laptop lids etc.).
+    probe_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     // Apply each cron behavior's CatchUp policy to its persisted
     // cursor. Runs once at boot, before any tick evaluates for real.
@@ -2790,6 +2910,9 @@ pub async fn run(
                         SchedulerCompletion::Provision(prov) => {
                             scheduler.apply_provision_completion(prov, &mut pending_io);
                         }
+                        SchedulerCompletion::Probe(probe) => {
+                            scheduler.apply_probe_completion(probe);
+                        }
                     }
                 }
             }
@@ -2808,6 +2931,9 @@ pub async fn run(
             }
             _ = retention_ticker.tick() => {
                 scheduler.retention_sweep();
+            }
+            _ = probe_ticker.tick() => {
+                pending_io.extend(scheduler.spawn_reachability_probes());
             }
         }
         scheduler.flush_dirty().await;

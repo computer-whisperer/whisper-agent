@@ -106,6 +106,20 @@ impl ProvisionPhase {
 pub(crate) enum SchedulerCompletion {
     Io(IoCompletion),
     Provision(ProvisionCompletion),
+    Probe(ProbeCompletion),
+}
+
+/// Result of a host-env provider reachability probe (`GET /health`).
+/// Produced by the background ticker; consumed in
+/// `apply_probe_completion` where it updates the registry entry's
+/// `reachability` and emits a push if the state changed.
+pub(crate) struct ProbeCompletion {
+    pub(crate) name: String,
+    pub(crate) observed_at: chrono::DateTime<chrono::Utc>,
+    /// `Ok(())` on successful probe; `Err(message)` on any failure
+    /// (connect timeout, non-2xx, I/O error). The scheduler maps the
+    /// error message to the `last_error` string on the registry.
+    pub(crate) result: Result<(), String>,
 }
 
 pub(crate) type SchedulerFuture = Pin<Box<dyn Future<Output = SchedulerCompletion> + Send>>;

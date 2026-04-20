@@ -26,11 +26,30 @@ use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::time::Duration;
 
 use thiserror::Error;
 use tracing::{info, warn};
 use whisper_agent_protocol::HostEnvSpec;
 use whisper_agent_protocol::sandbox::{ProvisionRequest, ProvisionResponse, TeardownRequest};
+
+/// TCP connect timeout for every daemon request. A powered-off daemon
+/// host would otherwise hang on Linux's default SYN retry for minutes;
+/// 5s is generous for any real LAN/loopback daemon and fails fast on
+/// everything else. Applies to probe, provision, and teardown alike.
+pub const DAEMON_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Overall request timeout for provision / teardown. The daemon may do
+/// real work on provision (spawn MCP host, set up cgroups / namespaces)
+/// so we can't make this too tight. 30s covers comfortable worst cases
+/// without letting a stuck daemon wedge the scheduler indefinitely.
+pub const DAEMON_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Overall request timeout for reachability probes. /health on a live
+/// daemon returns in single-digit ms, so anything over a few seconds
+/// means something is wedged — report unreachable and let the next
+/// probe tick try again.
+pub const DAEMON_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 
 type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
@@ -42,6 +61,11 @@ pub enum HostEnvError {
     Teardown(String),
     #[error("unknown provider `{0}` (not in host_env_providers catalog)")]
     UnknownProvider(String),
+    /// Reachability probe failed. Distinct from `Provision` so the
+    /// scheduler can update the registry entry's reachability without
+    /// confusing it with a real provision attempt.
+    #[error("probe failed: {0}")]
+    Probe(String),
 }
 
 /// One entry in the server's host-env-provider catalog. Loaded from
@@ -70,6 +94,13 @@ pub trait HostEnvProvider: Send + Sync {
         thread_id: &'a str,
         spec: &'a HostEnvSpec,
     ) -> BoxFuture<'a, Result<Box<dyn HostEnvHandle>, HostEnvError>>;
+
+    /// Lightweight liveness probe. The scheduler runs this periodically
+    /// and opportunistically to update the provider's `Reachability`.
+    /// Must finish quickly (single-digit seconds at most) because the
+    /// probe ticker fires every N seconds for every provider — a slow
+    /// probe drags the scheduler.
+    fn probe(&self) -> BoxFuture<'_, Result<(), HostEnvError>>;
 }
 
 /// A running host env. Held by the scheduler for the env's lifetime.
@@ -109,12 +140,43 @@ pub struct DaemonClient {
 
 impl DaemonClient {
     pub fn new(name: String, daemon_url: String, control_token: Option<String>) -> Self {
+        let http = reqwest::Client::builder()
+            .connect_timeout(DAEMON_CONNECT_TIMEOUT)
+            .timeout(DAEMON_REQUEST_TIMEOUT)
+            .build()
+            .unwrap_or_else(|e| {
+                // Falls back to the default client rather than panicking:
+                // a misconfigured rustls/native-tls provider is the only
+                // plausible failure here, and we'd rather the next
+                // request surface the real error than fail at registry
+                // construction.
+                warn!(error = %e, "reqwest client builder failed; falling back to defaults");
+                reqwest::Client::new()
+            });
         Self {
             name,
-            http: reqwest::Client::new(),
+            http,
             daemon_url: daemon_url.trim_end_matches('/').to_string(),
             control_token,
         }
+    }
+
+    async fn probe_inner(&self) -> Result<(), HostEnvError> {
+        let url = format!("{}/health", self.daemon_url);
+        let resp = self
+            .http
+            .get(&url)
+            .timeout(DAEMON_PROBE_TIMEOUT)
+            .send()
+            .await
+            .map_err(|e| HostEnvError::Probe(format!("daemon unreachable: {e}")))?;
+        if !resp.status().is_success() {
+            return Err(HostEnvError::Probe(format!(
+                "daemon /health returned {}",
+                resp.status()
+            )));
+        }
+        Ok(())
     }
 }
 
@@ -170,6 +232,10 @@ impl HostEnvProvider for DaemonClient {
                 mcp_token: prov.mcp_token,
             }) as Box<dyn HostEnvHandle>)
         })
+    }
+
+    fn probe(&self) -> BoxFuture<'_, Result<(), HostEnvError>> {
+        Box::pin(self.probe_inner())
     }
 }
 
@@ -242,6 +308,11 @@ pub struct RegistryEntry {
     /// token, which the caller is responsible for being aware of.
     pub token: Option<String>,
     pub provider: Arc<dyn HostEnvProvider>,
+    /// Last observed reachability — updated by periodic probes and
+    /// opportunistically by provision success / connect-fail. Starts
+    /// `Unknown` at registration and moves to `Reachable` or
+    /// `Unreachable` as signals arrive.
+    pub reachability: whisper_agent_protocol::HostEnvReachability,
 }
 
 impl HostEnvRegistry {
@@ -292,6 +363,56 @@ impl HostEnvRegistry {
         self.providers.get(name)
     }
 
+    /// Mark `name` reachable at the given observation time. Returns
+    /// whether the state actually changed (so callers can avoid
+    /// broadcasting a no-op push).
+    pub fn mark_reachable(&mut self, name: &str, at: chrono::DateTime<chrono::Utc>) -> bool {
+        use whisper_agent_protocol::HostEnvReachability;
+        let Some(entry) = self.providers.get_mut(name) else {
+            return false;
+        };
+        let at_str = at.to_rfc3339();
+        let new_state = HostEnvReachability::Reachable { at: at_str };
+        if entry.reachability == new_state {
+            return false;
+        }
+        entry.reachability = new_state;
+        true
+    }
+
+    /// Mark `name` unreachable. Preserves `since` across successive
+    /// failures so operators see how long the outage has lasted —
+    /// only the first failure after a `Reachable` / `Unknown` resets
+    /// it. Returns whether the state changed.
+    pub fn mark_unreachable(
+        &mut self,
+        name: &str,
+        at: chrono::DateTime<chrono::Utc>,
+        error: String,
+    ) -> bool {
+        use whisper_agent_protocol::HostEnvReachability;
+        let Some(entry) = self.providers.get_mut(name) else {
+            return false;
+        };
+        let at_str = at.to_rfc3339();
+        let new_state = match &entry.reachability {
+            HostEnvReachability::Unreachable { since, .. } => HostEnvReachability::Unreachable {
+                since: since.clone(),
+                last_error: error,
+            },
+            // Unknown or Reachable → start a fresh outage window.
+            _ => HostEnvReachability::Unreachable {
+                since: at_str,
+                last_error: error,
+            },
+        };
+        if entry.reachability == new_state {
+            return false;
+        }
+        entry.reachability = new_state;
+        true
+    }
+
     pub fn contains(&self, name: &str) -> bool {
         self.providers.contains_key(name)
     }
@@ -334,6 +455,7 @@ impl HostEnvRegistry {
                     origin: origin_for(&name),
                     has_token: entry.token.is_some(),
                     url: entry.url.clone(),
+                    reachability: entry.reachability.clone(),
                     name,
                 }
             })
@@ -353,6 +475,7 @@ fn build_entry(name: String, url: String, token: Option<String>) -> RegistryEntr
         url: url.clone(),
         token: token.clone(),
         provider: Arc::new(DaemonClient::new(name, url, token)) as Arc<dyn HostEnvProvider>,
+        reachability: whisper_agent_protocol::HostEnvReachability::Unknown,
     }
 }
 
@@ -461,6 +584,103 @@ mod tests {
         std::fs::write(&path, "   \n\n").unwrap();
         let err = read_token_file("x", &path).unwrap_err();
         assert!(format!("{err}").contains("empty after trim"));
+    }
+
+    #[test]
+    fn reachability_starts_unknown() {
+        let mut r = HostEnvRegistry::new();
+        r.insert("a".into(), "http://a".into(), None).unwrap();
+        let e = r.entry("a").unwrap();
+        assert!(matches!(
+            e.reachability,
+            whisper_agent_protocol::HostEnvReachability::Unknown
+        ));
+    }
+
+    #[test]
+    fn mark_reachable_transitions_and_dedups() {
+        let mut r = HostEnvRegistry::new();
+        r.insert("a".into(), "http://a".into(), None).unwrap();
+        let t1 = chrono::DateTime::parse_from_rfc3339("2026-04-20T12:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        assert!(r.mark_reachable("a", t1));
+        // Same state, same timestamp → no change.
+        assert!(!r.mark_reachable("a", t1));
+        let t2 = t1 + chrono::Duration::seconds(30);
+        // Different timestamp → state changes.
+        assert!(r.mark_reachable("a", t2));
+    }
+
+    #[test]
+    fn mark_unreachable_preserves_since_across_failures() {
+        use whisper_agent_protocol::HostEnvReachability;
+        let mut r = HostEnvRegistry::new();
+        r.insert("a".into(), "http://a".into(), None).unwrap();
+        let t1 = chrono::DateTime::parse_from_rfc3339("2026-04-20T12:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        r.mark_unreachable("a", t1, "connect refused".into());
+        let t2 = t1 + chrono::Duration::seconds(30);
+        r.mark_unreachable("a", t2, "connect timeout".into());
+        match &r.entry("a").unwrap().reachability {
+            HostEnvReachability::Unreachable { since, last_error } => {
+                assert_eq!(
+                    since,
+                    &t1.to_rfc3339(),
+                    "since must be pinned to first failure"
+                );
+                assert_eq!(last_error, "connect timeout");
+            }
+            other => panic!("expected Unreachable, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn reachable_to_unreachable_resets_since() {
+        use whisper_agent_protocol::HostEnvReachability;
+        let mut r = HostEnvRegistry::new();
+        r.insert("a".into(), "http://a".into(), None).unwrap();
+        let t1 = chrono::DateTime::parse_from_rfc3339("2026-04-20T12:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        r.mark_reachable("a", t1);
+        let t2 = t1 + chrono::Duration::seconds(30);
+        r.mark_unreachable("a", t2, "oops".into());
+        match &r.entry("a").unwrap().reachability {
+            HostEnvReachability::Unreachable { since, .. } => {
+                // Since must be t2 (first failure after reachable), not t1.
+                assert_eq!(since, &t2.to_rfc3339());
+            }
+            other => panic!("expected Unreachable, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn insert_or_replace_resets_reachability() {
+        use whisper_agent_protocol::HostEnvReachability;
+        let mut r = HostEnvRegistry::new();
+        r.insert("a".into(), "http://a".into(), None).unwrap();
+        let t1 = chrono::DateTime::parse_from_rfc3339("2026-04-20T12:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        r.mark_reachable("a", t1);
+        // Update flows through insert_or_replace; it rebuilds the entry
+        // so reachability goes back to Unknown — makes sense because
+        // the URL may now point at a different daemon.
+        r.insert_or_replace("a".into(), "http://a2".into(), Some("tok".into()));
+        assert!(matches!(
+            r.entry("a").unwrap().reachability,
+            HostEnvReachability::Unknown
+        ));
+    }
+
+    #[test]
+    fn mark_on_missing_name_is_noop() {
+        let mut r = HostEnvRegistry::new();
+        let t1 = chrono::Utc::now();
+        assert!(!r.mark_reachable("nope", t1));
+        assert!(!r.mark_unreachable("nope", t1, "x".into()));
     }
 
     #[test]
