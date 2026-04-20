@@ -53,10 +53,26 @@ class WireClient {
             }
 
             override fun onMessage(webSocket: WebSocket, bytes: ByteString) {
+                val raw = bytes.toByteArray()
                 val decoded = try {
-                    Codec.decodeFromServer(bytes.toByteArray())
+                    Codec.decodeFromServer(raw)
                 } catch (t: Throwable) {
-                    Log.w(TAG, "decode failed", t)
+                    // Hex-dump the (prefix of the) failing frame so we can
+                    // offline-decode it with ciborium and see which field the
+                    // Kotlin mirror disagrees with. Chunked logcat output
+                    // because a full snapshot can easily exceed the ~4 KB line
+                    // limit Android truncates at.
+                    val cap = minOf(raw.size, 131_072)
+                    val hex = buildString(cap * 2) {
+                        for (i in 0 until cap) append(HEX[(raw[i].toInt() ushr 4) and 0xF]).append(HEX[raw[i].toInt() and 0xF])
+                    }
+                    Log.w(TAG, "decode failed: ${t.message} (total=${raw.size}B)")
+                    var i = 0
+                    while (i < hex.length) {
+                        val end = minOf(i + 3800, hex.length)
+                        Log.w(TAG, "hex[$i..${end - 1}]=${hex.substring(i, end)}")
+                        i = end
+                    }
                     return
                 }
                 _incoming.tryEmit(decoded)
@@ -104,6 +120,10 @@ class WireClient {
     companion object {
         private const val TAG = "WireClient"
         private const val NORMAL_CLOSURE = 1000
+        private val HEX = charArrayOf(
+            '0', '1', '2', '3', '4', '5', '6', '7',
+            '8', '9', 'a', 'b', 'c', 'd', 'e', 'f',
+        )
 
         /**
          * `https://host[:port]` → `wss://host[:port]/ws`; `http://` → `ws://`.

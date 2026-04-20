@@ -1,0 +1,225 @@
+package com.cjbal.whisperagent.protocol
+
+import kotlin.test.Test
+import kotlin.test.assertContentEquals
+import kotlin.test.assertEquals
+import kotlin.test.assertIs
+import kotlin.test.assertTrue
+import kotlinx.serialization.ExperimentalSerializationApi
+import kotlinx.serialization.cbor.Cbor
+
+@OptIn(ExperimentalSerializationApi::class)
+class CodecTest {
+
+    private val cbor = Cbor {
+        ignoreUnknownKeys = true
+        useDefiniteLengthEncoding = true
+    }
+
+    // --- ClientToServer -------------------------------------------------------
+
+    @Test
+    fun clientToServer_listThreads_bare() {
+        // Matches serde `#[serde(tag = "type", rename_all = "snake_case")]` with
+        // correlation_id skipped (None + skip_serializing_if = Option::is_none).
+        val bytes = Codec.encodeToServer(ClientToServer.ListThreads())
+        // Expected CBOR: map with 1 entry { "type": "list_threads" }
+        //   0xA1 = map(1)
+        //   0x64 = text(4), "type"
+        //   0x6C = text(12), "list_threads"
+        val expected = byteArrayOf(
+            0xA1.toByte(),
+            0x64, 't'.code.toByte(), 'y'.code.toByte(), 'p'.code.toByte(), 'e'.code.toByte(),
+            0x6C,
+            'l'.code.toByte(), 'i'.code.toByte(), 's'.code.toByte(), 't'.code.toByte(),
+            '_'.code.toByte(),
+            't'.code.toByte(), 'h'.code.toByte(), 'r'.code.toByte(), 'e'.code.toByte(),
+            'a'.code.toByte(), 'd'.code.toByte(), 's'.code.toByte(),
+        )
+        assertContentEquals(expected, bytes)
+    }
+
+    @Test
+    fun clientToServer_sendUserMessage_roundTrip() {
+        val original = ClientToServer.SendUserMessage(threadId = "t-42", text = "hello")
+        val bytes = Codec.encodeToServer(original)
+        // Decode via the same serializer to check self-consistency.
+        val decoded = cbor.decodeFromByteArray(ClientToServer.serializer(), bytes)
+        assertEquals(original, decoded)
+    }
+
+    @Test
+    fun clientToServer_approvalDecision_omitsRememberFalse() {
+        // Matches Rust `#[serde(default)] remember: bool` — false is not emitted.
+        val bytes = Codec.encodeToServer(
+            ClientToServer.ApprovalDecision(
+                threadId = "t-1",
+                approvalId = "a-1",
+                decision = ApprovalChoice.Approve,
+                remember = false,
+            ),
+        )
+        // The serialized map should have exactly 4 entries (type, thread_id,
+        // approval_id, decision) — `remember` omitted.
+        // First byte encodes map-header; for ≤23 entries it's 0xA0 + len.
+        assertEquals(0xA4.toByte(), bytes[0])
+    }
+
+    @Test
+    fun clientToServer_approvalDecision_includesRememberTrue() {
+        val bytes = Codec.encodeToServer(
+            ClientToServer.ApprovalDecision(
+                threadId = "t-1",
+                approvalId = "a-1",
+                decision = ApprovalChoice.Approve,
+                remember = true,
+            ),
+        )
+        assertEquals(0xA5.toByte(), bytes[0])
+    }
+
+    // --- ServerToClient -------------------------------------------------------
+
+    @Test
+    fun serverToClient_threadList_roundTrip() {
+        val original = ServerToClient.ThreadList(
+            correlationId = "corr-1",
+            tasks = listOf(
+                ThreadSummary(
+                    threadId = "t-1",
+                    podId = "p-1",
+                    title = "hello",
+                    state = ThreadStateLabel.Idle,
+                    createdAt = "2026-04-20T00:00:00Z",
+                    lastActive = "2026-04-20T00:00:01Z",
+                ),
+            ),
+        )
+        val bytes = cbor.encodeToByteArray(ServerToClient.serializer(), original)
+        val decoded = Codec.decodeFromServer(bytes)
+        assertEquals(original, decoded)
+    }
+
+    @Test
+    fun serverToClient_unknown_variantFallback() {
+        // Simulate a server frame with a type our Kotlin mirror doesn't know —
+        // construct it by hand as a CBOR map { "type": "host_env_provider_added" }.
+        val rawCbor = byteArrayOf(
+            0xA1.toByte(), // map(1)
+            0x64, 't'.code.toByte(), 'y'.code.toByte(), 'p'.code.toByte(), 'e'.code.toByte(),
+            0x78, 0x19, // text(25)
+            'h'.code.toByte(), 'o'.code.toByte(), 's'.code.toByte(), 't'.code.toByte(),
+            '_'.code.toByte(),
+            'e'.code.toByte(), 'n'.code.toByte(), 'v'.code.toByte(),
+            '_'.code.toByte(),
+            'p'.code.toByte(), 'r'.code.toByte(), 'o'.code.toByte(), 'v'.code.toByte(),
+            'i'.code.toByte(), 'd'.code.toByte(), 'e'.code.toByte(), 'r'.code.toByte(),
+            '_'.code.toByte(),
+            'a'.code.toByte(), 'd'.code.toByte(), 'd'.code.toByte(), 'e'.code.toByte(),
+            'd'.code.toByte(),
+        )
+        val decoded = Codec.decodeFromServer(rawCbor)
+        val unknown = assertIs<ServerToClient.Unknown>(decoded)
+        assertEquals("host_env_provider_added", unknown.type)
+    }
+
+    @Test
+    fun serverToClient_assistantTextDelta_roundTrip() {
+        val original = ServerToClient.AssistantTextDelta(threadId = "t-1", delta = "Hello ")
+        val bytes = cbor.encodeToByteArray(ServerToClient.serializer(), original)
+        val decoded = Codec.decodeFromServer(bytes)
+        assertEquals(original, decoded)
+    }
+
+    @Test
+    fun serverToClient_error_roundTrip_nullThreadId() {
+        val original = ServerToClient.Error(
+            correlationId = null,
+            threadId = null,
+            message = "something broke",
+        )
+        val bytes = cbor.encodeToByteArray(ServerToClient.serializer(), original)
+        val decoded = Codec.decodeFromServer(bytes)
+        assertEquals(original, decoded)
+    }
+
+    // --- ContentBlock ---------------------------------------------------------
+
+    @Test
+    fun contentBlock_text_roundTrip() {
+        val original = ContentBlock.Text("hi")
+        val bytes = cbor.encodeToByteArray(ContentBlock.serializer(), original)
+        val decoded = cbor.decodeFromByteArray(ContentBlock.serializer(), bytes)
+        assertEquals(original, decoded)
+    }
+
+    @Test
+    fun contentBlock_discriminatorIsFirstKey() {
+        // Smoke-check the internal-tagging shape: after the CBOR map header
+        // byte, the next payload should be the 4-byte string "type".
+        val bytes = cbor.encodeToByteArray(ContentBlock.serializer(), ContentBlock.Text("hi"))
+        // header + "type" header (0x64 = text(4))
+        assertEquals(0x64.toByte(), bytes[1])
+        assertEquals('t'.code.toByte(), bytes[2])
+    }
+
+    @Test
+    fun contentBlock_thinking_roundTrip() {
+        val original = ContentBlock.Thinking("considering")
+        val bytes = cbor.encodeToByteArray(ContentBlock.serializer(), original)
+        val decoded = cbor.decodeFromByteArray(ContentBlock.serializer(), bytes)
+        assertEquals(original, decoded)
+    }
+
+    @Test
+    fun contentBlock_toolSchema_roundTrip() {
+        val original = ContentBlock.ToolSchema(name = "bash", description = "runs shell")
+        val bytes = cbor.encodeToByteArray(ContentBlock.serializer(), original)
+        val decoded = cbor.decodeFromByteArray(ContentBlock.serializer(), bytes)
+        assertEquals(original, decoded)
+    }
+
+    // --- Nested: ThreadSnapshot with ContentBlocks ----------------------------
+
+    @Test
+    fun serverToClient_snapshot_withNestedContentBlocks_roundTrip() {
+        val original = ServerToClient.Snapshot(
+            threadId = "t-7",
+            snapshot = ThreadSnapshot(
+                threadId = "t-7",
+                podId = "p-1",
+                title = null,
+                config = ThreadConfig(model = "claude-opus-4-7", maxTokens = 4096, maxTurns = 32),
+                state = ThreadStateLabel.Idle,
+                conversation = listOf(
+                    Message(role = Role.User, content = listOf(ContentBlock.Text("hello"))),
+                    Message(
+                        role = Role.Assistant,
+                        content = listOf(
+                            ContentBlock.Thinking("let me think"),
+                            ContentBlock.Text("hi there"),
+                        ),
+                    ),
+                ),
+                totalUsage = Usage(inputTokens = 12, outputTokens = 8),
+                createdAt = "2026-04-20T00:00:00Z",
+                lastActive = "2026-04-20T00:00:01Z",
+            ),
+        )
+        val bytes = cbor.encodeToByteArray(ServerToClient.serializer(), original)
+        val decoded = Codec.decodeFromServer(bytes)
+        assertEquals(original, decoded)
+    }
+
+    // --- Smoke check on the old-broken shape ----------------------------------
+
+    @Test
+    fun clientToServer_isNotArrayShape() {
+        // Regression guard: kotlinx-cbor's default polymorphic encoding is a
+        // 2-element CBOR array (major type 4 = 0x80..0x9F). If someone removes
+        // the `@Serializable(with = ...)` annotation, this test catches it.
+        val bytes = Codec.encodeToServer(ClientToServer.ListThreads())
+        val firstByte = bytes[0].toInt() and 0xFF
+        assertTrue(firstByte in 0xA0..0xBF, "expected CBOR map, got first byte 0x${firstByte.toString(16)}")
+    }
+}
