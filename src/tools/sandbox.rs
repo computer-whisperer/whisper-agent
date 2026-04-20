@@ -53,6 +53,34 @@ pub const DAEMON_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 
 type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
+/// Replace the host portion of a URL returned by the sandbox daemon's
+/// `/provision` with the host we already used to reach that daemon.
+///
+/// The daemon builds `mcp_url` from the IP its MCP host child is bound
+/// to. If the daemon binds `[::]` or is running on a remote LAN host
+/// (we reach it over an IPv6 ULA), the child's literal bind IP isn't
+/// useful to us — either it's the wildcard literal or it's the
+/// daemon's local view of its own interface. Either way, our known-
+/// reachable handle on the daemon is the URL we used to POST
+/// `/provision`; re-using that host with the child's port is correct.
+///
+/// Scheme and path are preserved from the child URL (it may not be
+/// http the daemon itself speaks, and `/mcp` etc. are the child's
+/// concern). Port is preserved as given by the daemon.
+fn rewrite_mcp_host(daemon_url: &str, mcp_url: &str) -> Result<String, HostEnvError> {
+    let daemon = url::Url::parse(daemon_url)
+        .map_err(|e| HostEnvError::Provision(format!("daemon URL unparseable: {e}")))?;
+    let mut mcp = url::Url::parse(mcp_url).map_err(|e| {
+        HostEnvError::Provision(format!("daemon returned unparseable mcp_url: {e}"))
+    })?;
+    let host = daemon
+        .host_str()
+        .ok_or_else(|| HostEnvError::Provision("daemon URL has no host".into()))?;
+    mcp.set_host(Some(host))
+        .map_err(|e| HostEnvError::Provision(format!("host swap on mcp_url failed: {e}")))?;
+    Ok(mcp.into())
+}
+
 #[derive(Debug, Error)]
 pub enum HostEnvError {
     #[error("provision failed: {0}")]
@@ -215,11 +243,20 @@ impl HostEnvProvider for DaemonClient {
                 .await
                 .map_err(|e| HostEnvError::Provision(format!("bad response: {e}")))?;
 
+            // The daemon returns a URL whose host is whatever IP it
+            // bound the MCP host child on — fine for a local daemon, but
+            // if the daemon bound `[::]` / `0.0.0.0` or we reached it
+            // over a LAN address, the returned host is unreachable from
+            // here. Swap it for the host we already used to reach the
+            // daemon control plane, which is reachable by construction.
+            let mcp_url = rewrite_mcp_host(&self.daemon_url, &prov.mcp_url)?;
+
             info!(
                 thread_id,
                 provider = %self.name,
                 session_id = %prov.session_id,
-                mcp_url = %prov.mcp_url,
+                daemon_mcp_url = %prov.mcp_url,
+                %mcp_url,
                 "host env provisioned"
             );
 
@@ -228,7 +265,7 @@ impl HostEnvProvider for DaemonClient {
                 daemon_url: self.daemon_url.clone(),
                 control_token: self.control_token.clone(),
                 session_id: prov.session_id,
-                mcp_url: prov.mcp_url,
+                mcp_url,
                 mcp_token: prov.mcp_token,
             }) as Box<dyn HostEnvHandle>)
         })
@@ -502,6 +539,35 @@ pub fn read_token_file(provider_name: &str, path: &std::path::Path) -> anyhow::R
 mod tests {
     use super::*;
     use whisper_agent_protocol::HostEnvProviderOrigin;
+
+    #[test]
+    fn rewrite_mcp_host_swaps_ipv4_loopback_for_lan_host() {
+        let out = rewrite_mcp_host(
+            "http://[fdb7:1860:52b3:2600::1]:9820",
+            "http://127.0.0.1:9901/mcp",
+        )
+        .unwrap();
+        assert_eq!(out, "http://[fdb7:1860:52b3:2600::1]:9901/mcp");
+    }
+
+    #[test]
+    fn rewrite_mcp_host_swaps_ipv6_unspecified_for_dns_name() {
+        let out = rewrite_mcp_host("http://sandbox.lan:9820", "http://[::]:9901/mcp").unwrap();
+        assert_eq!(out, "http://sandbox.lan:9901/mcp");
+    }
+
+    #[test]
+    fn rewrite_mcp_host_preserves_port_and_path() {
+        let out =
+            rewrite_mcp_host("http://10.0.0.5:9820/", "http://127.0.0.1:12345/mcp/v2").unwrap();
+        assert_eq!(out, "http://10.0.0.5:12345/mcp/v2");
+    }
+
+    #[test]
+    fn rewrite_mcp_host_rejects_unparseable_inputs() {
+        assert!(rewrite_mcp_host("not a url", "http://127.0.0.1:9901/mcp").is_err());
+        assert!(rewrite_mcp_host("http://a:9820", "::::").is_err());
+    }
 
     #[test]
     fn empty_registry_is_empty() {

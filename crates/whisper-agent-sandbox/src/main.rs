@@ -48,9 +48,11 @@ use whisper_agent_protocol::sandbox::{
     about = "Sandbox provisioning daemon"
 )]
 struct Args {
-    /// Address to listen on. Defaults to dual-stack (`[::]:9810`); the
-    /// daemon is reachable on both IPv6 and IPv4 (via v4-mapped) so a
-    /// remote `whisper-agent` server can connect from either family.
+    /// Address to listen on. Defaults to dual-stack (`[::]:9810`) for
+    /// the in-tree dev harness; the packaged systemd service overrides
+    /// this to `[::]:9820` so the two can run side by side. The
+    /// provisioned MCP host children bind on the same IP, so their
+    /// reachability tracks the daemon's.
     #[arg(long, default_value = "[::]:9810")]
     listen: SocketAddr,
 
@@ -86,6 +88,10 @@ struct DaemonState {
     sessions: Mutex<HashMap<String, Session>>,
     /// Expected control-plane bearer. `None` means `--no-auth`.
     control_token: Option<Arc<String>>,
+    /// The IP the daemon binds on. Provisioned MCP host children reuse
+    /// it so their network exposure matches the daemon's (dual-stack
+    /// when `[::]`, loopback-only when `127.0.0.1`, etc.).
+    bind_ip: std::net::IpAddr,
 }
 
 #[tokio::main]
@@ -127,6 +133,7 @@ async fn main() -> anyhow::Result<()> {
         mcp_host_bin: args.mcp_host_bin,
         sessions: Mutex::new(HashMap::new()),
         control_token,
+        bind_ip: listen.ip(),
     });
 
     // /health is deliberately exempt from auth so liveness/readiness
@@ -220,7 +227,7 @@ async fn handle_provision(
         }
     }
 
-    match provision::provision(&req.spec, &state.mcp_host_bin).await {
+    match provision::provision(&req.spec, &state.mcp_host_bin, state.bind_ip).await {
         Ok(session) => {
             let session_id = req.thread_id.clone();
             let mcp_url = session.mcp_url.clone();

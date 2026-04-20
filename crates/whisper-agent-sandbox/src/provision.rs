@@ -3,6 +3,7 @@
 //! Each backend takes a [`HostEnvSpec`] variant and produces a running MCP host
 //! process inside the appropriate isolation boundary.
 
+use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicU16, Ordering};
 use std::time::Duration;
 
@@ -13,8 +14,11 @@ use tokio::process::{Child, Command};
 use tracing::info;
 use whisper_agent_protocol::sandbox::{AccessMode, HostEnvSpec, NetworkPolicy, PathAccess};
 
-/// Port range for spawned MCP host instances. Each provision bumps the counter.
-static NEXT_PORT: AtomicU16 = AtomicU16::new(9820);
+/// Port range for spawned MCP host instances. Each provision bumps the
+/// counter. Starts well above the sibling daemon ports (sandbox 9810/9820,
+/// fetch 9830, search 9831) so the in-tree dev harness and the packaged
+/// systemd service can coexist on one host without colliding.
+static NEXT_PORT: AtomicU16 = AtomicU16::new(9900);
 
 pub struct ProvisionedSession {
     pub child: Child,
@@ -57,12 +61,13 @@ pub enum ProvisionError {
 pub async fn provision(
     spec: &HostEnvSpec,
     mcp_host_bin: &str,
+    bind_ip: IpAddr,
 ) -> Result<ProvisionedSession, ProvisionError> {
     match spec {
         HostEnvSpec::Landlock {
             allowed_paths,
             network,
-        } => provision_landlock(allowed_paths, network, mcp_host_bin).await,
+        } => provision_landlock(allowed_paths, network, mcp_host_bin, bind_ip).await,
         HostEnvSpec::Container { .. } => Err(ProvisionError::Unsupported(
             "container provisioning not yet implemented".into(),
         )),
@@ -94,6 +99,7 @@ async fn provision_landlock(
     allowed_paths: &[PathAccess],
     network: &NetworkPolicy,
     mcp_host_bin: &str,
+    bind_ip: IpAddr,
 ) -> Result<ProvisionedSession, ProvisionError> {
     let workspace_root = allowed_paths
         .iter()
@@ -104,7 +110,13 @@ async fn provision_landlock(
     let bin_dir = resolve_bin_dir(mcp_host_bin)?;
 
     let port = NEXT_PORT.fetch_add(1, Ordering::Relaxed);
-    let listen_addr = format!("127.0.0.1:{port}");
+    // Bind the MCP host child on the same interface the daemon itself
+    // listens on. If the daemon is on `[::]` or `0.0.0.0` (dual-stack
+    // wildcard), the child is reachable on every interface the daemon
+    // is; if the daemon is loopback-only, the child stays loopback-only
+    // as well. This keeps the child's network exposure in lockstep with
+    // an operator's conscious choice for the daemon.
+    let listen_addr = SocketAddr::new(bind_ip, port).to_string();
 
     info!(
         %workspace_root,

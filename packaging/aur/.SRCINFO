@@ -1,6 +1,6 @@
 pkgbase = whisper-agent-host
 	pkgdesc = Host-side sandbox daemon for whisper-agent (landlock-isolated per-thread MCP hosts)
-	pkgver = 0.2.0
+	pkgver = 0.2.1
 	pkgrel = 1
 	url = https://github.com/computer-whisperer/whisper-agent
 	install = whisper-agent-host.install
@@ -16,7 +16,7 @@ pkgbase = whisper-agent-host
 	provides = whisper-agent-sandbox
 	provides = whisper-agent-mcp-host
 	backup = etc/whisper-agent/sandbox.env
-	source = whisper-agent-host-0.2.0.tar.gz::https://github.com/computer-whisperer/whisper-agent/archive/v0.2.0.tar.gz
+	source = whisper-agent-host-0.2.1.tar.gz::https://github.com/computer-whisperer/whisper-agent/archive/v0.2.1.tar.gz
 	source = sandbox.env
 	source = whisper-agent-sandbox.service
 	source = ensure-control-token.sh
