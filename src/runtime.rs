@@ -10,5 +10,6 @@
 
 pub mod audit;
 pub mod io_dispatch;
+pub mod memory_snapshot;
 pub mod scheduler;
 pub mod thread;

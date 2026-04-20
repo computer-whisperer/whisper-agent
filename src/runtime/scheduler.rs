@@ -1362,6 +1362,13 @@ impl Scheduler {
         if self.host_env_mcp_is_ready(thread_id) {
             self.push_tools_snapshot(thread_id);
         }
+        // Memory index: read at thread-creation time and persist into
+        // the conversation as a Role::System message right after the
+        // tool manifest (or after System if Tools hasn't landed yet —
+        // the tight `setup_prefix_end` logic routes Tools into its
+        // slot on arrival, shuffling Memory to index 2). Idempotent:
+        // skipped silently if a prior call already planted the block.
+        self.push_memory_snapshot(thread_id);
         self.mark_dirty(thread_id);
     }
 
@@ -1442,6 +1449,63 @@ impl Scheduler {
                 at,
                 whisper_agent_protocol::Message::tools_manifest(tool_blocks),
             );
+            Some(task.snapshot())
+        } else {
+            None
+        };
+        self.mark_dirty(thread_id);
+        if let Some(snapshot) = snapshot {
+            self.router.broadcast_to_subscribers(
+                thread_id,
+                ServerToClient::ThreadSnapshot {
+                    thread_id: thread_id.to_string(),
+                    snapshot,
+                },
+            );
+        }
+    }
+
+    /// Insert the memory-index snapshot (a `Role::System` message
+    /// rendered from `<pod_dir>/memory/MEMORY.md` + a fresh timestamp)
+    /// into the thread's conversation at the setup-prefix boundary.
+    /// Idempotent: no-op if a `Role::System` message is already
+    /// present at that position (meaning the snapshot has already
+    /// been planted by a prior call — `seed_thread_setup`,
+    /// `HostEnvMcpCompleted` fan-out, compaction finalize, etc).
+    ///
+    /// Lives at the setup-prefix boundary (`setup_prefix_end()`), so
+    /// before `Role::Tools` lands the memory slot is index 1 (just
+    /// after System); after Tools arrives, the tools insert at index
+    /// 1 shifts Memory to index 2. Ordering `[System, Tools, Memory,
+    /// User, ...]` is the final steady state regardless of when each
+    /// piece arrived.
+    ///
+    /// The block is persisted into the log like any other setup-frame
+    /// message — same logic as why System prompt + Tools manifest are
+    /// persisted. The log is the faithful record of what the model
+    /// saw; re-reading MEMORY.md on every send would break prompt-
+    /// cache stability for no gain.
+    fn push_memory_snapshot(&mut self, thread_id: &str) {
+        let Some(task) = self.tasks.get(thread_id) else {
+            return;
+        };
+        let at = task.conversation.setup_prefix_end();
+        let already_has = task
+            .conversation
+            .messages()
+            .get(at)
+            .is_some_and(|m| m.role == whisper_agent_protocol::Role::System);
+        if already_has {
+            return;
+        }
+        let pod_dir = match self.pods.get(&task.pod_id) {
+            Some(p) => p.dir.clone(),
+            None => return,
+        };
+        let block = crate::runtime::memory_snapshot::build_block(&pod_dir, chrono::Utc::now());
+        let snapshot = if let Some(task) = self.tasks.get_mut(thread_id) {
+            let at = task.conversation.setup_prefix_end();
+            task.conversation.insert(at, block);
             Some(task.snapshot())
         } else {
             None

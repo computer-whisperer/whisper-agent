@@ -347,13 +347,47 @@ impl Conversation {
         })
     }
 
-    /// Index of the first message that is *not* part of the setup
-    /// prefix (neither `Role::System` nor `Role::Tools`). Used by
-    /// the model-request builder to slice off the setup messages
-    /// before handing the conversation to a provider adapter, and by
-    /// cache-policy code to skip setup when choosing the rolling
-    /// breakpoint anchor.
+    /// Index of the first message that is not lifted into a wire-level
+    /// request field by provider adapters. Exactly covers the thread-
+    /// prefix `Role::System` at index 0 and the `Role::Tools` manifest
+    /// at index 1 — both optional, both at fixed positions — so the
+    /// return value is always 0, 1, or 2. Used by the model-request
+    /// builder to slice off *just these* before handing the
+    /// conversation to the adapter; anything else (including mid-
+    /// conversation `Role::System` harness injections like the memory
+    /// index) is body content the adapter translates to a wire message.
     pub fn setup_prefix_end(&self) -> usize {
+        let mut end = 0;
+        if self
+            .messages
+            .first()
+            .is_some_and(|m| m.role == Role::System)
+        {
+            end = 1;
+        }
+        if self
+            .messages
+            .get(end)
+            .is_some_and(|m| m.role == Role::Tools)
+        {
+            end += 1;
+        }
+        end
+    }
+
+    /// Index of the first body message, treating every leading
+    /// `Role::System` or `Role::Tools` entry as part of the thread's
+    /// initial context. Broader than [`Self::setup_prefix_end`]: a
+    /// mid-conversation harness injection (e.g. a memory-index block
+    /// pushed as `Role::System` right after the tool manifest) is
+    /// counted here but NOT there — it's body content from the
+    /// adapter's perspective, but part of the thread's stable opening
+    /// frame from a fork's perspective.
+    ///
+    /// Fork inheritance uses this: copying through this index keeps
+    /// the forked prefix byte-identical to the parent's, so the
+    /// server's prompt cache still hits on the first send.
+    pub fn initial_context_end(&self) -> usize {
         self.messages
             .iter()
             .take_while(|m| matches!(m.role, Role::System | Role::Tools))
@@ -438,6 +472,50 @@ impl Conversation {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn setup_prefix_end_stops_at_tight_positions() {
+        // Only System@0 and Tools@1 count as the setup prefix now.
+        // A mid-conversation Role::System (e.g. a memory-index
+        // injection placed between Tools and the first user turn) is
+        // body content from the adapter's perspective — it must not
+        // be included in the setup slice the adapter strips.
+        let mut conv = Conversation::new();
+        conv.push(Message::system_text("prompt"));
+        conv.push(Message::tools_manifest(Vec::new()));
+        conv.push(Message::system_text("injected memory index"));
+        conv.push(Message::user_text("hi"));
+        assert_eq!(conv.setup_prefix_end(), 2);
+    }
+
+    #[test]
+    fn setup_prefix_end_handles_tools_only_and_system_only() {
+        // System present, no Tools yet: 1.
+        let mut conv = Conversation::new();
+        conv.push(Message::system_text("prompt"));
+        conv.push(Message::user_text("hi"));
+        assert_eq!(conv.setup_prefix_end(), 1);
+        // Tools-only (no System) — unusual but valid when the pod has
+        // an empty system prompt.
+        let mut conv = Conversation::new();
+        conv.push(Message::tools_manifest(Vec::new()));
+        conv.push(Message::user_text("hi"));
+        assert_eq!(conv.setup_prefix_end(), 1);
+    }
+
+    #[test]
+    fn initial_context_end_includes_memory_injection() {
+        // Fork-inheritance slice covers everything at the head that
+        // looks like scaffolding — System + Tools + the memory
+        // injection. Truncating at this index in the parent gives a
+        // byte-stable prefix for the fork.
+        let mut conv = Conversation::new();
+        conv.push(Message::system_text("prompt"));
+        conv.push(Message::tools_manifest(Vec::new()));
+        conv.push(Message::system_text("injected memory index"));
+        conv.push(Message::user_text("hi"));
+        assert_eq!(conv.initial_context_end(), 3);
+    }
 
     #[test]
     fn normalize_promotes_user_tool_result_to_tool_result_role() {
