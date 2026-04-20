@@ -5,19 +5,34 @@
 //! for protocol-level problems (unknown tool, bad arguments).
 
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::process::Stdio;
 use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
+use async_stream::stream;
+use futures::Stream;
 use regex::Regex;
 use serde::Deserialize;
 use serde_json::{Value, json};
+use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
-use tokio::time::timeout;
+use tokio::time::{Instant, timeout_at};
 
-use whisper_agent_mcp_proto::{CallToolResult, Tool, ToolAnnotations};
+use whisper_agent_mcp_proto::{CallToolResult, ContentBlock, Tool, ToolAnnotations};
 
 use crate::workspace::Workspace;
+
+/// One item from a streaming tool call.
+///
+/// A tool that has no incremental output yields exactly one `Final`. A tool
+/// that streams (today: `bash`) yields zero or more `Chunk` items followed by
+/// exactly one `Final`. The `Final` carries the complete, definitive result
+/// the model will see in its next turn — `Chunk`s are purely for live UI.
+pub enum ToolStreamItem {
+    Chunk(ContentBlock),
+    Final(CallToolResult),
+}
 
 pub fn descriptors() -> Vec<Tool> {
     vec![
@@ -32,22 +47,38 @@ pub fn descriptors() -> Vec<Tool> {
     ]
 }
 
-pub async fn call(
+/// Dispatch a tool call as a stream of [`ToolStreamItem`]s. All tools
+/// terminate with exactly one `Final`. Streaming tools (bash) yield
+/// `Chunk`s before the `Final`; non-streaming tools yield only the
+/// `Final`.
+pub fn call_stream(
     workspace: &Arc<Workspace>,
     name: &str,
     args: Value,
-) -> Result<CallToolResult, ToolDispatchError> {
+) -> Result<Pin<Box<dyn Stream<Item = ToolStreamItem> + Send>>, ToolDispatchError> {
+    let ws = workspace.clone();
     match name {
-        "read_file" => Ok(read_file(workspace, args).await),
-        "write_file" => Ok(write_file(workspace, args).await),
-        "edit_file" => Ok(edit_file(workspace, args).await),
-        "bash" => Ok(bash(workspace, args).await),
-        "list_dir" => Ok(list_dir(workspace, args).await),
-        "glob" => Ok(glob(workspace, args).await),
-        "grep" => Ok(grep(workspace, args).await),
-        "crate_source" => Ok(crate_source(args).await),
+        "bash" => Ok(bash_stream(ws, args)),
+        "read_file" => Ok(single(async move { read_file(&ws, args).await })),
+        "write_file" => Ok(single(async move { write_file(&ws, args).await })),
+        "edit_file" => Ok(single(async move { edit_file(&ws, args).await })),
+        "list_dir" => Ok(single(async move { list_dir(&ws, args).await })),
+        "glob" => Ok(single(async move { glob(&ws, args).await })),
+        "grep" => Ok(single(async move { grep(&ws, args).await })),
+        "crate_source" => Ok(single(crate_source(args))),
         _ => Err(ToolDispatchError::UnknownTool(name.to_string())),
     }
+}
+
+/// Wrap a one-shot tool's future as a single-item stream yielding `Final`.
+fn single<F>(fut: F) -> Pin<Box<dyn Stream<Item = ToolStreamItem> + Send>>
+where
+    F: std::future::Future<Output = CallToolResult> + Send + 'static,
+{
+    Box::pin(stream! {
+        let result = fut.await;
+        yield ToolStreamItem::Final(result);
+    })
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -511,70 +542,172 @@ fn strip_ansi(s: &str) -> String {
 /// tail, which is the part the model almost always needs.
 const BASH_MAX_OUTPUT_BYTES: usize = 30_000;
 
-async fn bash(workspace: &Arc<Workspace>, args: Value) -> CallToolResult {
-    let parsed: BashArgs = match serde_json::from_value(args) {
-        Ok(v) => v,
-        Err(e) => return CallToolResult::error_text(format!("invalid arguments: {e}")),
-    };
-
-    let cwd = match parsed.cwd.as_deref() {
-        None => workspace.root().to_path_buf(),
-        Some(rel) => match workspace.resolve(rel) {
-            Ok(p) => p,
-            Err(e) => return CallToolResult::error_text(e.to_string()),
-        },
-    };
-
-    let timeout_secs = parsed.timeout_seconds.unwrap_or(120).min(600);
-
-    // Merge stdout+stderr at shell level so the model sees one interleaved
-    // stream in shell-emission order (matching claude-code's bash envelope).
-    // The curly-brace group preserves the inner command's exit code; the
-    // newline before `}` stops a trailing `#` comment from swallowing the
-    // close.
-    let wrapped = format!("{{ {cmd}\n}} 2>&1", cmd = parsed.command);
-
-    let mut cmd = Command::new("bash");
-    cmd.arg("-c")
-        .arg(&wrapped)
-        .current_dir(&cwd)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        // bash's own stderr is only written to on wrapper-parse errors; keep
-        // it piped so we don't silently swallow those.
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
-
-    let child = match cmd.spawn() {
-        Ok(c) => c,
-        Err(e) => return CallToolResult::error_text(format!("spawn bash: {e}")),
-    };
-
-    let output_future = child.wait_with_output();
-    match timeout(Duration::from_secs(timeout_secs), output_future).await {
-        Ok(Ok(output)) => {
-            let mut merged = String::new();
-            merged.push_str(&String::from_utf8_lossy(&output.stdout));
-            merged.push_str(&String::from_utf8_lossy(&output.stderr));
-            if parsed.strip_ansi {
-                merged = strip_ansi(&merged);
+/// Spawn bash and stream its merged stdout/stderr line-by-line. Each line
+/// becomes a `Chunk(Text)` event the server forwards to the client as an
+/// SSE notification; the full accumulated body is returned in the `Final`
+/// event so the model (and retention) see the complete output.
+///
+/// Dropping the returned stream drops the child `Command`, which (via
+/// `kill_on_drop`) kills bash — so a cancelled HTTP connection aborts
+/// the command rather than leaving it running.
+fn bash_stream(
+    workspace: Arc<Workspace>,
+    args: Value,
+) -> Pin<Box<dyn Stream<Item = ToolStreamItem> + Send>> {
+    Box::pin(stream! {
+        let parsed: BashArgs = match serde_json::from_value(args) {
+            Ok(v) => v,
+            Err(e) => {
+                yield ToolStreamItem::Final(CallToolResult::error_text(
+                    format!("invalid arguments: {e}"),
+                ));
+                return;
             }
-            let merged = head_truncate(merged, BASH_MAX_OUTPUT_BYTES);
-            let exit_code = output.status.code().unwrap_or(-1);
-            let body = if output.status.success() {
-                merged
-            } else {
-                format!("Exit code {exit_code}\n{merged}")
-            };
-            if output.status.success() {
-                CallToolResult::text(body)
-            } else {
-                CallToolResult::error_text(body)
+        };
+
+        let cwd = match parsed.cwd.as_deref() {
+            None => workspace.root().to_path_buf(),
+            Some(rel) => match workspace.resolve(rel) {
+                Ok(p) => p,
+                Err(e) => {
+                    yield ToolStreamItem::Final(CallToolResult::error_text(e.to_string()));
+                    return;
+                }
+            },
+        };
+
+        let timeout_secs = parsed.timeout_seconds.unwrap_or(120).min(600);
+        let deadline = Instant::now() + Duration::from_secs(timeout_secs);
+
+        // Merge stdout+stderr at shell level so the model sees one interleaved
+        // stream in shell-emission order (matching claude-code's bash envelope).
+        // The curly-brace group preserves the inner command's exit code; the
+        // newline before `}` stops a trailing `#` comment from swallowing the
+        // close.
+        let wrapped = format!("{{ {cmd}\n}} 2>&1", cmd = parsed.command);
+
+        let mut cmd = Command::new("bash");
+        cmd.arg("-c")
+            .arg(&wrapped)
+            .current_dir(&cwd)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            // bash's own stderr is only written to on wrapper-parse errors; keep
+            // it piped so we don't silently swallow those.
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+
+        let mut child = match cmd.spawn() {
+            Ok(c) => c,
+            Err(e) => {
+                yield ToolStreamItem::Final(CallToolResult::error_text(
+                    format!("spawn bash: {e}"),
+                ));
+                return;
+            }
+        };
+
+        let stdout = child.stdout.take().expect("stdout piped");
+        let stderr = child.stderr.take().expect("stderr piped");
+        let mut stdout_reader = BufReader::new(stdout);
+        let mut stderr_reader = BufReader::new(stderr);
+
+        let mut accumulated = String::new();
+        let mut timed_out = false;
+
+        // Stream stdout (= merged child output via shell redirection) line-by-line
+        // until EOF or timeout. stderr from *bash itself* is drained afterwards
+        // so we never block on it while the child is running.
+        loop {
+            let mut line = String::new();
+            tokio::select! {
+                res = stdout_reader.read_line(&mut line) => {
+                    match res {
+                        Ok(0) => break,
+                        Ok(_) => {
+                            let emitted = if parsed.strip_ansi {
+                                strip_ansi(&line)
+                            } else {
+                                line.clone()
+                            };
+                            accumulated.push_str(&emitted);
+                            yield ToolStreamItem::Chunk(ContentBlock::Text { text: emitted });
+                        }
+                        Err(e) => {
+                            yield ToolStreamItem::Final(CallToolResult::error_text(
+                                format!("bash read failed: {e}"),
+                            ));
+                            return;
+                        }
+                    }
+                }
+                _ = tokio::time::sleep_until(deadline) => {
+                    timed_out = true;
+                    break;
+                }
             }
         }
-        Ok(Err(e)) => CallToolResult::error_text(format!("bash wait failed: {e}")),
-        Err(_) => CallToolResult::error_text(format!("bash timed out after {timeout_secs}s")),
-    }
+
+        if timed_out {
+            // kill_on_drop will reap bash when `child` drops at scope end; start
+            // the kill explicitly so we don't wait on a hung child.
+            let _ = child.start_kill();
+            yield ToolStreamItem::Final(CallToolResult::error_text(
+                format!("bash timed out after {timeout_secs}s"),
+            ));
+            return;
+        }
+
+        // Drain bash's own stderr (wrapper-parse errors, etc.) before waiting.
+        let mut bash_stderr = String::new();
+        loop {
+            let mut chunk = String::new();
+            match timeout_at(deadline, stderr_reader.read_line(&mut chunk)).await {
+                Ok(Ok(0)) => break,
+                Ok(Ok(_)) => bash_stderr.push_str(&chunk),
+                Ok(Err(_)) | Err(_) => break,
+            }
+        }
+
+        let status = match timeout_at(deadline, child.wait()).await {
+            Ok(Ok(s)) => s,
+            Ok(Err(e)) => {
+                yield ToolStreamItem::Final(CallToolResult::error_text(
+                    format!("bash wait failed: {e}"),
+                ));
+                return;
+            }
+            Err(_) => {
+                let _ = child.start_kill();
+                yield ToolStreamItem::Final(CallToolResult::error_text(
+                    format!("bash timed out after {timeout_secs}s"),
+                ));
+                return;
+            }
+        };
+
+        let mut merged = accumulated;
+        if !bash_stderr.is_empty() {
+            if parsed.strip_ansi {
+                merged.push_str(&strip_ansi(&bash_stderr));
+            } else {
+                merged.push_str(&bash_stderr);
+            }
+        }
+        let merged = head_truncate(merged, BASH_MAX_OUTPUT_BYTES);
+        let exit_code = status.code().unwrap_or(-1);
+        let body = if status.success() {
+            merged
+        } else {
+            format!("Exit code {exit_code}\n{merged}")
+        };
+        let result = if status.success() {
+            CallToolResult::text(body)
+        } else {
+            CallToolResult::error_text(body)
+        };
+        yield ToolStreamItem::Final(result);
+    })
 }
 
 /// Keep the last `max` bytes of `s`, prefixed with a marker noting how much

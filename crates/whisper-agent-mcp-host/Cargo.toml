@@ -23,4 +23,6 @@ ignore = "0.4"
 globset = "0.4"
 regex = "1"
 subtle = { workspace = true }
+futures = "0.3"
+async-stream = "0.3"
 whisper-agent-mcp-proto = { workspace = true }

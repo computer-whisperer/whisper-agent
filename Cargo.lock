@@ -4549,8 +4549,10 @@ name = "whisper-agent-mcp-host"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-stream",
  "axum",
  "clap",
+ "futures",
  "globset",
  "ignore",
  "regex",

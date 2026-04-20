@@ -10,15 +10,21 @@
 //! then returns to the scheduler in the provision response — it scopes what any
 //! local process with TCP reach can actually drive on the MCP wire.
 
+use std::convert::Infallible;
 use std::sync::Arc;
 
+use async_stream::stream;
 use axum::{
     Json, Router,
     extract::State,
     http::{HeaderMap, StatusCode},
-    response::{IntoResponse, Response},
+    response::{
+        IntoResponse, Response,
+        sse::{Event, KeepAlive, Sse},
+    },
     routing::post,
 };
+use futures::StreamExt;
 use serde_json::{Value, json};
 use subtle::ConstantTimeEq;
 use tracing::{debug, warn};
@@ -29,7 +35,7 @@ use whisper_agent_mcp_proto::{
     error_codes,
 };
 
-use crate::tools;
+use crate::tools::{self, ToolStreamItem};
 use crate::workspace::Workspace;
 
 #[derive(Clone)]
@@ -86,21 +92,21 @@ async fn handle_post(
     }
 
     let id = req.id.unwrap();
-    let response = match req.method.as_str() {
-        "initialize" => initialize(id, req.params),
-        "tools/list" => list_tools(id, &state),
+    match req.method.as_str() {
+        "initialize" => Json(initialize(id, req.params)).into_response(),
+        "tools/list" => Json(list_tools(id, &state)).into_response(),
         "tools/call" => call_tool(id, &state, req.params).await,
-        "ping" => JsonRpcResponse::success(id, json!({})),
+        "ping" => Json(JsonRpcResponse::success(id, json!({}))).into_response(),
         other => {
             warn!(method = %other, "unknown method");
-            JsonRpcResponse::error(
+            Json(JsonRpcResponse::error(
                 id,
                 error_codes::METHOD_NOT_FOUND,
                 format!("method not found: {other}"),
-            )
+            ))
+            .into_response()
         }
-    };
-    Json(response).into_response()
+    }
 }
 
 fn initialize(id: Value, params: Option<Value>) -> JsonRpcResponse {
@@ -140,23 +146,102 @@ fn list_tools(id: Value, _state: &AppState) -> JsonRpcResponse {
     JsonRpcResponse::success(id, serde_json::to_value(result).unwrap())
 }
 
-async fn call_tool(id: Value, state: &AppState, params: Option<Value>) -> JsonRpcResponse {
+async fn call_tool(id: Value, state: &AppState, params: Option<Value>) -> Response {
     let parsed: CallToolParams = match serde_json::from_value(params.unwrap_or(Value::Null)) {
         Ok(p) => p,
         Err(e) => {
-            return JsonRpcResponse::error(
+            return Json(JsonRpcResponse::error(
                 id,
                 error_codes::INVALID_PARAMS,
                 format!("tools/call params: {e}"),
-            );
+            ))
+            .into_response();
         }
     };
-    match tools::call(&state.workspace, &parsed.name, parsed.arguments).await {
-        Ok(result) => JsonRpcResponse::success(id, serde_json::to_value(result).unwrap()),
-        Err(tools::ToolDispatchError::UnknownTool(name)) => JsonRpcResponse::error(
+    let mut stream = match tools::call_stream(&state.workspace, &parsed.name, parsed.arguments) {
+        Ok(s) => s,
+        Err(tools::ToolDispatchError::UnknownTool(name)) => {
+            return Json(JsonRpcResponse::error(
+                id,
+                error_codes::METHOD_NOT_FOUND,
+                format!("unknown tool: {name}"),
+            ))
+            .into_response();
+        }
+    };
+
+    // Peek the first event. One-shot tools yield `Final` immediately and get a
+    // plain JSON response — no SSE overhead for the common case. A streaming
+    // tool yields a `Chunk` first, so we switch to SSE and keep draining.
+    let first = match stream.next().await {
+        Some(ev) => ev,
+        None => {
+            return Json(JsonRpcResponse::error(
+                id,
+                error_codes::INVALID_REQUEST,
+                "tool produced no events",
+            ))
+            .into_response();
+        }
+    };
+
+    match first {
+        ToolStreamItem::Final(result) => Json(JsonRpcResponse::success(
             id,
-            error_codes::METHOD_NOT_FOUND,
-            format!("unknown tool: {name}"),
-        ),
+            serde_json::to_value(result).unwrap(),
+        ))
+        .into_response(),
+        ToolStreamItem::Chunk(first_block) => sse_response(id, first_block, stream),
     }
+}
+
+/// Serialize the remainder of a streaming tool call as an SSE response.
+///
+/// Each mid-call content block is emitted as a `notifications/tools/output`
+/// JSON-RPC notification. The terminal `Final` is sent as the JSON-RPC
+/// response carrying the request id (the same shape the JSON transport
+/// returns for non-streaming calls).
+fn sse_response(
+    id: Value,
+    first_block: whisper_agent_mcp_proto::ContentBlock,
+    mut rest: std::pin::Pin<Box<dyn futures::Stream<Item = ToolStreamItem> + Send>>,
+) -> Response {
+    let events = stream! {
+        yield Ok::<_, Infallible>(output_event(&first_block));
+        while let Some(item) = rest.next().await {
+            match item {
+                ToolStreamItem::Chunk(block) => yield Ok(output_event(&block)),
+                ToolStreamItem::Final(result) => {
+                    let resp = JsonRpcResponse::success(
+                        id.clone(),
+                        serde_json::to_value(result).unwrap(),
+                    );
+                    yield Ok(Event::default().json_data(&resp).expect("serializable"));
+                    return;
+                }
+            }
+        }
+        // Stream ended without a Final — shouldn't happen, but send an
+        // error response so the client doesn't hang waiting for one.
+        let resp = JsonRpcResponse::error(
+            id.clone(),
+            error_codes::INVALID_REQUEST,
+            "tool stream ended without final result",
+        );
+        yield Ok(Event::default().json_data(&resp).expect("serializable"));
+    };
+    Sse::new(events)
+        .keep_alive(KeepAlive::default())
+        .into_response()
+}
+
+fn output_event(block: &whisper_agent_mcp_proto::ContentBlock) -> Event {
+    let notif = json!({
+        "jsonrpc": "2.0",
+        "method": "notifications/tools/output",
+        "params": { "content": block },
+    });
+    Event::default()
+        .json_data(&notif)
+        .expect("serializable notification")
 }

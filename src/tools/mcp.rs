@@ -2,14 +2,18 @@
 //!
 //! Models a single MCP host as a stateful session that owns a [`reqwest::Client`] and
 //! an `Mcp-Session-Id` once the server assigns one. Tool invocations return a
-//! `Stream<ToolEvent>` even when the underlying HTTP response is a single JSON object —
-//! the streaming shape is the API's contract; the transport is an implementation detail.
+//! `Stream<ToolEvent>` regardless of transport: the server may respond either
+//! with a single JSON body (non-streaming tools) or with
+//! `text/event-stream` interleaving `notifications/tools/output` chunks
+//! before the final response (streaming tools like `bash`). The streaming
+//! shape is the API's contract; which wire transport the server picks is
+//! an implementation detail.
 
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use async_stream::stream;
-use futures::Stream;
+use futures::{Stream, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use thiserror::Error;
@@ -84,13 +88,13 @@ pub struct CallToolResult {
 
 #[derive(Debug)]
 pub enum ToolEvent {
-    /// Streaming content fragment — text chunk, image, or structured
-    /// payload produced mid-call. The MVP transport (single-shot HTTP
-    /// JSON response) never emits these; they're here so consumers
-    /// handle streaming uniformly once the SSE transport + MCP
-    /// `notifications/progress` path lands for tools like bash.
+    /// Streaming content fragment — a text chunk, image, or structured
+    /// payload produced mid-call. Emitted over the SSE transport as
+    /// `notifications/tools/output` notifications arrive (bash output
+    /// lines, today). Non-streaming tools never emit this variant.
     Content(McpContentBlock),
-    /// Final outcome of a tool call. The MVP transport delivers exactly one of these per call.
+    /// Final outcome of a tool call. Every tool call produces exactly
+    /// one of these; it carries the full result the model will see.
     Completed(CallToolResult),
 }
 
@@ -175,24 +179,72 @@ impl McpSession {
         serde_json::from_value(tools).map_err(|e| McpError::Malformed(e.to_string()))
     }
 
-    /// Invoke a tool. Returns a stream that emits exactly one [`ToolEvent::Completed`]
-    /// for the MVP transport (no streaming output yet); the streaming shape is in place
-    /// so adding multi-event tools later is purely a server-side change.
+    /// Invoke a tool. The returned stream emits zero or more
+    /// [`ToolEvent::Content`]s as output arrives (SSE transport only) and
+    /// terminates with exactly one [`ToolEvent::Completed`]. A non-streaming
+    /// tool yields only the `Completed` event.
     pub async fn invoke(
         &self,
         name: &str,
         arguments: Value,
     ) -> Result<Pin<Box<dyn Stream<Item = ToolEvent> + Send>>, McpError> {
-        let result = self
-            .call(
-                "tools/call",
-                Some(json!({ "name": name, "arguments": arguments })),
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let req = JsonRpcRequest {
+            jsonrpc: "2.0",
+            id,
+            method: "tools/call",
+            params: Some(json!({ "name": name, "arguments": arguments })),
+        };
+        debug!(method = "tools/call", tool = name, "rpc out");
+
+        let mut builder = self
+            .http
+            .post(&self.url)
+            // Advertise both transports; the server chooses per-call. MVP
+            // tools get JSON, streaming tools (bash) get SSE.
+            .header(
+                reqwest::header::ACCEPT,
+                "application/json, text/event-stream",
             )
-            .await?;
-        let parsed: CallToolResult =
-            serde_json::from_value(result).map_err(|e| McpError::Malformed(e.to_string()))?;
-        let s = stream! { yield ToolEvent::Completed(parsed); };
-        Ok(Box::pin(s))
+            .json(&req);
+        if let Some(tok) = &self.bearer {
+            builder = builder.bearer_auth(tok);
+        }
+        let resp = builder.send().await?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(McpError::Transport {
+                status: status.as_u16(),
+                body,
+            });
+        }
+        let content_type = resp
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+
+        if content_type.starts_with("text/event-stream") {
+            Ok(Box::pin(sse_tool_stream(resp)))
+        } else {
+            let parsed: JsonRpcResponse = resp.json().await?;
+            if let Some(e) = parsed.error {
+                return Err(McpError::Rpc {
+                    code: e.code,
+                    message: e.message,
+                });
+            }
+            let result = parsed
+                .result
+                .ok_or_else(|| McpError::Malformed("response missing result".into()))?;
+            let tool_result: CallToolResult =
+                serde_json::from_value(result).map_err(|e| McpError::Malformed(e.to_string()))?;
+            Ok(Box::pin(
+                stream! { yield ToolEvent::Completed(tool_result); },
+            ))
+        }
     }
 
     async fn call(&self, method: &str, params: Option<Value>) -> Result<Value, McpError> {
@@ -250,5 +302,155 @@ impl McpSession {
             });
         }
         Ok(())
+    }
+}
+
+/// Parse the `text/event-stream` body of a streaming `tools/call` into a
+/// stream of [`ToolEvent`]s.
+///
+/// Each SSE `data:` payload is a JSON-RPC message. Notifications
+/// (`method == "notifications/tools/output"`) become `ToolEvent::Content`.
+/// The first response with a `result` field becomes `ToolEvent::Completed`
+/// and terminates the stream. Malformed frames and unrelated methods are
+/// logged and skipped — we never leak partial parsing errors into the
+/// tool-output stream the UI consumes.
+fn sse_tool_stream(resp: reqwest::Response) -> impl Stream<Item = ToolEvent> + Send {
+    stream! {
+        let mut bytes = resp.bytes_stream();
+        let mut buf = String::new();
+        'outer: while let Some(next) = bytes.next().await {
+            let chunk = match next {
+                Ok(b) => b,
+                Err(e) => {
+                    warn!(error = %e, "SSE byte stream errored mid-tool-call");
+                    return;
+                }
+            };
+            buf.push_str(&String::from_utf8_lossy(&chunk));
+            while let Some(frame) = take_sse_frame(&mut buf) {
+                let Some(data) = extract_sse_data(&frame) else {
+                    continue;
+                };
+                match serde_json::from_str::<Value>(&data) {
+                    Ok(Value::Object(msg)) => {
+                        // Response: has `id` + (`result` or `error`).
+                        if msg.contains_key("id") {
+                            if let Some(err) = msg.get("error") {
+                                warn!(error = %err, "SSE final response carried JSON-RPC error");
+                                return;
+                            }
+                            if let Some(result) = msg.get("result") {
+                                match serde_json::from_value::<CallToolResult>(result.clone()) {
+                                    Ok(parsed) => {
+                                        yield ToolEvent::Completed(parsed);
+                                        return;
+                                    }
+                                    Err(e) => {
+                                        warn!(error = %e, "SSE final result malformed");
+                                        return;
+                                    }
+                                }
+                            }
+                        }
+                        // Notification: carries `method` but no `id`.
+                        if let Some(method) = msg.get("method").and_then(|m| m.as_str())
+                            && method == "notifications/tools/output"
+                            && let Some(content) = msg.get("params").and_then(|p| p.get("content"))
+                            && let Ok(block) =
+                                serde_json::from_value::<McpContentBlock>(content.clone())
+                        {
+                            yield ToolEvent::Content(block);
+                            continue 'outer;
+                        }
+                    }
+                    Ok(_) => {
+                        warn!(data = %data, "SSE frame was not a JSON object");
+                    }
+                    Err(e) => {
+                        warn!(error = %e, data = %data, "SSE frame JSON parse failed");
+                    }
+                }
+            }
+        }
+        // Connection closed without a final response — log and let the
+        // caller see an empty tail. The dispatch layer surfaces "no
+        // Completed event in tool stream" in that case.
+        warn!("SSE stream ended without final tools/call response");
+    }
+}
+
+/// Extract the next complete SSE event frame from `buf`. A frame is the text
+/// preceding the first `\n\n` (or `\r\n\r\n`) boundary; processed bytes are
+/// drained from `buf`. Returns `None` while no full frame is buffered.
+fn take_sse_frame(buf: &mut String) -> Option<String> {
+    let idx_nn = buf.find("\n\n");
+    let idx_rnrn = buf.find("\r\n\r\n");
+    let (pos, boundary_len) = match (idx_nn, idx_rnrn) {
+        (Some(a), Some(b)) if a <= b => (a, 2),
+        (Some(_), Some(b)) => (b, 4),
+        (Some(a), None) => (a, 2),
+        (None, Some(b)) => (b, 4),
+        (None, None) => return None,
+    };
+    let frame: String = buf.drain(..pos).collect();
+    buf.drain(..boundary_len);
+    Some(frame)
+}
+
+/// Join the `data:` lines of an SSE frame. Per the spec, multiple
+/// `data:` lines concatenate with `\n`; the leading single space after
+/// the colon is stripped if present. Non-`data:` fields (`event:`,
+/// `id:`, `retry:`, comments) are ignored.
+fn extract_sse_data(frame: &str) -> Option<String> {
+    let mut out = String::new();
+    for line in frame.lines() {
+        let Some(rest) = line.strip_prefix("data:") else {
+            continue;
+        };
+        let rest = rest.strip_prefix(' ').unwrap_or(rest);
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        out.push_str(rest);
+    }
+    if out.is_empty() { None } else { Some(out) }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn take_sse_frame_splits_on_double_newline() {
+        let mut buf = String::from("data: a\n\ndata: b\n\npartial");
+        assert_eq!(take_sse_frame(&mut buf).as_deref(), Some("data: a"));
+        assert_eq!(take_sse_frame(&mut buf).as_deref(), Some("data: b"));
+        assert_eq!(take_sse_frame(&mut buf), None);
+        assert_eq!(buf, "partial");
+    }
+
+    #[test]
+    fn take_sse_frame_handles_crlf() {
+        let mut buf = String::from("data: hi\r\n\r\n");
+        assert_eq!(take_sse_frame(&mut buf).as_deref(), Some("data: hi"));
+        assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn extract_sse_data_joins_multiple_data_lines() {
+        let frame = "event: msg\ndata: first\ndata: second\nid: 1";
+        assert_eq!(extract_sse_data(frame).as_deref(), Some("first\nsecond"));
+    }
+
+    #[test]
+    fn extract_sse_data_handles_missing_leading_space() {
+        let frame = "data:nospace";
+        assert_eq!(extract_sse_data(frame).as_deref(), Some("nospace"));
+    }
+
+    #[test]
+    fn extract_sse_data_none_when_frame_has_no_data_line() {
+        let frame = "event: ping\nid: 5";
+        assert!(extract_sse_data(frame).is_none());
     }
 }
