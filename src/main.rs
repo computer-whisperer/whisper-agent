@@ -368,6 +368,7 @@ async fn run_serve(args: ServeArgs) -> Result<()> {
                         provider,
                         kind: bcfg.kind().into(),
                         default_model: bcfg.default_model().map(|s| s.to_string()),
+                        auth_mode: bcfg.auth_mode().map(str::to_string),
                     },
                 );
             }
@@ -391,6 +392,7 @@ async fn run_serve(args: ServeArgs) -> Result<()> {
                     provider: std::sync::Arc::new(AnthropicClient::new(key)),
                     kind: "anthropic".into(),
                     default_model: Some(args.model.clone()),
+                    auth_mode: Some("api_key".into()),
                 },
             );
             (

@@ -668,6 +668,10 @@ pub struct ChatApp {
     /// Modal state for the per-provider add/edit form. `None` = closed.
     /// Opened from the Providers tab (+Add or Edit row button).
     provider_editor_modal: Option<ProviderEditorModalState>,
+    /// Open state for the cog-button "Server settings" modal. `None`
+    /// when closed. The inner state holds which settings tab is
+    /// currently selected.
+    settings_modal: Option<SettingsModalState>,
     /// Provider names whose Remove button has been clicked once and is
     /// waiting for confirmation. Two-click UX mirrors the pod archive
     /// and behavior delete flows. Cleared on confirm / outside click /
@@ -1010,6 +1014,22 @@ enum ProviderEditorMode {
     Edit,
 }
 
+/// State for the "Server settings" modal opened from the cog in the
+/// top bar. Host to one or more inner tabs; today only "LLM backends"
+/// exists (read-only). Kept as a modal rather than a left-panel tab
+/// because settings are a low-frequency escape hatch, not part of
+/// day-to-day navigation.
+#[derive(Default)]
+struct SettingsModalState {
+    active_tab: SettingsTab,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum SettingsTab {
+    #[default]
+    Backends,
+}
+
 impl ProviderEditorModalState {
     fn new_add() -> Self {
         Self {
@@ -1335,6 +1355,7 @@ impl ChatApp {
             host_env_providers: Vec::new(),
             host_env_providers_requested: false,
             provider_editor_modal: None,
+            settings_modal: None,
             provider_remove_armed: HashSet::new(),
             provider_remove_pending: HashMap::new(),
             collapsed_pods: HashSet::new(),
@@ -2958,11 +2979,25 @@ impl eframe::App for ChatApp {
                         .small(),
                     );
                 }
-                // Right-aligned Functions chip: click opens a popover
-                // listing every in-flight Function. Hidden at zero to
-                // avoid a permanent "nothing to see" widget — presence
-                // is the signal.
+                // Right-aligned: cog (server settings) first, then the
+                // in-flight Functions chip to its left when present.
+                // Cog is always visible; Functions chip is hidden at
+                // zero so the bar doesn't grow a permanent "nothing to
+                // see" widget.
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let cog = ui
+                        .button(RichText::new("⚙").small())
+                        .on_hover_text("Server settings");
+                    if cog.clicked() {
+                        // Toggle: clicking the cog while open closes
+                        // the modal, matching a typical settings-button
+                        // affordance.
+                        self.settings_modal = match self.settings_modal.take() {
+                            Some(_) => None,
+                            None => Some(SettingsModalState::default()),
+                        };
+                    }
+
                     let count = self.active_functions.len();
                     if count == 0 {
                         return;
@@ -3439,6 +3474,7 @@ impl eframe::App for ChatApp {
         self.render_file_viewer_modal(&ctx);
         self.render_json_viewer_modal(&ctx);
         self.render_provider_editor_modal(&ctx);
+        self.render_settings_modal(&ctx);
 
         // Draft debounce tick. Schedule a repaint at the deadline so
         // the flush fires even if nothing else is driving frames.
@@ -4759,6 +4795,83 @@ impl ChatApp {
         });
     }
 
+    /// Server-settings modal opened from the top-bar cog. Read-only
+    /// today — the only tab is "LLM backends", which lists configured
+    /// backends with name/kind/auth-mode. Credential material is never
+    /// rendered. Add / edit / remove will land behind an admin-scope
+    /// gate in a follow-up PR.
+    fn render_settings_modal(&mut self, ctx: &egui::Context) {
+        let Some(mut modal) = self.settings_modal.take() else {
+            return;
+        };
+        let mut open = true;
+
+        egui::Window::new("Server settings")
+            .collapsible(false)
+            .resizable(true)
+            .default_width(520.0)
+            .default_height(400.0)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .open(&mut open)
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    if ui
+                        .selectable_label(modal.active_tab == SettingsTab::Backends, "LLM backends")
+                        .clicked()
+                    {
+                        modal.active_tab = SettingsTab::Backends;
+                    }
+                });
+                ui.separator();
+                ui.add_space(4.0);
+                match modal.active_tab {
+                    SettingsTab::Backends => self.render_settings_backends_tab(ui),
+                }
+            });
+
+        if open {
+            self.settings_modal = Some(modal);
+        }
+    }
+
+    /// Read-only backends list inside the server-settings modal. Name,
+    /// kind, default-model, and auth-mode per entry. Never shows
+    /// credential material.
+    fn render_settings_backends_tab(&mut self, ui: &mut egui::Ui) {
+        ui.label(
+            RichText::new(
+                "Configured LLM backends the scheduler can dispatch to. \
+                 Auth mode names where the credential lives; the credential \
+                 itself is never sent to the client.",
+            )
+            .small()
+            .color(Color32::from_gray(150)),
+        );
+        ui.add_space(6.0);
+
+        if self.backends.is_empty() {
+            ui.label(
+                RichText::new(
+                    "No backends configured. Seed them via [backends.*] in \
+                     whisper-agent.toml.",
+                )
+                .small()
+                .color(Color32::from_gray(150)),
+            );
+            return;
+        }
+
+        let backends = self.backends.clone();
+        let default_backend = self.default_backend.clone();
+        ScrollArea::vertical().show(ui, |ui| {
+            for b in &backends {
+                render_backend_settings_row(ui, b, &default_backend);
+                ui.add_space(2.0);
+                ui.separator();
+            }
+        });
+    }
+
     /// Add / edit provider modal. Dispatches `AddHostEnvProvider` or
     /// `UpdateHostEnvProvider` on Save, tracks the correlation so the
     /// matching response / error routes back here.
@@ -5783,6 +5896,46 @@ impl ChatApp {
             limits: PodLimits::default(),
         }
     }
+}
+
+/// One row in the Settings → LLM backends list. Shows name, kind,
+/// default model, and auth-mode badge. Never renders credential
+/// material — auth_mode only names *where* the credential lives
+/// ("api_key", "chatgpt_subscription", "google_oauth", or "(none)"
+/// for local endpoints that skip auth).
+fn render_backend_settings_row(ui: &mut egui::Ui, backend: &BackendSummary, default: &str) {
+    ui.horizontal(|ui| {
+        ui.label(RichText::new(&backend.name).strong());
+        if backend.name == default {
+            ui.label(
+                RichText::new("default")
+                    .small()
+                    .color(Color32::from_rgb(0x88, 0xbb, 0x88)),
+            );
+        }
+    });
+    ui.horizontal_wrapped(|ui| {
+        ui.label(
+            RichText::new(format!("kind: {}", backend.kind))
+                .small()
+                .color(Color32::from_gray(170)),
+        );
+        ui.label(RichText::new("·").small().color(Color32::from_gray(120)));
+        let auth = backend.auth_mode.as_deref().unwrap_or("(none)");
+        ui.label(
+            RichText::new(format!("auth: {auth}"))
+                .small()
+                .color(Color32::from_gray(170)),
+        );
+        if let Some(model) = backend.default_model.as_deref() {
+            ui.label(RichText::new("·").small().color(Color32::from_gray(120)));
+            ui.label(
+                RichText::new(format!("default model: {model}"))
+                    .small()
+                    .color(Color32::from_gray(170)),
+            );
+        }
+    });
 }
 
 /// Persistent banner for a task that's entered the Failed state. Survives resnapshot

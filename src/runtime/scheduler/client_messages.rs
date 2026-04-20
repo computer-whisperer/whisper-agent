@@ -371,6 +371,7 @@ impl Scheduler {
                         name: name.clone(),
                         kind: entry.kind.clone(),
                         default_model: entry.default_model.clone(),
+                        auth_mode: entry.auth_mode.clone(),
                     })
                     .collect();
                 self.router.send_to_client(

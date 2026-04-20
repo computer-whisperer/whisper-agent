@@ -185,6 +185,12 @@ pub struct BackendEntry {
     /// endpoints (most local llama.cpp setups) — the scheduler passes an empty
     /// model through in that case, which those endpoints ignore.
     pub default_model: Option<String>,
+    /// Auth mode tag this backend was built with (`"api_key"`,
+    /// `"chatgpt_subscription"`, `"google_oauth"`), or None when the
+    /// backend skips auth entirely. Retained after construction so the
+    /// settings panel can describe the credential slot without holding
+    /// the credential itself.
+    pub auth_mode: Option<String>,
 }
 
 /// Entry in the scheduler's shared-MCP-host catalog. Configured at server

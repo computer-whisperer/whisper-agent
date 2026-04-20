@@ -443,6 +443,13 @@ pub struct BackendSummary {
     /// model list and pick one (typical for single-model local endpoints).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_model: Option<String>,
+    /// Auth mode the backend was built with (`"api_key"`,
+    /// `"chatgpt_subscription"`, `"google_oauth"`). None when the
+    /// backend skips auth entirely (local OpenAI-compatible endpoints).
+    /// Surfaced so the settings panel can show where each credential
+    /// lives without leaking the credential itself.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_mode: Option<String>,
 }
 
 /// Entry in a `ModelsList` response.

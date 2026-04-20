@@ -166,6 +166,17 @@ pub enum GoogleOauthSource {
 }
 
 impl Auth {
+    /// Stable tag matching the serde `mode` string. Used by the settings
+    /// panel to display which credential slot a backend uses without
+    /// touching the credential itself.
+    pub fn mode_name(&self) -> &'static str {
+        match self {
+            Auth::ApiKey { .. } => "api_key",
+            Auth::ChatgptSubscription { .. } => "chatgpt_subscription",
+            Auth::GoogleOauth { .. } => "google_oauth",
+        }
+    }
+
     /// Resolve to the raw API key string, reading env vars as needed. Errors if the
     /// auth entry is malformed (neither or both of `value`/`env` set, env var unset),
     /// or if the auth mode isn't `api_key`.
@@ -249,6 +260,17 @@ impl BackendConfig {
             | BackendConfig::OpenAiChat { default_model, .. }
             | BackendConfig::OpenAiResponses { default_model, .. }
             | BackendConfig::Gemini { default_model, .. } => default_model.as_deref(),
+        }
+    }
+
+    /// Auth mode tag for this backend, or `None` if the backend is
+    /// configured without auth (e.g. a local openai-compatible endpoint).
+    pub fn auth_mode(&self) -> Option<&'static str> {
+        match self {
+            BackendConfig::Anthropic { auth, .. }
+            | BackendConfig::OpenAiResponses { auth, .. }
+            | BackendConfig::Gemini { auth, .. } => Some(auth.mode_name()),
+            BackendConfig::OpenAiChat { auth, .. } => auth.as_ref().map(Auth::mode_name),
         }
     }
 
