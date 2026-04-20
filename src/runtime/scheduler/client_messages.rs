@@ -426,6 +426,92 @@ impl Scheduler {
                     }
                 });
             }
+            ClientToServer::ListPodDir {
+                correlation_id,
+                pod_id,
+                path,
+            } => {
+                let Some((persister, outbound)) = self.persister_and_outbound(conn_id) else {
+                    return;
+                };
+                let rel = path.unwrap_or_default();
+                tokio::spawn(async move {
+                    match persister.list_pod_dir(&pod_id, &rel).await {
+                        Ok(entries) => {
+                            let _ = outbound.send(ServerToClient::PodDirListing {
+                                correlation_id,
+                                pod_id,
+                                path: rel,
+                                entries,
+                            });
+                        }
+                        Err(e) => {
+                            let _ = outbound.send(ServerToClient::Error {
+                                correlation_id,
+                                thread_id: None,
+                                message: format!("list_pod_dir: {e}"),
+                            });
+                        }
+                    }
+                });
+            }
+            ClientToServer::ReadPodFile {
+                correlation_id,
+                pod_id,
+                path,
+            } => {
+                let Some((persister, outbound)) = self.persister_and_outbound(conn_id) else {
+                    return;
+                };
+                tokio::spawn(async move {
+                    match persister.read_pod_file(&pod_id, &path).await {
+                        Ok((content, readonly)) => {
+                            let _ = outbound.send(ServerToClient::PodFileContent {
+                                correlation_id,
+                                pod_id,
+                                path,
+                                content,
+                                readonly,
+                            });
+                        }
+                        Err(e) => {
+                            let _ = outbound.send(ServerToClient::Error {
+                                correlation_id,
+                                thread_id: None,
+                                message: format!("read_pod_file: {e}"),
+                            });
+                        }
+                    }
+                });
+            }
+            ClientToServer::WritePodFile {
+                correlation_id,
+                pod_id,
+                path,
+                content,
+            } => {
+                let Some((persister, outbound)) = self.persister_and_outbound(conn_id) else {
+                    return;
+                };
+                tokio::spawn(async move {
+                    match persister.write_pod_file(&pod_id, &path, &content).await {
+                        Ok(()) => {
+                            let _ = outbound.send(ServerToClient::PodFileWritten {
+                                correlation_id,
+                                pod_id,
+                                path,
+                            });
+                        }
+                        Err(e) => {
+                            let _ = outbound.send(ServerToClient::Error {
+                                correlation_id,
+                                thread_id: None,
+                                message: format!("write_pod_file: {e}"),
+                            });
+                        }
+                    }
+                });
+            }
             ClientToServer::GetPod {
                 correlation_id,
                 pod_id,

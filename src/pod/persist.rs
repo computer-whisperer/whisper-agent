@@ -34,10 +34,11 @@ use tokio::fs;
 use tracing::{info, warn};
 
 use crate::pod::behaviors::{self as pod_behaviors};
+use crate::pod::fs::is_readonly_path;
 use crate::pod::{self, POD_STATE_JSON, POD_TOML, Pod, PodId, THREADS_DIR};
 use crate::runtime::thread::{Thread, ThreadInternalState};
 use whisper_agent_protocol::{
-    PodAllow, PodConfig, PodLimits, PodSnapshot, PodState, PodSummary, ThreadDefaults,
+    FsEntry, PodAllow, PodConfig, PodLimits, PodSnapshot, PodState, PodSummary, ThreadDefaults,
     ThreadSummary,
 };
 
@@ -48,6 +49,15 @@ pub struct LoadedState {
     pub pods: Vec<Pod>,
     pub threads: Vec<Thread>,
 }
+
+/// Upper bound on files the webui's generic viewer will read. 1 MiB is
+/// generous for any markdown / config / text asset a user would realistically
+/// want to edit inline and keeps the wire payload bounded.
+const MAX_POD_FILE_READ_BYTES: u64 = 1_048_576;
+
+/// Prefix scanned for null bytes before declaring a file binary.
+/// 8 KiB matches git's heuristic for the same purpose.
+const BINARY_SNIFF_BYTES: usize = 8192;
 
 #[derive(Clone)]
 pub struct Persister {
@@ -270,6 +280,163 @@ impl Persister {
         }))
     }
 
+    /// Shallow directory listing under `<pods_root>/<pod_id>/<rel_path>`.
+    /// Empty `rel_path` lists the pod root. Returns entries with dirs
+    /// first (name-sorted), then files (name-sorted); dotfiles are
+    /// filtered. `readonly` is computed from [`is_readonly_path`] on the
+    /// full pod-relative path of each entry.
+    ///
+    /// Safety: `rel_path` must be a plain relative path — any `..` or
+    /// absolute-path component returns an error rather than traversing
+    /// outside the pod. Used by the webui's file-tree panel; the MCP
+    /// `pod_list_files` tool has its own (allowlist-gated) listing
+    /// in `tools::builtin_tools::filesystem`.
+    pub async fn list_pod_dir(&self, pod_id: &str, rel_path: &str) -> Result<Vec<FsEntry>> {
+        validate_pod_id(pod_id)?;
+        let pod_dir = self.pod_dir(pod_id);
+        if !fs::try_exists(&pod_dir).await.unwrap_or(false) {
+            return Err(anyhow::anyhow!("pod `{pod_id}` does not exist"));
+        }
+        let rel = normalize_pod_relative_path(rel_path)?;
+        let dir = if rel.is_empty() {
+            pod_dir.clone()
+        } else {
+            pod_dir.join(&rel)
+        };
+        let meta = fs::metadata(&dir)
+            .await
+            .with_context(|| format!("stat {}", dir.display()))?;
+        if !meta.is_dir() {
+            return Err(anyhow::anyhow!("`{rel_path}` is not a directory"));
+        }
+
+        let mut read = fs::read_dir(&dir)
+            .await
+            .with_context(|| format!("read_dir {}", dir.display()))?;
+        let mut out: Vec<FsEntry> = Vec::new();
+        while let Some(entry) = read
+            .next_entry()
+            .await
+            .with_context(|| format!("iter {}", dir.display()))?
+        {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name.starts_with('.') {
+                continue;
+            }
+            let ft = match entry.file_type().await {
+                Ok(ft) => ft,
+                Err(_) => continue,
+            };
+            let is_dir = ft.is_dir();
+            let size = if is_dir {
+                0
+            } else {
+                entry.metadata().await.map(|m| m.len()).unwrap_or(0)
+            };
+            let full_rel = if rel.is_empty() {
+                name.clone()
+            } else {
+                format!("{rel}/{name}")
+            };
+            let readonly = !is_dir && is_readonly_path(&full_rel);
+            out.push(FsEntry {
+                name,
+                is_dir,
+                size,
+                readonly,
+            });
+        }
+        out.sort_by(|a, b| match (a.is_dir, b.is_dir) {
+            (true, false) => std::cmp::Ordering::Less,
+            (false, true) => std::cmp::Ordering::Greater,
+            _ => a.name.cmp(&b.name),
+        });
+        Ok(out)
+    }
+
+    /// Read one file under `<pods_root>/<pod_id>/<rel_path>` for the
+    /// webui's generic text viewer. Returns the file contents plus
+    /// the `is_readonly_path` verdict so the viewer can hide the Save
+    /// button. Rejects files larger than [`MAX_POD_FILE_READ_BYTES`]
+    /// and files whose first [`BINARY_SNIFF_BYTES`] contain a null byte
+    /// (the viewer is a plain-text surface and both cases are
+    /// non-renderable). `rel_path` must be a plain relative path —
+    /// same normalization rules as [`Persister::list_pod_dir`].
+    pub async fn read_pod_file(&self, pod_id: &str, rel_path: &str) -> Result<(String, bool)> {
+        validate_pod_id(pod_id)?;
+        let rel = normalize_pod_relative_path(rel_path)?;
+        if rel.is_empty() {
+            return Err(anyhow::anyhow!("path is empty"));
+        }
+        let pod_dir = self.pod_dir(pod_id);
+        if !fs::try_exists(&pod_dir).await.unwrap_or(false) {
+            return Err(anyhow::anyhow!("pod `{pod_id}` does not exist"));
+        }
+        let path = pod_dir.join(&rel);
+        let meta = fs::metadata(&path)
+            .await
+            .with_context(|| format!("stat {}", path.display()))?;
+        if !meta.is_file() {
+            return Err(anyhow::anyhow!("`{rel}` is not a regular file"));
+        }
+        if meta.len() > MAX_POD_FILE_READ_BYTES {
+            return Err(anyhow::anyhow!(
+                "file `{rel}` is {} bytes; viewer limit is {} bytes",
+                meta.len(),
+                MAX_POD_FILE_READ_BYTES
+            ));
+        }
+        let bytes = fs::read(&path)
+            .await
+            .with_context(|| format!("read {}", path.display()))?;
+        let sniff_end = bytes.len().min(BINARY_SNIFF_BYTES);
+        if bytes[..sniff_end].contains(&0u8) {
+            return Err(anyhow::anyhow!(
+                "file `{rel}` appears to be binary (null byte in first {BINARY_SNIFF_BYTES} bytes)"
+            ));
+        }
+        let content = String::from_utf8(bytes)
+            .with_context(|| format!("decode {} as UTF-8", path.display()))?;
+        Ok((content, is_readonly_path(&rel)))
+    }
+
+    /// Overwrite one text file under `<pods_root>/<pod_id>/<rel_path>`
+    /// for the webui's generic editor. Rejects read-only paths
+    /// (thread JSONs, pod_state.json, behaviors/*/state.json) and
+    /// paths that escape the pod root. Creates parent directories
+    /// implicitly if the file's immediate parent is missing, but
+    /// will NOT create arbitrary nested directory trees — the parent
+    /// has to already exist or be one level deep, matching the
+    /// granularity of files the user can reach from the tree viewer.
+    pub async fn write_pod_file(&self, pod_id: &str, rel_path: &str, content: &str) -> Result<()> {
+        validate_pod_id(pod_id)?;
+        let rel = normalize_pod_relative_path(rel_path)?;
+        if rel.is_empty() {
+            return Err(anyhow::anyhow!("path is empty"));
+        }
+        if is_readonly_path(&rel) {
+            return Err(anyhow::anyhow!(
+                "path `{rel}` is read-only (runtime state owned by the scheduler)"
+            ));
+        }
+        let pod_dir = self.pod_dir(pod_id);
+        if !fs::try_exists(&pod_dir).await.unwrap_or(false) {
+            return Err(anyhow::anyhow!("pod `{pod_id}` does not exist"));
+        }
+        let path = pod_dir.join(&rel);
+        if let Some(parent) = path.parent()
+            && !fs::try_exists(parent).await.unwrap_or(false)
+        {
+            fs::create_dir_all(parent)
+                .await
+                .with_context(|| format!("mkdir {}", parent.display()))?;
+        }
+        fs::write(&path, content.as_bytes())
+            .await
+            .with_context(|| format!("write {}", path.display()))?;
+        Ok(())
+    }
+
     /// Create a fresh pod directory and write `pod.toml` from the supplied
     /// config. Fails if a pod with the same id already exists or if the
     /// config doesn't validate.
@@ -387,6 +554,32 @@ pub async fn write_pod_state(pod_dir: &Path, state: &PodState) -> Result<()> {
         .await
         .with_context(|| format!("write {}", path.display()))?;
     Ok(())
+}
+
+/// Normalize a pod-relative path supplied by the wire. Accepts empty
+/// string (the pod root). Rejects absolute prefixes, `..` components,
+/// embedded nulls, and backslashes; collapses redundant separators and
+/// strips leading/trailing slashes so the returned string is always of
+/// the form `a/b/c` or empty. The result is safe to `join` onto the
+/// pod dir — it cannot escape the pod.
+fn normalize_pod_relative_path(rel: &str) -> Result<String> {
+    if rel.is_empty() {
+        return Ok(String::new());
+    }
+    if rel.contains('\0') || rel.contains('\\') {
+        return Err(anyhow::anyhow!("path contains illegal characters"));
+    }
+    let mut out: Vec<&str> = Vec::new();
+    for part in rel.split('/') {
+        if part.is_empty() || part == "." {
+            continue;
+        }
+        if part == ".." {
+            return Err(anyhow::anyhow!("path may not contain `..` components"));
+        }
+        out.push(part);
+    }
+    Ok(out.join("/"))
 }
 
 /// Reject pod ids containing path separators or other shell-hostile bits.
@@ -855,6 +1048,114 @@ mod tests {
             loaded.threads[0].bindings.host_env.is_none(),
             "legacy string id should be normalized to None on load"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn normalize_pod_relative_path_accepts_clean() {
+        assert_eq!(normalize_pod_relative_path("").unwrap(), "");
+        assert_eq!(normalize_pod_relative_path("a").unwrap(), "a");
+        assert_eq!(normalize_pod_relative_path("a/b").unwrap(), "a/b");
+        // Strips leading / and redundant separators.
+        assert_eq!(normalize_pod_relative_path("/a//b/").unwrap(), "a/b");
+        // Explicit `.` components are collapsed.
+        assert_eq!(normalize_pod_relative_path("./a/./b").unwrap(), "a/b");
+    }
+
+    #[test]
+    fn normalize_pod_relative_path_rejects_escapes() {
+        assert!(normalize_pod_relative_path("..").is_err());
+        assert!(normalize_pod_relative_path("a/../b").is_err());
+        assert!(normalize_pod_relative_path("a\\b").is_err());
+        assert!(normalize_pod_relative_path("a\0b").is_err());
+    }
+
+    #[tokio::test]
+    async fn read_pod_file_accepts_text_rejects_binary_and_escape() {
+        let dir = temp_dir();
+        let p = Persister::new(dir.clone()).await.unwrap();
+        let pod_id = "rw-pod";
+        let pod_dir = dir.join(pod_id);
+        std::fs::create_dir_all(&pod_dir).unwrap();
+        std::fs::write(pod_dir.join("pod.toml"), "name = \"x\"\n").unwrap();
+        std::fs::write(pod_dir.join("system_prompt.md"), "hello").unwrap();
+        std::fs::write(pod_dir.join("blob.bin"), b"\0\0binary\0").unwrap();
+
+        let (text, ro) = p.read_pod_file(pod_id, "system_prompt.md").await.unwrap();
+        assert_eq!(text, "hello");
+        assert!(!ro);
+
+        let err = p.read_pod_file(pod_id, "blob.bin").await.unwrap_err();
+        assert!(err.to_string().contains("binary"));
+
+        // Path traversal is rejected by normalization.
+        assert!(p.read_pod_file(pod_id, "../other").await.is_err());
+        // Empty path is rejected (the viewer targets individual files,
+        // not the pod root).
+        assert!(p.read_pod_file(pod_id, "").await.is_err());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn write_pod_file_enforces_readonly() {
+        let dir = temp_dir();
+        let p = Persister::new(dir.clone()).await.unwrap();
+        let pod_id = "write-pod";
+        let pod_dir = dir.join(pod_id);
+        std::fs::create_dir_all(pod_dir.join("threads")).unwrap();
+        std::fs::write(pod_dir.join("pod.toml"), "stub = 1\n").unwrap();
+
+        // Creating a brand-new file is fine.
+        p.write_pod_file(pod_id, "notes.md", "new content\n")
+            .await
+            .unwrap();
+        let roundtrip = std::fs::read_to_string(pod_dir.join("notes.md")).unwrap();
+        assert_eq!(roundtrip, "new content\n");
+
+        // Overwriting an existing editable file works.
+        p.write_pod_file(pod_id, "pod.toml", "name = \"edited\"\n")
+            .await
+            .unwrap();
+
+        // Read-only paths are rejected on write.
+        assert!(
+            p.write_pod_file(pod_id, "pod_state.json", "{}")
+                .await
+                .is_err()
+        );
+        assert!(
+            p.write_pod_file(pod_id, "threads/abc.json", "{}")
+                .await
+                .is_err()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn list_pod_dir_flags_readonly_and_rejects_escape() {
+        let dir = temp_dir();
+        let p = Persister::new(dir.clone()).await.unwrap();
+        let task = sample_task("fs-test");
+        p.flush(&task).await.unwrap();
+
+        let root = p.list_pod_dir("fs-test", "").await.unwrap();
+        // Dirs come first; `threads` exists after flush.
+        assert!(root.iter().any(|e| e.name == "threads" && e.is_dir));
+        assert!(root.iter().any(|e| e.name == "pod.toml" && !e.is_dir));
+
+        let threads = p.list_pod_dir("fs-test", "threads").await.unwrap();
+        let entry = threads
+            .iter()
+            .find(|e| e.name == "fs-test.json")
+            .expect("thread file");
+        assert!(
+            entry.readonly,
+            "threads/<id>.json should be flagged readonly"
+        );
+
+        // `..` escape is rejected.
+        assert!(p.list_pod_dir("fs-test", "../other").await.is_err());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -19,6 +19,7 @@
 
 pub mod behaviors;
 pub mod config;
+pub mod fs;
 pub mod persist;
 pub mod resources;
 

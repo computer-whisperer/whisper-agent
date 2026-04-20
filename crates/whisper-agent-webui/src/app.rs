@@ -34,11 +34,12 @@ use whisper_agent_protocol::sandbox::NetworkPolicy;
 use whisper_agent_protocol::{
     AllowMap, ApprovalChoice, BackendSummary, BehaviorConfig, BehaviorOrigin,
     BehaviorSnapshot as BehaviorSnapshotProto, BehaviorSummary, BehaviorThreadOverride,
-    ClientToServer, ContentBlock, Conversation, FunctionKind, FunctionSummary, HostEnvBinding,
-    HostEnvProviderInfo, HostEnvSpec, Message, ModelSummary, NamedHostEnv, PodAllow, PodConfig,
-    PodLimits, PodSummary, ResourceSnapshot, ResourceStateLabel, RetentionPolicy, Role,
-    ServerToClient, ThreadBindings, ThreadBindingsRequest, ThreadConfigOverride, ThreadDefaults,
-    ThreadStateLabel, ThreadSummary, ToolResultContent, TriggerSpec, TurnLog, Usage,
+    ClientToServer, ContentBlock, Conversation, FsEntry, FunctionKind, FunctionSummary,
+    HostEnvBinding, HostEnvProviderInfo, HostEnvSpec, Message, ModelSummary, NamedHostEnv,
+    PodAllow, PodConfig, PodLimits, PodSummary, ResourceSnapshot, ResourceStateLabel,
+    RetentionPolicy, Role, ServerToClient, ThreadBindings, ThreadBindingsRequest,
+    ThreadConfigOverride, ThreadDefaults, ThreadStateLabel, ThreadSummary, ToolResultContent,
+    TriggerSpec, TurnLog, Usage,
 };
 
 /// Events pushed into [`Inbound`]. In addition to decoded wire messages we pipe in
@@ -57,6 +58,22 @@ pub enum InboundEvent {
 
 pub type Inbound = Rc<RefCell<VecDeque<InboundEvent>>>;
 pub type SendFn = Box<dyn Fn(ClientToServer)>;
+
+/// Which UI action a click on a pod-file row triggers. Known
+/// specializations (pod.toml → pod editor, behaviors/* → behavior
+/// editor) dispatch to their modal. JSON files route to a read-only
+/// tree viewer; everything else goes through the generic text
+/// editor, whose server-side read rejects binaries via a null-byte
+/// sniff.
+enum PodFileDispatch {
+    PodConfig,
+    BehaviorConfig(String),
+    BehaviorPrompt(String),
+    /// Pod-relative path for the generic text editor.
+    TextEditor(String),
+    /// Pod-relative path for the JSON tree viewer.
+    JsonViewer(String),
+}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ConnectionStatus {
@@ -95,6 +112,106 @@ const SIDEBAR_DIM_COLOR: Color32 = Color32::from_gray(130);
 const SIDEBAR_DANGER_COLOR: Color32 = Color32::from_rgb(220, 90, 90);
 const SIDEBAR_WARNING_COLOR: Color32 = Color32::from_rgb(220, 170, 90);
 const SIDEBAR_ERROR_TEXT_COLOR: Color32 = Color32::from_rgb(220, 120, 120);
+
+/// Recursive renderer for the JSON tree viewer. `path` uniquely
+/// identifies this node (so egui's persistent collapse state doesn't
+/// collide across siblings); `label` is the display key
+/// (`foo` / `[3]` / `(root)`). Scalars become one-line labels;
+/// objects and arrays become collapsible headers with their child
+/// counts baked into the label. Only the root is default-open so a
+/// thread JSON doesn't dump the full conversation tree on first
+/// paint.
+fn render_json_node(
+    ui: &mut egui::Ui,
+    path: &str,
+    label: &str,
+    value: &serde_json::Value,
+    depth: usize,
+) {
+    const STRING_PREVIEW_BYTES: usize = 80;
+    match value {
+        serde_json::Value::Null => {
+            ui.label(
+                RichText::new(format!("{label}: null"))
+                    .small()
+                    .monospace()
+                    .color(Color32::from_gray(150)),
+            );
+        }
+        serde_json::Value::Bool(b) => {
+            ui.label(RichText::new(format!("{label}: {b}")).small().monospace());
+        }
+        serde_json::Value::Number(n) => {
+            ui.label(RichText::new(format!("{label}: {n}")).small().monospace());
+        }
+        serde_json::Value::String(s) => {
+            // Escape via Debug so quotes/newlines render visibly.
+            let full = format!("{s:?}");
+            let preview = if full.len() > STRING_PREVIEW_BYTES {
+                let mut cut = STRING_PREVIEW_BYTES;
+                while !full.is_char_boundary(cut) && cut > 0 {
+                    cut -= 1;
+                }
+                format!("{}…", &full[..cut])
+            } else {
+                full.clone()
+            };
+            let row = ui.label(
+                RichText::new(format!("{label}: {preview}"))
+                    .small()
+                    .monospace(),
+            );
+            if full.len() > STRING_PREVIEW_BYTES {
+                row.on_hover_text(s);
+            }
+        }
+        serde_json::Value::Array(arr) => {
+            let header = format!(
+                "{label}: [{} item{}]",
+                arr.len(),
+                if arr.len() == 1 { "" } else { "s" }
+            );
+            let state_id = ui.make_persistent_id(("json-array", path));
+            egui::collapsing_header::CollapsingState::load_with_default_open(
+                ui.ctx(),
+                state_id,
+                depth == 0,
+            )
+            .show_header(ui, |ui| {
+                ui.label(RichText::new(header).small().monospace().strong());
+            })
+            .body(|ui| {
+                for (i, item) in arr.iter().enumerate() {
+                    let child_path = format!("{path}/{i}");
+                    let child_label = format!("[{i}]");
+                    render_json_node(ui, &child_path, &child_label, item, depth + 1);
+                }
+            });
+        }
+        serde_json::Value::Object(obj) => {
+            let header = format!(
+                "{label}: {{ {} key{} }}",
+                obj.len(),
+                if obj.len() == 1 { "" } else { "s" }
+            );
+            let state_id = ui.make_persistent_id(("json-object", path));
+            egui::collapsing_header::CollapsingState::load_with_default_open(
+                ui.ctx(),
+                state_id,
+                depth == 0,
+            )
+            .show_header(ui, |ui| {
+                ui.label(RichText::new(header).small().monospace().strong());
+            })
+            .body(|ui| {
+                for (k, v) in obj.iter() {
+                    let child_path = format!("{path}/{k}");
+                    render_json_node(ui, &child_path, k, v, depth + 1);
+                }
+            });
+        }
+    }
+}
 
 /// Small-bold subsection header under a pod section ("Interactive",
 /// "Behaviors", "Deleted behaviors").
@@ -623,6 +740,31 @@ pub struct ChatApp {
     pod_configs: HashMap<String, PodConfig>,
     pod_configs_requested: HashSet<String>,
 
+    /// Modal state for the generic text editor — the fallback for pod
+    /// files that don't route to the pod or behavior editors.
+    /// `None` = closed.
+    file_viewer_modal: Option<FileViewerModalState>,
+    /// Modal state for the JSON tree viewer. Opened by clicking any
+    /// `.json` file in the tree. `None` = closed.
+    json_viewer_modal: Option<JsonViewerModalState>,
+    /// Pod id whose file tree is currently open in its modal viewer.
+    /// `None` = closed. The tree's per-directory expansion state and
+    /// cached listings live in egui memory and `pod_files` respectively
+    /// — reopening the modal resumes where the user left off.
+    file_tree_modal_pod: Option<String>,
+
+    /// Shallow directory listings keyed by `(pod_id, pod_relative_path)`.
+    /// Empty path is the pod root. Populated by `PodDirListing`
+    /// responses and consumed by the sidebar's per-pod file-tree
+    /// subsection. Never invalidated today — the tree refreshes only
+    /// on reload (future work: wire a refresh button / push events).
+    pod_files: HashMap<(String, String), Vec<FsEntry>>,
+    /// `(pod_id, path)` pairs we've already asked the server about.
+    /// Guards against repeatedly firing `ListPodDir` during the time
+    /// between the expansion that triggered the fetch and the
+    /// response landing.
+    pod_files_requested: HashSet<(String, String)>,
+
     /// Snapshot of every Function currently registered on the server,
     /// keyed by `function_id`. `BTreeMap` for deterministic rendering
     /// order (oldest first) in the status-bar popover — functions are
@@ -903,6 +1045,83 @@ impl BehaviorEditorModalState {
     }
 }
 
+/// State for the generic pod-file text editor. Opened by clicking a
+/// file in the file tree that doesn't route to a specialized editor
+/// (pod.toml / behavior config / behavior prompt have their own
+/// modals). The editor reads the file once via `ReadPodFile`,
+/// populates `working` + `baseline`, and lets the user edit the
+/// buffer and save with `WritePodFile`. `readonly` mirrors the
+/// server's `is_readonly_path` decision — read-only files hide the
+/// Save / Revert buttons entirely so the modal is clearly a viewer.
+struct FileViewerModalState {
+    pod_id: String,
+    path: String,
+    /// In-memory edit buffer. `None` until the `PodFileContent`
+    /// round-trip lands.
+    working: Option<String>,
+    /// Last-known server content. Used for the Revert baseline and
+    /// the dirty indicator (Save enabled only when they diverge).
+    baseline: Option<String>,
+    /// Reflects `is_readonly_path` on the file. Runtime state
+    /// (thread JSONs, pod_state.json, behaviors/*/state.json) loads
+    /// with `true` here and can't be saved.
+    readonly: bool,
+    /// Last read/write error surfaced inline in the footer.
+    error: Option<String>,
+    /// Correlation id of the in-flight `WritePodFile`. `Some` during
+    /// a save; cleared by the matching `PodFileWritten` (or error).
+    pending_correlation: Option<String>,
+}
+
+impl FileViewerModalState {
+    fn new(pod_id: String, path: String) -> Self {
+        Self {
+            pod_id,
+            path,
+            working: None,
+            baseline: None,
+            readonly: false,
+            error: None,
+            pending_correlation: None,
+        }
+    }
+
+    fn is_dirty(&self) -> bool {
+        match (&self.working, &self.baseline) {
+            (Some(w), Some(b)) => w != b,
+            _ => false,
+        }
+    }
+}
+
+/// State for the JSON tree viewer — the read-only counterpart to
+/// `FileViewerModalState` used for every `.json` path a user clicks
+/// in the file tree. Parses the content on arrival; a parse failure
+/// surfaces as `error` with `parsed = None` (raw bytes aren't shown
+/// — JSON in a pod dir is always machine-written and a broken file
+/// is more useful to surface than silently render as text).
+struct JsonViewerModalState {
+    pod_id: String,
+    path: String,
+    /// Parsed value. `None` while the read is in flight OR when the
+    /// file failed to parse as JSON — `error` disambiguates.
+    parsed: Option<serde_json::Value>,
+    error: Option<String>,
+    pending_correlation: Option<String>,
+}
+
+impl JsonViewerModalState {
+    fn new(pod_id: String, path: String) -> Self {
+        Self {
+            pod_id,
+            path,
+            parsed: None,
+            error: None,
+            pending_correlation: None,
+        }
+    }
+}
+
 /// State for the "+ New behavior" dialog. Two fields: the
 /// directory-friendly `behavior_id` (immutable on disk) and the
 /// display `name` (free text). On Save we send a `CreateBehavior`
@@ -1052,6 +1271,11 @@ impl ChatApp {
             default_pod_template: None,
             pod_configs: HashMap::new(),
             pod_configs_requested: HashSet::new(),
+            pod_files: HashMap::new(),
+            pod_files_requested: HashSet::new(),
+            file_viewer_modal: None,
+            json_viewer_modal: None,
+            file_tree_modal_pod: None,
             active_functions: std::collections::BTreeMap::new(),
             functions_requested: false,
             left_mode: LeftPanelMode::default(),
@@ -1548,6 +1772,24 @@ impl ChatApp {
                     modal.pending_correlation = None;
                     return;
                 }
+                // File viewer in-flight read or save.
+                if let Some(modal) = self.file_viewer_modal.as_mut()
+                    && correlation_id.is_some()
+                    && modal.pending_correlation == correlation_id
+                {
+                    modal.error = Some(message);
+                    modal.pending_correlation = None;
+                    return;
+                }
+                // JSON viewer in-flight read.
+                if let Some(modal) = self.json_viewer_modal.as_mut()
+                    && correlation_id.is_some()
+                    && modal.pending_correlation == correlation_id
+                {
+                    modal.error = Some(message);
+                    modal.pending_correlation = None;
+                    return;
+                }
                 if let Some(tid) = thread_id.as_ref()
                     && let Some(view) = self.tasks.get_mut(tid)
                 {
@@ -1692,6 +1934,72 @@ impl ChatApp {
                 // for the UI to refresh. The event is still delivered so
                 // a future "inspect current system prompt" panel can
                 // stay in sync without polling.
+            }
+            ServerToClient::PodDirListing {
+                pod_id,
+                path,
+                entries,
+                ..
+            } => {
+                let key = (pod_id, path);
+                self.pod_files_requested.remove(&key);
+                self.pod_files.insert(key, entries);
+            }
+            ServerToClient::PodFileContent {
+                pod_id,
+                path,
+                content,
+                readonly,
+                correlation_id,
+            } => {
+                if let Some(modal) = self.file_viewer_modal.as_mut()
+                    && modal.pod_id == pod_id
+                    && modal.path == path
+                    && modal.pending_correlation == correlation_id
+                {
+                    modal.baseline = Some(content.clone());
+                    modal.working = Some(content);
+                    modal.readonly = readonly;
+                    modal.pending_correlation = None;
+                    modal.error = None;
+                } else if let Some(modal) = self.json_viewer_modal.as_mut()
+                    && modal.pod_id == pod_id
+                    && modal.path == path
+                    && modal.pending_correlation == correlation_id
+                {
+                    modal.pending_correlation = None;
+                    match serde_json::from_str::<serde_json::Value>(&content) {
+                        Ok(value) => {
+                            modal.parsed = Some(value);
+                            modal.error = None;
+                        }
+                        Err(e) => {
+                            modal.parsed = None;
+                            modal.error = Some(format!("parse JSON: {e}"));
+                        }
+                    }
+                }
+            }
+            ServerToClient::PodFileWritten {
+                pod_id,
+                path,
+                correlation_id,
+            } => {
+                if let Some(modal) = self.file_viewer_modal.as_mut()
+                    && modal.pod_id == pod_id
+                    && modal.path == path
+                    && modal.pending_correlation == correlation_id
+                {
+                    // Save succeeded — adopt the working buffer as the
+                    // new baseline so the dirty indicator flips to
+                    // "saved" and the tree viewer's cached entry (if
+                    // any) remains consistent with disk.
+                    if let Some(w) = modal.working.clone() {
+                        modal.baseline = Some(w);
+                    }
+                    modal.pending_correlation = None;
+                    modal.error = None;
+                }
             }
             ServerToClient::PodArchived { pod_id } => {
                 self.pods.remove(&pod_id);
@@ -2946,6 +3254,9 @@ impl eframe::App for ChatApp {
         self.render_pod_editor_modal(&ctx);
         self.render_new_behavior_modal(&ctx);
         self.render_behavior_editor_modal(&ctx);
+        self.render_file_tree_modal(&ctx);
+        self.render_file_viewer_modal(&ctx);
+        self.render_json_viewer_modal(&ctx);
 
         // Draft debounce tick. Schedule a repaint at the deadline so
         // the flush fires even if nothing else is driving frames.
@@ -3048,6 +3359,7 @@ impl ChatApp {
         let mut archive_confirmed = false;
         let mut archive_disarm = false;
         let mut edit_config_clicked = false;
+        let mut open_files_clicked = false;
         let mut toggle_pod_behaviors_to: Option<bool> = None;
         let mut behavior_actions: Vec<BehaviorRowAction> = Vec::new();
         let header = egui::collapsing_header::CollapsingState::load_with_default_open(
@@ -3097,6 +3409,9 @@ impl ChatApp {
                     }
                     if sidebar_icon_button(ui, "⚙", "Edit pod config", true).clicked() {
                         edit_config_clicked = true;
+                    }
+                    if sidebar_icon_button(ui, "📁", "Browse pod files", true).clicked() {
+                        open_files_clicked = true;
                     }
                     if !pod_behaviors_enabled {
                         ui.label(RichText::new("paused").small().color(SIDEBAR_WARNING_COLOR));
@@ -3148,6 +3463,10 @@ impl ChatApp {
         if edit_config_clicked {
             self.open_pod_editor(pod_id.to_string());
         }
+        if open_files_clicked {
+            self.file_tree_modal_pod = Some(pod_id.to_string());
+            self.ensure_pod_dir_fetched(pod_id, "");
+        }
         if let Some(enabled) = toggle_pod_behaviors_to {
             self.send(ClientToServer::SetPodBehaviorsEnabled {
                 correlation_id: None,
@@ -3164,6 +3483,196 @@ impl ChatApp {
             pod_id: pod_id.clone(),
         });
         self.pod_editor_modal = Some(PodEditorModalState::new(pod_id));
+    }
+
+    /// Classify a pod-relative file path for the file-tree click
+    /// dispatcher. Strings mirror constants owned by the server
+    /// (`pod::POD_TOML`, `pod::behaviors::{BEHAVIOR_TOML, BEHAVIOR_PROMPT,
+    /// BEHAVIORS_DIR}`) — kept in sync by hand because the webui crate
+    /// deliberately doesn't depend on the server.
+    ///
+    /// Files with a `.json` extension explicitly fall through to
+    /// `Unknown`: a proper JSON viewer is planned separately and we
+    /// don't want users editing thread JSONs or state.json as plain
+    /// text by mistake. Every other file — known specializations
+    /// aside — routes to the generic text editor, whose server-side
+    /// read will reject binaries via a null-byte sniff.
+    fn classify_pod_file_path(path: &str) -> PodFileDispatch {
+        if path == "pod.toml" {
+            return PodFileDispatch::PodConfig;
+        }
+        if let Some(rest) = path.strip_prefix("behaviors/")
+            && let Some((id, suffix)) = rest.split_once('/')
+            && !id.is_empty()
+            && !suffix.is_empty()
+            && !suffix.contains('/')
+        {
+            match suffix {
+                "behavior.toml" => return PodFileDispatch::BehaviorConfig(id.to_string()),
+                "prompt.md" => return PodFileDispatch::BehaviorPrompt(id.to_string()),
+                _ => {}
+            }
+        }
+        if path.ends_with(".json") {
+            return PodFileDispatch::JsonViewer(path.to_string());
+        }
+        PodFileDispatch::TextEditor(path.to_string())
+    }
+
+    /// Fire a `ListPodDir` for `(pod_id, path)` iff we don't already
+    /// have a cached listing or a request in flight. Path is the
+    /// pod-relative directory ("" = pod root). Shallow — children of
+    /// expanded subdirectories are fetched one round-trip at a time.
+    fn ensure_pod_dir_fetched(&mut self, pod_id: &str, path: &str) {
+        let key = (pod_id.to_string(), path.to_string());
+        if self.pod_files.contains_key(&key) || self.pod_files_requested.contains(&key) {
+            return;
+        }
+        self.pod_files_requested.insert(key);
+        self.send(ClientToServer::ListPodDir {
+            correlation_id: None,
+            pod_id: pod_id.to_string(),
+            path: if path.is_empty() {
+                None
+            } else {
+                Some(path.to_string())
+            },
+        });
+    }
+
+    /// Render the file-tree modal — a centered Window rooted at a
+    /// specific pod's directory. Trigger: the folder icon in the pod
+    /// header. The tree body is the same shallow-lazy renderer used
+    /// for individual clicks to the pod / behavior / generic editors,
+    /// so opening a file from here behaves identically to any other
+    /// launch path.
+    fn render_file_tree_modal(&mut self, ctx: &egui::Context) {
+        let Some(pod_id) = self.file_tree_modal_pod.clone() else {
+            return;
+        };
+
+        let title = format!("Files — {pod_id}");
+        let screen = ctx.content_rect();
+        let max_h = (screen.height() - 60.0).max(280.0);
+        let max_w = (screen.width() - 60.0).max(360.0);
+        let mut open = true;
+
+        egui::Window::new(title)
+            .collapsible(false)
+            .resizable(true)
+            .default_width(480.0_f32.min(max_w))
+            .default_height(520.0_f32.min(max_h))
+            .max_width(max_w)
+            .max_height(max_h)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .open(&mut open)
+            .show(ctx, |ui| {
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        self.render_pod_dir(ui, &pod_id, "");
+                    });
+            });
+
+        if !open {
+            self.file_tree_modal_pod = None;
+        }
+    }
+
+    /// Render one directory's entries. Directories become further
+    /// collapsing headers; files are plain labels (read-only entries
+    /// are dimmed). Click-to-open dispatch lands in a later phase.
+    fn render_pod_dir(&mut self, ui: &mut egui::Ui, pod_id: &str, path: &str) {
+        let key = (pod_id.to_string(), path.to_string());
+        let Some(entries_ref) = self.pod_files.get(&key) else {
+            ui.label(
+                RichText::new("  loading…")
+                    .small()
+                    .italics()
+                    .color(SIDEBAR_MUTED_COLOR),
+            );
+            return;
+        };
+        if entries_ref.is_empty() {
+            ui.label(
+                RichText::new("  (empty)")
+                    .small()
+                    .italics()
+                    .color(SIDEBAR_MUTED_COLOR),
+            );
+            return;
+        }
+        // Release the borrow on `pod_files` before recursing: child
+        // renders may mutate the same map (via ensure_pod_dir_fetched →
+        // the inbound event loop) on later frames.
+        let entries: Vec<FsEntry> = entries_ref.clone();
+        let mut to_fetch: Vec<String> = Vec::new();
+        let mut to_dispatch: Option<PodFileDispatch> = None;
+        for entry in &entries {
+            let child_path = if path.is_empty() {
+                entry.name.clone()
+            } else {
+                format!("{path}/{}", entry.name)
+            };
+            if entry.is_dir {
+                let dir_state_id = ui.make_persistent_id(format!("pod-dir-{pod_id}::{child_path}"));
+                let dir_header = egui::collapsing_header::CollapsingState::load_with_default_open(
+                    ui.ctx(),
+                    dir_state_id,
+                    false,
+                )
+                .show_header(ui, |ui| {
+                    ui.add(
+                        egui::Label::new(
+                            RichText::new(format!("{}/", entry.name)).small().strong(),
+                        )
+                        .truncate(),
+                    );
+                });
+                let is_open = dir_header.is_open();
+                dir_header.body(|ui| {
+                    self.render_pod_dir(ui, pod_id, &child_path);
+                });
+                if is_open {
+                    to_fetch.push(child_path);
+                }
+            } else {
+                let dispatch = Self::classify_pod_file_path(&child_path);
+                let mut text = RichText::new(&entry.name).small();
+                if entry.readonly {
+                    text = text.color(SIDEBAR_MUTED_COLOR);
+                }
+                if ui.selectable_label(false, text).clicked() {
+                    to_dispatch = Some(dispatch);
+                }
+            }
+        }
+        for child in to_fetch {
+            self.ensure_pod_dir_fetched(pod_id, &child);
+        }
+        if let Some(dispatch) = to_dispatch {
+            match dispatch {
+                PodFileDispatch::PodConfig => {
+                    self.open_pod_editor(pod_id.to_string());
+                }
+                PodFileDispatch::BehaviorConfig(behavior_id) => {
+                    self.open_behavior_editor(pod_id.to_string(), behavior_id);
+                }
+                PodFileDispatch::BehaviorPrompt(behavior_id) => {
+                    self.open_behavior_editor_on_tab(
+                        pod_id.to_string(),
+                        behavior_id,
+                        BehaviorEditorTab::Prompt,
+                    );
+                }
+                PodFileDispatch::TextEditor(path) => {
+                    self.open_file_viewer(pod_id.to_string(), path);
+                }
+                PodFileDispatch::JsonViewer(path) => {
+                    self.open_json_viewer(pod_id.to_string(), path);
+                }
+            }
+        }
     }
 
     /// Fire a `ListBehaviors` for `pod_id` iff we haven't already.
@@ -3184,12 +3693,61 @@ impl ChatApp {
     }
 
     fn open_behavior_editor(&mut self, pod_id: String, behavior_id: String) {
+        self.open_behavior_editor_on_tab(pod_id, behavior_id, BehaviorEditorTab::Trigger);
+    }
+
+    /// Same as [`open_behavior_editor`] but lets the caller choose which
+    /// tab the modal opens on. Used by the file-tree dispatch so a click
+    /// on `behaviors/<id>/prompt.md` lands directly on the Prompt tab
+    /// instead of making the user navigate there.
+    fn open_behavior_editor_on_tab(
+        &mut self,
+        pod_id: String,
+        behavior_id: String,
+        tab: BehaviorEditorTab,
+    ) {
         self.send(ClientToServer::GetBehavior {
             correlation_id: None,
             pod_id: pod_id.clone(),
             behavior_id: behavior_id.clone(),
         });
-        self.behavior_editor_modal = Some(BehaviorEditorModalState::new(pod_id, behavior_id));
+        let mut state = BehaviorEditorModalState::new(pod_id, behavior_id);
+        state.tab = tab;
+        self.behavior_editor_modal = Some(state);
+    }
+
+    /// Open the generic text-editor modal on `<pod_id>/<path>`. Sends
+    /// `ReadPodFile` immediately; the returned `PodFileContent`
+    /// populates `working` + `baseline` + `readonly`. While the read
+    /// is in flight the modal renders a "loading…" placeholder, and
+    /// any server error on the read surfaces inline via the matching
+    /// correlation id.
+    fn open_file_viewer(&mut self, pod_id: String, path: String) {
+        let correlation = self.next_correlation_id();
+        let mut state = FileViewerModalState::new(pod_id.clone(), path.clone());
+        state.pending_correlation = Some(correlation.clone());
+        self.file_viewer_modal = Some(state);
+        self.send(ClientToServer::ReadPodFile {
+            correlation_id: Some(correlation),
+            pod_id,
+            path,
+        });
+    }
+
+    /// Open the JSON tree viewer on `<pod_id>/<path>`. Same read path
+    /// as [`open_file_viewer`]; divergence lives in the
+    /// `PodFileContent` handler, which parses the content into a
+    /// `serde_json::Value` when the correlation matches this modal.
+    fn open_json_viewer(&mut self, pod_id: String, path: String) {
+        let correlation = self.next_correlation_id();
+        let mut state = JsonViewerModalState::new(pod_id.clone(), path.clone());
+        state.pending_correlation = Some(correlation.clone());
+        self.json_viewer_modal = Some(state);
+        self.send(ClientToServer::ReadPodFile {
+            correlation_id: Some(correlation),
+            pod_id,
+            path,
+        });
     }
 
     /// Render the behaviors sub-section of a pod header, with each
@@ -4093,6 +4651,206 @@ impl ChatApp {
         } else {
             self.new_behavior_modal = Some(modal);
         }
+    }
+
+    /// Render the generic pod-file text editor. Single-textarea modal
+    /// — no tabs, no sub-forms. Save/Revert/Close footer for
+    /// writable files; a read-only notice replaces the footer for
+    /// paths the server has flagged as runtime state. Content loads
+    /// asynchronously (`ReadPodFile`); while in flight the body
+    /// renders a "loading…" placeholder.
+    /// Render the read-only JSON tree viewer. Scalars render as
+    /// `key: value` one-liners; objects and arrays render as
+    /// collapsible headers with their sizes in the label, default-open
+    /// at the root and default-closed deeper. Strings are shown
+    /// in-line with a preview and a hover tooltip carrying the full
+    /// text, so long message content doesn't blow out the row height.
+    fn render_json_viewer_modal(&mut self, ctx: &egui::Context) {
+        let Some(modal) = self.json_viewer_modal.take() else {
+            return;
+        };
+
+        let title = format!("{} — {}", modal.path, modal.pod_id);
+        let screen = ctx.content_rect();
+        let max_h = (screen.height() - 60.0).max(280.0);
+        let max_w = (screen.width() - 60.0).max(420.0);
+        let mut open = true;
+        let mut close_clicked = false;
+
+        egui::Window::new(title)
+            .collapsible(false)
+            .resizable(true)
+            .default_width(720.0_f32.min(max_w))
+            .default_height(560.0_f32.min(max_h))
+            .max_width(max_w)
+            .max_height(max_h)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .open(&mut open)
+            .show(ctx, |ui| {
+                egui::Panel::bottom("json_viewer_footer").show_inside(ui, |ui| {
+                    ui.add_space(6.0);
+                    if let Some(err) = modal.error.as_deref() {
+                        ui.colored_label(Color32::from_rgb(220, 80, 80), err);
+                        ui.add_space(4.0);
+                    }
+                    ui.separator();
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            RichText::new("read-only JSON viewer")
+                                .small()
+                                .color(Color32::from_gray(160)),
+                        );
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.button("Close").clicked() {
+                                close_clicked = true;
+                            }
+                        });
+                    });
+                });
+                egui::CentralPanel::default().show_inside(ui, |ui| {
+                    if let Some(value) = modal.parsed.as_ref() {
+                        egui::ScrollArea::vertical()
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| {
+                                render_json_node(ui, "$", "(root)", value, 0);
+                            });
+                    } else if modal.error.is_none() {
+                        ui.add_space(24.0);
+                        ui.label(
+                            RichText::new("loading…")
+                                .italics()
+                                .color(Color32::from_gray(160)),
+                        );
+                    }
+                });
+            });
+
+        if close_clicked || !open {
+            return;
+        }
+        self.json_viewer_modal = Some(modal);
+    }
+
+    fn render_file_viewer_modal(&mut self, ctx: &egui::Context) {
+        let Some(mut modal) = self.file_viewer_modal.take() else {
+            return;
+        };
+
+        let mut open = true;
+        let mut save_clicked = false;
+        let mut revert_clicked = false;
+        let mut close_clicked = false;
+
+        let title = format!("{} — {}", modal.path, modal.pod_id);
+        let screen = ctx.content_rect();
+        let max_h = (screen.height() - 60.0).max(280.0);
+        let max_w = (screen.width() - 60.0).max(420.0);
+        let dirty = modal.is_dirty();
+        let has_data = modal.working.is_some();
+        // "saving" iff we have content and a correlation is in flight
+        // (a correlation-in-flight with no content yet = pending read).
+        let saving = modal.pending_correlation.is_some() && has_data;
+
+        egui::Window::new(title)
+            .collapsible(false)
+            .resizable(true)
+            .default_width(720.0_f32.min(max_w))
+            .default_height(560.0_f32.min(max_h))
+            .max_width(max_w)
+            .max_height(max_h)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .open(&mut open)
+            .show(ctx, |ui| {
+                egui::Panel::bottom("file_viewer_footer").show_inside(ui, |ui| {
+                    if modal.readonly {
+                        ui.add_space(6.0);
+                        if let Some(err) = modal.error.as_deref() {
+                            ui.colored_label(Color32::from_rgb(220, 80, 80), err);
+                            ui.add_space(4.0);
+                        }
+                        ui.separator();
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                RichText::new("read-only — runtime state owned by the scheduler")
+                                    .small()
+                                    .color(Color32::from_gray(160)),
+                            );
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    if ui.button("Close").clicked() {
+                                        close_clicked = true;
+                                    }
+                                },
+                            );
+                        });
+                    } else {
+                        let actions = crate::editor::render_footer(
+                            ui,
+                            modal.error.as_deref(),
+                            has_data,
+                            dirty,
+                            saving,
+                        );
+                        save_clicked = actions.save;
+                        revert_clicked = actions.revert;
+                        close_clicked = actions.close;
+                    }
+                });
+                egui::CentralPanel::default().show_inside(ui, |ui| {
+                    let Some(working) = modal.working.as_mut() else {
+                        ui.add_space(24.0);
+                        if modal.error.is_none() {
+                            ui.label(
+                                RichText::new("loading…")
+                                    .italics()
+                                    .color(Color32::from_gray(160)),
+                            );
+                        }
+                        return;
+                    };
+                    egui::ScrollArea::vertical()
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            let mut edit = TextEdit::multiline(working)
+                                .code_editor()
+                                .desired_width(ui.available_width());
+                            if modal.readonly {
+                                edit = edit.interactive(false);
+                            }
+                            ui.add_sized(
+                                [ui.available_width(), ui.available_height().max(200.0)],
+                                edit,
+                            );
+                        });
+                });
+            });
+
+        if revert_clicked && let Some(b) = modal.baseline.clone() {
+            modal.working = Some(b);
+            modal.error = None;
+        }
+
+        if save_clicked
+            && modal.is_dirty()
+            && let Some(working) = modal.working.clone()
+        {
+            let correlation = self.next_correlation_id();
+            modal.pending_correlation = Some(correlation.clone());
+            modal.error = None;
+            self.send(ClientToServer::WritePodFile {
+                correlation_id: Some(correlation),
+                pod_id: modal.pod_id.clone(),
+                path: modal.path.clone(),
+                content: working,
+            });
+        }
+
+        if close_clicked || !open {
+            // Modal was taken out at the top — dropping = closed.
+            return;
+        }
+        self.file_viewer_modal = Some(modal);
     }
 
     fn render_pod_editor_modal(&mut self, ctx: &egui::Context) {

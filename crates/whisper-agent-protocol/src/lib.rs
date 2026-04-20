@@ -25,7 +25,7 @@ pub use conversation::{
     ContentBlock, Conversation, Message, ProviderReplay, Role, ToolResultContent,
 };
 pub use pod::{
-    CompactionConfig, NamedHostEnv, PodAllow, PodConfig, PodLimits, PodSnapshot, PodState,
+    CompactionConfig, FsEntry, NamedHostEnv, PodAllow, PodConfig, PodLimits, PodSnapshot, PodState,
     PodSummary, ThreadDefaults,
 };
 // `SystemPromptChoice` is defined below; re-export here so other
@@ -787,6 +787,53 @@ pub enum ClientToServer {
     ArchivePod {
         pod_id: String,
     },
+    /// Shallow directory listing under `<pods_root>/<pod_id>/<path>`. An
+    /// empty / absent `path` lists the pod's root. The webui file-tree
+    /// panel issues one of these per directory the user expands —
+    /// directories aren't enumerated recursively, so a pod with many
+    /// threads doesn't pay the full walk cost up front.
+    ///
+    /// Server filters hidden (dotfile) entries and rejects paths that
+    /// escape the pod root; responses flow back as `PodDirListing` on
+    /// success or `Error` on failure.
+    ListPodDir {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        correlation_id: Option<String>,
+        pod_id: String,
+        /// Path relative to the pod directory. Empty / absent = pod root.
+        /// Must be a plain relative path — no `..` components, no
+        /// absolute prefix.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        path: Option<String>,
+    },
+    /// Read one text file under a pod. Used by the webui's generic
+    /// file viewer for paths that don't route to a specialized editor
+    /// (pod.toml and behaviors/* go to their own modals). The server
+    /// rejects files larger than a fixed cap and files that look
+    /// binary (null bytes in the first 8 KB) — the viewer is a plain
+    /// text surface and can't render either. Responses: `PodFileContent`
+    /// on success or `Error` on failure.
+    ReadPodFile {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        correlation_id: Option<String>,
+        pod_id: String,
+        /// Path relative to the pod directory. Same normalization rules
+        /// as `ListPodDir.path` (no `..`, no absolute prefix).
+        path: String,
+    },
+    /// Overwrite one text file under a pod. Enforced server-side: the
+    /// target must not be on the read-only list (thread JSONs,
+    /// `pod_state.json`, behaviors/*/state.json). The webui is trusted
+    /// beyond the agent's `pod_write_file` allowlist — if the user can
+    /// see a file in the tree and it isn't read-only, they can edit
+    /// it. Ack: `PodFileWritten` on success, `Error` on failure.
+    WritePodFile {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        correlation_id: Option<String>,
+        pod_id: String,
+        path: String,
+        content: String,
+    },
 
     // --- Behavior registry (read-only in phase 1 — see
     //     docs/design_behaviors.md). Create / update / delete / run arrive
@@ -1170,6 +1217,38 @@ pub enum ServerToClient {
     },
     PodArchived {
         pod_id: String,
+    },
+    /// Reply to `ListPodDir`. Echoes the requested `pod_id` + `path`
+    /// (empty string for the pod root) alongside the entries so clients
+    /// can route the response into the right slot of their tree cache
+    /// when multiple expansions are in flight.
+    PodDirListing {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        correlation_id: Option<String>,
+        pod_id: String,
+        path: String,
+        entries: Vec<FsEntry>,
+    },
+    /// Reply to `ReadPodFile`. `readonly` mirrors `FsEntry.readonly`
+    /// so the viewer can hide the Save button without having to
+    /// re-classify the path itself.
+    PodFileContent {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        correlation_id: Option<String>,
+        pod_id: String,
+        path: String,
+        content: String,
+        readonly: bool,
+    },
+    /// Ack for a successful `WritePodFile`. Clients use the
+    /// `correlation_id` to clear the "saving…" state of a specific
+    /// save; the new content on disk is whatever the caller just sent,
+    /// so no payload echo is needed.
+    PodFileWritten {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        correlation_id: Option<String>,
+        pod_id: String,
+        path: String,
     },
 
     // --- Behavior registry ---

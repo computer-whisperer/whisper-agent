@@ -18,6 +18,7 @@ use super::{
 };
 use crate::pod;
 use crate::pod::behaviors::{BEHAVIOR_PROMPT, BEHAVIOR_STATE, BEHAVIOR_TOML, BEHAVIORS_DIR};
+use crate::pod::fs::{is_readonly_path, parse_behavior_path};
 use crate::tools::mcp::{ToolAnnotations, ToolDescriptor as McpTool};
 use whisper_agent_protocol::{BehaviorState, PodConfig};
 
@@ -36,52 +37,6 @@ pub(super) fn allowed_filenames(cfg: &PodConfig, behavior_ids: &[String]) -> Vec
         out.push(format!("{BEHAVIORS_DIR}/{id}/{BEHAVIOR_PROMPT}"));
     }
     out
-}
-
-/// Split `behaviors/<id>/<suffix>` into `(id, suffix)` when `filename`
-/// matches that shape. The id and suffix must each be a single path
-/// component (no nested subdirs).
-fn parse_behavior_path(filename: &str) -> Option<(&str, &str)> {
-    let rest = filename.strip_prefix(&format!("{BEHAVIORS_DIR}/"))?;
-    let (id, suffix) = rest.split_once('/')?;
-    if id.is_empty() || suffix.is_empty() || suffix.contains('/') {
-        return None;
-    }
-    Some((id, suffix))
-}
-
-/// Return the thread id for a path like `threads/<id>.json`, or None.
-fn parse_thread_path(filename: &str) -> Option<&str> {
-    let rest = filename.strip_prefix(&format!("{}/", pod::THREADS_DIR))?;
-    if rest.contains('/') || rest.starts_with('.') {
-        return None;
-    }
-    let id = rest.strip_suffix(".json")?;
-    if id.is_empty() {
-        return None;
-    }
-    Some(id)
-}
-
-/// Pattern-based check: a file that is readable but NOT writable via
-/// the pod_*_file tools. Runtime / observability data — thread JSONs,
-/// pod_state.json, per-behavior state.json. These aren't in the rw
-/// allowlist because they encode runtime state the scheduler owns;
-/// letting the agent edit them would bypass that ownership.
-fn is_readonly_path(filename: &str) -> bool {
-    if filename == pod::POD_STATE_JSON {
-        return true;
-    }
-    if parse_thread_path(filename).is_some() {
-        return true;
-    }
-    if let Some((id, suffix)) = parse_behavior_path(filename)
-        && suffix == crate::pod::behaviors::BEHAVIOR_STATE
-        && pod::behaviors::validate_behavior_id(id).is_ok()
-    {
-        return true;
-    }
-    false
 }
 
 /// Access level a filename resolves to under the current pod snapshot.
@@ -177,10 +132,9 @@ fn validate_filename(
     }
     Err(format!(
         "filename `{filename}` is not in this pod's allowlist. Allowed rw: [{}]. \
-         Read-only patterns: `pod_state.json`, `{}/<id>.json`, `{BEHAVIORS_DIR}/<id>/{}`.",
+         Read-only patterns: `pod_state.json`, `{}/<id>.json`, `{BEHAVIORS_DIR}/<id>/{BEHAVIOR_STATE}`.",
         allowed.join(", "),
         pod::THREADS_DIR,
-        crate::pod::behaviors::BEHAVIOR_STATE,
     ))
 }
 

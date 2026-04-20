@@ -233,3 +233,18 @@ pub struct PodSnapshot {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub behaviors: Vec<crate::BehaviorSummary>,
 }
+
+/// One entry in a `PodDirListing`. Directories report `size = 0`; the
+/// `readonly` flag reflects the server's `is_readonly_path` rule — true
+/// for `pod_state.json`, `threads/<id>.json`, and
+/// `behaviors/<id>/state.json`, false elsewhere (including for directories).
+/// Hidden (dotfile) entries and symlink loops are filtered out server-side.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct FsEntry {
+    pub name: String,
+    pub is_dir: bool,
+    #[serde(default)]
+    pub size: u64,
+    #[serde(default)]
+    pub readonly: bool,
+}
