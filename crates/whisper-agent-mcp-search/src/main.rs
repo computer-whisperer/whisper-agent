@@ -21,8 +21,10 @@ mod tools;
     about = "MCP server exposing the web_search tool (Brave Search API)."
 )]
 struct Args {
-    /// HTTP listen address.
-    #[arg(long, default_value = "127.0.0.1:9831")]
+    /// HTTP listen address. Defaults to dual-stack (`[::]:9831`); accepts
+    /// both IPv6 and IPv4 (via v4-mapped). Override to `127.0.0.1:9831`
+    /// for v4-only loopback.
+    #[arg(long, default_value = "[::]:9831")]
     listen: SocketAddr,
 
     /// Brave Search API key. Required — the daemon refuses to start without
@@ -80,6 +82,7 @@ async fn main() -> anyhow::Result<()> {
         .await
         .with_context(|| format!("failed to bind {}", args.listen))?;
     info!(
+        version = env!("CARGO_PKG_VERSION"),
         addr = %args.listen,
         timeout_s = args.request_timeout_seconds,
         default_count = args.default_count,

@@ -82,9 +82,22 @@ struct ConfigEnvArgs {
 
 #[derive(Parser, Debug)]
 struct ServeArgs {
-    /// HTTP listen address.
-    #[arg(long, default_value = "127.0.0.1:8080")]
+    /// HTTP listen address. Defaults to dual-stack (`[::]:8080`) so the
+    /// server is reachable on both IPv6 and IPv4 (via v4-mapped) without
+    /// extra config. Override to `127.0.0.1:8080` to bind v4-only.
+    #[arg(long, default_value = "[::]:8080")]
     listen: SocketAddr,
+
+    /// Path to a PEM-encoded TLS certificate chain. When set together
+    /// with `--tls-key`, the server speaks HTTPS instead of HTTP on
+    /// the same listen address. Both flags must be set together;
+    /// passing only one is a configuration error.
+    #[arg(long, requires = "tls_key")]
+    tls_cert: Option<PathBuf>,
+
+    /// Path to a PEM-encoded TLS private key. Pairs with `--tls-cert`.
+    #[arg(long, requires = "tls_cert")]
+    tls_key: Option<PathBuf>,
 
     /// Path to a TOML config file describing the model-backend catalog. If omitted,
     /// the server searches (in order): `$XDG_CONFIG_HOME/whisper-agent/whisper-agent.toml`,
@@ -267,6 +280,14 @@ async fn main() -> Result<()> {
         )
         .init();
 
+    // Pin rustls's process-level CryptoProvider before any TLS code
+    // runs. Both `ring` and `aws-lc-rs` arrive transitively, so rustls
+    // refuses to auto-pick. `.ok()` swallows the "already installed"
+    // error if some library beat us to it.
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .ok();
+
     let cli = Cli::parse();
     match cli.command {
         Command::Serve(args) => run_serve(args).await,
@@ -424,6 +445,16 @@ async fn run_serve(args: ServeArgs) -> Result<()> {
         &args.default_host_env_workspace,
     );
 
+    // clap's `requires` attr already enforces the cert+key pair, so by
+    // the time we get here the two are either both Some or both None.
+    let tls = match (args.tls_cert, args.tls_key) {
+        (Some(cert), Some(key)) => Some(server::TlsConfig {
+            cert_path: cert,
+            key_path: key,
+        }),
+        _ => None,
+    };
+
     let server_config = ServerConfig {
         backends,
         default_backend,
@@ -441,6 +472,7 @@ async fn run_serve(args: ServeArgs) -> Result<()> {
         pods_root,
         host_env_registry,
         shared_mcp_hosts,
+        tls,
     };
     server::serve(args.listen, server_config).await
 }

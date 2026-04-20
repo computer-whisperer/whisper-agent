@@ -2760,6 +2760,12 @@ impl eframe::App for ChatApp {
         egui::Panel::top("status_bar").show_inside(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.heading("whisper-agent");
+                ui.label(
+                    RichText::new(concat!("v", env!("CARGO_PKG_VERSION")))
+                        .color(Color32::from_gray(140))
+                        .small(),
+                )
+                .on_hover_text("whisper-agent-webui crate version (independent of the server)");
                 ui.separator();
                 let (label, color) = self.conn_status.label();
                 ui.label(RichText::new(label).color(color));

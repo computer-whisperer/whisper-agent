@@ -3,7 +3,8 @@ members = ["crates/*"]
 resolver = "3"
 
 [workspace.package]
-version = "0.1.0"
+# Each crate declares its own `version` so components can be bumped
+# independently. `edition` and `license` stay shared.
 edition = "2024"
 license = "MIT OR Apache-2.0"
 
@@ -53,7 +54,7 @@ whisper-agent-mcp-proto = { path = "crates/whisper-agent-mcp-proto" }
 [package]
 name = "whisper-agent"
 description = "Server-resident agent loop that reaches into managed POSIX hosts via MCP"
-version.workspace = true
+version = "0.1.0"
 edition.workspace = true
 license.workspace = true
 
@@ -80,7 +81,25 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "serd
 chrono-tz = { workspace = true }
 cron = { workspace = true }
 axum = { workspace = true, features = ["ws"] }
-tower-http = { version = "0.6", features = ["fs", "trace"] }
+# axum 0.8 itself doesn't expose a TLS server. axum-server provides
+# `bind_rustls`; the `tls-rustls` feature drops in tokio-rustls + the
+# rustls cert/key file loaders we need for `--tls-cert`/`--tls-key`.
+axum-server = { version = "0.8", features = ["tls-rustls"] }
+# Direct rustls dep to call `crypto::ring::default_provider()`
+# `.install_default()` once at startup. Both `aws-lc-rs` and `ring`
+# arrive transitively (reqwest via hyper-rustls uses ring;
+# axum-server/rustls default to aws-lc-rs), and rustls 0.23 panics on
+# the first TLS use if both are active without an explicit pick.
+# Keep it on `ring` to match reqwest's chain — avoids dragging in the
+# aws-lc-sys NASM build for an otherwise-unused crypto path.
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
+tower-http = { version = "0.6", features = ["trace"] }
+# `rust-embed` bakes the webui pkg/ + assets/ trees into the release
+# binary. In debug builds (default features) it reads from disk, so
+# `cargo run` in this repo still picks up live edits to assets and
+# wasm-pack output without a rebuild.
+rust-embed = "8"
+mime_guess = "2"
 whisper-agent-protocol = { workspace = true }
 toml = "1"
 base64 = "0.22"
