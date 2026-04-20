@@ -51,6 +51,14 @@ private fun WhisperAgentApp(app: WhisperAgentApp) {
         firstRouteDecided = true
     }
 
+    // Auto-open threads that CreateThread just spawned. AppSession emits
+    // on pendingNavigation when the server acks a thread-creation request.
+    LaunchedEffect(Unit) {
+        app.session.pendingNavigation.collect { newThreadId ->
+            nav.navigate(Routes.thread(newThreadId))
+        }
+    }
+
     NavHost(navController = nav, startDestination = Routes.THREADS) {
         composable(Routes.SETTINGS) {
             SettingsScreen(

@@ -47,9 +47,12 @@ sealed class ContentBlock {
 
     // TODO: ToolResult.content is `ToolResultContent` (also a sealed enum in
     //       the Rust crate) — model properly once needed for rendering.
+    // `previewText` is a client-side-only field populated from
+    // ThreadToolCallEnd's `result_preview`; never sent on the wire.
     data class ToolResult(
         val toolUseId: String,
         val isError: Boolean = false,
+        val previewText: String? = null,
     ) : ContentBlock()
 
     data class Thinking(val thinking: String) : ContentBlock()

@@ -61,5 +61,7 @@ dependencies {
 
     implementation(libs.okhttp)
 
+    implementation(libs.markdown.renderer.m3)
+
     testImplementation(kotlin("test"))
 }

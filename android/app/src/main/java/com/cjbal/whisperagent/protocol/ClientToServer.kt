@@ -19,6 +19,14 @@ sealed class ClientToServer {
         val correlationId: String? = null,
     ) : ClientToServer()
 
+    data class CreateThread(
+        val initialMessage: String,
+        val correlationId: String? = null,
+        val podId: String? = null,
+        // config_override and bindings_request are deferred — server falls
+        // back to the pod's `thread_defaults` when both are absent.
+    ) : ClientToServer()
+
     data class SubscribeToThread(
         val threadId: String,
     ) : ClientToServer()

@@ -39,6 +39,8 @@ object ClientToServerSerializer : KSerializer<ClientToServer> {
     private const val IDX_APPROVAL_ID = 4
     private const val IDX_DECISION = 5
     private const val IDX_REMEMBER = 6
+    private const val IDX_POD_ID = 7
+    private const val IDX_INITIAL_MESSAGE = 8
 
     override val descriptor: SerialDescriptor = buildClassSerialDescriptor("ClientToServer") {
         element("type", String.serializer().descriptor)
@@ -48,6 +50,8 @@ object ClientToServerSerializer : KSerializer<ClientToServer> {
         element("approval_id", String.serializer().descriptor, isOptional = true)
         element("decision", ApprovalChoice.serializer().descriptor, isOptional = true)
         element("remember", Boolean.serializer().descriptor, isOptional = true)
+        element("pod_id", String.serializer().descriptor, isOptional = true)
+        element("initial_message", String.serializer().descriptor, isOptional = true)
     }
 
     override fun serialize(encoder: Encoder, value: ClientToServer) {
@@ -60,6 +64,16 @@ object ClientToServerSerializer : KSerializer<ClientToServer> {
                     value.correlationId?.let {
                         encodeStringElement(descriptor, IDX_CORRELATION_ID, it)
                     }
+                }
+                is ClientToServer.CreateThread -> {
+                    encodeStringElement(descriptor, IDX_TYPE, "create_thread")
+                    value.correlationId?.let {
+                        encodeStringElement(descriptor, IDX_CORRELATION_ID, it)
+                    }
+                    value.podId?.let {
+                        encodeStringElement(descriptor, IDX_POD_ID, it)
+                    }
+                    encodeStringElement(descriptor, IDX_INITIAL_MESSAGE, value.initialMessage)
                 }
                 is ClientToServer.SubscribeToThread -> {
                     encodeStringElement(descriptor, IDX_TYPE, "subscribe_to_thread")
@@ -102,6 +116,8 @@ object ClientToServerSerializer : KSerializer<ClientToServer> {
             var approvalId: String? = null
             var decision: ApprovalChoice? = null
             var remember = false
+            var podId: String? = null
+            var initialMessage: String? = null
 
             loop@ while (true) {
                 when (val i = decodeElementIndex(descriptor)) {
@@ -115,12 +131,19 @@ object ClientToServerSerializer : KSerializer<ClientToServer> {
                         descriptor, i, ApprovalChoice.serializer(),
                     )
                     IDX_REMEMBER -> remember = decodeBooleanElement(descriptor, i)
+                    IDX_POD_ID -> podId = decodeStringElement(descriptor, i)
+                    IDX_INITIAL_MESSAGE -> initialMessage = decodeStringElement(descriptor, i)
                     else -> throw SerializationException("unexpected element index $i")
                 }
             }
 
             when (type) {
                 "list_threads" -> ClientToServer.ListThreads(correlationId)
+                "create_thread" -> ClientToServer.CreateThread(
+                    initialMessage = requireNotNull(initialMessage) { "missing initial_message" },
+                    correlationId = correlationId,
+                    podId = podId,
+                )
                 "subscribe_to_thread" -> ClientToServer.SubscribeToThread(
                     requireNotNull(threadId) { "missing thread_id" },
                 )
