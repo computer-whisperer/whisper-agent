@@ -44,8 +44,10 @@ use whisper_agent_protocol::sandbox::{
 #[derive(Parser, Debug)]
 #[command(name = "whisper-agent-sandbox", about = "Sandbox provisioning daemon")]
 struct Args {
-    /// Address to listen on.
-    #[arg(long, default_value = "127.0.0.1:9810")]
+    /// Address to listen on. Defaults to dual-stack (`[::]:9810`); the
+    /// daemon is reachable on both IPv6 and IPv4 (via v4-mapped) so a
+    /// remote `whisper-agent` server can connect from either family.
+    #[arg(long, default_value = "[::]:9810")]
     listen: SocketAddr,
 
     /// Path to the whisper-agent-mcp-host binary. The daemon starts this

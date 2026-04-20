@@ -18,8 +18,10 @@ mod tools;
 #[derive(Parser, Debug)]
 #[command(version, about = "MCP server exposing a guarded web_fetch tool.")]
 struct Args {
-    /// HTTP listen address.
-    #[arg(long, default_value = "127.0.0.1:9830")]
+    /// HTTP listen address. Defaults to dual-stack (`[::]:9830`); accepts
+    /// both IPv6 and IPv4 (via v4-mapped). Override to `127.0.0.1:9830`
+    /// for v4-only loopback.
+    #[arg(long, default_value = "[::]:9830")]
     listen: SocketAddr,
 
     /// Hard cap on response body size, in bytes.

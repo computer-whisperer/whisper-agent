@@ -21,8 +21,11 @@ use crate::workspace::Workspace;
     about = "MCP server exposing read_file, write_file, and bash within a workspace root."
 )]
 struct Args {
-    /// HTTP listen address.
-    #[arg(long, default_value = "127.0.0.1:8800")]
+    /// HTTP listen address. Defaults to dual-stack (`[::]:8800`) when run
+    /// standalone. Production use is via `whisper-agent-sandbox`, which
+    /// always passes an explicit `--listen 127.0.0.1:<port>` (one mcp-host
+    /// per landlock-isolated thread, loopback-only by design).
+    #[arg(long, default_value = "[::]:8800")]
     listen: SocketAddr,
 
     /// Workspace root. All file operations are confined to this directory.
