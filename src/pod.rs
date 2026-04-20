@@ -172,12 +172,16 @@ pub fn validate(config: &PodConfig) -> Result<(), PodConfigError> {
                 valid: valid_names.join(", "),
             });
         }
-    } else if !valid_names.contains(&config.thread_defaults.host_env.as_str()) {
-        return Err(PodConfigError::UnknownThreadDefault {
-            field: "host_env",
-            value: config.thread_defaults.host_env.clone(),
-            valid: valid_names.join(", "),
-        });
+    } else {
+        for name in &config.thread_defaults.host_env {
+            if !valid_names.contains(&name.as_str()) {
+                return Err(PodConfigError::UnknownThreadDefault {
+                    field: "host_env",
+                    value: name.clone(),
+                    valid: valid_names.join(", "),
+                });
+            }
+        }
     }
 
     for host in &config.thread_defaults.mcp_hosts {
@@ -240,7 +244,7 @@ mod tests {
                 system_prompt_file: "system_prompt.md".into(),
                 max_tokens: 32000,
                 max_turns: 100,
-                host_env: "landlock-rw".into(),
+                host_env: vec!["landlock-rw".into()],
                 mcp_hosts: vec!["fetch".into(), "search".into()],
                 compaction: Default::default(),
             },
@@ -290,7 +294,7 @@ mod tests {
     #[test]
     fn rejects_unknown_default_sandbox() {
         let mut cfg = sample_config();
-        cfg.thread_defaults.host_env = "phantom".into();
+        cfg.thread_defaults.host_env = vec!["phantom".into()];
         let err = validate(&cfg).unwrap_err();
         match err {
             PodConfigError::UnknownThreadDefault { field, .. } => assert_eq!(field, "host_env"),
@@ -302,7 +306,7 @@ mod tests {
     fn empty_default_sandbox_ok_when_allow_is_empty() {
         let mut cfg = sample_config();
         cfg.allow.host_env.clear();
-        cfg.thread_defaults.host_env = String::new();
+        cfg.thread_defaults.host_env.clear();
         validate(&cfg).unwrap();
     }
 
@@ -312,7 +316,7 @@ mod tests {
         // sample_config has entries in allow.host_env; empty defaults
         // is rejected so threads can't silently land on "no host env"
         // when the pod actually offers some.
-        cfg.thread_defaults.host_env = String::new();
+        cfg.thread_defaults.host_env.clear();
         let err = validate(&cfg).unwrap_err();
         assert!(
             matches!(err, PodConfigError::HostEnvDefaultRequired { .. }),
@@ -359,6 +363,26 @@ max_turns = 50
         assert_eq!(cfg.thread_defaults.max_tokens, 8000);
         // limits omitted → default 10
         assert_eq!(cfg.limits.max_concurrent_threads, 10);
+    }
+
+    #[test]
+    fn legacy_singular_host_env_default_parses_as_one_entry_vec() {
+        // Pre-multi-env pod.tomls set `host_env` as a bare string under
+        // `[thread_defaults]`. The deserializer must accept that form
+        // and wrap it in a one-entry vec so old files load without
+        // needing a manual edit.
+        let mut cfg = sample_config();
+        let text = to_toml(&cfg).unwrap();
+        // Swap the new list-shape back to the legacy bare-string form
+        // to simulate a file written by the old code.
+        let legacy_text = text.replace(
+            "host_env = [\"landlock-rw\"]",
+            "host_env = \"landlock-rw\"",
+        );
+        assert_ne!(text, legacy_text, "replacement must have landed");
+        let parsed = parse_toml(&legacy_text).unwrap();
+        cfg.thread_defaults.host_env = vec!["landlock-rw".into()];
+        assert_eq!(parsed.thread_defaults.host_env, cfg.thread_defaults.host_env);
     }
 
     #[test]

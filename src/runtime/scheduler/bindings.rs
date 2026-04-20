@@ -12,18 +12,21 @@ use crate::pod::Pod;
 pub(super) struct ResolvedBindings {
     /// Backend catalog name. Empty string = "use server default".
     pub(super) backend_name: String,
-    /// Persisted on the thread. `None` when the pod declares no host
-    /// envs (threads there get shared MCPs only). `Named` references
-    /// a pod `[[allow.host_env]]` entry; `Inline` carries its own
-    /// (provider, spec) for ad-hoc threads.
-    pub(super) host_env: Option<HostEnvBinding>,
+    /// Host envs the thread binds to, in declared order. Empty when the
+    /// pod declares no host envs (threads there get shared MCPs only)
+    /// OR when the request explicitly clears the list. Each entry is a
+    /// reference to a pod `[[allow.host_env]]` entry by name — the
+    /// allow list is authoritative; unknown names were already rejected
+    /// during resolution.
+    pub(super) host_env: Vec<HostEnvBinding>,
     /// Catalog names of shared MCP hosts the thread is bound to.
     pub(super) shared_host_names: Vec<String>,
 }
 
 /// Layer the request on top of pod `thread_defaults`, then verify each
-/// chosen value against the pod's `[allow]` table. Inline host-env
-/// requests carry both provider + spec, so no name lookup is needed.
+/// chosen value against the pod's `[allow]` table. Request-provided
+/// host-env names are validated one by one; unknown names fail the
+/// whole resolution so partial binding never lands.
 pub(super) fn resolve_bindings_choice(
     pod: &Pod,
     request: Option<ThreadBindingsRequest>,
@@ -42,17 +45,14 @@ pub(super) fn resolve_bindings_choice(
         ));
     }
 
-    // Every user-originated binding resolves to a named entry in the
-    // pod's allow.host_env table. Unknown names are rejected; the
-    // pod's allow list is authoritative.
-    let chosen_name: Option<String> = match request.host_env {
-        Some(name) => Some(name),
-        None if defaults.host_env.is_empty() => None,
-        None => Some(defaults.host_env.clone()),
-    };
-    let host_env: Option<HostEnvBinding> = match chosen_name {
-        None => None,
-        Some(name) => {
+    // `None` → inherit the pod default list; `Some(vec)` → replace
+    // exactly (empty vec means "bind to nothing, thread runs bare").
+    let chosen_names: Vec<String> = request
+        .host_env
+        .unwrap_or_else(|| defaults.host_env.clone());
+    let host_env: Vec<HostEnvBinding> = chosen_names
+        .into_iter()
+        .map(|name| {
             if !allow.host_env.iter().any(|nh| nh.name == name) {
                 return Err(format!(
                     "host env `{name}` not in pod `{}`'s allow.host_env ({})",
@@ -69,9 +69,9 @@ pub(super) fn resolve_bindings_choice(
                     },
                 ));
             }
-            Some(HostEnvBinding::Named { name })
-        }
-    };
+            Ok(HostEnvBinding::Named { name })
+        })
+        .collect::<Result<_, _>>()?;
 
     let shared_host_names = request
         .mcp_hosts

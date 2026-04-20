@@ -78,16 +78,43 @@ pub struct ThreadDefaults {
     pub system_prompt_file: String,
     pub max_tokens: u32,
     pub max_turns: u32,
-    /// Name of one of the `[[allow.host_env]]` entries. Empty allowed
-    /// only when `[allow].host_env` is empty.
-    #[serde(default)]
-    pub host_env: String,
+    /// Names of `[[allow.host_env]]` entries threads in this pod bind
+    /// to by default. Empty allowed (threads fall back to the bare
+    /// provider) but if `[allow].host_env` has entries, at least one
+    /// must be listed here — the pod validator enforces this.
+    ///
+    /// On disk accepts both a bare string (legacy pre-multi-env
+    /// pods: `host_env = "main"`) and an array (`host_env = ["main",
+    /// "edge"]`). Custom deserializer wraps the string form into a
+    /// one-entry vec so old pod.tomls load without edits.
+    #[serde(default, deserialize_with = "deserialize_string_or_vec")]
+    pub host_env: Vec<String>,
     #[serde(default)]
     pub mcp_hosts: Vec<String>,
     /// Compaction defaults threads in this pod inherit. Threads
     /// override via [`crate::ThreadConfigOverride.compaction`].
     #[serde(default)]
     pub compaction: CompactionConfig,
+}
+
+/// Accept both a plain string (legacy singular shape) and a
+/// `Vec<String>` (new plural shape). Empty string produces an empty
+/// vec so the legacy `host_env = ""` idiom still means "no host envs."
+pub(crate) fn deserialize_string_or_vec<'de, D>(d: D) -> Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Shape {
+        Many(Vec<String>),
+        One(String),
+    }
+    Ok(match Shape::deserialize(d)? {
+        Shape::Many(v) => v,
+        Shape::One(s) if s.is_empty() => Vec::new(),
+        Shape::One(s) => vec![s],
+    })
 }
 
 /// Policy for compacting an overlong thread into a fresh continuation.

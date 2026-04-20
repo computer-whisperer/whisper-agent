@@ -2341,7 +2341,15 @@ impl ChatApp {
         // pod's `allow.host_env` table. `None` → server applies
         // `thread_defaults.host_env`. The webui never constructs
         // inline specs; the server rejects Inline at the wire boundary.
-        let host_env = self.compose_host_env.clone();
+        // Phase-1 shape: compose picker is still single-value; wrap the
+        // chosen name in a one-entry vec for the wire type.
+        let host_env = self.compose_host_env.clone().map(|name| {
+            if name.is_empty() {
+                Vec::new()
+            } else {
+                vec![name]
+            }
+        });
         let config_override = if model.is_some() {
             Some(ThreadConfigOverride {
                 model,
@@ -3074,8 +3082,8 @@ impl eframe::App for ChatApp {
                                     .small()
                                     .color(Color32::from_gray(180)),
                             );
-                            let default_name = &pod_config.thread_defaults.host_env;
-                            let inherit_label = format!("pod default ({default_name})");
+                            let default_names = pod_config.thread_defaults.host_env.join(", ");
+                            let inherit_label = format!("pod default ({default_names})");
                             let selected_label = match &self.compose_host_env {
                                 None => inherit_label.clone(),
                                 Some(name) => name.clone(),
@@ -5055,7 +5063,7 @@ impl ChatApp {
                         // user gets a confusing inline error before
                         // they've even visited the Defaults tab.
                         if working.thread_defaults.host_env.is_empty() {
-                            working.thread_defaults.host_env = name;
+                            working.thread_defaults.host_env = vec![name];
                         }
                         modal.raw_dirty = false;
                     }
@@ -5078,13 +5086,19 @@ impl ChatApp {
             // instead of relying on a server-side error to surface
             // a dangling reference.
             let removed = working.allow.host_env.remove(idx);
-            if working.thread_defaults.host_env == removed.name {
-                working.thread_defaults.host_env = working
-                    .allow
-                    .host_env
-                    .first()
-                    .map(|nh| nh.name.clone())
-                    .unwrap_or_default();
+            // Drop the deleted entry from thread_defaults.host_env
+            // (list-shape, may contain zero or more names). If that
+            // empties the list and other allow entries remain, reseed
+            // with the first surviving one so the form stays valid by
+            // construction — mirrors the old single-value behavior.
+            working
+                .thread_defaults
+                .host_env
+                .retain(|n| n != &removed.name);
+            if working.thread_defaults.host_env.is_empty()
+                && let Some(fallback) = working.allow.host_env.first()
+            {
+                working.thread_defaults.host_env = vec![fallback.name.clone()];
             }
         }
         if let Some(sub) = sandbox_entry_open {
@@ -5411,7 +5425,7 @@ impl ChatApp {
                 system_prompt_file: "system_prompt.md".into(),
                 max_tokens: 16384,
                 max_turns: 30,
-                host_env: String::new(),
+                host_env: Vec::new(),
                 mcp_hosts: Vec::new(),
                 compaction: Default::default(),
             },
@@ -5615,12 +5629,21 @@ fn render_thread_context_inspector(ui: &mut egui::Ui, thread_id: &str, view: &Ta
                 if inspector.max_turns > 0 {
                     kv_row(ui, "max_turns", &inspector.max_turns.to_string());
                 }
-                let host_env_label = match &inspector.bindings.host_env {
-                    Some(HostEnvBinding::Named { name }) => name.clone(),
-                    Some(HostEnvBinding::Inline { provider, .. }) => {
-                        format!("(inline, provider = {provider})")
-                    }
-                    None => "(none — shared MCPs only)".to_string(),
+                let host_env_label = if inspector.bindings.host_env.is_empty() {
+                    "(none — shared MCPs only)".to_string()
+                } else {
+                    inspector
+                        .bindings
+                        .host_env
+                        .iter()
+                        .map(|b| match b {
+                            HostEnvBinding::Named { name } => name.clone(),
+                            HostEnvBinding::Inline { provider, .. } => {
+                                format!("(inline, provider = {provider})")
+                            }
+                        })
+                        .collect::<Vec<_>>()
+                        .join(", ")
                 };
                 kv_row(ui, "host_env", &host_env_label);
                 let mcp_label = if inspector.bindings.mcp_hosts.is_empty() {

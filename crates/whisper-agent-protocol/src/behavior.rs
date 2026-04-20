@@ -139,10 +139,51 @@ pub struct BehaviorThreadOverride {
 pub struct BehaviorBindingsOverride {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub backend: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub host_env: Option<String>,
+    /// Override the pod-default host-env list. `None` inherits;
+    /// `Some(vec)` replaces exactly — empty vec drops to bare, non-
+    /// empty binds to each named entry. Accepts a bare string (legacy
+    /// singular shape) or a list on disk.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "opt_string_or_vec"
+    )]
+    pub host_env: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mcp_hosts: Option<Vec<String>>,
+}
+
+/// Accept both `None`, a bare string (legacy), and a `Vec<String>` (new)
+/// for an optional plural-of-strings field. Mirrors
+/// [`crate::pod::deserialize_string_or_vec`] but for the `Option`-wrapped
+/// case — TOML serializers produce the same on-the-wire shape for both.
+mod opt_string_or_vec {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Shape {
+        Many(Vec<String>),
+        One(String),
+    }
+
+    pub fn serialize<S>(value: &Option<Vec<String>>, s: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        value.serialize(s)
+    }
+
+    pub fn deserialize<'de, D>(d: D) -> Result<Option<Vec<String>>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Ok(Option::<Shape>::deserialize(d)?.map(|shape| match shape {
+            Shape::Many(v) => v,
+            Shape::One(s) if s.is_empty() => Vec::new(),
+            Shape::One(s) => vec![s],
+        }))
+    }
 }
 
 /// What to do with a behavior-spawned thread once it terminates.

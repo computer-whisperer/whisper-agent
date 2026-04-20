@@ -364,12 +364,15 @@ pub(super) fn render_pod_editor_defaults_tab(
             // a thread with no host env binding is a shape for pods
             // that declare zero entries, not a fallback we let other
             // pods silently land on.
-            let sb_in_allow = working.thread_defaults.host_env.is_empty()
-                || working
-                    .allow
-                    .host_env
-                    .iter()
-                    .any(|s| s.name == working.thread_defaults.host_env);
+            // Phase-1 shape: a single-select combo that writes the
+            // whole Vec as zero or one entry. Multi-select will land
+            // in a later pass once the scheduler fans out provisioning
+            // across every bound env.
+            let sb_in_allow = working
+                .thread_defaults
+                .host_env
+                .iter()
+                .all(|name| working.allow.host_env.iter().any(|s| &s.name == name));
             if working.allow.host_env.is_empty() {
                 // Keep the value forced to empty — switching to a named
                 // entry from here is meaningless until the allow list
@@ -384,29 +387,39 @@ pub(super) fn render_pod_editor_defaults_tab(
                     .color(Color32::from_gray(160)),
                 );
             } else {
+                let current = working
+                    .thread_defaults
+                    .host_env
+                    .first()
+                    .cloned()
+                    .unwrap_or_default();
+                let mut selection = current.clone();
                 ComboBox::from_id_salt("pod_editor_defaults_sandbox")
-                    .selected_text(if working.thread_defaults.host_env.is_empty() {
+                    .selected_text(if selection.is_empty() {
                         "(pick one)".to_string()
                     } else {
-                        working.thread_defaults.host_env.clone()
+                        selection.clone()
                     })
                     .show_ui(ui, |ui| {
                         for entry in &working.allow.host_env {
-                            ui.selectable_value(
-                                &mut working.thread_defaults.host_env,
-                                entry.name.clone(),
-                                &entry.name,
-                            );
+                            ui.selectable_value(&mut selection, entry.name.clone(), &entry.name);
                         }
                     });
+                if selection != current {
+                    working.thread_defaults.host_env = if selection.is_empty() {
+                        Vec::new()
+                    } else {
+                        vec![selection]
+                    };
+                }
             }
             ui.end_row();
             if !sb_in_allow {
+                let invalid = working.thread_defaults.host_env.join(", ");
                 ui.label("");
                 ui.label(
                     RichText::new(format!(
-                        "`{}` is not in allow.host_env — server will reject on save",
-                        working.thread_defaults.host_env
+                        "`{invalid}` is not in allow.host_env — server will reject on save",
                     ))
                     .small()
                     .color(Color32::from_rgb(220, 90, 90)),
@@ -784,13 +797,25 @@ pub(super) fn render_behavior_editor_thread_tab(
         backend_catalog,
         "(inherit pod default)",
     );
+    // Phase-1 shape: present host_env binding as a single-select
+    // picker even though the underlying protocol field is now
+    // `Option<Vec<String>>`. Adapt at the boundary — show first-of-vec,
+    // write back as `vec![name]` or `Vec::new()` depending on the
+    // selection. Multi-select UI will come in Phase 3.
+    let mut adapted: Option<String> = cfg
+        .thread
+        .bindings
+        .host_env
+        .as_ref()
+        .map(|v| v.first().cloned().unwrap_or_default());
     render_optional_string_picker(
         ui,
         "host_env",
-        &mut cfg.thread.bindings.host_env,
+        &mut adapted,
         pod_host_env_names,
         "(inherit pod default)",
     );
+    cfg.thread.bindings.host_env = adapted.map(|s| if s.is_empty() { Vec::new() } else { vec![s] });
 
     ui.add_space(6.0);
     ui.label("mcp_hosts");

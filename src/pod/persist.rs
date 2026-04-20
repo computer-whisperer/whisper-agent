@@ -853,7 +853,7 @@ fn synthesize_pod_config(task: &Thread) -> PodConfig {
             system_prompt_file: "system_prompt.md".into(),
             max_tokens: task.config.max_tokens,
             max_turns: task.config.max_turns,
-            host_env: String::new(),
+            host_env: Vec::new(),
             mcp_hosts: Vec::new(),
             compaction: task.config.compaction.clone(),
         },
@@ -893,7 +893,7 @@ mod tests {
                 system_prompt_file: "system_prompt.md".into(),
                 max_tokens: 8000,
                 max_turns: 30,
-                host_env: String::new(),
+                host_env: Vec::new(),
                 mcp_hosts: Vec::new(),
                 compaction: Default::default(),
             },
@@ -910,7 +910,7 @@ mod tests {
         };
         let bindings = ThreadBindings {
             backend: "anthropic".into(),
-            host_env: None,
+            host_env: Vec::new(),
             mcp_hosts: vec![format!("mcp-primary-{id}"), "mcp-shared-fetch".into()],
             tool_filter: None,
         };
@@ -1045,8 +1045,8 @@ mod tests {
         let loaded = p.load_all().await.unwrap();
         assert_eq!(loaded.threads.len(), 1);
         assert!(
-            loaded.threads[0].bindings.host_env.is_none(),
-            "legacy string id should be normalized to None on load"
+            loaded.threads[0].bindings.host_env.is_empty(),
+            "legacy string id should be normalized to empty on load"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

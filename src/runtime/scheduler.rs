@@ -44,9 +44,8 @@ use futures::stream::FuturesUnordered;
 use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 use whisper_agent_protocol::{
-    ClientToServer, HostEnvBinding, HostEnvRebind, Message, ResourceKind, ServerToClient,
-    ThreadBindings, ThreadBindingsPatch, ThreadBindingsRequest, ThreadConfigOverride,
-    ThreadStateLabel,
+    ClientToServer, HostEnvBinding, Message, ResourceKind, ServerToClient, ThreadBindings,
+    ThreadBindingsPatch, ThreadBindingsRequest, ThreadConfigOverride, ThreadStateLabel,
 };
 
 use crate::pod::persist::{LoadedState, Persister};
@@ -481,18 +480,37 @@ impl Scheduler {
         }
     }
 
-    /// Compute the runtime `HostEnvId` for a thread's binding. Returns
-    /// `None` when the thread has no host env binding or when
-    /// `resolve_binding` couldn't find the named entry.
+    /// Compute the runtime `HostEnvId` for a thread's *first* binding.
+    /// Returns `None` when the thread has no host-env bindings, or
+    /// when `resolve_binding` couldn't find the named entry.
+    ///
+    /// Phase-1 compatibility helper: the underlying binding list is
+    /// plural, but most callers still take the first-of-vec for their
+    /// "the one host-env" assumption. Phase 2 replaces these with a
+    /// fan-out iterator.
     pub(crate) fn host_env_id_for_thread(&self, thread_id: &str) -> Option<HostEnvId> {
-        let task = self.tasks.get(thread_id)?;
-        let binding = task.bindings.host_env.as_ref()?;
-        let (provider, spec) = self.resolve_binding(&task.pod_id, binding)?;
-        Some(HostEnvId::for_provider_spec(&provider, &spec))
+        self.host_env_ids_for_thread(thread_id).into_iter().next()
     }
 
-    /// Look up the registry entry for a thread's bound host env.
-    /// Returns `None` when the thread has no binding, the binding
+    /// Compute the runtime `HostEnvId`s for every binding on the
+    /// thread, in the binding list's declared order. Empty when the
+    /// thread has no host envs; entries whose `resolve_binding` lookup
+    /// fails (named entry removed from pod allow list mid-flight) are
+    /// silently skipped rather than failing the whole list.
+    pub(crate) fn host_env_ids_for_thread(&self, thread_id: &str) -> Vec<HostEnvId> {
+        let Some(task) = self.tasks.get(thread_id) else {
+            return Vec::new();
+        };
+        task.bindings
+            .host_env
+            .iter()
+            .filter_map(|b| self.resolve_binding(&task.pod_id, b))
+            .map(|(provider, spec)| HostEnvId::for_provider_spec(&provider, &spec))
+            .collect()
+    }
+
+    /// Look up the registry entry for a thread's first bound host env.
+    /// Returns `None` when the thread has no bindings, the first binding
     /// can't be resolved (named entry removed), or when
     /// `pre_register_host_env` somehow wasn't called.
     pub(crate) fn host_env_for_thread(
@@ -723,30 +741,32 @@ impl Scheduler {
                 .collect(),
         };
 
-        let new_host_env_binding: Option<HostEnvBinding> = match &patch.host_env {
+        let new_host_env_bindings: Vec<HostEnvBinding> = match &patch.host_env {
             None => old_bindings.host_env.clone(),
-            Some(HostEnvRebind::Clear) => None,
-            Some(HostEnvRebind::Named { name }) => {
-                // Validate against the pod's allow list — cap is real.
-                if !pod_allow.host_env.iter().any(|nh| &nh.name == name) {
-                    return Err(format!(
-                        "host env `{name}` not in pod `{}`'s allow.host_env",
-                        pod_id,
-                    ));
-                }
-                Some(HostEnvBinding::Named { name: name.clone() })
-            }
+            Some(names) => names
+                .iter()
+                .map(|name| {
+                    // Validate against the pod's allow list — cap is real.
+                    if !pod_allow.host_env.iter().any(|nh| &nh.name == name) {
+                        return Err(format!(
+                            "host env `{name}` not in pod `{}`'s allow.host_env",
+                            pod_id,
+                        ));
+                    }
+                    Ok(HostEnvBinding::Named { name: name.clone() })
+                })
+                .collect::<Result<Vec<_>, _>>()?,
         };
-        // The runtime id is derived per binding for refcounting + emit.
-        // `None` here means the thread had no host env binding, or a
-        // Named binding whose entry has gone missing (already torn
-        // down or pod was edited mid-flight — we just skip the
-        // user-count drop).
-        let old_host_env_id = old_bindings
+        // Runtime ids derived per binding for refcounting + emit.
+        // Bindings whose Named entry has gone missing (pod edited
+        // mid-flight) resolve to `None` and get filtered — we skip the
+        // user-count drop on those, matching the pre-refactor behavior.
+        let old_host_env_ids: Vec<HostEnvId> = old_bindings
             .host_env
-            .as_ref()
-            .and_then(|b| self.resolve_binding(&pod_id, b))
-            .map(|(p, s)| HostEnvId::for_provider_spec(&p, &s));
+            .iter()
+            .filter_map(|b| self.resolve_binding(&pod_id, b))
+            .map(|(p, s)| HostEnvId::for_provider_spec(&p, &s))
+            .collect();
 
         // --- Phase 3: validate against pod allowlist ---
         if !new_backend.is_empty() && !pod_allow.backends.iter().any(|b| b == &new_backend) {
@@ -778,7 +798,7 @@ impl Scheduler {
 
         // --- Phase 4: figure out what actually changed ---
         let backend_changed = new_backend != old_bindings.backend;
-        let host_env_changed = new_host_env_binding != old_bindings.host_env;
+        let host_env_changed = new_host_env_bindings != old_bindings.host_env;
         let old_shared: HashSet<String> = old_bindings
             .mcp_hosts
             .iter()
@@ -808,23 +828,36 @@ impl Scheduler {
         }
 
         if host_env_changed {
-            // Release the old host env; tear it down if we were the last
-            // user and the entry isn't pinned. Tolerates a missing id
-            // (named entry was removed from pod.toml mid-life — the old
-            // entry is effectively orphaned and we just drop the user
-            // count if it's still around).
-            if let Some(old_id) = old_host_env_id {
-                let remaining = self.resources.release_host_env_user(&old_id, thread_id);
+            // Diff old vs new host-env ids: drop refcounts on removed
+            // ids, pre-register each added id. Resolve NEW ids fresh
+            // here rather than trusting the vec — bindings that fail to
+            // resolve (spec missing from pod allow) would error out at
+            // validation already, so resolution is expected to succeed.
+            let new_host_env_ids: Vec<HostEnvId> = new_host_env_bindings
+                .iter()
+                .map(|b| {
+                    self.resolve_binding(&pod_id, b)
+                        .map(|(p, s)| HostEnvId::for_provider_spec(&p, &s))
+                        .ok_or_else(|| "rebind: binding could not be resolved".to_string())
+                })
+                .collect::<Result<_, _>>()?;
+            let old_set: HashSet<HostEnvId> = old_host_env_ids.iter().cloned().collect();
+            let new_set: HashSet<HostEnvId> = new_host_env_ids.iter().cloned().collect();
+
+            for old_id in old_host_env_ids.iter().filter(|id| !new_set.contains(id)) {
+                // Release the old host env; tear it down if we were the
+                // last user and the entry isn't pinned.
+                let remaining = self.resources.release_host_env_user(old_id, thread_id);
                 let pinned = self
                     .resources
                     .host_envs
-                    .get(&old_id)
+                    .get(old_id)
                     .map(|e| e.pinned)
                     .unwrap_or(false);
                 if remaining == 0 && !pinned {
-                    let handle = self.resources.take_host_env_handle(&old_id);
-                    self.resources.mark_host_env_torn_down(&old_id);
-                    self.emit_host_env_updated(&old_id);
+                    let handle = self.resources.take_host_env_handle(old_id);
+                    self.resources.mark_host_env_torn_down(old_id);
+                    self.emit_host_env_updated(old_id);
                     if let Some(mut h) = handle {
                         let tid = thread_id.to_string();
                         tokio::spawn(async move {
@@ -833,16 +866,25 @@ impl Scheduler {
                             }
                         });
                     } else {
-                        self.emit_host_env_updated(&old_id);
+                        self.emit_host_env_updated(old_id);
                     }
                 } else {
-                    self.emit_host_env_updated(&old_id);
+                    self.emit_host_env_updated(old_id);
                 }
             }
-            // Pre-register the new host env (if any).
-            if let Some(binding) = &new_host_env_binding {
+            let added: Vec<HostEnvBinding> = new_host_env_bindings
+                .iter()
+                .filter(|b| {
+                    let id = self
+                        .resolve_binding(&pod_id, b)
+                        .map(|(p, s)| HostEnvId::for_provider_spec(&p, &s));
+                    id.map(|i| !old_set.contains(&i)).unwrap_or(false)
+                })
+                .cloned()
+                .collect();
+            for binding in added {
                 let (provider, spec) = self
-                    .resolve_binding(&pod_id, binding)
+                    .resolve_binding(&pod_id, &binding)
                     .ok_or_else(|| "rebind: binding could not be resolved".to_string())?;
                 let new_id = self
                     .resources
@@ -866,16 +908,19 @@ impl Scheduler {
 
         // --- Phase 6: host env change → re-provision its MCP ---
         if host_env_changed {
-            // Mark the OLD host-env MCP entry torn down (if there was one).
-            // The new binding will get its own fresh MCP entry when the
-            // next provision dispatches.
-            if let Some(old_id) = old_bindings
-                .host_env
-                .as_ref()
-                .and_then(|b| self.resolve_binding(&pod_id, b))
+            // Mark every old host-env MCP entry that's no longer bound
+            // as torn down. New bindings will get fresh MCP entries
+            // when the next provision dispatches.
+            let new_host_env_ids: HashSet<HostEnvId> = new_host_env_bindings
+                .iter()
+                .filter_map(|b| self.resolve_binding(&pod_id, b))
                 .map(|(p, s)| HostEnvId::for_provider_spec(&p, &s))
+                .collect();
+            for old_id in old_host_env_ids
+                .iter()
+                .filter(|id| !new_host_env_ids.contains(id))
             {
-                let mcp_id = McpHostId::for_host_env(&old_id);
+                let mcp_id = McpHostId::for_host_env(old_id);
                 self.resources.mark_mcp_torn_down(&mcp_id);
                 self.emit_mcp_host_updated(&mcp_id);
             }
@@ -887,7 +932,7 @@ impl Scheduler {
         // --- Phase 7: swap bindings + synthetic note + recompute waiting ---
         let new_bindings = ThreadBindings {
             backend: new_backend,
-            host_env: new_host_env_binding.clone(),
+            host_env: new_host_env_bindings.clone(),
             mcp_hosts: new_shared_hosts.clone(),
             tool_filter: old_bindings.tool_filter.clone(),
         };
@@ -988,106 +1033,99 @@ impl Scheduler {
             self.pods.insert(pod.id.clone(), pod);
         }
         for mut task in state.threads {
-            // Re-pre-register the thread's host env so the registry knows
-            // its (provider, spec). For a Named binding we look up the
-            // pod entry by name; for Inline the spec lives in the
-            // binding itself. If a Named binding can't be resolved
-            // (entry was removed from the pod) and the pod still has
-            // a default, we silently re-bind — surfacing the change as
-            // a `mark_dirty` so the new binding flushes on next tick.
-            // This is also the migration path for pre-refactor threads
-            // whose persisted host_env was a bare id string: persist
-            // normalizes that to None on load, and we re-bind here.
+            // Re-pre-register each of the thread's host-env bindings so
+            // the registry knows their (provider, spec) pairs. For
+            // `Named` bindings we look up the pod entry by name; for
+            // `Inline` the spec lives in the binding itself. Bindings
+            // that can't be resolved (pod allow entry removed, Inline
+            // spec no longer matches any allow entry) are dropped; if
+            // the resulting list is empty and the pod has a default,
+            // we re-seed from the default.
             let mut bindings_dirty = false;
-            // Migrate legacy Inline bindings: the pod's `allow.host_env`
-            // is now the sole source of truth for user-composed
-            // threads. Walk the pod's allow list for a structurally
-            // equivalent entry; if one exists, rebind to the Named
-            // reference. Otherwise fall through to the default-rebind
-            // path below (Inline becomes None, then Named default).
-            if let Some(HostEnvBinding::Inline { provider, spec }) = task.bindings.host_env.clone()
-                && let Some(pod) = self.pods.get(&task.pod_id)
-            {
-                let matching = pod
-                    .config
-                    .allow
-                    .host_env
-                    .iter()
-                    .find(|nh| nh.provider == provider && nh.spec == spec);
-                match matching {
-                    Some(nh) => {
-                        warn!(
-                            thread_id = %task.id,
-                            rebound_to = %nh.name,
-                            "migrating Inline host_env binding to Named reference",
-                        );
-                        task.bindings.host_env = Some(HostEnvBinding::Named {
-                            name: nh.name.clone(),
+            // Migrate legacy Inline bindings: walk the pod's allow
+            // list for a structurally equivalent entry and rebind to
+            // the Named reference; otherwise drop the binding.
+            let original = std::mem::take(&mut task.bindings.host_env);
+            let mut migrated: Vec<HostEnvBinding> = Vec::with_capacity(original.len());
+            for binding in original {
+                match binding {
+                    HostEnvBinding::Inline { provider, spec } => {
+                        let matching = self.pods.get(&task.pod_id).and_then(|pod| {
+                            pod.config
+                                .allow
+                                .host_env
+                                .iter()
+                                .find(|nh| nh.provider == provider && nh.spec == spec)
+                                .map(|nh| nh.name.clone())
                         });
-                        bindings_dirty = true;
-                    }
-                    None => {
-                        warn!(
-                            thread_id = %task.id,
-                            "Inline host_env binding has no structural match in pod.allow.host_env; rebinding to pod default",
-                        );
-                        task.bindings.host_env = None;
-                        bindings_dirty = true;
-                    }
-                }
-            }
-            if task.bindings.host_env.is_none()
-                && let Some(pod) = self.pods.get(&task.pod_id)
-                && !pod.config.thread_defaults.host_env.is_empty()
-            {
-                task.bindings.host_env = Some(HostEnvBinding::Named {
-                    name: pod.config.thread_defaults.host_env.clone(),
-                });
-                bindings_dirty = true;
-            }
-            if let Some(binding) = task.bindings.host_env.clone() {
-                match self.resolve_binding(&task.pod_id, &binding) {
-                    Some((provider, spec)) => {
-                        self.resources
-                            .pre_register_host_env(&task.id, provider, spec);
-                    }
-                    None => {
-                        // Named entry missing — fall back to pod default
-                        // when one exists, else drop the binding.
-                        let fallback = self
-                            .pods
-                            .get(&task.pod_id)
-                            .map(|p| p.config.thread_defaults.host_env.clone())
-                            .filter(|s| !s.is_empty());
-                        match fallback {
-                            Some(default_name) => {
-                                let new_binding = HostEnvBinding::Named {
-                                    name: default_name.clone(),
-                                };
-                                if let Some((provider, spec)) =
-                                    self.resolve_binding(&task.pod_id, &new_binding)
-                                {
-                                    warn!(
-                                        thread_id = %task.id,
-                                        replaced_with = %default_name,
-                                        "loaded thread's host_env binding could not be resolved; rebinding to pod default",
-                                    );
-                                    self.resources
-                                        .pre_register_host_env(&task.id, provider, spec);
-                                    task.bindings.host_env = Some(new_binding);
-                                    bindings_dirty = true;
-                                }
+                        match matching {
+                            Some(name) => {
+                                warn!(
+                                    thread_id = %task.id,
+                                    rebound_to = %name,
+                                    "migrating Inline host_env binding to Named reference",
+                                );
+                                migrated.push(HostEnvBinding::Named { name });
+                                bindings_dirty = true;
                             }
                             None => {
                                 warn!(
                                     thread_id = %task.id,
-                                    "loaded thread's host_env binding could not be resolved and pod has no default; dropping binding",
+                                    "Inline host_env binding has no structural match in pod.allow.host_env; dropping",
                                 );
-                                task.bindings.host_env = None;
                                 bindings_dirty = true;
                             }
                         }
                     }
+                    HostEnvBinding::Named { name } => {
+                        migrated.push(HostEnvBinding::Named { name });
+                    }
+                }
+            }
+            task.bindings.host_env = migrated;
+
+            // Resolve each surviving binding; drop those whose allow
+            // entry has gone missing. If the list ends up empty and the
+            // pod has defaults, re-seed from `thread_defaults.host_env`
+            // so threads don't silently land on "no host env."
+            let resolvable: Vec<HostEnvBinding> = task
+                .bindings
+                .host_env
+                .iter()
+                .filter(|b| self.resolve_binding(&task.pod_id, b).is_some())
+                .cloned()
+                .collect();
+            if resolvable.len() != task.bindings.host_env.len() {
+                warn!(
+                    thread_id = %task.id,
+                    "loaded thread has host_env bindings that could not be resolved; dropping them",
+                );
+                task.bindings.host_env = resolvable;
+                bindings_dirty = true;
+            }
+            if task.bindings.host_env.is_empty()
+                && let Some(pod) = self.pods.get(&task.pod_id)
+                && !pod.config.thread_defaults.host_env.is_empty()
+            {
+                let defaulted: Vec<HostEnvBinding> = pod
+                    .config
+                    .thread_defaults
+                    .host_env
+                    .iter()
+                    .map(|name| HostEnvBinding::Named { name: name.clone() })
+                    .collect();
+                warn!(
+                    thread_id = %task.id,
+                    replaced_with = ?pod.config.thread_defaults.host_env,
+                    "loaded thread had no resolvable host_env bindings; rebinding to pod defaults",
+                );
+                task.bindings.host_env = defaulted;
+                bindings_dirty = true;
+            }
+            for binding in task.bindings.host_env.clone() {
+                if let Some((provider, spec)) = self.resolve_binding(&task.pod_id, &binding) {
+                    self.resources
+                        .pre_register_host_env(&task.id, provider, spec);
                 }
             }
 
@@ -1548,20 +1586,20 @@ impl Scheduler {
 
         // Deterministic `HostEnvId` means a second thread with the
         // same (provider, spec) joins the existing entry as a user.
-        // No binding → no pre-register; tools come from shared MCPs
-        // alone.
-        let host_env_id = match task.bindings.host_env.as_ref() {
-            None => None,
-            Some(binding) => {
+        // Empty binding list → no pre-register; tools come from shared
+        // MCPs alone.
+        let host_env_ids: Vec<HostEnvId> = task
+            .bindings
+            .host_env
+            .iter()
+            .map(|binding| {
                 let (provider, spec) = self
                     .resolve_binding(&pod_id, binding)
                     .expect("caller already validated this binding");
-                Some(
-                    self.resources
-                        .pre_register_host_env(&thread_id, provider, spec),
-                )
-            }
-        };
+                self.resources
+                    .pre_register_host_env(&thread_id, provider, spec)
+            })
+            .collect();
 
         let backend_name = task.bindings.backend.clone();
         let shared_hosts = task.bindings.mcp_hosts.clone();
@@ -1574,7 +1612,7 @@ impl Scheduler {
         let backend_id = BackendId::for_name(&backend_name);
         self.resources.add_backend_user(&backend_id, &thread_id);
         self.emit_backend_updated(&backend_id);
-        if let Some(id) = host_env_id.as_ref() {
+        for id in &host_env_ids {
             self.emit_host_env_updated(id);
         }
         for name in &shared_hosts {
@@ -1651,13 +1689,13 @@ impl Scheduler {
         // was removed from the pod's allow list after the source
         // thread was created; fail cleanly without touching
         // resources or the task map.
-        if let Some(binding) = task.bindings.host_env.as_ref()
-            && self.resolve_binding(&pod_id, binding).is_none()
-        {
-            return Err(
-                "source thread's host_env binding no longer resolves in the pod's allow list"
-                    .into(),
-            );
+        for binding in task.bindings.host_env.iter() {
+            if self.resolve_binding(&pod_id, binding).is_none() {
+                return Err(
+                    "source thread's host_env binding no longer resolves in the pod's allow list"
+                        .into(),
+                );
+            }
         }
 
         let new_id = self.register_new_task(task, requester, correlation_id, pending_io);
@@ -2123,17 +2161,17 @@ impl Scheduler {
         pod_id: &str,
         bindings: &whisper_agent_protocol::ThreadBindings,
     ) {
-        if let Some(binding) = &bindings.host_env
-            && let Some((provider, spec)) = self.resolve_binding(pod_id, binding)
-        {
-            let sid = HostEnvId::for_provider_spec(&provider, &spec);
-            let _ = self.resources.release_host_env_user(&sid, thread_id);
-            self.emit_host_env_updated(&sid);
-            // The host-env MCP is scoped to the same (provider, spec)
-            // dedup, so drop this thread from its user set too.
-            let mcp_id = McpHostId::for_host_env(&sid);
-            self.resources.remove_mcp_user(&mcp_id, thread_id);
-            self.emit_mcp_host_updated(&mcp_id);
+        for binding in &bindings.host_env {
+            if let Some((provider, spec)) = self.resolve_binding(pod_id, binding) {
+                let sid = HostEnvId::for_provider_spec(&provider, &spec);
+                let _ = self.resources.release_host_env_user(&sid, thread_id);
+                self.emit_host_env_updated(&sid);
+                // The host-env MCP is scoped to the same (provider, spec)
+                // dedup, so drop this thread from its user set too.
+                let mcp_id = McpHostId::for_host_env(&sid);
+                self.resources.remove_mcp_user(&mcp_id, thread_id);
+                self.emit_mcp_host_updated(&mcp_id);
+            }
         }
         let backend_id = BackendId::for_name(&bindings.backend);
         self.resources.remove_backend_user(&backend_id, thread_id);

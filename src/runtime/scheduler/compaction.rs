@@ -282,14 +282,22 @@ impl Scheduler {
             system_prompt: None,
             compaction: None, // inherit pod's compaction defaults again
         });
+        // Compaction inherits the parent's host-env list verbatim —
+        // same pod allows both parent and continuation, so every entry
+        // still resolves. `Inline` variants aren't addressable by name;
+        // drop those and inherit the pod default for that slot (rare:
+        // `Inline` only exists on the reserved subagent path).
+        let inherited_host_env: Vec<String> = old_bindings
+            .host_env
+            .iter()
+            .filter_map(|b| match b {
+                whisper_agent_protocol::HostEnvBinding::Named { name } => Some(name.clone()),
+                whisper_agent_protocol::HostEnvBinding::Inline { .. } => None,
+            })
+            .collect();
         let bindings_request = Some(whisper_agent_protocol::ThreadBindingsRequest {
             backend: Some(old_bindings.backend.clone()),
-            host_env: old_bindings.host_env.clone().and_then(|b| match b {
-                whisper_agent_protocol::HostEnvBinding::Named { name } => Some(name),
-                // Inline bindings aren't currently addressable from a
-                // request; drop to inherit-pod-default.
-                whisper_agent_protocol::HostEnvBinding::Inline { .. } => None,
-            }),
+            host_env: Some(inherited_host_env),
             mcp_hosts: Some(old_bindings.mcp_hosts.clone()),
         });
         let new_thread_id = match self.create_task(

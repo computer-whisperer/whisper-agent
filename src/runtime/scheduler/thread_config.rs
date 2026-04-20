@@ -29,16 +29,16 @@ pub fn build_default_pod_config(
 ) -> whisper_agent_protocol::PodConfig {
     use whisper_agent_protocol::{NamedHostEnv, PodAllow, PodConfig, PodLimits, ThreadDefaults};
     const HOST_ENV_NAME: &str = "default";
-    let (host_env_entries, default_host_env_name) = match default_host_env {
+    let (host_env_entries, default_host_env_names) = match default_host_env {
         Some((provider, spec)) => (
             vec![NamedHostEnv {
                 name: HOST_ENV_NAME.to_string(),
                 provider,
                 spec,
             }],
-            HOST_ENV_NAME.to_string(),
+            vec![HOST_ENV_NAME.to_string()],
         ),
-        None => (Vec::new(), String::new()),
+        None => (Vec::new(), Vec::new()),
     };
     let now = chrono::Utc::now().to_rfc3339();
     PodConfig {
@@ -64,7 +64,7 @@ pub fn build_default_pod_config(
             system_prompt_file: "system_prompt.md".into(),
             max_tokens: config.max_tokens,
             max_turns: config.max_turns,
-            host_env: default_host_env_name,
+            host_env: default_host_env_names,
             mcp_hosts: shared_host_names.to_vec(),
             compaction: CompactionConfig::default(),
         },
@@ -211,7 +211,7 @@ mod tests {
             }),
             bindings: BehaviorBindingsOverride {
                 backend: Some("anthropic".into()),
-                host_env: Some("readonly".into()),
+                host_env: Some(vec!["readonly".into()]),
                 mcp_hosts: Some(vec!["fetch".into()]),
             },
         };
@@ -226,7 +226,7 @@ mod tests {
         ));
         let b = bindings.expect("bindings_request populated");
         assert_eq!(b.backend.as_deref(), Some("anthropic"));
-        assert_eq!(b.host_env.as_deref(), Some("readonly"));
+        assert_eq!(b.host_env.as_deref(), Some(&["readonly".to_string()][..]));
         assert_eq!(b.mcp_hosts.as_deref(), Some(&["fetch".to_string()][..]));
     }
 

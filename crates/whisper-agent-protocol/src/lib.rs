@@ -200,23 +200,51 @@ pub struct ThreadBindings {
     /// `backend-` prefix.
     #[serde(default)]
     pub backend: String,
-    /// What the thread is bound to. `None` for the always-built-in
-    /// `bare` provider (in-process, no isolation). For non-bare:
-    /// either a [`HostEnvBinding::Named`] referencing a
-    /// `[[allow.host_env]]` entry by name, or a
-    /// [`HostEnvBinding::Inline`] carrying its own (provider, spec)
-    /// pair. The runtime `HostEnvId` is derived from the binding at
-    /// registry-touch time — never persisted, so the binding survives
-    /// pod edits, refactors, and `DefaultHasher` shifts.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub host_env: Option<HostEnvBinding>,
-    /// Bound `McpHostId`s, in routing precedence order. The primary
-    /// (per-thread) host is at index 0; shared hosts follow in the
-    /// order they were declared on the pod.
+    /// Host envs the thread is bound to, in declared order. Empty vec
+    /// means "no host env" — the thread runs under the always-built-in
+    /// `bare` provider (in-process, no isolation). Each non-empty entry
+    /// resolves to its own runtime `HostEnvId` at registry-touch time;
+    /// the scheduler provisions and tears down envs independently.
+    ///
+    /// Persisted as an array. Legacy thread.json files (pre-multi-env)
+    /// stored a single `HostEnvBinding` under `host_env` — the custom
+    /// deserializer below accepts that object form and wraps it into a
+    /// one-entry vec, so old files load without a separate migration.
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        deserialize_with = "deserialize_host_env_bindings"
+    )]
+    pub host_env: Vec<HostEnvBinding>,
+    /// Bound `McpHostId`s, in routing precedence order. Per-thread
+    /// host-env MCPs come first (one per entry in `host_env`, in the
+    /// same order); shared hosts follow in the order they were
+    /// declared on the pod.
     #[serde(default)]
     pub mcp_hosts: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_filter: Option<Vec<String>>,
+}
+
+/// Accept both the legacy singular shape (`null` or a `HostEnvBinding`
+/// object) and the new plural shape (a `Vec<HostEnvBinding>`). The
+/// legacy form wraps into a one- or zero-entry vec so persisted thread
+/// JSONs from before the multi-host-env refactor load cleanly.
+fn deserialize_host_env_bindings<'de, D>(d: D) -> Result<Vec<HostEnvBinding>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Shape {
+        Many(Vec<HostEnvBinding>),
+        One(HostEnvBinding),
+    }
+    Ok(match Option::<Shape>::deserialize(d)? {
+        None => Vec::new(),
+        Some(Shape::Many(v)) => v,
+        Some(Shape::One(b)) => vec![b],
+    })
 }
 
 /// What a thread's `host_env` slot can hold.
@@ -231,10 +259,10 @@ pub struct ThreadBindings {
 /// [`Inline`](Self::Inline) is reserved for a future subagent /
 /// out-of-pod spawn path that needs to pin a spec the pod doesn't
 /// declare. It is **not** reachable from user-facing request types —
-/// [`ThreadBindingsRequest`] and [`HostEnvRebind`] both name entries
-/// by string only — so the wire can't sneak a spec past the pod cap.
-/// Kept as a variant (rather than collapsing the enum to
-/// `Option<String>`) so the stored-state type is stable when the
+/// [`ThreadBindingsRequest`] and [`ThreadBindingsPatch`] both name
+/// entries by string only — so the wire can't sneak a spec past the
+/// pod cap. Kept as a variant (rather than collapsing the enum to
+/// plain strings) so the stored-state type is stable when the
 /// subagent flow lands.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -259,11 +287,13 @@ pub struct ThreadBindingsRequest {
     /// Backend catalog name. Empty → server default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub backend: Option<String>,
-    /// Name of a `[[allow.host_env]]` entry in the target pod. `None`
-    /// inherits the pod's `thread_defaults.host_env`. Must resolve in
-    /// the pod's allow list — the server rejects unknown names.
+    /// Names of `[[allow.host_env]]` entries in the target pod. `None`
+    /// inherits the pod's `thread_defaults.host_env`; `Some(vec)`
+    /// replaces exactly (empty vec means "no host envs — bare thread").
+    /// Each name must resolve in the pod's allow list — the server
+    /// rejects unknown names.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub host_env: Option<String>,
+    pub host_env: Option<Vec<String>>,
     /// Catalog names of shared MCP hosts the thread should bind to. `None`
     /// inherits the pod default; `Some(vec)` replaces exactly (empty vec
     /// means "no shared hosts beyond the primary").
@@ -284,26 +314,17 @@ pub struct ThreadBindingsRequest {
 pub struct ThreadBindingsPatch {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub backend: Option<String>,
-    /// `Some(HostEnvRebind::Named { name })` re-binds to a named allow
-    /// entry; `Some(Clear)` drops the binding entirely (thread falls
-    /// back to the bare provider); `None` leaves it alone. Two layers
-    /// of Option because "set to nothing" and "leave alone" are distinct.
+    /// Replace the bound host-env list. `Some(vec)` replaces exactly —
+    /// empty vec drops all bindings (thread falls back to the bare
+    /// provider), non-empty rebinds to the listed allow entries.
+    /// `None` leaves the current list alone. Each name must resolve in
+    /// the pod's allow list at rebind time.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub host_env: Option<HostEnvRebind>,
+    pub host_env: Option<Vec<String>>,
     /// Replace the shared MCP host list. `Some(vec)` replaces exactly
     /// (empty vec means "no shared hosts"); `None` leaves the current set.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mcp_hosts: Option<Vec<String>>,
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum HostEnvRebind {
-    /// Replace the bound host env with the named allow entry `name`.
-    /// Server validates the entry exists in the pod's allow list.
-    Named { name: String },
-    /// Drop the host env binding entirely (thread falls back to `bare`).
-    Clear,
 }
 
 /// Server-advertised entry from the host-env-provider catalog. Sent in
