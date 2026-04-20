@@ -270,18 +270,28 @@ fn build_request_body<'a>(req: &'a ModelRequest<'a>) -> CreateMessageRequest<'a>
 /// Serialize a message and optionally patch `cache_control` onto its final
 /// content block.
 ///
-/// Beyond the serde derive, we also fix up two things the wire expects:
+/// Beyond the serde derive, we also fix up three things the wire expects:
 /// - `Role::ToolResult` → `user` on the role field (Anthropic only accepts
 ///   `user` and `assistant`).
+/// - `Role::System` (mid-conversation injection, not the thread-prefix
+///   system prompt — that one is lifted into the top-level `system` field
+///   upstream) → `user` on the role field, with each text block's content
+///   wrapped in `<system-reminder>...</system-reminder>` so the model can
+///   tell harness guidance from real user speech.
 /// - `Thinking.replay` → wire-level `signature` field when the block was
 ///   minted by this backend; stripped otherwise (a blob tagged for another
 ///   provider is meaningless and the server 400s on unknown fields).
 fn message_to_value(m: &Message, cache_last_block: bool) -> Value {
     let mut v = serde_json::to_value(m).expect("Message is serializable");
-    if let Some(role) = v.get_mut("role")
-        && role.as_str() == Some("tool_result")
-    {
-        *role = Value::String("user".into());
+    if let Some(role) = v.get_mut("role") {
+        match role.as_str() {
+            Some("tool_result") => *role = Value::String("user".into()),
+            Some("system") => {
+                *role = Value::String("user".into());
+                wrap_text_blocks_in_system_reminder(&mut v);
+            }
+            _ => {}
+        }
     }
     if let Some(content) = v.get_mut("content").and_then(|c| c.as_array_mut()) {
         for block in content.iter_mut() {
@@ -304,6 +314,34 @@ fn message_to_value(m: &Message, cache_last_block: bool) -> Value {
         serde_json::json!({"type": "ephemeral", "ttl": CACHE_TTL_1H}),
     );
     v
+}
+
+/// Wrap every text block's content in `<system-reminder>...</system-reminder>`
+/// tags. Applied to mid-conversation `Role::System` messages when they're
+/// translated to wire `role: "user"` so the model can distinguish harness
+/// guidance from real user speech (Anthropic models are trained on this
+/// convention; other tag choices would be out-of-distribution). Non-text
+/// blocks pass through untouched — we don't expect any in a system
+/// injection, but rewriting them blindly would be worse than a no-op.
+fn wrap_text_blocks_in_system_reminder(v: &mut Value) {
+    let Some(content) = v.get_mut("content").and_then(|c| c.as_array_mut()) else {
+        return;
+    };
+    for block in content.iter_mut() {
+        let Some(obj) = block.as_object_mut() else {
+            continue;
+        };
+        if obj.get("type").and_then(Value::as_str) != Some("text") {
+            continue;
+        }
+        let Some(Value::String(text)) = obj.remove("text") else {
+            continue;
+        };
+        obj.insert(
+            "text".into(),
+            Value::String(format!("<system-reminder>\n{text}\n</system-reminder>")),
+        );
+    }
 }
 
 /// Translate a serialized content block from our normalized shape into
@@ -1033,6 +1071,40 @@ mod tests {
         assert_eq!(block["thinking"], "prior reasoning");
         assert!(block.get("replay").is_none());
         assert!(block.get("signature").is_none());
+    }
+
+    #[test]
+    fn mid_conversation_system_becomes_user_with_wrapped_text() {
+        // An injected Role::System message (not the thread-prefix prompt —
+        // that one is lifted into the top-level `system` field upstream)
+        // must land on the wire as role:"user" with each text block wrapped
+        // in <system-reminder> tags so the model can distinguish harness
+        // guidance from real user speech.
+        let msg = Message::system_text("remember: check memory/ for prior context");
+        let v = message_to_value(&msg, false);
+        assert_eq!(v["role"], "user");
+        let blocks = v["content"].as_array().unwrap();
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0]["type"], "text");
+        assert_eq!(
+            blocks[0]["text"],
+            "<system-reminder>\nremember: check memory/ for prior context\n</system-reminder>"
+        );
+    }
+
+    #[test]
+    fn system_message_is_still_eligible_for_cache_control_marker() {
+        // cache_last_block applies after the role/content rewrite, so an
+        // AfterMessage breakpoint landing on an injected system message
+        // still attaches cache_control to the last (now-wrapped) text block.
+        let msg = Message::system_text("pinned harness note");
+        let v = message_to_value(&msg, true);
+        assert_eq!(v["role"], "user");
+        let blocks = v["content"].as_array().unwrap();
+        assert_eq!(
+            blocks[0]["cache_control"],
+            json!({"type": "ephemeral", "ttl": "1h"})
+        );
     }
 
     #[test]

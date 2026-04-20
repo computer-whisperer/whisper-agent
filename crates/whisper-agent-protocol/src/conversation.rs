@@ -12,16 +12,25 @@ use serde_json::Value;
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum Role {
-    /// The system prompt the model runs under. Lives as the first
-    /// message of every thread's conversation (modulo empty-prompt
-    /// pods, where it's omitted). Captured once at thread creation
-    /// so the log faithfully records what instructions the model
-    /// actually saw — the pod's `system_prompt.md` is just the
-    /// *template* the snapshot was taken from and may drift later
-    /// without affecting threads already created. Provider adapters
-    /// lift the content of this message into their wire-level
-    /// `system` field (Anthropic) or prefix message (OpenAI / Gemini
-    /// `systemInstruction`).
+    /// System-authored guidance the model should treat as harness
+    /// instructions, not as user speech. Covers two distinct uses:
+    ///
+    /// 1. **Thread-prefix system prompt** — lives as `messages[0]`,
+    ///    captured at thread creation so the log faithfully records
+    ///    what instructions the model saw. Provider adapters lift
+    ///    this into their wire-level `system` field (Anthropic) or
+    ///    prefix `system`-role message (OpenAI chat / Responses) /
+    ///    `systemInstruction` (Gemini).
+    ///
+    /// 2. **Mid-conversation injections** — later entries the harness
+    ///    appends to steer or brief the model (e.g. a memory-index
+    ///    block placed before the next user message). Providers that
+    ///    accept a mid-conversation system role (OpenAI chat,
+    ///    Responses) emit it as `role: "system"` in place; providers
+    ///    that don't (Anthropic, Gemini) emit it as a `user` message
+    ///    with content wrapped in `<system-reminder>...</system-reminder>`
+    ///    so the model can distinguish harness guidance from real
+    ///    user speech.
     System,
     /// Snapshot of the tool manifest the model was shown. Lives as
     /// a `Tools` message immediately after `System` at the top of

@@ -513,12 +513,18 @@ fn convert_message(m: &Message, id_to_name: &HashMap<String, String>) -> Option<
         // turn `ContentBlock::ToolResult` into a FunctionResponse.
         Role::User | Role::ToolResult => ("user", convert_user_parts(&m.content, id_to_name)),
         Role::Assistant => ("model", convert_assistant_parts(&m.content, id_to_name)),
-        // Setup-prefix messages (system prompt, tool manifest) are
-        // filtered out by `build_model_request`; Gemini lifts them
-        // into `systemInstruction` / `tools` separately. Dropping a
-        // stray occurrence yields no parts → the caller's `None`
-        // path skips the entry.
-        Role::System | Role::Tools => ("user", Vec::new()),
+        // Mid-conversation harness injection. The thread-prefix system
+        // prompt is lifted into `systemInstruction` upstream; anything
+        // that reaches here is a later injection (e.g. memory-index
+        // block). Gemini has no mid-conversation system role, so emit
+        // as a `user` Content with each text part wrapped in
+        // `<system-reminder>` tags — the same convention Anthropic
+        // uses for the equivalent case.
+        Role::System => ("user", convert_system_parts(&m.content)),
+        // Tool-manifest setup messages are filtered out upstream and
+        // lifted into the `tools` wire field. Dropping a stray one
+        // yields no parts → the caller's `None` path skips the entry.
+        Role::Tools => ("user", Vec::new()),
     };
     if parts.is_empty() {
         None
@@ -528,6 +534,24 @@ fn convert_message(m: &Message, id_to_name: &HashMap<String, String>) -> Option<
             parts,
         })
     }
+}
+
+/// Build Gemini `parts` for a mid-conversation `Role::System` injection.
+/// Each text block's content is wrapped in `<system-reminder>` tags so the
+/// model can distinguish harness guidance from real user speech when the
+/// Content lands on the wire as `role: "user"`. Non-text blocks are
+/// unexpected in a system injection and dropped.
+fn convert_system_parts(blocks: &[ContentBlock]) -> Vec<Part> {
+    let mut parts = Vec::new();
+    for block in blocks {
+        if let ContentBlock::Text { text } = block {
+            parts.push(Part::Text {
+                text: format!("<system-reminder>\n{text}\n</system-reminder>"),
+                thought: None,
+            });
+        }
+    }
+    parts
 }
 
 fn convert_user_parts(blocks: &[ContentBlock], id_to_name: &HashMap<String, String>) -> Vec<Part> {
@@ -1206,6 +1230,24 @@ mod tests {
         assert_eq!(
             json["systemInstruction"],
             serde_json::json!({"parts": [{"text": "be helpful"}]})
+        );
+    }
+
+    #[test]
+    fn mid_conversation_system_becomes_user_with_wrapped_text() {
+        // Injected Role::System is harness guidance, not the thread-prefix
+        // prompt (that one is lifted into `systemInstruction` upstream).
+        // Gemini has no mid-conversation system role, so emit as role:user
+        // with each text part wrapped in <system-reminder> tags.
+        let msgs = vec![Message::system_text("check memory/ before answering")];
+        let body = build_gemini_request(&req(&msgs, &[], "gemini-2.5-pro"));
+        let json = serde_json::to_value(&body).unwrap();
+        assert_eq!(
+            json["contents"],
+            serde_json::json!([{
+                "role": "user",
+                "parts": [{"text": "<system-reminder>\ncheck memory/ before answering\n</system-reminder>"}]
+            }])
         );
     }
 

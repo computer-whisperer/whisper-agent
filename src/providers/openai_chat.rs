@@ -305,12 +305,45 @@ fn convert_message(m: &Message, out: &mut Vec<OaMessage>) {
         // on the wire, which is exactly what OpenAI wants.
         Role::User | Role::ToolResult => convert_user_message(&m.content, out),
         Role::Assistant => convert_assistant_message(&m.content, out),
-        // Setup-prefix messages (system prompt, tool manifest) are
-        // filtered out by `build_model_request` and lifted into the
-        // system-role preamble / `tools` wire field. Defensive no-op
-        // if one slips through.
-        Role::System | Role::Tools => {}
+        // Mid-conversation harness guidance. The thread-prefix
+        // system prompt is already lifted into the preamble by
+        // `do_create_message` (via `req.system_prompt`) and stripped
+        // from `req.messages` by `build_model_request`, so anything
+        // reaching here is a harness injection (e.g. memory-index
+        // block before the next user turn). OpenAI chat accepts
+        // `role:"system"` mid-conversation, so emit inline.
+        Role::System => convert_system_message(&m.content, out),
+        // Tool-manifest setup messages are filtered out upstream and
+        // lifted into the `tools` wire field. Defensive no-op if one
+        // slips through.
+        Role::Tools => {}
     }
+}
+
+/// Emit a mid-conversation `Role::System` injection as `role:"system"`
+/// messages. Text blocks concatenate (newline-joined) into a single
+/// system message; non-text blocks (unexpected in a harness injection)
+/// are dropped silently.
+fn convert_system_message(blocks: &[ContentBlock], out: &mut Vec<OaMessage>) {
+    let mut text_accum = String::new();
+    for block in blocks {
+        if let ContentBlock::Text { text } = block {
+            if !text_accum.is_empty() {
+                text_accum.push('\n');
+            }
+            text_accum.push_str(text);
+        }
+    }
+    if text_accum.is_empty() {
+        return;
+    }
+    out.push(OaMessage {
+        role: "system".into(),
+        content: Some(OaContent::Text(text_accum)),
+        tool_calls: None,
+        tool_call_id: None,
+        reasoning_content: None,
+    });
 }
 
 /// A user turn can be a plain text prompt OR a bundle of tool results. OpenAI
@@ -1008,6 +1041,34 @@ mod tests {
         assert_eq!(tcs.len(), 1);
         assert_eq!(tcs[0].id, "toolu_1");
         assert_eq!(tcs[0].function.name, "read_file");
+    }
+
+    #[test]
+    fn mid_conversation_system_emits_role_system_message() {
+        // Injected Role::System messages (thread-prefix prompt is filtered
+        // out upstream, so anything hitting the adapter is a harness
+        // injection) land as role:"system" inline.
+        let msg = Message::system_text("check memory/ before answering");
+        let mut out = Vec::new();
+        convert_message(&msg, &mut out);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].role, "system");
+        assert!(
+            matches!(&out[0].content, Some(OaContent::Text(s)) if s == "check memory/ before answering")
+        );
+    }
+
+    #[test]
+    fn system_message_with_no_text_emits_nothing() {
+        // A system message with only non-text blocks (shouldn't occur in
+        // practice but defensively handled) produces no wire messages.
+        let msg = Message {
+            role: Role::System,
+            content: vec![],
+        };
+        let mut out = Vec::new();
+        convert_message(&msg, &mut out);
+        assert!(out.is_empty());
     }
 
     #[test]

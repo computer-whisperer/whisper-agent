@@ -345,13 +345,41 @@ fn convert_message(m: &Message, out: &mut Vec<RspItem>) {
         // Responses expects.
         Role::User | Role::ToolResult => convert_user_message(&m.content, out),
         Role::Assistant => convert_assistant_message(&m.content, out),
-        // Setup-prefix messages (system prompt, tool manifest) are
-        // filtered out of `ModelRequest.messages` by
-        // `build_model_request`; the adapter lifts them into the
-        // `instructions` / `tools` wire fields separately. If one
-        // slips through we drop it silently.
-        Role::System | Role::Tools => {}
+        // Mid-conversation harness injection. The thread-prefix
+        // system prompt is lifted into `instructions` upstream and
+        // stripped from `req.messages` by `build_model_request`, so
+        // anything reaching here is a harness injection. Responses
+        // accepts `role:"system"` as an input message item, so emit
+        // inline.
+        Role::System => convert_system_message(&m.content, out),
+        // Tool-manifest setup messages are filtered out upstream and
+        // lifted into the `tools` wire field. Defensive no-op if one
+        // slips through.
+        Role::Tools => {}
     }
+}
+
+/// Emit a mid-conversation `Role::System` injection as `role:"system"`
+/// input items. Text blocks concatenate (newline-joined) into a single
+/// system message; non-text blocks (unexpected in a harness injection)
+/// are dropped silently.
+fn convert_system_message(blocks: &[ContentBlock], out: &mut Vec<RspItem>) {
+    let mut text_accum = String::new();
+    for block in blocks {
+        if let ContentBlock::Text { text } = block {
+            if !text_accum.is_empty() {
+                text_accum.push('\n');
+            }
+            text_accum.push_str(text);
+        }
+    }
+    if text_accum.is_empty() {
+        return;
+    }
+    out.push(RspItem::Message {
+        role: "system",
+        content: vec![RspInputMessagePart::InputText { text: text_accum }],
+    });
 }
 
 /// A user turn is a mix of plain text and tool results. Responses wants tool
@@ -1160,6 +1188,23 @@ mod tests {
             serde_json::json!([
                 {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "ok"}]},
                 {"type": "function_call", "call_id": "call_1", "name": "shell", "arguments": "{\"cmd\":\"ls\"}"}
+            ])
+        );
+    }
+
+    #[test]
+    fn mid_conversation_system_emits_role_system_input_item() {
+        // Injected Role::System (not the thread-prefix prompt — that one
+        // is lifted into `instructions` upstream) should appear as a
+        // role:"system" input item with the wrapped text.
+        let msg = Message::system_text("check memory/ before answering");
+        let mut items = Vec::new();
+        convert_message(&msg, &mut items);
+        let json = serde_json::to_value(&items).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!([
+                {"type": "message", "role": "system", "content": [{"type": "input_text", "text": "check memory/ before answering"}]}
             ])
         );
     }

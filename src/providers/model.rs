@@ -213,15 +213,19 @@ pub async fn buffer_stream<'a>(
 /// 2× for 1h), and the redundancy only pays off if the longer entry TTLs out
 /// mid-session — unlikely at 1h. Two markers is also well under Anthropic's 4-cap.
 ///
-/// "User-side" is `Role::User` or `Role::ToolResult` — anything non-assistant.
-/// Tool results are where fresh input lands on tool-loop turns; filtering them
-/// out stalls the rolling checkpoint on the last human-typed message.
+/// "User-side" is `Role::User` or `Role::ToolResult` — anything representing
+/// fresh input the model consumes. `Role::Assistant` and `Role::System` are
+/// skipped: assistant output is where reasoning continues, not where input
+/// lands; mid-conversation system injections are harness guidance whose
+/// content can churn independently of user turns and shouldn't hijack the
+/// rolling breakpoint away from the stable user-anchored prefix.
 pub fn default_cache_policy(messages: &[Message]) -> Vec<CacheBreakpoint> {
+    use whisper_agent_protocol::Role;
     let mut out = vec![CacheBreakpoint::AfterSystem];
     if let Some(last) = messages
         .iter()
         .enumerate()
-        .rfind(|(_, m)| !matches!(m.role, whisper_agent_protocol::Role::Assistant))
+        .rfind(|(_, m)| !matches!(m.role, Role::Assistant | Role::System))
         .map(|(i, _)| i)
     {
         out.push(CacheBreakpoint::AfterMessage(last));
@@ -273,6 +277,29 @@ mod tests {
         // nothing to anchor a rolling breakpoint on, so only the system marker.
         let bps = default_cache_policy(&[]);
         assert_eq!(bps, vec![CacheBreakpoint::AfterSystem]);
+    }
+
+    #[test]
+    fn injected_system_message_is_skipped_for_rolling_breakpoint() {
+        // A mid-conversation Role::System (e.g. a memory-index injection
+        // placed just before the next send) should not capture the
+        // rolling breakpoint — the anchor belongs on the real user turn
+        // so cache lookups stay stable across injections whose content
+        // may churn.
+        let msgs = vec![
+            Message::user_text("hi"),
+            Message::assistant_blocks(vec![ContentBlock::Text { text: "hey".into() }]),
+            Message::user_text("do X"),
+            Message::system_text("<harness note>"),
+        ];
+        let bps = default_cache_policy(&msgs);
+        assert_eq!(
+            bps,
+            vec![
+                CacheBreakpoint::AfterSystem,
+                CacheBreakpoint::AfterMessage(2)
+            ]
+        );
     }
 
     #[test]
