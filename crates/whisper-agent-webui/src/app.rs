@@ -5592,6 +5592,7 @@ fn resource_state_chip(state: ResourceStateLabel) -> (&'static str, Color32) {
         ResourceStateLabel::Provisioning => ("provisioning", Color32::from_rgb(180, 160, 90)),
         ResourceStateLabel::Ready => ("ready", Color32::from_rgb(120, 180, 120)),
         ResourceStateLabel::Errored => ("errored", Color32::from_rgb(200, 110, 110)),
+        ResourceStateLabel::Lost => ("lost", Color32::from_rgb(210, 140, 90)),
         ResourceStateLabel::TornDown => ("torn down", Color32::from_gray(140)),
     }
 }

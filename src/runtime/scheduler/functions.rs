@@ -974,6 +974,7 @@ impl Scheduler {
                         },
                         pod_update: None,
                         scheduler_command: None,
+                        host_env_lost: None,
                     },
                 )
             }));
@@ -1025,6 +1026,7 @@ impl Scheduler {
                         },
                         pod_update: None,
                         scheduler_command: None,
+                        host_env_lost: None,
                     },
                 )
             }));
@@ -1598,6 +1600,7 @@ fn immediate_tool_error(
                 },
                 pod_update: None,
                 scheduler_command: None,
+                host_env_lost: None,
             },
         )
     })
@@ -1625,6 +1628,7 @@ fn make_denial_future(
                 },
                 pod_update: None,
                 scheduler_command: None,
+                host_env_lost: None,
             },
         )
     })

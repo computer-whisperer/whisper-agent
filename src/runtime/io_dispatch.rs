@@ -52,6 +52,20 @@ pub(crate) struct IoCompletion {
     pub(crate) result: IoResult,
     pub(crate) pod_update: Option<crate::tools::builtin_tools::PodUpdate>,
     pub(crate) scheduler_command: Option<crate::tools::builtin_tools::SchedulerCommand>,
+    /// When set, the dispatched tool call hit a transport-level
+    /// failure against a host-env MCP — the daemon session is gone.
+    /// The scheduler marks the named host env + its MCP entry `Lost`
+    /// *after* applying the tool result, so the thread sees a normal
+    /// tool-call error and keeps running. A later provision attempt
+    /// (same thread or another) re-provisions the env under the same
+    /// `(provider, spec)` key.
+    pub(crate) host_env_lost: Option<HostEnvLostSignal>,
+}
+
+#[derive(Clone)]
+pub(crate) struct HostEnvLostSignal {
+    pub(crate) mcp_host_id: crate::pod::resources::McpHostId,
+    pub(crate) message: String,
 }
 
 /// Completion message delivered by every host-env provisioning future.
@@ -371,6 +385,7 @@ fn model_call(scheduler: &Scheduler, thread_id: String, op_id: OpId) -> Schedule
                     result: IoResult::ModelCall(Err(msg)),
                     pod_update: None,
                     scheduler_command: None,
+                    host_env_lost: None,
                 })
             });
         }
@@ -399,6 +414,7 @@ fn model_call(scheduler: &Scheduler, thread_id: String, op_id: OpId) -> Schedule
             result,
             pod_update: None,
             scheduler_command: None,
+            host_env_lost: None,
         })
     })
 }
@@ -559,6 +575,7 @@ fn tool_call(
                             },
                             pod_update: None,
                             scheduler_command: None,
+                            host_env_lost: None,
                         })
                     });
                 }
@@ -593,21 +610,33 @@ fn tool_call(
                     },
                     pod_update,
                     scheduler_command,
+                    host_env_lost: None,
                 })
             })
         }
         Some(ToolRoute::Mcp {
             session: mcp,
             real_name,
-            ..
+            host,
         }) => {
             let stream_tx = scheduler.stream_sender();
             let stream_thread_id = thread_id.clone();
             let stream_tool_use_id = tool_use_id.clone();
+            let mcp_host_id = crate::pod::resources::McpHostId(host);
             Box::pin(async move {
                 // `real_name` is the tool name the MCP host advertises
                 // server-side — the public name the model called minus
                 // any `{env_name}_` prefix route_tool stripped off.
+                //
+                // If the invoke call itself fails at the transport
+                // layer AND the MCP is host-env-backed, signal the
+                // scheduler to mark the env `Lost` — the daemon
+                // session is gone and no amount of retry against this
+                // URL + session_id will bring it back. Shared MCPs
+                // just surface the error as-is; Lost is specifically
+                // a host-env concept (they're the thing that gets
+                // re-provisioned per thread).
+                let mut host_env_lost: Option<HostEnvLostSignal> = None;
                 let result = match mcp.invoke(&real_name, input).await {
                     Ok(mut stream) => {
                         let mut last = None;
@@ -632,7 +661,15 @@ fn tool_call(
                             None => Err("no Completed event in tool stream".to_string()),
                         }
                     }
-                    Err(e) => Err(e.to_string()),
+                    Err(e) => {
+                        if mcp_host_id.is_host_env() && e.is_transport_lost() {
+                            host_env_lost = Some(HostEnvLostSignal {
+                                mcp_host_id: mcp_host_id.clone(),
+                                message: e.to_string(),
+                            });
+                        }
+                        Err(e.to_string())
+                    }
                 };
                 SchedulerCompletion::Io(IoCompletion {
                     thread_id,
@@ -643,6 +680,7 @@ fn tool_call(
                     },
                     pod_update: None,
                     scheduler_command: None,
+                    host_env_lost,
                 })
             })
         }
@@ -656,6 +694,7 @@ fn tool_call(
                 },
                 pod_update: None,
                 scheduler_command: None,
+                host_env_lost: None,
             })
         }),
     }

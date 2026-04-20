@@ -2145,6 +2145,7 @@ impl Scheduler {
             result,
             pod_update,
             scheduler_command,
+            host_env_lost,
         } = completion;
         let mut events = Vec::new();
 
@@ -2156,6 +2157,34 @@ impl Scheduler {
         // broadcast pair.
         if let Some(update) = pod_update {
             self.apply_pod_update(&thread_id, update);
+        }
+
+        // Handle transport-lost signal from the MCP tool-call path.
+        // Mark both the host env and its MCP entry Lost, broadcast
+        // resource updates, and — since the session won't recover —
+        // don't emit a teardown RPC (mark_host_env_lost drops the
+        // cached handle itself). The thread sees the normal tool
+        // error below and keeps running; the next thread to arrive
+        // with the same (provider, spec) re-provisions via the
+        // existing Errored-reset path in pre_register_host_env.
+        if let Some(signal) = host_env_lost {
+            let message = signal.message;
+            if let Some(host_env_id) = signal.mcp_host_id.host_env_id() {
+                if self
+                    .resources
+                    .mark_host_env_lost(&host_env_id, message.clone())
+                {
+                    self.emit_host_env_updated(&host_env_id);
+                }
+                if self.resources.mark_mcp_lost(&signal.mcp_host_id, message) {
+                    self.emit_mcp_host_updated(&signal.mcp_host_id);
+                }
+                warn!(
+                    %thread_id,
+                    host_env_id = %host_env_id.0,
+                    "host env marked Lost after transport failure"
+                );
+            }
         }
         if let Some(command) = scheduler_command {
             self.apply_scheduler_command(&thread_id, command, pending_io);

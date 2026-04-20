@@ -464,6 +464,13 @@ pub enum ResourceStateLabel {
     Provisioning,
     Ready,
     Errored,
+    /// Live entry suddenly became unusable after having been Ready —
+    /// the daemon backing it lost our session (typical cause: the
+    /// daemon's host powered off or the daemon restarted). Distinct
+    /// from `Errored` (which means provisioning failed from the
+    /// start) so the UI can distinguish "this never worked" from
+    /// "this was working and went away".
+    Lost,
     TornDown,
 }
 

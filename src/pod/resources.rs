@@ -67,6 +67,28 @@ impl McpHostId {
     pub fn for_host_env(id: &HostEnvId) -> Self {
         Self(format!("mcp-{}", id.0))
     }
+    /// Whether this id points at a host-env-backed MCP (vs a shared
+    /// MCP). Used by the tool-call path to decide whether a transport
+    /// failure means "the sandbox daemon lost our session" (host-env
+    /// case, triggers Lost state) or "the shared MCP host is
+    /// unreachable" (shared case, surfaces as a plain tool error).
+    pub fn is_host_env(&self) -> bool {
+        self.0.starts_with("mcp-he-")
+    }
+    /// Recover the owning `HostEnvId` from a host-env-backed MCP id.
+    /// Returns `None` for shared MCPs. Uses the `mcp-` prefix from
+    /// `for_host_env`.
+    pub fn host_env_id(&self) -> Option<HostEnvId> {
+        let rest = self.0.strip_prefix("mcp-")?;
+        // Host-env form is `mcp-he-<hex>`; shared form is
+        // `mcp-shared-<name>` — guard against stripping `shared-`
+        // by accident.
+        if rest.starts_with("he-") {
+            Some(HostEnvId(rest.to_string()))
+        } else {
+            None
+        }
+    }
 }
 
 impl BackendId {
@@ -89,6 +111,15 @@ pub enum ResourceState {
     Errored {
         message: String,
     },
+    /// Previously Ready, but the daemon session became unusable
+    /// (typical cause: daemon host powered off, daemon restarted and
+    /// forgot our session id). Distinct from `Errored` so the UI can
+    /// distinguish "never worked" from "was working and went away".
+    /// Reset to Provisioning on the next thread arrival with the
+    /// same `(provider, spec)` key, same as `Errored`.
+    Lost {
+        message: String,
+    },
     /// Resource has been torn down. Entry lingers briefly for inspection then
     /// is reaped on the next GC pass.
     TornDown,
@@ -101,7 +132,7 @@ impl ResourceState {
     pub fn is_terminal(&self) -> bool {
         matches!(
             self,
-            ResourceState::Errored { .. } | ResourceState::TornDown
+            ResourceState::Errored { .. } | ResourceState::Lost { .. } | ResourceState::TornDown
         )
     }
     pub fn label(&self) -> ResourceStateLabel {
@@ -109,6 +140,7 @@ impl ResourceState {
             ResourceState::Provisioning { .. } => ResourceStateLabel::Provisioning,
             ResourceState::Ready => ResourceStateLabel::Ready,
             ResourceState::Errored { .. } => ResourceStateLabel::Errored,
+            ResourceState::Lost { .. } => ResourceStateLabel::Lost,
             ResourceState::TornDown => ResourceStateLabel::TornDown,
         }
     }
@@ -466,6 +498,39 @@ impl ResourceRegistry {
         }
     }
 
+    /// Mark a sandbox as Lost — it was provisioned successfully but
+    /// the daemon session is no longer usable (daemon gone, restarted,
+    /// or session forgotten). Drops the cached handle so GC doesn't
+    /// try to RPC a teardown against a daemon that can't honor it.
+    /// Returns whether the entry existed and transitioned.
+    pub fn mark_host_env_lost(&mut self, id: &HostEnvId, message: String) -> bool {
+        let Some(entry) = self.host_envs.get_mut(id) else {
+            return false;
+        };
+        entry.state = ResourceState::Lost { message };
+        entry.last_used = Utc::now();
+        // Drop the handle without calling teardown — the daemon either
+        // doesn't remember the session (restart) or can't be reached
+        // (powered off). Either way the teardown RPC is useless.
+        entry.handle = None;
+        true
+    }
+
+    /// Mark a primary MCP host as Lost. Same semantics as Errored but
+    /// specifically for the "was Ready, became unusable" transition.
+    pub fn mark_mcp_lost(&mut self, id: &McpHostId, message: String) -> bool {
+        let Some(entry) = self.mcp_hosts.get_mut(id) else {
+            return false;
+        };
+        entry.state = ResourceState::Lost { message };
+        entry.last_used = Utc::now();
+        // Drop the cached session so future tool calls can't accidentally
+        // hit the dead endpoint — they'll see the Lost state and the
+        // scheduler will re-provision on the next thread's arrival.
+        entry.session = None;
+        true
+    }
+
     /// Eagerly register a sandbox spec at thread-creation time, before any
     /// provisioning future runs. Returns the deterministic
     /// `HostEnvId::for_provider_spec(provider, spec)`; idempotent on the id (calling twice for
@@ -488,6 +553,19 @@ impl ResourceRegistry {
         let now = Utc::now();
         match self.host_envs.get_mut(&id) {
             Some(entry) => {
+                // If terminal (Errored from a prior failure, Lost from
+                // a daemon-gone classification, or TornDown after the
+                // last user left), reset back to Provisioning so the
+                // next provision future re-establishes a fresh
+                // sandbox. Handle / mcp_url / mcp_token are already
+                // cleared on Lost; clear them here as a belt-and-
+                // suspenders for Errored / TornDown.
+                if entry.state.is_terminal() {
+                    entry.state = ResourceState::Provisioning { op_id: 0 };
+                    entry.handle = None;
+                    entry.mcp_url = None;
+                    entry.mcp_token = None;
+                }
                 entry.users.insert(thread_id.to_string());
                 entry.last_used = now;
             }
@@ -1035,5 +1113,81 @@ mod tests {
         reg.populate_mcp_tools(&id, vec![tool], HashMap::new());
         assert_eq!(reg.mcp_hosts[&id].tools.len(), 1);
         assert_eq!(reg.mcp_hosts[&id].tools[0].name, "echo");
+    }
+
+    #[test]
+    fn mark_host_env_lost_drops_handle_and_transitions() {
+        let mut reg = ResourceRegistry::new();
+        let id = reg.pre_register_host_env(
+            "t-1",
+            "p".into(),
+            HostEnvSpec::Landlock {
+                allowed_paths: Vec::new(),
+                network: Default::default(),
+            },
+        );
+        reg.complete_host_env_provisioning(
+            &id,
+            Some("http://mcp".into()),
+            None,
+            None, // no handle in the test
+        );
+        assert!(reg.host_envs[&id].state.is_ready());
+        let transitioned = reg.mark_host_env_lost(&id, "daemon gone".into());
+        assert!(transitioned);
+        assert!(matches!(
+            reg.host_envs[&id].state,
+            ResourceState::Lost { .. }
+        ));
+        assert!(reg.host_envs[&id].state.is_terminal());
+        assert!(reg.host_envs[&id].handle.is_none());
+    }
+
+    #[test]
+    fn lost_host_env_resets_on_next_pre_register() {
+        let mut reg = ResourceRegistry::new();
+        let spec = HostEnvSpec::Landlock {
+            allowed_paths: Vec::new(),
+            network: Default::default(),
+        };
+        let id = reg.pre_register_host_env("t-1", "p".into(), spec.clone());
+        reg.complete_host_env_provisioning(&id, Some("http://mcp".into()), None, None);
+        reg.mark_host_env_lost(&id, "boom".into());
+        // New thread arrives with same (provider, spec) → the entry
+        // resets to Provisioning so provisioning can re-run.
+        let id2 = reg.pre_register_host_env("t-2", "p".into(), spec);
+        assert_eq!(id, id2);
+        assert!(
+            matches!(reg.host_envs[&id].state, ResourceState::Provisioning { .. }),
+            "expected reset to Provisioning, got {:?}",
+            reg.host_envs[&id].state
+        );
+        assert!(reg.host_envs[&id].mcp_url.is_none());
+        assert!(reg.host_envs[&id].users.contains("t-2"));
+    }
+
+    #[test]
+    fn mcp_host_id_distinguishes_shared_and_host_env() {
+        let shared = McpHostId::shared("fetch");
+        assert!(!shared.is_host_env());
+        assert!(shared.host_env_id().is_none());
+
+        let spec = HostEnvSpec::Landlock {
+            allowed_paths: Vec::new(),
+            network: Default::default(),
+        };
+        let he_id = HostEnvId::for_provider_spec("p", &spec);
+        let he_mcp = McpHostId::for_host_env(&he_id);
+        assert!(he_mcp.is_host_env());
+        assert_eq!(he_mcp.host_env_id(), Some(he_id));
+    }
+
+    #[test]
+    fn lost_terminal_state_label_maps_to_lost_wire() {
+        let state = ResourceState::Lost {
+            message: "x".into(),
+        };
+        assert_eq!(state.label(), ResourceStateLabel::Lost);
+        assert!(state.is_terminal());
     }
 }

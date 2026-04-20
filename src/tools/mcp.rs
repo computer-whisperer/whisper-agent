@@ -33,6 +33,32 @@ pub enum McpError {
     Malformed(String),
 }
 
+impl McpError {
+    /// Whether this error looks like "the MCP host is gone" — i.e. the
+    /// scheduler should mark the owning host-env `Lost` rather than
+    /// surface it as a normal tool-returned-an-error. Covers:
+    /// - connect failures and timeouts (daemon host unreachable),
+    /// - 5xx from the MCP (MCP host crashed; daemon may or may not be),
+    /// - 401/403 (daemon restarted and MCP host doesn't recognize our
+    ///   per-sandbox bearer anymore — effectively session-gone),
+    /// - 404 on the MCP URL (daemon restarted and the URL points
+    ///   nowhere usable).
+    ///
+    /// Rpc / Malformed are NOT transport: the MCP host *responded*, so
+    /// the session is alive — the tool just errored or the response
+    /// was garbage. Those flow as a normal tool-call failure.
+    pub fn is_transport_lost(&self) -> bool {
+        match self {
+            McpError::Http(e) => e.is_connect() || e.is_timeout() || e.is_request(),
+            McpError::Transport { status, .. } => matches!(
+                *status,
+                401 | 403 | 404 | 408 | 500 | 502 | 503 | 504 | 522 | 523 | 524
+            ),
+            McpError::Rpc { .. } | McpError::Malformed(_) => false,
+        }
+    }
+}
+
 #[derive(Deserialize, Debug, Clone)]
 pub struct ToolDescriptor {
     pub name: String,
