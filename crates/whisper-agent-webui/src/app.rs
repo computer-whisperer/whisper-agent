@@ -620,14 +620,15 @@ pub struct ChatApp {
     /// when the user overrides the backend we fall through to the
     /// backend catalog's default model instead.
     picker_model: Option<String>,
-    /// Name of the `[[allow.host_env]]` entry the compose form is
-    /// targeting for the new thread. `None` = inherit the target pod's
-    /// `thread_defaults.host_env`. Always resolves to an entry in the
-    /// pod's allow list — the webui never invents inline specs, and
-    /// the server rejects unknown names. Reset back to `None` after
+    /// `[[allow.host_env]]` entries the compose form is targeting for
+    /// the new thread. `None` = inherit the target pod's
+    /// `thread_defaults.host_env`; `Some(vec)` = replace exactly (empty
+    /// vec means "no host env — bare thread"). Every name must resolve
+    /// in the pod's allow list — the webui never invents inline specs,
+    /// and the server rejects unknown names. Reset back to `None` after
     /// every submit so the next compose starts from the pod default,
     /// not whatever the previous thread used.
-    compose_host_env: Option<String>,
+    compose_host_env: Option<Vec<String>>,
     /// Compose target pod id we last resolved the picker overrides
     /// against. When this changes (e.g. the user clicks "+ Thread" in
     /// a different pod), we clear `picker_backend`/`picker_model`/
@@ -2337,19 +2338,12 @@ impl ChatApp {
                         .map(|m| m.id.clone())
                 })
         });
-        // Host env is always a reference by name into the target
-        // pod's `allow.host_env` table. `None` → server applies
-        // `thread_defaults.host_env`. The webui never constructs
+        // Host env is always a list of references by name into the
+        // target pod's `allow.host_env` table. `None` → server applies
+        // `thread_defaults.host_env`; `Some(vec)` → replace exactly
+        // (empty vec means bare thread). The webui never constructs
         // inline specs; the server rejects Inline at the wire boundary.
-        // Phase-1 shape: compose picker is still single-value; wrap the
-        // chosen name in a one-entry vec for the wire type.
-        let host_env = self.compose_host_env.clone().map(|name| {
-            if name.is_empty() {
-                Vec::new()
-            } else {
-                vec![name]
-            }
-        });
+        let host_env = self.compose_host_env.clone();
         let config_override = if model.is_some() {
             Some(ThreadConfigOverride {
                 model,
@@ -3060,16 +3054,17 @@ impl eframe::App for ChatApp {
                                 }
                             });
 
-                        // Host env picker: dropdown over the target
-                        // pod's `allow.host_env` entries. First row =
-                        // "inherit pod default" (the server resolves
-                        // `compose_host_env = None` to
-                        // pod.thread_defaults.host_env, which the pod
-                        // validator guarantees names one of these
-                        // entries). Hidden entirely when the pod has
-                        // no host envs (threads there run with shared
-                        // MCPs only) or when the pod config hasn't
-                        // landed yet — inheriting is a safe default.
+                        // Host env picker: multi-select over the
+                        // target pod's `allow.host_env` entries. An
+                        // "override" toggle decides whether the
+                        // thread inherits the pod's
+                        // `thread_defaults.host_env` (None on the
+                        // wire) or replaces it with the explicit
+                        // list below (Some(vec) — empty means "bare
+                        // thread, no host envs"). Hidden entirely
+                        // when the pod has no host envs (threads
+                        // there run with shared MCPs only) or the
+                        // pod config hasn't landed yet.
                         let pod_config = self
                             .compose_target_pod_id()
                             .and_then(|id| self.pod_configs.get(id));
@@ -3077,34 +3072,43 @@ impl eframe::App for ChatApp {
                             && !pod_config.allow.host_env.is_empty()
                         {
                             ui.separator();
-                            ui.label(
-                                RichText::new("host env")
-                                    .small()
-                                    .color(Color32::from_gray(180)),
-                            );
                             let default_names = pod_config.thread_defaults.host_env.join(", ");
-                            let inherit_label = format!("pod default ({default_names})");
-                            let selected_label = match &self.compose_host_env {
-                                None => inherit_label.clone(),
-                                Some(name) => name.clone(),
-                            };
-                            ComboBox::from_id_salt("picker_host_env")
-                                .selected_text(selected_label)
-                                .show_ui(ui, |ui| {
-                                    ui.selectable_value(
-                                        &mut self.compose_host_env,
-                                        None,
-                                        inherit_label,
-                                    );
-                                    ui.separator();
+                            ui.horizontal(|ui| {
+                                ui.label(
+                                    RichText::new("host env")
+                                        .small()
+                                        .color(Color32::from_gray(180)),
+                                );
+                                let mut override_on = self.compose_host_env.is_some();
+                                if ui
+                                    .checkbox(
+                                        &mut override_on,
+                                        format!(
+                                            "override (else inherit pod default: {default_names})"
+                                        ),
+                                    )
+                                    .changed()
+                                {
+                                    self.compose_host_env =
+                                        if override_on { Some(Vec::new()) } else { None };
+                                }
+                            });
+                            if let Some(selected) = self.compose_host_env.as_mut() {
+                                ui.horizontal_wrapped(|ui| {
                                     for nh in &pod_config.allow.host_env {
-                                        ui.selectable_value(
-                                            &mut self.compose_host_env,
-                                            Some(nh.name.clone()),
-                                            &nh.name,
-                                        );
+                                        let mut on = selected.iter().any(|n| n == &nh.name);
+                                        if ui.checkbox(&mut on, &nh.name).changed() {
+                                            if on {
+                                                if !selected.iter().any(|n| n == &nh.name) {
+                                                    selected.push(nh.name.clone());
+                                                }
+                                            } else {
+                                                selected.retain(|n| n != &nh.name);
+                                            }
+                                        }
                                     }
                                 });
+                            }
                         }
                     });
                 }

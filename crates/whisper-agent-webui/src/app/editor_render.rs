@@ -356,27 +356,22 @@ pub(super) fn render_pod_editor_defaults_tab(
             ui.end_row();
 
             ui.label("host env");
-            // Pods with zero allow.host_env entries don't offer a host
-            // env to their threads at all — the default is fixed at
-            // empty and there's nothing to choose. Pods with entries
-            // must pick a default from them (the server's validator
-            // rejects mismatches). There is no "(none)" escape hatch:
-            // a thread with no host env binding is a shape for pods
-            // that declare zero entries, not a fallback we let other
-            // pods silently land on.
-            // Phase-1 shape: a single-select combo that writes the
-            // whole Vec as zero or one entry. Multi-select will land
-            // in a later pass once the scheduler fans out provisioning
-            // across every bound env.
+            // Multi-select over the pod's `[allow.host_env]` entries.
+            // Threads with zero bindings run bare (no host-env tools,
+            // only shared MCPs); threads with multiple bindings
+            // provision each env in parallel and the model sees
+            // every env's tools prefixed with the env's allow-list
+            // name (e.g. `c-dtop_write_file`).
+            //
+            // Pods with an empty allow.host_env can't offer bindings
+            // at all; keep the value forced to empty in that case to
+            // stop stale names from lingering after allow edits.
             let sb_in_allow = working
                 .thread_defaults
                 .host_env
                 .iter()
                 .all(|name| working.allow.host_env.iter().any(|s| &s.name == name));
             if working.allow.host_env.is_empty() {
-                // Keep the value forced to empty — switching to a named
-                // entry from here is meaningless until the allow list
-                // gains one on the Allow tab.
                 working.thread_defaults.host_env.clear();
                 ui.label(
                     RichText::new(
@@ -387,39 +382,53 @@ pub(super) fn render_pod_editor_defaults_tab(
                     .color(Color32::from_gray(160)),
                 );
             } else {
-                let current = working
-                    .thread_defaults
-                    .host_env
-                    .first()
-                    .cloned()
-                    .unwrap_or_default();
-                let mut selection = current.clone();
-                ComboBox::from_id_salt("pod_editor_defaults_sandbox")
-                    .selected_text(if selection.is_empty() {
-                        "(pick one)".to_string()
-                    } else {
-                        selection.clone()
-                    })
-                    .show_ui(ui, |ui| {
-                        for entry in &working.allow.host_env {
-                            ui.selectable_value(&mut selection, entry.name.clone(), &entry.name);
+                ui.horizontal_wrapped(|ui| {
+                    for entry in &working.allow.host_env {
+                        let mut on = working
+                            .thread_defaults
+                            .host_env
+                            .iter()
+                            .any(|n| n == &entry.name);
+                        if ui.checkbox(&mut on, &entry.name).changed() {
+                            if on {
+                                if !working
+                                    .thread_defaults
+                                    .host_env
+                                    .iter()
+                                    .any(|n| n == &entry.name)
+                                {
+                                    working.thread_defaults.host_env.push(entry.name.clone());
+                                }
+                            } else {
+                                working
+                                    .thread_defaults
+                                    .host_env
+                                    .retain(|n| n != &entry.name);
+                            }
                         }
-                    });
-                if selection != current {
-                    working.thread_defaults.host_env = if selection.is_empty() {
-                        Vec::new()
-                    } else {
-                        vec![selection]
-                    };
-                }
+                    }
+                });
             }
             ui.end_row();
             if !sb_in_allow {
-                let invalid = working.thread_defaults.host_env.join(", ");
+                // Surfaces only the names that fell out of allow — the
+                // subset-diff keeps the hint actionable even when most
+                // of the list is still valid.
+                let invalid: Vec<&String> = working
+                    .thread_defaults
+                    .host_env
+                    .iter()
+                    .filter(|n| !working.allow.host_env.iter().any(|s| s.name == **n))
+                    .collect();
                 ui.label("");
                 ui.label(
                     RichText::new(format!(
-                        "`{invalid}` is not in allow.host_env — server will reject on save",
+                        "{} not in allow.host_env — server will reject on save",
+                        invalid
+                            .iter()
+                            .map(|s| format!("`{s}`"))
+                            .collect::<Vec<_>>()
+                            .join(", "),
                     ))
                     .small()
                     .color(Color32::from_rgb(220, 90, 90)),
@@ -797,25 +806,45 @@ pub(super) fn render_behavior_editor_thread_tab(
         backend_catalog,
         "(inherit pod default)",
     );
-    // Phase-1 shape: present host_env binding as a single-select
-    // picker even though the underlying protocol field is now
-    // `Option<Vec<String>>`. Adapt at the boundary — show first-of-vec,
-    // write back as `vec![name]` or `Vec::new()` depending on the
-    // selection. Multi-select UI will come in Phase 3.
-    let mut adapted: Option<String> = cfg
-        .thread
-        .bindings
-        .host_env
-        .as_ref()
-        .map(|v| v.first().cloned().unwrap_or_default());
-    render_optional_string_picker(
-        ui,
-        "host_env",
-        &mut adapted,
-        pod_host_env_names,
-        "(inherit pod default)",
-    );
-    cfg.thread.bindings.host_env = adapted.map(|s| if s.is_empty() { Vec::new() } else { vec![s] });
+    ui.add_space(6.0);
+    ui.label("host_env");
+    let mut host_env_set = cfg.thread.bindings.host_env.is_some();
+    if ui
+        .checkbox(&mut host_env_set, "override pod default host_env")
+        .changed()
+    {
+        cfg.thread.bindings.host_env = if host_env_set { Some(Vec::new()) } else { None };
+    }
+    if let Some(selected) = cfg.thread.bindings.host_env.as_mut() {
+        if pod_host_env_names.is_empty() {
+            ui.label(
+                RichText::new("(pod declares no host envs in [allow])")
+                    .italics()
+                    .color(Color32::from_gray(160)),
+            );
+        } else {
+            ui.horizontal_wrapped(|ui| {
+                for name in pod_host_env_names {
+                    let mut on = selected.iter().any(|n| n == name);
+                    if ui.checkbox(&mut on, name).changed() {
+                        if on {
+                            if !selected.iter().any(|n| n == name) {
+                                selected.push(name.clone());
+                            }
+                        } else {
+                            selected.retain(|n| n != name);
+                        }
+                    }
+                }
+            });
+        }
+    } else {
+        ui.label(
+            RichText::new("(inherit pod default)")
+                .italics()
+                .color(Color32::from_gray(160)),
+        );
+    }
 
     ui.add_space(6.0);
     ui.label("mcp_hosts");
