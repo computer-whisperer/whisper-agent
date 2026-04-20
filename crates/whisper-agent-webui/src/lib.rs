@@ -10,7 +10,7 @@ mod editor;
 #[cfg(target_arch = "wasm32")]
 mod fonts;
 
-pub use app::ChatApp;
+pub use app::{ChatApp, Inbound, InboundEvent, SendFn};
 
 #[cfg(target_arch = "wasm32")]
 mod web_entry {
