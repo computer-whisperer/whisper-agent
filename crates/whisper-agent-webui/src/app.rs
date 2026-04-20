@@ -34,11 +34,11 @@ use whisper_agent_protocol::sandbox::NetworkPolicy;
 use whisper_agent_protocol::{
     AllowMap, ApprovalChoice, BackendSummary, BehaviorConfig, BehaviorOrigin,
     BehaviorSnapshot as BehaviorSnapshotProto, BehaviorSummary, BehaviorThreadOverride,
-    ClientToServer, ContentBlock, Conversation, HostEnvBinding, HostEnvProviderInfo, HostEnvSpec,
-    Message, ModelSummary, NamedHostEnv, PodAllow, PodConfig, PodLimits, PodSummary,
-    ResourceSnapshot, ResourceStateLabel, RetentionPolicy, Role, ServerToClient, ThreadBindings,
-    ThreadBindingsRequest, ThreadConfigOverride, ThreadDefaults, ThreadStateLabel, ThreadSummary,
-    ToolResultContent, TriggerSpec, TurnLog, Usage,
+    ClientToServer, ContentBlock, Conversation, FunctionKind, FunctionSummary, HostEnvBinding,
+    HostEnvProviderInfo, HostEnvSpec, Message, ModelSummary, NamedHostEnv, PodAllow, PodConfig,
+    PodLimits, PodSummary, ResourceSnapshot, ResourceStateLabel, RetentionPolicy, Role,
+    ServerToClient, ThreadBindings, ThreadBindingsRequest, ThreadConfigOverride, ThreadDefaults,
+    ThreadStateLabel, ThreadSummary, ToolResultContent, TriggerSpec, TurnLog, Usage,
 };
 
 /// Events pushed into [`Inbound`]. In addition to decoded wire messages we pipe in
@@ -114,6 +114,36 @@ fn sidebar_button(ui: &mut egui::Ui, text: RichText, enabled: bool) -> egui::Res
     ui.add_enabled(enabled, egui::Button::new(text.small()).small())
 }
 
+/// Compact single-glyph action button with a hover tooltip. Shares the
+/// `Button::small()` frame with `sidebar_button` so icon and text
+/// variants mix cleanly in the same row, but the glyph itself renders
+/// at default text size — `.small()` on Unicode icons like ⏸/🗑
+/// makes them hard to hit and hard to read. Accepts `impl Into<WidgetText>`
+/// so callers can pass a plain `&str` for the common case or a styled
+/// `RichText` when the glyph needs to shift color (e.g. the ⏻ toggle
+/// that tints muted when its underlying state is paused).
+///
+/// `min_size` pins every icon button to the same dimensions regardless
+/// of which font the glyph came from. The sidebar mixes glyphs from
+/// NotoEmoji (🗑, 🗄), NotoSansSymbols2 (⏻, ✎), emoji-icon-font (⚙,
+/// ⏸, ➕), and the default text font (▶) — each with different
+/// intrinsic metrics, which otherwise produces buttons of visibly
+/// different heights sitting on wobbling baselines when they line up
+/// in a row.
+fn sidebar_icon_button(
+    ui: &mut egui::Ui,
+    icon: impl Into<egui::WidgetText>,
+    tooltip: &str,
+    enabled: bool,
+) -> egui::Response {
+    let btn = egui::Button::new(icon)
+        .small()
+        .min_size(egui::vec2(22.0, 18.0));
+    ui.add_enabled(enabled, btn)
+        .on_hover_text(tooltip)
+        .on_disabled_hover_text(tooltip)
+}
+
 /// Full-width, left-aligned selectable row for the sidebar thread list.
 /// `ui.add_sized(...)` would wrap the widget in
 /// `Layout::centered_and_justified`, which centers the button's text;
@@ -128,6 +158,36 @@ fn add_sidebar_thread_row(ui: &mut egui::Ui, selected: bool, text: RichText) -> 
     .inner
 }
 
+/// Format an RFC3339 timestamp as a compact relative string for the
+/// sidebar: "just now", "5 min ago", "3 h ago", "yesterday", "4 d ago".
+/// Falls back to the original string if parsing fails — keeps the UI
+/// resilient to server-side format drift.
+fn format_relative_time(rfc3339: &str) -> String {
+    use chrono::{DateTime, Utc};
+    let Ok(parsed) = DateTime::parse_from_rfc3339(rfc3339) else {
+        return rfc3339.to_string();
+    };
+    let now = Utc::now();
+    let secs = (now - parsed.with_timezone(&Utc)).num_seconds();
+    // Negative = clock skew; treat as "just now" rather than "in 3s".
+    if secs < 30 {
+        return "just now".to_string();
+    }
+    let mins = secs / 60;
+    if mins < 60 {
+        return format!("{mins} min ago");
+    }
+    let hours = mins / 60;
+    if hours < 24 {
+        return format!("{hours} h ago");
+    }
+    let days = hours / 24;
+    if days == 1 {
+        return "yesterday".to_string();
+    }
+    format!("{days} d ago")
+}
+
 fn state_chip(state: ThreadStateLabel) -> (&'static str, Color32) {
     match state {
         ThreadStateLabel::Idle => ("idle", Color32::from_gray(160)),
@@ -136,6 +196,60 @@ fn state_chip(state: ThreadStateLabel) -> (&'static str, Color32) {
         ThreadStateLabel::Failed => ("failed", Color32::from_rgb(220, 110, 110)),
         ThreadStateLabel::Cancelled => ("cancelled", Color32::from_rgb(180, 140, 140)),
     }
+}
+
+/// Short human-readable label for a `FunctionKind`. Used in the
+/// functions-popover rows; shorter than the wire variant name so the
+/// popover stays compact.
+fn function_kind_label(kind: FunctionKind) -> &'static str {
+    match kind {
+        FunctionKind::CreateThread => "create",
+        FunctionKind::CompactThread => "compact",
+        FunctionKind::RebindThread => "rebind",
+        FunctionKind::CancelThread => "cancel",
+        FunctionKind::RunBehavior => "behavior",
+        FunctionKind::BuiltinToolCall => "tool",
+        FunctionKind::McpToolUse => "mcp tool",
+    }
+}
+
+/// Elapsed-time string for the functions popover, stopwatch-style.
+/// Unlike `format_relative_time`, this targets short in-flight
+/// durations — most Functions live for seconds, not hours.
+fn format_elapsed(started_at_rfc3339: &str) -> String {
+    use chrono::{DateTime, Utc};
+    let Ok(parsed) = DateTime::parse_from_rfc3339(started_at_rfc3339) else {
+        return "—".to_string();
+    };
+    let now = Utc::now();
+    let secs = (now - parsed.with_timezone(&Utc)).num_seconds().max(0);
+    if secs < 60 {
+        format!("{secs}s")
+    } else {
+        let m = secs / 60;
+        let s = secs % 60;
+        format!("{m}:{s:02}")
+    }
+}
+
+/// Priority-ordered target label for a `FunctionSummary`: the most
+/// specific identifier we have (tool > behavior > thread > pod > dash).
+fn function_target_label(summary: &FunctionSummary) -> String {
+    if let Some(t) = &summary.tool_name {
+        return t.clone();
+    }
+    if let Some(b) = &summary.behavior_id {
+        return format!("bh: {b}");
+    }
+    if let Some(t) = &summary.thread_id {
+        // Truncate thread ids — they're long hashes and eat popover width.
+        let short = if t.len() > 16 { &t[..16] } else { t.as_str() };
+        return format!("thread: {short}…");
+    }
+    if let Some(p) = &summary.pod_id {
+        return format!("pod: {p}");
+    }
+    "—".to_string()
 }
 
 enum DisplayItem {
@@ -380,9 +494,14 @@ pub struct ChatApp {
     /// Backends we've already sent a ListModels request for — dedup so UI changes
     /// don't re-request repeatedly.
     models_requested: HashSet<String>,
-    /// Backend chosen in the new-task picker. None = follow server default.
+    /// Backend chosen in the new-thread picker. None = follow the
+    /// compose target pod's `thread_defaults.backend` (or, if no pod
+    /// is resolved yet, the server default).
     picker_backend: Option<String>,
-    /// Model chosen in the new-task picker. None = follow backend default.
+    /// Model chosen in the new-thread picker. None = follow the pod's
+    /// `thread_defaults.model` when the backend is also unresolved;
+    /// when the user overrides the backend we fall through to the
+    /// backend catalog's default model instead.
     picker_model: Option<String>,
     /// Name of the `[[allow.host_env]]` entry the compose form is
     /// targeting for the new thread. `None` = inherit the target pod's
@@ -392,6 +511,14 @@ pub struct ChatApp {
     /// every submit so the next compose starts from the pod default,
     /// not whatever the previous thread used.
     compose_host_env: Option<String>,
+    /// Compose target pod id we last resolved the picker overrides
+    /// against. When this changes (e.g. the user clicks "+ Thread" in
+    /// a different pod), we clear `picker_backend`/`picker_model`/
+    /// `compose_host_env` so the pickers re-anchor on the new pod's
+    /// `thread_defaults`. Without this, a pick in pod A would stick
+    /// when the user switches to pod B and no longer reflect that
+    /// pod's defaults.
+    last_composed_pod: Option<String>,
 
     // --- Resource registry (Phase 1c read-only inspector) ---
     /// Snapshot of every resource the server has reported. Keyed by resource id.
@@ -495,6 +622,19 @@ pub struct ChatApp {
     /// repaint.
     pod_configs: HashMap<String, PodConfig>,
     pod_configs_requested: HashSet<String>,
+
+    /// Snapshot of every Function currently registered on the server,
+    /// keyed by `function_id`. `BTreeMap` for deterministic rendering
+    /// order (oldest first) in the status-bar popover — functions are
+    /// generally short-lived, and users scanning the list want a
+    /// stable layout that doesn't shuffle as new entries arrive.
+    /// Populated from `FunctionList` on connect and kept in sync via
+    /// `FunctionStarted` / `FunctionEnded` broadcasts.
+    active_functions: std::collections::BTreeMap<u64, FunctionSummary>,
+    /// Guards against resending `ListFunctions` on every idle
+    /// ConnectionOpened (the current reconnect handler reissues the
+    /// list-bootstrap suite).
+    functions_requested: bool,
 
     /// Which view the left side panel is showing.
     left_mode: LeftPanelMode,
@@ -885,6 +1025,7 @@ impl ChatApp {
             picker_backend: None,
             picker_model: None,
             compose_host_env: None,
+            last_composed_pod: None,
             resources: HashMap::new(),
             resources_requested: false,
             pods: HashMap::new(),
@@ -911,6 +1052,8 @@ impl ChatApp {
             default_pod_template: None,
             pod_configs: HashMap::new(),
             pod_configs_requested: HashSet::new(),
+            active_functions: std::collections::BTreeMap::new(),
+            functions_requested: false,
             left_mode: LeftPanelMode::default(),
             md_cache: CommonMarkCache::default(),
         }
@@ -950,21 +1093,43 @@ impl ChatApp {
         format!("c{}", self.next_correlation_seq)
     }
 
-    /// Resolve the picker-selected backend name, falling back to the server default.
+    /// Resolve the picker-selected backend name. Fallback chain:
+    ///   1. user's explicit `picker_backend`
+    ///   2. compose target pod's `thread_defaults.backend` (when the
+    ///      pod config has landed)
+    ///   3. server-wide `default_backend`
     fn effective_picker_backend(&self) -> &str {
-        self.picker_backend
-            .as_deref()
-            .unwrap_or(&self.default_backend)
+        if let Some(b) = self.picker_backend.as_deref() {
+            return b;
+        }
+        if let Some(pid) = self.compose_target_pod_id()
+            && let Some(cfg) = self.pod_configs.get(pid)
+            && !cfg.thread_defaults.backend.is_empty()
+        {
+            return &cfg.thread_defaults.backend;
+        }
+        &self.default_backend
     }
 
     /// Resolve the picker-selected model. Fallback chain:
-    ///   1. user's explicit picker_model
-    ///   2. backend's default_model from the catalog
-    ///   3. first model from the fetched ModelsList for that backend
-    ///   4. empty (display as "(loading…)")
+    ///   1. user's explicit `picker_model`
+    ///   2. compose target pod's `thread_defaults.model` — only when
+    ///      the backend is also coming from the pod default (picker
+    ///      backend override → pair the model override with it too,
+    ///      since the pod's model won't be valid on a different backend)
+    ///   3. effective backend's `default_model` from the catalog
+    ///   4. first model from the fetched ModelsList for that backend
+    ///   5. empty (display as "(loading…)")
     fn effective_picker_model(&self) -> String {
         if let Some(m) = &self.picker_model {
             return m.clone();
+        }
+        if self.picker_backend.is_none()
+            && let Some(pid) = self.compose_target_pod_id()
+            && let Some(cfg) = self.pod_configs.get(pid)
+            && !cfg.thread_defaults.model.is_empty()
+        {
+            return cfg.thread_defaults.model.clone();
         }
         let backend = self.effective_picker_backend();
         if let Some(m) = self
@@ -1038,6 +1203,12 @@ impl ChatApp {
                         correlation_id: None,
                     });
                     self.host_env_providers_requested = true;
+                }
+                if !self.functions_requested {
+                    self.send(ClientToServer::ListFunctions {
+                        correlation_id: None,
+                    });
+                    self.functions_requested = true;
                 }
             }
             InboundEvent::ConnectionClosed { detail } => {
@@ -1693,6 +1864,22 @@ impl ChatApp {
                     self.behavior_editor_modal = None;
                 }
             }
+            ServerToClient::FunctionList { functions, .. } => {
+                // Snapshot replaces the local map wholesale — the
+                // server's registry is the source of truth, and
+                // any stale ids we tracked before reconnect should
+                // be evicted.
+                self.active_functions.clear();
+                for summary in functions {
+                    self.active_functions.insert(summary.function_id, summary);
+                }
+            }
+            ServerToClient::FunctionStarted { summary } => {
+                self.active_functions.insert(summary.function_id, summary);
+            }
+            ServerToClient::FunctionEnded { function_id, .. } => {
+                self.active_functions.remove(&function_id);
+            }
         }
     }
 
@@ -2302,12 +2489,66 @@ impl eframe::App for ChatApp {
                         .small(),
                     );
                 }
+                // Right-aligned Functions chip: click opens a popover
+                // listing every in-flight Function. Hidden at zero to
+                // avoid a permanent "nothing to see" widget — presence
+                // is the signal.
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let count = self.active_functions.len();
+                    if count == 0 {
+                        return;
+                    }
+                    // Tick the frame while anything is in flight so
+                    // the elapsed column advances without needing a
+                    // pointer move or wire event to drive a repaint.
+                    ui.ctx()
+                        .request_repaint_after(std::time::Duration::from_millis(500));
+                    let chip = ui
+                        .button(
+                            RichText::new(format!("⚡ {count} active"))
+                                .small()
+                                .color(Color32::from_rgb(220, 180, 100)),
+                        )
+                        .on_hover_text("In-flight Functions — click to list");
+                    egui::Popup::from_toggle_button_response(&chip).show(|ui| {
+                        ui.set_min_width(280.0);
+                        ui.label(RichText::new("Active Functions").strong().small());
+                        ui.add_space(2.0);
+                        ui.separator();
+                        for summary in self.active_functions.values() {
+                            ui.horizontal(|ui| {
+                                ui.label(
+                                    RichText::new(function_kind_label(summary.kind))
+                                        .small()
+                                        .strong()
+                                        .color(Color32::from_gray(210)),
+                                );
+                                ui.label(
+                                    RichText::new(function_target_label(summary))
+                                        .small()
+                                        .color(Color32::from_gray(170)),
+                                );
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| {
+                                        ui.label(
+                                            RichText::new(format_elapsed(&summary.started_at))
+                                                .small()
+                                                .color(Color32::from_gray(150))
+                                                .monospace(),
+                                        );
+                                    },
+                                );
+                            });
+                        }
+                    });
+                });
             });
         });
 
         egui::Panel::left("task_list")
             .resizable(true)
-            .default_size(220.0)
+            .default_size(300.0)
             .show_inside(ui, |ui| {
                 ui.add_space(4.0);
                 ui.horizontal(|ui| {
@@ -2336,10 +2577,13 @@ impl eframe::App for ChatApp {
 
         let input_enabled = matches!(self.conn_status, ConnectionStatus::Connected);
         let composing = self.composing_new || self.selected.is_none();
-        // Reserve a String only when we need to interpolate a pod name
-        // into the hint; the static-string fallback is the common case.
+        // Resolve the compose target via `compose_target_pod_id`, not
+        // `compose_pod_id` directly — the former falls back to the
+        // server default pod, so fresh load still names a pod instead
+        // of showing the bare "Describe a new thread" hint with no
+        // scope.
         let pod_hint: Option<String> = if composing && input_enabled {
-            self.compose_pod_id.as_ref().map(|pid| {
+            self.compose_target_pod_id().map(|pid| {
                 let display = self.pods.get(pid).map(|p| p.name.as_str()).unwrap_or(pid);
                 format!("Describe a new thread in `{display}`")
             })
@@ -2349,19 +2593,84 @@ impl eframe::App for ChatApp {
         let hint: &str = match (composing, input_enabled, pod_hint.as_deref()) {
             (_, false, _) => "(connecting)",
             (true, true, Some(s)) => s,
-            (true, true, None) => "Describe a new task",
-            (false, true, _) => "Message this task",
+            (true, true, None) => "Describe a new thread",
+            (false, true, _) => "Message this thread",
         };
 
         let show_picker =
             (self.composing_new || self.selected.is_none()) && !self.backends.is_empty();
-        if show_picker && let Some(pod_id) = self.compose_target_pod_id().map(str::to_owned) {
-            self.ensure_pod_config(&pod_id);
+        if show_picker {
+            // When the compose target pod changes, drop stale picker
+            // overrides so the pickers re-anchor on the new pod's
+            // `thread_defaults`. A user who picked gpt-4 in pod A and
+            // then clicks "+ Thread" in pod B expects to see pod B's
+            // default, not their pick carried over.
+            let current_target = self.compose_target_pod_id().map(str::to_owned);
+            if current_target != self.last_composed_pod {
+                self.picker_backend = None;
+                self.picker_model = None;
+                self.compose_host_env = None;
+                self.last_composed_pod = current_target.clone();
+            }
+            if let Some(pod_id) = current_target {
+                self.ensure_pod_config(&pod_id);
+            }
+            // The pod config may arrive after the first render, bumping
+            // the effective backend to the pod's default. Keep the
+            // model list fresh for whichever backend is currently
+            // effective so the model combo isn't stuck on "(loading…)".
+            // Dedup-guarded by `models_requested`.
+            let effective = self.effective_picker_backend().to_string();
+            if !effective.is_empty() {
+                self.request_models_for(&effective);
+            }
         }
+        // Scope header text for the composer panel — answers "what am
+        // I about to send, and where" at a glance. Built once here so
+        // the borrow of `self.tasks`/`self.pods` doesn't fight the
+        // `&mut self` borrow inside `Panel::bottom(...).show_inside`.
+        let scope_line: String = if composing {
+            match self.compose_target_pod_id() {
+                Some(pid) => {
+                    let display = self.pods.get(pid).map(|p| p.name.as_str()).unwrap_or(pid);
+                    format!("New thread in `{display}`")
+                }
+                None => "New thread".to_string(),
+            }
+        } else {
+            match self.selected.as_deref().and_then(|tid| self.tasks.get(tid)) {
+                Some(view) => {
+                    let pod_display = self
+                        .pods
+                        .get(&view.summary.pod_id)
+                        .map(|p| p.name.as_str())
+                        .unwrap_or(view.summary.pod_id.as_str());
+                    let title = view
+                        .summary
+                        .title
+                        .as_deref()
+                        .filter(|s| !s.is_empty())
+                        .unwrap_or("(untitled)");
+                    format!("{title}  ·  in `{pod_display}`")
+                }
+                None => "(no thread selected)".to_string(),
+            }
+        };
         let mut request_models: Option<String> = None;
         egui::Panel::bottom("input_bar")
             .resizable(false)
             .show_inside(ui, |ui| {
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    ui.add(
+                        egui::Label::new(
+                            RichText::new(scope_line)
+                                .small()
+                                .color(Color32::from_gray(190)),
+                        )
+                        .truncate(),
+                    );
+                });
                 if show_picker {
                     ui.add_space(4.0);
                     ui.horizontal(|ui| {
@@ -2557,7 +2866,7 @@ impl eframe::App for ChatApp {
                     ui.add_space(60.0);
                     ui.label(
                         RichText::new(
-                            "no task selected — type a prompt below to create a new task",
+                            "no thread selected — type a prompt below to create a new thread",
                         )
                         .color(Color32::from_gray(140)),
                     );
@@ -2566,7 +2875,7 @@ impl eframe::App for ChatApp {
             Some(thread_id) => match tasks.get_mut(&thread_id) {
                 None => {
                     ui.label(
-                        RichText::new(format!("task {thread_id} not found"))
+                        RichText::new(format!("thread {thread_id} not found"))
                             .color(Color32::from_rgb(220, 120, 120)),
                     );
                 }
@@ -2669,17 +2978,9 @@ impl ChatApp {
             small.size *= 1.2;
         }
 
-        ui.horizontal(|ui| {
-            if ui.button("+ New thread").clicked() {
-                self.selected = None;
-                self.composing_new = true;
-                self.compose_pod_id = None;
-                self.input.clear();
-            }
-            if ui.button("+ New pod").clicked() {
-                self.new_pod_modal = Some(NewPodModalState::new());
-            }
-        });
+        if ui.button("+ New pod").clicked() {
+            self.new_pod_modal = Some(NewPodModalState::new());
+        }
         ui.separator();
 
         // Group threads by pod_id, preserving the existing newest-first
@@ -2729,18 +3030,18 @@ impl ChatApp {
         let (label, pod_behaviors_enabled) = match self.pods.get(pod_id) {
             Some(summary) => (
                 format!(
-                    "{}  ({})",
+                    "{} ({})",
                     summary.name,
                     thread_ids.map(|t| t.len()).unwrap_or(0)
                 ),
                 summary.behaviors_enabled,
             ),
             None => (
-                format!("{pod_id}  ({})", thread_ids.map(|t| t.len()).unwrap_or(0)),
+                format!("{pod_id} ({})", thread_ids.map(|t| t.len()).unwrap_or(0)),
                 true,
             ),
         };
-        let collapsed_id = format!("pod-section-{pod_id}");
+        let state_id = ui.make_persistent_id(format!("pod-section-{pod_id}"));
         let default_open = !self.collapsed_pods.contains(pod_id);
         let is_default_pod = pod_id == self.server_default_pod_id;
         let mut archive_clicked = false;
@@ -2749,31 +3050,24 @@ impl ChatApp {
         let mut edit_config_clicked = false;
         let mut toggle_pod_behaviors_to: Option<bool> = None;
         let mut behavior_actions: Vec<BehaviorRowAction> = Vec::new();
-        let header = egui::CollapsingHeader::new(RichText::new(label).strong())
-            .id_salt(&collapsed_id)
-            .default_open(default_open)
-            .show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    if sidebar_button(ui, RichText::new("+ Thread in this pod"), true).clicked() {
-                        self.selected = None;
-                        self.composing_new = true;
-                        self.compose_pod_id = Some(pod_id.to_string());
-                        self.input.clear();
-                    }
-                    if sidebar_button(ui, RichText::new("Edit config"), true).clicked() {
-                        edit_config_clicked = true;
-                    }
-                    let pod_pause_label = if pod_behaviors_enabled {
-                        "Pause behaviors"
-                    } else {
-                        "Resume behaviors"
-                    };
-                    if sidebar_button(ui, RichText::new(pod_pause_label), true).clicked() {
-                        toggle_pod_behaviors_to = Some(!pod_behaviors_enabled);
-                    }
-                    if !pod_behaviors_enabled {
-                        ui.label(RichText::new("paused").small().color(SIDEBAR_WARNING_COLOR));
-                    }
+        let header = egui::collapsing_header::CollapsingState::load_with_default_open(
+            ui.ctx(),
+            state_id,
+            default_open,
+        )
+        .show_header(ui, |ui| {
+            // Same `Sides::shrink_left().truncate()` pattern the
+            // behavior header uses: toolbar on the right keeps its
+            // natural width, pod name takes the rest and truncates
+            // with an ellipsis when the sidebar is narrow. Pod-level
+            // toolbar actions (edit config, pause all behaviors,
+            // archive) modify the pod as a whole.
+            egui::Sides::new().shrink_left().truncate().show(
+                ui,
+                |ui| {
+                    ui.add(egui::Label::new(RichText::new(label).strong()).truncate());
+                },
+                |ui| {
                     if !is_default_pod {
                         let armed = self.archive_armed_pod.as_deref() == Some(pod_id);
                         if armed {
@@ -2789,54 +3083,57 @@ impl ChatApp {
                             if sidebar_button(ui, RichText::new("Cancel"), true).clicked() {
                                 archive_disarm = true;
                             }
-                        } else if sidebar_button(
-                            ui,
-                            RichText::new("Archive").color(SIDEBAR_MUTED_COLOR),
-                            true,
-                        )
-                        .clicked()
-                        {
+                        } else if sidebar_icon_button(ui, "🗄", "Archive pod", true).clicked() {
                             archive_clicked = true;
                         }
                     }
-                });
-                // Partition the pod's threads into interactive (origin=None)
-                // vs. per-behavior buckets. Each `thread_ids` slice is already
-                // newest-first (inherits task_order), so the per-bucket Vecs
-                // land newest-first too.
-                let mut interactive: Vec<String> = Vec::new();
-                let mut by_behavior: HashMap<String, Vec<String>> = HashMap::new();
-                if let Some(thread_ids) = thread_ids {
-                    for tid in thread_ids {
-                        let Some(view) = self.tasks.get(tid) else {
-                            continue;
-                        };
-                        match &view.summary.origin {
-                            None => interactive.push(tid.clone()),
-                            Some(origin) => by_behavior
-                                .entry(origin.behavior_id.clone())
-                                .or_default()
-                                .push(tid.clone()),
-                        }
+                    let (pod_pause_icon, pod_pause_tip) = if pod_behaviors_enabled {
+                        ("⏸", "Pause all behaviors in this pod")
+                    } else {
+                        ("▶", "Resume behaviors in this pod")
+                    };
+                    if sidebar_icon_button(ui, pod_pause_icon, pod_pause_tip, true).clicked() {
+                        toggle_pod_behaviors_to = Some(!pod_behaviors_enabled);
+                    }
+                    if sidebar_icon_button(ui, "⚙", "Edit pod config", true).clicked() {
+                        edit_config_clicked = true;
+                    }
+                    if !pod_behaviors_enabled {
+                        ui.label(RichText::new("paused").small().color(SIDEBAR_WARNING_COLOR));
+                    }
+                },
+            );
+        });
+        let is_open = header.is_open();
+        header.body(|ui| {
+            // Partition the pod's threads into interactive (origin=None)
+            // vs. per-behavior buckets. Each `thread_ids` slice is already
+            // newest-first (inherits task_order), so the per-bucket Vecs
+            // land newest-first too.
+            let mut interactive: Vec<String> = Vec::new();
+            let mut by_behavior: HashMap<String, Vec<String>> = HashMap::new();
+            if let Some(thread_ids) = thread_ids {
+                for tid in thread_ids {
+                    let Some(view) = self.tasks.get(tid) else {
+                        continue;
+                    };
+                    match &view.summary.origin {
+                        None => interactive.push(tid.clone()),
+                        Some(origin) => by_behavior
+                            .entry(origin.behavior_id.clone())
+                            .or_default()
+                            .push(tid.clone()),
                     }
                 }
-                let has_any_threads = !interactive.is_empty() || !by_behavior.is_empty();
-                self.render_interactive_threads(ui, pod_id, &interactive);
-                self.render_behaviors_panel(ui, pod_id, &by_behavior, &mut behavior_actions);
-                if !has_any_threads {
-                    ui.label(
-                        RichText::new("(no threads)")
-                            .small()
-                            .italics()
-                            .color(SIDEBAR_MUTED_COLOR),
-                    );
-                }
-            });
+            }
+            self.render_interactive_threads(ui, pod_id, &interactive);
+            self.render_behaviors_panel(ui, pod_id, &by_behavior, &mut behavior_actions);
+        });
         // Track collapse state so it persists across renders.
-        if header.fully_closed() {
-            self.collapsed_pods.insert(pod_id.to_string());
-        } else {
+        if is_open {
             self.collapsed_pods.remove(pod_id);
+        } else {
+            self.collapsed_pods.insert(pod_id.to_string());
         }
         if archive_clicked {
             self.archive_armed_pod = Some(pod_id.to_string());
@@ -2918,7 +3215,7 @@ impl ChatApp {
         ui.separator();
         ui.horizontal(|ui| {
             sidebar_subsection_header(ui, "Behaviors");
-            if sidebar_button(ui, RichText::new("+ New"), true).clicked() {
+            if sidebar_icon_button(ui, "➕", "New behavior", true).clicked() {
                 actions.push(BehaviorRowAction::New);
             }
         });
@@ -2969,95 +3266,157 @@ impl ChatApp {
         threads: &[String],
         actions: &mut Vec<BehaviorRowAction>,
     ) {
-        ui.horizontal(|ui| {
-            let label_text = match &row.trigger_kind {
-                Some(kind) => format!("{}  [{}]", row.name, kind),
-                None => format!("{}  [errored]", row.name),
-            };
-            let color = if row.load_error.is_some() {
-                SIDEBAR_ERROR_TEXT_COLOR
-            } else if !row.enabled {
-                SIDEBAR_DIM_COLOR
-            } else {
-                SIDEBAR_BODY_COLOR
-            };
-            ui.label(RichText::new(label_text).small().strong().color(color));
-            if !row.enabled {
-                ui.label(RichText::new("paused").small().color(SIDEBAR_WARNING_COLOR));
-            }
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let armed = self
-                    .delete_armed_behavior
-                    .as_ref()
-                    .map(|(p, b)| p == &row.pod_id && b == &row.behavior_id)
-                    .unwrap_or(false);
-                if armed {
-                    if sidebar_button(
-                        ui,
-                        RichText::new("Confirm").color(SIDEBAR_DANGER_COLOR),
-                        true,
-                    )
-                    .clicked()
-                    {
-                        actions.push(BehaviorRowAction::ConfirmDelete {
-                            pod_id: row.pod_id.clone(),
-                            behavior_id: row.behavior_id.clone(),
-                        });
+        let label_text = match &row.trigger_kind {
+            Some(kind) => format!("{} [{}]", row.name, kind),
+            None => format!("{} [errored]", row.name),
+        };
+        let label_color = if row.load_error.is_some() {
+            SIDEBAR_ERROR_TEXT_COLOR
+        } else if !row.enabled {
+            SIDEBAR_DIM_COLOR
+        } else {
+            SIDEBAR_BODY_COLOR
+        };
+        // Each behavior is its own collapsible container: header shows
+        // name + toolbar, body shows last-fired timestamp and the
+        // behavior's recent threads. Default-open when the behavior has
+        // threads so history stays visible; default-closed when it has
+        // never fired so the sidebar doesn't grow empty rows.
+        let state_id = ui.make_persistent_id((
+            "behavior-row",
+            row.pod_id.as_str(),
+            row.behavior_id.as_str(),
+        ));
+        let default_open = !threads.is_empty();
+        let armed = self
+            .delete_armed_behavior
+            .as_ref()
+            .map(|(p, b)| p == &row.pod_id && b == &row.behavior_id)
+            .unwrap_or(false);
+        egui::collapsing_header::CollapsingState::load_with_default_open(
+            ui.ctx(),
+            state_id,
+            default_open,
+        )
+        .show_header(ui, |ui| {
+            // `Sides::shrink_left().truncate()` paints the right-side
+            // toolbar at its natural width first, then gives the label
+            // side whatever's left with `Truncate` wrap mode. This is
+            // what keeps the behavior name from walking under the
+            // action icons when the sidebar is narrow — the name just
+            // ends in an ellipsis instead.
+            egui::Sides::new().shrink_left().truncate().show(
+                ui,
+                |ui| {
+                    ui.add(
+                        egui::Label::new(
+                            RichText::new(label_text)
+                                .small()
+                                .strong()
+                                .color(label_color),
+                        )
+                        .truncate(),
+                    );
+                    if !row.enabled {
+                        ui.label(RichText::new("paused").small().color(SIDEBAR_WARNING_COLOR));
                     }
-                    if sidebar_button(ui, RichText::new("Cancel"), true).clicked() {
-                        actions.push(BehaviorRowAction::DisarmDelete);
-                    }
-                } else {
-                    if sidebar_button(ui, RichText::new("Delete").color(SIDEBAR_MUTED_COLOR), true)
+                },
+                |ui| {
+                    if armed {
+                        if sidebar_button(
+                            ui,
+                            RichText::new("Confirm").color(SIDEBAR_DANGER_COLOR),
+                            true,
+                        )
                         .clicked()
-                    {
-                        actions.push(BehaviorRowAction::ArmDelete {
-                            pod_id: row.pod_id.clone(),
-                            behavior_id: row.behavior_id.clone(),
-                        });
+                        {
+                            actions.push(BehaviorRowAction::ConfirmDelete {
+                                pod_id: row.pod_id.clone(),
+                                behavior_id: row.behavior_id.clone(),
+                            });
+                        }
+                        if sidebar_button(ui, RichText::new("Cancel"), true).clicked() {
+                            actions.push(BehaviorRowAction::DisarmDelete);
+                        }
+                    } else {
+                        // Sides' right sub-ui uses a right-to-left
+                        // layout: widgets stack from the far right
+                        // inward, so visual order is the reverse of
+                        // the call order. We want: ⏻ | ▶ | ✎ | 🗑
+                        // reading left-to-right — call 🗑 first.
+                        if sidebar_icon_button(ui, "🗑", "Delete behavior", true).clicked() {
+                            actions.push(BehaviorRowAction::ArmDelete {
+                                pod_id: row.pod_id.clone(),
+                                behavior_id: row.behavior_id.clone(),
+                            });
+                        }
+                        if sidebar_icon_button(ui, "✎", "Edit behavior", true).clicked() {
+                            actions.push(BehaviorRowAction::Edit {
+                                pod_id: row.pod_id.clone(),
+                                behavior_id: row.behavior_id.clone(),
+                            });
+                        }
+                        // Errored behaviors can't be run — disable Run
+                        // until the user fixes the config.
+                        let run_enabled = row.load_error.is_none();
+                        if sidebar_icon_button(ui, "▶", "Run now", run_enabled).clicked() {
+                            actions.push(BehaviorRowAction::Run {
+                                pod_id: row.pod_id.clone(),
+                                behavior_id: row.behavior_id.clone(),
+                            });
+                        }
+                        // Enable/disable toggle: ⏻ (power symbol) is
+                        // a universal on/off metaphor that doesn't
+                        // collide with the ▶ Run glyph next to it.
+                        // Bright color when enabled, dim when paused.
+                        let (toggle_color, toggle_tip) = if row.enabled {
+                            (SIDEBAR_BODY_COLOR, "Pause behavior")
+                        } else {
+                            (SIDEBAR_DIM_COLOR, "Resume behavior")
+                        };
+                        if sidebar_icon_button(
+                            ui,
+                            RichText::new("⏻").color(toggle_color),
+                            toggle_tip,
+                            true,
+                        )
+                        .clicked()
+                        {
+                            actions.push(BehaviorRowAction::SetEnabled {
+                                pod_id: row.pod_id.clone(),
+                                behavior_id: row.behavior_id.clone(),
+                                enabled: !row.enabled,
+                            });
+                        }
                     }
-                    if sidebar_button(ui, RichText::new("Edit"), true).clicked() {
-                        actions.push(BehaviorRowAction::Edit {
-                            pod_id: row.pod_id.clone(),
-                            behavior_id: row.behavior_id.clone(),
-                        });
-                    }
-                    // Errored behaviors can't be run — disable Run until
-                    // the user fixes the config.
-                    let run_enabled = row.load_error.is_none();
-                    if sidebar_button(ui, RichText::new("Run"), run_enabled).clicked() {
-                        actions.push(BehaviorRowAction::Run {
-                            pod_id: row.pod_id.clone(),
-                            behavior_id: row.behavior_id.clone(),
-                        });
-                    }
-                    let pause_label = if row.enabled { "Pause" } else { "Resume" };
-                    if sidebar_button(ui, RichText::new(pause_label), true).clicked() {
-                        actions.push(BehaviorRowAction::SetEnabled {
-                            pod_id: row.pod_id.clone(),
-                            behavior_id: row.behavior_id.clone(),
-                            enabled: !row.enabled,
-                        });
-                    }
-                }
-            });
+                },
+            );
+        })
+        .body(|ui| {
+            if let Some(err) = &row.load_error {
+                ui.label(
+                    RichText::new(format!("⚠ {err}"))
+                        .small()
+                        .color(SIDEBAR_ERROR_TEXT_COLOR),
+                );
+            } else if let Some(last) = &row.last_fired_at {
+                ui.label(
+                    RichText::new(format!("last fired: {}", format_relative_time(last)))
+                        .small()
+                        .color(SIDEBAR_MUTED_COLOR),
+                );
+            } else {
+                ui.label(
+                    RichText::new("no runs yet")
+                        .small()
+                        .italics()
+                        .color(SIDEBAR_MUTED_COLOR),
+                );
+            }
+            if !threads.is_empty() {
+                self.render_nested_thread_list(ui, &row.pod_id, &row.behavior_id, threads, actions);
+            }
         });
-        if let Some(err) = &row.load_error {
-            ui.label(
-                RichText::new(format!("  ⚠ {err}"))
-                    .small()
-                    .color(SIDEBAR_ERROR_TEXT_COLOR),
-            );
-        } else if let Some(last) = &row.last_fired_at {
-            ui.label(
-                RichText::new(format!("  last fired: {last}"))
-                    .small()
-                    .color(SIDEBAR_MUTED_COLOR),
-            );
-        }
-        if !threads.is_empty() {
-            self.render_nested_thread_list(ui, &row.pod_id, &row.behavior_id, threads, actions);
-        }
     }
 
     /// Render threads spawned by a behavior whose config is no longer in
@@ -3152,7 +3511,10 @@ impl ChatApp {
 
     /// Render the interactive-threads subsection under a pod. "Interactive"
     /// here means threads the user created directly (no behavior origin).
-    /// Skipped entirely when the pod has no such threads.
+    /// Always renders the section header (with its `➕ new thread`
+    /// affordance) — the `+` is the primary entry point for creating a
+    /// thread in this pod, so hiding it when the list is empty would
+    /// leave an empty pod unusable.
     ///
     /// Dispatched-thread children (`dispatched_by.is_some()`) are
     /// grouped under their parent in DFS order so the nesting is
@@ -3165,11 +3527,29 @@ impl ChatApp {
         pod_id: &str,
         interactive: &[String],
     ) {
+        ui.add_space(4.0);
+        let mut new_thread_clicked = false;
+        ui.horizontal(|ui| {
+            sidebar_subsection_header(ui, format!("Interactive ({})", interactive.len()));
+            if sidebar_icon_button(ui, "➕", "New thread in this pod", true).clicked() {
+                new_thread_clicked = true;
+            }
+        });
+        if new_thread_clicked {
+            self.selected = None;
+            self.composing_new = true;
+            self.compose_pod_id = Some(pod_id.to_string());
+            self.input.clear();
+        }
         if interactive.is_empty() {
+            ui.label(
+                RichText::new("  (no threads yet)")
+                    .small()
+                    .italics()
+                    .color(SIDEBAR_MUTED_COLOR),
+            );
             return;
         }
-        ui.add_space(4.0);
-        sidebar_subsection_header(ui, format!("Interactive  ({})", interactive.len()));
         // Reorder the flat list into DFS-by-dispatch: each root is
         // followed by its dispatched children (transitively). Returned
         // as Vec<(thread_id, depth)>; depth 0 = root, 1 = first-level
@@ -4566,7 +4946,7 @@ fn render_failure_banner(ui: &mut egui::Ui, view: &TaskView) {
         .show(ui, |ui| {
             ui.vertical(|ui| {
                 ui.label(
-                    RichText::new("task failed")
+                    RichText::new("thread failed")
                         .color(Color32::from_rgb(240, 140, 140))
                         .strong(),
                 );

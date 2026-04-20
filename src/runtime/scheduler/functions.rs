@@ -15,10 +15,13 @@
 //!   turn and stays in the registry until `finalize_pending_compaction`
 //!   fires `complete_function`.
 
+use chrono::{DateTime, Utc};
 use futures::stream::FuturesUnordered;
 use tokio::sync::oneshot;
 use tracing::{debug, warn};
-use whisper_agent_protocol::{ServerToClient, ThreadStateLabel};
+use whisper_agent_protocol::{
+    FunctionOutcomeTag, FunctionSummary, ServerToClient, ThreadStateLabel,
+};
 
 use super::Scheduler;
 use crate::functions::{
@@ -66,6 +69,31 @@ pub struct ActiveFunctionEntry {
     /// How the terminal is delivered to the caller. Set at
     /// registration; consumed by `complete_function`.
     pub delivery: FunctionDelivery,
+    /// Wall-clock at registration time. Emitted on the wire via
+    /// `FunctionSummary.started_at` so UI surfaces can compute
+    /// elapsed time — which is the primary signal that distinguishes
+    /// "quick tool call flickering by" from "long-running dispatch
+    /// worth attention." Captured once and never mutated.
+    pub started_at: DateTime<Utc>,
+}
+
+impl ActiveFunctionEntry {
+    /// Project the entry down to the display-facing wire summary used
+    /// in `FunctionStarted` and `FunctionList`. Cheap — strings are
+    /// cloned but all of them are small (ids + a RFC3339 timestamp).
+    pub(crate) fn wire_summary(&self) -> FunctionSummary {
+        let (thread_id, pod_id, tool_name, behavior_id) = self.spec.wire_scope_fields();
+        FunctionSummary {
+            function_id: self.id,
+            kind: self.spec.wire_kind(),
+            thread_id,
+            pod_id,
+            tool_name,
+            behavior_id,
+            caller_tag: self.caller.audit_tag(),
+            started_at: self.started_at.to_rfc3339(),
+        }
+    }
 }
 
 /// How the terminal of an in-flight Function gets delivered back to
@@ -169,13 +197,19 @@ impl Scheduler {
             pending_approval_io: None,
             awaiting_child_thread_id: None,
             delivery,
+            started_at: Utc::now(),
         };
         debug!(
             function_id = id,
             caller = %entry.caller.audit_tag(),
             "Function registered"
         );
+        // Broadcast before insertion so the summary snapshot reflects
+        // the just-registered state without an extra lookup round-trip.
+        let summary = entry.wire_summary();
         self.active_functions.insert(id, entry);
+        self.router
+            .broadcast_task_list(ServerToClient::FunctionStarted { summary });
         Ok(id)
     }
 
@@ -475,6 +509,22 @@ impl Scheduler {
             outcome = ?outcome,
             "Function terminal"
         );
+        // Paired with the `FunctionStarted` broadcast at
+        // registration time. UI surfaces use the outcome tag to pick
+        // success / error / cancelled chip colors when they animate
+        // out; the variant-specific terminal payload rides other
+        // dedicated events (`ThreadStateChanged`,
+        // `ThreadBindingsChanged`, tool-result messages, etc.).
+        let outcome_tag = match &outcome {
+            FunctionOutcome::Success(_) => FunctionOutcomeTag::Success,
+            FunctionOutcome::Error(_) => FunctionOutcomeTag::Error,
+            FunctionOutcome::Cancelled(_) => FunctionOutcomeTag::Cancelled,
+        };
+        self.router
+            .broadcast_task_list(ServerToClient::FunctionEnded {
+                function_id: id,
+                outcome: outcome_tag,
+            });
         let wire_error_for_ws_client = if let (
             FunctionOutcome::Error(err),
             CallerLink::WsClient {

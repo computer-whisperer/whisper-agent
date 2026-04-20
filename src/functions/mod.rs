@@ -123,6 +123,54 @@ impl Function {
             | Self::McpToolUse { .. } => None,
         }
     }
+
+    /// Display-facing wire kind used by the `FunctionStarted` /
+    /// `FunctionList` surfaces. Distinct from the internal enum variant
+    /// so protocol changes don't hinge on server-internal type shape.
+    pub fn wire_kind(&self) -> whisper_agent_protocol::FunctionKind {
+        use whisper_agent_protocol::FunctionKind as K;
+        match self {
+            Self::CreateThread { .. } => K::CreateThread,
+            Self::CompactThread { .. } => K::CompactThread,
+            Self::RebindThread { .. } => K::RebindThread,
+            Self::CancelThread { .. } => K::CancelThread,
+            Self::RunBehavior { .. } => K::RunBehavior,
+            Self::BuiltinToolCall { .. } => K::BuiltinToolCall,
+            Self::McpToolUse { .. } => K::McpToolUse,
+        }
+    }
+
+    /// Display-facing scope fields for `FunctionSummary`: the subset of
+    /// the spec that's safe + useful to expose to UI surfaces.
+    /// (thread_id, pod_id, tool_name, behavior_id).
+    ///
+    /// `CreateThread` surfaces its target `pod_id` (when explicit) but
+    /// not the initial_message or config — those are for subscribers of
+    /// the resulting thread, not for a top-level chip.
+    pub fn wire_scope_fields(
+        &self,
+    ) -> (
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    ) {
+        match self {
+            Self::CreateThread { pod_id, .. } => (None, pod_id.clone(), None, None),
+            Self::CompactThread { thread_id } => (Some(thread_id.clone()), None, None, None),
+            Self::RebindThread { thread_id, .. } => (Some(thread_id.clone()), None, None, None),
+            Self::CancelThread { thread_id } => (Some(thread_id.clone()), None, None, None),
+            Self::RunBehavior {
+                pod_id,
+                behavior_id,
+                ..
+            } => (None, Some(pod_id.clone()), None, Some(behavior_id.clone())),
+            Self::BuiltinToolCall { name, .. } => (None, None, Some(name.clone()), None),
+            Self::McpToolUse { host, name, .. } => {
+                (None, None, Some(format!("{host}/{name}")), None)
+            }
+        }
+    }
 }
 
 /// Sync vs async dispatch for `CreateThread`. Meaningful primarily when

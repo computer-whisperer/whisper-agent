@@ -901,6 +901,24 @@ impl Scheduler {
                     }
                 });
             }
+            ClientToServer::ListFunctions { correlation_id } => {
+                // Snapshot the `active_functions` registry for the
+                // caller's own channel. Fresh connects replay this
+                // once on join; subsequent lifecycle is delivered via
+                // `FunctionStarted` / `FunctionEnded` broadcasts.
+                let functions: Vec<_> = self
+                    .active_functions
+                    .values()
+                    .map(|entry| entry.wire_summary())
+                    .collect();
+                self.router.send_to_client(
+                    conn_id,
+                    ServerToClient::FunctionList {
+                        correlation_id,
+                        functions,
+                    },
+                );
+            }
         }
     }
 }

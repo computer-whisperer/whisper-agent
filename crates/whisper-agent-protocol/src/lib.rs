@@ -532,6 +532,68 @@ pub struct ThreadSnapshot {
 // variants are tens of bytes. Boxing the override would change every
 // construction site for a bytes-saved-per-message that's a rounding error
 // against typical `initial_message` payloads. Revisit if profiling shows it.
+/// Stable display-facing tag describing what kind of in-flight
+/// operation a Function represents. The server owns a richer
+/// `Function` enum with per-variant execution specs; this is a
+/// flattening of just the kind, for UI surfaces that track active
+/// Functions without needing to parse variant payloads.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum FunctionKind {
+    CreateThread,
+    CompactThread,
+    RebindThread,
+    CancelThread,
+    RunBehavior,
+    BuiltinToolCall,
+    McpToolUse,
+}
+
+/// Coarse outcome tag sent with `FunctionEnded`. The server's full
+/// `FunctionOutcome` carries per-variant terminal payloads; the webui
+/// only needs the kind of ending for chip semantics ("done" vs
+/// "errored" vs "cancelled") — variant-specific terminal data rides
+/// its own dedicated events (`ThreadStateChanged`, `ThreadCompacted`,
+/// tool-result messages).
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum FunctionOutcomeTag {
+    Success,
+    Error,
+    Cancelled,
+}
+
+/// Display snapshot of one in-flight Function. Sent as the payload of
+/// `FunctionStarted` and as list entries in `FunctionList`.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct FunctionSummary {
+    /// Server-assigned monotonic id. Not stable across restarts; only
+    /// used to correlate `FunctionStarted` / `FunctionEnded` pairs
+    /// within a session.
+    pub function_id: u64,
+    pub kind: FunctionKind,
+    /// Thread the Function targets, when applicable (Cancel, Compact,
+    /// Rebind, or `dispatch_thread`-shaped Creates).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread_id: Option<String>,
+    /// Pod the Function is scoped to, when knowable from the spec.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pod_id: Option<String>,
+    /// Tool name for `BuiltinToolCall` / `McpToolUse`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_name: Option<String>,
+    /// Behavior id for `RunBehavior`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub behavior_id: Option<String>,
+    /// Short audit tag from the CallerLink — "ws/42",
+    /// "tool/thread-123:tu-4", "lua/5", "internal". Lets the UI show
+    /// "who asked for this" without exposing internal struct shape.
+    pub caller_tag: String,
+    /// RFC3339 timestamp for when the Function was registered. UI
+    /// computes elapsed time relative to this.
+    pub started_at: String,
+}
+
 #[allow(clippy::large_enum_variant)]
 #[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -812,6 +874,17 @@ pub enum ClientToServer {
         correlation_id: Option<String>,
         pod_id: String,
         enabled: bool,
+    },
+
+    // --- Function registry (display surface) ---
+    /// Snapshot of every Function the scheduler currently has in its
+    /// `active_functions` registry. Issued on connect so a
+    /// newly-connected client isn't blind to Functions that started
+    /// before it joined — subsequent lifecycle is delivered via
+    /// `FunctionStarted` / `FunctionEnded` broadcasts.
+    ListFunctions {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        correlation_id: Option<String>,
     },
 }
 
@@ -1155,6 +1228,27 @@ pub enum ServerToClient {
         correlation_id: Option<String>,
         pod_id: String,
         enabled: bool,
+    },
+
+    // --- Function registry (broadcast to every connected client) ---
+    /// Reply to `ListFunctions`. Empty list is legitimate — the
+    /// scheduler may genuinely have no Functions in flight.
+    FunctionList {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        correlation_id: Option<String>,
+        functions: Vec<FunctionSummary>,
+    },
+    /// A new Function was admitted to the registry. Fanout to every
+    /// connected client; UI surfaces (status-bar chip, popover list)
+    /// use this as the "here's something new" signal.
+    FunctionStarted {
+        summary: FunctionSummary,
+    },
+    /// A Function completed (success / error / cancelled). UI drops
+    /// the corresponding `function_id` from its local active set.
+    FunctionEnded {
+        function_id: u64,
+        outcome: FunctionOutcomeTag,
     },
 
     Error {
