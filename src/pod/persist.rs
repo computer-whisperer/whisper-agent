@@ -14,7 +14,7 @@
 //! <pods_root>/
 //!   <pod_id>/                         pod_id == task.id == thread_id today
 //!     pod.toml                        synthesized on first flush
-//!     system_prompt.md                from task.config.system_prompt
+//!     system_prompt.md                from the thread's Role::System message
 //!     threads/
 //!       <thread_id>.json
 //!   <other-pod>/...
@@ -119,10 +119,13 @@ impl Persister {
                 .await
                 .with_context(|| format!("write {}", pod_toml.display()))?;
             // Drop the system prompt next to pod.toml so it's hand-editable.
-            // Empty prompts skip the file entirely.
-            if !task.config.system_prompt.is_empty() {
+            // Empty prompts skip the file entirely. Source is the thread's
+            // conversation[0] `Role::System` message — the config no
+            // longer stores the prompt separately.
+            let prompt_text = task.conversation.system_prompt_text();
+            if !prompt_text.is_empty() {
                 let prompt_path = pod_dir.join(&synthesized.thread_defaults.system_prompt_file);
-                fs::write(&prompt_path, &task.config.system_prompt)
+                fs::write(&prompt_path, prompt_text)
                     .await
                     .with_context(|| format!("write {}", prompt_path.display()))?;
             }
@@ -708,7 +711,6 @@ mod tests {
     fn sample_task(id: &str) -> Thread {
         let cfg = ThreadConfig {
             model: "claude-opus-4-7".into(),
-            system_prompt: "Hello.".into(),
             max_tokens: 8000,
             max_turns: 50,
             compaction: Default::default(),
@@ -721,6 +723,10 @@ mod tests {
         };
         let mut task = Thread::new(id.into(), id.into(), cfg, bindings, AllowMap::allow_all());
         task.title = Some("Sample task".into());
+        task.conversation
+            .push(whisper_agent_protocol::Message::system_text("Hello."));
+        task.conversation
+            .push(whisper_agent_protocol::Message::tools_manifest(Vec::new()));
         task
     }
 

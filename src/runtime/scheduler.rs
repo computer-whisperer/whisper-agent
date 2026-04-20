@@ -910,6 +910,33 @@ impl Scheduler {
             )
         };
 
+        // Refresh the thread-prefix `Role::Tools` manifest in place.
+        // The tool manifest is a cache-fingerprint-critical snapshot
+        // of what the model sees as its capability surface; a
+        // host-env or MCP-host rebind changes that surface, so the
+        // snapshot has to move with it. Mutates `conversation[1]`
+        // (or `[0]` if the thread somehow lacks a system-prefix) —
+        // adapters will pick the new manifest up on the next model
+        // call. Host-env provisioning is async; tools that arrive
+        // after the MCP host finishes connecting will still reach
+        // the model via the same wire path, just not this snapshot.
+        if env_changed {
+            let new_tool_blocks: Vec<whisper_agent_protocol::ContentBlock> = self
+                .tool_descriptors(thread_id)
+                .into_iter()
+                .map(|t| whisper_agent_protocol::ContentBlock::ToolSchema {
+                    name: t.name,
+                    description: t.description,
+                    input_schema: t.input_schema,
+                })
+                .collect();
+            if let Some(task) = self.tasks.get_mut(thread_id)
+                && let Some(tools_msg) = task.conversation.tools_message_mut()
+            {
+                tools_msg.content = new_tool_blocks;
+            }
+        }
+
         if host_env_changed {
             self.provisioning_in_flight.remove(thread_id);
             self.ensure_host_env_provisioning(thread_id, pending_io);
@@ -1213,7 +1240,15 @@ impl Scheduler {
             .get(&pod_id)
             .ok_or_else(|| format!("unknown pod `{pod_id}`"))?;
 
-        // Resolve the thread's plain config (model, prompts, limits, policy).
+        // Pull the system-prompt choice off the override before
+        // collapsing the rest into `ThreadConfig`. `ThreadConfig`
+        // intentionally doesn't carry the prompt anymore — it lands
+        // in `conversation[0]` via `seed_thread_setup` below — so the
+        // override field is a creation-time-only input.
+        let system_prompt_choice = config_override
+            .as_ref()
+            .and_then(|o| o.system_prompt.clone());
+        // Resolve the thread's plain config (model, limits, policy).
         let base_config = base_thread_config_from_pod(pod);
         let config = apply_config_override(base_config, config_override);
 
@@ -1267,8 +1302,160 @@ impl Scheduler {
         }
 
         let thread_id = self.register_new_task(task, requester, correlation_id, pending_io);
+        self.seed_thread_setup(&thread_id, system_prompt_choice.as_ref());
         info!(thread_id = %thread_id, pod_id = %pod_id, "task created");
         Ok(thread_id)
+    }
+
+    /// Push the setup prefix onto a freshly-registered thread's
+    /// conversation. System prompt is pod config — always available
+    /// synchronously, pushed immediately. Tool manifest depends on
+    /// resource state — if the thread has a host-env binding whose
+    /// MCP hasn't finished its initial `tools/list` yet, the
+    /// `Role::Tools` push is **deferred** to the
+    /// `HostEnvMcpCompleted` handler so the snapshot captures the
+    /// real catalog rather than an empty placeholder.
+    ///
+    /// Why defer instead of refresh-later: the setup prefix is
+    /// cache-fingerprint-critical to the model provider — once the
+    /// thread starts trading messages with the LLM, mutating
+    /// `messages[1]` busts the entire cached prefix and forces a
+    /// rewrite on every subsequent turn. Getting it right the first
+    /// time beats fixing it up after.
+    ///
+    /// `override_choice` — when `Some`, takes precedence over the
+    /// pod's cached `system_prompt`. `File { name }` reads
+    /// `<pod_dir>/<name>` synchronously (pod-relative, no parent-
+    /// escape); `Text { text }` uses the literal verbatim. Missing
+    /// or unreadable file falls back to the pod default with a
+    /// warn-level log — same graceful-degrade policy as the pod
+    /// loader when `system_prompt_file` points at nothing.
+    fn seed_thread_setup(
+        &mut self,
+        thread_id: &str,
+        override_choice: Option<&whisper_agent_protocol::SystemPromptChoice>,
+    ) {
+        let system_prompt = {
+            let pod = self
+                .tasks
+                .get(thread_id)
+                .and_then(|t| self.pods.get(&t.pod_id));
+            match (override_choice, pod) {
+                (Some(whisper_agent_protocol::SystemPromptChoice::Text { text }), _) => {
+                    text.clone()
+                }
+                (Some(whisper_agent_protocol::SystemPromptChoice::File { name }), Some(pod)) => {
+                    resolve_system_prompt_file(pod, name)
+                }
+                (None, Some(pod)) => pod.system_prompt.clone(),
+                // Thread/pod missing — defensive no-prompt. Shouldn't
+                // happen in practice (task was just registered).
+                (_, None) => String::new(),
+            }
+        };
+        if let Some(task) = self.tasks.get_mut(thread_id) {
+            task.conversation
+                .push(whisper_agent_protocol::Message::system_text(system_prompt));
+        }
+        // Tools: only if every resource advertising them is already
+        // Ready. Otherwise wait for the provisioning-complete hook.
+        if self.host_env_mcp_is_ready(thread_id) {
+            self.push_tools_snapshot(thread_id);
+        }
+        self.mark_dirty(thread_id);
+    }
+
+    /// Is the thread's host-env MCP ready to advertise tools? True
+    /// when there's no host-env binding at all, or when the bound
+    /// host-env MCP entry is in `ResourceState::Ready` (either from a
+    /// dedup-share with a prior thread or because provisioning has
+    /// already completed). False means the `Role::Tools` seed must
+    /// wait for `HostEnvMcpCompleted` to avoid freezing an empty
+    /// tool list into the conversation.
+    fn host_env_mcp_is_ready(&self, thread_id: &str) -> bool {
+        let Some(he_id) = self.host_env_id_for_thread(thread_id) else {
+            return true; // no host-env binding — nothing to wait for
+        };
+        let mcp_id = McpHostId::for_host_env(&he_id);
+        self.resources
+            .mcp_hosts
+            .get(&mcp_id)
+            .map(|e| e.state.is_ready())
+            .unwrap_or(false)
+    }
+
+    /// Insert a fresh `Role::Tools` manifest into the thread's
+    /// conversation at the setup-prefix boundary (right after the
+    /// `Role::System` message, before any body turns), built from
+    /// the current [`Self::tool_descriptors`] view. Idempotent: if
+    /// the thread already has a `Role::Tools` message this is a
+    /// no-op — keeps the `HostEnvMcpCompleted` handler's per-user
+    /// fan-out safe to call against every bound thread without
+    /// per-thread bookkeeping.
+    ///
+    /// Insertion (rather than append) matters when a user message
+    /// has already landed before provisioning completed — a
+    /// `CreateThread`-with-initial_message while the host-env MCP
+    /// is still spinning up leaves the conversation as
+    /// `[System, User]`. Pushing Tools at the tail would yield
+    /// `[System, User, Tools]`, which makes `setup_prefix_end()`
+    /// return 1 and hides the tool manifest from the adapter's
+    /// `tools:` wire field. Inserting at `setup_prefix_end()` keeps
+    /// the invariant that the setup prefix stays contiguous at the
+    /// head of the conversation.
+    ///
+    /// Because the insertion shifts later-message indices, it's a
+    /// non-append mutation — subscribed clients' incremental views
+    /// would drift from the server's conversation if they only saw
+    /// streaming events. To keep them honest we follow the insert
+    /// with a full `ThreadSnapshot` broadcast: subscribers rebuild
+    /// their view from authoritative state in one step, so `Tools`
+    /// becomes visible inline without waiting for a reload /
+    /// re-subscribe. One-time cost — the setup prefix only
+    /// finalizes once per thread.
+    fn push_tools_snapshot(&mut self, thread_id: &str) {
+        let already_has = self
+            .tasks
+            .get(thread_id)
+            .map(|t| {
+                t.conversation
+                    .messages()
+                    .iter()
+                    .any(|m| m.role == whisper_agent_protocol::Role::Tools)
+            })
+            .unwrap_or(true);
+        if already_has {
+            return;
+        }
+        let tool_blocks: Vec<whisper_agent_protocol::ContentBlock> = self
+            .tool_descriptors(thread_id)
+            .into_iter()
+            .map(|t| whisper_agent_protocol::ContentBlock::ToolSchema {
+                name: t.name,
+                description: t.description,
+                input_schema: t.input_schema,
+            })
+            .collect();
+        let snapshot = if let Some(task) = self.tasks.get_mut(thread_id) {
+            let at = task.conversation.setup_prefix_end();
+            task.conversation.insert(
+                at,
+                whisper_agent_protocol::Message::tools_manifest(tool_blocks),
+            );
+            Some(task.snapshot())
+        } else {
+            None
+        };
+        self.mark_dirty(thread_id);
+        if let Some(snapshot) = snapshot {
+            self.router.broadcast_to_subscribers(
+                thread_id,
+                ServerToClient::ThreadSnapshot {
+                    thread_id: thread_id.to_string(),
+                    snapshot,
+                },
+            );
+        }
     }
 
     /// Shared tail for freshly-constructed threads (minted by
@@ -1680,7 +1867,27 @@ impl Scheduler {
                     .populate_mcp_tools(&mcp_id, tools, annotations);
                 self.emit_mcp_host_updated(&mcp_id);
 
-                // 3. Nudge any threads that were waiting on these
+                // 3. Finalize the `Role::Tools` setup message for every
+                //    thread bound to this MCP that was deferred because
+                //    the catalog wasn't ready when the thread was
+                //    created. Runs BEFORE `step_until_blocked` below —
+                //    so no model call has fired yet, and the
+                //    setup-prefix write is still free (no cache-bust
+                //    because nothing has been cached yet). Idempotent:
+                //    `push_tools_snapshot` no-ops for threads that
+                //    already have a `Role::Tools` message (dedup
+                //    joiners that found the MCP already `Ready`).
+                let bound_to_mcp: Vec<String> = self
+                    .resources
+                    .mcp_hosts
+                    .get(&mcp_id)
+                    .map(|e| e.users.iter().cloned().collect())
+                    .unwrap_or_default();
+                for tid in &bound_to_mcp {
+                    self.push_tools_snapshot(tid);
+                }
+
+                // 4. Nudge any threads that were waiting on these
                 //    resources. Dedup means multiple threads can share
                 //    one host env + MCP pair.
                 let mut newly_ready: Vec<String> = Vec::new();
@@ -2145,6 +2352,37 @@ fn truncate(mut s: String, max: usize) -> String {
         s.push('…');
     }
     s
+}
+
+/// Read a pod-relative prompt file for a creation-time system-prompt
+/// override. Rejects any name containing path separators or a parent
+/// component — the override is a filename inside the pod dir, not an
+/// escape hatch. A missing or unreadable file falls back to the pod's
+/// cached default with a warn-level log, matching the pod loader's
+/// graceful-degrade policy for `thread_defaults.system_prompt_file`.
+fn resolve_system_prompt_file(pod: &crate::pod::Pod, name: &str) -> String {
+    if name.is_empty() || name.contains('/') || name.contains('\\') || name.contains("..") {
+        warn!(
+            pod_id = %pod.id,
+            file = %name,
+            "system_prompt File override name rejected (must be a plain filename inside the pod dir) \
+             — falling back to pod default"
+        );
+        return pod.system_prompt.clone();
+    }
+    let path = pod.dir.join(name);
+    match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(e) => {
+            warn!(
+                pod_id = %pod.id,
+                file = %name,
+                error = %e,
+                "system_prompt File override unreadable — falling back to pod default"
+            );
+            pod.system_prompt.clone()
+        }
+    }
 }
 
 // ---------- Run loop ----------

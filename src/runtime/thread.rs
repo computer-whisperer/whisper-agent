@@ -1041,7 +1041,6 @@ mod tests {
     fn basic_thread() -> Thread {
         let cfg = ThreadConfig {
             model: "test".into(),
-            system_prompt: "test".into(),
             max_tokens: 100,
             max_turns: 10,
             compaction: Default::default(),
@@ -1067,7 +1066,6 @@ mod tests {
     fn base_config_for_fork() -> ThreadConfig {
         ThreadConfig {
             model: "test".into(),
-            system_prompt: "test".into(),
             max_tokens: 100,
             max_turns: 10,
             compaction: Default::default(),

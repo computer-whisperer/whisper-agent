@@ -513,6 +513,12 @@ fn convert_message(m: &Message, id_to_name: &HashMap<String, String>) -> Option<
         // turn `ContentBlock::ToolResult` into a FunctionResponse.
         Role::User | Role::ToolResult => ("user", convert_user_parts(&m.content, id_to_name)),
         Role::Assistant => ("model", convert_assistant_parts(&m.content, id_to_name)),
+        // Setup-prefix messages (system prompt, tool manifest) are
+        // filtered out by `build_model_request`; Gemini lifts them
+        // into `systemInstruction` / `tools` separately. Dropping a
+        // stray occurrence yields no parts → the caller's `None`
+        // path skips the entry.
+        Role::System | Role::Tools => ("user", Vec::new()),
     };
     if parts.is_empty() {
         None
@@ -555,7 +561,9 @@ fn convert_user_parts(blocks: &[ContentBlock], id_to_name: &HashMap<String, Stri
                     },
                 });
             }
-            ContentBlock::ToolUse { .. } | ContentBlock::Thinking { .. } => {
+            ContentBlock::ToolUse { .. }
+            | ContentBlock::Thinking { .. }
+            | ContentBlock::ToolSchema { .. } => {
                 // Not valid on a user turn — drop silently.
             }
         }
@@ -620,8 +628,8 @@ fn convert_assistant_parts(
                     thought: Some(true),
                 });
             }
-            ContentBlock::ToolResult { .. } => {
-                // Not valid on an assistant turn.
+            ContentBlock::ToolResult { .. } | ContentBlock::ToolSchema { .. } => {
+                // Neither is valid on an assistant turn.
             }
         }
     }

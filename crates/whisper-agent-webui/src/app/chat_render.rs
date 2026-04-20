@@ -48,6 +48,7 @@ const COLOR_REASONING: Color32 = Color32::from_rgb(170, 150, 200);
 const COLOR_TOOL: Color32 = Color32::from_rgb(220, 180, 100);
 const COLOR_ERROR: Color32 = Color32::from_rgb(220, 120, 120);
 const COLOR_NEUTRAL: Color32 = Color32::from_gray(140);
+const COLOR_SETUP: Color32 = Color32::from_gray(110);
 
 fn item_palette(item: &DisplayItem) -> (Color32, Color32) {
     // (gutter color, frame fill)
@@ -70,6 +71,12 @@ fn item_palette(item: &DisplayItem) -> (Color32, Color32) {
             Color32::from_rgba_unmultiplied(220, 120, 120, 18),
         ),
         DisplayItem::SystemNote { .. } => (COLOR_NEUTRAL, Color32::TRANSPARENT),
+        // Setup-prefix rows are neutral-gray — they belong at the head
+        // of the log as quiet "what the model saw" metadata, not
+        // loud like user or assistant content.
+        DisplayItem::SetupPrompt { .. } | DisplayItem::SetupTools { .. } => {
+            (COLOR_SETUP, Color32::TRANSPARENT)
+        }
         // No gutter for stats — it's a dim diagnostic footer, not a
         // semantic role. Rendered inline at low emphasis so it doesn't
         // compete with conversation content.
@@ -145,6 +152,8 @@ pub(super) fn render_item(
                 is_error,
             } => render_tool_result(ui, tool_use_id, name, text, *is_error),
             DisplayItem::SystemNote { text, is_error } => render_system_note(ui, text, *is_error),
+            DisplayItem::SetupPrompt { text } => render_setup_prompt(ui, text),
+            DisplayItem::SetupTools { count, text } => render_setup_tools(ui, *count, text),
             DisplayItem::TurnStats { usage } => render_turn_stats(ui, usage),
         }
     });
@@ -276,6 +285,68 @@ const INLINE_CODE_BG: Color32 = Color32::from_rgba_premultiplied(47, 50, 56, 80)
 fn render_system_note(ui: &mut egui::Ui, text: &str, is_error: bool) {
     let color = if is_error { COLOR_ERROR } else { COLOR_NEUTRAL };
     ui.label(RichText::new(text).color(color).italics());
+}
+
+/// Render the thread-prefix system-prompt entry. Default-collapsed
+/// with a one-line preview, expands to show the full prompt in a
+/// code-styled read-only block. Mirrors `Reasoning`'s treatment so
+/// the head of the log reads quietly.
+fn render_setup_prompt(ui: &mut egui::Ui, text: &str) {
+    let id = ui.make_persistent_id(("setup-prompt", text.as_ptr() as usize));
+    let preview = text.lines().next().unwrap_or("").trim();
+    let header = if preview.is_empty() {
+        "(empty)".to_string()
+    } else if preview.chars().count() > 80 {
+        let mut h: String = preview.chars().take(80).collect();
+        h.push('…');
+        h
+    } else {
+        preview.to_string()
+    };
+    egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), id, false)
+        .show_header(ui, |ui| {
+            ui.label(RichText::new("SYSTEM").color(COLOR_SETUP).strong().small());
+            ui.add_space(8.0);
+            ui.label(
+                RichText::new(header)
+                    .color(Color32::from_gray(140))
+                    .italics(),
+            );
+        })
+        .body(|ui| {
+            ui.label(
+                RichText::new(text)
+                    .color(Color32::from_gray(180))
+                    .monospace()
+                    .small(),
+            );
+        });
+}
+
+/// Render the thread-prefix tool-manifest entry. Collapsed header
+/// shows the advertised count; expanded body lists each tool's
+/// name, description, and input schema. Default-collapsed so a
+/// thread with dozens of tools doesn't bury the conversation.
+fn render_setup_tools(ui: &mut egui::Ui, count: usize, text: &str) {
+    let id = ui.make_persistent_id(("setup-tools", text.as_ptr() as usize));
+    egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), id, false)
+        .show_header(ui, |ui| {
+            ui.label(RichText::new("TOOLS").color(COLOR_SETUP).strong().small());
+            ui.add_space(8.0);
+            ui.label(
+                RichText::new(format!("{count} tool{}", if count == 1 { "" } else { "s" }))
+                    .color(Color32::from_gray(140))
+                    .italics(),
+            );
+        })
+        .body(|ui| {
+            ui.label(
+                RichText::new(text)
+                    .color(Color32::from_gray(180))
+                    .monospace()
+                    .small(),
+            );
+        });
 }
 
 /// Per-turn diagnostic footer. Format: `tokens in 12,345 · cached

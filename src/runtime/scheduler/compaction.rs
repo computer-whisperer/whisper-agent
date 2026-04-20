@@ -219,6 +219,19 @@ impl Scheduler {
         let old_bindings = task.bindings.clone();
         let old_config = task.config.clone();
         let old_origin = task.origin.clone();
+        // Snapshot the parent's setup prefix (Role::System prompt +
+        // Role::Tools manifest) so the continuation can inherit it
+        // verbatim. Matches fork semantics — a compaction continuation
+        // is conceptually "more of the same thread" and should run
+        // under the same system prompt the parent was running under,
+        // not whatever the pod's current `system_prompt.md` happens to
+        // hold. Critical for behavior-origin threads whose parent was
+        // created with a behavior-specific setup — re-reading the pod
+        // default would silently swap personalities at the compaction
+        // boundary.
+        let setup_end = task.conversation.setup_prefix_end();
+        let parent_setup: Vec<whisper_agent_protocol::Message> =
+            task.conversation.messages()[..setup_end].to_vec();
 
         // Always clear the flag so a failed parse doesn't re-trigger
         // the finalize on every subsequent step.
@@ -259,9 +272,14 @@ impl Scheduler {
         // `ThreadCreated` broadcast fires.
         let config_override = Some(ThreadConfigOverride {
             model: Some(old_config.model.clone()),
-            system_prompt: Some(old_config.system_prompt.clone()),
             max_tokens: Some(old_config.max_tokens),
             max_turns: Some(old_config.max_turns),
+            // System-prompt override is intentionally `None` here:
+            // `create_task` will seed a fresh System message, and we
+            // then overwrite it below with the parent's verbatim
+            // setup prefix. Forwarding a file/text override here
+            // would be redundant and lose the parent's actual text.
+            system_prompt: None,
             compaction: None, // inherit pod's compaction defaults again
         });
         let bindings_request = Some(whisper_agent_protocol::ThreadBindingsRequest {
@@ -310,8 +328,31 @@ impl Scheduler {
         // linkage arrives via the `ThreadCompacted` broadcast below,
         // and any newly-joining client gets the stamped field from
         // `ThreadSnapshot` / `ThreadList`.
+        //
+        // Same pass overwrites the continuation's fresh setup prefix
+        // (seeded by `seed_thread_setup` inside `create_task` from
+        // current pod state) with the parent's snapshot. Copying
+        // verbatim keeps the continuation's system prompt and tool
+        // manifest identical to what the parent was running under —
+        // behaviors, custom-prompted threads, and mid-life pod edits
+        // all settle out the same way (continuation inherits, pod
+        // drift doesn't leak across the compaction boundary).
         if let Some(new_task) = self.tasks.get_mut(&new_thread_id) {
             new_task.continued_from = Some(thread_id.to_string());
+            let tail: Vec<whisper_agent_protocol::Message> = new_task
+                .conversation
+                .messages()
+                .iter()
+                .skip(new_task.conversation.setup_prefix_end())
+                .cloned()
+                .collect();
+            new_task.conversation = whisper_agent_protocol::Conversation::new();
+            for msg in parent_setup {
+                new_task.conversation.push(msg);
+            }
+            for msg in tail {
+                new_task.conversation.push(msg);
+            }
         }
         self.mark_dirty(&new_thread_id);
         self.router

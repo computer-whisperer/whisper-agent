@@ -204,6 +204,25 @@ enum DisplayItem {
         text: String,
         is_error: bool,
     },
+    /// Thread-prefix setup message captured at creation: the system
+    /// prompt (`Role::System` — `text` holds the prompt body) or the
+    /// tool-manifest snapshot (`Role::Tools` — `text` holds a
+    /// human-readable rendering of the advertised tools). Rendered
+    /// inline at the top of the chat log as a default-collapsed row
+    /// so what the model saw is visible in-place rather than hidden
+    /// behind a side-panel inspector.
+    SetupPrompt {
+        text: String,
+    },
+    SetupTools {
+        /// Count of tool schemas in the manifest (for the collapsed header).
+        count: usize,
+        /// Human-readable rendering of the manifest — one entry per
+        /// tool, name + description + input-schema — shown when the
+        /// row is expanded. Precomputed at item-build time so the
+        /// renderer doesn't re-serialize every frame.
+        text: String,
+    },
     /// Per-LLM-call diagnostic footer, emitted once at the end of
     /// every assistant turn. Sourced live from `ThreadAssistantEnd`
     /// and from `ThreadSnapshot.turn_log` on replay. Rendered as a
@@ -283,9 +302,14 @@ struct TaskView {
 /// summary). Split into its own struct so `TaskView` stays readable
 /// at a glance — the inspector fields are a handful of seldom-changing
 /// reference values, not per-turn state.
+///
+/// The system prompt used to live here; it now rides at the head of
+/// the thread's `Conversation` and is rendered inline in the chat log
+/// (default-collapsed), so the inspector no longer displays it
+/// separately. Keeps the conversation log as the single source of
+/// truth for what the model actually saw.
 #[derive(Clone, Default)]
 struct ThreadInspector {
-    system_prompt: String,
     max_tokens: u32,
     max_turns: u32,
     bindings: ThreadBindings,
@@ -319,7 +343,6 @@ impl TaskView {
             failure: None,
             tool_allowlist: Vec::new(),
             inspector: ThreadInspector {
-                system_prompt: String::new(),
                 max_tokens: 0,
                 max_turns: 0,
                 bindings: ThreadBindings::default(),
@@ -1103,7 +1126,6 @@ impl ChatApp {
                 let failure = snapshot.failure.clone();
                 let allowlist = snapshot.tool_allowlist.clone();
                 let inspector = ThreadInspector {
-                    system_prompt: snapshot.config.system_prompt.clone(),
                     max_tokens: snapshot.config.max_tokens,
                     max_turns: snapshot.config.max_turns,
                     bindings: snapshot.bindings.clone(),
@@ -1883,6 +1905,59 @@ fn conversation_to_items(conv: &Conversation, turn_log: &TurnLog) -> Vec<Display
 
 fn add_message_items(msg: &Message, msg_index: usize, out: &mut Vec<DisplayItem>) {
     match msg.role {
+        Role::System => {
+            // System prompt lives at the head of the conversation as a
+            // single `ContentBlock::Text`. Empty prompts produce no row
+            // so the chat log doesn't start with a meaningless
+            // "(empty)" entry.
+            let text = msg
+                .content
+                .iter()
+                .find_map(|b| match b {
+                    ContentBlock::Text { text } => Some(text.as_str()),
+                    _ => None,
+                })
+                .unwrap_or("");
+            if !text.is_empty() {
+                out.push(DisplayItem::SetupPrompt {
+                    text: text.to_string(),
+                });
+            }
+        }
+        Role::Tools => {
+            // Tool manifest: one `ContentBlock::ToolSchema` per tool.
+            // The collapsed row shows the count; expanded shows
+            // name + description + input-schema for each entry.
+            let mut rendered = String::new();
+            let mut count = 0usize;
+            for block in &msg.content {
+                if let ContentBlock::ToolSchema {
+                    name,
+                    description,
+                    input_schema,
+                } = block
+                {
+                    if count > 0 {
+                        rendered.push_str("\n\n");
+                    }
+                    rendered.push_str(name);
+                    if !description.is_empty() {
+                        rendered.push_str(" — ");
+                        rendered.push_str(description);
+                    }
+                    rendered.push('\n');
+                    rendered
+                        .push_str(&serde_json::to_string_pretty(input_schema).unwrap_or_default());
+                    count += 1;
+                }
+            }
+            if count > 0 {
+                out.push(DisplayItem::SetupTools {
+                    count,
+                    text: rendered,
+                });
+            }
+        }
         Role::User => {
             for block in &msg.content {
                 if let ContentBlock::Text { text } = block {
@@ -4463,29 +4538,10 @@ fn render_thread_context_inspector(ui: &mut egui::Ui, thread_id: &str, view: &Ta
                 });
         }
 
-        ui.add_space(6.0);
-        section_heading(ui, "System prompt");
-        if inspector.system_prompt.is_empty() {
-            ui.label(
-                RichText::new("(empty — model runs with no system prompt)")
-                    .italics()
-                    .color(Color32::from_gray(160)),
-            );
-        } else {
-            // Read-only: users edit the prompt via the pod editor's
-            // system_prompt_file, not here. Sized to fit a few lines of
-            // content up to a reasonable cap so very long prompts
-            // don't eat the whole viewport.
-            let mut prompt = inspector.system_prompt.as_str();
-            let line_count = inspector.system_prompt.lines().count().clamp(3, 20);
-            ui.add_sized(
-                [ui.available_width(), 0.0],
-                TextEdit::multiline(&mut prompt)
-                    .code_editor()
-                    .desired_rows(line_count)
-                    .interactive(false),
-            );
-        }
+        // System prompt + tool manifest used to render here; they now
+        // live as `Role::System` / `Role::Tools` messages at the head
+        // of the conversation and render inline in the chat log
+        // (default-collapsed).
     });
     ui.add_space(6.0);
 }
@@ -4741,6 +4797,8 @@ mod tests {
                 DisplayItem::ToolCall { .. } => "tool_call",
                 DisplayItem::ToolResult { .. } => "tool_result",
                 DisplayItem::SystemNote { .. } => "system_note",
+                DisplayItem::SetupPrompt { .. } => "setup_prompt",
+                DisplayItem::SetupTools { .. } => "setup_tools",
                 DisplayItem::TurnStats { .. } => "turn_stats",
             })
             .collect();

@@ -56,9 +56,14 @@ pub(super) fn descriptor() -> McpTool {
                 "config_override": {
                     "type": "object",
                     "description": "Optional ThreadConfigOverride. Shape mirrors \
-                                    the wire type: {model?, system_prompt?, max_tokens?, \
-                                    max_turns?, approval_policy?, compaction?}. \
-                                    Omitted fields inherit from pod defaults."
+                                    the wire type: {model?, max_tokens?, max_turns?, \
+                                    system_prompt?, compaction?}. Omitted fields \
+                                    inherit from pod defaults. The `system_prompt` \
+                                    field is `{kind: \"file\", name: \"<pod-relative \
+                                    filename>\"}` to read the prompt from a file in \
+                                    the pod directory, or `{kind: \"text\", text: \
+                                    \"<literal prompt>\"}` to inline it. Omitted \
+                                    inherits the pod's `system_prompt.md`."
                 },
                 "bindings_override": {
                     "type": "object",

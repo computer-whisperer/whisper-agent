@@ -72,14 +72,17 @@ pub fn build_default_pod_config(
     }
 }
 
-/// Render the pod's `thread_defaults` (model, prompt, limits, policy) into
-/// a fresh `ThreadConfig`. Binding-side defaults (backend, sandbox, shared
-/// hosts) are produced separately by `resolve_bindings_choice`.
+/// Render the pod's `thread_defaults` (model, limits, policy) into
+/// a fresh `ThreadConfig`. The system prompt and tool manifest are no
+/// longer on `ThreadConfig` — they get snapshotted into the new thread's
+/// `Conversation` at creation time (see the `create_task` path) so the
+/// chat log faithfully records what the model saw.
+/// Binding-side defaults (backend, sandbox, shared hosts) are produced
+/// separately by `resolve_bindings_choice`.
 pub(super) fn base_thread_config_from_pod(pod: &Pod) -> ThreadConfig {
     let defaults = &pod.config.thread_defaults;
     ThreadConfig {
         model: defaults.model.clone(),
-        system_prompt: pod.system_prompt.clone(),
         max_tokens: defaults.max_tokens,
         max_turns: defaults.max_turns,
         compaction: defaults.compaction.clone(),
@@ -94,7 +97,6 @@ pub(super) fn apply_config_override(
     let compaction = apply_compaction_override(base.compaction, ov.compaction);
     ThreadConfig {
         model: ov.model.unwrap_or(base.model),
-        system_prompt: ov.system_prompt.unwrap_or(base.system_prompt),
         max_tokens: ov.max_tokens.unwrap_or(base.max_tokens),
         max_turns: ov.max_turns.unwrap_or(base.max_turns),
         compaction,
@@ -128,13 +130,16 @@ fn apply_compaction_override(
 pub(super) fn behavior_override_to_requests(
     ov: &whisper_agent_protocol::BehaviorThreadOverride,
 ) -> (Option<ThreadConfigOverride>, Option<ThreadBindingsRequest>) {
-    let config_override = if ov.model.is_some() || ov.max_tokens.is_some() || ov.max_turns.is_some()
+    let config_override = if ov.model.is_some()
+        || ov.max_tokens.is_some()
+        || ov.max_turns.is_some()
+        || ov.system_prompt.is_some()
     {
         Some(ThreadConfigOverride {
             model: ov.model.clone(),
-            system_prompt: None, // behaviors inherit pod system_prompt
             max_tokens: ov.max_tokens,
             max_turns: ov.max_turns,
+            system_prompt: ov.system_prompt.clone(),
             compaction: None, // behaviors inherit pod compaction policy
         })
     } else {
@@ -201,6 +206,9 @@ mod tests {
             model: Some("sonnet-4-6".into()),
             max_tokens: Some(8192),
             max_turns: Some(20),
+            system_prompt: Some(whisper_agent_protocol::SystemPromptChoice::File {
+                name: "greeter.md".into(),
+            }),
             bindings: BehaviorBindingsOverride {
                 backend: Some("anthropic".into()),
                 host_env: Some("readonly".into()),
@@ -212,12 +220,33 @@ mod tests {
         assert_eq!(cfg.model.as_deref(), Some("sonnet-4-6"));
         assert_eq!(cfg.max_tokens, Some(8192));
         assert_eq!(cfg.max_turns, Some(20));
-        // Behaviors never override system_prompt — pod default is authoritative.
-        assert!(cfg.system_prompt.is_none());
+        assert!(matches!(
+            cfg.system_prompt,
+            Some(whisper_agent_protocol::SystemPromptChoice::File { ref name }) if name == "greeter.md"
+        ));
         let b = bindings.expect("bindings_request populated");
         assert_eq!(b.backend.as_deref(), Some("anthropic"));
         assert_eq!(b.host_env.as_deref(), Some("readonly"));
         assert_eq!(b.mcp_hosts.as_deref(), Some(&["fetch".to_string()][..]));
+    }
+
+    #[test]
+    fn override_populates_when_only_system_prompt_set() {
+        // system_prompt alone should still trip the config-side override
+        // (behaviors with custom personas wouldn't need to also set model).
+        let ov = BehaviorThreadOverride {
+            system_prompt: Some(whisper_agent_protocol::SystemPromptChoice::Text {
+                text: "You are a summarizer.".into(),
+            }),
+            ..Default::default()
+        };
+        let (cfg, bindings) = behavior_override_to_requests(&ov);
+        let cfg = cfg.expect("config_override populated");
+        assert!(matches!(
+            cfg.system_prompt,
+            Some(whisper_agent_protocol::SystemPromptChoice::Text { ref text }) if text == "You are a summarizer."
+        ));
+        assert!(bindings.is_none(), "no binding-side fields were set");
     }
 
     #[test]

@@ -31,7 +31,7 @@ use crate::providers::model::{
 };
 use crate::runtime::scheduler::{Scheduler, StreamUpdate};
 use crate::runtime::thread::{IoRequest, IoResult, OpId};
-use crate::tools::mcp::{McpSession, ToolDescriptor as McpTool};
+use crate::tools::mcp::McpSession;
 use crate::tools::sandbox::HostEnvHandle;
 
 /// Completion message delivered by every per-thread I/O future the
@@ -674,12 +674,23 @@ fn build_model_request(
     thread_id: &str,
 ) -> (OwnedModelRequest, String, String) {
     let task = scheduler.task(thread_id).expect("task exists");
-    let tools: Vec<ToolSpec> = scheduler
-        .tool_descriptors(thread_id)
-        .iter()
-        .map(mcp_tool_to_spec)
+    // System prompt + tool manifest live at the head of the
+    // conversation (captured there at thread creation / MCP-rebind
+    // time). Adapters keep their existing `req.system_prompt` +
+    // `req.tools` expectations — we just source those fields from
+    // the conversation here instead of a parallel config slot.
+    let system_prompt = task.conversation.system_prompt_text().to_string();
+    let tools: Vec<ToolSpec> = task
+        .conversation
+        .tool_schemas()
+        .map(|(name, description, input_schema)| ToolSpec {
+            name: name.to_string(),
+            description: description.to_string(),
+            input_schema: input_schema.clone(),
+        })
         .collect();
-    let messages = task.conversation.messages().to_vec();
+    let setup_end = task.conversation.setup_prefix_end();
+    let messages = task.conversation.messages()[setup_end..].to_vec();
     let backend_name = scheduler.resolve_backend_name(task).to_string();
     // Empty task.config.model → consult the backend's default_model. If that's
     // also None (common for single-model local endpoints), pass empty through.
@@ -697,7 +708,7 @@ fn build_model_request(
         OwnedModelRequest {
             model: model.clone(),
             max_tokens,
-            system_prompt: task.config.system_prompt.clone(),
+            system_prompt,
             tools,
             messages,
             cache_breakpoints,
@@ -705,12 +716,4 @@ fn build_model_request(
         model,
         backend_name,
     )
-}
-
-fn mcp_tool_to_spec(t: &McpTool) -> ToolSpec {
-    ToolSpec {
-        name: t.name.clone(),
-        description: t.description.clone(),
-        input_schema: t.input_schema.clone(),
-    }
 }

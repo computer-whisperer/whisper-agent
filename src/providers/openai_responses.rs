@@ -345,6 +345,12 @@ fn convert_message(m: &Message, out: &mut Vec<RspItem>) {
         // Responses expects.
         Role::User | Role::ToolResult => convert_user_message(&m.content, out),
         Role::Assistant => convert_assistant_message(&m.content, out),
+        // Setup-prefix messages (system prompt, tool manifest) are
+        // filtered out of `ModelRequest.messages` by
+        // `build_model_request`; the adapter lifts them into the
+        // `instructions` / `tools` wire fields separately. If one
+        // slips through we drop it silently.
+        Role::System | Role::Tools => {}
     }
 }
 
@@ -372,8 +378,10 @@ fn convert_user_message(blocks: &[ContentBlock], out: &mut Vec<RspItem>) {
                     output: tool_result_as_text(content, *is_error),
                 });
             }
-            ContentBlock::ToolUse { .. } | ContentBlock::Thinking { .. } => {
-                // Neither belongs on a user message. Drop silently.
+            ContentBlock::ToolUse { .. }
+            | ContentBlock::Thinking { .. }
+            | ContentBlock::ToolSchema { .. } => {
+                // None belong on a user message. Drop silently.
             }
         }
     }
@@ -443,8 +451,8 @@ fn convert_assistant_message(blocks: &[ContentBlock], out: &mut Vec<RspItem>) {
                     out.push(item);
                 }
             }
-            ContentBlock::ToolResult { .. } => {
-                // ToolResult doesn't belong on an assistant message.
+            ContentBlock::ToolResult { .. } | ContentBlock::ToolSchema { .. } => {
+                // Neither belongs on an assistant message.
             }
         }
     }

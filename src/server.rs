@@ -70,9 +70,14 @@ pub struct ServerConfig {
     pub backends: std::collections::HashMap<String, BackendEntry>,
     /// Fallback backend for tasks that don't specify one. Must be a key in `backends`.
     pub default_backend: String,
-    /// Plain config (model, prompt, limits, policy) the synthesized default
+    /// Plain config (model, limits, policy) the synthesized default
     /// pod's `thread_defaults` table is built from.
     pub default_task_config: ThreadConfig,
+    /// Seed text for the default pod's `system_prompt.md`. Populated
+    /// from the `--system-prompt` CLI flag; an empty string means the
+    /// default pod starts with no system prompt file (threads inside
+    /// it run under an empty system message).
+    pub default_system_prompt: String,
     /// Host-env spec + provider pairing for the synthesized default
     /// pod's single `[[allow.host_env]]` entry. `None` means "no host
     /// env" — the default pod has an empty allow.host_env and threads
@@ -136,7 +141,7 @@ pub async fn serve(listen: SocketAddr, config: ServerConfig) -> anyhow::Result<(
         .as_ref()
         .map(|root| root.join(&default_pod_id))
         .unwrap_or_else(|| PathBuf::from(format!("./{default_pod_id}")));
-    let default_system_prompt = config.default_task_config.system_prompt.clone();
+    let default_system_prompt = config.default_system_prompt.clone();
     let raw_toml = crate::pod::to_toml(&default_pod_config)
         .context("encode default pod.toml for in-memory bootstrap")?;
     let default_pod = Pod::new(

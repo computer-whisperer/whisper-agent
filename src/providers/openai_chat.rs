@@ -213,6 +213,11 @@ fn convert_message(m: &Message, out: &mut Vec<OaMessage>) {
         // on the wire, which is exactly what OpenAI wants.
         Role::User | Role::ToolResult => convert_user_message(&m.content, out),
         Role::Assistant => convert_assistant_message(&m.content, out),
+        // Setup-prefix messages (system prompt, tool manifest) are
+        // filtered out by `build_model_request` and lifted into the
+        // system-role preamble / `tools` wire field. Defensive no-op
+        // if one slips through.
+        Role::System | Role::Tools => {}
     }
 }
 
@@ -253,8 +258,10 @@ fn convert_user_message(blocks: &[ContentBlock], out: &mut Vec<OaMessage>) {
                     reasoning_content: None,
                 });
             }
-            ContentBlock::ToolUse { .. } | ContentBlock::Thinking { .. } => {
-                // Neither makes sense in a user message. Drop silently.
+            ContentBlock::ToolUse { .. }
+            | ContentBlock::Thinking { .. }
+            | ContentBlock::ToolSchema { .. } => {
+                // None make sense in a user message. Drop silently.
             }
         }
     }
@@ -301,8 +308,8 @@ fn convert_assistant_message(blocks: &[ContentBlock], out: &mut Vec<OaMessage>) 
                     },
                 });
             }
-            ContentBlock::ToolResult { .. } => {
-                // ToolResult doesn't belong on an assistant message.
+            ContentBlock::ToolResult { .. } | ContentBlock::ToolSchema { .. } => {
+                // Neither belongs on an assistant message.
             }
         }
     }

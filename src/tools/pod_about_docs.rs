@@ -155,6 +155,15 @@ max_tokens      = 32000
 max_turns       = 50
 approval_policy = \"auto_approve\"   # see pod.toml topic for values
 
+# Per-behavior system prompt. One of:
+#   { kind = \"file\", name = \"<pod-relative filename>\" }
+#   { kind = \"text\", text = \"<literal system prompt>\" }
+# Omitted → the behavior-spawned thread inherits the pod's
+# system_prompt.md. Useful for behaviors whose persona should differ
+# from the pod's default agent (e.g. a summarizer running in a
+# coding-agent pod).
+system_prompt = { kind = \"file\", name = \"greeter.md\" }
+
 [thread.bindings]                     # optional; narrow the thread's
                                        # capability surface below the pod
 backend   = \"anthropic\"             # each Some() replaces pod default

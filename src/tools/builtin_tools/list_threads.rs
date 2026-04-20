@@ -397,7 +397,7 @@ mod tests {
             "last_active": last_active,
             "title": title,
             "config": {},
-            "conversation": { "messages": messages, "system_prompt": "" },
+            "conversation": { "messages": messages },
             "total_usage": {},
             "internal": { "kind": internal_kind }
         });

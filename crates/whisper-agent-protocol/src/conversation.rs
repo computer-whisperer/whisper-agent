@@ -12,6 +12,30 @@ use serde_json::Value;
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum Role {
+    /// The system prompt the model runs under. Lives as the first
+    /// message of every thread's conversation (modulo empty-prompt
+    /// pods, where it's omitted). Captured once at thread creation
+    /// so the log faithfully records what instructions the model
+    /// actually saw — the pod's `system_prompt.md` is just the
+    /// *template* the snapshot was taken from and may drift later
+    /// without affecting threads already created. Provider adapters
+    /// lift the content of this message into their wire-level
+    /// `system` field (Anthropic) or prefix message (OpenAI / Gemini
+    /// `systemInstruction`).
+    System,
+    /// Snapshot of the tool manifest the model was shown. Lives as
+    /// a `Tools` message immediately after `System` at the top of
+    /// the conversation — content is a list of
+    /// `ContentBlock::ToolSchema` entries, one per tool advertised
+    /// at the moment the thread was created (or the tool set was
+    /// rebound). Stored in the conversation (rather than resolved
+    /// at request time) because any change to the tool manifest is
+    /// a prompt-cache buster: capturing the snapshot here keeps the
+    /// conversation log identical to what the model actually saw,
+    /// and makes mid-thread tool changes an explicit event rather
+    /// than silent drift. Adapters extract these blocks into their
+    /// native `tools` request field.
+    Tools,
     /// User-typed input, or server-injected text addressed to the
     /// model (behavior-trigger prompts, compaction continuation
     /// seeds, `dispatch_thread` async notifications). From the
@@ -48,6 +72,39 @@ impl Message {
         Self {
             role: Role::User,
             content: blocks,
+        }
+    }
+
+    /// Build the thread-prefix system message from the pod's resolved
+    /// system prompt text. Lives at `conversation[0]` for every thread;
+    /// provider adapters lift the text into their wire-level `system`
+    /// field. Intentionally preserved even when the pod's
+    /// `system_prompt.md` is empty (content is a single empty-string
+    /// text block) so the index of subsequent messages is stable —
+    /// adapters are responsible for skipping a wire `system` emission
+    /// when the text is empty.
+    pub fn system_text(text: impl Into<String>) -> Self {
+        Self {
+            role: Role::System,
+            content: vec![ContentBlock::Text { text: text.into() }],
+        }
+    }
+
+    /// Build the thread-prefix tools message from a resolved tool
+    /// manifest. Each entry becomes a `ContentBlock::ToolSchema`;
+    /// provider adapters lift these into their native `tools` field on
+    /// outbound requests. Lives at `conversation[1]` for every thread,
+    /// refreshed in place when bindings rebind the MCP host set.
+    pub fn tools_manifest(tools: Vec<ContentBlock>) -> Self {
+        debug_assert!(
+            tools
+                .iter()
+                .all(|b| matches!(b, ContentBlock::ToolSchema { .. })),
+            "Role::Tools content must be ContentBlock::ToolSchema entries"
+        );
+        Self {
+            role: Role::Tools,
+            content: tools,
         }
     }
 
@@ -123,6 +180,17 @@ pub enum ContentBlock {
         replay: Option<ProviderReplay>,
         thinking: String,
     },
+    /// One entry in a tool manifest snapshot. Appears only as content
+    /// on a `Role::Tools` message; provider adapters lift it into
+    /// their native `tools` request field (Anthropic `tools[]`,
+    /// OpenAI `tools[].function`, Gemini `FunctionDeclaration`). The
+    /// fields mirror `ToolSpec` — name, free-form description, JSON
+    /// Schema for the input — so translation is direct.
+    ToolSchema {
+        name: String,
+        description: String,
+        input_schema: Value,
+    },
 }
 
 /// Opaque provider-specific data echoed back into later requests so the
@@ -177,6 +245,16 @@ impl Conversation {
         self.messages.push(m);
     }
 
+    /// Insert `m` at `at`, shifting later messages right by one.
+    /// Callers use this when the setup prefix (`[System, Tools]`)
+    /// needs to be completed after body messages already landed —
+    /// specifically, when a host-env MCP's `tools/list` finishes
+    /// after the thread has accepted its initial user message.
+    /// Panics if `at > len()`, matching `Vec::insert` semantics.
+    pub fn insert(&mut self, at: usize, m: Message) {
+        self.messages.insert(at, m);
+    }
+
     pub fn messages(&self) -> &[Message] {
         &self.messages
     }
@@ -193,6 +271,84 @@ impl Conversation {
     /// [`Vec::truncate`], so `at >= self.len()` is a no-op.
     pub fn truncate(&mut self, at: usize) {
         self.messages.truncate(at);
+    }
+
+    /// System-prompt text captured at thread creation. Looks at
+    /// `messages[0]` and returns the first `ContentBlock::Text` body
+    /// if (and only if) the role is `Role::System`. Returns `""` for
+    /// conversations without a system-prefix (empty conversations,
+    /// legacy fixtures, etc.) so callers can treat the empty case as
+    /// "no system prompt."
+    pub fn system_prompt_text(&self) -> &str {
+        let Some(msg) = self.messages.first() else {
+            return "";
+        };
+        if msg.role != Role::System {
+            return "";
+        }
+        msg.content
+            .iter()
+            .find_map(|b| match b {
+                ContentBlock::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .unwrap_or("")
+    }
+
+    /// Mutable access to the `Role::Tools` manifest message — returns
+    /// `None` if the conversation doesn't yet have one at the expected
+    /// slot (`messages[1]` when `messages[0]` is `Role::System`, or
+    /// `messages[0]` otherwise). Used by the scheduler's rebind path to
+    /// refresh the snapshot in place when the MCP host set changes.
+    pub fn tools_message_mut(&mut self) -> Option<&mut Message> {
+        let idx = match self.messages.first() {
+            Some(m) if m.role == Role::System => 1,
+            _ => 0,
+        };
+        let msg = self.messages.get_mut(idx)?;
+        if msg.role == Role::Tools {
+            Some(msg)
+        } else {
+            None
+        }
+    }
+
+    /// Iterator over the `Role::ToolSchema` entries stored in the
+    /// thread's `Role::Tools` manifest message. Returns an empty iter
+    /// if the manifest slot isn't populated — adapters interpret that
+    /// as "this thread has no tools available."
+    pub fn tool_schemas(&self) -> impl Iterator<Item = (&str, &str, &Value)> {
+        let idx = match self.messages.first() {
+            Some(m) if m.role == Role::System => 1,
+            _ => 0,
+        };
+        let blocks = self
+            .messages
+            .get(idx)
+            .filter(|m| m.role == Role::Tools)
+            .map(|m| m.content.as_slice())
+            .unwrap_or(&[]);
+        blocks.iter().filter_map(|b| match b {
+            ContentBlock::ToolSchema {
+                name,
+                description,
+                input_schema,
+            } => Some((name.as_str(), description.as_str(), input_schema)),
+            _ => None,
+        })
+    }
+
+    /// Index of the first message that is *not* part of the setup
+    /// prefix (neither `Role::System` nor `Role::Tools`). Used by
+    /// the model-request builder to slice off the setup messages
+    /// before handing the conversation to a provider adapter, and by
+    /// cache-policy code to skip setup when choosing the rolling
+    /// breakpoint anchor.
+    pub fn setup_prefix_end(&self) -> usize {
+        self.messages
+            .iter()
+            .take_while(|m| matches!(m.role, Role::System | Role::Tools))
+            .count()
     }
 
     /// In-place migration for threads persisted before `Role::ToolResult`

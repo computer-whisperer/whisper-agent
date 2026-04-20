@@ -103,10 +103,17 @@ pub enum CatchUp {
 }
 
 /// Per-behavior thread-config override, layered on top of the pod's
-/// `thread_defaults`. Shape mirrors `ThreadConfigOverride` minus
-/// `system_prompt` (the behavior carries its own prompt in `prompt.md`)
-/// and gains a bindings subset so a behavior can narrow the thread's
-/// capability surface below the pod default.
+/// `thread_defaults`. Shape mirrors `ThreadConfigOverride` plus a
+/// bindings subset so a behavior can narrow the thread's capability
+/// surface below the pod default.
+///
+/// Note: `prompt.md` is the behavior's **user-message body** (the
+/// first turn the thread sees), while `system_prompt` here is the
+/// agent-personality preamble the model runs under. A behavior that
+/// wants to run its prompt.md under a different system prompt than
+/// the pod default sets `system_prompt` here — useful for e.g. a
+/// summarization behavior that should run as a summarizer, not the
+/// pod's default agent persona.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default)]
 pub struct BehaviorThreadOverride {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -115,6 +122,11 @@ pub struct BehaviorThreadOverride {
     pub max_tokens: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_turns: Option<u32>,
+    /// Per-thread system prompt for behavior-spawned threads. `None`
+    /// inherits the pod default; see [`SystemPromptChoice`] for the
+    /// File / Text variants.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub system_prompt: Option<crate::SystemPromptChoice>,
     #[serde(default)]
     pub bindings: BehaviorBindingsOverride,
 }

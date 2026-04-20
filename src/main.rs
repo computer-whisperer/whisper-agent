@@ -15,36 +15,23 @@ use whisper_agent::runtime::scheduler::{BackendEntry, SharedHostConfig};
 use whisper_agent::server::{self, ServerConfig};
 use whisper_agent::tools::sandbox::{HostEnvProviderEntry, HostEnvRegistry};
 
+// Seed for a fresh default pod's `system_prompt.md`. A neutral
+// general-assistant baseline — domain-specific pods should clone the
+// default pod and rewrite this file, or override per-thread via the
+// `system_prompt` field on `ThreadConfigOverride` / the [thread]
+// table in behavior.toml. Deliberately free of software-engineering
+// assumptions: the old "You are a software engineering agent" default
+// silently biased behavior-spawned threads toward build-tools / edit
+// actions even when the behavior's prompt.md said something else.
 const DEFAULT_SYSTEM_PROMPT: &str = "\
-You are a software engineering agent working in a workspace on the user's machine. Use the \
-available tools to investigate and change code to complete the user's request.
+You are a helpful AI assistant. Use the available tools to investigate, reason about, and \
+complete the user's requests.
 
-Tool selection:
-- Prefer dedicated tools over `bash` when one fits: `read_file`, `edit_file`, `write_file`, \
-`glob`, `grep`, `list_dir`. Reserve `bash` for shell-only work — builds, tests, git, running \
-scripts.
-- For searches: use `grep` for file contents and `glob` for filenames. Do NOT run \
-`grep`/`rg`/`find`/`ls`/`cat`/`head`/`tail`/`sed` via `bash`.
-- For edits: `edit_file` is for targeted substring edits and is almost always what you want. \
-Use `write_file` only to create a new file or fully rewrite one. Read the file before editing \
-it so your `old_string` matches what is actually on disk.
-- When tool calls are independent, issue them in parallel in a single response.
+Communicate concisely. Before your first tool call, say in one short sentence what you're \
+about to do. Give brief updates when you find something important, change direction, or hit \
+a blocker. End your turn with a one-to-two-sentence summary of what changed and what's next.
 
-Output style:
-- The user sees your text output, not your tool calls or reasoning. Before your first tool \
-call, say in one short sentence what you're about to do. Give brief updates when you find \
-something important, change direction, or hit a blocker — one sentence is almost always \
-enough.
-- Do not narrate deliberation or restate what tool results already show.
-- End-of-turn summary: one or two sentences on what changed and what's next. Nothing else.
-- Reference code as `path:line` so the user can jump to it.
-- Default to writing no comments in code unless the WHY is non-obvious. No emojis unless the \
-user asks.
-
-Scope:
-- Don't add features, refactors, or error handling beyond what the task requires.
-- Prefer editing existing files over creating new ones. Never create Markdown (*.md) or \
-README files unless the user explicitly asks.
+Cite sources you reference — for code, use `path:line` so the user can jump to it.
 ";
 const DEFAULT_BACKEND_NAME: &str = "anthropic";
 
@@ -442,11 +429,11 @@ async fn run_serve(args: ServeArgs) -> Result<()> {
         default_backend,
         default_task_config: ThreadConfig {
             model: default_model,
-            system_prompt: args.system_prompt,
             max_tokens: args.max_tokens,
             max_turns: args.max_turns,
             compaction: Default::default(),
         },
+        default_system_prompt: args.system_prompt,
         default_host_env,
         default_shared_host_names,
         audit_log_path: args.audit_log,

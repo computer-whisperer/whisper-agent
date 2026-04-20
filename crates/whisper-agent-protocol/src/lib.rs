@@ -28,6 +28,8 @@ pub use pod::{
     CompactionConfig, NamedHostEnv, PodAllow, PodConfig, PodLimits, PodSnapshot, PodState,
     PodSummary, ThreadDefaults,
 };
+// `SystemPromptChoice` is defined below; re-export here so other
+// crates can refer to it as `whisper_agent_protocol::SystemPromptChoice`.
 pub use sandbox::HostEnvSpec;
 
 use serde::{Deserialize, Serialize};
@@ -95,10 +97,17 @@ pub struct TurnEntry {
 }
 
 /// The per-thread configuration the server holds. Carries only "what the loop
-/// looks like" — model, prompts, limits, policy. Resource-side concerns
+/// looks like" — model, limits, policy. Resource-side concerns
 /// (which backend, which sandbox, which MCP hosts) live on
 /// [`ThreadBindings`]; the split was introduced in Phase 3d.i so resource
 /// lifecycles can move independently of thread config.
+///
+/// The system prompt and tool manifest used to live here too, but they
+/// now ride at the head of [`Conversation`] as `Role::System` and
+/// `Role::Tools` messages. Both are cache-fingerprint-critical — any
+/// change busts the prompt cache — so anchoring them to the immutable
+/// conversation log matches the operational reality and keeps the chat
+/// record identical to what the model actually saw.
 ///
 /// Clients can override pieces of this at thread-creation time via
 /// [`ThreadConfigOverride`]; bindings are overridden separately via
@@ -106,7 +115,6 @@ pub struct TurnEntry {
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct ThreadConfig {
     pub model: String,
-    pub system_prompt: String,
     pub max_tokens: u32,
     pub max_turns: u32,
     /// Policy for compacting an overlong thread into a continuation.
@@ -121,15 +129,41 @@ pub struct ThreadConfigOverride {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub system_prompt: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_tokens: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_turns: Option<u32>,
+    /// Creation-time choice of system prompt for the new thread.
+    /// `None` inherits the pod's cached `system_prompt` (the text of
+    /// the file named by `thread_defaults.system_prompt_file`).
+    /// `Some(File { name })` reads a sibling file from the pod dir;
+    /// `Some(Text { text })` uses the literal string. Resolved once
+    /// during thread creation and frozen into `conversation[0]` as
+    /// the `Role::System` message — not preserved on `ThreadConfig`,
+    /// since the conversation log is the source of truth for what the
+    /// model actually saw.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub system_prompt: Option<SystemPromptChoice>,
     /// Per-field compaction override. Fields left `None` inherit from
     /// the pod's defaults; any set field replaces it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub compaction: Option<CompactionConfigOverride>,
+}
+
+/// How a thread-creation caller specifies the system prompt to seed
+/// `conversation[0]` with. Pod-relative file lookup or inline text;
+/// more variants (e.g. named-template reference) can join later
+/// without changing call sites that already match on `File`/`Text`.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum SystemPromptChoice {
+    /// Read the prompt from `<pod_dir>/<name>`. Missing file logs a
+    /// warning and falls back to the pod's cached default prompt —
+    /// same graceful-degrade story as an unreadable
+    /// `thread_defaults.system_prompt_file`. Pod-relative (not
+    /// absolute) so the pod's filesystem boundary is respected.
+    File { name: String },
+    /// Inline prompt text used verbatim.
+    Text { text: String },
 }
 
 /// Per-thread compaction override. Shape mirrors [`CompactionConfig`] but
