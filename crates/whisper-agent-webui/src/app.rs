@@ -35,11 +35,11 @@ use whisper_agent_protocol::{
     AllowMap, ApprovalChoice, BackendSummary, BehaviorConfig, BehaviorOrigin,
     BehaviorSnapshot as BehaviorSnapshotProto, BehaviorSummary, BehaviorThreadOverride,
     ClientToServer, ContentBlock, Conversation, FsEntry, FunctionKind, FunctionSummary,
-    HostEnvBinding, HostEnvProviderInfo, HostEnvSpec, Message, ModelSummary, NamedHostEnv,
-    PodAllow, PodConfig, PodLimits, PodSummary, ResourceSnapshot, ResourceStateLabel,
-    RetentionPolicy, Role, ServerToClient, ThreadBindings, ThreadBindingsRequest,
-    ThreadConfigOverride, ThreadDefaults, ThreadStateLabel, ThreadSummary, ToolResultContent,
-    TriggerSpec, TurnLog, Usage,
+    HostEnvBinding, HostEnvProviderInfo, HostEnvProviderOrigin, HostEnvReachability, HostEnvSpec,
+    Message, ModelSummary, NamedHostEnv, PodAllow, PodConfig, PodLimits, PodSummary,
+    ResourceSnapshot, ResourceStateLabel, RetentionPolicy, Role, ServerToClient, ThreadBindings,
+    ThreadBindingsRequest, ThreadConfigOverride, ThreadDefaults, ThreadStateLabel, ThreadSummary,
+    ToolResultContent, TriggerSpec, TurnLog, Usage,
 };
 
 /// Events pushed into [`Inbound`]. In addition to decoded wire messages we pipe in
@@ -665,6 +665,19 @@ pub struct ChatApp {
     /// configuration; pods in it just can't declare host envs.
     host_env_providers: Vec<HostEnvProviderInfo>,
     host_env_providers_requested: bool,
+    /// Modal state for the per-provider add/edit form. `None` = closed.
+    /// Opened from the Providers tab (+Add or Edit row button).
+    provider_editor_modal: Option<ProviderEditorModalState>,
+    /// Provider names whose Remove button has been clicked once and is
+    /// waiting for confirmation. Two-click UX mirrors the pod archive
+    /// and behavior delete flows. Cleared on confirm / outside click /
+    /// successful remove response.
+    provider_remove_armed: HashSet<String>,
+    /// Per-provider in-flight remove correlation + any returned error.
+    /// The row renders "removing..." while a correlation is present;
+    /// on `HostEnvProviderRemoved` the entry is cleared; on `Error` the
+    /// message is stored for display and the correlation is cleared.
+    provider_remove_pending: HashMap<String, ProviderRemovePending>,
     /// Set of pod ids the user has manually collapsed in the left panel.
     /// Default is "all expanded"; toggling a header inverts membership.
     /// Persisted only in memory — re-expands across reloads.
@@ -795,6 +808,10 @@ enum LeftPanelMode {
     #[default]
     Threads,
     Resources,
+    /// Host-env provider catalog (server-wide settings). Distinct from
+    /// Resources — Resources shows *live* provisioned sandboxes, this
+    /// tab shows the *registered providers* that can be provisioned.
+    Providers,
 }
 
 /// State for the per-pod config editor. The modal is tabbed: three
@@ -962,6 +979,70 @@ impl NewPodModalState {
             error: None,
         }
     }
+}
+
+/// State for the per-provider add/edit modal. `mode` decides whether
+/// the name field is editable (Add) or read-only (Edit); everything
+/// else is shared. On Save the form dispatches `AddHostEnvProvider` or
+/// `UpdateHostEnvProvider` and stores the correlation_id so the
+/// corresponding response can find and close the modal.
+///
+/// Token is a free-text field; for Edit, the initial value is blank —
+/// the server never sends tokens back — and saving with an empty
+/// token means "clear the token on this entry" (matches the
+/// protocol's UpdateHostEnvProvider `token: None` semantics).
+struct ProviderEditorModalState {
+    mode: ProviderEditorMode,
+    name: String,
+    url: String,
+    token: String,
+    /// Tracks whether the existing entry had a token at modal open —
+    /// used only to render a "currently authenticated" hint next to
+    /// the blank token field in Edit mode.
+    had_token: bool,
+    error: Option<String>,
+    pending_correlation: Option<String>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ProviderEditorMode {
+    Add,
+    Edit,
+}
+
+impl ProviderEditorModalState {
+    fn new_add() -> Self {
+        Self {
+            mode: ProviderEditorMode::Add,
+            name: String::new(),
+            url: String::new(),
+            token: String::new(),
+            had_token: false,
+            error: None,
+            pending_correlation: None,
+        }
+    }
+
+    fn new_edit(info: &HostEnvProviderInfo) -> Self {
+        Self {
+            mode: ProviderEditorMode::Edit,
+            name: info.name.clone(),
+            url: info.url.clone(),
+            token: String::new(),
+            had_token: info.has_token,
+            error: None,
+            pending_correlation: None,
+        }
+    }
+}
+
+/// Tracks one in-flight `RemoveHostEnvProvider` request. `correlation`
+/// is the id we'll match against `HostEnvProviderRemoved` or `Error`;
+/// `error` carries any server-side refusal message (e.g. "referenced
+/// by pods [...]") so the row can render it inline.
+struct ProviderRemovePending {
+    correlation: String,
+    error: Option<String>,
 }
 
 /// State for the per-behavior editor modal. Edits two things in
@@ -1253,6 +1334,9 @@ impl ChatApp {
             behaviors_requested: HashSet::new(),
             host_env_providers: Vec::new(),
             host_env_providers_requested: false,
+            provider_editor_modal: None,
+            provider_remove_armed: HashSet::new(),
+            provider_remove_pending: HashMap::new(),
             collapsed_pods: HashSet::new(),
             expanded_interactive_pods: HashSet::new(),
             expanded_behavior_threads: HashSet::new(),
@@ -1791,6 +1875,30 @@ impl ChatApp {
                     modal.pending_correlation = None;
                     return;
                 }
+                // Provider editor modal pending add / update.
+                if let Some(modal) = self.provider_editor_modal.as_mut()
+                    && correlation_id.is_some()
+                    && modal.pending_correlation == correlation_id
+                {
+                    modal.error = Some(message);
+                    modal.pending_correlation = None;
+                    return;
+                }
+                // Provider remove pending on a specific row. Match by
+                // correlation rather than iterating names so a stale
+                // remove that targets a now-gone name still resolves.
+                if let Some(cid) = correlation_id.as_deref()
+                    && let Some((name, _)) = self
+                        .provider_remove_pending
+                        .iter()
+                        .find(|(_, p)| p.correlation == cid)
+                        .map(|(n, p)| (n.clone(), p))
+                {
+                    if let Some(p) = self.provider_remove_pending.get_mut(&name) {
+                        p.error = Some(message);
+                    }
+                    return;
+                }
                 if let Some(tid) = thread_id.as_ref()
                     && let Some(view) = self.tasks.get_mut(tid)
                 {
@@ -2189,8 +2297,14 @@ impl ChatApp {
             ServerToClient::FunctionEnded { function_id, .. } => {
                 self.active_functions.remove(&function_id);
             }
-            ServerToClient::HostEnvProviderAdded { provider, .. }
-            | ServerToClient::HostEnvProviderUpdated { provider, .. } => {
+            ServerToClient::HostEnvProviderAdded {
+                provider,
+                correlation_id,
+            }
+            | ServerToClient::HostEnvProviderUpdated {
+                provider,
+                correlation_id,
+            } => {
                 if let Some(existing) = self
                     .host_env_providers
                     .iter_mut()
@@ -2201,9 +2315,32 @@ impl ChatApp {
                     self.host_env_providers.push(provider);
                     self.host_env_providers.sort_by(|a, b| a.name.cmp(&b.name));
                 }
+                // Close the editor modal if it was waiting on this
+                // correlation. Edits that bypassed the modal (server-
+                // side seed, another client's CRUD) land here with
+                // `None` and leave the modal alone.
+                if correlation_id.is_some()
+                    && let Some(modal) = self.provider_editor_modal.as_ref()
+                    && modal.pending_correlation == correlation_id
+                {
+                    self.provider_editor_modal = None;
+                }
             }
-            ServerToClient::HostEnvProviderRemoved { name, .. } => {
+            ServerToClient::HostEnvProviderRemoved {
+                name,
+                correlation_id,
+            } => {
                 self.host_env_providers.retain(|p| p.name != name);
+                // Clear any pending-remove state if this was our
+                // request. Another client's remove lands here too
+                // (correlation_id: None); nothing to clean up in that
+                // case beyond the list itself.
+                if let Some(pending) = self.provider_remove_pending.get(&name)
+                    && correlation_id.as_deref() == Some(pending.correlation.as_str())
+                {
+                    self.provider_remove_pending.remove(&name);
+                }
+                self.provider_remove_armed.remove(&name);
             }
         }
     }
@@ -2899,11 +3036,21 @@ impl eframe::App for ChatApp {
                     {
                         self.left_mode = LeftPanelMode::Resources;
                     }
+                    if ui
+                        .selectable_label(
+                            self.left_mode == LeftPanelMode::Providers,
+                            format!("Providers ({})", self.host_env_providers.len()),
+                        )
+                        .clicked()
+                    {
+                        self.left_mode = LeftPanelMode::Providers;
+                    }
                 });
                 ui.separator();
                 match self.left_mode {
                     LeftPanelMode::Threads => self.render_thread_tree(ui),
                     LeftPanelMode::Resources => render_resource_list(ui, &self.resources),
+                    LeftPanelMode::Providers => self.render_providers_list(ui),
                 }
             });
 
@@ -3291,6 +3438,7 @@ impl eframe::App for ChatApp {
         self.render_file_tree_modal(&ctx);
         self.render_file_viewer_modal(&ctx);
         self.render_json_viewer_modal(&ctx);
+        self.render_provider_editor_modal(&ctx);
 
         // Draft debounce tick. Schedule a repaint at the deadline so
         // the flush fires even if nothing else is driving frames.
@@ -4568,6 +4716,189 @@ impl ChatApp {
         }
     }
 
+    /// Left-panel Providers tab. Lists registered host-env providers
+    /// with origin + reachability badges and per-row Edit / Remove
+    /// actions. "+ Add provider" at the top opens the add modal.
+    fn render_providers_list(&mut self, ui: &mut egui::Ui) {
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            if ui.button("+ Add provider").clicked() {
+                self.provider_editor_modal = Some(ProviderEditorModalState::new_add());
+            }
+            ui.label(
+                RichText::new("Sandbox daemons threads can provision host envs against.")
+                    .small()
+                    .color(Color32::from_gray(150)),
+            );
+        });
+        ui.separator();
+
+        if self.host_env_providers.is_empty() {
+            ui.add_space(8.0);
+            ui.label(
+                RichText::new(
+                    "No providers registered. Add one here, or seed them via \
+                     [[host_env_providers]] in whisper-agent.toml.",
+                )
+                .small()
+                .color(Color32::from_gray(150)),
+            );
+            return;
+        }
+
+        // Snapshot the provider list before the row loop so Edit /
+        // Remove actions can mutate `self` (modal state, correlation
+        // map) without fighting a borrow against the live Vec.
+        let providers = self.host_env_providers.clone();
+        ScrollArea::vertical().show(ui, |ui| {
+            for provider in &providers {
+                render_provider_row(ui, provider, self);
+                ui.add_space(2.0);
+                ui.separator();
+            }
+        });
+    }
+
+    /// Add / edit provider modal. Dispatches `AddHostEnvProvider` or
+    /// `UpdateHostEnvProvider` on Save, tracks the correlation so the
+    /// matching response / error routes back here.
+    fn render_provider_editor_modal(&mut self, ctx: &egui::Context) {
+        let Some(mut modal) = self.provider_editor_modal.take() else {
+            return;
+        };
+        let mut open = true;
+        let mut save_clicked = false;
+        let mut cancel_clicked = false;
+        let saving = modal.pending_correlation.is_some();
+        let title = match modal.mode {
+            ProviderEditorMode::Add => "Add host-env provider",
+            ProviderEditorMode::Edit => "Edit host-env provider",
+        };
+
+        egui::Window::new(title)
+            .collapsible(false)
+            .resizable(false)
+            .default_width(460.0)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .open(&mut open)
+            .show(ctx, |ui| {
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    ui.label("name");
+                    let name_edit = TextEdit::singleline(&mut modal.name)
+                        .hint_text("catalog name (e.g. 'landlock-laptop')")
+                        .desired_width(f32::INFINITY);
+                    // Edit mode: name is immutable — pod bindings
+                    // reference providers by name, so renaming would
+                    // dangle them. Rebuild by removing and re-adding
+                    // if truly needed.
+                    let editable = modal.mode == ProviderEditorMode::Add;
+                    ui.add_enabled(editable, name_edit);
+                });
+                if modal.mode == ProviderEditorMode::Edit {
+                    ui.label(
+                        RichText::new(
+                            "Name is fixed once set — pod bindings reference it. \
+                             Remove + re-add to rename.",
+                        )
+                        .small()
+                        .color(Color32::from_gray(150)),
+                    );
+                }
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    ui.label("url");
+                    ui.add(
+                        TextEdit::singleline(&mut modal.url)
+                            .hint_text("http://host:port")
+                            .desired_width(f32::INFINITY),
+                    );
+                });
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    ui.label("token");
+                    ui.add(
+                        TextEdit::singleline(&mut modal.token)
+                            .password(true)
+                            .hint_text(if modal.had_token {
+                                "leave blank to clear existing token"
+                            } else {
+                                "control-plane bearer (optional)"
+                            })
+                            .desired_width(f32::INFINITY),
+                    );
+                });
+                ui.label(
+                    RichText::new(
+                        "The token must match the daemon's --control-token-file \
+                         (or leave blank for a --no-auth dev daemon).",
+                    )
+                    .small()
+                    .color(Color32::from_gray(150)),
+                );
+                if let Some(err) = &modal.error {
+                    ui.add_space(6.0);
+                    ui.colored_label(Color32::from_rgb(220, 80, 80), err);
+                }
+                ui.add_space(8.0);
+                ui.separator();
+                ui.horizontal(|ui| {
+                    let save_enabled =
+                        !saving && !modal.name.trim().is_empty() && !modal.url.trim().is_empty();
+                    let label = if saving { "Saving…" } else { "Save" };
+                    if ui
+                        .add_enabled(save_enabled, egui::Button::new(label))
+                        .clicked()
+                    {
+                        save_clicked = true;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        cancel_clicked = true;
+                    }
+                });
+            });
+
+        if save_clicked {
+            modal.error = None;
+            let correlation = self.next_correlation_id();
+            modal.pending_correlation = Some(correlation.clone());
+            let name = modal.name.trim().to_string();
+            let url = modal.url.trim().to_string();
+            let token_raw = modal.token.trim().to_string();
+            let token = if token_raw.is_empty() {
+                None
+            } else {
+                Some(token_raw)
+            };
+            match modal.mode {
+                ProviderEditorMode::Add => {
+                    self.send(ClientToServer::AddHostEnvProvider {
+                        correlation_id: Some(correlation),
+                        name,
+                        url,
+                        token,
+                    });
+                }
+                ProviderEditorMode::Edit => {
+                    self.send(ClientToServer::UpdateHostEnvProvider {
+                        correlation_id: Some(correlation),
+                        name,
+                        url,
+                        token,
+                    });
+                }
+            }
+            // Keep the modal open; it closes on the matching response
+            // (HostEnvProviderAdded / HostEnvProviderUpdated) or shows
+            // the server's error via the Error event handler.
+            self.provider_editor_modal = Some(modal);
+        } else if cancel_clicked || !open {
+            // Modal closes.
+        } else {
+            self.provider_editor_modal = Some(modal);
+        }
+    }
+
     fn render_new_behavior_modal(&mut self, ctx: &egui::Context) {
         let Some(mut modal) = self.new_behavior_modal.take() else {
             return;
@@ -5584,6 +5915,136 @@ pub(super) fn spec_label(spec: &HostEnvSpec) -> String {
         HostEnvSpec::Landlock { allowed_paths, .. } => {
             format!("landlock · {} paths", allowed_paths.len())
         }
+    }
+}
+
+/// One row in the Providers tab. Takes `&mut App` so Edit/Remove
+/// clicks can mutate modal state and dispatch protocol messages. The
+/// provider snapshot is read from a clone so this function doesn't
+/// hold a borrow against the live `host_env_providers` Vec.
+fn render_provider_row(ui: &mut egui::Ui, info: &HostEnvProviderInfo, app: &mut ChatApp) {
+    let (origin_chip, origin_color) = provider_origin_chip(info.origin);
+    let (reach_chip, reach_color, reach_detail) = provider_reachability_chip(&info.reachability);
+    ui.horizontal(|ui| {
+        ui.label(RichText::new(&info.name).strong());
+        ui.label(
+            RichText::new(format!("[{origin_chip}]"))
+                .color(origin_color)
+                .small(),
+        );
+        ui.label(
+            RichText::new(format!("[{reach_chip}]"))
+                .color(reach_color)
+                .small(),
+        );
+        if info.has_token {
+            ui.label(RichText::new("auth").color(Color32::from_gray(160)).small());
+        } else {
+            ui.label(
+                RichText::new("no auth")
+                    .color(Color32::from_rgb(180, 140, 90))
+                    .small(),
+            );
+        }
+    });
+    ui.label(
+        RichText::new(&info.url)
+            .color(Color32::from_gray(160))
+            .small()
+            .monospace(),
+    );
+    if let Some(detail) = &reach_detail {
+        ui.label(RichText::new(detail).color(reach_color).small());
+    }
+
+    // Actions. Runtime-overlay entries (CLI flags) can't be edited or
+    // removed via the UI — the corresponding server-side command
+    // refuses them. Show the buttons disabled with a hint so the user
+    // isn't confused.
+    let is_overlay = info.origin == HostEnvProviderOrigin::RuntimeOverlay;
+    // Clone the relevant bits out so the closures below can re-borrow
+    // `app` mutably without fighting a lingering immutable borrow.
+    let pending_error = app
+        .provider_remove_pending
+        .get(&info.name)
+        .and_then(|p| p.error.clone());
+    let removing = app
+        .provider_remove_pending
+        .get(&info.name)
+        .is_some_and(|p| p.error.is_none());
+    let armed = app.provider_remove_armed.contains(&info.name);
+
+    ui.horizontal(|ui| {
+        let edit_btn = ui.add_enabled(!is_overlay && !removing, egui::Button::new("Edit"));
+        if edit_btn.clicked() {
+            app.provider_editor_modal = Some(ProviderEditorModalState::new_edit(info));
+        }
+
+        let remove_label = if removing {
+            "Removing…"
+        } else if armed {
+            "Confirm remove"
+        } else {
+            "Remove"
+        };
+        let remove_btn = ui.add_enabled(!is_overlay && !removing, egui::Button::new(remove_label));
+        if remove_btn.clicked() {
+            if armed {
+                let correlation = app.next_correlation_id();
+                app.provider_remove_armed.remove(&info.name);
+                app.provider_remove_pending.insert(
+                    info.name.clone(),
+                    ProviderRemovePending {
+                        correlation: correlation.clone(),
+                        error: None,
+                    },
+                );
+                app.send(ClientToServer::RemoveHostEnvProvider {
+                    correlation_id: Some(correlation),
+                    name: info.name.clone(),
+                });
+            } else {
+                app.provider_remove_armed.insert(info.name.clone());
+            }
+        }
+        if is_overlay {
+            ui.label(
+                RichText::new("CLI-overlay (drop --host-env-provider flag to manage here)")
+                    .small()
+                    .color(Color32::from_gray(150)),
+            );
+        }
+    });
+    if let Some(err) = pending_error {
+        ui.label(
+            RichText::new(format!("remove failed: {err}"))
+                .small()
+                .color(Color32::from_rgb(220, 80, 80)),
+        );
+    }
+}
+
+fn provider_origin_chip(origin: HostEnvProviderOrigin) -> (&'static str, Color32) {
+    match origin {
+        HostEnvProviderOrigin::Seeded => ("seeded", Color32::from_rgb(140, 160, 200)),
+        HostEnvProviderOrigin::Manual => ("manual", Color32::from_rgb(140, 200, 160)),
+        HostEnvProviderOrigin::RuntimeOverlay => ("cli-overlay", Color32::from_rgb(200, 180, 120)),
+    }
+}
+
+fn provider_reachability_chip(r: &HostEnvReachability) -> (&'static str, Color32, Option<String>) {
+    match r {
+        HostEnvReachability::Unknown => ("probing", Color32::from_gray(150), None),
+        HostEnvReachability::Reachable { at } => (
+            "reachable",
+            Color32::from_rgb(120, 180, 120),
+            Some(format!("last probe OK · {at}")),
+        ),
+        HostEnvReachability::Unreachable { since, last_error } => (
+            "unreachable",
+            Color32::from_rgb(220, 110, 110),
+            Some(format!("since {since} · {last_error}")),
+        ),
     }
 }
 
