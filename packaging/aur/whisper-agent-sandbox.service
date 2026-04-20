@@ -43,10 +43,22 @@ AmbientCapabilities=
 NoNewPrivileges=yes
 
 # Filesystem isolation. ReadWritePaths grants back the state dir.
+#
+# Deliberately NOT setting PrivateTmp=yes: pods configure their
+# workspace root as a host path (commonly under /tmp for scratch
+# work), and the child MCP host inherits this service's mount
+# namespace. A private /tmp would silently shadow those paths — the
+# child would see an empty tmpfs and fail to start. Per-thread
+# isolation is landlock's job, not systemd's.
+#
+# ProtectHome is left on: the whisper-agent user has no legitimate
+# access to /home or /root; sandbox workspaces that need to live
+# under a user home should either chown the directory to the
+# whisper-agent user or use a path outside of ProtectHome's default
+# cover.
 ProtectSystem=strict
 ProtectHome=yes
 ReadWritePaths=/var/lib/whisper-agent
-PrivateTmp=yes
 
 # Kernel surface: nothing the daemon needs.
 ProtectKernelTunables=yes
