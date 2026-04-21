@@ -329,6 +329,7 @@ fn function_kind_label(kind: FunctionKind) -> &'static str {
         FunctionKind::BuiltinToolCall => "tool",
         FunctionKind::McpToolUse => "mcp tool",
         FunctionKind::RequestEscalation => "escalate",
+        FunctionKind::Sudo => "sudo",
     }
 }
 
@@ -540,6 +541,17 @@ struct TaskView {
 struct PendingEscalation {
     thread_id: String,
     request: whisper_agent_protocol::permission::EscalationRequest,
+    reason: String,
+}
+
+/// In-flight `sudo` approval request the server is awaiting a decision
+/// on. Mirrors `PendingEscalation` but carries the wrapped tool name +
+/// args rather than a structured widening request.
+#[derive(Clone)]
+struct PendingSudo {
+    thread_id: String,
+    tool_name: String,
+    args: serde_json::Value,
     reason: String,
 }
 
@@ -809,6 +821,16 @@ pub struct ChatApp {
     /// escalation banner, keyed by `function_id`. Kept per-entry so
     /// switching between banners doesn't lose typing.
     escalation_reject_drafts: HashMap<u64, String>,
+
+    /// Pending `sudo` approval prompts awaiting user decision. Keyed
+    /// by `function_id` — the id the server expects back in
+    /// `ResolveSudo`. Populated by `SudoRequested`, drained by
+    /// `SudoResolved` (or by an explicit click that optimistically
+    /// removes the entry).
+    pending_sudos: HashMap<u64, PendingSudo>,
+    /// Draft text the user typed into the reject-reason field of a
+    /// sudo banner, keyed by `function_id`.
+    sudo_reject_drafts: HashMap<u64, String>,
 
     /// Which view the left side panel is showing.
     left_mode: LeftPanelMode,
@@ -1494,6 +1516,8 @@ impl ChatApp {
             functions_requested: false,
             pending_escalations: HashMap::new(),
             escalation_reject_drafts: HashMap::new(),
+            pending_sudos: HashMap::new(),
+            sudo_reject_drafts: HashMap::new(),
             left_mode: LeftPanelMode::default(),
             md_cache: CommonMarkCache::default(),
         }
@@ -2558,6 +2582,27 @@ impl ChatApp {
                 self.pending_escalations.remove(&function_id);
                 self.escalation_reject_drafts.remove(&function_id);
             }
+            ServerToClient::SudoRequested {
+                function_id,
+                thread_id,
+                tool_name,
+                args,
+                reason,
+            } => {
+                self.pending_sudos.insert(
+                    function_id,
+                    PendingSudo {
+                        thread_id,
+                        tool_name,
+                        args,
+                        reason,
+                    },
+                );
+            }
+            ServerToClient::SudoResolved { function_id, .. } => {
+                self.pending_sudos.remove(&function_id);
+                self.sudo_reject_drafts.remove(&function_id);
+            }
         }
     }
 
@@ -3568,6 +3613,12 @@ impl eframe::App for ChatApp {
             whisper_agent_protocol::permission::EscalationDecision,
             Option<String>,
         )> = Vec::new();
+        // Sudo-banner decisions — same pattern as escalation_decisions.
+        let mut sudo_decisions: Vec<(
+            u64,
+            whisper_agent_protocol::permission::SudoDecision,
+            Option<String>,
+        )> = Vec::new();
         // Pre-split borrows: the closure needs `&mut self.tasks` (via
         // get_mut), `&mut self.md_cache`, and read/write access to the
         // escalation state simultaneously. Destructuring up front lets
@@ -3578,6 +3629,8 @@ impl eframe::App for ChatApp {
         let md_cache = &mut self.md_cache;
         let pending_escalations = &self.pending_escalations;
         let escalation_reject_drafts = &mut self.escalation_reject_drafts;
+        let pending_sudos = &self.pending_sudos;
+        let sudo_reject_drafts = &mut self.sudo_reject_drafts;
         egui::CentralPanel::default().show_inside(ui, |ui| match selected.clone() {
             None => {
                 ui.vertical_centered(|ui| {
@@ -3606,6 +3659,13 @@ impl eframe::App for ChatApp {
                         pending_escalations,
                         escalation_reject_drafts,
                         &mut escalation_decisions,
+                    );
+                    render_sudo_banners(
+                        ui,
+                        &thread_id,
+                        pending_sudos,
+                        sudo_reject_drafts,
+                        &mut sudo_decisions,
                     );
                     ScrollArea::vertical().stick_to_bottom(true).show(ui, |ui| {
                         if view.items.is_empty() {
@@ -3661,6 +3721,15 @@ impl eframe::App for ChatApp {
             });
             self.pending_escalations.remove(&function_id);
             self.escalation_reject_drafts.remove(&function_id);
+        }
+        for (function_id, decision, reason) in sudo_decisions {
+            self.send(ClientToServer::ResolveSudo {
+                function_id,
+                decision,
+                reason,
+            });
+            self.pending_sudos.remove(&function_id);
+            self.sudo_reject_drafts.remove(&function_id);
         }
 
         let ctx = ui.ctx().clone();
@@ -7461,6 +7530,99 @@ fn describe_escalation_request(
         RaisePodModify { target } => format!("Raise pod_modify cap to {target:?}"),
         RaiseBehaviors { target } => format!("Raise behaviors cap to {target:?}"),
         RaiseDispatch { target } => format!("Raise dispatch cap to {target:?}"),
+    }
+}
+
+/// Render one three-way-approval banner per pending sudo for
+/// `thread_id`. Three buttons: Approve (once), Remember (approve +
+/// admit the tool name for the rest of the thread), Reject. Args are
+/// pretty-printed below the tool name so the user can see exactly what
+/// the model wants to run.
+fn render_sudo_banners(
+    ui: &mut egui::Ui,
+    thread_id: &str,
+    pending: &HashMap<u64, PendingSudo>,
+    reject_drafts: &mut HashMap<u64, String>,
+    decisions_out: &mut Vec<(
+        u64,
+        whisper_agent_protocol::permission::SudoDecision,
+        Option<String>,
+    )>,
+) {
+    use whisper_agent_protocol::permission::SudoDecision;
+
+    let mut ids: Vec<u64> = pending
+        .iter()
+        .filter_map(|(id, s)| (s.thread_id == thread_id).then_some(*id))
+        .collect();
+    ids.sort_unstable();
+
+    for function_id in ids {
+        let Some(s) = pending.get(&function_id) else {
+            continue;
+        };
+        egui::Frame::group(ui.style())
+            .fill(Color32::from_rgb(40, 40, 58))
+            .show(ui, |ui| {
+                ui.vertical(|ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            RichText::new("sudo requested")
+                                .color(Color32::from_rgb(180, 200, 250))
+                                .strong(),
+                        );
+                        ui.label(
+                            RichText::new(format!("fn #{function_id}"))
+                                .small()
+                                .color(Color32::from_gray(180)),
+                        );
+                    });
+                    ui.add_space(2.0);
+                    ui.label(
+                        RichText::new(format!("tool: `{}`", s.tool_name))
+                            .color(Color32::from_rgb(220, 230, 250))
+                            .monospace(),
+                    );
+                    let args_text = serde_json::to_string_pretty(&s.args)
+                        .unwrap_or_else(|_| s.args.to_string());
+                    ui.add_space(2.0);
+                    ui.label(
+                        RichText::new(args_text)
+                            .small()
+                            .monospace()
+                            .color(Color32::from_gray(200)),
+                    );
+                    if !s.reason.trim().is_empty() {
+                        ui.add_space(2.0);
+                        ui.label(
+                            RichText::new(format!("reason: {}", s.reason))
+                                .small()
+                                .color(Color32::from_gray(210)),
+                        );
+                    }
+                    ui.add_space(4.0);
+                    let draft = reject_drafts.entry(function_id).or_default();
+                    ui.horizontal(|ui| {
+                        if ui.button("Approve").clicked() {
+                            decisions_out.push((function_id, SudoDecision::ApproveOnce, None));
+                        }
+                        if ui.button("Remember").clicked() {
+                            decisions_out.push((function_id, SudoDecision::ApproveRemember, None));
+                        }
+                        if ui.button("Reject").clicked() {
+                            let reason = draft.trim();
+                            let reason = (!reason.is_empty()).then(|| reason.to_string());
+                            decisions_out.push((function_id, SudoDecision::Reject, reason));
+                        }
+                        ui.add(
+                            TextEdit::singleline(draft)
+                                .hint_text("reject reason (optional)")
+                                .desired_width(ui.available_width()),
+                        );
+                    });
+                });
+            });
+        ui.add_space(4.0);
     }
 }
 
