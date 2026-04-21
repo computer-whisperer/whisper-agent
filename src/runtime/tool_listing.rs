@@ -170,11 +170,7 @@ fn one_line_description(desc: &str) -> String {
     // want one line so the prompt stays tight. Truncate at the first
     // period/newline and cap at ~120 chars so a GitHub-style "this
     // tool does X (see also: Y)" still fits.
-    let first = desc
-        .split(['\n', '.'])
-        .next()
-        .unwrap_or(desc)
-        .trim();
+    let first = desc.split(['\n', '.']).next().unwrap_or(desc).trim();
     if first.len() > 120 {
         let mut t = first.chars().take(117).collect::<String>();
         t.push_str("...");
@@ -235,6 +231,66 @@ fn render_all_names(tools: &[AdmissibleTool], escalation_available: bool) -> Str
         out.push('\n');
     }
 
+    out
+}
+
+/// Render an append-only activation message announcing newly-available
+/// tools (by name, with one-line descriptions — schemas are fetched
+/// via `describe_tool` on demand). Used when `activation_surface =
+/// Announce`.
+///
+/// The message is a self-contained `## Tools newly available` section
+/// so the model can tell it apart from the initial listing at seed
+/// time. Grouped by source for readability.
+pub fn render_activation_announce(tools: &[AdmissibleTool]) -> String {
+    if tools.is_empty() {
+        return String::new();
+    }
+    let mut out = String::new();
+    out.push_str("## Tools newly available\n\n");
+    out.push_str(
+        "The tools listed below have just become available in this thread's scope. \
+         Full schemas aren't inlined — call `describe_tool` with a name to fetch one.\n\n",
+    );
+    // Reuse the seed-time grouping so the appearance is consistent.
+    for (label, entries) in group_by_category(tools) {
+        out.push_str(&format!("### {}\n", group_header(&label)));
+        for t in entries {
+            out.push_str(&format!(
+                "- `{}` — {}\n",
+                t.name,
+                one_line_description(&t.description)
+            ));
+        }
+        out.push('\n');
+    }
+    out
+}
+
+/// Render an append-only activation message that inlines the full
+/// schemas of newly-available tools. Used when `activation_surface =
+/// InjectSchema`. Trades upfront cost (schema tokens) for zero
+/// round-trips to `describe_tool` before first call.
+pub fn render_activation_inject(tools: &[AdmissibleTool]) -> String {
+    if tools.is_empty() {
+        return String::new();
+    }
+    let mut out = String::new();
+    out.push_str("## Tools newly available\n\n");
+    out.push_str(
+        "The tools listed below have just become available in this thread's scope. \
+         Full schemas are inlined for immediate use.\n\n",
+    );
+    for t in tools {
+        let schema = serde_json::to_string_pretty(&t.input_schema)
+            .unwrap_or_else(|e| format!("<schema serialization failed: {e}>"));
+        out.push_str(&format!(
+            "### `{name}` [{cat}]\n{desc}\n\nInput schema:\n```json\n{schema}\n```\n\n",
+            name = t.name,
+            cat = t.category.label(),
+            desc = t.description
+        ));
+    }
     out
 }
 
@@ -448,5 +504,56 @@ mod tests {
     fn one_line_description_stops_at_first_sentence() {
         let multi = "Short. Then more stuff.";
         assert_eq!(one_line_description(multi), "Short");
+    }
+
+    #[test]
+    fn activation_announce_groups_by_source() {
+        let tools = vec![
+            tool(
+                "rustdev_bash",
+                "shell",
+                ToolCategory::HostEnv {
+                    env_name: "rustdev".into(),
+                },
+                false,
+            ),
+            tool(
+                "create_issue",
+                "github",
+                ToolCategory::SharedMcp {
+                    host_name: "github".into(),
+                },
+                false,
+            ),
+        ];
+        let out = render_activation_announce(&tools);
+        assert!(out.contains("Tools newly available"));
+        assert!(out.contains("`rustdev_bash`"));
+        assert!(out.contains("`create_issue`"));
+        assert!(out.contains("Host env `rustdev`"));
+        assert!(out.contains("Shared MCP `github`"));
+    }
+
+    #[test]
+    fn activation_announce_empty_is_empty() {
+        assert!(render_activation_announce(&[]).is_empty());
+    }
+
+    #[test]
+    fn activation_inject_includes_schemas() {
+        let tools = vec![tool(
+            "rustdev_bash",
+            "shell",
+            ToolCategory::HostEnv {
+                env_name: "rustdev".into(),
+            },
+            false,
+        )];
+        let out = render_activation_inject(&tools);
+        assert!(out.contains("Tools newly available"));
+        assert!(out.contains("`rustdev_bash`"));
+        // Schema body is JSON-fenced.
+        assert!(out.contains("```json"));
+        assert!(out.contains("\"type\""));
     }
 }

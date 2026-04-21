@@ -2734,6 +2734,80 @@ impl Scheduler {
         }
     }
 
+    /// Binding-side prefix a given thread would apply to tool names
+    /// from `target_mcp_id`, if any. `Some(prefix)` for host-env
+    /// bindings (host-env tools are prefixed `{env_name}_{tool}` on
+    /// the wire); `None` for shared MCPs or if the thread isn't
+    /// bound to the target MCP. Used by the mid-conversation
+    /// activation path to render the right public names.
+    fn prefix_for_bound_mcp(&self, thread_id: &str, target_mcp_id: &McpHostId) -> Option<String> {
+        self.bound_mcp_hosts(thread_id)
+            .into_iter()
+            .find(|b| &b.entry.id == target_mcp_id)
+            .and_then(|b| b.prefix.map(|s| s.to_string()))
+    }
+
+    /// Append a tail-end `Role::System` activation message for a set
+    /// of newly-available tool names. Honors the thread's
+    /// `activation_surface`: `Announce` renders names + one-liners,
+    /// `InjectSchema` renders full schemas inline.
+    ///
+    /// Used by the escalation-approve path (for `AddTool` grants) and
+    /// by mid-conversation MCP-attach paths. Append-only by
+    /// construction — never mutates position-1 `Role::Tools`, so the
+    /// static prefix cache stays hot.
+    ///
+    /// Tools passed as `names` that aren't admissible to the thread
+    /// right now (denied, or out of pod ceiling) are silently dropped
+    /// — the caller doesn't need to pre-filter.
+    pub(crate) fn push_tool_activation_message(&mut self, thread_id: &str, names: &[String]) {
+        use whisper_agent_protocol::tool_surface::ActivationSurface;
+        if names.is_empty() {
+            return;
+        }
+        let Some(task) = self.tasks.get(thread_id) else {
+            return;
+        };
+        let surface = task.tool_surface.activation_surface;
+        let all = self.admissible_and_askable_tools(thread_id);
+        let wanted: std::collections::HashSet<&String> = names.iter().collect();
+        let matches: Vec<_> = all
+            .into_iter()
+            .filter(|t| wanted.contains(&t.name) && !t.requires_escalation)
+            .collect();
+        if matches.is_empty() {
+            return;
+        }
+        let text = match surface {
+            ActivationSurface::Announce => {
+                crate::runtime::tool_listing::render_activation_announce(&matches)
+            }
+            ActivationSurface::InjectSchema => {
+                crate::runtime::tool_listing::render_activation_inject(&matches)
+            }
+        };
+        if text.is_empty() {
+            return;
+        }
+        let snapshot = if let Some(task) = self.tasks.get_mut(thread_id) {
+            task.conversation
+                .push(whisper_agent_protocol::Message::system_text(text));
+            Some(task.snapshot())
+        } else {
+            None
+        };
+        self.mark_dirty(thread_id);
+        if let Some(snapshot) = snapshot {
+            self.router.broadcast_to_subscribers(
+                thread_id,
+                ServerToClient::ThreadSnapshot {
+                    thread_id: thread_id.to_string(),
+                    snapshot,
+                },
+            );
+        }
+    }
+
     /// Insert the memory-index snapshot (a `Role::System` message
     /// rendered from `<pod_dir>/memory/MEMORY.md` + a fresh timestamp)
     /// into the thread's conversation at the setup-prefix boundary.
@@ -3297,8 +3371,49 @@ impl Scheduler {
                     .get(&mcp_id)
                     .map(|e| e.users.iter().cloned().collect())
                     .unwrap_or_default();
+                // Snapshot the raw tool names now — the registry was
+                // populated above and we'll need them for the
+                // activation-message branch below (push_tools_snapshot
+                // / push_tool_listing_snapshot are both idempotent and
+                // don't help threads that already seeded).
+                let fresh_tool_names: Vec<String> = self
+                    .resources
+                    .mcp_hosts
+                    .get(&mcp_id)
+                    .map(|e| e.tools.iter().map(|t| t.name.clone()).collect())
+                    .unwrap_or_default();
                 for tid in &bound_to_mcp {
-                    if self.host_env_mcp_is_ready(tid) {
+                    if !self.host_env_mcp_is_ready(tid) {
+                        continue;
+                    }
+                    let already_seeded = self
+                        .tasks
+                        .get(tid)
+                        .map(|t| {
+                            t.conversation
+                                .messages()
+                                .iter()
+                                .any(|m| m.role == whisper_agent_protocol::Role::Tools)
+                        })
+                        .unwrap_or(false);
+                    if already_seeded {
+                        // Rare case: the thread already crossed its
+                        // setup boundary but this MCP is arriving now
+                        // (e.g. re-provision after a Lost state). The
+                        // static Role::Tools is immutable per cache-
+                        // coherence — emit an append-only activation
+                        // message instead so the model sees the new
+                        // names.
+                        let prefix = self.prefix_for_bound_mcp(tid, &mcp_id);
+                        let prefixed: Vec<String> = fresh_tool_names
+                            .iter()
+                            .map(|n| match &prefix {
+                                Some(p) => format!("{p}_{n}"),
+                                None => n.clone(),
+                            })
+                            .collect();
+                        self.push_tool_activation_message(tid, &prefixed);
+                    } else {
                         self.push_tools_snapshot(tid);
                         self.push_tool_listing_snapshot(tid);
                     }

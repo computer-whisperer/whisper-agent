@@ -1424,6 +1424,19 @@ impl Scheduler {
                                 },
                             );
                         }
+                        // `AddTool` grants surface the newly-admitted
+                        // tool to the model via an append-only
+                        // activation message. The tool-result blurb
+                        // above is delivered via the parked tool-call
+                        // terminal; the activation message is a
+                        // separate `Role::System` block carrying the
+                        // name + description (or schema, per
+                        // `activation_surface`) so subsequent turns
+                        // have persistent context about what changed.
+                        if let crate::permission::EscalationRequest::AddTool { name } = &request {
+                            let names = vec![name.clone()];
+                            self.push_tool_activation_message(&thread_id, &names);
+                        }
                         self.router
                             .broadcast_task_list(ServerToClient::EscalationResolved {
                                 function_id,
@@ -2050,11 +2063,7 @@ fn immediate_tool_success(
 /// but kept local to keep the scheduler module free of wiring into
 /// the tool-listing module's private helper.
 fn one_line(desc: &str) -> String {
-    let first = desc
-        .split(['\n', '.'])
-        .next()
-        .unwrap_or(desc)
-        .trim();
+    let first = desc.split(['\n', '.']).next().unwrap_or(desc).trim();
     if first.len() > 120 {
         let mut t = first.chars().take(117).collect::<String>();
         t.push_str("...");
