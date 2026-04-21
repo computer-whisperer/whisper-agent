@@ -21,7 +21,7 @@ use serde::{Deserialize, Serialize};
 use whisper_agent_protocol::{ThreadBindingsRequest, ThreadConfigOverride};
 
 use crate::permission::{HostName, PodId, ToolName};
-pub use whisper_agent_protocol::permission::{EscalationDecision, EscalationRequest, SudoDecision};
+pub use whisper_agent_protocol::permission::SudoDecision;
 
 // ---------------------------------------------------------------------------
 // Identifiers and bookkeeping
@@ -103,18 +103,6 @@ pub enum Function {
         name: ToolName,
         args: serde_json::Value,
     },
-    /// Model-initiated scope-widening request. Registered when the
-    /// model calls the `request_escalation` builtin tool on a thread
-    /// with an interactive escalation channel. Stays in the registry
-    /// until the interactive channel resolves it; the tool call parks
-    /// on the Function's terminal via `FunctionDelivery`.
-    RequestEscalation {
-        thread_id: ThreadId,
-        request: EscalationRequest,
-        /// Model-supplied reason for the request, shown to the user in
-        /// the approval UI. Empty if the model omitted the field.
-        reason: String,
-    },
     /// Model-initiated `sudo(tool_name, args, reason)` call. The
     /// scheduler parks the tool call on this Function's terminal; on
     /// user approval the wrapped tool is dispatched with pod-ceiling
@@ -141,7 +129,6 @@ impl Function {
         match self {
             Self::CompactThread { thread_id }
             | Self::CancelThread { thread_id }
-            | Self::RequestEscalation { thread_id, .. }
             | Self::Sudo { thread_id, .. } => Some(thread_id),
             Self::CreateThread { .. }
             | Self::RunBehavior { .. }
@@ -162,7 +149,6 @@ impl Function {
             Self::RunBehavior { .. } => K::RunBehavior,
             Self::BuiltinToolCall { .. } => K::BuiltinToolCall,
             Self::McpToolUse { .. } => K::McpToolUse,
-            Self::RequestEscalation { .. } => K::RequestEscalation,
             Self::Sudo { .. } => K::Sudo,
         }
     }
@@ -194,9 +180,6 @@ impl Function {
             Self::BuiltinToolCall { name, .. } => (None, None, Some(name.clone()), None),
             Self::McpToolUse { host, name, .. } => {
                 (None, None, Some(format!("{host}/{name}")), None)
-            }
-            Self::RequestEscalation { thread_id, .. } => {
-                (Some(thread_id.clone()), None, None, None)
             }
             Self::Sudo {
                 thread_id,
@@ -357,19 +340,7 @@ pub enum FunctionTerminal {
     RunBehavior(RunBehaviorTerminal),
     BuiltinToolCall(ToolResult),
     McpToolUse(ToolResult),
-    RequestEscalation(RequestEscalationTerminal),
     Sudo(SudoTerminal),
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct RequestEscalationTerminal {
-    pub decision: EscalationDecision,
-    /// Text returned to the model as the `request_escalation` tool's
-    /// result. For `Approve` it names what was widened; for `Reject`
-    /// it carries the user's reason (or a default). The scheduler
-    /// builds it at resolution time so `outcome_to_sync_tool_result`
-    /// has a concrete string to hand the parent turn.
-    pub tool_result_text: String,
 }
 
 #[derive(Debug, Clone, PartialEq)]

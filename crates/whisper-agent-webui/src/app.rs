@@ -328,7 +328,6 @@ fn function_kind_label(kind: FunctionKind) -> &'static str {
         FunctionKind::RunBehavior => "behavior",
         FunctionKind::BuiltinToolCall => "tool",
         FunctionKind::McpToolUse => "mcp tool",
-        FunctionKind::RequestEscalation => "escalate",
         FunctionKind::Sudo => "sudo",
     }
 }
@@ -534,19 +533,10 @@ struct TaskView {
 /// (default-collapsed), so the inspector no longer displays it
 /// separately. Keeps the conversation log as the single source of
 /// truth for what the model actually saw.
-/// In-flight scope-widening request the server is awaiting a decision on.
-/// Stored on `ChatApp` keyed by `function_id`; rendered as a banner above
-/// the selected thread's chat log.
-#[derive(Clone)]
-struct PendingEscalation {
-    thread_id: String,
-    request: whisper_agent_protocol::permission::EscalationRequest,
-    reason: String,
-}
-
 /// In-flight `sudo` approval request the server is awaiting a decision
-/// on. Mirrors `PendingEscalation` but carries the wrapped tool name +
-/// args rather than a structured widening request.
+/// on — the wrapped tool name, inner args, and the model's
+/// justification. Stored on `ChatApp` keyed by `function_id`; rendered
+/// as a banner above the selected thread's chat log.
 #[derive(Clone)]
 struct PendingSudo {
     thread_id: String,
@@ -809,18 +799,6 @@ pub struct ChatApp {
     /// ConnectionOpened (the current reconnect handler reissues the
     /// list-bootstrap suite).
     functions_requested: bool,
-
-    /// Pending scope-widening requests awaiting user decision. Keyed
-    /// by `function_id` — the id the server expects back in
-    /// `ResolveEscalation`. Populated by `EscalationRequested`,
-    /// drained by `EscalationResolved` (or by an explicit user click
-    /// that sends Approve/Reject and optimistically removes the
-    /// entry).
-    pending_escalations: HashMap<u64, PendingEscalation>,
-    /// Draft text the user typed into the reject-reason field of an
-    /// escalation banner, keyed by `function_id`. Kept per-entry so
-    /// switching between banners doesn't lose typing.
-    escalation_reject_drafts: HashMap<u64, String>,
 
     /// Pending `sudo` approval prompts awaiting user decision. Keyed
     /// by `function_id` — the id the server expects back in
@@ -1514,8 +1492,6 @@ impl ChatApp {
             file_tree_modal_pod: None,
             active_functions: std::collections::BTreeMap::new(),
             functions_requested: false,
-            pending_escalations: HashMap::new(),
-            escalation_reject_drafts: HashMap::new(),
             pending_sudos: HashMap::new(),
             sudo_reject_drafts: HashMap::new(),
             left_mode: LeftPanelMode::default(),
@@ -2563,25 +2539,6 @@ impl ChatApp {
                     settings.shared_mcp_banner = Some(Ok(format!("Removed `{name}`.")));
                 }
             }
-            ServerToClient::EscalationRequested {
-                function_id,
-                thread_id,
-                request,
-                reason,
-            } => {
-                self.pending_escalations.insert(
-                    function_id,
-                    PendingEscalation {
-                        thread_id,
-                        request,
-                        reason,
-                    },
-                );
-            }
-            ServerToClient::EscalationResolved { function_id, .. } => {
-                self.pending_escalations.remove(&function_id);
-                self.escalation_reject_drafts.remove(&function_id);
-            }
             ServerToClient::SudoRequested {
                 function_id,
                 thread_id,
@@ -3605,15 +3562,9 @@ impl eframe::App for ChatApp {
         // (msg_index, seed_text) — paired with `selected` after the
         // render closure since render_item doesn't see thread_id.
         let mut fork_request: Option<(usize, String)> = None;
-        // Escalation-banner decisions the user triggered this frame.
+        // Sudo-banner decisions the user triggered this frame.
         // Collected here and dispatched after the central-panel closure
         // so the closure doesn't need `&mut self` for `send`.
-        let mut escalation_decisions: Vec<(
-            u64,
-            whisper_agent_protocol::permission::EscalationDecision,
-            Option<String>,
-        )> = Vec::new();
-        // Sudo-banner decisions — same pattern as escalation_decisions.
         let mut sudo_decisions: Vec<(
             u64,
             whisper_agent_protocol::permission::SudoDecision,
@@ -3627,8 +3578,6 @@ impl eframe::App for ChatApp {
         let selected = self.selected.clone();
         let tasks = &mut self.tasks;
         let md_cache = &mut self.md_cache;
-        let pending_escalations = &self.pending_escalations;
-        let escalation_reject_drafts = &mut self.escalation_reject_drafts;
         let pending_sudos = &self.pending_sudos;
         let sudo_reject_drafts = &mut self.sudo_reject_drafts;
         egui::CentralPanel::default().show_inside(ui, |ui| match selected.clone() {
@@ -3653,13 +3602,6 @@ impl eframe::App for ChatApp {
                 Some(view) => {
                     render_thread_context_inspector(ui, &thread_id, view);
                     render_failure_banner(ui, view);
-                    render_escalation_banners(
-                        ui,
-                        &thread_id,
-                        pending_escalations,
-                        escalation_reject_drafts,
-                        &mut escalation_decisions,
-                    );
                     render_sudo_banners(
                         ui,
                         &thread_id,
@@ -3707,21 +3649,12 @@ impl eframe::App for ChatApp {
             });
         }
 
-        // Dispatch any escalation approve/reject the user clicked this
-        // frame. Optimistically drop the entry from `pending_escalations`
-        // — the server's `EscalationResolved` broadcast will land later
-        // and be a no-op. Keeping the banner mounted until the server
-        // echoed back was too flickery on the approve path, where the
-        // parent thread's next turn starts immediately on grant.
-        for (function_id, decision, reason) in escalation_decisions {
-            self.send(ClientToServer::ResolveEscalation {
-                function_id,
-                decision,
-                reason,
-            });
-            self.pending_escalations.remove(&function_id);
-            self.escalation_reject_drafts.remove(&function_id);
-        }
+        // Dispatch any sudo approve/reject the user clicked this frame.
+        // Optimistically drop the entry from `pending_sudos` — the
+        // server's `SudoResolved` broadcast will land later and be a
+        // no-op. Keeping the banner mounted until the server echoed
+        // back was too flickery on the approve path, where the parent
+        // thread's next turn starts immediately on grant.
         for (function_id, decision, reason) in sudo_decisions {
             self.send(ClientToServer::ResolveSudo {
                 function_id,
@@ -7434,103 +7367,6 @@ fn render_scope_summary(
             };
             kv_row(ui, "escalation", esc);
         });
-}
-
-/// Render one Approve/Reject banner per pending escalation for
-/// `thread_id`. Clicks append onto `decisions_out`; the caller dispatches
-/// them after this closure frame so `&mut self.send` doesn't have to be
-/// in scope here.
-fn render_escalation_banners(
-    ui: &mut egui::Ui,
-    thread_id: &str,
-    pending: &HashMap<u64, PendingEscalation>,
-    reject_drafts: &mut HashMap<u64, String>,
-    decisions_out: &mut Vec<(
-        u64,
-        whisper_agent_protocol::permission::EscalationDecision,
-        Option<String>,
-    )>,
-) {
-    use whisper_agent_protocol::permission::EscalationDecision;
-
-    // Stable iteration order — BTreeMap slice would be cheaper but the
-    // map type is fixed elsewhere; a small sort on the handful of
-    // typically-pending entries is fine.
-    let mut ids: Vec<u64> = pending
-        .iter()
-        .filter_map(|(id, esc)| (esc.thread_id == thread_id).then_some(*id))
-        .collect();
-    ids.sort_unstable();
-
-    for function_id in ids {
-        let Some(esc) = pending.get(&function_id) else {
-            continue;
-        };
-        egui::Frame::group(ui.style())
-            .fill(Color32::from_rgb(54, 48, 16))
-            .show(ui, |ui| {
-                ui.vertical(|ui| {
-                    ui.horizontal(|ui| {
-                        ui.label(
-                            RichText::new("escalation requested")
-                                .color(Color32::from_rgb(240, 220, 120))
-                                .strong(),
-                        );
-                        ui.label(
-                            RichText::new(format!("fn #{function_id}"))
-                                .small()
-                                .color(Color32::from_gray(180)),
-                        );
-                    });
-                    ui.add_space(2.0);
-                    ui.label(
-                        RichText::new(describe_escalation_request(&esc.request))
-                            .color(Color32::from_rgb(240, 230, 180))
-                            .monospace(),
-                    );
-                    if !esc.reason.trim().is_empty() {
-                        ui.add_space(2.0);
-                        ui.label(
-                            RichText::new(format!("reason: {}", esc.reason))
-                                .small()
-                                .color(Color32::from_gray(210)),
-                        );
-                    }
-                    ui.add_space(4.0);
-                    let draft = reject_drafts.entry(function_id).or_default();
-                    ui.horizontal(|ui| {
-                        if ui.button("Approve").clicked() {
-                            decisions_out.push((function_id, EscalationDecision::Approve, None));
-                        }
-                        if ui.button("Reject").clicked() {
-                            let reason = draft.trim();
-                            let reason = (!reason.is_empty()).then(|| reason.to_string());
-                            decisions_out.push((function_id, EscalationDecision::Reject, reason));
-                        }
-                        ui.add(
-                            TextEdit::singleline(draft)
-                                .hint_text("reject reason (optional)")
-                                .desired_width(ui.available_width()),
-                        );
-                    });
-                });
-            });
-        ui.add_space(4.0);
-    }
-}
-
-/// One-line human-readable description of a scope-widening request,
-/// shown in the approval banner's body.
-fn describe_escalation_request(
-    req: &whisper_agent_protocol::permission::EscalationRequest,
-) -> String {
-    use whisper_agent_protocol::permission::EscalationRequest::*;
-    match req {
-        AddTool { name } => format!("Admit tool `{name}` for this thread"),
-        RaisePodModify { target } => format!("Raise pod_modify cap to {target:?}"),
-        RaiseBehaviors { target } => format!("Raise behaviors cap to {target:?}"),
-        RaiseDispatch { target } => format!("Raise dispatch cap to {target:?}"),
-    }
 }
 
 /// Render one three-way-approval banner per pending sudo for

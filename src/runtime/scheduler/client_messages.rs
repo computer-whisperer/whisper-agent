@@ -1221,13 +1221,6 @@ impl Scheduler {
                     },
                 );
             }
-            ClientToServer::ResolveEscalation {
-                function_id,
-                decision,
-                reason,
-            } => {
-                self.resolve_escalation(conn_id, function_id, decision, reason, pending_io);
-            }
             ClientToServer::ResolveSudo {
                 function_id,
                 decision,

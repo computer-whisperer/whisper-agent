@@ -696,11 +696,6 @@ pub enum FunctionKind {
     RunBehavior,
     BuiltinToolCall,
     McpToolUse,
-    /// A model-initiated scope-widening request (see
-    /// `docs/design_permissions_rework.md`). Stays in the registry
-    /// until the owning interactive channel resolves it via
-    /// `ClientToServer::ResolveEscalation`.
-    RequestEscalation,
     /// A model-initiated `sudo` call — the model wants to invoke a
     /// named tool with explicit user approval. Stays in the registry
     /// until the owning interactive channel resolves it via
@@ -1180,22 +1175,6 @@ pub enum ClientToServer {
         correlation_id: Option<String>,
     },
 
-    // --- Escalation ---
-    /// User's answer to a pending `RequestEscalation` Function. The
-    /// scheduler looks the Function up by `function_id`, validates that
-    /// the resolving connection is the thread's interactive channel,
-    /// applies the widening on Approve, and completes the Function —
-    /// unblocking the model's tool call with a tool_result describing
-    /// the outcome.
-    ResolveEscalation {
-        function_id: u64,
-        decision: crate::permission::EscalationDecision,
-        /// Optional free-form reason. Shown to the model on reject so
-        /// it can course-correct; ignored on approve.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        reason: Option<String>,
-    },
-
     // --- Sudo ---
     /// User's answer to a pending `Sudo` Function — the approval reply
     /// to a model's `sudo` tool call. On approve (once or remember) the
@@ -1642,30 +1621,6 @@ pub enum ServerToClient {
     FunctionEnded {
         function_id: u64,
         outcome: FunctionOutcomeTag,
-    },
-
-    // --- Escalation ---
-    /// A thread's model issued `request_escalation`. Delivered only to
-    /// the thread's interactive channel (the conn that created it, or
-    /// inherited via dispatch); autonomous threads cannot emit this.
-    /// The client renders an approval UI and replies with
-    /// `ClientToServer::ResolveEscalation { function_id, decision }`.
-    EscalationRequested {
-        function_id: u64,
-        thread_id: String,
-        request: crate::permission::EscalationRequest,
-        /// Model-supplied justification. Free-form string.
-        reason: String,
-    },
-    /// An escalation Function completed. Broadcast to subscribers of
-    /// the affected thread so any observer (not just the original
-    /// approver) can update its scope view. The server separately
-    /// broadcasts a `ThreadSnapshot` on approve to reflect the widened
-    /// scope once scope-on-the-wire lands.
-    EscalationResolved {
-        function_id: u64,
-        thread_id: String,
-        decision: crate::permission::EscalationDecision,
     },
 
     // --- Sudo ---

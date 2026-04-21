@@ -2,10 +2,10 @@
 //! tool with user approval, bypassing the thread's current scope for
 //! that one invocation (within the pod's ceiling).
 //!
-//! Like `request_escalation` and `dispatch_thread`, `sudo` is
-//! intercepted at the scheduler layer (`register_sudo_tool`) so it
-//! can register a Function, emit the wire approval request, and park
-//! the model's tool call on the Function's terminal.
+//! Like `dispatch_thread`, `sudo` is intercepted at the scheduler
+//! layer (`register_sudo_tool`) so it can register a Function, emit
+//! the wire approval request, and park the model's tool call on the
+//! Function's terminal.
 //!
 //! Visibility: the scheduler's tool-listing filters this tool out of
 //! the catalog when the thread has no interactive approver. Headless
@@ -57,8 +57,8 @@ pub(super) fn descriptor() -> McpTool {
                     "description": "Name of the tool to run. Must be present in \
                                     the pod's admissible set (see find_tool / \
                                     describe_tool); sudo cannot call `sudo` \
-                                    itself, `request_escalation`, or \
-                                    `dispatch_thread`."
+                                    itself or `dispatch_thread` (both must be \
+                                    called directly)."
                 },
                 "args": {
                     "type": "object",

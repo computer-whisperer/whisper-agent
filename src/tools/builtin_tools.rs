@@ -31,7 +31,6 @@ mod filesystem;
 pub mod find_tool;
 mod grep;
 mod list_threads;
-pub mod request_escalation;
 pub mod sudo;
 
 use std::collections::HashMap;
@@ -133,7 +132,6 @@ pub const ABOUT: &str = "about";
 pub const POD_RUN_BEHAVIOR: &str = "pod_run_behavior";
 pub const POD_SET_BEHAVIOR_ENABLED: &str = "pod_set_behavior_enabled";
 pub const DISPATCH_THREAD: &str = "dispatch_thread";
-pub const REQUEST_ESCALATION: &str = "request_escalation";
 pub const SUDO: &str = "sudo";
 pub const DESCRIBE_TOOL: &str = "describe_tool";
 pub const FIND_TOOL: &str = "find_tool";
@@ -153,7 +151,6 @@ pub fn is_builtin(name: &str) -> bool {
             | POD_RUN_BEHAVIOR
             | POD_SET_BEHAVIOR_ENABLED
             | DISPATCH_THREAD
-            | REQUEST_ESCALATION
             | SUDO
             | DESCRIBE_TOOL
             | FIND_TOOL
@@ -180,7 +177,6 @@ pub fn reserved_env_name_prefixes() -> Vec<&'static str> {
         POD_RUN_BEHAVIOR,
         POD_SET_BEHAVIOR_ENABLED,
         DISPATCH_THREAD,
-        REQUEST_ESCALATION,
         SUDO,
         DESCRIBE_TOOL,
         FIND_TOOL,
@@ -208,7 +204,6 @@ pub fn descriptors() -> Vec<McpTool> {
         behavior_control::run_behavior_descriptor(),
         behavior_control::set_behavior_enabled_descriptor(),
         dispatch_thread::descriptor(),
-        request_escalation::descriptor(),
         sudo::descriptor(),
         describe_tool::descriptor(),
         find_tool::descriptor(),
@@ -356,11 +351,6 @@ pub async fn dispatch(
         DISPATCH_THREAD => no_update_error(
             "dispatch_thread must be intercepted at the scheduler layer \
              (io_dispatch::tool_call); reaching this arm is a bug"
-                .into(),
-        ),
-        REQUEST_ESCALATION => no_update_error(
-            "request_escalation must be intercepted at the scheduler layer \
-             (register_request_escalation_tool); reaching this arm is a bug"
                 .into(),
         ),
         SUDO => no_update_error(

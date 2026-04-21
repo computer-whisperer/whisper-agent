@@ -1662,13 +1662,10 @@ impl Scheduler {
         };
 
         for tool in crate::tools::builtin_tools::descriptors() {
-            // `request_escalation` is only meaningful with an
-            // interactive approver attached. Autonomous threads see
-            // a Deny on it via this early filter even if scope/ceiling
-            // would otherwise admit — no use listing a tool whose
-            // calls would go nowhere.
-            if tool.name == crate::tools::builtin_tools::REQUEST_ESCALATION && !escalation_available
-            {
+            // `sudo` is only meaningful with an interactive approver
+            // attached. Autonomous threads hide the tool entirely — no
+            // use listing a tool whose calls would go nowhere.
+            if tool.name == crate::tools::builtin_tools::SUDO && !escalation_available {
                 continue;
             }
             let admission = classify(&tool.name);

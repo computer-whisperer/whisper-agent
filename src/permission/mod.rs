@@ -7,8 +7,8 @@
 //! See `docs/design_permissions_rework.md` for the full design.
 
 pub use whisper_agent_protocol::permission::{
-    AllowMap, BehaviorOpsCap, DispatchCap, Disposition, Escalation, EscalationDecision,
-    EscalationRequest, PodModifyCap, Scope, SetOrAll, SudoDecision,
+    AllowMap, BehaviorOpsCap, DispatchCap, Disposition, Escalation, PodModifyCap, Scope, SetOrAll,
+    SudoDecision,
 };
 
 pub type BackendName = String;
