@@ -427,29 +427,56 @@ fn sse_tool_stream(resp: reqwest::Response) -> impl Stream<Item = ToolEvent> + S
     }
 }
 
-/// Read a single JSON-RPC response from an SSE body, returning the
-/// response's `result` (or mapping `error` to `McpError::Rpc`). Used
-/// by `McpSession::call` for one-shot RPCs (`initialize`,
-/// `tools/list`) when the server opted to respond via SSE instead of
-/// inline JSON. Walks frames and matches on `id == expected_id` so
-/// any intermediate notifications (servers with chatty logging
-/// channels) don't confuse us.
-///
-/// Distinct from `sse_tool_stream` in two ways: returns a single
-/// value instead of a stream, and it's generic over the RPC
-/// method — the tool-stream parser knows it's parsing a
-/// `tools/call` response and decodes as `CallToolResult`; here we
-/// return the raw `Value` for the caller's `serde_json::from_value`.
+/// Read a single JSON-RPC response from an SSE body. Thin wrapper
+/// around [`SseRpcParser`]: drives the reqwest byte-stream and feeds
+/// each chunk into the pure parser. Splitting them lets the parser
+/// be table-driven tested without spinning up a real HTTP server.
 async fn read_json_rpc_from_sse(
     resp: reqwest::Response,
     expected_id: u64,
 ) -> Result<Value, McpError> {
     let mut bytes = resp.bytes_stream();
-    let mut buf = String::new();
+    let mut parser = SseRpcParser::new(expected_id);
     while let Some(next) = bytes.next().await {
         let chunk = next.map_err(|e| McpError::Malformed(format!("SSE byte stream: {e}")))?;
-        buf.push_str(&String::from_utf8_lossy(&chunk));
-        while let Some(frame) = take_sse_frame(&mut buf) {
+        if let Some(outcome) = parser.push(&chunk) {
+            return outcome;
+        }
+    }
+    Err(McpError::Malformed(
+        "SSE stream ended before a matching JSON-RPC response arrived".into(),
+    ))
+}
+
+/// Stateful SSE-RPC parser. Buffers byte chunks until complete event
+/// frames arrive, then checks each frame against the expected id.
+/// Held open across multiple `push` calls so a response split mid-
+/// frame across reqwest chunks still parses cleanly.
+///
+/// `push` returns `Some` the moment a decision is final:
+/// `Some(Ok(result))` on the matching response, `Some(Err(...))` on
+/// an explicit JSON-RPC error frame. It returns `None` while the
+/// caller should keep feeding chunks — notifications, unmatched-id
+/// frames, and half-read frames all land there. Used by
+/// [`McpSession::call`] for one-shot RPCs (`initialize`,
+/// `tools/list`) when the server opted to respond via SSE instead
+/// of inline JSON.
+struct SseRpcParser {
+    buf: String,
+    expected_id: u64,
+}
+
+impl SseRpcParser {
+    fn new(expected_id: u64) -> Self {
+        Self {
+            buf: String::new(),
+            expected_id,
+        }
+    }
+
+    fn push(&mut self, chunk: &[u8]) -> Option<Result<Value, McpError>> {
+        self.buf.push_str(&String::from_utf8_lossy(chunk));
+        while let Some(frame) = take_sse_frame(&mut self.buf) {
             let Some(data) = extract_sse_data(&frame) else {
                 continue;
             };
@@ -466,7 +493,7 @@ async fn read_json_rpc_from_sse(
             let id_match = obj
                 .get("id")
                 .and_then(|v| v.as_u64())
-                .map(|n| n == expected_id)
+                .map(|n| n == self.expected_id)
                 .unwrap_or(false);
             if !id_match {
                 continue;
@@ -478,17 +505,16 @@ async fn read_json_rpc_from_sse(
                     .and_then(|m| m.as_str())
                     .unwrap_or("<no message>")
                     .to_string();
-                return Err(McpError::Rpc { code, message });
+                return Some(Err(McpError::Rpc { code, message }));
             }
-            return obj
-                .get("result")
-                .cloned()
-                .ok_or_else(|| McpError::Malformed("SSE RPC response missing result".into()));
+            return Some(
+                obj.get("result")
+                    .cloned()
+                    .ok_or_else(|| McpError::Malformed("SSE RPC response missing result".into())),
+            );
         }
+        None
     }
-    Err(McpError::Malformed(
-        "SSE stream ended before a matching JSON-RPC response arrived".into(),
-    ))
 }
 
 /// Extract the next complete SSE event frame from `buf`. A frame is the text
@@ -564,5 +590,106 @@ mod tests {
     fn extract_sse_data_none_when_frame_has_no_data_line() {
         let frame = "event: ping\nid: 5";
         assert!(extract_sse_data(frame).is_none());
+    }
+
+    // ---------- SseRpcParser ----------
+
+    fn push(parser: &mut SseRpcParser, s: &str) -> Option<Result<Value, McpError>> {
+        parser.push(s.as_bytes())
+    }
+
+    #[test]
+    fn sse_rpc_parser_returns_result_on_matching_id() {
+        let mut p = SseRpcParser::new(7);
+        let body = "data: {\"jsonrpc\":\"2.0\",\"id\":7,\"result\":{\"ok\":true}}\n\n";
+        let outcome = push(&mut p, body).expect("should resolve after first frame");
+        let result = outcome.expect("expected Ok");
+        assert_eq!(result, serde_json::json!({"ok": true}));
+    }
+
+    #[test]
+    fn sse_rpc_parser_resumes_across_chunk_boundary() {
+        // Frame split mid-data across two `push` calls — common with
+        // real reqwest reads since SSE traffic tends to be short
+        // frames but chunk boundaries don't respect them.
+        let mut p = SseRpcParser::new(1);
+        assert!(push(&mut p, "data: {\"jsonrpc\":\"2.0\",\"id\":1,").is_none());
+        let outcome = push(&mut p, "\"result\":{\"v\":42}}\n\n")
+            .expect("second push should deliver the frame");
+        let result = outcome.unwrap();
+        assert_eq!(result, serde_json::json!({"v": 42}));
+    }
+
+    #[test]
+    fn sse_rpc_parser_skips_unmatched_id_then_returns_match() {
+        // Some servers send unrelated notifications / responses on the
+        // same SSE channel. We must scan past them and only act on the
+        // frame whose id matches.
+        let mut p = SseRpcParser::new(9);
+        let body = concat!(
+            "data: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\",\"params\":{\"pct\":50}}\n\n",
+            "data: {\"jsonrpc\":\"2.0\",\"id\":4,\"result\":{\"stale\":true}}\n\n",
+            "data: {\"jsonrpc\":\"2.0\",\"id\":9,\"result\":{\"match\":true}}\n\n",
+        );
+        let outcome = push(&mut p, body).expect("should find the id=9 frame");
+        assert_eq!(outcome.unwrap(), serde_json::json!({"match": true}));
+    }
+
+    #[test]
+    fn sse_rpc_parser_maps_rpc_error() {
+        let mut p = SseRpcParser::new(3);
+        let body = "data: {\"jsonrpc\":\"2.0\",\"id\":3,\"error\":{\"code\":-32000,\"message\":\"nope\"}}\n\n";
+        let outcome = push(&mut p, body).expect("should resolve");
+        let err = outcome.expect_err("expected Err");
+        match err {
+            McpError::Rpc { code, message } => {
+                assert_eq!(code, -32000);
+                assert_eq!(message, "nope");
+            }
+            other => panic!("expected Rpc err, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sse_rpc_parser_malformed_when_result_field_missing() {
+        // Malformed final frame (id matches, but neither result nor
+        // error is present) surfaces as Malformed.
+        let mut p = SseRpcParser::new(2);
+        let body = "data: {\"jsonrpc\":\"2.0\",\"id\":2}\n\n";
+        let outcome = push(&mut p, body).expect("should resolve");
+        let err = outcome.expect_err("expected Err");
+        assert!(
+            matches!(err, McpError::Malformed(ref m) if m.contains("missing result")),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn sse_rpc_parser_ignores_garbage_frames() {
+        // Non-JSON data: lines shouldn't abort — we just log and keep
+        // looking, because servers may emit comments or keepalives
+        // the spec doesn't categorize for us.
+        let mut p = SseRpcParser::new(5);
+        let body = concat!(
+            "data: not valid json at all\n\n",
+            "data: {\"jsonrpc\":\"2.0\",\"id\":5,\"result\":\"yes\"}\n\n",
+        );
+        let outcome = push(&mut p, body).expect("should skip garbage, land on match");
+        assert_eq!(outcome.unwrap(), serde_json::json!("yes"));
+    }
+
+    #[test]
+    fn sse_rpc_parser_returns_none_until_frame_boundary() {
+        // Data without the terminating double-newline isn't a frame
+        // yet — parser must wait for it. This lets the async wrapper
+        // know whether to keep reading.
+        let mut p = SseRpcParser::new(1);
+        assert!(
+            push(
+                &mut p,
+                "data: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":true}"
+            )
+            .is_none()
+        );
     }
 }

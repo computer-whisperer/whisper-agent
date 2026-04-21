@@ -6797,13 +6797,23 @@ fn render_shared_mcp_host_row(
     }
     let is_overlay = matches!(host.origin, HostEnvProviderOrigin::RuntimeOverlay);
     ui.horizontal(|ui| {
+        // Edit is disabled on both CLI overlays and OAuth entries:
+        // overlays can't mutate at runtime (shadowed by catalog);
+        // OAuth entries would have their tokens silently overwritten
+        // by the Bearer/Anonymous fields in the Edit form, wiping the
+        // whole authorization handshake. For OAuth, the only
+        // supported "edit" is remove + re-add (re-running the flow).
+        let is_oauth = matches!(host.auth, SharedMcpAuthPublic::Oauth2 { .. });
+        let edit_enabled = !is_overlay && !is_oauth;
         let edit_hover = if is_overlay {
             "CLI --shared-mcp-host overlays can't be edited at runtime"
+        } else if is_oauth {
+            "OAuth hosts can't be edited — remove and re-add to change URL or re-authorize"
         } else {
             "Edit url or auth"
         };
         if ui
-            .add_enabled(!is_overlay, egui::Button::new("Edit").small())
+            .add_enabled(edit_enabled, egui::Button::new("Edit").small())
             .on_hover_text(edit_hover)
             .clicked()
         {

@@ -359,6 +359,16 @@ pub struct Scheduler {
     /// warning for. Once-per-entry log to avoid spamming the
     /// journal on every refresh tick for non-refreshable entries.
     oauth_refresh_no_refresh_token_warned: HashSet<String>,
+    /// Consecutive refresh failure count per catalog entry name.
+    /// Reset to 0 on any successful refresh. When it reaches
+    /// `OAUTH_REFRESH_FAIL_THRESHOLD`, the MCP host entry is marked
+    /// Errored so the operator sees the real state in the webui
+    /// instead of `connected: true` backed by an about-to-expire
+    /// token. Not persisted — a server restart reloads the catalog,
+    /// reconnects via `connect_shared_mcp_on_boot`, and either the
+    /// next refresh works or the boot reconnect fails with its own
+    /// clear error.
+    oauth_refresh_failure_counts: HashMap<String, u32>,
 
     tasks: HashMap<String, Thread>,
     /// Owns the connection registry, subscription map, audit log, and the
@@ -503,6 +513,7 @@ impl Scheduler {
                 pending_oauth_flows: HashMap::new(),
                 oauth_refresh_in_flight: HashSet::new(),
                 oauth_refresh_no_refresh_token_warned: HashSet::new(),
+                oauth_refresh_failure_counts: HashMap::new(),
                 tasks: HashMap::new(),
                 router: ThreadEventRouter::new(audit, host_id),
                 resources,
@@ -1381,6 +1392,15 @@ impl Scheduler {
     /// still rotates eventually if the AS revokes the access one).
     const OAUTH_REFRESH_MARGIN_SECS: i64 = 300;
 
+    /// How many consecutive refresh failures before we flip the MCP
+    /// registry entry to Errored. 3 is a middle ground — a transient
+    /// token-endpoint blip (one failed tick) shouldn't redecorate
+    /// the operator's UI, but a structural failure (revoked
+    /// refresh_token, AS outage, DCR client wiped) should surface
+    /// within ~3 minutes rather than silently rotting until the
+    /// access_token expires for real.
+    const OAUTH_REFRESH_FAIL_THRESHOLD: u32 = 3;
+
     /// Walk every catalog entry and dispatch a refresh future for
     /// each OAuth entry whose access_token is within the safety
     /// margin of expiring (or already expired). Returns a vec of
@@ -1496,16 +1516,51 @@ impl Scheduler {
                     );
                     return;
                 }
+                // Successful rotation clears any accumulated failure
+                // count. If we'd marked the entry Errored earlier,
+                // `replace_shared_mcp_session` already flipped it
+                // back to Ready.
+                self.oauth_refresh_failure_counts.remove(&name);
                 info!(host = %name, "oauth refresh: rotated tokens and swapped session");
             }
             Err(message) => {
-                // Don't nuke the entry on a transient failure. The
-                // existing session still works until the access
-                // token actually expires; the next tick retries.
-                // Eventually it'll succeed, or the token expires
-                // and tool calls 401 — the operator notices in the
-                // UI ("connected: false") and investigates.
-                warn!(host = %name, error = %message, "oauth refresh failed");
+                // Bounded retry policy: one or two failures don't
+                // flip the entry's state (a transient token-endpoint
+                // blip recovers on the next tick). After
+                // `OAUTH_REFRESH_FAIL_THRESHOLD` consecutive
+                // failures we mark the MCP entry Errored so the
+                // operator sees the real state in the webui instead
+                // of a `connected: true` lie backed by a token
+                // that's about to expire.
+                // Increment then drop the map borrow before touching
+                // `self.resources` — `mark_mcp_errored` + `emit_...`
+                // need their own &mut self and can't coexist with a
+                // live `HashMap::entry` reference.
+                let count = {
+                    let slot = self
+                        .oauth_refresh_failure_counts
+                        .entry(name.clone())
+                        .or_insert(0);
+                    *slot += 1;
+                    *slot
+                };
+                if count >= Self::OAUTH_REFRESH_FAIL_THRESHOLD {
+                    use crate::pod::resources::McpHostId;
+                    let id = McpHostId::shared(&name);
+                    self.resources.mark_mcp_errored(
+                        &id,
+                        format!("oauth refresh failed {count} times: {message}"),
+                    );
+                    self.emit_mcp_host_updated(&id);
+                    warn!(
+                        host = %name,
+                        count,
+                        error = %message,
+                        "oauth refresh failed repeatedly; marked MCP entry Errored"
+                    );
+                } else {
+                    warn!(host = %name, count, error = %message, "oauth refresh failed");
+                }
             }
         }
     }
