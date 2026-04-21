@@ -282,7 +282,19 @@ impl McpSession {
             params,
         };
         debug!(method, "rpc out");
-        let mut builder = self.http.post(&self.url).json(&req);
+        // Accept both transports: MCP streamable-HTTP lets the server
+        // pick JSON or SSE. In-tree whisper-agent-mcp-host always
+        // returns JSON for one-shot RPCs; third-party servers (e.g.
+        // GitHub's Copilot MCP) pick SSE even for `initialize` and
+        // `tools/list`. Advertising both means we work with either.
+        let mut builder = self
+            .http
+            .post(&self.url)
+            .header(
+                reqwest::header::ACCEPT,
+                "application/json, text/event-stream",
+            )
+            .json(&req);
         if let Some(tok) = &self.bearer {
             builder = builder.bearer_auth(tok);
         }
@@ -295,16 +307,26 @@ impl McpSession {
                 body,
             });
         }
-        let parsed: JsonRpcResponse = resp.json().await?;
-        if let Some(e) = parsed.error {
-            return Err(McpError::Rpc {
-                code: e.code,
-                message: e.message,
-            });
+        let content_type = resp
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+        if content_type.starts_with("text/event-stream") {
+            read_json_rpc_from_sse(resp, id).await
+        } else {
+            let parsed: JsonRpcResponse = resp.json().await?;
+            if let Some(e) = parsed.error {
+                return Err(McpError::Rpc {
+                    code: e.code,
+                    message: e.message,
+                });
+            }
+            parsed
+                .result
+                .ok_or_else(|| McpError::Malformed("response missing both result and error".into()))
         }
-        parsed
-            .result
-            .ok_or_else(|| McpError::Malformed("response missing both result and error".into()))
     }
 
     async fn notify(&self, method: &str, params: Option<Value>) -> Result<(), McpError> {
@@ -403,6 +425,70 @@ fn sse_tool_stream(resp: reqwest::Response) -> impl Stream<Item = ToolEvent> + S
         // Completed event in tool stream" in that case.
         warn!("SSE stream ended without final tools/call response");
     }
+}
+
+/// Read a single JSON-RPC response from an SSE body, returning the
+/// response's `result` (or mapping `error` to `McpError::Rpc`). Used
+/// by `McpSession::call` for one-shot RPCs (`initialize`,
+/// `tools/list`) when the server opted to respond via SSE instead of
+/// inline JSON. Walks frames and matches on `id == expected_id` so
+/// any intermediate notifications (servers with chatty logging
+/// channels) don't confuse us.
+///
+/// Distinct from `sse_tool_stream` in two ways: returns a single
+/// value instead of a stream, and it's generic over the RPC
+/// method — the tool-stream parser knows it's parsing a
+/// `tools/call` response and decodes as `CallToolResult`; here we
+/// return the raw `Value` for the caller's `serde_json::from_value`.
+async fn read_json_rpc_from_sse(
+    resp: reqwest::Response,
+    expected_id: u64,
+) -> Result<Value, McpError> {
+    let mut bytes = resp.bytes_stream();
+    let mut buf = String::new();
+    while let Some(next) = bytes.next().await {
+        let chunk = next.map_err(|e| McpError::Malformed(format!("SSE byte stream: {e}")))?;
+        buf.push_str(&String::from_utf8_lossy(&chunk));
+        while let Some(frame) = take_sse_frame(&mut buf) {
+            let Some(data) = extract_sse_data(&frame) else {
+                continue;
+            };
+            let msg: Value = match serde_json::from_str(&data) {
+                Ok(v) => v,
+                Err(e) => {
+                    warn!(error = %e, data = %data, "SSE RPC frame JSON parse failed");
+                    continue;
+                }
+            };
+            let Some(obj) = msg.as_object() else {
+                continue;
+            };
+            let id_match = obj
+                .get("id")
+                .and_then(|v| v.as_u64())
+                .map(|n| n == expected_id)
+                .unwrap_or(false);
+            if !id_match {
+                continue;
+            }
+            if let Some(err) = obj.get("error") {
+                let code = err.get("code").and_then(|c| c.as_i64()).unwrap_or(0) as i32;
+                let message = err
+                    .get("message")
+                    .and_then(|m| m.as_str())
+                    .unwrap_or("<no message>")
+                    .to_string();
+                return Err(McpError::Rpc { code, message });
+            }
+            return obj
+                .get("result")
+                .cloned()
+                .ok_or_else(|| McpError::Malformed("SSE RPC response missing result".into()));
+        }
+    }
+    Err(McpError::Malformed(
+        "SSE stream ended before a matching JSON-RPC response arrived".into(),
+    ))
 }
 
 /// Extract the next complete SSE event frame from `buf`. A frame is the text
