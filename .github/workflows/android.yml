@@ -1,0 +1,46 @@
+name: android
+
+on:
+  push:
+    branches: [main, android-client]
+    paths:
+      - 'android/**'
+      - '.github/workflows/android.yml'
+  pull_request:
+    paths:
+      - 'android/**'
+      - '.github/workflows/android.yml'
+
+jobs:
+  build:
+    name: assembleDebug
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: android
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      # Installs cmdline-tools + accepts SDK licenses so Gradle can pull
+      # whichever platform / build-tools the project's `compileSdk` asks
+      # for without an interactive prompt.
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      # Caches ~/.gradle/caches keyed off the build scripts + wrapper so
+      # subsequent runs skip the dependency resolution cost. Also handles
+      # the Gradle daemon setup.
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          cache-read-only: ${{ github.ref != 'refs/heads/main' && github.ref != 'refs/heads/android-client' }}
+          build-root-directory: android
+
+      - name: assembleDebug
+        run: ./gradlew assembleDebug --no-daemon --stacktrace
