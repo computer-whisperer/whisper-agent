@@ -1140,22 +1140,14 @@ impl Scheduler {
         let all = self.admissible_and_askable_tools(thread_id);
         let limit = args.effective_limit() as usize;
         let offset = args.effective_offset() as usize;
-        let matched: Vec<_> = all
-            .into_iter()
-            .filter(|t| {
-                if !args.include_escalation && t.requires_escalation {
-                    return false;
-                }
-                if let Some(cat) = &args.category
-                    && cat != t.category.coarse()
-                {
-                    return false;
-                }
-                regex.is_match(&t.name) || regex.is_match(&t.description)
-            })
-            .collect();
-        let total = matched.len();
-        let page: Vec<_> = matched.into_iter().skip(offset).take(limit).collect();
+        let (page, total) = crate::runtime::tool_listing::filter_tools_for_find(
+            &all,
+            &regex,
+            args.category.as_deref(),
+            args.include_escalation,
+            limit,
+            offset,
+        );
         let shown = page.len();
         let mut out = String::new();
         out.push_str(&format!(

@@ -234,6 +234,42 @@ fn render_all_names(tools: &[AdmissibleTool], escalation_available: bool) -> Str
     out
 }
 
+/// Apply `find_tool`'s filter + pagination to a set of admissible
+/// tools. Returns the page of matches and the unpaged total, so the
+/// caller can render a "N more, use offset=..." tail.
+///
+/// Pure — takes the full tool list (from `admissible_and_askable_tools`)
+/// and the parsed filter args, no scheduler state. The regex is pre-
+/// compiled by the caller (it's a user input that can fail to parse,
+/// which is the caller's concern to surface).
+pub fn filter_tools_for_find(
+    tools: &[AdmissibleTool],
+    regex: &regex::Regex,
+    category_coarse: Option<&str>,
+    include_escalation: bool,
+    limit: usize,
+    offset: usize,
+) -> (Vec<AdmissibleTool>, usize) {
+    let matched: Vec<AdmissibleTool> = tools
+        .iter()
+        .filter(|t| {
+            if !include_escalation && t.requires_escalation {
+                return false;
+            }
+            if let Some(cat) = category_coarse
+                && cat != t.category.coarse()
+            {
+                return false;
+            }
+            regex.is_match(&t.name) || regex.is_match(&t.description)
+        })
+        .cloned()
+        .collect();
+    let total = matched.len();
+    let page: Vec<AdmissibleTool> = matched.into_iter().skip(offset).take(limit).collect();
+    (page, total)
+}
+
 /// Render an append-only activation message announcing newly-available
 /// tools (by name, with one-line descriptions — schemas are fetched
 /// via `describe_tool` on demand). Used when `activation_surface =
@@ -537,6 +573,102 @@ mod tests {
     #[test]
     fn activation_announce_empty_is_empty() {
         assert!(render_activation_announce(&[]).is_empty());
+    }
+
+    fn sample_catalog() -> Vec<AdmissibleTool> {
+        vec![
+            tool(
+                "pod_read_file",
+                "read a pod file",
+                ToolCategory::Builtin,
+                false,
+            ),
+            tool(
+                "pod_write_file",
+                "write a pod file",
+                ToolCategory::Builtin,
+                false,
+            ),
+            tool(
+                "describe_tool",
+                "return a tool's schema",
+                ToolCategory::Builtin,
+                false,
+            ),
+            tool(
+                "rustdev_bash",
+                "run a shell command",
+                ToolCategory::HostEnv {
+                    env_name: "rustdev".into(),
+                },
+                false,
+            ),
+            tool(
+                "rustdev_edit",
+                "edit files in the sandbox",
+                ToolCategory::HostEnv {
+                    env_name: "rustdev".into(),
+                },
+                true,
+            ),
+            tool(
+                "create_issue",
+                "open a GitHub issue",
+                ToolCategory::SharedMcp {
+                    host_name: "github".into(),
+                },
+                false,
+            ),
+        ]
+    }
+
+    #[test]
+    fn filter_matches_name_or_description() {
+        let cat = sample_catalog();
+        let re = regex::Regex::new("write|edit").unwrap();
+        let (page, total) = filter_tools_for_find(&cat, &re, None, true, 50, 0);
+        assert_eq!(total, 2);
+        let names: Vec<&str> = page.iter().map(|t| t.name.as_str()).collect();
+        assert!(names.contains(&"pod_write_file"));
+        assert!(names.contains(&"rustdev_edit"));
+    }
+
+    #[test]
+    fn filter_excludes_escalation_when_flag_off() {
+        let cat = sample_catalog();
+        let re = regex::Regex::new("rustdev_").unwrap();
+        let (page, total) = filter_tools_for_find(&cat, &re, None, false, 50, 0);
+        assert_eq!(total, 1);
+        assert_eq!(page[0].name, "rustdev_bash");
+    }
+
+    #[test]
+    fn filter_honors_coarse_category() {
+        let cat = sample_catalog();
+        let re = regex::Regex::new(".*").unwrap();
+        let (page, _) = filter_tools_for_find(&cat, &re, Some("shared_mcp"), true, 50, 0);
+        assert_eq!(page.len(), 1);
+        assert_eq!(page[0].name, "create_issue");
+    }
+
+    #[test]
+    fn filter_paginates() {
+        let cat = sample_catalog();
+        let re = regex::Regex::new(".*").unwrap();
+        let (page1, total) = filter_tools_for_find(&cat, &re, None, true, 2, 0);
+        assert_eq!(total, 6);
+        assert_eq!(page1.len(), 2);
+        let (page2, _) = filter_tools_for_find(&cat, &re, None, true, 2, 4);
+        assert_eq!(page2.len(), 2);
+    }
+
+    #[test]
+    fn filter_unknown_category_returns_empty() {
+        let cat = sample_catalog();
+        let re = regex::Regex::new(".*").unwrap();
+        let (page, total) = filter_tools_for_find(&cat, &re, Some("unknown"), true, 50, 0);
+        assert_eq!(total, 0);
+        assert!(page.is_empty());
     }
 
     #[test]

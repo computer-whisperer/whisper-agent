@@ -667,6 +667,65 @@ kind = "manual"
         assert_eq!(cfg.scope, whisper_agent_protocol::BehaviorScope::default());
     }
 
+    #[test]
+    fn tool_surface_override_round_trips_through_toml() {
+        use whisper_agent_protocol::BehaviorScope;
+        use whisper_agent_protocol::tool_surface::{
+            ActivationSurface, CoreTools, InitialListing, ToolSurface,
+        };
+        let cfg = BehaviorConfig {
+            name: "surface".into(),
+            description: None,
+            trigger: TriggerSpec::default(),
+            thread: whisper_agent_protocol::BehaviorThreadOverride::default(),
+            on_completion: RetentionPolicy::default(),
+            scope: BehaviorScope {
+                tool_surface: Some(ToolSurface {
+                    core_tools: CoreTools::Named(vec!["describe_tool".into()]),
+                    initial_listing: InitialListing::CoreOnly,
+                    activation_surface: ActivationSurface::InjectSchema,
+                }),
+                ..Default::default()
+            },
+        };
+        let text = to_toml(&cfg).unwrap();
+        let back = parse_toml(&text).unwrap();
+        assert_eq!(back, cfg);
+        // `core_tools` lands as a bare array, not a tagged envelope —
+        // hand-edited behavior.toml needs to look natural.
+        assert!(
+            text.contains("core_tools = [\"describe_tool\"]"),
+            "expected bare array; got:\n{text}"
+        );
+    }
+
+    #[test]
+    fn tool_surface_all_sentinel_round_trips_through_toml() {
+        use whisper_agent_protocol::BehaviorScope;
+        use whisper_agent_protocol::tool_surface::{CoreTools, ToolSurface};
+        let cfg = BehaviorConfig {
+            name: "all".into(),
+            description: None,
+            trigger: TriggerSpec::default(),
+            thread: whisper_agent_protocol::BehaviorThreadOverride::default(),
+            on_completion: RetentionPolicy::default(),
+            scope: BehaviorScope {
+                tool_surface: Some(ToolSurface {
+                    core_tools: CoreTools::All,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        };
+        let text = to_toml(&cfg).unwrap();
+        let back = parse_toml(&text).unwrap();
+        assert_eq!(back, cfg);
+        assert!(
+            text.contains("core_tools = \"all\""),
+            "expected string sentinel; got:\n{text}"
+        );
+    }
+
     #[tokio::test]
     async fn loads_multiple_behaviors_from_disk() {
         let pod_dir = scratch_dir();

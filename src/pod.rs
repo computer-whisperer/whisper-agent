@@ -341,6 +341,52 @@ mod tests {
     }
 
     #[test]
+    fn thread_defaults_tool_surface_round_trips_through_toml() {
+        use whisper_agent_protocol::tool_surface::{
+            ActivationSurface, CoreTools, InitialListing, ToolSurface,
+        };
+        let mut cfg = sample_config();
+        cfg.thread_defaults.tool_surface = ToolSurface {
+            core_tools: CoreTools::Named(vec!["describe_tool".into(), "find_tool".into()]),
+            initial_listing: InitialListing::CoreOnly,
+            activation_surface: ActivationSurface::InjectSchema,
+        };
+        let text = to_toml(&cfg).unwrap();
+        let back = parse_toml(&text).unwrap();
+        assert_eq!(cfg, back);
+        assert!(
+            text.contains("[thread_defaults.tool_surface]"),
+            "expected nested table; got:\n{text}"
+        );
+    }
+
+    #[test]
+    fn thread_defaults_tool_surface_omitted_loads_as_default() {
+        let text = r#"
+name = "t"
+created_at = "2026-04-17T00:00:00Z"
+[allow]
+backends = ["anthropic"]
+mcp_hosts = []
+host_env = []
+[thread_defaults]
+backend = "anthropic"
+model = "claude-opus-4-7"
+system_prompt_file = "system_prompt.md"
+max_tokens = 8000
+max_turns = 50
+"#;
+        let cfg = parse_toml(text).unwrap();
+        // Omitted tool_surface deserializes to defaults — small core
+        // set, all_names listing, announce activation. This is the
+        // "most pods get sane defaults for free" guarantee.
+        assert_eq!(
+            cfg.thread_defaults.tool_surface,
+            whisper_agent_protocol::tool_surface::ToolSurface::default()
+        );
+    }
+
+    #[test]
     fn detects_duplicate_sandbox_name() {
         let mut cfg = sample_config();
         cfg.allow.host_env.push(NamedHostEnv {
