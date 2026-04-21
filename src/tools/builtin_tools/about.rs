@@ -1,22 +1,23 @@
-//! `pod_about` — serve the in-tree documentation for the pod/behavior system.
+//! `about` — serve the in-tree documentation for the whisper-agent system.
 
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use super::{POD_ABOUT, ToolOutcome, no_update_error, no_update_text};
+use super::{ABOUT, ToolOutcome, no_update_error, no_update_text};
 use crate::tools::mcp::{ToolAnnotations, ToolDescriptor as McpTool};
 
 pub(super) fn descriptor() -> McpTool {
     McpTool {
-        name: POD_ABOUT.into(),
-        description: "Read documentation about the pod-agent system you run inside: \
-                      schemas for pod.toml and behavior.toml, trigger variants, cron \
-                      syntax, retention policies, and how self-modification works via \
-                      the pod_*_file tools. Call with no arguments (or \
+        name: ABOUT.into(),
+        description: "Read documentation about the whisper-agent system you run \
+                      inside: how threads and pods work, what tools you have and \
+                      how to reach more, filesystem and sandbox rules, the memory \
+                      system, and pod/behavior authoring (schemas, triggers, cron, \
+                      retention, self-modification). Call with no arguments (or \
                       `topic: \"index\"`) for the list of topics, then call again \
-                      with a specific topic name. Use this BEFORE writing a new \
-                      behavior.toml or pod.toml if you haven't recently — the schemas \
-                      may have fields you don't remember."
+                      with a specific topic name. Use this early when orienting, \
+                      and BEFORE writing a pod.toml / behavior.toml if you haven't \
+                      recently — the schemas may have fields you don't remember."
             .into(),
         input_schema: json!({
             "type": "object",
@@ -49,11 +50,11 @@ pub(super) fn run(args: Value) -> ToolOutcome {
         Err(e) => return no_update_error(format!("invalid arguments: {e}")),
     };
     let topic = parsed.topic.as_deref().unwrap_or("index");
-    match crate::tools::pod_about_docs::topic(topic) {
+    match crate::tools::about_docs::topic(topic) {
         Some(text) => no_update_text(text.to_string()),
         None => no_update_error(format!(
-            "unknown topic `{topic}`. Valid topics: [{}]. Call pod_about with no args for the index.",
-            crate::tools::pod_about_docs::TOPIC_NAMES.join(", ")
+            "unknown topic `{topic}`. Valid topics: [{}]. Call about with no args for the index.",
+            crate::tools::about_docs::TOPIC_NAMES.join(", ")
         )),
     }
 }
@@ -73,7 +74,7 @@ mod tests {
             vec![],
             crate::permission::PodModifyCap::ModifyAllow,
             crate::permission::BehaviorOpsCap::AuthorAny,
-            POD_ABOUT,
+            ABOUT,
             json!({}),
         )
         .await;
@@ -96,7 +97,7 @@ mod tests {
             vec![],
             crate::permission::PodModifyCap::ModifyAllow,
             crate::permission::BehaviorOpsCap::AuthorAny,
-            POD_ABOUT,
+            ABOUT,
             json!({ "topic": "cron" }),
         )
         .await;
@@ -118,7 +119,7 @@ mod tests {
             vec![],
             crate::permission::PodModifyCap::ModifyAllow,
             crate::permission::BehaviorOpsCap::AuthorAny,
-            POD_ABOUT,
+            ABOUT,
             json!({ "topic": "nonsense" }),
         )
         .await;

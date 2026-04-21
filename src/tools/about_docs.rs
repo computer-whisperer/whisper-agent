@@ -1,9 +1,11 @@
-//! Static documentation returned by the `pod_about` builtin tool.
+//! Static documentation returned by the `about` builtin tool.
 //!
 //! One entry per topic. `topic(name)` returns the markdown body; `index`
 //! is a synthetic topic that lists every other name with a one-line
-//! summary. These strings are the agent's primary reference for the
-//! pod/behavior schemas — keep them in sync with the types in
+//! summary. These strings are the agent's primary reference for how the
+//! whisper-agent system works — thread/pod structure, the tool surface,
+//! filesystem and sandbox rules, the memory system, and pod/behavior
+//! authoring. Keep schemas in sync with the types in
 //! `whisper-agent-protocol::{pod, behavior}` by hand.
 
 pub fn topic(name: &str) -> Option<&'static str> {
@@ -32,7 +34,7 @@ pub const TOPIC_NAMES: &[&str] = &[
     "self-modification",
 ];
 
-const INDEX: &str = "# pod_about topics
+const INDEX: &str = "# about topics
 
 - `overview` — what a pod is, how behaviors and threads relate
 - `pod.toml` — field reference for the pod's root config
@@ -42,7 +44,7 @@ const INDEX: &str = "# pod_about topics
 - `retention` — on_completion policies for spawned threads
 - `self-modification` — editing this pod's config via pod_*_file tools
 
-Call `pod_about` with `{\"topic\": \"<name>\"}` for the details.
+Call `about` with `{\"topic\": \"<name>\"}` for the details.
 ";
 
 const OVERVIEW: &str = "# Overview
@@ -127,7 +129,7 @@ max_concurrent_threads = 10                  # default 10 if omitted
 
 ## `HostEnvSpec`
 
-See `pod_about` topic `self-modification` for how to inspect the
+See `about` topic `self-modification` for how to inspect the
 current pod's `[[allow.host_env]]` entries. The variant discriminator
 is `type`:
 
@@ -349,7 +351,7 @@ only these can.
   behavior/state/since/turn-count filters. Returns a one-line
   summary per hit. Sorted newest-first. Use before `pod_read_file`
   when you want \"the most recent run of behavior X\" or similar.
-- `pod_about` — this tool.
+- `about` — this tool.
 
 ## Orchestration tools (runtime state)
 

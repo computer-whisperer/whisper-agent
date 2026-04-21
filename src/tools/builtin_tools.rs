@@ -128,7 +128,7 @@ pub const POD_EDIT_FILE: &str = "pod_edit_file";
 pub const POD_LIST_FILES: &str = "pod_list_files";
 pub const POD_GREP: &str = "pod_grep";
 pub const POD_LIST_THREADS: &str = "pod_list_threads";
-pub const POD_ABOUT: &str = "pod_about";
+pub const ABOUT: &str = "about";
 pub const POD_RUN_BEHAVIOR: &str = "pod_run_behavior";
 pub const POD_SET_BEHAVIOR_ENABLED: &str = "pod_set_behavior_enabled";
 pub const DISPATCH_THREAD: &str = "dispatch_thread";
@@ -147,7 +147,7 @@ pub fn is_builtin(name: &str) -> bool {
             | POD_LIST_FILES
             | POD_GREP
             | POD_LIST_THREADS
-            | POD_ABOUT
+            | ABOUT
             | POD_RUN_BEHAVIOR
             | POD_SET_BEHAVIOR_ENABLED
             | DISPATCH_THREAD
@@ -173,7 +173,7 @@ pub fn reserved_env_name_prefixes() -> Vec<&'static str> {
         POD_LIST_FILES,
         POD_GREP,
         POD_LIST_THREADS,
-        POD_ABOUT,
+        ABOUT,
         POD_RUN_BEHAVIOR,
         POD_SET_BEHAVIOR_ENABLED,
         DISPATCH_THREAD,
@@ -345,7 +345,7 @@ pub async fn dispatch(
         POD_EDIT_FILE => filesystem::edit_file(&pod_dir, &allowed, &behavior_ids, args).await,
         POD_GREP => grep::run(&pod_dir, args).await,
         POD_LIST_THREADS => list_threads::run(&pod_dir, args).await,
-        POD_ABOUT => about::run(args),
+        ABOUT => about::run(args),
         POD_RUN_BEHAVIOR => behavior_control::run_behavior(&behavior_ids, args),
         POD_SET_BEHAVIOR_ENABLED => behavior_control::set_behavior_enabled(&behavior_ids, args),
         DISPATCH_THREAD => no_update_error(
