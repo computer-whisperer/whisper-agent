@@ -1022,6 +1022,26 @@ fn tool_call(
             };
             let pod_modify = scheduler.thread_pod_modify_cap(&thread_id);
             let behaviors_cap = scheduler.thread_behaviors_cap(&thread_id);
+            // Authoring gate: a write to `behaviors/<id>/behavior.toml`
+            // is denied if the caller's `BehaviorOpsCap` doesn't admit
+            // the declared scope. Runs BEFORE the builtin dispatch so
+            // a partially-applied state is never reached — if the gate
+            // denies, we never hit `prepare_update` or `PodUpdate`.
+            if let Some(denial) = scheduler.check_behavior_authoring(&thread_id, &name, &input) {
+                return Box::pin(async move {
+                    SchedulerCompletion::Io(IoCompletion {
+                        thread_id,
+                        op_id,
+                        result: IoResult::ToolCall {
+                            tool_use_id,
+                            result: Err(denial),
+                        },
+                        pod_update: None,
+                        scheduler_command: None,
+                        host_env_lost: None,
+                    })
+                });
+            }
             Box::pin(async move {
                 let outcome = crate::tools::builtin_tools::dispatch(
                     snapshot.pod_dir,

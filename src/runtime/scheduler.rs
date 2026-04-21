@@ -1893,6 +1893,45 @@ impl Scheduler {
             .unwrap_or(crate::permission::BehaviorOpsCap::None)
     }
 
+    /// Apply the behavior-authoring gate. When `tool_name` is a pod-file
+    /// write targeting `behaviors/<id>/behavior.toml`, compare the
+    /// declared scope against the author thread's scope per
+    /// [`crate::permission::BehaviorOpsCap`] rules and return
+    /// `Some(error_message)` on a denial. Returns `None` (admits) for
+    /// every other tool / path, and for writes that fail to parse
+    /// (let `prepare_update` surface the parse error downstream).
+    ///
+    /// Thin wrapper around [`check_behavior_authoring_pure`] that looks
+    /// up the caller's scope and pod ceiling from scheduler state. The
+    /// decision logic itself is pure and covered by that helper's tests.
+    pub(crate) fn check_behavior_authoring(
+        &self,
+        thread_id: &str,
+        tool_name: &str,
+        args: &serde_json::Value,
+    ) -> Option<String> {
+        use crate::tools::builtin_tools::{POD_EDIT_FILE, POD_WRITE_FILE};
+
+        if !matches!(tool_name, POD_WRITE_FILE | POD_EDIT_FILE) {
+            return None;
+        }
+        let filename = args.get("filename").and_then(|v| v.as_str())?;
+        let (_id, suffix) = crate::pod::fs::parse_behavior_path(filename)?;
+        if suffix != crate::pod::behaviors::BEHAVIOR_TOML {
+            return None;
+        }
+
+        let task = self.tasks.get(thread_id)?;
+        let caller_scope = task.scope.clone();
+        let pod_ceiling = self.pod_scope_ceiling(&task.pod_id);
+
+        let content = args.get("content").and_then(|v| v.as_str())?;
+        let Ok(parsed) = crate::pod::behaviors::parse_toml(content) else {
+            return None;
+        };
+        check_behavior_authoring_pure(&caller_scope, &pod_ceiling, filename, &parsed.scope)
+    }
+
     /// Derive the effective [`Scope`] a newly-created thread in `pod_id`
     /// starts with. The bindings + tools come from the pod's `[allow]`
     /// table; typed caps come from `[thread_defaults.caps]` in the pod
@@ -3484,6 +3523,60 @@ impl Scheduler {
     }
 }
 
+/// Pure decision logic for the behavior-authoring gate. Split out of
+/// [`Scheduler::check_behavior_authoring`] so the three
+/// `BehaviorOpsCap` branches + the "strictly narrower" subset-check
+/// can be unit-tested without building a full Scheduler.
+///
+/// Rules (from `docs/design_permissions_rework.md`):
+///   - `None` / `Read`: authoring denied outright.
+///   - `AuthorNarrower`: the behavior's fire-time scope
+///     (`pod.allow.narrow(behavior.scope)`) must be **strictly**
+///     narrower than the caller's. Equal-scope writes are denied —
+///     AuthorNarrower lets an author mint a less-privileged behavior,
+///     not one at their own power level.
+///   - `AuthorAny`: admits anything; the pod.allow narrowing at fire
+///     time is the only remaining bound.
+pub(crate) fn check_behavior_authoring_pure(
+    caller_scope: &crate::permission::Scope,
+    pod_ceiling: &crate::permission::Scope,
+    filename: &str,
+    declared_scope: &whisper_agent_protocol::BehaviorScope,
+) -> Option<String> {
+    use crate::permission::BehaviorOpsCap;
+
+    let fire_scope = pod_ceiling.narrow(&declared_scope.as_scope_narrower());
+    match caller_scope.behaviors {
+        BehaviorOpsCap::None | BehaviorOpsCap::Read => Some(format!(
+            "`{filename}`: authoring a behavior requires behaviors cap ≥ \
+             author_narrower (have: {:?}). Ask for scope widening if \
+             this action is needed.",
+            caller_scope.behaviors
+        )),
+        BehaviorOpsCap::AuthorNarrower => {
+            // `inner.narrow(&outer) == inner` iff `inner ⊆ outer`.
+            let is_subset = fire_scope.narrow(caller_scope) == fire_scope;
+            if !is_subset {
+                return Some(format!(
+                    "`{filename}`: author_narrower requires the behavior's \
+                     effective scope to fit within the author's; one or more \
+                     fields exceed the caller's scope."
+                ));
+            }
+            if fire_scope == *caller_scope {
+                return Some(format!(
+                    "`{filename}`: author_narrower requires the behavior's \
+                     effective scope to be strictly narrower than the \
+                     author's; this write would produce a scope equal to \
+                     the caller's."
+                ));
+            }
+            None
+        }
+        BehaviorOpsCap::AuthorAny => None,
+    }
+}
+
 /// Read a pod-relative prompt file for a creation-time system-prompt
 /// override. Rejects any name containing path separators or a parent
 /// component — the override is a filename inside the pod dir, not an
@@ -3692,4 +3785,195 @@ async fn connect_shared_mcp_on_boot(
         .map(|t| (t.name.clone(), t.annotations.clone()))
         .collect();
     resources.populate_mcp_tools(&id, tools, annotations);
+}
+
+#[cfg(test)]
+mod authoring_gate_tests {
+    use super::*;
+    use crate::permission::{BehaviorOpsCap, PodModifyCap, Scope, SetOrAll};
+    use whisper_agent_protocol::{BehaviorScope, BehaviorScopeCaps};
+
+    fn pod_ceiling_allow_all() -> Scope {
+        Scope::allow_all()
+    }
+
+    /// A caller scope with full resources but a specific `behaviors`
+    /// cap and `pod_modify` narrowed to `Content` (typical interactive
+    /// authoring baseline).
+    fn caller_with_behaviors(cap: BehaviorOpsCap) -> Scope {
+        let mut s = Scope::allow_all();
+        s.behaviors = cap;
+        s.pod_modify = PodModifyCap::Content;
+        s
+    }
+
+    #[test]
+    fn none_cap_denied() {
+        let r = check_behavior_authoring_pure(
+            &caller_with_behaviors(BehaviorOpsCap::None),
+            &pod_ceiling_allow_all(),
+            "behaviors/x/behavior.toml",
+            &BehaviorScope::default(),
+        );
+        assert!(r.is_some());
+        assert!(r.unwrap().contains("author_narrower"));
+    }
+
+    #[test]
+    fn read_cap_denied() {
+        // Read admits list/read but never authoring.
+        let r = check_behavior_authoring_pure(
+            &caller_with_behaviors(BehaviorOpsCap::Read),
+            &pod_ceiling_allow_all(),
+            "behaviors/x/behavior.toml",
+            &BehaviorScope::default(),
+        );
+        assert!(r.is_some());
+    }
+
+    #[test]
+    fn author_any_admits_any_scope() {
+        // AuthorAny == "within pod.allow", which narrowing enforces
+        // automatically — the gate itself imposes no extra check.
+        let r = check_behavior_authoring_pure(
+            &caller_with_behaviors(BehaviorOpsCap::AuthorAny),
+            &pod_ceiling_allow_all(),
+            "behaviors/x/behavior.toml",
+            &BehaviorScope::default(),
+        );
+        assert!(r.is_none());
+    }
+
+    #[test]
+    fn author_narrower_denied_for_equal_scope() {
+        // Caller has behaviors=AuthorNarrower (narrower than pod ceiling);
+        // declared narrows behaviors cap to match exactly, every other
+        // field defaults. Fire-time scope matches the caller on every
+        // dimension → strictly-narrower rule rejects the equal case.
+        let mut caller = Scope::allow_all();
+        caller.behaviors = BehaviorOpsCap::AuthorNarrower;
+        let declared = BehaviorScope {
+            caps: BehaviorScopeCaps {
+                behaviors: Some(BehaviorOpsCap::AuthorNarrower),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let r = check_behavior_authoring_pure(
+            &caller,
+            &pod_ceiling_allow_all(),
+            "behaviors/x/behavior.toml",
+            &declared,
+        );
+        assert!(r.is_some());
+        assert!(r.unwrap().contains("strictly narrower"));
+    }
+
+    #[test]
+    fn author_narrower_denied_when_fire_scope_exceeds_caller() {
+        // Caller narrower than pod.allow on host_envs; behavior declares
+        // no `[scope]` block, so fire_scope inherits the pod ceiling —
+        // wider than the caller on host_envs AND on behaviors cap
+        // (pod's AuthorAny vs caller's AuthorNarrower). Subset fails.
+        let mut caller = Scope::allow_all();
+        caller.behaviors = BehaviorOpsCap::AuthorNarrower;
+        caller.host_envs = SetOrAll::only(["narrow".to_string()]);
+        let r = check_behavior_authoring_pure(
+            &caller,
+            &pod_ceiling_allow_all(),
+            "behaviors/x/behavior.toml",
+            &BehaviorScope::default(),
+        );
+        assert!(r.is_some());
+        assert!(r.unwrap().contains("fit within the author"));
+    }
+
+    #[test]
+    fn author_narrower_admits_strict_subset() {
+        // Caller has host_envs ∈ {a, b}; behavior restricts to {a} AND
+        // narrows behaviors cap to match caller. Fire scope ⊆ caller
+        // and is strictly smaller on host_envs.
+        let mut caller = Scope::allow_all();
+        caller.behaviors = BehaviorOpsCap::AuthorNarrower;
+        caller.host_envs = SetOrAll::only(["a".to_string(), "b".to_string()]);
+        let declared = BehaviorScope {
+            host_envs: Some(vec!["a".to_string()]),
+            caps: BehaviorScopeCaps {
+                behaviors: Some(BehaviorOpsCap::AuthorNarrower),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let r = check_behavior_authoring_pure(
+            &caller,
+            &pod_ceiling_allow_all(),
+            "behaviors/x/behavior.toml",
+            &declared,
+        );
+        assert!(r.is_none(), "expected admission, got: {r:?}");
+    }
+
+    #[test]
+    fn author_narrower_admits_when_a_cap_is_strictly_less() {
+        // Caller = pod.allow on every field (including behaviors=AuthorAny
+        // so fire_scope doesn't inherit wider). Declared narrows
+        // pod_modify to None — strictly less on that one dimension.
+        let caller = Scope::allow_all();
+        // Leave caller.behaviors at AuthorAny so no cap mismatch.
+        let declared = BehaviorScope {
+            caps: BehaviorScopeCaps {
+                pod_modify: Some(PodModifyCap::None),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        // Flip behaviors cap to AuthorNarrower on a clone of caller to
+        // activate the AuthorNarrower branch.
+        let mut author = caller.clone();
+        author.behaviors = BehaviorOpsCap::AuthorNarrower;
+        // But we need the author's scope to *contain* fire_scope — which
+        // it does because fire_scope only narrows pod_modify further,
+        // and behaviors=AuthorNarrower ≤ AuthorAny (the inherited default).
+        // Wait: fire_scope.behaviors = AuthorAny (inherited) > author's
+        // AuthorNarrower. Same inheritance trap as above — declared must
+        // match the author's behaviors cap for subset to hold.
+        let declared = BehaviorScope {
+            caps: BehaviorScopeCaps {
+                pod_modify: Some(PodModifyCap::None),
+                behaviors: Some(BehaviorOpsCap::AuthorNarrower),
+                ..Default::default()
+            },
+            ..declared
+        };
+        let r = check_behavior_authoring_pure(
+            &author,
+            &pod_ceiling_allow_all(),
+            "behaviors/x/behavior.toml",
+            &declared,
+        );
+        assert!(r.is_none(), "expected admission, got: {r:?}");
+    }
+
+    #[test]
+    fn author_narrower_inheriting_pod_ceiling_on_behaviors_is_denied() {
+        // Documents the inheritance trap: an AuthorNarrower caller who
+        // forgets to narrow `[scope.caps.behaviors]` in their behavior
+        // TOML gets denied because the fire-time `behaviors` cap
+        // inherits the pod ceiling (usually AuthorAny), which exceeds
+        // the author's cap. This is intentional — authors must be
+        // explicit to avoid minting behaviors more privileged than
+        // themselves. The denial message surfaces the "fit within"
+        // subset failure so the author can diagnose.
+        let mut caller = Scope::allow_all();
+        caller.behaviors = BehaviorOpsCap::AuthorNarrower;
+        let declared = BehaviorScope::default();
+        let r = check_behavior_authoring_pure(
+            &caller,
+            &pod_ceiling_allow_all(),
+            "behaviors/x/behavior.toml",
+            &declared,
+        );
+        assert!(r.is_some());
+        assert!(r.unwrap().contains("fit within the author"));
+    }
 }

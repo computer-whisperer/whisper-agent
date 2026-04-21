@@ -984,6 +984,59 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    async fn read_file_denies_behavior_paths_when_behaviors_cap_is_none() {
+        // A thread with `behaviors: None` cap can't inspect the pod's
+        // behavior library even if the filename allowlist admits the
+        // path. Per design: Read = "list / read behavior configs and
+        // prompts"; None is below that.
+        let dir = temp_dir();
+        let cfg = sample_config();
+        let out = dispatch(
+            dir.clone(),
+            cfg,
+            vec!["daily".to_string()],
+            crate::permission::PodModifyCap::ModifyAllow,
+            crate::permission::BehaviorOpsCap::None,
+            POD_READ_FILE,
+            json!({ "filename": "behaviors/daily/behavior.toml" }),
+        )
+        .await;
+        assert!(out.result.is_error);
+        let text = join_blocks(&out.result.content);
+        assert!(
+            text.contains("behaviors cap"),
+            "expected behaviors-cap denial, got: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn read_file_admits_behavior_paths_at_read_cap() {
+        let dir = temp_dir();
+        tokio::fs::create_dir_all(dir.join("behaviors/daily"))
+            .await
+            .unwrap();
+        tokio::fs::write(dir.join("behaviors/daily/behavior.toml"), "name = \"d\"\n")
+            .await
+            .unwrap();
+        let cfg = sample_config();
+        let out = dispatch(
+            dir.clone(),
+            cfg,
+            vec!["daily".to_string()],
+            crate::permission::PodModifyCap::ModifyAllow,
+            crate::permission::BehaviorOpsCap::Read,
+            POD_READ_FILE,
+            json!({ "filename": "behaviors/daily/behavior.toml" }),
+        )
+        .await;
+        assert!(
+            !out.result.is_error,
+            "Read cap should admit; got: {}",
+            join_blocks(&out.result.content)
+        );
+    }
+
+    #[tokio::test]
     async fn read_file_whitelists_filename() {
         let dir = temp_dir();
         tokio::fs::write(dir.join("pod.toml"), "hello")
