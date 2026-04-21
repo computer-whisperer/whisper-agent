@@ -819,10 +819,6 @@ enum LeftPanelMode {
     #[default]
     Threads,
     Resources,
-    /// Host-env provider catalog (server-wide settings). Distinct from
-    /// Resources — Resources shows *live* provisioned sandboxes, this
-    /// tab shows the *registered providers* that can be provisioned.
-    Providers,
 }
 
 /// State for the per-pod config editor. The modal is tabbed: three
@@ -1052,6 +1048,11 @@ struct SettingsModalState {
 enum SettingsTab {
     #[default]
     Backends,
+    /// Host-env provider catalog (sandbox daemons threads provision
+    /// jails against). Used to live in the left sidebar next to
+    /// Threads/Resources; moved here so all server-wide settings are
+    /// in one place and the sidebar can focus on per-thread state.
+    HostEnvProviders,
     SharedMcp,
 }
 
@@ -3294,21 +3295,11 @@ impl eframe::App for ChatApp {
                     {
                         self.left_mode = LeftPanelMode::Resources;
                     }
-                    if ui
-                        .selectable_label(
-                            self.left_mode == LeftPanelMode::Providers,
-                            format!("Providers ({})", self.host_env_providers.len()),
-                        )
-                        .clicked()
-                    {
-                        self.left_mode = LeftPanelMode::Providers;
-                    }
                 });
                 ui.separator();
                 match self.left_mode {
                     LeftPanelMode::Threads => self.render_thread_tree(ui),
                     LeftPanelMode::Resources => render_resource_list(ui, &self.resources),
-                    LeftPanelMode::Providers => self.render_providers_list(ui),
                 }
             });
 
@@ -4978,25 +4969,33 @@ impl ChatApp {
     /// Left-panel Providers tab. Lists registered host-env providers
     /// with origin + reachability badges and per-row Edit / Remove
     /// actions. "+ Add provider" at the top opens the add modal.
-    fn render_providers_list(&mut self, ui: &mut egui::Ui) {
-        ui.add_space(4.0);
+    /// Host-env provider catalog tab. The sandbox daemons threads
+    /// can provision isolated MCP hosts against; distinct from the
+    /// Shared MCP hosts tab (long-lived endpoints the operator
+    /// points us at). Used to live in the left sidebar; moved here
+    /// so server-wide settings are all in one place.
+    fn render_settings_host_env_providers_tab(&mut self, ui: &mut egui::Ui) {
+        ui.label(
+            RichText::new(
+                "Sandbox daemons threads can provision isolated host envs \
+                 against. Each thread that binds a host env gets its own \
+                 landlock-isolated MCP host from the daemon named here.",
+            )
+            .small()
+            .color(Color32::from_gray(150)),
+        );
+        ui.add_space(6.0);
         ui.horizontal(|ui| {
             if ui.button("+ Add provider").clicked() {
                 self.provider_editor_modal = Some(ProviderEditorModalState::new_add());
             }
-            ui.label(
-                RichText::new("Sandbox daemons threads can provision host envs against.")
-                    .small()
-                    .color(Color32::from_gray(150)),
-            );
         });
-        ui.separator();
+        ui.add_space(4.0);
 
         if self.host_env_providers.is_empty() {
-            ui.add_space(8.0);
             ui.label(
                 RichText::new(
-                    "No providers registered. Add one here, or seed them via \
+                    "No providers registered. Add one above or seed via \
                      [[host_env_providers]] in whisper-agent.toml.",
                 )
                 .small()
@@ -5051,6 +5050,15 @@ impl ChatApp {
                     }
                     if ui
                         .selectable_label(
+                            modal.active_tab == SettingsTab::HostEnvProviders,
+                            "Host-env providers",
+                        )
+                        .clicked()
+                    {
+                        modal.active_tab = SettingsTab::HostEnvProviders;
+                    }
+                    if ui
+                        .selectable_label(
                             modal.active_tab == SettingsTab::SharedMcp,
                             "Shared MCP hosts",
                         )
@@ -5067,6 +5075,9 @@ impl ChatApp {
                         &modal.codex_rotate_banner,
                         &mut rotate_request,
                     ),
+                    SettingsTab::HostEnvProviders => {
+                        self.render_settings_host_env_providers_tab(ui);
+                    }
                     SettingsTab::SharedMcp => self.render_settings_shared_mcp_tab(
                         ui,
                         &modal.shared_mcp_banner,
