@@ -701,6 +701,11 @@ pub enum FunctionKind {
     /// until the owning interactive channel resolves it via
     /// `ClientToServer::ResolveEscalation`.
     RequestEscalation,
+    /// A model-initiated `sudo` call — the model wants to invoke a
+    /// named tool with explicit user approval. Stays in the registry
+    /// until the owning interactive channel resolves it via
+    /// `ClientToServer::ResolveSudo`.
+    Sudo,
 }
 
 /// Coarse outcome tag sent with `FunctionEnded`. The server's full
@@ -1190,6 +1195,22 @@ pub enum ClientToServer {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         reason: Option<String>,
     },
+
+    // --- Sudo ---
+    /// User's answer to a pending `Sudo` Function — the approval reply
+    /// to a model's `sudo` tool call. On approve (once or remember) the
+    /// scheduler dispatches the wrapped tool with pod-ceiling caps and
+    /// sends the result back as the sudo call's tool_result. On
+    /// `approve_remember`, the wrapped tool name is additionally flipped
+    /// to `Allow` in the thread's `scope.tools` so future direct calls
+    /// skip the approval prompt. On reject the `reason` (if any) is
+    /// delivered to the model as the tool_result error text.
+    ResolveSudo {
+        function_id: u64,
+        decision: crate::permission::SudoDecision,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+    },
 }
 
 /// Messages the server sends to the client.
@@ -1645,6 +1666,29 @@ pub enum ServerToClient {
         function_id: u64,
         thread_id: String,
         decision: crate::permission::EscalationDecision,
+    },
+
+    // --- Sudo ---
+    /// A thread's model issued `sudo(tool_name, args, reason)`. Delivered
+    /// only to the thread's interactive channel; autonomous threads
+    /// cannot emit this (the `sudo` tool hard-errors on threads without
+    /// an interactive approver). The client renders an approval UI
+    /// showing the wrapped tool name, the inner args, and the model's
+    /// reason, then replies with `ClientToServer::ResolveSudo`.
+    SudoRequested {
+        function_id: u64,
+        thread_id: String,
+        tool_name: String,
+        args: serde_json::Value,
+        /// Model-supplied justification. Free-form string.
+        reason: String,
+    },
+    /// A sudo Function completed. Broadcast to subscribers so any
+    /// observer (not just the approver) can reflect the resolution.
+    SudoResolved {
+        function_id: u64,
+        thread_id: String,
+        decision: crate::permission::SudoDecision,
     },
 
     Error {

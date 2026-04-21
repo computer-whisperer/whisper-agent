@@ -8,7 +8,7 @@
 
 pub use whisper_agent_protocol::permission::{
     AllowMap, BehaviorOpsCap, DispatchCap, Disposition, Escalation, EscalationDecision,
-    EscalationRequest, PodModifyCap, Scope, SetOrAll,
+    EscalationRequest, PodModifyCap, Scope, SetOrAll, SudoDecision,
 };
 
 pub type BackendName = String;

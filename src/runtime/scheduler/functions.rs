@@ -295,6 +295,20 @@ impl Scheduler {
                     .check_escalation(request, &pod_ceiling)
                     .map_err(|detail| RejectReason::ScopeDenied { detail })
             }
+            Function::Sudo { thread_id, .. } => {
+                let task =
+                    self.tasks
+                        .get(thread_id)
+                        .ok_or_else(|| RejectReason::PreconditionFailed {
+                            detail: format!("unknown thread {thread_id}"),
+                        })?;
+                if !task.scope.escalation.is_interactive() {
+                    return Err(RejectReason::ScopeDenied {
+                        detail: "thread has no interactive approver for `sudo`".into(),
+                    });
+                }
+                Ok(())
+            }
         }
     }
 
@@ -441,6 +455,41 @@ impl Scheduler {
                         function_id: id,
                         thread_id: thread_id.clone(),
                         request: request.clone(),
+                        reason: reason.clone(),
+                    },
+                );
+            }
+            Function::Sudo {
+                thread_id,
+                tool_name,
+                args,
+                reason,
+            } => {
+                // Parallel to RequestEscalation's launch path: emit the
+                // wire approval request to the thread's interactive
+                // channel; the Function stays admitted until
+                // `resolve_sudo` fires.
+                let via_conn = match self.tasks.get(&thread_id).map(|t| t.scope.escalation) {
+                    Some(crate::permission::Escalation::Interactive { via_conn }) => via_conn,
+                    _ => {
+                        self.complete_function(
+                            id,
+                            FunctionOutcome::Error(crate::functions::FunctionError {
+                                kind: crate::functions::FunctionErrorKind::Execution,
+                                detail: "interactive approver unavailable".into(),
+                            }),
+                            pending_io,
+                        );
+                        return;
+                    }
+                };
+                self.router.send_to_client(
+                    via_conn,
+                    ServerToClient::SudoRequested {
+                        function_id: id,
+                        thread_id: thread_id.clone(),
+                        tool_name: tool_name.clone(),
+                        args: args.clone(),
                         reason: reason.clone(),
                     },
                 );
@@ -744,6 +793,22 @@ impl Scheduler {
         // terminal via a `FunctionDelivery::ToolResultChannel`.
         if name == crate::tools::builtin_tools::REQUEST_ESCALATION {
             self.register_request_escalation_tool(
+                thread_id,
+                op_id,
+                tool_use_id,
+                input,
+                disposition,
+                pending_io,
+            );
+            return;
+        }
+
+        // `sudo` is intercepted like request_escalation — register a
+        // Function::Sudo that emits the approval request on launch and
+        // parks the tool call on its terminal. Approval dispatches the
+        // wrapped tool; rejection returns the user's reason.
+        if name == crate::tools::builtin_tools::SUDO {
+            self.register_sudo_tool(
                 thread_id,
                 op_id,
                 tool_use_id,
@@ -1522,6 +1587,434 @@ impl Scheduler {
         }
     }
 
+    /// `sudo`-specific registration path. Parses the tool args, refuses
+    /// at the tool layer if the thread's scope lacks an interactive
+    /// approver, otherwise registers a `Function::Sudo` (which fires
+    /// the `SudoRequested` event on launch) and parks the tool call on
+    /// its terminal via `FunctionDelivery::ToolResultChannel`. The
+    /// parent's turn resumes when the user resolves the sudo.
+    fn register_sudo_tool(
+        &mut self,
+        thread_id: &str,
+        op_id: crate::runtime::thread::OpId,
+        tool_use_id: String,
+        input: serde_json::Value,
+        disposition: crate::permission::Disposition,
+        pending_io: &mut FuturesUnordered<SchedulerFuture>,
+    ) {
+        if matches!(disposition, crate::permission::Disposition::Deny) {
+            pending_io.push(make_denial_future(
+                thread_id.to_string(),
+                tool_use_id,
+                op_id,
+                crate::tools::builtin_tools::SUDO.to_string(),
+            ));
+            return;
+        }
+        let interactive = self
+            .tasks
+            .get(thread_id)
+            .map(|t| t.scope.escalation.is_interactive())
+            .unwrap_or(false);
+        if !interactive {
+            pending_io.push(immediate_tool_error(
+                thread_id.to_string(),
+                op_id,
+                tool_use_id,
+                "sudo denied: thread has no interactive approver. Autonomous \
+                 threads cannot run sudo — use the tool directly if admitted \
+                 by scope, or have a parent widen this thread's scope."
+                    .into(),
+            ));
+            return;
+        }
+        let args = match crate::tools::builtin_tools::sudo::parse_args(input) {
+            Ok(a) => a,
+            Err(e) => {
+                pending_io.push(immediate_tool_error(
+                    thread_id.to_string(),
+                    op_id,
+                    tool_use_id,
+                    e,
+                ));
+                return;
+            }
+        };
+        // Reject recursive / meta targets at register time so the user
+        // never sees an approval prompt for them.
+        let disallowed_targets = [
+            crate::tools::builtin_tools::SUDO,
+            crate::tools::builtin_tools::REQUEST_ESCALATION,
+            crate::tools::builtin_tools::DISPATCH_THREAD,
+        ];
+        if disallowed_targets.contains(&args.tool_name.as_str()) {
+            pending_io.push(immediate_tool_error(
+                thread_id.to_string(),
+                op_id,
+                tool_use_id,
+                format!("sudo cannot wrap `{}`. Call it directly.", args.tool_name),
+            ));
+            return;
+        }
+        // The wrapped tool must at least be routable in this thread's
+        // pod (builtin or bound MCP) — don't prompt the user for a
+        // name we can't resolve.
+        if self.route_tool(thread_id, &args.tool_name).is_none() {
+            pending_io.push(immediate_tool_error(
+                thread_id.to_string(),
+                op_id,
+                tool_use_id,
+                format!(
+                    "sudo: no bound host advertises `{}`. Check `find_tool` \
+                     for the exact name.",
+                    args.tool_name
+                ),
+            ));
+            return;
+        }
+        let spec = Function::Sudo {
+            thread_id: thread_id.to_string(),
+            tool_name: args.tool_name,
+            args: args.args,
+            reason: args.reason,
+        };
+        let caller = CallerLink::ThreadToolCall {
+            thread_id: thread_id.to_string(),
+            tool_use_id: tool_use_id.clone(),
+        };
+        let (tx, rx) = tokio::sync::oneshot::channel::<Result<String, String>>();
+        let delivery = FunctionDelivery::ToolResultChannel(tx);
+        let fn_id = match self.register_function_with_delivery(spec, caller, delivery) {
+            Ok(id) => id,
+            Err(e) => {
+                pending_io.push(immediate_tool_error(
+                    thread_id.to_string(),
+                    op_id,
+                    tool_use_id,
+                    format!("sudo: {}", super::client_messages::reject_reason_detail(&e)),
+                ));
+                return;
+            }
+        };
+        self.launch_function(fn_id, pending_io);
+        let parent_id = thread_id.to_string();
+        pending_io.push(Box::pin(async move {
+            let result = match rx.await {
+                Ok(Ok(text)) => Ok(crate::tools::mcp::CallToolResult {
+                    content: vec![crate::tools::mcp::McpContentBlock::Text { text }],
+                    is_error: false,
+                }),
+                Ok(Err(msg)) => Ok(crate::tools::mcp::CallToolResult {
+                    content: vec![crate::tools::mcp::McpContentBlock::Text { text: msg }],
+                    is_error: true,
+                }),
+                Err(_) => Err("sudo: Function terminated without delivering a result".into()),
+            };
+            crate::runtime::io_dispatch::SchedulerCompletion::Io(
+                crate::runtime::io_dispatch::IoCompletion {
+                    thread_id: parent_id,
+                    op_id,
+                    result: crate::runtime::thread::IoResult::ToolCall {
+                        tool_use_id,
+                        result,
+                    },
+                    pod_update: None,
+                    scheduler_command: None,
+                    host_env_lost: None,
+                },
+            )
+        }));
+    }
+
+    /// Resolve an in-flight `Sudo` Function. On approve (once or
+    /// remember), runs the wrapped tool with pod-ceiling caps and
+    /// sends the inner result back through the parked tool-call
+    /// oneshot. `ApproveRemember` additionally widens `scope.tools`
+    /// so future direct calls of the wrapped tool skip the prompt.
+    /// On reject, surfaces the user's reason through the tool result.
+    pub(crate) fn resolve_sudo(
+        &mut self,
+        resolver_conn: ConnId,
+        function_id: crate::functions::FunctionId,
+        decision: crate::permission::SudoDecision,
+        reason: Option<String>,
+        pending_io: &mut FuturesUnordered<SchedulerFuture>,
+    ) {
+        let entry = match self.active_functions.get(&function_id) {
+            Some(e) => e,
+            None => {
+                warn!(function_id, resolver_conn, "resolve_sudo: no such Function");
+                self.router.send_to_client(
+                    resolver_conn,
+                    ServerToClient::Error {
+                        correlation_id: None,
+                        thread_id: None,
+                        message: format!("resolve_sudo: unknown function_id {function_id}"),
+                    },
+                );
+                return;
+            }
+        };
+        let Function::Sudo {
+            thread_id,
+            tool_name,
+            args,
+            ..
+        } = entry.spec.clone()
+        else {
+            self.router.send_to_client(
+                resolver_conn,
+                ServerToClient::Error {
+                    correlation_id: None,
+                    thread_id: entry.spec.primary_thread_id().map(str::to_string),
+                    message: format!("resolve_sudo: function {function_id} is not a Sudo"),
+                },
+            );
+            return;
+        };
+        let channel_conn = self
+            .tasks
+            .get(&thread_id)
+            .and_then(|t| match t.scope.escalation {
+                crate::permission::Escalation::Interactive { via_conn } => Some(via_conn),
+                crate::permission::Escalation::None => None,
+            });
+        if channel_conn != Some(resolver_conn) {
+            self.router.send_to_client(
+                resolver_conn,
+                ServerToClient::Error {
+                    correlation_id: None,
+                    thread_id: Some(thread_id.clone()),
+                    message: "resolve_sudo: caller is not the thread's interactive channel"
+                        .to_string(),
+                },
+            );
+            return;
+        }
+        match decision {
+            crate::permission::SudoDecision::Reject => {
+                let denial_text = match &reason {
+                    Some(r) if !r.trim().is_empty() => format!("sudo rejected: {r}"),
+                    _ => "sudo rejected by user.".to_string(),
+                };
+                self.router
+                    .broadcast_task_list(ServerToClient::SudoResolved {
+                        function_id,
+                        thread_id: thread_id.clone(),
+                        decision,
+                    });
+                self.complete_function(
+                    function_id,
+                    FunctionOutcome::Error(crate::functions::FunctionError {
+                        kind: crate::functions::FunctionErrorKind::Execution,
+                        detail: denial_text,
+                    }),
+                    pending_io,
+                );
+            }
+            crate::permission::SudoDecision::ApproveOnce
+            | crate::permission::SudoDecision::ApproveRemember => {
+                if matches!(decision, crate::permission::SudoDecision::ApproveRemember)
+                    && let Some(task) = self.tasks.get_mut(&thread_id)
+                {
+                    task.scope.tools.set_allow(tool_name.clone());
+                    let snapshot = task.snapshot();
+                    self.mark_dirty(&thread_id);
+                    self.router.broadcast_to_subscribers(
+                        &thread_id,
+                        ServerToClient::ThreadSnapshot {
+                            thread_id: thread_id.clone(),
+                            snapshot,
+                        },
+                    );
+                }
+                self.router
+                    .broadcast_task_list(ServerToClient::SudoResolved {
+                        function_id,
+                        thread_id: thread_id.clone(),
+                        decision,
+                    });
+                // Dispatch the wrapped tool with pod-ceiling caps. The
+                // future emits SchedulerCompletion::SudoInner, routed to
+                // `apply_sudo_inner_completion`, which completes the
+                // Function with the inner tool's result.
+                let inner = self.build_sudo_inner_future(
+                    function_id,
+                    thread_id.clone(),
+                    decision,
+                    tool_name,
+                    args,
+                );
+                pending_io.push(inner);
+            }
+        }
+    }
+
+    /// Build the future that runs a sudo'd inner tool call with
+    /// pod-ceiling caps, emitting a `SchedulerCompletion::SudoInner`
+    /// that the scheduler loop converts into a Function completion.
+    fn build_sudo_inner_future(
+        &self,
+        function_id: crate::functions::FunctionId,
+        thread_id: String,
+        decision: crate::permission::SudoDecision,
+        tool_name: String,
+        args: serde_json::Value,
+    ) -> SchedulerFuture {
+        use crate::runtime::io_dispatch::{SchedulerCompletion, SudoInnerCompletion};
+        let route = self.route_tool(&thread_id, &tool_name);
+        let pod_id = self.tasks.get(&thread_id).map(|t| t.pod_id.clone());
+        let (pod_modify_ceiling, behaviors_ceiling) = match pod_id.as_deref() {
+            Some(id) => match self.pods.get(id) {
+                Some(pod) => (
+                    pod.config.allow.caps.pod_modify,
+                    pod.config.allow.caps.behaviors,
+                ),
+                None => (
+                    crate::permission::PodModifyCap::None,
+                    crate::permission::BehaviorOpsCap::None,
+                ),
+            },
+            None => (
+                crate::permission::PodModifyCap::None,
+                crate::permission::BehaviorOpsCap::None,
+            ),
+        };
+        match route {
+            Some(crate::runtime::scheduler::ToolRoute::Builtin { pod_id }) => {
+                let snapshot = self.pod_snapshot(&pod_id);
+                Box::pin(async move {
+                    let snapshot = match snapshot {
+                        Some(s) => s,
+                        None => {
+                            return SchedulerCompletion::SudoInner(SudoInnerCompletion {
+                                function_id,
+                                thread_id,
+                                decision,
+                                result: Err(format!("sudo: pod `{pod_id}` vanished")),
+                            });
+                        }
+                    };
+                    let outcome = crate::tools::builtin_tools::dispatch(
+                        snapshot.pod_dir,
+                        snapshot.config,
+                        snapshot.behavior_ids,
+                        pod_modify_ceiling,
+                        behaviors_ceiling,
+                        &tool_name,
+                        args,
+                    )
+                    .await;
+                    SchedulerCompletion::SudoInner(SudoInnerCompletion {
+                        function_id,
+                        thread_id,
+                        decision,
+                        result: Ok(outcome.result),
+                    })
+                })
+            }
+            Some(crate::runtime::scheduler::ToolRoute::Mcp {
+                session, real_name, ..
+            }) => Box::pin(async move {
+                use futures::StreamExt;
+                let result = match session.invoke(&real_name, args).await {
+                    Ok(mut stream) => {
+                        let mut last = None;
+                        while let Some(event) = stream.next().await {
+                            if let crate::tools::mcp::ToolEvent::Completed(r) = event {
+                                last = Some(r);
+                            }
+                        }
+                        match last {
+                            Some(r) => Ok(r),
+                            None => Err("no Completed event in tool stream".to_string()),
+                        }
+                    }
+                    Err(e) => Err(e.to_string()),
+                };
+                SchedulerCompletion::SudoInner(SudoInnerCompletion {
+                    function_id,
+                    thread_id,
+                    decision,
+                    result,
+                })
+            }),
+            None => Box::pin(async move {
+                SchedulerCompletion::SudoInner(SudoInnerCompletion {
+                    function_id,
+                    thread_id,
+                    decision,
+                    result: Err(format!("sudo: no bound host advertises `{tool_name}`")),
+                })
+            }),
+        }
+    }
+
+    /// Convert a `SchedulerCompletion::SudoInner` into the Function
+    /// outcome: wrap an Ok CallToolResult as `Sudo(SudoTerminal)` with
+    /// the inner text (inherited `is_error` bit drives the parent's
+    /// tool_result flag via the parked oneshot); wrap an Err as a
+    /// Function error so the parent's oneshot fires Err.
+    pub(crate) fn apply_sudo_inner_completion(
+        &mut self,
+        done: crate::runtime::io_dispatch::SudoInnerCompletion,
+        pending_io: &mut FuturesUnordered<SchedulerFuture>,
+    ) {
+        use crate::runtime::io_dispatch::SudoInnerCompletion;
+        let SudoInnerCompletion {
+            function_id,
+            decision,
+            result,
+            ..
+        } = done;
+        match result {
+            Ok(call_result) => {
+                let text = call_result
+                    .content
+                    .iter()
+                    .map(|b| match b {
+                        crate::tools::mcp::McpContentBlock::Text { text } => text.as_str(),
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                if call_result.is_error {
+                    // Inner tool ran but failed — surface the error text
+                    // on the parent's oneshot as Err so the model's
+                    // tool_result is flagged as an error.
+                    self.complete_function(
+                        function_id,
+                        FunctionOutcome::Error(crate::functions::FunctionError {
+                            kind: crate::functions::FunctionErrorKind::Execution,
+                            detail: text,
+                        }),
+                        pending_io,
+                    );
+                } else {
+                    self.complete_function(
+                        function_id,
+                        FunctionOutcome::Success(crate::functions::FunctionTerminal::Sudo(
+                            crate::functions::SudoTerminal {
+                                decision,
+                                tool_result_text: text,
+                            },
+                        )),
+                        pending_io,
+                    );
+                }
+            }
+            Err(detail) => {
+                self.complete_function(
+                    function_id,
+                    FunctionOutcome::Error(crate::functions::FunctionError {
+                        kind: crate::functions::FunctionErrorKind::Execution,
+                        detail,
+                    }),
+                    pending_io,
+                );
+            }
+        }
+    }
+
     /// Sweep the task map and the active-functions registry for any
     /// state tied to the dropped conn. Threads whose scope's
     /// interactive channel was this conn flip to autonomous;
@@ -1573,6 +2066,32 @@ impl Scheduler {
                 FunctionOutcome::Error(crate::functions::FunctionError {
                     kind: crate::functions::FunctionErrorKind::Execution,
                     detail: "escalation channel closed before the user could approve; \
+                         request abandoned"
+                        .into(),
+                }),
+                pending_io,
+            );
+        }
+        // Sudo Functions follow the same fate: abandon pending requests
+        // for threads whose approver just dropped.
+        let pending_sudo: Vec<crate::functions::FunctionId> = self
+            .active_functions
+            .iter()
+            .filter_map(|(id, entry)| match &entry.spec {
+                Function::Sudo { thread_id, .. }
+                    if affected_threads.iter().any(|t| t == thread_id) =>
+                {
+                    Some(*id)
+                }
+                _ => None,
+            })
+            .collect();
+        for fn_id in pending_sudo {
+            self.complete_function(
+                fn_id,
+                FunctionOutcome::Error(crate::functions::FunctionError {
+                    kind: crate::functions::FunctionErrorKind::Execution,
+                    detail: "sudo approver closed before the user could approve; \
                          request abandoned"
                         .into(),
                 }),
@@ -1984,6 +2503,7 @@ fn outcome_to_sync_tool_result(outcome: &FunctionOutcome) -> Result<String, Stri
         FunctionOutcome::Success(FunctionTerminal::RequestEscalation(term)) => {
             Ok(term.tool_result_text.clone())
         }
+        FunctionOutcome::Success(FunctionTerminal::Sudo(term)) => Ok(term.tool_result_text.clone()),
         FunctionOutcome::Success(_) => {
             Err("tool-parked Function terminated with non-tool-result payload".to_string())
         }
@@ -2175,5 +2695,30 @@ mod tests {
         });
         let e = outcome_to_sync_tool_result(&outcome).expect_err("recheck failure is Err");
         assert!(e.contains("re-check failed"));
+    }
+
+    #[test]
+    fn outcome_to_sync_tool_result_forwards_sudo_text_on_approve() {
+        use crate::functions::SudoTerminal;
+        use crate::permission::SudoDecision;
+        let outcome = FunctionOutcome::Success(FunctionTerminal::Sudo(SudoTerminal {
+            decision: SudoDecision::ApproveOnce,
+            tool_result_text: "wrote 42 bytes to system_prompt.md".into(),
+        }));
+        let r = outcome_to_sync_tool_result(&outcome).expect("approved sudo is Ok");
+        assert!(r.contains("wrote 42 bytes"));
+    }
+
+    #[test]
+    fn outcome_to_sync_tool_result_forwards_sudo_error_on_inner_fail() {
+        // ApproveOnce + inner failure rides the Error outcome so the
+        // parent's parked oneshot fires Err(detail) — the model's
+        // tool_result shows is_error: true with the inner tool's text.
+        let outcome = FunctionOutcome::Error(FunctionError {
+            kind: FunctionErrorKind::Execution,
+            detail: "pod_write_file: path `.archived/x` is not in the allowlist".into(),
+        });
+        let e = outcome_to_sync_tool_result(&outcome).expect_err("inner failure is Err");
+        assert!(e.contains("allowlist"));
     }
 }

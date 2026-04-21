@@ -386,6 +386,23 @@ pub enum EscalationDecision {
     Reject,
 }
 
+/// User's answer to a model-issued `sudo` tool call. Three-way split:
+/// approve the one call without changing future scope; approve and
+/// admit the wrapped tool name for the remainder of the thread (so
+/// future direct calls skip the prompt); or reject.
+///
+/// "Remember" only widens [`Scope::tools`] for the named tool — caps
+/// (`pod_modify` / `dispatch` / `behaviors`) are bypassed for this one
+/// call and stay narrow for future direct calls. If the user wants a
+/// persistent cap widening they edit `pod.toml`.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SudoDecision {
+    ApproveOnce,
+    ApproveRemember,
+    Reject,
+}
+
 // ---------------------------------------------------------------------------
 // Scope
 // ---------------------------------------------------------------------------

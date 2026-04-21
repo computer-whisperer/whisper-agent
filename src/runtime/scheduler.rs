@@ -3902,6 +3902,9 @@ pub async fn run(
                         SchedulerCompletion::OauthRefresh(done) => {
                             scheduler.apply_oauth_refresh_completion(done);
                         }
+                        SchedulerCompletion::SudoInner(done) => {
+                            scheduler.apply_sudo_inner_completion(done, &mut pending_io);
+                        }
                     }
                 }
             }

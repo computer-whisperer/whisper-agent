@@ -125,6 +125,25 @@ pub(crate) enum SchedulerCompletion {
     OauthStart(OauthStartCompletion),
     OauthComplete(OauthCompleteCompletion),
     OauthRefresh(OauthRefreshCompletion),
+    /// A `sudo` approval completed its wrapped tool call; the scheduler
+    /// loop routes this to `complete_function` on the Function::Sudo
+    /// entry, firing the parked parent tool call's oneshot delivery.
+    SudoInner(SudoInnerCompletion),
+}
+
+/// Result of a sudo'd inner tool invocation. `result` is the usual
+/// builtin/MCP outcome: `Ok(CallToolResult)` on a reachable handler
+/// (which may still carry `is_error = true`) or `Err(message)` when
+/// routing / transport failed before we could run it.
+pub(crate) struct SudoInnerCompletion {
+    pub(crate) function_id: crate::functions::FunctionId,
+    /// Carried for diagnostic tracing in future logging hooks. Not read
+    /// by `apply_sudo_inner_completion` today (the Function registry
+    /// already knows which thread parked on the call).
+    #[allow(dead_code)]
+    pub(crate) thread_id: String,
+    pub(crate) decision: crate::permission::SudoDecision,
+    pub(crate) result: Result<crate::tools::mcp::CallToolResult, String>,
 }
 
 /// Which Add/Update operation the completion applies to. The
