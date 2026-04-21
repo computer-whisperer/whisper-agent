@@ -607,10 +607,63 @@ days = 0
             },
             thread: whisper_agent_protocol::BehaviorThreadOverride::default(),
             on_completion: RetentionPolicy::DeleteAfterDays { days: 7 },
+            scope: Default::default(),
         };
         let text = to_toml(&cfg).unwrap();
         let back = parse_toml(&text).unwrap();
         assert_eq!(back, cfg);
+    }
+
+    #[test]
+    fn scope_block_round_trips_as_bare_arrays() {
+        use whisper_agent_protocol::{BehaviorScope, BehaviorScopeCaps, DispatchCap, PodModifyCap};
+        let cfg = BehaviorConfig {
+            name: "scoped".into(),
+            description: None,
+            trigger: TriggerSpec::default(),
+            thread: whisper_agent_protocol::BehaviorThreadOverride::default(),
+            on_completion: RetentionPolicy::default(),
+            scope: BehaviorScope {
+                backends: Some(vec!["anthropic".into()]),
+                host_envs: None,
+                mcp_hosts: Some(vec!["fetch".into()]),
+                tools: None,
+                caps: BehaviorScopeCaps {
+                    pod_modify: Some(PodModifyCap::None),
+                    dispatch: Some(DispatchCap::None),
+                    behaviors: None,
+                },
+            },
+        };
+        let text = to_toml(&cfg).unwrap();
+        let back = parse_toml(&text).unwrap();
+        assert_eq!(back, cfg);
+        // Lists should land as plain TOML arrays, not tagged
+        // `{ kind = "only", items = [...] }` envelopes — hand-edited
+        // behavior.toml files need the shape the design doc shows.
+        assert!(
+            text.contains("backends = [\"anthropic\"]"),
+            "expected plain array form; got:\n{text}"
+        );
+        // `None` fields are skipped on write so an author with
+        // inherit-everything defaults can omit the `[scope]` table
+        // entirely and round-trip through.
+        assert!(
+            !text.contains("host_envs"),
+            "None fields should be skipped; got:\n{text}"
+        );
+    }
+
+    #[test]
+    fn scope_absent_parses_as_default() {
+        let text = r#"
+name = "x"
+
+[trigger]
+kind = "manual"
+"#;
+        let cfg = parse_toml(text).unwrap();
+        assert_eq!(cfg.scope, whisper_agent_protocol::BehaviorScope::default());
     }
 
     #[tokio::test]
@@ -709,6 +762,7 @@ kind = "webhook"
             trigger: TriggerSpec::default(),
             thread: whisper_agent_protocol::BehaviorThreadOverride::default(),
             on_completion: RetentionPolicy::default(),
+            scope: Default::default(),
         };
         create_on_disk(&pod_dir, "daily", &cfg, "do the thing")
             .await
@@ -731,6 +785,7 @@ kind = "webhook"
             trigger: TriggerSpec::default(),
             thread: whisper_agent_protocol::BehaviorThreadOverride::default(),
             on_completion: RetentionPolicy::default(),
+            scope: Default::default(),
         };
         create_on_disk(&pod_dir, "x", &cfg, "").await.unwrap();
         let err = create_on_disk(&pod_dir, "x", &cfg, "").await.unwrap_err();
@@ -747,6 +802,7 @@ kind = "webhook"
             trigger: TriggerSpec::default(),
             thread: whisper_agent_protocol::BehaviorThreadOverride::default(),
             on_completion: RetentionPolicy::default(),
+            scope: Default::default(),
         };
         create_on_disk(&pod_dir, "b", &cfg, "v1-prompt")
             .await
@@ -788,6 +844,7 @@ kind = "webhook"
             trigger: TriggerSpec::default(),
             thread: whisper_agent_protocol::BehaviorThreadOverride::default(),
             on_completion: RetentionPolicy::default(),
+            scope: Default::default(),
         };
         let err = update_on_disk(&pod_dir, "ghost", &cfg, "")
             .await
@@ -813,6 +870,7 @@ kind = "webhook"
             trigger: TriggerSpec::default(),
             thread: whisper_agent_protocol::BehaviorThreadOverride::default(),
             on_completion: RetentionPolicy::default(),
+            scope: Default::default(),
         };
         create_on_disk(&pod_dir, "gone", &cfg, "").await.unwrap();
         delete_on_disk(&pod_dir, "gone").await.unwrap();

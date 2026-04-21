@@ -453,6 +453,7 @@ mod tests {
             cfg.clone(),
             vec![],
             crate::permission::PodModifyCap::ModifyAllow,
+            crate::permission::BehaviorOpsCap::AuthorAny,
             POD_LIST_THREADS,
             json!({ "behavior_id": "daily" }),
         )
@@ -470,6 +471,7 @@ mod tests {
             cfg,
             vec![],
             crate::permission::PodModifyCap::ModifyAllow,
+            crate::permission::BehaviorOpsCap::AuthorAny,
             POD_LIST_THREADS,
             json!({ "behavior_id": "interactive" }),
         )
@@ -518,6 +520,7 @@ mod tests {
             cfg.clone(),
             vec![],
             crate::permission::PodModifyCap::ModifyAllow,
+            crate::permission::BehaviorOpsCap::AuthorAny,
             POD_LIST_THREADS,
             json!({ "state": "failed" }),
         )
@@ -533,6 +536,7 @@ mod tests {
             cfg.clone(),
             vec![],
             crate::permission::PodModifyCap::ModifyAllow,
+            crate::permission::BehaviorOpsCap::AuthorAny,
             POD_LIST_THREADS,
             json!({ "state": "working" }),
         )
@@ -550,6 +554,7 @@ mod tests {
             cfg,
             vec![],
             crate::permission::PodModifyCap::ModifyAllow,
+            crate::permission::BehaviorOpsCap::AuthorAny,
             POD_LIST_THREADS,
             json!({ "min_turns": 5 }),
         )
@@ -589,6 +594,7 @@ mod tests {
             cfg,
             vec![],
             crate::permission::PodModifyCap::ModifyAllow,
+            crate::permission::BehaviorOpsCap::AuthorAny,
             POD_LIST_THREADS,
             json!({ "since": "2026-04-18T00:00:00Z" }),
         )
@@ -620,6 +626,7 @@ mod tests {
             cfg,
             vec![],
             crate::permission::PodModifyCap::ModifyAllow,
+            crate::permission::BehaviorOpsCap::AuthorAny,
             POD_LIST_THREADS,
             json!({ "limit": 3 }),
         )
@@ -640,6 +647,7 @@ mod tests {
             cfg,
             vec![],
             crate::permission::PodModifyCap::ModifyAllow,
+            crate::permission::BehaviorOpsCap::AuthorAny,
             POD_LIST_THREADS,
             json!({}),
         )

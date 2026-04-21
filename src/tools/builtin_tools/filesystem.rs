@@ -995,6 +995,7 @@ mod tests {
             cfg.clone(),
             vec![],
             crate::permission::PodModifyCap::ModifyAllow,
+            crate::permission::BehaviorOpsCap::AuthorAny,
             POD_READ_FILE,
             json!({ "filename": "secrets.env" }),
         )
@@ -1006,6 +1007,7 @@ mod tests {
             cfg,
             vec![],
             crate::permission::PodModifyCap::ModifyAllow,
+            crate::permission::BehaviorOpsCap::AuthorAny,
             POD_READ_FILE,
             json!({ "filename": "pod.toml" }),
         )
@@ -1029,6 +1031,7 @@ mod tests {
             cfg.clone(),
             vec![],
             crate::permission::PodModifyCap::ModifyAllow,
+            crate::permission::BehaviorOpsCap::AuthorAny,
             POD_WRITE_FILE,
             json!({ "filename": "pod.toml", "content": "name = \"broken\" # no thread_defaults" }),
         )
@@ -1050,6 +1053,7 @@ mod tests {
             cfg,
             vec![],
             crate::permission::PodModifyCap::ModifyAllow,
+            crate::permission::BehaviorOpsCap::AuthorAny,
             POD_WRITE_FILE,
             json!({ "filename": "system_prompt.md", "content": "You are helpful." }),
         )
@@ -1073,6 +1077,7 @@ mod tests {
             cfg,
             vec![],
             crate::permission::PodModifyCap::ModifyAllow,
+            crate::permission::BehaviorOpsCap::AuthorAny,
             POD_EDIT_FILE,
             json!({
                 "filename": "system_prompt.md",
@@ -1117,6 +1122,7 @@ mod tests {
             cfg,
             vec![],
             crate::permission::PodModifyCap::ModifyAllow,
+            crate::permission::BehaviorOpsCap::AuthorAny,
             POD_EDIT_FILE,
             json!({
                 "filename": "system_prompt.md",
@@ -1148,6 +1154,7 @@ mod tests {
             cfg,
             vec![],
             crate::permission::PodModifyCap::ModifyAllow,
+            crate::permission::BehaviorOpsCap::AuthorAny,
             POD_LIST_FILES,
             json!({}),
         )
@@ -1190,6 +1197,7 @@ mod tests {
             cfg,
             vec![],
             crate::permission::PodModifyCap::ModifyAllow,
+            crate::permission::BehaviorOpsCap::AuthorAny,
             POD_WRITE_FILE,
             json!({
                 "filename": "memory/user_role.md",
@@ -1228,6 +1236,7 @@ mod tests {
             cfg,
             vec![],
             crate::permission::PodModifyCap::ModifyAllow,
+            crate::permission::BehaviorOpsCap::AuthorAny,
             POD_WRITE_FILE,
             json!({
                 "filename": "memory/MEMORY.md",
@@ -1253,6 +1262,7 @@ mod tests {
                 cfg.clone(),
                 vec![],
                 crate::permission::PodModifyCap::ModifyAllow,
+                crate::permission::BehaviorOpsCap::AuthorAny,
                 POD_WRITE_FILE,
                 json!({ "filename": bad, "content": "x" }),
             )
@@ -1281,6 +1291,7 @@ mod tests {
             cfg,
             vec![],
             crate::permission::PodModifyCap::ModifyAllow,
+            crate::permission::BehaviorOpsCap::AuthorAny,
             POD_EDIT_FILE,
             json!({
                 "filename": "memory/notes.md",
@@ -1314,6 +1325,7 @@ mod tests {
             cfg,
             vec![],
             crate::permission::PodModifyCap::ModifyAllow,
+            crate::permission::BehaviorOpsCap::AuthorAny,
             POD_LIST_FILES,
             json!({}),
         )
@@ -1345,6 +1357,7 @@ mod tests {
             cfg,
             vec![],
             crate::permission::PodModifyCap::ModifyAllow,
+            crate::permission::BehaviorOpsCap::AuthorAny,
             POD_LIST_FILES,
             json!({}),
         )
@@ -1392,6 +1405,7 @@ schedule = "0 9 * * *"
             cfg,
             vec![],
             crate::permission::PodModifyCap::ModifyAllow,
+            crate::permission::BehaviorOpsCap::AuthorAny,
             POD_WRITE_FILE,
             json!({
                 "filename": "behaviors/nightly/behavior.toml",
@@ -1434,6 +1448,7 @@ schedule = "0 9 * * *"
             cfg,
             vec![],
             crate::permission::PodModifyCap::ModifyAllow,
+            crate::permission::BehaviorOpsCap::AuthorAny,
             POD_WRITE_FILE,
             json!({
                 "filename": "behaviors/ghost/prompt.md",
@@ -1463,6 +1478,7 @@ schedule = "0 9 * * *"
             cfg,
             vec![],
             crate::permission::PodModifyCap::ModifyAllow,
+            crate::permission::BehaviorOpsCap::AuthorAny,
             POD_WRITE_FILE,
             json!({
                 "filename": "behaviors/bad/behavior.toml",
@@ -1504,6 +1520,7 @@ schedule = "0 9 * * *"
             cfg,
             vec!["daily".to_string()],
             crate::permission::PodModifyCap::ModifyAllow,
+            crate::permission::BehaviorOpsCap::AuthorAny,
             POD_WRITE_FILE,
             json!({
                 "filename": "behaviors/daily/behavior.toml",
@@ -1539,6 +1556,7 @@ schedule = "0 9 * * *"
             cfg,
             vec!["daily".to_string()],
             crate::permission::PodModifyCap::ModifyAllow,
+            crate::permission::BehaviorOpsCap::AuthorAny,
             POD_WRITE_FILE,
             json!({
                 "filename": "behaviors/daily/prompt.md",
@@ -1573,6 +1591,7 @@ schedule = "0 9 * * *"
             cfg,
             vec![],
             crate::permission::PodModifyCap::ModifyAllow,
+            crate::permission::BehaviorOpsCap::AuthorAny,
             POD_READ_FILE,
             json!({ "filename": "threads/abc.json" }),
         )
@@ -1597,6 +1616,7 @@ schedule = "0 9 * * *"
             cfg,
             vec![],
             crate::permission::PodModifyCap::ModifyAllow,
+            crate::permission::BehaviorOpsCap::AuthorAny,
             POD_WRITE_FILE,
             json!({ "filename": "threads/abc.json", "content": "{}" }),
         )
@@ -1633,6 +1653,7 @@ schedule = "0 9 * * *"
             cfg.clone(),
             vec![],
             crate::permission::PodModifyCap::ModifyAllow,
+            crate::permission::BehaviorOpsCap::AuthorAny,
             POD_READ_FILE,
             json!({ "filename": "threads/big.json" }),
         )
@@ -1651,6 +1672,7 @@ schedule = "0 9 * * *"
             cfg,
             vec![],
             crate::permission::PodModifyCap::ModifyAllow,
+            crate::permission::BehaviorOpsCap::AuthorAny,
             POD_READ_FILE,
             json!({ "filename": "threads/big.json", "limit": 5 }),
         )
@@ -1681,6 +1703,7 @@ schedule = "0 9 * * *"
             cfg,
             vec![],
             crate::permission::PodModifyCap::ModifyAllow,
+            crate::permission::BehaviorOpsCap::AuthorAny,
             POD_LIST_FILES,
             json!({}),
         )
@@ -1731,6 +1754,7 @@ schedule = "0 9 * * *"
             cfg,
             vec!["alpha".to_string(), "beta".to_string()],
             crate::permission::PodModifyCap::ModifyAllow,
+            crate::permission::BehaviorOpsCap::AuthorAny,
             POD_LIST_FILES,
             json!({}),
         )

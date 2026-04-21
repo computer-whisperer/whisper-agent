@@ -72,6 +72,7 @@ mod tests {
             cfg.clone(),
             vec![],
             crate::permission::PodModifyCap::ModifyAllow,
+            crate::permission::BehaviorOpsCap::AuthorAny,
             POD_ABOUT,
             json!({}),
         )
@@ -94,6 +95,7 @@ mod tests {
             cfg,
             vec![],
             crate::permission::PodModifyCap::ModifyAllow,
+            crate::permission::BehaviorOpsCap::AuthorAny,
             POD_ABOUT,
             json!({ "topic": "cron" }),
         )
@@ -115,6 +117,7 @@ mod tests {
             cfg,
             vec![],
             crate::permission::PodModifyCap::ModifyAllow,
+            crate::permission::BehaviorOpsCap::AuthorAny,
             POD_ABOUT,
             json!({ "topic": "nonsense" }),
         )

@@ -123,6 +123,16 @@ impl Scheduler {
 
         let (config_override, bindings_request) = behavior_override_to_requests(&config.thread);
 
+        // Behavior fire-time scope: pod.allow ceiling narrowed by the
+        // behavior's declared `[scope]` block. Differs from the
+        // interactive create-thread baseline (`thread_defaults.caps`),
+        // which is conservative because interactive threads escalate.
+        // Behaviors are autonomous — their scope is decided once, at
+        // author time, and bounded only by pod.allow at fire time.
+        let behavior_scope = self
+            .pod_scope_ceiling(pod_id)
+            .narrow(&config.scope.as_scope_narrower());
+
         let origin = whisper_agent_protocol::BehaviorOrigin {
             behavior_id: behavior_id.to_string(),
             fired_at: chrono::Utc::now().to_rfc3339(),
@@ -137,6 +147,7 @@ impl Scheduler {
             bindings_request,
             Some(origin),
             None,
+            Some(behavior_scope),
             pending_io,
         )?;
         self.mark_dirty(&thread_id);

@@ -8,6 +8,8 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::permission::{AllowMap, BehaviorOpsCap, DispatchCap, PodModifyCap};
+
 /// Parsed `behavior.toml`. Round-trips through TOML; every field is
 /// covered by a serde default so hand-written files can omit
 /// everything but `name`.
@@ -24,6 +26,89 @@ pub struct BehaviorConfig {
     pub thread: BehaviorThreadOverride,
     #[serde(default)]
     pub on_completion: RetentionPolicy,
+    /// Per-behavior runtime scope. Composed with the pod's `[allow]`
+    /// ceiling at fire time: `child_scope = pod.allow.narrow(scope)`.
+    /// Every field is an `Option` so a behavior can declare "inherit
+    /// the pod ceiling for this resource" without writing it out — an
+    /// entirely-absent `[scope]` block means the behavior runs at the
+    /// pod's full ceiling.
+    #[serde(default)]
+    pub scope: BehaviorScope,
+}
+
+/// Behavior-declared runtime scope. Shape mirrors the pod's `[allow]`
+/// block: named resource lists, a per-tool allow map, and the three
+/// typed caps. On disk every field is optional (`None` = inherit
+/// pod ceiling for that field); at fire time the scheduler converts
+/// this into a full [`crate::permission::Scope`] via
+/// `Scope::narrow(pod_allow, behavior.resolved_scope_narrower())`.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default)]
+pub struct BehaviorScope {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backends: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_envs: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mcp_hosts: Option<Vec<String>>,
+    /// Tool-level allow map. `None` = inherit the pod's `allow.tools`
+    /// (every admitted tool). `Some(map)` narrows per-tool.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tools: Option<AllowMap<String>>,
+    #[serde(default)]
+    pub caps: BehaviorScopeCaps,
+}
+
+/// Per-cap narrowing for a behavior. Each field is `None` by default
+/// (inherit the pod ceiling); when set, narrows the pod-allow cap to
+/// the declared value. Since scopes narrow monotonically, a value
+/// above the pod ceiling collapses to the ceiling — i.e., behaviors
+/// can only reduce, never widen.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct BehaviorScopeCaps {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pod_modify: Option<PodModifyCap>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dispatch: Option<DispatchCap>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub behaviors: Option<BehaviorOpsCap>,
+}
+
+impl BehaviorScope {
+    /// Render this behavior scope as a full [`crate::permission::Scope`]
+    /// suitable for use as the right-hand side of
+    /// `pod_allow_scope.narrow(behavior.as_scope_narrower())`.
+    ///
+    /// Every `None` field becomes the most-permissive value (`All`,
+    /// `AllowMap::allow_all`, highest cap) so it's an identity under
+    /// narrow — the pod ceiling controls. Every `Some` field becomes
+    /// the declared value; narrowing then produces `min(ceiling,
+    /// declared)` per the usual rules.
+    ///
+    /// `escalation` is always `None` — behaviors run autonomously and
+    /// cannot escalate. Narrowing with `Escalation::None` collapses
+    /// any parent `Interactive` to `None`, which is exactly the
+    /// desired behavior.
+    pub fn as_scope_narrower(&self) -> crate::permission::Scope {
+        use crate::permission::{Escalation, Scope, SetOrAll};
+
+        fn list_to_setorall(list: &Option<Vec<String>>) -> SetOrAll<String> {
+            match list {
+                None => SetOrAll::all(),
+                Some(names) => SetOrAll::only(names.iter().cloned()),
+            }
+        }
+
+        Scope {
+            backends: list_to_setorall(&self.backends),
+            host_envs: list_to_setorall(&self.host_envs),
+            mcp_hosts: list_to_setorall(&self.mcp_hosts),
+            tools: self.tools.clone().unwrap_or_else(AllowMap::allow_all),
+            pod_modify: self.caps.pod_modify.unwrap_or(PodModifyCap::ModifyAllow),
+            dispatch: self.caps.dispatch.unwrap_or(DispatchCap::WithinScope),
+            behaviors: self.caps.behaviors.unwrap_or(BehaviorOpsCap::AuthorAny),
+            escalation: Escalation::None,
+        }
+    }
 }
 
 /// Trigger discriminator. Internally tagged on `kind` so TOML looks like
@@ -340,6 +425,7 @@ mod tests {
             trigger: TriggerSpec::default(),
             thread: BehaviorThreadOverride::default(),
             on_completion: RetentionPolicy::default(),
+            scope: Default::default(),
         };
         assert!(matches!(cfg.trigger, TriggerSpec::Manual));
         assert!(matches!(cfg.on_completion, RetentionPolicy::Keep));
@@ -352,5 +438,80 @@ mod tests {
         // tag = "retention" per the serde attribute; keeps TOML readable.
         assert!(json.contains("\"retention\":\"archive_after_days\""));
         assert!(json.contains("\"days\":30"));
+    }
+
+    #[test]
+    fn default_scope_is_identity_under_narrow() {
+        // A behavior with no `[scope]` block should narrow to exactly
+        // the pod ceiling — no fields restricted.
+        use crate::permission::Scope;
+        let ceiling = Scope::allow_all();
+        let behavior_scope = BehaviorScope::default();
+        let result = ceiling.narrow(&behavior_scope.as_scope_narrower());
+        assert_eq!(result, ceiling);
+    }
+
+    #[test]
+    fn as_scope_narrower_restricts_declared_fields() {
+        use crate::permission::{BehaviorOpsCap, DispatchCap, PodModifyCap, Scope, SetOrAll};
+        let behavior_scope = BehaviorScope {
+            backends: Some(vec!["anthropic".into()]),
+            host_envs: Some(vec!["narrow".into()]),
+            mcp_hosts: None,
+            tools: None,
+            caps: BehaviorScopeCaps {
+                pod_modify: Some(PodModifyCap::None),
+                dispatch: Some(DispatchCap::None),
+                behaviors: Some(BehaviorOpsCap::None),
+            },
+        };
+        let narrower = behavior_scope.as_scope_narrower();
+        assert_eq!(narrower.backends, SetOrAll::only(["anthropic".to_string()]));
+        assert_eq!(narrower.host_envs, SetOrAll::only(["narrow".to_string()]));
+        assert!(matches!(narrower.mcp_hosts, SetOrAll::All));
+        assert_eq!(narrower.pod_modify, PodModifyCap::None);
+        assert_eq!(narrower.dispatch, DispatchCap::None);
+        assert_eq!(narrower.behaviors, BehaviorOpsCap::None);
+        // Applying against a permissive ceiling: the narrower values win.
+        let ceiling = Scope::allow_all();
+        let composed = ceiling.narrow(&narrower);
+        assert_eq!(composed.pod_modify, PodModifyCap::None);
+        assert_eq!(composed.dispatch, DispatchCap::None);
+    }
+
+    #[test]
+    fn behavior_scope_round_trips_through_json() {
+        // TOML round-trip coverage for BehaviorConfig lives in
+        // `src/pod/behaviors.rs` (the crate with the toml dep); this
+        // serde test uses JSON so we stay dep-free in the protocol
+        // crate. Same serde contract applies to both.
+        let cfg = BehaviorConfig {
+            name: "narrowed".into(),
+            description: None,
+            trigger: TriggerSpec::default(),
+            thread: BehaviorThreadOverride::default(),
+            on_completion: RetentionPolicy::default(),
+            scope: BehaviorScope {
+                backends: Some(vec!["anthropic".into()]),
+                host_envs: None,
+                mcp_hosts: Some(vec!["fetch".into()]),
+                tools: None,
+                caps: BehaviorScopeCaps {
+                    pod_modify: Some(crate::permission::PodModifyCap::None),
+                    dispatch: Some(crate::permission::DispatchCap::None),
+                    behaviors: None,
+                },
+            },
+        };
+        let json = serde_json::to_string(&cfg).unwrap();
+        let back: BehaviorConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, cfg);
+        assert!(
+            json.contains("\"backends\":[\"anthropic\"]"),
+            "backends should serialize as bare array; got: {json}"
+        );
+        // `None` fields are skipped; behaviors with an inherit-everything
+        // scope don't clutter the wire.
+        assert!(!json.contains("\"host_envs\""));
     }
 }

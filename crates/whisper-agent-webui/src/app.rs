@@ -5890,6 +5890,7 @@ impl ChatApp {
                 trigger: TriggerSpec::Manual,
                 thread: BehaviorThreadOverride::default(),
                 on_completion: RetentionPolicy::default(),
+                scope: Default::default(),
             };
             modal.pending_correlation = Some(correlation.clone());
             modal.error = None;

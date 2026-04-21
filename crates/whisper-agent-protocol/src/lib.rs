@@ -17,9 +17,9 @@ pub mod sandbox;
 pub use permission::{AllowMap, Disposition};
 
 pub use behavior::{
-    BehaviorBindingsOverride, BehaviorConfig, BehaviorOrigin, BehaviorOutcome, BehaviorSnapshot,
-    BehaviorState, BehaviorSummary, BehaviorThreadOverride, CatchUp, Overlap, RetentionPolicy,
-    TriggerSpec,
+    BehaviorBindingsOverride, BehaviorConfig, BehaviorOrigin, BehaviorOutcome, BehaviorScope,
+    BehaviorScopeCaps, BehaviorSnapshot, BehaviorState, BehaviorSummary, BehaviorThreadOverride,
+    CatchUp, Overlap, RetentionPolicy, TriggerSpec,
 };
 pub use conversation::{
     ContentBlock, Conversation, Message, ProviderReplay, Role, ToolResultContent,

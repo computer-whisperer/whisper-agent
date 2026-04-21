@@ -204,6 +204,7 @@ mod tests {
             trigger: t,
             thread: whisper_agent_protocol::BehaviorThreadOverride::default(),
             on_completion: whisper_agent_protocol::RetentionPolicy::default(),
+            scope: Default::default(),
         });
         crate::pod::behaviors::Behavior {
             id: "b".into(),

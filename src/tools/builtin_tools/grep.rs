@@ -286,6 +286,7 @@ mod tests {
             cfg,
             vec![],
             crate::permission::PodModifyCap::ModifyAllow,
+            crate::permission::BehaviorOpsCap::AuthorAny,
             POD_GREP,
             json!({ "pattern": "error" }),
         )
@@ -319,6 +320,7 @@ mod tests {
             cfg,
             vec![],
             crate::permission::PodModifyCap::ModifyAllow,
+            crate::permission::BehaviorOpsCap::AuthorAny,
             POD_GREP,
             json!({ "pattern": "target", "context": 1 }),
         )
@@ -360,6 +362,7 @@ mod tests {
             cfg,
             vec![],
             crate::permission::PodModifyCap::ModifyAllow,
+            crate::permission::BehaviorOpsCap::AuthorAny,
             POD_GREP,
             json!({ "pattern": "target", "path": "threads/" }),
         )
@@ -385,6 +388,7 @@ mod tests {
             cfg,
             vec![],
             crate::permission::PodModifyCap::ModifyAllow,
+            crate::permission::BehaviorOpsCap::AuthorAny,
             POD_GREP,
             json!({ "pattern": "x", "path": "../etc" }),
         )
@@ -422,6 +426,7 @@ mod tests {
             cfg,
             vec![],
             crate::permission::PodModifyCap::ModifyAllow,
+            crate::permission::BehaviorOpsCap::AuthorAny,
             POD_GREP,
             json!({ "pattern": "has match" }),
         )
@@ -447,6 +452,7 @@ mod tests {
             cfg,
             vec![],
             crate::permission::PodModifyCap::ModifyAllow,
+            crate::permission::BehaviorOpsCap::AuthorAny,
             POD_GREP,
             json!({ "pattern": "nowhere-in-sight" }),
         )
@@ -471,6 +477,7 @@ mod tests {
             cfg,
             vec![],
             crate::permission::PodModifyCap::ModifyAllow,
+            crate::permission::BehaviorOpsCap::AuthorAny,
             POD_GREP,
             json!({ "pattern": "hit" }),
         )

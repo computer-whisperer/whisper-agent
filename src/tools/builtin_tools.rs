@@ -280,6 +280,7 @@ pub async fn dispatch(
     pod_config: PodConfig,
     behavior_ids: Vec<String>,
     pod_modify: crate::permission::PodModifyCap,
+    behaviors_cap: crate::permission::BehaviorOpsCap,
     tool_name: &str,
     args: Value,
 ) -> ToolOutcome {
@@ -296,6 +297,20 @@ pub async fn dispatch(
         return no_update_error(format!(
             "`{tool_name}` on `{filename}` is denied by the thread's pod_modify capability \
              ({pod_modify:?}). Ask for scope widening if this action is needed."
+        ));
+    }
+    // Behavior-subsystem tools are gated by the thread's `behaviors` cap.
+    // `None` denies all access; `Read` and above admit run / pause-resume
+    // (they're invocations/state-flips on an already-authored asset, not
+    // authoring). Creating or modifying a behavior's config flows through
+    // `pod_write_file`, which is gated by `PodModifyCap` — the author-cap
+    // distinction (AuthorNarrower vs AuthorAny) isn't yet enforced there.
+    if matches!(tool_name, POD_RUN_BEHAVIOR | POD_SET_BEHAVIOR_ENABLED)
+        && behaviors_cap == crate::permission::BehaviorOpsCap::None
+    {
+        return no_update_error(format!(
+            "`{tool_name}` is denied by the thread's behaviors capability \
+             ({behaviors_cap:?}). Ask for scope widening if this action is needed."
         ));
     }
     match tool_name {

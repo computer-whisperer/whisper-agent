@@ -1880,6 +1880,19 @@ impl Scheduler {
             .unwrap_or(crate::permission::PodModifyCap::None)
     }
 
+    /// The thread's current `behaviors` cap, or `None` if the thread is
+    /// unknown. Used to gate `pod_run_behavior` / `pod_set_behavior_enabled`
+    /// at tool-dispatch entry.
+    pub(crate) fn thread_behaviors_cap(
+        &self,
+        thread_id: &str,
+    ) -> crate::permission::BehaviorOpsCap {
+        self.tasks
+            .get(thread_id)
+            .map(|t| t.scope.behaviors)
+            .unwrap_or(crate::permission::BehaviorOpsCap::None)
+    }
+
     /// Derive the effective [`Scope`] a newly-created thread in `pod_id`
     /// starts with. The bindings + tools come from the pod's `[allow]`
     /// table; typed caps come from `[thread_defaults.caps]` in the pod
@@ -2178,6 +2191,14 @@ impl Scheduler {
     /// connection that asked for it, if any; trigger-driven spawns
     /// (behaviors, cron, etc.) pass `None`. `origin` stamps behavior
     /// provenance on the thread; `None` for interactive work.
+    ///
+    /// `base_scope_override` lets a caller (notably `run_behavior`)
+    /// supply a pre-composed base scope that differs from the pod's
+    /// `thread_defaults` baseline. Behavior fires use the pod.allow
+    /// ceiling narrowed by the behavior's declared `[scope]` — a
+    /// wider starting point than interactive threads, because the
+    /// behavior author already committed to a scope at author time.
+    /// `None` uses the pod's thread_defaults (interactive baseline).
     #[allow(clippy::too_many_arguments)]
     pub(super) fn create_task(
         &mut self,
@@ -2193,6 +2214,7 @@ impl Scheduler {
         // arrival and the sidebar's dispatch-nesting view renders
         // correctly without a second patch event.
         dispatched_by_parent: Option<(String, u32)>,
+        base_scope_override: Option<crate::permission::Scope>,
         pending_io: &mut FuturesUnordered<SchedulerFuture>,
     ) -> Result<String, String> {
         // Resolve which pod this thread lands in. None routes to the
@@ -2272,7 +2294,7 @@ impl Scheduler {
         //   - Top-level WS create: attach `Interactive{via_conn: conn_id}`.
         //   - Behavior fire / auto-compact / cron: stays `None`;
         //     `request_escalation` is filtered out of the catalog.
-        let base_scope = self.pod_thread_scope(&pod_id);
+        let base_scope = base_scope_override.unwrap_or_else(|| self.pod_thread_scope(&pod_id));
         let mut scope = match &dispatched_by_parent {
             Some((parent_id, _)) => match self.tasks.get(parent_id) {
                 Some(parent) => base_scope.narrow(&parent.scope),

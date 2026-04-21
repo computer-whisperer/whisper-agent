@@ -163,6 +163,7 @@ mod tests {
             cfg,
             vec!["real".to_string()],
             crate::permission::PodModifyCap::ModifyAllow,
+            crate::permission::BehaviorOpsCap::AuthorAny,
             POD_RUN_BEHAVIOR,
             json!({ "behavior_id": "ghost" }),
         )
@@ -182,6 +183,7 @@ mod tests {
             cfg,
             vec!["daily".to_string()],
             crate::permission::PodModifyCap::ModifyAllow,
+            crate::permission::BehaviorOpsCap::AuthorAny,
             POD_RUN_BEHAVIOR,
             json!({ "behavior_id": "daily", "payload": {"foo": 1} }),
         )
@@ -208,6 +210,7 @@ mod tests {
             cfg,
             vec!["daily".to_string()],
             crate::permission::PodModifyCap::ModifyAllow,
+            crate::permission::BehaviorOpsCap::AuthorAny,
             POD_RUN_BEHAVIOR,
             json!({ "behavior_id": "daily" }),
         )
@@ -230,6 +233,7 @@ mod tests {
             cfg,
             vec!["daily".to_string()],
             crate::permission::PodModifyCap::ModifyAllow,
+            crate::permission::BehaviorOpsCap::AuthorAny,
             POD_SET_BEHAVIOR_ENABLED,
             json!({ "behavior_id": "daily", "enabled": false }),
         )
@@ -256,11 +260,70 @@ mod tests {
             cfg,
             vec![],
             crate::permission::PodModifyCap::ModifyAllow,
+            crate::permission::BehaviorOpsCap::AuthorAny,
             POD_SET_BEHAVIOR_ENABLED,
             json!({ "behavior_id": "ghost", "enabled": true }),
         )
         .await;
         assert!(out.result.is_error);
         assert!(out.scheduler_command.is_none());
+    }
+
+    #[tokio::test]
+    async fn run_behavior_denied_when_behaviors_cap_is_none() {
+        let dir = temp_dir();
+        let cfg = sample_config();
+        let out = dispatch(
+            dir.clone(),
+            cfg,
+            vec!["daily".to_string()],
+            crate::permission::PodModifyCap::ModifyAllow,
+            crate::permission::BehaviorOpsCap::None,
+            POD_RUN_BEHAVIOR,
+            json!({ "behavior_id": "daily" }),
+        )
+        .await;
+        assert!(out.result.is_error);
+        assert!(out.scheduler_command.is_none());
+        let text = join_blocks(&out.result.content);
+        assert!(text.contains("behaviors capability"), "wrong error: {text}");
+    }
+
+    #[tokio::test]
+    async fn set_behavior_enabled_denied_when_behaviors_cap_is_none() {
+        let dir = temp_dir();
+        let cfg = sample_config();
+        let out = dispatch(
+            dir.clone(),
+            cfg,
+            vec!["daily".to_string()],
+            crate::permission::PodModifyCap::ModifyAllow,
+            crate::permission::BehaviorOpsCap::None,
+            POD_SET_BEHAVIOR_ENABLED,
+            json!({ "behavior_id": "daily", "enabled": false }),
+        )
+        .await;
+        assert!(out.result.is_error);
+        assert!(out.scheduler_command.is_none());
+    }
+
+    #[tokio::test]
+    async fn run_behavior_admitted_at_read_cap() {
+        // Read is the minimum cap to fire or pause-resume an existing
+        // behavior — those are invocation / state-flip, not authoring.
+        let dir = temp_dir();
+        let cfg = sample_config();
+        let out = dispatch(
+            dir.clone(),
+            cfg,
+            vec!["daily".to_string()],
+            crate::permission::PodModifyCap::ModifyAllow,
+            crate::permission::BehaviorOpsCap::Read,
+            POD_RUN_BEHAVIOR,
+            json!({ "behavior_id": "daily" }),
+        )
+        .await;
+        assert!(!out.result.is_error);
+        assert!(out.scheduler_command.is_some());
     }
 }
