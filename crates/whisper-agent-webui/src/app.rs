@@ -32,7 +32,7 @@ use egui::{Color32, ComboBox, Grid, RichText, ScrollArea, TextEdit};
 use egui_commonmark::CommonMarkCache;
 use whisper_agent_protocol::sandbox::NetworkPolicy;
 use whisper_agent_protocol::{
-    AllowMap, ApprovalChoice, BackendSummary, BehaviorConfig, BehaviorOrigin,
+    AllowMap, BackendSummary, BehaviorConfig, BehaviorOrigin,
     BehaviorSnapshot as BehaviorSnapshotProto, BehaviorSummary, BehaviorThreadOverride,
     ClientToServer, ContentBlock, Conversation, FsEntry, FunctionKind, FunctionSummary,
     HostEnvBinding, HostEnvProviderInfo, HostEnvProviderOrigin, HostEnvReachability, HostEnvSpec,
@@ -323,11 +323,11 @@ fn function_kind_label(kind: FunctionKind) -> &'static str {
     match kind {
         FunctionKind::CreateThread => "create",
         FunctionKind::CompactThread => "compact",
-        FunctionKind::RebindThread => "rebind",
         FunctionKind::CancelThread => "cancel",
         FunctionKind::RunBehavior => "behavior",
         FunctionKind::BuiltinToolCall => "tool",
         FunctionKind::McpToolUse => "mcp tool",
+        FunctionKind::RequestEscalation => "escalate",
     }
 }
 
@@ -492,9 +492,6 @@ struct TaskView {
     items: Vec<DisplayItem>,
     total_usage: Usage,
     subscribed: bool,
-    /// Currently-open approval requests, in arrival order. Cleared on snapshot so
-    /// re-subscribe can re-seed them without duplicates.
-    pending_approvals: Vec<PendingApproval>,
     /// Backend alias the server resolved for this task. Populated from ThreadSnapshot.
     /// Empty string means "server default" — the status bar resolves that to the
     /// known default_backend name at render time.
@@ -505,14 +502,9 @@ struct TaskView {
     /// Rendered as a persistent banner so it survives re-subscribe (unlike items,
     /// which get rebuilt from the conversation on every snapshot).
     failure: Option<String>,
-    /// Tool names this task has approved-and-remembered. Mirrors
-    /// `ThreadSnapshot.tool_allowlist`; refreshed by `ThreadAllowlistUpdated`.
-    tool_allowlist: Vec<String>,
     /// Extra snapshot-carried fields the context inspector renders.
-    /// Populated on `ThreadSnapshot`; kept in sync via the per-field
-    /// update events (`ThreadBindingsChanged`, etc). Small enough to
-    /// hold per-view rather than shipping an extra request when the
-    /// inspector opens.
+    /// Populated on `ThreadSnapshot`. Small enough to hold per-view
+    /// rather than shipping an extra request when the inspector opens.
     inspector: ThreadInspector,
     /// Running count of `Message`s in the server's `Conversation` for
     /// this thread. Tracks the absolute message index at which the
@@ -540,6 +532,16 @@ struct TaskView {
 /// (default-collapsed), so the inspector no longer displays it
 /// separately. Keeps the conversation log as the single source of
 /// truth for what the model actually saw.
+/// In-flight scope-widening request the server is awaiting a decision on.
+/// Stored on `ChatApp` keyed by `function_id`; rendered as a banner above
+/// the selected thread's chat log.
+#[derive(Clone)]
+struct PendingEscalation {
+    thread_id: String,
+    request: whisper_agent_protocol::permission::EscalationRequest,
+    reason: String,
+}
+
 #[derive(Clone, Default)]
 struct ThreadInspector {
     max_tokens: u32,
@@ -547,17 +549,10 @@ struct ThreadInspector {
     bindings: ThreadBindings,
     origin: Option<BehaviorOrigin>,
     created_at: String,
-}
-
-struct PendingApproval {
-    approval_id: String,
-    name: String,
-    args_preview: String,
-    destructive: bool,
-    read_only: bool,
-    /// True after the local user clicked Approve/Reject — buttons disable until the
-    /// server's ThreadApprovalResolved arrives (and removes the entry entirely).
-    submitted: bool,
+    /// Thread's current effective permission scope. Updated on every
+    /// `ThreadSnapshot` — so escalation grants that widen the scope
+    /// land here the moment the server re-broadcasts the snapshot.
+    scope: whisper_agent_protocol::permission::Scope,
 }
 
 impl TaskView {
@@ -569,17 +564,16 @@ impl TaskView {
             items: Vec::new(),
             total_usage: Usage::default(),
             subscribed: false,
-            pending_approvals: Vec::new(),
             backend: String::new(),
             model: String::new(),
             failure: None,
-            tool_allowlist: Vec::new(),
             inspector: ThreadInspector {
                 max_tokens: 0,
                 max_turns: 0,
                 bindings: ThreadBindings::default(),
                 origin,
                 created_at,
+                scope: whisper_agent_protocol::permission::Scope::default(),
             },
             conv_message_count: 0,
             draft: String::new(),
@@ -802,6 +796,18 @@ pub struct ChatApp {
     /// ConnectionOpened (the current reconnect handler reissues the
     /// list-bootstrap suite).
     functions_requested: bool,
+
+    /// Pending scope-widening requests awaiting user decision. Keyed
+    /// by `function_id` — the id the server expects back in
+    /// `ResolveEscalation`. Populated by `EscalationRequested`,
+    /// drained by `EscalationResolved` (or by an explicit user click
+    /// that sends Approve/Reject and optimistically removes the
+    /// entry).
+    pending_escalations: HashMap<u64, PendingEscalation>,
+    /// Draft text the user typed into the reject-reason field of an
+    /// escalation banner, keyed by `function_id`. Kept per-entry so
+    /// switching between banners doesn't lose typing.
+    escalation_reject_drafts: HashMap<u64, String>,
 
     /// Which view the left side panel is showing.
     left_mode: LeftPanelMode,
@@ -1483,6 +1489,8 @@ impl ChatApp {
             file_tree_modal_pod: None,
             active_functions: std::collections::BTreeMap::new(),
             functions_requested: false,
+            pending_escalations: HashMap::new(),
+            escalation_reject_drafts: HashMap::new(),
             left_mode: LeftPanelMode::default(),
             md_cache: CommonMarkCache::default(),
         }
@@ -1730,13 +1738,13 @@ impl ChatApp {
                 let backend = snapshot.bindings.backend.clone();
                 let model = snapshot.config.model.clone();
                 let failure = snapshot.failure.clone();
-                let allowlist = snapshot.tool_allowlist.clone();
                 let inspector = ThreadInspector {
                     max_tokens: snapshot.config.max_tokens,
                     max_turns: snapshot.config.max_turns,
                     bindings: snapshot.bindings.clone(),
                     origin: snapshot.origin.clone(),
                     created_at: snapshot.created_at.clone(),
+                    scope: snapshot.scope.clone(),
                 };
                 let view = self
                     .tasks
@@ -1751,7 +1759,6 @@ impl ChatApp {
                 view.backend = backend;
                 view.model = model;
                 view.failure = failure;
-                view.tool_allowlist = allowlist;
                 view.inspector = inspector;
                 view.conv_message_count = snapshot.conversation.len();
                 view.draft = snapshot.draft.clone();
@@ -1764,8 +1771,6 @@ impl ChatApp {
                     self.input = snapshot.draft;
                     self.last_input_change_at = None;
                 }
-                // Pending-approval events that follow the snapshot will re-seed this.
-                view.pending_approvals.clear();
             }
             ServerToClient::ThreadDraftUpdated { thread_id, text } => {
                 // Skip redundant echoes (reconnect + resubscribe can
@@ -1782,24 +1787,6 @@ impl ChatApp {
                 if self.selected.as_deref() == Some(&thread_id) {
                     self.input = text;
                     self.last_input_change_at = None;
-                }
-            }
-            ServerToClient::ThreadAllowlistUpdated {
-                thread_id,
-                tool_allowlist,
-            } => {
-                if let Some(view) = self.tasks.get_mut(&thread_id) {
-                    view.tool_allowlist = tool_allowlist;
-                }
-            }
-            ServerToClient::ThreadBindingsChanged {
-                thread_id,
-                bindings,
-                ..
-            } => {
-                if let Some(view) = self.tasks.get_mut(&thread_id) {
-                    view.backend = bindings.backend.clone();
-                    view.inspector.bindings = bindings;
                 }
             }
             ServerToClient::ThreadCompacted {
@@ -1910,44 +1897,6 @@ impl ChatApp {
                 }
             }
             ServerToClient::ThreadLoopComplete { .. } => {}
-            ServerToClient::ThreadPendingApproval {
-                thread_id,
-                approval_id,
-                name,
-                args_preview,
-                destructive,
-                read_only,
-                ..
-            } => {
-                if let Some(view) = self.tasks.get_mut(&thread_id) {
-                    // Deduplicate — the same approval can arrive again if the client
-                    // re-subscribes while a decision is still outstanding.
-                    if !view
-                        .pending_approvals
-                        .iter()
-                        .any(|p| p.approval_id == approval_id)
-                    {
-                        view.pending_approvals.push(PendingApproval {
-                            approval_id,
-                            name,
-                            args_preview,
-                            destructive,
-                            read_only,
-                            submitted: false,
-                        });
-                    }
-                }
-            }
-            ServerToClient::ThreadApprovalResolved {
-                thread_id,
-                approval_id,
-                ..
-            } => {
-                if let Some(view) = self.tasks.get_mut(&thread_id) {
-                    view.pending_approvals
-                        .retain(|p| p.approval_id != approval_id);
-                }
-            }
             ServerToClient::Error {
                 thread_id,
                 message,
@@ -2586,6 +2535,25 @@ impl ChatApp {
                     settings.shared_mcp_remove_armed.remove(&name);
                     settings.shared_mcp_banner = Some(Ok(format!("Removed `{name}`.")));
                 }
+            }
+            ServerToClient::EscalationRequested {
+                function_id,
+                thread_id,
+                request,
+                reason,
+            } => {
+                self.pending_escalations.insert(
+                    function_id,
+                    PendingEscalation {
+                        thread_id,
+                        request,
+                        reason,
+                    },
+                );
+            }
+            ServerToClient::EscalationResolved { function_id, .. } => {
+                self.pending_escalations.remove(&function_id);
+                self.escalation_reject_drafts.remove(&function_id);
             }
         }
     }
@@ -3586,18 +3554,27 @@ impl eframe::App for ChatApp {
             self.request_models_for(&backend);
         }
 
-        let mut pending_decisions: Vec<(String, String, ApprovalChoice, bool)> = Vec::new();
-        let mut allowlist_revocations: Vec<(String, String)> = Vec::new();
         // (msg_index, seed_text) — paired with `selected` after the
         // render closure since render_item doesn't see thread_id.
         let mut fork_request: Option<(usize, String)> = None;
+        // Escalation-banner decisions the user triggered this frame.
+        // Collected here and dispatched after the central-panel closure
+        // so the closure doesn't need `&mut self` for `send`.
+        let mut escalation_decisions: Vec<(
+            u64,
+            whisper_agent_protocol::permission::EscalationDecision,
+            Option<String>,
+        )> = Vec::new();
         // Pre-split borrows: the closure needs `&mut self.tasks` (via
-        // get_mut) and `&mut self.md_cache` simultaneously. Destructuring
-        // up front lets the closure capture each field independently
-        // instead of re-borrowing through `&mut self`.
+        // get_mut), `&mut self.md_cache`, and read/write access to the
+        // escalation state simultaneously. Destructuring up front lets
+        // the closure capture each field independently instead of
+        // re-borrowing through `&mut self`.
         let selected = self.selected.clone();
         let tasks = &mut self.tasks;
         let md_cache = &mut self.md_cache;
+        let pending_escalations = &self.pending_escalations;
+        let escalation_reject_drafts = &mut self.escalation_reject_drafts;
         egui::CentralPanel::default().show_inside(ui, |ui| match selected.clone() {
             None => {
                 ui.vertical_centered(|ui| {
@@ -3620,8 +3597,13 @@ impl eframe::App for ChatApp {
                 Some(view) => {
                     render_thread_context_inspector(ui, &thread_id, view);
                     render_failure_banner(ui, view);
-                    render_allowlist_chips(ui, &thread_id, view, &mut allowlist_revocations);
-                    render_approval_banner(ui, &thread_id, view, &mut pending_decisions);
+                    render_escalation_banners(
+                        ui,
+                        &thread_id,
+                        pending_escalations,
+                        escalation_reject_drafts,
+                        &mut escalation_decisions,
+                    );
                     ScrollArea::vertical().stick_to_bottom(true).show(ui, |ui| {
                         if view.items.is_empty() {
                             ui.vertical_centered(|ui| {
@@ -3662,20 +3644,20 @@ impl eframe::App for ChatApp {
             });
         }
 
-        // Submit any approval decisions that were clicked this frame.
-        for (thread_id, approval_id, decision, remember) in pending_decisions {
-            self.send(ClientToServer::ApprovalDecision {
-                thread_id,
-                approval_id,
+        // Dispatch any escalation approve/reject the user clicked this
+        // frame. Optimistically drop the entry from `pending_escalations`
+        // — the server's `EscalationResolved` broadcast will land later
+        // and be a no-op. Keeping the banner mounted until the server
+        // echoed back was too flickery on the approve path, where the
+        // parent thread's next turn starts immediately on grant.
+        for (function_id, decision, reason) in escalation_decisions {
+            self.send(ClientToServer::ResolveEscalation {
+                function_id,
                 decision,
-                remember,
+                reason,
             });
-        }
-        for (thread_id, tool_name) in allowlist_revocations {
-            self.send(ClientToServer::RemoveToolAllowlistEntry {
-                thread_id,
-                tool_name,
-            });
+            self.pending_escalations.remove(&function_id);
+            self.escalation_reject_drafts.remove(&function_id);
         }
 
         let ctx = ui.ctx().clone();
@@ -6677,6 +6659,7 @@ impl ChatApp {
                 mcp_hosts: Vec::new(),
                 host_env: Vec::<NamedHostEnv>::new(),
                 tools: AllowMap::allow_all(),
+                caps: Default::default(),
             },
             thread_defaults: ThreadDefaults {
                 backend: default_backend,
@@ -6687,6 +6670,7 @@ impl ChatApp {
                 host_env: Vec::new(),
                 mcp_hosts: Vec::new(),
                 compaction: Default::default(),
+                caps: Default::default(),
             },
             limits: PodLimits::default(),
         }
@@ -7263,10 +7247,11 @@ fn render_thread_context_inspector(ui: &mut egui::Ui, thread_id: &str, view: &Ta
                         ),
                     );
                 }
-                if !view.tool_allowlist.is_empty() {
-                    kv_row(ui, "tool_allowlist", &view.tool_allowlist.join(", "));
-                }
             });
+
+        ui.add_space(6.0);
+        section_heading(ui, "Scope");
+        render_scope_summary(ui, thread_id, &inspector.scope);
 
         if let Some(origin) = inspector.origin.as_ref() {
             ui.add_space(6.0);
@@ -7309,6 +7294,154 @@ fn kv_row(ui: &mut egui::Ui, key: &str, value: &str) {
     ui.end_row();
 }
 
+/// Compact projection of a thread's `Scope` into the inspector. Shows
+/// the bindings-side admission sets, the typed caps, and whether the
+/// thread has an interactive escalation channel. Tool dispositions ride
+/// alongside the catalog in the chat log so they aren't duplicated
+/// here — the common "what can this thread do?" question is typically
+/// about bindings + caps, which the rest of the UI doesn't surface.
+fn render_scope_summary(
+    ui: &mut egui::Ui,
+    thread_id: &str,
+    scope: &whisper_agent_protocol::permission::Scope,
+) {
+    use whisper_agent_protocol::permission::{Escalation, SetOrAll};
+
+    fn fmt_set(set: &SetOrAll<String>) -> String {
+        match set {
+            SetOrAll::All => "(all)".to_string(),
+            SetOrAll::Only { items } if items.is_empty() => "(none)".to_string(),
+            SetOrAll::Only { items } => items.iter().cloned().collect::<Vec<_>>().join(", "),
+        }
+    }
+
+    Grid::new(format!("thread-scope-grid-{thread_id}"))
+        .num_columns(2)
+        .min_col_width(120.0)
+        .spacing([12.0, 4.0])
+        .show(ui, |ui| {
+            kv_row(ui, "backends", &fmt_set(&scope.backends));
+            kv_row(ui, "host_envs", &fmt_set(&scope.host_envs));
+            kv_row(ui, "mcp_hosts", &fmt_set(&scope.mcp_hosts));
+            kv_row(ui, "tools default", &format!("{:?}", scope.tools.default));
+            if !scope.tools.overrides.is_empty() {
+                let overrides = scope
+                    .tools
+                    .overrides
+                    .iter()
+                    .map(|(k, v)| format!("{k}={v:?}"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                kv_row(ui, "tools overrides", &overrides);
+            }
+            kv_row(ui, "pod_modify", &format!("{:?}", scope.pod_modify));
+            kv_row(ui, "dispatch", &format!("{:?}", scope.dispatch));
+            kv_row(ui, "behaviors", &format!("{:?}", scope.behaviors));
+            let esc = match scope.escalation {
+                Escalation::Interactive { .. } => "interactive",
+                Escalation::None => "autonomous",
+            };
+            kv_row(ui, "escalation", esc);
+        });
+}
+
+/// Render one Approve/Reject banner per pending escalation for
+/// `thread_id`. Clicks append onto `decisions_out`; the caller dispatches
+/// them after this closure frame so `&mut self.send` doesn't have to be
+/// in scope here.
+fn render_escalation_banners(
+    ui: &mut egui::Ui,
+    thread_id: &str,
+    pending: &HashMap<u64, PendingEscalation>,
+    reject_drafts: &mut HashMap<u64, String>,
+    decisions_out: &mut Vec<(
+        u64,
+        whisper_agent_protocol::permission::EscalationDecision,
+        Option<String>,
+    )>,
+) {
+    use whisper_agent_protocol::permission::EscalationDecision;
+
+    // Stable iteration order — BTreeMap slice would be cheaper but the
+    // map type is fixed elsewhere; a small sort on the handful of
+    // typically-pending entries is fine.
+    let mut ids: Vec<u64> = pending
+        .iter()
+        .filter_map(|(id, esc)| (esc.thread_id == thread_id).then_some(*id))
+        .collect();
+    ids.sort_unstable();
+
+    for function_id in ids {
+        let Some(esc) = pending.get(&function_id) else {
+            continue;
+        };
+        egui::Frame::group(ui.style())
+            .fill(Color32::from_rgb(54, 48, 16))
+            .show(ui, |ui| {
+                ui.vertical(|ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            RichText::new("escalation requested")
+                                .color(Color32::from_rgb(240, 220, 120))
+                                .strong(),
+                        );
+                        ui.label(
+                            RichText::new(format!("fn #{function_id}"))
+                                .small()
+                                .color(Color32::from_gray(180)),
+                        );
+                    });
+                    ui.add_space(2.0);
+                    ui.label(
+                        RichText::new(describe_escalation_request(&esc.request))
+                            .color(Color32::from_rgb(240, 230, 180))
+                            .monospace(),
+                    );
+                    if !esc.reason.trim().is_empty() {
+                        ui.add_space(2.0);
+                        ui.label(
+                            RichText::new(format!("reason: {}", esc.reason))
+                                .small()
+                                .color(Color32::from_gray(210)),
+                        );
+                    }
+                    ui.add_space(4.0);
+                    let draft = reject_drafts.entry(function_id).or_default();
+                    ui.horizontal(|ui| {
+                        if ui.button("Approve").clicked() {
+                            decisions_out.push((function_id, EscalationDecision::Approve, None));
+                        }
+                        if ui.button("Reject").clicked() {
+                            let reason = draft.trim();
+                            let reason = (!reason.is_empty()).then(|| reason.to_string());
+                            decisions_out.push((function_id, EscalationDecision::Reject, reason));
+                        }
+                        ui.add(
+                            TextEdit::singleline(draft)
+                                .hint_text("reject reason (optional)")
+                                .desired_width(ui.available_width()),
+                        );
+                    });
+                });
+            });
+        ui.add_space(4.0);
+    }
+}
+
+/// One-line human-readable description of a scope-widening request,
+/// shown in the approval banner's body.
+fn describe_escalation_request(
+    req: &whisper_agent_protocol::permission::EscalationRequest,
+) -> String {
+    use whisper_agent_protocol::permission::EscalationRequest::*;
+    match req {
+        AddTool { name } => format!("Admit tool `{name}` for this thread"),
+        RaisePodModify { target } => format!("Raise pod_modify cap to {target:?}"),
+        RaiseBehaviors { target } => format!("Raise behaviors cap to {target:?}"),
+        RaiseDispatch { target } => format!("Raise dispatch cap to {target:?}"),
+    }
+}
+
 fn render_failure_banner(ui: &mut egui::Ui, view: &TaskView) {
     let Some(detail) = view.failure.as_deref() else {
         return;
@@ -7333,136 +7466,6 @@ fn render_failure_banner(ui: &mut egui::Ui, view: &TaskView) {
                 );
             });
         });
-    ui.add_space(4.0);
-}
-
-fn render_approval_banner(
-    ui: &mut egui::Ui,
-    thread_id: &str,
-    view: &mut TaskView,
-    pending_decisions: &mut Vec<(String, String, ApprovalChoice, bool)>,
-) {
-    if view.pending_approvals.is_empty() {
-        return;
-    }
-    egui::Frame::group(ui.style())
-        .fill(Color32::from_rgb(56, 44, 32))
-        .show(ui, |ui| {
-            ui.vertical(|ui| {
-                ui.label(
-                    RichText::new("approval required")
-                        .color(Color32::from_rgb(240, 200, 120))
-                        .strong(),
-                );
-                ui.add_space(2.0);
-                for approval in view.pending_approvals.iter_mut() {
-                    ui.horizontal_top(|ui| {
-                        let hint = if approval.destructive {
-                            RichText::new("destructive")
-                                .color(Color32::from_rgb(220, 110, 110))
-                                .small()
-                        } else if approval.read_only {
-                            RichText::new("read-only")
-                                .color(Color32::from_gray(180))
-                                .small()
-                        } else {
-                            RichText::new("unannotated")
-                                .color(Color32::from_gray(180))
-                                .small()
-                        };
-                        ui.label(hint);
-                        ui.label(
-                            RichText::new(format!("{}({})", approval.name, approval.args_preview))
-                                .color(Color32::from_gray(220))
-                                .monospace(),
-                        );
-                    });
-                    ui.horizontal(|ui| {
-                        ui.add_enabled_ui(!approval.submitted, |ui| {
-                            if ui.button("Approve").clicked() {
-                                approval.submitted = true;
-                                pending_decisions.push((
-                                    thread_id.to_string(),
-                                    approval.approval_id.clone(),
-                                    ApprovalChoice::Approve,
-                                    false,
-                                ));
-                            }
-                            if ui
-                                .button(format!("Always allow {}", approval.name))
-                                .on_hover_text(
-                                    "Approve this call and skip future approvals for \
-                                     this tool name (this task only).",
-                                )
-                                .clicked()
-                            {
-                                approval.submitted = true;
-                                pending_decisions.push((
-                                    thread_id.to_string(),
-                                    approval.approval_id.clone(),
-                                    ApprovalChoice::Approve,
-                                    true,
-                                ));
-                            }
-                            if ui.button("Reject").clicked() {
-                                approval.submitted = true;
-                                pending_decisions.push((
-                                    thread_id.to_string(),
-                                    approval.approval_id.clone(),
-                                    ApprovalChoice::Reject,
-                                    false,
-                                ));
-                            }
-                        });
-                        if approval.submitted {
-                            ui.label(
-                                RichText::new("submitted…")
-                                    .color(Color32::from_gray(160))
-                                    .italics(),
-                            );
-                        }
-                    });
-                    ui.add_space(4.0);
-                }
-            });
-        });
-    ui.add_space(6.0);
-}
-
-/// Compact strip of "always-allowed" tool names with revoke buttons. Hidden when
-/// the allowlist is empty so it doesn't take vertical space in the common case.
-fn render_allowlist_chips(
-    ui: &mut egui::Ui,
-    thread_id: &str,
-    view: &TaskView,
-    revocations: &mut Vec<(String, String)>,
-) {
-    if view.tool_allowlist.is_empty() {
-        return;
-    }
-    ui.horizontal_wrapped(|ui| {
-        ui.label(
-            RichText::new("always allow:")
-                .small()
-                .color(Color32::from_gray(170)),
-        );
-        for tool_name in &view.tool_allowlist {
-            ui.label(
-                RichText::new(tool_name)
-                    .small()
-                    .color(Color32::from_rgb(170, 200, 230))
-                    .monospace(),
-            );
-            if ui
-                .small_button("×")
-                .on_hover_text(format!("Stop always-allowing `{tool_name}`"))
-                .clicked()
-            {
-                revocations.push((thread_id.to_string(), tool_name.clone()));
-            }
-            ui.add_space(2.0);
-        }
-    });
     ui.add_space(4.0);
 }
 

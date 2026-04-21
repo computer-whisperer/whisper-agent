@@ -58,7 +58,7 @@ Pod ids are directory names — immutable. Renaming a pod would break thread-int
 
 ## Pod config TOML
 
-A pod is fully described by its `pod.toml`. Shape (from `src/pod/mod.rs` and `crates/whisper-agent-protocol/src/pod.rs`):
+A pod is fully described by its `pod.toml`. Shape (from `src/pod.rs` and `crates/whisper-agent-protocol/src/pod.rs`):
 
 ```toml
 # Identity
@@ -72,6 +72,16 @@ created_at = "2026-04-16T10:23:11Z"      # set on creation; informational
 [allow]
 backends  = ["anthropic", "openai"]      # references to server-catalog backends
 mcp_hosts = ["fetch", "search"]          # references to server-catalog shared hosts
+
+# Tool gate — default disposition plus per-tool overrides. Replaces the
+# old thread_defaults.approval_policy preset enum. Threads snapshot this
+# map into their own tools_scope at creation. Omit the table entirely
+# for "allow all tools" (the old AutoApproveAll preset).
+[allow.tools]
+default = "allow"                        # allow | allow_with_prompt | deny
+[allow.tools.overrides]
+pod_write_file = "allow_with_prompt"
+pod_edit_file  = "allow_with_prompt"
 
 # Host-env entries are named (provider, spec) pairs. The provider name
 # resolves against the server's durable provider catalog
@@ -96,8 +106,11 @@ model              = "claude-sonnet-4-6"
 system_prompt_file = "system_prompt.md"  # path relative to pod dir
 max_tokens         = 16384
 max_turns          = 30
-approval_policy    = "prompt_pod_modify" # see design_permissions.md
-host_env           = "default"           # name from [[allow.host_env]]
+host_env           = ["default"]         # names from [[allow.host_env]]; may be
+                                         # multiple (ordered; tool-name collisions
+                                         # resolved by order). Bare-string form
+                                         # `host_env = "default"` still accepted
+                                         # for back-compat.
 mcp_hosts          = ["fetch", "search"] # subset of [allow].mcp_hosts
 
 # Pod-level limits across all threads.
@@ -113,11 +126,11 @@ Why this shape:
 - **`thread_defaults` separate from `[allow]`.** Defaults are a starting point for new threads; `[allow]` is the cap. A thread can pick a backend that's allowed-but-not-default; it can't pick one that isn't in `[allow]`.
 - **`system_prompt_file` references a sibling file** so long prompts edit cleanly with normal text editors instead of being squashed into a TOML string.
 
-Validation (see `src/pod/mod.rs::validate`):
+Validation (see `src/pod.rs::validate`):
 
-- Sandbox names must be unique within a pod.
+- Host-env names must be unique within a pod.
 - `thread_defaults.backend` must be in `allow.backends`.
-- `thread_defaults.host_env` must be in `allow.host_env` (or both must be empty — a shared-only pod with no host-env MCP).
+- `thread_defaults.host_env` entries must all be in `allow.host_env`. An empty default on a pod with zero `[[allow.host_env]]` entries is fine (shared-MCP-only pod). An empty default on a pod that *has* entries is rejected — we don't want a silent "no host env" fallback.
 - `thread_defaults.mcp_hosts` must all be in `allow.mcp_hosts`.
 
 ## Data model (in-memory)
@@ -248,7 +261,7 @@ GC: refcount + idle timeout + pin. Ready resources with zero users for 5 minutes
 
 ## Auto-provisioning
 
-A `ResourceResolver` sits between thread creation/rebind and the registries. When a thread wants `bindings.host_env = Named { name: "default" }`:
+A `ResourceResolver` sits between thread creation and the registries. When a thread wants `bindings.host_env = Named { name: "default" }`:
 
 ```
 1. Look up "default" in the pod's [[allow.host_env]] entries.
@@ -263,23 +276,6 @@ A `ResourceResolver` sits between thread creation/rebind and the registries. Whe
 Same logic for MCP hosts (matched by catalog name + url) and backends (matched by catalog name).
 
 The resolver is the only code path that spawns resources implicitly. UI-driven `CreateHostEnv` requests bypass it (those create unscoped resources, used for diagnostic or shared infrastructure).
-
-## Mid-thread rebinding
-
-```rust
-ClientToServer::RebindThread {
-    thread_id: ThreadId,
-    patch: ThreadBindingsPatch,   // backend / host_env / mcp_hosts
-}
-```
-
-Applied immediately. Patches are validated against the pod's `[allow]` table — same rules as initial binding. Future I/O ops use the new bindings; in-flight ops complete against their original resources (already captured in the future). Refcounts adjust: old resources `users.remove(thread_id)`, new ones `.insert(thread_id)`.
-
-When bindings change materially, the scheduler appends a synthetic system message to the conversation:
-
-> *Note: the execution environment changed at this point. Files, processes, and tool availability may differ from earlier in this conversation.*
-
-Without this marker, the model continues referencing files and outputs from the old environment with no awareness that they may not exist.
 
 ## Wire protocol
 
@@ -300,7 +296,6 @@ enum ClientToServer {
                        config_override: Option<ThreadConfigOverride> },
     SendUserMessage  { thread_id, text },
     CancelThread     { thread_id },
-    RebindThread     { thread_id, patch: ThreadBindingsPatch },
     ApprovalDecision { thread_id, approval_id, choice, remember },
 
     // Subscription (two tiers)
@@ -336,14 +331,13 @@ enum ServerToClient {
     PodSnapshot        { pod_id, snapshot },
     ThreadCreated      { pod_id, thread_id, summary },
     ThreadStateChanged { pod_id, thread_id, state },
-    ThreadBindingsChanged { thread_id, bindings },
 
     // Per-thread turn tier (subscribers of that thread)
     ThreadAssistantBegin / Text / Reasoning / End   { thread_id, ... },
     ThreadToolCallBegin / End                        { thread_id, ... },
-    ThreadPendingApproval / ApprovalResolved         { thread_id, ... },
+    ThreadPendingApproval / ThreadApprovalResolved   { thread_id, ... },
     ThreadLoopComplete                               { thread_id },
-    ThreadAllowlistUpdated                           { thread_id, allowlist },
+    ThreadAllowlistUpdated                           { thread_id, tool_allowlist },
 
     // Resource tier (broadcast — registry is small)
     ResourceList        { correlation_id, resources },
@@ -381,7 +375,7 @@ The CLI uses `/tmp/whisper-agent-cli-<pid>/` as its `pods_root`. Inside, it crea
 - **Compact (replace a thread's conversation with a summary).** Also deferred.
 - **Lua hooks on thread lifecycle events.** The `pod.toml` has no `[[hooks]]` table yet; the design leaves room for one without committing to a scripting model.
 - **Autonomous behaviors** (scheduled or event-driven threads). Separate design: [`design_behaviors.md`](design_behaviors.md).
-- **Pod self-modification via tool.** Builtin tools can edit pod config today (`PromptPodModify` gates them); a more ergonomic patch-style interface is deferred.
+- **Pod self-modification via tool.** Builtin `pod_write_file` / `pod_edit_file` can edit `pod.toml` today (pods that want to gate them list those names in `[allow.tools]` overrides as `allow_with_prompt`); a more ergonomic patch-style interface is deferred.
 - **Concurrent server access to the same `pods_root`.** Single-server-instance assumption holds. File locking, lease coordination, etc. are future work.
 - **Real cancellation of in-flight tools.** `Cancelled` marks the thread; in-flight futures complete and discard. Proper cancellation (tool rollback, abort-after-timeout) is deferred.
 - **Pod-level quota / rate-limiting.** `[limits]` reserves space; only `max_concurrent_threads` is concrete. Token/cost budgets land when there's a concrete enforcement path.

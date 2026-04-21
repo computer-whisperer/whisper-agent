@@ -452,6 +452,7 @@ mod tests {
             dir.clone(),
             cfg.clone(),
             vec![],
+            crate::permission::PodModifyCap::ModifyAllow,
             POD_LIST_THREADS,
             json!({ "behavior_id": "daily" }),
         )
@@ -468,6 +469,7 @@ mod tests {
             dir.clone(),
             cfg,
             vec![],
+            crate::permission::PodModifyCap::ModifyAllow,
             POD_LIST_THREADS,
             json!({ "behavior_id": "interactive" }),
         )
@@ -515,6 +517,7 @@ mod tests {
             dir.clone(),
             cfg.clone(),
             vec![],
+            crate::permission::PodModifyCap::ModifyAllow,
             POD_LIST_THREADS,
             json!({ "state": "failed" }),
         )
@@ -529,6 +532,7 @@ mod tests {
             dir.clone(),
             cfg.clone(),
             vec![],
+            crate::permission::PodModifyCap::ModifyAllow,
             POD_LIST_THREADS,
             json!({ "state": "working" }),
         )
@@ -545,6 +549,7 @@ mod tests {
             dir.clone(),
             cfg,
             vec![],
+            crate::permission::PodModifyCap::ModifyAllow,
             POD_LIST_THREADS,
             json!({ "min_turns": 5 }),
         )
@@ -583,6 +588,7 @@ mod tests {
             dir.clone(),
             cfg,
             vec![],
+            crate::permission::PodModifyCap::ModifyAllow,
             POD_LIST_THREADS,
             json!({ "since": "2026-04-18T00:00:00Z" }),
         )
@@ -613,6 +619,7 @@ mod tests {
             dir.clone(),
             cfg,
             vec![],
+            crate::permission::PodModifyCap::ModifyAllow,
             POD_LIST_THREADS,
             json!({ "limit": 3 }),
         )
@@ -628,7 +635,15 @@ mod tests {
     async fn list_threads_empty_directory_gives_helpful_message() {
         let dir = temp_dir();
         let cfg = sample_config();
-        let out = dispatch(dir.clone(), cfg, vec![], POD_LIST_THREADS, json!({})).await;
+        let out = dispatch(
+            dir.clone(),
+            cfg,
+            vec![],
+            crate::permission::PodModifyCap::ModifyAllow,
+            POD_LIST_THREADS,
+            json!({}),
+        )
+        .await;
         assert!(!out.result.is_error);
         let text = join_blocks(&out.result.content);
         assert!(

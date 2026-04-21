@@ -26,7 +26,6 @@ use whisper_agent_protocol::{
 fn disposition_label(d: Disposition) -> &'static str {
     match d {
         Disposition::Allow => "allow",
-        Disposition::AllowWithPrompt => "allow with prompt",
         Disposition::Deny => "deny",
     }
 }
@@ -330,11 +329,6 @@ pub(super) fn render_pod_editor_defaults_tab(
                         &mut working.allow.tools.default,
                         Disposition::Allow,
                         disposition_label(Disposition::Allow),
-                    );
-                    ui.selectable_value(
-                        &mut working.allow.tools.default,
-                        Disposition::AllowWithPrompt,
-                        disposition_label(Disposition::AllowWithPrompt),
                     );
                     ui.selectable_value(
                         &mut working.allow.tools.default,

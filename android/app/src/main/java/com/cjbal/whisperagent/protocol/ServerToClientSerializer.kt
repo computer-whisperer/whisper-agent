@@ -41,19 +41,15 @@ object ServerToClientSerializer : KSerializer<ServerToClient> {
     private const val IDX_ARGS_PREVIEW = 15
     private const val IDX_RESULT_PREVIEW = 16
     private const val IDX_IS_ERROR = 17
-    private const val IDX_APPROVAL_ID = 18
-    private const val IDX_DESTRUCTIVE = 19
-    private const val IDX_READ_ONLY = 20
-    private const val IDX_DECISION = 21
-    private const val IDX_MESSAGE = 22
-    private const val IDX_PODS = 23
-    private const val IDX_DEFAULT_POD_ID = 24
-    private const val IDX_POD = 25
-    private const val IDX_POD_ID = 26
-    private const val IDX_BACKENDS = 27
-    private const val IDX_DEFAULT_BACKEND = 28
-    private const val IDX_MODELS = 29
-    private const val IDX_BACKEND = 30
+    private const val IDX_MESSAGE = 18
+    private const val IDX_PODS = 19
+    private const val IDX_DEFAULT_POD_ID = 20
+    private const val IDX_POD = 21
+    private const val IDX_POD_ID = 22
+    private const val IDX_BACKENDS = 23
+    private const val IDX_DEFAULT_BACKEND = 24
+    private const val IDX_MODELS = 25
+    private const val IDX_BACKEND = 26
 
     private val tasksSerializer = ListSerializer(ThreadSummary.serializer())
     private val podsSerializer = ListSerializer(PodSummary.serializer())
@@ -79,10 +75,6 @@ object ServerToClientSerializer : KSerializer<ServerToClient> {
         element("args_preview", String.serializer().descriptor, isOptional = true)
         element("result_preview", String.serializer().descriptor, isOptional = true)
         element("is_error", Boolean.serializer().descriptor, isOptional = true)
-        element("approval_id", String.serializer().descriptor, isOptional = true)
-        element("destructive", Boolean.serializer().descriptor, isOptional = true)
-        element("read_only", Boolean.serializer().descriptor, isOptional = true)
-        element("decision", ApprovalChoice.serializer().descriptor, isOptional = true)
         element("message", String.serializer().descriptor, isOptional = true)
         element("pods", podsSerializer.descriptor, isOptional = true)
         element("default_pod_id", String.serializer().descriptor, isOptional = true)
@@ -189,28 +181,6 @@ object ServerToClientSerializer : KSerializer<ServerToClient> {
                     encodeStringElement(descriptor, IDX_TYPE, "thread_loop_complete")
                     encodeStringElement(descriptor, IDX_THREAD_ID, value.threadId)
                 }
-                is ServerToClient.PendingApproval -> {
-                    encodeStringElement(descriptor, IDX_TYPE, "thread_pending_approval")
-                    encodeStringElement(descriptor, IDX_THREAD_ID, value.threadId)
-                    encodeStringElement(descriptor, IDX_APPROVAL_ID, value.approvalId)
-                    encodeStringElement(descriptor, IDX_TOOL_USE_ID, value.toolUseId)
-                    encodeStringElement(descriptor, IDX_NAME, value.name)
-                    encodeStringElement(descriptor, IDX_ARGS_PREVIEW, value.argsPreview)
-                    if (value.destructive) {
-                        encodeBooleanElement(descriptor, IDX_DESTRUCTIVE, true)
-                    }
-                    if (value.readOnly) {
-                        encodeBooleanElement(descriptor, IDX_READ_ONLY, true)
-                    }
-                }
-                is ServerToClient.ApprovalResolved -> {
-                    encodeStringElement(descriptor, IDX_TYPE, "thread_approval_resolved")
-                    encodeStringElement(descriptor, IDX_THREAD_ID, value.threadId)
-                    encodeStringElement(descriptor, IDX_APPROVAL_ID, value.approvalId)
-                    encodeSerializableElement(
-                        descriptor, IDX_DECISION, ApprovalChoice.serializer(), value.decision,
-                    )
-                }
                 is ServerToClient.PodList -> {
                     encodeStringElement(descriptor, IDX_TYPE, "pod_list")
                     value.correlationId?.let {
@@ -288,10 +258,6 @@ object ServerToClientSerializer : KSerializer<ServerToClient> {
             var argsPreview: String? = null
             var resultPreview: String? = null
             var isError = false
-            var approvalId: String? = null
-            var destructive = false
-            var readOnly = false
-            var decision: ApprovalChoice? = null
             var message: String? = null
             var pods: List<PodSummary>? = null
             var defaultPodId: String? = null
@@ -331,12 +297,6 @@ object ServerToClientSerializer : KSerializer<ServerToClient> {
                     IDX_ARGS_PREVIEW -> argsPreview = decodeStringElement(descriptor, i)
                     IDX_RESULT_PREVIEW -> resultPreview = decodeStringElement(descriptor, i)
                     IDX_IS_ERROR -> isError = decodeBooleanElement(descriptor, i)
-                    IDX_APPROVAL_ID -> approvalId = decodeStringElement(descriptor, i)
-                    IDX_DESTRUCTIVE -> destructive = decodeBooleanElement(descriptor, i)
-                    IDX_READ_ONLY -> readOnly = decodeBooleanElement(descriptor, i)
-                    IDX_DECISION -> decision = decodeSerializableElement(
-                        descriptor, i, ApprovalChoice.serializer(),
-                    )
                     IDX_MESSAGE -> message = decodeStringElement(descriptor, i)
                     IDX_PODS -> pods = decodeSerializableElement(descriptor, i, podsSerializer)
                     IDX_DEFAULT_POD_ID -> defaultPodId = decodeStringElement(descriptor, i)
@@ -416,20 +376,6 @@ object ServerToClientSerializer : KSerializer<ServerToClient> {
                 )
                 "thread_loop_complete" -> ServerToClient.LoopComplete(
                     threadId = requireNotNull(threadId) { "missing thread_id" },
-                )
-                "thread_pending_approval" -> ServerToClient.PendingApproval(
-                    threadId = requireNotNull(threadId) { "missing thread_id" },
-                    approvalId = requireNotNull(approvalId) { "missing approval_id" },
-                    toolUseId = requireNotNull(toolUseId) { "missing tool_use_id" },
-                    name = requireNotNull(name) { "missing name" },
-                    argsPreview = requireNotNull(argsPreview) { "missing args_preview" },
-                    destructive = destructive,
-                    readOnly = readOnly,
-                )
-                "thread_approval_resolved" -> ServerToClient.ApprovalResolved(
-                    threadId = requireNotNull(threadId) { "missing thread_id" },
-                    approvalId = requireNotNull(approvalId) { "missing approval_id" },
-                    decision = requireNotNull(decision) { "missing decision" },
                 )
                 "pod_list" -> ServerToClient.PodList(
                     correlationId = correlationId,

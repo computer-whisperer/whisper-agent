@@ -221,42 +221,6 @@ impl ThreadEventRouter {
                         },
                     );
                 }
-                ThreadEvent::PendingApproval {
-                    approval_id,
-                    tool_use_id,
-                    name,
-                    args_preview,
-                    destructive,
-                    read_only,
-                } => {
-                    self.broadcast_to_subscribers(
-                        thread_id,
-                        ServerToClient::ThreadPendingApproval {
-                            thread_id: thread_id.to_string(),
-                            approval_id,
-                            tool_use_id,
-                            name,
-                            args_preview,
-                            destructive,
-                            read_only,
-                        },
-                    );
-                }
-                ThreadEvent::ApprovalResolved {
-                    approval_id,
-                    decision,
-                    decided_by_conn,
-                } => {
-                    self.broadcast_to_subscribers(
-                        thread_id,
-                        ServerToClient::ThreadApprovalResolved {
-                            thread_id: thread_id.to_string(),
-                            approval_id,
-                            decision,
-                            decided_by_conn,
-                        },
-                    );
-                }
                 ThreadEvent::AssistantEnd { stop_reason, usage } => {
                     self.broadcast_to_subscribers(
                         thread_id,
@@ -291,41 +255,19 @@ impl ThreadEventRouter {
                         },
                     );
                 }
-                ThreadEvent::AllowlistChanged { allowlist } => {
-                    self.broadcast_to_subscribers(
-                        thread_id,
-                        ServerToClient::ThreadAllowlistUpdated {
-                            thread_id: thread_id.to_string(),
-                            tool_allowlist: allowlist,
-                        },
-                    );
-                }
                 ThreadEvent::AuditToolCall {
                     tool_name,
                     args,
                     is_error,
                     error_message,
-                    decision,
-                    who_decided,
                 } => {
-                    self.write_audit(
-                        thread_id,
-                        tool_name,
-                        args,
-                        is_error,
-                        error_message,
-                        decision,
-                        who_decided,
-                    );
+                    self.write_audit(thread_id, tool_name, args, is_error, error_message);
                 }
             }
         }
     }
 
     /// Fire-and-forget audit write — never blocks task progression.
-    // The args mirror `ThreadEvent::AuditToolCall` 1:1; grouping them into a
-    // struct just shuffles the same fields without buying clarity.
-    #[allow(clippy::too_many_arguments)]
     fn write_audit(
         &self,
         thread_id: &str,
@@ -333,8 +275,6 @@ impl ThreadEventRouter {
         args: serde_json::Value,
         is_error: bool,
         error_message: Option<String>,
-        decision: String,
-        who_decided: String,
     ) {
         let audit = self.audit.clone();
         let thread_id = thread_id.to_string();
@@ -350,8 +290,6 @@ impl ThreadEventRouter {
                 host_id: &host_id,
                 tool_name: &tool_name,
                 args,
-                decision: &decision,
-                who_decided: &who_decided,
                 outcome,
             };
             if let Err(e) = audit.write(&entry).await {

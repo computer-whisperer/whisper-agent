@@ -24,9 +24,10 @@ pub use behavior::{
 pub use conversation::{
     ContentBlock, Conversation, Message, ProviderReplay, Role, ToolResultContent,
 };
+pub use permission::{BehaviorOpsCap, DispatchCap, PodModifyCap};
 pub use pod::{
-    CompactionConfig, FsEntry, NamedHostEnv, PodAllow, PodConfig, PodLimits, PodSnapshot, PodState,
-    PodSummary, ThreadDefaults,
+    CompactionConfig, FsEntry, NamedHostEnv, PodAllow, PodAllowCaps, PodConfig, PodLimits,
+    PodSnapshot, PodState, PodSummary, ThreadDefaultCaps, ThreadDefaults,
 };
 // `SystemPromptChoice` is defined below; re-export here so other
 // crates can refer to it as `whisper_agent_protocol::SystemPromptChoice`.
@@ -259,11 +260,10 @@ where
 /// [`Inline`](Self::Inline) is reserved for a future subagent /
 /// out-of-pod spawn path that needs to pin a spec the pod doesn't
 /// declare. It is **not** reachable from user-facing request types —
-/// [`ThreadBindingsRequest`] and [`ThreadBindingsPatch`] both name
-/// entries by string only — so the wire can't sneak a spec past the
-/// pod cap. Kept as a variant (rather than collapsing the enum to
-/// plain strings) so the stored-state type is stable when the
-/// subagent flow lands.
+/// [`ThreadBindingsRequest`] names entries by string only — so the
+/// wire can't sneak a spec past the pod cap. Kept as a variant
+/// (rather than collapsing the enum to plain strings) so the
+/// stored-state type is stable when the subagent flow lands.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum HostEnvBinding {
@@ -297,32 +297,6 @@ pub struct ThreadBindingsRequest {
     /// Catalog names of shared MCP hosts the thread should bind to. `None`
     /// inherits the pod default; `Some(vec)` replaces exactly (empty vec
     /// means "no shared hosts beyond the primary").
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub mcp_hosts: Option<Vec<String>>,
-}
-
-/// Mid-thread rebind patch. Applied to the live `ThreadBindings` of a
-/// running thread; each `Some` field replaces the matching binding, `None`
-/// leaves it alone. Validated against the pod's `[allow]` table — same
-/// rules as initial binding.
-///
-/// In-flight I/O against the *previous* bindings completes against its
-/// captured resources; only future ops see the new state. When the
-/// host env or MCP host set changes, the scheduler appends a synthetic
-/// conversation note so the model knows the execution environment shifted.
-#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
-pub struct ThreadBindingsPatch {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub backend: Option<String>,
-    /// Replace the bound host-env list. `Some(vec)` replaces exactly —
-    /// empty vec drops all bindings (thread falls back to the bare
-    /// provider), non-empty rebinds to the listed allow entries.
-    /// `None` leaves the current list alone. Each name must resolve in
-    /// the pod's allow list at rebind time.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub host_env: Option<Vec<String>>,
-    /// Replace the shared MCP host list. `Some(vec)` replaces exactly
-    /// (empty vec means "no shared hosts"); `None` leaves the current set.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mcp_hosts: Option<Vec<String>>,
 }
@@ -480,14 +454,6 @@ pub enum SharedMcpAuthInput {
         /// reverse-proxied) without any infer-from-Host guesswork.
         redirect_base: String,
     },
-}
-
-/// User's decision on a pending approval.
-#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum ApprovalChoice {
-    Approve,
-    Reject,
 }
 
 /// Lightweight per-task summary. Broadcast to every connected client and used by
@@ -686,10 +652,6 @@ pub struct ThreadSnapshot {
     /// failure can still render why. `None` for non-Failed tasks.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub failure: Option<String>,
-    /// Tool names this task has marked "always allow" — they bypass the approval
-    /// prompt for the rest of the task's lifetime. Sorted for stable display.
-    #[serde(default)]
-    pub tool_allowlist: Vec<String>,
     /// Behavior-origin stamp for threads spawned by a behavior trigger.
     /// Carries the full payload (`ThreadSummary` carries the same field
     /// but payload-size concerns may trim it there later).
@@ -703,6 +665,12 @@ pub struct ThreadSnapshot {
     /// `dispatch_thread` tool call. `None` for top-level threads.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dispatched_by: Option<String>,
+    /// The thread's effective permission scope, as snapshotted at
+    /// creation and widened by any escalation grants so far. Lets
+    /// clients render what the thread is allowed to do without
+    /// re-deriving from pod config.
+    #[serde(default)]
+    pub scope: crate::permission::Scope,
 }
 
 // ---------- Wire enums ----------
@@ -722,11 +690,15 @@ pub struct ThreadSnapshot {
 pub enum FunctionKind {
     CreateThread,
     CompactThread,
-    RebindThread,
     CancelThread,
     RunBehavior,
     BuiltinToolCall,
     McpToolUse,
+    /// A model-initiated scope-widening request (see
+    /// `docs/design_permissions_rework.md`). Stays in the registry
+    /// until the owning interactive channel resolves it via
+    /// `ClientToServer::ResolveEscalation`.
+    RequestEscalation,
 }
 
 /// Coarse outcome tag sent with `FunctionEnded`. The server's full
@@ -802,37 +774,6 @@ pub enum ClientToServer {
     SendUserMessage {
         thread_id: String,
         text: String,
-    },
-    /// Respond to a pending tool-call approval. If `remember` is true and the
-    /// decision is `Approve`, the tool's name is added to the task's allowlist —
-    /// future calls to that tool skip the prompt for the rest of the task's
-    /// lifetime. `remember` with `Reject` is currently ignored (no
-    /// "always reject" semantics).
-    ApprovalDecision {
-        thread_id: String,
-        approval_id: String,
-        decision: ApprovalChoice,
-        #[serde(default)]
-        remember: bool,
-    },
-    /// Remove a tool name from the task's allowlist. Future calls to that tool
-    /// will prompt again under the task's policy.
-    RemoveToolAllowlistEntry {
-        thread_id: String,
-        tool_name: String,
-    },
-    /// Replace pieces of a running thread's resource bindings (backend,
-    /// sandbox, shared MCP hosts). The patch is validated against the
-    /// pod's `[allow]` table; on success the scheduler swaps the bindings
-    /// in place, adjusts resource refcounts, re-provisions the primary
-    /// MCP if the sandbox changed, and appends a synthetic conversation
-    /// note so the model is aware the execution environment may have
-    /// shifted. In-flight ops complete against their captured resources.
-    RebindThread {
-        thread_id: String,
-        patch: ThreadBindingsPatch,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        correlation_id: Option<String>,
     },
     /// Cancel a task. Stubbed for now — flips state to `Cancelled` without rolling back
     /// any in-flight tool work. Proper rollback semantics are a v0.3 problem.
@@ -1231,6 +1172,22 @@ pub enum ClientToServer {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         correlation_id: Option<String>,
     },
+
+    // --- Escalation ---
+    /// User's answer to a pending `RequestEscalation` Function. The
+    /// scheduler looks the Function up by `function_id`, validates that
+    /// the resolving connection is the thread's interactive channel,
+    /// applies the widening on Approve, and completes the Function —
+    /// unblocking the model's tool call with a tool_result describing
+    /// the outcome.
+    ResolveEscalation {
+        function_id: u64,
+        decision: crate::permission::EscalationDecision,
+        /// Optional free-form reason. Shown to the model on reject so
+        /// it can course-correct; ignored on approve.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+    },
 }
 
 /// Messages the server sends to the client.
@@ -1268,15 +1225,6 @@ pub enum ServerToClient {
     ThreadDraftUpdated {
         thread_id: String,
         text: String,
-    },
-    /// A `RebindThread` was applied (or denied — see correlation_id +
-    /// matching Error). Carries the new bindings so subscribed clients
-    /// can refresh any rendered binding info.
-    ThreadBindingsChanged {
-        thread_id: String,
-        bindings: ThreadBindings,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        correlation_id: Option<String>,
     },
     /// Compaction finished on `thread_id`: the scheduler spawned
     /// `new_thread_id` seeded with the extracted summary, and
@@ -1355,35 +1303,6 @@ pub enum ServerToClient {
     ThreadAssistantReasoningDelta {
         thread_id: String,
         delta: String,
-    },
-    /// A tool call needs user approval before it can be dispatched.
-    ThreadPendingApproval {
-        thread_id: String,
-        approval_id: String,
-        tool_use_id: String,
-        name: String,
-        args_preview: String,
-        /// Server-declared `destructiveHint` (default false if unannotated).
-        destructive: bool,
-        /// Server-declared `readOnlyHint` (default false if unannotated).
-        read_only: bool,
-    },
-    /// A previously-pending approval has been resolved (by any connected client).
-    ThreadApprovalResolved {
-        thread_id: String,
-        approval_id: String,
-        decision: ApprovalChoice,
-        /// Connection id that submitted the decision, if known.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        decided_by_conn: Option<u64>,
-    },
-    /// Task's tool allowlist changed. Sent whenever a tool is added (via an
-    /// `ApprovalDecision` with `remember: true`) or removed (via
-    /// `RemoveToolAllowlistEntry`). Carries the full new list so clients don't
-    /// have to track add/remove deltas.
-    ThreadAllowlistUpdated {
-        thread_id: String,
-        tool_allowlist: Vec<String>,
     },
     ThreadToolCallBegin {
         thread_id: String,
@@ -1700,6 +1619,30 @@ pub enum ServerToClient {
     FunctionEnded {
         function_id: u64,
         outcome: FunctionOutcomeTag,
+    },
+
+    // --- Escalation ---
+    /// A thread's model issued `request_escalation`. Delivered only to
+    /// the thread's interactive channel (the conn that created it, or
+    /// inherited via dispatch); autonomous threads cannot emit this.
+    /// The client renders an approval UI and replies with
+    /// `ClientToServer::ResolveEscalation { function_id, decision }`.
+    EscalationRequested {
+        function_id: u64,
+        thread_id: String,
+        request: crate::permission::EscalationRequest,
+        /// Model-supplied justification. Free-form string.
+        reason: String,
+    },
+    /// An escalation Function completed. Broadcast to subscribers of
+    /// the affected thread so any observer (not just the original
+    /// approver) can update its scope view. The server separately
+    /// broadcasts a `ThreadSnapshot` on approve to reflect the widened
+    /// scope once scope-on-the-wire lands.
+    EscalationResolved {
+        function_id: u64,
+        thread_id: String,
+        decision: crate::permission::EscalationDecision,
     },
 
     Error {

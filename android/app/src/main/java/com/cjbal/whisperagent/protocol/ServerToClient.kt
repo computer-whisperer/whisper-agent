@@ -94,22 +94,6 @@ sealed class ServerToClient {
         val threadId: String,
     ) : ServerToClient()
 
-    data class PendingApproval(
-        val threadId: String,
-        val approvalId: String,
-        val toolUseId: String,
-        val name: String,
-        val argsPreview: String,
-        val destructive: Boolean = false,
-        val readOnly: Boolean = false,
-    ) : ServerToClient()
-
-    data class ApprovalResolved(
-        val threadId: String,
-        val approvalId: String,
-        val decision: ApprovalChoice,
-    ) : ServerToClient()
-
     // --- Pod-registry tier ----------------------------------------------------
 
     data class PodList(

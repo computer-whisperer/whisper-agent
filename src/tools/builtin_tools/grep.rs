@@ -285,6 +285,7 @@ mod tests {
             dir.clone(),
             cfg,
             vec![],
+            crate::permission::PodModifyCap::ModifyAllow,
             POD_GREP,
             json!({ "pattern": "error" }),
         )
@@ -317,6 +318,7 @@ mod tests {
             dir.clone(),
             cfg,
             vec![],
+            crate::permission::PodModifyCap::ModifyAllow,
             POD_GREP,
             json!({ "pattern": "target", "context": 1 }),
         )
@@ -357,6 +359,7 @@ mod tests {
             dir.clone(),
             cfg,
             vec![],
+            crate::permission::PodModifyCap::ModifyAllow,
             POD_GREP,
             json!({ "pattern": "target", "path": "threads/" }),
         )
@@ -381,6 +384,7 @@ mod tests {
             dir.clone(),
             cfg,
             vec![],
+            crate::permission::PodModifyCap::ModifyAllow,
             POD_GREP,
             json!({ "pattern": "x", "path": "../etc" }),
         )
@@ -417,6 +421,7 @@ mod tests {
             dir.clone(),
             cfg,
             vec![],
+            crate::permission::PodModifyCap::ModifyAllow,
             POD_GREP,
             json!({ "pattern": "has match" }),
         )
@@ -441,6 +446,7 @@ mod tests {
             dir.clone(),
             cfg,
             vec![],
+            crate::permission::PodModifyCap::ModifyAllow,
             POD_GREP,
             json!({ "pattern": "nowhere-in-sight" }),
         )
@@ -464,6 +470,7 @@ mod tests {
             dir.clone(),
             cfg,
             vec![],
+            crate::permission::PodModifyCap::ModifyAllow,
             POD_GREP,
             json!({ "pattern": "hit" }),
         )

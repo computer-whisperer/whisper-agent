@@ -162,6 +162,7 @@ mod tests {
             dir.clone(),
             cfg,
             vec!["real".to_string()],
+            crate::permission::PodModifyCap::ModifyAllow,
             POD_RUN_BEHAVIOR,
             json!({ "behavior_id": "ghost" }),
         )
@@ -180,6 +181,7 @@ mod tests {
             dir.clone(),
             cfg,
             vec!["daily".to_string()],
+            crate::permission::PodModifyCap::ModifyAllow,
             POD_RUN_BEHAVIOR,
             json!({ "behavior_id": "daily", "payload": {"foo": 1} }),
         )
@@ -205,6 +207,7 @@ mod tests {
             dir.clone(),
             cfg,
             vec!["daily".to_string()],
+            crate::permission::PodModifyCap::ModifyAllow,
             POD_RUN_BEHAVIOR,
             json!({ "behavior_id": "daily" }),
         )
@@ -226,6 +229,7 @@ mod tests {
             dir.clone(),
             cfg,
             vec!["daily".to_string()],
+            crate::permission::PodModifyCap::ModifyAllow,
             POD_SET_BEHAVIOR_ENABLED,
             json!({ "behavior_id": "daily", "enabled": false }),
         )
@@ -251,6 +255,7 @@ mod tests {
             dir.clone(),
             cfg,
             vec![],
+            crate::permission::PodModifyCap::ModifyAllow,
             POD_SET_BEHAVIOR_ENABLED,
             json!({ "behavior_id": "ghost", "enabled": true }),
         )

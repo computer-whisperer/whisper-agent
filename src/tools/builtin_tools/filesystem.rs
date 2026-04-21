@@ -980,7 +980,7 @@ fn multi_match_hint(content: &str, old_string: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::super::{dispatch, is_pod_modify, join_blocks, sample_config, temp_dir};
+    use super::super::{dispatch, join_blocks, sample_config, temp_dir};
     use super::*;
 
     #[tokio::test]
@@ -994,6 +994,7 @@ mod tests {
             dir.clone(),
             cfg.clone(),
             vec![],
+            crate::permission::PodModifyCap::ModifyAllow,
             POD_READ_FILE,
             json!({ "filename": "secrets.env" }),
         )
@@ -1004,6 +1005,7 @@ mod tests {
             dir.clone(),
             cfg,
             vec![],
+            crate::permission::PodModifyCap::ModifyAllow,
             POD_READ_FILE,
             json!({ "filename": "pod.toml" }),
         )
@@ -1026,6 +1028,7 @@ mod tests {
             dir.clone(),
             cfg.clone(),
             vec![],
+            crate::permission::PodModifyCap::ModifyAllow,
             POD_WRITE_FILE,
             json!({ "filename": "pod.toml", "content": "name = \"broken\" # no thread_defaults" }),
         )
@@ -1046,6 +1049,7 @@ mod tests {
             dir.clone(),
             cfg,
             vec![],
+            crate::permission::PodModifyCap::ModifyAllow,
             POD_WRITE_FILE,
             json!({ "filename": "system_prompt.md", "content": "You are helpful." }),
         )
@@ -1068,6 +1072,7 @@ mod tests {
             dir.clone(),
             cfg,
             vec![],
+            crate::permission::PodModifyCap::ModifyAllow,
             POD_EDIT_FILE,
             json!({
                 "filename": "system_prompt.md",
@@ -1111,6 +1116,7 @@ mod tests {
             dir.clone(),
             cfg,
             vec![],
+            crate::permission::PodModifyCap::ModifyAllow,
             POD_EDIT_FILE,
             json!({
                 "filename": "system_prompt.md",
@@ -1127,15 +1133,6 @@ mod tests {
         assert_eq!(disk, "bye\nbye\n");
     }
 
-    #[test]
-    fn is_pod_modify_classification() {
-        assert!(!is_pod_modify(POD_READ_FILE));
-        assert!(!is_pod_modify(POD_LIST_FILES));
-        assert!(is_pod_modify(POD_WRITE_FILE));
-        assert!(is_pod_modify(POD_EDIT_FILE));
-        assert!(!is_pod_modify("some_mcp_tool"));
-    }
-
     #[tokio::test]
     async fn list_files_marks_allowed_and_absent() {
         let dir = temp_dir();
@@ -1146,7 +1143,15 @@ mod tests {
             .unwrap();
         tokio::fs::create_dir(dir.join("threads")).await.unwrap();
 
-        let out = dispatch(dir.clone(), cfg, vec![], POD_LIST_FILES, json!({})).await;
+        let out = dispatch(
+            dir.clone(),
+            cfg,
+            vec![],
+            crate::permission::PodModifyCap::ModifyAllow,
+            POD_LIST_FILES,
+            json!({}),
+        )
+        .await;
         assert!(!out.result.is_error);
         let text = join_blocks(&out.result.content);
         assert!(text.contains("[rw]"), "missing rw marker: {text}");
@@ -1184,6 +1189,7 @@ mod tests {
             dir.clone(),
             cfg,
             vec![],
+            crate::permission::PodModifyCap::ModifyAllow,
             POD_WRITE_FILE,
             json!({
                 "filename": "memory/user_role.md",
@@ -1221,6 +1227,7 @@ mod tests {
             dir.clone(),
             cfg,
             vec![],
+            crate::permission::PodModifyCap::ModifyAllow,
             POD_WRITE_FILE,
             json!({
                 "filename": "memory/MEMORY.md",
@@ -1245,6 +1252,7 @@ mod tests {
                 dir.clone(),
                 cfg.clone(),
                 vec![],
+                crate::permission::PodModifyCap::ModifyAllow,
                 POD_WRITE_FILE,
                 json!({ "filename": bad, "content": "x" }),
             )
@@ -1272,6 +1280,7 @@ mod tests {
             dir.clone(),
             cfg,
             vec![],
+            crate::permission::PodModifyCap::ModifyAllow,
             POD_EDIT_FILE,
             json!({
                 "filename": "memory/notes.md",
@@ -1300,7 +1309,15 @@ mod tests {
             .await
             .unwrap();
         let cfg = sample_config();
-        let out = dispatch(dir.clone(), cfg, vec![], POD_LIST_FILES, json!({})).await;
+        let out = dispatch(
+            dir.clone(),
+            cfg,
+            vec![],
+            crate::permission::PodModifyCap::ModifyAllow,
+            POD_LIST_FILES,
+            json!({}),
+        )
+        .await;
         assert!(!out.result.is_error);
         let text = join_blocks(&out.result.content);
         assert!(
@@ -1323,7 +1340,15 @@ mod tests {
             .await
             .unwrap();
         let cfg = sample_config();
-        let out = dispatch(dir.clone(), cfg, vec![], POD_LIST_FILES, json!({})).await;
+        let out = dispatch(
+            dir.clone(),
+            cfg,
+            vec![],
+            crate::permission::PodModifyCap::ModifyAllow,
+            POD_LIST_FILES,
+            json!({}),
+        )
+        .await;
         assert!(!out.result.is_error);
         let text = join_blocks(&out.result.content);
         assert!(text.contains("-- memory/ --"), "missing memory section");
@@ -1366,6 +1391,7 @@ schedule = "0 9 * * *"
             dir.clone(),
             cfg,
             vec![],
+            crate::permission::PodModifyCap::ModifyAllow,
             POD_WRITE_FILE,
             json!({
                 "filename": "behaviors/nightly/behavior.toml",
@@ -1407,6 +1433,7 @@ schedule = "0 9 * * *"
             dir.clone(),
             cfg,
             vec![],
+            crate::permission::PodModifyCap::ModifyAllow,
             POD_WRITE_FILE,
             json!({
                 "filename": "behaviors/ghost/prompt.md",
@@ -1435,6 +1462,7 @@ schedule = "0 9 * * *"
             dir.clone(),
             cfg,
             vec![],
+            crate::permission::PodModifyCap::ModifyAllow,
             POD_WRITE_FILE,
             json!({
                 "filename": "behaviors/bad/behavior.toml",
@@ -1475,6 +1503,7 @@ schedule = "0 9 * * *"
             dir.clone(),
             cfg,
             vec!["daily".to_string()],
+            crate::permission::PodModifyCap::ModifyAllow,
             POD_WRITE_FILE,
             json!({
                 "filename": "behaviors/daily/behavior.toml",
@@ -1509,6 +1538,7 @@ schedule = "0 9 * * *"
             dir.clone(),
             cfg,
             vec!["daily".to_string()],
+            crate::permission::PodModifyCap::ModifyAllow,
             POD_WRITE_FILE,
             json!({
                 "filename": "behaviors/daily/prompt.md",
@@ -1542,6 +1572,7 @@ schedule = "0 9 * * *"
             dir.clone(),
             cfg,
             vec![],
+            crate::permission::PodModifyCap::ModifyAllow,
             POD_READ_FILE,
             json!({ "filename": "threads/abc.json" }),
         )
@@ -1565,15 +1596,20 @@ schedule = "0 9 * * *"
             dir.clone(),
             cfg,
             vec![],
+            crate::permission::PodModifyCap::ModifyAllow,
             POD_WRITE_FILE,
             json!({ "filename": "threads/abc.json", "content": "{}" }),
         )
         .await;
         assert!(out.result.is_error);
         let text = join_blocks(&out.result.content);
+        // `threads/*.json` is pod-internal runtime state; writes are
+        // rejected by the pod_modify cap even at ModifyAllow (the cap
+        // hierarchy doesn't cover runtime-state paths; reads are
+        // allowlist-gated separately).
         assert!(
-            text.contains("read-only"),
-            "expected read-only error: {text}"
+            text.contains("pod_modify"),
+            "expected pod_modify-cap denial: {text}"
         );
     }
 
@@ -1596,6 +1632,7 @@ schedule = "0 9 * * *"
             dir.clone(),
             cfg.clone(),
             vec![],
+            crate::permission::PodModifyCap::ModifyAllow,
             POD_READ_FILE,
             json!({ "filename": "threads/big.json" }),
         )
@@ -1613,6 +1650,7 @@ schedule = "0 9 * * *"
             dir.clone(),
             cfg,
             vec![],
+            crate::permission::PodModifyCap::ModifyAllow,
             POD_READ_FILE,
             json!({ "filename": "threads/big.json", "limit": 5 }),
         )
@@ -1638,7 +1676,15 @@ schedule = "0 9 * * *"
                 .await
                 .unwrap();
         }
-        let out = dispatch(dir.clone(), cfg, vec![], POD_LIST_FILES, json!({})).await;
+        let out = dispatch(
+            dir.clone(),
+            cfg,
+            vec![],
+            crate::permission::PodModifyCap::ModifyAllow,
+            POD_LIST_FILES,
+            json!({}),
+        )
+        .await;
         assert!(!out.result.is_error);
         let text = join_blocks(&out.result.content);
         assert!(
@@ -1684,6 +1730,7 @@ schedule = "0 9 * * *"
             dir.clone(),
             cfg,
             vec!["alpha".to_string(), "beta".to_string()],
+            crate::permission::PodModifyCap::ModifyAllow,
             POD_LIST_FILES,
             json!({}),
         )

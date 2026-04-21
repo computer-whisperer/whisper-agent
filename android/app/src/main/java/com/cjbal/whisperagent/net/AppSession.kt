@@ -322,11 +322,6 @@ class AppSession(
             is ServerToClient.ToolCallEnd,
             is ServerToClient.LoopComplete,
             -> reduceStreaming(event)
-            is ServerToClient.PendingApproval,
-            is ServerToClient.ApprovalResolved,
-            -> {
-                // TODO: surface approval prompts in the UI.
-            }
             is ServerToClient.Error -> {
                 Log.w(TAG, "server error: ${event.message}")
             }

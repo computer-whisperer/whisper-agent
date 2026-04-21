@@ -36,23 +36,17 @@ object ClientToServerSerializer : KSerializer<ClientToServer> {
     private const val IDX_CORRELATION_ID = 1
     private const val IDX_THREAD_ID = 2
     private const val IDX_TEXT = 3
-    private const val IDX_APPROVAL_ID = 4
-    private const val IDX_DECISION = 5
-    private const val IDX_REMEMBER = 6
-    private const val IDX_POD_ID = 7
-    private const val IDX_INITIAL_MESSAGE = 8
-    private const val IDX_CONFIG_OVERRIDE = 9
-    private const val IDX_BINDINGS_REQUEST = 10
-    private const val IDX_BACKEND = 11
+    private const val IDX_POD_ID = 4
+    private const val IDX_INITIAL_MESSAGE = 5
+    private const val IDX_CONFIG_OVERRIDE = 6
+    private const val IDX_BINDINGS_REQUEST = 7
+    private const val IDX_BACKEND = 8
 
     override val descriptor: SerialDescriptor = buildClassSerialDescriptor("ClientToServer") {
         element("type", String.serializer().descriptor)
         element("correlation_id", String.serializer().descriptor, isOptional = true)
         element("thread_id", String.serializer().descriptor, isOptional = true)
         element("text", String.serializer().descriptor, isOptional = true)
-        element("approval_id", String.serializer().descriptor, isOptional = true)
-        element("decision", ApprovalChoice.serializer().descriptor, isOptional = true)
-        element("remember", Boolean.serializer().descriptor, isOptional = true)
         element("pod_id", String.serializer().descriptor, isOptional = true)
         element("initial_message", String.serializer().descriptor, isOptional = true)
         element("config_override", ThreadConfigOverride.serializer().descriptor, isOptional = true)
@@ -106,19 +100,6 @@ object ClientToServerSerializer : KSerializer<ClientToServer> {
                     encodeStringElement(descriptor, IDX_THREAD_ID, value.threadId)
                     encodeStringElement(descriptor, IDX_TEXT, value.text)
                 }
-                is ClientToServer.ApprovalDecision -> {
-                    encodeStringElement(descriptor, IDX_TYPE, "approval_decision")
-                    encodeStringElement(descriptor, IDX_THREAD_ID, value.threadId)
-                    encodeStringElement(descriptor, IDX_APPROVAL_ID, value.approvalId)
-                    encodeSerializableElement(
-                        descriptor, IDX_DECISION, ApprovalChoice.serializer(), value.decision,
-                    )
-                    // Serde's `#[serde(default)]` on `remember` means it's
-                    // serialized only when true, matching Rust's default false.
-                    if (value.remember) {
-                        encodeBooleanElement(descriptor, IDX_REMEMBER, true)
-                    }
-                }
                 is ClientToServer.ListPods -> {
                     encodeStringElement(descriptor, IDX_TYPE, "list_pods")
                     value.correlationId?.let {
@@ -150,9 +131,6 @@ object ClientToServerSerializer : KSerializer<ClientToServer> {
             var correlationId: String? = null
             var threadId: String? = null
             var text: String? = null
-            var approvalId: String? = null
-            var decision: ApprovalChoice? = null
-            var remember = false
             var podId: String? = null
             var initialMessage: String? = null
             var configOverride: ThreadConfigOverride? = null
@@ -166,11 +144,6 @@ object ClientToServerSerializer : KSerializer<ClientToServer> {
                     IDX_CORRELATION_ID -> correlationId = decodeStringElement(descriptor, i)
                     IDX_THREAD_ID -> threadId = decodeStringElement(descriptor, i)
                     IDX_TEXT -> text = decodeStringElement(descriptor, i)
-                    IDX_APPROVAL_ID -> approvalId = decodeStringElement(descriptor, i)
-                    IDX_DECISION -> decision = decodeSerializableElement(
-                        descriptor, i, ApprovalChoice.serializer(),
-                    )
-                    IDX_REMEMBER -> remember = decodeBooleanElement(descriptor, i)
                     IDX_POD_ID -> podId = decodeStringElement(descriptor, i)
                     IDX_INITIAL_MESSAGE -> initialMessage = decodeStringElement(descriptor, i)
                     IDX_CONFIG_OVERRIDE -> configOverride = decodeSerializableElement(
@@ -202,12 +175,6 @@ object ClientToServerSerializer : KSerializer<ClientToServer> {
                 "send_user_message" -> ClientToServer.SendUserMessage(
                     threadId = requireNotNull(threadId) { "missing thread_id" },
                     text = requireNotNull(text) { "missing text" },
-                )
-                "approval_decision" -> ClientToServer.ApprovalDecision(
-                    threadId = requireNotNull(threadId) { "missing thread_id" },
-                    approvalId = requireNotNull(approvalId) { "missing approval_id" },
-                    decision = requireNotNull(decision) { "missing decision" },
-                    remember = remember,
                 )
                 "list_pods" -> ClientToServer.ListPods(correlationId)
                 "list_backends" -> ClientToServer.ListBackends(correlationId)

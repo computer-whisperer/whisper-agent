@@ -40,13 +40,6 @@ sealed class ClientToServer {
         val text: String,
     ) : ClientToServer()
 
-    data class ApprovalDecision(
-        val threadId: String,
-        val approvalId: String,
-        val decision: ApprovalChoice,
-        val remember: Boolean = false,
-    ) : ClientToServer()
-
     data class ListPods(
         val correlationId: String? = null,
     ) : ClientToServer()

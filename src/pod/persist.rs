@@ -846,6 +846,7 @@ fn synthesize_pod_config(task: &Thread) -> PodConfig {
             mcp_hosts: Vec::new(),
             host_env: Vec::new(),
             tools: whisper_agent_protocol::AllowMap::allow_all(),
+            caps: Default::default(),
         },
         thread_defaults: ThreadDefaults {
             backend,
@@ -856,6 +857,7 @@ fn synthesize_pod_config(task: &Thread) -> PodConfig {
             host_env: Vec::new(),
             mcp_hosts: Vec::new(),
             compaction: task.config.compaction.clone(),
+            caps: Default::default(),
         },
         limits: PodLimits::default(),
     }
@@ -866,6 +868,8 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU64, Ordering};
     use whisper_agent_protocol::{AllowMap, ThreadBindings, ThreadConfig};
+
+    use crate::permission::Scope;
 
     static COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -886,6 +890,7 @@ mod tests {
                 mcp_hosts: Vec::new(),
                 host_env: Vec::new(),
                 tools: AllowMap::allow_all(),
+                caps: Default::default(),
             },
             thread_defaults: ThreadDefaults {
                 backend: "anthropic".into(),
@@ -896,6 +901,7 @@ mod tests {
                 host_env: Vec::new(),
                 mcp_hosts: Vec::new(),
                 compaction: Default::default(),
+                caps: Default::default(),
             },
             limits: PodLimits::default(),
         }
@@ -914,7 +920,7 @@ mod tests {
             mcp_hosts: vec![format!("mcp-primary-{id}"), "mcp-shared-fetch".into()],
             tool_filter: None,
         };
-        let mut task = Thread::new(id.into(), id.into(), cfg, bindings, AllowMap::allow_all());
+        let mut task = Thread::new(id.into(), id.into(), cfg, bindings, Scope::allow_all());
         task.title = Some("Sample task".into());
         task.conversation
             .push(whisper_agent_protocol::Message::system_text("Hello."));

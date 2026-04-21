@@ -108,7 +108,6 @@ data class ThreadSnapshot(
     @SerialName("created_at") val createdAt: String,
     @SerialName("last_active") val lastActive: String,
     val failure: String? = null,
-    @SerialName("tool_allowlist") val toolAllowlist: List<String> = emptyList(),
     @SerialName("continued_from") val continuedFrom: String? = null,
     @SerialName("dispatched_by") val dispatchedBy: String? = null,
     // origin: BehaviorOrigin? is omitted from v1 — ignoreUnknownKeys skips it.

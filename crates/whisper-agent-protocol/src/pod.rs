@@ -9,7 +9,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::permission::AllowMap;
+use crate::permission::{AllowMap, BehaviorOpsCap, DispatchCap, PodModifyCap};
 use crate::sandbox::HostEnvSpec;
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
@@ -43,6 +43,48 @@ pub struct PodAllow {
     /// (matches the old `AutoApproveAll` preset).
     #[serde(default = "AllowMap::allow_all")]
     pub tools: AllowMap<String>,
+    /// Ceiling for each typed capability any thread in this pod can
+    /// hold. Threads can start below or equal to these bounds;
+    /// `request_escalation` cannot widen a thread past them. Omitted
+    /// defaults to the most-permissive ceiling so pre-schema pods
+    /// behave the way they did before caps landed on the wire.
+    #[serde(default)]
+    pub caps: PodAllowCaps,
+}
+
+/// Per-cap ceiling block under `[allow.caps]`. Defaults to the most
+/// permissive values to preserve behavior for pods authored before
+/// caps landed.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PodAllowCaps {
+    #[serde(default = "PodAllowCaps::default_pod_modify")]
+    pub pod_modify: PodModifyCap,
+    #[serde(default = "PodAllowCaps::default_dispatch")]
+    pub dispatch: DispatchCap,
+    #[serde(default = "PodAllowCaps::default_behaviors")]
+    pub behaviors: BehaviorOpsCap,
+}
+
+impl PodAllowCaps {
+    fn default_pod_modify() -> PodModifyCap {
+        PodModifyCap::ModifyAllow
+    }
+    fn default_dispatch() -> DispatchCap {
+        DispatchCap::WithinScope
+    }
+    fn default_behaviors() -> BehaviorOpsCap {
+        BehaviorOpsCap::AuthorAny
+    }
+}
+
+impl Default for PodAllowCaps {
+    fn default() -> Self {
+        Self {
+            pod_modify: Self::default_pod_modify(),
+            dispatch: Self::default_dispatch(),
+            behaviors: Self::default_behaviors(),
+        }
+    }
 }
 
 /// One pod-level "host env" entry — a named (provider, spec) pair the
@@ -95,6 +137,49 @@ pub struct ThreadDefaults {
     /// override via [`crate::ThreadConfigOverride.compaction`].
     #[serde(default)]
     pub compaction: CompactionConfig,
+    /// Starting typed-cap values for a freshly-created thread. Each
+    /// must be ≤ the matching entry in `allow.caps`; the pod validator
+    /// enforces this. Omitted on disk → conservative defaults that
+    /// match the pre-schema scheduler behavior.
+    #[serde(default)]
+    pub caps: ThreadDefaultCaps,
+}
+
+/// Per-cap starting value for a freshly-created thread. Defaults to
+/// the baseline described in `docs/design_permissions_rework.md`:
+/// memories-scoped pod writes, narrower-dispatch allowed, read-only
+/// behavior access, no escalation (interactive attachment happens at
+/// the scheduler layer per-request).
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ThreadDefaultCaps {
+    #[serde(default = "ThreadDefaultCaps::default_pod_modify")]
+    pub pod_modify: PodModifyCap,
+    #[serde(default = "ThreadDefaultCaps::default_dispatch")]
+    pub dispatch: DispatchCap,
+    #[serde(default = "ThreadDefaultCaps::default_behaviors")]
+    pub behaviors: BehaviorOpsCap,
+}
+
+impl ThreadDefaultCaps {
+    fn default_pod_modify() -> PodModifyCap {
+        PodModifyCap::Memories
+    }
+    fn default_dispatch() -> DispatchCap {
+        DispatchCap::WithinScope
+    }
+    fn default_behaviors() -> BehaviorOpsCap {
+        BehaviorOpsCap::Read
+    }
+}
+
+impl Default for ThreadDefaultCaps {
+    fn default() -> Self {
+        Self {
+            pod_modify: Self::default_pod_modify(),
+            dispatch: Self::default_dispatch(),
+            behaviors: Self::default_behaviors(),
+        }
+    }
 }
 
 /// Accept both a plain string (legacy singular shape) and a

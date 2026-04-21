@@ -57,6 +57,7 @@ pub fn build_default_pod_config(
             // AutoApproveAll preset — every tool admitted without a
             // prompt. Real pods tighten this by editing pod.toml.
             tools: AllowMap::allow_all(),
+            caps: Default::default(),
         },
         thread_defaults: ThreadDefaults {
             backend: default_backend.to_string(),
@@ -67,6 +68,7 @@ pub fn build_default_pod_config(
             host_env: default_host_env_names,
             mcp_hosts: shared_host_names.to_vec(),
             compaction: CompactionConfig::default(),
+            caps: Default::default(),
         },
         limits: PodLimits::default(),
     }

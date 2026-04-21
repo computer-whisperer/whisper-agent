@@ -15,7 +15,7 @@ use futures::stream::FuturesUnordered;
 use tracing::warn;
 use whisper_agent_protocol::{BackendSummary, ClientToServer, ModelSummary, ServerToClient};
 
-use super::{ConnId, Scheduler, pending_approvals_of};
+use super::{ConnId, Scheduler};
 use crate::functions::RejectReason;
 use crate::pod::Pod;
 use crate::runtime::io_dispatch::SchedulerFuture;
@@ -72,12 +72,12 @@ impl Scheduler {
                     config_override,
                     bindings_request,
                 };
-                let scope = self.ws_client_scope();
+
                 let caller = crate::functions::CallerLink::WsClient {
                     conn_id,
                     correlation_id: correlation_id.clone(),
                 };
-                match self.register_function(spec, scope, caller) {
+                match self.register_function(spec, caller) {
                     Ok(fn_id) => self.launch_function(fn_id, pending_io),
                     Err(e) => {
                         warn!(error = ?e, conn_id, "create_thread rejected");
@@ -107,114 +107,6 @@ impl Scheduler {
                     );
                 }
             }
-            ClientToServer::ApprovalDecision {
-                thread_id,
-                approval_id,
-                decision,
-                remember,
-            } => {
-                if !self.tasks.contains_key(&thread_id) {
-                    self.router.send_to_client(
-                        conn_id,
-                        ServerToClient::Error {
-                            correlation_id: None,
-                            thread_id: Some(thread_id),
-                            message: "unknown task".into(),
-                        },
-                    );
-                    return;
-                }
-                // Approval now routes to the tool-call Function whose
-                // caller-link matches (thread_id, approval_id's
-                // tool_use_id). The Function either pushes the
-                // deferred IO future (Approve) or synthesizes a denial
-                // (Reject); thread-side state is unchanged until the
-                // synthetic or real completion lands.
-                let resolved = self.resolve_tool_approval(
-                    &thread_id,
-                    &approval_id,
-                    decision,
-                    remember,
-                    pending_io,
-                );
-                if resolved {
-                    self.mark_dirty(&thread_id);
-                    self.step_until_blocked(&thread_id, pending_io);
-                } else {
-                    // Stale or duplicate decision — no Function was
-                    // waiting on this approval id. Ignore silently;
-                    // the UI shouldn't surface this as an error
-                    // because race conditions can produce benign
-                    // duplicates.
-                    warn!(
-                        %thread_id, %approval_id,
-                        "ApprovalDecision for unknown or already-resolved approval"
-                    );
-                }
-            }
-            ClientToServer::RemoveToolAllowlistEntry {
-                thread_id,
-                tool_name,
-            } => {
-                let removed = self
-                    .tasks
-                    .get_mut(&thread_id)
-                    .map(|t| (t.remove_from_allowlist(&tool_name), t.allowlist_snapshot()));
-                match removed {
-                    Some((true, snapshot)) => {
-                        self.mark_dirty(&thread_id);
-                        self.router.broadcast_to_subscribers(
-                            &thread_id,
-                            ServerToClient::ThreadAllowlistUpdated {
-                                thread_id: thread_id.clone(),
-                                tool_allowlist: snapshot,
-                            },
-                        );
-                    }
-                    Some((false, _)) => { /* nothing to remove — silent no-op */ }
-                    None => self.router.send_to_client(
-                        conn_id,
-                        ServerToClient::Error {
-                            correlation_id: None,
-                            thread_id: Some(thread_id),
-                            message: "unknown task".into(),
-                        },
-                    ),
-                }
-            }
-            ClientToServer::RebindThread {
-                thread_id,
-                patch,
-                correlation_id,
-            } => {
-                // Route through the Function registry. Validation
-                // errors inside apply_rebind surface as an Error
-                // terminal, which complete_function routes back to
-                // the originating conn_id + correlation_id.
-                let spec = crate::functions::Function::RebindThread {
-                    thread_id: thread_id.clone(),
-                    patch,
-                };
-                let scope = self.ws_client_scope();
-                let caller = crate::functions::CallerLink::WsClient {
-                    conn_id,
-                    correlation_id: correlation_id.clone(),
-                };
-                match self.register_function(spec, scope, caller) {
-                    Ok(fn_id) => self.launch_function(fn_id, pending_io),
-                    Err(e) => {
-                        warn!(error = ?e, conn_id, %thread_id, "rebind_thread rejected");
-                        self.router.send_to_client(
-                            conn_id,
-                            ServerToClient::Error {
-                                correlation_id,
-                                thread_id: Some(thread_id),
-                                message: format!("rebind: {}", reject_reason_detail(&e)),
-                            },
-                        );
-                    }
-                }
-            }
             ClientToServer::CancelThread { thread_id } => {
                 // Route through the Function registry. See
                 // `src/runtime/scheduler/functions.rs` and
@@ -223,7 +115,7 @@ impl Scheduler {
                 let spec = crate::functions::Function::CancelThread {
                     thread_id: thread_id.clone(),
                 };
-                let scope = self.ws_client_scope();
+
                 let caller = crate::functions::CallerLink::WsClient {
                     conn_id,
                     // CancelThread has no correlation_id on the wire —
@@ -232,7 +124,7 @@ impl Scheduler {
                     // correct per the CorrelationId contract.
                     correlation_id: None,
                 };
-                match self.register_function(spec, scope, caller) {
+                match self.register_function(spec, caller) {
                     Ok(fn_id) => self.launch_function(fn_id, pending_io),
                     Err(e) => {
                         warn!(error = ?e, conn_id, thread_id, "CancelThread rejected");
@@ -256,12 +148,12 @@ impl Scheduler {
                 let spec = crate::functions::Function::CompactThread {
                     thread_id: thread_id.clone(),
                 };
-                let scope = self.ws_client_scope();
+
                 let caller = crate::functions::CallerLink::WsClient {
                     conn_id,
                     correlation_id: correlation_id.clone(),
                 };
-                match self.register_function(spec, scope, caller) {
+                match self.register_function(spec, caller) {
                     Ok(fn_id) => self.launch_function(fn_id, pending_io),
                     Err(e) => {
                         warn!(error = ?e, conn_id, %thread_id, "compact_thread rejected");
@@ -338,10 +230,6 @@ impl Scheduler {
                 if let Some(task) = self.tasks.get(&thread_id) {
                     self.router.subscribe(conn_id, &thread_id);
                     let snapshot = task.snapshot();
-                    // Rehydrate any still-pending approvals so the newly-subscribed
-                    // client can render the approval UI. The snapshot itself doesn't
-                    // carry approval state.
-                    let pending = pending_approvals_of(self, task);
                     self.router.send_to_client(
                         conn_id,
                         ServerToClient::ThreadSnapshot {
@@ -349,9 +237,6 @@ impl Scheduler {
                             snapshot,
                         },
                     );
-                    for event in pending {
-                        self.router.send_to_client(conn_id, event);
-                    }
                 } else {
                     self.router.send_to_client(
                         conn_id,
@@ -1190,12 +1075,12 @@ impl Scheduler {
                     behavior_id: behavior_id.clone(),
                     payload: payload.unwrap_or(serde_json::Value::Null),
                 };
-                let scope = self.ws_client_scope();
+
                 let caller = crate::functions::CallerLink::WsClient {
                     conn_id,
                     correlation_id: correlation_id.clone(),
                 };
-                match self.register_function(spec, scope, caller) {
+                match self.register_function(spec, caller) {
                     Ok(fn_id) => self.launch_function(fn_id, pending_io),
                     Err(e) => {
                         self.router.send_to_client(
@@ -1335,6 +1220,13 @@ impl Scheduler {
                         functions,
                     },
                 );
+            }
+            ClientToServer::ResolveEscalation {
+                function_id,
+                decision,
+                reason,
+            } => {
+                self.resolve_escalation(conn_id, function_id, decision, reason, pending_io);
             }
         }
     }

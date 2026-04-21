@@ -23,7 +23,6 @@ Anything caller-initiated, asynchronous, and worth auditing as a single unit of 
 
 - `CreateThread` (interactive, behavior-spawned, and dispatched-child all collapse to one)
 - `CompactThread`
-- `RebindThread`
 - `CancelThread` (admits synchronously with a no-op progress stream and immediate terminal; kept as a Function for uniform caller access rather than a parallel API)
 - `RunBehavior` (manual / cron / webhook all converge)
 - `BuiltinToolCall` (each builtin is a variant, or a sub-dispatch inside one variant)
@@ -66,7 +65,6 @@ enum Function {
         wait_mode: WaitMode,   // meaningful primarily when `parent` is set
     },
     CompactThread { thread_id: ThreadId },
-    RebindThread { thread_id: ThreadId, patch: ThreadBindingsPatch },
     CancelThread { thread_id: ThreadId },
     RunBehavior { pod_id: PodId, behavior_id: BehaviorId, payload: Value },
     BuiltinToolCall { name: ToolName, args: Value },
@@ -138,20 +136,24 @@ A pure capability set: *what* the Function (or Pod, or Thread) is allowed to do.
 - **Thread effective scope** is a `PermissionScope` — derived from the pod's scope narrowed by the thread's bindings and config.
 - **Caller scope** (for a Function invocation) is a `PermissionScope` — supplied or derived per caller surface.
 
-Because they're the same type, the same subset-check function is used at every boundary: pod-level gate, thread creation, rebind validation, Function registration.
+Because they're the same type, the same subset-check function is used at every boundary: pod-level gate, thread creation, Function registration.
 
 **Sketch of the v1 shape** (names indicative, not final):
 
 ```
 struct PermissionScope {
-    // What bindings may be used / granted. Each is an AllowMap with
-    // tri-state dispositions (Allow / AllowWithPrompt / Deny).
-    backends: AllowMap<BackendName>,
-    host_envs: AllowMap<ProviderName>,
-    mcp_hosts: AllowMap<HostName>,
+    // What bindings may be used / granted. Today these are plain
+    // Vec<String> — implicit `Allow` for listed items, implicit `Deny`
+    // for everything else. No current use case wants `AllowWithPrompt`
+    // on a binding (prompting to use a backend, a host-env, or an MCP
+    // host is not a flow we've needed), so the AllowMap upgrade is
+    // deferred until one arises.
+    backends: Vec<BackendName>,
+    host_envs: Vec<ProviderName>,
+    mcp_hosts: Vec<HostName>,
 
-    // What tools may be invoked. Same AllowMap shape — no special
-    // treatment. Approval-required tools get AllowWithPrompt.
+    // Tools are the one field that actually needs tri-state today —
+    // AllowWithPrompt on a tool is the pre-execution approval gate.
     tools: AllowMap<ToolName>,
 
     // Pod-level access.
@@ -169,7 +171,7 @@ enum PodsScope {
 }
 
 struct PodOps {
-    threads:   AllowMap<ThreadOp>,     // Create | Read | Send | Cancel | Compact | Rebind | Archive
+    threads:   AllowMap<ThreadOp>,     // Create | Read | Send | Cancel | Compact | Archive
     behaviors: AllowMap<BehaviorOp>,   // Create | Modify | Delete | Run
     config:    AllowMap<PodConfigOp>,  // Read | Modify
 }
@@ -189,7 +191,7 @@ Rules:
 - **Tri-state disposition.** `Deny > AllowWithPrompt > Allow` by restrictiveness. Scope check returns a `Disposition`, not a bool. `Allow` admits directly, `AllowWithPrompt` admits but triggers a prompt (see Approval section), `Deny` rejects synchronously at registration.
 - **Monotonic composition.** When Function A's execution triggers Function B, B's scope is ≤ A's. Never widens. Narrowing picks the *more restrictive* disposition per item: `max(a, b)` under the ordering above. `AllowMap` intersection is `{ default: max(a.default, b.default), overrides: merged map taking max per key, with missing keys taking the other side's default }`.
 - **Gated at the scheduler, not inside variants.** The scope check happens at registration, before the variant's logic runs. Variants don't re-check their own scope.
-- **No per-field special cases.** Tools get the same `AllowMap` treatment as backends and mcp_hosts. Today's `ApprovalPolicy` presets (`AutoApproveAll` / `PromptDestructive` / `PromptPodModify`) become constructors that build the appropriate `AllowMap<ToolName>` at pod/thread config-load time. The `tool_allowlist` ("remember approval") becomes per-tool overrides that upgrade `AllowWithPrompt` entries to `Allow` for specific tool names.
+- **Tools use `AllowMap`; bindings are plain `Vec` today.** Tools need the full tri-state for per-call approval prompts. Bindings (backends, host_envs, mcp_hosts) only need "admitted or not" in the flows we've built, so they're `Vec<String>` with implicit-`Deny` default. The remove-and-replace path to `AllowMap` on bindings is straightforward if a future flow needs `AllowWithPrompt` there. The `tool_allowlist` ("remember approval") is per-tool `Allow` overrides in the thread's `AllowMap<ToolName>`, narrowing `AllowWithPrompt` entries to `Allow` for specific tool names.
 - **Cross-pod is expressible at the type level; single-pod is a construction-path default.** `PodsScope::Per` with a single entry is what pod/thread construction produces today; `PodsScope::All` is used for scheduler-internal and WS-client full-trust callers. The first concrete multi-pod caller (likely a cross-pod lua hook) will construct a `PodsScope::Per` with multiple entries explicitly, and registration will check each operation's target pod is admitted by the scope's `PodsScope`.
 
 ### Scope carries permission; the scheduler supplies the resource
@@ -201,18 +203,17 @@ The actual clients (backend HTTP clients, MCP sessions, host-env handles) live i
 Why this split matters:
 
 - **Lua-without-a-thread has a natural path to MCP tools.** Lua's scope includes host names it's permitted to reach; when it invokes `McpToolUse`, the scheduler resolves the host name to whatever session exists (typically a shared pod-level session). The caller never holds the resource.
-- **Thread rebind works cleanly.** A rebind swaps the thread's resource set; it doesn't touch the caller's scope. In-flight Functions continue against the resources they resolved at start; future Functions resolve against the new set.
 - **Scope remains pure data.** No lifetime-entangled handles, no refcounts, no concurrency concerns. Two scopes can be intersected without touching the registry.
 - **The scope check is pure authorization, not resource availability.** Registration may still fail later (resource name valid but the resource is down, e.g., MCP host unreachable) — that's a deferred error on the Function's terminal, not a scope-check reject.
 
-**What this consolidates from today:**
+**What this consolidated from the pre-Function-registry design:**
 
-- Pod `[allow]` table (backends, host_envs, mcp_hosts) → the bindings fields as `AllowMap`s. **pod.toml schema will be rewritten** to express `AllowMap`s / `Disposition`s directly rather than via the old preset names. The project is still early enough that we drop backwards compatibility outright — existing persistence directories will be wiped, not migrated.
-- Thread `bindings` gating → the same bindings fields, narrowed.
-- `ApprovalPolicy` presets → `AllowMap<ToolName>` constructors. `AutoApproveAll` = all-`Allow`. `PromptDestructive` = destructive tools `AllowWithPrompt`, rest `Allow`. `PromptPodModify` = pod-modifying tools `AllowWithPrompt`, rest `Allow`.
-- Per-thread `tool_allowlist` ("remember approval") → per-tool `Allow` overrides in the thread's `AllowMap<ToolName>`.
-- Client implicit-trust → a scope that admits everything, explicitly; no caller-type bypass.
-- Lua hook scope → assembled per-hook from pod/thread context and hook declaration.
+- Pod `[allow]` table → the bindings and tools fields on `PermissionScope`. The pod.toml schema was rewritten: `[allow.tools]` is now an explicit `default` + `overrides` map rather than an `ApprovalPolicy` preset enum.
+- Thread `bindings` gating → the same bindings fields, narrowed by the thread's bindings request against the pod cap.
+- `ApprovalPolicy` presets → `AllowMap<ToolName>`. The old `AutoApproveAll` is `default: allow` with no overrides; `PromptDestructive` / `PromptPodModify` are expressed by the pod author as `default: allow` with `allow_with_prompt` overrides on the relevant tool names.
+- Per-thread `tool_allowlist` ("remember approval") → per-tool `Allow` overrides on the thread's `tools_scope`, narrowing `AllowWithPrompt` entries.
+- Client implicit-trust → a hardcoded full-trust `PermissionScope` constructed at WS-session open; no caller-type bypass in the scheduler.
+- Lua hook scope (when it lands) → assembled per-hook from pod/thread context and hook declaration.
 
 **What PermissionScope deliberately does *not* own:**
 
@@ -351,7 +352,6 @@ The terminal is what callers program against; its shape must be predictable with
 enum FunctionTerminal {
     CreateThread(CreateThreadTerminal),
     CompactThread(CompactThreadTerminal),
-    RebindThread(RebindThreadTerminal),
     CancelThread(()),              // immediate, no payload
     RunBehavior(RunBehaviorTerminal),
     BuiltinToolCall(ToolResult),
@@ -564,7 +564,7 @@ Any one of the three can deny; all three must pass.
 
 **Lifecycle and source:**
 
-Tool pools are assembled per caller session (thread, lua hook, client connection) from the caller's context. The primary source is **pod config** — pools are declared on the pod and projected per caller type (model-facing pool, lua-facing pool, etc.) at session construction. Thread bindings and caller-surface rules can narrow further. Pools are not persisted independently — they're always derivable from pod/thread config + caller type. Changing pod config or rebinding a thread can change the pool available to a running caller (this is how today's MCP-tool list refresh works).
+Tool pools are assembled per caller session (thread, lua hook, client connection) from the caller's context. The primary source is **pod config** — pools are declared on the pod and projected per caller type (model-facing pool, lua-facing pool, etc.) at session construction. Thread bindings and caller-surface rules can narrow further. Pools are not persisted independently — they're always derivable from pod/thread config + caller type. Changing pod config can change the pool available to a running caller (this is how today's MCP-tool list refresh works).
 
 ## Observability
 

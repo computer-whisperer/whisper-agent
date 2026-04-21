@@ -67,7 +67,15 @@ mod tests {
     async fn about_returns_index_by_default() {
         let dir = temp_dir();
         let cfg = sample_config();
-        let out = dispatch(dir.clone(), cfg.clone(), vec![], POD_ABOUT, json!({})).await;
+        let out = dispatch(
+            dir.clone(),
+            cfg.clone(),
+            vec![],
+            crate::permission::PodModifyCap::ModifyAllow,
+            POD_ABOUT,
+            json!({}),
+        )
+        .await;
         assert!(!out.result.is_error);
         let text = join_blocks(&out.result.content);
         assert!(text.contains("pod.toml"), "index missing pod.toml: {text}");
@@ -85,6 +93,7 @@ mod tests {
             dir.clone(),
             cfg,
             vec![],
+            crate::permission::PodModifyCap::ModifyAllow,
             POD_ABOUT,
             json!({ "topic": "cron" }),
         )
@@ -105,6 +114,7 @@ mod tests {
             dir.clone(),
             cfg,
             vec![],
+            crate::permission::PodModifyCap::ModifyAllow,
             POD_ABOUT,
             json!({ "topic": "nonsense" }),
         )

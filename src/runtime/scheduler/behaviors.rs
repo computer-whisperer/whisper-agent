@@ -325,7 +325,7 @@ impl Scheduler {
             behavior_id: behavior_id.to_string(),
             payload,
         };
-        let scope = self.internal_scope();
+
         let caller = crate::functions::CallerLink::SchedulerInternal(
             crate::functions::InternalOriginator::BehaviorFire {
                 pod_id: pod_id.to_string(),
@@ -333,7 +333,7 @@ impl Scheduler {
                 source,
             },
         );
-        match self.register_function(spec, scope, caller) {
+        match self.register_function(spec, caller) {
             Ok(fn_id) => self.launch_function(fn_id, pending_io),
             Err(e) => warn!(
                 source = %source.as_str(),

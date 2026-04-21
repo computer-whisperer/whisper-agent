@@ -1020,11 +1020,13 @@ fn tool_call(
                     });
                 }
             };
+            let pod_modify = scheduler.thread_pod_modify_cap(&thread_id);
             Box::pin(async move {
                 let outcome = crate::tools::builtin_tools::dispatch(
                     snapshot.pod_dir,
                     snapshot.config,
                     snapshot.behavior_ids,
+                    pod_modify,
                     &name,
                     input,
                 )

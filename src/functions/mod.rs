@@ -5,8 +5,9 @@
 //! - Every caller-initiated operation (create thread, compact, invoke tool,
 //!   run behavior, etc.) is a variant of the `Function` enum.
 //! - The scheduler owns an `active_functions` registry of `ActiveFunction`s,
-//!   each with a `PermissionScope` (what's admissible), a `CallerLink` (who
-//!   invoked and where the results go), and two streams (progress, terminal).
+//!   each with a `CallerLink` (who invoked and where the results go) and
+//!   two streams (progress, terminal). A `Scope` field will land here
+//!   with the permissions rework (`docs/design_permissions_rework.md`).
 //! - `Function` implementations are opaque to the caller surface. Caller
 //!   surfaces (WS client, model tool call, lua hook, scheduler-internal)
 //!   differ only in `CallerLink` variant.
@@ -17,9 +18,10 @@
 
 use bitflags::bitflags;
 use serde::{Deserialize, Serialize};
-use whisper_agent_protocol::{ThreadBindingsPatch, ThreadBindingsRequest, ThreadConfigOverride};
+use whisper_agent_protocol::{ThreadBindingsRequest, ThreadConfigOverride};
 
 use crate::permission::{HostName, PodId, ToolName};
+pub use whisper_agent_protocol::permission::{EscalationDecision, EscalationRequest};
 
 // ---------------------------------------------------------------------------
 // Identifiers and bookkeeping
@@ -84,10 +86,6 @@ pub enum Function {
     CompactThread {
         thread_id: ThreadId,
     },
-    RebindThread {
-        thread_id: ThreadId,
-        patch: ThreadBindingsPatch,
-    },
     CancelThread {
         thread_id: ThreadId,
     },
@@ -105,6 +103,18 @@ pub enum Function {
         name: ToolName,
         args: serde_json::Value,
     },
+    /// Model-initiated scope-widening request. Registered when the
+    /// model calls the `request_escalation` builtin tool on a thread
+    /// with an interactive escalation channel. Stays in the registry
+    /// until the interactive channel resolves it; the tool call parks
+    /// on the Function's terminal via `FunctionDelivery`.
+    RequestEscalation {
+        thread_id: ThreadId,
+        request: EscalationRequest,
+        /// Model-supplied reason for the request, shown to the user in
+        /// the approval UI. Empty if the model omitted the field.
+        reason: String,
+    },
 }
 
 impl Function {
@@ -115,8 +125,8 @@ impl Function {
     pub fn primary_thread_id(&self) -> Option<&str> {
         match self {
             Self::CompactThread { thread_id }
-            | Self::RebindThread { thread_id, .. }
-            | Self::CancelThread { thread_id } => Some(thread_id),
+            | Self::CancelThread { thread_id }
+            | Self::RequestEscalation { thread_id, .. } => Some(thread_id),
             Self::CreateThread { .. }
             | Self::RunBehavior { .. }
             | Self::BuiltinToolCall { .. }
@@ -132,11 +142,11 @@ impl Function {
         match self {
             Self::CreateThread { .. } => K::CreateThread,
             Self::CompactThread { .. } => K::CompactThread,
-            Self::RebindThread { .. } => K::RebindThread,
             Self::CancelThread { .. } => K::CancelThread,
             Self::RunBehavior { .. } => K::RunBehavior,
             Self::BuiltinToolCall { .. } => K::BuiltinToolCall,
             Self::McpToolUse { .. } => K::McpToolUse,
+            Self::RequestEscalation { .. } => K::RequestEscalation,
         }
     }
 
@@ -158,7 +168,6 @@ impl Function {
         match self {
             Self::CreateThread { pod_id, .. } => (None, pod_id.clone(), None, None),
             Self::CompactThread { thread_id } => (Some(thread_id.clone()), None, None, None),
-            Self::RebindThread { thread_id, .. } => (Some(thread_id.clone()), None, None, None),
             Self::CancelThread { thread_id } => (Some(thread_id.clone()), None, None, None),
             Self::RunBehavior {
                 pod_id,
@@ -168,6 +177,9 @@ impl Function {
             Self::BuiltinToolCall { name, .. } => (None, None, Some(name.clone()), None),
             Self::McpToolUse { host, name, .. } => {
                 (None, None, Some(format!("{host}/{name}")), None)
+            }
+            Self::RequestEscalation { thread_id, .. } => {
+                (Some(thread_id.clone()), None, None, None)
             }
         }
     }
@@ -319,11 +331,22 @@ impl CallerLink {
 pub enum FunctionTerminal {
     CreateThread(CreateThreadTerminal),
     CompactThread(CompactThreadTerminal),
-    RebindThread(RebindThreadTerminal),
     CancelThread,
     RunBehavior(RunBehaviorTerminal),
     BuiltinToolCall(ToolResult),
     McpToolUse(ToolResult),
+    RequestEscalation(RequestEscalationTerminal),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct RequestEscalationTerminal {
+    pub decision: EscalationDecision,
+    /// Text returned to the model as the `request_escalation` tool's
+    /// result. For `Approve` it names what was widened; for `Reject`
+    /// it carries the user's reason (or a default). The scheduler
+    /// builds it at resolution time so `outcome_to_sync_tool_result`
+    /// has a concrete string to hand the parent turn.
+    pub tool_result_text: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -346,11 +369,6 @@ pub struct ThreadTerminalSummary {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CompactThreadTerminal {
     pub continuation_thread_id: ThreadId,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct RebindThreadTerminal {
-    // Empty for now; migration may add resolved bindings summary.
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -408,8 +426,6 @@ pub enum FunctionErrorKind {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CancelReason {
-    /// User denied the approval prompt for an `AllowWithPrompt` Function.
-    UserDenied,
     /// Explicit cancel from the caller (or scheduler on behalf of an
     /// originator that dropped — e.g., thread cancel cascading to its
     /// tool-call Functions).
@@ -417,10 +433,6 @@ pub enum CancelReason {
     /// Caller-link went away before the Function terminated (per-variant
     /// cancel-on-caller-gone policy fired).
     CallerGone,
-    /// `AllowWithPrompt` Function registered but no delivery surface
-    /// exists to show the prompt to a human. Auto-denied after a bounded
-    /// wait.
-    NoApprovalPath,
 }
 
 // ---------------------------------------------------------------------------
@@ -460,12 +472,8 @@ pub enum ProgressEvent {
     /// `ContentBlock` protocol type (interim alias to `serde_json::Value`)
     /// so multimodal payloads ride the CBOR wire natively.
     Content(ContentBlock),
-    /// Status transitions — "starting", "waiting_approval", "retrying", etc.
+    /// Status transitions — "starting", "retrying", etc.
     Status(StatusKind),
-    /// Approval request — produced by tool Functions whose scope-check
-    /// disposition was `AllowWithPrompt`. The resolution routes back into
-    /// the Function.
-    ApprovalRequest(ApprovalRequest),
     /// Escape hatch for variant-specific progress that isn't worth naming
     /// in the common enum. `kind` is a stable string tag.
     Custom {
@@ -477,20 +485,10 @@ pub enum ProgressEvent {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StatusKind {
     Starting,
-    WaitingApproval,
     Retrying,
     /// Free-form status for variant-specific transitions. Keeps the common
     /// named variants small.
     Other(String),
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ApprovalRequest {
-    /// Human-readable summary of what's being approved.
-    pub message: String,
-    /// Opaque context — e.g., serialized tool spec + args. Rendering is a
-    /// caller-link-router concern.
-    pub detail: Option<serde_json::Value>,
 }
 
 // ---------------------------------------------------------------------------
@@ -509,7 +507,6 @@ bitflags! {
     #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
     pub struct InFlightOps: u32 {
         const COMPACTING = 1 << 0;
-        const REBINDING  = 1 << 1;
         // New bits as operations are migrated that need exclusivity.
     }
 }
@@ -582,7 +579,6 @@ mod tests {
         let mut ops = InFlightOps::empty();
         ops.insert(InFlightOps::COMPACTING);
         assert!(ops.contains(InFlightOps::COMPACTING));
-        assert!(!ops.contains(InFlightOps::REBINDING));
         ops.remove(InFlightOps::COMPACTING);
         assert!(ops.is_empty());
     }
@@ -592,7 +588,7 @@ mod tests {
     #[test]
     fn types_construct_without_warnings() {
         let _ = RejectReason::ScopeDenied { detail: "x".into() };
-        let _ = FunctionOutcome::Cancelled(CancelReason::UserDenied);
+        let _ = FunctionOutcome::Cancelled(CancelReason::ExplicitCancel);
         let _ = ProgressEvent::Status(StatusKind::Starting);
         let _ = Function::CancelThread {
             thread_id: "t".into(),

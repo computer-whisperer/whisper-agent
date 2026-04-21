@@ -1,9 +1,9 @@
 //! Append-only JSONL audit log.
 //!
-//! One line per tool call decision. The MVP harness always auto-approves, but the log
-//! shape is identical to what real per-call prompts will emit later — switching to
-//! interactive approval is a UX layer change, not a log-format change.
-//! See `docs/design_permissions.md`.
+//! One line per tool-call completion. Scope-widening grants and other
+//! permission-changing events will land here as distinct entry shapes
+//! when the `request_escalation` family is wired up — see
+//! `docs/design_permissions_rework.md`.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -22,8 +22,6 @@ pub struct ToolCallEntry<'a> {
     pub host_id: &'a str,
     pub tool_name: &'a str,
     pub args: Value,
-    pub decision: &'a str,
-    pub who_decided: &'a str,
     pub outcome: ToolCallOutcome<'a>,
 }
 

@@ -44,8 +44,8 @@ use futures::stream::FuturesUnordered;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 use whisper_agent_protocol::{
-    ClientToServer, HostEnvBinding, Message, ResourceKind, ServerToClient, ThreadBindings,
-    ThreadBindingsPatch, ThreadBindingsRequest, ThreadConfigOverride, ThreadStateLabel,
+    ClientToServer, HostEnvBinding, ResourceKind, ServerToClient, ThreadBindings,
+    ThreadBindingsRequest, ThreadConfigOverride, ThreadStateLabel,
 };
 
 use crate::pod::persist::{LoadedState, Persister};
@@ -59,9 +59,7 @@ use crate::runtime::io_dispatch::{
     self, IoCompletion, ProvisionCompletion, ProvisionPhase, ProvisionResult, SchedulerCompletion,
     SchedulerFuture,
 };
-use crate::runtime::thread::{
-    IoResult, OpId, StepOutcome, Thread, ThreadInternalState, derive_title, new_task_id,
-};
+use crate::runtime::thread::{IoResult, OpId, StepOutcome, Thread, derive_title, new_task_id};
 use crate::server::thread_router::ThreadEventRouter;
 use crate::tools::mcp::{McpSession, ToolAnnotations, ToolDescriptor as McpTool};
 use crate::tools::sandbox::HostEnvProvider;
@@ -1641,13 +1639,26 @@ impl Scheduler {
         let scope_denies = |name: &str| -> bool {
             self.tasks
                 .get(thread_id)
-                .map(|t| !t.tools_scope.disposition(&name.to_string()).admits())
+                .map(|t| !t.scope.tools.disposition(&name.to_string()).admits())
                 .unwrap_or(false)
         };
+        // `request_escalation` is only meaningful when the thread has
+        // an interactive channel — autonomous threads can't reach an
+        // approver, so advertising the tool would just produce tool
+        // calls with nowhere to go.
+        let escalation_available = self
+            .tasks
+            .get(thread_id)
+            .map(|t| t.scope.escalation.is_interactive())
+            .unwrap_or(false);
         let mut out: Vec<McpTool> = Vec::new();
         let mut seen: HashSet<String> = HashSet::new();
         for tool in crate::tools::builtin_tools::descriptors() {
             if scope_denies(&tool.name) {
+                continue;
+            }
+            if tool.name == crate::tools::builtin_tools::REQUEST_ESCALATION && !escalation_available
+            {
                 continue;
             }
             if seen.insert(tool.name.clone()) {
@@ -1859,333 +1870,64 @@ impl Scheduler {
         }
     }
 
-    /// Apply a [`ThreadBindingsPatch`] to a running thread.
-    ///
-    /// Validates the patch against the pod's `[allow]` table (backend +
-    /// shared MCP host names; sandbox specs are accepted as-is — see
-    /// `resolve_bindings_choice` for why), swaps the bindings in place,
-    /// adjusts every affected resource's user count, re-provisions the
-    /// primary MCP if the sandbox changed, and appends a synthetic
-    /// conversation note when the execution environment shifted. Threads
-    /// parked in `WaitingOnResources` get a recomputed `needed` list and
-    /// transition to `NeedsModelCall` if the new set is empty.
-    pub(super) fn apply_rebind(
-        &mut self,
-        thread_id: &str,
-        patch: ThreadBindingsPatch,
-        correlation_id: Option<String>,
-        pending_io: &mut FuturesUnordered<SchedulerFuture>,
-    ) -> Result<(), String> {
-        // --- Phase 1: snapshot read-only state ---
-        let (pod_id, old_bindings) = {
-            let task = self
-                .tasks
-                .get(thread_id)
-                .ok_or_else(|| format!("unknown thread `{thread_id}`"))?;
-            (task.pod_id.clone(), task.bindings.clone())
+    /// The thread's current `pod_modify` cap, or `None` if the thread is
+    /// unknown. Read-only access for tool-dispatch sites that need the
+    /// cap to gate path-scoped pod-file operations.
+    pub(crate) fn thread_pod_modify_cap(&self, thread_id: &str) -> crate::permission::PodModifyCap {
+        self.tasks
+            .get(thread_id)
+            .map(|t| t.scope.pod_modify)
+            .unwrap_or(crate::permission::PodModifyCap::None)
+    }
+
+    /// Derive the effective [`Scope`] a newly-created thread in `pod_id`
+    /// starts with. The bindings + tools come from the pod's `[allow]`
+    /// table; typed caps come from `[thread_defaults.caps]` in the pod
+    /// TOML (conservative defaults when the section is omitted — see
+    /// `ThreadDefaultCaps::default`). Escalation channels are attached
+    /// at `create_task` per-caller, so this snapshot always starts
+    /// `Escalation::None`.
+    pub(super) fn pod_thread_scope(&self, pod_id: &str) -> crate::permission::Scope {
+        use crate::permission::{Escalation, Scope, SetOrAll};
+        let Some(pod) = self.pods.get(pod_id) else {
+            return Scope::deny_all();
         };
-        let pod_allow = self
-            .pods
-            .get(&pod_id)
-            .ok_or_else(|| format!("thread `{thread_id}` references unknown pod `{pod_id}`"))?
-            .config
-            .allow
-            .clone();
+        let allow = &pod.config.allow;
+        let td_caps = pod.config.thread_defaults.caps;
+        Scope {
+            backends: SetOrAll::only(allow.backends.iter().cloned()),
+            host_envs: SetOrAll::only(allow.host_env.iter().map(|h| h.name.clone())),
+            mcp_hosts: SetOrAll::only(allow.mcp_hosts.iter().cloned()),
+            tools: allow.tools.clone(),
+            pod_modify: td_caps.pod_modify,
+            dispatch: td_caps.dispatch,
+            behaviors: td_caps.behaviors,
+            escalation: Escalation::None,
+        }
+    }
 
-        // --- Phase 2: compute new pieces (no mutation yet — we want
-        //              validation failures to leave the thread untouched) ---
-        let new_backend = patch
-            .backend
-            .clone()
-            .unwrap_or_else(|| old_bindings.backend.clone());
-
-        let new_shared_hosts: Vec<String> = match &patch.mcp_hosts {
-            Some(list) => list.clone(),
-            None => old_bindings
-                .mcp_hosts
-                .iter()
-                .filter_map(|raw| raw.strip_prefix("mcp-shared-").map(String::from))
-                .collect(),
+    /// Build a `Scope` representing the pod's `[allow]` ceiling — the
+    /// hardest bound threads in this pod can hold. Used as the ceiling
+    /// argument to [`crate::permission::Scope::check_escalation`] so a
+    /// grant can't widen a thread past what the pod allows. Differs
+    /// from [`Self::pod_thread_scope`] only on the typed caps — which
+    /// read from `allow.caps` rather than `thread_defaults.caps`.
+    pub(super) fn pod_scope_ceiling(&self, pod_id: &str) -> crate::permission::Scope {
+        use crate::permission::{Escalation, Scope, SetOrAll};
+        let Some(pod) = self.pods.get(pod_id) else {
+            return Scope::deny_all();
         };
-
-        let new_host_env_bindings: Vec<HostEnvBinding> = match &patch.host_env {
-            None => old_bindings.host_env.clone(),
-            Some(names) => names
-                .iter()
-                .map(|name| {
-                    // Validate against the pod's allow list — cap is real.
-                    if !pod_allow.host_env.iter().any(|nh| &nh.name == name) {
-                        return Err(format!(
-                            "host env `{name}` not in pod `{}`'s allow.host_env",
-                            pod_id,
-                        ));
-                    }
-                    Ok(HostEnvBinding::Named { name: name.clone() })
-                })
-                .collect::<Result<Vec<_>, _>>()?,
-        };
-        // Runtime ids derived per binding for refcounting + emit.
-        // Bindings whose Named entry has gone missing (pod edited
-        // mid-flight) resolve to `None` and get filtered — we skip the
-        // user-count drop on those, matching the pre-refactor behavior.
-        let old_host_env_ids: Vec<HostEnvId> = old_bindings
-            .host_env
-            .iter()
-            .filter_map(|b| self.resolve_binding(&pod_id, b))
-            .map(|(p, s)| HostEnvId::for_provider_spec(&p, &s))
-            .collect();
-
-        // --- Phase 3: validate against pod allowlist ---
-        if !new_backend.is_empty() && !pod_allow.backends.iter().any(|b| b == &new_backend) {
-            return Err(format!(
-                "backend `{}` not in pod `{}`'s allow.backends ({})",
-                new_backend,
-                pod_id,
-                pod_allow.backends.join(", ")
-            ));
+        let allow = &pod.config.allow;
+        Scope {
+            backends: SetOrAll::only(allow.backends.iter().cloned()),
+            host_envs: SetOrAll::only(allow.host_env.iter().map(|h| h.name.clone())),
+            mcp_hosts: SetOrAll::only(allow.mcp_hosts.iter().cloned()),
+            tools: allow.tools.clone(),
+            pod_modify: allow.caps.pod_modify,
+            dispatch: allow.caps.dispatch,
+            behaviors: allow.caps.behaviors,
+            escalation: Escalation::None,
         }
-        for name in &new_shared_hosts {
-            if !pod_allow.mcp_hosts.iter().any(|h| h == name) {
-                return Err(format!(
-                    "shared MCP host `{name}` not in pod `{}`'s allow.mcp_hosts ({})",
-                    pod_id,
-                    pod_allow.mcp_hosts.join(", "),
-                ));
-            }
-            if !self
-                .resources
-                .mcp_hosts
-                .contains_key(&McpHostId::shared(name))
-            {
-                return Err(format!(
-                    "shared MCP host `{name}` not configured on this server",
-                ));
-            }
-        }
-
-        // --- Phase 4: figure out what actually changed ---
-        let backend_changed = new_backend != old_bindings.backend;
-        let host_env_changed = new_host_env_bindings != old_bindings.host_env;
-        let old_shared: HashSet<String> = old_bindings
-            .mcp_hosts
-            .iter()
-            .filter_map(|raw| raw.strip_prefix("mcp-shared-").map(String::from))
-            .collect();
-        let new_shared: HashSet<String> = new_shared_hosts.iter().cloned().collect();
-        let mcp_hosts_changed = old_shared != new_shared;
-
-        // --- Phase 5: refcount adjustments ---
-        if backend_changed {
-            let old_resolved: &str = if old_bindings.backend.is_empty() {
-                &self.default_backend
-            } else {
-                &old_bindings.backend
-            };
-            let new_resolved: &str = if new_backend.is_empty() {
-                &self.default_backend
-            } else {
-                &new_backend
-            };
-            let old_id = BackendId::for_name(old_resolved);
-            let new_id = BackendId::for_name(new_resolved);
-            self.resources.remove_backend_user(&old_id, thread_id);
-            self.resources.add_backend_user(&new_id, thread_id);
-            self.emit_backend_updated(&old_id);
-            self.emit_backend_updated(&new_id);
-        }
-
-        if host_env_changed {
-            // Diff old vs new host-env ids: drop refcounts on removed
-            // ids, pre-register each added id. Resolve NEW ids fresh
-            // here rather than trusting the vec — bindings that fail to
-            // resolve (spec missing from pod allow) would error out at
-            // validation already, so resolution is expected to succeed.
-            let new_host_env_ids: Vec<HostEnvId> = new_host_env_bindings
-                .iter()
-                .map(|b| {
-                    self.resolve_binding(&pod_id, b)
-                        .map(|(p, s)| HostEnvId::for_provider_spec(&p, &s))
-                        .ok_or_else(|| "rebind: binding could not be resolved".to_string())
-                })
-                .collect::<Result<_, _>>()?;
-            let old_set: HashSet<HostEnvId> = old_host_env_ids.iter().cloned().collect();
-            let new_set: HashSet<HostEnvId> = new_host_env_ids.iter().cloned().collect();
-
-            for old_id in old_host_env_ids.iter().filter(|id| !new_set.contains(id)) {
-                // Release the old host env; tear it down if we were the
-                // last user and the entry isn't pinned.
-                let remaining = self.resources.release_host_env_user(old_id, thread_id);
-                let pinned = self
-                    .resources
-                    .host_envs
-                    .get(old_id)
-                    .map(|e| e.pinned)
-                    .unwrap_or(false);
-                if remaining == 0 && !pinned {
-                    let handle = self.resources.take_host_env_handle(old_id);
-                    self.resources.mark_host_env_torn_down(old_id);
-                    self.emit_host_env_updated(old_id);
-                    if let Some(mut h) = handle {
-                        let tid = thread_id.to_string();
-                        tokio::spawn(async move {
-                            if let Err(e) = h.teardown().await {
-                                warn!(thread_id = %tid, error = %e, "host env teardown after rebind failed");
-                            }
-                        });
-                    } else {
-                        self.emit_host_env_updated(old_id);
-                    }
-                } else {
-                    self.emit_host_env_updated(old_id);
-                }
-            }
-            let added: Vec<HostEnvBinding> = new_host_env_bindings
-                .iter()
-                .filter(|b| {
-                    let id = self
-                        .resolve_binding(&pod_id, b)
-                        .map(|(p, s)| HostEnvId::for_provider_spec(&p, &s));
-                    id.map(|i| !old_set.contains(&i)).unwrap_or(false)
-                })
-                .cloned()
-                .collect();
-            for binding in added {
-                let (provider, spec) = self
-                    .resolve_binding(&pod_id, &binding)
-                    .ok_or_else(|| "rebind: binding could not be resolved".to_string())?;
-                let new_id = self
-                    .resources
-                    .pre_register_host_env(thread_id, provider, spec);
-                self.emit_host_env_updated(&new_id);
-            }
-        }
-
-        if mcp_hosts_changed {
-            for name in old_shared.difference(&new_shared) {
-                let id = McpHostId::shared(name);
-                self.resources.remove_mcp_user(&id, thread_id);
-                self.emit_mcp_host_updated(&id);
-            }
-            for name in new_shared.difference(&old_shared) {
-                let id = McpHostId::shared(name);
-                self.resources.add_mcp_user(&id, thread_id);
-                self.emit_mcp_host_updated(&id);
-            }
-        }
-
-        // --- Phase 6: host env change → re-provision its MCP ---
-        if host_env_changed {
-            // Mark every old host-env MCP entry that's no longer bound
-            // as torn down. New bindings will get fresh MCP entries
-            // when the next provision dispatches.
-            let new_host_env_ids: HashSet<HostEnvId> = new_host_env_bindings
-                .iter()
-                .filter_map(|b| self.resolve_binding(&pod_id, b))
-                .map(|(p, s)| HostEnvId::for_provider_spec(&p, &s))
-                .collect();
-            for old_id in old_host_env_ids
-                .iter()
-                .filter(|id| !new_host_env_ids.contains(id))
-            {
-                let mcp_id = McpHostId::for_host_env(old_id);
-                self.resources.mark_mcp_torn_down(&mcp_id);
-                self.emit_mcp_host_updated(&mcp_id);
-            }
-            // Drop the in-flight guard so ensure_host_env_provisioning
-            // dispatches a fresh future. Swap bindings first so the
-            // dispatcher sees the new binding.
-        }
-
-        // --- Phase 7: swap bindings + synthetic note + recompute waiting ---
-        let new_bindings = ThreadBindings {
-            backend: new_backend,
-            host_env: new_host_env_bindings.clone(),
-            mcp_hosts: new_shared_hosts.clone(),
-            tool_filter: old_bindings.tool_filter.clone(),
-        };
-
-        let env_changed = host_env_changed || mcp_hosts_changed;
-        let was_waiting = {
-            let task = self.tasks.get_mut(thread_id).expect("checked in phase 1");
-            task.bindings = new_bindings.clone();
-            task.touch();
-            if env_changed {
-                task.conversation.push(Message::user_text(
-                    "*Note: the execution environment changed at this point. \
-                     Files, processes, and tool availability may differ from \
-                     earlier in this conversation.*",
-                ));
-            }
-            matches!(
-                task.internal,
-                ThreadInternalState::WaitingOnResources { .. }
-            )
-        };
-
-        // Refresh the thread-prefix `Role::Tools` manifest in place.
-        // The tool manifest is a cache-fingerprint-critical snapshot
-        // of what the model sees as its capability surface; a
-        // host-env or MCP-host rebind changes that surface, so the
-        // snapshot has to move with it. Mutates `conversation[1]`
-        // (or `[0]` if the thread somehow lacks a system-prefix) —
-        // adapters will pick the new manifest up on the next model
-        // call. Host-env provisioning is async; tools that arrive
-        // after the MCP host finishes connecting will still reach
-        // the model via the same wire path, just not this snapshot.
-        if env_changed {
-            let new_tool_blocks: Vec<whisper_agent_protocol::ContentBlock> = self
-                .tool_descriptors(thread_id)
-                .into_iter()
-                .map(|t| whisper_agent_protocol::ContentBlock::ToolSchema {
-                    name: t.name,
-                    description: t.description,
-                    input_schema: t.input_schema,
-                })
-                .collect();
-            if let Some(task) = self.tasks.get_mut(thread_id)
-                && let Some(tools_msg) = task.conversation.tools_message_mut()
-            {
-                tools_msg.content = new_tool_blocks;
-            }
-        }
-
-        if host_env_changed {
-            // Per-id guard doesn't need thread-scoped clearing on
-            // rebind — new ids aren't in the set, so ensure will
-            // dispatch for them; old ids either keep running (shared
-            // with other threads) or their future completes and
-            // clears the guard itself.
-            self.ensure_host_env_provisioning(thread_id, pending_io);
-        }
-
-        let mut now_unblocked = false;
-        if was_waiting {
-            let new_needed = self.pending_resources_for(thread_id);
-            if let Some(task) = self.tasks.get_mut(thread_id)
-                && let ThreadInternalState::WaitingOnResources { needed } = &mut task.internal
-            {
-                *needed = new_needed;
-                if needed.is_empty() {
-                    task.internal = ThreadInternalState::NeedsModelCall;
-                    now_unblocked = true;
-                }
-            }
-        }
-
-        // --- Phase 8: persist + broadcast ---
-        self.mark_dirty(thread_id);
-        self.router.broadcast_to_subscribers(
-            thread_id,
-            ServerToClient::ThreadBindingsChanged {
-                thread_id: thread_id.to_string(),
-                bindings: new_bindings,
-                correlation_id,
-            },
-        );
-        if now_unblocked {
-            self.step_until_blocked(thread_id, pending_io);
-        }
-        Ok(())
     }
 
     pub fn with_persister(mut self, persister: Persister) -> Self {
@@ -2408,6 +2150,7 @@ impl Scheduler {
             SchedulerMsg::UnregisterClient { conn_id } => {
                 self.router.unregister_client(conn_id);
                 self.admin_connections.remove(&conn_id);
+                self.revoke_escalation_channel(conn_id, pending_io);
             }
             SchedulerMsg::ClientMessage { conn_id, msg } => {
                 self.apply_client_message(conn_id, msg, pending_io);
@@ -2474,8 +2217,15 @@ impl Scheduler {
 
         // Resolve the binding choices (backend / sandbox / shared MCP hosts):
         // start from pod defaults, layer the request on top, validate every
-        // choice against the pod's `[allow]` cap.
-        let resolved = resolve_bindings_choice(pod, bindings_request)?;
+        // choice against the pod's `[allow]` cap — and, for dispatched
+        // children, against the dispatching parent's scope. This is the
+        // "child bindings must live within parent scope" half of the
+        // narrowing invariant; the scope-narrowing below is the other half.
+        let parent_scope = dispatched_by_parent
+            .as_ref()
+            .and_then(|(parent_id, _)| self.tasks.get(parent_id))
+            .map(|p| p.scope.clone());
+        let resolved = resolve_bindings_choice(pod, bindings_request, parent_scope.as_ref())?;
         // Validate shared MCP host names against the server catalog too —
         // a name allowed by the pod but not actually wired up at the server
         // is a misconfiguration we want to surface at create-time.
@@ -2499,21 +2249,49 @@ impl Scheduler {
             tool_filter: None,
         };
 
-        // Snapshot the pod's tool-scope into the thread; mid-flight
-        // edits to the pod's allow.tools won't retroactively change
-        // the thread's active scope (rebind is the explicit path).
-        let tools_scope = self
-            .pods
-            .get(&pod_id)
-            .map(|p| p.config.allow.tools.clone())
-            .unwrap_or_else(whisper_agent_protocol::AllowMap::allow_all);
-        let mut task = Thread::new(
-            thread_id.clone(),
-            pod_id.clone(),
-            config,
-            bindings,
-            tools_scope,
-        );
+        // Snapshot the pod's effective Scope into the thread; mid-flight
+        // edits to the pod's allow table don't retroactively change the
+        // thread's active scope. Caps default to the `thread_defaults`
+        // baseline described in `docs/design_permissions_rework.md`
+        // until pod.toml schema grows `[allow.caps]` /
+        // `[thread_defaults.caps]` (task #6).
+        //
+        // Pod-allow-derived base, then narrow by parent's scope when the
+        // thread is dispatched — the child can never hold more than the
+        // parent on bindings, tools, or caps. Non-dispatched threads
+        // (WS-client create, cron-fired behavior) get the raw pod-
+        // derived scope.
+        //
+        // Escalation is set separately — it's a runtime channel pointer,
+        // not an authority bound, so it isn't narrowed against the pod
+        // ceiling (which doesn't configure conn ids):
+        //   - Dispatched child: inherit the parent's channel verbatim.
+        //     A child with `Interactive{parent_conn}` can request
+        //     widening; if that conn drops, the escalation sweep
+        //     revokes it.
+        //   - Top-level WS create: attach `Interactive{via_conn: conn_id}`.
+        //   - Behavior fire / auto-compact / cron: stays `None`;
+        //     `request_escalation` is filtered out of the catalog.
+        let base_scope = self.pod_thread_scope(&pod_id);
+        let mut scope = match &dispatched_by_parent {
+            Some((parent_id, _)) => match self.tasks.get(parent_id) {
+                Some(parent) => base_scope.narrow(&parent.scope),
+                None => base_scope,
+            },
+            None => base_scope,
+        };
+        scope.escalation = match &dispatched_by_parent {
+            Some((parent_id, _)) => self
+                .tasks
+                .get(parent_id)
+                .map(|p| p.scope.escalation)
+                .unwrap_or(crate::permission::Escalation::None),
+            None => match requester {
+                Some(conn_id) => crate::permission::Escalation::Interactive { via_conn: conn_id },
+                None => crate::permission::Escalation::None,
+            },
+        };
+        let mut task = Thread::new(thread_id.clone(), pod_id.clone(), config, bindings, scope);
         if let Some(origin) = origin {
             task = task.with_origin(origin);
         }
@@ -3682,59 +3460,6 @@ impl Scheduler {
             }
         }
     }
-}
-
-/// Build the `ThreadPendingApproval` events that a newly-subscribed
-/// client needs to render the approval UI. Scans the Function registry
-/// for tool-call entries on this thread that are waiting on approval.
-pub(super) fn pending_approvals_of(scheduler: &Scheduler, task: &Thread) -> Vec<ServerToClient> {
-    let mut out = Vec::new();
-    for entry in scheduler.active_functions.values() {
-        // Only tool-call Functions on this thread that are paused
-        // awaiting an approval decision contribute to the snapshot.
-        let crate::functions::CallerLink::ThreadToolCall {
-            thread_id,
-            tool_use_id,
-        } = &entry.caller
-        else {
-            continue;
-        };
-        if thread_id != &task.id {
-            continue;
-        }
-        let Some(io_req) = &entry.pending_approval_io else {
-            continue;
-        };
-        let crate::runtime::thread::IoRequest::ToolCall { name, input, .. } = io_req else {
-            continue;
-        };
-        let approval_id = format!("ap-{tool_use_id}");
-        let annotations = scheduler.annotations_for(&task.id);
-        let empty = ToolAnnotations::default();
-        let ann = annotations.get(name).unwrap_or(&empty);
-        out.push(ServerToClient::ThreadPendingApproval {
-            thread_id: task.id.clone(),
-            approval_id,
-            tool_use_id: tool_use_id.clone(),
-            name: name.clone(),
-            args_preview: truncate(serde_json::to_string(input).unwrap_or_default(), 200),
-            destructive: ann.is_destructive(),
-            read_only: ann.is_read_only(),
-        });
-    }
-    out
-}
-
-fn truncate(mut s: String, max: usize) -> String {
-    if s.len() > max {
-        let mut cut = max;
-        while cut > 0 && !s.is_char_boundary(cut) {
-            cut -= 1;
-        }
-        s.truncate(cut);
-        s.push('…');
-    }
-    s
 }
 
 /// Read a pod-relative prompt file for a creation-time system-prompt

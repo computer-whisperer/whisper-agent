@@ -75,13 +75,12 @@ catch_up  = "one"                      # one | none | all  (on server restart af
 # Thread config overrides layered on top of pod.thread_defaults.
 # Any field omitted here inherits from the pod.
 [thread]
-max_turns       = 30
-approval_policy = "auto_approve_all"
-model           = "claude-sonnet-4-6"
+max_turns = 30
+model     = "claude-sonnet-4-6"
 
 # Bindings override — must be a subset of pod.allow.
 [thread.bindings]
-host_env  = "read-only-workspace"
+host_env  = ["read-only-workspace"]
 mcp_hosts = ["github", "fetch"]
 
 # What to do when the thread reaches a terminal state.

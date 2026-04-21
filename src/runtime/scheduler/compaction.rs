@@ -158,13 +158,13 @@ impl Scheduler {
         let spec = crate::functions::Function::CompactThread {
             thread_id: thread_id.to_string(),
         };
-        let scope = self.internal_scope();
+
         let caller = crate::functions::CallerLink::SchedulerInternal(
             crate::functions::InternalOriginator::AutoCompact {
                 thread_id: thread_id.to_string(),
             },
         );
-        match self.register_function(spec, scope, caller) {
+        match self.register_function(spec, caller) {
             Ok(fn_id) => self.launch_function(fn_id, pending_io),
             Err(e) => {
                 // All reject reasons here are benign — the state

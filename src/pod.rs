@@ -117,6 +117,12 @@ pub enum PodConfigError {
     HostEnvDefaultRequired { valid: String },
     #[error("invalid [[allow.host_env]] name `{name}`: {reason}")]
     InvalidHostEnvName { name: String, reason: String },
+    #[error("thread_defaults.caps.{field} = {default:?} exceeds allow.caps.{field} = {ceiling:?}")]
+    CapsDefaultExceedsCeiling {
+        field: &'static str,
+        default: String,
+        ceiling: String,
+    },
 }
 
 /// Validate a `[[allow.host_env]]` entry's name. Names are used as tool-
@@ -236,6 +242,32 @@ pub fn validate(config: &PodConfig) -> Result<(), PodConfigError> {
         }
     }
 
+    // thread_defaults.caps must not exceed allow.caps. Each cap enum
+    // is totally ordered; `default <= ceiling` is the check.
+    let td = &config.thread_defaults.caps;
+    let ac = &config.allow.caps;
+    if td.pod_modify > ac.pod_modify {
+        return Err(PodConfigError::CapsDefaultExceedsCeiling {
+            field: "pod_modify",
+            default: format!("{:?}", td.pod_modify),
+            ceiling: format!("{:?}", ac.pod_modify),
+        });
+    }
+    if td.dispatch > ac.dispatch {
+        return Err(PodConfigError::CapsDefaultExceedsCeiling {
+            field: "dispatch",
+            default: format!("{:?}", td.dispatch),
+            ceiling: format!("{:?}", ac.dispatch),
+        });
+    }
+    if td.behaviors > ac.behaviors {
+        return Err(PodConfigError::CapsDefaultExceedsCeiling {
+            field: "behaviors",
+            default: format!("{:?}", td.behaviors),
+            ceiling: format!("{:?}", ac.behaviors),
+        });
+    }
+
     Ok(())
 }
 
@@ -244,7 +276,8 @@ mod tests {
     use super::*;
     use whisper_agent_protocol::sandbox::{NetworkPolicy, PathAccess};
     use whisper_agent_protocol::{
-        AllowMap, Disposition, HostEnvSpec, NamedHostEnv, PodAllow, PodLimits, ThreadDefaults,
+        AllowMap, BehaviorOpsCap, DispatchCap, Disposition, HostEnvSpec, NamedHostEnv, PodAllow,
+        PodAllowCaps, PodLimits, PodModifyCap, ThreadDefaultCaps, ThreadDefaults,
     };
 
     fn sample_config() -> PodConfig {
@@ -275,10 +308,11 @@ mod tests {
                 ],
                 tools: AllowMap {
                     default: Disposition::Allow,
-                    overrides: [("bash".to_string(), Disposition::AllowWithPrompt)]
+                    overrides: [("bash".to_string(), Disposition::Deny)]
                         .into_iter()
                         .collect(),
                 },
+                caps: PodAllowCaps::default(),
             },
             thread_defaults: ThreadDefaults {
                 backend: "anthropic".into(),
@@ -289,6 +323,7 @@ mod tests {
                 host_env: vec!["landlock-rw".into()],
                 mcp_hosts: vec!["fetch".into(), "search".into()],
                 compaction: Default::default(),
+                caps: ThreadDefaultCaps::default(),
             },
             limits: PodLimits {
                 max_concurrent_threads: 10,
@@ -405,6 +440,62 @@ max_turns = 50
         assert_eq!(cfg.thread_defaults.max_tokens, 8000);
         // limits omitted → default 10
         assert_eq!(cfg.limits.max_concurrent_threads, 10);
+        // Caps sections omitted → permissive ceiling + baseline defaults.
+        assert_eq!(cfg.allow.caps.pod_modify, PodModifyCap::ModifyAllow);
+        assert_eq!(cfg.allow.caps.dispatch, DispatchCap::WithinScope);
+        assert_eq!(cfg.allow.caps.behaviors, BehaviorOpsCap::AuthorAny);
+        assert_eq!(cfg.thread_defaults.caps.pod_modify, PodModifyCap::Memories);
+        assert_eq!(cfg.thread_defaults.caps.dispatch, DispatchCap::WithinScope);
+        assert_eq!(cfg.thread_defaults.caps.behaviors, BehaviorOpsCap::Read);
+    }
+
+    #[test]
+    fn parses_pod_with_explicit_caps() {
+        let text = r#"
+name = "tight"
+created_at = "2026-04-21T10:00:00Z"
+
+[allow]
+backends = ["anthropic"]
+mcp_hosts = []
+host_env = []
+
+[allow.caps]
+pod_modify = "content"
+dispatch = "within_scope"
+behaviors = "author_narrower"
+
+[thread_defaults]
+backend = "anthropic"
+model = "claude-opus-4-7"
+system_prompt_file = "system_prompt.md"
+max_tokens = 8000
+max_turns = 50
+
+[thread_defaults.caps]
+pod_modify = "none"
+dispatch = "none"
+behaviors = "none"
+"#;
+        let cfg = parse_toml(text).unwrap();
+        assert_eq!(cfg.allow.caps.pod_modify, PodModifyCap::Content);
+        assert_eq!(cfg.allow.caps.behaviors, BehaviorOpsCap::AuthorNarrower);
+        assert_eq!(cfg.thread_defaults.caps.pod_modify, PodModifyCap::None);
+        assert_eq!(cfg.thread_defaults.caps.dispatch, DispatchCap::None);
+    }
+
+    #[test]
+    fn rejects_thread_defaults_caps_above_ceiling() {
+        let mut cfg = sample_config();
+        cfg.allow.caps.pod_modify = PodModifyCap::Memories;
+        cfg.thread_defaults.caps.pod_modify = PodModifyCap::Content;
+        let err = validate(&cfg).unwrap_err();
+        match err {
+            PodConfigError::CapsDefaultExceedsCeiling { field, .. } => {
+                assert_eq!(field, "pod_modify");
+            }
+            other => panic!("expected CapsDefaultExceedsCeiling, got {other:?}"),
+        }
     }
 
     #[test]

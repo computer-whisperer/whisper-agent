@@ -29,6 +29,7 @@ pub mod dispatch_thread;
 mod filesystem;
 mod grep;
 mod list_threads;
+pub mod request_escalation;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -129,6 +130,7 @@ pub const POD_ABOUT: &str = "pod_about";
 pub const POD_RUN_BEHAVIOR: &str = "pod_run_behavior";
 pub const POD_SET_BEHAVIOR_ENABLED: &str = "pod_set_behavior_enabled";
 pub const DISPATCH_THREAD: &str = "dispatch_thread";
+pub const REQUEST_ESCALATION: &str = "request_escalation";
 
 /// True if `name` is a builtin pod tool. Used by the scheduler's router
 /// to branch the tool-call dispatch path.
@@ -145,6 +147,7 @@ pub fn is_builtin(name: &str) -> bool {
             | POD_RUN_BEHAVIOR
             | POD_SET_BEHAVIOR_ENABLED
             | DISPATCH_THREAD
+            | REQUEST_ESCALATION
     )
 }
 
@@ -168,6 +171,7 @@ pub fn reserved_env_name_prefixes() -> Vec<&'static str> {
         POD_RUN_BEHAVIOR,
         POD_SET_BEHAVIOR_ENABLED,
         DISPATCH_THREAD,
+        REQUEST_ESCALATION,
     ];
     let mut out: Vec<&'static str> = BUILTINS
         .iter()
@@ -176,15 +180,6 @@ pub fn reserved_env_name_prefixes() -> Vec<&'static str> {
     out.sort();
     out.dedup();
     out
-}
-
-/// True if `name` is a builtin tool that modifies the pod. Pod-editing
-/// tools are a privilege-escalation vector; a pod that wants to gate
-/// them without prompting on every MCP tool sets `AllowWithPrompt` on
-/// these names in its `[allow.tools]` overrides while keeping the
-/// default `Allow`.
-pub fn is_pod_modify(name: &str) -> bool {
-    matches!(name, POD_WRITE_FILE | POD_EDIT_FILE)
 }
 
 /// Tool descriptors for the builtin set, shaped for direct inclusion in
@@ -201,6 +196,7 @@ pub fn descriptors() -> Vec<McpTool> {
         behavior_control::run_behavior_descriptor(),
         behavior_control::set_behavior_enabled_descriptor(),
         dispatch_thread::descriptor(),
+        request_escalation::descriptor(),
     ]
 }
 
@@ -275,14 +271,33 @@ pub struct ToolOutcome {
 /// `pod_config` is the current in-memory config; `behavior_ids` lists
 /// the behaviors currently registered (used to derive the dynamic slice
 /// of the allowlist and to distinguish create vs update on write).
+/// `pod_modify` is the calling thread's scope-level pod-modify cap —
+/// pod-file reads/writes are denied at this layer when the target path
+/// isn't admitted by the cap, regardless of what the filename
+/// allowlist says.
 pub async fn dispatch(
     pod_dir: PathBuf,
     pod_config: PodConfig,
     behavior_ids: Vec<String>,
+    pod_modify: crate::permission::PodModifyCap,
     tool_name: &str,
     args: Value,
 ) -> ToolOutcome {
     let allowed = filesystem::allowed_filenames(&pod_config, &behavior_ids);
+    // Pod-file *writes* are gated by `PodModifyCap::admits(path)` before
+    // reaching the handler. Reads use the broader filename allowlist —
+    // inspecting pod-internal state (`threads/*.json`, etc.) is not a
+    // capability-raising action, so the cap hierarchy doesn't apply.
+    // See `docs/design_permissions_rework.md`.
+    if matches!(tool_name, POD_WRITE_FILE | POD_EDIT_FILE)
+        && let Some(filename) = args.get("filename").and_then(|v| v.as_str())
+        && !pod_modify.admits(filename)
+    {
+        return no_update_error(format!(
+            "`{tool_name}` on `{filename}` is denied by the thread's pod_modify capability \
+             ({pod_modify:?}). Ask for scope widening if this action is needed."
+        ));
+    }
     match tool_name {
         POD_LIST_FILES => filesystem::list_files(&pod_dir, &allowed, args).await,
         POD_READ_FILE => filesystem::read_file(&pod_dir, &allowed, &behavior_ids, args).await,
@@ -296,6 +311,11 @@ pub async fn dispatch(
         DISPATCH_THREAD => no_update_error(
             "dispatch_thread must be intercepted at the scheduler layer \
              (io_dispatch::tool_call); reaching this arm is a bug"
+                .into(),
+        ),
+        REQUEST_ESCALATION => no_update_error(
+            "request_escalation must be intercepted at the scheduler layer \
+             (register_request_escalation_tool); reaching this arm is a bug"
                 .into(),
         ),
         other => no_update_error(format!("unknown builtin tool: {other}")),

@@ -17,17 +17,17 @@
 //! sub-phases (e.g. `NeedsModelCall` vs `AwaitingModelCall`) without touching
 //! the wire.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::HashMap;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use whisper_agent_protocol::{
-    AllowMap, ApprovalChoice, BehaviorOrigin, ContentBlock, Conversation, Message, Role,
-    ThreadBindings, ThreadConfig, ThreadSnapshot, ThreadStateLabel, ThreadSummary,
-    ToolResultContent, TurnEntry, TurnLog, Usage,
+    BehaviorOrigin, ContentBlock, Conversation, Message, Role, ThreadBindings, ThreadConfig,
+    ThreadSnapshot, ThreadStateLabel, ThreadSummary, ToolResultContent, TurnEntry, TurnLog, Usage,
 };
 
 use crate::functions::InFlightOps;
+use crate::permission::Scope;
 use crate::providers::model::ModelResponse;
 use crate::tools::mcp::{CallToolResult, ToolAnnotations};
 
@@ -64,19 +64,15 @@ pub struct Thread {
     /// Turns issued in the current user-message cycle; resets on user message.
     #[serde(default)]
     pub turns_in_cycle: u32,
-    /// Snapshot of the pod's tool gate (`PodAllow.tools`) at thread-
-    /// creation time. Consulted at approval-check time. Stored on the
-    /// thread rather than looked up from the pod so mid-flight edits to
-    /// the pod's allow table don't retroactively change a thread's
-    /// active scope — rebind is the explicit path for that.
-    #[serde(default = "AllowMap::allow_all")]
-    pub tools_scope: AllowMap<String>,
-    /// Per-thread "always allow" set keyed by tool name. Calls to a
-    /// name in this set bypass a `AllowWithPrompt` disposition from
-    /// `tools_scope` — the "remember this approval" action adds a name
-    /// here. Persisted with the thread.
+    /// The thread's permission scope, snapshotted from the pod's
+    /// `[allow]` table at creation. Stored on the thread rather than
+    /// looked up from the pod so mid-flight edits to the pod's allow
+    /// table don't retroactively change a thread's active scope —
+    /// pod-file edits apply to *future* threads. Escalation grants
+    /// (when the request_escalation family lands in task #5) widen this
+    /// in place.
     #[serde(default)]
-    pub tool_allowlist: BTreeSet<String>,
+    pub scope: Scope,
     /// Provenance stamp for threads spawned by a behavior trigger. `None`
     /// for interactive threads. Load-only plumbing: the scheduler stamps
     /// this on spawn and the on-completion hook reads it back.
@@ -157,18 +153,12 @@ pub enum ThreadInternalState {
     /// Model responded with tool_uses. Each entry in `pending_dispatch` still needs to
     /// be fired at MCP; `pending_io` maps op_ids of in-flight tool calls to their
     /// tool_use_ids; `completed` accumulates ToolResult blocks as they return. A tool
-    /// that was rejected during the approval phase is already synthesized into
-    /// `completed` here with `is_error: true` so the model's next turn sees the denial.
-    ///
-    /// `approvals` carries the decision that led each tool to be dispatched so the audit
-    /// log can record it when the tool completes (one line per call — see
-    /// `design_permissions.md`). Keyed by tool_use_id.
+    /// denied by the thread's scope is synthesized into `completed` here with
+    /// `is_error: true` so the model's next turn sees the denial.
     AwaitingTools {
         pending_dispatch: Vec<ToolUseReq>,
         pending_io: HashMap<OpId, String>,
         completed: Vec<ContentBlock>,
-        #[serde(default)]
-        approvals: HashMap<String, ApprovalRecord>,
     },
     /// Terminal: unrecoverable error.
     Failed { at_phase: String, message: String },
@@ -182,14 +172,6 @@ pub struct ToolUseReq {
     pub tool_use_id: String,
     pub name: String,
     pub input: serde_json::Value,
-}
-
-/// Decision record threaded from an approval outcome into the dispatch phase so the
-/// audit log captures who said yes (or that policy auto-approved).
-#[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct ApprovalRecord {
-    pub decision: String,    // "auto" | "approve" | "reject"
-    pub who_decided: String, // "policy:read_only" | "policy:auto_approve_all" | "user:{conn}"
 }
 
 /// Request for an I/O operation to be dispatched by the scheduler.
@@ -252,19 +234,6 @@ pub enum ThreadEvent {
         result_preview: String,
         is_error: bool,
     },
-    PendingApproval {
-        approval_id: String,
-        tool_use_id: String,
-        name: String,
-        args_preview: String,
-        destructive: bool,
-        read_only: bool,
-    },
-    ApprovalResolved {
-        approval_id: String,
-        decision: ApprovalChoice,
-        decided_by_conn: Option<u64>,
-    },
     AssistantEnd {
         stop_reason: Option<String>,
         usage: Usage,
@@ -279,13 +248,6 @@ pub enum ThreadEvent {
     Error {
         message: String,
     },
-    /// The task's `tool_allowlist` set was modified — either a tool was added
-    /// (via an approve-and-remember decision) or removed (via the revoke UI).
-    /// Carries the full new set so the scheduler can broadcast it without
-    /// recomputing.
-    AllowlistChanged {
-        allowlist: Vec<String>,
-    },
     /// Tool call completed. Carried separately from the user-visible ToolCallEnd event
     /// so the scheduler can write an audit entry outside the task state machine.
     AuditToolCall {
@@ -293,8 +255,6 @@ pub enum ThreadEvent {
         args: serde_json::Value,
         is_error: bool,
         error_message: Option<String>,
-        decision: String,
-        who_decided: String,
     },
 }
 
@@ -304,7 +264,7 @@ impl Thread {
         pod_id: String,
         config: ThreadConfig,
         bindings: ThreadBindings,
-        tools_scope: AllowMap<String>,
+        scope: Scope,
     ) -> Self {
         let now = Utc::now();
         Self {
@@ -320,8 +280,7 @@ impl Thread {
             turn_log: TurnLog::default(),
             archived: false,
             turns_in_cycle: 0,
-            tools_scope,
-            tool_allowlist: BTreeSet::new(),
+            scope,
             origin: None,
             continued_from: None,
             in_flight: InFlightOps::empty(),
@@ -365,8 +324,8 @@ impl Thread {
 
     /// Build a new thread by rewinding `self` to message index
     /// `from_message_index` (exclusive). Carries pod_id, config,
-    /// bindings, and tool_allowlist over verbatim; resets per-run
-    /// state (title, origin, lineage, cycle counter, compaction flag).
+    /// bindings, and scope over verbatim; resets per-run state
+    /// (title, origin, lineage, cycle counter, compaction flag).
     ///
     /// Rejects mid-turn sources (working, awaiting approval,
     /// compacting) — the in-flight operation has no meaning in the
@@ -426,8 +385,7 @@ impl Thread {
             turn_log,
             archived: false,
             turns_in_cycle: 0,
-            tools_scope: self.tools_scope.clone(),
-            tool_allowlist: self.tool_allowlist.clone(),
+            scope: self.scope.clone(),
             origin: None,
             continued_from: None,
             in_flight: InFlightOps::empty(),
@@ -485,10 +443,10 @@ impl Thread {
             created_at: self.created_at.to_rfc3339(),
             last_active: self.last_active.to_rfc3339(),
             failure: self.failure_detail(),
-            tool_allowlist: self.tool_allowlist.iter().cloned().collect(),
             origin: self.origin.clone(),
             continued_from: self.continued_from.clone(),
             dispatched_by: self.dispatched_by.clone(),
+            scope: self.scope.clone(),
         }
     }
 
@@ -574,20 +532,6 @@ impl Thread {
         self.touch();
     }
 
-    /// Drop a tool name from the allowlist. Returns true if the entry was
-    /// present (so the caller knows whether to broadcast an update).
-    pub fn remove_from_allowlist(&mut self, tool_name: &str) -> bool {
-        let removed = self.tool_allowlist.remove(tool_name);
-        if removed {
-            self.touch();
-        }
-        removed
-    }
-
-    pub fn allowlist_snapshot(&self) -> Vec<String> {
-        self.tool_allowlist.iter().cloned().collect()
-    }
-
     /// Is the task accepting new user input right now?
     pub fn is_idle(&self) -> bool {
         matches!(
@@ -654,7 +598,6 @@ impl Thread {
                 mut pending_dispatch,
                 mut pending_io,
                 completed,
-                approvals,
             } => {
                 if let Some(next) = pending_dispatch.pop() {
                     let op_id = next_id(next_op_id);
@@ -678,7 +621,6 @@ impl Thread {
                         pending_dispatch,
                         pending_io,
                         completed,
-                        approvals,
                     };
                     self.touch();
                     StepOutcome::DispatchIo(dispatch)
@@ -694,7 +636,6 @@ impl Thread {
                         pending_dispatch,
                         pending_io,
                         completed,
-                        approvals,
                     };
                     StepOutcome::Paused
                 }
@@ -810,33 +751,16 @@ impl Thread {
             return;
         }
 
-        // Approval evaluation has moved to the scheduler's Function
-        // registry (see `register_tool_function` in
-        // `src/runtime/scheduler/functions.rs`). Every tool_use emerges
-        // from here as AutoApproved; the scheduler either dispatches
-        // it, defers it pending a user prompt, or synthesizes a denial
-        // depending on the pod's tool-scope disposition.
-        let _ = tool_annotations; // Consulted scheduler-side now.
-        // Approvals are recorded for audit at the scheduler-side
-        // Function layer; here we mark each call as "scheduler-gated"
-        // in the thread's approvals map so the audit path stays uniform.
-        let approvals: HashMap<String, ApprovalRecord> = tool_uses
-            .iter()
-            .map(|tu| {
-                (
-                    tu.tool_use_id.clone(),
-                    ApprovalRecord {
-                        decision: "auto".into(),
-                        who_decided: "scheduler_gated".into(),
-                    },
-                )
-            })
-            .collect();
+        // Scope admission lives at the scheduler's Function registry
+        // (see `register_tool_function` in
+        // `src/runtime/scheduler/functions.rs`): denied calls arrive
+        // here as `is_error: true` tool_results, admitted calls run as
+        // ordinary tool IO.
+        let _ = tool_annotations;
         self.internal = ThreadInternalState::AwaitingTools {
             pending_dispatch: make_dispatch_order(tool_uses),
             pending_io: HashMap::new(),
             completed: Vec::new(),
-            approvals,
         };
     }
 
@@ -851,7 +775,6 @@ impl Thread {
             pending_dispatch,
             mut pending_io,
             mut completed,
-            mut approvals,
         } = std::mem::replace(&mut self.internal, ThreadInternalState::Idle)
         else {
             unreachable!("matched guard ensures we're in AwaitingTools")
@@ -860,13 +783,6 @@ impl Thread {
         // The op_id should be tracked. Use it to verify; tool_use_id is the canonical
         // key for the conversation block either way.
         pending_io.remove(&op_id);
-
-        let approval = approvals
-            .remove(&tool_use_id)
-            .unwrap_or_else(|| ApprovalRecord {
-                decision: "dispatched".into(),
-                who_decided: "policy".into(),
-            });
 
         let (text, is_error, tool_name, args, err_msg) = match result {
             Ok(r) => {
@@ -898,8 +814,6 @@ impl Thread {
             args,
             is_error,
             error_message: err_msg,
-            decision: approval.decision,
-            who_decided: approval.who_decided,
         });
 
         completed.push(ContentBlock::ToolResult {
@@ -912,7 +826,6 @@ impl Thread {
             pending_dispatch,
             pending_io,
             completed,
-            approvals,
         };
     }
 }
@@ -1033,36 +946,6 @@ mod tests {
         assert_eq!(truncate("abcdefghij".into(), 4), "abcd…");
     }
 
-    // Approval-flow tests moved to the scheduler-side Function
-    // registry in Phase 4c; Thread no longer owns that path. Unit tests
-    // covering the scheduler's register_tool_function + resolve_tool_approval
-    // arrive with later scheduler-integration-test work.
-
-    fn basic_thread() -> Thread {
-        let cfg = ThreadConfig {
-            model: "test".into(),
-            max_tokens: 100,
-            max_turns: 10,
-            compaction: Default::default(),
-        };
-        Thread::new(
-            "t1".into(),
-            "t1".into(),
-            cfg,
-            ThreadBindings::default(),
-            AllowMap::allow_all(),
-        )
-    }
-
-    #[test]
-    fn remove_from_allowlist_returns_true_only_when_present() {
-        let mut task = basic_thread();
-        task.tool_allowlist.insert("edit_file".into());
-        assert!(task.remove_from_allowlist("edit_file"));
-        assert!(!task.remove_from_allowlist("edit_file"));
-        assert!(!task.remove_from_allowlist("never_added"));
-    }
-
     fn base_config_for_fork() -> ThreadConfig {
         ThreadConfig {
             model: "test".into(),
@@ -1078,8 +961,9 @@ mod tests {
             "pod".into(),
             base_config_for_fork(),
             ThreadBindings::default(),
-            AllowMap::allow_all(),
+            Scope::allow_all(),
         );
+
         // [user, assistant, user, assistant] — two complete turns.
         task.conversation.push(Message::user_text("hi"));
         task.conversation
@@ -1110,7 +994,6 @@ mod tests {
             output_tokens: 6,
             ..Usage::default()
         };
-        task.tool_allowlist.insert("edit_file".into());
         task.internal = ThreadInternalState::Idle;
         task
     }
@@ -1124,7 +1007,6 @@ mod tests {
         assert_eq!(forked.turn_log.entries.len(), 1);
         assert_eq!(forked.total_usage.input_tokens, 10);
         assert_eq!(forked.total_usage.output_tokens, 2);
-        assert!(forked.tool_allowlist.contains("edit_file"));
         assert_eq!(forked.id, "new");
         assert_eq!(forked.pod_id, "pod");
         assert!(!forked.archived);

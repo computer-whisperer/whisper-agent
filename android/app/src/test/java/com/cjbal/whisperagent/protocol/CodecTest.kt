@@ -48,36 +48,6 @@ class CodecTest {
         assertEquals(original, decoded)
     }
 
-    @Test
-    fun clientToServer_approvalDecision_omitsRememberFalse() {
-        // Matches Rust `#[serde(default)] remember: bool` — false is not emitted.
-        val bytes = Codec.encodeToServer(
-            ClientToServer.ApprovalDecision(
-                threadId = "t-1",
-                approvalId = "a-1",
-                decision = ApprovalChoice.Approve,
-                remember = false,
-            ),
-        )
-        // The serialized map should have exactly 4 entries (type, thread_id,
-        // approval_id, decision) — `remember` omitted.
-        // First byte encodes map-header; for ≤23 entries it's 0xA0 + len.
-        assertEquals(0xA4.toByte(), bytes[0])
-    }
-
-    @Test
-    fun clientToServer_approvalDecision_includesRememberTrue() {
-        val bytes = Codec.encodeToServer(
-            ClientToServer.ApprovalDecision(
-                threadId = "t-1",
-                approvalId = "a-1",
-                decision = ApprovalChoice.Approve,
-                remember = true,
-            ),
-        )
-        assertEquals(0xA5.toByte(), bytes[0])
-    }
-
     // --- ServerToClient -------------------------------------------------------
 
     @Test

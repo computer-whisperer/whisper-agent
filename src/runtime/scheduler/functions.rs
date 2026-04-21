@@ -23,11 +23,10 @@ use whisper_agent_protocol::{
     FunctionOutcomeTag, FunctionSummary, ServerToClient, ThreadStateLabel,
 };
 
-use super::Scheduler;
+use super::{ConnId, Scheduler};
 use crate::functions::{
     CallerLink, Function, FunctionId, FunctionOutcome, FunctionTerminal, InFlightOps, RejectReason,
 };
-use crate::permission::{BehaviorOp, PermissionScope, ThreadOp};
 use crate::runtime::io_dispatch::SchedulerFuture;
 
 /// Compile-in cap on `dispatch_thread` nesting depth. A dispatched
@@ -50,17 +49,7 @@ pub(super) const MAX_DISPATCH_DEPTH: u32 = 4;
 pub struct ActiveFunctionEntry {
     pub id: FunctionId,
     pub spec: Function,
-    pub scope: PermissionScope,
     pub caller: CallerLink,
-    /// For tool-call Functions whose scope disposition is
-    /// `AllowWithPrompt`: the IoRequest is buffered here while we
-    /// wait for the user's approval. When the `ApprovalDecision`
-    /// arrives, the scheduler rebuilds the future from this request
-    /// (for approve) or synthesizes a denial (for reject).
-    ///
-    /// `None` for Functions that aren't pending approval (synchronous
-    /// variants, already-approved tool calls, etc.).
-    pub pending_approval_io: Option<crate::runtime::thread::IoRequest>,
     /// For `Function::CreateThread { wait_mode: ThreadTerminal, .. }`:
     /// the child thread whose terminal completes this Function. The
     /// scheduler's thread-terminal hook reads this to decide which
@@ -104,8 +93,7 @@ impl ActiveFunctionEntry {
 pub enum FunctionDelivery {
     /// Default — no variant-specific delivery. Errors for `WsClient`
     /// callers still produce a wire `Error`; successful terminals
-    /// rely on variant-level broadcasts (`ThreadCompacted`,
-    /// `ThreadBindingsChanged`, etc.).
+    /// rely on variant-level broadcasts (`ThreadCompacted`, etc.).
     None,
     /// Sync tool-call parking: fire this oneshot with the terminal's
     /// final text (`Ok` on Success, `Err` on Error/Cancelled). The
@@ -149,20 +137,6 @@ impl Scheduler {
         id
     }
 
-    /// Full-trust scope for WS clients. Hardcoded for Phase 2 — see the
-    /// "scope plumbing" commitment in `docs/design_functions.md`. Becomes
-    /// per-identity when we ship Pattern-3 authz.
-    pub(super) fn ws_client_scope(&self) -> PermissionScope {
-        PermissionScope::allow_all()
-    }
-
-    /// Full-trust scope for scheduler-internal callers (auto-compact,
-    /// cron fires). These originate from the server's own timers /
-    /// state machine; there's no caller identity to narrow against.
-    pub(super) fn internal_scope(&self) -> PermissionScope {
-        PermissionScope::allow_all()
-    }
-
     /// Synchronous accept-or-deny registration. On accept the
     /// `ActiveFunctionEntry` enters the registry and its `FunctionId` is
     /// returned. Anything that requires awaiting I/O happens later, in
@@ -170,10 +144,9 @@ impl Scheduler {
     pub(super) fn register_function(
         &mut self,
         spec: Function,
-        scope: PermissionScope,
         caller: CallerLink,
     ) -> Result<FunctionId, RejectReason> {
-        self.register_function_with_delivery(spec, scope, caller, FunctionDelivery::None)
+        self.register_function_with_delivery(spec, caller, FunctionDelivery::None)
     }
 
     /// Full registration shape used by callers that need to attach a
@@ -183,18 +156,15 @@ impl Scheduler {
     pub(super) fn register_function_with_delivery(
         &mut self,
         spec: Function,
-        scope: PermissionScope,
         caller: CallerLink,
         delivery: FunctionDelivery,
     ) -> Result<FunctionId, RejectReason> {
-        self.variant_precondition_check(&spec, &scope)?;
+        self.variant_precondition_check(&spec)?;
         let id = self.next_function_id();
         let entry = ActiveFunctionEntry {
             id,
             spec,
-            scope,
             caller,
-            pending_approval_io: None,
             awaiting_child_thread_id: None,
             delivery,
             started_at: Utc::now(),
@@ -213,24 +183,19 @@ impl Scheduler {
         Ok(id)
     }
 
-    /// Variant-specific scope + precondition check. Called synchronously
-    /// from `register_function` before admission.
-    fn variant_precondition_check(
-        &self,
-        spec: &Function,
-        scope: &PermissionScope,
-    ) -> Result<(), RejectReason> {
+    /// Variant-specific precondition check. Called synchronously
+    /// from `register_function` before admission. The permissions
+    /// layer is mid-rework — capability-admission checks return here
+    /// when the new `Scope` type lands (task #3 / #4).
+    fn variant_precondition_check(&self, spec: &Function) -> Result<(), RejectReason> {
         match spec {
             Function::CancelThread { thread_id } => {
-                let task =
-                    self.tasks
-                        .get(thread_id)
-                        .ok_or_else(|| RejectReason::PreconditionFailed {
-                            detail: format!("unknown thread {thread_id}"),
-                        })?;
-                admission_check(scope.thread_op(&task.pod_id, ThreadOp::Cancel), || {
-                    format!("thread {thread_id} cancel denied by scope")
-                })
+                self.tasks
+                    .get(thread_id)
+                    .ok_or_else(|| RejectReason::PreconditionFailed {
+                        detail: format!("unknown thread {thread_id}"),
+                    })?;
+                Ok(())
             }
             Function::CompactThread { thread_id } => {
                 let task =
@@ -239,9 +204,6 @@ impl Scheduler {
                         .ok_or_else(|| RejectReason::PreconditionFailed {
                             detail: format!("unknown thread {thread_id}"),
                         })?;
-                admission_check(scope.thread_op(&task.pod_id, ThreadOp::Compact), || {
-                    format!("thread {thread_id} compact denied by scope")
-                })?;
                 if !task.config.compaction.enabled {
                     return Err(RejectReason::PreconditionFailed {
                         detail: "compaction is disabled on this thread".into(),
@@ -283,9 +245,7 @@ impl Scheduler {
                         });
                     }
                 }
-                admission_check(scope.thread_op(&effective_pod, ThreadOp::Create), || {
-                    format!("thread create in pod {effective_pod} denied by scope")
-                })
+                Ok(())
             }
             Function::RunBehavior {
                 pod_id,
@@ -313,34 +273,27 @@ impl Scheduler {
                         detail: format!("behavior `{behavior_id}` has no parsed config"),
                     });
                 }
-                admission_check(scope.behavior_op(pod_id, BehaviorOp::Run), || {
-                    format!("behavior {behavior_id} run denied by scope")
-                })
+                Ok(())
             }
-            Function::RebindThread { thread_id, .. } => {
+            Function::BuiltinToolCall { .. } | Function::McpToolUse { .. } => Ok(()),
+            Function::RequestEscalation {
+                thread_id, request, ..
+            } => {
                 let task =
                     self.tasks
                         .get(thread_id)
                         .ok_or_else(|| RejectReason::PreconditionFailed {
                             detail: format!("unknown thread {thread_id}"),
                         })?;
-                admission_check(scope.thread_op(&task.pod_id, ThreadOp::Rebind), || {
-                    format!("thread {thread_id} rebind denied by scope")
-                })
-                // Full validation (pod allowlist, MCP-host existence)
-                // happens inside `apply_rebind` at launch; errors there
-                // surface as a Function Error terminal routed through
-                // the caller-link.
-            }
-            Function::BuiltinToolCall { name, .. } => {
-                // Scope rubber-stamps for Phase 4b: the thread's
-                // `tools_scope`-based evaluate path in `Thread::step`
-                // already gated this call. Phase 4c moves that
-                // evaluation here and removes the thread-side check.
-                admission_check(scope.tool(name), || format!("tool {name} denied by scope"))
-            }
-            Function::McpToolUse { name, .. } => {
-                admission_check(scope.tool(name), || format!("tool {name} denied by scope"))
+                if !task.scope.escalation.is_interactive() {
+                    return Err(RejectReason::ScopeDenied {
+                        detail: "thread has no interactive escalation channel".into(),
+                    });
+                }
+                let pod_ceiling = self.pod_scope_ceiling(&task.pod_id);
+                task.scope
+                    .check_escalation(request, &pod_ceiling)
+                    .map_err(|detail| RejectReason::ScopeDenied { detail })
             }
         }
     }
@@ -438,36 +391,6 @@ impl Scheduler {
                     ),
                 }
             }
-            Function::RebindThread { thread_id, patch } => {
-                // Pull correlation_id from the caller-link so the
-                // ThreadBindingsChanged broadcast still tags its
-                // originator. WS caller is the only current source;
-                // other variants pass `None`.
-                let correlation_id = match self.active_functions.get(&id) {
-                    Some(entry) => match &entry.caller {
-                        CallerLink::WsClient { correlation_id, .. } => correlation_id.clone(),
-                        _ => None,
-                    },
-                    None => None,
-                };
-                match self.apply_rebind(&thread_id, patch, correlation_id, pending_io) {
-                    Ok(()) => self.complete_function(
-                        id,
-                        FunctionOutcome::Success(FunctionTerminal::RebindThread(
-                            crate::functions::RebindThreadTerminal::default(),
-                        )),
-                        pending_io,
-                    ),
-                    Err(e) => self.complete_function(
-                        id,
-                        FunctionOutcome::Error(crate::functions::FunctionError {
-                            kind: crate::functions::FunctionErrorKind::Execution,
-                            detail: e,
-                        }),
-                        pending_io,
-                    ),
-                }
-            }
             Function::BuiltinToolCall { .. } | Function::McpToolUse { .. } => {
                 // The tool call's actual work is pumped by the existing
                 // IO-future mechanism in `build_io_future`; the Function
@@ -480,6 +403,47 @@ impl Scheduler {
                 // `apply_io_completion` locates it by caller-link
                 // (ThreadToolCall { thread_id, tool_use_id }) and calls
                 // `complete_function`.
+            }
+            Function::RequestEscalation {
+                thread_id,
+                request,
+                reason,
+            } => {
+                // Emit the wire-side approval request to the thread's
+                // interactive channel. The Function stays admitted
+                // until `apply_client_message` routes a matching
+                // `ClientToServer::ResolveEscalation` through
+                // `resolve_escalation`, which either applies the
+                // widening and completes successfully or completes
+                // with an error.
+                let via_conn = match self.tasks.get(&thread_id).map(|t| t.scope.escalation) {
+                    Some(crate::permission::Escalation::Interactive { via_conn }) => via_conn,
+                    _ => {
+                        // Precondition says this can't happen, but be
+                        // defensive: if the escalation channel vanished
+                        // between registration and launch, complete the
+                        // Function with a denial rather than leaving it
+                        // pending with no route back.
+                        self.complete_function(
+                            id,
+                            FunctionOutcome::Error(crate::functions::FunctionError {
+                                kind: crate::functions::FunctionErrorKind::Execution,
+                                detail: "interactive escalation channel unavailable".into(),
+                            }),
+                            pending_io,
+                        );
+                        return;
+                    }
+                };
+                self.router.send_to_client(
+                    via_conn,
+                    ServerToClient::EscalationRequested {
+                        function_id: id,
+                        thread_id: thread_id.clone(),
+                        request: request.clone(),
+                        reason: reason.clone(),
+                    },
+                );
             }
         }
     }
@@ -513,8 +477,8 @@ impl Scheduler {
         // registration time. UI surfaces use the outcome tag to pick
         // success / error / cancelled chip colors when they animate
         // out; the variant-specific terminal payload rides other
-        // dedicated events (`ThreadStateChanged`,
-        // `ThreadBindingsChanged`, tool-result messages, etc.).
+        // dedicated events (`ThreadStateChanged`, tool-result messages,
+        // etc.).
         let outcome_tag = match &outcome {
             FunctionOutcome::Success(_) => FunctionOutcomeTag::Success,
             FunctionOutcome::Error(_) => FunctionOutcomeTag::Error,
@@ -747,7 +711,7 @@ impl Scheduler {
             return;
         };
 
-        let Some(scope) = self.thread_scope(thread_id) else {
+        let Some(disposition) = self.tool_disposition(thread_id, &name) else {
             // Unknown thread — defensive; upstream route_tool checks
             // will surface the error.
             let fut = crate::runtime::io_dispatch::build_io_future(
@@ -758,18 +722,32 @@ impl Scheduler {
             pending_io.push(fut);
             return;
         };
-        let disposition = scope.tool(&name);
 
         // `dispatch_thread` is a model-facing alias for
         // `Function::CreateThread`. Deny stops at the tool layer;
-        // Allow / AllowWithPrompt proceed with the CreateThread spec.
+        // Allow proceeds with the CreateThread spec.
         if name == crate::tools::builtin_tools::DISPATCH_THREAD {
             self.register_dispatch_thread_tool(
                 thread_id,
                 op_id,
                 tool_use_id,
                 input,
-                scope,
+                disposition,
+                pending_io,
+            );
+            return;
+        }
+
+        // `request_escalation` is intercepted the same way: register
+        // a `Function::RequestEscalation`, emit the wire event to the
+        // interactive channel, park the tool call on the Function's
+        // terminal via a `FunctionDelivery::ToolResultChannel`.
+        if name == crate::tools::builtin_tools::REQUEST_ESCALATION {
+            self.register_request_escalation_tool(
+                thread_id,
+                op_id,
+                tool_use_id,
+                input,
                 disposition,
                 pending_io,
             );
@@ -807,46 +785,13 @@ impl Scheduler {
 
         match disposition {
             crate::permission::Disposition::Allow => {
-                let _ = self.register_function(spec, scope, caller);
+                let _ = self.register_function(spec, caller);
                 let fut = crate::runtime::io_dispatch::build_io_future(
                     self,
                     thread_id.to_string(),
                     io_request,
                 );
                 pending_io.push(fut);
-            }
-            crate::permission::Disposition::AllowWithPrompt => {
-                // Register the Function with the IoRequest buffered.
-                // Emit a PendingApproval event so the UI can prompt.
-                // Approval resolution later rebuilds the future from
-                // the buffered IoRequest.
-                match self.register_function(spec, scope, caller) {
-                    Ok(fn_id) => {
-                        if let Some(entry) = self.active_functions.get_mut(&fn_id) {
-                            entry.pending_approval_io = Some(io_request);
-                        }
-                        let approval_id = format!("ap-{tool_use_id}");
-                        self.emit_pending_approval(
-                            thread_id,
-                            &approval_id,
-                            &tool_use_id,
-                            &name,
-                            &input,
-                        );
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            %thread_id, %tool_use_id, %name, error = ?e,
-                            "AllowWithPrompt tool registration unexpectedly rejected"
-                        );
-                        let fut = crate::runtime::io_dispatch::build_io_future(
-                            self,
-                            thread_id.to_string(),
-                            io_request,
-                        );
-                        pending_io.push(fut);
-                    }
-                }
             }
             crate::permission::Disposition::Deny => {
                 // Reject — don't register the Function at all.
@@ -868,11 +813,7 @@ impl Scheduler {
     /// `wait_mode: ThreadTerminal`, picks a `FunctionDelivery` based
     /// on `args.sync`, registers + launches the Function, and pushes
     /// the parent-facing tool-call future (oneshot-awaiting for sync
-    /// or immediate ack for async). `AllowWithPrompt` for
-    /// `dispatch_thread` is not yet supported — treated as Allow with
-    /// a warn log. The common case today is `Allow`; approval
-    /// integration for Function-spawning tool aliases can land when
-    /// there's a concrete use case.
+    /// or immediate ack for async).
     #[allow(clippy::too_many_arguments)]
     fn register_dispatch_thread_tool(
         &mut self,
@@ -880,7 +821,6 @@ impl Scheduler {
         op_id: crate::runtime::thread::OpId,
         tool_use_id: String,
         input: serde_json::Value,
-        scope: PermissionScope,
         disposition: crate::permission::Disposition,
         pending_io: &mut FuturesUnordered<SchedulerFuture>,
     ) {
@@ -893,12 +833,25 @@ impl Scheduler {
             ));
             return;
         }
-        if matches!(disposition, crate::permission::Disposition::AllowWithPrompt) {
-            tracing::warn!(
-                parent = %parent_thread_id, %tool_use_id,
-                "dispatch_thread has AllowWithPrompt disposition; approval integration \
-                 for Function-spawning aliases is not yet implemented — proceeding as Allow"
-            );
+        // DispatchCap gate: a thread whose scope admits no dispatch
+        // can't spawn children regardless of what `[allow.tools]`
+        // says about the tool name.
+        let dispatch_admitted = self
+            .tasks
+            .get(parent_thread_id)
+            .map(|t| t.scope.dispatch)
+            .unwrap_or(crate::permission::DispatchCap::None)
+            != crate::permission::DispatchCap::None;
+        if !dispatch_admitted {
+            pending_io.push(immediate_tool_error(
+                parent_thread_id.to_string(),
+                op_id,
+                tool_use_id,
+                "dispatch_thread denied: thread's scope does not admit dispatching \
+                 (DispatchCap::None). Ask for scope widening if this is needed."
+                    .into(),
+            ));
+            return;
         }
 
         let args = match crate::tools::builtin_tools::dispatch_thread::parse_args(input) {
@@ -935,7 +888,7 @@ impl Scheduler {
         if args.sync {
             let (tx, rx) = tokio::sync::oneshot::channel::<Result<String, String>>();
             let delivery = FunctionDelivery::ToolResultChannel(tx);
-            let fn_id = match self.register_function_with_delivery(spec, scope, caller, delivery) {
+            let fn_id = match self.register_function_with_delivery(spec, caller, delivery) {
                 Ok(id) => id,
                 Err(e) => {
                     pending_io.push(immediate_tool_error(
@@ -983,7 +936,7 @@ impl Scheduler {
                 parent_thread_id: parent_thread_id.to_string(),
                 parent_tool_use_id: tool_use_id.clone(),
             };
-            let fn_id = match self.register_function_with_delivery(spec, scope, caller, delivery) {
+            let fn_id = match self.register_function_with_delivery(spec, caller, delivery) {
                 Ok(id) => id,
                 Err(e) => {
                     pending_io.push(immediate_tool_error(
@@ -1033,144 +986,373 @@ impl Scheduler {
         }
     }
 
-    /// Emit a `ThreadEvent::PendingApproval` into the thread's event
-    /// stream. Called from the scheduler-side approval path, replacing
-    /// the old thread-side emission (which happened inside
-    /// `Thread::step` before the approval move).
-    fn emit_pending_approval(
+    /// `request_escalation`-specific registration path. Parses the
+    /// tool args, refuses at the tool layer if the thread's scope lacks
+    /// an interactive channel, otherwise registers the Function (which
+    /// fires the wire event on launch) and parks the tool call on its
+    /// terminal via `FunctionDelivery::ToolResultChannel`. The parent's
+    /// turn resumes when the user resolves the escalation.
+    fn register_request_escalation_tool(
         &mut self,
         thread_id: &str,
-        approval_id: &str,
-        tool_use_id: &str,
-        name: &str,
-        input: &serde_json::Value,
+        op_id: crate::runtime::thread::OpId,
+        tool_use_id: String,
+        input: serde_json::Value,
+        disposition: crate::permission::Disposition,
+        pending_io: &mut FuturesUnordered<SchedulerFuture>,
     ) {
-        let annotations = self.annotations_for(thread_id);
-        let empty = crate::tools::mcp::ToolAnnotations::default();
-        let ann = annotations.get(name).unwrap_or(&empty);
-        let args_preview = {
-            let s = serde_json::to_string(input).unwrap_or_default();
-            if s.len() > 200 {
-                let mut i = 200;
-                while !s.is_char_boundary(i) && i > 0 {
-                    i -= 1;
-                }
-                format!("{}…", &s[..i])
-            } else {
-                s
-            }
-        };
-        let ev = crate::runtime::thread::ThreadEvent::PendingApproval {
-            approval_id: approval_id.to_string(),
-            tool_use_id: tool_use_id.to_string(),
-            name: name.to_string(),
-            args_preview,
-            destructive: ann.is_destructive(),
-            read_only: ann.is_read_only(),
-        };
-        self.router.dispatch_events(thread_id, vec![ev]);
-    }
-
-    /// Resolve a pending-approval Function given the client's
-    /// `ApprovalDecision`. Routes the decision to the Function whose
-    /// caller-link matches `(thread_id, approval_id's tool_use_id)`.
-    ///
-    /// - Approve: build and push the buffered IO future; narrow the
-    ///   thread's `tools_scope` to Allow for this tool if `remember`.
-    /// - Reject: complete the Function with `Cancelled(UserDenied)`
-    ///   and push a synthetic denial so the thread integrates a
-    ///   denied tool_result and continues.
-    pub(super) fn resolve_tool_approval(
-        &mut self,
-        thread_id: &str,
-        approval_id: &str,
-        decision: whisper_agent_protocol::ApprovalChoice,
-        remember: bool,
-        pending_io: &mut futures::stream::FuturesUnordered<SchedulerFuture>,
-    ) -> bool {
-        // approval_id format is "ap-{tool_use_id}" — see emit_pending_approval.
-        let tool_use_id = approval_id.strip_prefix("ap-").unwrap_or(approval_id);
-        let Some(fn_id) = self.find_tool_function_for(thread_id, tool_use_id) else {
-            return false;
-        };
-        let Some(entry) = self.active_functions.get_mut(&fn_id) else {
-            return false;
-        };
-        let Some(io_request) = entry.pending_approval_io.take() else {
-            // Function exists but isn't pending approval — caller sent
-            // a stale decision. Ignore.
-            return false;
-        };
-        let tool_name = match &entry.spec {
-            Function::BuiltinToolCall { name, .. } | Function::McpToolUse { name, .. } => {
-                name.clone()
-            }
-            _ => String::new(),
-        };
-
-        // Emit the ApprovalResolved event into the thread's event stream.
-        let resolved_ev = crate::runtime::thread::ThreadEvent::ApprovalResolved {
-            approval_id: approval_id.to_string(),
-            decision,
-            decided_by_conn: None,
-        };
-        self.router.dispatch_events(thread_id, vec![resolved_ev]);
-
-        match decision {
-            whisper_agent_protocol::ApprovalChoice::Approve => {
-                // "Remember this approval" narrows the thread's
-                // tools_scope so future calls to this tool skip the
-                // prompt.
-                if remember && let Some(task) = self.tasks.get_mut(thread_id) {
-                    task.tools_scope.set_allow(tool_name.clone());
-                    task.tool_allowlist.insert(tool_name.clone());
-                    let allowlist_ev = crate::runtime::thread::ThreadEvent::AllowlistChanged {
-                        allowlist: task.tool_allowlist.iter().cloned().collect(),
-                    };
-                    self.router.dispatch_events(thread_id, vec![allowlist_ev]);
-                }
-                let fut = crate::runtime::io_dispatch::build_io_future(
-                    self,
+        if matches!(disposition, crate::permission::Disposition::Deny) {
+            pending_io.push(make_denial_future(
+                thread_id.to_string(),
+                tool_use_id,
+                op_id,
+                crate::tools::builtin_tools::REQUEST_ESCALATION.to_string(),
+            ));
+            return;
+        }
+        // Hard gate: without an interactive channel, there's no
+        // approver — `request_escalation` is a no-op.
+        let interactive = self
+            .tasks
+            .get(thread_id)
+            .map(|t| t.scope.escalation.is_interactive())
+            .unwrap_or(false);
+        if !interactive {
+            pending_io.push(immediate_tool_error(
+                thread_id.to_string(),
+                op_id,
+                tool_use_id,
+                "request_escalation denied: thread has no interactive approver \
+                 (scope.escalation = None). Autonomous threads cannot widen \
+                 their own scope."
+                    .into(),
+            ));
+            return;
+        }
+        let args = match crate::tools::builtin_tools::request_escalation::parse_args(input) {
+            Ok(a) => a,
+            Err(e) => {
+                pending_io.push(immediate_tool_error(
                     thread_id.to_string(),
-                    io_request,
-                );
-                pending_io.push(fut);
-                true
-            }
-            whisper_agent_protocol::ApprovalChoice::Reject => {
-                // Synthesize a denial and complete the Function.
-                let crate::runtime::thread::IoRequest::ToolCall {
                     op_id,
                     tool_use_id,
-                    name,
-                    ..
-                } = io_request
-                else {
-                    return false;
+                    e,
+                ));
+                return;
+            }
+        };
+        let spec = Function::RequestEscalation {
+            thread_id: thread_id.to_string(),
+            request: args.request,
+            reason: args.reason,
+        };
+        let caller = CallerLink::ThreadToolCall {
+            thread_id: thread_id.to_string(),
+            tool_use_id: tool_use_id.clone(),
+        };
+        let (tx, rx) = tokio::sync::oneshot::channel::<Result<String, String>>();
+        let delivery = FunctionDelivery::ToolResultChannel(tx);
+        let fn_id = match self.register_function_with_delivery(spec, caller, delivery) {
+            Ok(id) => id,
+            Err(e) => {
+                pending_io.push(immediate_tool_error(
+                    thread_id.to_string(),
+                    op_id,
+                    tool_use_id,
+                    format!(
+                        "request_escalation: {}",
+                        super::client_messages::reject_reason_detail(&e)
+                    ),
+                ));
+                return;
+            }
+        };
+        self.launch_function(fn_id, pending_io);
+        let parent_id = thread_id.to_string();
+        pending_io.push(Box::pin(async move {
+            let result = match rx.await {
+                Ok(Ok(text)) => Ok(crate::tools::mcp::CallToolResult {
+                    content: vec![crate::tools::mcp::McpContentBlock::Text { text }],
+                    is_error: false,
+                }),
+                Ok(Err(msg)) => Ok(crate::tools::mcp::CallToolResult {
+                    // On reject / channel-drop we return is_error=true
+                    // but keep the message inline so the model's tool
+                    // result carries the denial text for course
+                    // correction.
+                    content: vec![crate::tools::mcp::McpContentBlock::Text { text: msg }],
+                    is_error: true,
+                }),
+                Err(_) => Err(
+                    "request_escalation: Function terminated without delivering a result".into(),
+                ),
+            };
+            crate::runtime::io_dispatch::SchedulerCompletion::Io(
+                crate::runtime::io_dispatch::IoCompletion {
+                    thread_id: parent_id,
+                    op_id,
+                    result: crate::runtime::thread::IoResult::ToolCall {
+                        tool_use_id,
+                        result,
+                    },
+                    pod_update: None,
+                    scheduler_command: None,
+                    host_env_lost: None,
+                },
+            )
+        }));
+    }
+
+    /// Resolve an in-flight `RequestEscalation` Function. On approve,
+    /// widens the thread's scope in place and broadcasts a refreshed
+    /// `ThreadSnapshot` so subscribers see the new scope; on reject,
+    /// surfaces the user's reason through the tool result. Either path
+    /// completes the Function, firing the parked tool-result oneshot
+    /// and unblocking the thread's turn.
+    ///
+    /// `resolver_conn` is the connection that sent the resolution —
+    /// must match the thread's interactive channel. A mismatch returns
+    /// an error event to the resolver and leaves the Function pending.
+    pub(crate) fn resolve_escalation(
+        &mut self,
+        resolver_conn: ConnId,
+        function_id: crate::functions::FunctionId,
+        decision: crate::permission::EscalationDecision,
+        reason: Option<String>,
+        pending_io: &mut FuturesUnordered<SchedulerFuture>,
+    ) {
+        let entry = match self.active_functions.get(&function_id) {
+            Some(e) => e,
+            None => {
+                warn!(
+                    function_id,
+                    resolver_conn, "resolve_escalation: no such Function"
+                );
+                self.router.send_to_client(
+                    resolver_conn,
+                    ServerToClient::Error {
+                        correlation_id: None,
+                        thread_id: None,
+                        message: format!("resolve_escalation: unknown function_id {function_id}"),
+                    },
+                );
+                return;
+            }
+        };
+        let Function::RequestEscalation {
+            thread_id, request, ..
+        } = entry.spec.clone()
+        else {
+            self.router.send_to_client(
+                resolver_conn,
+                ServerToClient::Error {
+                    correlation_id: None,
+                    thread_id: entry.spec.primary_thread_id().map(str::to_string),
+                    message: format!(
+                        "resolve_escalation: function {function_id} is not a RequestEscalation"
+                    ),
+                },
+            );
+            return;
+        };
+        // The resolver must own the thread's interactive channel —
+        // arbitrary third parties can't grant each other's widenings.
+        let channel_conn = self
+            .tasks
+            .get(&thread_id)
+            .and_then(|t| match t.scope.escalation {
+                crate::permission::Escalation::Interactive { via_conn } => Some(via_conn),
+                crate::permission::Escalation::None => None,
+            });
+        if channel_conn != Some(resolver_conn) {
+            self.router.send_to_client(
+                resolver_conn,
+                ServerToClient::Error {
+                    correlation_id: None,
+                    thread_id: Some(thread_id.clone()),
+                    message: "resolve_escalation: caller is not the thread's interactive channel"
+                        .to_string(),
+                },
+            );
+            return;
+        }
+        match decision {
+            crate::permission::EscalationDecision::Approve => {
+                // Re-check the widening against the current scope +
+                // pod ceiling at grant time. Mid-flight pod edits or
+                // other grants could have shifted the baseline — if
+                // the check fails now, surface the reason rather than
+                // silently succeeding on a stale request.
+                let grant_text = {
+                    let pod_id = self.tasks.get(&thread_id).map(|t| t.pod_id.clone());
+                    let pod_ceiling = pod_id.as_deref().map(|id| self.pod_scope_ceiling(id));
+                    let check = self.tasks.get(&thread_id).and_then(|t| {
+                        pod_ceiling
+                            .as_ref()
+                            .map(|c| t.scope.check_escalation(&request, c))
+                    });
+                    match check {
+                        Some(Ok(())) => Ok(()),
+                        Some(Err(detail)) => Err(detail),
+                        None => Err("thread gone".into()),
+                    }
                 };
-                let synthetic =
-                    make_denial_future(thread_id.to_string(), tool_use_id.clone(), op_id, name);
-                pending_io.push(synthetic);
+                match grant_text {
+                    Ok(()) => {
+                        let snapshot = if let Some(task) = self.tasks.get_mut(&thread_id) {
+                            task.scope.apply_escalation(&request);
+                            Some(task.snapshot())
+                        } else {
+                            None
+                        };
+                        let blurb = format!(
+                            "Escalation granted: {}. The capability is now available \
+                             for this thread.",
+                            describe_request(&request)
+                        );
+                        self.mark_dirty(&thread_id);
+                        if let Some(snapshot) = snapshot {
+                            self.router.broadcast_to_subscribers(
+                                &thread_id,
+                                ServerToClient::ThreadSnapshot {
+                                    thread_id: thread_id.clone(),
+                                    snapshot,
+                                },
+                            );
+                        }
+                        self.router
+                            .broadcast_task_list(ServerToClient::EscalationResolved {
+                                function_id,
+                                thread_id: thread_id.clone(),
+                                decision,
+                            });
+                        self.complete_function(
+                            function_id,
+                            FunctionOutcome::Success(
+                                crate::functions::FunctionTerminal::RequestEscalation(
+                                    crate::functions::RequestEscalationTerminal {
+                                        decision,
+                                        tool_result_text: blurb,
+                                    },
+                                ),
+                            ),
+                            pending_io,
+                        );
+                    }
+                    Err(detail) => {
+                        self.router
+                            .broadcast_task_list(ServerToClient::EscalationResolved {
+                                function_id,
+                                thread_id: thread_id.clone(),
+                                decision: crate::permission::EscalationDecision::Reject,
+                            });
+                        self.complete_function(
+                            function_id,
+                            FunctionOutcome::Error(crate::functions::FunctionError {
+                                kind: crate::functions::FunctionErrorKind::Execution,
+                                detail: format!("escalation grant re-check failed: {detail}"),
+                            }),
+                            pending_io,
+                        );
+                    }
+                }
+            }
+            crate::permission::EscalationDecision::Reject => {
+                let denial_text = match reason {
+                    Some(r) if !r.trim().is_empty() => format!("Escalation rejected: {r}"),
+                    _ => "Escalation rejected by user.".to_string(),
+                };
+                self.router
+                    .broadcast_task_list(ServerToClient::EscalationResolved {
+                        function_id,
+                        thread_id,
+                        decision,
+                    });
+                // Rejection rides the Error outcome so
+                // `outcome_to_sync_tool_result` returns `Err(detail)`,
+                // which the parked oneshot in
+                // `register_request_escalation_tool` converts into a
+                // `CallToolResult { is_error: true }`. The model sees
+                // the denial framed as a tool-result error and can
+                // course-correct.
                 self.complete_function(
-                    fn_id,
-                    FunctionOutcome::Cancelled(crate::functions::CancelReason::UserDenied),
+                    function_id,
+                    FunctionOutcome::Error(crate::functions::FunctionError {
+                        kind: crate::functions::FunctionErrorKind::Execution,
+                        detail: denial_text,
+                    }),
                     pending_io,
                 );
-                true
             }
         }
     }
 
-    /// Build a best-effort PermissionScope from the thread's current
-    /// state. Phase 4b: only `tools_scope` is populated meaningfully;
-    /// other fields rubber-stamp. Future commits extend this to cover
-    /// bindings and pod-level operations as they start being gated at
-    /// registration.
-    pub(super) fn thread_scope(&self, thread_id: &str) -> Option<PermissionScope> {
+    /// Sweep the task map and the active-functions registry for any
+    /// state tied to the dropped conn. Threads whose scope's
+    /// interactive channel was this conn flip to autonomous;
+    /// `RequestEscalation` Functions targeting those threads complete
+    /// with a channel-gone error so their parked tool calls resume.
+    pub(crate) fn revoke_escalation_channel(
+        &mut self,
+        dropped: ConnId,
+        pending_io: &mut FuturesUnordered<SchedulerFuture>,
+    ) {
+        let affected_threads: Vec<String> = self
+            .tasks
+            .iter_mut()
+            .filter_map(|(id, task)| match task.scope.escalation {
+                crate::permission::Escalation::Interactive { via_conn } if via_conn == dropped => {
+                    task.scope.escalation = crate::permission::Escalation::None;
+                    Some(id.clone())
+                }
+                _ => None,
+            })
+            .collect();
+        if affected_threads.is_empty() {
+            return;
+        }
+        let pending_fns: Vec<crate::functions::FunctionId> = self
+            .active_functions
+            .iter()
+            .filter_map(|(id, entry)| match &entry.spec {
+                Function::RequestEscalation { thread_id, .. }
+                    if affected_threads.iter().any(|t| t == thread_id) =>
+                {
+                    Some(*id)
+                }
+                _ => None,
+            })
+            .collect();
+        for fn_id in pending_fns {
+            self.complete_function(
+                fn_id,
+                FunctionOutcome::Error(crate::functions::FunctionError {
+                    kind: crate::functions::FunctionErrorKind::Execution,
+                    detail: "escalation channel closed before the user could approve; \
+                         request abandoned"
+                        .into(),
+                }),
+                pending_io,
+            );
+        }
+        for thread_id in &affected_threads {
+            self.mark_dirty(thread_id);
+        }
+    }
+
+    /// Look up the effective tool disposition for `thread_id` + tool
+    /// `name`. Returns `None` if the thread is unknown — callers pass
+    /// the request through unchecked in that case so upstream
+    /// route_tool surfaces the error. Consults the thread's snapshot
+    /// `Scope.tools`; pod-file edits don't retroactively change a
+    /// thread's active scope.
+    pub(super) fn tool_disposition(
+        &self,
+        thread_id: &str,
+        name: &str,
+    ) -> Option<crate::permission::Disposition> {
         let task = self.tasks.get(thread_id)?;
-        let mut scope = PermissionScope::allow_all();
-        scope.tools = task.tools_scope.clone();
-        Some(scope)
+        Some(task.scope.tools.disposition(&name.to_string()))
     }
 
     /// Complete the tool-call Function for `(thread_id, tool_use_id)`
@@ -1553,29 +1735,14 @@ fn outcome_to_sync_tool_result(outcome: &FunctionOutcome) -> Result<String, Stri
                 .unwrap_or_default();
             Ok(text)
         }
+        FunctionOutcome::Success(FunctionTerminal::RequestEscalation(term)) => {
+            Ok(term.tool_result_text.clone())
+        }
         FunctionOutcome::Success(_) => {
-            Err("dispatch_thread Function terminated with non-CreateThread payload".to_string())
+            Err("tool-parked Function terminated with non-tool-result payload".to_string())
         }
-        FunctionOutcome::Error(err) => Err(format!("dispatched child failed: {}", err.detail)),
-        FunctionOutcome::Cancelled(reason) => {
-            Err(format!("dispatched child cancelled ({:?})", reason))
-        }
-    }
-}
-
-/// Translate a scope-check `Disposition` into a `Result`. `Deny` rejects;
-/// `Allow` and `AllowWithPrompt` both admit. The prompt dimension is
-/// handled per-variant by the caller (tool Functions buffer the IO
-/// request and emit a PendingApproval event; other variants treat
-/// AllowWithPrompt as admit-and-proceed since they have no prompt UX).
-fn admission_check(
-    disp: crate::permission::Disposition,
-    detail: impl FnOnce() -> String,
-) -> Result<(), RejectReason> {
-    if disp.admits() {
-        Ok(())
-    } else {
-        Err(RejectReason::ScopeDenied { detail: detail() })
+        FunctionOutcome::Error(err) => Err(err.detail.clone()),
+        FunctionOutcome::Cancelled(reason) => Err(format!("tool call cancelled ({:?})", reason)),
     }
 }
 
@@ -1632,4 +1799,16 @@ fn make_denial_future(
             },
         )
     })
+}
+
+/// Human-readable one-liner describing what an `EscalationRequest`
+/// would widen. Used in the grant tool-result text.
+fn describe_request(req: &crate::permission::EscalationRequest) -> String {
+    use crate::permission::EscalationRequest::*;
+    match req {
+        AddTool { name } => format!("tool `{name}` added to scope"),
+        RaisePodModify { target } => format!("pod_modify raised to {target:?}"),
+        RaiseBehaviors { target } => format!("behaviors raised to {target:?}"),
+        RaiseDispatch { target } => format!("dispatch raised to {target:?}"),
+    }
 }

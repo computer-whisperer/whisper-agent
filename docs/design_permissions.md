@@ -22,9 +22,13 @@ Inputs to the disposition:
 
 - **Tool annotations** from the MCP server (`readOnlyHint`, `destructiveHint`, `idempotentHint`, `openWorldHint`) — carried on `ToolAnnotations` in `src/tools/mcp.rs` and surfaced in the `PendingApproval` wire event for client rendering.
 - **Pod's `[allow.tools]` table** — `AllowMap<String>` with a `default` Disposition plus per-tool overrides. Replaces the old `ApprovalPolicy` preset enum: pods now declare exactly which disposition applies by default and which tools override.
-- **Per-thread `tool_allowlist`** — when the user approves a call with "remember," the tool's disposition on the thread's `tools_scope` narrows to `Allow`. Future calls to that name skip the prompt. Persisted with the thread.
+- **Per-thread `tools_scope`** — an `AllowMap<String>` snapshotted from the pod's `[allow.tools]` at thread creation (`src/runtime/scheduler.rs::create_task`). When the user approves a call with "remember," that tool name gets a per-tool `Allow` override on `tools_scope` (and the older name `tool_allowlist` is kept around on `Thread` for back-compat, mirroring the same narrow set). Future calls to that name skip the prompt. Persisted with the thread.
 
 Pre-Function-model references to `ApprovalPolicy` / `AwaitingApproval` / `ApprovalDisposition` were removed during the Function-registry migration — see `docs/design_functions.md`. The scheduler's `register_tool_function` is the single dispatch entry point; the thread has no separate approval state.
+
+**Known gap: `tools_scope` is a frozen snapshot.** `UpdatePodConfig` (`src/runtime/scheduler/config_updates.rs::apply_pod_config_update`) does not re-sync a thread's `tools_scope` from the pod's current `[allow.tools]`. A thread that self-edits its own pod.toml via `pod_write_file` will not see its own tool scope change for the rest of its lifetime — only newly-created threads pick up the new map. The permissions rework (`design_permissions_rework.md`) promotes this behavior from gap to intended semantic.
+
+**Known gap: `dispatch_thread` with `AllowWithPrompt` does not prompt.** `src/runtime/scheduler/functions.rs::register_dispatch_thread_tool` logs a `warn!` and proceeds as `Allow`. Buffering the pre-launch state for a Function-spawning tool alias takes more plumbing than the current `pending_approval_io: IoRequest` buffer supports, and no concrete use case has required it yet. Tracked in `design_functions.md`'s open questions.
 
 ### Pattern 2 — Server-initiated mid-execution elicitation *(deferred)*
 
@@ -47,7 +51,7 @@ Today this is out of scope: the transport is loopback-only, there is no identity
 
 Pattern 1 is one layer. The others are **sandboxing** and **audit**.
 
-**Sandboxing** is the load-bearing safety boundary for unattended work. Each thread binds to a `host_env` — a named (provider, spec) pair declared in the pod's `[[allow.host_env]]` table. The provider (today: `local-landlock`, via `whisper-agent-sandbox`) provisions the host-env for the thread and spawns the MCP host inside it, scoped to the allowed paths and network policy. Tools running inside can't escape the landlock ruleset regardless of what they're asked to do. See [sandbox architecture memory](../) for the layering rationale: per-task `SandboxSpec`, `SandboxBackend` trait, provisioned below the MCP layer because MCP's roots (advisory `file://` URIs) don't carry an image, mount mode, or network policy — real isolation has to come from below.
+**Sandboxing** is the load-bearing safety boundary for unattended work. A thread binds to one or more `host_env` entries — each a named (provider, spec) pair declared in the pod's `[[allow.host_env]]` table. The provider (today: `local-landlock`, via `whisper-agent-sandbox`) provisions the host-env for the thread and spawns the MCP host inside it, scoped to the allowed paths and network policy. Tools running inside can't escape the landlock ruleset regardless of what they're asked to do. The pod's `[[allow.host_env]]` entries are the only place allowed_paths can be declared — there is no mechanism for narrowing `allowed_paths` per-dispatch, so a thread runs with the full path set of every named host-env it is bound to. See [sandbox architecture memory](../) for the layering rationale: per-task `SandboxSpec`, `SandboxBackend` trait, provisioned below the MCP layer because MCP's roots (advisory `file://` URIs) don't carry an image, mount mode, or network policy — real isolation has to come from below.
 
 This is why an all-`Allow` default `[allow.tools]` is sensible for autonomous behaviors: the sandbox bounds blast radius regardless of what the model decides to do. For interactive use where the sandbox is relaxed, per-tool `AllowWithPrompt` overrides — typically on the builtin pod-editing tools and any destructive MCP tools — give a second line of defense around privilege-escalation vectors.
 
@@ -60,9 +64,8 @@ struct ToolCallEntry {
     host_id: &str,
     tool_name: &str,
     args: Value,
-    decision: &str,       // "auto" | "approve" | "reject"
-    who_decided: &str,    // "policy:read_only" | "policy:auto_approve_all" |
-                          // "policy:allowlist" | "user:{conn_id}"
+    decision: &str,       // "auto" | "approve" | "reject" | "dispatched"
+    who_decided: &str,    // "scheduler_gated" | "policy" | "user:{conn_id}"
     outcome: ToolCallOutcome,  // Ok { is_error } | Failed { message }
 }
 ```
@@ -81,10 +84,10 @@ This is one of the cleanest architectural wins of the model, and the reason we'r
 
 Pattern 1 surfaces as:
 
-- `PendingApproval { approval_id, tool_use_id, name, args_preview, destructive, read_only }` events when a call needs human review.
+- `ServerToClient::ThreadPendingApproval { thread_id, approval_id, tool_use_id, name, args_preview, destructive, read_only }` when a call needs human review.
 - `ClientToServer::ApprovalDecision { thread_id, approval_id, choice, remember }` client→server.
-- `ApprovalResolved { approval_id, decision, decided_by_conn }` events when a decision lands.
-- `AllowlistChanged { allowlist }` when the thread's allowlist changes (via remember-yes or explicit revoke).
+- `ServerToClient::ThreadApprovalResolved { thread_id, approval_id, decision, decided_by_conn }` when a decision lands.
+- `ServerToClient::ThreadAllowlistUpdated { thread_id, tool_allowlist }` when the thread's allowlist changes (via remember-yes or explicit revoke). Internally the thread emits a `ThreadEvent::AllowlistChanged` which the router translates to the wire variant.
 
 The pod config carries `[allow.tools]` as an `AllowMap<String>` (default + per-tool overrides); each thread snapshots the pod's tools map into its own `tools_scope` at creation, which it narrows further via remember-approvals. See `docs/design_functions.md` for the full scope-composition model.
 
