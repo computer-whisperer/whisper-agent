@@ -1630,7 +1630,7 @@ impl Scheduler {
     /// pod ceiling but denied by current scope).
     ///
     /// Single primitive used by four surfaces: the wire `tools:`
-    /// array (`core_tool_descriptors`), the system-prompt listing
+    /// array (`wire_tool_descriptors`), the system-prompt listing
     /// (`render_initial_listing`), `find_tool`'s regex search, and
     /// `describe_tool`'s exact lookup. Keeps classification logic
     /// in one place instead of scattered `scope_denies` closures.
@@ -1727,52 +1727,53 @@ impl Scheduler {
         out
     }
 
-    /// Tools that land as full schemas in the thread's wire `tools:`
-    /// array (via `Role::Tools` content at position 1). Everything
-    /// outside this list still appears in the system-prompt listing
-    /// and is dispatchable by name — the model just has to call
-    /// `describe_tool` first to learn the schema.
+    /// Tool descriptors for the thread's wire `tools:` array
+    /// (`Role::Tools` content at position 1). Every admitted
+    /// (non-askable) tool lands on the wire so the model can actually
+    /// invoke it — llama.cpp-backed endpoints build a grammar from
+    /// this array and mask every other tool name at sample time, so
+    /// tools advertised only in prose can't be called on those
+    /// providers. The `core_tools` policy therefore only controls
+    /// *description verbosity*, not which tools appear:
     ///
-    /// Policy:
-    /// - Only admitted (not askable) tools are eligible — schemas
-    ///   the model can't call wouldn't help.
-    /// - `CoreTools::All` → every admitted tool's schema.
-    /// - `CoreTools::Named(list)` → only tools whose name appears in
-    ///   the list. Missing names are silently dropped ("include these
-    ///   IF admissible," not "admit these").
-    pub(crate) fn core_tool_descriptors(&self, thread_id: &str) -> Vec<McpTool> {
+    /// - Tools named in `core_tools` (or all tools when `CoreTools::All`)
+    ///   carry their full description — this is where we spend
+    ///   tokens to help the model pick the right tool.
+    /// - Every other admitted tool carries a first-line-only summary
+    ///   (via `one_line_description`) — enough to recognize what it
+    ///   does, with full docs reachable via `describe_tool`.
+    ///
+    /// Input schemas are always included verbatim — they constrain
+    /// the grammar's argument rules (in formats that use
+    /// `parameters`) and the server's dispatch route, and aren't
+    /// the bloat we're trying to trim.
+    pub(crate) fn wire_tool_descriptors(&self, thread_id: &str) -> Vec<McpTool> {
         use whisper_agent_protocol::tool_surface::CoreTools;
         let Some(task) = self.tasks.get(thread_id) else {
             return Vec::new();
         };
-        let core = task.tool_surface.core_tools.clone();
-        let admitted = self
-            .admissible_and_askable_tools(thread_id)
+        let full_desc_all = matches!(task.tool_surface.core_tools, CoreTools::All);
+        let full_desc_set: HashSet<String> = match &task.tool_surface.core_tools {
+            CoreTools::All => HashSet::new(),
+            CoreTools::Named(names) => names.iter().cloned().collect(),
+        };
+        self.admissible_and_askable_tools(thread_id)
             .into_iter()
-            .filter(|t| !t.requires_escalation);
-        let filtered: Vec<McpTool> = match core {
-            CoreTools::All => admitted
-                .map(|t| McpTool {
+            .filter(|t| !t.requires_escalation)
+            .map(|t| {
+                let description = if full_desc_all || full_desc_set.contains(&t.name) {
+                    t.description
+                } else {
+                    crate::runtime::tool_listing::one_line_description(&t.description)
+                };
+                McpTool {
                     name: t.name,
-                    description: t.description,
+                    description,
                     input_schema: t.input_schema,
                     annotations: t.annotations,
-                })
-                .collect(),
-            CoreTools::Named(names) => {
-                let set: HashSet<String> = names.into_iter().collect();
-                admitted
-                    .filter(|t| set.contains(&t.name))
-                    .map(|t| McpTool {
-                        name: t.name,
-                        description: t.description,
-                        input_schema: t.input_schema,
-                        annotations: t.annotations,
-                    })
-                    .collect()
-            }
-        };
-        filtered
+                }
+            })
+            .collect()
     }
 
     /// Render the tool-catalog listing to append to the system prompt
@@ -2558,21 +2559,12 @@ impl Scheduler {
             task.conversation
                 .push(whisper_agent_protocol::Message::system_text(system_prompt));
         }
-        // Tools + listing: only if every host-env MCP is already
-        // Ready. Otherwise both wait for the provisioning-complete
-        // hook (the listing enumerates those MCPs' tools, so it
-        // can't be rendered before they've reported).
-        if self.host_env_mcp_is_ready(thread_id) {
-            self.push_tools_snapshot(thread_id);
-            self.push_tool_listing_snapshot(thread_id);
-        }
-        // Memory index: read at thread-creation time and persist into
-        // the conversation as a Role::System message right after the
-        // tool manifest (or after System if Tools hasn't landed yet —
-        // the tight `setup_prefix_end` logic routes Tools into its
-        // slot on arrival, shuffling Memory to index 2). Idempotent:
-        // skipped silently if a prior call already planted the block.
-        self.push_memory_snapshot(thread_id);
+        // Tools manifest + initial listing + memory snapshot all land
+        // together as a single idempotent operation. Self-gates on
+        // host-env MCP readiness: if some binding is still
+        // provisioning, the hook in `apply_provision_completion`
+        // calls back once it lands.
+        self.finalize_setup_prefix(thread_id);
         self.mark_dirty(thread_id);
     }
 
@@ -2599,51 +2591,55 @@ impl Scheduler {
         })
     }
 
-    /// Insert a fresh `Role::Tools` manifest into the thread's
-    /// conversation at the setup-prefix boundary (right after the
-    /// `Role::System` message, before any body turns), built from
-    /// the current [`Self::tool_descriptors`] view. Idempotent: if
-    /// the thread already has a `Role::Tools` message this is a
-    /// no-op — keeps the `HostEnvMcpCompleted` handler's per-user
-    /// fan-out safe to call against every bound thread without
-    /// per-thread bookkeeping.
+    /// Finalize the setup prefix for a freshly-seeded thread: insert
+    /// the `Role::Tools` manifest, the initial tool-catalog listing
+    /// (a `Role::System` block), and the memory-index snapshot (also
+    /// `Role::System`), in that order, at `setup_prefix_end()`.
     ///
-    /// Insertion (rather than append) matters when a user message
-    /// has already landed before provisioning completed — a
-    /// `CreateThread`-with-initial_message while the host-env MCP
-    /// is still spinning up leaves the conversation as
-    /// `[System, User]`. Pushing Tools at the tail would yield
-    /// `[System, User, Tools]`, which makes `setup_prefix_end()`
-    /// return 1 and hides the tool manifest from the adapter's
-    /// `tools:` wire field. Inserting at `setup_prefix_end()` keeps
-    /// the invariant that the setup prefix stays contiguous at the
-    /// head of the conversation.
+    /// Single idempotent handler — replaces the prior trio of
+    /// `push_*_snapshot` methods that each carried their own marker
+    /// check. Those markers overlapped (listing and memory are both
+    /// `Role::System` at the same position), which meant ordering
+    /// between the three calls had to be just right or one would
+    /// false-match another. Consolidating them here makes the
+    /// idempotency gate one thing: does `Role::Tools` exist in the
+    /// conversation? If yes, the prefix already finalized and nothing
+    /// more is needed. If no, assemble and insert all three together.
     ///
-    /// Because the insertion shifts later-message indices, it's a
-    /// non-append mutation — subscribed clients' incremental views
-    /// would drift from the server's conversation if they only saw
-    /// streaming events. To keep them honest we follow the insert
-    /// with a full `ThreadSnapshot` broadcast: subscribers rebuild
-    /// their view from authoritative state in one step, so `Tools`
-    /// becomes visible inline without waiting for a reload /
-    /// re-subscribe. One-time cost — the setup prefix only
-    /// finalizes once per thread.
-    fn push_tools_snapshot(&mut self, thread_id: &str) {
-        let already_has = self
-            .tasks
-            .get(thread_id)
-            .map(|t| {
-                t.conversation
-                    .messages()
-                    .iter()
-                    .any(|m| m.role == whisper_agent_protocol::Role::Tools)
-            })
-            .unwrap_or(true);
-        if already_has {
+    /// Self-gates on `host_env_mcp_is_ready` — returns early if any
+    /// host-env MCP is still provisioning. The completion hook
+    /// (`apply_provision_completion`) calls us again once the last
+    /// MCP lands, so there's one well-defined trigger: "all
+    /// ingredients ready, assemble now."
+    ///
+    /// Steady-state layout is `[System, Tools, Listing?, Memory,
+    /// ...body]` — listing sits adjacent to Tools (it's a rendering
+    /// of the same catalog) and memory closes the prefix before the
+    /// first body turn. Listing is skipped when
+    /// `tool_surface.initial_listing = None` (empty render).
+    ///
+    /// Non-append mutation: inserting at `setup_prefix_end()` shifts
+    /// later messages, so streaming subscribers would drift from
+    /// server state. One `ThreadSnapshot` broadcast at the end
+    /// rebuilds their view from authoritative state in a single pass.
+    fn finalize_setup_prefix(&mut self, thread_id: &str) {
+        if !self.host_env_mcp_is_ready(thread_id) {
             return;
         }
+        let Some(task) = self.tasks.get(thread_id) else {
+            return;
+        };
+        let already_finalized = task
+            .conversation
+            .messages()
+            .iter()
+            .any(|m| m.role == whisper_agent_protocol::Role::Tools);
+        if already_finalized {
+            return;
+        }
+
         let tool_blocks: Vec<whisper_agent_protocol::ContentBlock> = self
-            .core_tool_descriptors(thread_id)
+            .wire_tool_descriptors(thread_id)
             .into_iter()
             .map(|t| whisper_agent_protocol::ContentBlock::ToolSchema {
                 name: t.name,
@@ -2651,73 +2647,32 @@ impl Scheduler {
                 input_schema: t.input_schema,
             })
             .collect();
-        let snapshot = if let Some(task) = self.tasks.get_mut(thread_id) {
-            let at = task.conversation.setup_prefix_end();
-            task.conversation.insert(
-                at,
-                whisper_agent_protocol::Message::tools_manifest(tool_blocks),
-            );
-            Some(task.snapshot())
-        } else {
-            None
-        };
-        self.mark_dirty(thread_id);
-        if let Some(snapshot) = snapshot {
-            self.router.broadcast_to_subscribers(
-                thread_id,
-                ServerToClient::ThreadSnapshot {
-                    thread_id: thread_id.to_string(),
-                    snapshot,
-                },
-            );
-        }
-    }
+        let tools_msg = whisper_agent_protocol::Message::tools_manifest(tool_blocks);
 
-    /// Insert the system-prompt-appended tool catalog listing (a
-    /// `Role::System` message rendered via [`Self::render_initial_listing`])
-    /// right after `Role::Tools`. Paired with [`Self::push_tools_snapshot`]
-    /// — both depend on MCP readiness and both land at the same moment.
-    ///
-    /// Idempotent via a content marker: the render always starts with
-    /// `"## Available tools"`, so we scan existing Role::System blocks
-    /// for that prefix before inserting. No-op if
-    /// `initial_listing = None` (empty render).
-    ///
-    /// Listing lands *before* the memory snapshot in final ordering —
-    /// push order is Tools → listing → memory, so memory inserts at
-    /// setup_prefix_end while listing is already body content, leaving
-    /// `[System, Tools, Listing, Memory]` as the steady state.
-    fn push_tool_listing_snapshot(&mut self, thread_id: &str) {
-        let listing = self.render_initial_listing(thread_id);
-        if listing.is_empty() {
-            return;
-        }
-        // Content-marker idempotency: scan existing Role::System blocks
-        // for the render's fixed prefix. Disjoint from memory's check
-        // (which looks at position), so the two snapshots don't
-        // interfere even when both land at setup_prefix_end.
-        let already_has = self
+        let listing_text = self.render_initial_listing(thread_id);
+
+        let pod_dir = self
             .tasks
             .get(thread_id)
-            .map(|t| {
-                t.conversation.messages().iter().any(|m| {
-                    m.role == whisper_agent_protocol::Role::System
-                        && m.content.iter().any(|b| match b {
-                            whisper_agent_protocol::ContentBlock::Text { text } => {
-                                text.starts_with("## Available tools")
-                            }
-                            _ => false,
-                        })
-                })
-            })
-            .unwrap_or(true);
-        if already_has {
-            return;
-        }
+            .and_then(|t| self.pods.get(&t.pod_id))
+            .map(|p| p.dir.clone());
+        let memory_msg = pod_dir
+            .map(|dir| crate::runtime::memory_snapshot::build_block(&dir, chrono::Utc::now()));
+
         let snapshot = if let Some(task) = self.tasks.get_mut(thread_id) {
-            let at = task.conversation.setup_prefix_end();
-            task.conversation
-                .insert(at, whisper_agent_protocol::Message::system_text(listing));
+            let mut at = task.conversation.setup_prefix_end();
+            task.conversation.insert(at, tools_msg);
+            at += 1;
+            if !listing_text.is_empty() {
+                task.conversation.insert(
+                    at,
+                    whisper_agent_protocol::Message::system_text(listing_text),
+                );
+                at += 1;
+            }
+            if let Some(memory_msg) = memory_msg {
+                task.conversation.insert(at, memory_msg);
+            }
             Some(task.snapshot())
         } else {
             None
@@ -2792,63 +2747,6 @@ impl Scheduler {
         let snapshot = if let Some(task) = self.tasks.get_mut(thread_id) {
             task.conversation
                 .push(whisper_agent_protocol::Message::system_text(text));
-            Some(task.snapshot())
-        } else {
-            None
-        };
-        self.mark_dirty(thread_id);
-        if let Some(snapshot) = snapshot {
-            self.router.broadcast_to_subscribers(
-                thread_id,
-                ServerToClient::ThreadSnapshot {
-                    thread_id: thread_id.to_string(),
-                    snapshot,
-                },
-            );
-        }
-    }
-
-    /// Insert the memory-index snapshot (a `Role::System` message
-    /// rendered from `<pod_dir>/memory/MEMORY.md` + a fresh timestamp)
-    /// into the thread's conversation at the setup-prefix boundary.
-    /// Idempotent: no-op if a `Role::System` message is already
-    /// present at that position (meaning the snapshot has already
-    /// been planted by a prior call — `seed_thread_setup`,
-    /// `HostEnvMcpCompleted` fan-out, compaction finalize, etc).
-    ///
-    /// Lives at the setup-prefix boundary (`setup_prefix_end()`), so
-    /// before `Role::Tools` lands the memory slot is index 1 (just
-    /// after System); after Tools arrives, the tools insert at index
-    /// 1 shifts Memory to index 2. Ordering `[System, Tools, Memory,
-    /// User, ...]` is the final steady state regardless of when each
-    /// piece arrived.
-    ///
-    /// The block is persisted into the log like any other setup-frame
-    /// message — same logic as why System prompt + Tools manifest are
-    /// persisted. The log is the faithful record of what the model
-    /// saw; re-reading MEMORY.md on every send would break prompt-
-    /// cache stability for no gain.
-    fn push_memory_snapshot(&mut self, thread_id: &str) {
-        let Some(task) = self.tasks.get(thread_id) else {
-            return;
-        };
-        let at = task.conversation.setup_prefix_end();
-        let already_has = task
-            .conversation
-            .messages()
-            .get(at)
-            .is_some_and(|m| m.role == whisper_agent_protocol::Role::System);
-        if already_has {
-            return;
-        }
-        let pod_dir = match self.pods.get(&task.pod_id) {
-            Some(p) => p.dir.clone(),
-            None => return,
-        };
-        let block = crate::runtime::memory_snapshot::build_block(&pod_dir, chrono::Utc::now());
-        let snapshot = if let Some(task) = self.tasks.get_mut(thread_id) {
-            let at = task.conversation.setup_prefix_end();
-            task.conversation.insert(at, block);
             Some(task.snapshot())
         } else {
             None
@@ -3351,20 +3249,19 @@ impl Scheduler {
                     .populate_mcp_tools(&mcp_id, tools, annotations);
                 self.emit_mcp_host_updated(&mcp_id);
 
-                // 3. Finalize the `Role::Tools` setup message for every
-                //    thread bound to this MCP *whose remaining host-
-                //    env MCPs are also Ready*. Threads that bind to
-                //    multiple envs merge every env's tools into one
-                //    manifest; pushing partway would freeze a tool
-                //    list missing the slower envs' contributions.
-                //    `host_env_mcp_is_ready` returns true both for
-                //    "no host-env bindings" and "every binding is
-                //    Ready." Runs BEFORE `step_until_blocked` below
-                //    — so no model call has fired yet, and the
-                //    setup-prefix write is still free (no cache-bust
-                //    because nothing has been cached yet). Idempotent:
-                //    `push_tools_snapshot` no-ops for threads that
-                //    already have a `Role::Tools` message.
+                // 3. Finalize the setup prefix for every thread bound
+                //    to this MCP *whose remaining host-env MCPs are
+                //    also Ready*. Threads that bind to multiple envs
+                //    merge every env's tools into one manifest;
+                //    pushing partway would freeze a tool list missing
+                //    the slower envs' contributions.
+                //    `finalize_setup_prefix` self-gates on
+                //    `host_env_mcp_is_ready` and is idempotent (keyed
+                //    on `Role::Tools` existence), so it's safe to
+                //    call against every bound thread. Runs BEFORE
+                //    `step_until_blocked` below — so no model call
+                //    has fired yet, and the setup-prefix write is
+                //    still free (nothing has been cached).
                 let bound_to_mcp: Vec<String> = self
                     .resources
                     .mcp_hosts
@@ -3373,9 +3270,9 @@ impl Scheduler {
                     .unwrap_or_default();
                 // Snapshot the raw tool names now — the registry was
                 // populated above and we'll need them for the
-                // activation-message branch below (push_tools_snapshot
-                // / push_tool_listing_snapshot are both idempotent and
-                // don't help threads that already seeded).
+                // activation-message branch below (the setup-prefix
+                // path handles already-seeded threads itself; this is
+                // only for threads whose prefix already finalized).
                 let fresh_tool_names: Vec<String> = self
                     .resources
                     .mcp_hosts
@@ -3383,9 +3280,6 @@ impl Scheduler {
                     .map(|e| e.tools.iter().map(|t| t.name.clone()).collect())
                     .unwrap_or_default();
                 for tid in &bound_to_mcp {
-                    if !self.host_env_mcp_is_ready(tid) {
-                        continue;
-                    }
                     let already_seeded = self
                         .tasks
                         .get(tid)
@@ -3414,8 +3308,7 @@ impl Scheduler {
                             .collect();
                         self.push_tool_activation_message(tid, &prefixed);
                     } else {
-                        self.push_tools_snapshot(tid);
-                        self.push_tool_listing_snapshot(tid);
+                        self.finalize_setup_prefix(tid);
                     }
                 }
 

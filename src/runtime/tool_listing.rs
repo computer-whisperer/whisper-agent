@@ -165,7 +165,7 @@ fn group_header(label: &str) -> String {
     }
 }
 
-fn one_line_description(desc: &str) -> String {
+pub(crate) fn one_line_description(desc: &str) -> String {
     // Tool descriptions are often multi-sentence; for the listing we
     // want one line so the prompt stays tight. Truncate at the first
     // period/newline and cap at ~120 chars so a GitHub-style "this

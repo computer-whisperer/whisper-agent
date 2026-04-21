@@ -14,12 +14,15 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 /// optional full-replace override.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct ToolSurface {
-    /// Which tools get full schemas in the wire `tools:` array (and
-    /// thus the thread's `Role::Tools` message at position 1).
-    /// Everything outside this set is still callable — the model
-    /// either learned the name from `initial_listing` or from a
-    /// mid-conversation activation message, and fetches the schema
-    /// via `describe_tool` on demand.
+    /// Which tools carry their full description in the wire `tools:`
+    /// array (`Role::Tools` at position 1). Every admitted tool lands
+    /// on the wire regardless — llama.cpp-backed endpoints
+    /// grammar-mask any tool name not in that array, so "advertise in
+    /// prose, activate later" doesn't work there. This knob only
+    /// controls description verbosity: tools listed here keep full
+    /// prose, every other admitted tool carries a first-line-only
+    /// summary. Input schemas go on the wire for every tool (the
+    /// grammar needs them).
     #[serde(default = "default_core_tools")]
     pub core_tools: CoreTools,
     /// What to include in the system-prompt-appended tool catalog
@@ -45,23 +48,23 @@ impl Default for ToolSurface {
     }
 }
 
-/// Which tools get full schemas in the thread's wire `tools:` field.
+/// Which tools keep full descriptions on the wire. Does NOT decide
+/// which tools go on the wire — every admitted tool does — just
+/// which ones get verbose prose vs. a first-line summary.
 ///
-/// On disk accepts either the string `"all"` (unrestricted — every
-/// admissible tool gets a full schema, matching pre-rework behavior)
-/// or a list of tool names. Names that aren't admissible by the
-/// thread's scope are silently dropped at seed time — the policy says
-/// "include these IF admissible," not "admit these."
+/// On disk accepts either the string `"all"` (every admitted tool
+/// keeps full description — matches pre-rework behavior) or a list
+/// of tool names. Names not admitted to the thread are silently
+/// dropped ("full-describe these IF admissible," not "admit these").
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CoreTools {
-    /// Every scope-admitted tool's full schema lands in `Role::Tools`.
-    /// Reproduces the original catalog-dumping behavior and is still
-    /// useful when the pod has few tools or the author explicitly
-    /// wants "nothing deferred."
+    /// Every admitted tool keeps its full description. Useful when
+    /// the pod has few tools or the author explicitly wants "no
+    /// summarization."
     All,
-    /// Only these names get full schemas. The rest appear in the
-    /// system-prompt listing (if `initial_listing = AllNames`) with
-    /// schemas fetched on demand via `describe_tool`.
+    /// Only these names keep full descriptions; every other admitted
+    /// tool carries a first-line-only summary. The model can still
+    /// fetch full docs for any tool via `describe_tool`.
     Named(Vec<String>),
 }
 
@@ -101,26 +104,30 @@ fn default_core_tools() -> CoreTools {
 }
 
 /// What tool-catalog content gets appended to the system prompt at
-/// thread seed time.
+/// thread seed time. Default is `None` — admitted tools are already
+/// on the wire with names and first-line descriptions, so the prose
+/// listing would duplicate them. The remaining value of the listing
+/// is surfacing *askable* (escalation-available) tools, which is why
+/// the `AllNames` variant still exists as opt-in.
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum InitialListing {
+    /// No listing appended. Admitted tools are discoverable through
+    /// the wire `tools:` array; the model uses `find_tool` to reach
+    /// askable tools, or learns about them from activation messages
+    /// after an escalation approval.
+    #[default]
+    None,
     /// Enumerate every admissible tool — name + one-line description,
     /// grouped by source (builtins / host-env MCP / shared MCP), plus
     /// a trailing "available via escalation" section when the thread
-    /// has an interactive channel. This is the default: it solves
-    /// discovery at the cost of a few hundred tokens of prose, vs.
-    /// the kilobytes that full schemas would cost.
-    #[default]
+    /// has an interactive channel. Duplicates what's on the wire for
+    /// admitted tools; useful mostly to surface askable tools at seed.
     AllNames,
     /// Only a summary: counts by group, plus the core-tools names.
     /// Useful when the pod has so many tools that even the name list
-    /// is uncomfortably long; the model relies on `find_tool` to
-    /// discover what exists.
+    /// is uncomfortably long.
     CoreOnly,
-    /// No listing appended — the model learns about tools only via
-    /// `find_tool`, or never. Discovery-first.
-    None,
 }
 
 /// How mid-conversation additions are surfaced to the model. In
@@ -143,7 +150,7 @@ pub enum ActivationSurface {
 }
 
 fn default_initial_listing() -> InitialListing {
-    InitialListing::AllNames
+    InitialListing::None
 }
 
 fn default_activation_surface() -> ActivationSurface {
@@ -166,7 +173,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn default_is_small_core_plus_all_names() {
+    fn default_is_small_core_plus_no_listing() {
         let s = ToolSurface::default();
         match &s.core_tools {
             CoreTools::Named(v) => {
@@ -177,7 +184,7 @@ mod tests {
             }
             CoreTools::All => panic!("default should be a small named set, not All"),
         }
-        assert_eq!(s.initial_listing, InitialListing::AllNames);
+        assert_eq!(s.initial_listing, InitialListing::None);
         assert_eq!(s.activation_surface, ActivationSurface::Announce);
     }
 
