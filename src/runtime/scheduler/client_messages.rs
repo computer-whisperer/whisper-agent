@@ -31,17 +31,21 @@ pub(super) fn reject_reason_detail(r: &RejectReason) -> &str {
     }
 }
 
-/// Translate the wire-shape `SharedMcpAuthInput` (secrets inbound)
-/// into the catalog's `SharedMcpAuth`. A thin mapping today —
-/// Step 2's OAuth variant will extend both ends symmetrically.
-pub(super) fn shared_mcp_auth_from_input(
+/// Translate the direct-auth portion of a wire-shape
+/// `SharedMcpAuthInput` (secrets inbound) into the catalog's
+/// `SharedMcpAuth`. Returns `None` for `Oauth2Start` — the Add
+/// handler inspects the raw input first and routes `Oauth2Start`
+/// into the OAuth flow rather than the synchronous add path. So a
+/// `None` return here is a caller-error signal, not a domain value.
+pub(super) fn shared_mcp_auth_from_direct_input(
     input: whisper_agent_protocol::SharedMcpAuthInput,
-) -> crate::tools::shared_mcp_catalog::SharedMcpAuth {
+) -> Option<crate::tools::shared_mcp_catalog::SharedMcpAuth> {
     use crate::tools::shared_mcp_catalog::SharedMcpAuth;
     use whisper_agent_protocol::SharedMcpAuthInput;
     match input {
-        SharedMcpAuthInput::None => SharedMcpAuth::None,
-        SharedMcpAuthInput::Bearer { token } => SharedMcpAuth::Bearer { token },
+        SharedMcpAuthInput::None => Some(SharedMcpAuth::None),
+        SharedMcpAuthInput::Bearer { token } => Some(SharedMcpAuth::Bearer { token }),
+        SharedMcpAuthInput::Oauth2Start { .. } => None,
     }
 }
 
@@ -533,17 +537,40 @@ impl Scheduler {
                     );
                     return;
                 }
-                let catalog_auth = shared_mcp_auth_from_input(auth);
-                pending_io.push(
-                    crate::runtime::io_dispatch::build_shared_mcp_connect_future(
-                        conn_id,
-                        correlation_id,
-                        name,
-                        url,
-                        catalog_auth,
-                        crate::runtime::io_dispatch::SharedMcpOp::Add,
-                    ),
-                );
+                // Route on the auth variant: Oauth2Start dispatches
+                // the discovery+DCR+authz-URL pipeline; direct
+                // None/Bearer go straight to the synchronous connect
+                // path.
+                match auth {
+                    whisper_agent_protocol::SharedMcpAuthInput::Oauth2Start {
+                        scope,
+                        redirect_base,
+                    } => {
+                        self.start_shared_mcp_oauth(
+                            conn_id,
+                            correlation_id,
+                            name,
+                            url,
+                            scope,
+                            redirect_base,
+                            pending_io,
+                        );
+                    }
+                    other => {
+                        let catalog_auth = shared_mcp_auth_from_direct_input(other)
+                            .expect("non-Oauth2Start input has a direct mapping");
+                        pending_io.push(
+                            crate::runtime::io_dispatch::build_shared_mcp_connect_future(
+                                conn_id,
+                                correlation_id,
+                                name,
+                                url,
+                                catalog_auth,
+                                crate::runtime::io_dispatch::SharedMcpOp::Add,
+                            ),
+                        );
+                    }
+                }
             }
             ClientToServer::UpdateSharedMcpHost {
                 correlation_id,
@@ -564,7 +591,29 @@ impl Scheduler {
                     );
                     return;
                 }
-                let new_auth = auth.map(shared_mcp_auth_from_input);
+                // Update refuses Oauth2Start — OAuth hosts must be
+                // created fresh (discovery + DCR happen at Add time
+                // and aren't re-runnable on an existing catalog entry
+                // in a principled way). Direct None/Bearer edits pass
+                // through.
+                let new_auth = match auth {
+                    Some(input) => match shared_mcp_auth_from_direct_input(input) {
+                        Some(a) => Some(a),
+                        None => {
+                            self.router.send_to_client(
+                                conn_id,
+                                ServerToClient::Error {
+                                    correlation_id,
+                                    thread_id: None,
+                                    message: "update_shared_mcp_host: Oauth2Start is only valid on AddSharedMcpHost"
+                                        .into(),
+                                },
+                            );
+                            return;
+                        }
+                    },
+                    None => None,
+                };
                 let effective_auth =
                     match self.validate_shared_mcp_update(&name, &url, new_auth.as_ref()) {
                         Ok(a) => a,

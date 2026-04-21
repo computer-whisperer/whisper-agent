@@ -1066,25 +1066,52 @@ struct SharedMcpEditorState {
     mode: SharedMcpEditorMode,
     name: String,
     url: String,
-    /// Staged bearer. Blank + `!auth_keep` → clear; non-blank +
-    /// `!auth_keep` → set bearer. On Add, always treated as set-if-
-    /// non-blank (no auth_keep semantics because there's no existing
-    /// auth).
+    /// Which auth variant the operator is currently composing.
+    /// Defaults to `Anonymous` on Add, `keep existing` equivalent on
+    /// Edit. Selecting `Oauth2Start` disables the bearer field and
+    /// (on Save) dispatches the webui-orchestrated OAuth flow; the
+    /// server replies with `SharedMcpOauthFlowStarted` carrying the
+    /// authorization URL to open.
+    auth_choice: SharedMcpAuthChoice,
+    /// Staged bearer. Only consulted when `auth_choice` is `Bearer`.
     bearer: String,
-    /// Whether the existing auth should be preserved (Edit only). See
-    /// `auth_kind_on_load` for the value this was read from.
-    auth_keep: bool,
+    /// Optional scope string (space-separated) for OAuth flows.
+    /// Omitted when empty so the server falls back to the AS's
+    /// `scopes_supported`.
+    oauth_scope: String,
     /// The auth kind on the entry when the editor opened, so the UI
     /// can describe the "keep existing auth" option meaningfully.
     auth_kind_on_load: SharedMcpAuthPublic,
     error: Option<String>,
     pending_correlation: Option<String>,
+    /// True while an OAuth flow has been started and the authz URL
+    /// has been opened in a new tab, but the final
+    /// `SharedMcpHostAdded` hasn't arrived yet. The form stays open
+    /// in a "waiting for consent" banner until the callback fires.
+    oauth_in_flight: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SharedMcpEditorMode {
     Add,
     Edit,
+}
+
+/// Which auth variant the user is composing in the editor. The Edit
+/// mode adds a fourth `KeepExisting` semantic via the
+/// `SharedMcpAuthInput::None` wire value being elided (see the save
+/// path); we model that inline rather than as a variant to keep the
+/// radio-row UI simple.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SharedMcpAuthChoice {
+    /// Anonymous — no Authorization header sent.
+    Anonymous,
+    /// Static bearer pasted by the operator.
+    Bearer,
+    /// OAuth 2.1 via the authorization_code + PKCE flow. Only
+    /// selectable on Add (Edit of an existing OAuth entry routes
+    /// token refresh through a separate path, not this form).
+    Oauth2,
 }
 
 /// Sub-form shown over the Settings modal when the user clicks
@@ -2496,6 +2523,25 @@ impl ChatApp {
             }
             ServerToClient::SharedMcpHostsList { hosts, .. } => {
                 self.shared_mcp_hosts = hosts;
+            }
+            ServerToClient::SharedMcpOauthFlowStarted {
+                authorization_url,
+                correlation_id,
+                name: _,
+            } => {
+                // Open the authorization URL in a new browser tab
+                // and flip the editor form into "waiting for
+                // authorization" mode so the operator can't send
+                // another request. The final SharedMcpHostAdded
+                // (or Error) resolves the flow.
+                if let Some(settings) = self.settings_modal.as_mut()
+                    && let Some(sub) = settings.shared_mcp_editor.as_mut()
+                    && sub.pending_correlation.is_some()
+                    && sub.pending_correlation == correlation_id
+                {
+                    sub.oauth_in_flight = true;
+                }
+                open_in_new_tab(&authorization_url);
             }
             ServerToClient::SharedMcpHostAdded {
                 host,
@@ -5048,24 +5094,38 @@ impl ChatApp {
                 mode: SharedMcpEditorMode::Add,
                 name: String::new(),
                 url: String::new(),
+                auth_choice: SharedMcpAuthChoice::Anonymous,
                 bearer: String::new(),
-                auth_keep: false,
+                oauth_scope: String::new(),
                 auth_kind_on_load: SharedMcpAuthPublic::None,
                 error: None,
                 pending_correlation: None,
+                oauth_in_flight: false,
             });
         }
         if let Some(host) = shared_mcp_edit_request {
             modal.shared_mcp_banner = None;
+            // On Edit the initial choice mirrors what the host has:
+            // Bearer → staged Bearer with `keep existing` semantics;
+            // None → Anonymous; Oauth2 → also shown as Bearer so the
+            // user isn't offered "reopen the OAuth flow" here (Update
+            // doesn't support Oauth2Start anyway).
+            let auth_choice = match &host.auth {
+                SharedMcpAuthPublic::None => SharedMcpAuthChoice::Anonymous,
+                SharedMcpAuthPublic::Bearer => SharedMcpAuthChoice::Bearer,
+                SharedMcpAuthPublic::Oauth2 { .. } => SharedMcpAuthChoice::Bearer,
+            };
             modal.shared_mcp_editor = Some(SharedMcpEditorState {
                 mode: SharedMcpEditorMode::Edit,
                 name: host.name,
                 url: host.url,
+                auth_choice,
                 bearer: String::new(),
-                auth_keep: matches!(host.auth, SharedMcpAuthPublic::Bearer),
+                oauth_scope: String::new(),
                 auth_kind_on_load: host.auth,
                 error: None,
                 pending_correlation: None,
+                oauth_in_flight: false,
             });
         }
         if let Some(name) = shared_mcp_remove_request {
@@ -5388,33 +5448,96 @@ impl ChatApp {
                 });
                 ui.add_space(6.0);
 
-                // Auth section. Add: just a bearer field (blank = anonymous).
-                // Edit: offer "keep existing auth" when the entry had one.
-                if sub.mode == SharedMcpEditorMode::Edit
-                    && matches!(sub.auth_kind_on_load, SharedMcpAuthPublic::Bearer)
-                {
-                    ui.checkbox(&mut sub.auth_keep, "keep existing bearer token");
-                    ui.label(
-                        RichText::new(
-                            "Uncheck to replace or clear. A blank bearer field \
-                             with this unchecked clears auth entirely.",
-                        )
+                // Auth picker. Radio row — Anonymous / Bearer / OAuth.
+                // OAuth is Add-only; on Edit it's silently disabled.
+                ui.label(
+                    RichText::new("Authentication")
                         .small()
-                        .color(Color32::from_gray(150)),
-                    );
-                    ui.add_space(4.0);
-                }
-                let bearer_enabled = !sub.auth_keep || sub.mode == SharedMcpEditorMode::Add;
+                        .color(Color32::from_gray(170)),
+                );
                 ui.horizontal(|ui| {
-                    ui.label("bearer");
-                    ui.add_enabled(
-                        bearer_enabled,
-                        TextEdit::singleline(&mut sub.bearer)
-                            .password(true)
-                            .hint_text("optional; leave blank for anonymous")
-                            .desired_width(f32::INFINITY),
-                    );
+                    ui.radio_value(&mut sub.auth_choice, SharedMcpAuthChoice::Anonymous, "None");
+                    ui.radio_value(&mut sub.auth_choice, SharedMcpAuthChoice::Bearer, "Bearer");
+                    let oauth_enabled = sub.mode == SharedMcpEditorMode::Add && OAUTH_AVAILABLE;
+                    let resp = ui
+                        .add_enabled(
+                            oauth_enabled,
+                            egui::RadioButton::new(
+                                sub.auth_choice == SharedMcpAuthChoice::Oauth2,
+                                "OAuth",
+                            ),
+                        )
+                        .on_disabled_hover_text(if !OAUTH_AVAILABLE {
+                            "OAuth requires the browser webui"
+                        } else {
+                            "OAuth is only available when adding a host"
+                        });
+                    if oauth_enabled && resp.clicked() {
+                        sub.auth_choice = SharedMcpAuthChoice::Oauth2;
+                    }
                 });
+                ui.add_space(4.0);
+
+                match sub.auth_choice {
+                    SharedMcpAuthChoice::Anonymous => {
+                        if sub.mode == SharedMcpEditorMode::Edit
+                            && matches!(sub.auth_kind_on_load, SharedMcpAuthPublic::Bearer)
+                        {
+                            ui.label(
+                                RichText::new("Saving will clear the existing bearer token.")
+                                    .small()
+                                    .color(Color32::from_rgb(0xd0, 0xa0, 0x70)),
+                            );
+                        }
+                    }
+                    SharedMcpAuthChoice::Bearer => {
+                        let had_bearer =
+                            matches!(sub.auth_kind_on_load, SharedMcpAuthPublic::Bearer);
+                        ui.horizontal(|ui| {
+                            ui.label("bearer");
+                            ui.add(
+                                TextEdit::singleline(&mut sub.bearer)
+                                    .password(true)
+                                    .hint_text(if had_bearer {
+                                        "leave blank to keep existing"
+                                    } else {
+                                        "paste bearer token"
+                                    })
+                                    .desired_width(f32::INFINITY),
+                            );
+                        });
+                    }
+                    SharedMcpAuthChoice::Oauth2 => {
+                        ui.horizontal(|ui| {
+                            ui.label("scope");
+                            ui.add(
+                                TextEdit::singleline(&mut sub.oauth_scope)
+                                    .hint_text(
+                                        "optional; space-separated (defaults to AS metadata)",
+                                    )
+                                    .desired_width(f32::INFINITY),
+                            );
+                        });
+                        ui.label(
+                            RichText::new(
+                                "Saving opens the authorization server in a new \
+                                 tab. Grant consent there; this window stays open \
+                                 until the flow completes.",
+                            )
+                            .small()
+                            .color(Color32::from_gray(150)),
+                        );
+                    }
+                }
+
+                if sub.oauth_in_flight {
+                    ui.add_space(6.0);
+                    ui.colored_label(
+                        Color32::from_rgb(0x88, 0xbb, 0xd8),
+                        "Waiting for authorization… complete the flow in the \
+                         browser tab that opened.",
+                    );
+                }
 
                 if let Some(err) = &sub.error {
                     ui.add_space(6.0);
@@ -5423,9 +5546,17 @@ impl ChatApp {
                 ui.add_space(8.0);
                 ui.separator();
                 ui.horizontal(|ui| {
-                    let save_enabled =
-                        !saving && !sub.name.trim().is_empty() && !sub.url.trim().is_empty();
-                    let label = if saving { "Connecting…" } else { "Save" };
+                    let save_enabled = !saving
+                        && !sub.oauth_in_flight
+                        && !sub.name.trim().is_empty()
+                        && !sub.url.trim().is_empty();
+                    let label = if saving || sub.oauth_in_flight {
+                        "Waiting…"
+                    } else if sub.auth_choice == SharedMcpAuthChoice::Oauth2 {
+                        "Authorize"
+                    } else {
+                        "Save"
+                    };
                     if ui
                         .add_enabled(save_enabled, egui::Button::new(label))
                         .clicked()
@@ -5450,31 +5581,62 @@ impl ChatApp {
             sub.pending_correlation = Some(correlation.clone());
             sub.error = None;
             let bearer = sub.bearer.trim().to_string();
-            let msg = match sub.mode {
-                SharedMcpEditorMode::Add => {
-                    let auth = if bearer.is_empty() {
-                        SharedMcpAuthInput::None
-                    } else {
-                        SharedMcpAuthInput::Bearer { token: bearer }
-                    };
+            let scope = sub.oauth_scope.trim().to_string();
+            let msg = match (sub.mode, sub.auth_choice) {
+                (SharedMcpEditorMode::Add, SharedMcpAuthChoice::Oauth2) => {
+                    // Grab the origin the webui is served from so the
+                    // redirect_uri on the authorization URL matches
+                    // what the browser will actually reach our /oauth/callback
+                    // on.
+                    let redirect_base = webui_origin();
                     ClientToServer::AddSharedMcpHost {
                         correlation_id: Some(correlation),
                         name: sub.name.trim().to_string(),
                         url: sub.url.trim().to_string(),
-                        auth,
+                        auth: SharedMcpAuthInput::Oauth2Start {
+                            scope: if scope.is_empty() { None } else { Some(scope) },
+                            redirect_base,
+                        },
                     }
                 }
-                SharedMcpEditorMode::Edit => {
-                    // `auth_keep = true` means "don't touch auth" —
-                    // send None on the wire. Otherwise translate the
-                    // bearer field: blank = explicit clear, non-blank
-                    // = set bearer.
-                    let auth = if sub.auth_keep {
-                        None
-                    } else if bearer.is_empty() {
-                        Some(SharedMcpAuthInput::None)
-                    } else {
-                        Some(SharedMcpAuthInput::Bearer { token: bearer })
+                (SharedMcpEditorMode::Add, SharedMcpAuthChoice::Bearer) => {
+                    ClientToServer::AddSharedMcpHost {
+                        correlation_id: Some(correlation),
+                        name: sub.name.trim().to_string(),
+                        url: sub.url.trim().to_string(),
+                        auth: SharedMcpAuthInput::Bearer { token: bearer },
+                    }
+                }
+                (SharedMcpEditorMode::Add, SharedMcpAuthChoice::Anonymous) => {
+                    ClientToServer::AddSharedMcpHost {
+                        correlation_id: Some(correlation),
+                        name: sub.name.trim().to_string(),
+                        url: sub.url.trim().to_string(),
+                        auth: SharedMcpAuthInput::None,
+                    }
+                }
+                (SharedMcpEditorMode::Edit, choice) => {
+                    let auth = match choice {
+                        SharedMcpAuthChoice::Anonymous => Some(SharedMcpAuthInput::None),
+                        SharedMcpAuthChoice::Bearer => {
+                            // Blank bearer with existing bearer on file
+                            // = "keep existing" (send None to leave auth
+                            // untouched); blank + no existing = explicit
+                            // clear; non-blank = set bearer.
+                            let had_bearer =
+                                matches!(sub.auth_kind_on_load, SharedMcpAuthPublic::Bearer,);
+                            if bearer.is_empty() && had_bearer {
+                                None
+                            } else if bearer.is_empty() {
+                                Some(SharedMcpAuthInput::None)
+                            } else {
+                                Some(SharedMcpAuthInput::Bearer { token: bearer })
+                            }
+                        }
+                        // Oauth2 is disabled on Edit; this arm is
+                        // unreachable in practice but the match wants
+                        // exhaustiveness.
+                        SharedMcpAuthChoice::Oauth2 => None,
                     };
                     ClientToServer::UpdateSharedMcpHost {
                         correlation_id: Some(correlation),
@@ -6615,9 +6777,10 @@ fn render_shared_mcp_host_row(
                 .color(Color32::from_gray(170)),
         );
         ui.label(RichText::new("·").small().color(Color32::from_gray(120)));
-        let auth = match host.auth {
-            SharedMcpAuthPublic::None => "anonymous",
-            SharedMcpAuthPublic::Bearer => "bearer",
+        let auth = match &host.auth {
+            SharedMcpAuthPublic::None => "anonymous".to_string(),
+            SharedMcpAuthPublic::Bearer => "bearer".to_string(),
+            SharedMcpAuthPublic::Oauth2 { issuer, .. } => format!("oauth2 ({issuer})"),
         };
         ui.label(
             RichText::new(format!("auth: {auth}"))
@@ -6667,6 +6830,45 @@ fn render_shared_mcp_host_row(
         }
     });
 }
+
+/// The origin the webui is served from (e.g. `http://127.0.0.1:8080`).
+/// Used as the base for the OAuth redirect URI — we hand it to the
+/// server so it builds a redirect URL the browser will actually be
+/// able to reach. Only meaningful on the wasm32 (browser) target;
+/// desktop builds return an empty string and the UI gates the OAuth
+/// option off.
+#[cfg(target_arch = "wasm32")]
+fn webui_origin() -> String {
+    web_sys::window()
+        .and_then(|w| w.location().origin().ok())
+        .unwrap_or_default()
+}
+#[cfg(not(target_arch = "wasm32"))]
+fn webui_origin() -> String {
+    String::new()
+}
+
+/// Open `url` in a new browser tab. Used by the OAuth flow to hand
+/// the user off to the authorization server. No-op on desktop —
+/// native OAuth would route through the system browser via
+/// a crate like `webbrowser`, which we'll add when desktop needs it.
+#[cfg(target_arch = "wasm32")]
+fn open_in_new_tab(url: &str) {
+    if let Some(window) = web_sys::window() {
+        let _ = window.open_with_url_and_target(url, "_blank");
+    }
+}
+#[cfg(not(target_arch = "wasm32"))]
+fn open_in_new_tab(_url: &str) {}
+
+/// True when OAuth flows are actually usable — the webui is in a
+/// browser that can open a new tab + receive a redirect on the
+/// server's `/oauth/callback` route. False on desktop (no browser
+/// to drive the flow); the UI disables the OAuth radio option.
+#[cfg(target_arch = "wasm32")]
+const OAUTH_AVAILABLE: bool = true;
+#[cfg(not(target_arch = "wasm32"))]
+const OAUTH_AVAILABLE: bool = false;
 
 /// Persistent banner for a task that's entered the Failed state. Survives resnapshot
 /// because `failure` is captured from the snapshot itself rather than derived from

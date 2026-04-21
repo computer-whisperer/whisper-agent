@@ -107,3 +107,8 @@ base64 = "0.22"
 regex = { workspace = true }
 bitflags = { version = "2", features = ["serde"] }
 subtle = { workspace = true }
+# OAuth 2.1 + PKCE for shared-MCP-host authorization: `rand` mints
+# per-flow state + PKCE verifiers; `sha2` hashes the verifier into
+# the S256 code_challenge presented on the authorization URL.
+rand = "0.9"
+sha2 = "0.10"

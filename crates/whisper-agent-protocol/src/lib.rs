@@ -423,10 +423,9 @@ pub struct SharedMcpHostInfo {
 }
 
 /// Public view of a shared-MCP-host's authentication configuration —
-/// the bits a client is allowed to see. Tagged union keyed by `kind`
-/// so new auth methods land additively (Step 2 adds `oauth2` for
-/// third-party servers that require a user-driven authorization
-/// dance).
+/// the bits a client is allowed to see. Tagged union keyed by `kind`;
+/// new auth methods land additively (Oauth2 added for third-party
+/// servers that require a browser-driven authorization flow).
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum SharedMcpAuthPublic {
@@ -439,11 +438,23 @@ pub enum SharedMcpAuthPublic {
     /// tokens, long-lived PATs). The token is stored server-side; the
     /// client only learns that one is configured.
     Bearer,
+    /// OAuth 2.1 handshake completed. The catalog holds an access
+    /// token + refresh token; `issuer` and `scope` are the non-secret
+    /// pieces the UI shows so operators can tell OAuth backings apart.
+    Oauth2 {
+        issuer: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        scope: Option<String>,
+    },
 }
 
-/// Client-supplied auth payload for Add/Update. Mirrors
-/// `SharedMcpAuthPublic` but carries secrets — used only on the wire
-/// in the client→server direction and never echoed back.
+/// Client-supplied auth payload for Add/Update. Carries secrets in
+/// the `Bearer` variant and the request-shape for `Oauth2Start`; never
+/// echoed back. `Oauth2Start` begins a flow rather than completing
+/// one: the server replies with a `SharedMcpOauthFlowStarted` event
+/// carrying the URL the webui should open, and finishes the flow
+/// itself when the authorization server redirects to
+/// `/oauth/callback`.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum SharedMcpAuthInput {
@@ -451,6 +462,23 @@ pub enum SharedMcpAuthInput {
     None,
     Bearer {
         token: String,
+    },
+    /// Start an OAuth 2.1 authorization_code + PKCE flow. `scope` is
+    /// optional; omit to let the server ask the AS metadata what it
+    /// needs. Only valid on `AddSharedMcpHost` (OAuth hosts can't be
+    /// created as anonymous-then-upgraded via Update — the discovery
+    /// + DCR only makes sense up front).
+    Oauth2Start {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        scope: Option<String>,
+        /// Origin the webui is served from — e.g.
+        /// `http://127.0.0.1:8080`. The server uses this to build
+        /// the redirect URI (`<redirect_base>/oauth/callback`) that's
+        /// sent to the authorization server and embedded in the URL
+        /// the webui opens. Letting the webui dictate this keeps the
+        /// server correct across deployments (loopback-only, LAN,
+        /// reverse-proxied) without any infer-from-Host guesswork.
+        redirect_base: String,
     },
 }
 
@@ -1474,6 +1502,24 @@ pub enum ServerToClient {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         correlation_id: Option<String>,
         name: String,
+    },
+    /// Intermediate response to an `AddSharedMcpHost` with
+    /// `auth = Oauth2Start`. The server has discovered the AS
+    /// metadata, optionally DCR'd, and built the authorization URL.
+    /// The webui should open `authorization_url` in a new browser
+    /// window; the final outcome arrives later as
+    /// `SharedMcpHostAdded` (success) or `Error` (failure).
+    SharedMcpOauthFlowStarted {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        correlation_id: Option<String>,
+        /// Target name the host will be filed under on success. Echoed
+        /// so the webui can keep its pending-form state tied to the
+        /// right future completion.
+        name: String,
+        /// URL the webui opens in a new tab/window for the user to
+        /// authorize. Carries `state` so the callback can be matched
+        /// back to this in-flight flow.
+        authorization_url: String,
     },
     /// ACK for `UpdateCodexAuth`. The backend named `backend` has its
     /// in-memory auth state refreshed; subsequent requests will use the

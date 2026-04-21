@@ -4,6 +4,7 @@
 //! can render them from wire snapshots without a server round-trip per event.
 
 pub mod functions;
+pub mod mcp_oauth;
 pub mod permission;
 pub mod pod;
 pub mod providers;

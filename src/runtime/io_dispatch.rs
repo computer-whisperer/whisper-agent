@@ -122,6 +122,8 @@ pub(crate) enum SchedulerCompletion {
     Provision(ProvisionCompletion),
     Probe(ProbeCompletion),
     SharedMcp(SharedMcpCompletion),
+    OauthStart(OauthStartCompletion),
+    OauthComplete(OauthCompleteCompletion),
 }
 
 /// Which Add/Update operation the completion applies to. The
@@ -147,6 +149,270 @@ pub(crate) struct SharedMcpCompletion {
     pub(crate) auth: crate::tools::shared_mcp_catalog::SharedMcpAuth,
     pub(crate) op: SharedMcpOp,
     pub(crate) result: Result<(Arc<McpSession>, Vec<crate::tools::mcp::ToolDescriptor>), String>,
+}
+
+// ---------- OAuth flow completions ----------
+//
+// The shared-MCP OAuth flow has two off-thread phases: (1) discover
+// AS metadata + DCR + build the authorization URL (runs after the
+// Add handler), and (2) exchange the authorization code + connect
+// MCP with the new access token (runs after the /oauth/callback
+// axum handler feeds a SchedulerMsg::OauthCallback into the inbox).
+// Keeping each as its own completion type means the scheduler loop
+// dispatches by match arm, not by a flag on a shared struct.
+
+/// Result of the pre-authorization phase. On Ok, the scheduler
+/// stashes the pending flow (keyed by `state`) and pushes
+/// `SharedMcpOauthFlowStarted` to the caller; on Err, an `Error`.
+pub(crate) struct OauthStartCompletion {
+    pub(crate) conn_id: crate::runtime::scheduler::ConnId,
+    pub(crate) correlation_id: Option<String>,
+    pub(crate) name: String,
+    pub(crate) url: String,
+    pub(crate) redirect_uri: String,
+    pub(crate) scope: Option<String>,
+    pub(crate) result: Result<OauthStartData, String>,
+}
+
+/// Bundle of everything produced by the pre-authorization phase that
+/// the post-authorization phase will need. Moved into the pending-
+/// flow map by the scheduler.
+pub(crate) struct OauthStartData {
+    pub(crate) authorization_url: String,
+    pub(crate) state: String,
+    pub(crate) pkce_verifier: String,
+    pub(crate) issuer: String,
+    pub(crate) token_endpoint: String,
+    pub(crate) registration_endpoint: Option<String>,
+    pub(crate) client_id: String,
+    pub(crate) client_secret: Option<String>,
+    pub(crate) resource: String,
+}
+
+/// Result of the post-authorization phase: token exchange + MCP
+/// connect + tools/list. On Ok, the scheduler writes the catalog
+/// entry (OAuth2 variant) and inserts into the resource registry; on
+/// Err, surfaces the failure to the originating webui connection.
+pub(crate) struct OauthCompleteCompletion {
+    pub(crate) conn_id: crate::runtime::scheduler::ConnId,
+    pub(crate) correlation_id: Option<String>,
+    pub(crate) name: String,
+    pub(crate) url: String,
+    /// Echoed so the scheduler can build the `SharedMcpAuth::Oauth2`
+    /// entry without a second lookup into the pending-flow state
+    /// (which has already been removed by this point).
+    pub(crate) issuer: String,
+    pub(crate) token_endpoint: String,
+    pub(crate) registration_endpoint: Option<String>,
+    pub(crate) client_id: String,
+    pub(crate) client_secret: Option<String>,
+    pub(crate) resource: String,
+    pub(crate) scope: Option<String>,
+    pub(crate) result: Result<OauthCompleteData, String>,
+}
+
+pub(crate) struct OauthCompleteData {
+    pub(crate) session: Arc<McpSession>,
+    pub(crate) tools: Vec<crate::tools::mcp::ToolDescriptor>,
+    pub(crate) access_token: String,
+    pub(crate) refresh_token: Option<String>,
+    pub(crate) expires_at: Option<i64>,
+    pub(crate) scope_granted: Option<String>,
+}
+
+/// Discovery + DCR + authz URL build. Runs off-thread so a slow AS
+/// can't stall the scheduler loop. `redirect_base` comes from the
+/// webui (its own origin); we append `/oauth/callback`.
+pub(crate) fn build_oauth_start_future(
+    conn_id: crate::runtime::scheduler::ConnId,
+    correlation_id: Option<String>,
+    name: String,
+    url: String,
+    scope: Option<String>,
+    redirect_base: String,
+) -> SchedulerFuture {
+    let redirect_uri = format!("{}/oauth/callback", redirect_base.trim_end_matches('/'));
+    Box::pin(async move {
+        let http = match crate::mcp_oauth::http_client() {
+            Ok(c) => c,
+            Err(e) => {
+                return SchedulerCompletion::OauthStart(OauthStartCompletion {
+                    conn_id,
+                    correlation_id,
+                    name,
+                    url,
+                    redirect_uri,
+                    scope,
+                    result: Err(format!("init http client: {e}")),
+                });
+            }
+        };
+
+        let start = async {
+            let discovered = crate::mcp_oauth::discover(&http, &url)
+                .await
+                .map_err(|e| format!("discover `{name}` ({url}): {e}"))?;
+            let registration_endpoint =
+                discovered.registration_endpoint.clone().ok_or_else(|| {
+                    format!(
+                        "AS {} does not support dynamic client registration \
+                         (no registration_endpoint); pre-registered clients \
+                         aren't supported yet",
+                        discovered.issuer
+                    )
+                })?;
+            // Honour caller-supplied scope, fall back to the
+            // server-advertised list, or omit entirely.
+            let effective_scope = scope.clone().or_else(|| {
+                if discovered.scopes_supported.is_empty() {
+                    None
+                } else {
+                    Some(discovered.scopes_supported.join(" "))
+                }
+            });
+            let client = crate::mcp_oauth::dynamic_client_register(
+                &http,
+                &registration_endpoint,
+                &redirect_uri,
+                &format!("whisper-agent shared MCP: {name}"),
+                effective_scope.as_deref(),
+            )
+            .await
+            .map_err(|e| format!("DCR at {registration_endpoint}: {e}"))?;
+            let pkce = crate::mcp_oauth::pkce_pair();
+            let state = crate::mcp_oauth::random_state();
+            let authorization_url = crate::mcp_oauth::build_authorization_url(
+                &crate::mcp_oauth::AuthorizationUrlArgs {
+                    authorization_endpoint: &discovered.authorization_endpoint,
+                    client_id: &client.client_id,
+                    redirect_uri: &redirect_uri,
+                    state: &state,
+                    code_challenge: &pkce.challenge,
+                    scope: effective_scope.as_deref(),
+                    resource: &discovered.resource,
+                },
+            )
+            .map_err(|e| format!("build authz URL: {e}"))?;
+            Ok::<OauthStartData, String>(OauthStartData {
+                authorization_url,
+                state,
+                pkce_verifier: pkce.verifier,
+                issuer: discovered.issuer,
+                token_endpoint: discovered.token_endpoint,
+                registration_endpoint: Some(registration_endpoint),
+                client_id: client.client_id,
+                client_secret: client.client_secret,
+                resource: discovered.resource,
+            })
+        }
+        .await;
+
+        SchedulerCompletion::OauthStart(OauthStartCompletion {
+            conn_id,
+            correlation_id,
+            name,
+            url,
+            redirect_uri,
+            scope,
+            result: start,
+        })
+    })
+}
+
+/// Post-authorization phase: exchange the code at the token
+/// endpoint, open an MCP session with the fresh access token, run
+/// `tools/list`. The scheduler's pending-flow entry has been
+/// consumed into the arguments by now; this future can't look
+/// anything up, it just does the I/O.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn build_oauth_complete_future(
+    conn_id: crate::runtime::scheduler::ConnId,
+    correlation_id: Option<String>,
+    name: String,
+    url: String,
+    issuer: String,
+    token_endpoint: String,
+    registration_endpoint: Option<String>,
+    client_id: String,
+    client_secret: Option<String>,
+    resource: String,
+    scope: Option<String>,
+    code: String,
+    code_verifier: String,
+    redirect_uri: String,
+) -> SchedulerFuture {
+    Box::pin(async move {
+        let http = match crate::mcp_oauth::http_client() {
+            Ok(c) => c,
+            Err(e) => {
+                return SchedulerCompletion::OauthComplete(OauthCompleteCompletion {
+                    conn_id,
+                    correlation_id,
+                    name,
+                    url,
+                    issuer,
+                    token_endpoint,
+                    registration_endpoint,
+                    client_id,
+                    client_secret,
+                    resource,
+                    scope,
+                    result: Err(format!("init http client: {e}")),
+                });
+            }
+        };
+
+        let complete = async {
+            let token = crate::mcp_oauth::exchange_code(
+                &http,
+                &token_endpoint,
+                &code,
+                &redirect_uri,
+                &client_id,
+                client_secret.as_deref(),
+                &code_verifier,
+                &resource,
+            )
+            .await
+            .map_err(|e| format!("token exchange: {e}"))?;
+            let session = Arc::new(
+                McpSession::connect(&url, Some(token.access_token.clone()))
+                    .await
+                    .map_err(|e| format!("mcp connect with new access token: {e}"))?,
+            );
+            let tools = session
+                .list_tools()
+                .await
+                .map_err(|e| format!("tools/list: {e}"))?;
+            let expires_at = token
+                .expires_in
+                .map(|secs| chrono::Utc::now().timestamp() + secs);
+            Ok::<OauthCompleteData, String>(OauthCompleteData {
+                session,
+                tools,
+                access_token: token.access_token,
+                refresh_token: token.refresh_token,
+                expires_at,
+                scope_granted: token.scope,
+            })
+        }
+        .await;
+
+        SchedulerCompletion::OauthComplete(OauthCompleteCompletion {
+            conn_id,
+            correlation_id,
+            name,
+            url,
+            issuer,
+            token_endpoint,
+            registration_endpoint,
+            client_id,
+            client_secret,
+            resource,
+            scope,
+            result: complete,
+        })
+    })
 }
 
 /// Build a future that connects to a shared-MCP-host URL, runs

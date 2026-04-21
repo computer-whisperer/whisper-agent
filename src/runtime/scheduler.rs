@@ -148,6 +148,19 @@ pub enum SchedulerMsg {
         payload: serde_json::Value,
         reply: tokio::sync::oneshot::Sender<Result<(), TriggerFireError>>,
     },
+    /// OAuth redirect landed on the server's `/oauth/callback` route.
+    /// The axum handler extracts `code` + `state` from the query and
+    /// forwards here; the scheduler looks up the matching pending
+    /// flow, dispatches the token-exchange future, and eventually
+    /// replies to the originating webui connection with
+    /// `SharedMcpHostAdded` or `Error`. `error` is populated when
+    /// the AS redirected with `?error=...` instead of `?code=...`
+    /// (e.g. the user declined consent).
+    OauthCallback {
+        state: String,
+        code: Option<String>,
+        error: Option<String>,
+    },
 }
 
 /// Per-fire validation result surfaced back to whatever transport
@@ -207,6 +220,42 @@ pub struct BackendEntry {
 pub struct SharedHostOverlay {
     pub name: String,
     pub url: String,
+}
+
+/// In-flight OAuth 2.1 flow for a pending `AddSharedMcpHost`. Keyed
+/// in `Scheduler.pending_oauth_flows` by the random `state` parameter
+/// we embed in the authorization URL. `state` is what the AS echoes
+/// back to our `/oauth/callback`, letting us match a redirect to the
+/// webui connection that started the flow.
+///
+/// The struct holds everything the post-authorization phase (code →
+/// token exchange) needs, because by the time the callback fires,
+/// the webui connection may have gone away and we can't re-derive
+/// endpoints from it.
+#[derive(Debug, Clone)]
+pub(crate) struct PendingOauthFlow {
+    pub(crate) name: String,
+    pub(crate) url: String,
+    pub(crate) issuer: String,
+    pub(crate) token_endpoint: String,
+    pub(crate) registration_endpoint: Option<String>,
+    pub(crate) client_id: String,
+    pub(crate) client_secret: Option<String>,
+    pub(crate) resource: String,
+    pub(crate) scope: Option<String>,
+    pub(crate) pkce_verifier: String,
+    pub(crate) redirect_uri: String,
+    /// Connection that initiated the flow. Used to route the final
+    /// SharedMcpHostAdded / Error reply. If the connection has gone
+    /// away by the time the callback fires, the reply is dropped
+    /// silently — the catalog entry still lands.
+    pub(crate) conn_id: ConnId,
+    pub(crate) correlation_id: Option<String>,
+    /// Wall-clock deadline. Flows older than this are swept by
+    /// `sweep_expired_oauth_flows` on the GC tick so a user who
+    /// opened the authorization window and walked away doesn't leave
+    /// an indefinite memory residue.
+    pub(crate) expires_at: chrono::DateTime<chrono::Utc>,
 }
 
 /// How long a Ready resource can sit with zero users before the GC sweep
@@ -286,6 +335,14 @@ pub struct Scheduler {
     /// commands refuse overlay names (restart without the flag to
     /// unshadow the catalog entry).
     shared_mcp_overlay_names: std::collections::BTreeSet<String>,
+    /// In-flight OAuth 2.1 flows for `AddSharedMcpHost { auth: Oauth2Start }`,
+    /// keyed by the `state` parameter we embed in the authorization
+    /// URL. Populated when the pre-authorization phase (discovery +
+    /// DCR + URL build) completes; drained when the `/oauth/callback`
+    /// redirect arrives and dispatches the post-authorization phase
+    /// (code exchange + MCP connect). Swept for expiry on the GC
+    /// tick so walked-away users don't leak.
+    pending_oauth_flows: HashMap<String, PendingOauthFlow>,
 
     tasks: HashMap<String, Thread>,
     /// Owns the connection registry, subscription map, audit log, and the
@@ -427,6 +484,7 @@ impl Scheduler {
                 host_env_catalog,
                 shared_mcp_catalog,
                 shared_mcp_overlay_names: overlay_names,
+                pending_oauth_flows: HashMap::new(),
                 tasks: HashMap::new(),
                 router: ThreadEventRouter::new(audit, host_id),
                 resources,
@@ -1025,6 +1083,289 @@ impl Scheduler {
         self.shared_mcp_catalog.remove(name)?;
         self.resources.mcp_hosts.remove(&id);
         Ok(())
+    }
+
+    // ---------- OAuth 2.1 flow for third-party shared MCP hosts ----------
+
+    /// How long a pending OAuth flow can sit unaclaimed before the
+    /// GC sweep evicts it. 10 min is long enough for a user to open
+    /// the authorization URL, read the consent screen, and click
+    /// Allow; short enough that a walked-away user doesn't leak.
+    const OAUTH_FLOW_TTL_SECS: i64 = 600;
+
+    /// Kick off the pre-authorization phase of an
+    /// `AddSharedMcpHost { auth: Oauth2Start }`. The preconditions
+    /// (admin gate, name/url validity, no-collision) have already
+    /// been checked by the client-message handler; this method just
+    /// dispatches the discovery+DCR+authz-URL future.
+    // Wire-shape args (conn + correlation + name + url + scope +
+    // redirect + pending_io) all land here from the client-message
+    // handler; grouping into a struct is churn without clarity.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn start_shared_mcp_oauth(
+        &mut self,
+        conn_id: ConnId,
+        correlation_id: Option<String>,
+        name: String,
+        url: String,
+        scope: Option<String>,
+        redirect_base: String,
+        pending_io: &mut FuturesUnordered<SchedulerFuture>,
+    ) {
+        pending_io.push(crate::runtime::io_dispatch::build_oauth_start_future(
+            conn_id,
+            correlation_id,
+            name,
+            url,
+            scope,
+            redirect_base,
+        ));
+    }
+
+    /// Handle the pre-auth phase completion: either stash the
+    /// pending flow + tell the webui to open the authorization URL,
+    /// or surface the discovery/DCR failure.
+    pub(crate) fn apply_oauth_start_completion(
+        &mut self,
+        completion: crate::runtime::io_dispatch::OauthStartCompletion,
+    ) {
+        let crate::runtime::io_dispatch::OauthStartCompletion {
+            conn_id,
+            correlation_id,
+            name,
+            url,
+            redirect_uri,
+            scope,
+            result,
+        } = completion;
+        match result {
+            Ok(data) => {
+                let crate::runtime::io_dispatch::OauthStartData {
+                    authorization_url,
+                    state,
+                    pkce_verifier,
+                    issuer,
+                    token_endpoint,
+                    registration_endpoint,
+                    client_id,
+                    client_secret,
+                    resource,
+                } = data;
+                let expires_at =
+                    chrono::Utc::now() + chrono::Duration::seconds(Self::OAUTH_FLOW_TTL_SECS);
+                self.pending_oauth_flows.insert(
+                    state.clone(),
+                    PendingOauthFlow {
+                        name: name.clone(),
+                        url,
+                        issuer,
+                        token_endpoint,
+                        registration_endpoint,
+                        client_id,
+                        client_secret,
+                        resource,
+                        scope,
+                        pkce_verifier,
+                        redirect_uri,
+                        conn_id,
+                        correlation_id: correlation_id.clone(),
+                        expires_at,
+                    },
+                );
+                self.router.send_to_client(
+                    conn_id,
+                    ServerToClient::SharedMcpOauthFlowStarted {
+                        correlation_id,
+                        name,
+                        authorization_url,
+                    },
+                );
+            }
+            Err(message) => {
+                self.router.send_to_client(
+                    conn_id,
+                    ServerToClient::Error {
+                        correlation_id,
+                        thread_id: None,
+                        message: format!("add_shared_mcp_host (oauth2): {message}"),
+                    },
+                );
+            }
+        }
+    }
+
+    /// Called from the inbox when the `/oauth/callback` route hands
+    /// us a redirect. Looks up the pending flow by `state`; on miss,
+    /// logs + drops (the callback page was already served). On hit,
+    /// dispatches the token-exchange future. `error` is populated
+    /// when the AS reported e.g. `access_denied`.
+    pub(crate) fn apply_oauth_callback(
+        &mut self,
+        state: String,
+        code: Option<String>,
+        error: Option<String>,
+        pending_io: &mut FuturesUnordered<SchedulerFuture>,
+    ) {
+        let Some(flow) = self.pending_oauth_flows.remove(&state) else {
+            warn!(%state, "oauth callback for unknown or expired state; ignoring");
+            return;
+        };
+        if let Some(err) = error {
+            self.router.send_to_client(
+                flow.conn_id,
+                ServerToClient::Error {
+                    correlation_id: flow.correlation_id,
+                    thread_id: None,
+                    message: format!(
+                        "add_shared_mcp_host (oauth2): authorization server returned error: {err}"
+                    ),
+                },
+            );
+            return;
+        }
+        let Some(code) = code else {
+            self.router.send_to_client(
+                flow.conn_id,
+                ServerToClient::Error {
+                    correlation_id: flow.correlation_id,
+                    thread_id: None,
+                    message: "add_shared_mcp_host (oauth2): authorization server redirected without a code".into(),
+                },
+            );
+            return;
+        };
+        pending_io.push(crate::runtime::io_dispatch::build_oauth_complete_future(
+            flow.conn_id,
+            flow.correlation_id,
+            flow.name,
+            flow.url,
+            flow.issuer,
+            flow.token_endpoint,
+            flow.registration_endpoint,
+            flow.client_id,
+            flow.client_secret,
+            flow.resource,
+            flow.scope,
+            code,
+            flow.pkce_verifier,
+            flow.redirect_uri,
+        ));
+    }
+
+    /// Apply the post-authorization phase result: write the catalog
+    /// entry, insert the MCP session into the registry, send the
+    /// originating connection a `SharedMcpHostAdded` (or Error on
+    /// failure). Because the connection may have dropped between
+    /// flow start and callback, `send_to_client` is best-effort —
+    /// the catalog entry still lands.
+    pub(crate) fn apply_oauth_complete_completion(
+        &mut self,
+        completion: crate::runtime::io_dispatch::OauthCompleteCompletion,
+    ) {
+        let crate::runtime::io_dispatch::OauthCompleteCompletion {
+            conn_id,
+            correlation_id,
+            name,
+            url,
+            issuer,
+            token_endpoint,
+            registration_endpoint,
+            client_id,
+            client_secret,
+            resource,
+            scope,
+            result,
+        } = completion;
+        match result {
+            Ok(data) => {
+                let crate::runtime::io_dispatch::OauthCompleteData {
+                    session,
+                    tools,
+                    access_token,
+                    refresh_token,
+                    expires_at,
+                    scope_granted,
+                } = data;
+                // Granted scope wins over requested scope — the AS
+                // may have down-granted and we want to refresh with
+                // exactly what we have.
+                let effective_scope = scope_granted.or(scope);
+                let auth = crate::tools::shared_mcp_catalog::SharedMcpAuth::Oauth2(Box::new(
+                    crate::tools::shared_mcp_catalog::SharedMcpOauth2 {
+                        issuer,
+                        token_endpoint,
+                        registration_endpoint,
+                        client_id,
+                        client_secret,
+                        access_token,
+                        refresh_token,
+                        expires_at,
+                        scope: effective_scope,
+                        resource,
+                    },
+                ));
+                let now = chrono::Utc::now();
+                if let Err(e) = self.shared_mcp_catalog.insert(
+                    crate::tools::shared_mcp_catalog::new_manual_entry(
+                        name.clone(),
+                        url.clone(),
+                        auth,
+                        now,
+                    ),
+                ) {
+                    self.router.send_to_client(
+                        conn_id,
+                        ServerToClient::Error {
+                            correlation_id,
+                            thread_id: None,
+                            message: format!(
+                                "add_shared_mcp_host (oauth2): catalog write failed: {e}"
+                            ),
+                        },
+                    );
+                    return;
+                }
+                let id = self
+                    .resources
+                    .insert_shared_mcp_host(name.clone(), url, session);
+                let annotations: HashMap<String, ToolAnnotations> = tools
+                    .iter()
+                    .map(|t| (t.name.clone(), t.annotations.clone()))
+                    .collect();
+                self.resources.populate_mcp_tools(&id, tools, annotations);
+                let host = self.shared_mcp_host_info(&name).expect("just inserted");
+                self.router.send_to_client(
+                    conn_id,
+                    ServerToClient::SharedMcpHostAdded {
+                        correlation_id,
+                        host,
+                    },
+                );
+            }
+            Err(message) => {
+                self.router.send_to_client(
+                    conn_id,
+                    ServerToClient::Error {
+                        correlation_id,
+                        thread_id: None,
+                        message: format!("add_shared_mcp_host (oauth2): {message}"),
+                    },
+                );
+            }
+        }
+    }
+
+    /// Evict pending OAuth flows whose deadline has passed. Called
+    /// from the GC tick. Counts the eviction so operators can
+    /// correlate a missing callback to a TTL expiry.
+    pub(crate) fn sweep_expired_oauth_flows(&mut self) {
+        let now = chrono::Utc::now();
+        let before = self.pending_oauth_flows.len();
+        self.pending_oauth_flows.retain(|_, f| f.expires_at > now);
+        let evicted = before - self.pending_oauth_flows.len();
+        if evicted > 0 {
+            info!(evicted, "swept expired shared-mcp oauth flows");
+        }
     }
 
     /// Resolve a [`HostEnvBinding`] into the (provider, spec) pair the
@@ -1873,6 +2214,9 @@ impl Scheduler {
                 // (client disconnect / timeout). The fire already happened
                 // if it was going to; nothing to clean up.
                 let _ = reply.send(result);
+            }
+            SchedulerMsg::OauthCallback { state, code, error } => {
+                self.apply_oauth_callback(state, code, error, pending_io);
             }
         }
     }
@@ -3032,6 +3376,7 @@ impl Scheduler {
     /// teardown futures and broadcasts `ResourceUpdated` /
     /// `ResourceDestroyed` events for every change.
     fn gc_tick(&mut self) {
+        self.sweep_expired_oauth_flows();
         let plan = self.resources.reap_idle(
             chrono::Utc::now(),
             chrono::Duration::seconds(IDLE_RESOURCE_SECS),
@@ -3274,6 +3619,12 @@ pub async fn run(
                         }
                         SchedulerCompletion::SharedMcp(done) => {
                             scheduler.apply_shared_mcp_completion(done);
+                        }
+                        SchedulerCompletion::OauthStart(done) => {
+                            scheduler.apply_oauth_start_completion(done);
+                        }
+                        SchedulerCompletion::OauthComplete(done) => {
+                            scheduler.apply_oauth_complete_completion(done);
                         }
                     }
                 }

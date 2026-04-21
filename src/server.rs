@@ -28,12 +28,12 @@ use axum::{
     Router,
     body::Bytes,
     extract::{
-        ConnectInfo, Path, State,
+        ConnectInfo, Path, Query, State,
         ws::{Message, WebSocket, WebSocketUpgrade},
     },
     http::{HeaderMap, StatusCode, header},
     middleware,
-    response::{IntoResponse, Response},
+    response::{Html, IntoResponse, Response},
     routing::{get, post},
 };
 
@@ -302,6 +302,7 @@ pub async fn serve(listen: SocketAddr, config: ServerConfig) -> anyhow::Result<(
             "/triggers/{pod_id}/{behavior_id}",
             post(webhook_trigger_handler),
         )
+        .route("/oauth/callback", get(oauth_callback_handler))
         .route(
             "/pkg/{*path}",
             get(|Path(p): Path<String>| async move { serve_embedded::<WebuiPkg>(&p) }),
@@ -369,6 +370,68 @@ pub async fn serve(listen: SocketAddr, config: ServerConfig) -> anyhow::Result<(
     let _ = scheduler_handle.await;
     serve_result?;
     Ok(())
+}
+
+/// Query params on `GET /oauth/callback`. The authorization server
+/// redirects the user's browser here after consent; we forward the
+/// `state` + `code` (or `error`) to the scheduler via the inbox and
+/// serve a static page telling the user they can close the tab. The
+/// final success/failure lands on the webui WS connection that
+/// started the flow.
+#[derive(serde::Deserialize, Debug)]
+struct OauthCallbackQuery {
+    #[serde(default)]
+    code: Option<String>,
+    #[serde(default)]
+    state: Option<String>,
+    #[serde(default)]
+    error: Option<String>,
+    #[serde(default)]
+    error_description: Option<String>,
+}
+
+/// `GET /oauth/callback` — unauthenticated; lives after
+/// `route_layer(require_auth)` so the OAuth provider's browser
+/// redirect doesn't need to carry our bearer. The `state` parameter
+/// (CSRF-bound + minted server-side) is our identity check.
+async fn oauth_callback_handler(
+    State(state): State<AppState>,
+    Query(q): Query<OauthCallbackQuery>,
+) -> impl IntoResponse {
+    let Some(state_param) = q.state else {
+        return (StatusCode::BAD_REQUEST, "missing `state` query parameter").into_response();
+    };
+    // Combine `error` + `error_description` into a single readable
+    // string so the scheduler's reply to the webui surfaces both.
+    let combined_error = match (q.error.as_deref(), q.error_description.as_deref()) {
+        (Some(e), Some(d)) => Some(format!("{e}: {d}")),
+        (Some(e), None) => Some(e.to_string()),
+        (None, Some(d)) => Some(d.to_string()),
+        (None, None) => None,
+    };
+    let msg = SchedulerMsg::OauthCallback {
+        state: state_param,
+        code: q.code,
+        error: combined_error,
+    };
+    if state.inbox.send(msg).is_err() {
+        return (StatusCode::SERVICE_UNAVAILABLE, "scheduler inbox closed").into_response();
+    }
+    // Minimal "you can close this tab" page. We don't try to
+    // auto-close — many browsers block script-driven close on tabs
+    // the script didn't open — so a manual close with a clear
+    // explanation is the least-surprising UX.
+    Html(
+        r#"<!doctype html>
+<html>
+  <head><meta charset="utf-8"><title>Authorization complete</title></head>
+  <body style="font-family: system-ui, sans-serif; max-width: 32rem; margin: 3rem auto; line-height: 1.5;">
+    <h1>Authorization complete</h1>
+    <p>You can close this tab and return to whisper-agent.</p>
+  </body>
+</html>"#,
+    )
+    .into_response()
 }
 
 async fn ws_handler(

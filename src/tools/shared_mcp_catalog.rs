@@ -44,9 +44,12 @@ pub fn default_path_for_pods_root(pods_root: &Path) -> PathBuf {
 }
 
 /// Auth configuration for a catalog entry. Tagged union keyed by
-/// `kind` so Step 2 can add an `oauth2` variant without rewriting
-/// existing rows. `None` is the default and emits nothing on the
-/// wire — an entry with no `[host.auth]` table parses as anonymous.
+/// `kind`. `None` is the default and emits nothing on the wire — an
+/// entry with no `[host.auth]` table parses as anonymous. The
+/// Oauth2 payload is boxed so the enum stays small in entries that
+/// don't use it — most shared hosts are anonymous or static-bearer,
+/// and paying 230+ bytes per variant for an unused payload is
+/// gratuitous.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum SharedMcpAuth {
@@ -55,6 +58,63 @@ pub enum SharedMcpAuth {
     /// Static bearer presented as `Authorization: Bearer <token>`.
     /// Suitable for Slack-style bot tokens and long-lived PATs.
     Bearer { token: String },
+    /// OAuth 2.1 with PKCE. All the state needed to both present the
+    /// current access token and refresh it when it expires lives in
+    /// the boxed payload so the server can keep a long-lived MCP
+    /// session without the webui (or any user) being connected.
+    /// Added at the end of a successful authorization_code flow;
+    /// mutated in place when a refresh rotates tokens.
+    Oauth2(Box<SharedMcpOauth2>),
+}
+
+/// Payload for `SharedMcpAuth::Oauth2`. Split into its own struct so
+/// the enum variant is a single pointer-sized tag and a single
+/// heap allocation, matching the clippy `large_enum_variant` lint.
+/// `#[serde(flatten)]` on the variant keeps the wire / on-disk
+/// representation unchanged from a hypothetical inline-field layout —
+/// TOML serializers see the same `[host.auth]` table shape either way.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SharedMcpOauth2 {
+    /// Authorization server issuer URL (the `issuer` field from its
+    /// metadata). Identifies the AS across refreshes and lets
+    /// operators tell two OAuth backings apart.
+    pub issuer: String,
+    /// Token endpoint — used for refresh. Cached from AS metadata
+    /// discovery so we don't re-probe on every refresh.
+    pub token_endpoint: String,
+    /// Registration endpoint from AS metadata, if advertised. Present
+    /// when the AS supports RFC 7591 DCR; absent when we
+    /// pre-configured the client_id. Not used after the initial flow
+    /// but kept for operator inspection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub registration_endpoint: Option<String>,
+    /// Client credentials obtained via DCR (or pre-registered).
+    /// `client_secret` is `None` for public (non-confidential)
+    /// clients; present for confidential clients.
+    pub client_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_secret: Option<String>,
+    /// Current access token — presented as
+    /// `Authorization: Bearer <access_token>`. Rotates on refresh.
+    pub access_token: String,
+    /// Refresh token, if the AS issued one. Without this we can't
+    /// renew the access token and the entry effectively expires at
+    /// `expires_at`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refresh_token: Option<String>,
+    /// Seconds-since-epoch expiry of `access_token`. `None` when the
+    /// AS didn't return `expires_in`; the refresh path treats the
+    /// token as valid until a 401 proves otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<i64>,
+    /// Scope granted (space-separated, as on the wire). Kept for
+    /// display and so re-auth requests the same surface.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<String>,
+    /// Resource indicator per RFC 8707 — always the MCP server URL.
+    /// Stored so refreshes re-present it; servers that enforce
+    /// resource-bound tokens require it on every token request.
+    pub resource: String,
 }
 
 impl SharedMcpAuth {
@@ -62,10 +122,13 @@ impl SharedMcpAuth {
         matches!(self, SharedMcpAuth::None)
     }
 
-    /// Bearer token to attach on MCP requests, if any.
+    /// Bearer token to attach on MCP requests, if any. For Oauth2
+    /// entries this is the current `access_token`; refresh happens
+    /// elsewhere and rewrites the field in place.
     pub fn bearer(&self) -> Option<&str> {
         match self {
             SharedMcpAuth::Bearer { token } => Some(token.as_str()),
+            SharedMcpAuth::Oauth2(o) => Some(o.access_token.as_str()),
             SharedMcpAuth::None => None,
         }
     }
@@ -76,6 +139,10 @@ impl SharedMcpAuth {
         match self {
             SharedMcpAuth::None => SharedMcpAuthPublic::None,
             SharedMcpAuth::Bearer { .. } => SharedMcpAuthPublic::Bearer,
+            SharedMcpAuth::Oauth2(o) => SharedMcpAuthPublic::Oauth2 {
+                issuer: o.issuer.clone(),
+                scope: o.scope.clone(),
+            },
         }
     }
 }
