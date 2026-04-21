@@ -128,6 +128,20 @@ sealed class ServerToClient {
         val podId: String,
     ) : ServerToClient()
 
+    // --- Model-catalog responses ---------------------------------------------
+
+    data class BackendsList(
+        val correlationId: String? = null,
+        val defaultBackend: String,
+        val backends: List<BackendSummary>,
+    ) : ServerToClient()
+
+    data class ModelsList(
+        val correlationId: String? = null,
+        val backend: String,
+        val models: List<ModelSummary>,
+    ) : ServerToClient()
+
     // --- Errors ---------------------------------------------------------------
 
     data class Error(

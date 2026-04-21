@@ -280,6 +280,94 @@ class CodecTest {
         assertEquals(original, decoded)
     }
 
+    // --- Backend / model catalog ---------------------------------------------
+
+    @Test
+    fun clientToServer_listBackends_bare() {
+        val bytes = Codec.encodeToServer(ClientToServer.ListBackends())
+        // map(1) { "type": "list_backends" }
+        assertEquals(0xA1.toByte(), bytes[0])
+        val decoded = cbor.decodeFromByteArray(ClientToServer.serializer(), bytes)
+        assertEquals(ClientToServer.ListBackends(), decoded)
+    }
+
+    @Test
+    fun clientToServer_listModels_roundTrip() {
+        val original = ClientToServer.ListModels(backend = "anthropic", correlationId = "m-1")
+        val bytes = Codec.encodeToServer(original)
+        val decoded = cbor.decodeFromByteArray(ClientToServer.serializer(), bytes)
+        assertEquals(original, decoded)
+    }
+
+    @Test
+    fun clientToServer_createThread_withOverrides_roundTrip() {
+        val original = ClientToServer.CreateThread(
+            initialMessage = "hello",
+            correlationId = "create-1",
+            podId = "default",
+            configOverride = ThreadConfigOverride(model = "claude-opus-4-7"),
+            bindingsRequest = ThreadBindingsRequest(backend = "anthropic"),
+        )
+        val bytes = Codec.encodeToServer(original)
+        val decoded = cbor.decodeFromByteArray(ClientToServer.serializer(), bytes)
+        assertEquals(original, decoded)
+    }
+
+    @Test
+    fun clientToServer_createThread_noOverrides_omitsFields() {
+        // Serde's skip_serializing_if must round-trip as "fields absent" —
+        // our Kotlin nulls should not emit keys on the wire.
+        val original = ClientToServer.CreateThread(
+            initialMessage = "bare",
+            podId = null,
+        )
+        val bytes = Codec.encodeToServer(original)
+        // Expect a map with exactly 2 entries: "type" and "initial_message".
+        assertEquals(0xA2.toByte(), bytes[0])
+        val decoded = cbor.decodeFromByteArray(ClientToServer.serializer(), bytes)
+        assertEquals(original, decoded)
+    }
+
+    @Test
+    fun serverToClient_backendsList_roundTrip() {
+        val original = ServerToClient.BackendsList(
+            correlationId = "b-1",
+            defaultBackend = "anthropic",
+            backends = listOf(
+                BackendSummary(
+                    name = "anthropic",
+                    kind = "anthropic",
+                    defaultModel = "claude-opus-4-7",
+                    authMode = "api_key",
+                ),
+                BackendSummary(
+                    name = "local-llama",
+                    kind = "openai_chat",
+                    defaultModel = null,
+                    authMode = null,
+                ),
+            ),
+        )
+        val bytes = cbor.encodeToByteArray(ServerToClient.serializer(), original)
+        val decoded = Codec.decodeFromServer(bytes)
+        assertEquals(original, decoded)
+    }
+
+    @Test
+    fun serverToClient_modelsList_roundTrip() {
+        val original = ServerToClient.ModelsList(
+            correlationId = "m-1",
+            backend = "anthropic",
+            models = listOf(
+                ModelSummary(id = "claude-opus-4-7", displayName = "Claude Opus 4.7"),
+                ModelSummary(id = "claude-sonnet-4-6"),
+            ),
+        )
+        val bytes = cbor.encodeToByteArray(ServerToClient.serializer(), original)
+        val decoded = Codec.decodeFromServer(bytes)
+        assertEquals(original, decoded)
+    }
+
     // --- Smoke check on the old-broken shape ----------------------------------
 
     @Test

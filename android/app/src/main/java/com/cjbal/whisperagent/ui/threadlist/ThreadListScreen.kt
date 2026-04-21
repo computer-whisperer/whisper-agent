@@ -21,6 +21,8 @@ import androidx.compose.material3.Button
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.ExposedDropdownMenuBox
+import androidx.compose.material3.ExposedDropdownMenuDefaults
 import androidx.compose.material3.FloatingActionButton
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
@@ -45,6 +47,8 @@ import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.cjbal.whisperagent.net.AppSession
 import com.cjbal.whisperagent.net.ConnectionState
+import com.cjbal.whisperagent.protocol.BackendSummary
+import com.cjbal.whisperagent.protocol.ModelSummary
 import com.cjbal.whisperagent.protocol.PodSummary
 import com.cjbal.whisperagent.protocol.ThreadSummary
 import kotlinx.coroutines.launch
@@ -61,6 +65,9 @@ fun ThreadListScreen(
     val pods by session.pods.collectAsStateWithLifecycle()
     val selectedPodId by session.selectedPodId.collectAsStateWithLifecycle()
     val defaultPodId by session.defaultPodId.collectAsStateWithLifecycle()
+    val backends by session.backends.collectAsStateWithLifecycle()
+    val defaultBackend by session.defaultBackend.collectAsStateWithLifecycle()
+    val modelsByBackend by session.modelsByBackend.collectAsStateWithLifecycle()
 
     var showCompose by remember { mutableStateOf(false) }
 
@@ -113,9 +120,13 @@ fun ThreadListScreen(
     if (showCompose) {
         NewThreadSheet(
             targetPod = selectedPod,
+            backends = backends,
+            defaultBackend = defaultBackend,
+            modelsByBackend = modelsByBackend,
+            onFetchModels = session::fetchModels,
             onDismiss = { showCompose = false },
-            onCreate = { text ->
-                session.createThread(text)
+            onCreate = { text, backendOverride, modelOverride ->
+                session.createThread(text, backendOverride, modelOverride)
                 showCompose = false
             },
         )
@@ -241,12 +252,20 @@ private fun ThreadRow(summary: ThreadSummary, onClick: () -> Unit) {
 @Composable
 private fun NewThreadSheet(
     targetPod: PodSummary?,
+    backends: List<BackendSummary>,
+    defaultBackend: String,
+    modelsByBackend: Map<String, List<ModelSummary>>,
+    onFetchModels: (String) -> Unit,
     onDismiss: () -> Unit,
-    onCreate: (String) -> Unit,
+    onCreate: (text: String, backendOverride: String?, modelOverride: String?) -> Unit,
 ) {
     val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
     val scope = rememberCoroutineScope()
     var text by remember { mutableStateOf("") }
+    // `null` means "pod default" on both axes. Changing backend resets model
+    // because the model catalog is backend-specific.
+    var backendChoice by remember { mutableStateOf<String?>(null) }
+    var modelChoice by remember { mutableStateOf<String?>(null) }
 
     // Collapse the sheet with animation before notifying the parent, so the
     // sheet closes smoothly instead of snapping shut from underneath the FAB.
@@ -286,13 +305,34 @@ private fun NewThreadSheet(
                     .fillMaxWidth()
                     .heightIn(min = 160.dp),
             )
+            BackendDropdown(
+                backends = backends,
+                defaultBackend = defaultBackend,
+                selected = backendChoice,
+                onPick = {
+                    backendChoice = it
+                    // Model catalog depends on backend; reset to "Pod default"
+                    // so we never send a model that the new backend doesn't
+                    // know about.
+                    modelChoice = null
+                },
+            )
+            ModelDropdown(
+                backend = backendChoice,
+                models = backendChoice?.let { modelsByBackend[it] },
+                selected = modelChoice,
+                onOpen = { backendChoice?.let(onFetchModels) },
+                onPick = { modelChoice = it },
+            )
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.End,
             ) {
                 TextButton(onClick = { hide(onDismiss) }) { Text("Cancel") }
                 Button(
-                    onClick = { hide { onCreate(text.trim()) } },
+                    onClick = {
+                        hide { onCreate(text.trim(), backendChoice, modelChoice) }
+                    },
                     enabled = text.isNotBlank(),
                     modifier = Modifier.padding(start = 8.dp),
                 ) { Text("Create") }
@@ -300,3 +340,164 @@ private fun NewThreadSheet(
         }
     }
 }
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun BackendDropdown(
+    backends: List<BackendSummary>,
+    defaultBackend: String,
+    selected: String?,
+    onPick: (String?) -> Unit,
+) {
+    var expanded by remember { mutableStateOf(false) }
+    // "Pod default" is the authoritative phrasing even though we also know
+    // the server's global default — the pod's thread_defaults may pick a
+    // different backend, and we don't have that resolved here.
+    val display = selected ?: "Pod default"
+    ExposedDropdownMenuBox(
+        expanded = expanded,
+        onExpandedChange = { expanded = !expanded },
+    ) {
+        OutlinedTextField(
+            readOnly = true,
+            value = display,
+            onValueChange = {},
+            label = { Text("Backend") },
+            trailingIcon = { ExposedDropdownMenuDefaults.TrailingIcon(expanded = expanded) },
+            modifier = Modifier
+                .menuAnchor()
+                .fillMaxWidth(),
+        )
+        DropdownMenu(
+            expanded = expanded,
+            onDismissRequest = { expanded = false },
+            modifier = Modifier.fillMaxWidth(0.9f),
+        ) {
+            DropdownMenuItem(
+                text = { Text("Pod default") },
+                onClick = {
+                    onPick(null)
+                    expanded = false
+                },
+            )
+            backends.forEach { b ->
+                DropdownMenuItem(
+                    text = {
+                        Column {
+                            val isDefault = b.name == defaultBackend
+                            Text(
+                                if (isDefault) "${b.name} (server default)" else b.name,
+                            )
+                            val sub = buildList {
+                                add(b.kind)
+                                b.defaultModel?.let { add("default: $it") }
+                            }.joinToString(" · ")
+                            Text(
+                                sub,
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                        }
+                    },
+                    onClick = {
+                        onPick(b.name)
+                        expanded = false
+                    },
+                )
+            }
+        }
+    }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun ModelDropdown(
+    backend: String?,
+    models: List<ModelSummary>?,
+    selected: String?,
+    onOpen: () -> Unit,
+    onPick: (String?) -> Unit,
+) {
+    var expanded by remember { mutableStateOf(false) }
+    // With no pinned backend, the server picks both. The dropdown is
+    // visible but disabled so the user understands why they can't choose
+    // a specific model.
+    val enabled = backend != null
+    val display = when {
+        selected != null -> selected
+        backend == null -> "Inherits from backend"
+        else -> "Backend default"
+    }
+    ExposedDropdownMenuBox(
+        expanded = expanded && enabled,
+        onExpandedChange = {
+            if (!enabled) return@ExposedDropdownMenuBox
+            val next = !expanded
+            expanded = next
+            if (next) onOpen()
+        },
+    ) {
+        OutlinedTextField(
+            readOnly = true,
+            enabled = enabled,
+            value = display,
+            onValueChange = {},
+            label = { Text("Model") },
+            trailingIcon = { ExposedDropdownMenuDefaults.TrailingIcon(expanded = expanded && enabled) },
+            modifier = Modifier
+                .menuAnchor()
+                .fillMaxWidth(),
+        )
+        DropdownMenu(
+            expanded = expanded && enabled,
+            onDismissRequest = { expanded = false },
+            modifier = Modifier.fillMaxWidth(0.9f),
+        ) {
+            DropdownMenuItem(
+                text = { Text("Backend default") },
+                onClick = {
+                    onPick(null)
+                    expanded = false
+                },
+            )
+            when {
+                models == null -> DropdownMenuItem(
+                    text = { Text("Loading…", color = MaterialTheme.colorScheme.onSurfaceVariant) },
+                    enabled = false,
+                    onClick = {},
+                )
+                models.isEmpty() -> DropdownMenuItem(
+                    text = {
+                        Text(
+                            "No models reported — backend default only.",
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    },
+                    enabled = false,
+                    onClick = {},
+                )
+                else -> models.forEach { m ->
+                    DropdownMenuItem(
+                        text = {
+                            Column {
+                                Text(m.displayName?.takeIf { it.isNotBlank() } ?: m.id)
+                                if (!m.displayName.isNullOrBlank() && m.displayName != m.id) {
+                                    Text(
+                                        m.id,
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    )
+                                }
+                            }
+                        },
+                        onClick = {
+                            onPick(m.id)
+                            expanded = false
+                        },
+                    )
+                }
+            }
+        }
+    }
+}
+

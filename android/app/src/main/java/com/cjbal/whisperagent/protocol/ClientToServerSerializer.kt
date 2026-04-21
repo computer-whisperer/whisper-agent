@@ -41,6 +41,9 @@ object ClientToServerSerializer : KSerializer<ClientToServer> {
     private const val IDX_REMEMBER = 6
     private const val IDX_POD_ID = 7
     private const val IDX_INITIAL_MESSAGE = 8
+    private const val IDX_CONFIG_OVERRIDE = 9
+    private const val IDX_BINDINGS_REQUEST = 10
+    private const val IDX_BACKEND = 11
 
     override val descriptor: SerialDescriptor = buildClassSerialDescriptor("ClientToServer") {
         element("type", String.serializer().descriptor)
@@ -52,6 +55,9 @@ object ClientToServerSerializer : KSerializer<ClientToServer> {
         element("remember", Boolean.serializer().descriptor, isOptional = true)
         element("pod_id", String.serializer().descriptor, isOptional = true)
         element("initial_message", String.serializer().descriptor, isOptional = true)
+        element("config_override", ThreadConfigOverride.serializer().descriptor, isOptional = true)
+        element("bindings_request", ThreadBindingsRequest.serializer().descriptor, isOptional = true)
+        element("backend", String.serializer().descriptor, isOptional = true)
     }
 
     override fun serialize(encoder: Encoder, value: ClientToServer) {
@@ -74,6 +80,18 @@ object ClientToServerSerializer : KSerializer<ClientToServer> {
                         encodeStringElement(descriptor, IDX_POD_ID, it)
                     }
                     encodeStringElement(descriptor, IDX_INITIAL_MESSAGE, value.initialMessage)
+                    value.configOverride?.let {
+                        encodeSerializableElement(
+                            descriptor, IDX_CONFIG_OVERRIDE,
+                            ThreadConfigOverride.serializer(), it,
+                        )
+                    }
+                    value.bindingsRequest?.let {
+                        encodeSerializableElement(
+                            descriptor, IDX_BINDINGS_REQUEST,
+                            ThreadBindingsRequest.serializer(), it,
+                        )
+                    }
                 }
                 is ClientToServer.SubscribeToThread -> {
                     encodeStringElement(descriptor, IDX_TYPE, "subscribe_to_thread")
@@ -107,6 +125,19 @@ object ClientToServerSerializer : KSerializer<ClientToServer> {
                         encodeStringElement(descriptor, IDX_CORRELATION_ID, it)
                     }
                 }
+                is ClientToServer.ListBackends -> {
+                    encodeStringElement(descriptor, IDX_TYPE, "list_backends")
+                    value.correlationId?.let {
+                        encodeStringElement(descriptor, IDX_CORRELATION_ID, it)
+                    }
+                }
+                is ClientToServer.ListModels -> {
+                    encodeStringElement(descriptor, IDX_TYPE, "list_models")
+                    value.correlationId?.let {
+                        encodeStringElement(descriptor, IDX_CORRELATION_ID, it)
+                    }
+                    encodeStringElement(descriptor, IDX_BACKEND, value.backend)
+                }
             }
         }
     }
@@ -124,6 +155,9 @@ object ClientToServerSerializer : KSerializer<ClientToServer> {
             var remember = false
             var podId: String? = null
             var initialMessage: String? = null
+            var configOverride: ThreadConfigOverride? = null
+            var bindingsRequest: ThreadBindingsRequest? = null
+            var backend: String? = null
 
             loop@ while (true) {
                 when (val i = decodeElementIndex(descriptor)) {
@@ -139,6 +173,13 @@ object ClientToServerSerializer : KSerializer<ClientToServer> {
                     IDX_REMEMBER -> remember = decodeBooleanElement(descriptor, i)
                     IDX_POD_ID -> podId = decodeStringElement(descriptor, i)
                     IDX_INITIAL_MESSAGE -> initialMessage = decodeStringElement(descriptor, i)
+                    IDX_CONFIG_OVERRIDE -> configOverride = decodeSerializableElement(
+                        descriptor, i, ThreadConfigOverride.serializer(),
+                    )
+                    IDX_BINDINGS_REQUEST -> bindingsRequest = decodeSerializableElement(
+                        descriptor, i, ThreadBindingsRequest.serializer(),
+                    )
+                    IDX_BACKEND -> backend = decodeStringElement(descriptor, i)
                     else -> throw SerializationException("unexpected element index $i")
                 }
             }
@@ -149,6 +190,8 @@ object ClientToServerSerializer : KSerializer<ClientToServer> {
                     initialMessage = requireNotNull(initialMessage) { "missing initial_message" },
                     correlationId = correlationId,
                     podId = podId,
+                    configOverride = configOverride,
+                    bindingsRequest = bindingsRequest,
                 )
                 "subscribe_to_thread" -> ClientToServer.SubscribeToThread(
                     requireNotNull(threadId) { "missing thread_id" },
@@ -167,6 +210,11 @@ object ClientToServerSerializer : KSerializer<ClientToServer> {
                     remember = remember,
                 )
                 "list_pods" -> ClientToServer.ListPods(correlationId)
+                "list_backends" -> ClientToServer.ListBackends(correlationId)
+                "list_models" -> ClientToServer.ListModels(
+                    backend = requireNotNull(backend) { "missing backend" },
+                    correlationId = correlationId,
+                )
                 null -> throw SerializationException("missing 'type' discriminator")
                 else -> throw SerializationException("unknown ClientToServer variant: $type")
             }

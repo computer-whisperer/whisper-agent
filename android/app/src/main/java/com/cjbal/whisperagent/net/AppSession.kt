@@ -3,12 +3,16 @@ package com.cjbal.whisperagent.net
 import android.util.Log
 import com.cjbal.whisperagent.auth.ServerConfig
 import com.cjbal.whisperagent.auth.SettingsRepository
+import com.cjbal.whisperagent.protocol.BackendSummary
 import com.cjbal.whisperagent.protocol.ClientToServer
 import com.cjbal.whisperagent.protocol.ContentBlock
 import com.cjbal.whisperagent.protocol.Message
+import com.cjbal.whisperagent.protocol.ModelSummary
 import com.cjbal.whisperagent.protocol.PodSummary
 import com.cjbal.whisperagent.protocol.Role
 import com.cjbal.whisperagent.protocol.ServerToClient
+import com.cjbal.whisperagent.protocol.ThreadBindingsRequest
+import com.cjbal.whisperagent.protocol.ThreadConfigOverride
 import com.cjbal.whisperagent.protocol.ThreadSnapshot
 import com.cjbal.whisperagent.protocol.ThreadSummary
 import kotlinx.coroutines.CoroutineScope
@@ -71,6 +75,23 @@ class AppSession(
      */
     private var preferredPodId: String? = settings.lastPodId()
 
+    private val _backends = MutableStateFlow<List<BackendSummary>>(emptyList())
+    val backends: StateFlow<List<BackendSummary>> = _backends.asStateFlow()
+
+    /** Server-advertised default backend. Empty until a [BackendsList] arrives. */
+    private val _defaultBackend = MutableStateFlow("")
+    val defaultBackend: StateFlow<String> = _defaultBackend.asStateFlow()
+
+    /**
+     * Model catalog by backend name. Populated lazily — the server round-trips
+     * to the backend for each [ClientToServer.ListModels] request, so we only
+     * ask for backends the UI is about to show.
+     */
+    private val _modelsByBackend = MutableStateFlow<Map<String, List<ModelSummary>>>(emptyMap())
+    val modelsByBackend: StateFlow<Map<String, List<ModelSummary>>> = _modelsByBackend.asStateFlow()
+
+    private val modelsInFlight = mutableSetOf<String>()
+
     /**
      * One-shot signal used by the UI to navigate to a freshly-created
      * thread. Emits the new thread id when the matching `ThreadCreated`
@@ -129,11 +150,18 @@ class AppSession(
 
     /**
      * Ask the server to spawn a new thread in the currently-selected pod
-     * (or the default pod if no selection yet). The matching `ThreadCreated`
-     * event will fire [pendingNavigation] with the new thread id so the UI
-     * can switch to it.
+     * (or the default pod if no selection yet). [backendOverride] and
+     * [modelOverride] each default to `null`, meaning "inherit from the pod's
+     * `thread_defaults`"; setting either builds the matching
+     * [ThreadBindingsRequest] / [ThreadConfigOverride] for the wire. The
+     * matching `ThreadCreated` event will fire [pendingNavigation] with the
+     * new thread id so the UI can switch to it.
      */
-    fun createThread(initialMessage: String) {
+    fun createThread(
+        initialMessage: String,
+        backendOverride: String? = null,
+        modelOverride: String? = null,
+    ) {
         if (initialMessage.isBlank()) return
         val correlation = "create-${correlationCounter.incrementAndGet()}"
         pendingCreateCorrelation = correlation
@@ -141,13 +169,32 @@ class AppSession(
         // implicitly by sending pod_id = null when we haven't received a
         // PodList yet.
         val targetPodId = _selectedPodId.value?.takeIf { it.isNotBlank() }
+        val bindings = backendOverride?.takeIf { it.isNotBlank() }
+            ?.let { ThreadBindingsRequest(backend = it) }
+        val config = modelOverride?.takeIf { it.isNotBlank() }
+            ?.let { ThreadConfigOverride(model = it) }
         wire.send(
             ClientToServer.CreateThread(
                 initialMessage = initialMessage,
                 correlationId = correlation,
                 podId = targetPodId,
+                configOverride = config,
+                bindingsRequest = bindings,
             ),
         )
+    }
+
+    /**
+     * Ask the server for the model list advertised by [backend]. Responses
+     * arrive as [ServerToClient.ModelsList] and populate [modelsByBackend].
+     * No-op if a request is already in flight for the same backend or if
+     * we already have a cached list.
+     */
+    fun fetchModels(backend: String) {
+        if (backend.isBlank()) return
+        if (_modelsByBackend.value.containsKey(backend)) return
+        if (!modelsInFlight.add(backend)) return
+        wire.send(ClientToServer.ListModels(backend = backend))
     }
 
     /**
@@ -178,6 +225,7 @@ class AppSession(
                     if (s is ConnectionState.Connected) {
                         wire.send(ClientToServer.ListThreads())
                         wire.send(ClientToServer.ListPods())
+                        wire.send(ClientToServer.ListBackends())
                         // Re-subscribe the screen the user was last on.
                         subscribedThreadId?.let {
                             wire.send(ClientToServer.SubscribeToThread(it))
@@ -185,6 +233,11 @@ class AppSession(
                     }
                     if (s is ConnectionState.Disconnected) {
                         _activeSnapshot.value = null
+                        // Drop cached model lists — they're tied to the server
+                        // we just disconnected from; next connection will refetch
+                        // on demand.
+                        _modelsByBackend.value = emptyMap()
+                        modelsInFlight.clear()
                     }
                 }
             }
@@ -246,6 +299,14 @@ class AppSession(
                 if (_selectedPodId.value == event.podId) {
                     _selectedPodId.value = resolveFocusPodId()
                 }
+            }
+            is ServerToClient.BackendsList -> {
+                _backends.value = event.backends
+                _defaultBackend.value = event.defaultBackend
+            }
+            is ServerToClient.ModelsList -> {
+                modelsInFlight.remove(event.backend)
+                _modelsByBackend.update { it + (event.backend to event.models) }
             }
             is ServerToClient.Snapshot -> {
                 if (event.threadId == subscribedThreadId) {

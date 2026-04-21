@@ -23,8 +23,8 @@ sealed class ClientToServer {
         val initialMessage: String,
         val correlationId: String? = null,
         val podId: String? = null,
-        // config_override and bindings_request are deferred — server falls
-        // back to the pod's `thread_defaults` when both are absent.
+        val configOverride: ThreadConfigOverride? = null,
+        val bindingsRequest: ThreadBindingsRequest? = null,
     ) : ClientToServer()
 
     data class SubscribeToThread(
@@ -48,6 +48,15 @@ sealed class ClientToServer {
     ) : ClientToServer()
 
     data class ListPods(
+        val correlationId: String? = null,
+    ) : ClientToServer()
+
+    data class ListBackends(
+        val correlationId: String? = null,
+    ) : ClientToServer()
+
+    data class ListModels(
+        val backend: String,
         val correlationId: String? = null,
     ) : ClientToServer()
 }

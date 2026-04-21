@@ -50,9 +50,15 @@ object ServerToClientSerializer : KSerializer<ServerToClient> {
     private const val IDX_DEFAULT_POD_ID = 24
     private const val IDX_POD = 25
     private const val IDX_POD_ID = 26
+    private const val IDX_BACKENDS = 27
+    private const val IDX_DEFAULT_BACKEND = 28
+    private const val IDX_MODELS = 29
+    private const val IDX_BACKEND = 30
 
     private val tasksSerializer = ListSerializer(ThreadSummary.serializer())
     private val podsSerializer = ListSerializer(PodSummary.serializer())
+    private val backendsSerializer = ListSerializer(BackendSummary.serializer())
+    private val modelsSerializer = ListSerializer(ModelSummary.serializer())
 
     override val descriptor: SerialDescriptor = buildClassSerialDescriptor("ServerToClient") {
         element("type", String.serializer().descriptor)
@@ -82,6 +88,10 @@ object ServerToClientSerializer : KSerializer<ServerToClient> {
         element("default_pod_id", String.serializer().descriptor, isOptional = true)
         element("pod", PodSummary.serializer().descriptor, isOptional = true)
         element("pod_id", String.serializer().descriptor, isOptional = true)
+        element("backends", backendsSerializer.descriptor, isOptional = true)
+        element("default_backend", String.serializer().descriptor, isOptional = true)
+        element("models", modelsSerializer.descriptor, isOptional = true)
+        element("backend", String.serializer().descriptor, isOptional = true)
     }
 
     override fun serialize(encoder: Encoder, value: ServerToClient) {
@@ -222,6 +232,26 @@ object ServerToClientSerializer : KSerializer<ServerToClient> {
                     encodeStringElement(descriptor, IDX_TYPE, "pod_archived")
                     encodeStringElement(descriptor, IDX_POD_ID, value.podId)
                 }
+                is ServerToClient.BackendsList -> {
+                    encodeStringElement(descriptor, IDX_TYPE, "backends_list")
+                    value.correlationId?.let {
+                        encodeStringElement(descriptor, IDX_CORRELATION_ID, it)
+                    }
+                    encodeStringElement(descriptor, IDX_DEFAULT_BACKEND, value.defaultBackend)
+                    encodeSerializableElement(
+                        descriptor, IDX_BACKENDS, backendsSerializer, value.backends,
+                    )
+                }
+                is ServerToClient.ModelsList -> {
+                    encodeStringElement(descriptor, IDX_TYPE, "models_list")
+                    value.correlationId?.let {
+                        encodeStringElement(descriptor, IDX_CORRELATION_ID, it)
+                    }
+                    encodeStringElement(descriptor, IDX_BACKEND, value.backend)
+                    encodeSerializableElement(
+                        descriptor, IDX_MODELS, modelsSerializer, value.models,
+                    )
+                }
                 is ServerToClient.Error -> {
                     encodeStringElement(descriptor, IDX_TYPE, "error")
                     value.correlationId?.let {
@@ -267,6 +297,10 @@ object ServerToClientSerializer : KSerializer<ServerToClient> {
             var defaultPodId: String? = null
             var pod: PodSummary? = null
             var podId: String? = null
+            var backends: List<BackendSummary>? = null
+            var defaultBackend: String? = null
+            var models: List<ModelSummary>? = null
+            var backend: String? = null
 
             loop@ while (true) {
                 when (val i = decodeElementIndex(descriptor)) {
@@ -310,6 +344,14 @@ object ServerToClientSerializer : KSerializer<ServerToClient> {
                         descriptor, i, PodSummary.serializer(),
                     )
                     IDX_POD_ID -> podId = decodeStringElement(descriptor, i)
+                    IDX_BACKENDS -> backends = decodeSerializableElement(
+                        descriptor, i, backendsSerializer,
+                    )
+                    IDX_DEFAULT_BACKEND -> defaultBackend = decodeStringElement(descriptor, i)
+                    IDX_MODELS -> models = decodeSerializableElement(
+                        descriptor, i, modelsSerializer,
+                    )
+                    IDX_BACKEND -> backend = decodeStringElement(descriptor, i)
                     else -> throw SerializationException("unexpected element index $i")
                 }
             }
@@ -400,6 +442,16 @@ object ServerToClientSerializer : KSerializer<ServerToClient> {
                 )
                 "pod_archived" -> ServerToClient.PodArchived(
                     podId = requireNotNull(podId) { "missing pod_id" },
+                )
+                "backends_list" -> ServerToClient.BackendsList(
+                    correlationId = correlationId,
+                    defaultBackend = defaultBackend ?: "",
+                    backends = backends ?: emptyList(),
+                )
+                "models_list" -> ServerToClient.ModelsList(
+                    correlationId = correlationId,
+                    backend = requireNotNull(backend) { "missing backend" },
+                    models = models ?: emptyList(),
                 )
                 "error" -> ServerToClient.Error(
                     correlationId = correlationId,
