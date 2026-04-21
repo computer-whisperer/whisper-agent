@@ -1123,7 +1123,7 @@ impl Scheduler {
         let text = match found {
             Some(t) => {
                 let status = if t.requires_escalation {
-                    "available via escalation"
+                    "askable via sudo"
                 } else {
                     "admitted"
                 };
@@ -1220,11 +1220,7 @@ impl Scheduler {
             pattern = args.pattern
         ));
         for t in page {
-            let tag = if t.requires_escalation {
-                " [escalation]"
-            } else {
-                ""
-            };
+            let tag = if t.requires_escalation { " [sudo]" } else { "" };
             out.push_str(&format!(
                 "- `{name}` [{cat}]{tag} — {desc}\n",
                 name = t.name,

@@ -58,7 +58,8 @@ impl ToolCategory {
 
 /// One tool the thread could reach — either it's currently admitted
 /// by scope, or the pod ceiling admits it and it's askable via
-/// `request_escalation` AddTool.
+/// `sudo` (user-approved one-off invocation, optionally with
+/// "remember" to admit the name for the rest of the thread).
 ///
 /// Carries the full schema so `describe_tool` and the core-tools
 /// filter can operate off a single walk. `find_tool` and the listing
@@ -73,8 +74,8 @@ pub struct AdmissibleTool {
     pub annotations: ToolAnnotations,
     pub category: ToolCategory,
     /// `true` when scope denies but the pod ceiling admits — the
-    /// model can request admission via `request_escalation`'s
-    /// AddTool variant. `false` when the tool is already in scope.
+    /// model can invoke the tool via `sudo` (with user approval).
+    /// `false` when the tool is already in scope.
     pub requires_escalation: bool,
 }
 
@@ -83,7 +84,8 @@ pub struct AdmissibleTool {
 pub enum ToolAdmission {
     /// Scope admits — model can call directly.
     Admitted,
-    /// Scope denies but ceiling admits — model can widen via escalation.
+    /// Scope denies but ceiling admits — model can invoke via `sudo`
+    /// with user approval.
     Askable,
     /// Ceiling denies — truly out of reach. Should not appear in any
     /// listing or find result.
@@ -112,8 +114,8 @@ pub fn classify_admission(
 /// Render the system-prompt listing appended at thread seed.
 ///
 /// - `AllNames` → every admitted-or-askable tool, grouped by source,
-///   with an "available via escalation" trailer when any tool is
-///   askable AND the thread has an interactive channel.
+///   with an "available via sudo" trailer when any tool is askable
+///   AND the thread has an interactive approver.
 /// - `CoreOnly` → counts per group + a short summary of core tools.
 /// - `None` → empty string.
 ///
@@ -213,10 +215,13 @@ fn render_all_names(tools: &[AdmissibleTool], escalation_available: bool) -> Str
     }
 
     if escalation_available && !askable.is_empty() {
-        out.push_str("### Available via escalation\n");
+        out.push_str("### Available via sudo\n");
         out.push_str(
             "These tools are within the pod's allow-ceiling but not currently in your scope. \
-             Request them with `request_escalation` (variant `add_tool`) when you need one.\n",
+             Call `sudo` with `tool_name` set to one of them when you need to run it — the \
+             user decides approve-once / approve-remember / reject. Pick `approve_remember` \
+             if you expect to call the same tool repeatedly; once remembered, future direct \
+             calls skip the prompt.\n",
         );
         for (label, entries) in group_by_category(&askable) {
             out.push_str(&format!("\n#### {}\n", group_header(&label)));
@@ -472,7 +477,7 @@ mod tests {
     }
 
     #[test]
-    fn listing_all_names_includes_escalation_section_when_available() {
+    fn listing_all_names_includes_sudo_section_when_available() {
         let tools = vec![
             tool("pod_read_file", "read", ToolCategory::Builtin, false),
             tool(
@@ -485,12 +490,12 @@ mod tests {
             ),
         ];
         let out = render_listing(&tools, InitialListing::AllNames, true, &[]);
-        assert!(out.contains("Available via escalation"));
+        assert!(out.contains("Available via sudo"));
         assert!(out.contains("`rustdev_bash`"));
     }
 
     #[test]
-    fn listing_all_names_omits_escalation_section_when_channel_closed() {
+    fn listing_all_names_omits_sudo_section_when_channel_closed() {
         let tools = vec![tool(
             "rustdev_bash",
             "shell",
@@ -500,7 +505,7 @@ mod tests {
             true,
         )];
         let out = render_listing(&tools, InitialListing::AllNames, false, &[]);
-        assert!(!out.contains("Available via escalation"));
+        assert!(!out.contains("Available via sudo"));
         // Askable tools aren't listed at all on autonomous threads —
         // there's nowhere to ask.
         assert!(!out.contains("rustdev_bash"));

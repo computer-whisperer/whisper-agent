@@ -25,12 +25,13 @@ pub(super) fn descriptor() -> McpTool {
         name: FIND_TOOL.into(),
         description: "Search the tool catalog by regex over name+description. \
                       Returns name, one-line description, category, and whether \
-                      the tool requires escalation — schemas are NOT included \
-                      (call `describe_tool` for those). \
-                      Optional `category` narrows to one coarse bucket \
-                      (`builtin`, `host_env`, `shared_mcp`). \
-                      `include_escalation` (default true) includes tools \
-                      in the pod ceiling but not your current scope. \
+                      the tool requires `sudo` to invoke (askable rather than \
+                      admitted) — schemas are NOT included (call `describe_tool` \
+                      for those). Optional `category` narrows to one coarse \
+                      bucket (`builtin`, `host_env`, `shared_mcp`). \
+                      `include_escalation` (default true) includes askable tools \
+                      — those within the pod ceiling but outside your current \
+                      scope, reachable via `sudo` with user approval. \
                       `limit` defaults to 50; use `offset` to page."
             .into(),
         input_schema: json!({

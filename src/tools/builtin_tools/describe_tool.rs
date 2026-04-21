@@ -10,8 +10,8 @@
 //!
 //! Scope semantics: we admit a tool for `describe_tool` if the thread
 //! has it in-scope OR if the pod ceiling admits it. Askable tools are
-//! described so the model can decide whether requesting an escalation
-//! is worth it; truly out-of-reach tools return a deny error.
+//! described so the model knows the schema before wrapping the call
+//! in `sudo`; truly out-of-reach tools return a deny error.
 
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -27,8 +27,9 @@ pub(super) fn descriptor() -> McpTool {
                       message. The result is the input-schema the tool expects, \
                       plus its annotations — ready to call directly. Works for \
                       tools currently in your scope AND for tools available via \
-                      escalation (the schema is readable either way; calling \
-                      requires `request_escalation` first for the latter)."
+                      `sudo` (the schema is readable either way; calling askable \
+                      tools requires wrapping the invocation in `sudo` for user \
+                      approval)."
             .into(),
         input_schema: json!({
             "type": "object",
