@@ -1,6 +1,5 @@
 package com.cjbal.whisperagent.protocol
 
-import android.util.Log
 import kotlinx.serialization.KSerializer
 import kotlinx.serialization.SerializationException
 import kotlinx.serialization.builtins.serializer
@@ -20,8 +19,6 @@ import kotlinx.serialization.encoding.encodeStructure
  * noted in [ContentBlock]).
  */
 object ContentBlockSerializer : KSerializer<ContentBlock> {
-
-    private const val TAG = "ContentBlockSerde"
 
     private const val IDX_TYPE = 0
     private const val IDX_TEXT = 1
@@ -106,21 +103,19 @@ object ContentBlockSerializer : KSerializer<ContentBlock> {
 
             when (type) {
                 "text" -> ContentBlock.Text(requireNotNull(text) { "missing text" })
-                    .also { Log.d(TAG, "decoded Text(len=${it.text.length})") }
                 "tool_use" -> ContentBlock.ToolUse(
                     id = requireNotNull(id) { "missing id" },
                     name = requireNotNull(name) { "missing name" },
-                ).also { Log.d(TAG, "decoded ToolUse(id=${it.id}, name=${it.name})") }
+                )
                 "tool_result" -> ContentBlock.ToolResult(
                     toolUseId = requireNotNull(toolUseId) { "missing tool_use_id" },
                     isError = isError,
-                ).also { Log.d(TAG, "decoded ToolResult(tool_use_id=${it.toolUseId}, is_error=${it.isError})") }
+                )
                 "thinking" -> ContentBlock.Thinking(requireNotNull(thinking) { "missing thinking" })
-                    .also { Log.d(TAG, "decoded Thinking(len=${it.thinking.length})") }
                 "tool_schema" -> ContentBlock.ToolSchema(
                     name = requireNotNull(name) { "missing name" },
                     description = requireNotNull(description) { "missing description" },
-                ).also { Log.d(TAG, "decoded ToolSchema(name=${it.name})") }
+                )
                 null -> throw SerializationException(
                     "ContentBlock missing 'type' discriminator — saw: " +
                         "text=${text?.take(32)}, id=$id, name=$name, toolUseId=$toolUseId, " +

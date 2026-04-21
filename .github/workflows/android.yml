@@ -42,5 +42,5 @@ jobs:
           cache-read-only: ${{ github.ref != 'refs/heads/main' && github.ref != 'refs/heads/android-client' }}
           build-root-directory: android
 
-      - name: assembleDebug
-        run: ./gradlew assembleDebug --no-daemon --stacktrace
+      - name: assembleDebug + unit tests
+        run: ./gradlew assembleDebug testDebugUnitTest --no-daemon --stacktrace

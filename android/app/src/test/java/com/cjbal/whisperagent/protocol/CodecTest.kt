@@ -104,10 +104,12 @@ class CodecTest {
     fun serverToClient_unknown_variantFallback() {
         // Simulate a server frame with a type our Kotlin mirror doesn't know —
         // construct it by hand as a CBOR map { "type": "host_env_provider_added" }.
+        // 0x77 = text(23), matching "host_env_provider_added" (CBOR packs
+        // lengths 0..23 directly into the major-type byte).
         val rawCbor = byteArrayOf(
             0xA1.toByte(), // map(1)
             0x64, 't'.code.toByte(), 'y'.code.toByte(), 'p'.code.toByte(), 'e'.code.toByte(),
-            0x78, 0x19, // text(25)
+            0x77,
             'h'.code.toByte(), 'o'.code.toByte(), 's'.code.toByte(), 't'.code.toByte(),
             '_'.code.toByte(),
             'e'.code.toByte(), 'n'.code.toByte(), 'v'.code.toByte(),
