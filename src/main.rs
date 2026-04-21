@@ -11,10 +11,11 @@ use whisper_agent_protocol::sandbox::{HostEnvSpec, NetworkPolicy, PathAccess};
 
 use whisper_agent::pod::config::Config;
 use whisper_agent::providers::anthropic::AnthropicClient;
-use whisper_agent::runtime::scheduler::{BackendEntry, SharedHostConfig};
+use whisper_agent::runtime::scheduler::{BackendEntry, SharedHostOverlay};
 use whisper_agent::server::{self, ServerConfig};
 use whisper_agent::tools::host_env_catalog::{self, CatalogStore, new_seeded_entry};
 use whisper_agent::tools::sandbox::{self, HostEnvRegistry};
+use whisper_agent::tools::shared_mcp_catalog;
 
 // Seed for a fresh default pod's `system_prompt.md`. A neutral
 // general-assistant baseline — domain-specific pods should clone the
@@ -343,7 +344,7 @@ async fn run_serve(args: ServeArgs) -> Result<()> {
         backends,
         default_backend,
         default_model,
-        mut shared_host_map,
+        shared_host_map,
         toml_provider_entries,
         auth_clients,
         auth_admins,
@@ -408,18 +409,26 @@ async fn run_serve(args: ServeArgs) -> Result<()> {
             )
         }
     };
-    for (name, url) in args.shared_mcp_hosts {
-        shared_host_map.insert(name, url);
-    }
-    let mut shared_mcp_hosts: Vec<SharedHostConfig> = shared_host_map
+    // `shared_host_map` starts life as the `[shared_mcp_hosts]` TOML
+    // table. These entries seed the durable catalog as anonymous
+    // (no bearer) `Seeded` rows on first boot; CLI
+    // `--shared-mcp-host` flags are kept separate as runtime overlays.
+    let toml_shared_hosts = shared_host_map.clone();
+    let mut cli_overlays: Vec<SharedHostOverlay> = args
+        .shared_mcp_hosts
         .into_iter()
-        .map(|(name, url)| SharedHostConfig { name, url })
+        .map(|(name, url)| SharedHostOverlay { name, url })
         .collect();
-    // Stable order so log output and the default_task_config list don't
-    // depend on HashMap iteration order.
-    shared_mcp_hosts.sort_by(|a, b| a.name.cmp(&b.name));
-    let default_shared_host_names: Vec<String> =
-        shared_mcp_hosts.iter().map(|h| h.name.clone()).collect();
+    cli_overlays.sort_by(|a, b| a.name.cmp(&b.name));
+    // Default-pod `[allow].mcp_hosts` still wants every name a thread
+    // might bind to; union catalog-seed names + CLI overlays.
+    let mut default_shared_host_names: Vec<String> = toml_shared_hosts
+        .keys()
+        .cloned()
+        .chain(cli_overlays.iter().map(|o| o.name.clone()))
+        .collect();
+    default_shared_host_names.sort();
+    default_shared_host_names.dedup();
 
     let cli_token_files: HashMap<String, PathBuf> =
         args.host_env_provider_tokens.iter().cloned().collect();
@@ -495,6 +504,27 @@ async fn run_serve(args: ServeArgs) -> Result<()> {
         }
     }
 
+    // Load (or initialize) the shared-MCP-host catalog and seed it
+    // with `[shared_mcp_hosts]` TOML entries (name → url, no auth).
+    // Same pattern as the host-env catalog: catalog is authority,
+    // TOML entries are insert-if-missing so runtime edits stick.
+    let shared_mcp_path = pods_root
+        .as_deref()
+        .map(shared_mcp_catalog::default_path_for_pods_root)
+        .unwrap_or_else(|| PathBuf::from(shared_mcp_catalog::CATALOG_FILENAME));
+    let mut shared_mcp_catalog_store = shared_mcp_catalog::CatalogStore::load(shared_mcp_path)
+        .context("load shared-mcp catalog")?;
+    for (name, url) in &toml_shared_hosts {
+        let inserted =
+            shared_mcp_catalog_store.insert_if_missing(shared_mcp_catalog::new_seeded_entry(
+                name.clone(),
+                url.clone(),
+                shared_mcp_catalog::SharedMcpAuth::None,
+                now,
+            ))?;
+        shared_mcp_catalog::log_seed_result(name, inserted);
+    }
+
     let default_host_env = build_default_host_env(
         &args.default_host_env_provider,
         &args.default_host_env_workspace,
@@ -541,7 +571,8 @@ async fn run_serve(args: ServeArgs) -> Result<()> {
         pods_root,
         host_env_registry,
         host_env_catalog: catalog,
-        shared_mcp_hosts,
+        shared_mcp_catalog: shared_mcp_catalog_store,
+        shared_mcp_overlays: cli_overlays,
         tls,
         auth_clients,
         auth_admins,

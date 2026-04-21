@@ -409,6 +409,41 @@ impl ResourceRegistry {
         id
     }
 
+    /// Register a shared MCP host as Errored — used when a startup
+    /// connect fails but the catalog still knows about the entry.
+    /// Surfaces the connect error on `ListSharedMcpHosts` so the
+    /// operator doesn't have to dig in server logs to learn why the
+    /// entry shows as disconnected.
+    pub fn insert_shared_mcp_host_errored(
+        &mut self,
+        name: String,
+        url: String,
+        message: String,
+    ) -> McpHostId {
+        let id = McpHostId::shared(&name);
+        let now = Utc::now();
+        self.mcp_hosts.insert(
+            id.clone(),
+            McpHostEntry {
+                id: id.clone(),
+                spec: McpHostSpec {
+                    url,
+                    label: name,
+                    per_task: false,
+                },
+                state: ResourceState::Errored { message },
+                session: None,
+                tools: Vec::new(),
+                annotations: HashMap::new(),
+                users: BTreeSet::new(),
+                pinned: true,
+                created_at: now,
+                last_used: now,
+            },
+        );
+        id
+    }
+
     /// Eagerly register the MCP host belonging to a host env, as
     /// `Provisioning`. One-to-one with the [`HostEnvId`] — distinct
     /// host envs get distinct MCP hosts, while a second thread sharing

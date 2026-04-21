@@ -53,7 +53,7 @@ use crate::pod::persist::Persister;
 use crate::pod::{Pod, PodId};
 use crate::runtime::audit::AuditLog;
 use crate::runtime::scheduler::{
-    BackendEntry, ConnId, Scheduler, SchedulerMsg, SharedHostConfig, TriggerFireError,
+    BackendEntry, ConnId, Scheduler, SchedulerMsg, SharedHostOverlay, TriggerFireError,
     build_default_pod_config,
 };
 
@@ -125,9 +125,13 @@ pub struct ServerConfig {
     /// prior state starts with an empty store sitting at
     /// `<pods_root>/../host_env_providers.toml`.
     pub host_env_catalog: crate::tools::host_env_catalog::CatalogStore,
-    /// Catalog of shared (singleton) MCP hosts the scheduler connects to at
-    /// startup. Pods opt in by name via `[allow].mcp_hosts`.
-    pub shared_mcp_hosts: Vec<SharedHostConfig>,
+    /// Durable catalog of shared MCP hosts. Add/Update/Remove wire
+    /// commands mutate this on the scheduler thread.
+    pub shared_mcp_catalog: crate::tools::shared_mcp_catalog::CatalogStore,
+    /// CLI `--shared-mcp-host name=url` entries the server run was
+    /// launched with. These are anonymous, non-persistent, and
+    /// shadowed by any catalog entry with the same name.
+    pub shared_mcp_overlays: Vec<SharedHostOverlay>,
     /// When set, the server speaks HTTPS instead of plain HTTP on the
     /// listen address. The cert and key are PEM-encoded files; cert
     /// chains with intermediates are supported.
@@ -209,7 +213,8 @@ pub async fn serve(listen: SocketAddr, config: ServerConfig) -> anyhow::Result<(
         audit,
         config.host_env_registry,
         config.host_env_catalog,
-        config.shared_mcp_hosts,
+        config.shared_mcp_catalog,
+        config.shared_mcp_overlays,
     )
     .await
     .context("scheduler init")?;

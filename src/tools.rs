@@ -6,9 +6,12 @@
 //! jails that MCP hosts and other subprocesses run inside.
 //! [`host_env_catalog`] is the durable store sandbox provider entries
 //! persist into across restarts.
+//! [`shared_mcp_catalog`] is the sibling durable store for shared
+//! MCP hosts (third-party endpoints with their own auth).
 
 pub mod builtin_tools;
 pub mod host_env_catalog;
 pub mod mcp;
 pub mod pod_about_docs;
 pub mod sandbox;
+pub mod shared_mcp_catalog;

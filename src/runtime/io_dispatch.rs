@@ -121,6 +121,72 @@ pub(crate) enum SchedulerCompletion {
     Io(IoCompletion),
     Provision(ProvisionCompletion),
     Probe(ProbeCompletion),
+    SharedMcp(SharedMcpCompletion),
+}
+
+/// Which Add/Update operation the completion applies to. The
+/// scheduler uses this to decide the reply event and whether the
+/// catalog write is an `insert` or `update`.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum SharedMcpOp {
+    Add,
+    Update,
+}
+
+/// Result delivered to the scheduler loop after a runtime
+/// `AddSharedMcpHost` / `UpdateSharedMcpHost` finishes its connect +
+/// tools/list. Validation already ran synchronously on the loop
+/// before this future was dispatched — if we got here, the only
+/// failure mode left is the network one, surfaced as
+/// `Err(message)`.
+pub(crate) struct SharedMcpCompletion {
+    pub(crate) conn_id: crate::runtime::scheduler::ConnId,
+    pub(crate) correlation_id: Option<String>,
+    pub(crate) name: String,
+    pub(crate) url: String,
+    pub(crate) auth: crate::tools::shared_mcp_catalog::SharedMcpAuth,
+    pub(crate) op: SharedMcpOp,
+    pub(crate) result: Result<(Arc<McpSession>, Vec<crate::tools::mcp::ToolDescriptor>), String>,
+}
+
+/// Build a future that connects to a shared-MCP-host URL, runs
+/// `tools/list`, and yields a [`SchedulerCompletion::SharedMcp`].
+/// The scheduler pushes this into `pending_io` from the Add/Update
+/// handlers; the completion's `apply_shared_mcp_completion` performs
+/// the catalog + registry mutation on the scheduler thread.
+pub(crate) fn build_shared_mcp_connect_future(
+    conn_id: crate::runtime::scheduler::ConnId,
+    correlation_id: Option<String>,
+    name: String,
+    url: String,
+    auth: crate::tools::shared_mcp_catalog::SharedMcpAuth,
+    op: SharedMcpOp,
+) -> SchedulerFuture {
+    Box::pin(async move {
+        let bearer = auth.bearer().map(str::to_string);
+        let result = async {
+            let session = Arc::new(
+                McpSession::connect(&url, bearer)
+                    .await
+                    .map_err(|e| format!("connect `{name}` ({url}): {e}"))?,
+            );
+            let tools = session
+                .list_tools()
+                .await
+                .map_err(|e| format!("tools/list on `{name}`: {e}"))?;
+            Ok::<_, String>((session, tools))
+        }
+        .await;
+        SchedulerCompletion::SharedMcp(SharedMcpCompletion {
+            conn_id,
+            correlation_id,
+            name,
+            url,
+            auth,
+            op,
+            result,
+        })
+    })
 }
 
 /// Result of a host-env provider reachability probe (`GET /health`).

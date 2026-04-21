@@ -31,6 +31,20 @@ pub(super) fn reject_reason_detail(r: &RejectReason) -> &str {
     }
 }
 
+/// Translate the wire-shape `SharedMcpAuthInput` (secrets inbound)
+/// into the catalog's `SharedMcpAuth`. A thin mapping today —
+/// Step 2's OAuth variant will extend both ends symmetrically.
+pub(super) fn shared_mcp_auth_from_input(
+    input: whisper_agent_protocol::SharedMcpAuthInput,
+) -> crate::tools::shared_mcp_catalog::SharedMcpAuth {
+    use crate::tools::shared_mcp_catalog::SharedMcpAuth;
+    use whisper_agent_protocol::SharedMcpAuthInput;
+    match input {
+        SharedMcpAuthInput::None => SharedMcpAuth::None,
+        SharedMcpAuthInput::Bearer { token } => SharedMcpAuth::Bearer { token },
+    }
+}
+
 impl Scheduler {
     pub(super) fn apply_client_message(
         &mut self,
@@ -479,6 +493,143 @@ impl Scheduler {
                     );
                 }
             },
+            ClientToServer::ListSharedMcpHosts { correlation_id } => {
+                let hosts = self.shared_mcp_hosts_snapshot();
+                self.router.send_to_client(
+                    conn_id,
+                    ServerToClient::SharedMcpHostsList {
+                        correlation_id,
+                        hosts,
+                    },
+                );
+            }
+            ClientToServer::AddSharedMcpHost {
+                correlation_id,
+                name,
+                url,
+                auth,
+            } => {
+                if !self.admin_connections.contains(&conn_id) {
+                    self.router.send_to_client(
+                        conn_id,
+                        ServerToClient::Error {
+                            correlation_id,
+                            thread_id: None,
+                            message:
+                                "add_shared_mcp_host: admin capability required (token is not in [[auth.admins]])"
+                                    .into(),
+                        },
+                    );
+                    return;
+                }
+                if let Err(e) = self.validate_shared_mcp_add(&name, &url) {
+                    self.router.send_to_client(
+                        conn_id,
+                        ServerToClient::Error {
+                            correlation_id,
+                            thread_id: None,
+                            message: format!("add_shared_mcp_host: {e}"),
+                        },
+                    );
+                    return;
+                }
+                let catalog_auth = shared_mcp_auth_from_input(auth);
+                pending_io.push(
+                    crate::runtime::io_dispatch::build_shared_mcp_connect_future(
+                        conn_id,
+                        correlation_id,
+                        name,
+                        url,
+                        catalog_auth,
+                        crate::runtime::io_dispatch::SharedMcpOp::Add,
+                    ),
+                );
+            }
+            ClientToServer::UpdateSharedMcpHost {
+                correlation_id,
+                name,
+                url,
+                auth,
+            } => {
+                if !self.admin_connections.contains(&conn_id) {
+                    self.router.send_to_client(
+                        conn_id,
+                        ServerToClient::Error {
+                            correlation_id,
+                            thread_id: None,
+                            message:
+                                "update_shared_mcp_host: admin capability required (token is not in [[auth.admins]])"
+                                    .into(),
+                        },
+                    );
+                    return;
+                }
+                let new_auth = auth.map(shared_mcp_auth_from_input);
+                let effective_auth =
+                    match self.validate_shared_mcp_update(&name, &url, new_auth.as_ref()) {
+                        Ok(a) => a,
+                        Err(e) => {
+                            self.router.send_to_client(
+                                conn_id,
+                                ServerToClient::Error {
+                                    correlation_id,
+                                    thread_id: None,
+                                    message: format!("update_shared_mcp_host: {e}"),
+                                },
+                            );
+                            return;
+                        }
+                    };
+                pending_io.push(
+                    crate::runtime::io_dispatch::build_shared_mcp_connect_future(
+                        conn_id,
+                        correlation_id,
+                        name,
+                        url,
+                        effective_auth,
+                        crate::runtime::io_dispatch::SharedMcpOp::Update,
+                    ),
+                );
+            }
+            ClientToServer::RemoveSharedMcpHost {
+                correlation_id,
+                name,
+            } => {
+                if !self.admin_connections.contains(&conn_id) {
+                    self.router.send_to_client(
+                        conn_id,
+                        ServerToClient::Error {
+                            correlation_id,
+                            thread_id: None,
+                            message:
+                                "remove_shared_mcp_host: admin capability required (token is not in [[auth.admins]])"
+                                    .into(),
+                        },
+                    );
+                    return;
+                }
+                match self.remove_shared_mcp_host(&name) {
+                    Ok(()) => {
+                        self.router.send_to_client(
+                            conn_id,
+                            ServerToClient::SharedMcpHostRemoved {
+                                correlation_id,
+                                name,
+                            },
+                        );
+                    }
+                    Err(e) => {
+                        self.router.send_to_client(
+                            conn_id,
+                            ServerToClient::Error {
+                                correlation_id,
+                                thread_id: None,
+                                message: format!("remove_shared_mcp_host: {e}"),
+                            },
+                        );
+                    }
+                }
+            }
             ClientToServer::UpdateCodexAuth {
                 correlation_id,
                 backend,

@@ -387,6 +387,73 @@ pub enum HostEnvProviderOrigin {
     RuntimeOverlay,
 }
 
+/// Server-advertised entry from the shared-MCP-host catalog. Unlike
+/// host-env providers (which are our own daemons we spawn / own),
+/// shared MCP hosts are endpoints the operator points us at — often
+/// third-party servers that require their own authentication. The
+/// catalog lets operators register these at runtime instead of only
+/// via TOML at boot, and carries enough auth metadata to connect
+/// without leaking secrets back to clients.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct SharedMcpHostInfo {
+    /// User-facing catalog name; matches `ThreadConfig.shared_mcp_hosts`
+    /// entries and the key in pod `bindings.mcp_hosts`.
+    pub name: String,
+    /// Endpoint URL (streamable-HTTP or SSE MCP transport).
+    pub url: String,
+    /// How this entry entered the catalog. Mirrors the host-env shape
+    /// (`Seeded` from `[shared_mcp_hosts]` TOML, `Manual` from WebUI /
+    /// RPC, `RuntimeOverlay` from a CLI `--shared-mcp-host` flag).
+    pub origin: HostEnvProviderOrigin,
+    /// Non-secret auth classification. The secret itself (bearer token,
+    /// OAuth tokens) is never sent to the client; the UI gets just
+    /// enough to render "anonymous" / "bearer-auth" / etc.
+    pub auth: SharedMcpAuthPublic,
+    /// Whether the server currently holds a connected MCP session for
+    /// this host. `true` means `tools/list` has succeeded at least once;
+    /// `false` means the connect attempt failed and the entry is
+    /// registered but non-functional until the next successful update.
+    pub connected: bool,
+    /// Latest connect error if `connected` is false. Empty when
+    /// connected or when the host has never been attempted. Operators
+    /// use this to diagnose bad URLs / invalid tokens without digging
+    /// in server logs.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub last_error: String,
+}
+
+/// Public view of a shared-MCP-host's authentication configuration —
+/// the bits a client is allowed to see. Tagged union keyed by `kind`
+/// so new auth methods land additively (Step 2 adds `oauth2` for
+/// third-party servers that require a user-driven authorization
+/// dance).
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum SharedMcpAuthPublic {
+    /// Anonymous access — the server attaches no `Authorization`
+    /// header. Used by dev loopback servers and MCPs that don't
+    /// require auth.
+    #[default]
+    None,
+    /// Static bearer token provided out-of-band (e.g. Slack app bot
+    /// tokens, long-lived PATs). The token is stored server-side; the
+    /// client only learns that one is configured.
+    Bearer,
+}
+
+/// Client-supplied auth payload for Add/Update. Mirrors
+/// `SharedMcpAuthPublic` but carries secrets — used only on the wire
+/// in the client→server direction and never echoed back.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum SharedMcpAuthInput {
+    #[default]
+    None,
+    Bearer {
+        token: String,
+    },
+}
+
 /// User's decision on a pending approval.
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -886,6 +953,55 @@ pub enum ClientToServer {
         name: String,
     },
 
+    /// Enumerate shared-MCP-host catalog entries. Server responds with
+    /// `SharedMcpHostsList`.
+    ListSharedMcpHosts {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        correlation_id: Option<String>,
+    },
+
+    /// Register a shared MCP host with the durable catalog. The server
+    /// attempts to open an MCP session using the supplied auth before
+    /// persisting — on handshake failure, the entry is not added and
+    /// the response is an `Error`. Admin-only. Responds with
+    /// `SharedMcpHostAdded` on success.
+    AddSharedMcpHost {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        correlation_id: Option<String>,
+        name: String,
+        url: String,
+        #[serde(default)]
+        auth: SharedMcpAuthInput,
+    },
+
+    /// Replace url / auth on an existing shared-MCP-host entry. Opens a
+    /// fresh session against the new url+auth; if that succeeds the old
+    /// session is swapped out (in-flight tool calls keep running on the
+    /// old `Arc<McpSession>` until they complete). Admin-only. Omit
+    /// `auth` to leave it unchanged; pass `{ "kind": "none" }` to
+    /// explicitly clear. Responds with `SharedMcpHostUpdated`.
+    UpdateSharedMcpHost {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        correlation_id: Option<String>,
+        name: String,
+        url: String,
+        /// `None` means "leave auth unchanged" so a URL-only edit
+        /// doesn't force the client to re-enter a bearer token it
+        /// can't see. To clear auth, pass `Some(SharedMcpAuthInput::None)`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        auth: Option<SharedMcpAuthInput>,
+    },
+
+    /// Remove a shared MCP host. Refused when any live thread currently
+    /// opts into it (the registry's `users` set is non-empty) — the
+    /// operator should end / retarget those threads first. Admin-only.
+    /// Responds with `SharedMcpHostRemoved`.
+    RemoveSharedMcpHost {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        correlation_id: Option<String>,
+        name: String,
+    },
+
     // --- Server-settings mutations (admin-only) ---
     /// Replace the Codex `auth.json` contents for a ChatGPT-subscription
     /// backend. Server validates the JSON against the Codex schema,
@@ -1328,6 +1444,33 @@ pub enum ServerToClient {
     /// Successful response to `RemoveHostEnvProvider`. The name is
     /// echoed so clients can identify which local entry to drop.
     HostEnvProviderRemoved {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        correlation_id: Option<String>,
+        name: String,
+    },
+    /// Snapshot response to `ListSharedMcpHosts`. Entries in
+    /// name-sorted order.
+    SharedMcpHostsList {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        correlation_id: Option<String>,
+        hosts: Vec<SharedMcpHostInfo>,
+    },
+    /// Successful response to `AddSharedMcpHost`. Broadcast so every
+    /// connected client's view stays in sync without re-fetching the
+    /// full list.
+    SharedMcpHostAdded {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        correlation_id: Option<String>,
+        host: SharedMcpHostInfo,
+    },
+    /// Successful response to `UpdateSharedMcpHost`. Broadcast.
+    SharedMcpHostUpdated {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        correlation_id: Option<String>,
+        host: SharedMcpHostInfo,
+    },
+    /// Successful response to `RemoveSharedMcpHost`. Broadcast.
+    SharedMcpHostRemoved {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         correlation_id: Option<String>,
         name: String,

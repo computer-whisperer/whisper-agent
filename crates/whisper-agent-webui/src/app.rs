@@ -37,7 +37,8 @@ use whisper_agent_protocol::{
     ClientToServer, ContentBlock, Conversation, FsEntry, FunctionKind, FunctionSummary,
     HostEnvBinding, HostEnvProviderInfo, HostEnvProviderOrigin, HostEnvReachability, HostEnvSpec,
     Message, ModelSummary, NamedHostEnv, PodAllow, PodConfig, PodLimits, PodSummary,
-    ResourceSnapshot, ResourceStateLabel, RetentionPolicy, Role, ServerToClient, ThreadBindings,
+    ResourceSnapshot, ResourceStateLabel, RetentionPolicy, Role, ServerToClient,
+    SharedMcpAuthInput, SharedMcpAuthPublic, SharedMcpHostInfo, ThreadBindings,
     ThreadBindingsRequest, ThreadConfigOverride, ThreadDefaults, ThreadStateLabel, ThreadSummary,
     ToolResultContent, TriggerSpec, TurnLog, Usage,
 };
@@ -665,6 +666,12 @@ pub struct ChatApp {
     /// configuration; pods in it just can't declare host envs.
     host_env_providers: Vec<HostEnvProviderInfo>,
     host_env_providers_requested: bool,
+    /// Server's shared-MCP-host catalog. Populated lazily on the first
+    /// ListSharedMcpHosts round-trip (triggered when the settings
+    /// modal opens the Shared MCP tab). Read-only for non-admin
+    /// clients; admins can add/edit/remove from the settings panel.
+    shared_mcp_hosts: Vec<SharedMcpHostInfo>,
+    shared_mcp_hosts_requested: bool,
     /// Modal state for the per-provider add/edit form. `None` = closed.
     /// Opened from the Providers tab (+Add or Edit row button).
     provider_editor_modal: Option<ProviderEditorModalState>,
@@ -1030,12 +1037,54 @@ struct SettingsModalState {
     /// success line above the list; `Err((backend, detail))` an error.
     /// Cleared the next time the user opens a rotation form.
     codex_rotate_banner: Option<Result<String, (String, String)>>,
+    /// Add/edit form for the Shared MCP tab. `None` when the list is
+    /// shown; `Some` when the user clicked +Add or Edit.
+    shared_mcp_editor: Option<SharedMcpEditorState>,
+    /// Most-recent Shared MCP add/update outcome (banner).
+    shared_mcp_banner: Option<Result<String, String>>,
+    /// Shared MCP host names whose Remove button has been clicked
+    /// once and is waiting for confirmation. Cleared on confirm / on
+    /// remove response / when the tab closes.
+    shared_mcp_remove_armed: HashSet<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 enum SettingsTab {
     #[default]
     Backends,
+    SharedMcp,
+}
+
+/// Inline add/edit form state for one Shared MCP host entry.
+/// `mode = Add` collects name + url + optional bearer; `mode = Edit`
+/// locks the name (pod bindings reference it) and allows url + auth
+/// changes. `auth_keep` is Edit-only — true means "leave the existing
+/// auth alone" (the default); setting it to false unlocks the bearer
+/// field where a blank value means "clear auth" and a non-blank value
+/// means "set bearer".
+struct SharedMcpEditorState {
+    mode: SharedMcpEditorMode,
+    name: String,
+    url: String,
+    /// Staged bearer. Blank + `!auth_keep` → clear; non-blank +
+    /// `!auth_keep` → set bearer. On Add, always treated as set-if-
+    /// non-blank (no auth_keep semantics because there's no existing
+    /// auth).
+    bearer: String,
+    /// Whether the existing auth should be preserved (Edit only). See
+    /// `auth_kind_on_load` for the value this was read from.
+    auth_keep: bool,
+    /// The auth kind on the entry when the editor opened, so the UI
+    /// can describe the "keep existing auth" option meaningfully.
+    auth_kind_on_load: SharedMcpAuthPublic,
+    error: Option<String>,
+    pending_correlation: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SharedMcpEditorMode {
+    Add,
+    Edit,
 }
 
 /// Sub-form shown over the Settings modal when the user clicks
@@ -1374,6 +1423,8 @@ impl ChatApp {
             behaviors_requested: HashSet::new(),
             host_env_providers: Vec::new(),
             host_env_providers_requested: false,
+            shared_mcp_hosts: Vec::new(),
+            shared_mcp_hosts_requested: false,
             provider_editor_modal: None,
             settings_modal: None,
             provider_remove_armed: HashSet::new(),
@@ -1553,6 +1604,12 @@ impl ChatApp {
                         correlation_id: None,
                     });
                     self.host_env_providers_requested = true;
+                }
+                if !self.shared_mcp_hosts_requested {
+                    self.send(ClientToServer::ListSharedMcpHosts {
+                        correlation_id: None,
+                    });
+                    self.shared_mcp_hosts_requested = true;
                 }
                 if !self.functions_requested {
                     self.send(ClientToServer::ListFunctions {
@@ -1936,6 +1993,27 @@ impl ChatApp {
                 {
                     sub.error = Some(message);
                     sub.pending_correlation = None;
+                    return;
+                }
+                // Shared-MCP editor sub-form pending add/update. Keep
+                // the form open and surface the connect/validation
+                // failure inline so the operator can fix and retry.
+                if let Some(settings) = self.settings_modal.as_mut()
+                    && let Some(sub) = settings.shared_mcp_editor.as_mut()
+                    && correlation_id.is_some()
+                    && sub.pending_correlation == correlation_id
+                {
+                    sub.error = Some(message);
+                    sub.pending_correlation = None;
+                    return;
+                }
+                // Shared-MCP remove response — no sub-form, just a
+                // banner on the parent tab.
+                if let Some(settings) = self.settings_modal.as_mut()
+                    && correlation_id.is_some()
+                    && message.starts_with("remove_shared_mcp_host:")
+                {
+                    settings.shared_mcp_banner = Some(Err(message));
                     return;
                 }
                 // Provider remove pending on a specific row. Match by
@@ -2414,6 +2492,52 @@ impl ChatApp {
                         settings.codex_rotate = None;
                         settings.codex_rotate_banner = Some(Ok(backend));
                     }
+                }
+            }
+            ServerToClient::SharedMcpHostsList { hosts, .. } => {
+                self.shared_mcp_hosts = hosts;
+            }
+            ServerToClient::SharedMcpHostAdded {
+                host,
+                correlation_id,
+            }
+            | ServerToClient::SharedMcpHostUpdated {
+                host,
+                correlation_id,
+            } => {
+                // Replace-or-insert by name so adds and updates both
+                // converge the local list without a round-trip.
+                if let Some(existing) = self
+                    .shared_mcp_hosts
+                    .iter_mut()
+                    .find(|h| h.name == host.name)
+                {
+                    *existing = host.clone();
+                } else {
+                    self.shared_mcp_hosts.push(host.clone());
+                    self.shared_mcp_hosts.sort_by(|a, b| a.name.cmp(&b.name));
+                }
+                // When the open editor's pending correlation matches,
+                // the server accepted the save — close the form and
+                // show a success banner.
+                if let Some(settings) = self.settings_modal.as_mut() {
+                    let close_editor = settings.shared_mcp_editor.as_ref().is_some_and(|s| {
+                        s.pending_correlation.is_some() && s.pending_correlation == correlation_id
+                    });
+                    if close_editor {
+                        settings.shared_mcp_editor = None;
+                        settings.shared_mcp_banner = Some(Ok(host.name.clone()));
+                    }
+                }
+            }
+            ServerToClient::SharedMcpHostRemoved {
+                name,
+                correlation_id: _,
+            } => {
+                self.shared_mcp_hosts.retain(|h| h.name != name);
+                if let Some(settings) = self.settings_modal.as_mut() {
+                    settings.shared_mcp_remove_armed.remove(&name);
+                    settings.shared_mcp_banner = Some(Ok(format!("Removed `{name}`.")));
                 }
             }
         }
@@ -4860,6 +4984,9 @@ impl ChatApp {
         };
         let mut open = true;
         let mut rotate_request: Option<String> = None;
+        let mut shared_mcp_add_request = false;
+        let mut shared_mcp_edit_request: Option<SharedMcpHostInfo> = None;
+        let mut shared_mcp_remove_request: Option<String> = None;
 
         egui::Window::new("Server settings")
             .collapsible(false)
@@ -4876,6 +5003,15 @@ impl ChatApp {
                     {
                         modal.active_tab = SettingsTab::Backends;
                     }
+                    if ui
+                        .selectable_label(
+                            modal.active_tab == SettingsTab::SharedMcp,
+                            "Shared MCP hosts",
+                        )
+                        .clicked()
+                    {
+                        modal.active_tab = SettingsTab::SharedMcp;
+                    }
                 });
                 ui.separator();
                 ui.add_space(4.0);
@@ -4884,6 +5020,14 @@ impl ChatApp {
                         ui,
                         &modal.codex_rotate_banner,
                         &mut rotate_request,
+                    ),
+                    SettingsTab::SharedMcp => self.render_settings_shared_mcp_tab(
+                        ui,
+                        &modal.shared_mcp_banner,
+                        &mut modal.shared_mcp_remove_armed,
+                        &mut shared_mcp_add_request,
+                        &mut shared_mcp_edit_request,
+                        &mut shared_mcp_remove_request,
                     ),
                 }
             });
@@ -4898,11 +5042,48 @@ impl ChatApp {
             });
         }
 
+        if shared_mcp_add_request {
+            modal.shared_mcp_banner = None;
+            modal.shared_mcp_editor = Some(SharedMcpEditorState {
+                mode: SharedMcpEditorMode::Add,
+                name: String::new(),
+                url: String::new(),
+                bearer: String::new(),
+                auth_keep: false,
+                auth_kind_on_load: SharedMcpAuthPublic::None,
+                error: None,
+                pending_correlation: None,
+            });
+        }
+        if let Some(host) = shared_mcp_edit_request {
+            modal.shared_mcp_banner = None;
+            modal.shared_mcp_editor = Some(SharedMcpEditorState {
+                mode: SharedMcpEditorMode::Edit,
+                name: host.name,
+                url: host.url,
+                bearer: String::new(),
+                auth_keep: matches!(host.auth, SharedMcpAuthPublic::Bearer),
+                auth_kind_on_load: host.auth,
+                error: None,
+                pending_correlation: None,
+            });
+        }
+        if let Some(name) = shared_mcp_remove_request {
+            let correlation = self.next_correlation_id();
+            self.send(ClientToServer::RemoveSharedMcpHost {
+                correlation_id: Some(correlation),
+                name,
+            });
+        }
+
         // Paste-auth.json sub-form. Rendered outside the main window so
         // egui stacks it on top; closing it returns to the list.
         let mut keep_main_open = true;
         if modal.codex_rotate.is_some() {
             self.render_codex_rotate_subform(ctx, &mut modal, &mut keep_main_open);
+        }
+        if modal.shared_mcp_editor.is_some() {
+            self.render_shared_mcp_editor_subform(ctx, &mut modal);
         }
 
         if open && keep_main_open {
@@ -5073,6 +5254,244 @@ impl ChatApp {
                 ui.separator();
             }
         });
+    }
+
+    /// Shared MCP hosts tab. Admin-only operations (add/edit/remove)
+    /// are rendered as buttons; a non-admin connection receives an
+    /// `Error` reply which the banner surfaces. Bearer tokens never
+    /// come back from the server — the UI only shows `auth_kind`.
+    fn render_settings_shared_mcp_tab(
+        &mut self,
+        ui: &mut egui::Ui,
+        banner: &Option<Result<String, String>>,
+        remove_armed: &mut HashSet<String>,
+        add_request: &mut bool,
+        edit_request: &mut Option<SharedMcpHostInfo>,
+        remove_request: &mut Option<String>,
+    ) {
+        ui.label(
+            RichText::new(
+                "Shared MCP hosts the scheduler connects to at startup \
+                 (one singleton session per name, shared across all \
+                 threads that opt in). Third-party endpoints often \
+                 require a bearer token; Step 2 adds OAuth for servers \
+                 that need a browser-driven authorization flow.",
+            )
+            .small()
+            .color(Color32::from_gray(150)),
+        );
+        ui.add_space(6.0);
+
+        if let Some(banner) = banner {
+            match banner {
+                Ok(name) => {
+                    ui.colored_label(
+                        Color32::from_rgb(0x88, 0xbb, 0x88),
+                        format!("Saved `{name}`."),
+                    );
+                }
+                Err(detail) => {
+                    ui.colored_label(Color32::from_rgb(0xd0, 0x70, 0x70), detail.to_string());
+                }
+            }
+            ui.add_space(6.0);
+        }
+
+        ui.horizontal(|ui| {
+            if ui.button("+ Add host").clicked() {
+                *add_request = true;
+            }
+        });
+        ui.add_space(4.0);
+
+        if self.shared_mcp_hosts.is_empty() {
+            ui.label(
+                RichText::new(
+                    "No shared MCP hosts configured. Add one above or \
+                     seed via [shared_mcp_hosts] in whisper-agent.toml.",
+                )
+                .small()
+                .color(Color32::from_gray(150)),
+            );
+            return;
+        }
+
+        let hosts = self.shared_mcp_hosts.clone();
+        ScrollArea::vertical().show(ui, |ui| {
+            for host in &hosts {
+                render_shared_mcp_host_row(ui, host, remove_armed, edit_request, remove_request);
+                ui.add_space(2.0);
+                ui.separator();
+            }
+        });
+    }
+
+    /// Paste-bearer / edit-url sub-form for Shared MCP hosts.
+    /// Dispatches `AddSharedMcpHost` or `UpdateSharedMcpHost` on Save
+    /// and tracks the correlation so the matching response routes the
+    /// form closed (success) or an inline error back into `sub.error`
+    /// (failure). The sub-form sits on top of the main modal — egui
+    /// stacks windows in open-order.
+    fn render_shared_mcp_editor_subform(
+        &mut self,
+        ctx: &egui::Context,
+        modal: &mut SettingsModalState,
+    ) {
+        let Some(mut sub) = modal.shared_mcp_editor.take() else {
+            return;
+        };
+        let mut open = true;
+        let mut save_clicked = false;
+        let mut cancel_clicked = false;
+        let saving = sub.pending_correlation.is_some();
+        let title = match sub.mode {
+            SharedMcpEditorMode::Add => "Add shared MCP host".to_string(),
+            SharedMcpEditorMode::Edit => format!("Edit shared MCP host — {}", sub.name),
+        };
+
+        egui::Window::new(title)
+            .collapsible(false)
+            .resizable(false)
+            .default_width(460.0)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .open(&mut open)
+            .show(ctx, |ui| {
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    ui.label("name");
+                    let editable = sub.mode == SharedMcpEditorMode::Add;
+                    ui.add_enabled(
+                        editable,
+                        TextEdit::singleline(&mut sub.name)
+                            .hint_text("catalog name (e.g. 'slack', 'fetch')")
+                            .desired_width(f32::INFINITY),
+                    );
+                });
+                if sub.mode == SharedMcpEditorMode::Edit {
+                    ui.label(
+                        RichText::new(
+                            "Name is fixed — pods and threads reference it. \
+                             Remove + re-add to rename.",
+                        )
+                        .small()
+                        .color(Color32::from_gray(150)),
+                    );
+                }
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    ui.label("url");
+                    ui.add(
+                        TextEdit::singleline(&mut sub.url)
+                            .hint_text("https://mcp.example.com/...")
+                            .desired_width(f32::INFINITY),
+                    );
+                });
+                ui.add_space(6.0);
+
+                // Auth section. Add: just a bearer field (blank = anonymous).
+                // Edit: offer "keep existing auth" when the entry had one.
+                if sub.mode == SharedMcpEditorMode::Edit
+                    && matches!(sub.auth_kind_on_load, SharedMcpAuthPublic::Bearer)
+                {
+                    ui.checkbox(&mut sub.auth_keep, "keep existing bearer token");
+                    ui.label(
+                        RichText::new(
+                            "Uncheck to replace or clear. A blank bearer field \
+                             with this unchecked clears auth entirely.",
+                        )
+                        .small()
+                        .color(Color32::from_gray(150)),
+                    );
+                    ui.add_space(4.0);
+                }
+                let bearer_enabled = !sub.auth_keep || sub.mode == SharedMcpEditorMode::Add;
+                ui.horizontal(|ui| {
+                    ui.label("bearer");
+                    ui.add_enabled(
+                        bearer_enabled,
+                        TextEdit::singleline(&mut sub.bearer)
+                            .password(true)
+                            .hint_text("optional; leave blank for anonymous")
+                            .desired_width(f32::INFINITY),
+                    );
+                });
+
+                if let Some(err) = &sub.error {
+                    ui.add_space(6.0);
+                    ui.colored_label(Color32::from_rgb(0xd0, 0x70, 0x70), err);
+                }
+                ui.add_space(8.0);
+                ui.separator();
+                ui.horizontal(|ui| {
+                    let save_enabled =
+                        !saving && !sub.name.trim().is_empty() && !sub.url.trim().is_empty();
+                    let label = if saving { "Connecting…" } else { "Save" };
+                    if ui
+                        .add_enabled(save_enabled, egui::Button::new(label))
+                        .clicked()
+                    {
+                        save_clicked = true;
+                    }
+                    if ui
+                        .add_enabled(!saving, egui::Button::new("Cancel"))
+                        .clicked()
+                    {
+                        cancel_clicked = true;
+                    }
+                });
+            });
+
+        if cancel_clicked {
+            open = false;
+        }
+
+        if save_clicked {
+            let correlation = self.next_correlation_id();
+            sub.pending_correlation = Some(correlation.clone());
+            sub.error = None;
+            let bearer = sub.bearer.trim().to_string();
+            let msg = match sub.mode {
+                SharedMcpEditorMode::Add => {
+                    let auth = if bearer.is_empty() {
+                        SharedMcpAuthInput::None
+                    } else {
+                        SharedMcpAuthInput::Bearer { token: bearer }
+                    };
+                    ClientToServer::AddSharedMcpHost {
+                        correlation_id: Some(correlation),
+                        name: sub.name.trim().to_string(),
+                        url: sub.url.trim().to_string(),
+                        auth,
+                    }
+                }
+                SharedMcpEditorMode::Edit => {
+                    // `auth_keep = true` means "don't touch auth" —
+                    // send None on the wire. Otherwise translate the
+                    // bearer field: blank = explicit clear, non-blank
+                    // = set bearer.
+                    let auth = if sub.auth_keep {
+                        None
+                    } else if bearer.is_empty() {
+                        Some(SharedMcpAuthInput::None)
+                    } else {
+                        Some(SharedMcpAuthInput::Bearer { token: bearer })
+                    };
+                    ClientToServer::UpdateSharedMcpHost {
+                        correlation_id: Some(correlation),
+                        name: sub.name.clone(),
+                        url: sub.url.trim().to_string(),
+                        auth,
+                    }
+                }
+            };
+            self.send(msg);
+        }
+
+        if !open {
+            let _ = sub;
+        } else {
+            modal.shared_mcp_editor = Some(sub);
+        }
     }
 
     /// Add / edit provider modal. Dispatches `AddHostEnvProvider` or
@@ -6153,6 +6572,98 @@ fn render_backend_settings_row(
                     .small()
                     .color(Color32::from_gray(170)),
             );
+        }
+    });
+}
+
+/// One shared-MCP-host entry in the settings list. Name + live status
+/// on the first line; URL, origin, auth-kind on the second; edit /
+/// remove buttons on the third. Remove uses a two-click guard.
+fn render_shared_mcp_host_row(
+    ui: &mut egui::Ui,
+    host: &SharedMcpHostInfo,
+    remove_armed: &mut HashSet<String>,
+    edit_request: &mut Option<SharedMcpHostInfo>,
+    remove_request: &mut Option<String>,
+) {
+    ui.horizontal(|ui| {
+        ui.label(RichText::new(&host.name).strong());
+        let (label, color) = if host.connected {
+            ("connected", Color32::from_rgb(0x88, 0xbb, 0x88))
+        } else if !host.last_error.is_empty() {
+            ("connect failed", Color32::from_rgb(0xd0, 0x70, 0x70))
+        } else {
+            ("not connected", Color32::from_gray(170))
+        };
+        ui.label(RichText::new(label).small().color(color));
+    });
+    ui.horizontal_wrapped(|ui| {
+        ui.label(
+            RichText::new(format!("url: {}", host.url))
+                .small()
+                .color(Color32::from_gray(170)),
+        );
+        ui.label(RichText::new("·").small().color(Color32::from_gray(120)));
+        let origin = match host.origin {
+            HostEnvProviderOrigin::Seeded => "seeded",
+            HostEnvProviderOrigin::Manual => "manual",
+            HostEnvProviderOrigin::RuntimeOverlay => "cli-overlay",
+        };
+        ui.label(
+            RichText::new(format!("origin: {origin}"))
+                .small()
+                .color(Color32::from_gray(170)),
+        );
+        ui.label(RichText::new("·").small().color(Color32::from_gray(120)));
+        let auth = match host.auth {
+            SharedMcpAuthPublic::None => "anonymous",
+            SharedMcpAuthPublic::Bearer => "bearer",
+        };
+        ui.label(
+            RichText::new(format!("auth: {auth}"))
+                .small()
+                .color(Color32::from_gray(170)),
+        );
+    });
+    if !host.last_error.is_empty() {
+        ui.label(
+            RichText::new(&host.last_error)
+                .small()
+                .color(Color32::from_rgb(0xd0, 0x70, 0x70)),
+        );
+    }
+    let is_overlay = matches!(host.origin, HostEnvProviderOrigin::RuntimeOverlay);
+    ui.horizontal(|ui| {
+        let edit_hover = if is_overlay {
+            "CLI --shared-mcp-host overlays can't be edited at runtime"
+        } else {
+            "Edit url or auth"
+        };
+        if ui
+            .add_enabled(!is_overlay, egui::Button::new("Edit").small())
+            .on_hover_text(edit_hover)
+            .clicked()
+        {
+            *edit_request = Some(host.clone());
+        }
+        let armed = remove_armed.contains(&host.name);
+        let remove_label = if armed { "Confirm remove" } else { "Remove" };
+        let remove_hover = if is_overlay {
+            "CLI overlay — restart without the flag to unregister"
+        } else {
+            "Remove from catalog. Fails if any thread is currently using this host."
+        };
+        if ui
+            .add_enabled(!is_overlay, egui::Button::new(remove_label).small())
+            .on_hover_text(remove_hover)
+            .clicked()
+        {
+            if armed {
+                remove_armed.remove(&host.name);
+                *remove_request = Some(host.name.clone());
+            } else {
+                remove_armed.insert(host.name.clone());
+            }
         }
     });
 }

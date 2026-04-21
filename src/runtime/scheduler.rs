@@ -198,14 +198,14 @@ pub struct BackendEntry {
     pub auth_mode: Option<String>,
 }
 
-/// Entry in the scheduler's shared-MCP-host catalog. Configured at server
-/// start; one connection per host shared across all tasks that opt in via
-/// `ThreadConfig.shared_mcp_hosts`.
+/// CLI-provided shared MCP host (`--shared-mcp-host name=url`). These
+/// are runtime-overlays: they don't land in the durable catalog, and
+/// they can't be edited through the WebUI (the catalog entry would
+/// shadow them after the next add). Always anonymous — the catalog is
+/// the place to attach a bearer token.
 #[derive(Debug, Clone)]
-pub struct SharedHostConfig {
-    /// Stable name; what `ThreadConfig.shared_mcp_hosts` references.
+pub struct SharedHostOverlay {
     pub name: String,
-    /// MCP endpoint URL (typically `http://127.0.0.1:9830/mcp`).
     pub url: String,
 }
 
@@ -275,6 +275,17 @@ pub struct Scheduler {
     /// runtime-overlay providers. Add/update/remove commands write
     /// through here so the catalog survives restart.
     host_env_catalog: crate::tools::host_env_catalog::CatalogStore,
+    /// Durable catalog of shared MCP hosts. The scheduler is the
+    /// authority; `ResourceRegistry.mcp_hosts` holds the live
+    /// `McpSession` per name, which we keep in sync on every
+    /// Add/Update/Remove. CLI overlays don't write here.
+    shared_mcp_catalog: crate::tools::shared_mcp_catalog::CatalogStore,
+    /// CLI `--shared-mcp-host` runtime-overlay names. Used for origin
+    /// classification on list responses — an entry in this set that
+    /// isn't in the catalog reports as `RuntimeOverlay`. Add/Update
+    /// commands refuse overlay names (restart without the flag to
+    /// unshadow the catalog entry).
+    shared_mcp_overlay_names: std::collections::BTreeSet<String>,
 
     tasks: HashMap<String, Thread>,
     /// Owns the connection registry, subscription map, audit log, and the
@@ -343,7 +354,8 @@ impl Scheduler {
         audit: AuditLog,
         host_env_registry: crate::tools::sandbox::HostEnvRegistry,
         host_env_catalog: crate::tools::host_env_catalog::CatalogStore,
-        shared_host_configs: Vec<SharedHostConfig>,
+        shared_mcp_catalog: crate::tools::shared_mcp_catalog::CatalogStore,
+        shared_mcp_overlays: Vec<SharedHostOverlay>,
     ) -> anyhow::Result<(Self, mpsc::UnboundedReceiver<StreamUpdate>)> {
         assert!(
             backends.contains_key(&default_backend),
@@ -359,29 +371,44 @@ impl Scheduler {
             );
         }
 
-        for cfg in shared_host_configs {
-            info!(name = %cfg.name, url = %cfg.url, "connecting to shared MCP host");
-            // Shared hosts use anonymous MCP access today; adding auth
-            // here is a separate change with its own config shape
-            // (they're long-lived endpoints, not per-sandbox).
-            let session = Arc::new(McpSession::connect(&cfg.url, None).await.map_err(|e| {
-                anyhow::anyhow!("shared MCP host `{}` ({}): {e}", cfg.name, cfg.url)
-            })?);
-            // Phase 3c: list tools at startup so per-thread routing can
-            // walk the registry without a per-thread fan-out. Failure
-            // here is a startup failure — a misbehaving shared host that
-            // can't list tools is the same kind of fatal misconfiguration
-            // as one that can't handshake.
-            let tools = session
-                .list_tools()
-                .await
-                .map_err(|e| anyhow::anyhow!("list_tools on shared MCP `{}`: {e}", cfg.name))?;
-            let id = resources.insert_shared_mcp_host(cfg.name.clone(), cfg.url.clone(), session);
-            let annotations: HashMap<String, ToolAnnotations> = tools
-                .iter()
-                .map(|t| (t.name.clone(), t.annotations.clone()))
-                .collect();
-            resources.populate_mcp_tools(&id, tools, annotations);
+        // Connect shared MCP hosts: catalog entries first (authoritative
+        // list, may carry bearer tokens), then CLI overlays (anonymous
+        // only; catalog name wins on collision). Connect failures are
+        // logged and the entry is dropped from the registry — a
+        // misconfigured shared host doesn't brick server startup, and
+        // the operator can fix it via the WebUI (re-add triggers
+        // another connect attempt).
+        for entry in shared_mcp_catalog.entries() {
+            connect_shared_mcp_on_boot(
+                &mut resources,
+                &entry.name,
+                &entry.url,
+                entry.auth.bearer().map(str::to_string),
+                "catalog",
+            )
+            .await;
+        }
+        // `overlay_names` tracks CLI entries only; used later for
+        // origin classification on list responses.
+        let mut overlay_names: std::collections::BTreeSet<String> =
+            std::collections::BTreeSet::new();
+        for overlay in shared_mcp_overlays {
+            if shared_mcp_catalog.contains(&overlay.name) {
+                info!(
+                    name = %overlay.name,
+                    "CLI --shared-mcp-host flag shadowed by catalog entry; using catalog"
+                );
+                continue;
+            }
+            overlay_names.insert(overlay.name.clone());
+            connect_shared_mcp_on_boot(
+                &mut resources,
+                &overlay.name,
+                &overlay.url,
+                None,
+                "cli-overlay",
+            )
+            .await;
         }
 
         let default_pod_id = default_pod.id.clone();
@@ -398,6 +425,8 @@ impl Scheduler {
                 persister: None,
                 host_env_registry,
                 host_env_catalog,
+                shared_mcp_catalog,
+                shared_mcp_overlay_names: overlay_names,
                 tasks: HashMap::new(),
                 router: ThreadEventRouter::new(audit, host_id),
                 resources,
@@ -737,6 +766,264 @@ impl Scheduler {
         }
         self.host_env_catalog.remove(name)?;
         self.host_env_registry.remove(name);
+        Ok(())
+    }
+
+    // ---------- Shared-MCP-host catalog surface ----------
+
+    /// Classify a shared-MCP-host's origin for protocol output.
+    /// Same shape as `host_env_provider_origin`: catalog wins over
+    /// CLI overlay, unknown names report as `RuntimeOverlay` (they
+    /// exist in the registry but nowhere durable).
+    fn shared_mcp_host_origin(&self, name: &str) -> whisper_agent_protocol::HostEnvProviderOrigin {
+        use crate::tools::host_env_catalog::CatalogOrigin;
+        use whisper_agent_protocol::HostEnvProviderOrigin;
+        match self.shared_mcp_catalog.get(name).map(|e| e.origin) {
+            Some(CatalogOrigin::Seeded) => HostEnvProviderOrigin::Seeded,
+            Some(CatalogOrigin::Manual) => HostEnvProviderOrigin::Manual,
+            None => HostEnvProviderOrigin::RuntimeOverlay,
+        }
+    }
+
+    /// Build a `SharedMcpHostInfo` for one name, combining catalog
+    /// state (origin + auth classification) with live-registry state
+    /// (connected + last_error). Returns `None` when the name is in
+    /// neither source — caller shouldn't be asking about unknown
+    /// names.
+    fn shared_mcp_host_info(
+        &self,
+        name: &str,
+    ) -> Option<whisper_agent_protocol::SharedMcpHostInfo> {
+        use crate::pod::resources::{McpHostId, ResourceState};
+        let catalog_entry = self.shared_mcp_catalog.get(name);
+        let is_overlay = self.shared_mcp_overlay_names.contains(name);
+        if catalog_entry.is_none() && !is_overlay {
+            return None;
+        }
+        let auth = catalog_entry
+            .map(|e| e.auth.public())
+            .unwrap_or(whisper_agent_protocol::SharedMcpAuthPublic::None);
+        let url = catalog_entry
+            .map(|e| e.url.clone())
+            .or_else(|| {
+                // Runtime overlays stash their URL in the registry's
+                // McpHostEntry.spec.url; this is the one source of
+                // truth for an overlay's URL.
+                self.resources
+                    .mcp_hosts
+                    .get(&McpHostId::shared(name))
+                    .map(|e| e.spec.url.clone())
+            })
+            .unwrap_or_default();
+        let (connected, last_error) = match self.resources.mcp_hosts.get(&McpHostId::shared(name)) {
+            Some(entry) => match &entry.state {
+                ResourceState::Ready => (true, String::new()),
+                ResourceState::Errored { message } | ResourceState::Lost { message } => {
+                    (false, message.clone())
+                }
+                _ => (false, String::new()),
+            },
+            None => (false, String::new()),
+        };
+        Some(whisper_agent_protocol::SharedMcpHostInfo {
+            name: name.to_string(),
+            url,
+            origin: self.shared_mcp_host_origin(name),
+            auth,
+            connected,
+            last_error,
+        })
+    }
+
+    /// Snapshot the catalog + overlays for `ListSharedMcpHosts`.
+    /// Name-sorted. Merges catalog entries and CLI-overlay names so
+    /// a CLI-overlay-only host still appears.
+    pub(crate) fn shared_mcp_hosts_snapshot(
+        &self,
+    ) -> Vec<whisper_agent_protocol::SharedMcpHostInfo> {
+        let mut names: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+        for e in self.shared_mcp_catalog.entries() {
+            names.insert(e.name.as_str());
+        }
+        for n in &self.shared_mcp_overlay_names {
+            names.insert(n.as_str());
+        }
+        names
+            .into_iter()
+            .filter_map(|n| self.shared_mcp_host_info(n))
+            .collect()
+    }
+
+    /// Pre-flight validation for Add. Runs on the scheduler loop
+    /// before any network I/O; failures surface immediately as an
+    /// `Error` response. Returns the validated catalog-auth shape
+    /// the connect future will use.
+    pub(crate) fn validate_shared_mcp_add(&self, name: &str, url: &str) -> anyhow::Result<()> {
+        if name.is_empty() {
+            anyhow::bail!("host name must be non-empty");
+        }
+        if url.is_empty() {
+            anyhow::bail!("host url must be non-empty");
+        }
+        if self.shared_mcp_catalog.contains(name) {
+            anyhow::bail!("host `{name}` already exists in catalog");
+        }
+        if self.shared_mcp_overlay_names.contains(name) {
+            anyhow::bail!(
+                "host `{name}` is a CLI --shared-mcp-host overlay; remove the flag and restart to manage it through the catalog"
+            );
+        }
+        Ok(())
+    }
+
+    /// Pre-flight validation for Update. Resolves the auth the connect
+    /// future should use — explicit `new_auth` when set, otherwise the
+    /// existing catalog entry's.
+    pub(crate) fn validate_shared_mcp_update(
+        &self,
+        name: &str,
+        url: &str,
+        new_auth: Option<&crate::tools::shared_mcp_catalog::SharedMcpAuth>,
+    ) -> anyhow::Result<crate::tools::shared_mcp_catalog::SharedMcpAuth> {
+        if url.is_empty() {
+            anyhow::bail!("host url must be non-empty");
+        }
+        if !self.shared_mcp_catalog.contains(name) {
+            if self.shared_mcp_overlay_names.contains(name) {
+                anyhow::bail!(
+                    "host `{name}` is a CLI --shared-mcp-host overlay; remove the flag and restart to manage it through the catalog"
+                );
+            }
+            anyhow::bail!("host `{name}` not in catalog");
+        }
+        let effective = match new_auth {
+            Some(a) => a.clone(),
+            None => self
+                .shared_mcp_catalog
+                .get(name)
+                .expect("checked above")
+                .auth
+                .clone(),
+        };
+        Ok(effective)
+    }
+
+    /// Apply a completed shared-MCP connect attempt (Add or Update).
+    /// Runs on the scheduler loop so catalog + registry writes stay
+    /// single-threaded. On success, mutates state and sends the
+    /// matching `SharedMcpHost{Added,Updated}` to the originating
+    /// connection. On failure, sends an `Error`.
+    pub(crate) fn apply_shared_mcp_completion(
+        &mut self,
+        completion: crate::runtime::io_dispatch::SharedMcpCompletion,
+    ) {
+        use crate::runtime::io_dispatch::SharedMcpOp;
+        let crate::runtime::io_dispatch::SharedMcpCompletion {
+            conn_id,
+            correlation_id,
+            name,
+            url,
+            auth,
+            op,
+            result,
+        } = completion;
+        match result {
+            Ok((session, tools)) => {
+                // Write the catalog first, then the registry — same
+                // order as the direct mutation APIs so failure mid-
+                // way can't leave a live registry entry the catalog
+                // doesn't reflect.
+                let now = chrono::Utc::now();
+                let catalog_write = match op {
+                    SharedMcpOp::Add => self.shared_mcp_catalog.insert(
+                        crate::tools::shared_mcp_catalog::new_manual_entry(
+                            name.clone(),
+                            url.clone(),
+                            auth.clone(),
+                            now,
+                        ),
+                    ),
+                    SharedMcpOp::Update => {
+                        self.shared_mcp_catalog
+                            .update(&name, url.clone(), Some(auth.clone()), now)
+                    }
+                };
+                if let Err(e) = catalog_write {
+                    self.router.send_to_client(
+                        conn_id,
+                        ServerToClient::Error {
+                            correlation_id,
+                            thread_id: None,
+                            message: format!("shared_mcp_host catalog write: {e}"),
+                        },
+                    );
+                    return;
+                }
+                let id = self
+                    .resources
+                    .insert_shared_mcp_host(name.clone(), url, session);
+                let annotations: HashMap<String, ToolAnnotations> = tools
+                    .iter()
+                    .map(|t| (t.name.clone(), t.annotations.clone()))
+                    .collect();
+                self.resources.populate_mcp_tools(&id, tools, annotations);
+                let host = self.shared_mcp_host_info(&name).expect("just applied");
+                let reply = match op {
+                    SharedMcpOp::Add => ServerToClient::SharedMcpHostAdded {
+                        correlation_id,
+                        host,
+                    },
+                    SharedMcpOp::Update => ServerToClient::SharedMcpHostUpdated {
+                        correlation_id,
+                        host,
+                    },
+                };
+                self.router.send_to_client(conn_id, reply);
+            }
+            Err(message) => {
+                let verb = match op {
+                    SharedMcpOp::Add => "add_shared_mcp_host",
+                    SharedMcpOp::Update => "update_shared_mcp_host",
+                };
+                self.router.send_to_client(
+                    conn_id,
+                    ServerToClient::Error {
+                        correlation_id,
+                        thread_id: None,
+                        message: format!("{verb}: {message}"),
+                    },
+                );
+            }
+        }
+    }
+
+    /// Remove a shared MCP host from the catalog and registry.
+    /// Refuses when any live thread holds the host in its `users` set
+    /// — the caller should retarget / finish those threads first.
+    /// Refuses overlay-only entries (CLI-only) too.
+    pub(crate) fn remove_shared_mcp_host(&mut self, name: &str) -> anyhow::Result<()> {
+        use crate::pod::resources::McpHostId;
+        if !self.shared_mcp_catalog.contains(name) {
+            if self.shared_mcp_overlay_names.contains(name) {
+                anyhow::bail!(
+                    "host `{name}` is a CLI --shared-mcp-host overlay; remove the flag and restart to unregister"
+                );
+            }
+            anyhow::bail!("host `{name}` not in catalog");
+        }
+        let id = McpHostId::shared(name);
+        if let Some(entry) = self.resources.mcp_hosts.get(&id)
+            && !entry.users.is_empty()
+        {
+            let mut users: Vec<&str> = entry.users.iter().map(String::as_str).collect();
+            users.sort();
+            anyhow::bail!(
+                "host `{name}` is currently in use by threads: [{}]. End or retarget those threads first",
+                users.join(", ")
+            );
+        }
+        self.shared_mcp_catalog.remove(name)?;
+        self.resources.mcp_hosts.remove(&id);
         Ok(())
     }
 
@@ -2985,6 +3272,9 @@ pub async fn run(
                         SchedulerCompletion::Probe(probe) => {
                             scheduler.apply_probe_completion(probe);
                         }
+                        SchedulerCompletion::SharedMcp(done) => {
+                            scheduler.apply_shared_mcp_completion(done);
+                        }
                     }
                 }
             }
@@ -3024,4 +3314,60 @@ async fn next_completion(
     pending: &mut FuturesUnordered<SchedulerFuture>,
 ) -> Option<SchedulerCompletion> {
     pending.next().await
+}
+
+/// Best-effort shared-MCP-host connect at startup. Success populates
+/// the registry as `Ready` with tools listed; failure registers the
+/// entry as `Errored` with the connect message so the operator can
+/// see the error in the WebUI list without digging in server logs.
+/// `source` is included in logs to distinguish catalog vs CLI-overlay
+/// entries.
+async fn connect_shared_mcp_on_boot(
+    resources: &mut ResourceRegistry,
+    name: &str,
+    url: &str,
+    bearer: Option<String>,
+    source: &str,
+) {
+    info!(name = %name, url = %url, %source, "connecting to shared MCP host");
+    let session = match McpSession::connect(url, bearer).await {
+        Ok(s) => Arc::new(s),
+        Err(e) => {
+            warn!(
+                name = %name,
+                url = %url,
+                error = %e,
+                "shared MCP connect failed at startup; entry registered as Errored"
+            );
+            resources.insert_shared_mcp_host_errored(
+                name.to_string(),
+                url.to_string(),
+                format!("connect: {e}"),
+            );
+            return;
+        }
+    };
+    let tools = match session.list_tools().await {
+        Ok(t) => t,
+        Err(e) => {
+            warn!(
+                name = %name,
+                url = %url,
+                error = %e,
+                "shared MCP tools/list failed at startup; entry registered as Errored"
+            );
+            resources.insert_shared_mcp_host_errored(
+                name.to_string(),
+                url.to_string(),
+                format!("tools/list: {e}"),
+            );
+            return;
+        }
+    };
+    let id = resources.insert_shared_mcp_host(name.to_string(), url.to_string(), session);
+    let annotations: HashMap<String, ToolAnnotations> = tools
+        .iter()
+        .map(|t| (t.name.clone(), t.annotations.clone()))
+        .collect();
+    resources.populate_mcp_tools(&id, tools, annotations);
 }
