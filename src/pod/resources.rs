@@ -409,6 +409,36 @@ impl ResourceRegistry {
         id
     }
 
+    /// Swap the `Arc<McpSession>` on an existing shared-MCP entry
+    /// without rebuilding the entry from scratch. Preserves `users`,
+    /// `tools`, `annotations`, `pinned`, and `created_at`; advances
+    /// `last_used`. Used by the OAuth refresh path: a rotated
+    /// access_token spawns a fresh `McpSession`, which this method
+    /// installs in-place so the entry's thread-attachment count
+    /// survives the rotation.
+    ///
+    /// In-flight tool calls that captured the old `Arc` before the
+    /// swap keep running against the old session (and may 401 on the
+    /// server if their bearer has already expired). New calls dispatch
+    /// through the new session. Returns false when the entry is
+    /// missing — caller should treat as a lost-entry error.
+    pub fn replace_shared_mcp_session(
+        &mut self,
+        name: &str,
+        url: String,
+        session: Arc<McpSession>,
+    ) -> bool {
+        let id = McpHostId::shared(name);
+        let Some(entry) = self.mcp_hosts.get_mut(&id) else {
+            return false;
+        };
+        entry.spec.url = url;
+        entry.session = Some(session);
+        entry.state = ResourceState::Ready;
+        entry.last_used = Utc::now();
+        true
+    }
+
     /// Register a shared MCP host as Errored — used when a startup
     /// connect fails but the catalog still knows about the entry.
     /// Surfaces the connect error on `ListSharedMcpHosts` so the

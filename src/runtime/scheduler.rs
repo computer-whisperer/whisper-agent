@@ -287,6 +287,13 @@ const RETENTION_TICK_SECS: u64 = 3600;
 /// going down. Also bounds how stale the reachability indicator can
 /// be when nothing else is exercising the provider.
 const HOST_ENV_PROBE_TICK_SECS: u64 = 30;
+/// How often the OAuth refresh sweep runs. 60s is short enough that
+/// the 5-minute safety margin (`OAUTH_REFRESH_MARGIN_SECS`) covers
+/// ~5 sweep attempts per token lifetime — plenty of headroom for a
+/// transient token-endpoint blip to recover before expiry actually
+/// hits. Longer would mean fewer retries; shorter would spend
+/// scheduler cycles scanning a cold catalog.
+const OAUTH_REFRESH_TICK_SECS: u64 = 60;
 
 /// Interim event a dispatched I/O task pushes back to the scheduler for
 /// immediate fan-out to subscribers. Distinct from the per-task I/O
@@ -343,6 +350,15 @@ pub struct Scheduler {
     /// (code exchange + MCP connect). Swept for expiry on the GC
     /// tick so walked-away users don't leak.
     pending_oauth_flows: HashMap<String, PendingOauthFlow>,
+    /// Catalog entry names whose OAuth refresh is currently
+    /// dispatched but hasn't completed yet. Prevents the refresh
+    /// ticker from enqueueing a second refresh for the same entry
+    /// while the first is in flight.
+    oauth_refresh_in_flight: HashSet<String>,
+    /// Catalog entry names we've already logged a "no refresh_token"
+    /// warning for. Once-per-entry log to avoid spamming the
+    /// journal on every refresh tick for non-refreshable entries.
+    oauth_refresh_no_refresh_token_warned: HashSet<String>,
 
     tasks: HashMap<String, Thread>,
     /// Owns the connection registry, subscription map, audit log, and the
@@ -485,6 +501,8 @@ impl Scheduler {
                 shared_mcp_catalog,
                 shared_mcp_overlay_names: overlay_names,
                 pending_oauth_flows: HashMap::new(),
+                oauth_refresh_in_flight: HashSet::new(),
+                oauth_refresh_no_refresh_token_warned: HashSet::new(),
                 tasks: HashMap::new(),
                 router: ThreadEventRouter::new(audit, host_id),
                 resources,
@@ -1351,6 +1369,143 @@ impl Scheduler {
                         message: format!("add_shared_mcp_host (oauth2): {message}"),
                     },
                 );
+            }
+        }
+    }
+
+    /// How far before expiry the refresh sweep starts trying to
+    /// rotate a token. 5 minutes is generous relative to typical
+    /// tool-call latencies (seconds to tens of seconds) so in-flight
+    /// calls almost never straddle a rotation boundary. Tokens with
+    /// no `expires_at` are refreshed on demand (their `refresh_token`
+    /// still rotates eventually if the AS revokes the access one).
+    const OAUTH_REFRESH_MARGIN_SECS: i64 = 300;
+
+    /// Walk every catalog entry and dispatch a refresh future for
+    /// each OAuth entry whose access_token is within the safety
+    /// margin of expiring (or already expired). Returns a vec of
+    /// `SchedulerFuture`s the caller extends into `pending_io`.
+    /// `in_flight` is populated with the names we just dispatched
+    /// so the next tick doesn't re-enqueue entries still waiting
+    /// for their refresh to complete — the `apply_oauth_refresh_completion`
+    /// handler removes the name on landing.
+    pub(crate) fn spawn_oauth_refresh_futures(
+        &mut self,
+    ) -> Vec<crate::runtime::io_dispatch::SchedulerFuture> {
+        let now = chrono::Utc::now().timestamp();
+        let margin = Self::OAUTH_REFRESH_MARGIN_SECS;
+        let mut out: Vec<crate::runtime::io_dispatch::SchedulerFuture> = Vec::new();
+        for entry in self.shared_mcp_catalog.entries() {
+            let crate::tools::shared_mcp_catalog::SharedMcpAuth::Oauth2(o) = &entry.auth else {
+                continue;
+            };
+            if self.oauth_refresh_in_flight.contains(&entry.name) {
+                continue;
+            }
+            let Some(refresh_token) = o.refresh_token.clone() else {
+                // No refresh token → can't refresh this entry. The
+                // access token will expire on its own; tool calls
+                // will start 401ing; the operator has to remove +
+                // re-add through the webui. Logged once per entry
+                // the first time we skip it.
+                if self
+                    .oauth_refresh_no_refresh_token_warned
+                    .insert(entry.name.clone())
+                {
+                    warn!(
+                        host = %entry.name,
+                        "oauth host has no refresh_token; will not auto-renew when access_token expires"
+                    );
+                }
+                continue;
+            };
+            // Skip when expiry is far out. `expires_at = None`
+            // falls through (the `<` against now + margin is false
+            // when the option is None), so no-expiry entries don't
+            // get preemptively refreshed. They'll still be
+            // refreshed reactively when the access token starts
+            // failing (followup in step 2c).
+            let needs_refresh = match o.expires_at {
+                Some(exp) => exp < now + margin,
+                None => false,
+            };
+            if !needs_refresh {
+                continue;
+            }
+            self.oauth_refresh_in_flight.insert(entry.name.clone());
+            out.push(crate::runtime::io_dispatch::build_oauth_refresh_future(
+                crate::runtime::io_dispatch::OauthRefreshArgs {
+                    name: entry.name.clone(),
+                    url: entry.url.clone(),
+                    token_endpoint: o.token_endpoint.clone(),
+                    client_id: o.client_id.clone(),
+                    client_secret: o.client_secret.clone(),
+                    refresh_token,
+                    resource: o.resource.clone(),
+                    scope: o.scope.clone(),
+                },
+            ));
+        }
+        out
+    }
+
+    /// Apply a completed refresh: on success, rotate tokens in the
+    /// catalog and swap the session in the registry; on failure,
+    /// log + leave the old session in place (it may still work
+    /// until the token actually expires, and the next tick will
+    /// retry). Either way, `oauth_refresh_in_flight` is updated so
+    /// the entry becomes eligible for the next sweep.
+    pub(crate) fn apply_oauth_refresh_completion(
+        &mut self,
+        completion: crate::runtime::io_dispatch::OauthRefreshCompletion,
+    ) {
+        let crate::runtime::io_dispatch::OauthRefreshCompletion { name, url, result } = completion;
+        self.oauth_refresh_in_flight.remove(&name);
+        match result {
+            Ok(data) => {
+                let crate::runtime::io_dispatch::OauthRefreshData {
+                    session,
+                    access_token,
+                    refresh_token,
+                    expires_at,
+                    scope,
+                } = data;
+                let now = chrono::Utc::now();
+                if let Err(e) = self.shared_mcp_catalog.rotate_oauth_tokens(
+                    &name,
+                    access_token,
+                    refresh_token,
+                    expires_at,
+                    scope,
+                    now,
+                ) {
+                    warn!(
+                        host = %name,
+                        error = %e,
+                        "oauth refresh: catalog rotate failed; session not swapped"
+                    );
+                    return;
+                }
+                let swapped = self
+                    .resources
+                    .replace_shared_mcp_session(&name, url, session);
+                if !swapped {
+                    warn!(
+                        host = %name,
+                        "oauth refresh: registry entry missing; catalog rotated but session not swapped (will be picked up on next connect attempt)"
+                    );
+                    return;
+                }
+                info!(host = %name, "oauth refresh: rotated tokens and swapped session");
+            }
+            Err(message) => {
+                // Don't nuke the entry on a transient failure. The
+                // existing session still works until the access
+                // token actually expires; the next tick retries.
+                // Eventually it'll succeed, or the token expires
+                // and tool calls 401 — the operator notices in the
+                // UI ("connected: false") and investigates.
+                warn!(host = %name, error = %message, "oauth refresh failed");
             }
         }
     }
@@ -3570,6 +3725,8 @@ pub async fn run(
     let mut cron_ticker = tokio::time::interval(Duration::from_secs(CRON_TICK_SECS));
     let mut retention_ticker = tokio::time::interval(Duration::from_secs(RETENTION_TICK_SECS));
     let mut probe_ticker = tokio::time::interval(Duration::from_secs(HOST_ENV_PROBE_TICK_SECS));
+    let mut oauth_refresh_ticker =
+        tokio::time::interval(Duration::from_secs(OAUTH_REFRESH_TICK_SECS));
     // Skip the first immediate tick on all — `interval` fires at t=0 by default.
     gc_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     gc_ticker.tick().await;
@@ -3583,6 +3740,12 @@ pub async fn run(
     // 30 s. MissedTickBehavior::Skip prevents thundering-herd bursts
     // after the process suspends and resumes (laptop lids etc.).
     probe_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // Oauth refresh: skip the first tick (no point refreshing at
+    // boot — freshly loaded tokens are, by definition, fresh) and
+    // drop missed ticks instead of bursting. Suspended laptops can
+    // otherwise fire a dozen refreshes at once on resume.
+    oauth_refresh_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    oauth_refresh_ticker.tick().await;
 
     // Apply each cron behavior's CatchUp policy to its persisted
     // cursor. Runs once at boot, before any tick evaluates for real.
@@ -3626,6 +3789,9 @@ pub async fn run(
                         SchedulerCompletion::OauthComplete(done) => {
                             scheduler.apply_oauth_complete_completion(done);
                         }
+                        SchedulerCompletion::OauthRefresh(done) => {
+                            scheduler.apply_oauth_refresh_completion(done);
+                        }
                     }
                 }
             }
@@ -3647,6 +3813,9 @@ pub async fn run(
             }
             _ = probe_ticker.tick() => {
                 pending_io.extend(scheduler.spawn_reachability_probes());
+            }
+            _ = oauth_refresh_ticker.tick() => {
+                pending_io.extend(scheduler.spawn_oauth_refresh_futures());
             }
         }
         scheduler.flush_dirty().await;

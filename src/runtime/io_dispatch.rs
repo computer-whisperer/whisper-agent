@@ -124,6 +124,7 @@ pub(crate) enum SchedulerCompletion {
     SharedMcp(SharedMcpCompletion),
     OauthStart(OauthStartCompletion),
     OauthComplete(OauthCompleteCompletion),
+    OauthRefresh(OauthRefreshCompletion),
 }
 
 /// Which Add/Update operation the completion applies to. The
@@ -412,6 +413,113 @@ pub(crate) fn build_oauth_complete_future(
             scope,
             result: complete,
         })
+    })
+}
+
+// ---------- OAuth refresh ----------
+//
+// Runs off the scheduler thread because it calls the token endpoint
+// (HTTP) and then re-handshakes with the MCP server. The scheduler
+// feeds all refreshable entries into this pipeline on the 60s
+// refresh tick; completions write the rotated tokens back to the
+// catalog and swap the session in the registry.
+
+pub(crate) struct OauthRefreshCompletion {
+    /// Name of the catalog entry being refreshed. The completion
+    /// handler re-looks up the entry to detect the rare
+    /// "entry removed mid-flight" case.
+    pub(crate) name: String,
+    /// MCP URL captured at dispatch time. Used to re-connect after
+    /// the token rotates. The catalog's URL doesn't change during a
+    /// refresh so passing it through the future keeps the
+    /// completion self-contained.
+    pub(crate) url: String,
+    pub(crate) result: Result<OauthRefreshData, String>,
+}
+
+pub(crate) struct OauthRefreshData {
+    /// Fresh session authenticated with the rotated access_token.
+    pub(crate) session: Arc<McpSession>,
+    pub(crate) access_token: String,
+    pub(crate) refresh_token: Option<String>,
+    pub(crate) expires_at: Option<i64>,
+    pub(crate) scope: Option<String>,
+}
+
+/// Arguments for `build_oauth_refresh_future`. The refresh future is
+/// stateless — it does the HTTP exchange + an MCP re-connect and
+/// returns the outcome; the scheduler then performs all catalog +
+/// registry mutation on its own thread. Grouped into a struct
+/// because the flat parameter list hit 8 positional args, which
+/// clippy flags and which tend to rot as OAuth fields evolve.
+pub(crate) struct OauthRefreshArgs {
+    pub(crate) name: String,
+    pub(crate) url: String,
+    pub(crate) token_endpoint: String,
+    pub(crate) client_id: String,
+    pub(crate) client_secret: Option<String>,
+    pub(crate) refresh_token: String,
+    pub(crate) resource: String,
+    pub(crate) scope: Option<String>,
+}
+
+pub(crate) fn build_oauth_refresh_future(args: OauthRefreshArgs) -> SchedulerFuture {
+    let OauthRefreshArgs {
+        name,
+        url,
+        token_endpoint,
+        client_id,
+        client_secret,
+        refresh_token,
+        resource,
+        scope,
+    } = args;
+    Box::pin(async move {
+        let http = match crate::mcp_oauth::http_client() {
+            Ok(c) => c,
+            Err(e) => {
+                return SchedulerCompletion::OauthRefresh(OauthRefreshCompletion {
+                    name,
+                    url,
+                    result: Err(format!("init http client: {e}")),
+                });
+            }
+        };
+        let result = async {
+            let token = crate::mcp_oauth::refresh_access_token(
+                &http,
+                &token_endpoint,
+                &refresh_token,
+                &client_id,
+                client_secret.as_deref(),
+                &resource,
+                scope.as_deref(),
+            )
+            .await
+            .map_err(|e| format!("refresh_access_token: {e}"))?;
+            // Re-open the MCP session with the new access token. The
+            // MCP `initialize` RPC is cheap — one round-trip — and
+            // keeps the session state machine clean. If this ever
+            // becomes hot, we can swap `McpSession.bearer` for an
+            // interior-mutable field instead.
+            let session = Arc::new(
+                McpSession::connect(&url, Some(token.access_token.clone()))
+                    .await
+                    .map_err(|e| format!("mcp reconnect with rotated token: {e}"))?,
+            );
+            let expires_at = token
+                .expires_in
+                .map(|secs| chrono::Utc::now().timestamp() + secs);
+            Ok::<OauthRefreshData, String>(OauthRefreshData {
+                session,
+                access_token: token.access_token,
+                refresh_token: token.refresh_token,
+                expires_at,
+                scope: token.scope,
+            })
+        }
+        .await;
+        SchedulerCompletion::OauthRefresh(OauthRefreshCompletion { name, url, result })
     })
 }
 

@@ -276,6 +276,52 @@ impl CatalogStore {
         self.save()
     }
 
+    /// Rotate the short-lived fields of an existing `Oauth2` entry
+    /// in place — used by the refresh path. Only the tokens +
+    /// expiry + granted scope change; issuer, endpoints, client
+    /// credentials, and the resource indicator stay fixed. Fails
+    /// when the entry doesn't exist, is a different `auth.kind`, or
+    /// the refresh response didn't carry an access_token (which
+    /// would leave us with no way to authenticate).
+    ///
+    /// `new_refresh_token` `None` means "the AS didn't return a new
+    /// one" (common for ASes that rotate every time — the old one
+    /// stays valid). A `Some(x)` replaces whatever was there, which
+    /// is the correct behavior for rotating refresh-token ASes too.
+    pub fn rotate_oauth_tokens(
+        &mut self,
+        name: &str,
+        new_access_token: String,
+        new_refresh_token: Option<String>,
+        new_expires_at: Option<i64>,
+        new_scope: Option<String>,
+        now: DateTime<Utc>,
+    ) -> Result<()> {
+        let entry = self
+            .entries
+            .iter_mut()
+            .find(|e| e.name == name)
+            .ok_or_else(|| anyhow!("host `{name}` not in catalog"))?;
+        let SharedMcpAuth::Oauth2(o) = &mut entry.auth else {
+            bail!("host `{name}` is not an OAuth entry; refresh is not applicable");
+        };
+        o.access_token = new_access_token;
+        // Preserve the existing refresh_token when the AS didn't
+        // return a new one. Replace when it did (rotating ASes).
+        if let Some(rt) = new_refresh_token {
+            o.refresh_token = Some(rt);
+        }
+        o.expires_at = new_expires_at;
+        // Similar shape for scope: preserve the existing granted
+        // scope when the AS echoes nothing back; overwrite when it
+        // does (most ASes echo).
+        if new_scope.is_some() {
+            o.scope = new_scope;
+        }
+        entry.updated_at = now;
+        self.save()
+    }
+
     pub fn remove(&mut self, name: &str) -> Result<Option<CatalogEntry>> {
         let Some(idx) = self.entries.iter().position(|e| e.name == name) else {
             return Ok(None);
@@ -565,6 +611,98 @@ mod tests {
         assert_eq!(
             default_path_for_pods_root(&pods_root),
             PathBuf::from("/var/lib/whisper-agent/shared_mcp_hosts.toml")
+        );
+    }
+
+    fn oauth_entry(name: &str, access: &str, refresh: Option<&str>) -> CatalogEntry {
+        new_manual_entry(
+            name.into(),
+            "https://mcp.example.com/mcp".into(),
+            SharedMcpAuth::Oauth2(Box::new(SharedMcpOauth2 {
+                issuer: "https://as.example.com".into(),
+                token_endpoint: "https://as.example.com/token".into(),
+                registration_endpoint: None,
+                client_id: "clid".into(),
+                client_secret: None,
+                access_token: access.into(),
+                refresh_token: refresh.map(str::to_string),
+                expires_at: Some(1_700_000_000),
+                scope: Some("mcp".into()),
+                resource: "https://mcp.example.com/mcp".into(),
+            })),
+            now(),
+        )
+    }
+
+    #[test]
+    fn rotate_oauth_tokens_updates_access_and_expiry() {
+        let dir = scratch_dir();
+        let path = dir.join(CATALOG_FILENAME);
+        let mut store = CatalogStore::load(path).unwrap();
+        store
+            .insert(oauth_entry("svc", "old-access", Some("old-refresh")))
+            .unwrap();
+        let later = now() + chrono::Duration::minutes(30);
+        store
+            .rotate_oauth_tokens(
+                "svc",
+                "new-access".into(),
+                Some("new-refresh".into()),
+                Some(1_700_010_000),
+                Some("mcp other".into()),
+                later,
+            )
+            .unwrap();
+        let SharedMcpAuth::Oauth2(o) = &store.get("svc").unwrap().auth else {
+            panic!("expected Oauth2");
+        };
+        assert_eq!(o.access_token, "new-access");
+        assert_eq!(o.refresh_token.as_deref(), Some("new-refresh"));
+        assert_eq!(o.expires_at, Some(1_700_010_000));
+        assert_eq!(o.scope.as_deref(), Some("mcp other"));
+        assert_eq!(store.get("svc").unwrap().updated_at, later);
+    }
+
+    #[test]
+    fn rotate_oauth_tokens_preserves_refresh_when_none() {
+        let dir = scratch_dir();
+        let path = dir.join(CATALOG_FILENAME);
+        let mut store = CatalogStore::load(path).unwrap();
+        store
+            .insert(oauth_entry("svc", "old", Some("keepme")))
+            .unwrap();
+        store
+            .rotate_oauth_tokens("svc", "new".into(), None, None, None, now())
+            .unwrap();
+        let SharedMcpAuth::Oauth2(o) = &store.get("svc").unwrap().auth else {
+            panic!("expected Oauth2");
+        };
+        assert_eq!(o.access_token, "new");
+        // Refresh token preserved because the AS didn't rotate it.
+        assert_eq!(o.refresh_token.as_deref(), Some("keepme"));
+        // Scope also preserved.
+        assert_eq!(o.scope.as_deref(), Some("mcp"));
+    }
+
+    #[test]
+    fn rotate_oauth_tokens_rejects_non_oauth_entry() {
+        let dir = scratch_dir();
+        let path = dir.join(CATALOG_FILENAME);
+        let mut store = CatalogStore::load(path).unwrap();
+        store
+            .insert(new_manual_entry(
+                "svc".into(),
+                "http://mcp".into(),
+                SharedMcpAuth::Bearer { token: "b".into() },
+                now(),
+            ))
+            .unwrap();
+        let err = store
+            .rotate_oauth_tokens("svc", "x".into(), None, None, None, now())
+            .unwrap_err();
+        assert!(
+            format!("{err}").contains("not an OAuth entry"),
+            "got: {err}"
         );
     }
 
