@@ -1226,6 +1226,11 @@ impl Scheduler {
                                 thread_id: thread_id.clone(),
                                 decision,
                             });
+                        self.router.write_escalation_audit(
+                            &thread_id,
+                            request.clone(),
+                            crate::server::thread_router::EscalationResolutionOwned::Approved,
+                        );
                         self.complete_function(
                             function_id,
                             FunctionOutcome::Success(
@@ -1246,6 +1251,13 @@ impl Scheduler {
                                 thread_id: thread_id.clone(),
                                 decision: crate::permission::EscalationDecision::Reject,
                             });
+                        self.router.write_escalation_audit(
+                            &thread_id,
+                            request.clone(),
+                            crate::server::thread_router::EscalationResolutionOwned::RecheckFailed {
+                                detail: detail.clone(),
+                            },
+                        );
                         self.complete_function(
                             function_id,
                             FunctionOutcome::Error(crate::functions::FunctionError {
@@ -1258,16 +1270,30 @@ impl Scheduler {
                 }
             }
             crate::permission::EscalationDecision::Reject => {
-                let denial_text = match reason {
+                let denial_text = match &reason {
                     Some(r) if !r.trim().is_empty() => format!("Escalation rejected: {r}"),
                     _ => "Escalation rejected by user.".to_string(),
                 };
                 self.router
                     .broadcast_task_list(ServerToClient::EscalationResolved {
                         function_id,
-                        thread_id,
+                        thread_id: thread_id.clone(),
                         decision,
                     });
+                self.router.write_escalation_audit(
+                    &thread_id,
+                    request.clone(),
+                    crate::server::thread_router::EscalationResolutionOwned::Rejected {
+                        reason: reason.as_ref().and_then(|r| {
+                            let trimmed = r.trim();
+                            if trimmed.is_empty() {
+                                None
+                            } else {
+                                Some(trimmed.to_string())
+                            }
+                        }),
+                    },
+                );
                 // Rejection rides the Error outcome so
                 // `outcome_to_sync_tool_result` returns `Err(detail)`,
                 // which the parked oneshot in
@@ -1311,19 +1337,28 @@ impl Scheduler {
         if affected_threads.is_empty() {
             return;
         }
-        let pending_fns: Vec<crate::functions::FunctionId> = self
+        let pending_fns: Vec<(
+            crate::functions::FunctionId,
+            String,
+            crate::permission::EscalationRequest,
+        )> = self
             .active_functions
             .iter()
             .filter_map(|(id, entry)| match &entry.spec {
-                Function::RequestEscalation { thread_id, .. }
-                    if affected_threads.iter().any(|t| t == thread_id) =>
-                {
-                    Some(*id)
+                Function::RequestEscalation {
+                    thread_id, request, ..
+                } if affected_threads.iter().any(|t| t == thread_id) => {
+                    Some((*id, thread_id.clone(), request.clone()))
                 }
                 _ => None,
             })
             .collect();
-        for fn_id in pending_fns {
+        for (fn_id, thread_id, request) in pending_fns {
+            self.router.write_escalation_audit(
+                &thread_id,
+                request,
+                crate::server::thread_router::EscalationResolutionOwned::ChannelDropped,
+            );
             self.complete_function(
                 fn_id,
                 FunctionOutcome::Error(crate::functions::FunctionError {
@@ -1810,5 +1845,78 @@ fn describe_request(req: &crate::permission::EscalationRequest) -> String {
         RaisePodModify { target } => format!("pod_modify raised to {target:?}"),
         RaiseBehaviors { target } => format!("behaviors raised to {target:?}"),
         RaiseDispatch { target } => format!("dispatch raised to {target:?}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::functions::{FunctionError, FunctionErrorKind, RequestEscalationTerminal};
+    use crate::permission::{BehaviorOpsCap, DispatchCap, EscalationDecision, PodModifyCap};
+
+    #[test]
+    fn describe_request_covers_every_variant() {
+        use crate::permission::EscalationRequest::*;
+        assert_eq!(
+            describe_request(&AddTool {
+                name: "write_file".into()
+            }),
+            "tool `write_file` added to scope"
+        );
+        assert!(
+            describe_request(&RaisePodModify {
+                target: PodModifyCap::ModifyAllow,
+            })
+            .contains("pod_modify raised to"),
+        );
+        assert!(
+            describe_request(&RaiseBehaviors {
+                target: BehaviorOpsCap::AuthorAny,
+            })
+            .contains("behaviors raised to"),
+        );
+        assert!(
+            describe_request(&RaiseDispatch {
+                target: DispatchCap::WithinScope,
+            })
+            .contains("dispatch raised to"),
+        );
+    }
+
+    #[test]
+    fn outcome_to_sync_tool_result_returns_ok_for_approved_escalation() {
+        let outcome = FunctionOutcome::Success(FunctionTerminal::RequestEscalation(
+            RequestEscalationTerminal {
+                decision: EscalationDecision::Approve,
+                tool_result_text: "Escalation granted: tool `exec` added to scope.".into(),
+            },
+        ));
+        let r = outcome_to_sync_tool_result(&outcome).expect("approved grant is Ok");
+        assert!(r.contains("Escalation granted"));
+    }
+
+    #[test]
+    fn outcome_to_sync_tool_result_returns_err_for_rejected_escalation() {
+        // Rejection rides the Error outcome (see note in resolve_escalation):
+        // the parked oneshot converts Err(detail) into a tool-result with
+        // is_error: true, so the model reads it as a denial and recovers.
+        let outcome = FunctionOutcome::Error(FunctionError {
+            kind: FunctionErrorKind::Execution,
+            detail: "Escalation rejected: not now.".into(),
+        });
+        let e = outcome_to_sync_tool_result(&outcome).expect_err("rejection surfaces as Err");
+        assert!(e.contains("rejected"));
+    }
+
+    #[test]
+    fn outcome_to_sync_tool_result_reports_recheck_failure_as_err() {
+        // Approve-path re-check failure is also surfaced as Err so the
+        // calling tool sees an error result rather than a silent success.
+        let outcome = FunctionOutcome::Error(FunctionError {
+            kind: FunctionErrorKind::Execution,
+            detail: "escalation grant re-check failed: would exceed pod ceiling".into(),
+        });
+        let e = outcome_to_sync_tool_result(&outcome).expect_err("recheck failure is Err");
+        assert!(e.contains("re-check failed"));
     }
 }

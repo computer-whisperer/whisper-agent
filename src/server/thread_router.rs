@@ -20,7 +20,10 @@ use tokio::sync::mpsc;
 use tracing::{error, warn};
 use whisper_agent_protocol::ServerToClient;
 
-use crate::runtime::audit::{AuditLog, ToolCallEntry, ToolCallOutcome};
+use crate::runtime::audit::{
+    AuditLog, EscalationEntry, EscalationEventTag, EscalationResolution, ToolCallEntry,
+    ToolCallEventTag, ToolCallOutcome,
+};
 use crate::runtime::scheduler::ConnId;
 use crate::runtime::thread::ThreadEvent;
 
@@ -285,6 +288,7 @@ impl ThreadEventRouter {
                 None => ToolCallOutcome::Ok { is_error },
             };
             let entry = ToolCallEntry {
+                event: ToolCallEventTag::ToolCall,
                 timestamp: chrono::Utc::now(),
                 thread_id: &thread_id,
                 host_id: &host_id,
@@ -297,4 +301,52 @@ impl ThreadEventRouter {
             }
         });
     }
+
+    /// Fire-and-forget escalation audit write. Called from every
+    /// terminal transition of a `request_escalation` Function
+    /// (approve-success, approve-recheck-fail, reject, channel-drop
+    /// revocation) so the widening decision trail is never silent.
+    pub(crate) fn write_escalation_audit(
+        &self,
+        thread_id: &str,
+        request: whisper_agent_protocol::permission::EscalationRequest,
+        resolution: EscalationResolutionOwned,
+    ) {
+        let audit = self.audit.clone();
+        let thread_id = thread_id.to_string();
+        let host_id = self.host_id.clone();
+        tokio::spawn(async move {
+            let resolution_ref = match &resolution {
+                EscalationResolutionOwned::Approved => EscalationResolution::Approved,
+                EscalationResolutionOwned::Rejected { reason } => EscalationResolution::Rejected {
+                    reason: reason.as_deref(),
+                },
+                EscalationResolutionOwned::RecheckFailed { detail } => {
+                    EscalationResolution::RecheckFailed { detail }
+                }
+                EscalationResolutionOwned::ChannelDropped => EscalationResolution::ChannelDropped,
+            };
+            let entry = EscalationEntry {
+                event: EscalationEventTag::Escalation,
+                timestamp: chrono::Utc::now(),
+                thread_id: &thread_id,
+                host_id: &host_id,
+                request: &request,
+                resolution: resolution_ref,
+            };
+            if let Err(e) = audit.write_escalation(&entry).await {
+                error!(error = %e, "escalation audit write failed");
+            }
+        });
+    }
+}
+
+/// Owned mirror of `EscalationResolution` so call sites can hand a
+/// value to the fire-and-forget spawn without borrowing from transient
+/// scheduler state.
+pub(crate) enum EscalationResolutionOwned {
+    Approved,
+    Rejected { reason: Option<String> },
+    RecheckFailed { detail: String },
+    ChannelDropped,
 }
