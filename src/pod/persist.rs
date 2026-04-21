@@ -34,6 +34,7 @@ use tokio::fs;
 use tracing::{info, warn};
 
 use crate::pod::behaviors::{self as pod_behaviors};
+use crate::pod::fs::MEMORY_DIR;
 use crate::pod::fs::is_readonly_path;
 use crate::pod::{self, POD_STATE_JSON, POD_TOML, Pod, PodId, THREADS_DIR};
 use crate::runtime::thread::{Thread, ThreadInternalState};
@@ -158,6 +159,9 @@ impl Persister {
         fs::create_dir_all(pod_dir.join(THREADS_DIR))
             .await
             .with_context(|| format!("mkdir {}", pod_dir.display()))?;
+        fs::create_dir_all(pod_dir.join(MEMORY_DIR))
+            .await
+            .with_context(|| format!("mkdir {}/{MEMORY_DIR}", pod_dir.display()))?;
         let pod_toml = pod_dir.join(POD_TOML);
         if fs::try_exists(&pod_toml).await.unwrap_or(false) {
             return Ok(());
@@ -469,6 +473,9 @@ impl Persister {
         fs::create_dir_all(pod_dir.join(THREADS_DIR))
             .await
             .with_context(|| format!("mkdir {}", pod_dir.display()))?;
+        fs::create_dir_all(pod_dir.join(MEMORY_DIR))
+            .await
+            .with_context(|| format!("mkdir {}/{MEMORY_DIR}", pod_dir.display()))?;
         let toml_text = pod::to_toml(&config).context("encode pod.toml")?;
         fs::write(pod_dir.join(POD_TOML), &toml_text)
             .await
