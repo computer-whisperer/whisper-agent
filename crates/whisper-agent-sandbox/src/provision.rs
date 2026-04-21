@@ -5,12 +5,10 @@
 
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU16, Ordering};
 use std::time::Duration;
 
 use rand::RngCore;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::Mutex;
 use tracing::info;
@@ -21,11 +19,12 @@ use whisper_agent_protocol::sandbox::{AccessMode, HostEnvSpec, NetworkPolicy, Pa
 /// `anyhow!` chain without letting a chatty child bloat memory.
 const STDERR_TAIL_BYTES: usize = 4096;
 
-/// Port range for spawned MCP host instances. Each provision bumps the
-/// counter. Starts well above the sibling daemon ports (sandbox 9810/9820,
-/// fetch 9830, search 9831) so the in-tree dev harness and the packaged
-/// systemd service can coexist on one host without colliding.
-static NEXT_PORT: AtomicU16 = AtomicU16::new(9900);
+/// How long we wait for the spawned mcp-host to print its
+/// `listening <addr>` handshake line. The child has to bind a TCP
+/// listener and flush one line — normally ~milliseconds. A second
+/// daemon running on the same host can slow things down; 10 s is
+/// comfortable while still catching a wedged child.
+const READY_TIMEOUT_SECS: u64 = 10;
 
 pub struct ProvisionedSession {
     pub child: Child,
@@ -147,14 +146,18 @@ async fn provision_landlock(
 
     let bin_dir = resolve_bin_dir(mcp_host_bin)?;
 
-    let port = NEXT_PORT.fetch_add(1, Ordering::Relaxed);
-    // Bind the MCP host child on the same interface the daemon itself
-    // listens on. If the daemon is on `[::]` or `0.0.0.0` (dual-stack
-    // wildcard), the child is reachable on every interface the daemon
-    // is; if the daemon is loopback-only, the child stays loopback-only
-    // as well. This keeps the child's network exposure in lockstep with
-    // an operator's conscious choice for the daemon.
-    let listen_addr = SocketAddr::new(bind_ip, port).to_string();
+    // Ask the kernel to pick a free port (port 0). The child binds,
+    // then prints `listening <addr>` on stdout; we read that line to
+    // learn the actual port. This eliminates the whole class of
+    // "another daemon got there first" races (which were real:
+    // different sandbox daemons on the same host could otherwise hand
+    // the scheduler a URL pointing at each other's mcp-host).
+    //
+    // `bind_ip` still controls the interface family: loopback-only
+    // daemons produce loopback-only children, `[::]`/`0.0.0.0`
+    // daemons produce wildcard-bound children. The port is the only
+    // thing the kernel picks.
+    let listen_addr = SocketAddr::new(bind_ip, 0).to_string();
 
     info!(
         %workspace_root,
@@ -181,7 +184,11 @@ async fn provision_landlock(
     // without exposing it in argv or the environment (both readable via
     // /proc/<pid>/... under the same uid).
     cmd.stdin(std::process::Stdio::piped());
-    cmd.stdout(std::process::Stdio::inherit());
+    // stdout is piped so we can read the child's `listening <addr>`
+    // handshake line after it binds. The child's own tracing logs go
+    // to stderr (drained below), so stdout carries only this one
+    // structured handshake line.
+    cmd.stdout(std::process::Stdio::piped());
     // stderr is piped so we can grab a tail on startup failure. The
     // spawned drainer below tees to the daemon's own stderr so
     // journalctl still shows the child's output at runtime.
@@ -232,9 +239,13 @@ async fn provision_landlock(
         tokio::spawn(drain_stderr(pipe, tail));
     }
 
-    match wait_for_ready_or_exit(&listen_addr, 10, &mut child).await {
-        WaitOutcome::Listening => {
-            let mcp_url = format!("http://{listen_addr}/mcp");
+    let stdout_pipe = child
+        .stdout
+        .take()
+        .ok_or_else(|| ProvisionError::Spawn("child stdout not captured".into()))?;
+    match wait_for_listening_line(stdout_pipe, READY_TIMEOUT_SECS, &mut child).await {
+        ListeningOutcome::Bound { addr } => {
+            let mcp_url = format!("http://{addr}/mcp");
             info!(%mcp_url, "MCP host ready");
             Ok(ProvisionedSession {
                 child,
@@ -242,19 +253,29 @@ async fn provision_landlock(
                 mcp_token,
             })
         }
-        WaitOutcome::Exited { code } => Err(ProvisionError::ChildExited {
+        ListeningOutcome::Exited { code } => Err(ProvisionError::ChildExited {
             code,
             stderr_tail: read_tail(&stderr_tail).await,
         }),
-        WaitOutcome::Timeout { seconds } => {
-            // Child is still running and not responding — kill it so
-            // we don't leak the process, then surface whatever stderr
-            // did accumulate (may be empty for a hung child).
+        ListeningOutcome::Timeout { seconds } => {
             let _ = child.kill().await;
             Err(ProvisionError::StartupTimeout {
                 seconds,
                 stderr_tail: read_tail(&stderr_tail).await,
             })
+        }
+        ListeningOutcome::BadHandshake { detail } => {
+            // Child exited or closed stdout without emitting a
+            // well-formed "listening <addr>" line. Surface the stderr
+            // tail — the real reason (bind failure, panic) lives there.
+            let _ = child.kill().await;
+            let tail = read_tail(&stderr_tail).await;
+            let joined = if tail.is_empty() {
+                detail
+            } else {
+                format!("{detail}: {tail}")
+            };
+            Err(ProvisionError::Spawn(joined))
         }
     }
 }
@@ -354,43 +375,76 @@ fn apply_landlock(
     Ok(())
 }
 
-enum WaitOutcome {
-    /// Child bound the listen port — TCP connect succeeded.
-    Listening,
-    /// Child exited before binding. Surface with stderr tail so the
-    /// operator sees the real reason (bad config, missing path, etc.)
-    /// rather than a generic timeout.
+enum ListeningOutcome {
+    /// Child emitted a well-formed `listening <addr>` handshake line.
+    /// `addr` is the parsed socket address — use this to build the
+    /// mcp_url. The child is still running; caller owns it.
+    Bound { addr: SocketAddr },
+    /// Child exited before emitting a handshake. Surface with the
+    /// stderr tail so the operator sees the real cause (bind failure,
+    /// panic) rather than a generic timeout.
     Exited { code: Option<i32> },
-    /// Neither happened within the deadline. Child is still running;
+    /// Deadline hit; no handshake line. Child is still running;
     /// caller is expected to kill it.
     Timeout { seconds: u64 },
+    /// Child's stdout closed or emitted a malformed line without the
+    /// child itself exiting with an observable code. Caller kills it
+    /// and formats a Spawn error with this detail + stderr tail.
+    BadHandshake { detail: String },
 }
 
-/// Poll TCP connect on `addr` until it succeeds, the child exits, or
-/// the deadline is hit — whichever comes first. Distinguishing the
-/// three outcomes is what lets the caller surface "your pod spec
-/// pointed at a nonexistent path" instead of "timeout waiting for
-/// readiness".
-async fn wait_for_ready_or_exit(addr: &str, timeout_secs: u64, child: &mut Child) -> WaitOutcome {
-    let connect_loop = async {
-        loop {
-            if TcpStream::connect(addr).await.is_ok() {
-                return WaitOutcome::Listening;
+/// Read the child's stdout until one of:
+/// - a well-formed `listening <addr>` line arrives (happy path)
+/// - child exits (surface exit code)
+/// - `timeout_secs` elapses (surface timeout)
+/// - stdout closes without a handshake line (malformed: some non-
+///   emitting panic or a version-skewed child)
+async fn wait_for_listening_line(
+    stdout: tokio::process::ChildStdout,
+    timeout_secs: u64,
+    child: &mut Child,
+) -> ListeningOutcome {
+    let read_line = async {
+        let mut reader = BufReader::new(stdout);
+        let mut line = String::new();
+        match reader.read_line(&mut line).await {
+            Ok(0) => ListeningOutcome::BadHandshake {
+                detail: "child stdout closed before emitting `listening <addr>`".into(),
+            },
+            Ok(_) => {
+                let trimmed = line.trim();
+                match parse_listening_line(trimmed) {
+                    Some(addr) => ListeningOutcome::Bound { addr },
+                    None => ListeningOutcome::BadHandshake {
+                        detail: format!("unexpected child handshake: {trimmed:?}"),
+                    },
+                }
             }
-            tokio::time::sleep(Duration::from_millis(50)).await;
+            Err(e) => ListeningOutcome::BadHandshake {
+                detail: format!("reading child handshake: {e}"),
+            },
         }
     };
     let exit_watch = async {
         let code = child.wait().await.ok().and_then(|s| s.code());
-        WaitOutcome::Exited { code }
+        ListeningOutcome::Exited { code }
     };
     let deadline = tokio::time::sleep(Duration::from_secs(timeout_secs));
 
     tokio::select! {
-        outcome = connect_loop => outcome,
+        outcome = read_line => outcome,
         outcome = exit_watch => outcome,
-        _ = deadline => WaitOutcome::Timeout { seconds: timeout_secs },
+        _ = deadline => ListeningOutcome::Timeout { seconds: timeout_secs },
     }
+}
+
+/// Parse the one-line handshake the mcp-host prints after binding:
+/// `listening 127.0.0.1:12345` (or `[::1]:12345` for IPv6). Returns
+/// `None` if the shape doesn't match — caller treats that as a
+/// malformed handshake.
+fn parse_listening_line(line: &str) -> Option<SocketAddr> {
+    let rest = line.strip_prefix("listening ")?;
+    rest.parse().ok()
 }
 
 #[cfg(test)]
@@ -440,5 +494,29 @@ mod tests {
             err.to_string(),
             "MCP host failed to become ready within 10s"
         );
+    }
+
+    #[test]
+    fn parse_listening_line_accepts_ipv4() {
+        let a = parse_listening_line("listening 127.0.0.1:12345").unwrap();
+        assert_eq!(a.to_string(), "127.0.0.1:12345");
+    }
+
+    #[test]
+    fn parse_listening_line_accepts_ipv6() {
+        let a = parse_listening_line("listening [::1]:42").unwrap();
+        assert!(a.is_ipv6());
+        assert_eq!(a.port(), 42);
+    }
+
+    #[test]
+    fn parse_listening_line_rejects_missing_prefix() {
+        assert!(parse_listening_line("127.0.0.1:8000").is_none());
+    }
+
+    #[test]
+    fn parse_listening_line_rejects_garbage() {
+        assert!(parse_listening_line("listening not-a-socket").is_none());
+        assert!(parse_listening_line("listening 127.0.0.1").is_none());
     }
 }

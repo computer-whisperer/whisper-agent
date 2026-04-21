@@ -97,10 +97,29 @@ async fn main() -> anyhow::Result<()> {
     let listener = TcpListener::bind(args.listen)
         .await
         .with_context(|| format!("failed to bind {}", args.listen))?;
+    // Announce the bound address to our parent on stdout. When called
+    // from whisper-agent-sandbox we're launched with --listen
+    // 127.0.0.1:0 and the sandbox reads this line to learn the
+    // kernel-assigned port. Also useful for standalone operators
+    // running with a fixed port — one canonical source of truth for
+    // "am I actually up?". tracing writes to stderr, so this line
+    // doesn't interleave with log output.
+    let actual_addr = listener
+        .local_addr()
+        .context("query local_addr on bound listener")?;
+    println!("listening {actual_addr}");
+    // Flush explicitly: when stdout is a pipe (sandbox-spawned case),
+    // the default line-buffering may defer the write long enough for
+    // the parent's readline to timeout. Flush guarantees the parent
+    // sees the line synchronously with the bind.
+    use std::io::Write;
+    std::io::stdout()
+        .flush()
+        .context("flush stdout handshake line")?;
     if args.no_auth {
-        info!(version = env!("CARGO_PKG_VERSION"), addr = %args.listen, root = %args.workspace_root.display(), "whisper-agent-mcp-host listening (NO AUTH)");
+        info!(version = env!("CARGO_PKG_VERSION"), addr = %actual_addr, root = %args.workspace_root.display(), "whisper-agent-mcp-host listening (NO AUTH)");
     } else {
-        info!(version = env!("CARGO_PKG_VERSION"), addr = %args.listen, root = %args.workspace_root.display(), "whisper-agent-mcp-host listening (bearer auth)");
+        info!(version = env!("CARGO_PKG_VERSION"), addr = %actual_addr, root = %args.workspace_root.display(), "whisper-agent-mcp-host listening (bearer auth)");
     }
 
     axum::serve(listener, app)
