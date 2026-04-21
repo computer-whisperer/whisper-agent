@@ -17,6 +17,9 @@ use egui::{Color32, ComboBox, DragValue, Grid, RichText, ScrollArea, TextEdit};
 use whisper_agent_protocol::sandbox::{
     AccessMode, Mount, NetworkPolicy, PathAccess, ResourceLimits,
 };
+use whisper_agent_protocol::tool_surface::{
+    ActivationSurface, CoreTools, InitialListing, ToolSurface,
+};
 use whisper_agent_protocol::{
     BehaviorConfig, BehaviorOpsCap, BehaviorSnapshot as BehaviorSnapshotProto, BehaviorSummary,
     CatchUp, DispatchCap, Disposition, HostEnvProviderInfo, HostEnvSpec, ModelSummary, Overlap,
@@ -653,7 +656,168 @@ pub(super) fn render_pod_editor_defaults_tab(
             }
         });
     }
+
+    ui.add_space(10.0);
+    section_heading(ui, "Tool surface");
+    hint(
+        ui,
+        "Controls how the thread's tool catalog is presented to the model. \
+         Defaults ship a small core set (describe_tool / find_tool / \
+         request_escalation) with a name-only listing in the system prompt; \
+         the rest are fetched on demand. Setting core_tools = \"all\" and \
+         initial_listing = \"none\" restores the pre-rework behavior of \
+         dumping every schema upfront.",
+    );
+    render_tool_surface_editor(
+        ui,
+        "pod_editor_tool_surface",
+        &mut working.thread_defaults.tool_surface,
+    );
+
     ui.add_space(8.0);
+}
+
+/// Tool-surface editor shared between the pod-editor (edits the pod
+/// baseline) and the behavior-editor (edits the per-behavior override).
+/// Caller provides a unique `id_salt` prefix so the nested widgets
+/// don't collide between instances.
+fn render_tool_surface_editor(ui: &mut egui::Ui, id_salt: &str, surface: &mut ToolSurface) {
+    // core_tools: radio between All and Named + a text area for the
+    // named list. Keep the CoreTools variant swap robust so the
+    // editor doesn't throw away a user's list if they toggle All and
+    // back.
+    ui.label(RichText::new("Wire `tools:` core set").strong());
+    let mut is_all = matches!(surface.core_tools, CoreTools::All);
+    let mut named_buf: String = match &surface.core_tools {
+        CoreTools::All => default_core_tools_text(),
+        CoreTools::Named(list) => list.join("\n"),
+    };
+    ui.horizontal(|ui| {
+        if ui.radio(!is_all, "Only these tools").clicked() {
+            is_all = false;
+        }
+        if ui
+            .radio(is_all, "All admissible tools (`\"all\"`)")
+            .clicked()
+        {
+            is_all = true;
+        }
+    });
+    if is_all {
+        surface.core_tools = CoreTools::All;
+    } else {
+        ui.label(
+            RichText::new(
+                "One name per line. Only admissible names land in Role::Tools; \
+                 unknown names are silently dropped.",
+            )
+            .small()
+            .color(Color32::from_gray(160)),
+        );
+        let resp = ui.add(
+            TextEdit::multiline(&mut named_buf)
+                .id_salt(format!("{id_salt}_core_tools_named"))
+                .desired_rows(3)
+                .desired_width(f32::INFINITY),
+        );
+        if resp.changed() {
+            let parsed: Vec<String> = named_buf
+                .lines()
+                .map(|l| l.trim())
+                .filter(|l| !l.is_empty())
+                .map(|l| l.to_string())
+                .collect();
+            surface.core_tools = CoreTools::Named(parsed);
+        } else if matches!(surface.core_tools, CoreTools::All) {
+            // We toggled from All to Named this frame but haven't
+            // edited the buffer yet — commit the default-text parse.
+            let parsed: Vec<String> = named_buf
+                .lines()
+                .map(|l| l.trim())
+                .filter(|l| !l.is_empty())
+                .map(|l| l.to_string())
+                .collect();
+            surface.core_tools = CoreTools::Named(parsed);
+        }
+    }
+
+    ui.add_space(6.0);
+    ui.label(RichText::new("System-prompt listing").strong());
+    ui.horizontal(|ui| {
+        if ui
+            .radio(
+                matches!(surface.initial_listing, InitialListing::AllNames),
+                "All names (default)",
+            )
+            .clicked()
+        {
+            surface.initial_listing = InitialListing::AllNames;
+        }
+        if ui
+            .radio(
+                matches!(surface.initial_listing, InitialListing::CoreOnly),
+                "Core only + counts",
+            )
+            .clicked()
+        {
+            surface.initial_listing = InitialListing::CoreOnly;
+        }
+        if ui
+            .radio(
+                matches!(surface.initial_listing, InitialListing::None),
+                "None (discovery-first)",
+            )
+            .clicked()
+        {
+            surface.initial_listing = InitialListing::None;
+        }
+    });
+    ui.label(
+        RichText::new(
+            "`All names` lists every admissible tool in the system prompt \
+             (plus a trailing section for escalation-available tools). \
+             `Core only` shows counts per group. `None` requires find_tool.",
+        )
+        .small()
+        .color(Color32::from_gray(160)),
+    );
+
+    ui.add_space(6.0);
+    ui.label(RichText::new("Mid-conversation activation").strong());
+    ui.horizontal(|ui| {
+        if ui
+            .radio(
+                matches!(surface.activation_surface, ActivationSurface::Announce),
+                "Announce names (default)",
+            )
+            .clicked()
+        {
+            surface.activation_surface = ActivationSurface::Announce;
+        }
+        if ui
+            .radio(
+                matches!(surface.activation_surface, ActivationSurface::InjectSchema),
+                "Inject schemas",
+            )
+            .clicked()
+        {
+            surface.activation_surface = ActivationSurface::InjectSchema;
+        }
+    });
+    ui.label(
+        RichText::new(
+            "Fires when escalation widens scope or a late MCP attaches. \
+             `Announce` just lists names — the model fetches schemas via \
+             `describe_tool`. `Inject schemas` inlines them, trading tokens \
+             for zero round-trips.",
+        )
+        .small()
+        .color(Color32::from_gray(160)),
+    );
+}
+
+fn default_core_tools_text() -> String {
+    "describe_tool\nfind_tool\nrequest_escalation".to_string()
 }
 
 pub(super) fn render_pod_editor_limits_tab(ui: &mut egui::Ui, working: &mut PodConfig) {
@@ -1199,6 +1363,37 @@ pub(super) fn render_behavior_editor_scope_tab(
                 &mut cfg.scope.caps.behaviors,
             );
         });
+
+    ui.add_space(10.0);
+    section_heading(ui, "Tool surface");
+    hint(
+        ui,
+        "Optional per-behavior override of the pod's `thread_defaults.tool_surface`. \
+         Unlike the scope caps above, this replaces the pod baseline wholesale \
+         (core_tools + initial_listing + activation_surface as a unit) — it's a \
+         presentation preference, not a permission gate.",
+    );
+    ui.add_space(4.0);
+    let mut overriding = cfg.scope.tool_surface.is_some();
+    if ui
+        .checkbox(&mut overriding, "override pod tool surface")
+        .changed()
+    {
+        cfg.scope.tool_surface = if overriding {
+            Some(ToolSurface::default())
+        } else {
+            None
+        };
+    }
+    if let Some(surface) = cfg.scope.tool_surface.as_mut() {
+        render_tool_surface_editor(ui, "behavior_scope_tool_surface", surface);
+    } else {
+        ui.label(
+            RichText::new("(inherit pod thread_defaults.tool_surface)")
+                .italics()
+                .color(Color32::from_gray(160)),
+        );
+    }
 }
 
 /// Behavior-editor-style multi-select for an `Option<Vec<String>>`
