@@ -109,6 +109,19 @@ mod tests {
         );
     }
 
+    #[test]
+    fn every_listed_topic_resolves() {
+        // Catches drift between the TOPIC_NAMES list and the `topic()`
+        // match: adding a name to one but not the other would silently
+        // 404 that topic. Keeps the index trustworthy as content grows.
+        for name in crate::tools::about_docs::TOPIC_NAMES {
+            assert!(
+                crate::tools::about_docs::topic(name).is_some(),
+                "TOPIC_NAMES lists `{name}` but topic() returns None for it"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn about_rejects_unknown_topic() {
         let dir = temp_dir();
