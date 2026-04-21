@@ -139,6 +139,9 @@ impl Scheduler {
             trigger_payload: payload,
         };
 
+        // Behavior's `[scope.tool_surface]` replaces the pod baseline
+        // wholesale. `None` = inherit pod default.
+        let tool_surface_override = config.scope.tool_surface.clone();
         let thread_id = self.create_task(
             requester,
             correlation_id,
@@ -148,6 +151,7 @@ impl Scheduler {
             Some(origin),
             None,
             Some(behavior_scope),
+            tool_surface_override,
             pending_io,
         )?;
         self.mark_dirty(&thread_id);

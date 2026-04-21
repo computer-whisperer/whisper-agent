@@ -324,6 +324,7 @@ mod tests {
                 mcp_hosts: vec!["fetch".into(), "search".into()],
                 compaction: Default::default(),
                 caps: ThreadDefaultCaps::default(),
+                tool_surface: Default::default(),
             },
             limits: PodLimits {
                 max_concurrent_threads: 10,

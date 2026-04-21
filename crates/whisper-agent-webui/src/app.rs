@@ -6692,6 +6692,7 @@ impl ChatApp {
                 mcp_hosts: Vec::new(),
                 compaction: Default::default(),
                 caps: Default::default(),
+                tool_surface: Default::default(),
             },
             limits: PodLimits::default(),
         }

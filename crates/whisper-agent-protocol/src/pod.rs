@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::permission::{AllowMap, BehaviorOpsCap, DispatchCap, PodModifyCap};
 use crate::sandbox::HostEnvSpec;
+use crate::tool_surface::ToolSurface;
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct PodConfig {
@@ -143,6 +144,15 @@ pub struct ThreadDefaults {
     /// match the pre-schema scheduler behavior.
     #[serde(default)]
     pub caps: ThreadDefaultCaps,
+    /// How the thread presents its tool catalog to the model. Default
+    /// is a small core set (`describe_tool`, `find_tool`,
+    /// `request_escalation`) with an all-names listing appended to
+    /// the system prompt — everything else is fetched on demand.
+    /// Authoring a pod with `core_tools = "all"` and `initial_listing
+    /// = "none"` restores the pre-rework "dump every schema upfront"
+    /// behavior.
+    #[serde(default)]
+    pub tool_surface: ToolSurface,
 }
 
 /// Per-cap starting value for a freshly-created thread. Defaults to

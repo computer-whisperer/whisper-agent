@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::permission::{AllowMap, BehaviorOpsCap, DispatchCap, PodModifyCap};
+use crate::tool_surface::ToolSurface;
 
 /// Parsed `behavior.toml`. Round-trips through TOML; every field is
 /// covered by a serde default so hand-written files can omit
@@ -56,6 +57,14 @@ pub struct BehaviorScope {
     pub tools: Option<AllowMap<String>>,
     #[serde(default)]
     pub caps: BehaviorScopeCaps,
+    /// Per-behavior override of the pod's `thread_defaults.tool_surface`.
+    /// `None` = inherit the pod baseline; `Some` = replace wholesale
+    /// (core_tools / initial_listing / activation_surface are replaced
+    /// as a unit, not narrowed per field — tool-surface knobs are
+    /// presentation preferences, not permissions, so per-field
+    /// composition is unnecessary).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_surface: Option<ToolSurface>,
 }
 
 /// Per-cap narrowing for a behavior. Each field is `None` by default
@@ -464,6 +473,7 @@ mod tests {
                 dispatch: Some(DispatchCap::None),
                 behaviors: Some(BehaviorOpsCap::None),
             },
+            tool_surface: None,
         };
         let narrower = behavior_scope.as_scope_narrower();
         assert_eq!(narrower.backends, SetOrAll::only(["anthropic".to_string()]));
@@ -501,6 +511,7 @@ mod tests {
                     dispatch: Some(crate::permission::DispatchCap::None),
                     behaviors: None,
                 },
+                tool_surface: None,
             },
         };
         let json = serde_json::to_string(&cfg).unwrap();

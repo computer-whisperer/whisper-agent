@@ -754,6 +754,35 @@ impl Scheduler {
             return;
         }
 
+        // `describe_tool` and `find_tool` are synchronous — no
+        // Function, no async waiting. We compute the result from the
+        // scheduler's tool registry and push a pre-resolved future
+        // that fires with the result on the next scheduler iteration.
+        // The disposition gate still applies: the user can deny
+        // these via `scope.tools` if they want to disable introspection.
+        if name == crate::tools::builtin_tools::DESCRIBE_TOOL {
+            self.complete_describe_tool_call(
+                thread_id,
+                op_id,
+                tool_use_id,
+                input,
+                disposition,
+                pending_io,
+            );
+            return;
+        }
+        if name == crate::tools::builtin_tools::FIND_TOOL {
+            self.complete_find_tool_call(
+                thread_id,
+                op_id,
+                tool_use_id,
+                input,
+                disposition,
+                pending_io,
+            );
+            return;
+        }
+
         let spec = match self.route_tool(thread_id, &name) {
             Some(ToolRoute::Builtin { .. }) => Function::BuiltinToolCall {
                 name: name.clone(),
@@ -984,6 +1013,181 @@ impl Scheduler {
                 )
             }));
         }
+    }
+
+    /// `describe_tool`-specific synchronous path. No Function is
+    /// registered — the result is computed from the scheduler's tool
+    /// registry and delivered on the next tick via a pre-resolved
+    /// future. Respects `scope.tools` disposition (Deny stops here)
+    /// and admits tools in the pod ceiling so the model can read
+    /// schemas of askable tools before deciding to escalate.
+    fn complete_describe_tool_call(
+        &mut self,
+        thread_id: &str,
+        op_id: crate::runtime::thread::OpId,
+        tool_use_id: String,
+        input: serde_json::Value,
+        disposition: crate::permission::Disposition,
+        pending_io: &mut FuturesUnordered<SchedulerFuture>,
+    ) {
+        if matches!(disposition, crate::permission::Disposition::Deny) {
+            pending_io.push(make_denial_future(
+                thread_id.to_string(),
+                tool_use_id,
+                op_id,
+                crate::tools::builtin_tools::DESCRIBE_TOOL.to_string(),
+            ));
+            return;
+        }
+        let args = match crate::tools::builtin_tools::describe_tool::parse_args(input) {
+            Ok(a) => a,
+            Err(e) => {
+                pending_io.push(immediate_tool_error(
+                    thread_id.to_string(),
+                    op_id,
+                    tool_use_id,
+                    e,
+                ));
+                return;
+            }
+        };
+        let found = self
+            .admissible_and_askable_tools(thread_id)
+            .into_iter()
+            .find(|t| t.name == args.name);
+        let text = match found {
+            Some(t) => {
+                let status = if t.requires_escalation {
+                    "available via escalation"
+                } else {
+                    "admitted"
+                };
+                let schema = serde_json::to_string_pretty(&t.input_schema)
+                    .unwrap_or_else(|e| format!("<schema serialization failed: {e}>"));
+                format!(
+                    "Tool `{name}` ({status})\n\
+                     Category: {cat}\n\
+                     Description: {desc}\n\
+                     \n\
+                     Input schema:\n{schema}",
+                    name = t.name,
+                    cat = t.category.label(),
+                    desc = t.description,
+                )
+            }
+            None => format!(
+                "tool `{}` not found in this thread's catalog (check the name — \
+                 host-env tools are prefixed, e.g. `rustdev_bash`; use `find_tool` \
+                 to search)",
+                args.name
+            ),
+        };
+        pending_io.push(immediate_tool_success(
+            thread_id.to_string(),
+            op_id,
+            tool_use_id,
+            text,
+        ));
+    }
+
+    /// `find_tool`-specific synchronous path. Matches regex over
+    /// name+description, filters by coarse category, honors
+    /// `include_escalation`, paginates via `limit`+`offset`. Returns
+    /// a structured text result (name/desc/cat/requires_escalation
+    /// per entry) suitable for the model to parse or scan.
+    fn complete_find_tool_call(
+        &mut self,
+        thread_id: &str,
+        op_id: crate::runtime::thread::OpId,
+        tool_use_id: String,
+        input: serde_json::Value,
+        disposition: crate::permission::Disposition,
+        pending_io: &mut FuturesUnordered<SchedulerFuture>,
+    ) {
+        if matches!(disposition, crate::permission::Disposition::Deny) {
+            pending_io.push(make_denial_future(
+                thread_id.to_string(),
+                tool_use_id,
+                op_id,
+                crate::tools::builtin_tools::FIND_TOOL.to_string(),
+            ));
+            return;
+        }
+        let args = match crate::tools::builtin_tools::find_tool::parse_args(input) {
+            Ok(a) => a,
+            Err(e) => {
+                pending_io.push(immediate_tool_error(
+                    thread_id.to_string(),
+                    op_id,
+                    tool_use_id,
+                    e,
+                ));
+                return;
+            }
+        };
+        let regex = match regex::Regex::new(&args.pattern) {
+            Ok(r) => r,
+            Err(e) => {
+                pending_io.push(immediate_tool_error(
+                    thread_id.to_string(),
+                    op_id,
+                    tool_use_id,
+                    format!("invalid regex pattern `{}`: {e}", args.pattern),
+                ));
+                return;
+            }
+        };
+        let all = self.admissible_and_askable_tools(thread_id);
+        let limit = args.effective_limit() as usize;
+        let offset = args.effective_offset() as usize;
+        let matched: Vec<_> = all
+            .into_iter()
+            .filter(|t| {
+                if !args.include_escalation && t.requires_escalation {
+                    return false;
+                }
+                if let Some(cat) = &args.category
+                    && cat != t.category.coarse()
+                {
+                    return false;
+                }
+                regex.is_match(&t.name) || regex.is_match(&t.description)
+            })
+            .collect();
+        let total = matched.len();
+        let page: Vec<_> = matched.into_iter().skip(offset).take(limit).collect();
+        let shown = page.len();
+        let mut out = String::new();
+        out.push_str(&format!(
+            "Found {total} tool(s) matching `{pattern}`; showing {shown} (offset {offset}, limit {limit}).\n\n",
+            pattern = args.pattern
+        ));
+        for t in page {
+            let tag = if t.requires_escalation {
+                " [escalation]"
+            } else {
+                ""
+            };
+            out.push_str(&format!(
+                "- `{name}` [{cat}]{tag} — {desc}\n",
+                name = t.name,
+                cat = t.category.label(),
+                desc = one_line(&t.description),
+            ));
+        }
+        if total > offset + shown {
+            out.push_str(&format!(
+                "\n… {} more. Page with `offset={}`.\n",
+                total - offset - shown,
+                offset + shown
+            ));
+        }
+        pending_io.push(immediate_tool_success(
+            thread_id.to_string(),
+            op_id,
+            tool_use_id,
+            out,
+        ));
     }
 
     /// `request_escalation`-specific registration path. Parses the
@@ -1498,6 +1702,7 @@ impl Scheduler {
             None,
             dispatch_lineage,
             None,
+            None,
             pending_io,
         );
         let thread_id = match create_result {
@@ -1807,6 +2012,56 @@ fn immediate_tool_error(
             },
         )
     })
+}
+
+/// Build a future that immediately fires with a successful tool
+/// completion carrying the given text body. Used by the synchronous
+/// scheduler-intercepted tools (`describe_tool`, `find_tool`) where
+/// the result is computable directly from scheduler state — no I/O,
+/// no Function, no waiting.
+fn immediate_tool_success(
+    parent_thread_id: String,
+    op_id: crate::runtime::thread::OpId,
+    tool_use_id: String,
+    text: String,
+) -> SchedulerFuture {
+    Box::pin(async move {
+        crate::runtime::io_dispatch::SchedulerCompletion::Io(
+            crate::runtime::io_dispatch::IoCompletion {
+                thread_id: parent_thread_id,
+                op_id,
+                result: crate::runtime::thread::IoResult::ToolCall {
+                    tool_use_id,
+                    result: Ok(crate::tools::mcp::CallToolResult {
+                        content: vec![crate::tools::mcp::McpContentBlock::Text { text }],
+                        is_error: false,
+                    }),
+                },
+                pod_update: None,
+                scheduler_command: None,
+                host_env_lost: None,
+            },
+        )
+    })
+}
+
+/// Truncate a multi-line/multi-sentence description for `find_tool`'s
+/// result lines. Same spirit as `tool_listing::one_line_description`
+/// but kept local to keep the scheduler module free of wiring into
+/// the tool-listing module's private helper.
+fn one_line(desc: &str) -> String {
+    let first = desc
+        .split(['\n', '.'])
+        .next()
+        .unwrap_or(desc)
+        .trim();
+    if first.len() > 120 {
+        let mut t = first.chars().take(117).collect::<String>();
+        t.push_str("...");
+        t
+    } else {
+        first.to_string()
+    }
 }
 
 /// Build a future that immediately fires with a tool-denial completion.

@@ -13,6 +13,7 @@ pub mod conversation;
 pub mod permission;
 pub mod pod;
 pub mod sandbox;
+pub mod tool_surface;
 
 pub use permission::{AllowMap, Disposition};
 
@@ -29,6 +30,7 @@ pub use pod::{
     CompactionConfig, FsEntry, NamedHostEnv, PodAllow, PodAllowCaps, PodConfig, PodLimits,
     PodSnapshot, PodState, PodSummary, ThreadDefaultCaps, ThreadDefaults,
 };
+pub use tool_surface::{ActivationSurface, CoreTools, InitialListing, ToolSurface};
 // `SystemPromptChoice` is defined below; re-export here so other
 // crates can refer to it as `whisper_agent_protocol::SystemPromptChoice`.
 pub use sandbox::HostEnvSpec;

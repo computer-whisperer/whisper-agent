@@ -633,6 +633,7 @@ days = 0
                     dispatch: Some(DispatchCap::None),
                     behaviors: None,
                 },
+                tool_surface: None,
             },
         };
         let text = to_toml(&cfg).unwrap();

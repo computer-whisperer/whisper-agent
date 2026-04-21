@@ -69,6 +69,7 @@ pub fn build_default_pod_config(
             mcp_hosts: shared_host_names.to_vec(),
             compaction: CompactionConfig::default(),
             caps: Default::default(),
+            tool_surface: Default::default(),
         },
         limits: PodLimits::default(),
     }

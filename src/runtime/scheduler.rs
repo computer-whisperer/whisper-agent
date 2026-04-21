@@ -95,7 +95,14 @@ pub enum ToolRoute {
 /// Inline host-env path).
 struct BoundMcp<'a> {
     entry: &'a crate::pod::resources::McpHostEntry,
+    /// Prefix applied to tool names for host-env MCPs. `None` for
+    /// shared MCPs (tools unprefixed on the wire).
     prefix: Option<&'a str>,
+    /// Human-meaningful source name — the host-env binding name for
+    /// host-env MCPs, the shared catalog host name for shared MCPs.
+    /// Used for listing categorization; distinct from `entry.id` which
+    /// is a registry-internal opaque handle.
+    source_name: String,
 }
 
 /// Snapshot of a pod's on-disk directory + parsed config + behavior ids.
@@ -1618,70 +1625,179 @@ impl Scheduler {
             .collect()
     }
 
-    /// Build the thread's effective tool catalog — the model-facing
-    /// pool. Prepends the builtin pod-editing tools, then every host-env
-    /// MCP's tools (prefixed `{env_name}_`), then each shared MCP host
-    /// in pod-declared order (unprefixed). The prefix scheme keeps
-    /// host-env tools addressable independently even when two envs
-    /// advertise the same bare name — `c-dtop_write_file` vs
-    /// `c-srv3_write_file` coexist on the wire. Builtins and shared
-    /// MCPs live in a single flat namespace because they're already
-    /// unique by construction (builtins are `pod_*`, shared MCPs are
-    /// singletons per server).
+    /// Enumerate every tool the thread could reach — either admitted
+    /// by scope now, or askable via `request_escalation` (in scope's
+    /// pod ceiling but denied by current scope).
     ///
-    /// Tools whose scope disposition is `Deny` for this thread are
-    /// omitted entirely — no point advertising a tool to the model that
-    /// will be synthesize-denied on call. `Allow` and `AllowWithPrompt`
-    /// both surface; the approval layer handles the latter at dispatch
-    /// time. Scope evaluation uses the *prefixed* name so policies can
-    /// target a specific env's tool without touching the others.
-    pub(crate) fn tool_descriptors(&self, thread_id: &str) -> Vec<McpTool> {
-        let scope_denies = |name: &str| -> bool {
-            self.tasks
-                .get(thread_id)
-                .map(|t| !t.scope.tools.disposition(&name.to_string()).admits())
-                .unwrap_or(false)
+    /// Single primitive used by four surfaces: the wire `tools:`
+    /// array (`core_tool_descriptors`), the system-prompt listing
+    /// (`render_initial_listing`), `find_tool`'s regex search, and
+    /// `describe_tool`'s exact lookup. Keeps classification logic
+    /// in one place instead of scattered `scope_denies` closures.
+    ///
+    /// Tool names are already prefix-adjusted for host-env MCPs
+    /// (`{env_name}_{tool}`) so callers can filter / match against
+    /// the wire-level identifier directly.
+    pub(crate) fn admissible_and_askable_tools(
+        &self,
+        thread_id: &str,
+    ) -> Vec<crate::runtime::tool_listing::AdmissibleTool> {
+        use crate::runtime::tool_listing::{
+            AdmissibleTool, ToolAdmission, ToolCategory, classify_admission,
         };
-        // `request_escalation` is only meaningful when the thread has
-        // an interactive channel — autonomous threads can't reach an
-        // approver, so advertising the tool would just produce tool
-        // calls with nowhere to go.
-        let escalation_available = self
-            .tasks
-            .get(thread_id)
-            .map(|t| t.scope.escalation.is_interactive())
-            .unwrap_or(false);
-        let mut out: Vec<McpTool> = Vec::new();
+        let Some(task) = self.tasks.get(thread_id) else {
+            return Vec::new();
+        };
+        let pod_ceiling_tools = self
+            .pods
+            .get(&task.pod_id)
+            .map(|p| p.config.allow.tools.clone())
+            .unwrap_or_else(whisper_agent_protocol::AllowMap::deny_all);
+        let escalation_available = task.scope.escalation.is_interactive();
+        let mut out: Vec<AdmissibleTool> = Vec::new();
         let mut seen: HashSet<String> = HashSet::new();
+
+        let classify = |name: &str| -> ToolAdmission {
+            classify_admission(&task.scope.tools, &pod_ceiling_tools, name)
+        };
+
         for tool in crate::tools::builtin_tools::descriptors() {
-            if scope_denies(&tool.name) {
-                continue;
-            }
+            // `request_escalation` is only meaningful with an
+            // interactive approver attached. Autonomous threads see
+            // a Deny on it via this early filter even if scope/ceiling
+            // would otherwise admit — no use listing a tool whose
+            // calls would go nowhere.
             if tool.name == crate::tools::builtin_tools::REQUEST_ESCALATION && !escalation_available
             {
                 continue;
             }
+            let admission = classify(&tool.name);
+            let requires_escalation = match admission {
+                ToolAdmission::Admitted => false,
+                ToolAdmission::Askable => true,
+                ToolAdmission::OutOfReach => continue,
+            };
             if seen.insert(tool.name.clone()) {
-                out.push(tool);
+                out.push(AdmissibleTool {
+                    name: tool.name,
+                    description: tool.description,
+                    input_schema: tool.input_schema,
+                    annotations: tool.annotations,
+                    category: ToolCategory::Builtin,
+                    requires_escalation,
+                });
             }
         }
+
         for bound in self.bound_mcp_hosts(thread_id) {
             for tool in &bound.entry.tools {
-                let public_name = match bound.prefix {
-                    Some(prefix) => format!("{prefix}_{}", tool.name),
-                    None => tool.name.clone(),
+                let (public_name, category) = match bound.prefix {
+                    Some(prefix) => (
+                        format!("{prefix}_{}", tool.name),
+                        ToolCategory::HostEnv {
+                            env_name: prefix.to_string(),
+                        },
+                    ),
+                    None => (
+                        tool.name.clone(),
+                        ToolCategory::SharedMcp {
+                            host_name: bound.source_name.clone(),
+                        },
+                    ),
                 };
-                if scope_denies(&public_name) {
-                    continue;
-                }
+                let admission = classify(&public_name);
+                let requires_escalation = match admission {
+                    ToolAdmission::Admitted => false,
+                    ToolAdmission::Askable => true,
+                    ToolAdmission::OutOfReach => continue,
+                };
                 if seen.insert(public_name.clone()) {
-                    let mut renamed = tool.clone();
-                    renamed.name = public_name;
-                    out.push(renamed);
+                    out.push(AdmissibleTool {
+                        name: public_name,
+                        description: tool.description.clone(),
+                        input_schema: tool.input_schema.clone(),
+                        annotations: tool.annotations.clone(),
+                        category,
+                        requires_escalation,
+                    });
                 }
             }
         }
+
         out
+    }
+
+    /// Tools that land as full schemas in the thread's wire `tools:`
+    /// array (via `Role::Tools` content at position 1). Everything
+    /// outside this list still appears in the system-prompt listing
+    /// and is dispatchable by name — the model just has to call
+    /// `describe_tool` first to learn the schema.
+    ///
+    /// Policy:
+    /// - Only admitted (not askable) tools are eligible — schemas
+    ///   the model can't call wouldn't help.
+    /// - `CoreTools::All` → every admitted tool's schema.
+    /// - `CoreTools::Named(list)` → only tools whose name appears in
+    ///   the list. Missing names are silently dropped ("include these
+    ///   IF admissible," not "admit these").
+    pub(crate) fn core_tool_descriptors(&self, thread_id: &str) -> Vec<McpTool> {
+        use whisper_agent_protocol::tool_surface::CoreTools;
+        let Some(task) = self.tasks.get(thread_id) else {
+            return Vec::new();
+        };
+        let core = task.tool_surface.core_tools.clone();
+        let admitted = self
+            .admissible_and_askable_tools(thread_id)
+            .into_iter()
+            .filter(|t| !t.requires_escalation);
+        let filtered: Vec<McpTool> = match core {
+            CoreTools::All => admitted
+                .map(|t| McpTool {
+                    name: t.name,
+                    description: t.description,
+                    input_schema: t.input_schema,
+                    annotations: t.annotations,
+                })
+                .collect(),
+            CoreTools::Named(names) => {
+                let set: HashSet<String> = names.into_iter().collect();
+                admitted
+                    .filter(|t| set.contains(&t.name))
+                    .map(|t| McpTool {
+                        name: t.name,
+                        description: t.description,
+                        input_schema: t.input_schema,
+                        annotations: t.annotations,
+                    })
+                    .collect()
+            }
+        };
+        filtered
+    }
+
+    /// Render the tool-catalog listing to append to the system prompt
+    /// at thread seed. Empty string when `initial_listing = None`.
+    pub(crate) fn render_initial_listing(&self, thread_id: &str) -> String {
+        use whisper_agent_protocol::tool_surface::CoreTools;
+        let Some(task) = self.tasks.get(thread_id) else {
+            return String::new();
+        };
+        let escalation_available = task.scope.escalation.is_interactive();
+        let tools = self.admissible_and_askable_tools(thread_id);
+        let core_names: Vec<String> = match &task.tool_surface.core_tools {
+            CoreTools::All => tools
+                .iter()
+                .filter(|t| !t.requires_escalation)
+                .map(|t| t.name.clone())
+                .collect(),
+            CoreTools::Named(n) => n.clone(),
+        };
+        crate::runtime::tool_listing::render_listing(
+            &tools,
+            task.tool_surface.initial_listing,
+            escalation_available,
+            &core_names,
+        )
     }
 
     /// Resolve which handler should receive a tool invocation.
@@ -1773,11 +1889,15 @@ impl Scheduler {
             let Some(entry) = self.resources.mcp_hosts.get(&mcp_id) else {
                 continue;
             };
-            let prefix = match binding {
-                HostEnvBinding::Named { name } => Some(name.as_str()),
-                HostEnvBinding::Inline { .. } => None,
+            let (prefix, source_name) = match binding {
+                HostEnvBinding::Named { name } => (Some(name.as_str()), name.clone()),
+                HostEnvBinding::Inline { .. } => (None, "<inline>".to_string()),
             };
-            out.push(BoundMcp { entry, prefix });
+            out.push(BoundMcp {
+                entry,
+                prefix,
+                source_name,
+            });
         }
         for name in &task.bindings.mcp_hosts {
             let id = McpHostId::shared(name);
@@ -1785,6 +1905,7 @@ impl Scheduler {
                 out.push(BoundMcp {
                     entry,
                     prefix: None,
+                    source_name: name.clone(),
                 });
             }
         }
@@ -2254,6 +2375,11 @@ impl Scheduler {
         // correctly without a second patch event.
         dispatched_by_parent: Option<(String, u32)>,
         base_scope_override: Option<crate::permission::Scope>,
+        // Behavior fires pass their `scope.tool_surface` override
+        // composed onto the pod baseline; other callers (WS create,
+        // dispatch, compaction) pass `None` and inherit the pod's
+        // `thread_defaults.tool_surface`.
+        tool_surface_override: Option<whisper_agent_protocol::ToolSurface>,
         pending_io: &mut FuturesUnordered<SchedulerFuture>,
     ) -> Result<String, String> {
         // Resolve which pod this thread lands in. None routes to the
@@ -2352,7 +2478,23 @@ impl Scheduler {
                 None => crate::permission::Escalation::None,
             },
         };
-        let mut task = Thread::new(thread_id.clone(), pod_id.clone(), config, bindings, scope);
+        // Compose the effective tool surface: pod baseline, optionally
+        // replaced by the behavior-declared override. `compose` is a
+        // wholesale replace (not per-field narrowing) — tool-surface
+        // knobs are presentation preferences, not permissions.
+        let tool_surface = pod
+            .config
+            .thread_defaults
+            .tool_surface
+            .compose(tool_surface_override.as_ref());
+        let mut task = Thread::new(
+            thread_id.clone(),
+            pod_id.clone(),
+            config,
+            bindings,
+            scope,
+            tool_surface,
+        );
         if let Some(origin) = origin {
             task = task.with_origin(origin);
         }
@@ -2416,10 +2558,13 @@ impl Scheduler {
             task.conversation
                 .push(whisper_agent_protocol::Message::system_text(system_prompt));
         }
-        // Tools: only if every resource advertising them is already
-        // Ready. Otherwise wait for the provisioning-complete hook.
+        // Tools + listing: only if every host-env MCP is already
+        // Ready. Otherwise both wait for the provisioning-complete
+        // hook (the listing enumerates those MCPs' tools, so it
+        // can't be rendered before they've reported).
         if self.host_env_mcp_is_ready(thread_id) {
             self.push_tools_snapshot(thread_id);
+            self.push_tool_listing_snapshot(thread_id);
         }
         // Memory index: read at thread-creation time and persist into
         // the conversation as a Role::System message right after the
@@ -2498,7 +2643,7 @@ impl Scheduler {
             return;
         }
         let tool_blocks: Vec<whisper_agent_protocol::ContentBlock> = self
-            .tool_descriptors(thread_id)
+            .core_tool_descriptors(thread_id)
             .into_iter()
             .map(|t| whisper_agent_protocol::ContentBlock::ToolSchema {
                 name: t.name,
@@ -2512,6 +2657,67 @@ impl Scheduler {
                 at,
                 whisper_agent_protocol::Message::tools_manifest(tool_blocks),
             );
+            Some(task.snapshot())
+        } else {
+            None
+        };
+        self.mark_dirty(thread_id);
+        if let Some(snapshot) = snapshot {
+            self.router.broadcast_to_subscribers(
+                thread_id,
+                ServerToClient::ThreadSnapshot {
+                    thread_id: thread_id.to_string(),
+                    snapshot,
+                },
+            );
+        }
+    }
+
+    /// Insert the system-prompt-appended tool catalog listing (a
+    /// `Role::System` message rendered via [`Self::render_initial_listing`])
+    /// right after `Role::Tools`. Paired with [`Self::push_tools_snapshot`]
+    /// — both depend on MCP readiness and both land at the same moment.
+    ///
+    /// Idempotent via a content marker: the render always starts with
+    /// `"## Available tools"`, so we scan existing Role::System blocks
+    /// for that prefix before inserting. No-op if
+    /// `initial_listing = None` (empty render).
+    ///
+    /// Listing lands *before* the memory snapshot in final ordering —
+    /// push order is Tools → listing → memory, so memory inserts at
+    /// setup_prefix_end while listing is already body content, leaving
+    /// `[System, Tools, Listing, Memory]` as the steady state.
+    fn push_tool_listing_snapshot(&mut self, thread_id: &str) {
+        let listing = self.render_initial_listing(thread_id);
+        if listing.is_empty() {
+            return;
+        }
+        // Content-marker idempotency: scan existing Role::System blocks
+        // for the render's fixed prefix. Disjoint from memory's check
+        // (which looks at position), so the two snapshots don't
+        // interfere even when both land at setup_prefix_end.
+        let already_has = self
+            .tasks
+            .get(thread_id)
+            .map(|t| {
+                t.conversation.messages().iter().any(|m| {
+                    m.role == whisper_agent_protocol::Role::System
+                        && m.content.iter().any(|b| match b {
+                            whisper_agent_protocol::ContentBlock::Text { text } => {
+                                text.starts_with("## Available tools")
+                            }
+                            _ => false,
+                        })
+                })
+            })
+            .unwrap_or(true);
+        if already_has {
+            return;
+        }
+        let snapshot = if let Some(task) = self.tasks.get_mut(thread_id) {
+            let at = task.conversation.setup_prefix_end();
+            task.conversation
+                .insert(at, whisper_agent_protocol::Message::system_text(listing));
             Some(task.snapshot())
         } else {
             None
@@ -3094,6 +3300,7 @@ impl Scheduler {
                 for tid in &bound_to_mcp {
                     if self.host_env_mcp_is_ready(tid) {
                         self.push_tools_snapshot(tid);
+                        self.push_tool_listing_snapshot(tid);
                     }
                 }
 

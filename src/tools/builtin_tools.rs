@@ -25,8 +25,10 @@
 
 mod about;
 mod behavior_control;
+pub mod describe_tool;
 pub mod dispatch_thread;
 mod filesystem;
+pub mod find_tool;
 mod grep;
 mod list_threads;
 pub mod request_escalation;
@@ -131,6 +133,8 @@ pub const POD_RUN_BEHAVIOR: &str = "pod_run_behavior";
 pub const POD_SET_BEHAVIOR_ENABLED: &str = "pod_set_behavior_enabled";
 pub const DISPATCH_THREAD: &str = "dispatch_thread";
 pub const REQUEST_ESCALATION: &str = "request_escalation";
+pub const DESCRIBE_TOOL: &str = "describe_tool";
+pub const FIND_TOOL: &str = "find_tool";
 
 /// True if `name` is a builtin pod tool. Used by the scheduler's router
 /// to branch the tool-call dispatch path.
@@ -148,6 +152,8 @@ pub fn is_builtin(name: &str) -> bool {
             | POD_SET_BEHAVIOR_ENABLED
             | DISPATCH_THREAD
             | REQUEST_ESCALATION
+            | DESCRIBE_TOOL
+            | FIND_TOOL
     )
 }
 
@@ -172,6 +178,8 @@ pub fn reserved_env_name_prefixes() -> Vec<&'static str> {
         POD_SET_BEHAVIOR_ENABLED,
         DISPATCH_THREAD,
         REQUEST_ESCALATION,
+        DESCRIBE_TOOL,
+        FIND_TOOL,
     ];
     let mut out: Vec<&'static str> = BUILTINS
         .iter()
@@ -197,6 +205,8 @@ pub fn descriptors() -> Vec<McpTool> {
         behavior_control::set_behavior_enabled_descriptor(),
         dispatch_thread::descriptor(),
         request_escalation::descriptor(),
+        describe_tool::descriptor(),
+        find_tool::descriptor(),
     ]
 }
 
@@ -346,6 +356,16 @@ pub async fn dispatch(
         REQUEST_ESCALATION => no_update_error(
             "request_escalation must be intercepted at the scheduler layer \
              (register_request_escalation_tool); reaching this arm is a bug"
+                .into(),
+        ),
+        DESCRIBE_TOOL => no_update_error(
+            "describe_tool must be intercepted at the scheduler layer \
+             (complete_describe_tool_call); reaching this arm is a bug"
+                .into(),
+        ),
+        FIND_TOOL => no_update_error(
+            "find_tool must be intercepted at the scheduler layer \
+             (complete_find_tool_call); reaching this arm is a bug"
                 .into(),
         ),
         other => no_update_error(format!("unknown builtin tool: {other}")),

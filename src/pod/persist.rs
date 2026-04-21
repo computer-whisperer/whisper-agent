@@ -858,6 +858,7 @@ fn synthesize_pod_config(task: &Thread) -> PodConfig {
             mcp_hosts: Vec::new(),
             compaction: task.config.compaction.clone(),
             caps: Default::default(),
+            tool_surface: Default::default(),
         },
         limits: PodLimits::default(),
     }
@@ -902,6 +903,7 @@ mod tests {
                 mcp_hosts: Vec::new(),
                 compaction: Default::default(),
                 caps: Default::default(),
+                tool_surface: Default::default(),
             },
             limits: PodLimits::default(),
         }
@@ -920,7 +922,14 @@ mod tests {
             mcp_hosts: vec![format!("mcp-primary-{id}"), "mcp-shared-fetch".into()],
             tool_filter: None,
         };
-        let mut task = Thread::new(id.into(), id.into(), cfg, bindings, Scope::allow_all());
+        let mut task = Thread::new(
+            id.into(),
+            id.into(),
+            cfg,
+            bindings,
+            Scope::allow_all(),
+            whisper_agent_protocol::ToolSurface::default(),
+        );
         task.title = Some("Sample task".into());
         task.conversation
             .push(whisper_agent_protocol::Message::system_text("Hello."));

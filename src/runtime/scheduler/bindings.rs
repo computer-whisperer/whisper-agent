@@ -173,6 +173,7 @@ mod tests {
                 mcp_hosts: vec!["fetch".into()],
                 compaction: Default::default(),
                 caps: Default::default(),
+                tool_surface: Default::default(),
             },
             limits: PodLimits::default(),
         };

@@ -23,7 +23,8 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use whisper_agent_protocol::{
     BehaviorOrigin, ContentBlock, Conversation, Message, Role, ThreadBindings, ThreadConfig,
-    ThreadSnapshot, ThreadStateLabel, ThreadSummary, ToolResultContent, TurnEntry, TurnLog, Usage,
+    ThreadSnapshot, ThreadStateLabel, ThreadSummary, ToolResultContent, ToolSurface, TurnEntry,
+    TurnLog, Usage,
 };
 
 use crate::functions::InFlightOps;
@@ -73,6 +74,14 @@ pub struct Thread {
     /// in place.
     #[serde(default)]
     pub scope: Scope,
+    /// How the thread presents its tool catalog. Composed at creation
+    /// from the pod's `thread_defaults.tool_surface` and the behavior's
+    /// optional override; frozen for the thread's lifetime. Affects
+    /// `Role::Tools` content at seed time and the listing appended to
+    /// the system prompt — but not what the thread can actually call
+    /// (that's `scope.tools`).
+    #[serde(default)]
+    pub tool_surface: ToolSurface,
     /// Provenance stamp for threads spawned by a behavior trigger. `None`
     /// for interactive threads. Load-only plumbing: the scheduler stamps
     /// this on spawn and the on-completion hook reads it back.
@@ -265,6 +274,7 @@ impl Thread {
         config: ThreadConfig,
         bindings: ThreadBindings,
         scope: Scope,
+        tool_surface: ToolSurface,
     ) -> Self {
         let now = Utc::now();
         Self {
@@ -281,6 +291,7 @@ impl Thread {
             archived: false,
             turns_in_cycle: 0,
             scope,
+            tool_surface,
             origin: None,
             continued_from: None,
             in_flight: InFlightOps::empty(),
@@ -386,6 +397,7 @@ impl Thread {
             archived: false,
             turns_in_cycle: 0,
             scope: self.scope.clone(),
+            tool_surface: self.tool_surface.clone(),
             origin: None,
             continued_from: None,
             in_flight: InFlightOps::empty(),
@@ -962,6 +974,7 @@ mod tests {
             base_config_for_fork(),
             ThreadBindings::default(),
             Scope::allow_all(),
+            ToolSurface::default(),
         );
 
         // [user, assistant, user, assistant] — two complete turns.
