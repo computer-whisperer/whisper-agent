@@ -41,6 +41,13 @@ class SettingsRepository(appContext: Context) {
         prefs.edit().clear().apply()
     }
 
+    /** Last pod id the user picked in the thread-list view. Null if unset. */
+    fun lastPodId(): String? = prefs.getString(KEY_LAST_POD_ID, null)?.ifBlank { null }
+
+    fun saveLastPodId(podId: String) {
+        prefs.edit().putString(KEY_LAST_POD_ID, podId).apply()
+    }
+
     /** Emits the current config immediately, then re-emits whenever it changes. */
     fun observe(): Flow<ServerConfig?> = callbackFlow {
         trySend(current())
@@ -55,5 +62,6 @@ class SettingsRepository(appContext: Context) {
         private const val PREFS_NAME = "whisper_agent_settings"
         private const val KEY_URL = "server_url"
         private const val KEY_TOKEN = "server_token"
+        private const val KEY_LAST_POD_ID = "last_pod_id"
     }
 }

@@ -101,6 +101,12 @@ object ClientToServerSerializer : KSerializer<ClientToServer> {
                         encodeBooleanElement(descriptor, IDX_REMEMBER, true)
                     }
                 }
+                is ClientToServer.ListPods -> {
+                    encodeStringElement(descriptor, IDX_TYPE, "list_pods")
+                    value.correlationId?.let {
+                        encodeStringElement(descriptor, IDX_CORRELATION_ID, it)
+                    }
+                }
             }
         }
     }
@@ -160,6 +166,7 @@ object ClientToServerSerializer : KSerializer<ClientToServer> {
                     decision = requireNotNull(decision) { "missing decision" },
                     remember = remember,
                 )
+                "list_pods" -> ClientToServer.ListPods(correlationId)
                 null -> throw SerializationException("missing 'type' discriminator")
                 else -> throw SerializationException("unknown ClientToServer variant: $type")
             }

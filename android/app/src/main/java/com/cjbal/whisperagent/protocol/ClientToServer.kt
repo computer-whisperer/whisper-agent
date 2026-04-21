@@ -46,4 +46,8 @@ sealed class ClientToServer {
         val decision: ApprovalChoice,
         val remember: Boolean = false,
     ) : ClientToServer()
+
+    data class ListPods(
+        val correlationId: String? = null,
+    ) : ClientToServer()
 }

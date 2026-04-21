@@ -211,6 +211,75 @@ class CodecTest {
         assertEquals(original, decoded)
     }
 
+    // --- Pod-registry variants ------------------------------------------------
+
+    @Test
+    fun clientToServer_listPods_bare() {
+        val bytes = Codec.encodeToServer(ClientToServer.ListPods())
+        // map(1) { "type": "list_pods" }
+        val expected = byteArrayOf(
+            0xA1.toByte(),
+            0x64, 't'.code.toByte(), 'y'.code.toByte(), 'p'.code.toByte(), 'e'.code.toByte(),
+            0x69, // text(9)
+            'l'.code.toByte(), 'i'.code.toByte(), 's'.code.toByte(), 't'.code.toByte(),
+            '_'.code.toByte(),
+            'p'.code.toByte(), 'o'.code.toByte(), 'd'.code.toByte(), 's'.code.toByte(),
+        )
+        assertContentEquals(expected, bytes)
+    }
+
+    @Test
+    fun serverToClient_podList_roundTrip() {
+        val original = ServerToClient.PodList(
+            correlationId = "corr-7",
+            pods = listOf(
+                PodSummary(
+                    podId = "default",
+                    name = "Default",
+                    description = null,
+                    createdAt = "2026-04-20T00:00:00Z",
+                    threadCount = 3,
+                    archived = false,
+                    behaviorsEnabled = true,
+                ),
+                PodSummary(
+                    podId = "scratch",
+                    name = "Scratch",
+                    description = "experimental",
+                    createdAt = "2026-04-20T01:00:00Z",
+                    threadCount = 0,
+                ),
+            ),
+            defaultPodId = "default",
+        )
+        val bytes = cbor.encodeToByteArray(ServerToClient.serializer(), original)
+        val decoded = Codec.decodeFromServer(bytes)
+        assertEquals(original, decoded)
+    }
+
+    @Test
+    fun serverToClient_podCreated_roundTrip() {
+        val original = ServerToClient.PodCreated(
+            pod = PodSummary(
+                podId = "fresh",
+                name = "Fresh",
+                createdAt = "2026-04-20T02:00:00Z",
+            ),
+            correlationId = "corr-make-pod",
+        )
+        val bytes = cbor.encodeToByteArray(ServerToClient.serializer(), original)
+        val decoded = Codec.decodeFromServer(bytes)
+        assertEquals(original, decoded)
+    }
+
+    @Test
+    fun serverToClient_podArchived_roundTrip() {
+        val original = ServerToClient.PodArchived(podId = "scratch")
+        val bytes = cbor.encodeToByteArray(ServerToClient.serializer(), original)
+        val decoded = Codec.decodeFromServer(bytes)
+        assertEquals(original, decoded)
+    }
+
     // --- Smoke check on the old-broken shape ----------------------------------
 
     @Test

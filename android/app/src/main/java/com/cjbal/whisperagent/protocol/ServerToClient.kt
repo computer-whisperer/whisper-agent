@@ -110,6 +110,24 @@ sealed class ServerToClient {
         val decision: ApprovalChoice,
     ) : ServerToClient()
 
+    // --- Pod-registry tier ----------------------------------------------------
+
+    data class PodList(
+        val correlationId: String? = null,
+        val pods: List<PodSummary>,
+        /** Pod the server routes `CreateThread { pod_id: None }` to. */
+        val defaultPodId: String,
+    ) : ServerToClient()
+
+    data class PodCreated(
+        val pod: PodSummary,
+        val correlationId: String? = null,
+    ) : ServerToClient()
+
+    data class PodArchived(
+        val podId: String,
+    ) : ServerToClient()
+
     // --- Errors ---------------------------------------------------------------
 
     data class Error(

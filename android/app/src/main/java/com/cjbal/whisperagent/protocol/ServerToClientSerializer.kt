@@ -46,8 +46,13 @@ object ServerToClientSerializer : KSerializer<ServerToClient> {
     private const val IDX_READ_ONLY = 20
     private const val IDX_DECISION = 21
     private const val IDX_MESSAGE = 22
+    private const val IDX_PODS = 23
+    private const val IDX_DEFAULT_POD_ID = 24
+    private const val IDX_POD = 25
+    private const val IDX_POD_ID = 26
 
     private val tasksSerializer = ListSerializer(ThreadSummary.serializer())
+    private val podsSerializer = ListSerializer(PodSummary.serializer())
 
     override val descriptor: SerialDescriptor = buildClassSerialDescriptor("ServerToClient") {
         element("type", String.serializer().descriptor)
@@ -73,6 +78,10 @@ object ServerToClientSerializer : KSerializer<ServerToClient> {
         element("read_only", Boolean.serializer().descriptor, isOptional = true)
         element("decision", ApprovalChoice.serializer().descriptor, isOptional = true)
         element("message", String.serializer().descriptor, isOptional = true)
+        element("pods", podsSerializer.descriptor, isOptional = true)
+        element("default_pod_id", String.serializer().descriptor, isOptional = true)
+        element("pod", PodSummary.serializer().descriptor, isOptional = true)
+        element("pod_id", String.serializer().descriptor, isOptional = true)
     }
 
     override fun serialize(encoder: Encoder, value: ServerToClient) {
@@ -192,6 +201,27 @@ object ServerToClientSerializer : KSerializer<ServerToClient> {
                         descriptor, IDX_DECISION, ApprovalChoice.serializer(), value.decision,
                     )
                 }
+                is ServerToClient.PodList -> {
+                    encodeStringElement(descriptor, IDX_TYPE, "pod_list")
+                    value.correlationId?.let {
+                        encodeStringElement(descriptor, IDX_CORRELATION_ID, it)
+                    }
+                    encodeSerializableElement(descriptor, IDX_PODS, podsSerializer, value.pods)
+                    encodeStringElement(descriptor, IDX_DEFAULT_POD_ID, value.defaultPodId)
+                }
+                is ServerToClient.PodCreated -> {
+                    encodeStringElement(descriptor, IDX_TYPE, "pod_created")
+                    encodeSerializableElement(
+                        descriptor, IDX_POD, PodSummary.serializer(), value.pod,
+                    )
+                    value.correlationId?.let {
+                        encodeStringElement(descriptor, IDX_CORRELATION_ID, it)
+                    }
+                }
+                is ServerToClient.PodArchived -> {
+                    encodeStringElement(descriptor, IDX_TYPE, "pod_archived")
+                    encodeStringElement(descriptor, IDX_POD_ID, value.podId)
+                }
                 is ServerToClient.Error -> {
                     encodeStringElement(descriptor, IDX_TYPE, "error")
                     value.correlationId?.let {
@@ -233,6 +263,10 @@ object ServerToClientSerializer : KSerializer<ServerToClient> {
             var readOnly = false
             var decision: ApprovalChoice? = null
             var message: String? = null
+            var pods: List<PodSummary>? = null
+            var defaultPodId: String? = null
+            var pod: PodSummary? = null
+            var podId: String? = null
 
             loop@ while (true) {
                 when (val i = decodeElementIndex(descriptor)) {
@@ -270,6 +304,12 @@ object ServerToClientSerializer : KSerializer<ServerToClient> {
                         descriptor, i, ApprovalChoice.serializer(),
                     )
                     IDX_MESSAGE -> message = decodeStringElement(descriptor, i)
+                    IDX_PODS -> pods = decodeSerializableElement(descriptor, i, podsSerializer)
+                    IDX_DEFAULT_POD_ID -> defaultPodId = decodeStringElement(descriptor, i)
+                    IDX_POD -> pod = decodeSerializableElement(
+                        descriptor, i, PodSummary.serializer(),
+                    )
+                    IDX_POD_ID -> podId = decodeStringElement(descriptor, i)
                     else -> throw SerializationException("unexpected element index $i")
                 }
             }
@@ -348,6 +388,18 @@ object ServerToClientSerializer : KSerializer<ServerToClient> {
                     threadId = requireNotNull(threadId) { "missing thread_id" },
                     approvalId = requireNotNull(approvalId) { "missing approval_id" },
                     decision = requireNotNull(decision) { "missing decision" },
+                )
+                "pod_list" -> ServerToClient.PodList(
+                    correlationId = correlationId,
+                    pods = pods ?: emptyList(),
+                    defaultPodId = defaultPodId ?: "",
+                )
+                "pod_created" -> ServerToClient.PodCreated(
+                    pod = requireNotNull(pod) { "missing pod" },
+                    correlationId = correlationId,
+                )
+                "pod_archived" -> ServerToClient.PodArchived(
+                    podId = requireNotNull(podId) { "missing pod_id" },
                 )
                 "error" -> ServerToClient.Error(
                     correlationId = correlationId,

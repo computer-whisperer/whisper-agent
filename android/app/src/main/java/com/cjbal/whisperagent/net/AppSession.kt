@@ -6,6 +6,7 @@ import com.cjbal.whisperagent.auth.SettingsRepository
 import com.cjbal.whisperagent.protocol.ClientToServer
 import com.cjbal.whisperagent.protocol.ContentBlock
 import com.cjbal.whisperagent.protocol.Message
+import com.cjbal.whisperagent.protocol.PodSummary
 import com.cjbal.whisperagent.protocol.Role
 import com.cjbal.whisperagent.protocol.ServerToClient
 import com.cjbal.whisperagent.protocol.ThreadSnapshot
@@ -45,6 +46,30 @@ class AppSession(
 
     private val _activeSnapshot = MutableStateFlow<ThreadSnapshot?>(null)
     val activeSnapshot: StateFlow<ThreadSnapshot?> = _activeSnapshot.asStateFlow()
+
+    private val _pods = MutableStateFlow<Map<String, PodSummary>>(emptyMap())
+    val pods: StateFlow<Map<String, PodSummary>> = _pods.asStateFlow()
+
+    /** Server-advertised default pod — destination for `CreateThread { pod_id: None }`. */
+    private val _defaultPodId = MutableStateFlow("")
+    val defaultPodId: StateFlow<String> = _defaultPodId.asStateFlow()
+
+    /**
+     * Pod the UI is currently focused on. Null until the first [ServerToClient.PodList]
+     * arrives; afterwards never null as long as the server advertises any pods
+     * (we fall back to [defaultPodId] if the remembered selection has been
+     * archived).
+     */
+    private val _selectedPodId = MutableStateFlow<String?>(null)
+    val selectedPodId: StateFlow<String?> = _selectedPodId.asStateFlow()
+
+    /**
+     * User's explicit preference, persisted across sessions. Kept separate from
+     * [_selectedPodId] so a server whose pod catalog temporarily omits the
+     * preferred pod doesn't overwrite storage — next time it reappears we
+     * return to it.
+     */
+    private var preferredPodId: String? = settings.lastPodId()
 
     /**
      * One-shot signal used by the UI to navigate to a freshly-created
@@ -103,20 +128,38 @@ class AppSession(
     }
 
     /**
-     * Ask the server to spawn a new thread in the default pod. The matching
-     * `ThreadCreated` event will fire [pendingNavigation] with the new
-     * thread id so the UI can switch to it.
+     * Ask the server to spawn a new thread in the currently-selected pod
+     * (or the default pod if no selection yet). The matching `ThreadCreated`
+     * event will fire [pendingNavigation] with the new thread id so the UI
+     * can switch to it.
      */
     fun createThread(initialMessage: String) {
         if (initialMessage.isBlank()) return
         val correlation = "create-${correlationCounter.incrementAndGet()}"
         pendingCreateCorrelation = correlation
+        // Prefer the user's current focus; fall back to the server default
+        // implicitly by sending pod_id = null when we haven't received a
+        // PodList yet.
+        val targetPodId = _selectedPodId.value?.takeIf { it.isNotBlank() }
         wire.send(
             ClientToServer.CreateThread(
                 initialMessage = initialMessage,
                 correlationId = correlation,
+                podId = targetPodId,
             ),
         )
+    }
+
+    /**
+     * Switch the UI's current pod. Persists the preference so the same pod
+     * is restored on next launch. Ignored if [podId] isn't in the pod
+     * catalog — callers should drive the UI from [pods].
+     */
+    fun selectPod(podId: String) {
+        if (_pods.value[podId] == null) return
+        preferredPodId = podId
+        _selectedPodId.value = podId
+        settings.saveLastPodId(podId)
     }
 
     private fun connectIfConfigured() {
@@ -127,11 +170,14 @@ class AppSession(
     private fun startPump() {
         pumpJob?.cancel()
         pumpJob = scope.launch {
-            // Kick off a ListThreads as soon as the state flips to Connected.
+            // Kick off a ListThreads + ListPods as soon as the state flips
+            // to Connected. Pod-registry broadcasts (PodCreated / PodArchived)
+            // keep the catalog fresh after the initial snapshot.
             launch {
                 wire.state.collect { s ->
                     if (s is ConnectionState.Connected) {
                         wire.send(ClientToServer.ListThreads())
+                        wire.send(ClientToServer.ListPods())
                         // Re-subscribe the screen the user was last on.
                         subscribedThreadId?.let {
                             wire.send(ClientToServer.SubscribeToThread(it))
@@ -179,6 +225,27 @@ class AppSession(
             }
             is ServerToClient.ThreadArchived -> {
                 _threads.update { it - event.threadId }
+            }
+            is ServerToClient.PodList -> {
+                _pods.value = event.pods
+                    .filter { !it.archived }
+                    .associateBy { it.podId }
+                _defaultPodId.value = event.defaultPodId
+                _selectedPodId.value = resolveFocusPodId()
+            }
+            is ServerToClient.PodCreated -> {
+                if (!event.pod.archived) {
+                    _pods.update { it + (event.pod.podId to event.pod) }
+                }
+                if (_selectedPodId.value == null) {
+                    _selectedPodId.value = resolveFocusPodId()
+                }
+            }
+            is ServerToClient.PodArchived -> {
+                _pods.update { it - event.podId }
+                if (_selectedPodId.value == event.podId) {
+                    _selectedPodId.value = resolveFocusPodId()
+                }
             }
             is ServerToClient.Snapshot -> {
                 if (event.threadId == subscribedThreadId) {
@@ -251,6 +318,20 @@ class AppSession(
                 else -> snap
             }
         }
+    }
+
+    /**
+     * Pick the pod the UI should currently focus on, honoring the user's
+     * stored preference when possible. Order: remembered pod → server default
+     * → any pod in the catalog → null (server has no pods yet).
+     */
+    private fun resolveFocusPodId(): String? {
+        val catalog = _pods.value
+        if (catalog.isEmpty()) return null
+        preferredPodId?.let { if (catalog.containsKey(it)) return it }
+        val default = _defaultPodId.value
+        if (default.isNotBlank() && catalog.containsKey(default)) return default
+        return catalog.keys.firstOrNull()
     }
 
     private fun streamingEventThreadId(event: ServerToClient): String? = when (event) {
