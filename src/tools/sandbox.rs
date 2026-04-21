@@ -401,20 +401,20 @@ impl HostEnvRegistry {
     }
 
     /// Mark `name` reachable at the given observation time. Returns
-    /// whether the state actually changed (so callers can avoid
-    /// broadcasting a no-op push).
+    /// whether the **variant** actually changed — a repeat reachable
+    /// probe refreshes `at` silently and returns `false`, so callers
+    /// don't log / broadcast a "recovered" edge on every 30s tick for
+    /// a steadily-up daemon.
     pub fn mark_reachable(&mut self, name: &str, at: chrono::DateTime<chrono::Utc>) -> bool {
         use whisper_agent_protocol::HostEnvReachability;
         let Some(entry) = self.providers.get_mut(name) else {
             return false;
         };
-        let at_str = at.to_rfc3339();
-        let new_state = HostEnvReachability::Reachable { at: at_str };
-        if entry.reachability == new_state {
-            return false;
-        }
-        entry.reachability = new_state;
-        true
+        let was_reachable = matches!(entry.reachability, HostEnvReachability::Reachable { .. });
+        entry.reachability = HostEnvReachability::Reachable {
+            at: at.to_rfc3339(),
+        };
+        !was_reachable
     }
 
     /// Mark `name` unreachable. Preserves `since` across successive
@@ -665,17 +665,27 @@ mod tests {
 
     #[test]
     fn mark_reachable_transitions_and_dedups() {
+        use whisper_agent_protocol::HostEnvReachability;
         let mut r = HostEnvRegistry::new();
         r.insert("a".into(), "http://a".into(), None).unwrap();
         let t1 = chrono::DateTime::parse_from_rfc3339("2026-04-20T12:00:00Z")
             .unwrap()
             .with_timezone(&chrono::Utc);
+        // Unknown → Reachable is a real transition.
         assert!(r.mark_reachable("a", t1));
         // Same state, same timestamp → no change.
         assert!(!r.mark_reachable("a", t1));
+        // Same variant, different timestamp → still a repeat; the
+        // 30s probe tick shouldn't log "recovered" every iteration.
         let t2 = t1 + chrono::Duration::seconds(30);
-        // Different timestamp → state changes.
-        assert!(r.mark_reachable("a", t2));
+        assert!(!r.mark_reachable("a", t2));
+        // But the stored `at` refreshes so freshness is observable.
+        match &r.entry("a").unwrap().reachability {
+            HostEnvReachability::Reachable { at } => {
+                assert_eq!(at, &t2.to_rfc3339());
+            }
+            other => panic!("expected Reachable, got {other:?}"),
+        }
     }
 
     #[test]
