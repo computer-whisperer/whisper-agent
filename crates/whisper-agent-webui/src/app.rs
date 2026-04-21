@@ -1016,18 +1016,38 @@ enum ProviderEditorMode {
 
 /// State for the "Server settings" modal opened from the cog in the
 /// top bar. Host to one or more inner tabs; today only "LLM backends"
-/// exists (read-only). Kept as a modal rather than a left-panel tab
-/// because settings are a low-frequency escape hatch, not part of
-/// day-to-day navigation.
+/// exists. Kept as a modal rather than a left-panel tab because
+/// settings are a low-frequency escape hatch, not part of day-to-day
+/// navigation.
 #[derive(Default)]
 struct SettingsModalState {
     active_tab: SettingsTab,
+    /// Open state for the "rotate Codex credentials" sub-form. `None`
+    /// when no rotation is in progress; `Some` when the user clicked
+    /// Rotate on a `chatgpt_subscription` row.
+    codex_rotate: Option<CodexRotateState>,
+    /// Last rotation outcome (banner). `Ok(backend)` shows a brief
+    /// success line above the list; `Err((backend, detail))` an error.
+    /// Cleared the next time the user opens a rotation form.
+    codex_rotate_banner: Option<Result<String, (String, String)>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 enum SettingsTab {
     #[default]
     Backends,
+}
+
+/// Sub-form shown over the Settings modal when the user clicks
+/// "Rotate credentials" on a `chatgpt_subscription` backend. Collects
+/// the pasted `auth.json` blob and dispatches `UpdateCodexAuth`. The
+/// form stays open while `pending_correlation` is set and closes when
+/// the matching response / error lands.
+struct CodexRotateState {
+    backend: String,
+    contents: String,
+    error: Option<String>,
+    pending_correlation: Option<String>,
 }
 
 impl ProviderEditorModalState {
@@ -1905,6 +1925,19 @@ impl ChatApp {
                     modal.pending_correlation = None;
                     return;
                 }
+                // Codex-auth rotation sub-form pending save. Route the
+                // detail into the sub-form's error field so the user
+                // can fix the paste without retyping; the sub-form
+                // stays open until they explicitly cancel.
+                if let Some(settings) = self.settings_modal.as_mut()
+                    && let Some(sub) = settings.codex_rotate.as_mut()
+                    && correlation_id.is_some()
+                    && sub.pending_correlation == correlation_id
+                {
+                    sub.error = Some(message);
+                    sub.pending_correlation = None;
+                    return;
+                }
                 // Provider remove pending on a specific row. Match by
                 // correlation rather than iterating names so a stale
                 // remove that targets a now-gone name still resolves.
@@ -2362,6 +2395,26 @@ impl ChatApp {
                     self.provider_remove_pending.remove(&name);
                 }
                 self.provider_remove_armed.remove(&name);
+            }
+            ServerToClient::CodexAuthUpdated {
+                backend,
+                correlation_id,
+            } => {
+                // Only close the sub-form if this ack matches our own
+                // pending rotation. (The server currently only unicasts
+                // this event to the requester, but treating a stray
+                // broadcast as benign costs nothing.)
+                if let Some(settings) = self.settings_modal.as_mut() {
+                    let is_ours = settings.codex_rotate.as_ref().is_some_and(|s| {
+                        s.pending_correlation.is_some()
+                            && s.pending_correlation == correlation_id
+                            && s.backend == backend
+                    });
+                    if is_ours {
+                        settings.codex_rotate = None;
+                        settings.codex_rotate_banner = Some(Ok(backend));
+                    }
+                }
             }
         }
     }
@@ -4795,16 +4848,18 @@ impl ChatApp {
         });
     }
 
-    /// Server-settings modal opened from the top-bar cog. Read-only
-    /// today — the only tab is "LLM backends", which lists configured
-    /// backends with name/kind/auth-mode. Credential material is never
-    /// rendered. Add / edit / remove will land behind an admin-scope
-    /// gate in a follow-up PR.
+    /// Server-settings modal opened from the top-bar cog. Hosts the
+    /// "LLM backends" tab (list + Rotate-credentials for
+    /// `chatgpt_subscription` backends) plus, on top of it, the paste-
+    /// `auth.json` sub-form when a rotation is in progress. Mutation
+    /// paths require an admin token; plain client tokens get a polite
+    /// error from the server which surfaces in the banner.
     fn render_settings_modal(&mut self, ctx: &egui::Context) {
         let Some(mut modal) = self.settings_modal.take() else {
             return;
         };
         let mut open = true;
+        let mut rotate_request: Option<String> = None;
 
         egui::Window::new("Server settings")
             .collapsible(false)
@@ -4825,19 +4880,149 @@ impl ChatApp {
                 ui.separator();
                 ui.add_space(4.0);
                 match modal.active_tab {
-                    SettingsTab::Backends => self.render_settings_backends_tab(ui),
+                    SettingsTab::Backends => self.render_settings_backends_tab(
+                        ui,
+                        &modal.codex_rotate_banner,
+                        &mut rotate_request,
+                    ),
                 }
             });
 
-        if open {
+        if let Some(backend) = rotate_request {
+            modal.codex_rotate_banner = None;
+            modal.codex_rotate = Some(CodexRotateState {
+                backend,
+                contents: String::new(),
+                error: None,
+                pending_correlation: None,
+            });
+        }
+
+        // Paste-auth.json sub-form. Rendered outside the main window so
+        // egui stacks it on top; closing it returns to the list.
+        let mut keep_main_open = true;
+        if modal.codex_rotate.is_some() {
+            self.render_codex_rotate_subform(ctx, &mut modal, &mut keep_main_open);
+        }
+
+        if open && keep_main_open {
             self.settings_modal = Some(modal);
         }
     }
 
-    /// Read-only backends list inside the server-settings modal. Name,
-    /// kind, default-model, and auth-mode per entry. Never shows
-    /// credential material.
-    fn render_settings_backends_tab(&mut self, ui: &mut egui::Ui) {
+    /// Paste-auth.json sub-form. Stays open while a request is in
+    /// flight (disables the Save button). Success / error banners live
+    /// on the parent modal, not here — we close on either outcome.
+    fn render_codex_rotate_subform(
+        &mut self,
+        ctx: &egui::Context,
+        modal: &mut SettingsModalState,
+        keep_main_open: &mut bool,
+    ) {
+        let Some(mut sub) = modal.codex_rotate.take() else {
+            return;
+        };
+        let mut open = true;
+        let mut save_clicked = false;
+        let mut cancel_clicked = false;
+        let saving = sub.pending_correlation.is_some();
+
+        egui::Window::new(format!("Rotate Codex credentials — {}", sub.backend))
+            .collapsible(false)
+            .resizable(true)
+            .default_width(520.0)
+            .default_height(360.0)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .open(&mut open)
+            .show(ctx, |ui| {
+                ui.label(
+                    RichText::new(
+                        "Paste the full contents of a working ~/.codex/auth.json \
+                         (the file produced by `codex login` on a machine with a \
+                         ChatGPT subscription). Server validates the JSON, writes \
+                         it to the backend's configured path, and swaps the \
+                         in-memory tokens — no restart needed.",
+                    )
+                    .small()
+                    .color(Color32::from_gray(160)),
+                );
+                ui.add_space(6.0);
+                ScrollArea::vertical().max_height(200.0).show(ui, |ui| {
+                    ui.add(
+                        TextEdit::multiline(&mut sub.contents)
+                            .code_editor()
+                            .hint_text("{\"tokens\": { ... }}")
+                            .desired_width(f32::INFINITY)
+                            .desired_rows(10),
+                    );
+                });
+                if let Some(err) = &sub.error {
+                    ui.add_space(6.0);
+                    ui.colored_label(Color32::from_rgb(0xd0, 0x70, 0x70), err);
+                }
+                ui.add_space(8.0);
+                ui.separator();
+                ui.horizontal(|ui| {
+                    let enabled = !saving && !sub.contents.trim().is_empty();
+                    let label = if saving { "Saving…" } else { "Save" };
+                    if ui.add_enabled(enabled, egui::Button::new(label)).clicked() {
+                        save_clicked = true;
+                    }
+                    if ui
+                        .add_enabled(!saving, egui::Button::new("Cancel"))
+                        .clicked()
+                    {
+                        cancel_clicked = true;
+                    }
+                });
+            });
+
+        if cancel_clicked {
+            open = false;
+        }
+
+        if save_clicked {
+            let correlation = self.next_correlation_id();
+            sub.pending_correlation = Some(correlation.clone());
+            sub.error = None;
+            let msg = ClientToServer::UpdateCodexAuth {
+                correlation_id: Some(correlation),
+                backend: sub.backend.clone(),
+                contents: sub.contents.clone(),
+            };
+            self.send(msg);
+        }
+
+        if !open {
+            // Cancelled / closed — discard the in-flight form. If a
+            // response later lands with the stashed correlation, the
+            // handler harmlessly falls through (no match).
+            let _ = sub;
+        } else {
+            modal.codex_rotate = Some(sub);
+        }
+        // The sub-form is always rendered on top of the main modal;
+        // we never request the main modal to close from here, we just
+        // propagate the main `open` state unchanged.
+        let _ = keep_main_open;
+    }
+
+    /// Backends list inside the server-settings modal. Renders one row
+    /// per configured backend (name, kind, default-model, auth-mode)
+    /// plus a Rotate button for `chatgpt_subscription` backends that
+    /// opens the paste-auth.json sub-form. Credential material is
+    /// never displayed.
+    ///
+    /// `rotate_request` is an out-parameter: when the user clicks a
+    /// Rotate button we record the backend name here, and the caller
+    /// transitions the sub-form on our behalf (we can't borrow
+    /// `settings_modal` here because it's already held mutably).
+    fn render_settings_backends_tab(
+        &mut self,
+        ui: &mut egui::Ui,
+        banner: &Option<Result<String, (String, String)>>,
+        rotate_request: &mut Option<String>,
+    ) {
         ui.label(
             RichText::new(
                 "Configured LLM backends the scheduler can dispatch to. \
@@ -4848,6 +5033,24 @@ impl ChatApp {
             .color(Color32::from_gray(150)),
         );
         ui.add_space(6.0);
+
+        if let Some(banner) = banner {
+            match banner {
+                Ok(backend) => {
+                    ui.colored_label(
+                        Color32::from_rgb(0x88, 0xbb, 0x88),
+                        format!("Rotated Codex credentials for `{backend}`."),
+                    );
+                }
+                Err((backend, detail)) => {
+                    ui.colored_label(
+                        Color32::from_rgb(0xd0, 0x70, 0x70),
+                        format!("Rotation failed for `{backend}`: {detail}"),
+                    );
+                }
+            }
+            ui.add_space(6.0);
+        }
 
         if self.backends.is_empty() {
             ui.label(
@@ -4865,7 +5068,7 @@ impl ChatApp {
         let default_backend = self.default_backend.clone();
         ScrollArea::vertical().show(ui, |ui| {
             for b in &backends {
-                render_backend_settings_row(ui, b, &default_backend);
+                render_backend_settings_row(ui, b, &default_backend, rotate_request);
                 ui.add_space(2.0);
                 ui.separator();
             }
@@ -5899,11 +6102,16 @@ impl ChatApp {
 }
 
 /// One row in the Settings → LLM backends list. Shows name, kind,
-/// default model, and auth-mode badge. Never renders credential
-/// material — auth_mode only names *where* the credential lives
-/// ("api_key", "chatgpt_subscription", "google_oauth", or "(none)"
-/// for local endpoints that skip auth).
-fn render_backend_settings_row(ui: &mut egui::Ui, backend: &BackendSummary, default: &str) {
+/// default model, and auth-mode badge; for `chatgpt_subscription`
+/// backends, a right-aligned "Rotate credentials" button that bubbles
+/// the backend name up through `rotate_request` so the caller can open
+/// the paste-`auth.json` sub-form. Never renders credential material.
+fn render_backend_settings_row(
+    ui: &mut egui::Ui,
+    backend: &BackendSummary,
+    default: &str,
+    rotate_request: &mut Option<String>,
+) {
     ui.horizontal(|ui| {
         ui.label(RichText::new(&backend.name).strong());
         if backend.name == default {
@@ -5912,6 +6120,17 @@ fn render_backend_settings_row(ui: &mut egui::Ui, backend: &BackendSummary, defa
                     .small()
                     .color(Color32::from_rgb(0x88, 0xbb, 0x88)),
             );
+        }
+        if backend.auth_mode.as_deref() == Some("chatgpt_subscription") {
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui
+                    .small_button("Rotate credentials")
+                    .on_hover_text("Paste a fresh ~/.codex/auth.json to rotate the ChatGPT subscription tokens")
+                    .clicked()
+                {
+                    *rotate_request = Some(backend.name.clone());
+                }
+            });
         }
     });
     ui.horizontal_wrapped(|ui| {

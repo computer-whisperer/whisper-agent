@@ -50,7 +50,17 @@ impl CodexAuth {
         };
         let text = std::fs::read_to_string(&path)
             .with_context(|| format!("read codex auth file {}", path.display()))?;
-        let data: AuthDotJson = serde_json::from_str(&text)
+        Self::from_contents(path, &text)
+    }
+
+    /// Parse the raw `auth.json` contents into an in-memory `CodexAuth`
+    /// bound to `path`. Used by `load()` and by the admin-driven
+    /// rotation path (the latter writes `contents` to `path` *after*
+    /// this validation succeeds). Separated from `load()` so the
+    /// settings panel's "paste your auth.json" action can validate
+    /// without touching disk first.
+    pub fn from_contents(path: PathBuf, text: &str) -> Result<Self> {
+        let data: AuthDotJson = serde_json::from_str(text)
             .with_context(|| format!("parse codex auth file {}", path.display()))?;
         let tokens = data
             .tokens
@@ -67,6 +77,23 @@ impl CodexAuth {
             exp,
             account_id,
         })
+    }
+
+    /// On-disk path this `CodexAuth` reads and writes. Exposed so the
+    /// admin rotation handler can echo the write target in success
+    /// logs and, if needed, report it in errors.
+    pub fn path(&self) -> &std::path::Path {
+        &self.path
+    }
+
+    /// Write the current in-memory state to `self.path`. Used by the
+    /// admin-driven rotation path: parse + swap happens first, then
+    /// we persist so a concurrent refresh (held behind the same
+    /// `Arc<Mutex<CodexAuth>>`) can't race us into writing a stale
+    /// blob. Publicly exposed so the provider can drive the write
+    /// without also exposing the private `data` field.
+    pub fn persist(&self) -> Result<()> {
+        self.save()
     }
 
     pub fn access_token(&self) -> &str {
@@ -289,6 +316,42 @@ mod tests {
         assert_eq!(exp.timestamp(), 1_700_000_000);
         let acc = parse_account_id(&jwt_id).unwrap();
         assert_eq!(acc.as_deref(), Some("acc-123"));
+    }
+
+    #[test]
+    fn from_contents_validates_before_touching_disk() {
+        let path = PathBuf::from("/nonexistent/ignored-by-this-test");
+        // Invalid JSON — surfaces a parse error.
+        assert!(CodexAuth::from_contents(path.clone(), "not json").is_err());
+        // Valid JSON but no `tokens` block — the admin-rotation path
+        // relies on this rejection to stop the user pasting an
+        // unrelated blob (e.g. an API-key auth.json).
+        let err = match CodexAuth::from_contents(path.clone(), "{}") {
+            Ok(_) => panic!("expected `tokens`-missing error"),
+            Err(e) => e,
+        };
+        assert!(
+            err.to_string().contains("tokens"),
+            "expected `tokens`-missing error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn from_contents_accepts_well_formed_blob() {
+        let jwt_access = encode_jwt(&serde_json::json!({ "exp": 1_700_000_000i64 }));
+        let jwt_id = encode_jwt(&serde_json::json!({
+            "https://api.openai.com/auth": { "chatgpt_account_id": "acc-1" }
+        }));
+        let raw = serde_json::json!({
+            "tokens": {
+                "id_token": jwt_id,
+                "access_token": jwt_access,
+                "refresh_token": "rt",
+            }
+        })
+        .to_string();
+        let auth = CodexAuth::from_contents(PathBuf::from("/ignored"), &raw).unwrap();
+        assert_eq!(auth.chatgpt_account_id(), Some("acc-1"));
     }
 
     #[test]

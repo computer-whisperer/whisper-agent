@@ -28,10 +28,10 @@ use axum::{
     Router,
     body::Bytes,
     extract::{
-        Path, State,
+        ConnectInfo, Path, State,
         ws::{Message, WebSocket, WebSocketUpgrade},
     },
-    http::{StatusCode, header},
+    http::{HeaderMap, StatusCode, header},
     middleware,
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -138,6 +138,10 @@ pub struct ServerConfig {
     /// names are registered at startup; the runtime gate only consults
     /// the tokens.
     pub auth_clients: Vec<AuthClient>,
+    /// Configured admin-auth tokens. Admin tokens also grant chat access
+    /// (every `matches_client` check is a superset), but additionally
+    /// unlock settings-mutation handlers like `UpdateCodexAuth`.
+    pub auth_admins: Vec<AuthClient>,
 }
 
 /// Paths to the PEM-encoded cert chain and private key. Loaded from
@@ -152,6 +156,12 @@ pub struct TlsConfig {
 struct AppState {
     inbox: mpsc::UnboundedSender<SchedulerMsg>,
     next_conn_id: Arc<AtomicU64>,
+    /// Shared auth state — used by the ws upgrade handler to re-read
+    /// the presented token and decide whether the connection has admin
+    /// capability. The `require_auth` middleware has already verified
+    /// that the token is valid; this probe only refines "plain client"
+    /// vs "admin" from the same token bytes.
+    auth: Arc<AuthState>,
 }
 
 pub async fn serve(listen: SocketAddr, config: ServerConfig) -> anyhow::Result<()> {
@@ -238,30 +248,33 @@ pub async fn serve(listen: SocketAddr, config: ServerConfig) -> anyhow::Result<(
         scheduler, inbox_rx, stream_rx,
     ));
 
-    let state = AppState {
-        inbox: inbox_tx.clone(),
-        next_conn_id: Arc::new(AtomicU64::new(1)),
-    };
-
     let auth_state = Arc::new(AuthState::new(
         config
             .auth_clients
             .iter()
             .map(|c| c.token.clone())
             .collect(),
+        config.auth_admins.iter().map(|c| c.token.clone()).collect(),
     ));
-    if config.auth_clients.is_empty() {
+    if !auth_state.any_configured() {
         info!(
-            "client auth disabled (no [[auth.clients]] in config) — non-loopback connections will be rejected"
+            "client auth disabled (no [[auth.clients]] or [[auth.admins]] in config) — non-loopback connections will be rejected"
         );
     } else {
-        let names: Vec<&str> = config
+        let client_names: Vec<&str> = config
             .auth_clients
             .iter()
             .map(|c| c.name.as_str())
             .collect();
-        info!(clients = ?names, "client auth enabled");
+        let admin_names: Vec<&str> = config.auth_admins.iter().map(|c| c.name.as_str()).collect();
+        info!(clients = ?client_names, admins = ?admin_names, "client auth enabled");
     }
+
+    let state = AppState {
+        inbox: inbox_tx.clone(),
+        next_conn_id: Arc::new(AtomicU64::new(1)),
+        auth: auth_state.clone(),
+    };
 
     // route_layer applies only to routes registered before it. The /ws and
     // /auth/check routes go through the gate; /auth/login (the way you
@@ -353,8 +366,25 @@ pub async fn serve(listen: SocketAddr, config: ServerConfig) -> anyhow::Result<(
     Ok(())
 }
 
-async fn ws_handler(State(state): State<AppState>, ws: WebSocketUpgrade) -> impl IntoResponse {
-    ws.on_upgrade(move |socket| handle_ws_session(socket, state))
+async fn ws_handler(
+    State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    ws: WebSocketUpgrade,
+) -> impl IntoResponse {
+    // The `require_auth` middleware has already approved the request.
+    // Re-read the presented token here to decide whether the connection
+    // is admin-capable. Loopback peers are promoted to admin
+    // unconditionally — they can already read the config from disk, so
+    // the gate would be theatre.
+    let is_admin = if addr.ip().is_loopback() {
+        true
+    } else {
+        auth::bearer_or_cookie(&headers)
+            .map(|t| state.auth.matches_admin(t.as_bytes()))
+            .unwrap_or(false)
+    };
+    ws.on_upgrade(move |socket| handle_ws_session(socket, state, is_admin))
 }
 
 /// Webhook trigger delivery. `POST /triggers/{pod_id}/{behavior_id}`
@@ -427,7 +457,7 @@ async fn webhook_trigger_handler(
     }
 }
 
-async fn handle_ws_session(socket: WebSocket, state: AppState) {
+async fn handle_ws_session(socket: WebSocket, state: AppState, is_admin: bool) {
     let conn_id: ConnId = state.next_conn_id.fetch_add(1, Ordering::Relaxed);
     let (outbound_tx, mut outbound_rx) = mpsc::unbounded_channel::<ServerToClient>();
 
@@ -437,13 +467,14 @@ async fn handle_ws_session(socket: WebSocket, state: AppState) {
         .send(SchedulerMsg::RegisterClient {
             conn_id,
             outbound: outbound_tx,
+            is_admin,
         })
         .is_err()
     {
         error!("scheduler inbox closed; cannot register client");
         return;
     }
-    info!(conn_id, "ws session opened");
+    info!(conn_id, is_admin, "ws session opened");
 
     let (mut sink, mut stream) = socket.split();
 

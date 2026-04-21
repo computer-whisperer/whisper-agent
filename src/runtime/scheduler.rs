@@ -128,6 +128,11 @@ pub enum SchedulerMsg {
     RegisterClient {
         conn_id: ConnId,
         outbound: mpsc::UnboundedSender<ServerToClient>,
+        /// True when the connection authed with an admin token (or is
+        /// loopback). Promoted connections pass privileged handlers
+        /// like `UpdateCodexAuth`; non-admin connections receive
+        /// `Error` responses for those messages.
+        is_admin: bool,
     },
     UnregisterClient {
         conn_id: ConnId,
@@ -311,6 +316,11 @@ pub struct Scheduler {
     active_functions: HashMap<crate::functions::FunctionId, functions::ActiveFunctionEntry>,
     /// Monotonic counter for assigning `FunctionId`s at registration time.
     next_function_id: crate::functions::FunctionId,
+    /// Connection ids that authed with an admin token (or came in over
+    /// loopback). Consulted by settings-mutation handlers to decide
+    /// whether to honour or reject the request. Populated on
+    /// `RegisterClient`, cleared on `UnregisterClient`.
+    admin_connections: HashSet<ConnId>,
 }
 
 impl Scheduler {
@@ -398,6 +408,7 @@ impl Scheduler {
                 stream_tx,
                 active_functions: HashMap::new(),
                 next_function_id: 1,
+                admin_connections: HashSet::new(),
             },
             stream_rx,
         ))
@@ -1546,11 +1557,19 @@ impl Scheduler {
         pending_io: &mut FuturesUnordered<SchedulerFuture>,
     ) {
         match input {
-            SchedulerMsg::RegisterClient { conn_id, outbound } => {
+            SchedulerMsg::RegisterClient {
+                conn_id,
+                outbound,
+                is_admin,
+            } => {
                 self.router.register_client(conn_id, outbound);
+                if is_admin {
+                    self.admin_connections.insert(conn_id);
+                }
             }
             SchedulerMsg::UnregisterClient { conn_id } => {
                 self.router.unregister_client(conn_id);
+                self.admin_connections.remove(&conn_id);
             }
             SchedulerMsg::ClientMessage { conn_id, msg } => {
                 self.apply_client_message(conn_id, msg, pending_io);

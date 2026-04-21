@@ -109,6 +109,18 @@ impl ThreadEventRouter {
         self.clients.values().cloned().collect()
     }
 
+    /// Clone of one client's outbound channel. Used by handlers that
+    /// spawn an async task (e.g. `UpdateCodexAuth` awaits on provider
+    /// state mutation) and need to deliver an ack or error to the
+    /// original requester without re-entering the scheduler loop.
+    /// Returns `None` if the connection has disconnected.
+    pub(crate) fn client_outbound(
+        &self,
+        conn_id: ConnId,
+    ) -> Option<mpsc::UnboundedSender<ServerToClient>> {
+        self.clients.get(&conn_id).cloned()
+    }
+
     pub(crate) fn broadcast_task_list_except(&self, event: ServerToClient, skip: ConnId) {
         for (conn_id, tx) in &self.clients {
             if *conn_id != skip {

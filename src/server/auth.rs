@@ -29,26 +29,60 @@ use subtle::ConstantTimeEq;
 /// and shared (Arc) across the gate middleware and the `/auth/login`
 /// handler. Names live in the TOML for human bookkeeping; runtime only
 /// needs the token bytes.
+///
+/// Two lists: `client_tokens` grant chat access; `admin_tokens` grant
+/// settings-mutation access *in addition to* chat access (an admin
+/// token matches every check a client token does). The ws upgrade
+/// decides a connection's admin capability once at handshake and stores
+/// it on the scheduler's per-connection state; there is no wire-level
+/// protocol message that asks the server "am I admin".
 #[derive(Debug, Default)]
 pub struct AuthState {
-    pub tokens: Vec<String>,
+    pub client_tokens: Vec<String>,
+    pub admin_tokens: Vec<String>,
 }
 
 impl AuthState {
-    pub fn new(tokens: Vec<String>) -> Self {
-        Self { tokens }
+    pub fn new(client_tokens: Vec<String>, admin_tokens: Vec<String>) -> Self {
+        Self {
+            client_tokens,
+            admin_tokens,
+        }
     }
 
-    /// Constant-time check: presented bytes match any configured token.
-    /// Iterates the full list (no early exit) so timing doesn't leak
-    /// which slot matched — or that any slot did.
-    fn matches(&self, presented: &[u8]) -> bool {
-        let mut matched = 0u8;
-        for token in &self.tokens {
-            matched |= presented.ct_eq(token.as_bytes()).unwrap_u8();
-        }
-        matched == 1
+    /// True iff `presented` matches any configured client OR admin
+    /// token. Constant-time over the combined list.
+    pub fn matches(&self, presented: &[u8]) -> bool {
+        self.matches_client(presented) || self.matches_admin(presented)
     }
+
+    /// Constant-time match against the chat-access token list.
+    pub fn matches_client(&self, presented: &[u8]) -> bool {
+        ct_match_any(presented, &self.client_tokens)
+    }
+
+    /// Constant-time match against the admin token list. Used at ws
+    /// upgrade to stamp the connection's capability.
+    pub fn matches_admin(&self, presented: &[u8]) -> bool {
+        ct_match_any(presented, &self.admin_tokens)
+    }
+
+    /// Returns true iff *any* tokens are configured (client or admin).
+    /// The gate uses this to decide whether to reject non-loopback
+    /// traffic outright (no tokens configured → no way to authenticate).
+    pub fn any_configured(&self) -> bool {
+        !self.client_tokens.is_empty() || !self.admin_tokens.is_empty()
+    }
+}
+
+/// Iterate the full list without early exit so timing doesn't leak
+/// which slot matched — or that any slot did.
+fn ct_match_any(presented: &[u8], tokens: &[String]) -> bool {
+    let mut matched = 0u8;
+    for token in tokens {
+        matched |= presented.ct_eq(token.as_bytes()).unwrap_u8();
+    }
+    matched == 1
 }
 
 /// Tower middleware: gate non-loopback requests behind a configured token.
@@ -64,7 +98,7 @@ pub async fn require_auth(
     if addr.ip().is_loopback() {
         return next.run(req).await;
     }
-    if auth.tokens.is_empty() {
+    if !auth.any_configured() {
         return (
             StatusCode::UNAUTHORIZED,
             "client auth not configured; non-loopback access denied",
@@ -102,7 +136,7 @@ pub async fn handle_login(
     State(auth): State<Arc<AuthState>>,
     Json(body): Json<LoginRequest>,
 ) -> Response {
-    if auth.tokens.is_empty() || !auth.matches(body.token.as_bytes()) {
+    if !auth.any_configured() || !auth.matches(body.token.as_bytes()) {
         return (StatusCode::UNAUTHORIZED, "invalid token").into_response();
     }
     let cookie = format!(
@@ -124,7 +158,12 @@ pub async fn handle_check() -> StatusCode {
     StatusCode::NO_CONTENT
 }
 
-fn bearer_or_cookie(headers: &HeaderMap) -> Option<String> {
+/// Extract the bearer token (or `wa_session` cookie fallback) from a
+/// request's headers. `pub(crate)` so the ws upgrade handler can
+/// re-read the token after the middleware has already authed the
+/// request — needed to determine whether the connection should be
+/// admin-capable.
+pub(crate) fn bearer_or_cookie(headers: &HeaderMap) -> Option<String> {
     if let Some(bearer) = headers
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
@@ -189,10 +228,30 @@ mod tests {
 
     #[test]
     fn matches_finds_configured_token() {
-        let auth = AuthState::new(vec!["aaa".into(), "bbb".into()]);
+        let auth = AuthState::new(vec!["aaa".into(), "bbb".into()], vec!["zzz".into()]);
         assert!(auth.matches(b"aaa"));
         assert!(auth.matches(b"bbb"));
+        assert!(auth.matches(b"zzz"));
         assert!(!auth.matches(b"ccc"));
         assert!(!auth.matches(b""));
+    }
+
+    #[test]
+    fn admin_capability_is_distinct_from_client_match() {
+        let auth = AuthState::new(vec!["chat".into()], vec!["admin".into()]);
+        assert!(auth.matches_client(b"chat"));
+        assert!(!auth.matches_client(b"admin"));
+        assert!(auth.matches_admin(b"admin"));
+        assert!(!auth.matches_admin(b"chat"));
+        // Both still pass the combined gate.
+        assert!(auth.matches(b"chat"));
+        assert!(auth.matches(b"admin"));
+    }
+
+    #[test]
+    fn any_configured_reports_either_list() {
+        assert!(!AuthState::default().any_configured());
+        assert!(AuthState::new(vec!["c".into()], vec![]).any_configured());
+        assert!(AuthState::new(vec![], vec!["a".into()]).any_configured());
     }
 }

@@ -886,6 +886,27 @@ pub enum ClientToServer {
         name: String,
     },
 
+    // --- Server-settings mutations (admin-only) ---
+    /// Replace the Codex `auth.json` contents for a ChatGPT-subscription
+    /// backend. Server validates the JSON against the Codex schema,
+    /// writes it to the backend's configured path, and swaps the
+    /// in-memory auth state so in-flight and subsequent requests pick
+    /// it up without a restart. Admin-only — plain client tokens are
+    /// rejected. Server responds with `CodexAuthUpdated` on success or
+    /// `Error` on validation / IO / permission failure.
+    UpdateCodexAuth {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        correlation_id: Option<String>,
+        /// Backend name as it appears in `BackendsList` / the TOML
+        /// `[backends.<name>]` table. Must reference a backend whose
+        /// auth_mode is `chatgpt_subscription`.
+        backend: String,
+        /// Full `auth.json` contents — typically the result of
+        /// `cat ~/.codex/auth.json` on a machine that just ran
+        /// `codex login`.
+        contents: String,
+    },
+
     // --- Pod registry (Phase 2d.i — wire surface only; the scheduler
     //     becomes pod-aware in 2d.iii). ---
     /// Walk `<pods_root>/` and return every non-archived pod's summary.
@@ -1310,6 +1331,15 @@ pub enum ServerToClient {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         correlation_id: Option<String>,
         name: String,
+    },
+    /// ACK for `UpdateCodexAuth`. The backend named `backend` has its
+    /// in-memory auth state refreshed; subsequent requests will use the
+    /// new tokens. Broadcast to every connected client so a concurrent
+    /// admin session sees the change.
+    CodexAuthUpdated {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        correlation_id: Option<String>,
+        backend: String,
     },
     /// A new entry appeared in the registry.
     ResourceCreated {

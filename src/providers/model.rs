@@ -170,6 +170,38 @@ pub trait ModelProvider: Send + Sync {
     }
 
     fn list_models<'a>(&'a self) -> BoxFuture<'a, Result<Vec<ModelInfo>, ModelError>>;
+
+    /// Replace the Codex `auth.json` contents for this provider, writing
+    /// the new bytes to the same on-disk path the provider was built
+    /// with and swapping the in-memory auth state so subsequent
+    /// requests use the new tokens.
+    ///
+    /// Async because providers whose in-memory auth is guarded by a
+    /// `tokio::sync::Mutex` (the Codex flow) need to await the lock
+    /// on a runtime thread that might currently be mid-refresh.
+    /// Returns `Err(UpdateAuthError::NotSupported)` by default — only
+    /// `OpenAiResponsesClient` configured with `ClientAuth::Codex(_)`
+    /// overrides.
+    fn update_codex_auth<'a>(
+        &'a self,
+        _contents: &'a str,
+    ) -> BoxFuture<'a, Result<(), UpdateAuthError>> {
+        Box::pin(async { Err(UpdateAuthError::NotSupported) })
+    }
+}
+
+/// Failure shape for [`ModelProvider::update_codex_auth`]. Kept as a
+/// narrow enum rather than `anyhow::Error` so handlers can tell "not
+/// supported" (client error) from "disk write failed" (server error)
+/// and map to the right surface.
+#[derive(Debug, Error)]
+pub enum UpdateAuthError {
+    #[error("this backend does not support codex auth rotation")]
+    NotSupported,
+    #[error("invalid codex auth.json: {0}")]
+    Invalid(String),
+    #[error("failed to persist codex auth.json: {0}")]
+    Io(String),
 }
 
 /// Drain a `create_message_streaming` stream into a single [`ModelResponse`]

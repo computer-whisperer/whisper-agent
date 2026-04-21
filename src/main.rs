@@ -346,6 +346,7 @@ async fn run_serve(args: ServeArgs) -> Result<()> {
         mut shared_host_map,
         toml_provider_entries,
         auth_clients,
+        auth_admins,
     ) = match &resolved_config {
         Some(path) => {
             info!(config = %path.display(), "loading backend catalog");
@@ -379,6 +380,7 @@ async fn run_serve(args: ServeArgs) -> Result<()> {
                 cfg.shared_mcp_hosts.into_iter().collect::<HashMap<_, _>>(),
                 cfg.host_env_providers,
                 cfg.auth.clients,
+                cfg.auth.admins,
             )
         }
         None => {
@@ -400,6 +402,7 @@ async fn run_serve(args: ServeArgs) -> Result<()> {
                 DEFAULT_BACKEND_NAME.into(),
                 args.model.clone(),
                 HashMap::new(),
+                Vec::new(),
                 Vec::new(),
                 Vec::new(),
             )
@@ -512,9 +515,10 @@ async fn run_serve(args: ServeArgs) -> Result<()> {
     // wire in cleartext is a footgun we'd rather hard-fail on than warn
     // about. Wildcard binds (0.0.0.0, ::) are conservatively treated as
     // non-loopback because they accept both.
-    if !auth_clients.is_empty() && !args.listen.ip().is_loopback() && tls.is_none() {
+    let any_tokens = !auth_clients.is_empty() || !auth_admins.is_empty();
+    if any_tokens && !args.listen.ip().is_loopback() && tls.is_none() {
         return Err(anyhow!(
-            "[[auth.clients]] is configured and --listen {} is not loopback, but no --tls-cert/--tls-key was provided; \
+            "[[auth.clients]] or [[auth.admins]] is configured and --listen {} is not loopback, but no --tls-cert/--tls-key was provided; \
              refusing to send tokens over plain HTTP",
             args.listen
         ));
@@ -540,6 +544,7 @@ async fn run_serve(args: ServeArgs) -> Result<()> {
         shared_mcp_hosts,
         tls,
         auth_clients,
+        auth_admins,
     };
     server::serve(args.listen, server_config).await
 }

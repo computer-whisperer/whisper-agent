@@ -479,6 +479,58 @@ impl Scheduler {
                     );
                 }
             },
+            ClientToServer::UpdateCodexAuth {
+                correlation_id,
+                backend,
+                contents,
+            } => {
+                if !self.admin_connections.contains(&conn_id) {
+                    self.router.send_to_client(
+                        conn_id,
+                        ServerToClient::Error {
+                            correlation_id,
+                            thread_id: None,
+                            message:
+                                "update_codex_auth: admin capability required (token is not in [[auth.admins]])"
+                                    .into(),
+                        },
+                    );
+                    return;
+                }
+                let Some(entry) = self.backends.get(&backend) else {
+                    self.router.send_to_client(
+                        conn_id,
+                        ServerToClient::Error {
+                            correlation_id,
+                            thread_id: None,
+                            message: format!("update_codex_auth: unknown backend `{backend}`"),
+                        },
+                    );
+                    return;
+                };
+                let provider = entry.provider.clone();
+                let Some(outbound) = self.router.client_outbound(conn_id) else {
+                    // Client disconnected between send and dispatch —
+                    // nothing to ack to. Skip the work; the next admin
+                    // session can retry.
+                    return;
+                };
+                tokio::spawn(async move {
+                    let result = provider.update_codex_auth(&contents).await;
+                    let event = match result {
+                        Ok(()) => ServerToClient::CodexAuthUpdated {
+                            correlation_id,
+                            backend,
+                        },
+                        Err(e) => ServerToClient::Error {
+                            correlation_id,
+                            thread_id: None,
+                            message: format!("update_codex_auth: {e}"),
+                        },
+                    };
+                    let _ = outbound.send(event);
+                });
+            }
             ClientToServer::ListPods { correlation_id } => {
                 let Some((persister, outbound)) = self.persister_and_outbound(conn_id) else {
                     return;

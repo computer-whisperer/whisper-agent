@@ -83,15 +83,24 @@ pub struct Config {
 /// credentials in `whisper-agent.toml` (e.g. provider API keys). The server
 /// presents these to bearer-token comparisons (`Authorization: Bearer <tok>`
 /// for native clients, `wa_session=<tok>` cookie for browser).
+///
+/// Two token lists: `[[auth.clients]]` for everyday chat access, and
+/// `[[auth.admins]]` for settings mutations (rotate provider
+/// credentials, etc.). An admin token also grants client access —
+/// the handlers check "is admin" as a capability on top of the base
+/// auth match.
 #[derive(Deserialize, Debug, Clone, Default)]
 pub struct AuthConfig {
     #[serde(default)]
     pub clients: Vec<AuthClient>,
+    #[serde(default)]
+    pub admins: Vec<AuthClient>,
 }
 
-/// One entry from `[[auth.clients]]`. `name` is descriptive (used to identify
-/// a device for revocation by editing the file); `token` is the opaque bearer
-/// string. Suggested generator: `openssl rand -base64 32`.
+/// One entry from `[[auth.clients]]` or `[[auth.admins]]`. `name` is
+/// descriptive (used to identify a device for revocation by editing
+/// the file); `token` is the opaque bearer string. Suggested
+/// generator: `openssl rand -base64 32`.
 #[derive(Deserialize, Debug, Clone)]
 pub struct AuthClient {
     pub name: String,

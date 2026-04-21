@@ -39,7 +39,7 @@ use whisper_agent_protocol::{
 use crate::providers::codex_auth::CodexAuth;
 use crate::providers::model::{
     BoxFuture, BoxStream, ModelError, ModelEvent, ModelInfo, ModelProvider, ModelRequest,
-    ModelResponse, ToolSpec,
+    ModelResponse, ToolSpec, UpdateAuthError,
 };
 
 pub const OPENAI_API_BASE: &str = "https://api.openai.com/v1";
@@ -330,6 +330,34 @@ impl ModelProvider for OpenAiResponsesClient {
 
     fn list_models<'a>(&'a self) -> BoxFuture<'a, Result<Vec<ModelInfo>, ModelError>> {
         Box::pin(self.do_list_models())
+    }
+
+    /// Only meaningful for `ClientAuth::Codex` — API-key clients have
+    /// nothing to rotate via this path and return `NotSupported`.
+    /// For Codex: parse the pasted `auth.json` blob against the in-memory
+    /// path (so the new credential file lands exactly where the refresh
+    /// loop expects), lock the mutex briefly, and swap the inner state.
+    /// We write to disk *after* the swap so an error here doesn't leave
+    /// the on-disk file and in-memory state desynced.
+    fn update_codex_auth<'a>(
+        &'a self,
+        contents: &'a str,
+    ) -> BoxFuture<'a, Result<(), UpdateAuthError>> {
+        Box::pin(async move {
+            let m = match &self.auth {
+                ClientAuth::ApiKey(_) => return Err(UpdateAuthError::NotSupported),
+                ClientAuth::Codex(m) => m,
+            };
+            let mut guard = m.lock().await;
+            let path = guard.path().to_path_buf();
+            let fresh = CodexAuth::from_contents(path.clone(), contents)
+                .map_err(|e| UpdateAuthError::Invalid(format!("{e:#}")))?;
+            *guard = fresh;
+            guard
+                .persist()
+                .map_err(|e| UpdateAuthError::Io(format!("{e:#}")))?;
+            Ok(())
+        })
     }
 }
 
