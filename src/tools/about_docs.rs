@@ -15,7 +15,7 @@ pub fn topic(name: &str) -> Option<&'static str> {
         "overview" => OVERVIEW,
         "threads" => THREADS,
         "tools" => TOOLS,
-        "escalation" => ESCALATION,
+        "sudo" => SUDO,
         "filesystem" => FILESYSTEM,
         "sandbox" => SANDBOX,
         "memory" => MEMORY,
@@ -36,7 +36,7 @@ pub const TOPIC_NAMES: &[&str] = &[
     "overview",
     "threads",
     "tools",
-    "escalation",
+    "sudo",
     "filesystem",
     "sandbox",
     "memory",
@@ -57,7 +57,7 @@ Orientation
 
 Tools & permissions
 - `tools` — the tool surface: admitted vs askable, categories, `describe_tool`/`find_tool`
-- `escalation` — asking for tools or capabilities you don't currently hold
+- `sudo` — running a tool with explicit user approval (the escalation path)
 
 Environment
 - `filesystem` — what the `pod_*_file` tools can read/write; the pod-dir layout
@@ -111,19 +111,19 @@ your `pod_*_file` tools edit.
 ```
 
 Tools come from three sources: **builtins** (the `pod_*` tools,
-`about`, `describe_tool`, `find_tool`, `dispatch_thread`,
-`request_escalation`); **host-env MCP** tools from the sandbox this
-thread bound to (e.g. a `rustdev_bash` tool if the sandbox is a Rust
-dev environment); and **shared MCP** tools from third-party services
-the pod is allowed to reach. See the `tools` topic.
+`about`, `describe_tool`, `find_tool`, `dispatch_thread`, `sudo`);
+**host-env MCP** tools from the sandbox this thread bound to (e.g.
+a `rustdev_bash` tool if the sandbox is a Rust dev environment); and
+**shared MCP** tools from third-party services the pod is allowed
+to reach. See the `tools` topic.
 
 Not every call you make runs unconditionally. A thread has a
 **scope** — the set of tools and capabilities it currently holds.
 Scope starts from the pod's `[allow]` ceiling, can be narrowed by the
 parent (for dispatch-spawned threads) or by a behavior's declared
-scope (for trigger-spawned threads), and can be widened at runtime
-via `request_escalation` when an interactive approver is attached.
-See `escalation`.
+scope (for trigger-spawned threads), and can be widened call-by-call
+at runtime via `sudo` when an interactive approver is attached. See
+the `sudo` topic.
 
 The full topic index lives at `about` with no arguments.
 ";
@@ -199,8 +199,8 @@ const TOOLS: &str = "# Tools
 ## Two buckets: admitted vs askable
 
 Every tool visible to you is either **admitted** (you can call it
-now) or **askable** (it exists, but calling it requires running
-`request_escalation` first — see the `escalation` topic).
+now) or **askable** (it exists, but calling it requires wrapping
+the invocation in `sudo` for user approval — see the `sudo` topic).
 
 Admitted tools are on the wire from turn 0: their name, input
 schema, and description land in the `Role::Tools` manifest at thread
@@ -210,11 +210,11 @@ their schemas are fetched on demand.
 ## Description verbosity
 
 The manifest is sized to fit the pod's budget. A small set of
-\"core\" tools (by default: `describe_tool`, `find_tool`,
-`request_escalation`) carry their full prose description. Every
-other admitted tool carries a first-line summary only. The input
-schema is always full — the grammar needs it — but for details on
-what a tool does, fetch it with `describe_tool`.
+\"core\" tools (by default: `describe_tool`, `find_tool`, `sudo`)
+carry their full prose description. Every other admitted tool
+carries a first-line summary only. The input schema is always full —
+the grammar needs it — but for details on what a tool does, fetch
+it with `describe_tool`.
 
 ## Categories
 
@@ -229,7 +229,7 @@ Tools come from three sources; a tool's name prefix tells you which:
     behaviors manually. See `behaviors`.
   - `dispatch_thread` — spawn a child thread from a named behavior
     or an ad-hoc config. See `behaviors`.
-  - `request_escalation` — ask for a tool or cap you don't have.
+  - `sudo` — run a tool with explicit user approval. See `sudo`.
   - `about` / `describe_tool` / `find_tool` — documentation surfaces.
 
 - **Host-env MCP** — tools from the sandbox this thread is bound to
@@ -259,68 +259,78 @@ denial reason. If the name isn't in the pod at all, you get an
 unknown-tool error — try `find_tool` to see what actually exists.
 ";
 
-const ESCALATION: &str = "# Escalation
+const SUDO: &str = "# Sudo
 
-Escalation widens your thread's scope at runtime by asking an
-interactive approver. Use it when you discover you need a tool or
-capability the thread's current scope denies. The mechanism is the
-`request_escalation` builtin.
+Sudo runs a tool with explicit user approval. It's the single
+runtime escalation path: when you discover you need a tool the
+thread's scope denies, OR when a call you're allowed to make would
+exceed your current caps (e.g. writing a content path with
+`pod_modify: memories`), wrap it in `sudo`.
 
-## What you can ask for
+## Shape
 
-Four request variants (`request` field):
+```json
+sudo({
+  \"tool_name\": \"pod_write_file\",
+  \"args\": { \"filename\": \"system_prompt.md\", \"content\": \"...\" },
+  \"reason\": \"tightening the system prompt; inner edit preview below\"
+})
+```
 
-- `{type: \"add_tool\", name: \"<tool>\"}` — admit a single tool name
-  currently marked askable. The most common form.
-- `{type: \"raise_pod_modify\", target: \"<level>\"}` — widen the
-  thread's pod-directory write cap. Levels: `memories` <
-  `content` < `modify_allow`. You cannot go above the pod's
-  `allow.caps.pod_modify` ceiling.
-- `{type: \"raise_dispatch\", target: \"within_scope\"}` — admit
-  child-thread spawning via `dispatch_thread`.
-- `{type: \"raise_behaviors\", target: \"<level>\"}` — widen the
-  thread's behavior-subsystem cap. Levels: `read` <
-  `author_narrower` < `author_any`.
+- `tool_name` — the wrapped tool. Must be routable in this pod
+  (check with `find_tool` if unsure). Sudo cannot wrap itself or
+  `dispatch_thread`; call those directly.
+- `args` — the arguments for the wrapped tool. Shape must match
+  that tool's input schema. If you haven't called it before, run
+  `describe_tool(name: \"<tool_name>\")` first to fetch the schema.
+- `reason` — short justification shown to the user in the approval
+  UI. Tie it to the specific call, not a generic explanation.
+  \"Rewriting the prompt to add the new memory-dir instruction\"
+  beats \"need write access.\"
 
-Every variant takes a second field:
+## Approval: three outcomes
 
-- `reason: \"<string>\"` — a short justification shown to the user.
-  Say what you need and why; \"I want to run `cargo test` to verify
-  the fix\" beats \"I need bash.\" The user is deciding whether to
-  grant you wider reach than the pod's default — give them the
-  context to decide well.
+The user sees the tool name, the pretty-printed args, and your
+reason, then picks one:
 
-## How approval works
+- **Approve once** — run this single call; scope stays as-is.
+  Future direct calls of the same tool face the same gate.
+- **Approve remember** — run the call AND flip `scope.tools` to
+  admit the tool name for the rest of this thread. Future direct
+  calls skip the prompt. Caps are NOT remembered — each cap-gated
+  operation needs a fresh sudo.
+- **Reject** — the sudo call errors with the user's reason (if any).
+  Course-correct from there; don't just retry the same sudo.
 
-The request is sent to the interactive approver attached to this
-thread. The UI surfaces it; the user approves or denies. The tool
-call blocks (synchronously) until the user responds — there is no
-timeout and no polling.
+The tool call parks until the user responds — there is no timeout
+and no polling.
 
-If the user approves, the grant is applied in-memory to this
-thread's scope. The conversation gains a tail `Role::System`
-announcing the new tool (or a short summary for cap raises), and
-the next turn can use it.
+## Cap bypass
 
-## Scope and persistence
+When approved (either flavor), the wrapped tool runs at the pod's
+full ceiling for this one invocation: `pod.allow.caps.pod_modify`,
+`pod.allow.caps.dispatch`, `pod.allow.caps.behaviors`. That's
+deliberate — the user is explicitly OK-ing the call, and you
+shouldn't also have to explain why the cap-widening is justified
+separately from the call itself.
 
-- **Per-thread, not persistent.** The grant lives for the
-  remainder of this thread's conversation only. A fresh thread
-  starts from the pod baseline. If you want a widening to persist,
-  write it into `pod.toml`'s `[allow]` or a behavior's `[scope]`
-  block (requires `pod_modify` cap).
-- **Capped by the pod.** You cannot escalate above
-  `pod.allow.caps.*` or outside `pod.allow.tools` — those are
-  ceilings no runtime request can cross.
-- **Headless threads cannot escalate.** If no interactive channel
-  is attached (e.g. a cron-triggered behavior thread),
-  `request_escalation` returns an error immediately. This is a
-  deliberate design property: autonomous threads run at their
-  author-declared scope and nothing wider.
+Caveat: sudo cannot cross the pod's ceiling. Tools not in
+`pod.allow.tools` are unreachable; cap targets above
+`pod.allow.caps.*` are unreachable. Persistent widening past those
+requires editing `pod.toml` (and a scope with `pod_modify:
+modify_allow`).
+
+## Headless threads
+
+Threads without an interactive approver (cron-triggered behaviors,
+scheduled runs) cannot use sudo — it hard-errors at the tool layer.
+The `sudo` tool is filtered from the catalog for autonomous
+threads. Design property: autonomous threads run at their
+author-declared scope and nothing wider.
 
 ## When to use it vs. alternatives
 
-- Need a tool once, for this conversation only → `request_escalation`.
+- Need a tool once, for this conversation only → `sudo`.
 - Need a tool every time this agent runs → edit `pod.toml` (if the
   thread has `pod_modify: modify_allow`) or ask the user to.
 - Need a tool every time a specific behavior fires → edit that
@@ -387,8 +397,9 @@ All operate on paths relative to the pod root and never escape it.
 - `modify_allow` — everything above plus `pod.toml`.
 
 Check `pod_list_files` tags to see what you actually have. If a
-write you expect to work returns a cap error, use
-`request_escalation` with `raise_pod_modify`.
+write you expect to work returns a cap error, wrap the call in
+`sudo` — an approved sudo'd call bypasses the cap for that single
+invocation.
 
 ## Validation
 
@@ -472,9 +483,10 @@ usual suspect:
   the binary the tool expects.
 - **Timeout** — long-running command exceeded `limits.timeout_s`.
 
-To widen: edit `pod.toml` (requires `pod_modify: modify_allow`) or
-ask the user via `request_escalation`'s `reason` field — sandbox
-widening typically wants an explicit human decision.
+To widen the sandbox itself, edit `pod.toml` (requires
+`pod_modify: modify_allow` — which you can get one-off via `sudo` on
+the pod_write_file call). Sandbox widening typically wants an
+explicit human decision.
 
 ## No host-env configured
 
@@ -581,7 +593,7 @@ A thread spawned from a behavior is a full first-class thread —
 same setup prefix, same persistence, same tool surface — but its
 scope is capped by both the pod's `[allow]` and the behavior's own
 `[scope]` block. Behaviors run autonomously: they have no
-interactive approver and cannot `request_escalation`.
+interactive approver and cannot use `sudo`.
 
 ## Anatomy
 
@@ -681,7 +693,7 @@ network       = \"isolated\"
 default   = \"allow\"                 # \"allow\" | \"deny\"
 overrides = { pod_write_file = \"deny\" }
 
-# Capability ceilings. A thread in this pod cannot escalate past these.
+# Capability ceilings. No thread in this pod — no sudo grant — can exceed these.
 [allow.caps]
 pod_modify = \"modify_allow\"         # none < memories < content < modify_allow
 dispatch   = \"within_scope\"         # none | within_scope
@@ -706,7 +718,7 @@ behaviors  = \"read\"
 
 # Tool-surface presentation knobs. See `tools` topic for semantics.
 [thread_defaults.tool_surface]
-core_tools       = [\"describe_tool\", \"find_tool\", \"request_escalation\"]
+core_tools       = [\"describe_tool\", \"find_tool\", \"sudo\"]
 initial_listing  = \"none\"           # \"none\" | \"all_names\" | \"core_only\"
 activation_surface = \"announce\"     # \"announce\" | \"inject_schema\"
 
@@ -977,8 +989,8 @@ table and the `behaviors` topic for authoring sub-agents.
   and don't catch up at startup — but `pod_run_behavior` still
   works (explicit actions always run).
 - `dispatch_thread` — spawn an ad-hoc child thread; see `behaviors`.
-- `request_escalation` — ask for a tool or cap you don't have; see
-  `escalation`.
+- `sudo` — run any admissible tool with explicit user approval; see
+  `sudo`.
 
 ## Creating a new behavior
 
