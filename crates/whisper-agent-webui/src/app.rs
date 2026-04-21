@@ -18,9 +18,10 @@ use self::chat_render::{ChatItemEvent, render_item};
 use self::editor_render::{
     behavior_summary_from_snapshot, hint, render_behavior_editor_prompt_tab,
     render_behavior_editor_raw_tab, render_behavior_editor_retention_tab,
-    render_behavior_editor_thread_tab, render_behavior_editor_trigger_tab,
-    render_pod_editor_allow_tab, render_pod_editor_defaults_tab, render_pod_editor_limits_tab,
-    render_pod_editor_raw_tab, render_sandbox_entry_modal, section_heading,
+    render_behavior_editor_scope_tab, render_behavior_editor_thread_tab,
+    render_behavior_editor_trigger_tab, render_pod_editor_allow_tab,
+    render_pod_editor_defaults_tab, render_pod_editor_limits_tab, render_pod_editor_raw_tab,
+    render_sandbox_entry_modal, section_heading,
 };
 
 use std::cell::RefCell;
@@ -1203,6 +1204,7 @@ struct BehaviorEditorModalState {
 enum BehaviorEditorTab {
     Trigger,
     Thread,
+    Scope,
     Retention,
     Prompt,
     RawToml,
@@ -1213,6 +1215,7 @@ impl BehaviorEditorTab {
         match self {
             BehaviorEditorTab::Trigger => "Trigger",
             BehaviorEditorTab::Thread => "Thread",
+            BehaviorEditorTab::Scope => "Scope",
             BehaviorEditorTab::Retention => "Retention",
             BehaviorEditorTab::Prompt => "Prompt",
             BehaviorEditorTab::RawToml => "Raw TOML",
@@ -6422,6 +6425,11 @@ impl ChatApp {
             return;
         };
         let backend_catalog: Vec<String> = self.backends.iter().map(|b| b.name.clone()).collect();
+        let pod_backend_names: Vec<String> = self
+            .pod_configs
+            .get(&modal.pod_id)
+            .map(|cfg| cfg.allow.backends.clone())
+            .unwrap_or_default();
         let pod_host_env_names: Vec<String> = self
             .pod_configs
             .get(&modal.pod_id)
@@ -6498,6 +6506,7 @@ impl ChatApp {
                         for tab in [
                             BehaviorEditorTab::Trigger,
                             BehaviorEditorTab::Thread,
+                            BehaviorEditorTab::Scope,
                             BehaviorEditorTab::Retention,
                             BehaviorEditorTab::Prompt,
                             BehaviorEditorTab::RawToml,
@@ -6544,6 +6553,17 @@ impl ChatApp {
                                         &pod_mcp_host_names,
                                         &models_by_backend,
                                         &pod_default_backend,
+                                    );
+                                }
+                            }
+                            BehaviorEditorTab::Scope => {
+                                if let Some(cfg) = modal.working_config.as_mut() {
+                                    render_behavior_editor_scope_tab(
+                                        ui,
+                                        cfg,
+                                        &pod_backend_names,
+                                        &pod_host_env_names,
+                                        &pod_mcp_host_names,
                                     );
                                 }
                             }

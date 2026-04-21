@@ -18,9 +18,9 @@ use whisper_agent_protocol::sandbox::{
     AccessMode, Mount, NetworkPolicy, PathAccess, ResourceLimits,
 };
 use whisper_agent_protocol::{
-    BehaviorConfig, BehaviorSnapshot as BehaviorSnapshotProto, BehaviorSummary, CatchUp,
-    Disposition, HostEnvProviderInfo, HostEnvSpec, ModelSummary, Overlap, PodConfig,
-    RetentionPolicy, TriggerSpec,
+    BehaviorConfig, BehaviorOpsCap, BehaviorSnapshot as BehaviorSnapshotProto, BehaviorSummary,
+    CatchUp, DispatchCap, Disposition, HostEnvProviderInfo, HostEnvSpec, ModelSummary, Overlap,
+    PodConfig, PodModifyCap, RetentionPolicy, TriggerSpec,
 };
 
 fn disposition_label(d: Disposition) -> &'static str {
@@ -28,6 +28,89 @@ fn disposition_label(d: Disposition) -> &'static str {
         Disposition::Allow => "allow",
         Disposition::Deny => "deny",
     }
+}
+
+fn pod_modify_cap_label(c: PodModifyCap) -> &'static str {
+    match c {
+        PodModifyCap::None => "none",
+        PodModifyCap::Memories => "memories",
+        PodModifyCap::Content => "content",
+        PodModifyCap::ModifyAllow => "modify_allow",
+    }
+}
+
+fn dispatch_cap_label(c: DispatchCap) -> &'static str {
+    match c {
+        DispatchCap::None => "none",
+        DispatchCap::WithinScope => "within_scope",
+    }
+}
+
+fn behaviors_cap_label(c: BehaviorOpsCap) -> &'static str {
+    match c {
+        BehaviorOpsCap::None => "none",
+        BehaviorOpsCap::Read => "read",
+        BehaviorOpsCap::AuthorNarrower => "author_narrower",
+        BehaviorOpsCap::AuthorAny => "author_any",
+    }
+}
+
+/// ComboBox picking a [`PodModifyCap`]. When `ceiling` is set and the
+/// user picks a value above it, the ComboBox still lets the pick land
+/// (the validator surfaces the error on save); this renderer is dumb
+/// by design — warnings are the caller's job.
+fn pod_modify_cap_combo(ui: &mut egui::Ui, id_salt: &str, value: &mut PodModifyCap) {
+    ComboBox::from_id_salt(id_salt)
+        .selected_text(pod_modify_cap_label(*value))
+        .show_ui(ui, |ui| {
+            for c in [
+                PodModifyCap::None,
+                PodModifyCap::Memories,
+                PodModifyCap::Content,
+                PodModifyCap::ModifyAllow,
+            ] {
+                ui.selectable_value(value, c, pod_modify_cap_label(c));
+            }
+        });
+}
+
+fn dispatch_cap_combo(ui: &mut egui::Ui, id_salt: &str, value: &mut DispatchCap) {
+    ComboBox::from_id_salt(id_salt)
+        .selected_text(dispatch_cap_label(*value))
+        .show_ui(ui, |ui| {
+            for c in [DispatchCap::None, DispatchCap::WithinScope] {
+                ui.selectable_value(value, c, dispatch_cap_label(c));
+            }
+        });
+}
+
+fn behaviors_cap_combo(ui: &mut egui::Ui, id_salt: &str, value: &mut BehaviorOpsCap) {
+    ComboBox::from_id_salt(id_salt)
+        .selected_text(behaviors_cap_label(*value))
+        .show_ui(ui, |ui| {
+            for c in [
+                BehaviorOpsCap::None,
+                BehaviorOpsCap::Read,
+                BehaviorOpsCap::AuthorNarrower,
+                BehaviorOpsCap::AuthorAny,
+            ] {
+                ui.selectable_value(value, c, behaviors_cap_label(c));
+            }
+        });
+}
+
+/// Red-tinted one-liner surfaced when a `thread_defaults.caps` pick
+/// exceeds the matching `allow.caps` ceiling. The pod validator will
+/// reject on save anyway; this just makes the miss visible in the
+/// form so the user can fix it before hitting Save.
+fn exceed_ceiling_hint(ui: &mut egui::Ui, message: &str) {
+    ui.label("");
+    ui.label(
+        RichText::new(message)
+            .small()
+            .color(Color32::from_rgb(220, 90, 90)),
+    );
+    ui.end_row();
 }
 
 use super::{SandboxEntryEditorState, spec_label};
@@ -203,6 +286,46 @@ pub(super) fn render_pod_editor_allow_tab(
         let default_provider = host_env_providers.first().map(|p| p.name.as_str());
         *sandbox_open = Some(SandboxEntryEditorState::new_for_add(default_provider));
     }
+
+    ui.add_space(10.0);
+    section_heading(ui, "Capability ceilings");
+    hint(
+        ui,
+        "Hard upper bound on each typed cap for threads in this pod. A thread \
+         can hold a cap up to but not exceeding these — `request_escalation` \
+         widens a thread's scope only within these limits. See \
+         `docs/design_permissions_rework.md` for what each level admits.",
+    );
+    ui.add_space(4.0);
+    Grid::new("pod_editor_allow_caps")
+        .num_columns(2)
+        .min_col_width(140.0)
+        .spacing([12.0, 8.0])
+        .show(ui, |ui| {
+            ui.label("pod_modify");
+            pod_modify_cap_combo(
+                ui,
+                "pod_editor_allow_caps_pod_modify",
+                &mut working.allow.caps.pod_modify,
+            );
+            ui.end_row();
+
+            ui.label("dispatch");
+            dispatch_cap_combo(
+                ui,
+                "pod_editor_allow_caps_dispatch",
+                &mut working.allow.caps.dispatch,
+            );
+            ui.end_row();
+
+            ui.label("behaviors");
+            behaviors_cap_combo(
+                ui,
+                "pod_editor_allow_caps_behaviors",
+                &mut working.allow.caps.behaviors,
+            );
+            ui.end_row();
+        });
     ui.add_space(8.0);
 }
 
@@ -428,6 +551,76 @@ pub(super) fn render_pod_editor_defaults_tab(
                     .color(Color32::from_rgb(220, 90, 90)),
                 );
                 ui.end_row();
+            }
+        });
+
+    ui.add_space(10.0);
+    section_heading(ui, "Default capabilities");
+    hint(
+        ui,
+        "Starting value for each typed cap on a freshly-created thread. Each \
+         must be ≤ the matching `[allow.caps]` ceiling — the server rejects \
+         saves that break this. Interactive threads can still escalate \
+         upward within the ceiling via `request_escalation`.",
+    );
+    ui.add_space(4.0);
+    Grid::new("pod_editor_thread_defaults_caps")
+        .num_columns(2)
+        .min_col_width(140.0)
+        .spacing([12.0, 8.0])
+        .show(ui, |ui| {
+            ui.label("pod_modify");
+            pod_modify_cap_combo(
+                ui,
+                "pod_editor_defaults_caps_pod_modify",
+                &mut working.thread_defaults.caps.pod_modify,
+            );
+            ui.end_row();
+            if working.thread_defaults.caps.pod_modify > working.allow.caps.pod_modify {
+                exceed_ceiling_hint(
+                    ui,
+                    &format!(
+                        "`{}` exceeds allow.caps.pod_modify (`{}`) — server will reject on save",
+                        pod_modify_cap_label(working.thread_defaults.caps.pod_modify),
+                        pod_modify_cap_label(working.allow.caps.pod_modify),
+                    ),
+                );
+            }
+
+            ui.label("dispatch");
+            dispatch_cap_combo(
+                ui,
+                "pod_editor_defaults_caps_dispatch",
+                &mut working.thread_defaults.caps.dispatch,
+            );
+            ui.end_row();
+            if working.thread_defaults.caps.dispatch > working.allow.caps.dispatch {
+                exceed_ceiling_hint(
+                    ui,
+                    &format!(
+                        "`{}` exceeds allow.caps.dispatch (`{}`) — server will reject on save",
+                        dispatch_cap_label(working.thread_defaults.caps.dispatch),
+                        dispatch_cap_label(working.allow.caps.dispatch),
+                    ),
+                );
+            }
+
+            ui.label("behaviors");
+            behaviors_cap_combo(
+                ui,
+                "pod_editor_defaults_caps_behaviors",
+                &mut working.thread_defaults.caps.behaviors,
+            );
+            ui.end_row();
+            if working.thread_defaults.caps.behaviors > working.allow.caps.behaviors {
+                exceed_ceiling_hint(
+                    ui,
+                    &format!(
+                        "`{}` exceeds allow.caps.behaviors (`{}`) — server will reject on save",
+                        behaviors_cap_label(working.thread_defaults.caps.behaviors),
+                        behaviors_cap_label(working.allow.caps.behaviors),
+                    ),
+                );
             }
         });
 
@@ -871,6 +1064,264 @@ pub(super) fn render_behavior_editor_thread_tab(
             });
         }
     }
+}
+
+/// Scope tab — edits the behavior's `[scope]` block. Every field is
+/// optional with an "inherit pod default" toggle; the composition at
+/// fire time is `pod.allow.narrow(behavior.scope)`, so unselected
+/// resource names or capped caps fall through to the pod's ceiling.
+///
+/// Tool allow-map overrides are deferred to raw TOML (mirrors the
+/// pod editor's stance on `[allow.tools.overrides]`) — the common
+/// "tighten tools for this behavior" case is the `default: deny`
+/// toggle, which is cheap to expose.
+pub(super) fn render_behavior_editor_scope_tab(
+    ui: &mut egui::Ui,
+    cfg: &mut BehaviorConfig,
+    pod_backend_names: &[String],
+    pod_host_env_names: &[String],
+    pod_mcp_host_names: &[String],
+) {
+    use whisper_agent_protocol::AllowMap;
+
+    ui.add_space(4.0);
+    section_heading(ui, "Runtime scope");
+    hint(
+        ui,
+        "Per-behavior scope narrowing. At fire time the spawned thread \
+         runs with `pod.allow.narrow(scope)` — this is the authoring-time \
+         capping of what the behavior is authorized to do. Every field is \
+         optional; unset fields inherit the pod ceiling.",
+    );
+    ui.add_space(4.0);
+
+    section_heading(ui, "Resource sets");
+    render_optional_name_list(
+        ui,
+        "backends",
+        &mut cfg.scope.backends,
+        pod_backend_names,
+        "pod declares no backends",
+    );
+    ui.add_space(6.0);
+    render_optional_name_list(
+        ui,
+        "host_envs",
+        &mut cfg.scope.host_envs,
+        pod_host_env_names,
+        "pod declares no host envs",
+    );
+    ui.add_space(6.0);
+    render_optional_name_list(
+        ui,
+        "mcp_hosts",
+        &mut cfg.scope.mcp_hosts,
+        pod_mcp_host_names,
+        "pod declares no shared MCP hosts",
+    );
+
+    ui.add_space(10.0);
+    section_heading(ui, "Tools");
+    ui.horizontal(|ui| {
+        let mut tools_set = cfg.scope.tools.is_some();
+        if ui
+            .checkbox(&mut tools_set, "override pod allow.tools")
+            .changed()
+        {
+            cfg.scope.tools = if tools_set {
+                Some(AllowMap::allow_all())
+            } else {
+                None
+            };
+        }
+        if let Some(map) = cfg.scope.tools.as_mut() {
+            ui.label("default");
+            ComboBox::from_id_salt("behavior_scope_tools_default")
+                .selected_text(disposition_label(map.default))
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(
+                        &mut map.default,
+                        Disposition::Allow,
+                        disposition_label(Disposition::Allow),
+                    );
+                    ui.selectable_value(
+                        &mut map.default,
+                        Disposition::Deny,
+                        disposition_label(Disposition::Deny),
+                    );
+                });
+            let override_count = map.overrides.len();
+            ui.label(if override_count == 0 {
+                "(no per-tool overrides)".to_string()
+            } else {
+                format!("{override_count} per-tool override(s) — edit via raw TOML")
+            });
+        } else {
+            ui.label(
+                RichText::new("(inherit pod allow.tools)")
+                    .italics()
+                    .color(Color32::from_gray(160)),
+            );
+        }
+    });
+
+    ui.add_space(10.0);
+    section_heading(ui, "Caps");
+    hint(
+        ui,
+        "Each cap is `None` on disk = inherit the pod ceiling. Pick a \
+         value to narrow further — e.g. `pod_modify = none` for a behavior \
+         that must not touch the pod directory even though the pod allows \
+         it.",
+    );
+    ui.add_space(4.0);
+    Grid::new("behavior_scope_caps")
+        .num_columns(2)
+        .min_col_width(140.0)
+        .spacing([12.0, 8.0])
+        .show(ui, |ui| {
+            render_optional_pod_modify_cap_row(
+                ui,
+                "pod_modify",
+                "behavior_scope_caps_pod_modify",
+                &mut cfg.scope.caps.pod_modify,
+            );
+            render_optional_dispatch_cap_row(
+                ui,
+                "dispatch",
+                "behavior_scope_caps_dispatch",
+                &mut cfg.scope.caps.dispatch,
+            );
+            render_optional_behaviors_cap_row(
+                ui,
+                "behaviors",
+                "behavior_scope_caps_behaviors",
+                &mut cfg.scope.caps.behaviors,
+            );
+        });
+}
+
+/// Behavior-editor-style multi-select for an `Option<Vec<String>>`
+/// resource-name list. `None` = inherit pod ceiling; `Some(vec)` =
+/// restrict to the checked names. Empty `Some` means "bind to none" —
+/// distinct from `None`.
+fn render_optional_name_list(
+    ui: &mut egui::Ui,
+    label: &str,
+    field: &mut Option<Vec<String>>,
+    available: &[String],
+    empty_hint: &str,
+) {
+    ui.label(label);
+    let mut overriding = field.is_some();
+    if ui
+        .checkbox(&mut overriding, "restrict to a subset")
+        .changed()
+    {
+        *field = if overriding { Some(Vec::new()) } else { None };
+    }
+    if let Some(selected) = field.as_mut() {
+        if available.is_empty() {
+            ui.label(
+                RichText::new(format!("({empty_hint})"))
+                    .italics()
+                    .color(Color32::from_gray(160)),
+            );
+        } else {
+            ui.horizontal_wrapped(|ui| {
+                for name in available {
+                    let mut on = selected.iter().any(|n| n == name);
+                    if ui.checkbox(&mut on, name).changed() {
+                        if on {
+                            if !selected.iter().any(|n| n == name) {
+                                selected.push(name.clone());
+                            }
+                        } else {
+                            selected.retain(|n| n != name);
+                        }
+                    }
+                }
+            });
+        }
+    } else {
+        ui.label(
+            RichText::new("(inherit pod ceiling)")
+                .italics()
+                .color(Color32::from_gray(160)),
+        );
+    }
+}
+
+/// Per-cap grid row with an "override" checkbox + cap picker. Kept
+/// per-type (not a generic) because each cap enum has its own
+/// variants; the trade in duplication is tiny.
+fn render_optional_pod_modify_cap_row(
+    ui: &mut egui::Ui,
+    label: &str,
+    id_salt: &str,
+    field: &mut Option<PodModifyCap>,
+) {
+    ui.label(label);
+    let mut overriding = field.is_some();
+    let mut value = field.unwrap_or(PodModifyCap::ModifyAllow);
+    ui.horizontal(|ui| {
+        if ui.checkbox(&mut overriding, "override").changed() {
+            *field = if overriding { Some(value) } else { None };
+        }
+        ui.add_enabled_ui(overriding, |ui| {
+            pod_modify_cap_combo(ui, id_salt, &mut value);
+        });
+        if overriding {
+            *field = Some(value);
+        }
+    });
+    ui.end_row();
+}
+
+fn render_optional_dispatch_cap_row(
+    ui: &mut egui::Ui,
+    label: &str,
+    id_salt: &str,
+    field: &mut Option<DispatchCap>,
+) {
+    ui.label(label);
+    let mut overriding = field.is_some();
+    let mut value = field.unwrap_or(DispatchCap::WithinScope);
+    ui.horizontal(|ui| {
+        if ui.checkbox(&mut overriding, "override").changed() {
+            *field = if overriding { Some(value) } else { None };
+        }
+        ui.add_enabled_ui(overriding, |ui| {
+            dispatch_cap_combo(ui, id_salt, &mut value);
+        });
+        if overriding {
+            *field = Some(value);
+        }
+    });
+    ui.end_row();
+}
+
+fn render_optional_behaviors_cap_row(
+    ui: &mut egui::Ui,
+    label: &str,
+    id_salt: &str,
+    field: &mut Option<BehaviorOpsCap>,
+) {
+    ui.label(label);
+    let mut overriding = field.is_some();
+    let mut value = field.unwrap_or(BehaviorOpsCap::AuthorAny);
+    ui.horizontal(|ui| {
+        if ui.checkbox(&mut overriding, "override").changed() {
+            *field = if overriding { Some(value) } else { None };
+        }
+        ui.add_enabled_ui(overriding, |ui| {
+            behaviors_cap_combo(ui, id_salt, &mut value);
+        });
+        if overriding {
+            *field = Some(value);
+        }
+    });
+    ui.end_row();
 }
 
 /// Shared helper: optional-u32 field with an "override" checkbox +
