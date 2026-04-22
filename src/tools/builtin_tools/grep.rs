@@ -15,6 +15,12 @@ const GREP_MATCH_CAP: usize = 200;
 /// Max caller-supplied context window radius.
 const GREP_CONTEXT_MAX: usize = 20;
 
+/// Per-line truncation applied before emitting `path:line: <content>` rows.
+/// Without this a single match inside a pretty-printed JSON field (e.g. a
+/// serialized tool_result body in `threads/*.json`) can dump tens of KB
+/// into the tool output and blow the next model request's context budget.
+const GREP_LINE_MAX_BYTES: usize = 400;
+
 pub(super) fn descriptor() -> McpTool {
     McpTool {
         name: POD_GREP.into(),
@@ -27,8 +33,13 @@ pub(super) fn descriptor() -> McpTool {
                       skipped. Pattern matching is literal — no regex — so a \
                       period or bracket in `pattern` matches itself. Output is \
                       `path:line: <content>` per match (`-` separator instead of \
-                      `:` for `context` lines). Capped at 200 matches — narrow \
-                      `path` if your first call hits the cap."
+                      `:` for `context` lines). Each emitted line is truncated \
+                      at ~400 bytes with a `… [+N bytes]` hint — matches inside \
+                      pretty-printed JSON (e.g. serialized tool_results in \
+                      `threads/*.json`) will be clipped; open the file with \
+                      `pod_read_file` or `pod_show_thread` to see the full \
+                      content. Capped at 200 matches — narrow `path` if your \
+                      first call hits the cap."
             .into(),
         input_schema: json!({
             "type": "object",
@@ -133,7 +144,8 @@ pub(super) async fn run(pod_dir: &Path, args: Value) -> ToolOutcome {
                 let i = *start + offset;
                 let is_match = match_lines.binary_search(&i).is_ok();
                 let sep = if is_match { ':' } else { '-' };
-                out.push_str(&format!("{rel}:{}{sep} {}\n", i + 1, line));
+                let shown = truncate_line(line, GREP_LINE_MAX_BYTES);
+                out.push_str(&format!("{rel}:{}{sep} {}\n", i + 1, shown));
                 if is_match {
                     total_matches += 1;
                     if total_matches >= GREP_MATCH_CAP {
@@ -226,6 +238,21 @@ async fn collect_grep_files(root: &Path) -> Vec<PathBuf> {
     }
     out.sort();
     out
+}
+
+/// Truncate `line` to at most `max_bytes` and append a `… [+N bytes]`
+/// hint. Walks back to the nearest UTF-8 char boundary so we don't slice
+/// a multi-byte codepoint.
+fn truncate_line(line: &str, max_bytes: usize) -> String {
+    if line.len() <= max_bytes {
+        return line.to_string();
+    }
+    let mut cut = max_bytes;
+    while cut > 0 && !line.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    let elided = line.len() - cut;
+    format!("{}… [+{elided} bytes]", &line[..cut])
 }
 
 /// Merge per-match windows of radius `context` around each line in
@@ -502,5 +529,62 @@ mod tests {
         // Clamping near start / end.
         let merged = merge_windows(&[0, 99], 2, 100);
         assert_eq!(merged, vec![(0, 2), (97, 99)]);
+    }
+
+    #[test]
+    fn truncate_line_preserves_short_lines() {
+        assert_eq!(truncate_line("short line", 400), "short line");
+    }
+
+    #[test]
+    fn truncate_line_cuts_long_lines() {
+        let line = "x".repeat(1000);
+        let out = truncate_line(&line, 400);
+        assert!(out.starts_with(&"x".repeat(400)));
+        assert!(out.contains("… [+600 bytes]"));
+    }
+
+    #[test]
+    fn truncate_line_respects_char_boundaries() {
+        // "…" is 3 bytes (E2 80 A6); placing it so the cut would land
+        // mid-codepoint forces the walk-back path.
+        let line = format!("{}…tail", "a".repeat(398));
+        let out = truncate_line(&line, 400);
+        // Cut falls back to byte 398 (on a char boundary); "…" and "tail"
+        // are all in the elided suffix (3 + 4 = 7 bytes).
+        assert_eq!(out, format!("{}… [+7 bytes]", "a".repeat(398)));
+    }
+
+    #[tokio::test]
+    async fn grep_truncates_long_matched_lines() {
+        let dir = temp_dir();
+        let cfg = sample_config();
+        // Simulate a thread JSON file with a giant serialized-JSON line —
+        // the `threads/` blowup path from the field-reported incident.
+        let huge = "x".repeat(50_000);
+        let line = format!(r#"  "content": "target {huge}""#);
+        tokio::fs::create_dir_all(dir.join("threads"))
+            .await
+            .unwrap();
+        tokio::fs::write(dir.join("threads").join("big.json"), line.clone())
+            .await
+            .unwrap();
+
+        let out = dispatch(
+            dir.clone(),
+            cfg,
+            vec![],
+            crate::permission::PodModifyCap::ModifyAllow,
+            crate::permission::BehaviorOpsCap::AuthorAny,
+            POD_GREP,
+            json!({ "pattern": "target" }),
+        )
+        .await;
+        assert!(!out.result.is_error, "grep errored: {:?}", out.result);
+        let text = join_blocks(&out.result.content);
+        assert!(text.contains("threads/big.json:1:"), "missing hit: {text}");
+        assert!(text.contains("[+"), "expected truncation hint: {text}");
+        // Total output is comfortably bounded, not 50KB.
+        assert!(text.len() < 2_000, "output unbounded: {} bytes", text.len());
     }
 }
