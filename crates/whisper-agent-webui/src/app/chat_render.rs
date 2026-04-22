@@ -195,21 +195,36 @@ fn render_user(
     ui.horizontal(|ui| {
         ui.label(RichText::new("USER").color(COLOR_USER).strong().small());
         if row_hovered {
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let btn = egui::Button::new(
-                    RichText::new("⑂ fork")
-                        .color(Color32::from_gray(160))
-                        .small(),
-                )
-                .frame(false);
-                if ui
-                    .add(btn)
-                    .on_hover_text("Fork a new thread starting from this message")
-                    .clicked()
-                {
-                    fork_clicked = true;
-                }
-            });
+            // Anchor the chip to the scroll viewport's right edge, not
+            // the frame's. A non-wrapping markdown child (wide code
+            // block, long URL) pushes the frame wider than the viewport
+            // so a plain right-to-left layout lands the button in the
+            // clipped region off-screen.
+            let clip_right = ui.clip_rect().right();
+            let cursor_x = ui.cursor().min.x;
+            let budget = (clip_right - cursor_x).max(0.0);
+            if budget > 0.0 {
+                let height = ui.spacing().interact_size.y;
+                ui.allocate_ui_with_layout(
+                    egui::vec2(budget, height),
+                    egui::Layout::right_to_left(egui::Align::Center),
+                    |ui| {
+                        let btn = egui::Button::new(
+                            RichText::new("⑂ fork")
+                                .color(Color32::from_gray(160))
+                                .small(),
+                        )
+                        .frame(false);
+                        if ui
+                            .add(btn)
+                            .on_hover_text("Fork a new thread starting from this message")
+                            .clicked()
+                        {
+                            fork_clicked = true;
+                        }
+                    },
+                );
+            }
         }
     });
     render_markdown(ui, cache, ("user", text), text);
@@ -264,15 +279,30 @@ fn render_markdown(
     id_source: (&'static str, &str),
     text: &str,
 ) {
-    ui.push_id(id_source, |ui| {
-        // Inline code (`foo`) uses `Visuals::code_bg_color` as its
-        // rect fill via RichText::code(). egui's dark-mode default
-        // (from_gray(64)) reads as a blocky highlight; swap in a
-        // softer translucent tint that sits closer to GitHub's
-        // dark-mode inline-code style. push_id creates a scoped
-        // child Ui, so the override doesn't leak out of this block.
-        ui.visuals_mut().code_bg_color = INLINE_CODE_BG;
-        CommonMarkViewer::new().show(ui, cache, text);
+    // Cap the render width to the scroll viewport so a non-wrapping
+    // markdown child (fenced code block, long URL) can't push the
+    // frame past the viewport's right edge — overflow there hides
+    // the trailing text and kicks the row's hover controls (the
+    // "⑂ fork" chip) off-screen. egui_commonmark derives code-block
+    // wrap_width from `ui.available_width()`, so constraining it on
+    // the scoped Ui propagates through `TextEdit::multiline` layout.
+    let clip_right = ui.clip_rect().right();
+    let cursor_x = ui.cursor().min.x;
+    let budget = (clip_right - cursor_x).max(0.0);
+    ui.scope(|ui| {
+        if budget > 0.0 {
+            ui.set_max_width(budget);
+        }
+        ui.push_id(id_source, |ui| {
+            // Inline code (`foo`) uses `Visuals::code_bg_color` as its
+            // rect fill via RichText::code(). egui's dark-mode default
+            // (from_gray(64)) reads as a blocky highlight; swap in a
+            // softer translucent tint that sits closer to GitHub's
+            // dark-mode inline-code style. push_id creates a scoped
+            // child Ui, so the override doesn't leak out of this block.
+            ui.visuals_mut().code_bg_color = INLINE_CODE_BG;
+            CommonMarkViewer::new().show(ui, cache, text);
+        });
     });
 }
 
