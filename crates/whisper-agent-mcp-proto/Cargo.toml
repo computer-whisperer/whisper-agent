@@ -1,7 +1,7 @@
 [package]
 name = "whisper-agent-mcp-proto"
 description = "Shared MCP and JSON-RPC types for whisper-agent's MCP servers (mcp-host, mcp-fetch)"
-version = "0.3.3"
+version = "0.3.4"
 edition.workspace = true
 license.workspace = true
 
