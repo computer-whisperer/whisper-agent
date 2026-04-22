@@ -3637,8 +3637,8 @@ impl eframe::App for ChatApp {
                                 );
                             });
                         } else {
-                            for item in &view.items {
-                                if let Some(event) = render_item(ui, md_cache, item) {
+                            for (idx, item) in view.items.iter().enumerate() {
+                                if let Some(event) = render_item(ui, md_cache, idx, item) {
                                     match event {
                                         ChatItemEvent::ForkRequested {
                                             msg_index,

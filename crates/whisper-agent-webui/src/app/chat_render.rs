@@ -87,6 +87,7 @@ fn item_palette(item: &DisplayItem) -> (Color32, Color32) {
 pub(super) fn render_item(
     ui: &mut egui::Ui,
     cache: &mut CommonMarkCache,
+    idx: usize,
     item: &DisplayItem,
 ) -> Option<ChatItemEvent> {
     let (gutter_color, fill) = item_palette(item);
@@ -103,10 +104,14 @@ pub(super) fn render_item(
     // hovered" before drawing the button, but the row's final rect
     // isn't known until after. egui memory stashes last frame's
     // answer; the one-frame lag is imperceptible.
-    let row_hover_id = if let DisplayItem::User { msg_index, .. } = item {
-        Some(ui.make_persistent_id(("chat-row-hover", "user", *msg_index)))
-    } else {
-        None
+    let row_hover_id = match item {
+        DisplayItem::User { msg_index, .. } => {
+            Some(ui.make_persistent_id(("chat-row-hover", "user", *msg_index)))
+        }
+        DisplayItem::AssistantText { .. } => {
+            Some(ui.make_persistent_id(("chat-row-hover", "assistant", idx)))
+        }
+        _ => None,
     };
     let hovered_prev_frame = row_hover_id
         .map(|id| {
@@ -165,6 +170,14 @@ pub(super) fn render_item(
     let gutter_rect = egui::Rect::from_min_max(r.min, egui::pos2(r.min.x + GUTTER_WIDTH, r.max.y));
     ui.painter().rect_filled(gutter_rect, 0.0, gutter_color);
 
+    // AssistantText has no header to hang controls off of, so the
+    // hover-revealed copy button is overlaid at top-right via `ui.put`.
+    // This avoids a layout shift when the button appears (vs. reserving
+    // a header row that's empty when not hovered).
+    if hovered_prev_frame && let DisplayItem::AssistantText { text } = item {
+        overlay_copy_button(ui, r, text, ("assistant-copy", idx));
+    }
+
     // Persist hover for next frame; repaint on the edge so the
     // button transitions don't wait for an unrelated event.
     if let Some(id) = row_hover_id {
@@ -176,6 +189,39 @@ pub(super) fn render_item(
     }
 
     event
+}
+
+/// Draw a small "copy" button anchored to the top-right of `frame_rect`
+/// (clamped to the scroll viewport's clip rect so a too-wide row can't
+/// push it off-screen) that copies `text` to the clipboard on click.
+/// `id_source` scopes the inner widget id so multiple overlay buttons
+/// (one per row) don't collide on a shared call-site id.
+fn overlay_copy_button(
+    ui: &mut egui::Ui,
+    frame_rect: egui::Rect,
+    text: &str,
+    id_source: (&'static str, usize),
+) {
+    let clip_right = ui.clip_rect().right();
+    let right = clip_right.min(frame_rect.right()) - 8.0;
+    let top = frame_rect.top() + 4.0;
+    let size = egui::vec2(40.0, ui.spacing().interact_size.y);
+    let btn_rect = egui::Rect::from_min_size(egui::pos2(right - size.x, top), size);
+    let btn = egui::Button::new(RichText::new("copy").color(Color32::from_gray(160)).small())
+        .frame(false);
+    let mut clicked = false;
+    ui.push_id(id_source, |ui| {
+        if ui
+            .put(btn_rect, btn)
+            .on_hover_text("Copy this turn's text to clipboard")
+            .clicked()
+        {
+            clicked = true;
+        }
+    });
+    if clicked {
+        ui.ctx().copy_text(text.to_string());
+    }
 }
 
 /// Returns `true` when the user clicked the hover-reveal "fork" button on
@@ -195,10 +241,10 @@ fn render_user(
     ui.horizontal(|ui| {
         ui.label(RichText::new("USER").color(COLOR_USER).strong().small());
         if row_hovered {
-            // Anchor the chip to the scroll viewport's right edge, not
+            // Anchor the chips to the scroll viewport's right edge, not
             // the frame's. A non-wrapping markdown child (wide code
             // block, long URL) pushes the frame wider than the viewport
-            // so a plain right-to-left layout lands the button in the
+            // so a plain right-to-left layout lands the buttons in the
             // clipped region off-screen.
             let clip_right = ui.clip_rect().right();
             let cursor_x = ui.cursor().min.x;
@@ -209,18 +255,29 @@ fn render_user(
                     egui::vec2(budget, height),
                     egui::Layout::right_to_left(egui::Align::Center),
                     |ui| {
-                        let btn = egui::Button::new(
+                        let fork_btn = egui::Button::new(
                             RichText::new("⑂ fork")
                                 .color(Color32::from_gray(160))
                                 .small(),
                         )
                         .frame(false);
                         if ui
-                            .add(btn)
+                            .add(fork_btn)
                             .on_hover_text("Fork a new thread starting from this message")
                             .clicked()
                         {
                             fork_clicked = true;
+                        }
+                        let copy_btn = egui::Button::new(
+                            RichText::new("copy").color(Color32::from_gray(160)).small(),
+                        )
+                        .frame(false);
+                        if ui
+                            .add(copy_btn)
+                            .on_hover_text("Copy this message's text to clipboard")
+                            .clicked()
+                        {
+                            ui.ctx().copy_text(text.to_string());
                         }
                     },
                 );
@@ -263,6 +320,33 @@ fn render_reasoning(ui: &mut egui::Ui, cache: &mut CommonMarkCache, text: &str) 
                     .color(Color32::from_gray(140))
                     .italics(),
             );
+            // Right-aligned copy button. Anchored to the scroll
+            // viewport's right edge for the same reason as the
+            // user-row controls — a wide preview line could otherwise
+            // push the button off-screen.
+            let clip_right = ui.clip_rect().right();
+            let cursor_x = ui.cursor().min.x;
+            let budget = (clip_right - cursor_x).max(0.0);
+            if budget > 0.0 {
+                let height = ui.spacing().interact_size.y;
+                ui.allocate_ui_with_layout(
+                    egui::vec2(budget, height),
+                    egui::Layout::right_to_left(egui::Align::Center),
+                    |ui| {
+                        let copy_btn = egui::Button::new(
+                            RichText::new("copy").color(Color32::from_gray(160)).small(),
+                        )
+                        .frame(false);
+                        if ui
+                            .add(copy_btn)
+                            .on_hover_text("Copy reasoning text to clipboard")
+                            .clicked()
+                        {
+                            ui.ctx().copy_text(text.to_string());
+                        }
+                    },
+                );
+            }
         })
         .body(|ui| {
             render_markdown(ui, cache, ("reasoning", text), text);
