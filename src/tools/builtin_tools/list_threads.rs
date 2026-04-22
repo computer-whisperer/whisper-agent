@@ -30,13 +30,15 @@ pub(super) fn descriptor() -> McpTool {
         name: POD_LIST_THREADS.into(),
         description: "Query this pod's threads with structured filters. Returns a \
                       short summary per hit (id, state, origin, turns, last_active) \
-                      — use `pod_read_file(\"threads/<id>.json\")` afterwards to pull \
-                      the full conversation. Threads are scanned newest-first by \
-                      modification time, so `since` + `limit` gives you \"recent \
-                      runs of behavior X\". Sentinel value `\"interactive\"` in \
-                      `behavior_id` filters to threads NOT spawned by any behavior \
-                      (direct user interaction). Scan is capped at 1000 files — \
-                      narrow with filters if the output notes the cap was hit."
+                      — follow up with `pod_show_thread(thread_id)` for a compact \
+                      transcript of a specific thread, or `pod_read_file(\
+                      \"threads/<id>.json\")` when you need the raw state-machine \
+                      checkpoint. Threads are scanned newest-first by modification \
+                      time, so `since` + `limit` gives you \"recent runs of behavior \
+                      X\". Sentinel value `\"interactive\"` in `behavior_id` filters \
+                      to threads NOT spawned by any behavior (direct user \
+                      interaction). Scan is capped at 1000 files — narrow with \
+                      filters if the output notes the cap was hit."
             .into(),
         input_schema: json!({
             "type": "object",
