@@ -11,8 +11,12 @@ use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum WorkspaceError {
-    #[error("workspace root {0} does not exist")]
-    NotFound(PathBuf),
+    #[error("workspace root {path} is unreachable: {source}")]
+    Canonicalize {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
     #[error("workspace root {0} is not a directory")]
     NotADirectory(PathBuf),
 }
@@ -26,7 +30,10 @@ impl Workspace {
     pub fn new(root: &Path) -> Result<Self, WorkspaceError> {
         let canonical = root
             .canonicalize()
-            .map_err(|_| WorkspaceError::NotFound(root.to_path_buf()))?;
+            .map_err(|source| WorkspaceError::Canonicalize {
+                path: root.to_path_buf(),
+                source,
+            })?;
         if !canonical.is_dir() {
             return Err(WorkspaceError::NotADirectory(canonical));
         }

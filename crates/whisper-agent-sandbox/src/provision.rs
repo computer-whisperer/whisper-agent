@@ -351,7 +351,13 @@ fn apply_landlock(
     // The MCP host binary's directory — read+execute so exec() works.
     created = created.add_rules(path_beneath_rules([bin_dir], AccessFs::from_read(abi)))?;
 
-    // User-specified paths from the spec.
+    // User-specified paths from the spec. NB: `path_beneath_rules`
+    // silently filters out paths that can't be opened (BestEffort
+    // compatibility mode in the landlock crate). The daemon runs as
+    // root with full caps so it can open user-owned paths at
+    // restrictive modes like 0700 — dropping DAC caps here would
+    // leave the ruleset silently missing rules for home-dir
+    // workspaces.
     for pa in allowed_paths {
         let access = match pa.mode {
             AccessMode::ReadOnly => AccessFs::from_read(abi),

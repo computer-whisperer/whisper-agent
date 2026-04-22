@@ -41,12 +41,13 @@ Restart=on-failure
 RestartSec=5
 
 # --- Hardening ---------------------------------------------------------
-# The daemon runs as root but doesn't need any capabilities of its own
-# — landlock is a purely-userland gate and the spawned children
-# inherit no caps (pre_exec drops them). Drop the bounding set so a
-# compromised daemon can't regain privilege.
-CapabilityBoundingSet=
-AmbientCapabilities=
+# The daemon runs with its default (full) root capability set. It
+# needs CAP_DAC_READ_SEARCH + CAP_DAC_OVERRIDE to open user-owned
+# paths at restrictive modes like 0700 — those fds become the input
+# to landlock's `path_beneath_rules`. Stripping DAC caps here would
+# leave landlock silently missing rules for any workspace under a
+# user's home. The spawned mcp-host child then operates within the
+# landlock restrictions regardless of the caps it inherited.
 NoNewPrivileges=yes
 
 # Filesystem isolation.
