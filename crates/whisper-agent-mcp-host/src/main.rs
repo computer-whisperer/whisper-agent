@@ -9,6 +9,8 @@ use tokio::net::TcpListener;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
+#[cfg(unix)]
+mod runas;
 mod server;
 mod tools;
 mod workspace;

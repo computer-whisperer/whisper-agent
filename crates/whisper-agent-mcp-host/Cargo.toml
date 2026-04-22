@@ -26,3 +26,6 @@ subtle = { workspace = true }
 futures = "0.3"
 async-stream = "0.3"
 whisper-agent-mcp-proto = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

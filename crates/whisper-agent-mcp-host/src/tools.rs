@@ -495,7 +495,8 @@ fn bash_descriptor() -> Tool {
                 "command": { "type": "string", "description": "Command to run via `bash -c`." },
                 "cwd": { "type": "string", "description": "Optional cwd — absolute, or relative to the workspace root. Defaults to the workspace root." },
                 "timeout_seconds": { "type": "integer", "description": "Kill the command after this many seconds. Default 120, max 600." },
-                "strip_ansi": { "type": "boolean", "description": "Strip ANSI escape sequences (colors, cursor codes) from stdout and stderr. Default true — only turn off if you specifically need the raw escape bytes." }
+                "strip_ansi": { "type": "boolean", "description": "Strip ANSI escape sequences (colors, cursor codes) from stdout and stderr. Default true — only turn off if you specifically need the raw escape bytes." },
+                "run_as": { "type": "string", "description": "Optional Unix username to run the command as. The host drops to that user's uid/gid/groups before exec, sets HOME/USER/LOGNAME accordingly, and fails the call if it lacks the privilege to assume that user. Omit to run with the host's default identity." }
             },
             "required": ["command"]
         }),
@@ -522,6 +523,8 @@ struct BashArgs {
     timeout_seconds: Option<u64>,
     #[serde(default = "default_strip_ansi")]
     strip_ansi: bool,
+    #[serde(default)]
+    run_as: Option<String>,
 }
 
 static ANSI_ESCAPE: LazyLock<Regex> = LazyLock::new(|| {
@@ -579,6 +582,24 @@ fn bash_stream(
         let timeout_secs = parsed.timeout_seconds.unwrap_or(120).min(600);
         let deadline = Instant::now() + Duration::from_secs(timeout_secs);
 
+        // Resolve `run_as` in the parent: NSS lookups aren't async-signal-safe
+        // and so can't run inside `pre_exec`. The actual setuid happens in the
+        // child between fork and exec; if the host can't assume that user, the
+        // libc error surfaces as a clean tool-result error from `cmd.spawn()`.
+        #[cfg(unix)]
+        let run_as_id = match parsed.run_as.as_deref() {
+            None => None,
+            Some(name) => match crate::runas::lookup(name) {
+                Ok(id) => Some(id),
+                Err(e) => {
+                    yield ToolStreamItem::Final(CallToolResult::error_text(
+                        format!("run_as `{name}`: {e}"),
+                    ));
+                    return;
+                }
+            },
+        };
+
         // Merge stdout+stderr at shell level so the model sees one interleaved
         // stream in shell-emission order (matching claude-code's bash envelope).
         // The curly-brace group preserves the inner command's exit code; the
@@ -596,6 +617,23 @@ fn bash_stream(
             // it piped so we don't silently swallow those.
             .stderr(Stdio::piped())
             .kill_on_drop(true);
+
+        #[cfg(unix)]
+        if let Some(id) = &run_as_id {
+            // Override the env that bash and most CLI tools read to identify
+            // "who am I". Without these, e.g. `~` expansion would still point
+            // at the host user's home.
+            cmd.env("HOME", &id.home)
+                .env("USER", &id.name)
+                .env("LOGNAME", &id.name);
+            let id_for_child = id.clone();
+            // Safety: the closure runs in the forked child between fork and
+            // exec, so it only changes the child's identity. It calls only
+            // async-signal-safe libc routines (setgroups/setgid/setuid).
+            unsafe {
+                cmd.pre_exec(move || crate::runas::apply_in_child(&id_for_child));
+            }
+        }
 
         let mut child = match cmd.spawn() {
             Ok(c) => c,
