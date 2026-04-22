@@ -1731,19 +1731,18 @@ impl Scheduler {
     /// this array and mask every other tool name at sample time, so
     /// tools advertised only in prose can't be called on those
     /// providers. The `core_tools` policy therefore only controls
-    /// *description verbosity*, not which tools appear:
+    /// *representation verbosity*, not which tools appear:
     ///
     /// - Tools named in `core_tools` (or all tools when `CoreTools::All`)
-    ///   carry their full description — this is where we spend
-    ///   tokens to help the model pick the right tool.
-    /// - Every other admitted tool carries a first-line-only summary
-    ///   (via `one_line_description`) — enough to recognize what it
-    ///   does, with full docs reachable via `describe_tool`.
-    ///
-    /// Input schemas are always included verbatim — they constrain
-    /// the grammar's argument rules (in formats that use
-    /// `parameters`) and the server's dispatch route, and aren't
-    /// the bloat we're trying to trim.
+    ///   carry their full description and full input-schema — this is
+    ///   where we spend tokens to help the model pick the right tool.
+    /// - Every other admitted tool is stripped: empty `description`,
+    ///   and `input_schema` has every `description` / `title`
+    ///   metadata field removed (preserving `type`, `properties`,
+    ///   `required`, `enum`, combinators — everything the grammar
+    ///   mask and argument validator need). The model can still
+    ///   invoke these tools; when it needs the prose, `describe_tool`
+    ///   re-fetches the full schema, which is kept server-side.
     pub(crate) fn wire_tool_descriptors(&self, thread_id: &str) -> Vec<McpTool> {
         use whisper_agent_protocol::tool_surface::CoreTools;
         let Some(task) = self.tasks.get(thread_id) else {
@@ -1758,15 +1757,19 @@ impl Scheduler {
             .into_iter()
             .filter(|t| !t.requires_escalation)
             .map(|t| {
-                let description = if full_desc_all || full_desc_set.contains(&t.name) {
-                    t.description
+                let is_core = full_desc_all || full_desc_set.contains(&t.name);
+                let (description, input_schema) = if is_core {
+                    (t.description, t.input_schema)
                 } else {
-                    crate::runtime::tool_listing::one_line_description(&t.description)
+                    (
+                        String::new(),
+                        crate::runtime::tool_listing::strip_schema_descriptions(&t.input_schema),
+                    )
                 };
                 McpTool {
                     name: t.name,
                     description,
-                    input_schema: t.input_schema,
+                    input_schema,
                     annotations: t.annotations,
                 }
             })
@@ -2165,6 +2168,17 @@ impl Scheduler {
             // the resulting list is empty and the pod has a default,
             // we re-seed from the default.
             let mut bindings_dirty = false;
+            // Escalation is a live-conn pointer; conn ids don't
+            // survive a process restart. Any persisted
+            // `Interactive{via_conn}` refers to a conn that no longer
+            // exists — keeping it would leave the thread reporting
+            // `is_interactive() == true` while `sudo` prompts silently
+            // route to a dead conn. Clear to `None`; the first
+            // `SendUserMessage` from a live conn rebinds via
+            // `rebind_escalation_if_orphaned`.
+            if let crate::permission::Escalation::Interactive { .. } = task.scope.escalation {
+                task.scope.escalation = crate::permission::Escalation::None;
+            }
             // Migrate legacy Inline bindings: walk the pod's allow
             // list for a structurally equivalent entry and rebind to
             // the Named reference; otherwise drop the binding.
@@ -2893,25 +2907,36 @@ impl Scheduler {
     }
 
     /// Fork a thread at a prefix boundary. Mirrors the resource-wiring
-    /// tail of [`Self::create_task`] but against bindings copied from
-    /// the source thread rather than re-resolved from pod defaults +
-    /// a patch. The new thread's [`ThreadBindings`] are a verbatim
-    /// clone of the source's, so every backend / host_env / shared
-    /// MCP registration follows from those fields directly.
+    /// tail of [`Self::create_task`]. The new thread's conversation
+    /// prefix comes from [`Thread::fork_from`]; capabilities come
+    /// from one of two paths:
+    ///
+    /// - `reset_capabilities = false` (default): the fork inherits
+    ///   the source's live bindings / scope / config / tool_surface
+    ///   verbatim. "Continue this conversation with all my
+    ///   sudo-remembers and current settings intact."
+    /// - `reset_capabilities = true`: bindings, scope, config, and
+    ///   tool_surface are re-derived from the pod's current
+    ///   `thread_defaults` — equivalent to a fresh thread carrying
+    ///   the source's conversation prefix. Use this to pick up
+    ///   pod-config changes that post-date the source (newly-added
+    ///   MCP hosts, sandbox bindings, cap widenings).
     ///
     /// Returns the new thread id on success. Failures before
     /// insertion leave no partial registration: the source thread is
     /// untouched and no resource refcounts move.
+    #[allow(clippy::too_many_arguments)]
     fn fork_task(
         &mut self,
         requester: Option<ConnId>,
         correlation_id: Option<String>,
         source_thread_id: &str,
         from_message_index: usize,
+        reset_capabilities: bool,
         pending_io: &mut FuturesUnordered<SchedulerFuture>,
     ) -> Result<String, String> {
         let new_id = crate::runtime::thread::new_task_id();
-        let task = {
+        let mut task = {
             let source = self
                 .tasks
                 .get(source_thread_id)
@@ -2922,16 +2947,62 @@ impl Scheduler {
         if !self.pods.contains_key(&pod_id) {
             return Err(format!("unknown pod `{pod_id}`"));
         }
+        if reset_capabilities {
+            use crate::pod::resources::McpHostId;
+            // Resolve bindings first — it's the failure-prone step
+            // (shared MCP host not actually wired up, etc.) and we
+            // want to bail before mutating `task`.
+            let resolved = {
+                let pod = self
+                    .pods
+                    .get(&pod_id)
+                    .ok_or_else(|| format!("unknown pod `{pod_id}`"))?;
+                resolve_bindings_choice(pod, None, None)?
+            };
+            for name in &resolved.shared_host_names {
+                if !self
+                    .resources
+                    .mcp_hosts
+                    .contains_key(&McpHostId::shared(name))
+                {
+                    return Err(format!(
+                        "shared MCP host `{name}` not configured on this server (pod `{pod_id}` allows it but no upstream is wired up)",
+                    ));
+                }
+            }
+            task.bindings = ThreadBindings {
+                backend: resolved.backend_name.clone(),
+                host_env: resolved.host_env.clone(),
+                mcp_hosts: resolved.shared_host_names.clone(),
+                tool_filter: None,
+            };
+            let pod = self.pods.get(&pod_id).expect("pod presence checked above");
+            task.config = apply_config_override(base_thread_config_from_pod(pod), None);
+            task.tool_surface = pod.config.thread_defaults.tool_surface.compose(None);
+            task.scope = self.pod_thread_scope(&pod_id);
+        }
+        // Escalation is a live-channel pointer, not part of the
+        // source's conversation prefix. The forking client owns the
+        // new thread, so bind the channel to the forking conn (or
+        // clear it if no conn is known). Applies to both the
+        // inherit and reset paths — inheriting leaks the source's
+        // stale `via_conn`; resetting starts from `None`.
+        task.scope.escalation = match requester {
+            Some(conn_id) => crate::permission::Escalation::Interactive { via_conn: conn_id },
+            None => crate::permission::Escalation::None,
+        };
         // Pre-validate the host_env binding before handing the task
         // off to `register_new_task` (which `.expect()`s that the
-        // binding resolves). A Named binding can dangle if the entry
-        // was removed from the pod's allow list after the source
-        // thread was created; fail cleanly without touching
-        // resources or the task map.
+        // binding resolves). Relevant to the inherit path: a Named
+        // binding can dangle if the entry was removed from the
+        // pod's allow list after the source thread was created. The
+        // reset path re-derived from `pod.allow` above, so this
+        // loop is a no-op there.
         for binding in task.bindings.host_env.iter() {
             if self.resolve_binding(&pod_id, binding).is_none() {
                 return Err(
-                    "source thread's host_env binding no longer resolves in the pod's allow list"
+                    "source thread's host_env binding no longer resolves in the pod's allow list \
+                     (fork with `reset_capabilities: true` to re-derive from pod defaults)"
                         .into(),
                 );
             }

@@ -169,16 +169,96 @@ fn group_header(label: &str) -> String {
 
 pub(crate) fn one_line_description(desc: &str) -> String {
     // Tool descriptions are often multi-sentence; for the listing we
-    // want one line so the prompt stays tight. Truncate at the first
-    // period/newline and cap at ~120 chars so a GitHub-style "this
-    // tool does X (see also: Y)" still fits.
-    let first = desc.split(['\n', '.']).next().unwrap_or(desc).trim();
-    if first.len() > 120 {
+    // want one line so the prompt stays tight. Stop at the first
+    // newline or sentence boundary and cap at 120 chars. "Sentence
+    // boundary" is a period followed by whitespace or end-of-string,
+    // so intra-word periods like `pod.toml`, `github.com`, `v1.2.3`
+    // don't falsely split the description mid-token.
+    let mut end = desc.len();
+    for (i, ch) in desc.char_indices() {
+        if ch == '\n' {
+            end = i;
+            break;
+        }
+        if ch == '.' {
+            let after = i + ch.len_utf8();
+            let next_is_boundary = desc[after..]
+                .chars()
+                .next()
+                .is_none_or(|c| c.is_whitespace());
+            if next_is_boundary {
+                end = i;
+                break;
+            }
+        }
+    }
+    let first = desc[..end].trim();
+    if first.chars().count() > 120 {
         let mut t = first.chars().take(117).collect::<String>();
         t.push_str("...");
         t
     } else {
         first.to_string()
+    }
+}
+
+/// Remove JSON Schema `description` metadata from `schema`, preserving
+/// every structural field the wire grammar depends on (`type`,
+/// `properties`, `required`, `enum`, `items`, subschema combinators).
+///
+/// Used by `wire_tool_descriptors` to strip non-core tools' input
+/// schemas down to what the llama.cpp grammar mask needs. The model
+/// can still call the tool; when it wants the prose, `describe_tool`
+/// re-fetches the full schema (which is kept server-side verbatim).
+///
+/// Walks the schema shape by known JSON Schema keywords rather than
+/// blindly deleting every key named `description` — that would delete
+/// a tool parameter literally named `description` (e.g. a `create_issue`
+/// tool's `description` property).
+pub(crate) fn strip_schema_descriptions(schema: &serde_json::Value) -> serde_json::Value {
+    let mut out = schema.clone();
+    strip_in_place(&mut out);
+    out
+}
+
+fn strip_in_place(value: &mut serde_json::Value) {
+    let serde_json::Value::Object(map) = value else {
+        return;
+    };
+    // This level's metadata prose.
+    map.remove("description");
+    map.remove("title");
+    // Property sub-schemas, keyed by property name. Recurse into each
+    // value (which is itself a schema) — don't touch the keys.
+    for key in ["properties", "patternProperties", "$defs", "definitions"] {
+        if let Some(serde_json::Value::Object(sub)) = map.get_mut(key) {
+            for s in sub.values_mut() {
+                strip_in_place(s);
+            }
+        }
+    }
+    // Single sub-schema keywords.
+    for key in [
+        "items",
+        "additionalProperties",
+        "contains",
+        "not",
+        "if",
+        "then",
+        "else",
+        "propertyNames",
+    ] {
+        if let Some(sub) = map.get_mut(key) {
+            strip_in_place(sub);
+        }
+    }
+    // Array-of-sub-schema keywords.
+    for key in ["oneOf", "anyOf", "allOf", "prefixItems"] {
+        if let Some(serde_json::Value::Array(arr)) = map.get_mut(key) {
+            for s in arr.iter_mut() {
+                strip_in_place(s);
+            }
+        }
     }
 }
 
@@ -545,6 +625,110 @@ mod tests {
     fn one_line_description_stops_at_first_sentence() {
         let multi = "Short. Then more stuff.";
         assert_eq!(one_line_description(multi), "Short");
+    }
+
+    #[test]
+    fn one_line_description_preserves_intra_word_periods() {
+        // Prior bug: `desc.split('.')` cut at the first period,
+        // mangling references to dotted identifiers like `pod.toml`
+        // or `github.com`. Sentence boundary is period-plus-whitespace.
+        let desc = "Read one of this pod's files: pod.toml, memory/*.md, behaviors/<id>/prompt.md";
+        assert_eq!(one_line_description(desc), desc);
+    }
+
+    #[test]
+    fn one_line_description_stops_at_sentence_end_followed_by_space() {
+        let desc = "Edit pod.toml in place. Intended for small tweaks.";
+        assert_eq!(one_line_description(desc), "Edit pod.toml in place");
+    }
+
+    #[test]
+    fn strip_schema_descriptions_removes_prop_descriptions_only() {
+        use serde_json::json;
+        // A tool whose parameters include one literally named
+        // "description" — the property *key* must survive; the
+        // metadata `description` fields get removed at every level.
+        let schema = json!({
+            "type": "object",
+            "description": "top-level tool description",
+            "title": "Create Issue",
+            "properties": {
+                "title": {"type": "string", "description": "issue title"},
+                "description": {"type": "string", "description": "issue body"},
+                "labels": {
+                    "type": "array",
+                    "description": "labels to apply",
+                    "items": {"type": "string", "description": "a label"}
+                }
+            },
+            "required": ["title"]
+        });
+        let stripped = strip_schema_descriptions(&schema);
+        // Structural fields preserved.
+        assert_eq!(stripped["type"], "object");
+        assert_eq!(stripped["required"], json!(["title"]));
+        assert!(stripped["properties"].is_object());
+        // Top-level metadata gone.
+        assert!(stripped.get("description").is_none());
+        assert!(stripped.get("title").is_none());
+        // Property `description` (the key) preserved; its metadata stripped.
+        let props = &stripped["properties"];
+        assert!(props.get("description").is_some());
+        assert!(props["description"].get("description").is_none());
+        assert_eq!(props["description"]["type"], "string");
+        // Nested items metadata also stripped.
+        assert!(props["labels"].get("description").is_none());
+        assert!(props["labels"]["items"].get("description").is_none());
+        assert_eq!(props["labels"]["items"]["type"], "string");
+    }
+
+    #[test]
+    fn strip_schema_descriptions_preserves_enum_and_constraints() {
+        use serde_json::json;
+        // Grammar-relevant fields must survive stripping.
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "method": {
+                    "type": "string",
+                    "description": "which operation",
+                    "enum": ["get", "post", "delete"]
+                },
+                "count": {
+                    "type": "integer",
+                    "description": "how many",
+                    "minimum": 1,
+                    "maximum": 100
+                }
+            },
+            "required": ["method"]
+        });
+        let stripped = strip_schema_descriptions(&schema);
+        let m = &stripped["properties"]["method"];
+        assert_eq!(m["enum"], json!(["get", "post", "delete"]));
+        assert_eq!(m["type"], "string");
+        assert!(m.get("description").is_none());
+        let c = &stripped["properties"]["count"];
+        assert_eq!(c["minimum"], 1);
+        assert_eq!(c["maximum"], 100);
+        assert!(c.get("description").is_none());
+    }
+
+    #[test]
+    fn strip_schema_descriptions_walks_combinators() {
+        use serde_json::json;
+        let schema = json!({
+            "oneOf": [
+                {"type": "string", "description": "as string"},
+                {"type": "integer", "description": "as int"}
+            ]
+        });
+        let stripped = strip_schema_descriptions(&schema);
+        let arr = stripped["oneOf"].as_array().unwrap();
+        assert_eq!(arr.len(), 2);
+        for entry in arr {
+            assert!(entry.get("description").is_none());
+        }
     }
 
     #[test]

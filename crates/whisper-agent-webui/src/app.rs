@@ -968,6 +968,12 @@ struct ForkModalState {
     thread_id: String,
     from_message_index: usize,
     archive_original: bool,
+    /// When `true`, the server re-derives scope, bindings, config,
+    /// and tool_surface from the pod's current `thread_defaults`
+    /// instead of inheriting them from the source thread. Default
+    /// `false` — explicit opt-in, since most forks are "continue
+    /// where I left off" with the source's live settings.
+    reset_capabilities: bool,
     /// Captured at click time so `confirm` can seed the new thread's
     /// draft with the original prompt for in-place editing.
     seed_text: String,
@@ -3645,6 +3651,7 @@ impl eframe::App for ChatApp {
                 thread_id,
                 from_message_index: msg_index,
                 archive_original: true,
+                reset_capabilities: false,
                 seed_text,
             });
         }
@@ -4816,6 +4823,23 @@ impl ChatApp {
                     .color(Color32::from_gray(140))
                     .small(),
                 );
+                ui.add_space(8.0);
+                ui.checkbox(
+                    &mut modal.reset_capabilities,
+                    "Reset capabilities to pod defaults",
+                );
+                ui.add_space(4.0);
+                ui.label(
+                    RichText::new(
+                        "Unchecked: new thread inherits the source's live bindings, \
+                         scope, and config. Checked: re-derive from the pod's current \
+                         defaults — use this to pick up newly-added MCP hosts, sandbox \
+                         bindings, or cap changes made since the source thread was \
+                         created.",
+                    )
+                    .color(Color32::from_gray(140))
+                    .small(),
+                );
                 ui.add_space(10.0);
                 ui.separator();
                 ui.horizontal(|ui| {
@@ -4839,6 +4863,7 @@ impl ChatApp {
                 thread_id: modal.thread_id.clone(),
                 from_message_index: modal.from_message_index,
                 archive_original: modal.archive_original,
+                reset_capabilities: modal.reset_capabilities,
                 correlation_id: Some(correlation_id),
             });
         } else if cancel_clicked || !open {

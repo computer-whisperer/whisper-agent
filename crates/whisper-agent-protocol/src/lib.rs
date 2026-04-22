@@ -799,10 +799,22 @@ pub enum ClientToServer {
     },
     /// Fork `thread_id` at `from_message_index` into a new thread in
     /// the same pod. The new thread's conversation is the prefix
-    /// `[0..from_message_index)`; bindings, config, and tool
-    /// allowlist carry over; total_usage is recomputed from the
-    /// truncated turn_log; dispatch lineage / behavior origin do
-    /// not propagate.
+    /// `[0..from_message_index)`; `total_usage` is recomputed from
+    /// the truncated turn_log; dispatch lineage / behavior origin
+    /// do not propagate.
+    ///
+    /// `reset_capabilities` picks between two capability-inheritance
+    /// modes:
+    /// - `false` (default): the fork inherits the source's live
+    ///   bindings, scope, config, and tool_surface verbatim. Good
+    ///   for "continue this conversation from here with all my
+    ///   sudo-remembers and current settings intact."
+    /// - `true`: the fork re-derives bindings, scope, config, and
+    ///   tool_surface from the pod's current `thread_defaults` —
+    ///   equivalent to a fresh thread carrying the source's
+    ///   conversation prefix. Use this to pick up newly-added MCP
+    ///   hosts, sandbox bindings, or cap changes that post-date
+    ///   the source thread.
     ///
     /// `from_message_index` must point at a `Role::User` message
     /// (v1 keeps tool_use / tool_result atomicity trivial).
@@ -817,6 +829,8 @@ pub enum ClientToServer {
         from_message_index: usize,
         #[serde(default)]
         archive_original: bool,
+        #[serde(default)]
+        reset_capabilities: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         correlation_id: Option<String>,
     },
@@ -1683,4 +1697,51 @@ pub fn encode_to_client(msg: &ServerToClient) -> Result<Vec<u8>, CodecError> {
 
 pub fn decode_from_server(bytes: &[u8]) -> Result<ServerToClient, CodecError> {
     ciborium::de::from_reader(bytes).map_err(|e| CodecError::Decode(e.to_string()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fork_thread_reset_capabilities_defaults_false() {
+        // Old clients (and anyone sending a minimal message) must
+        // still parse into the current-behavior branch. `#[serde(default)]`
+        // is the contract — guard against someone renaming the field
+        // or dropping the attribute.
+        let json = r#"{
+            "type": "fork_thread",
+            "thread_id": "task-1",
+            "from_message_index": 2
+        }"#;
+        let msg: ClientToServer = serde_json::from_str(json).unwrap();
+        match msg {
+            ClientToServer::ForkThread {
+                reset_capabilities,
+                archive_original,
+                ..
+            } => {
+                assert!(!reset_capabilities);
+                assert!(!archive_original);
+            }
+            other => panic!("expected ForkThread, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fork_thread_reset_capabilities_roundtrip() {
+        let json = r#"{
+            "type": "fork_thread",
+            "thread_id": "task-1",
+            "from_message_index": 2,
+            "reset_capabilities": true
+        }"#;
+        let msg: ClientToServer = serde_json::from_str(json).unwrap();
+        match msg {
+            ClientToServer::ForkThread {
+                reset_capabilities, ..
+            } => assert!(reset_capabilities),
+            other => panic!("expected ForkThread, got {other:?}"),
+        }
+    }
 }

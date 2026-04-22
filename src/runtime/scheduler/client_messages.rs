@@ -94,6 +94,7 @@ impl Scheduler {
             }
             ClientToServer::SendUserMessage { thread_id, text } => {
                 if self.tasks.contains_key(&thread_id) {
+                    self.rebind_escalation_if_orphaned(&thread_id, conn_id);
                     self.send_user_message(&thread_id, text, pending_io);
                     self.step_until_blocked(&thread_id, pending_io);
                 } else {
@@ -201,12 +202,14 @@ impl Scheduler {
                 thread_id,
                 from_message_index,
                 archive_original,
+                reset_capabilities,
                 correlation_id,
             } => match self.fork_task(
                 Some(conn_id),
                 correlation_id.clone(),
                 &thread_id,
                 from_message_index,
+                reset_capabilities,
                 pending_io,
             ) {
                 Ok(_) => {

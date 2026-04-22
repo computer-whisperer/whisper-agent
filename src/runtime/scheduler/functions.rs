@@ -1741,6 +1741,35 @@ impl Scheduler {
         }
     }
 
+    /// If `thread_id` is a user-owned top-level thread whose
+    /// escalation channel is currently `None`, re-attach it to
+    /// `conn_id`. Called from the `SendUserMessage` handler so that a
+    /// user who reconnects after their original conn dropped (page
+    /// reload, WS blip, server restart sanitize) regains `sudo`
+    /// without having to recreate the thread.
+    ///
+    /// Conservative on two axes:
+    /// - Only touches `None`. An existing `Interactive{via_conn: M}`
+    ///   is left alone even if `M != conn_id` — don't steal a live
+    ///   channel out from under another client.
+    /// - Only touches threads with no behavior `origin` and no
+    ///   `dispatched_by`. Behavior-fired / dispatched threads get
+    ///   their escalation at creation and should not gain one from a
+    ///   stray client message.
+    pub(crate) fn rebind_escalation_if_orphaned(&mut self, thread_id: &str, conn_id: ConnId) {
+        let Some(task) = self.tasks.get_mut(thread_id) else {
+            return;
+        };
+        if task.origin.is_some() || task.dispatched_by.is_some() {
+            return;
+        }
+        if !matches!(task.scope.escalation, crate::permission::Escalation::None) {
+            return;
+        }
+        task.scope.escalation = crate::permission::Escalation::Interactive { via_conn: conn_id };
+        self.mark_dirty(thread_id);
+    }
+
     /// Look up the effective tool disposition for `thread_id` + tool
     /// `name`. Returns `None` if the thread is unknown — callers pass
     /// the request through unchecked in that case so upstream
