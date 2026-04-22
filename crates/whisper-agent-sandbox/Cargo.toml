@@ -1,7 +1,7 @@
 [package]
 name = "whisper-agent-sandbox"
 description = "Sandbox provisioning daemon — creates isolated execution environments and runs MCP hosts inside them"
-version = "0.3.4"
+version = "0.3.5"
 edition.workspace = true
 license.workspace = true
 
