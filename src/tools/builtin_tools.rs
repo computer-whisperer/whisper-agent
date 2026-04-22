@@ -30,6 +30,7 @@ pub mod dispatch_thread;
 mod filesystem;
 pub mod find_tool;
 mod grep;
+pub mod list_llm_providers;
 mod list_threads;
 pub mod sudo;
 
@@ -136,6 +137,7 @@ pub const DISPATCH_THREAD: &str = "dispatch_thread";
 pub const SUDO: &str = "sudo";
 pub const DESCRIBE_TOOL: &str = "describe_tool";
 pub const FIND_TOOL: &str = "find_tool";
+pub const LIST_LLM_PROVIDERS: &str = "list_llm_providers";
 
 /// True if `name` is a builtin pod tool. Used by the scheduler's router
 /// to branch the tool-call dispatch path.
@@ -156,6 +158,7 @@ pub fn is_builtin(name: &str) -> bool {
             | SUDO
             | DESCRIBE_TOOL
             | FIND_TOOL
+            | LIST_LLM_PROVIDERS
     )
 }
 
@@ -183,6 +186,7 @@ pub fn reserved_env_name_prefixes() -> Vec<&'static str> {
         SUDO,
         DESCRIBE_TOOL,
         FIND_TOOL,
+        LIST_LLM_PROVIDERS,
     ];
     let mut out: Vec<&'static str> = BUILTINS
         .iter()
@@ -211,6 +215,7 @@ pub fn descriptors() -> Vec<McpTool> {
         sudo::descriptor(),
         describe_tool::descriptor(),
         find_tool::descriptor(),
+        list_llm_providers::descriptor(),
     ]
 }
 
@@ -396,6 +401,11 @@ pub async fn dispatch(
         FIND_TOOL => no_update_error(
             "find_tool must be intercepted at the scheduler layer \
              (complete_find_tool_call); reaching this arm is a bug"
+                .into(),
+        ),
+        LIST_LLM_PROVIDERS => no_update_error(
+            "list_llm_providers must be intercepted at the scheduler layer \
+             (complete_list_llm_providers_call); reaching this arm is a bug"
                 .into(),
         ),
         other => no_update_error(format!("unknown builtin tool: {other}")),

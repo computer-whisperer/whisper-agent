@@ -771,6 +771,17 @@ impl Scheduler {
             );
             return;
         }
+        if name == crate::tools::builtin_tools::LIST_LLM_PROVIDERS {
+            self.complete_list_llm_providers_call(
+                thread_id,
+                op_id,
+                tool_use_id,
+                input,
+                disposition,
+                pending_io,
+            );
+            return;
+        }
 
         let spec = match self.route_tool(thread_id, &name) {
             Some(ToolRoute::Builtin { .. }) => Function::BuiltinToolCall {
@@ -1165,6 +1176,161 @@ impl Scheduler {
             tool_use_id,
             out,
         ));
+    }
+
+    /// `list_llm_providers`-specific synchronous path. Without args,
+    /// reads the scheduler's backend catalog and emits an immediate
+    /// tool result. With `backend`, resolves the provider, clones its
+    /// `Arc<dyn ModelProvider>`, and pushes an async future that
+    /// awaits `list_models()` — the scheduler loop doesn't block on
+    /// the HTTP round-trip.
+    fn complete_list_llm_providers_call(
+        &mut self,
+        thread_id: &str,
+        op_id: crate::runtime::thread::OpId,
+        tool_use_id: String,
+        input: serde_json::Value,
+        disposition: crate::permission::Disposition,
+        pending_io: &mut FuturesUnordered<SchedulerFuture>,
+    ) {
+        if matches!(disposition, crate::permission::Disposition::Deny) {
+            pending_io.push(make_denial_future(
+                thread_id.to_string(),
+                tool_use_id,
+                op_id,
+                crate::tools::builtin_tools::LIST_LLM_PROVIDERS.to_string(),
+            ));
+            return;
+        }
+        let args = match crate::tools::builtin_tools::list_llm_providers::parse_args(input) {
+            Ok(a) => a,
+            Err(e) => {
+                pending_io.push(immediate_tool_error(
+                    thread_id.to_string(),
+                    op_id,
+                    tool_use_id,
+                    e,
+                ));
+                return;
+            }
+        };
+
+        // Always prepare the backend summary header — it's the cheap
+        // part and callers expanding one backend still want the
+        // roster for context.
+        let default_backend = self.default_backend.clone();
+        let mut backend_lines: Vec<(String, String)> = self
+            .backends
+            .iter()
+            .map(|(name, entry)| {
+                let default_marker = if *name == default_backend {
+                    " [default]"
+                } else {
+                    ""
+                };
+                let default_model = entry.default_model.as_deref().unwrap_or("—");
+                let auth = entry.auth_mode.as_deref().unwrap_or("none");
+                (
+                    name.clone(),
+                    format!(
+                        "- `{name}`{default_marker} — kind={kind}, default_model={dm}, auth={auth}",
+                        kind = entry.kind,
+                        dm = default_model,
+                    ),
+                )
+            })
+            .collect();
+        backend_lines.sort_by(|a, b| a.0.cmp(&b.0));
+        let mut header = String::new();
+        header.push_str(&format!(
+            "Configured LLM backends (default: `{default_backend}`):\n"
+        ));
+        for (_, line) in &backend_lines {
+            header.push_str(line);
+            header.push('\n');
+        }
+
+        let Some(backend_name) = args.backend else {
+            // No expansion requested — cheap path, synchronous.
+            pending_io.push(immediate_tool_success(
+                thread_id.to_string(),
+                op_id,
+                tool_use_id,
+                header,
+            ));
+            return;
+        };
+
+        // Expand models for the named backend. Clone the provider Arc
+        // out so the future can own it; surface an immediate error
+        // when the name doesn't resolve — and include the roster in
+        // the error so the agent doesn't have to make a second call
+        // to see the valid names.
+        let Some(entry) = self.backends.get(&backend_name) else {
+            pending_io.push(immediate_tool_error(
+                thread_id.to_string(),
+                op_id,
+                tool_use_id,
+                format!("unknown backend `{backend_name}`.\n\n{header}"),
+            ));
+            return;
+        };
+        let provider = entry.provider.clone();
+        let thread_id_s = thread_id.to_string();
+        pending_io.push(Box::pin(async move {
+            let body = match provider.list_models().await {
+                Ok(models) => {
+                    let mut s = header;
+                    s.push('\n');
+                    s.push_str(&format!(
+                        "Models on `{backend_name}` ({count}):\n",
+                        count = models.len()
+                    ));
+                    if models.is_empty() {
+                        s.push_str(
+                            "  (provider returned no models — this is typical for \
+                             single-model local endpoints; use an empty model id)\n",
+                        );
+                    } else {
+                        for m in models {
+                            match m.display_name {
+                                Some(dn) if !dn.is_empty() && dn != m.id => {
+                                    s.push_str(&format!("- `{}` — {}\n", m.id, dn));
+                                }
+                                _ => {
+                                    s.push_str(&format!("- `{}`\n", m.id));
+                                }
+                            }
+                        }
+                    }
+                    Ok(s)
+                }
+                Err(e) => Err(format!("list_models(`{backend_name}`) failed: {e}")),
+            };
+            let result = match body {
+                Ok(text) => crate::runtime::thread::IoResult::ToolCall {
+                    tool_use_id,
+                    result: Ok(crate::tools::mcp::CallToolResult {
+                        content: vec![crate::tools::mcp::McpContentBlock::Text { text }],
+                        is_error: false,
+                    }),
+                },
+                Err(message) => crate::runtime::thread::IoResult::ToolCall {
+                    tool_use_id,
+                    result: Err(message),
+                },
+            };
+            crate::runtime::io_dispatch::SchedulerCompletion::Io(
+                crate::runtime::io_dispatch::IoCompletion {
+                    thread_id: thread_id_s,
+                    op_id,
+                    result,
+                    pod_update: None,
+                    scheduler_command: None,
+                    host_env_lost: None,
+                },
+            )
+        }));
     }
 
     /// `sudo`-specific registration path. Parses the tool args, refuses
