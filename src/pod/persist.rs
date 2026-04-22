@@ -741,6 +741,13 @@ async fn load_one(path: &Path, pod_id: &str) -> Result<Thread> {
     // Idempotent — a no-op for already-migrated threads.
     task.conversation.normalize_legacy_tool_result_role();
     if is_in_flight(&task.internal) {
+        // Heal the conversation before flipping to Failed so an
+        // `AwaitingTools` thread's `completed` results (and synthesized
+        // errors for pending/in-flight tool_uses) are preserved rather
+        // than discarded with the `internal` replacement. No event
+        // subscribers exist at load time — the Vec is thrown away.
+        let mut _events = Vec::new();
+        task.heal_to_idle("task was in-flight at last shutdown", &mut _events);
         task.fail("resume", "task was in-flight at last shutdown");
     }
     Ok(task)

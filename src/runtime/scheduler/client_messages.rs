@@ -140,6 +140,21 @@ impl Scheduler {
             ClientToServer::ArchiveThread { thread_id } => {
                 self.archive_thread(&thread_id);
             }
+            ClientToServer::RecoverThread {
+                thread_id,
+                correlation_id,
+            } => {
+                if let Err(msg) = self.recover_thread(&thread_id) {
+                    self.router.send_to_client(
+                        conn_id,
+                        ServerToClient::Error {
+                            correlation_id,
+                            thread_id: Some(thread_id),
+                            message: format!("recover_thread: {msg}"),
+                        },
+                    );
+                }
+            }
             ClientToServer::CompactThread {
                 thread_id,
                 correlation_id,

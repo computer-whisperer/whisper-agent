@@ -494,40 +494,54 @@ impl Thread {
         self.touch();
     }
 
-    /// If the thread is mid tool-call-cycle (`AwaitingTools`), synthesize
-    /// `is_error: true` `tool_result` blocks for every unresolved
-    /// `tool_use_id` in the conversation's latest assistant turn, push
-    /// them as a single `Role::ToolResult` message, and drop out of
-    /// `AwaitingTools`. Preserves any tool results that already
-    /// completed.
+    /// Bring the thread to a clean `Idle` state that can accept a new
+    /// user message (or be stepped from scratch) without corrupting
+    /// the conversation shape.
     ///
-    /// Returns the list of interrupted `tool_use_id`s so the caller
-    /// can cancel the corresponding in-flight Function entries (their
-    /// late-arriving I/O results will then hit a state mismatch in
-    /// `apply_io_result` and be discarded as warn-logs).
+    /// - `AwaitingTools`: synthesize `is_error: true` `tool_result`
+    ///   blocks for every unresolved `tool_use_id` and merge them with
+    ///   any already-completed results into a single
+    ///   `Role::ToolResult` message. Returns the interrupted
+    ///   `tool_use_id`s so the caller can cancel their Function
+    ///   entries (late-arriving I/O results will hit a state mismatch
+    ///   in `apply_io_result` and be discarded).
+    /// - `AwaitingModel` / `NeedsModelCall` / `WaitingOnResources`:
+    ///   transition to `Idle`. These paths don't mutate the
+    ///   conversation tail during their active phase (streaming
+    ///   deltas go to subscribers, not `self.conversation`), so no
+    ///   synthesized filler is needed.
+    /// - `Idle` / `Completed` / `Failed` / `Cancelled`: no-op. The
+    ///   terminal-state → `Idle` promotion belongs to an explicit
+    ///   `recover()` action so "heal" doesn't silently clear a
+    ///   terminal state out from under a caller that just wanted to
+    ///   make sure the conversation was flushed.
     ///
-    /// Exists to paper over a specific Anthropic-API constraint: every
+    /// Exists to paper over the Anthropic-API constraint that every
     /// `tool_use` content block must be immediately followed by a
-    /// matching `tool_result` block in the next message. A naked
-    /// `SendUserMessage` arriving while the thread had pending tool
-    /// calls would append a `Role::User` message right after the
-    /// `assistant[tool_use]`, producing a 400 on the next model call.
-    ///
-    /// No-op for any other state — callers still append the user
-    /// message unconditionally.
-    pub fn interrupt_pending_tools(
-        &mut self,
-        reason: &str,
-        events: &mut Vec<ThreadEvent>,
-    ) -> Vec<String> {
-        if !matches!(self.internal, ThreadInternalState::AwaitingTools { .. }) {
-            return Vec::new();
+    /// matching `tool_result` block. Callers include: `SendUserMessage`
+    /// while the thread is `AwaitingTools` (would otherwise append a
+    /// bare `Role::User` after `assistant[tool_use]`) and the resume
+    /// path on startup (would otherwise drop `AwaitingTools::completed`
+    /// on the floor when marking the thread Failed).
+    pub fn heal_to_idle(&mut self, reason: &str, events: &mut Vec<ThreadEvent>) -> Vec<String> {
+        match &self.internal {
+            ThreadInternalState::Idle
+            | ThreadInternalState::Completed
+            | ThreadInternalState::Failed { .. }
+            | ThreadInternalState::Cancelled => return Vec::new(),
+            ThreadInternalState::NeedsModelCall
+            | ThreadInternalState::AwaitingModel { .. }
+            | ThreadInternalState::WaitingOnResources { .. } => {
+                self.internal = ThreadInternalState::Idle;
+                self.touch();
+                return Vec::new();
+            }
+            ThreadInternalState::AwaitingTools { .. } => {}
         }
         // `std::mem::replace` lets us move the fields out without
         // re-borrowing — we take ownership of `pending_dispatch`,
         // `pending_io`, and `completed`, then reinstate the state
-        // below with `Idle` (the caller's `submit_user_message` will
-        // transition it to `NeedsModelCall` / `WaitingOnResources`).
+        // below with `Idle`.
         let ThreadInternalState::AwaitingTools {
             pending_dispatch,
             pending_io,
@@ -621,6 +635,63 @@ impl Thread {
             message: message.into(),
         };
         self.touch();
+    }
+
+    /// Promote a `Failed` thread back to `Idle` so it can accept a new
+    /// user message. Returns `false` (with no state change) if the
+    /// thread isn't in `Failed`.
+    ///
+    /// Defensive tail-heal: if the conversation ends in a
+    /// `Role::Assistant` message with `ToolUse` blocks that aren't
+    /// followed by a `Role::ToolResult`, synth `is_error: true`
+    /// tool_result blocks for them first. The fail-path in
+    /// `pod::persist::load_one` already heals via `heal_to_idle`
+    /// before marking the thread Failed, so this only matters for
+    /// threads persisted before that heal wiring existed — cheap
+    /// insurance, no cost for threads that were already clean.
+    pub fn recover(&mut self, events: &mut Vec<ThreadEvent>) -> bool {
+        if !matches!(self.internal, ThreadInternalState::Failed { .. }) {
+            return false;
+        }
+        self.synthesize_trailing_tool_results("recovered after failure", events);
+        self.internal = ThreadInternalState::Idle;
+        self.touch();
+        true
+    }
+
+    fn synthesize_trailing_tool_results(&mut self, reason: &str, events: &mut Vec<ThreadEvent>) {
+        let Some(last) = self.conversation.messages().last() else {
+            return;
+        };
+        if last.role != Role::Assistant {
+            return;
+        }
+        let pending_ids: Vec<String> = last
+            .content
+            .iter()
+            .filter_map(|b| match b {
+                ContentBlock::ToolUse { id, .. } => Some(id.clone()),
+                _ => None,
+            })
+            .collect();
+        if pending_ids.is_empty() {
+            return;
+        }
+        let synth_text = format!("tool call interrupted: {reason}");
+        let mut blocks: Vec<ContentBlock> = Vec::with_capacity(pending_ids.len());
+        for id in pending_ids {
+            events.push(ThreadEvent::ToolCallEnd {
+                tool_use_id: id.clone(),
+                result_preview: synth_text.clone(),
+                is_error: true,
+            });
+            blocks.push(ContentBlock::ToolResult {
+                tool_use_id: id,
+                content: ToolResultContent::Text(synth_text.clone()),
+                is_error: true,
+            });
+        }
+        self.conversation.push(Message::tool_result_blocks(blocks));
     }
 
     /// Is the task accepting new user input right now?
@@ -1175,7 +1246,7 @@ mod tests {
         // Seed a prior assistant turn with the tool_uses so
         // `find_tool_name` / `find_tool_args` can resolve them if the
         // integration path ever walks them back. Not strictly needed
-        // for `interrupt_pending_tools`, but keeps the conversation
+        // for `heal_to_idle`, but keeps the conversation
         // well-formed at the tool_use layer.
         let mut tool_use_blocks: Vec<ContentBlock> = Vec::new();
         for req in &pending_dispatch {
@@ -1205,18 +1276,60 @@ mod tests {
     }
 
     #[test]
-    fn interrupt_pending_tools_noop_when_not_awaiting() {
+    fn heal_to_idle_noop_on_terminal_states() {
         let mut task = thread_with_two_turns(); // state = Idle
         let mut events = Vec::new();
-        let interrupted = task.interrupt_pending_tools("boom", &mut events);
+        let interrupted = task.heal_to_idle("boom", &mut events);
         assert!(interrupted.is_empty());
         assert!(events.is_empty());
-        // Conversation unchanged.
+        // Conversation unchanged; Idle stays Idle.
+        assert_eq!(task.conversation.messages().len(), 4);
+        assert!(matches!(task.internal, ThreadInternalState::Idle));
+
+        // Failed is a terminal state: heal_to_idle leaves it alone so a
+        // later explicit `recover()` can own the Failed → Idle
+        // promotion.
+        task.fail("test", "boom");
+        let interrupted = task.heal_to_idle("second", &mut events);
+        assert!(interrupted.is_empty());
+        assert!(events.is_empty());
+        assert!(matches!(task.internal, ThreadInternalState::Failed { .. }));
+    }
+
+    #[test]
+    fn heal_to_idle_flips_non_awaiting_work_states() {
+        let mut task = thread_with_two_turns();
+        let mut events = Vec::new();
+
+        task.internal = ThreadInternalState::NeedsModelCall;
+        let interrupted = task.heal_to_idle("reset", &mut events);
+        assert!(interrupted.is_empty());
+        assert!(events.is_empty());
+        assert!(matches!(task.internal, ThreadInternalState::Idle));
+
+        task.internal = ThreadInternalState::AwaitingModel {
+            op_id: 42,
+            started_at: Utc::now(),
+        };
+        let interrupted = task.heal_to_idle("reset", &mut events);
+        assert!(interrupted.is_empty());
+        assert!(events.is_empty());
+        assert!(matches!(task.internal, ThreadInternalState::Idle));
+
+        task.internal = ThreadInternalState::WaitingOnResources {
+            needed: vec!["he-x".into()],
+        };
+        let interrupted = task.heal_to_idle("reset", &mut events);
+        assert!(interrupted.is_empty());
+        assert!(events.is_empty());
+        assert!(matches!(task.internal, ThreadInternalState::Idle));
+
+        // Conversation untouched through all three flips.
         assert_eq!(task.conversation.messages().len(), 4);
     }
 
     #[test]
-    fn interrupt_pending_tools_synthesizes_for_in_flight_and_queued() {
+    fn heal_to_idle_synthesizes_for_in_flight_and_queued() {
         // Two categories: one already-dispatched (in pending_io,
         // op_id 5), one still queued (in pending_dispatch, no op_id
         // yet). Plus one previously-completed result we must
@@ -1236,7 +1349,7 @@ mod tests {
         let mut task = thread_awaiting_tools(pending_dispatch, pending_io, completed);
 
         let mut events = Vec::new();
-        let mut interrupted = task.interrupt_pending_tools("tests", &mut events);
+        let mut interrupted = task.heal_to_idle("tests", &mut events);
         interrupted.sort();
         assert_eq!(
             interrupted,
@@ -1277,6 +1390,138 @@ mod tests {
     }
 
     #[test]
+    fn heal_then_fail_preserves_awaiting_tools_results() {
+        // Mimics the persist.rs resume path: an AwaitingTools thread
+        // loaded from disk with `completed` results. Without the heal
+        // step, `fail()` replaces `internal` and those completed
+        // results vanish from the thread (the conversation only has
+        // the assistant[tool_use] turn, with no tool_result follow-up).
+        // With the heal step, the completed results + synth errors
+        // for pending calls land in the conversation before Failed.
+        let mut pending_io = HashMap::new();
+        pending_io.insert(9, "toolu_inflight".to_string());
+        let pending_dispatch = vec![ToolUseReq {
+            tool_use_id: "toolu_queued".into(),
+            name: "bash".into(),
+            input: serde_json::json!({}),
+        }];
+        let completed = vec![ContentBlock::ToolResult {
+            tool_use_id: "toolu_done".into(),
+            content: ToolResultContent::Text("ok".into()),
+            is_error: false,
+        }];
+        let mut task = thread_awaiting_tools(pending_dispatch, pending_io, completed);
+
+        let mut events = Vec::new();
+        task.heal_to_idle("resume", &mut events);
+        task.fail("resume", "was in-flight at shutdown");
+
+        assert!(matches!(task.internal, ThreadInternalState::Failed { .. }));
+        // Conversation ends in a tool_result message carrying all
+        // three ids (one previously-completed, two synthesized).
+        let last = task.conversation.messages().last().unwrap();
+        assert_eq!(last.role, Role::ToolResult);
+        let ids: Vec<&str> = last
+            .content
+            .iter()
+            .filter_map(|b| match b {
+                ContentBlock::ToolResult { tool_use_id, .. } => Some(tool_use_id.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(ids.contains(&"toolu_done"));
+        assert!(ids.contains(&"toolu_inflight"));
+        assert!(ids.contains(&"toolu_queued"));
+    }
+
+    #[test]
+    fn recover_rejects_non_failed_states() {
+        let mut task = thread_with_two_turns(); // Idle
+        let mut events = Vec::new();
+        assert!(!task.recover(&mut events));
+        assert!(matches!(task.internal, ThreadInternalState::Idle));
+
+        task.internal = ThreadInternalState::Completed;
+        assert!(!task.recover(&mut events));
+        assert!(matches!(task.internal, ThreadInternalState::Completed));
+
+        task.internal = ThreadInternalState::Cancelled;
+        assert!(!task.recover(&mut events));
+        assert!(matches!(task.internal, ThreadInternalState::Cancelled));
+
+        task.internal = ThreadInternalState::NeedsModelCall;
+        assert!(!task.recover(&mut events));
+        assert!(matches!(task.internal, ThreadInternalState::NeedsModelCall));
+
+        assert!(events.is_empty());
+    }
+
+    #[test]
+    fn recover_flips_failed_to_idle() {
+        let mut task = thread_with_two_turns();
+        task.fail("model_call", "nope");
+        let before = task.last_active;
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        let mut events = Vec::new();
+        assert!(task.recover(&mut events));
+        assert!(matches!(task.internal, ThreadInternalState::Idle));
+        assert!(task.last_active > before);
+        // Conversation untouched — no dangling tool_use at the tail.
+        assert_eq!(task.conversation.messages().len(), 4);
+        assert!(events.is_empty());
+    }
+
+    #[test]
+    fn recover_synthesizes_tool_results_for_dangling_tool_use() {
+        // Simulates a Failed thread persisted before the heal-at-fail
+        // wiring existed: the conversation ends in assistant[tool_use]
+        // with no following tool_result. Recovery must synth filler so
+        // the next model call doesn't 400 on shape.
+        let mut task = thread_with_two_turns();
+        task.conversation.push(Message::assistant_blocks(vec![
+            ContentBlock::ToolUse {
+                id: "toolu_orphan_a".into(),
+                name: "bash".into(),
+                input: serde_json::json!({}),
+                replay: None,
+            },
+            ContentBlock::ToolUse {
+                id: "toolu_orphan_b".into(),
+                name: "bash".into(),
+                input: serde_json::json!({}),
+                replay: None,
+            },
+        ]));
+        task.fail("resume", "in-flight at shutdown");
+        let prior_len = task.conversation.messages().len();
+
+        let mut events = Vec::new();
+        assert!(task.recover(&mut events));
+        assert!(matches!(task.internal, ThreadInternalState::Idle));
+
+        // A new tool_result message landed at the tail covering both ids.
+        assert_eq!(task.conversation.messages().len(), prior_len + 1);
+        let last = task.conversation.messages().last().unwrap();
+        assert_eq!(last.role, Role::ToolResult);
+        let ids: Vec<&str> = last
+            .content
+            .iter()
+            .filter_map(|b| match b {
+                ContentBlock::ToolResult {
+                    tool_use_id,
+                    is_error: true,
+                    ..
+                } => Some(tool_use_id.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(ids.contains(&"toolu_orphan_a"));
+        assert!(ids.contains(&"toolu_orphan_b"));
+        // One ToolCallEnd event per synthesized result.
+        assert_eq!(events.len(), 2);
+    }
+
+    #[test]
     fn submit_user_message_after_interrupt_reaches_needs_model_call() {
         // End-to-end shape: AwaitingTools → interrupt → submit_user
         // leaves the thread with a valid conversation
@@ -1286,7 +1531,7 @@ mod tests {
         pending_io.insert(7, "toolu_x".to_string());
         let mut task = thread_awaiting_tools(Vec::new(), pending_io, Vec::new());
         let mut events = Vec::new();
-        let interrupted = task.interrupt_pending_tools("new_user_msg", &mut events);
+        let interrupted = task.heal_to_idle("new_user_msg", &mut events);
         assert_eq!(interrupted, vec!["toolu_x".to_string()]);
         task.submit_user_message("follow-up".into(), Vec::new());
         assert!(matches!(task.internal, ThreadInternalState::NeedsModelCall));

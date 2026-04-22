@@ -865,13 +865,11 @@ fn model_call(scheduler: &Scheduler, thread_id: String, op_id: OpId) -> Schedule
             messages: &owned_req.messages,
             cache_breakpoints: &owned_req.cache_breakpoints,
         };
-        let result =
-            match stream_with_rate_limit_retry(provider.as_ref(), &req, &thread_id, &stream_tx)
-                .await
-            {
-                Ok(resp) => IoResult::ModelCall(Ok(resp)),
-                Err(e) => IoResult::ModelCall(Err(e.to_string())),
-            };
+        let result = match stream_with_retry(provider.as_ref(), &req, &thread_id, &stream_tx).await
+        {
+            Ok(resp) => IoResult::ModelCall(Ok(resp)),
+            Err(e) => IoResult::ModelCall(Err(e.to_string())),
+        };
         SchedulerCompletion::Io(IoCompletion {
             thread_id,
             op_id,
@@ -889,37 +887,71 @@ fn model_call(scheduler: &Scheduler, thread_id: String, op_id: OpId) -> Schedule
 /// failures so the user isn't left waiting on a minutes-long sleep.
 const MAX_RATE_LIMIT_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// Maximum number of retry attempts (not counting the initial try)
+/// for first-event failures. Shared budget across rate-limit and
+/// transient-fatal (transport / 5xx / 408) errors.
+const MAX_FIRST_EVENT_RETRIES: u32 = 3;
+
 /// Drive a streaming model call to completion, pushing live deltas into
 /// `stream_tx` as they arrive and returning the assembled `ModelResponse`.
 ///
-/// Rate-limit retry only applies when the *first* stream item is the
-/// RateLimited error — once any delta has been broadcast, a mid-stream
-/// failure is terminal (we can't un-send events to subscribers).
-async fn stream_with_rate_limit_retry(
+/// Retries only apply when the *first* stream item is the error — once
+/// any delta has been broadcast, a mid-stream failure is terminal (we
+/// can't un-send events to subscribers). Retryable first-event errors:
+/// server-signalled rate limits with a short `retry_after`, and any
+/// `ModelError::is_transient()` (transport glitch, 408, or 5xx). The
+/// retry budget is shared; transient errors use a fixed exponential
+/// backoff (1s, 2s, 4s).
+async fn stream_with_retry(
     provider: &dyn crate::providers::model::ModelProvider,
     req: &ModelRequest<'_>,
     thread_id: &str,
     stream_tx: &tokio::sync::mpsc::UnboundedSender<StreamUpdate>,
 ) -> Result<crate::providers::model::ModelResponse, crate::providers::model::ModelError> {
-    match consume_stream(provider, req, thread_id, stream_tx).await {
-        Ok(resp) => Ok(resp),
-        Err(FirstEventError::RateLimited {
-            retry_after,
-            body: _,
-        }) if retry_after <= MAX_RATE_LIMIT_WAIT => {
-            tracing::warn!(
-                %thread_id,
-                wait_ms = retry_after.as_millis() as u64,
-                "model backend rate-limited on first event; waiting before single retry"
-            );
-            tokio::time::sleep(retry_after).await;
-            match consume_stream(provider, req, thread_id, stream_tx).await {
-                Ok(resp) => Ok(resp),
-                Err(e) => Err(e.into_model_error()),
+    let mut attempt = 0u32;
+    loop {
+        match consume_stream(provider, req, thread_id, stream_tx).await {
+            Ok(resp) => return Ok(resp),
+            Err(FirstEventError::RateLimited { retry_after, body })
+                if retry_after <= MAX_RATE_LIMIT_WAIT && attempt < MAX_FIRST_EVENT_RETRIES =>
+            {
+                tracing::warn!(
+                    %thread_id,
+                    attempt = attempt + 1,
+                    wait_ms = retry_after.as_millis() as u64,
+                    "model backend rate-limited on first event; waiting before retry"
+                );
+                tokio::time::sleep(retry_after).await;
+                attempt += 1;
+                // Body is only needed when we give up — on retry
+                // success / further retries we discard it.
+                drop(body);
             }
+            Err(FirstEventError::Fatal(e))
+                if e.is_transient() && attempt < MAX_FIRST_EVENT_RETRIES =>
+            {
+                let wait = transient_backoff(attempt);
+                tracing::warn!(
+                    %thread_id,
+                    attempt = attempt + 1,
+                    wait_ms = wait.as_millis() as u64,
+                    error = %e,
+                    "transient model-call error on first event; retrying after backoff"
+                );
+                tokio::time::sleep(wait).await;
+                attempt += 1;
+            }
+            Err(e) => return Err(e.into_model_error()),
         }
-        Err(e) => Err(e.into_model_error()),
     }
+}
+
+/// Backoff for transient first-event failures (non-rate-limit).
+/// Sequence: 1s, 2s, 4s. `attempt` is zero-indexed — 0 is the wait
+/// taken *before* the second attempt.
+fn transient_backoff(attempt: u32) -> std::time::Duration {
+    let secs = 1u64 << attempt.min(3);
+    std::time::Duration::from_secs(secs)
 }
 
 /// Error shape that distinguishes "error before any delta was emitted"
@@ -1270,4 +1302,21 @@ fn build_model_request(
         model,
         backend_name,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn transient_backoff_doubles_then_caps() {
+        use std::time::Duration;
+        assert_eq!(transient_backoff(0), Duration::from_secs(1));
+        assert_eq!(transient_backoff(1), Duration::from_secs(2));
+        assert_eq!(transient_backoff(2), Duration::from_secs(4));
+        // Clamp keeps the sequence bounded even if an accidental
+        // off-by-one walks past MAX_FIRST_EVENT_RETRIES.
+        assert_eq!(transient_backoff(3), Duration::from_secs(8));
+        assert_eq!(transient_backoff(99), Duration::from_secs(8));
+    }
 }

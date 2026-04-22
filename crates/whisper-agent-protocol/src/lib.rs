@@ -782,6 +782,17 @@ pub enum ClientToServer {
     CancelThread {
         thread_id: String,
     },
+    /// Promote a `Failed` thread back to `Idle` so it can accept a
+    /// new user message. Rejected (`Error` reply) when the thread
+    /// isn't in `Failed`. Defensively synthesizes trailing
+    /// `tool_result` blocks if the conversation ends with an
+    /// unmatched `assistant[tool_use]`, so the recovered thread's
+    /// next model call lands on a well-formed conversation.
+    RecoverThread {
+        thread_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        correlation_id: Option<String>,
+    },
     /// Archive (hide) a task. It remains on disk but drops off the broadcast list.
     ArchiveThread {
         thread_id: String,

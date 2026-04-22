@@ -82,6 +82,24 @@ pub enum ModelError {
     RateLimited { retry_after: Duration, body: String },
 }
 
+impl ModelError {
+    /// True when this error is a transient infrastructure fault worth
+    /// retrying transparently — network glitches, request timeouts,
+    /// and 5xx server errors (including Anthropic's 529 Overloaded).
+    /// Client-side 4xx (malformed request, auth failure, context
+    /// exhausted) and `RateLimited` are NOT transient here:
+    /// `RateLimited` has its own retry path driven by the
+    /// server-suggested `retry_after`, and 4xx won't fix itself on
+    /// retry.
+    pub fn is_transient(&self) -> bool {
+        match self {
+            ModelError::Transport(_) => true,
+            ModelError::Api { status, .. } => matches!(*status, 408 | 500..=599),
+            ModelError::RateLimited { .. } => false,
+        }
+    }
+}
+
 /// Incremental event emitted from a streaming model call. Intended for live UI
 /// updates; the canonical, assembled turn content lands in the terminal
 /// [`ModelEvent::Completed`] event.
@@ -331,6 +349,86 @@ mod tests {
                 CacheBreakpoint::AfterSystem,
                 CacheBreakpoint::AfterMessage(2)
             ]
+        );
+    }
+
+    #[test]
+    fn is_transient_classification() {
+        assert!(ModelError::Transport("read timeout".into()).is_transient());
+        // 5xx server errors — retry.
+        assert!(
+            ModelError::Api {
+                status: 500,
+                body: String::new()
+            }
+            .is_transient()
+        );
+        assert!(
+            ModelError::Api {
+                status: 502,
+                body: String::new()
+            }
+            .is_transient()
+        );
+        assert!(
+            ModelError::Api {
+                status: 503,
+                body: String::new()
+            }
+            .is_transient()
+        );
+        assert!(
+            ModelError::Api {
+                status: 529,
+                body: String::new()
+            }
+            .is_transient()
+        );
+        // 408 Request Timeout — retry.
+        assert!(
+            ModelError::Api {
+                status: 408,
+                body: String::new()
+            }
+            .is_transient()
+        );
+        // Client-side 4xx — don't retry (auth, bad request, context exhausted).
+        assert!(
+            !ModelError::Api {
+                status: 400,
+                body: String::new()
+            }
+            .is_transient()
+        );
+        assert!(
+            !ModelError::Api {
+                status: 401,
+                body: String::new()
+            }
+            .is_transient()
+        );
+        assert!(
+            !ModelError::Api {
+                status: 403,
+                body: String::new()
+            }
+            .is_transient()
+        );
+        assert!(
+            !ModelError::Api {
+                status: 404,
+                body: String::new()
+            }
+            .is_transient()
+        );
+        // 429 is carried by RateLimited, not Api — but even if it showed up as Api,
+        // rate-limit retry is driven by the dedicated variant's retry_after path.
+        assert!(
+            !ModelError::RateLimited {
+                retry_after: Duration::from_secs(2),
+                body: String::new()
+            }
+            .is_transient()
         );
     }
 

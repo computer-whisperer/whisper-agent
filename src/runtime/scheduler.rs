@@ -3038,6 +3038,32 @@ impl Scheduler {
             });
     }
 
+    /// Promote a `Failed` thread back to `Idle` so the user can send
+    /// a follow-up message. Returns `Err` with a human-readable
+    /// reason when the thread doesn't exist or isn't in `Failed`;
+    /// the caller turns that into an `Error` wire reply.
+    pub(crate) fn recover_thread(&mut self, thread_id: &str) -> Result<(), String> {
+        let Some(task) = self.tasks.get_mut(thread_id) else {
+            return Err("unknown thread".into());
+        };
+        let mut events = Vec::new();
+        if !task.recover(&mut events) {
+            return Err(format!(
+                "thread is not in Failed state (current: {:?})",
+                task.public_state()
+            ));
+        }
+        let new_state = task.public_state();
+        self.mark_dirty(thread_id);
+        self.router.dispatch_events(thread_id, events);
+        self.router
+            .broadcast_task_list(ServerToClient::ThreadStateChanged {
+                thread_id: thread_id.to_string(),
+                state: new_state,
+            });
+        Ok(())
+    }
+
     fn send_user_message(
         &mut self,
         thread_id: &str,
@@ -3062,7 +3088,7 @@ impl Scheduler {
         let interrupted = {
             let mut events = Vec::new();
             let task = self.tasks.get_mut(thread_id).expect("task exists");
-            let list = task.interrupt_pending_tools("superseded by new user message", &mut events);
+            let list = task.heal_to_idle("superseded by new user message", &mut events);
             self.router.dispatch_events(thread_id, events);
             list
         };
