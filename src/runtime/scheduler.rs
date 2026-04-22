@@ -2051,6 +2051,45 @@ impl Scheduler {
         check_behavior_authoring_pure(&caller_scope, &pod_ceiling, filename, &parsed.scope)
     }
 
+    /// Sudo-path authoring gate. Same rules as
+    /// [`Self::check_behavior_authoring`] but runs with the caller's
+    /// scope effectively raised to `pod_ceiling` — the single-call
+    /// cap bypass sudo grants. So on an `author_narrower` ceiling the
+    /// strictly-narrower subset check still applies (fire_scope must
+    /// be a strict subset of the pod ceiling), and on `author_any`
+    /// every admissible behavior write passes. Runs at sudo-register
+    /// time so the user never sees an approval prompt for a write
+    /// that would fail this gate anyway.
+    pub(crate) fn check_behavior_authoring_for_sudo(
+        &self,
+        thread_id: &str,
+        tool_name: &str,
+        args: &serde_json::Value,
+    ) -> Option<String> {
+        use crate::tools::builtin_tools::{POD_EDIT_FILE, POD_WRITE_FILE};
+
+        if !matches!(tool_name, POD_WRITE_FILE | POD_EDIT_FILE) {
+            return None;
+        }
+        let filename = args.get("filename").and_then(|v| v.as_str())?;
+        let (_id, suffix) = crate::pod::fs::parse_behavior_path(filename)?;
+        if suffix != crate::pod::behaviors::BEHAVIOR_TOML {
+            return None;
+        }
+
+        let task = self.tasks.get(thread_id)?;
+        let pod_ceiling = self.pod_scope_ceiling(&task.pod_id);
+
+        let content = args.get("content").and_then(|v| v.as_str())?;
+        let Ok(parsed) = crate::pod::behaviors::parse_toml(content) else {
+            return None;
+        };
+        // pod_ceiling twice: as caller_scope (sudo-elevated) and as
+        // the ceiling narrowing fire_scope — identical by construction
+        // under sudo.
+        check_behavior_authoring_pure(&pod_ceiling, &pod_ceiling, filename, &parsed.scope)
+    }
+
     /// Derive the effective [`Scope`] a newly-created thread in `pod_id`
     /// starts with. The bindings + tools come from the pod's `[allow]`
     /// table; typed caps come from `[thread_defaults.caps]` in the pod

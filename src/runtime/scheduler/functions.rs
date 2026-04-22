@@ -1251,6 +1251,22 @@ impl Scheduler {
             ));
             return;
         }
+        // Behavior-authoring gate runs BEFORE we prompt the user. A
+        // sudo'd write of `behaviors/<id>/behavior.toml` whose fire
+        // scope exceeds the pod ceiling (under `author_narrower`)
+        // would fail anyway after approval — refuse up front so the
+        // approver isn't bothered with an impossible request.
+        if let Some(denial) =
+            self.check_behavior_authoring_for_sudo(thread_id, &args.tool_name, &args.args)
+        {
+            pending_io.push(immediate_tool_error(
+                thread_id.to_string(),
+                op_id,
+                tool_use_id,
+                format!("sudo: {denial}"),
+            ));
+            return;
+        }
         let spec = Function::Sudo {
             thread_id: thread_id.to_string(),
             tool_name: args.tool_name,
@@ -1338,7 +1354,7 @@ impl Scheduler {
             thread_id,
             tool_name,
             args,
-            ..
+            reason: sudo_reason,
         } = entry.spec.clone()
         else {
             self.router.send_to_client(
@@ -1376,6 +1392,15 @@ impl Scheduler {
                     Some(r) if !r.trim().is_empty() => format!("sudo rejected: {r}"),
                     _ => "sudo rejected by user.".to_string(),
                 };
+                self.router.write_sudo_audit(
+                    &thread_id,
+                    &tool_name,
+                    args.clone(),
+                    sudo_reason,
+                    crate::runtime::audit::SudoDecisionTag::Reject,
+                    reason.clone(),
+                    None,
+                );
                 self.router
                     .broadcast_task_list(ServerToClient::SudoResolved {
                         function_id,
@@ -1556,6 +1581,23 @@ impl Scheduler {
             pod_update,
             scheduler_command,
         } = done;
+        // Capture audit context from the Function entry BEFORE
+        // complete_function (below) removes it. For the Sudo variant
+        // we know it's populated; if the entry is gone (racey
+        // double-complete) we skip the audit rather than panic.
+        let audit_ctx = self.active_functions.get(&function_id).and_then(|e| {
+            if let Function::Sudo {
+                tool_name,
+                args,
+                reason,
+                ..
+            } = &e.spec
+            {
+                Some((tool_name.clone(), args.clone(), reason.clone()))
+            } else {
+                None
+            }
+        });
         match result {
             Ok(call_result) => {
                 // Mirror the normal tool-call path: apply side effects
@@ -1580,6 +1622,20 @@ impl Scheduler {
                     })
                     .collect::<Vec<_>>()
                     .join("\n");
+                if let Some((tool_name, args, reason)) = audit_ctx.clone() {
+                    let inner_outcome = crate::server::thread_router::SudoInnerOutcome::Ok {
+                        is_error: call_result.is_error,
+                    };
+                    self.router.write_sudo_audit(
+                        &thread_id,
+                        &tool_name,
+                        args,
+                        reason,
+                        sudo_decision_tag(decision),
+                        None,
+                        Some(inner_outcome),
+                    );
+                }
                 if call_result.is_error {
                     // Inner tool ran but failed — surface the error text
                     // on the parent's oneshot as Err so the model's
@@ -1606,6 +1662,20 @@ impl Scheduler {
                 }
             }
             Err(detail) => {
+                if let Some((tool_name, args, reason)) = audit_ctx {
+                    let inner_outcome = crate::server::thread_router::SudoInnerOutcome::Failed {
+                        message: detail.clone(),
+                    };
+                    self.router.write_sudo_audit(
+                        &thread_id,
+                        &tool_name,
+                        args,
+                        reason,
+                        sudo_decision_tag(decision),
+                        None,
+                        Some(inner_outcome),
+                    );
+                }
                 self.complete_function(
                     function_id,
                     FunctionOutcome::Error(crate::functions::FunctionError {
@@ -2052,6 +2122,24 @@ impl Scheduler {
         // them via caller-gone cascade.
         self.complete_functions_awaiting_thread(thread_id, pending_io);
         self.cascade_cancel_caller_gone(thread_id, pending_io);
+    }
+}
+
+/// Map the wire-level [`crate::permission::SudoDecision`] to the
+/// audit-log [`crate::runtime::audit::SudoDecisionTag`]. They're the
+/// same three variants; the indirection keeps the audit module from
+/// importing the protocol crate's permission types directly.
+fn sudo_decision_tag(
+    decision: crate::permission::SudoDecision,
+) -> crate::runtime::audit::SudoDecisionTag {
+    match decision {
+        crate::permission::SudoDecision::ApproveOnce => {
+            crate::runtime::audit::SudoDecisionTag::ApproveOnce
+        }
+        crate::permission::SudoDecision::ApproveRemember => {
+            crate::runtime::audit::SudoDecisionTag::ApproveRemember
+        }
+        crate::permission::SudoDecision::Reject => crate::runtime::audit::SudoDecisionTag::Reject,
     }
 }
 

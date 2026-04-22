@@ -20,7 +20,19 @@ use tokio::sync::mpsc;
 use tracing::{error, warn};
 use whisper_agent_protocol::ServerToClient;
 
-use crate::runtime::audit::{AuditLog, ToolCallEntry, ToolCallEventTag, ToolCallOutcome};
+use crate::runtime::audit::{
+    AuditLog, SudoDecisionEntry, SudoDecisionEventTag, SudoDecisionTag, ToolCallEntry,
+    ToolCallEventTag, ToolCallOutcome,
+};
+
+/// Owned mirror of [`ToolCallOutcome`] — used as a fire-and-forget
+/// audit argument where the caller can't easily keep the backing
+/// `&str` alive past the spawn. The fire-and-forget helper rehydrates
+/// it into the borrowed form just before serialization.
+pub(crate) enum SudoInnerOutcome {
+    Ok { is_error: bool },
+    Failed { message: String },
+}
 use crate::runtime::scheduler::ConnId;
 use crate::runtime::thread::ThreadEvent;
 
@@ -265,6 +277,53 @@ impl ThreadEventRouter {
                 }
             }
         }
+    }
+
+    /// Fire-and-forget audit write for a single user sudo decision.
+    /// Called from the scheduler's `resolve_sudo` (Reject branch) and
+    /// `apply_sudo_inner_completion` (Approve branches, once the
+    /// inner tool has produced its outcome). Never blocks task
+    /// progression — errors are logged and dropped.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn write_sudo_audit(
+        &self,
+        thread_id: &str,
+        tool_name: &str,
+        args: serde_json::Value,
+        reason: String,
+        decision: SudoDecisionTag,
+        reject_reason: Option<String>,
+        inner_outcome: Option<SudoInnerOutcome>,
+    ) {
+        let audit = self.audit.clone();
+        let thread_id = thread_id.to_string();
+        let host_id = self.host_id.clone();
+        let tool_name = tool_name.to_string();
+        tokio::spawn(async move {
+            let outcome_ref = inner_outcome.as_ref().map(|o| match o {
+                SudoInnerOutcome::Ok { is_error } => ToolCallOutcome::Ok {
+                    is_error: *is_error,
+                },
+                SudoInnerOutcome::Failed { message } => ToolCallOutcome::Failed {
+                    message: message.as_str(),
+                },
+            });
+            let entry = SudoDecisionEntry {
+                event: SudoDecisionEventTag::SudoDecision,
+                timestamp: chrono::Utc::now(),
+                thread_id: &thread_id,
+                host_id: &host_id,
+                tool_name: &tool_name,
+                args,
+                reason: &reason,
+                decision,
+                reject_reason: reject_reason.as_deref(),
+                inner_outcome: outcome_ref,
+            };
+            if let Err(e) = audit.write_sudo(&entry).await {
+                error!(error = %e, "sudo audit write failed");
+            }
+        });
     }
 
     /// Fire-and-forget audit write — never blocks task progression.
