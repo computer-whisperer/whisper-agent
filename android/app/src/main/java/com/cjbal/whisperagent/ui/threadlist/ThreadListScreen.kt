@@ -1,6 +1,11 @@
 package com.cjbal.whisperagent.ui.threadlist
 
+import androidx.compose.foundation.ExperimentalFoundationApi
+import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.combinedClickable
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -17,6 +22,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.ArrowDropDown
 import androidx.compose.material.icons.filled.Settings
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
@@ -31,11 +37,14 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
+import androidx.compose.material3.SnackbarHost
+import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -43,6 +52,7 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.cjbal.whisperagent.net.AppSession
@@ -50,6 +60,7 @@ import com.cjbal.whisperagent.net.ConnectionState
 import com.cjbal.whisperagent.protocol.BackendSummary
 import com.cjbal.whisperagent.protocol.ModelSummary
 import com.cjbal.whisperagent.protocol.PodSummary
+import com.cjbal.whisperagent.protocol.ThreadStateLabel
 import com.cjbal.whisperagent.protocol.ThreadSummary
 import kotlinx.coroutines.launch
 
@@ -70,6 +81,17 @@ fun ThreadListScreen(
     val modelsByBackend by session.modelsByBackend.collectAsStateWithLifecycle()
 
     var showCompose by remember { mutableStateOf(false) }
+    // `threadId` of the thread the user long-pressed; non-null → confirmation
+    // dialog is open. Kept local to the list screen — archive is a list-only
+    // operation (you can't archive the thread you're currently viewing).
+    var archiveCandidate by remember { mutableStateOf<ThreadSummary?>(null) }
+    val snackbarHost = remember { SnackbarHostState() }
+
+    LaunchedEffect(session) {
+        session.errors.collect { msg ->
+            snackbarHost.showSnackbar(msg)
+        }
+    }
 
     val selectedPod = selectedPodId?.let { pods[it] }
 
@@ -91,6 +113,7 @@ fun ThreadListScreen(
                 },
             )
         },
+        snackbarHost = { SnackbarHost(snackbarHost) },
         floatingActionButton = {
             FloatingActionButton(onClick = { showCompose = true }) {
                 Icon(Icons.Default.Add, contentDescription = "New thread")
@@ -109,12 +132,38 @@ fun ThreadListScreen(
             } else {
                 LazyColumn(modifier = Modifier.fillMaxSize()) {
                     items(filtered, key = { it.threadId }) { t ->
-                        ThreadRow(t, onClick = { onOpenThread(t.threadId) })
+                        ThreadRow(
+                            t,
+                            onClick = { onOpenThread(t.threadId) },
+                            onLongClick = { archiveCandidate = t },
+                        )
                         HorizontalDivider()
                     }
                 }
             }
         }
+    }
+
+    archiveCandidate?.let { candidate ->
+        AlertDialog(
+            onDismissRequest = { archiveCandidate = null },
+            title = { Text("Archive thread?") },
+            text = {
+                Text(
+                    "“${candidate.title?.takeIf { it.isNotBlank() } ?: candidate.threadId}” " +
+                        "will stop appearing in this list. History stays on disk.",
+                )
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    session.archiveThread(candidate.threadId)
+                    archiveCandidate = null
+                }) { Text("Archive") }
+            },
+            dismissButton = {
+                TextButton(onClick = { archiveCandidate = null }) { Text("Cancel") }
+            },
+        )
     }
 
     if (showCompose) {
@@ -229,23 +278,69 @@ private fun ConnectionBanner(state: ConnectionState) {
     )
 }
 
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
-private fun ThreadRow(summary: ThreadSummary, onClick: () -> Unit) {
-    Column(
+private fun ThreadRow(
+    summary: ThreadSummary,
+    onClick: () -> Unit,
+    onLongClick: () -> Unit,
+) {
+    Row(
         modifier = Modifier
             .fillMaxWidth()
-            .clickable(onClick = onClick)
+            .combinedClickable(onClick = onClick, onLongClick = onLongClick)
             .padding(horizontal = 16.dp, vertical = 12.dp),
+        verticalAlignment = Alignment.CenterVertically,
     ) {
-        Text(
-            text = summary.title?.takeIf { it.isNotBlank() } ?: summary.threadId,
-            style = MaterialTheme.typography.bodyLarge,
-        )
-        Text(
-            text = summary.state.name.lowercase(),
-            style = MaterialTheme.typography.bodySmall,
-        )
+        StateDot(summary.state)
+        Column(modifier = Modifier.padding(start = 12.dp).weight(1f)) {
+            Text(
+                text = summary.title?.takeIf { it.isNotBlank() } ?: summary.threadId,
+                style = MaterialTheme.typography.bodyLarge,
+                maxLines = 1,
+            )
+            // Only surface non-obvious states — idle threads don't need an
+            // extra line saying "idle".
+            stateSubtitle(summary.state)?.let { sub ->
+                Text(
+                    text = sub,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = stateColor(summary.state),
+                )
+            }
+        }
     }
+}
+
+/**
+ * Small filled circle that badges a thread's state. Idle and Completed get a
+ * neutral disk; working / failed / cancelled get their own color so the list
+ * communicates activity at a glance.
+ */
+@Composable
+private fun StateDot(state: ThreadStateLabel) {
+    Box(
+        modifier = Modifier
+            .size(10.dp)
+            .clip(CircleShape)
+            .background(stateColor(state)),
+    )
+}
+
+@Composable
+private fun stateColor(state: ThreadStateLabel) = when (state) {
+    ThreadStateLabel.Working -> MaterialTheme.colorScheme.primary
+    ThreadStateLabel.Failed -> MaterialTheme.colorScheme.error
+    ThreadStateLabel.Cancelled -> MaterialTheme.colorScheme.onSurfaceVariant
+    ThreadStateLabel.Completed -> MaterialTheme.colorScheme.tertiary
+    ThreadStateLabel.Idle -> MaterialTheme.colorScheme.outlineVariant
+}
+
+private fun stateSubtitle(state: ThreadStateLabel): String? = when (state) {
+    ThreadStateLabel.Working -> "working"
+    ThreadStateLabel.Failed -> "failed"
+    ThreadStateLabel.Cancelled -> "cancelled"
+    ThreadStateLabel.Idle, ThreadStateLabel.Completed -> null
 }
 
 @OptIn(ExperimentalMaterial3Api::class)

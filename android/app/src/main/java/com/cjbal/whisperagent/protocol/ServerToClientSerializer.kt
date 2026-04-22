@@ -50,6 +50,12 @@ object ServerToClientSerializer : KSerializer<ServerToClient> {
     private const val IDX_DEFAULT_BACKEND = 24
     private const val IDX_MODELS = 25
     private const val IDX_BACKEND = 26
+    private const val IDX_FUNCTION_ID = 27
+    private const val IDX_TOOL_NAME = 28
+    private const val IDX_REASON = 29
+    private const val IDX_DECISION = 30
+    private const val IDX_NEW_THREAD_ID = 31
+    private const val IDX_SUMMARY_TEXT = 32
 
     private val tasksSerializer = ListSerializer(ThreadSummary.serializer())
     private val podsSerializer = ListSerializer(PodSummary.serializer())
@@ -84,6 +90,12 @@ object ServerToClientSerializer : KSerializer<ServerToClient> {
         element("default_backend", String.serializer().descriptor, isOptional = true)
         element("models", modelsSerializer.descriptor, isOptional = true)
         element("backend", String.serializer().descriptor, isOptional = true)
+        element("function_id", Long.serializer().descriptor, isOptional = true)
+        element("tool_name", String.serializer().descriptor, isOptional = true)
+        element("reason", String.serializer().descriptor, isOptional = true)
+        element("decision", SudoDecision.serializer().descriptor, isOptional = true)
+        element("new_thread_id", String.serializer().descriptor, isOptional = true)
+        element("summary_text", String.serializer().descriptor, isOptional = true)
     }
 
     override fun serialize(encoder: Encoder, value: ServerToClient) {
@@ -125,6 +137,20 @@ object ServerToClientSerializer : KSerializer<ServerToClient> {
                 is ServerToClient.ThreadArchived -> {
                     encodeStringElement(descriptor, IDX_TYPE, "thread_archived")
                     encodeStringElement(descriptor, IDX_THREAD_ID, value.threadId)
+                }
+                is ServerToClient.ThreadCompacted -> {
+                    encodeStringElement(descriptor, IDX_TYPE, "thread_compacted")
+                    encodeStringElement(descriptor, IDX_THREAD_ID, value.threadId)
+                    encodeStringElement(descriptor, IDX_NEW_THREAD_ID, value.newThreadId)
+                    encodeStringElement(descriptor, IDX_SUMMARY_TEXT, value.summaryText)
+                    value.correlationId?.let {
+                        encodeStringElement(descriptor, IDX_CORRELATION_ID, it)
+                    }
+                }
+                is ServerToClient.ThreadDraftUpdated -> {
+                    encodeStringElement(descriptor, IDX_TYPE, "thread_draft_updated")
+                    encodeStringElement(descriptor, IDX_THREAD_ID, value.threadId)
+                    encodeStringElement(descriptor, IDX_TEXT, value.text)
                 }
                 is ServerToClient.Snapshot -> {
                     encodeStringElement(descriptor, IDX_TYPE, "thread_snapshot")
@@ -222,6 +248,21 @@ object ServerToClientSerializer : KSerializer<ServerToClient> {
                         descriptor, IDX_MODELS, modelsSerializer, value.models,
                     )
                 }
+                is ServerToClient.SudoRequested -> {
+                    encodeStringElement(descriptor, IDX_TYPE, "sudo_requested")
+                    encodeLongElement(descriptor, IDX_FUNCTION_ID, value.functionId)
+                    encodeStringElement(descriptor, IDX_THREAD_ID, value.threadId)
+                    encodeStringElement(descriptor, IDX_TOOL_NAME, value.toolName)
+                    encodeStringElement(descriptor, IDX_REASON, value.reason)
+                }
+                is ServerToClient.SudoResolved -> {
+                    encodeStringElement(descriptor, IDX_TYPE, "sudo_resolved")
+                    encodeLongElement(descriptor, IDX_FUNCTION_ID, value.functionId)
+                    encodeStringElement(descriptor, IDX_THREAD_ID, value.threadId)
+                    encodeSerializableElement(
+                        descriptor, IDX_DECISION, SudoDecision.serializer(), value.decision,
+                    )
+                }
                 is ServerToClient.Error -> {
                     encodeStringElement(descriptor, IDX_TYPE, "error")
                     value.correlationId?.let {
@@ -267,6 +308,12 @@ object ServerToClientSerializer : KSerializer<ServerToClient> {
             var defaultBackend: String? = null
             var models: List<ModelSummary>? = null
             var backend: String? = null
+            var functionId: Long? = null
+            var toolName: String? = null
+            var reason: String? = null
+            var decision: SudoDecision? = null
+            var newThreadId: String? = null
+            var summaryText: String? = null
 
             loop@ while (true) {
                 when (val i = decodeElementIndex(descriptor)) {
@@ -312,6 +359,14 @@ object ServerToClientSerializer : KSerializer<ServerToClient> {
                         descriptor, i, modelsSerializer,
                     )
                     IDX_BACKEND -> backend = decodeStringElement(descriptor, i)
+                    IDX_FUNCTION_ID -> functionId = decodeLongElement(descriptor, i)
+                    IDX_TOOL_NAME -> toolName = decodeStringElement(descriptor, i)
+                    IDX_REASON -> reason = decodeStringElement(descriptor, i)
+                    IDX_DECISION -> decision = decodeSerializableElement(
+                        descriptor, i, SudoDecision.serializer(),
+                    )
+                    IDX_NEW_THREAD_ID -> newThreadId = decodeStringElement(descriptor, i)
+                    IDX_SUMMARY_TEXT -> summaryText = decodeStringElement(descriptor, i)
                     else -> throw SerializationException("unexpected element index $i")
                 }
             }
@@ -336,6 +391,16 @@ object ServerToClientSerializer : KSerializer<ServerToClient> {
                 )
                 "thread_archived" -> ServerToClient.ThreadArchived(
                     threadId = requireNotNull(threadId) { "missing thread_id" },
+                )
+                "thread_compacted" -> ServerToClient.ThreadCompacted(
+                    threadId = requireNotNull(threadId) { "missing thread_id" },
+                    newThreadId = requireNotNull(newThreadId) { "missing new_thread_id" },
+                    summaryText = summaryText ?: "",
+                    correlationId = correlationId,
+                )
+                "thread_draft_updated" -> ServerToClient.ThreadDraftUpdated(
+                    threadId = requireNotNull(threadId) { "missing thread_id" },
+                    text = text ?: "",
                 )
                 "thread_snapshot" -> ServerToClient.Snapshot(
                     threadId = requireNotNull(threadId) { "missing thread_id" },
@@ -398,6 +463,17 @@ object ServerToClientSerializer : KSerializer<ServerToClient> {
                     correlationId = correlationId,
                     backend = requireNotNull(backend) { "missing backend" },
                     models = models ?: emptyList(),
+                )
+                "sudo_requested" -> ServerToClient.SudoRequested(
+                    functionId = requireNotNull(functionId) { "missing function_id" },
+                    threadId = requireNotNull(threadId) { "missing thread_id" },
+                    toolName = requireNotNull(toolName) { "missing tool_name" },
+                    reason = reason ?: "",
+                )
+                "sudo_resolved" -> ServerToClient.SudoResolved(
+                    functionId = requireNotNull(functionId) { "missing function_id" },
+                    threadId = requireNotNull(threadId) { "missing thread_id" },
+                    decision = requireNotNull(decision) { "missing decision" },
                 )
                 "error" -> ServerToClient.Error(
                     correlationId = correlationId,

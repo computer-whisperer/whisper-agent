@@ -52,4 +52,65 @@ sealed class ClientToServer {
         val backend: String,
         val correlationId: String? = null,
     ) : ClientToServer()
+
+    data class CancelThread(
+        val threadId: String,
+    ) : ClientToServer()
+
+    data class ArchiveThread(
+        val threadId: String,
+    ) : ClientToServer()
+
+    /**
+     * Reply to a [ServerToClient.SudoRequested] prompt. `functionId` is
+     * the opaque u64 correlator the server assigned to the sudo Function
+     * — pulled straight from the matching `SudoRequested` event.
+     *
+     * Wire-encoded as CBOR unsigned int (major type 0). Kotlin's [Long] is
+     * signed, but sudo function ids are a small monotonic counter so the
+     * value never overflows the positive range.
+     */
+    data class ResolveSudo(
+        val functionId: Long,
+        val decision: SudoDecision,
+        val reason: String? = null,
+    ) : ClientToServer()
+
+    /**
+     * Summarize the conversation into a new thread seeded with that
+     * summary. Server rejects mid-turn or if the thread's compaction is
+     * disabled; reply comes back as [ServerToClient.ThreadCompacted]
+     * carrying the new thread id.
+     */
+    data class CompactThread(
+        val threadId: String,
+        val correlationId: String? = null,
+    ) : ClientToServer()
+
+    /**
+     * Promote a `Failed` thread back to `Idle`. Only valid when the
+     * thread is actually failed; anything else comes back as an `Error`.
+     */
+    data class RecoverThread(
+        val threadId: String,
+        val correlationId: String? = null,
+    ) : ClientToServer()
+
+    /**
+     * Fork a thread at the given user-message index. The new thread's
+     * conversation is the prefix `[0, fromMessageIndex)`; caller opts in
+     * to archiving the source and to resetting capabilities to the pod's
+     * current defaults.
+     *
+     * Server echoes back a `ThreadCreated` with `correlationId` matching
+     * what was sent — AppSession uses this to auto-navigate to the
+     * fork.
+     */
+    data class ForkThread(
+        val threadId: String,
+        val fromMessageIndex: Int,
+        val archiveOriginal: Boolean = false,
+        val resetCapabilities: Boolean = false,
+        val correlationId: String? = null,
+    ) : ClientToServer()
 }

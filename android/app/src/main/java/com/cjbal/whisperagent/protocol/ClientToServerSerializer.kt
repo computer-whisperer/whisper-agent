@@ -41,6 +41,12 @@ object ClientToServerSerializer : KSerializer<ClientToServer> {
     private const val IDX_CONFIG_OVERRIDE = 6
     private const val IDX_BINDINGS_REQUEST = 7
     private const val IDX_BACKEND = 8
+    private const val IDX_FUNCTION_ID = 9
+    private const val IDX_DECISION = 10
+    private const val IDX_REASON = 11
+    private const val IDX_FROM_MESSAGE_INDEX = 12
+    private const val IDX_ARCHIVE_ORIGINAL = 13
+    private const val IDX_RESET_CAPABILITIES = 14
 
     override val descriptor: SerialDescriptor = buildClassSerialDescriptor("ClientToServer") {
         element("type", String.serializer().descriptor)
@@ -52,6 +58,12 @@ object ClientToServerSerializer : KSerializer<ClientToServer> {
         element("config_override", ThreadConfigOverride.serializer().descriptor, isOptional = true)
         element("bindings_request", ThreadBindingsRequest.serializer().descriptor, isOptional = true)
         element("backend", String.serializer().descriptor, isOptional = true)
+        element("function_id", Long.serializer().descriptor, isOptional = true)
+        element("decision", SudoDecision.serializer().descriptor, isOptional = true)
+        element("reason", String.serializer().descriptor, isOptional = true)
+        element("from_message_index", Int.serializer().descriptor, isOptional = true)
+        element("archive_original", Boolean.serializer().descriptor, isOptional = true)
+        element("reset_capabilities", Boolean.serializer().descriptor, isOptional = true)
     }
 
     override fun serialize(encoder: Encoder, value: ClientToServer) {
@@ -119,6 +131,60 @@ object ClientToServerSerializer : KSerializer<ClientToServer> {
                     }
                     encodeStringElement(descriptor, IDX_BACKEND, value.backend)
                 }
+                is ClientToServer.CancelThread -> {
+                    encodeStringElement(descriptor, IDX_TYPE, "cancel_thread")
+                    encodeStringElement(descriptor, IDX_THREAD_ID, value.threadId)
+                }
+                is ClientToServer.ArchiveThread -> {
+                    encodeStringElement(descriptor, IDX_TYPE, "archive_thread")
+                    encodeStringElement(descriptor, IDX_THREAD_ID, value.threadId)
+                }
+                is ClientToServer.ResolveSudo -> {
+                    encodeStringElement(descriptor, IDX_TYPE, "resolve_sudo")
+                    encodeLongElement(descriptor, IDX_FUNCTION_ID, value.functionId)
+                    encodeSerializableElement(
+                        descriptor, IDX_DECISION, SudoDecision.serializer(), value.decision,
+                    )
+                    value.reason?.let {
+                        encodeStringElement(descriptor, IDX_REASON, it)
+                    }
+                }
+                is ClientToServer.CompactThread -> {
+                    encodeStringElement(descriptor, IDX_TYPE, "compact_thread")
+                    encodeStringElement(descriptor, IDX_THREAD_ID, value.threadId)
+                    value.correlationId?.let {
+                        encodeStringElement(descriptor, IDX_CORRELATION_ID, it)
+                    }
+                }
+                is ClientToServer.RecoverThread -> {
+                    encodeStringElement(descriptor, IDX_TYPE, "recover_thread")
+                    encodeStringElement(descriptor, IDX_THREAD_ID, value.threadId)
+                    value.correlationId?.let {
+                        encodeStringElement(descriptor, IDX_CORRELATION_ID, it)
+                    }
+                }
+                is ClientToServer.ForkThread -> {
+                    encodeStringElement(descriptor, IDX_TYPE, "fork_thread")
+                    encodeStringElement(descriptor, IDX_THREAD_ID, value.threadId)
+                    encodeIntElement(
+                        descriptor, IDX_FROM_MESSAGE_INDEX, value.fromMessageIndex,
+                    )
+                    // Matches serde's `#[serde(default)]` — emit only when
+                    // non-default to keep the wire spare.
+                    if (value.archiveOriginal) {
+                        encodeBooleanElement(
+                            descriptor, IDX_ARCHIVE_ORIGINAL, value.archiveOriginal,
+                        )
+                    }
+                    if (value.resetCapabilities) {
+                        encodeBooleanElement(
+                            descriptor, IDX_RESET_CAPABILITIES, value.resetCapabilities,
+                        )
+                    }
+                    value.correlationId?.let {
+                        encodeStringElement(descriptor, IDX_CORRELATION_ID, it)
+                    }
+                }
             }
         }
     }
@@ -136,6 +202,12 @@ object ClientToServerSerializer : KSerializer<ClientToServer> {
             var configOverride: ThreadConfigOverride? = null
             var bindingsRequest: ThreadBindingsRequest? = null
             var backend: String? = null
+            var functionId: Long? = null
+            var decision: SudoDecision? = null
+            var reason: String? = null
+            var fromMessageIndex: Int? = null
+            var archiveOriginal = false
+            var resetCapabilities = false
 
             loop@ while (true) {
                 when (val i = decodeElementIndex(descriptor)) {
@@ -153,6 +225,14 @@ object ClientToServerSerializer : KSerializer<ClientToServer> {
                         descriptor, i, ThreadBindingsRequest.serializer(),
                     )
                     IDX_BACKEND -> backend = decodeStringElement(descriptor, i)
+                    IDX_FUNCTION_ID -> functionId = decodeLongElement(descriptor, i)
+                    IDX_DECISION -> decision = decodeSerializableElement(
+                        descriptor, i, SudoDecision.serializer(),
+                    )
+                    IDX_REASON -> reason = decodeStringElement(descriptor, i)
+                    IDX_FROM_MESSAGE_INDEX -> fromMessageIndex = decodeIntElement(descriptor, i)
+                    IDX_ARCHIVE_ORIGINAL -> archiveOriginal = decodeBooleanElement(descriptor, i)
+                    IDX_RESET_CAPABILITIES -> resetCapabilities = decodeBooleanElement(descriptor, i)
                     else -> throw SerializationException("unexpected element index $i")
                 }
             }
@@ -180,6 +260,34 @@ object ClientToServerSerializer : KSerializer<ClientToServer> {
                 "list_backends" -> ClientToServer.ListBackends(correlationId)
                 "list_models" -> ClientToServer.ListModels(
                     backend = requireNotNull(backend) { "missing backend" },
+                    correlationId = correlationId,
+                )
+                "cancel_thread" -> ClientToServer.CancelThread(
+                    threadId = requireNotNull(threadId) { "missing thread_id" },
+                )
+                "archive_thread" -> ClientToServer.ArchiveThread(
+                    threadId = requireNotNull(threadId) { "missing thread_id" },
+                )
+                "resolve_sudo" -> ClientToServer.ResolveSudo(
+                    functionId = requireNotNull(functionId) { "missing function_id" },
+                    decision = requireNotNull(decision) { "missing decision" },
+                    reason = reason,
+                )
+                "compact_thread" -> ClientToServer.CompactThread(
+                    threadId = requireNotNull(threadId) { "missing thread_id" },
+                    correlationId = correlationId,
+                )
+                "recover_thread" -> ClientToServer.RecoverThread(
+                    threadId = requireNotNull(threadId) { "missing thread_id" },
+                    correlationId = correlationId,
+                )
+                "fork_thread" -> ClientToServer.ForkThread(
+                    threadId = requireNotNull(threadId) { "missing thread_id" },
+                    fromMessageIndex = requireNotNull(fromMessageIndex) {
+                        "missing from_message_index"
+                    },
+                    archiveOriginal = archiveOriginal,
+                    resetCapabilities = resetCapabilities,
                     correlationId = correlationId,
                 )
                 null -> throw SerializationException("missing 'type' discriminator")

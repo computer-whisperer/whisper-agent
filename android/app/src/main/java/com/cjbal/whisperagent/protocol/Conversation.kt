@@ -38,11 +38,14 @@ typealias Conversation = List<Message>
 sealed class ContentBlock {
     data class Text(val text: String) : ContentBlock()
 
-    // TODO: ToolUse.input is `serde_json::Value` — decide how to carry a
-    //       CBOR-tree value once the proof-of-concept confirms the shape.
+    // `argsPreview` is a client-side-only field populated from streaming
+    // `ThreadToolCallBegin.args_preview` — the wire `ToolUse.input` is a
+    // `serde_json::Value` we don't decode yet (pending CBOR-tree support).
+    // Never sent to the server.
     data class ToolUse(
         val id: String,
         val name: String,
+        val argsPreview: String? = null,
     ) : ContentBlock()
 
     // TODO: ToolResult.content is `ToolResultContent` (also a sealed enum in

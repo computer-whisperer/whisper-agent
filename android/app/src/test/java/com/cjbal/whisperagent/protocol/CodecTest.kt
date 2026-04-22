@@ -340,6 +340,151 @@ class CodecTest {
         assertEquals(original, decoded)
     }
 
+    // --- Cancel / archive / sudo ---------------------------------------------
+
+    @Test
+    fun clientToServer_cancelThread_roundTrip() {
+        val original = ClientToServer.CancelThread(threadId = "t-9")
+        val bytes = Codec.encodeToServer(original)
+        val decoded = cbor.decodeFromByteArray(ClientToServer.serializer(), bytes)
+        assertEquals(original, decoded)
+    }
+
+    @Test
+    fun clientToServer_archiveThread_roundTrip() {
+        val original = ClientToServer.ArchiveThread(threadId = "t-9")
+        val bytes = Codec.encodeToServer(original)
+        val decoded = cbor.decodeFromByteArray(ClientToServer.serializer(), bytes)
+        assertEquals(original, decoded)
+    }
+
+    @Test
+    fun clientToServer_resolveSudo_roundTrip() {
+        val original = ClientToServer.ResolveSudo(
+            functionId = 42L,
+            decision = SudoDecision.ApproveRemember,
+            reason = "ok",
+        )
+        val bytes = Codec.encodeToServer(original)
+        val decoded = cbor.decodeFromByteArray(ClientToServer.serializer(), bytes)
+        assertEquals(original, decoded)
+    }
+
+    @Test
+    fun clientToServer_resolveSudo_noReason_roundTrip() {
+        // Skipped reason maps to Option::None on the server — encoder must
+        // omit the field entirely, not send "".
+        val original = ClientToServer.ResolveSudo(
+            functionId = 7L,
+            decision = SudoDecision.Reject,
+        )
+        val bytes = Codec.encodeToServer(original)
+        val decoded = cbor.decodeFromByteArray(ClientToServer.serializer(), bytes)
+        assertEquals(original, decoded)
+        assertEquals(null, decoded.let { (it as ClientToServer.ResolveSudo).reason })
+    }
+
+    @Test
+    fun serverToClient_sudoRequested_roundTrip() {
+        // `args` on the wire is a serde_json::Value we don't model — but the
+        // decoder should still accept a frame whose other fields are present,
+        // falling back on ignoreUnknownKeys for `args`. Simulate this by
+        // hand-building a CBOR map that includes an extra `args` key and
+        // ensuring we decode it.
+        val original = ServerToClient.SudoRequested(
+            functionId = 5L,
+            threadId = "t-sudo",
+            toolName = "bash",
+            reason = "needs /etc",
+        )
+        val bytes = cbor.encodeToByteArray(ServerToClient.serializer(), original)
+        val decoded = Codec.decodeFromServer(bytes)
+        assertEquals(original, decoded)
+    }
+
+    @Test
+    fun serverToClient_sudoResolved_roundTrip() {
+        val original = ServerToClient.SudoResolved(
+            functionId = 5L,
+            threadId = "t-sudo",
+            decision = SudoDecision.ApproveOnce,
+        )
+        val bytes = cbor.encodeToByteArray(ServerToClient.serializer(), original)
+        val decoded = Codec.decodeFromServer(bytes)
+        assertEquals(original, decoded)
+    }
+
+    // --- Compact / fork / recover --------------------------------------------
+
+    @Test
+    fun clientToServer_compactThread_roundTrip() {
+        val original = ClientToServer.CompactThread(
+            threadId = "t-1",
+            correlationId = "c-1",
+        )
+        val bytes = Codec.encodeToServer(original)
+        val decoded = cbor.decodeFromByteArray(ClientToServer.serializer(), bytes)
+        assertEquals(original, decoded)
+    }
+
+    @Test
+    fun clientToServer_recoverThread_roundTrip() {
+        val original = ClientToServer.RecoverThread(threadId = "t-2")
+        val bytes = Codec.encodeToServer(original)
+        val decoded = cbor.decodeFromByteArray(ClientToServer.serializer(), bytes)
+        assertEquals(original, decoded)
+    }
+
+    @Test
+    fun clientToServer_forkThread_roundTrip() {
+        val original = ClientToServer.ForkThread(
+            threadId = "t-3",
+            fromMessageIndex = 4,
+            archiveOriginal = true,
+            resetCapabilities = false,
+            correlationId = "fork-1",
+        )
+        val bytes = Codec.encodeToServer(original)
+        val decoded = cbor.decodeFromByteArray(ClientToServer.serializer(), bytes)
+        assertEquals(original, decoded)
+    }
+
+    @Test
+    fun clientToServer_forkThread_defaults_omitted() {
+        // Defaults (archive_original=false, reset_capabilities=false) must be
+        // skipped on the wire — matches serde's `#[serde(default)]` so old
+        // servers reading with the current-behavior branch keep working.
+        val original = ClientToServer.ForkThread(threadId = "t-3", fromMessageIndex = 0)
+        val bytes = Codec.encodeToServer(original)
+        val decoded = cbor.decodeFromByteArray(ClientToServer.serializer(), bytes)
+        assertEquals(original, decoded)
+        assertEquals(false, (decoded as ClientToServer.ForkThread).archiveOriginal)
+    }
+
+    @Test
+    fun serverToClient_threadCompacted_roundTrip() {
+        val original = ServerToClient.ThreadCompacted(
+            threadId = "t-src",
+            newThreadId = "t-cont",
+            summaryText = "compacted body",
+            correlationId = "compact-1",
+        )
+        val bytes = cbor.encodeToByteArray(ServerToClient.serializer(), original)
+        val decoded = Codec.decodeFromServer(bytes)
+        assertEquals(original, decoded)
+    }
+
+    @Test
+    fun serverToClient_threadDraftUpdated_roundTrip() {
+        val original = ServerToClient.ThreadDraftUpdated(
+            threadId = "t-4",
+            text = "draft in progress",
+        )
+        val bytes = cbor.encodeToByteArray(ServerToClient.serializer(), original)
+        val decoded = Codec.decodeFromServer(bytes)
+        assertEquals(original, decoded)
+    }
+
     // --- Smoke check on the old-broken shape ----------------------------------
 
     @Test

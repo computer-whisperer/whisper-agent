@@ -70,6 +70,10 @@ private fun WhisperAgentApp(app: WhisperAgentApp) {
                         popUpTo(Routes.SETTINGS) { inclusive = true }
                     }
                 },
+                onClear = {
+                    app.settings.clear()
+                    app.session.restart()
+                },
             )
         }
         composable(Routes.THREADS) {

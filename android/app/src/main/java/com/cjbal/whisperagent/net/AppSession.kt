@@ -11,12 +11,14 @@ import com.cjbal.whisperagent.protocol.ModelSummary
 import com.cjbal.whisperagent.protocol.PodSummary
 import com.cjbal.whisperagent.protocol.Role
 import com.cjbal.whisperagent.protocol.ServerToClient
+import com.cjbal.whisperagent.protocol.SudoDecision
 import com.cjbal.whisperagent.protocol.ThreadBindingsRequest
 import com.cjbal.whisperagent.protocol.ThreadConfigOverride
 import com.cjbal.whisperagent.protocol.ThreadSnapshot
 import com.cjbal.whisperagent.protocol.ThreadSummary
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharedFlow
@@ -100,12 +102,30 @@ class AppSession(
     private val _pendingNavigation = MutableSharedFlow<String>(extraBufferCapacity = 1)
     val pendingNavigation: SharedFlow<String> = _pendingNavigation.asSharedFlow()
 
+    /**
+     * Server-sent error strings, fanned out to any UI snackbar host. Buffered
+     * so an error arriving while no subscriber is active still gets shown on
+     * the next screen composition.
+     */
+    private val _errors = MutableSharedFlow<String>(extraBufferCapacity = 16)
+    val errors: SharedFlow<String> = _errors.asSharedFlow()
+
+    /**
+     * Outstanding sudo prompts keyed by thread id. We only model one
+     * outstanding prompt per thread — the server serializes sudo Functions
+     * within a thread anyway. Cleared on [SudoResolved], thread unsubscribe,
+     * and disconnect.
+     */
+    private val _pendingSudo = MutableStateFlow<Map<String, PendingSudo>>(emptyMap())
+    val pendingSudo: StateFlow<Map<String, PendingSudo>> = _pendingSudo.asStateFlow()
+
     private val correlationCounter = AtomicLong(0)
     private var pendingCreateCorrelation: String? = null
 
     private var pumpJob: Job? = null
     private var subscribedThreadId: String? = null
     private var foreground: Boolean = false
+    private var reconnectJob: Job? = null
 
     init {
         startPump()
@@ -118,6 +138,8 @@ class AppSession(
 
     fun onAppBackgrounded() {
         foreground = false
+        reconnectJob?.cancel()
+        reconnectJob = null
         wire.disconnect()
     }
 
@@ -125,6 +147,8 @@ class AppSession(
      * Call after the user saves new credentials on the settings screen.
      */
     fun restart() {
+        reconnectJob?.cancel()
+        reconnectJob = null
         wire.disconnect()
         if (foreground) connectIfConfigured()
     }
@@ -139,6 +163,10 @@ class AppSession(
         val id = subscribedThreadId ?: return
         subscribedThreadId = null
         _activeSnapshot.value = null
+        // Banner belongs to the thread you were just on — dropping it here
+        // matches what the server does on UnsubscribeFromThread (no more
+        // SudoRequested/SudoResolved for that thread until you re-subscribe).
+        _pendingSudo.update { it - id }
         wire.send(ClientToServer.UnsubscribeFromThread(id))
     }
 
@@ -146,6 +174,88 @@ class AppSession(
         val id = subscribedThreadId ?: return
         if (text.isBlank()) return
         wire.send(ClientToServer.SendUserMessage(id, text))
+    }
+
+    /**
+     * Ask the server to cancel a running thread. Server flips the state to
+     * `Cancelled`; we'll pick up the transition via
+     * [ServerToClient.ThreadStateChanged].
+     */
+    fun cancelThread(threadId: String) {
+        if (threadId.isBlank()) return
+        wire.send(ClientToServer.CancelThread(threadId))
+    }
+
+    /**
+     * Archive (hide) a thread. It stays on disk but drops off the broadcast
+     * list and [ServerToClient.ThreadArchived] prunes it from [threads].
+     */
+    fun archiveThread(threadId: String) {
+        if (threadId.isBlank()) return
+        wire.send(ClientToServer.ArchiveThread(threadId))
+    }
+
+    /**
+     * Resolve an outstanding sudo prompt. Clears the local pending entry so
+     * the UI drops the banner immediately — the broadcast [ServerToClient.SudoResolved]
+     * is authoritative but races the round-trip.
+     */
+    /**
+     * Ask the server to compact the thread. On success the server will
+     * emit `ThreadCompacted` and a `ThreadCreated` for the continuation; we
+     * navigate the UI to the new thread via [pendingNavigation].
+     */
+    fun compactThread(threadId: String) {
+        if (threadId.isBlank()) return
+        val correlation = "compact-${correlationCounter.incrementAndGet()}"
+        pendingCreateCorrelation = correlation
+        wire.send(ClientToServer.CompactThread(threadId = threadId, correlationId = correlation))
+    }
+
+    /**
+     * Promote a failed thread back to `Idle`. Ignored if the thread isn't
+     * actually failed — the server rejects with `Error` in that case, which
+     * our snackbar surfaces.
+     */
+    fun recoverThread(threadId: String) {
+        if (threadId.isBlank()) return
+        wire.send(ClientToServer.RecoverThread(threadId))
+    }
+
+    /**
+     * Fork the currently-subscribed thread at [fromMessageIndex]. Navigation
+     * to the fork rides the standard `ThreadCreated` correlation path.
+     */
+    fun forkThread(
+        threadId: String,
+        fromMessageIndex: Int,
+        archiveOriginal: Boolean = true,
+        resetCapabilities: Boolean = false,
+    ) {
+        if (threadId.isBlank()) return
+        val correlation = "fork-${correlationCounter.incrementAndGet()}"
+        pendingCreateCorrelation = correlation
+        wire.send(
+            ClientToServer.ForkThread(
+                threadId = threadId,
+                fromMessageIndex = fromMessageIndex,
+                archiveOriginal = archiveOriginal,
+                resetCapabilities = resetCapabilities,
+                correlationId = correlation,
+            ),
+        )
+    }
+
+    fun resolveSudo(threadId: String, decision: SudoDecision, reason: String? = null) {
+        val pending = _pendingSudo.value[threadId] ?: return
+        wire.send(
+            ClientToServer.ResolveSudo(
+                functionId = pending.functionId,
+                decision = decision,
+                reason = reason?.takeIf { it.isNotBlank() },
+            ),
+        )
+        _pendingSudo.update { it - threadId }
     }
 
     /**
@@ -222,26 +332,59 @@ class AppSession(
             // keep the catalog fresh after the initial snapshot.
             launch {
                 wire.state.collect { s ->
-                    if (s is ConnectionState.Connected) {
-                        wire.send(ClientToServer.ListThreads())
-                        wire.send(ClientToServer.ListPods())
-                        wire.send(ClientToServer.ListBackends())
-                        // Re-subscribe the screen the user was last on.
-                        subscribedThreadId?.let {
-                            wire.send(ClientToServer.SubscribeToThread(it))
+                    when (s) {
+                        is ConnectionState.Connected -> {
+                            reconnectJob?.cancel()
+                            reconnectJob = null
+                            wire.send(ClientToServer.ListThreads())
+                            wire.send(ClientToServer.ListPods())
+                            wire.send(ClientToServer.ListBackends())
+                            // Re-subscribe the screen the user was last on.
+                            subscribedThreadId?.let {
+                                wire.send(ClientToServer.SubscribeToThread(it))
+                            }
                         }
-                    }
-                    if (s is ConnectionState.Disconnected) {
-                        _activeSnapshot.value = null
-                        // Drop cached model lists — they're tied to the server
-                        // we just disconnected from; next connection will refetch
-                        // on demand.
-                        _modelsByBackend.value = emptyMap()
-                        modelsInFlight.clear()
+                        ConnectionState.Disconnected,
+                        is ConnectionState.Errored,
+                        -> {
+                            _activeSnapshot.value = null
+                            // Drop any pending sudo banners — they're tied to the
+                            // session we just lost. The server will re-send
+                            // SudoRequested for still-live prompts on re-subscribe.
+                            _pendingSudo.value = emptyMap()
+                            // Drop cached model lists — they're tied to the server
+                            // we just disconnected from; next connection will refetch
+                            // on demand.
+                            _modelsByBackend.value = emptyMap()
+                            modelsInFlight.clear()
+                            // Transient drop while the user is actively using the
+                            // app? Re-dial with a small backoff rather than sit
+                            // silent until the next foreground cycle.
+                            if (foreground) scheduleReconnect()
+                        }
+                        ConnectionState.Connecting -> Unit
                     }
                 }
             }
             wire.incoming.collect(::reduce)
+        }
+    }
+
+    /**
+     * Kick off a bounded exponential-backoff reconnect loop. Cheap enough to
+     * run on one Job; [startPump]'s Connected branch cancels it the moment we
+     * reattach.
+     */
+    private fun scheduleReconnect() {
+        if (reconnectJob?.isActive == true) return
+        reconnectJob = scope.launch {
+            var delayMs = INITIAL_RECONNECT_DELAY_MS
+            while (foreground && wire.state.value !is ConnectionState.Connected) {
+                delay(delayMs)
+                if (!foreground) return@launch
+                connectIfConfigured()
+                delayMs = (delayMs * 2).coerceAtMost(MAX_RECONNECT_DELAY_MS)
+            }
         }
     }
 
@@ -278,6 +421,16 @@ class AppSession(
             }
             is ServerToClient.ThreadArchived -> {
                 _threads.update { it - event.threadId }
+            }
+            is ServerToClient.ThreadCompacted -> {
+                // The matching ThreadCreated + correlation will drive navigation
+                // into the continuation thread. Nothing to do here beyond
+                // letting the original thread fall through — the server keeps
+                // it in place, flipped to Completed, via ThreadStateChanged.
+            }
+            is ServerToClient.ThreadDraftUpdated -> {
+                // No draft UI yet on Android — event is decoded so it stops
+                // landing on the Unknown branch.
             }
             is ServerToClient.PodList -> {
                 _pods.value = event.pods
@@ -322,8 +475,25 @@ class AppSession(
             is ServerToClient.ToolCallEnd,
             is ServerToClient.LoopComplete,
             -> reduceStreaming(event)
+            is ServerToClient.SudoRequested -> {
+                _pendingSudo.update {
+                    it + (event.threadId to PendingSudo(
+                        functionId = event.functionId,
+                        threadId = event.threadId,
+                        toolName = event.toolName,
+                        reason = event.reason,
+                    ))
+                }
+            }
+            is ServerToClient.SudoResolved -> {
+                _pendingSudo.update { map ->
+                    val existing = map[event.threadId] ?: return@update map
+                    if (existing.functionId == event.functionId) map - event.threadId else map
+                }
+            }
             is ServerToClient.Error -> {
                 Log.w(TAG, "server error: ${event.message}")
+                _errors.tryEmit(event.message)
             }
             is ServerToClient.Unknown -> {
                 Log.d(TAG, "unhandled variant: ${event.type}")
@@ -359,7 +529,11 @@ class AppSession(
                     asThinkingDelta = event.delta,
                 )
                 is ServerToClient.ToolCallBegin -> snap.appendBlockToLastAssistant(
-                    ContentBlock.ToolUse(id = event.toolUseId, name = event.name),
+                    ContentBlock.ToolUse(
+                        id = event.toolUseId,
+                        name = event.name,
+                        argsPreview = event.argsPreview.ifBlank { null },
+                    ),
                 )
                 is ServerToClient.ToolCallEnd -> snap.appendToolResult(
                     ContentBlock.ToolResult(
@@ -404,8 +578,23 @@ class AppSession(
 
     companion object {
         private const val TAG = "AppSession"
+        private const val INITIAL_RECONNECT_DELAY_MS = 1_000L
+        private const val MAX_RECONNECT_DELAY_MS = 30_000L
     }
 }
+
+/**
+ * UI-facing view of an outstanding sudo prompt. `functionId` is the opaque
+ * correlator the server uses to match our [ClientToServer.ResolveSudo] to the
+ * pending Function — AppSession round-trips it without the UI caring what's
+ * inside.
+ */
+data class PendingSudo(
+    val functionId: Long,
+    val threadId: String,
+    val toolName: String,
+    val reason: String,
+)
 
 // --- Snapshot mutation helpers --------------------------------------------------
 //

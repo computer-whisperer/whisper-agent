@@ -42,6 +42,29 @@ sealed class ServerToClient {
         val threadId: String,
     ) : ServerToClient()
 
+    /**
+     * `CompactThread` finished: the scheduler spawned [newThreadId] seeded
+     * with the extracted summary. AppSession emits a navigation hint so the
+     * UI can jump to the continuation thread.
+     */
+    data class ThreadCompacted(
+        val threadId: String,
+        val newThreadId: String,
+        val summaryText: String,
+        val correlationId: String? = null,
+    ) : ServerToClient()
+
+    /**
+     * Broadcast when the persisted draft for a thread changes. Fanout
+     * excludes the client that issued the `SetThreadDraft`. The Android
+     * client doesn't send drafts today; we still decode this event so it
+     * stops landing as [Unknown].
+     */
+    data class ThreadDraftUpdated(
+        val threadId: String,
+        val text: String,
+    ) : ServerToClient()
+
     // --- Per-thread tier ------------------------------------------------------
 
     data class Snapshot(
@@ -124,6 +147,36 @@ sealed class ServerToClient {
         val correlationId: String? = null,
         val backend: String,
         val models: List<ModelSummary>,
+    ) : ServerToClient()
+
+    // --- Sudo / escalation ----------------------------------------------------
+
+    /**
+     * A tool that fell outside the thread's scope wants an escalation decision.
+     * Persists until the user resolves it with [ClientToServer.ResolveSudo].
+     *
+     * `args` is `serde_json::Value` on the server — we don't decode it (no
+     * CBOR-tree type available); the decoder's `ignoreUnknownKeys = true`
+     * skips it silently. UI shows [toolName] + [reason]; for a richer preview
+     * the model's own `ToolCallBegin.argsPreview` is usually already in the
+     * conversation.
+     */
+    data class SudoRequested(
+        val functionId: Long,
+        val threadId: String,
+        val toolName: String,
+        val reason: String,
+    ) : ServerToClient()
+
+    /**
+     * Broadcast after any subscriber resolves a matching [SudoRequested].
+     * Emitted to every subscriber, not just the approver, so observers reflect
+     * the decision and clear any local banner.
+     */
+    data class SudoResolved(
+        val functionId: Long,
+        val threadId: String,
+        val decision: SudoDecision,
     ) : ServerToClient()
 
     // --- Errors ---------------------------------------------------------------
