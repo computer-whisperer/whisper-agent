@@ -1,24 +1,16 @@
-_create_user() {
-    getent group whisper-agent >/dev/null || \
-        groupadd --system whisper-agent
-    getent passwd whisper-agent >/dev/null || \
-        useradd --system \
-                --gid whisper-agent \
-                --no-create-home \
-                --home-dir /var/lib/whisper-agent \
-                --shell /usr/bin/nologin \
-                whisper-agent
-}
-
 post_install() {
-    _create_user
-
     cat <<MSG
 ==> whisper-agent-host installed.
 
   This package ships the host-side daemons:
     /usr/bin/whisper-agent-sandbox    landlock-isolated MCP host provisioner
     /usr/bin/whisper-agent-mcp-host   the per-thread MCP server (spawned by sandbox)
+
+  The daemon runs as root. Landlock rules — applied per-child from
+  each pod's \`allowed_paths\` — are the filesystem gate. Running as a
+  dedicated service user would subtract DAC reach before landlock
+  ever narrowed it, leaving workspaces like /home/<you>/projects
+  unreachable regardless of what the pod config requested.
 
   The control-plane bearer token is auto-generated on first start at:
     /var/lib/whisper-agent/sandbox-control-token   (mode 0600)
@@ -37,7 +29,23 @@ MSG
 }
 
 post_upgrade() {
-    _create_user
+    # Pre-0.3.0-2 the daemon ran under a dedicated 'whisper-agent'
+    # system user. That model is gone — landlock alone is the gate
+    # now. Old installs may still have the user + the root-owned
+    # state dir; clean up best-effort so a restart picks up the new
+    # user cleanly. Failure here is non-fatal (the admin may have
+    # repurposed the user).
+    if getent passwd whisper-agent >/dev/null; then
+        echo "==> removing legacy 'whisper-agent' system user (no longer used)"
+        userdel whisper-agent 2>/dev/null || true
+    fi
+    if getent group whisper-agent >/dev/null; then
+        groupdel whisper-agent 2>/dev/null || true
+    fi
+    # Re-chown the state dir so the root-owned daemon can write it.
+    if [[ -d /var/lib/whisper-agent ]]; then
+        chown -R root:root /var/lib/whisper-agent 2>/dev/null || true
+    fi
 
     if systemctl is-active --quiet whisper-agent-sandbox.service 2>/dev/null; then
         echo "==> restart whisper-agent-sandbox.service to pick up new binaries"
@@ -57,11 +65,10 @@ post_remove() {
     cat <<MSG
 ==> whisper-agent-host removed.
 
-  The 'whisper-agent' system user and the runtime data directory
-  /var/lib/whisper-agent/ were preserved (sandbox-control-token,
-  pods/, audit.jsonl). Remove them manually if no longer needed:
+  The runtime data directory /var/lib/whisper-agent/ was preserved
+  (sandbox-control-token, pods/, audit.jsonl). Remove it manually
+  if no longer needed:
 
-    userdel whisper-agent
     rm -rf /var/lib/whisper-agent
 MSG
 }

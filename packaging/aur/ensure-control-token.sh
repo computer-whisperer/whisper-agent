@@ -8,7 +8,7 @@
 #
 # The token is 64 hex chars (256 bits of /dev/urandom). The file is
 # created mode 0600, owned by whoever runs this script (the systemd
-# unit runs it as the whisper-agent service user).
+# unit runs it as root).
 
 set -euo pipefail
 

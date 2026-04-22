@@ -18,7 +18,7 @@
 
 pkgname=whisper-agent-host
 pkgver=0.3.0
-pkgrel=1
+pkgrel=2
 pkgdesc="Host-side sandbox daemon for whisper-agent (landlock-isolated per-thread MCP hosts)"
 arch=('x86_64' 'aarch64')
 url="https://github.com/computer-whisperer/whisper-agent"

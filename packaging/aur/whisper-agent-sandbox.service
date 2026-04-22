@@ -6,8 +6,13 @@ After=network-online.target
 
 [Service]
 Type=simple
-User=whisper-agent
-Group=whisper-agent
+# Runs as root by design. The daemon's job is to provision
+# landlock-isolated mcp-host children that reach into host files on
+# behalf of a remote whisper-agent server; confining the daemon under
+# an unprivileged service user would subtract DAC reach before
+# landlock ever narrows it, leaving the gate mostly-closed regardless
+# of what the pod's `allowed_paths` lists. Landlock is the gate.
+# (System-level hardening below still applies to the daemon process.)
 
 # Tunables (LISTEN address etc.). Optional; the unit ships with a
 # sample at /etc/whisper-agent/sandbox.env populated with the
@@ -15,9 +20,9 @@ Group=whisper-agent
 EnvironmentFile=-/etc/whisper-agent/sandbox.env
 Environment=WHISPER_AGENT_SANDBOX_LISTEN=[::]:9820
 
-# systemd creates /var/lib/whisper-agent (mode 0750, owned by the
-# service user) before ExecStartPre fires, so the helper can drop the
-# control token there without a separate tmpfiles.d entry.
+# systemd creates /var/lib/whisper-agent before ExecStartPre fires, so
+# the helper can drop the control token there without a separate
+# tmpfiles.d entry.
 StateDirectory=whisper-agent
 StateDirectoryMode=0750
 
@@ -36,13 +41,15 @@ Restart=on-failure
 RestartSec=5
 
 # --- Hardening ---------------------------------------------------------
-# The sandbox daemon and the mcp-host children it spawns are unprivileged:
-# landlock applies user-mode restrictions, no caps required. Drop them all.
+# The daemon runs as root but doesn't need any capabilities of its own
+# — landlock is a purely-userland gate and the spawned children
+# inherit no caps (pre_exec drops them). Drop the bounding set so a
+# compromised daemon can't regain privilege.
 CapabilityBoundingSet=
 AmbientCapabilities=
 NoNewPrivileges=yes
 
-# Filesystem isolation. ReadWritePaths grants back the state dir.
+# Filesystem isolation.
 #
 # Deliberately NOT setting PrivateTmp=yes: pods configure their
 # workspace root as a host path (commonly under /tmp for scratch
@@ -51,13 +58,13 @@ NoNewPrivileges=yes
 # child would see an empty tmpfs and fail to start. Per-thread
 # isolation is landlock's job, not systemd's.
 #
-# ProtectHome is left on: the whisper-agent user has no legitimate
-# access to /home or /root; sandbox workspaces that need to live
-# under a user home should either chown the directory to the
-# whisper-agent user or use a path outside of ProtectHome's default
-# cover.
+# ProtectHome is NOT set here either: pods routinely declare
+# workspaces under `/home/<user>/` (e.g. a data dir, a project
+# checkout), and landlock — applied per-child with the pod's
+# `allowed_paths` — is what actually scopes the child's reach. Having
+# systemd blanket-deny /home at the daemon level would prevent the
+# very resolution the child needs to perform.
 ProtectSystem=strict
-ProtectHome=yes
 ReadWritePaths=/var/lib/whisper-agent
 
 # Kernel surface: nothing the daemon needs.
