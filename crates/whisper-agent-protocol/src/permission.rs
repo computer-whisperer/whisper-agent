@@ -205,8 +205,16 @@ impl<T: Ord + Clone> Default for SetOrAll<T> {
 /// |---------------|---------------------------------------------------------------|
 /// | `None`        | nothing                                                       |
 /// | `Memories`    | `memory/**`                                                   |
-/// | `Content`     | `Memories` + `system_prompt.md`, `behaviors/*/prompt.md`, `behaviors/*/behavior.toml` |
-/// | `ModifyAllow` | `Content` + `pod.toml`                                        |
+/// | `Content`     | `Memories` + `system_prompt.md`, `behaviors/<id>/*.md`, `behaviors/<id>/behavior.toml` |
+/// | `ModifyAllow` | `Content` + `pod.toml` + any `*.md` anywhere in the pod       |
+///
+/// `ModifyAllow` is deliberately blacklist-shaped at the .md tier:
+/// scheduler-owned runtime state (`threads/*.json`,
+/// `behaviors/<id>/state.json`, `pod_state.json`) is all `.json`, so
+/// "any .md anywhere" stays inside the content surface without
+/// needing a long deny list. A future non-`.md` scheduler file would
+/// need to land outside the pod tree or acquire its own explicit
+/// deny entry.
 #[derive(
     Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default,
 )]
@@ -251,8 +259,18 @@ impl PodModifyCap {
                 if p == "system_prompt.md" {
                     return true;
                 }
-                if let Some(rest) = p.strip_prefix("behaviors/") {
-                    return rest.ends_with("/prompt.md") || rest.ends_with("/behavior.toml");
+                if let Some(rest) = p.strip_prefix("behaviors/")
+                    && let Some((id, file)) = rest.split_once('/')
+                {
+                    // Single-level under behaviors/<id>/: reject any
+                    // further nesting. `state.json` is scheduler-owned
+                    // and gated separately; this tier admits config +
+                    // any markdown (prompt.md, custom system prompts,
+                    // supplementary docs).
+                    if id.is_empty() || file.contains('/') {
+                        return false;
+                    }
+                    return file == "behavior.toml" || file.ends_with(".md");
                 }
                 false
             }
@@ -260,7 +278,13 @@ impl PodModifyCap {
                 if Self::Content.admits(p) {
                     return true;
                 }
-                p == "pod.toml"
+                if p == "pod.toml" {
+                    return true;
+                }
+                // Blanket admission for any `.md` file anywhere in
+                // the pod. See the cap-table doc comment for why this
+                // is safe without an explicit deny list.
+                p.ends_with(".md")
             }
         }
     }
@@ -588,7 +612,22 @@ mod tests {
         assert!(cap.admits("system_prompt.md"));
         assert!(cap.admits("behaviors/cron-daily/prompt.md"));
         assert!(cap.admits("behaviors/cron-daily/behavior.toml"));
+        // Content now admits any .md file inside a behavior dir, not
+        // just the hardcoded `prompt.md`. Behaviors that reference a
+        // `system_prompt.md` (or any supplementary markdown) via
+        // their config's `system_prompt = { kind = "file", ... }`
+        // need to be able to author that file.
+        assert!(cap.admits("behaviors/cron-daily/system_prompt.md"));
+        assert!(cap.admits("behaviors/cron-daily/notes.md"));
+        // Still rejects non-md suffixes and `state.json`.
         assert!(!cap.admits("behaviors/cron-daily/other.txt"));
+        assert!(!cap.admits("behaviors/cron-daily/state.json"));
+        // Nested subdirs under a behavior id are rejected — the
+        // behavior dir is flat.
+        assert!(!cap.admits("behaviors/cron-daily/nested/foo.md"));
+        // Rejects the `behaviors/` root itself and empty id segments.
+        assert!(!cap.admits("behaviors/"));
+        assert!(!cap.admits("behaviors//prompt.md"));
         assert!(!cap.admits("pod.toml"));
     }
 
@@ -598,6 +637,27 @@ mod tests {
         assert!(cap.admits("memory/notes.md"));
         assert!(cap.admits("system_prompt.md"));
         assert!(cap.admits("pod.toml"));
+    }
+
+    #[test]
+    fn pod_modify_cap_admits_modify_allow_blanket_md() {
+        let cap = PodModifyCap::ModifyAllow;
+        // Blacklist tier: any .md file anywhere. Covers custom names
+        // that don't fit the Content whitelist — a compaction prompt
+        // file at the pod root, a supplementary doc outside `memory/`,
+        // etc.
+        assert!(cap.admits("notes.md"));
+        assert!(cap.admits("docs/architecture.md"));
+        assert!(cap.admits("compaction.md"));
+        assert!(cap.admits("behaviors/x/system_prompt.md"));
+        // Scheduler-owned JSON files stay unreachable: admits follows
+        // the .md gate, not a broader "any file" rule.
+        assert!(!cap.admits("threads/task-foo.json"));
+        assert!(!cap.admits("behaviors/x/state.json"));
+        assert!(!cap.admits("pod_state.json"));
+        // Non-.md content files also stay outside the tier.
+        assert!(!cap.admits("script.sh"));
+        assert!(!cap.admits("data.csv"));
     }
 
     #[test]

@@ -372,11 +372,17 @@ pub async fn dispatch(
              Ask for scope widening if this action is needed."
         ));
     }
+    let system_prompt_file = pod_config.thread_defaults.system_prompt_file.as_str();
     match tool_name {
-        POD_LIST_FILES => filesystem::list_files(&pod_dir, &allowed, args).await,
+        POD_LIST_FILES => filesystem::list_files(&pod_dir, &allowed, &behavior_ids, args).await,
         POD_READ_FILE => filesystem::read_file(&pod_dir, &allowed, &behavior_ids, args).await,
-        POD_WRITE_FILE => filesystem::write_file(&pod_dir, &allowed, &behavior_ids, args).await,
-        POD_EDIT_FILE => filesystem::edit_file(&pod_dir, &allowed, &behavior_ids, args).await,
+        POD_WRITE_FILE => {
+            filesystem::write_file(&pod_dir, &allowed, &behavior_ids, system_prompt_file, args)
+                .await
+        }
+        POD_EDIT_FILE => {
+            filesystem::edit_file(&pod_dir, &allowed, &behavior_ids, system_prompt_file, args).await
+        }
         POD_REMOVE_FILE => filesystem::remove_file(&pod_dir, &allowed, &behavior_ids, args).await,
         POD_GREP => grep::run(&pod_dir, args).await,
         POD_LIST_THREADS => list_threads::run(&pod_dir, args).await,

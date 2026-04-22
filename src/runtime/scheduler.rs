@@ -3939,12 +3939,25 @@ pub(crate) fn check_behavior_authoring_pure(
 /// cached default with a warn-level log, matching the pod loader's
 /// graceful-degrade policy for `thread_defaults.system_prompt_file`.
 fn resolve_system_prompt_file(pod: &crate::pod::Pod, name: &str) -> String {
-    if name.is_empty() || name.contains('/') || name.contains('\\') || name.contains("..") {
+    // Pod-relative path: accept nested directories (e.g.
+    // `behaviors/<id>/system_prompt.md`) but reject traversal, absolute
+    // paths, and Windows-style separators. The `PodModifyCap` tier
+    // admits writes across the same surface — allowing the loader to
+    // read a file the cap would let the agent author in the first
+    // place.
+    if name.is_empty()
+        || name.starts_with('/')
+        || name.starts_with('\\')
+        || name.contains('\\')
+        || name
+            .split('/')
+            .any(|seg| seg.is_empty() || seg == "." || seg == "..")
+    {
         warn!(
             pod_id = %pod.id,
             file = %name,
-            "system_prompt File override name rejected (must be a plain filename inside the pod dir) \
-             — falling back to pod default"
+            "system_prompt File override name rejected (must be a pod-relative path with no \
+             traversal) — falling back to pod default"
         );
         return pod.system_prompt.clone();
     }
@@ -4333,5 +4346,101 @@ mod authoring_gate_tests {
         );
         assert!(r.is_some());
         assert!(r.unwrap().contains("fit within the author"));
+    }
+}
+
+#[cfg(test)]
+mod resolve_system_prompt_file_tests {
+    use super::resolve_system_prompt_file;
+    use crate::pod::Pod;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use whisper_agent_protocol::PodConfig;
+
+    fn sample_pod(dir: PathBuf, fallback: &str) -> Pod {
+        // Minimal Pod fixture: only the fields the function touches
+        // (id for log scope, dir for path resolution, system_prompt
+        // for the fallback body) matter; the rest use `Pod::new`'s
+        // defaults.
+        let toml = r#"name = "test"
+created_at = "2026-04-22T00:00:00Z"
+[allow]
+backends = ["anthropic"]
+mcp_hosts = []
+host_env = []
+[thread_defaults]
+backend = "anthropic"
+model = "x"
+system_prompt_file = "system_prompt.md"
+max_tokens = 1000
+max_turns = 10
+"#;
+        let cfg: PodConfig = crate::pod::parse_toml(toml).unwrap();
+        Pod::new("test".into(), dir, cfg, toml.to_string(), fallback.into())
+    }
+
+    fn temp_pod_dir() -> PathBuf {
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let path =
+            std::env::temp_dir().join(format!("wa-resolve-syspm-test-{}-{n}", std::process::id()));
+        std::fs::create_dir_all(&path).unwrap();
+        path
+    }
+
+    #[test]
+    fn accepts_nested_pod_relative_path() {
+        // Regression: prior to the fix, any name containing `/` was
+        // rejected — so a behavior referencing
+        // `behaviors/<id>/system_prompt.md` could never load its own
+        // prompt. Verify we now read it off disk.
+        let dir = temp_pod_dir();
+        std::fs::create_dir_all(dir.join("behaviors/researcher")).unwrap();
+        std::fs::write(
+            dir.join("behaviors/researcher/system_prompt.md"),
+            "researcher sys",
+        )
+        .unwrap();
+        let pod = sample_pod(dir, "fallback");
+        let out = resolve_system_prompt_file(&pod, "behaviors/researcher/system_prompt.md");
+        assert_eq!(out, "researcher sys");
+    }
+
+    #[test]
+    fn accepts_flat_filename() {
+        // The existing flat-filename case must keep working.
+        let dir = temp_pod_dir();
+        std::fs::write(dir.join("custom.md"), "flat").unwrap();
+        let pod = sample_pod(dir, "fallback");
+        assert_eq!(resolve_system_prompt_file(&pod, "custom.md"), "flat");
+    }
+
+    #[test]
+    fn rejects_traversal_absolute_and_empty() {
+        let dir = temp_pod_dir();
+        let pod = sample_pod(dir, "fallback-body");
+        for bad in [
+            "",
+            "/etc/passwd",
+            "../../etc/passwd",
+            "behaviors/../escape",
+            "a/./b.md",
+            "behaviors//x.md",
+            r"behaviors\researcher.md",
+        ] {
+            let out = resolve_system_prompt_file(&pod, bad);
+            assert_eq!(
+                out, "fallback-body",
+                "name `{bad}` should have been rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn missing_file_falls_back_to_pod_default() {
+        let dir = temp_pod_dir();
+        let pod = sample_pod(dir, "fallback-default");
+        let out = resolve_system_prompt_file(&pod, "behaviors/ghost/absent.md");
+        assert_eq!(out, "fallback-default");
     }
 }

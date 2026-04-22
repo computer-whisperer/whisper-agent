@@ -61,10 +61,26 @@ enum Access {
 
 /// Classify `filename` for list output. Purely pattern-based on the
 /// existing rw allowlist plus `is_readonly_path` — does NOT touch disk.
-fn access_for(filename: &str, rw_allowed: &[String]) -> Access {
+/// `behavior_ids` gates the "any .md inside an existing behavior dir"
+/// rule so the listing agrees with `validate_filename` / the cap table.
+fn access_for(filename: &str, rw_allowed: &[String], behavior_ids: &[String]) -> Access {
     if rw_allowed.iter().any(|n| n == filename) || parse_memory_path(filename).is_some() {
-        Access::Rw
-    } else if is_readonly_path(filename) {
+        return Access::Rw;
+    }
+    if let Some((id, suffix)) = parse_behavior_path(filename)
+        && behavior_ids.iter().any(|i| i == id)
+        && (suffix == BEHAVIOR_TOML || suffix.ends_with(".md"))
+    {
+        return Access::Rw;
+    }
+    // Any .md file elsewhere in the pod — reachable under the
+    // `ModifyAllow` cap tier. Not a readable-only claim on its own
+    // (reads gate on `validate_filename`, which also admits these
+    // paths), so the listing tagging stays honest.
+    if filename.ends_with(".md") && !is_readonly_path(filename) {
+        return Access::Rw;
+    }
+    if is_readonly_path(filename) {
         Access::Ro
     } else {
         Access::None
@@ -83,6 +99,12 @@ enum BehaviorWrite {
     UpdateConfig,
     /// `prompt.md` for an existing id — content replace only.
     UpdatePrompt,
+    /// Any other `.md` file inside an existing behavior dir (e.g.
+    /// `system_prompt.md`, supplementary notes). Plain-file write,
+    /// no scheduler-side cache refresh needed — the referring
+    /// behavior.toml re-reads its `system_prompt = { kind = "file" }`
+    /// target at each fire.
+    UpdateMarkdown,
 }
 
 /// Classify a `behaviors/<id>/<suffix>` write.  Returns `Err` with a
@@ -94,6 +116,16 @@ fn classify_behavior_write(
     behavior_ids: &[String],
 ) -> Result<BehaviorWrite, String> {
     let exists = behavior_ids.iter().any(|i| i == id);
+    // `state.json` is scheduler-owned; writes to it must be rejected
+    // before reaching this classifier (via `is_readonly_path`), but
+    // we double-check here in case a caller plumbs a behavior path
+    // without first consulting the readonly gate.
+    if suffix == BEHAVIOR_STATE {
+        return Err(format!(
+            "`{BEHAVIORS_DIR}/{id}/{BEHAVIOR_STATE}` is read-only runtime state owned \
+             by the scheduler"
+        ));
+    }
     match (suffix, exists) {
         (BEHAVIOR_TOML, false) => Ok(BehaviorWrite::CreateConfig),
         (BEHAVIOR_TOML, true) => Ok(BehaviorWrite::UpdateConfig),
@@ -102,8 +134,14 @@ fn classify_behavior_write(
             "behavior `{id}` does not exist yet — create it first by writing \
              `{BEHAVIORS_DIR}/{id}/{BEHAVIOR_TOML}` before its `{BEHAVIOR_PROMPT}`"
         )),
+        (other, true) if other.ends_with(".md") => Ok(BehaviorWrite::UpdateMarkdown),
+        (other, false) if other.ends_with(".md") => Err(format!(
+            "behavior `{id}` does not exist yet — create it first by writing \
+             `{BEHAVIORS_DIR}/{id}/{BEHAVIOR_TOML}` before other files in that dir"
+        )),
         (other, _) => Err(format!(
-            "unknown behavior filename suffix `{other}` for behavior `{id}`"
+            "unsupported behavior filename `{other}` for behavior `{id}` \
+             (allowed: `{BEHAVIOR_TOML}`, any `.md` file)"
         )),
     }
 }
@@ -123,14 +161,27 @@ fn validate_filename(
     if parse_memory_path(filename).is_some() {
         return Ok(());
     }
-    // Create-new: writing `behaviors/<new-id>/behavior.toml` is
-    // legitimate even though the id is absent from `allowed`. Reads /
-    // edits against an unknown id fall through to the error below.
-    if for_write && let Some((id, suffix)) = parse_behavior_path(filename) {
+    // Behavior paths — structural validation (for_write classifies so
+    // the write handler knows whether to mkdir, what PodUpdate to
+    // emit; reads just need to confirm admissibility).
+    if let Some((id, suffix)) = parse_behavior_path(filename) {
         if let Err(e) = pod::behaviors::validate_behavior_id(id) {
             return Err(format!("behavior id `{id}`: {e}"));
         }
-        return classify_behavior_write(id, suffix, behavior_ids).map(|_| ());
+        if suffix == BEHAVIOR_STATE {
+            // Falls through to the readonly handling below — reads
+            // allowed, writes rejected with the scheduler-owned message.
+        } else if for_write {
+            return classify_behavior_write(id, suffix, behavior_ids).map(|_| ());
+        } else {
+            // Read: admit `behavior.toml` and any `.md` file under an
+            // existing behavior dir. Unknown ids and non-admissible
+            // suffixes fall through to the error below.
+            let exists = behavior_ids.iter().any(|i| i == id);
+            if exists && (suffix == BEHAVIOR_TOML || suffix.ends_with(".md")) {
+                return Ok(());
+            }
+        }
     }
     // Read-only: thread JSONs, pod_state.json, per-behavior state.json.
     // Writes to these paths fall through to the error message — the
@@ -145,9 +196,28 @@ fn validate_filename(
              `pod_run_behavior` for runtime transitions."
         ));
     }
+    // Generic `.md` fallthrough: any markdown file under the pod root
+    // that isn't covered by a stricter rule. The cap-layer check
+    // (`PodModifyCap::admits` under `ModifyAllow`) has already cleared
+    // writes by the time we reach here; reads never had a cap gate.
+    // Explicitly exclude the `memory/` and `behaviors/` prefixes
+    // — those have their own flat-dir rules (checked above) that a
+    // generic `.md` rule would otherwise bypass (e.g. a nested
+    // `memory/sub/foo.md` is not legal, even though it's `.md`).
+    if filename.ends_with(".md")
+        && !filename.starts_with('/')
+        && !filename
+            .split('/')
+            .any(|seg| seg.is_empty() || seg == "." || seg == "..")
+        && !filename.starts_with(&format!("{MEMORY_DIR}/"))
+        && !filename.starts_with(&format!("{BEHAVIORS_DIR}/"))
+    {
+        return Ok(());
+    }
     Err(format!(
         "filename `{filename}` is not in this pod's allowlist. Allowed rw: [{}]. \
-         Pattern-based rw: `{MEMORY_DIR}/<name>.md`. \
+         Pattern-based rw: `{MEMORY_DIR}/<name>.md`, `{BEHAVIORS_DIR}/<id>/*.md`, \
+         any `.md` file under the pod root (requires `pod_modify = modify_allow`). \
          Read-only patterns: `pod_state.json`, `{}/<id>.json`, `{BEHAVIORS_DIR}/<id>/{BEHAVIOR_STATE}`.",
         allowed.join(", "),
         pod::THREADS_DIR,
@@ -190,9 +260,14 @@ pub(super) fn list_descriptor() -> McpTool {
 /// run history would otherwise blow the tool output size.
 const THREADS_LIST_CAP: usize = 30;
 
-pub(super) async fn list_files(pod_dir: &Path, allowed: &[String], _args: Value) -> ToolOutcome {
+pub(super) async fn list_files(
+    pod_dir: &Path,
+    allowed: &[String],
+    behavior_ids: &[String],
+    _args: Value,
+) -> ToolOutcome {
     let mut out = String::new();
-    if let Err(e) = list_one_dir(pod_dir, "", allowed, &mut out).await {
+    if let Err(e) = list_one_dir(pod_dir, "", allowed, behavior_ids, &mut out).await {
         return no_update_error(e);
     }
 
@@ -218,7 +293,14 @@ pub(super) async fn list_files(pod_dir: &Path, allowed: &[String], _args: Value)
         for id in ids {
             let prefix = format!("{BEHAVIORS_DIR}/{id}/");
             out.push_str(&format!("\n-- {prefix} --\n"));
-            if let Err(e) = list_one_dir(&behaviors_dir.join(&id), &prefix, allowed, &mut out).await
+            if let Err(e) = list_one_dir(
+                &behaviors_dir.join(&id),
+                &prefix,
+                allowed,
+                behavior_ids,
+                &mut out,
+            )
+            .await
             {
                 return no_update_error(e);
             }
@@ -233,8 +315,14 @@ pub(super) async fn list_files(pod_dir: &Path, allowed: &[String], _args: Value)
     let memory_dir = pod_dir.join(MEMORY_DIR);
     out.push_str(&format!("\n-- {MEMORY_DIR}/ --\n"));
     if tokio::fs::try_exists(&memory_dir).await.unwrap_or(false) {
-        if let Err(e) =
-            list_one_dir(&memory_dir, &format!("{MEMORY_DIR}/"), allowed, &mut out).await
+        if let Err(e) = list_one_dir(
+            &memory_dir,
+            &format!("{MEMORY_DIR}/"),
+            allowed,
+            behavior_ids,
+            &mut out,
+        )
+        .await
         {
             return no_update_error(e);
         }
@@ -323,6 +411,7 @@ async fn list_one_dir(
     dir: &Path,
     path_prefix: &str,
     allowed: &[String],
+    behavior_ids: &[String],
     out: &mut String,
 ) -> Result<(), String> {
     let mut read = tokio::fs::read_dir(dir)
@@ -355,13 +444,13 @@ async fn list_one_dir(
     entries.sort_by(|a, b| {
         let a_full = format!("{path_prefix}{}", a.0);
         let b_full = format!("{path_prefix}{}", b.0);
-        let a_rank = access_rank(access_for(&a_full, allowed), a.1);
-        let b_rank = access_rank(access_for(&b_full, allowed), b.1);
+        let a_rank = access_rank(access_for(&a_full, allowed, behavior_ids), a.1);
+        let b_rank = access_rank(access_for(&b_full, allowed, behavior_ids), b.1);
         a_rank.cmp(&b_rank).then_with(|| a.0.cmp(&b.0))
     });
     for (name, is_dir, size) in &entries {
         let full = format!("{path_prefix}{name}");
-        let tag = match access_for(&full, allowed) {
+        let tag = match access_for(&full, allowed, behavior_ids) {
             Access::Rw => "[rw]",
             Access::Ro => "[r-]",
             Access::None => "[--]",
@@ -611,6 +700,7 @@ pub(super) async fn write_file(
     pod_dir: &Path,
     allowed: &[String],
     behavior_ids: &[String],
+    system_prompt_file: &str,
     args: Value,
 ) -> ToolOutcome {
     let parsed: WriteArgs = match serde_json::from_value(args) {
@@ -643,7 +733,7 @@ pub(super) async fn write_file(
             scheduler_command: None,
         };
     }
-    let update = match prepare_update(&parsed.filename, &parsed.content) {
+    let update = match prepare_update(&parsed.filename, &parsed.content, system_prompt_file) {
         Ok(u) => u,
         Err(e) => return no_update_error(e),
     };
@@ -651,10 +741,22 @@ pub(super) async fn write_file(
         return no_update_error(e);
     }
     let path = pod_dir.join(&parsed.filename);
+    // `.md` paths nested in subdirectories that don't yet exist need
+    // their parent created. `prepare_behavior_dir` handles the
+    // behavior case; other subdirs (e.g. `docs/architecture.md`
+    // under `ModifyAllow`) are created here.
+    if let Some(parent) = path.parent()
+        && parent != pod_dir
+        && let Err(e) = tokio::fs::create_dir_all(parent).await
+    {
+        return no_update_error(format!("mkdir {}: {e}", parent.display()));
+    }
     if let Err(e) = tokio::fs::write(&path, parsed.content.as_bytes()).await {
         return no_update_error(format!("write {}: {e}", parsed.filename));
     }
-    if let Err(e) = seed_behavior_state_if_needed(pod_dir, &update).await {
+    if let Some(u) = &update
+        && let Err(e) = seed_behavior_state_if_needed(pod_dir, u).await
+    {
         return no_update_error(e);
     }
     ToolOutcome {
@@ -663,7 +765,7 @@ pub(super) async fn write_file(
             parsed.content.len(),
             parsed.filename
         )),
-        pod_update: Some(update),
+        pod_update: update,
         scheduler_command: None,
     }
 }
@@ -740,6 +842,7 @@ pub(super) async fn edit_file(
     pod_dir: &Path,
     allowed: &[String],
     behavior_ids: &[String],
+    system_prompt_file: &str,
     args: Value,
 ) -> ToolOutcome {
     let parsed: EditArgs = match serde_json::from_value(args) {
@@ -794,10 +897,10 @@ pub(super) async fn edit_file(
     let update = if parse_memory_path(&parsed.filename).is_some() {
         None
     } else {
-        Some(match prepare_update(&parsed.filename, &new_content) {
+        match prepare_update(&parsed.filename, &new_content, system_prompt_file) {
             Ok(u) => u,
             Err(e) => return no_update_error(e),
-        })
+        }
     };
     if let Err(e) = tokio::fs::write(&path, new_content.as_bytes()).await {
         return no_update_error(format!("write {}: {e}", parsed.filename));
@@ -947,37 +1050,57 @@ pub(super) async fn remove_file(
 /// For structured files (pod.toml, behavior.toml) we parse + validate
 /// here — failure becomes a tool error BEFORE any disk write, so partial
 /// state is never reached.
-fn prepare_update(filename: &str, content: &str) -> Result<PodUpdate, String> {
+///
+/// Returns `None` when the write doesn't require a scheduler-side
+/// refresh (arbitrary `.md` files that no in-memory cache tracks —
+/// e.g. `behaviors/<id>/system_prompt.md`, which the referring
+/// behavior re-reads on each fire, or an ad-hoc doc under the pod
+/// root). `system_prompt_file` identifies the pod's configured
+/// system-prompt file so a write to that specific name still emits
+/// `PodUpdate::SystemPrompt`.
+fn prepare_update(
+    filename: &str,
+    content: &str,
+    system_prompt_file: &str,
+) -> Result<Option<PodUpdate>, String> {
     if filename == pod::POD_TOML {
         let parsed = pod::parse_toml(content).map_err(|e| format!("pod.toml: {e}"))?;
-        return Ok(PodUpdate::Config {
+        return Ok(Some(PodUpdate::Config {
             toml_text: content.to_string(),
             parsed: Box::new(parsed),
-        });
+        }));
     }
     if let Some((id, suffix)) = parse_behavior_path(filename) {
         return match suffix {
             BEHAVIOR_TOML => {
                 let parsed = pod::behaviors::parse_toml(content)
                     .map_err(|e| format!("{BEHAVIORS_DIR}/{id}/{BEHAVIOR_TOML}: {e}"))?;
-                Ok(PodUpdate::BehaviorConfig {
+                Ok(Some(PodUpdate::BehaviorConfig {
                     behavior_id: id.to_string(),
                     toml_text: content.to_string(),
                     parsed: Box::new(parsed),
-                })
+                }))
             }
-            BEHAVIOR_PROMPT => Ok(PodUpdate::BehaviorPrompt {
+            BEHAVIOR_PROMPT => Ok(Some(PodUpdate::BehaviorPrompt {
                 behavior_id: id.to_string(),
                 text: content.to_string(),
-            }),
+            })),
+            other if other.ends_with(".md") => Ok(None),
             other => Err(format!(
-                "unknown behavior filename suffix `{other}` for behavior `{id}`"
+                "unsupported behavior filename `{other}` for behavior `{id}`"
             )),
         };
     }
-    Ok(PodUpdate::SystemPrompt {
-        text: content.to_string(),
-    })
+    // Root-level file. The pod's configured system-prompt file keeps
+    // its `SystemPrompt` PodUpdate path so the scheduler refreshes the
+    // cached prompt; any other `.md` file at the pod root is a plain
+    // write with no scheduler-side state to invalidate.
+    if !system_prompt_file.is_empty() && filename == system_prompt_file {
+        return Ok(Some(PodUpdate::SystemPrompt {
+            text: content.to_string(),
+        }));
+    }
+    Ok(None)
 }
 
 /// Create `behaviors/<id>/` on disk when the write targets a not-yet-
@@ -1692,6 +1815,192 @@ schedule = "0 9 * * *"
         );
         // Nothing hit disk.
         assert!(!dir.join("behaviors").join("ghost").exists());
+    }
+
+    #[tokio::test]
+    async fn write_behavior_system_prompt_md_for_existing_id() {
+        // Regression for the mavis sudo-write bug: the agent authored
+        // `behaviors/researcher/behavior.toml` referencing
+        // `system_prompt = { kind = "file", name = "behaviors/researcher/system_prompt.md" }`,
+        // then tried to write that file. Before the cap + filesystem
+        // fix, `pod_write_file` was rejected at ModifyAllow because
+        // the admissible set was hardcoded to `prompt.md` +
+        // `behavior.toml`. Now any `.md` file inside an existing
+        // behavior dir is writable.
+        let dir = temp_dir();
+        let cfg = sample_config();
+        let behavior_dir = dir.join("behaviors").join("researcher");
+        tokio::fs::create_dir_all(&behavior_dir).await.unwrap();
+        tokio::fs::write(behavior_dir.join("behavior.toml"), r#"name = "Researcher""#)
+            .await
+            .unwrap();
+
+        let out = dispatch(
+            dir.clone(),
+            cfg,
+            vec!["researcher".into()],
+            crate::permission::PodModifyCap::Content,
+            crate::permission::BehaviorOpsCap::AuthorAny,
+            POD_WRITE_FILE,
+            json!({
+                "filename": "behaviors/researcher/system_prompt.md",
+                "content": "You are a research agent.",
+            }),
+        )
+        .await;
+        assert!(
+            !out.result.is_error,
+            "expected write to succeed: {:?}",
+            out.result
+        );
+        // Plain-file write: no PodUpdate — the behavior re-reads the
+        // file on each fire via resolve_system_prompt_file.
+        assert!(out.pod_update.is_none());
+        let on_disk = tokio::fs::read_to_string(behavior_dir.join("system_prompt.md"))
+            .await
+            .unwrap();
+        assert_eq!(on_disk, "You are a research agent.");
+    }
+
+    #[tokio::test]
+    async fn read_behavior_md_file_for_existing_id() {
+        let dir = temp_dir();
+        let cfg = sample_config();
+        let behavior_dir = dir.join("behaviors").join("researcher");
+        tokio::fs::create_dir_all(&behavior_dir).await.unwrap();
+        tokio::fs::write(behavior_dir.join("behavior.toml"), r#"name = "Researcher""#)
+            .await
+            .unwrap();
+        tokio::fs::write(behavior_dir.join("system_prompt.md"), "sys prompt\n")
+            .await
+            .unwrap();
+
+        let out = dispatch(
+            dir.clone(),
+            cfg,
+            vec!["researcher".into()],
+            crate::permission::PodModifyCap::Memories,
+            crate::permission::BehaviorOpsCap::Read,
+            POD_READ_FILE,
+            json!({
+                "filename": "behaviors/researcher/system_prompt.md",
+            }),
+        )
+        .await;
+        assert!(!out.result.is_error);
+        let text = join_blocks(&out.result.content);
+        assert!(text.contains("sys prompt"), "unexpected read body: {text}");
+    }
+
+    #[tokio::test]
+    async fn content_cap_admits_behavior_md_file() {
+        // End-to-end: cap=Content (one tier below ModifyAllow) must
+        // admit a behavior .md write. The prior whitelist only
+        // matched `prompt.md`, so this would have been denied at the
+        // cap layer with no way for the agent to author the file.
+        let dir = temp_dir();
+        let cfg = sample_config();
+        let behavior_dir = dir.join("behaviors").join("researcher");
+        tokio::fs::create_dir_all(&behavior_dir).await.unwrap();
+        tokio::fs::write(behavior_dir.join("behavior.toml"), r#"name = "R""#)
+            .await
+            .unwrap();
+
+        let out = dispatch(
+            dir.clone(),
+            cfg,
+            vec!["researcher".into()],
+            crate::permission::PodModifyCap::Content,
+            crate::permission::BehaviorOpsCap::AuthorAny,
+            POD_WRITE_FILE,
+            json!({
+                "filename": "behaviors/researcher/system_prompt.md",
+                "content": "x",
+            }),
+        )
+        .await;
+        assert!(!out.result.is_error, "{:?}", out.result);
+    }
+
+    #[tokio::test]
+    async fn modify_allow_admits_arbitrary_md_at_pod_root_and_subdirs() {
+        // ModifyAllow tier: any `.md` file under the pod is writable,
+        // including subdirs that don't exist yet — write_file mkdirs
+        // the parent.
+        let dir = temp_dir();
+        let cfg = sample_config();
+
+        for path in ["notes.md", "docs/architecture.md", "compaction.md"] {
+            let out = dispatch(
+                dir.clone(),
+                cfg.clone(),
+                vec![],
+                crate::permission::PodModifyCap::ModifyAllow,
+                crate::permission::BehaviorOpsCap::AuthorAny,
+                POD_WRITE_FILE,
+                json!({ "filename": path, "content": "hello" }),
+            )
+            .await;
+            assert!(
+                !out.result.is_error,
+                "expected write to {path} to succeed: {:?}",
+                out.result
+            );
+            assert!(out.pod_update.is_none(), "{path} should not emit PodUpdate");
+            let on_disk = tokio::fs::read_to_string(dir.join(path)).await.unwrap();
+            assert_eq!(on_disk, "hello");
+        }
+    }
+
+    #[tokio::test]
+    async fn content_cap_denies_arbitrary_md_outside_behaviors() {
+        // Content is the tier below ModifyAllow: it admits behavior
+        // markdown but not arbitrary pod-root / docs-subdir files.
+        // Verifies the cap gate — dispatch rejects before reaching
+        // the filesystem handler.
+        let dir = temp_dir();
+        let cfg = sample_config();
+        let out = dispatch(
+            dir.clone(),
+            cfg,
+            vec![],
+            crate::permission::PodModifyCap::Content,
+            crate::permission::BehaviorOpsCap::AuthorAny,
+            POD_WRITE_FILE,
+            json!({ "filename": "notes.md", "content": "x" }),
+        )
+        .await;
+        assert!(out.result.is_error, "Content must deny `notes.md`");
+        let text = join_blocks(&out.result.content);
+        assert!(
+            text.contains("pod_modify capability"),
+            "expected cap-denial error, got: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn behavior_state_json_remains_read_only() {
+        // Even ModifyAllow must not admit writes to scheduler-owned
+        // state.json — it's .json not .md, so the blacklist tier
+        // covers it, but double-check the end-to-end rejection.
+        let dir = temp_dir();
+        let cfg = sample_config();
+        let behavior_dir = dir.join("behaviors").join("x");
+        tokio::fs::create_dir_all(&behavior_dir).await.unwrap();
+        tokio::fs::write(behavior_dir.join("behavior.toml"), r#"name = "X""#)
+            .await
+            .unwrap();
+        let out = dispatch(
+            dir.clone(),
+            cfg,
+            vec!["x".into()],
+            crate::permission::PodModifyCap::ModifyAllow,
+            crate::permission::BehaviorOpsCap::AuthorAny,
+            POD_WRITE_FILE,
+            json!({ "filename": "behaviors/x/state.json", "content": "{}" }),
+        )
+        .await;
+        assert!(out.result.is_error);
     }
 
     #[tokio::test]
