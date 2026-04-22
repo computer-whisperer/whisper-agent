@@ -354,9 +354,13 @@ All operate on paths relative to the pod root and never escape it.
   `[rw]` (readable + writable), `[r-]` (readable, writable to
   scheduler only), or `[--]` (hidden from your tools). Use at thread
   start to orient.
-- `pod_read_file(path, offset?, limit?)` — whole file or line range.
-  Default cap is 500 lines when no offset/limit is given — ask for a
-  specific range if the file is large.
+- `pod_read_file(path, offset?, limit?, tail?)` — whole file or
+  line range. Default cap is 500 lines when no slicing args are
+  given. `tail: N` returns the last N lines directly (handy for the
+  end of a long thread log). Any sliced response closes with a
+  `[showing lines X-Y of N]` marker so you know the file's total
+  length without a follow-up call. `tail` and `offset` are mutually
+  exclusive.
 - `pod_write_file(path, content)` — create or full overwrite. Prefer
   `pod_edit_file` for targeted changes to existing files.
 - `pod_edit_file(path, old_string, new_string, replace_all?)` —
@@ -977,7 +981,8 @@ table and the `behaviors` topic for authoring sub-agents.
 - `pod_list_files` — walk the pod dir, tagging each entry `[rw]` /
   `[r-]` / `[--]` by access level at your current cap.
 - `pod_read_file` — whole file or a line range (default cap: 500
-  lines when no offset/limit supplied).
+  lines when no slicing args supplied). `tail: N` reads the last N
+  lines directly; every sliced response reports total line count.
 - `pod_write_file` — full overwrite or create.
 - `pod_edit_file` — literal-substring replace; `replace_all` to
   change every occurrence.

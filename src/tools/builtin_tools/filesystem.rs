@@ -408,8 +408,12 @@ pub(super) fn read_descriptor() -> McpTool {
                       returns the whole file if it fits within 500 lines; longer \
                       files (typical for thread JSONs) are auto-truncated to the \
                       first 500 lines with a note. Use `offset`/`limit` to page \
-                      or target a specific range. For searching across many \
-                      files, `pod_grep` is usually a better starting point."
+                      or target a specific range, or `tail` to grab the last N \
+                      lines directly (handy for the end of a long thread log). \
+                      Every sliced response includes a `[lines X-Y of N]` \
+                      marker so you know the file's total length without a \
+                      follow-up call. For searching across many files, \
+                      `pod_grep` is usually a better starting point."
             .into(),
         input_schema: json!({
             "type": "object",
@@ -421,11 +425,20 @@ pub(super) fn read_descriptor() -> McpTool {
                 },
                 "offset": {
                     "type": "integer",
-                    "description": "1-indexed line to start from. Default 1."
+                    "description": "1-indexed line to start from. Default 1. \
+                                    Mutually exclusive with `tail`."
                 },
                 "limit": {
                     "type": "integer",
-                    "description": "Maximum number of lines to return. Default: no limit."
+                    "description": "Maximum number of lines to return. Default: \
+                                    no limit (capped at 500 when neither offset \
+                                    nor limit is supplied)."
+                },
+                "tail": {
+                    "type": "integer",
+                    "description": "Return the last N lines of the file. \
+                                    Mutually exclusive with `offset`. If N is \
+                                    larger than the file, returns everything."
                 }
             },
             "required": ["filename"]
@@ -447,6 +460,8 @@ struct ReadArgs {
     offset: Option<u32>,
     #[serde(default)]
     limit: Option<u32>,
+    #[serde(default)]
+    tail: Option<u32>,
 }
 
 /// Default line cap when the caller supplies neither `offset` nor
@@ -465,6 +480,13 @@ pub(super) async fn read_file(
         Ok(v) => v,
         Err(e) => return no_update_error(format!("invalid arguments: {e}")),
     };
+    if parsed.tail.is_some() && parsed.offset.is_some() {
+        return no_update_error(
+            "pod_read_file: `tail` and `offset` are mutually exclusive — \
+             pick one or the other."
+                .into(),
+        );
+    }
     if let Err(e) = validate_filename(&parsed.filename, allowed, behavior_ids, false) {
         return no_update_error(e);
     }
@@ -475,40 +497,59 @@ pub(super) async fn read_file(
     };
     let offset_supplied = parsed.offset.is_some();
     let limit_supplied = parsed.limit.is_some();
+    let tail_supplied = parsed.tail.is_some();
     let lines: Vec<&str> = content.lines().collect();
     let total = lines.len();
 
     // Small file and no explicit slicing → whole file, preserve original
     // text (trailing newline is lost by `.lines()`).
-    if !offset_supplied && !limit_supplied && total <= READ_DEFAULT_LINE_CAP {
+    if !offset_supplied && !limit_supplied && !tail_supplied && total <= READ_DEFAULT_LINE_CAP {
         return no_update_text(content);
     }
 
-    let offset = parsed.offset.unwrap_or(1).max(1) as usize;
-    // When neither offset nor limit is supplied on a large file, cap
-    // at READ_DEFAULT_LINE_CAP. When the caller supplied `limit`,
-    // honor it. When the caller supplied only `offset`, cap from
-    // there — avoids a surprise when paging past the default.
-    let limit = parsed
-        .limit
-        .map(|n| n as usize)
-        .unwrap_or(READ_DEFAULT_LINE_CAP);
-    let start = (offset - 1).min(total);
-    let end = start.saturating_add(limit).min(total);
+    // Resolve the (start, end) window. `tail` short-circuits the
+    // offset/limit logic; otherwise fall through to the paging path.
+    // Both paths 1-index `offset` in the eventual marker text.
+    let (start, end, effective_offset) = if let Some(n) = parsed.tail {
+        let n = n as usize;
+        let start = total.saturating_sub(n);
+        (start, total, start + 1)
+    } else {
+        let offset = parsed.offset.unwrap_or(1).max(1) as usize;
+        // When neither offset nor limit is supplied on a large file,
+        // cap at READ_DEFAULT_LINE_CAP. When the caller supplied
+        // `limit`, honor it. When the caller supplied only `offset`,
+        // cap from there — avoids a surprise when paging past the
+        // default.
+        let limit = parsed
+            .limit
+            .map(|n| n as usize)
+            .unwrap_or(READ_DEFAULT_LINE_CAP);
+        let start = (offset - 1).min(total);
+        let end = start.saturating_add(limit).min(total);
+        (start, end, offset)
+    };
+
     let mut out = lines[start..end].join("\n");
     if end == total && content.ends_with('\n') {
         out.push('\n');
     }
-    if end < total {
-        let note = if !offset_supplied && !limit_supplied {
-            format!(
-                "\n[showing first {READ_DEFAULT_LINE_CAP} of {total} lines; pass offset/limit to see more]\n"
-            )
+    // Every sliced response closes with a marker giving the absolute
+    // window + total. Lets the model reach for the tail or next page
+    // without a scouting call to learn the file's length.
+    let note = if end < total && !offset_supplied && !limit_supplied && !tail_supplied {
+        format!(
+            "\n[showing first {READ_DEFAULT_LINE_CAP} of {total} lines; pass offset/limit/tail to see more]\n"
+        )
+    } else {
+        let more = if end < total {
+            "; pass offset/limit/tail to see more"
         } else {
-            format!("\n[showing lines {offset}-{end} of {total}; pass offset/limit to see more]\n")
+            ""
         };
-        out.push_str(&note);
-    }
+        format!("\n[showing lines {effective_offset}-{end} of {total}{more}]\n")
+    };
+    out.push_str(&note);
     no_update_text(out)
 }
 
@@ -2145,5 +2186,137 @@ schedule = "0 9 * * *"
         )
         .await;
         assert!(out.result.is_error);
+    }
+
+    // ---------- pod_read_file: tail + total-line markers ----------
+
+    #[tokio::test]
+    async fn read_file_tail_returns_last_n_lines_with_total_marker() {
+        let dir = temp_dir();
+        tokio::fs::create_dir_all(dir.join("threads"))
+            .await
+            .unwrap();
+        let mut body = String::new();
+        for i in 0..120 {
+            body.push_str(&format!("line {i}\n"));
+        }
+        tokio::fs::write(dir.join("threads").join("log.json"), &body)
+            .await
+            .unwrap();
+        let out = dispatch(
+            dir,
+            sample_config(),
+            vec![],
+            crate::permission::PodModifyCap::None,
+            crate::permission::BehaviorOpsCap::None,
+            POD_READ_FILE,
+            json!({ "filename": "threads/log.json", "tail": 5 }),
+        )
+        .await;
+        assert!(!out.result.is_error);
+        let text = join_blocks(&out.result.content);
+        // Last 5 content lines are 115..120.
+        for i in 115..120 {
+            assert!(text.contains(&format!("line {i}")), "missing line {i}");
+        }
+        assert!(!text.contains("line 114"), "tail should exclude line 114");
+        assert!(
+            text.contains("[showing lines 116-120 of 120]"),
+            "expected exact tail marker: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn read_file_tail_larger_than_file_returns_whole_file() {
+        let dir = temp_dir();
+        tokio::fs::create_dir_all(dir.join("threads"))
+            .await
+            .unwrap();
+        tokio::fs::write(dir.join("threads").join("short.json"), "only\ntwo\nlines\n")
+            .await
+            .unwrap();
+        let out = dispatch(
+            dir,
+            sample_config(),
+            vec![],
+            crate::permission::PodModifyCap::None,
+            crate::permission::BehaviorOpsCap::None,
+            POD_READ_FILE,
+            json!({ "filename": "threads/short.json", "tail": 500 }),
+        )
+        .await;
+        assert!(!out.result.is_error);
+        let text = join_blocks(&out.result.content);
+        assert!(text.contains("only") && text.contains("lines"));
+        assert!(
+            text.contains("[showing lines 1-3 of 3]"),
+            "expected full-file marker: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn read_file_tail_and_offset_are_mutually_exclusive() {
+        let dir = temp_dir();
+        tokio::fs::create_dir_all(dir.join("threads"))
+            .await
+            .unwrap();
+        tokio::fs::write(dir.join("threads").join("f.json"), "x\n")
+            .await
+            .unwrap();
+        let out = dispatch(
+            dir,
+            sample_config(),
+            vec![],
+            crate::permission::PodModifyCap::None,
+            crate::permission::BehaviorOpsCap::None,
+            POD_READ_FILE,
+            json!({ "filename": "threads/f.json", "tail": 5, "offset": 1 }),
+        )
+        .await;
+        assert!(out.result.is_error);
+        assert!(
+            join_blocks(&out.result.content).contains("mutually exclusive"),
+            "expected mutual-exclusion error"
+        );
+    }
+
+    #[tokio::test]
+    async fn read_file_explicit_slice_at_eof_still_shows_total() {
+        // Previously an end-aligned explicit slice returned the content
+        // with no total marker; callers had to truncate to see the
+        // `of N` hint. The end-at-EOF slice now always carries the
+        // `[showing lines X-Y of N]` marker.
+        let dir = temp_dir();
+        tokio::fs::create_dir_all(dir.join("threads"))
+            .await
+            .unwrap();
+        let mut body = String::new();
+        for i in 0..10 {
+            body.push_str(&format!("line {i}\n"));
+        }
+        tokio::fs::write(dir.join("threads").join("mid.json"), &body)
+            .await
+            .unwrap();
+        let out = dispatch(
+            dir,
+            sample_config(),
+            vec![],
+            crate::permission::PodModifyCap::None,
+            crate::permission::BehaviorOpsCap::None,
+            POD_READ_FILE,
+            json!({ "filename": "threads/mid.json", "offset": 6, "limit": 100 }),
+        )
+        .await;
+        assert!(!out.result.is_error);
+        let text = join_blocks(&out.result.content);
+        assert!(
+            text.contains("[showing lines 6-10 of 10]"),
+            "expected end-aligned marker: {text}"
+        );
+        // And the "see more" suffix should NOT appear when end == total.
+        assert!(
+            !text.contains("see more"),
+            "no pagination suffix when slice reaches EOF: {text}"
+        );
     }
 }
