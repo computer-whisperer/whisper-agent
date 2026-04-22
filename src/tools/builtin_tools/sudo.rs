@@ -101,10 +101,21 @@ fn default_args() -> Value {
 }
 
 pub fn parse_args(value: Value) -> Result<SudoArgs, String> {
-    let parsed: SudoArgs =
+    let mut parsed: SudoArgs =
         serde_json::from_value(value).map_err(|e| format!("invalid sudo arguments: {e}"))?;
     if parsed.tool_name.trim().is_empty() {
         return Err("sudo: tool_name must not be empty".to_string());
+    }
+    // Some models double-encode `args`: passing a JSON-encoded string
+    // containing the object rather than an inline object. Unwrap when
+    // the string parses to an object so the wrapped tool's deserializer
+    // sees the structured form instead of failing with "expected
+    // struct, got string".
+    if let Value::String(s) = &parsed.args
+        && let Ok(inner) = serde_json::from_str::<Value>(s)
+        && inner.is_object()
+    {
+        parsed.args = inner;
     }
     Ok(parsed)
 }
@@ -151,5 +162,40 @@ mod tests {
         let v = json!({ "tool_name": "pod_list_files", "reason": "inspect" });
         let parsed = parse_args(v).unwrap();
         assert_eq!(parsed.args, json!({}));
+    }
+
+    #[test]
+    fn parse_args_double_encoded_string_unwrapped() {
+        let v = json!({
+            "tool_name": "pod_write_file",
+            "args": "{\"filename\": \"x.md\", \"content\": \"hi\"}",
+            "reason": "fix"
+        });
+        let parsed = parse_args(v).unwrap();
+        assert_eq!(parsed.args, json!({ "filename": "x.md", "content": "hi" }));
+    }
+
+    #[test]
+    fn parse_args_non_object_string_left_alone() {
+        // A string that parses as a non-object (e.g. a number literal)
+        // is not unwrapped — let the wrapped tool's deserializer decide.
+        let v = json!({
+            "tool_name": "x",
+            "args": "42",
+            "reason": "r"
+        });
+        let parsed = parse_args(v).unwrap();
+        assert_eq!(parsed.args, json!("42"));
+    }
+
+    #[test]
+    fn parse_args_garbage_string_left_alone() {
+        let v = json!({
+            "tool_name": "x",
+            "args": "not json {{",
+            "reason": "r"
+        });
+        let parsed = parse_args(v).unwrap();
+        assert_eq!(parsed.args, json!("not json {{"));
     }
 }

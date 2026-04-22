@@ -7459,12 +7459,18 @@ fn render_sudo_banners(
                     let args_text = serde_json::to_string_pretty(&s.args)
                         .unwrap_or_else(|_| s.args.to_string());
                     ui.add_space(2.0);
-                    ui.label(
-                        RichText::new(args_text)
-                            .small()
-                            .monospace()
-                            .color(Color32::from_gray(200)),
-                    );
+                    egui::ScrollArea::vertical()
+                        .id_salt(("sudo_args_scroll", function_id))
+                        .max_height(200.0)
+                        .auto_shrink([false, true])
+                        .show(ui, |ui| {
+                            ui.label(
+                                RichText::new(args_text)
+                                    .small()
+                                    .monospace()
+                                    .color(Color32::from_gray(200)),
+                            );
+                        });
                     if !s.reason.trim().is_empty() {
                         ui.add_space(2.0);
                         ui.label(
