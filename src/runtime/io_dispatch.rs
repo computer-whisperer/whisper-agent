@@ -135,15 +135,20 @@ pub(crate) enum SchedulerCompletion {
 /// builtin/MCP outcome: `Ok(CallToolResult)` on a reachable handler
 /// (which may still carry `is_error = true`) or `Err(message)` when
 /// routing / transport failed before we could run it.
+///
+/// `pod_update` / `scheduler_command` mirror the same fields on
+/// `IoCompletion` — a successful sudo'd builtin tool produces the
+/// same side effects (`pod.toml` reparse, behavior register, etc.)
+/// as a direct call, and the scheduler applies them before the
+/// Function's terminal fires so subsequent sudo calls observe the
+/// refreshed state.
 pub(crate) struct SudoInnerCompletion {
     pub(crate) function_id: crate::functions::FunctionId,
-    /// Carried for diagnostic tracing in future logging hooks. Not read
-    /// by `apply_sudo_inner_completion` today (the Function registry
-    /// already knows which thread parked on the call).
-    #[allow(dead_code)]
     pub(crate) thread_id: String,
     pub(crate) decision: crate::permission::SudoDecision,
     pub(crate) result: Result<crate::tools::mcp::CallToolResult, String>,
+    pub(crate) pod_update: Option<crate::tools::builtin_tools::PodUpdate>,
+    pub(crate) scheduler_command: Option<crate::tools::builtin_tools::SchedulerCommand>,
 }
 
 /// Which Add/Update operation the completion applies to. The

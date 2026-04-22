@@ -1471,6 +1471,8 @@ impl Scheduler {
                                 thread_id,
                                 decision,
                                 result: Err(format!("sudo: pod `{pod_id}` vanished")),
+                                pod_update: None,
+                                scheduler_command: None,
                             });
                         }
                     };
@@ -1489,6 +1491,8 @@ impl Scheduler {
                         thread_id,
                         decision,
                         result: Ok(outcome.result),
+                        pod_update: outcome.pod_update,
+                        scheduler_command: outcome.scheduler_command,
                     })
                 })
             }
@@ -1516,6 +1520,8 @@ impl Scheduler {
                     thread_id,
                     decision,
                     result,
+                    pod_update: None,
+                    scheduler_command: None,
                 })
             }),
             None => Box::pin(async move {
@@ -1524,6 +1530,8 @@ impl Scheduler {
                     thread_id,
                     decision,
                     result: Err(format!("sudo: no bound host advertises `{tool_name}`")),
+                    pod_update: None,
+                    scheduler_command: None,
                 })
             }),
         }
@@ -1542,12 +1550,28 @@ impl Scheduler {
         use crate::runtime::io_dispatch::SudoInnerCompletion;
         let SudoInnerCompletion {
             function_id,
+            thread_id,
             decision,
             result,
-            ..
+            pod_update,
+            scheduler_command,
         } = done;
         match result {
             Ok(call_result) => {
+                // Mirror the normal tool-call path: apply side effects
+                // (pod config refresh, behavior register, run/enable
+                // commands) BEFORE firing the Function terminal so the
+                // parent thread — and any subsequent sudo in the same
+                // authoring sequence — observes the updated scheduler
+                // state. Skipped when the inner tool reported an error.
+                if !call_result.is_error {
+                    if let Some(update) = pod_update {
+                        self.apply_pod_update(&thread_id, update);
+                    }
+                    if let Some(command) = scheduler_command {
+                        self.apply_scheduler_command(&thread_id, command, pending_io);
+                    }
+                }
                 let text = call_result
                     .content
                     .iter()
