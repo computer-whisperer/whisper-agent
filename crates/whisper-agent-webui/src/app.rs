@@ -1710,7 +1710,19 @@ impl ChatApp {
                     }
                 }
                 if self.selected.as_deref() != Some(&thread_id) {
-                    self.select_task(thread_id);
+                    // Don't yank focus for background spawns.
+                    // Behavior-triggered threads carry an `origin`;
+                    // dispatch_thread-spawned children carry
+                    // `dispatched_by`. Bare creates, forks, and
+                    // compaction continuations all leave both fields
+                    // None and keep the current auto-focus UX the
+                    // user expects after taking a direct action.
+                    let background = self.tasks.get(&thread_id).is_some_and(|v| {
+                        v.summary.origin.is_some() || v.summary.dispatched_by.is_some()
+                    });
+                    if !background {
+                        self.select_task(thread_id);
+                    }
                 }
             }
             ServerToClient::ThreadStateChanged { thread_id, state } => {
