@@ -621,11 +621,102 @@ fn strip_ansi(s: &str) -> String {
 /// tail, which is the part the model almost always needs.
 const BASH_MAX_OUTPUT_BYTES: usize = 30_000;
 
+/// Per-line cap when reading child stdout. Bounds worst-case memory for a
+/// command that emits a single enormous line with no `\n` (pathological
+/// — `python -c "print('x'*1_000_000_000)"`), where `read_line` would
+/// otherwise buffer the whole thing. Lines longer than this get a
+/// `[line truncated, cap=N bytes]` marker appended.
+const BASH_MAX_LINE_BYTES: usize = 8_192;
+
+/// Total bytes of streaming `Chunk` events forwarded to the subscriber
+/// before we stop emitting and silently drain the rest. Past this point
+/// the subscriber has seen enough progress; the final tool_result still
+/// carries the 30KB tail the model needs. Keeps client memory and the
+/// over-the-wire byte count bounded for a runaway `ls -R /` etc.
+const BASH_STREAM_TOTAL_BYTES: usize = 262_144;
+
 /// Spawn bash and stream its merged stdout/stderr line-by-line. Each line
 /// becomes a `Chunk(Text)` event the server forwards to the client as an
 /// SSE notification; the full accumulated body is returned in the `Final`
 /// event so the model (and retention) see the complete output.
 ///
+/// Read one line from `reader` into `out`, stopping at `\n`, EOF, or
+/// `max_bytes` of non-newline content — whichever comes first. Returns
+/// `Ok(ReadOutcome)` describing the outcome.
+///
+/// On `Truncated`, `out` was filled to `max_bytes` and the reader was
+/// then advanced past the rest of the line (up to and including the
+/// next `\n` or EOF) so the following call sees the start of the next
+/// line. Bytes beyond the cap are dropped on the floor, not counted —
+/// the only guarantee is that the caller's memory doesn't grow with
+/// the runaway line.
+///
+/// Used in place of [`AsyncBufReadExt::read_line`] so a pathological
+/// child that prints gigabytes with no `\n` can't OOM the mcp-host
+/// process.
+async fn read_capped_line<R: tokio::io::AsyncBufRead + Unpin>(
+    reader: &mut R,
+    out: &mut Vec<u8>,
+    max_bytes: usize,
+) -> std::io::Result<ReadOutcome> {
+    let start = out.len();
+    let mut truncated = false;
+    loop {
+        let buf = reader.fill_buf().await?;
+        if buf.is_empty() {
+            if out.len() == start {
+                return Ok(ReadOutcome::Eof);
+            }
+            return Ok(if truncated {
+                ReadOutcome::Truncated
+            } else {
+                ReadOutcome::Line
+            });
+        }
+        let nl_pos = buf.iter().position(|&b| b == b'\n');
+        let end_in_buf = nl_pos.map(|p| p + 1).unwrap_or(buf.len());
+
+        if truncated {
+            // Already at cap; discard bytes until the line's newline.
+            reader.consume(end_in_buf);
+            if nl_pos.is_some() {
+                return Ok(ReadOutcome::Truncated);
+            }
+            continue;
+        }
+
+        let room = max_bytes.saturating_sub(out.len() - start);
+        if end_in_buf <= room {
+            out.extend_from_slice(&buf[..end_in_buf]);
+            reader.consume(end_in_buf);
+            if nl_pos.is_some() {
+                return Ok(ReadOutcome::Line);
+            }
+            continue;
+        }
+        // The next line chunk would exceed the cap. Fill to cap, then
+        // drain the rest of the line below.
+        out.extend_from_slice(&buf[..room]);
+        reader.consume(end_in_buf);
+        truncated = true;
+        if nl_pos.is_some() {
+            return Ok(ReadOutcome::Truncated);
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum ReadOutcome {
+    /// `out` was extended by a full line (up to and including `\n`, or
+    /// the final line's content before EOF).
+    Line,
+    /// `out` was filled to `max_bytes` and the remainder of the line
+    /// was discarded.
+    Truncated,
+    /// EOF at start of line — nothing appended.
+    Eof,
+}
+
 /// Dropping the returned stream drops the child `Command`, which (via
 /// `kill_on_drop`) kills bash — so a cancelled HTTP connection aborts
 /// the command rather than leaving it running.
@@ -727,33 +818,85 @@ fn bash_stream(
         let mut stderr_reader = BufReader::new(stderr);
 
         let mut accumulated = String::new();
+        let mut streamed_bytes: usize = 0;
+        let mut stream_cap_announced = false;
         let mut timed_out = false;
 
         // Stream stdout (= merged child output via shell redirection) line-by-line
         // until EOF or timeout. stderr from *bash itself* is drained afterwards
         // so we never block on it while the child is running.
+        //
+        // Three caps keep a runaway command from blowing up memory or flooding
+        // the subscriber:
+        //   * `read_capped_line` bounds per-line buffering at
+        //     `BASH_MAX_LINE_BYTES` — a child emitting gigabytes without a `\n`
+        //     can't OOM us.
+        //   * `accumulated` is re-head-truncated to `BASH_MAX_OUTPUT_BYTES` once
+        //     it grows past 2x that — the final `head_truncate` below wants the
+        //     tail, so trimming early is lossless.
+        //   * Past `BASH_STREAM_TOTAL_BYTES` of emitted chunks we stop yielding
+        //     chunks (after one trailing marker) but keep draining the child so
+        //     its stdout pipe doesn't block.
         loop {
-            let mut line = String::new();
+            let mut line_bytes: Vec<u8> = Vec::new();
             tokio::select! {
-                res = stdout_reader.read_line(&mut line) => {
-                    match res {
-                        Ok(0) => break,
-                        Ok(_) => {
-                            let emitted = if parsed.strip_ansi {
-                                strip_ansi(&line)
-                            } else {
-                                line.clone()
-                            };
-                            accumulated.push_str(&emitted);
-                            yield ToolStreamItem::Chunk(ContentBlock::Text { text: emitted });
-                        }
+                res = read_capped_line(&mut stdout_reader, &mut line_bytes, BASH_MAX_LINE_BYTES) => {
+                    let outcome = match res {
+                        Ok(o) => o,
                         Err(e) => {
                             yield ToolStreamItem::Final(CallToolResult::error_text(
                                 format!("bash read failed: {e}"),
                             ));
                             return;
                         }
+                    };
+                    if outcome == ReadOutcome::Eof {
+                        break;
                     }
+                    // Decode — child output isn't guaranteed UTF-8 (tools that
+                    // emit binary, locale mismatches). `from_utf8_lossy`
+                    // substitutes the replacement char for invalid sequences
+                    // rather than failing the whole tool call.
+                    let mut emitted = String::from_utf8_lossy(&line_bytes).into_owned();
+                    if outcome == ReadOutcome::Truncated {
+                        if !emitted.ends_with('\n') {
+                            emitted.push('\n');
+                        }
+                        emitted.insert_str(
+                            emitted.len() - 1,
+                            &format!(" [line truncated at {BASH_MAX_LINE_BYTES} bytes]"),
+                        );
+                    }
+                    if parsed.strip_ansi {
+                        emitted = strip_ansi(&emitted);
+                    }
+                    accumulated.push_str(&emitted);
+                    // Keep `accumulated` bounded so a long-running command
+                    // can't grow us past ~2x the final cap. Trim leaves the
+                    // last `BASH_MAX_OUTPUT_BYTES` on a char boundary; final
+                    // `head_truncate` handles the rest.
+                    if accumulated.len() > 2 * BASH_MAX_OUTPUT_BYTES {
+                        let mut start = accumulated.len() - BASH_MAX_OUTPUT_BYTES;
+                        while start < accumulated.len() && !accumulated.is_char_boundary(start) {
+                            start += 1;
+                        }
+                        accumulated.drain(..start);
+                    }
+                    if streamed_bytes + emitted.len() <= BASH_STREAM_TOTAL_BYTES {
+                        streamed_bytes += emitted.len();
+                        yield ToolStreamItem::Chunk(ContentBlock::Text { text: emitted });
+                    } else if !stream_cap_announced {
+                        stream_cap_announced = true;
+                        streamed_bytes = BASH_STREAM_TOTAL_BYTES; // clamp for the log
+                        yield ToolStreamItem::Chunk(ContentBlock::Text {
+                            text: format!(
+                                "\n... [streaming cap reached at {BASH_STREAM_TOTAL_BYTES} bytes; \
+                                 command still running, final tool_result will show the tail] ...\n"
+                            ),
+                        });
+                    }
+                    // Past the cap: silently drain `accumulated` (it stays
+                    // bounded above) so bash's stdout pipe doesn't fill.
                 }
                 _ = tokio::time::sleep_until(deadline) => {
                     timed_out = true;
@@ -773,12 +916,25 @@ fn bash_stream(
         }
 
         // Drain bash's own stderr (wrapper-parse errors, etc.) before waiting.
+        // Same per-line and total caps as stdout: this channel is practically
+        // always tiny (bash complaints about the wrapper script), but a
+        // misbehaving shell replacement has no reason to bring down the host.
         let mut bash_stderr = String::new();
         loop {
-            let mut chunk = String::new();
-            match timeout_at(deadline, stderr_reader.read_line(&mut chunk)).await {
-                Ok(Ok(0)) => break,
-                Ok(Ok(_)) => bash_stderr.push_str(&chunk),
+            let mut chunk_bytes: Vec<u8> = Vec::new();
+            match timeout_at(
+                deadline,
+                read_capped_line(&mut stderr_reader, &mut chunk_bytes, BASH_MAX_LINE_BYTES),
+            )
+            .await
+            {
+                Ok(Ok(ReadOutcome::Eof)) => break,
+                Ok(Ok(_)) => {
+                    bash_stderr.push_str(&String::from_utf8_lossy(&chunk_bytes));
+                    if bash_stderr.len() >= BASH_MAX_OUTPUT_BYTES {
+                        break;
+                    }
+                }
                 Ok(Err(_)) | Err(_) => break,
             }
         }
@@ -1697,5 +1853,172 @@ fn main() {
         let _ = std::fs::remove_dir_all(&nope);
         let hits = scan_registry_for_crate(&nope, "tokio").unwrap();
         assert!(hits.is_empty());
+    }
+
+    // ---------- read_capped_line ----------
+
+    async fn read_capped_line_from_slice(input: &[u8], cap: usize) -> Vec<(ReadOutcome, Vec<u8>)> {
+        let mut reader = BufReader::new(input);
+        let mut out = Vec::new();
+        loop {
+            let mut buf = Vec::new();
+            let outcome = read_capped_line(&mut reader, &mut buf, cap).await.unwrap();
+            if outcome == ReadOutcome::Eof {
+                break;
+            }
+            out.push((outcome, buf));
+        }
+        out
+    }
+
+    #[tokio::test]
+    async fn read_capped_line_splits_on_newlines() {
+        let lines = read_capped_line_from_slice(b"alpha\nbeta\ngamma\n", 1024).await;
+        assert_eq!(
+            lines,
+            vec![
+                (ReadOutcome::Line, b"alpha\n".to_vec()),
+                (ReadOutcome::Line, b"beta\n".to_vec()),
+                (ReadOutcome::Line, b"gamma\n".to_vec()),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn read_capped_line_handles_trailing_no_newline() {
+        let lines = read_capped_line_from_slice(b"alpha\nbeta", 1024).await;
+        assert_eq!(
+            lines,
+            vec![
+                (ReadOutcome::Line, b"alpha\n".to_vec()),
+                (ReadOutcome::Line, b"beta".to_vec()),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn read_capped_line_truncates_single_overlong_line() {
+        // A 10_000-byte line with no `\n`, followed by a normal line —
+        // mimics a child that emits a huge JSON blob on one line then
+        // continues. The capped reader returns the first `cap` bytes
+        // marked Truncated, drains the rest of the overlong line, then
+        // surfaces the next line cleanly.
+        let mut input = Vec::from(vec![b'x'; 10_000].as_slice());
+        input.extend_from_slice(b"\nnext-line\n");
+        let lines = read_capped_line_from_slice(&input, 128).await;
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0].0, ReadOutcome::Truncated);
+        assert_eq!(lines[0].1.len(), 128);
+        assert_eq!(lines[0].1, vec![b'x'; 128]);
+        assert_eq!(lines[1], (ReadOutcome::Line, b"next-line\n".to_vec()));
+    }
+
+    #[tokio::test]
+    async fn read_capped_line_reports_truncated_on_cap_hit_at_eof() {
+        // Overlong line with no trailing newline and no following data —
+        // still reports Truncated (not Eof or Line) so callers can
+        // append a marker.
+        let input = vec![b'a'; 1024];
+        let lines = read_capped_line_from_slice(&input, 64).await;
+        assert_eq!(lines, vec![(ReadOutcome::Truncated, vec![b'a'; 64])]);
+    }
+
+    // ---------- bash_stream end-to-end (caps) ----------
+
+    fn test_workspace() -> Arc<Workspace> {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let mut root = std::env::temp_dir();
+        root.push(format!("wamh-bash-test-{}-{n}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        Arc::new(Workspace::new(&root).unwrap())
+    }
+
+    async fn run_bash_to_final(ws: Arc<Workspace>, args: Value) -> (Vec<String>, CallToolResult) {
+        use futures::StreamExt;
+        let mut stream = bash_stream(ws, args);
+        let mut chunks: Vec<String> = Vec::new();
+        let mut final_result: Option<CallToolResult> = None;
+        while let Some(item) = stream.next().await {
+            match item {
+                ToolStreamItem::Chunk(ContentBlock::Text { text }) => chunks.push(text),
+                ToolStreamItem::Final(r) => {
+                    final_result = Some(r);
+                    break;
+                }
+            }
+        }
+        (chunks, final_result.expect("bash_stream produced no Final"))
+    }
+
+    #[tokio::test]
+    async fn bash_streaming_chunks_cap_at_total_budget() {
+        // Emit ~4 MB of output (40k lines × ~100 bytes) — well past the
+        // streaming cap. The subscriber sees a bounded chunk volume
+        // plus one cap-reached marker, and the final tool_result shows
+        // the tail.
+        let ws = test_workspace();
+        let (chunks, final_result) = run_bash_to_final(
+            ws,
+            json!({
+                "command": "for i in $(seq 1 40000); do printf 'line %06d %s\\n' $i xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx; done",
+                "timeout_seconds": 60,
+            }),
+        )
+        .await;
+        let streamed_bytes: usize = chunks.iter().map(|c| c.len()).sum();
+        assert!(
+            streamed_bytes <= BASH_STREAM_TOTAL_BYTES + 512,
+            "streamed {streamed_bytes} exceeds cap"
+        );
+        let saw_cap_marker = chunks.iter().any(|c| c.contains("streaming cap reached"));
+        assert!(saw_cap_marker, "expected streaming-cap marker chunk");
+        let body = final_tool_text(&final_result);
+        assert!(
+            body.len() <= BASH_MAX_OUTPUT_BYTES + 256,
+            "final body {}B exceeds 30KB cap",
+            body.len()
+        );
+        // Final tail should include the latest lines — head-truncate keeps tail.
+        assert!(
+            body.contains("line 040000"),
+            "expected final tail to contain last line; body ends with: {}",
+            &body[body.len().saturating_sub(200)..]
+        );
+    }
+
+    #[tokio::test]
+    async fn bash_truncates_overlong_single_line() {
+        // A single 200_000-byte line would OOM `read_line`. With our
+        // capped reader, the tool survives and the output shows a
+        // truncation marker.
+        let ws = test_workspace();
+        let (chunks, final_result) = run_bash_to_final(
+            ws,
+            json!({
+                "command": "printf 'x%.0s' $(seq 1 200000); echo",
+                "timeout_seconds": 30,
+            }),
+        )
+        .await;
+        let streamed: String = chunks.concat();
+        assert!(
+            streamed.contains("line truncated"),
+            "expected line-truncation marker; got {} bytes",
+            streamed.len()
+        );
+        let body = final_tool_text(&final_result);
+        assert!(body.len() <= BASH_MAX_OUTPUT_BYTES + 256);
+    }
+
+    /// Collapse a `CallToolResult`'s `Text` blocks into a single `&str` for
+    /// test assertions. All content blocks in this crate are Text today, so
+    /// we just grab the first (every bash_stream Final has exactly one).
+    fn final_tool_text(r: &CallToolResult) -> &str {
+        match r.content.first() {
+            Some(ContentBlock::Text { text }) => text.as_str(),
+            None => "",
+        }
     }
 }
