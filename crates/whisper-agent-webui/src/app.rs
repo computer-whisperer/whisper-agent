@@ -513,8 +513,22 @@ struct TaskView {
     /// stamps can stay in step with the server's conversation view.
     /// Seeded from `ThreadSnapshot.conversation.len()`; bumped by each
     /// event that appends a message (`ThreadUserMessage`,
-    /// `ThreadToolResultMessage`, `ThreadAssistantEnd`).
+    /// `ThreadToolResultMessage`, `ThreadAssistantEnd`, and — via
+    /// `pending_tool_batch` below — the sync tool_result batch append
+    /// the server performs after all `ToolCallEnd`s of a turn).
     conv_message_count: usize,
+    /// Set to `true` on `ThreadToolCallBegin`; flushed to a
+    /// `conv_message_count += 1` on the next non-tool event. The server
+    /// pushes exactly one `Role::ToolResult` message to the conversation
+    /// once all tool calls of an assistant turn resolve (thread.rs step()
+    /// transitions out of `AwaitingTools`), but it doesn't emit a
+    /// dedicated event for that append — the sync path only surfaces per-
+    /// tool `ToolCallEnd`s. Without this flag, a turn with N tool calls
+    /// leaves `conv_message_count` under by 1 and every subsequent
+    /// `DisplayItem::User.msg_index` stamped by streaming is wrong,
+    /// which is how fork_thread's server-side user-role check ends up
+    /// rejecting a perfectly valid fork target.
+    pending_tool_batch: bool,
     /// Server-confirmed draft. Authoritative for re-populating the
     /// compose box when the user switches back to this thread; when
     /// this thread *is* selected, `ChatApp.input` leads and this
@@ -579,7 +593,21 @@ impl TaskView {
                 scope: whisper_agent_protocol::permission::Scope::default(),
             },
             conv_message_count: 0,
+            pending_tool_batch: false,
             draft: String::new(),
+        }
+    }
+
+    /// Cash in the `pending_tool_batch` flag into a `conv_message_count`
+    /// bump. Called from the `handle_wire` prologue whenever an event
+    /// arrives that isn't part of the tool-streaming trio — i.e. the
+    /// server is moving on from the tool phase, which on the server side
+    /// means `thread.rs::step()` has already pushed the batched
+    /// `Role::ToolResult` message. Idempotent when the flag is clear.
+    fn flush_pending_tool_batch(&mut self) {
+        if self.pending_tool_batch {
+            self.conv_message_count += 1;
+            self.pending_tool_batch = false;
         }
     }
 }
@@ -1676,6 +1704,17 @@ impl ChatApp {
     }
 
     fn handle_wire(&mut self, msg: ServerToClient) {
+        // Flush a pending sync-tool-batch append on the first event that
+        // isn't part of the tool-streaming trio. `thread.rs::step()`
+        // pushes exactly one `Role::ToolResult` message to the
+        // conversation when all tool calls of a turn resolve, without a
+        // dedicated event — so arming on `ToolCallBegin` and flushing
+        // here keeps `conv_message_count` in step with server state.
+        if let Some(tid) = pending_tool_batch_flush_thread_id(&msg)
+            && let Some(view) = self.tasks.get_mut(tid)
+        {
+            view.flush_pending_tool_batch();
+        }
         match msg {
             ServerToClient::ThreadCreated {
                 thread_id,
@@ -1782,6 +1821,10 @@ impl ChatApp {
                 view.failure = failure;
                 view.inspector = inspector;
                 view.conv_message_count = snapshot.conversation.len();
+                // Any in-flight tool batch carried over by the client is
+                // moot — snapshot length is authoritative, so reset the
+                // flush flag to avoid double-counting the same append.
+                view.pending_tool_batch = false;
                 view.draft = snapshot.draft.clone();
                 // Sync compose box from the just-arrived snapshot
                 // when we're looking at this thread and haven't
@@ -1881,6 +1924,11 @@ impl ChatApp {
                 args,
             } => {
                 if let Some(view) = self.tasks.get_mut(&thread_id) {
+                    // Arm the batch-append flag; a later non-tool event
+                    // flushes it into `conv_message_count += 1` to match
+                    // the `Role::ToolResult` message the server pushes
+                    // once all tool calls of this turn resolve.
+                    view.pending_tool_batch = true;
                     view.items.push(build_tool_call_item(
                         tool_use_id,
                         name,
@@ -2751,6 +2799,38 @@ impl ChatApp {
             None
         };
         (config_override, bindings_request)
+    }
+}
+
+/// Thread id of a `ServerToClient` event for the purpose of flushing a
+/// pending sync-tool-batch append. Returns `None` for the three tool-
+/// streaming events (Begin / Content / End) — those are the *tool*
+/// phase that the flag was armed for, so they must not flush — and for
+/// events that aren't associated with a single thread (pod/resource
+/// catalog updates, acks, etc.), which are also outside the per-thread
+/// append stream.
+fn pending_tool_batch_flush_thread_id(msg: &ServerToClient) -> Option<&str> {
+    match msg {
+        // Tool streaming — do not flush.
+        ServerToClient::ThreadToolCallBegin { .. }
+        | ServerToClient::ThreadToolCallContent { .. }
+        | ServerToClient::ThreadToolCallEnd { .. } => None,
+        // Snapshot resets the counter itself; let its handler take
+        // over rather than flush here.
+        ServerToClient::ThreadSnapshot { .. } => None,
+        // Per-thread events — flush before processing.
+        ServerToClient::ThreadUserMessage { thread_id, .. }
+        | ServerToClient::ThreadToolResultMessage { thread_id, .. }
+        | ServerToClient::ThreadAssistantBegin { thread_id, .. }
+        | ServerToClient::ThreadAssistantTextDelta { thread_id, .. }
+        | ServerToClient::ThreadAssistantReasoningDelta { thread_id, .. }
+        | ServerToClient::ThreadAssistantEnd { thread_id, .. }
+        | ServerToClient::ThreadLoopComplete { thread_id, .. }
+        | ServerToClient::ThreadStateChanged { thread_id, .. }
+        | ServerToClient::ThreadTitleUpdated { thread_id, .. }
+        | ServerToClient::ThreadDraftUpdated { thread_id, .. }
+        | ServerToClient::ThreadArchived { thread_id } => Some(thread_id.as_str()),
+        _ => None,
     }
 }
 
@@ -7535,7 +7615,100 @@ fn render_failure_banner(ui: &mut egui::Ui, view: &TaskView) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use whisper_agent_protocol::{ContentBlock, Conversation, Message, ToolResultContent};
+    use whisper_agent_protocol::{
+        ContentBlock, Conversation, Message, ThreadStateLabel, ToolResultContent, Usage,
+    };
+
+    fn summary_stub() -> ThreadSummary {
+        ThreadSummary {
+            thread_id: "t".into(),
+            pod_id: "p".into(),
+            title: None,
+            state: ThreadStateLabel::Idle,
+            created_at: String::new(),
+            last_active: String::new(),
+            origin: None,
+            continued_from: None,
+            dispatched_by: None,
+        }
+    }
+
+    /// Walk a `TaskView` through the event stream the server emits for
+    /// an assistant turn with N sequential tool calls and verify that
+    /// `conv_message_count` lines up with the server's authoritative
+    /// `Conversation::len()` after each event. The underlying bug:
+    /// `ThreadToolCallEnd` doesn't trigger a bump, but the server pushes
+    /// a single `Role::ToolResult` message when all calls resolve, so
+    /// every tool-heavy turn used to drift the client by +1 and
+    /// `DisplayItem::User.msg_index` stamped during streaming ended up
+    /// below the real server index (the fork_thread breakage).
+    #[test]
+    fn conv_message_count_tracks_server_across_sync_tool_batch() {
+        let mut view = TaskView::new(summary_stub());
+        // Simulate a snapshot landing with setup prefix + first user
+        // message: [System, Tools, System(listing), User] → len 4.
+        view.conv_message_count = 4;
+
+        // Turn 1: assistant issues 3 sequential tool calls.
+        view.flush_pending_tool_batch(); // AssistantBegin: no-op.
+        // ... streaming deltas, no counter touch ...
+        // AssistantEnd bumps +1 for the assistant message.
+        view.flush_pending_tool_batch();
+        view.conv_message_count += 1;
+        assert_eq!(view.conv_message_count, 5);
+
+        // Three tool calls, each Begin → End. Arm-then-flush happens on
+        // Begin only; End keeps the flag armed.
+        for _ in 0..3 {
+            view.pending_tool_batch = true; // ToolCallBegin
+            // ToolCallEnd emits no counter change.
+        }
+        // Turn 2 starts: AssistantBegin → flush fires once.
+        view.flush_pending_tool_batch();
+        assert_eq!(
+            view.conv_message_count, 6,
+            "batched tool_result append should bump count by exactly 1"
+        );
+        assert!(!view.pending_tool_batch);
+
+        // Assistant of turn 2 — text-only, no tools.
+        view.conv_message_count += 1; // AssistantEnd.
+        assert_eq!(view.conv_message_count, 7);
+        // User replies ("go ahead"). Handler reads `msg_index = count`
+        // *before* bumping; msg_index is now correct at 7 (server index).
+        let msg_index_for_user = view.conv_message_count;
+        view.conv_message_count += 1;
+        assert_eq!(msg_index_for_user, 7);
+        assert_eq!(view.conv_message_count, 8);
+    }
+
+    #[test]
+    fn flush_dispatcher_skips_tool_events_and_snapshot() {
+        let begin = ServerToClient::ThreadToolCallBegin {
+            thread_id: "t".into(),
+            tool_use_id: "tu-1".into(),
+            name: "bash".into(),
+            args_preview: String::new(),
+            args: None,
+        };
+        let end = ServerToClient::ThreadToolCallEnd {
+            thread_id: "t".into(),
+            tool_use_id: "tu-1".into(),
+            result_preview: String::new(),
+            is_error: false,
+        };
+        let assistant_end = ServerToClient::ThreadAssistantEnd {
+            thread_id: "t".into(),
+            stop_reason: Some("tool_use".into()),
+            usage: Usage::default(),
+        };
+        assert!(pending_tool_batch_flush_thread_id(&begin).is_none());
+        assert!(pending_tool_batch_flush_thread_id(&end).is_none());
+        assert_eq!(
+            pending_tool_batch_flush_thread_id(&assistant_end),
+            Some("t"),
+        );
+    }
 
     fn conv_with_tool_call() -> Conversation {
         let mut conv = Conversation::new();
