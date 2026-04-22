@@ -32,6 +32,7 @@ pub mod find_tool;
 mod grep;
 pub mod list_llm_providers;
 mod list_threads;
+mod pod_show_thread;
 pub mod sudo;
 
 use std::collections::HashMap;
@@ -130,6 +131,7 @@ pub const POD_REMOVE_FILE: &str = "pod_remove_file";
 pub const POD_LIST_FILES: &str = "pod_list_files";
 pub const POD_GREP: &str = "pod_grep";
 pub const POD_LIST_THREADS: &str = "pod_list_threads";
+pub const POD_SHOW_THREAD: &str = "pod_show_thread";
 pub const ABOUT: &str = "about";
 pub const POD_RUN_BEHAVIOR: &str = "pod_run_behavior";
 pub const POD_SET_BEHAVIOR_ENABLED: &str = "pod_set_behavior_enabled";
@@ -151,6 +153,7 @@ pub fn is_builtin(name: &str) -> bool {
             | POD_LIST_FILES
             | POD_GREP
             | POD_LIST_THREADS
+            | POD_SHOW_THREAD
             | ABOUT
             | POD_RUN_BEHAVIOR
             | POD_SET_BEHAVIOR_ENABLED
@@ -179,6 +182,7 @@ pub fn reserved_env_name_prefixes() -> Vec<&'static str> {
         POD_LIST_FILES,
         POD_GREP,
         POD_LIST_THREADS,
+        POD_SHOW_THREAD,
         ABOUT,
         POD_RUN_BEHAVIOR,
         POD_SET_BEHAVIOR_ENABLED,
@@ -208,6 +212,7 @@ pub fn descriptors() -> Vec<McpTool> {
         filesystem::remove_descriptor(),
         grep::descriptor(),
         list_threads::descriptor(),
+        pod_show_thread::descriptor(),
         about::descriptor(),
         behavior_control::run_behavior_descriptor(),
         behavior_control::set_behavior_enabled_descriptor(),
@@ -386,6 +391,7 @@ pub async fn dispatch(
         POD_REMOVE_FILE => filesystem::remove_file(&pod_dir, &allowed, &behavior_ids, args).await,
         POD_GREP => grep::run(&pod_dir, args).await,
         POD_LIST_THREADS => list_threads::run(&pod_dir, args).await,
+        POD_SHOW_THREAD => pod_show_thread::run(&pod_dir, args).await,
         ABOUT => about::run(args),
         POD_RUN_BEHAVIOR => behavior_control::run_behavior(&behavior_ids, args),
         POD_SET_BEHAVIOR_ENABLED => behavior_control::set_behavior_enabled(&behavior_ids, args),
