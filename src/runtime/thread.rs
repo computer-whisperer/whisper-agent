@@ -494,6 +494,85 @@ impl Thread {
         self.touch();
     }
 
+    /// If the thread is mid tool-call-cycle (`AwaitingTools`), synthesize
+    /// `is_error: true` `tool_result` blocks for every unresolved
+    /// `tool_use_id` in the conversation's latest assistant turn, push
+    /// them as a single `Role::ToolResult` message, and drop out of
+    /// `AwaitingTools`. Preserves any tool results that already
+    /// completed.
+    ///
+    /// Returns the list of interrupted `tool_use_id`s so the caller
+    /// can cancel the corresponding in-flight Function entries (their
+    /// late-arriving I/O results will then hit a state mismatch in
+    /// `apply_io_result` and be discarded as warn-logs).
+    ///
+    /// Exists to paper over a specific Anthropic-API constraint: every
+    /// `tool_use` content block must be immediately followed by a
+    /// matching `tool_result` block in the next message. A naked
+    /// `SendUserMessage` arriving while the thread had pending tool
+    /// calls would append a `Role::User` message right after the
+    /// `assistant[tool_use]`, producing a 400 on the next model call.
+    ///
+    /// No-op for any other state — callers still append the user
+    /// message unconditionally.
+    pub fn interrupt_pending_tools(
+        &mut self,
+        reason: &str,
+        events: &mut Vec<ThreadEvent>,
+    ) -> Vec<String> {
+        if !matches!(self.internal, ThreadInternalState::AwaitingTools { .. }) {
+            return Vec::new();
+        }
+        // `std::mem::replace` lets us move the fields out without
+        // re-borrowing — we take ownership of `pending_dispatch`,
+        // `pending_io`, and `completed`, then reinstate the state
+        // below with `Idle` (the caller's `submit_user_message` will
+        // transition it to `NeedsModelCall` / `WaitingOnResources`).
+        let ThreadInternalState::AwaitingTools {
+            pending_dispatch,
+            pending_io,
+            mut completed,
+        } = std::mem::replace(&mut self.internal, ThreadInternalState::Idle)
+        else {
+            unreachable!("matched guard above");
+        };
+
+        let mut interrupted: Vec<String> = Vec::new();
+        let synth_text = format!("tool call interrupted: {reason}");
+        for req in pending_dispatch {
+            events.push(ThreadEvent::ToolCallEnd {
+                tool_use_id: req.tool_use_id.clone(),
+                result_preview: synth_text.clone(),
+                is_error: true,
+            });
+            completed.push(ContentBlock::ToolResult {
+                tool_use_id: req.tool_use_id.clone(),
+                content: ToolResultContent::Text(synth_text.clone()),
+                is_error: true,
+            });
+            interrupted.push(req.tool_use_id);
+        }
+        for (_op_id, tool_use_id) in pending_io {
+            events.push(ThreadEvent::ToolCallEnd {
+                tool_use_id: tool_use_id.clone(),
+                result_preview: synth_text.clone(),
+                is_error: true,
+            });
+            completed.push(ContentBlock::ToolResult {
+                tool_use_id: tool_use_id.clone(),
+                content: ToolResultContent::Text(synth_text.clone()),
+                is_error: true,
+            });
+            interrupted.push(tool_use_id);
+        }
+        if !completed.is_empty() {
+            self.conversation
+                .push(Message::tool_result_blocks(completed));
+        }
+        self.touch();
+        interrupted
+    }
+
     /// Append a tool-output text message and transition the thread
     /// toward its next model call. Same state transition as
     /// [`Self::submit_user_message`] — the only difference is the
@@ -1078,5 +1157,144 @@ mod tests {
         let mut src = thread_with_two_turns();
         src.in_flight.insert(InFlightOps::COMPACTING);
         assert!(src.fork_from("new".into(), 2).is_err());
+    }
+
+    fn thread_awaiting_tools(
+        pending_dispatch: Vec<ToolUseReq>,
+        pending_io: HashMap<OpId, String>,
+        completed: Vec<ContentBlock>,
+    ) -> Thread {
+        let mut task = Thread::new(
+            "t".into(),
+            "pod".into(),
+            base_config_for_fork(),
+            ThreadBindings::default(),
+            Scope::allow_all(),
+            ToolSurface::default(),
+        );
+        // Seed a prior assistant turn with the tool_uses so
+        // `find_tool_name` / `find_tool_args` can resolve them if the
+        // integration path ever walks them back. Not strictly needed
+        // for `interrupt_pending_tools`, but keeps the conversation
+        // well-formed at the tool_use layer.
+        let mut tool_use_blocks: Vec<ContentBlock> = Vec::new();
+        for req in &pending_dispatch {
+            tool_use_blocks.push(ContentBlock::ToolUse {
+                id: req.tool_use_id.clone(),
+                name: req.name.clone(),
+                input: req.input.clone(),
+                replay: None,
+            });
+        }
+        for tool_use_id in pending_io.values() {
+            tool_use_blocks.push(ContentBlock::ToolUse {
+                id: tool_use_id.clone(),
+                name: "test_tool".into(),
+                input: serde_json::json!({}),
+                replay: None,
+            });
+        }
+        task.conversation
+            .push(Message::assistant_blocks(tool_use_blocks));
+        task.internal = ThreadInternalState::AwaitingTools {
+            pending_dispatch,
+            pending_io,
+            completed,
+        };
+        task
+    }
+
+    #[test]
+    fn interrupt_pending_tools_noop_when_not_awaiting() {
+        let mut task = thread_with_two_turns(); // state = Idle
+        let mut events = Vec::new();
+        let interrupted = task.interrupt_pending_tools("boom", &mut events);
+        assert!(interrupted.is_empty());
+        assert!(events.is_empty());
+        // Conversation unchanged.
+        assert_eq!(task.conversation.messages().len(), 4);
+    }
+
+    #[test]
+    fn interrupt_pending_tools_synthesizes_for_in_flight_and_queued() {
+        // Two categories: one already-dispatched (in pending_io,
+        // op_id 5), one still queued (in pending_dispatch, no op_id
+        // yet). Plus one previously-completed result we must
+        // preserve in the output message.
+        let mut pending_io = HashMap::new();
+        pending_io.insert(5, "toolu_inflight".to_string());
+        let pending_dispatch = vec![ToolUseReq {
+            tool_use_id: "toolu_queued".into(),
+            name: "bash".into(),
+            input: serde_json::json!({"command": "ls"}),
+        }];
+        let completed = vec![ContentBlock::ToolResult {
+            tool_use_id: "toolu_done".into(),
+            content: ToolResultContent::Text("ok".into()),
+            is_error: false,
+        }];
+        let mut task = thread_awaiting_tools(pending_dispatch, pending_io, completed);
+
+        let mut events = Vec::new();
+        let mut interrupted = task.interrupt_pending_tools("tests", &mut events);
+        interrupted.sort();
+        assert_eq!(
+            interrupted,
+            vec!["toolu_inflight".to_string(), "toolu_queued".into()]
+        );
+        // One ToolCallEnd event per synthesized result.
+        assert_eq!(events.len(), 2);
+        for ev in &events {
+            let ThreadEvent::ToolCallEnd {
+                is_error,
+                result_preview,
+                ..
+            } = ev
+            else {
+                panic!("expected ToolCallEnd, got {ev:?}");
+            };
+            assert!(*is_error);
+            assert!(result_preview.contains("tests"));
+        }
+
+        // State cleared; last conversation message is a Role::ToolResult
+        // carrying: the already-completed block + one synthesized block
+        // per interrupted tool_use_id.
+        assert!(matches!(task.internal, ThreadInternalState::Idle));
+        let last = task.conversation.messages().last().unwrap();
+        assert_eq!(last.role, Role::ToolResult);
+        let ids: Vec<&str> = last
+            .content
+            .iter()
+            .filter_map(|b| match b {
+                ContentBlock::ToolResult { tool_use_id, .. } => Some(tool_use_id.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(ids.contains(&"toolu_done"));
+        assert!(ids.contains(&"toolu_inflight"));
+        assert!(ids.contains(&"toolu_queued"));
+    }
+
+    #[test]
+    fn submit_user_message_after_interrupt_reaches_needs_model_call() {
+        // End-to-end shape: AwaitingTools → interrupt → submit_user
+        // leaves the thread with a valid conversation
+        // (tool_result message sits between the assistant tool_use
+        // and the new user message) and state = NeedsModelCall.
+        let mut pending_io = HashMap::new();
+        pending_io.insert(7, "toolu_x".to_string());
+        let mut task = thread_awaiting_tools(Vec::new(), pending_io, Vec::new());
+        let mut events = Vec::new();
+        let interrupted = task.interrupt_pending_tools("new_user_msg", &mut events);
+        assert_eq!(interrupted, vec!["toolu_x".to_string()]);
+        task.submit_user_message("follow-up".into(), Vec::new());
+        assert!(matches!(task.internal, ThreadInternalState::NeedsModelCall));
+        let msgs = task.conversation.messages();
+        // [assistant[tool_use], tool_result, user]
+        assert_eq!(msgs.len(), 3);
+        assert_eq!(msgs[0].role, Role::Assistant);
+        assert_eq!(msgs[1].role, Role::ToolResult);
+        assert_eq!(msgs[2].role, Role::User);
     }
 }

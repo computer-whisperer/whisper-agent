@@ -3051,6 +3051,32 @@ impl Scheduler {
         // create_task already dispatched in this cycle or when the
         // thread has no host_env binding.
         self.ensure_host_env_provisioning(thread_id, pending_io);
+        // If the thread was mid tool-call-cycle (AwaitingTools) when
+        // this user message arrived, synthesize error-tagged
+        // tool_results for every unresolved tool_use so the
+        // conversation stays Anthropic-valid (`assistant[tool_use]`
+        // must be followed by `tool_result`, not bare `user[text]`).
+        // Then cancel the corresponding Function entries so late-
+        // arriving I/O results are discarded at the scheduler layer
+        // rather than re-integrated against a finalized conversation.
+        let interrupted = {
+            let mut events = Vec::new();
+            let task = self.tasks.get_mut(thread_id).expect("task exists");
+            let list = task.interrupt_pending_tools("superseded by new user message", &mut events);
+            self.router.dispatch_events(thread_id, events);
+            list
+        };
+        for tool_use_id in &interrupted {
+            if let Some(fn_id) = self.find_tool_function_for(thread_id, tool_use_id) {
+                self.complete_function(
+                    fn_id,
+                    crate::functions::FunctionOutcome::Cancelled(
+                        crate::functions::CancelReason::ExplicitCancel,
+                    ),
+                    pending_io,
+                );
+            }
+        }
         // Derive title on the first user message.
         let title_new = {
             let task = self.tasks.get_mut(thread_id).expect("task exists");
