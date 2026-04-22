@@ -125,6 +125,7 @@ fn no_update_text(message: String) -> ToolOutcome {
 pub const POD_READ_FILE: &str = "pod_read_file";
 pub const POD_WRITE_FILE: &str = "pod_write_file";
 pub const POD_EDIT_FILE: &str = "pod_edit_file";
+pub const POD_REMOVE_FILE: &str = "pod_remove_file";
 pub const POD_LIST_FILES: &str = "pod_list_files";
 pub const POD_GREP: &str = "pod_grep";
 pub const POD_LIST_THREADS: &str = "pod_list_threads";
@@ -144,6 +145,7 @@ pub fn is_builtin(name: &str) -> bool {
         POD_READ_FILE
             | POD_WRITE_FILE
             | POD_EDIT_FILE
+            | POD_REMOVE_FILE
             | POD_LIST_FILES
             | POD_GREP
             | POD_LIST_THREADS
@@ -170,6 +172,7 @@ pub fn reserved_env_name_prefixes() -> Vec<&'static str> {
         POD_READ_FILE,
         POD_WRITE_FILE,
         POD_EDIT_FILE,
+        POD_REMOVE_FILE,
         POD_LIST_FILES,
         POD_GREP,
         POD_LIST_THREADS,
@@ -198,6 +201,7 @@ pub fn descriptors() -> Vec<McpTool> {
         filesystem::read_descriptor(),
         filesystem::write_descriptor(),
         filesystem::edit_descriptor(),
+        filesystem::remove_descriptor(),
         grep::descriptor(),
         list_threads::descriptor(),
         about::descriptor(),
@@ -243,6 +247,11 @@ pub enum PodUpdate {
     /// behavior already exists in-memory (see module docs); the tool
     /// handler rejects prompt writes for unknown ids.
     BehaviorPrompt { behavior_id: String, text: String },
+    /// A `pod_remove_file` on `behaviors/<id>/behavior.toml` removed
+    /// the behavior's entire directory from disk. The scheduler
+    /// unregisters the in-memory behavior and broadcasts
+    /// `BehaviorDeleted`.
+    BehaviorDeleted { behavior_id: String },
 }
 
 /// Runtime action a builtin tool asks the scheduler to perform AFTER
@@ -300,13 +309,33 @@ pub async fn dispatch(
     // inspecting pod-internal state (`threads/*.json`, etc.) is not a
     // capability-raising action, so the cap hierarchy doesn't apply.
     // See `docs/design_permissions_rework.md`.
-    if matches!(tool_name, POD_WRITE_FILE | POD_EDIT_FILE)
+    if matches!(tool_name, POD_WRITE_FILE | POD_EDIT_FILE | POD_REMOVE_FILE)
         && let Some(filename) = args.get("filename").and_then(|v| v.as_str())
         && !pod_modify.admits(filename)
     {
         return no_update_error(format!(
             "`{tool_name}` on `{filename}` is denied by the thread's pod_modify capability \
              ({pod_modify:?}). Ask for scope widening if this action is needed."
+        ));
+    }
+    // Removing a behavior (`behaviors/<id>/behavior.toml`) requires
+    // `behaviors` cap ≥ author_narrower — the same tier authorized to
+    // create one. None / Read can neither mint nor retire behaviors.
+    // Memory removes and future plain-file removes pass through on
+    // the pod_modify check above; non-behavior paths skip this gate.
+    if tool_name == POD_REMOVE_FILE
+        && let Some(filename) = args.get("filename").and_then(|v| v.as_str())
+        && filename.starts_with(&format!("{}/", crate::pod::behaviors::BEHAVIORS_DIR))
+        && filename.ends_with(&format!("/{}", crate::pod::behaviors::BEHAVIOR_TOML))
+        && !matches!(
+            behaviors_cap,
+            crate::permission::BehaviorOpsCap::AuthorNarrower
+                | crate::permission::BehaviorOpsCap::AuthorAny
+        )
+    {
+        return no_update_error(format!(
+            "`{tool_name}` on `{filename}` requires behaviors cap ≥ author_narrower \
+             (have: {behaviors_cap:?}). Ask for scope widening if this action is needed."
         ));
     }
     // Behavior-subsystem tools are gated by the thread's `behaviors` cap.
@@ -343,6 +372,7 @@ pub async fn dispatch(
         POD_READ_FILE => filesystem::read_file(&pod_dir, &allowed, &behavior_ids, args).await,
         POD_WRITE_FILE => filesystem::write_file(&pod_dir, &allowed, &behavior_ids, args).await,
         POD_EDIT_FILE => filesystem::edit_file(&pod_dir, &allowed, &behavior_ids, args).await,
+        POD_REMOVE_FILE => filesystem::remove_file(&pod_dir, &allowed, &behavior_ids, args).await,
         POD_GREP => grep::run(&pod_dir, args).await,
         POD_LIST_THREADS => list_threads::run(&pod_dir, args).await,
         ABOUT => about::run(args),

@@ -52,6 +52,37 @@ impl Scheduler {
             crate::tools::builtin_tools::PodUpdate::BehaviorPrompt { behavior_id, text } => {
                 self.apply_behavior_prompt_update(&pod_id, behavior_id, text);
             }
+            crate::tools::builtin_tools::PodUpdate::BehaviorDeleted { behavior_id } => {
+                self.apply_behavior_deleted(&pod_id, behavior_id);
+            }
+        }
+    }
+
+    /// Retire a behavior from in-memory pod state after a successful
+    /// `pod_remove_file` on `behaviors/<id>/behavior.toml`. The
+    /// on-disk directory is already gone (the tool handler unlinked
+    /// it before we got here). Broadcasts `BehaviorDeleted` to every
+    /// connected client — same wire shape the explicit
+    /// `DeleteBehavior` client message emits, so UI code doesn't
+    /// branch on the removal source. A missing entry logs a warn and
+    /// drops the broadcast; the tool layer already rejected unknown
+    /// ids, so this path indicates a race or a bug.
+    fn apply_behavior_deleted(&mut self, pod_id: &str, behavior_id: String) {
+        let Some(pod) = self.pods.get_mut(pod_id) else {
+            warn!(%pod_id, %behavior_id, "apply_behavior_deleted: unknown pod");
+            return;
+        };
+        if pod.behaviors.remove(&behavior_id).is_none() {
+            warn!(%pod_id, %behavior_id, "apply_behavior_deleted: unknown behavior");
+            return;
+        }
+        let ev = ServerToClient::BehaviorDeleted {
+            correlation_id: None,
+            pod_id: pod_id.to_string(),
+            behavior_id,
+        };
+        for tx in self.router.outbound_snapshot() {
+            let _ = tx.send(ev.clone());
         }
     }
 

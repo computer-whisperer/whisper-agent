@@ -223,8 +223,9 @@ Tools come from three sources; a tool's name prefix tells you which:
 - **Builtins** — in-process, no network, always available when
   admitted. Includes:
   - `pod_read_file` / `pod_write_file` / `pod_edit_file` /
-    `pod_list_files` / `pod_grep` / `pod_list_threads` — edit and
-    search the pod directory. See `filesystem`.
+    `pod_remove_file` / `pod_list_files` / `pod_grep` /
+    `pod_list_threads` — edit and search the pod directory. See
+    `filesystem`.
   - `pod_run_behavior` / `pod_set_behavior_enabled` — fire or pause
     behaviors manually. See `behaviors`.
   - `dispatch_thread` — spawn a child thread from a named behavior
@@ -364,6 +365,13 @@ All operate on paths relative to the pod root and never escape it.
   `old_string` with surrounding context to disambiguate, extend
   `new_string` by the same text — extending only `old_string`
   deletes the intervening characters.
+- `pod_remove_file(path)` — delete a `memory/<name>.md` or
+  retire an entire behavior by removing its
+  `behaviors/<id>/behavior.toml` (this also drops the directory's
+  `prompt.md` + `state.json` and unregisters the behavior so it
+  stops firing). `prompt.md` cannot be removed on its own; the
+  top-level config files (`pod.toml`, the system-prompt file) are
+  not removable through this tool.
 - `pod_grep(pattern, path?)` — literal-substring search across the
   pod tree. Useful for locating which thread logged an error or
   which behavior references a particular tool.
@@ -973,6 +981,8 @@ table and the `behaviors` topic for authoring sub-agents.
 - `pod_write_file` — full overwrite or create.
 - `pod_edit_file` — literal-substring replace; `replace_all` to
   change every occurrence.
+- `pod_remove_file` — delete a `memory/<name>.md` or retire a
+  behavior by removing its `behaviors/<id>/behavior.toml`.
 - `pod_grep` — literal-substring search across the whole pod tree.
 - `pod_list_threads` — structured query over `threads/` with
   behavior/state/since/turn-count filters.

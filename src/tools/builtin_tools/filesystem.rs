@@ -1,5 +1,6 @@
-//! `pod_list_files` / `pod_read_file` / `pod_write_file` / `pod_edit_file`
-//! — the on-disk file tools that let an agent edit its own pod config.
+//! `pod_list_files` / `pod_read_file` / `pod_write_file` /
+//! `pod_edit_file` / `pod_remove_file` — the on-disk file tools that
+//! let an agent edit its own pod config.
 //!
 //! Writes route through `validate_filename` + per-type prep
 //! (`prepare_update` for pod.toml/behavior.toml, direct write for plain
@@ -13,8 +14,8 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use super::{
-    POD_EDIT_FILE, POD_LIST_FILES, POD_READ_FILE, POD_WRITE_FILE, PodUpdate, ToolOutcome,
-    no_update_error, no_update_text, text_result,
+    POD_EDIT_FILE, POD_LIST_FILES, POD_READ_FILE, POD_REMOVE_FILE, POD_WRITE_FILE, PodUpdate,
+    ToolOutcome, no_update_error, no_update_text, text_result,
 };
 use crate::pod;
 use crate::pod::behaviors::{BEHAVIOR_PROMPT, BEHAVIOR_STATE, BEHAVIOR_TOML, BEHAVIORS_DIR};
@@ -769,6 +770,136 @@ pub(super) async fn edit_file(
         pod_update: update,
         scheduler_command: None,
     }
+}
+
+// ---------- remove ----------
+
+pub(super) fn remove_descriptor() -> McpTool {
+    McpTool {
+        name: POD_REMOVE_FILE.into(),
+        description: "Delete a pod file. Two file classes are removable: \
+                      `memory/<name>.md` (unlinks the memory file — the \
+                      `memory/MEMORY.md` index file itself is removable \
+                      too; remove it to clear the memory system entirely) \
+                      and `behaviors/<id>/behavior.toml` (removes the \
+                      entire `behaviors/<id>/` directory including its \
+                      `prompt.md` + `state.json`, and unregisters the \
+                      behavior in-memory so it stops firing immediately). \
+                      A behavior's `prompt.md` cannot be removed on its \
+                      own — delete the `behavior.toml` to retire the \
+                      behavior. `pod.toml`, the pod system-prompt file, \
+                      and any read-only runtime state (thread files, \
+                      `pod_state.json`, per-behavior `state.json`) are \
+                      not removable through this tool. Idempotent — \
+                      removing a missing file returns a `not-found` \
+                      error rather than silent success so the agent can \
+                      tell whether the file actually existed."
+            .into(),
+        input_schema: json!({
+            "type": "object",
+            "properties": {
+                "filename": {
+                    "type": "string",
+                    "description": "File to remove. Must be `memory/<name>.md` \
+                                    or `behaviors/<id>/behavior.toml`."
+                }
+            },
+            "required": ["filename"]
+        }),
+        annotations: ToolAnnotations {
+            title: Some("Remove pod file".into()),
+            read_only_hint: Some(false),
+            destructive_hint: Some(true),
+            idempotent_hint: Some(false),
+            open_world_hint: Some(false),
+        },
+    }
+}
+
+#[derive(Deserialize)]
+struct RemoveArgs {
+    filename: String,
+}
+
+pub(super) async fn remove_file(
+    pod_dir: &Path,
+    allowed: &[String],
+    behavior_ids: &[String],
+    args: Value,
+) -> ToolOutcome {
+    let parsed: RemoveArgs = match serde_json::from_value(args) {
+        Ok(v) => v,
+        Err(e) => return no_update_error(format!("invalid arguments: {e}")),
+    };
+    // Reuse the write-side validator: it accepts `memory/<name>.md`,
+    // `behaviors/<id>/<suffix>`, and the top-level allowlist — and
+    // rejects read-only paths with a targeted message.
+    if let Err(e) = validate_filename(&parsed.filename, allowed, behavior_ids, true) {
+        return no_update_error(e);
+    }
+
+    // Memory files: flat directory of agent-managed markdown, plain
+    // unlink. No in-memory state to refresh.
+    if parse_memory_path(&parsed.filename).is_some() {
+        let path = pod_dir.join(&parsed.filename);
+        return match tokio::fs::remove_file(&path).await {
+            Ok(()) => no_update_text(format!("removed {}", parsed.filename)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                no_update_error(format!("remove {}: not found", parsed.filename))
+            }
+            Err(e) => no_update_error(format!("remove {}: {e}", parsed.filename)),
+        };
+    }
+
+    // Behavior files: `behavior.toml` retires the entire behavior
+    // (delete the directory + fire BehaviorDeleted). `prompt.md` on
+    // its own would leave a broken behavior, so force the caller to
+    // go through `behavior.toml` instead.
+    if let Some((id, suffix)) = parse_behavior_path(&parsed.filename) {
+        if suffix == BEHAVIOR_PROMPT {
+            return no_update_error(format!(
+                "removing `{}` alone would leave behavior `{id}` without a prompt. \
+                 Remove `{BEHAVIORS_DIR}/{id}/{BEHAVIOR_TOML}` to retire the whole \
+                 behavior.",
+                parsed.filename
+            ));
+        }
+        if suffix != BEHAVIOR_TOML {
+            return no_update_error(format!(
+                "unknown behavior filename suffix `{suffix}` for behavior `{id}`"
+            ));
+        }
+        if !behavior_ids.iter().any(|i| i == id) {
+            return no_update_error(format!(
+                "remove {}: behavior `{id}` not found",
+                parsed.filename
+            ));
+        }
+        let dir = pod_dir.join(BEHAVIORS_DIR).join(id);
+        if let Err(e) = tokio::fs::remove_dir_all(&dir).await {
+            return no_update_error(format!("remove {}: {e}", parsed.filename));
+        }
+        return ToolOutcome {
+            result: text_result(format!("removed behavior `{id}` ({BEHAVIORS_DIR}/{id}/)")),
+            pod_update: Some(PodUpdate::BehaviorDeleted {
+                behavior_id: id.to_string(),
+            }),
+            scheduler_command: None,
+        };
+    }
+
+    // Everything else (pod.toml, the pod's system-prompt file, any
+    // custom allowlist entry) — refuse. Removing pod.toml nukes the
+    // pod from within; removing the prompt leaves the pod in a
+    // partially-configured state with no clear recovery path.
+    no_update_error(format!(
+        "`{tool_name}` on `{filename}` is not permitted. Removable paths are \
+         `{MEMORY_DIR}/<name>.md` and `{BEHAVIORS_DIR}/<id>/{BEHAVIOR_TOML}` \
+         (which retires the entire behavior). Top-level config files are not \
+         removable through this tool.",
+        tool_name = POD_REMOVE_FILE,
+        filename = parsed.filename,
+    ))
 }
 
 /// Decide what kind of [`PodUpdate`] a successful write produces.
@@ -1835,5 +1966,184 @@ schedule = "0 9 * * *"
             state_line.starts_with("[r-]"),
             "state.json should be read-only, got: {state_line}"
         );
+    }
+
+    // ---------- pod_remove_file ----------
+
+    #[tokio::test]
+    async fn remove_memory_file_unlinks_and_emits_no_pod_update() {
+        let dir = temp_dir();
+        tokio::fs::create_dir_all(dir.join(MEMORY_DIR))
+            .await
+            .unwrap();
+        let file = dir.join(MEMORY_DIR).join("notes.md");
+        tokio::fs::write(&file, "hello\n").await.unwrap();
+        let out = dispatch(
+            dir.clone(),
+            sample_config(),
+            vec![],
+            crate::permission::PodModifyCap::Memories,
+            crate::permission::BehaviorOpsCap::None,
+            POD_REMOVE_FILE,
+            json!({ "filename": "memory/notes.md" }),
+        )
+        .await;
+        assert!(!out.result.is_error, "{:?}", out.result);
+        assert!(out.pod_update.is_none());
+        assert!(!file.exists(), "memory file should be gone");
+    }
+
+    #[tokio::test]
+    async fn remove_missing_memory_file_returns_not_found() {
+        let dir = temp_dir();
+        let out = dispatch(
+            dir.clone(),
+            sample_config(),
+            vec![],
+            crate::permission::PodModifyCap::Memories,
+            crate::permission::BehaviorOpsCap::None,
+            POD_REMOVE_FILE,
+            json!({ "filename": "memory/missing.md" }),
+        )
+        .await;
+        assert!(out.result.is_error);
+        assert!(join_blocks(&out.result.content).contains("not found"));
+    }
+
+    #[tokio::test]
+    async fn remove_behavior_toml_deletes_directory_and_emits_behavior_deleted() {
+        let dir = temp_dir();
+        let behavior_dir = dir.join("behaviors").join("nightly");
+        tokio::fs::create_dir_all(&behavior_dir).await.unwrap();
+        tokio::fs::write(behavior_dir.join("behavior.toml"), r#"name = "n""#)
+            .await
+            .unwrap();
+        tokio::fs::write(behavior_dir.join("prompt.md"), "hi")
+            .await
+            .unwrap();
+        tokio::fs::write(behavior_dir.join("state.json"), "{}")
+            .await
+            .unwrap();
+
+        let out = dispatch(
+            dir.clone(),
+            sample_config(),
+            vec!["nightly".to_string()],
+            crate::permission::PodModifyCap::Content,
+            crate::permission::BehaviorOpsCap::AuthorAny,
+            POD_REMOVE_FILE,
+            json!({ "filename": "behaviors/nightly/behavior.toml" }),
+        )
+        .await;
+        assert!(!out.result.is_error, "{:?}", out.result);
+        match out.pod_update {
+            Some(PodUpdate::BehaviorDeleted { behavior_id }) => {
+                assert_eq!(behavior_id, "nightly");
+            }
+            other => panic!("expected BehaviorDeleted, got {other:?}"),
+        }
+        assert!(!behavior_dir.exists(), "whole behavior dir should be gone");
+    }
+
+    #[tokio::test]
+    async fn remove_behavior_prompt_alone_is_rejected() {
+        let dir = temp_dir();
+        let out = dispatch(
+            dir,
+            sample_config(),
+            vec!["nightly".to_string()],
+            crate::permission::PodModifyCap::Content,
+            crate::permission::BehaviorOpsCap::AuthorAny,
+            POD_REMOVE_FILE,
+            json!({ "filename": "behaviors/nightly/prompt.md" }),
+        )
+        .await;
+        assert!(out.result.is_error);
+        let text = join_blocks(&out.result.content);
+        assert!(
+            text.contains("without a prompt") && text.contains("behavior.toml"),
+            "expected redirection to behavior.toml: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn remove_pod_toml_is_rejected_even_with_modify_allow() {
+        let dir = temp_dir();
+        let out = dispatch(
+            dir,
+            sample_config(),
+            vec![],
+            crate::permission::PodModifyCap::ModifyAllow,
+            crate::permission::BehaviorOpsCap::AuthorAny,
+            POD_REMOVE_FILE,
+            json!({ "filename": "pod.toml" }),
+        )
+        .await;
+        assert!(out.result.is_error);
+        let text = join_blocks(&out.result.content);
+        assert!(
+            text.contains("not permitted") || text.contains("not removable"),
+            "expected refusal for pod.toml: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn remove_behavior_denied_without_behaviors_cap() {
+        // pod_modify admits the path, but behaviors = Read is below
+        // the author_narrower floor that gates behavior removal.
+        let dir = temp_dir();
+        let out = dispatch(
+            dir,
+            sample_config(),
+            vec!["nightly".to_string()],
+            crate::permission::PodModifyCap::Content,
+            crate::permission::BehaviorOpsCap::Read,
+            POD_REMOVE_FILE,
+            json!({ "filename": "behaviors/nightly/behavior.toml" }),
+        )
+        .await;
+        assert!(out.result.is_error);
+        let text = join_blocks(&out.result.content);
+        assert!(
+            text.contains("behaviors cap") && text.contains("author_narrower"),
+            "expected behaviors-cap denial: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn remove_denied_without_pod_modify_cap() {
+        let dir = temp_dir();
+        let out = dispatch(
+            dir,
+            sample_config(),
+            vec![],
+            crate::permission::PodModifyCap::None,
+            crate::permission::BehaviorOpsCap::AuthorAny,
+            POD_REMOVE_FILE,
+            json!({ "filename": "memory/anything.md" }),
+        )
+        .await;
+        assert!(out.result.is_error);
+        assert!(join_blocks(&out.result.content).contains("pod_modify"));
+    }
+
+    #[tokio::test]
+    async fn remove_readonly_state_file_rejected() {
+        // `pod_state.json` is runtime state, not a config file.
+        // `pod_modify` doesn't admit it at any level, so the dispatch-
+        // layer cap gate fires first — the test just needs to confirm
+        // the remove is refused.
+        let dir = temp_dir();
+        let out = dispatch(
+            dir,
+            sample_config(),
+            vec![],
+            crate::permission::PodModifyCap::ModifyAllow,
+            crate::permission::BehaviorOpsCap::AuthorAny,
+            POD_REMOVE_FILE,
+            json!({ "filename": "pod_state.json" }),
+        )
+        .await;
+        assert!(out.result.is_error);
     }
 }
