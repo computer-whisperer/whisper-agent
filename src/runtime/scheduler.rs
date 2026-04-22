@@ -3748,10 +3748,43 @@ impl Scheduler {
     /// `ResourceDestroyed` events for every change.
     fn gc_tick(&mut self) {
         self.sweep_expired_oauth_flows();
+        // Ground-truth "in use" sets. A thread's `bindings.host_env` +
+        // `bindings.mcp_hosts` pin the corresponding registry entries
+        // against reap for as long as the thread is live — regardless
+        // of whether the registry's `users` refcount has drifted. A
+        // thread parked on a slow model call or a dispatched child
+        // touches nothing in the registry, so refcount-only idle
+        // detection would race live work. Failed / Cancelled threads
+        // don't count — their bindings are already released via
+        // `teardown_host_env_if_terminal` and they're on their way
+        // out anyway.
+        let mut in_use_host_envs: HashSet<HostEnvId> = HashSet::new();
+        let mut in_use_mcp_hosts: HashSet<McpHostId> = HashSet::new();
+        for task in self.tasks.values() {
+            if matches!(
+                task.public_state(),
+                ThreadStateLabel::Failed | ThreadStateLabel::Cancelled
+            ) {
+                continue;
+            }
+            for binding in &task.bindings.host_env {
+                if let Some((provider, spec)) = self.resolve_binding(&task.pod_id, binding) {
+                    let hid = HostEnvId::for_provider_spec(&provider, &spec);
+                    let mid = McpHostId::for_host_env(&hid);
+                    in_use_host_envs.insert(hid);
+                    in_use_mcp_hosts.insert(mid);
+                }
+            }
+            for name in &task.bindings.mcp_hosts {
+                in_use_mcp_hosts.insert(McpHostId::shared(name));
+            }
+        }
         let plan = self.resources.reap_idle(
             chrono::Utc::now(),
             chrono::Duration::seconds(IDLE_RESOURCE_SECS),
             chrono::Duration::seconds(TERMINAL_RETENTION_SECS),
+            &in_use_host_envs,
+            &in_use_mcp_hosts,
         );
         if plan.torn_down_host_envs.is_empty()
             && plan.torn_down_mcp_hosts.is_empty()

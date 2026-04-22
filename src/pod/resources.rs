@@ -12,7 +12,7 @@
 //! introduces `ThreadId`, the `users: BTreeSet<String>` field swaps for
 //! `BTreeSet<ThreadId>` and the rest of the module stays put.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
@@ -737,6 +737,12 @@ impl ResourceRegistry {
     pub fn remove_mcp_user(&mut self, id: &McpHostId, user: &str) {
         if let Some(entry) = self.mcp_hosts.get_mut(id) {
             entry.users.remove(user);
+            // Start the idle grace window from the moment the last
+            // user actually leaves — otherwise `last_used` can carry
+            // a stale timestamp from provisioning while the entry sits
+            // unreferenced, and reap_idle would tear it down as soon
+            // as the new in-use check passes.
+            entry.last_used = Utc::now();
         }
     }
 
@@ -750,6 +756,7 @@ impl ResourceRegistry {
     pub fn remove_host_env_user(&mut self, id: &HostEnvId, user: &str) {
         if let Some(entry) = self.host_envs.get_mut(id) {
             entry.users.remove(user);
+            entry.last_used = Utc::now();
         }
     }
 
@@ -787,11 +794,21 @@ impl ResourceRegistry {
     /// Single GC sweep over the registry. Two passes:
     ///
     /// 1. **Idle Ready entries** — sandboxes and MCP hosts that are
-    ///    `Ready`, have no users, aren't pinned, and haven't been
+    ///    `Ready`, aren't pinned, aren't bound by any live thread
+    ///    (per the caller-supplied `in_use_*` sets), and haven't been
     ///    touched since `now - idle_threshold`. These are torn down:
     ///    sandbox handles are pulled out (returned in the plan so the
     ///    caller can spawn `handle.teardown()`), MCP sessions are
     ///    dropped, and the entries flip to `TornDown`.
+    ///
+    ///    The "bound by a live thread" check is ground truth from the
+    ///    scheduler's `tasks` map, not the registry's `users` refcount.
+    ///    `users` is maintained for UI / broadcast but doesn't gate
+    ///    GC — a thread parked on a model call or waiting on a
+    ///    dispatched child doesn't touch the registry, so refcount-
+    ///    only GC would race live work. As long as any thread still
+    ///    has the resource in `bindings.host_env` (and isn't
+    ///    Failed / Cancelled), the entry is pinned against reap.
     ///
     /// 2. **Stale terminal entries** — sandboxes and MCP hosts in
     ///    `Errored` or `TornDown` state whose `last_used` is older than
@@ -809,6 +826,8 @@ impl ResourceRegistry {
         now: DateTime<Utc>,
         idle_threshold: chrono::Duration,
         terminal_retention: chrono::Duration,
+        in_use_host_envs: &HashSet<HostEnvId>,
+        in_use_mcp_hosts: &HashSet<McpHostId>,
     ) -> ReapPlan {
         let mut plan = ReapPlan::default();
 
@@ -816,10 +835,10 @@ impl ResourceRegistry {
         let idle_sandboxes: Vec<HostEnvId> = self
             .host_envs
             .iter()
-            .filter(|(_, e)| {
+            .filter(|(id, e)| {
                 e.state.is_ready()
                     && !e.pinned
-                    && e.users.is_empty()
+                    && !in_use_host_envs.contains(id)
                     && now.signed_duration_since(e.last_used) >= idle_threshold
             })
             .map(|(id, _)| id.clone())
@@ -837,10 +856,10 @@ impl ResourceRegistry {
         let idle_mcp: Vec<McpHostId> = self
             .mcp_hosts
             .iter()
-            .filter(|(_, e)| {
+            .filter(|(id, e)| {
                 e.state.is_ready()
                     && !e.pinned
-                    && e.users.is_empty()
+                    && !in_use_mcp_hosts.contains(id)
                     && now.signed_duration_since(e.last_used) >= idle_threshold
             })
             .map(|(id, _)| id.clone())
@@ -1080,6 +1099,8 @@ mod tests {
             now,
             chrono::Duration::seconds(300),
             chrono::Duration::seconds(3600),
+            &HashSet::new(),
+            &HashSet::new(),
         );
         assert_eq!(plan.torn_down_host_envs.len(), 1);
         assert_eq!(plan.torn_down_host_envs[0].0, idle_id);
@@ -1094,7 +1115,7 @@ mod tests {
     }
 
     #[test]
-    fn reap_idle_skips_recently_used_and_user_held() {
+    fn reap_idle_skips_recently_used() {
         let mut reg = ResourceRegistry::new();
         let id = reg.pre_register_host_env(
             "t-1",
@@ -1105,16 +1126,91 @@ mod tests {
             },
         );
         let _ = reg.complete_host_env_provisioning(&id, None, None, None);
-        // last_used is `now`; should NOT reap on the first sweep.
+        // last_used is `now`; should NOT reap on the first sweep even
+        // with an empty in-use set — the idle threshold protects.
         let plan = reg.reap_idle(
             Utc::now(),
             chrono::Duration::seconds(300),
             chrono::Duration::seconds(3600),
+            &HashSet::new(),
+            &HashSet::new(),
         );
         assert!(plan.torn_down_host_envs.is_empty());
         assert!(reg.host_envs[&id].state.is_ready());
-        // Still has its user.
-        assert_eq!(reg.host_envs[&id].users.len(), 1);
+    }
+
+    #[test]
+    fn reap_idle_skips_entries_pinned_by_live_thread() {
+        // Ground truth: a live thread binding this resource keeps
+        // it alive regardless of the entry's `users` refcount or how
+        // long it's been since `last_used` was bumped. Covers the
+        // mavis-pod incident where a thread parked for 5+ minutes
+        // between tool calls got its mcp-host reaped out from under
+        // it mid-conversation.
+        let mut reg = ResourceRegistry::new();
+        let id = reg.pre_register_host_env(
+            "t-parked",
+            "test-landlock".into(),
+            HostEnvSpec::Landlock {
+                allowed_paths: Vec::new(),
+                network: Default::default(),
+            },
+        );
+        let _ = reg.complete_host_env_provisioning(&id, None, None, None);
+        let mcp_id = McpHostId::for_host_env(&id);
+        // Seed a Ready MCP entry so Pass 1b has a candidate. Simulate
+        // the "refcount drifted empty but thread is still bound" race:
+        // users is empty, last_used is ancient, idle threshold passed.
+        reg.mcp_hosts.insert(
+            mcp_id.clone(),
+            McpHostEntry {
+                id: mcp_id.clone(),
+                spec: McpHostSpec {
+                    url: "http://mcp".into(),
+                    label: format!("host_env:{}", id.0),
+                    per_task: false,
+                },
+                state: ResourceState::Ready,
+                session: None,
+                tools: Vec::new(),
+                annotations: HashMap::new(),
+                users: BTreeSet::new(),
+                pinned: false,
+                created_at: Utc::now(),
+                last_used: Utc::now() - chrono::Duration::seconds(9999),
+            },
+        );
+        if let Some(e) = reg.host_envs.get_mut(&id) {
+            e.users.clear();
+            e.last_used = Utc::now() - chrono::Duration::seconds(9999);
+        }
+
+        // Sweep with the thread listed as in-use: NOT reaped.
+        let in_use_he: HashSet<HostEnvId> = [id.clone()].into();
+        let in_use_mcp: HashSet<McpHostId> = [mcp_id.clone()].into();
+        let plan = reg.reap_idle(
+            Utc::now(),
+            chrono::Duration::seconds(300),
+            chrono::Duration::seconds(3600),
+            &in_use_he,
+            &in_use_mcp,
+        );
+        assert!(plan.torn_down_host_envs.is_empty());
+        assert!(plan.torn_down_mcp_hosts.is_empty());
+        assert!(reg.host_envs[&id].state.is_ready());
+        assert!(reg.mcp_hosts[&mcp_id].state.is_ready());
+
+        // Now the thread is gone (swept): same entries get reaped.
+        let plan = reg.reap_idle(
+            Utc::now(),
+            chrono::Duration::seconds(300),
+            chrono::Duration::seconds(3600),
+            &HashSet::new(),
+            &HashSet::new(),
+        );
+        assert_eq!(plan.torn_down_host_envs.len(), 1);
+        assert_eq!(plan.torn_down_host_envs[0].0, id);
+        assert_eq!(plan.torn_down_mcp_hosts, vec![mcp_id]);
     }
 
     #[test]
