@@ -200,7 +200,8 @@ fn write_file_descriptor() -> Tool {
             "type": "object",
             "properties": {
                 "path": { "type": "string", "description": "Path — absolute, or relative to the workspace root." },
-                "content": { "type": "string", "description": "File contents to write." }
+                "content": { "type": "string", "description": "File contents to write." },
+                "run_as": { "type": "string", "description": "Optional Unix username to write the file as. Parent directories are still created with the host's identity if missing; the leaf file itself is written by a child process running as the target user (so the file's owner is that user). Fails the call if the host lacks the privilege to assume that user." }
             },
             "required": ["path", "content"]
         }),
@@ -218,6 +219,8 @@ fn write_file_descriptor() -> Tool {
 struct WriteFileArgs {
     path: PathBuf,
     content: String,
+    #[serde(default)]
+    run_as: Option<String>,
 }
 
 async fn write_file(workspace: &Arc<Workspace>, args: Value) -> CallToolResult {
@@ -234,6 +237,10 @@ async fn write_file(workspace: &Arc<Workspace>, args: Value) -> CallToolResult {
     {
         return CallToolResult::error_text(format!("create_dir_all({}): {e}", parent.display()));
     }
+    #[cfg(unix)]
+    if let Some(name) = parsed.run_as.as_deref() {
+        return write_file_as_user(name, &path, &parsed.path, parsed.content.as_bytes()).await;
+    }
     match tokio::fs::write(&path, parsed.content.as_bytes()).await {
         Ok(()) => CallToolResult::text(format!(
             "wrote {} bytes to {}",
@@ -242,6 +249,75 @@ async fn write_file(workspace: &Arc<Workspace>, args: Value) -> CallToolResult {
         )),
         Err(e) => CallToolResult::error_text(format!("write_file({}): {e}", parsed.path.display())),
     }
+}
+
+/// Write `content` to `abs_path` as `user`. Spawns `tee <abs_path>` with
+/// `pre_exec` setuid so the leaf file's owner is the target user; the
+/// host-resolved `display_path` is only used for the success/error
+/// message so the model sees the same path it asked for.
+#[cfg(unix)]
+async fn write_file_as_user(
+    user: &str,
+    abs_path: &std::path::Path,
+    display_path: &std::path::Path,
+    content: &[u8],
+) -> CallToolResult {
+    use tokio::io::AsyncWriteExt;
+
+    let id = match crate::runas::lookup(user) {
+        Ok(id) => id,
+        Err(e) => return CallToolResult::error_text(format!("run_as `{user}`: {e}")),
+    };
+
+    let mut cmd = Command::new("tee");
+    cmd.arg(abs_path)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .env("HOME", &id.home)
+        .env("USER", &id.name)
+        .env("LOGNAME", &id.name)
+        .kill_on_drop(true);
+    let id_for_child = id.clone();
+    // Safety: closure runs in the forked child between fork and exec,
+    // so it only changes the child's identity. Calls only async-signal-
+    // safe libc routines (setgroups/setgid/setuid).
+    unsafe {
+        cmd.pre_exec(move || crate::runas::apply_in_child(&id_for_child));
+    }
+
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            return CallToolResult::error_text(format!("spawn tee as {}: {e}", id.name));
+        }
+    };
+
+    let mut stdin = child.stdin.take().expect("stdin piped");
+    if let Err(e) = stdin.write_all(content).await {
+        return CallToolResult::error_text(format!("write to tee stdin: {e}"));
+    }
+    drop(stdin); // close to signal EOF so tee exits
+
+    let output = match child.wait_with_output().await {
+        Ok(o) => o,
+        Err(e) => return CallToolResult::error_text(format!("wait tee: {e}")),
+    };
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let code = output.status.code().unwrap_or(-1);
+        return CallToolResult::error_text(format!(
+            "tee as {} exited {code}: {}",
+            id.name,
+            stderr.trim()
+        ));
+    }
+    CallToolResult::text(format!(
+        "wrote {} bytes to {} as {}",
+        content.len(),
+        display_path.display(),
+        id.name
+    ))
 }
 
 // ---------- edit_file ----------
