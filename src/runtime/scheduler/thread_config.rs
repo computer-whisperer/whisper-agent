@@ -19,10 +19,15 @@ use crate::pod::Pod;
 /// `None`, the synthesized pod has an empty `allow.host_env` and its
 /// `thread_defaults.host_env` is the empty string — threads inside the
 /// default pod run with no host-env MCP connection.
+///
+/// `thread_defaults.backend` is seeded with the first entry in
+/// `backend_names` (alphabetical, since the caller drains from a
+/// `BTreeMap`). If the server boots with zero backends, the field is
+/// empty — pods can still be created, but threads spawned from them
+/// fail until the user picks a backend on creation.
 pub fn build_default_pod_config(
     pod_id: &str,
     config: &ThreadConfig,
-    default_backend: &str,
     default_host_env: Option<(String, HostEnvSpec)>,
     backend_names: &[String],
     shared_host_names: &[String],
@@ -60,7 +65,7 @@ pub fn build_default_pod_config(
             caps: Default::default(),
         },
         thread_defaults: ThreadDefaults {
-            backend: default_backend.to_string(),
+            backend: backend_names.first().cloned().unwrap_or_default(),
             model: config.model.clone(),
             system_prompt_file: "system_prompt.md".into(),
             max_tokens: config.max_tokens,

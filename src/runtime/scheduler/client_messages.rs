@@ -299,7 +299,6 @@ impl Scheduler {
                     conn_id,
                     ServerToClient::BackendsList {
                         correlation_id,
-                        default_backend: self.default_backend.clone(),
                         backends,
                     },
                 );

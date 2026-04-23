@@ -93,8 +93,6 @@ fn serve_embedded<E: RustEmbed>(path: &str) -> Response {
 pub struct ServerConfig {
     /// Named backends the scheduler can dispatch model calls to.
     pub backends: std::collections::HashMap<String, BackendEntry>,
-    /// Fallback backend for tasks that don't specify one. Must be a key in `backends`.
-    pub default_backend: String,
     /// Plain config (model, limits, policy) the synthesized default
     /// pod's `thread_defaults` table is built from.
     pub default_task_config: ThreadConfig,
@@ -180,11 +178,14 @@ pub async fn serve(listen: SocketAddr, config: ServerConfig) -> anyhow::Result<(
     // no-pod-specified `CreateThread` requests to.
     const DEFAULT_POD_ID: &str = "default";
     let default_pod_id: PodId = DEFAULT_POD_ID.into();
-    let backend_names: Vec<String> = config.backends.keys().cloned().collect();
+    // Sorted so the synthesized pod's `thread_defaults.backend` (which
+    // picks the first entry) is stable across runs — `config.backends`
+    // is a HashMap, so iteration order alone is not.
+    let mut backend_names: Vec<String> = config.backends.keys().cloned().collect();
+    backend_names.sort();
     let default_pod_config = build_default_pod_config(
         &default_pod_id,
         &config.default_task_config,
-        &config.default_backend,
         config.default_host_env.clone(),
         &backend_names,
         &config.default_shared_host_names,
@@ -209,7 +210,6 @@ pub async fn serve(listen: SocketAddr, config: ServerConfig) -> anyhow::Result<(
         default_pod,
         config.host_id,
         config.backends,
-        config.default_backend,
         audit,
         config.host_env_registry,
         config.host_env_catalog,

@@ -217,8 +217,6 @@ Tasks-as-data discipline: thread mutation happens *only* through `thread.step()`
 Pod TOMLs reference backends, MCP hosts, and host-env providers *by name*. Backends and shared MCP hosts are declared in the server's top-level TOML (the file the `whisper-agent serve` command points at — typically `whisper-agent.toml`):
 
 ```toml
-default_backend = "anthropic"
-
 [backends.anthropic]
 kind = "anthropic"
 default_model = "claude-sonnet-4-6"
@@ -344,7 +342,7 @@ enum ServerToClient {
     ResourceCreated / Updated / Destroyed { ... },
 
     // Catalog responses
-    BackendsList        { correlation_id, default_backend, backends },
+    BackendsList        { correlation_id, backends },
     McpHostsList        { correlation_id, hosts },
     ModelsList          { correlation_id, backend, models },
 

@@ -1277,7 +1277,7 @@ fn build_model_request(
         .collect();
     let setup_end = task.conversation.setup_prefix_end();
     let messages = task.conversation.messages()[setup_end..].to_vec();
-    let backend_name = scheduler.resolve_backend_name(task).to_string();
+    let backend_name = task.bindings.backend.clone();
     // Empty task.config.model → consult the backend's default_model. If that's
     // also None (common for single-model local endpoints), pass empty through.
     let model = if task.config.model.is_empty() {

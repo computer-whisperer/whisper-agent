@@ -340,74 +340,66 @@ async fn run_serve(args: ServeArgs) -> Result<()> {
     // from a TOML config; CLI --shared-mcp-host flags layer on top (CLI wins
     // on name conflict).
     let resolved_config = resolve_config_path(args.config.clone())?;
-    let (
-        backends,
-        default_backend,
-        default_model,
-        shared_host_map,
-        toml_provider_entries,
-        auth_clients,
-        auth_admins,
-    ) = match &resolved_config {
-        Some(path) => {
-            info!(config = %path.display(), "loading backend catalog");
-            let cfg = Config::load(path).await?;
-            let default_model = cfg
-                .backends
-                .get(&cfg.default_backend)
-                .ok_or_else(|| anyhow!("config: default_backend missing entry"))?
-                .default_model()
-                .map(|s| s.to_string())
-                .unwrap_or_default();
-            let mut map = HashMap::new();
-            for (name, bcfg) in &cfg.backends {
-                let provider = bcfg
-                    .build()
-                    .with_context(|| format!("build backend `{name}`"))?;
+    let (backends, shared_host_map, toml_provider_entries, auth_clients, auth_admins) =
+        match &resolved_config {
+            Some(path) => {
+                info!(config = %path.display(), "loading backend catalog");
+                let cfg = Config::load(path).await?;
+                let mut map = HashMap::new();
+                for (name, bcfg) in &cfg.backends {
+                    let provider = bcfg
+                        .build()
+                        .with_context(|| format!("build backend `{name}`"))?;
+                    map.insert(
+                        name.clone(),
+                        BackendEntry {
+                            provider,
+                            kind: bcfg.kind().into(),
+                            default_model: bcfg.default_model().map(|s| s.to_string()),
+                            auth_mode: bcfg.auth_mode().map(str::to_string),
+                        },
+                    );
+                }
+                (
+                    map,
+                    cfg.shared_mcp_hosts.into_iter().collect::<HashMap<_, _>>(),
+                    cfg.host_env_providers,
+                    cfg.auth.clients,
+                    cfg.auth.admins,
+                )
+            }
+            None => {
+                let key = args.anthropic_api_key.clone().ok_or_else(|| {
+                    anyhow!(
+                        "no --config provided and ANTHROPIC_API_KEY / --anthropic-api-key is unset"
+                    )
+                })?;
+                let mut map = HashMap::new();
                 map.insert(
-                    name.clone(),
+                    DEFAULT_BACKEND_NAME.into(),
                     BackendEntry {
-                        provider,
-                        kind: bcfg.kind().into(),
-                        default_model: bcfg.default_model().map(|s| s.to_string()),
-                        auth_mode: bcfg.auth_mode().map(str::to_string),
+                        provider: std::sync::Arc::new(AnthropicClient::new(key)),
+                        kind: "anthropic".into(),
+                        default_model: Some(args.model.clone()),
+                        auth_mode: Some("api_key".into()),
                     },
                 );
+                (map, HashMap::new(), Vec::new(), Vec::new(), Vec::new())
             }
-            (
-                map,
-                cfg.default_backend,
-                default_model,
-                cfg.shared_mcp_hosts.into_iter().collect::<HashMap<_, _>>(),
-                cfg.host_env_providers,
-                cfg.auth.clients,
-                cfg.auth.admins,
-            )
-        }
-        None => {
-            let key = args.anthropic_api_key.clone().ok_or_else(|| {
-                anyhow!("no --config provided and ANTHROPIC_API_KEY / --anthropic-api-key is unset")
-            })?;
-            let mut map = HashMap::new();
-            map.insert(
-                DEFAULT_BACKEND_NAME.into(),
-                BackendEntry {
-                    provider: std::sync::Arc::new(AnthropicClient::new(key)),
-                    kind: "anthropic".into(),
-                    default_model: Some(args.model.clone()),
-                    auth_mode: Some("api_key".into()),
-                },
-            );
-            (
-                map,
-                DEFAULT_BACKEND_NAME.into(),
-                args.model.clone(),
-                HashMap::new(),
-                Vec::new(),
-                Vec::new(),
-                Vec::new(),
-            )
-        }
+        };
+    // Synthesized default pod's `thread_defaults.model` is the
+    // alphabetically-first backend's `default_model` (matches the
+    // backend chosen by `build_default_pod_config`). Empty when the
+    // server boots with zero backends or that backend lacks a
+    // `default_model`.
+    let default_model = {
+        let mut names: Vec<&String> = backends.keys().collect();
+        names.sort();
+        names
+            .first()
+            .and_then(|n| backends.get(*n))
+            .and_then(|e| e.default_model.clone())
+            .unwrap_or_default()
     };
     // `shared_host_map` starts life as the `[shared_mcp_hosts]` TOML
     // table. These entries seed the durable catalog as anonymous
@@ -556,7 +548,6 @@ async fn run_serve(args: ServeArgs) -> Result<()> {
 
     let server_config = ServerConfig {
         backends,
-        default_backend,
         default_task_config: ThreadConfig {
             model: default_model,
             max_tokens: args.max_tokens,

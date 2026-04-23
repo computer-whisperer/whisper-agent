@@ -494,8 +494,8 @@ struct TaskView {
     total_usage: Usage,
     subscribed: bool,
     /// Backend alias the server resolved for this task. Populated from ThreadSnapshot.
-    /// Empty string means "server default" — the status bar resolves that to the
-    /// known default_backend name at render time.
+    /// Empty string means "no backend bound" — the status bar renders that
+    /// as `—` and model calls would fail until the thread is rebound.
     backend: String,
     /// Model the task was created with. Populated from ThreadSnapshot.
     model: String,
@@ -630,7 +630,6 @@ pub struct ChatApp {
 
     // --- Model-backend catalog ---
     backends: Vec<BackendSummary>,
-    default_backend: String,
     backends_requested: bool,
     /// Cached model lists keyed by backend name.
     models_by_backend: HashMap<String, Vec<ModelSummary>>,
@@ -1479,7 +1478,6 @@ impl ChatApp {
             send_fn,
             list_requested: false,
             backends: Vec::new(),
-            default_backend: String::new(),
             backends_requested: false,
             models_by_backend: HashMap::new(),
             models_requested: HashSet::new(),
@@ -1571,7 +1569,9 @@ impl ChatApp {
     ///   1. user's explicit `picker_backend`
     ///   2. compose target pod's `thread_defaults.backend` (when the
     ///      pod config has landed)
-    ///   3. server-wide `default_backend`
+    ///   3. first backend from the catalog (alphabetical), so the
+    ///      picker always has *something* preselected when the pod
+    ///      default is empty
     fn effective_picker_backend(&self) -> &str {
         if let Some(b) = self.picker_backend.as_deref() {
             return b;
@@ -1582,7 +1582,11 @@ impl ChatApp {
         {
             return &cfg.thread_defaults.backend;
         }
-        &self.default_backend
+        self.backends
+            .iter()
+            .map(|b| b.name.as_str())
+            .min()
+            .unwrap_or("")
     }
 
     /// Resolve the picker-selected model. Fallback chain:
@@ -2094,17 +2098,15 @@ impl ChatApp {
                     self.conn_detail = Some(message);
                 }
             }
-            ServerToClient::BackendsList {
-                default_backend,
-                backends,
-                ..
-            } => {
-                self.default_backend = default_backend;
+            ServerToClient::BackendsList { backends, .. } => {
                 self.backends = backends;
-                // Pre-fetch the default backend's models so the picker is ready on
-                // first open without a visible delay.
-                let default = self.default_backend.clone();
-                self.request_models_for(&default);
+                // Pre-fetch the alphabetically-first backend's models so the
+                // picker is ready on first open without a visible delay
+                // — that's the entry `effective_picker_backend` falls back
+                // to when no pod default is set.
+                if let Some(first) = self.backends.iter().map(|b| b.name.clone()).min() {
+                    self.request_models_for(&first);
+                }
             }
             ServerToClient::ModelsList {
                 backend, models, ..
@@ -3247,11 +3249,7 @@ impl eframe::App for ChatApp {
                     ui.separator();
                     let (text, c) = state_chip(view.summary.state);
                     ui.label(RichText::new(text).color(c));
-                    let backend_label = if view.backend.is_empty() {
-                        &self.default_backend
-                    } else {
-                        &view.backend
-                    };
+                    let backend_label = view.backend.as_str();
                     if !backend_label.is_empty() {
                         ui.separator();
                         ui.label(
@@ -5421,10 +5419,9 @@ impl ChatApp {
         }
 
         let backends = self.backends.clone();
-        let default_backend = self.default_backend.clone();
         ScrollArea::vertical().show(ui, |ui| {
             for b in &backends {
-                render_backend_settings_row(ui, b, &default_backend, rotate_request);
+                render_backend_settings_row(ui, b, rotate_request);
                 ui.add_space(2.0);
                 ui.separator();
             }
@@ -6784,12 +6781,9 @@ impl ChatApp {
             cfg.created_at = String::new();
             return cfg;
         }
-        let backend_names: Vec<String> = self.backends.iter().map(|b| b.name.clone()).collect();
-        let default_backend = if !self.default_backend.is_empty() {
-            self.default_backend.clone()
-        } else {
-            backend_names.first().cloned().unwrap_or_default()
-        };
+        let mut backend_names: Vec<String> = self.backends.iter().map(|b| b.name.clone()).collect();
+        backend_names.sort();
+        let default_backend = backend_names.first().cloned().unwrap_or_default();
         PodConfig {
             name,
             description: None,
@@ -6826,18 +6820,10 @@ impl ChatApp {
 fn render_backend_settings_row(
     ui: &mut egui::Ui,
     backend: &BackendSummary,
-    default: &str,
     rotate_request: &mut Option<String>,
 ) {
     ui.horizontal(|ui| {
         ui.label(RichText::new(&backend.name).strong());
-        if backend.name == default {
-            ui.label(
-                RichText::new("default")
-                    .small()
-                    .color(Color32::from_rgb(0x88, 0xbb, 0x88)),
-            );
-        }
         if backend.auth_mode.as_deref() == Some("chatgpt_subscription") {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui

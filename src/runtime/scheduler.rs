@@ -322,8 +322,6 @@ pub struct Scheduler {
     pods: HashMap<PodId, Pod>,
     /// Named backends: `ThreadConfig.backend` resolves against this map.
     backends: HashMap<String, BackendEntry>,
-    /// Fallback when a task doesn't specify a backend. Must be a key in `backends`.
-    default_backend: String,
     persister: Option<Persister>,
     /// Live catalog of host-env providers, keyed by name. Empty when
     /// the server was started without any catalog entries or TOML-seed
@@ -438,18 +436,12 @@ impl Scheduler {
         default_pod: Pod,
         host_id: String,
         backends: HashMap<String, BackendEntry>,
-        default_backend: String,
         audit: AuditLog,
         host_env_registry: crate::tools::sandbox::HostEnvRegistry,
         host_env_catalog: crate::tools::host_env_catalog::CatalogStore,
         shared_mcp_catalog: crate::tools::shared_mcp_catalog::CatalogStore,
         shared_mcp_overlays: Vec<SharedHostOverlay>,
     ) -> anyhow::Result<(Self, mpsc::UnboundedReceiver<StreamUpdate>)> {
-        assert!(
-            backends.contains_key(&default_backend),
-            "default_backend must be in backends"
-        );
-
         let mut resources = ResourceRegistry::new();
         for (name, entry) in &backends {
             resources.insert_backend(
@@ -509,7 +501,6 @@ impl Scheduler {
                 default_pod_id,
                 pods,
                 backends,
-                default_backend,
                 persister: None,
                 host_env_registry,
                 host_env_catalog,
@@ -594,17 +585,6 @@ impl Scheduler {
         if let Some(snap) = self.resources.snapshot_backend(id) {
             self.router
                 .broadcast_resource(ServerToClient::ResourceUpdated { resource: snap });
-        }
-    }
-
-    /// Returns the backend name the thread is bound to, falling back to the
-    /// server's default if the binding's `backend` field is empty. Does NOT
-    /// validate existence.
-    pub(crate) fn resolve_backend_name<'a>(&'a self, task: &'a Thread) -> &'a str {
-        if task.bindings.backend.is_empty() {
-            &self.default_backend
-        } else {
-            &task.bindings.backend
         }
     }
 
@@ -2266,7 +2246,7 @@ impl Scheduler {
                 }
             }
 
-            let backend_id = BackendId::for_name(self.resolve_backend_name(&task));
+            let backend_id = BackendId::for_name(&task.bindings.backend);
             self.resources.add_backend_user(&backend_id, &task.id);
             // Refcount the shared MCP hosts this thread is bound to.
             // Shared registry entries exist from server startup, so

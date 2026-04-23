@@ -1218,22 +1218,16 @@ impl Scheduler {
         // Always prepare the backend summary header — it's the cheap
         // part and callers expanding one backend still want the
         // roster for context.
-        let default_backend = self.default_backend.clone();
         let mut backend_lines: Vec<(String, String)> = self
             .backends
             .iter()
             .map(|(name, entry)| {
-                let default_marker = if *name == default_backend {
-                    " [default]"
-                } else {
-                    ""
-                };
                 let default_model = entry.default_model.as_deref().unwrap_or("—");
                 let auth = entry.auth_mode.as_deref().unwrap_or("none");
                 (
                     name.clone(),
                     format!(
-                        "- `{name}`{default_marker} — kind={kind}, default_model={dm}, auth={auth}",
+                        "- `{name}` — kind={kind}, default_model={dm}, auth={auth}",
                         kind = entry.kind,
                         dm = default_model,
                     ),
@@ -1242,9 +1236,7 @@ impl Scheduler {
             .collect();
         backend_lines.sort_by(|a, b| a.0.cmp(&b.0));
         let mut header = String::new();
-        header.push_str(&format!(
-            "Configured LLM backends (default: `{default_backend}`):\n"
-        ));
+        header.push_str("Configured LLM backends:\n");
         for (_, line) in &backend_lines {
             header.push_str(line);
             header.push('\n');

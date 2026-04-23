@@ -10,8 +10,6 @@
 //! inline `value` or an `env` var name:
 //!
 //! ```toml
-//! default_backend = "anthropic"
-//!
 //! [backends.anthropic]
 //! kind = "anthropic"
 //! default_model = "claude-sonnet-4-6"
@@ -51,7 +49,6 @@ use crate::providers::openai_responses::{
 
 #[derive(Deserialize, Debug, Clone)]
 pub struct Config {
-    pub default_backend: String,
     #[serde(default)]
     pub backends: BTreeMap<String, BackendConfig>,
     /// Optional `[shared_mcp_hosts]` table mapping name → url. CLI-provided
@@ -371,12 +368,6 @@ impl Config {
         if self.backends.is_empty() {
             return Err(anyhow!("config: no backends defined"));
         }
-        if !self.backends.contains_key(&self.default_backend) {
-            return Err(anyhow!(
-                "config: default_backend `{}` not in backends",
-                self.default_backend
-            ));
-        }
         let mut names: std::collections::HashSet<&str> = std::collections::HashSet::new();
         let mut tokens: std::collections::HashSet<&str> = std::collections::HashSet::new();
         for client in &self.auth.clients {
@@ -409,8 +400,6 @@ mod tests {
     #[test]
     fn parses_api_key_variants() {
         let text = r#"
-default_backend = "cloud"
-
 [backends.cloud]
 kind = "anthropic"
 default_model = "claude-sonnet-4-6"
@@ -456,8 +445,6 @@ base_url = "http://localhost:11434/v1"
     #[test]
     fn parses_auth_clients_section() {
         let text = r#"
-default_backend = "cloud"
-
 [backends.cloud]
 kind = "anthropic"
 auth = { mode = "api_key", value = "sk-test" }
@@ -480,8 +467,6 @@ token = "wsk_bbb"
     #[test]
     fn auth_clients_section_is_optional() {
         let text = r#"
-default_backend = "cloud"
-
 [backends.cloud]
 kind = "anthropic"
 auth = { mode = "api_key", value = "sk-test" }
@@ -494,8 +479,6 @@ auth = { mode = "api_key", value = "sk-test" }
     #[test]
     fn auth_clients_validation_rejects_collisions() {
         let base = r#"
-default_backend = "cloud"
-
 [backends.cloud]
 kind = "anthropic"
 auth = { mode = "api_key", value = "sk-test" }

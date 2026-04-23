@@ -197,10 +197,11 @@ pub struct CompactionConfigOverride {
 /// not yet honored.)
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
 pub struct ThreadBindings {
-    /// Backend catalog name (e.g. `"anthropic"`). Empty string means "use the
-    /// server's default backend." Kept as a name rather than a `BackendId`
-    /// so display surfaces (UI labels, logs) don't have to strip the
-    /// `backend-` prefix.
+    /// Backend catalog name (e.g. `"anthropic"`). Empty string means
+    /// "no backend bound" — model calls fail until the thread is
+    /// rebound. Kept as a name rather than a `BackendId` so display
+    /// surfaces (UI labels, logs) don't have to strip the `backend-`
+    /// prefix.
     #[serde(default)]
     pub backend: String,
     /// Host envs the thread is bound to, in declared order. Empty vec
@@ -1377,7 +1378,6 @@ pub enum ServerToClient {
     BackendsList {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         correlation_id: Option<String>,
-        default_backend: String,
         backends: Vec<BackendSummary>,
     },
     ModelsList {
