@@ -144,6 +144,11 @@ pub struct ServerConfig {
     /// (every `matches_client` check is a superset), but additionally
     /// unlock settings-mutation handlers like `UpdateCodexAuth`.
     pub auth_admins: Vec<AuthClient>,
+    /// Path to the `whisper-agent.toml` the server was loaded from. `None`
+    /// when the server was started without `--config` (env-key-only
+    /// fallback) — runtime config-edit endpoints reject in that mode
+    /// since there's no on-disk file to round-trip through.
+    pub server_config_path: Option<PathBuf>,
 }
 
 /// Paths to the PEM-encoded cert chain and private key. Loaded from
@@ -215,6 +220,7 @@ pub async fn serve(listen: SocketAddr, config: ServerConfig) -> anyhow::Result<(
         config.host_env_catalog,
         config.shared_mcp_catalog,
         config.shared_mcp_overlays,
+        config.server_config_path,
     )
     .await
     .context("scheduler init")?;

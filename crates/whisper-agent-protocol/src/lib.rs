@@ -1049,6 +1049,31 @@ pub enum ClientToServer {
         pod_id: String,
         toml_text: String,
     },
+    /// Read the server-level `whisper-agent.toml` raw text. Admin-only —
+    /// the file contains API keys and bearer tokens. The server replies
+    /// with `ServerConfigFetched` on success, `Error` if not authorized
+    /// or if the server was started without `--config` (no path to
+    /// read).
+    FetchServerConfig {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        correlation_id: Option<String>,
+    },
+    /// Replace `whisper-agent.toml` with the given text. Admin-only.
+    /// Server parses and validates the new config, then atomically
+    /// hot-swaps the in-memory backend catalog: any thread bound to a
+    /// removed or modified backend is cancelled before the swap so it
+    /// can't silently transition to a new provider mid-conversation.
+    /// Other config sections (shared_mcp_hosts, host_env_providers,
+    /// secrets, auth) are persisted to disk but require a server
+    /// restart to take effect — the server reports them in the
+    /// response's `restart_required_sections` list. Response:
+    /// `ServerConfigUpdateResult` on success, `Error` on validation or
+    /// disk-write failure.
+    UpdateServerConfig {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        correlation_id: Option<String>,
+        toml_text: String,
+    },
     /// Move the pod's directory under `<pods_root>/.archived/`. Threads
     /// inside become unreachable (they're not loaded from .archived/).
     ArchivePod {
@@ -1520,6 +1545,30 @@ pub enum ServerToClient {
         pod_id: String,
         toml_text: String,
         parsed: PodConfig,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        correlation_id: Option<String>,
+    },
+    /// Reply to `FetchServerConfig`. Sent only to the originating
+    /// connection — the file contains secrets and is not broadcast.
+    ServerConfigFetched {
+        toml_text: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        correlation_id: Option<String>,
+    },
+    /// Reply to a successful `UpdateServerConfig`. Sent only to the
+    /// originator (other clients are notified about the catalog change
+    /// via a follow-up `BackendsList` broadcast). `cancelled_threads`
+    /// lists thread ids that were cancelled because their backend was
+    /// removed or modified. `restart_required_sections` lists config
+    /// sections that changed but only take effect on next server
+    /// start. `pods_with_missing_backends` lists pod ids whose
+    /// `[allow].backends` references one of the removed backends —
+    /// the user is expected to edit those pods or risk thread-creation
+    /// failures.
+    ServerConfigUpdateResult {
+        cancelled_threads: Vec<String>,
+        restart_required_sections: Vec<String>,
+        pods_with_missing_backends: Vec<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         correlation_id: Option<String>,
     },

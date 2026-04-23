@@ -938,6 +938,37 @@ impl Scheduler {
                 self.apply_pod_config_update(&pod_id, toml_text.clone(), parsed, correlation_id);
                 self.persist_pod_config(pod_id, toml_text, Some(conn_id));
             }
+            ClientToServer::FetchServerConfig { correlation_id } => {
+                if !self.admin_connections.contains(&conn_id) {
+                    self.router.send_to_client(
+                        conn_id,
+                        ServerToClient::Error {
+                            correlation_id,
+                            thread_id: None,
+                            message: "fetch_server_config: admin capability required (token is not in [[auth.admins]])".into(),
+                        },
+                    );
+                    return;
+                }
+                self.handle_fetch_server_config(conn_id, correlation_id);
+            }
+            ClientToServer::UpdateServerConfig {
+                correlation_id,
+                toml_text,
+            } => {
+                if !self.admin_connections.contains(&conn_id) {
+                    self.router.send_to_client(
+                        conn_id,
+                        ServerToClient::Error {
+                            correlation_id,
+                            thread_id: None,
+                            message: "update_server_config: admin capability required (token is not in [[auth.admins]])".into(),
+                        },
+                    );
+                    return;
+                }
+                self.handle_update_server_config(conn_id, correlation_id, toml_text, pending_io);
+            }
             ClientToServer::ArchivePod { pod_id } => {
                 if let Err(e) = crate::pod::persist::validate_pod_id(&pod_id) {
                     self.router.send_to_client(

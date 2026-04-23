@@ -26,6 +26,7 @@ mod config_updates;
 mod dispatch;
 mod functions;
 mod retention;
+mod server_config;
 mod thread_config;
 mod triggers;
 
@@ -36,6 +37,7 @@ use self::retention::{RetentionAction, archive_thread_json, delete_thread_json};
 use self::thread_config::{apply_config_override, base_thread_config_from_pod};
 
 use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -214,6 +216,11 @@ pub struct BackendEntry {
     /// settings panel can describe the credential slot without holding
     /// the credential itself.
     pub auth_mode: Option<String>,
+    /// Source `BackendConfig` this entry was built from — kept so
+    /// runtime config-edit handlers can diff old vs new without
+    /// re-parsing the on-disk TOML and so they can decide whether to
+    /// rebuild the provider.
+    pub source: crate::pod::config::BackendConfig,
 }
 
 /// CLI-provided shared MCP host (`--shared-mcp-host name=url`). These
@@ -322,6 +329,10 @@ pub struct Scheduler {
     pods: HashMap<PodId, Pod>,
     /// Named backends: `ThreadConfig.backend` resolves against this map.
     backends: HashMap<String, BackendEntry>,
+    /// Path to the `whisper-agent.toml` the server was loaded from.
+    /// `None` when started with the env-key fallback (no `--config`).
+    /// Runtime config-edit handlers refuse to write back without it.
+    server_config_path: Option<PathBuf>,
     persister: Option<Persister>,
     /// Live catalog of host-env providers, keyed by name. Empty when
     /// the server was started without any catalog entries or TOML-seed
@@ -441,6 +452,7 @@ impl Scheduler {
         host_env_catalog: crate::tools::host_env_catalog::CatalogStore,
         shared_mcp_catalog: crate::tools::shared_mcp_catalog::CatalogStore,
         shared_mcp_overlays: Vec<SharedHostOverlay>,
+        server_config_path: Option<PathBuf>,
     ) -> anyhow::Result<(Self, mpsc::UnboundedReceiver<StreamUpdate>)> {
         let mut resources = ResourceRegistry::new();
         for (name, entry) in &backends {
@@ -501,6 +513,7 @@ impl Scheduler {
                 default_pod_id,
                 pods,
                 backends,
+                server_config_path,
                 persister: None,
                 host_env_registry,
                 host_env_catalog,

@@ -9,7 +9,7 @@ use tracing_subscriber::EnvFilter;
 use whisper_agent_protocol::ThreadConfig;
 use whisper_agent_protocol::sandbox::{HostEnvSpec, NetworkPolicy, PathAccess};
 
-use whisper_agent::pod::config::Config;
+use whisper_agent::pod::config::{Auth, BackendConfig, Config};
 use whisper_agent::providers::anthropic::AnthropicClient;
 use whisper_agent::runtime::scheduler::{BackendEntry, SharedHostOverlay};
 use whisper_agent::server::{self, ServerConfig};
@@ -357,6 +357,7 @@ async fn run_serve(args: ServeArgs) -> Result<()> {
                             kind: bcfg.kind().into(),
                             default_model: bcfg.default_model().map(|s| s.to_string()),
                             auth_mode: bcfg.auth_mode().map(str::to_string),
+                            source: bcfg.clone(),
                         },
                     );
                 }
@@ -374,6 +375,13 @@ async fn run_serve(args: ServeArgs) -> Result<()> {
                         "no --config provided and ANTHROPIC_API_KEY / --anthropic-api-key is unset"
                     )
                 })?;
+                let source = BackendConfig::Anthropic {
+                    auth: Auth::ApiKey {
+                        value: Some(key.clone()),
+                        env: None,
+                    },
+                    default_model: Some(args.model.clone()),
+                };
                 let mut map = HashMap::new();
                 map.insert(
                     DEFAULT_BACKEND_NAME.into(),
@@ -382,6 +390,7 @@ async fn run_serve(args: ServeArgs) -> Result<()> {
                         kind: "anthropic".into(),
                         default_model: Some(args.model.clone()),
                         auth_mode: Some("api_key".into()),
+                        source,
                     },
                 );
                 (map, HashMap::new(), Vec::new(), Vec::new(), Vec::new())
@@ -567,6 +576,7 @@ async fn run_serve(args: ServeArgs) -> Result<()> {
         tls,
         auth_clients,
         auth_admins,
+        server_config_path: resolved_config,
     };
     server::serve(args.listen, server_config).await
 }

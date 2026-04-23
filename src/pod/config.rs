@@ -86,7 +86,7 @@ pub struct Config {
 /// credentials, etc.). An admin token also grants client access —
 /// the handlers check "is admin" as a capability on top of the base
 /// auth match.
-#[derive(Deserialize, Debug, Clone, Default)]
+#[derive(Deserialize, Debug, Clone, Default, PartialEq, Eq)]
 pub struct AuthConfig {
     #[serde(default)]
     pub clients: Vec<AuthClient>,
@@ -98,7 +98,7 @@ pub struct AuthConfig {
 /// descriptive (used to identify a device for revocation by editing
 /// the file); `token` is the opaque bearer string. Suggested
 /// generator: `openssl rand -base64 32`.
-#[derive(Deserialize, Debug, Clone)]
+#[derive(Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct AuthClient {
     pub name: String,
     pub token: String,
@@ -111,7 +111,7 @@ pub struct AuthClient {
 /// Future security fields (`tls = { ca = "...", client_cert = "..." }`,
 /// etc.) plug in here without breaking compat — TOML deserialize
 /// ignores unknown keys by default.
-#[derive(Deserialize, Debug, Clone)]
+#[derive(Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct HostEnvProviderConfig {
     pub name: String,
     pub url: String,
@@ -130,7 +130,7 @@ pub struct HostEnvProviderConfig {
 /// auth = { mode = "chatgpt_subscription", source = "codex" }
 /// auth = { mode = "chatgpt_subscription", source = "codex", path = "/custom/auth.json" }
 /// ```
-#[derive(Deserialize, Debug, Clone)]
+#[derive(Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(tag = "mode", rename_all = "snake_case")]
 pub enum Auth {
     ApiKey {
@@ -205,7 +205,7 @@ impl Auth {
     }
 }
 
-#[derive(Deserialize, Debug, Clone)]
+#[derive(Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum BackendConfig {
     Anthropic {
@@ -364,7 +364,7 @@ impl Config {
         Ok(config)
     }
 
-    fn validate(&self) -> Result<()> {
+    pub fn validate(&self) -> Result<()> {
         if self.backends.is_empty() {
             return Err(anyhow!("config: no backends defined"));
         }

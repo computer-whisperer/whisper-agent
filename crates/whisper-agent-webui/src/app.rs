@@ -1082,6 +1082,38 @@ struct SettingsModalState {
     /// once and is waiting for confirmation. Cleared on confirm / on
     /// remove response / when the tab closes.
     shared_mcp_remove_armed: HashSet<String>,
+    /// Editor state for the Server-config tab. `None` until the tab
+    /// has been opened at least once; once initialized, persists
+    /// across tab switches so in-progress edits aren't lost.
+    server_config: Option<ServerConfigEditorState>,
+}
+
+/// Summary of a successful `UpdateServerConfig` — shown as a banner
+/// on the server-config editor.
+#[derive(Debug, Clone)]
+struct ServerConfigSaveSummary {
+    cancelled_threads: Vec<String>,
+    restart_required_sections: Vec<String>,
+    pods_with_missing_backends: Vec<String>,
+}
+
+/// Editor state for the server-config tab. Fetched lazily on first
+/// open — `original` is populated only after the server replies with
+/// `ServerConfigFetched`.
+struct ServerConfigEditorState {
+    /// Raw TOML as last fetched from the server. `None` while the
+    /// fetch round-trip is in flight (we render a spinner).
+    original: Option<String>,
+    /// Text the user is currently editing. Seeded from `original`
+    /// when fetch completes.
+    working: String,
+    /// Correlation id of the in-flight `FetchServerConfig`, if any.
+    fetch_correlation: Option<String>,
+    /// Correlation id of the in-flight `UpdateServerConfig`, if any.
+    save_correlation: Option<String>,
+    /// Last save outcome. `Ok` displays the success summary;
+    /// `Err(msg)` renders inline above the editor.
+    banner: Option<Result<ServerConfigSaveSummary, String>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -1094,6 +1126,12 @@ enum SettingsTab {
     /// in one place and the sidebar can focus on per-thread state.
     HostEnvProviders,
     SharedMcp,
+    /// Raw editor for `whisper-agent.toml`. Admin-only — the server
+    /// rejects `FetchServerConfig` / `UpdateServerConfig` from
+    /// non-admin connections. On save, the server hot-swaps the
+    /// backend catalog and cancels any thread using a
+    /// removed/modified backend.
+    ServerConfig,
 }
 
 /// Inline add/edit form state for one Shared MCP host entry.
@@ -2066,6 +2104,24 @@ impl ChatApp {
                     settings.shared_mcp_banner = Some(Err(message));
                     return;
                 }
+                // Server-config editor — match either the in-flight
+                // fetch or the in-flight save correlation. Either
+                // failure stays on the editor as an inline banner.
+                if let Some(settings) = self.settings_modal.as_mut()
+                    && let Some(editor) = settings.server_config.as_mut()
+                    && correlation_id.is_some()
+                {
+                    if editor.fetch_correlation == correlation_id {
+                        editor.banner = Some(Err(format!("fetch: {message}")));
+                        editor.fetch_correlation = None;
+                        return;
+                    }
+                    if editor.save_correlation == correlation_id {
+                        editor.banner = Some(Err(message));
+                        editor.save_correlation = None;
+                        return;
+                    }
+                }
                 // Provider remove pending on a specific row. Match by
                 // correlation rather than iterating names so a stale
                 // remove that targets a now-gone name still resolves.
@@ -2627,6 +2683,45 @@ impl ChatApp {
             ServerToClient::SudoResolved { function_id, .. } => {
                 self.pending_sudos.remove(&function_id);
                 self.sudo_reject_drafts.remove(&function_id);
+            }
+            ServerToClient::ServerConfigFetched {
+                toml_text,
+                correlation_id,
+            } => {
+                if let Some(settings) = self.settings_modal.as_mut()
+                    && let Some(editor) = settings.server_config.as_mut()
+                    && correlation_id.is_some()
+                    && editor.fetch_correlation == correlation_id
+                {
+                    editor.original = Some(toml_text.clone());
+                    editor.working = toml_text;
+                    editor.fetch_correlation = None;
+                }
+            }
+            ServerToClient::ServerConfigUpdateResult {
+                cancelled_threads,
+                restart_required_sections,
+                pods_with_missing_backends,
+                correlation_id,
+            } => {
+                if let Some(settings) = self.settings_modal.as_mut()
+                    && let Some(editor) = settings.server_config.as_mut()
+                    && correlation_id.is_some()
+                    && editor.save_correlation == correlation_id
+                {
+                    // Successful save: the working text is now the
+                    // authoritative on-disk content — seed
+                    // `original` so the "modified" indicator
+                    // correctly shows no diff and the Revert button
+                    // greys out.
+                    editor.original = Some(editor.working.clone());
+                    editor.save_correlation = None;
+                    editor.banner = Some(Ok(ServerConfigSaveSummary {
+                        cancelled_threads,
+                        restart_required_sections,
+                        pods_with_missing_backends,
+                    }));
+                }
             }
         }
     }
@@ -5168,6 +5263,15 @@ impl ChatApp {
                     {
                         modal.active_tab = SettingsTab::SharedMcp;
                     }
+                    if ui
+                        .selectable_label(
+                            modal.active_tab == SettingsTab::ServerConfig,
+                            "Server config",
+                        )
+                        .clicked()
+                    {
+                        modal.active_tab = SettingsTab::ServerConfig;
+                    }
                 });
                 ui.separator();
                 ui.add_space(4.0);
@@ -5188,6 +5292,9 @@ impl ChatApp {
                         &mut shared_mcp_edit_request,
                         &mut shared_mcp_remove_request,
                     ),
+                    SettingsTab::ServerConfig => {
+                        self.render_settings_server_config_tab(ui, &mut modal.server_config);
+                    }
                 }
             });
 
@@ -5424,6 +5531,145 @@ impl ChatApp {
                 render_backend_settings_row(ui, b, rotate_request);
                 ui.add_space(2.0);
                 ui.separator();
+            }
+        });
+    }
+
+    /// Server-config tab: raw TOML editor for `whisper-agent.toml`.
+    /// Admin-only; the server rejects the fetch/update calls from
+    /// non-admin connections and the error banner surfaces the
+    /// refusal. Fetches on first open (lazy) and keeps its working
+    /// draft across tab switches.
+    fn render_settings_server_config_tab(
+        &mut self,
+        ui: &mut egui::Ui,
+        state_slot: &mut Option<ServerConfigEditorState>,
+    ) {
+        // Lazy init: first open triggers a FetchServerConfig.
+        if state_slot.is_none() {
+            let corr = self.next_correlation_id();
+            self.send(ClientToServer::FetchServerConfig {
+                correlation_id: Some(corr.clone()),
+            });
+            *state_slot = Some(ServerConfigEditorState {
+                original: None,
+                working: String::new(),
+                fetch_correlation: Some(corr),
+                save_correlation: None,
+                banner: None,
+            });
+        }
+        let state = state_slot.as_mut().expect("initialized above");
+
+        ui.label(
+            RichText::new(
+                "Edits the server-level whisper-agent.toml. Backend-catalog \
+                 changes hot-swap immediately and cancel any thread using a \
+                 removed or modified backend. Other sections (shared_mcp_hosts, \
+                 host_env_providers, secrets, auth) persist to disk but require \
+                 a server restart.",
+            )
+            .small()
+            .color(Color32::from_gray(170)),
+        );
+        ui.add_space(6.0);
+
+        // Outcome banner from the last save, if any.
+        match &state.banner {
+            Some(Ok(summary)) => {
+                ui.colored_label(Color32::from_rgb(0x88, 0xbb, 0x88), "Saved.");
+                if !summary.cancelled_threads.is_empty() {
+                    ui.label(format!(
+                        "Cancelled {} thread(s): {}",
+                        summary.cancelled_threads.len(),
+                        summary.cancelled_threads.join(", "),
+                    ));
+                }
+                if !summary.restart_required_sections.is_empty() {
+                    ui.colored_label(
+                        Color32::from_rgb(0xd0, 0xb0, 0x70),
+                        format!(
+                            "Restart required for: {}",
+                            summary.restart_required_sections.join(", "),
+                        ),
+                    );
+                }
+                if !summary.pods_with_missing_backends.is_empty() {
+                    ui.colored_label(
+                        Color32::from_rgb(0xd0, 0xb0, 0x70),
+                        format!(
+                            "Pods referencing removed backends: {}",
+                            summary.pods_with_missing_backends.join(", "),
+                        ),
+                    );
+                }
+                ui.add_space(6.0);
+            }
+            Some(Err(msg)) => {
+                ui.colored_label(
+                    Color32::from_rgb(0xd0, 0x70, 0x70),
+                    format!("Save failed: {msg}"),
+                );
+                ui.add_space(6.0);
+            }
+            None => {}
+        }
+
+        let fetch_in_flight = state.fetch_correlation.is_some();
+        let save_in_flight = state.save_correlation.is_some();
+
+        if fetch_in_flight && state.original.is_none() {
+            ui.label(
+                RichText::new("Loading whisper-agent.toml…")
+                    .small()
+                    .color(Color32::from_gray(150)),
+            );
+            return;
+        }
+
+        ScrollArea::vertical().max_height(280.0).show(ui, |ui| {
+            ui.add_enabled(
+                !save_in_flight,
+                egui::TextEdit::multiline(&mut state.working)
+                    .font(egui::TextStyle::Monospace)
+                    .code_editor()
+                    .desired_width(f32::INFINITY)
+                    .desired_rows(20),
+            );
+        });
+
+        ui.add_space(6.0);
+        let modified = state
+            .original
+            .as_deref()
+            .map(|o| o != state.working)
+            .unwrap_or(false);
+        ui.horizontal(|ui| {
+            let save_clicked = ui
+                .add_enabled(modified && !save_in_flight, egui::Button::new("Save"))
+                .clicked();
+            let revert_clicked = ui
+                .add_enabled(modified && !save_in_flight, egui::Button::new("Revert"))
+                .clicked();
+            if save_in_flight {
+                ui.label(
+                    RichText::new("Applying…")
+                        .small()
+                        .color(Color32::from_gray(160)),
+                );
+            }
+            if save_clicked {
+                let corr = self.next_correlation_id();
+                state.banner = None;
+                state.save_correlation = Some(corr.clone());
+                self.send(ClientToServer::UpdateServerConfig {
+                    correlation_id: Some(corr),
+                    toml_text: state.working.clone(),
+                });
+            }
+            if revert_clicked && let Some(original) = state.original.as_deref() {
+                state.working = original.to_string();
+                state.banner = None;
             }
         });
     }

@@ -2281,8 +2281,9 @@ impl Scheduler {
     /// existing lifecycle cascade (host-env teardown, behavior terminal
     /// hook, dispatch resolution, child cancellation). Equivalent to the
     /// pre-migration `ClientToServer::CancelThread` handler body; called
-    /// by `Function::CancelThread`'s launch path.
-    fn execute_cancel_thread(
+    /// by `Function::CancelThread`'s launch path and by server-config
+    /// updates that need to cancel users of a removed/changed backend.
+    pub(super) fn execute_cancel_thread(
         &mut self,
         thread_id: &str,
         pending_io: &mut FuturesUnordered<SchedulerFuture>,
