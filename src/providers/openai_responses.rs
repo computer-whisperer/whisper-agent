@@ -376,9 +376,11 @@ fn convert_message(m: &Message, out: &mut Vec<RspItem>) {
         // Mid-conversation harness injection. The thread-prefix
         // system prompt is lifted into `instructions` upstream and
         // stripped from `req.messages` by `build_model_request`, so
-        // anything reaching here is a harness injection. Responses
-        // accepts `role:"system"` as an input message item, so emit
-        // inline.
+        // anything reaching here is a harness injection. Emitted as
+        // `role:"developer"` — the Responses API's canonical
+        // instructions role. `role:"system"` used to be accepted but
+        // `chatgpt.com/backend-api/codex` now rejects it with
+        // `{"detail":"System messages are not allowed"}`.
         Role::System => convert_system_message(&m.content, out),
         // Tool-manifest setup messages are filtered out upstream and
         // lifted into the `tools` wire field. Defensive no-op if one
@@ -387,10 +389,10 @@ fn convert_message(m: &Message, out: &mut Vec<RspItem>) {
     }
 }
 
-/// Emit a mid-conversation `Role::System` injection as `role:"system"`
-/// input items. Text blocks concatenate (newline-joined) into a single
-/// system message; non-text blocks (unexpected in a harness injection)
-/// are dropped silently.
+/// Emit a mid-conversation `Role::System` injection as a
+/// `role:"developer"` input item. Text blocks concatenate
+/// (newline-joined) into a single message; non-text blocks
+/// (unexpected in a harness injection) are dropped silently.
 fn convert_system_message(blocks: &[ContentBlock], out: &mut Vec<RspItem>) {
     let mut text_accum = String::new();
     for block in blocks {
@@ -405,7 +407,7 @@ fn convert_system_message(blocks: &[ContentBlock], out: &mut Vec<RspItem>) {
         return;
     }
     out.push(RspItem::Message {
-        role: "system",
+        role: "developer",
         content: vec![RspInputMessagePart::InputText { text: text_accum }],
     });
 }
@@ -1221,10 +1223,12 @@ mod tests {
     }
 
     #[test]
-    fn mid_conversation_system_emits_role_system_input_item() {
+    fn mid_conversation_system_emits_role_developer_input_item() {
         // Injected Role::System (not the thread-prefix prompt — that one
         // is lifted into `instructions` upstream) should appear as a
-        // role:"system" input item with the wrapped text.
+        // role:"developer" input item with the wrapped text. The Codex
+        // backend rejects `role:"system"`; `developer` is the modern
+        // Responses-API name for the same slot.
         let msg = Message::system_text("check memory/ before answering");
         let mut items = Vec::new();
         convert_message(&msg, &mut items);
@@ -1232,7 +1236,7 @@ mod tests {
         assert_eq!(
             json,
             serde_json::json!([
-                {"type": "message", "role": "system", "content": [{"type": "input_text", "text": "check memory/ before answering"}]}
+                {"type": "message", "role": "developer", "content": [{"type": "input_text", "text": "check memory/ before answering"}]}
             ])
         );
     }
