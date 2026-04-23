@@ -162,10 +162,20 @@ impl Scheduler {
         // manual, it's the "last run" timestamp the UI shows. Actual
         // run_count / last_outcome still wait for the thread to reach
         // terminal; those fields track completions, not fires.
+        //
+        // `last_thread_id` is also advanced here (not only at terminal)
+        // so `behavior_has_inflight_run` — which the Skip/QueueOne
+        // overlap gate consults — can see the freshly-spawned thread.
+        // `last_outcome` is cleared in the same breath: the terminal
+        // hook's idempotence guard (`last_thread_id == thread_id &&
+        // last_outcome.is_some()`) would otherwise match against the
+        // previous run's outcome and skip recording this thread.
         if let Some(pod) = self.pods.get_mut(pod_id)
             && let Some(behavior) = pod.behaviors.get_mut(behavior_id)
         {
             behavior.state.last_fired_at = Some(chrono::Utc::now().to_rfc3339());
+            behavior.state.last_thread_id = Some(thread_id.clone());
+            behavior.state.last_outcome = None;
             let state = behavior.state.clone();
             self.mark_behavior_dirty(pod_id, behavior_id);
             self.router
