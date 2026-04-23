@@ -1,5 +1,5 @@
-# Claude Code per-workspace permission cache (developer-local)
-.claude/settings.local.json
+# Claude Code per-workspace state (developer-local)
+.claude/
 
 # Rust build artifacts (added ahead of any actual Rust code)
 /target/
@@ -21,3 +21,7 @@ crates/whisper-agent-webui/pkg/
 
 # Android client: captured logcat dumps (ad-hoc decode debugging)
 /adb_log.txt
+
+# makepkg outputs under packaging/aur/ (source tarball + built packages)
+packaging/aur/*.pkg.tar.zst
+packaging/aur/*.tar.gz
