@@ -88,7 +88,19 @@ web-sys = { version = "0.3", features = [
     "Window",
     "Document",
     "HtmlCanvasElement",
+    "HtmlElement",
     "BinaryType",
     "Storage",
+    # Drag-drop takeover: eframe's web backend doesn't deliver drop
+    # events to egui's input queue reliably across canvas/body
+    # boundaries. We install our own document-level `dragover` +
+    # `drop` handlers that read files via the Blob.arrayBuffer()
+    # Promise and push into the same pending-picks queue the attach
+    # button uses.
+    "DragEvent",
+    "DataTransfer",
+    "File",
+    "FileList",
+    "Blob",
 ] }
 getrandom = { version = "0.4", features = ["wasm_js"] }

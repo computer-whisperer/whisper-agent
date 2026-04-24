@@ -49,9 +49,30 @@ use whisper_agent_protocol::{
 /// inputs both produce this shape so the downstream staging pipeline
 /// is one function, not two. `source_desc` feeds the user-facing hint
 /// on rejection so the reason can mention the filename.
-struct RawPick {
-    bytes: Vec<u8>,
-    source_desc: String,
+pub(crate) struct RawPick {
+    pub(crate) bytes: Vec<u8>,
+    pub(crate) source_desc: String,
+}
+
+/// Cloneable handle for pushing attachments into `ChatApp` from code
+/// that doesn't hold `&mut ChatApp`. Used by the wasm drop handlers
+/// installed on `document.body` — those run inside JS event callbacks
+/// long after `ChatApp::new` has returned, and need a thread-safe way
+/// to enqueue picks that also wakes egui so the next frame drains the
+/// queue instead of waiting for unrelated user input.
+#[derive(Clone)]
+pub struct AttachmentIngress {
+    queue: std::sync::Arc<std::sync::Mutex<Vec<RawPick>>>,
+    ctx: egui::Context,
+}
+
+impl AttachmentIngress {
+    pub fn push(&self, bytes: Vec<u8>, source_desc: String) {
+        if let Ok(mut q) = self.queue.lock() {
+            q.push(RawPick { bytes, source_desc });
+        }
+        self.ctx.request_repaint();
+    }
 }
 
 /// Tri-state outcome of checking whether the currently-selected model
@@ -1646,6 +1667,18 @@ fn validate_behavior_id_client(id: &str) -> Result<(), &'static str> {
 }
 
 impl ChatApp {
+    /// Obtain a cloneable handle for enqueuing attachments from
+    /// outside the egui event loop. Wasm uses this to install JS-level
+    /// drop handlers on `document.body` so dropped files don't depend
+    /// on eframe's winit-web DnD plumbing (which was observed to
+    /// deliver nothing in the browser).
+    pub fn attachment_ingress(&self, ctx: egui::Context) -> AttachmentIngress {
+        AttachmentIngress {
+            queue: self.pending_picks.clone(),
+            ctx,
+        }
+    }
+
     pub fn new(inbound: Inbound, send_fn: SendFn) -> Self {
         Self {
             conn_status: ConnectionStatus::Connecting,

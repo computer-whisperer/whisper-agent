@@ -10,7 +10,7 @@ mod editor;
 #[cfg(target_arch = "wasm32")]
 mod fonts;
 
-pub use app::{ChatApp, Inbound, InboundEvent, SendFn};
+pub use app::{AttachmentIngress, ChatApp, Inbound, InboundEvent, SendFn};
 
 #[cfg(target_arch = "wasm32")]
 mod web_entry {
@@ -23,7 +23,7 @@ mod web_entry {
     use web_sys::{BinaryType, CloseEvent, ErrorEvent, MessageEvent, WebSocket};
     use whisper_agent_protocol::{ClientToServer, decode_from_server, encode_to_server};
 
-    use super::app::{ChatApp, Inbound, InboundEvent, SendFn};
+    use super::app::{AttachmentIngress, ChatApp, Inbound, InboundEvent, SendFn};
 
     #[wasm_bindgen(start)]
     pub fn start() {
@@ -60,7 +60,17 @@ mod web_entry {
                         // images decode without hitting the network.
                         egui_extras::install_image_loaders(&cc.egui_ctx);
                         let (inbound, send_fn) = open_websocket(cc.egui_ctx.clone());
-                        Ok(Box::new(ChatApp::new(inbound, send_fn)))
+                        let app = ChatApp::new(inbound, send_fn);
+                        // eframe's web backend doesn't deliver drop
+                        // events to egui's input queue on this build
+                        // (empirical: `i.raw.dropped_files` stays
+                        // empty through drops). Install our own JS
+                        // listeners at document-body scope — they
+                        // catch drops anywhere on the page and push
+                        // through the same attachment-ingress the
+                        // file-picker button uses.
+                        install_drop_handlers(app.attachment_ingress(cc.egui_ctx.clone()));
+                        Ok(Box::new(app))
                     }),
                 )
                 .await;
@@ -164,6 +174,85 @@ mod web_entry {
         });
 
         (inbound, send_fn)
+    }
+
+    /// Install document-level HTML5 drag-drop handlers so dropped
+    /// files on the whisper-agent page land in the compose area's
+    /// attachment queue. Runs once at app startup; the forgotten
+    /// closures live for the lifetime of the page. Scoped to
+    /// `document.body` (not the canvas) so the drop zone is the
+    /// whole visible UI — users aim at their compose box but may
+    /// release slightly off-target, and a body-level target forgives
+    /// that.
+    ///
+    /// `dragover` `preventDefault` is required: without it the
+    /// browser refuses the drop outright (cursor stays "not-allowed").
+    /// `drop` `preventDefault` is required to stop the browser from
+    /// navigating away to show the dropped image.
+    fn install_drop_handlers(ingress: AttachmentIngress) {
+        let Some(window) = web_sys::window() else {
+            log::warn!("install_drop_handlers: no window; skipping");
+            return;
+        };
+        let Some(document) = window.document() else {
+            log::warn!("install_drop_handlers: no document; skipping");
+            return;
+        };
+        let Some(body) = document.body() else {
+            log::warn!("install_drop_handlers: no body; skipping");
+            return;
+        };
+
+        let dragover_cb = Closure::wrap(Box::new(|e: web_sys::DragEvent| {
+            e.prevent_default();
+        }) as Box<dyn FnMut(web_sys::DragEvent)>);
+        if let Err(e) =
+            body.add_event_listener_with_callback("dragover", dragover_cb.as_ref().unchecked_ref())
+        {
+            log::warn!("failed to install dragover listener: {e:?}");
+        }
+        dragover_cb.forget();
+
+        let drop_cb = Closure::wrap(Box::new(move |e: web_sys::DragEvent| {
+            e.prevent_default();
+            let Some(dt) = e.data_transfer() else {
+                log::warn!("drop event had no DataTransfer");
+                return;
+            };
+            let Some(files) = dt.files() else {
+                log::warn!("drop DataTransfer carried no files");
+                return;
+            };
+            let len = files.length();
+            log::info!("drop: {len} file(s) received");
+            for i in 0..len {
+                let Some(file) = files.item(i) else {
+                    continue;
+                };
+                let name = file.name();
+                let ingress = ingress.clone();
+                // File.arrayBuffer() returns a Promise<ArrayBuffer>;
+                // wrap as a JsFuture so we can await it.
+                let promise = file.array_buffer();
+                wasm_bindgen_futures::spawn_local(async move {
+                    match wasm_bindgen_futures::JsFuture::from(promise).await {
+                        Ok(buffer) => {
+                            let array = js_sys::Uint8Array::new(&buffer);
+                            ingress.push(array.to_vec(), name);
+                        }
+                        Err(err) => {
+                            log::warn!("failed to read dropped file {name}: {err:?}");
+                        }
+                    }
+                });
+            }
+        }) as Box<dyn FnMut(web_sys::DragEvent)>);
+        if let Err(e) =
+            body.add_event_listener_with_callback("drop", drop_cb.as_ref().unchecked_ref())
+        {
+            log::warn!("failed to install drop listener: {e:?}");
+        }
+        drop_cb.forget();
     }
 
     fn ws_url() -> String {
