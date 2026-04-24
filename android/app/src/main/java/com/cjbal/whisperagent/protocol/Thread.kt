@@ -30,8 +30,7 @@ data class ThreadSummary(
     @SerialName("last_active") val lastActive: String,
     @SerialName("continued_from") val continuedFrom: String? = null,
     @SerialName("dispatched_by") val dispatchedBy: String? = null,
-    // origin: BehaviorOrigin? is omitted from v1 — decoder keeps working because
-    // kotlinx-cbor ignores unknown map entries by default.
+    val origin: BehaviorOrigin? = null,
 )
 
 /**
@@ -110,5 +109,5 @@ data class ThreadSnapshot(
     val failure: String? = null,
     @SerialName("continued_from") val continuedFrom: String? = null,
     @SerialName("dispatched_by") val dispatchedBy: String? = null,
-    // origin: BehaviorOrigin? is omitted from v1 — ignoreUnknownKeys skips it.
+    val origin: BehaviorOrigin? = null,
 )

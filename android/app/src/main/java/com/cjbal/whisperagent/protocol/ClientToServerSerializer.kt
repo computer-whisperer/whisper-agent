@@ -47,6 +47,8 @@ object ClientToServerSerializer : KSerializer<ClientToServer> {
     private const val IDX_FROM_MESSAGE_INDEX = 12
     private const val IDX_ARCHIVE_ORIGINAL = 13
     private const val IDX_RESET_CAPABILITIES = 14
+    private const val IDX_BEHAVIOR_ID = 15
+    private const val IDX_ENABLED = 16
 
     override val descriptor: SerialDescriptor = buildClassSerialDescriptor("ClientToServer") {
         element("type", String.serializer().descriptor)
@@ -64,6 +66,8 @@ object ClientToServerSerializer : KSerializer<ClientToServer> {
         element("from_message_index", Int.serializer().descriptor, isOptional = true)
         element("archive_original", Boolean.serializer().descriptor, isOptional = true)
         element("reset_capabilities", Boolean.serializer().descriptor, isOptional = true)
+        element("behavior_id", String.serializer().descriptor, isOptional = true)
+        element("enabled", Boolean.serializer().descriptor, isOptional = true)
     }
 
     override fun serialize(encoder: Encoder, value: ClientToServer) {
@@ -185,6 +189,30 @@ object ClientToServerSerializer : KSerializer<ClientToServer> {
                         encodeStringElement(descriptor, IDX_CORRELATION_ID, it)
                     }
                 }
+                is ClientToServer.ListBehaviors -> {
+                    encodeStringElement(descriptor, IDX_TYPE, "list_behaviors")
+                    encodeStringElement(descriptor, IDX_POD_ID, value.podId)
+                    value.correlationId?.let {
+                        encodeStringElement(descriptor, IDX_CORRELATION_ID, it)
+                    }
+                }
+                is ClientToServer.RunBehavior -> {
+                    encodeStringElement(descriptor, IDX_TYPE, "run_behavior")
+                    encodeStringElement(descriptor, IDX_POD_ID, value.podId)
+                    encodeStringElement(descriptor, IDX_BEHAVIOR_ID, value.behaviorId)
+                    value.correlationId?.let {
+                        encodeStringElement(descriptor, IDX_CORRELATION_ID, it)
+                    }
+                }
+                is ClientToServer.SetBehaviorEnabled -> {
+                    encodeStringElement(descriptor, IDX_TYPE, "set_behavior_enabled")
+                    encodeStringElement(descriptor, IDX_POD_ID, value.podId)
+                    encodeStringElement(descriptor, IDX_BEHAVIOR_ID, value.behaviorId)
+                    encodeBooleanElement(descriptor, IDX_ENABLED, value.enabled)
+                    value.correlationId?.let {
+                        encodeStringElement(descriptor, IDX_CORRELATION_ID, it)
+                    }
+                }
             }
         }
     }
@@ -208,6 +236,8 @@ object ClientToServerSerializer : KSerializer<ClientToServer> {
             var fromMessageIndex: Int? = null
             var archiveOriginal = false
             var resetCapabilities = false
+            var behaviorId: String? = null
+            var enabled: Boolean? = null
 
             loop@ while (true) {
                 when (val i = decodeElementIndex(descriptor)) {
@@ -233,6 +263,8 @@ object ClientToServerSerializer : KSerializer<ClientToServer> {
                     IDX_FROM_MESSAGE_INDEX -> fromMessageIndex = decodeIntElement(descriptor, i)
                     IDX_ARCHIVE_ORIGINAL -> archiveOriginal = decodeBooleanElement(descriptor, i)
                     IDX_RESET_CAPABILITIES -> resetCapabilities = decodeBooleanElement(descriptor, i)
+                    IDX_BEHAVIOR_ID -> behaviorId = decodeStringElement(descriptor, i)
+                    IDX_ENABLED -> enabled = decodeBooleanElement(descriptor, i)
                     else -> throw SerializationException("unexpected element index $i")
                 }
             }
@@ -288,6 +320,21 @@ object ClientToServerSerializer : KSerializer<ClientToServer> {
                     },
                     archiveOriginal = archiveOriginal,
                     resetCapabilities = resetCapabilities,
+                    correlationId = correlationId,
+                )
+                "list_behaviors" -> ClientToServer.ListBehaviors(
+                    podId = requireNotNull(podId) { "missing pod_id" },
+                    correlationId = correlationId,
+                )
+                "run_behavior" -> ClientToServer.RunBehavior(
+                    podId = requireNotNull(podId) { "missing pod_id" },
+                    behaviorId = requireNotNull(behaviorId) { "missing behavior_id" },
+                    correlationId = correlationId,
+                )
+                "set_behavior_enabled" -> ClientToServer.SetBehaviorEnabled(
+                    podId = requireNotNull(podId) { "missing pod_id" },
+                    behaviorId = requireNotNull(behaviorId) { "missing behavior_id" },
+                    enabled = requireNotNull(enabled) { "missing enabled" },
                     correlationId = correlationId,
                 )
                 null -> throw SerializationException("missing 'type' discriminator")

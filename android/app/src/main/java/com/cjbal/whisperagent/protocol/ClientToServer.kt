@@ -113,4 +113,37 @@ sealed class ClientToServer {
         val resetCapabilities: Boolean = false,
         val correlationId: String? = null,
     ) : ClientToServer()
+
+    /**
+     * Ask the server for the behavior catalog belonging to [podId]. Reply is
+     * [ServerToClient.BehaviorList]. AppSession fires one of these per pod it
+     * discovers so the sidebar's behaviors section renders on first connect.
+     */
+    data class ListBehaviors(
+        val podId: String,
+        val correlationId: String? = null,
+    ) : ClientToServer()
+
+    /**
+     * Manually fire a behavior. Server spawns a thread with the behavior's
+     * prompt + origin; we don't pass a payload (the webui's richer trigger
+     * form is still phone-absent, so manual runs always carry null payload).
+     */
+    data class RunBehavior(
+        val podId: String,
+        val behaviorId: String,
+        val correlationId: String? = null,
+    ) : ClientToServer()
+
+    /**
+     * Pause / resume a single behavior. `enabled=false` stops cron ticks and
+     * webhook fires; manual [RunBehavior] still works. State change is
+     * broadcast back as [ServerToClient.BehaviorStateChanged].
+     */
+    data class SetBehaviorEnabled(
+        val podId: String,
+        val behaviorId: String,
+        val enabled: Boolean,
+        val correlationId: String? = null,
+    ) : ClientToServer()
 }

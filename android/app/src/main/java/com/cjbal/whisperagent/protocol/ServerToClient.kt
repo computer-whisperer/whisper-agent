@@ -179,6 +179,50 @@ sealed class ServerToClient {
         val decision: SudoDecision,
     ) : ServerToClient()
 
+    // --- Behaviors ------------------------------------------------------------
+
+    /**
+     * Reply to [ClientToServer.ListBehaviors] — every behavior the pod
+     * currently holds, loaded or load-errored.
+     */
+    data class BehaviorList(
+        val podId: String,
+        val behaviors: List<BehaviorSummary>,
+        val correlationId: String? = null,
+    ) : ServerToClient()
+
+    /**
+     * A fresh behavior was authored in the pod (webui or API). Broadcast so
+     * every client folds it into the behaviors sidebar without a refetch.
+     */
+    data class BehaviorCreated(
+        val summary: BehaviorSummary,
+        val correlationId: String? = null,
+    ) : ServerToClient()
+
+    /**
+     * An existing behavior was removed. Spawned threads keep their
+     * `origin.behavior_id`, so the UI surfaces them under a "Deleted
+     * behaviors" bucket instead of under the (now-gone) behavior row.
+     */
+    data class BehaviorDeleted(
+        val podId: String,
+        val behaviorId: String,
+        val correlationId: String? = null,
+    ) : ServerToClient()
+
+    /**
+     * A behavior's persisted state changed — a run fired, a pause toggled,
+     * last_fired_at advanced. We fold the three fields we actually render
+     * (enabled, run_count, last_fired_at) into the cached [BehaviorSummary];
+     * other state fields arrive on the wire but are ignored.
+     */
+    data class BehaviorStateChanged(
+        val podId: String,
+        val behaviorId: String,
+        val state: BehaviorState,
+    ) : ServerToClient()
+
     // --- Errors ---------------------------------------------------------------
 
     data class Error(

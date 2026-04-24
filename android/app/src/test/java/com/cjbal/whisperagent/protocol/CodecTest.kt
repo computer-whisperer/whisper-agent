@@ -485,6 +485,102 @@ class CodecTest {
         assertEquals(original, decoded)
     }
 
+    // --- Behaviors ------------------------------------------------------------
+
+    @Test
+    fun clientToServer_listBehaviors_roundTrip() {
+        val original = ClientToServer.ListBehaviors(podId = "scratch", correlationId = "b-1")
+        val bytes = Codec.encodeToServer(original)
+        val decoded = cbor.decodeFromByteArray(ClientToServer.serializer(), bytes)
+        assertEquals(original, decoded)
+    }
+
+    @Test
+    fun clientToServer_runBehavior_roundTrip() {
+        val original = ClientToServer.RunBehavior(podId = "scratch", behaviorId = "daily")
+        val bytes = Codec.encodeToServer(original)
+        val decoded = cbor.decodeFromByteArray(ClientToServer.serializer(), bytes)
+        assertEquals(original, decoded)
+    }
+
+    @Test
+    fun clientToServer_setBehaviorEnabled_roundTrip() {
+        val original = ClientToServer.SetBehaviorEnabled(
+            podId = "scratch",
+            behaviorId = "daily",
+            enabled = false,
+        )
+        val bytes = Codec.encodeToServer(original)
+        val decoded = cbor.decodeFromByteArray(ClientToServer.serializer(), bytes)
+        assertEquals(original, decoded)
+    }
+
+    @Test
+    fun serverToClient_behaviorList_roundTrip() {
+        val original = ServerToClient.BehaviorList(
+            podId = "scratch",
+            behaviors = listOf(
+                BehaviorSummary(
+                    behaviorId = "daily",
+                    podId = "scratch",
+                    name = "Daily check",
+                    triggerKind = "cron",
+                    enabled = true,
+                    runCount = 3,
+                    lastFiredAt = "2026-04-23T12:00:00Z",
+                ),
+            ),
+        )
+        val bytes = cbor.encodeToByteArray(ServerToClient.serializer(), original)
+        val decoded = Codec.decodeFromServer(bytes)
+        assertEquals(original, decoded)
+    }
+
+    @Test
+    fun serverToClient_behaviorCreated_decodesSummaryAsBehaviorSummary() {
+        // Guards the shared-wire-key dispatch in the deserializer: both
+        // ThreadCreated and BehaviorCreated carry "summary" at IDX_SUMMARY,
+        // and we rely on `type` arriving first to pick the right decoder.
+        val original = ServerToClient.BehaviorCreated(
+            summary = BehaviorSummary(
+                behaviorId = "daily",
+                podId = "scratch",
+                name = "Daily check",
+                triggerKind = "manual",
+            ),
+        )
+        val bytes = cbor.encodeToByteArray(ServerToClient.serializer(), original)
+        val decoded = Codec.decodeFromServer(bytes)
+        assertEquals(original, decoded)
+    }
+
+    @Test
+    fun serverToClient_behaviorDeleted_roundTrip() {
+        val original = ServerToClient.BehaviorDeleted(podId = "scratch", behaviorId = "daily")
+        val bytes = cbor.encodeToByteArray(ServerToClient.serializer(), original)
+        val decoded = Codec.decodeFromServer(bytes)
+        assertEquals(original, decoded)
+    }
+
+    @Test
+    fun serverToClient_behaviorStateChanged_decodesStateAsBehaviorState() {
+        // Same shared-wire-key story as behavior_created: `state` is
+        // borrowed from ThreadStateChanged's descriptor slot and the
+        // deserializer picks the right decoder based on `type`.
+        val original = ServerToClient.BehaviorStateChanged(
+            podId = "scratch",
+            behaviorId = "daily",
+            state = BehaviorState(
+                enabled = false,
+                runCount = 5,
+                lastFiredAt = "2026-04-23T12:00:00Z",
+            ),
+        )
+        val bytes = cbor.encodeToByteArray(ServerToClient.serializer(), original)
+        val decoded = Codec.decodeFromServer(bytes)
+        assertEquals(original, decoded)
+    }
+
     // --- Smoke check on the old-broken shape ----------------------------------
 
     @Test

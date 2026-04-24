@@ -4,6 +4,7 @@ import android.util.Log
 import com.cjbal.whisperagent.auth.ServerConfig
 import com.cjbal.whisperagent.auth.SettingsRepository
 import com.cjbal.whisperagent.protocol.BackendSummary
+import com.cjbal.whisperagent.protocol.BehaviorSummary
 import com.cjbal.whisperagent.protocol.ClientToServer
 import com.cjbal.whisperagent.protocol.ContentBlock
 import com.cjbal.whisperagent.protocol.Message
@@ -93,6 +94,19 @@ class AppSession(
     val modelsByBackend: StateFlow<Map<String, List<ModelSummary>>> = _modelsByBackend.asStateFlow()
 
     private val modelsInFlight = mutableSetOf<String>()
+
+    /**
+     * Behavior catalog by pod id. Populated on first discovery of each pod
+     * (PodList / PodCreated) via a [ClientToServer.ListBehaviors] round-trip;
+     * kept fresh afterwards via [ServerToClient.BehaviorCreated] /
+     * [ServerToClient.BehaviorDeleted] / [ServerToClient.BehaviorStateChanged]
+     * broadcasts.
+     */
+    private val _behaviorsByPod = MutableStateFlow<Map<String, List<BehaviorSummary>>>(emptyMap())
+    val behaviorsByPod: StateFlow<Map<String, List<BehaviorSummary>>> =
+        _behaviorsByPod.asStateFlow()
+
+    private val behaviorsRequested = mutableSetOf<String>()
 
     /**
      * One-shot signal used by the UI to navigate to a freshly-created
@@ -319,6 +333,42 @@ class AppSession(
     }
 
     /**
+     * Fire one `ListBehaviors` for [podId] unless we've already done so this
+     * session. Dedup via [behaviorsRequested]; clears on disconnect so a
+     * reconnect re-fetches.
+     */
+    private fun ensureBehaviorsFetched(podId: String) {
+        if (podId.isBlank()) return
+        if (!behaviorsRequested.add(podId)) return
+        wire.send(ClientToServer.ListBehaviors(podId = podId))
+    }
+
+    /**
+     * Manual fire: spawn a thread from [behaviorId]'s prompt. Payload is
+     * always null from the phone (the webui carries a richer trigger form).
+     * Result shows up as a new thread via the standard broadcast channel.
+     */
+    fun runBehavior(podId: String, behaviorId: String) {
+        if (podId.isBlank() || behaviorId.isBlank()) return
+        wire.send(ClientToServer.RunBehavior(podId = podId, behaviorId = behaviorId))
+    }
+
+    /**
+     * Pause / resume the behavior's auto-triggers (cron, webhook). Manual
+     * [runBehavior] continues to work regardless of [enabled].
+     */
+    fun setBehaviorEnabled(podId: String, behaviorId: String, enabled: Boolean) {
+        if (podId.isBlank() || behaviorId.isBlank()) return
+        wire.send(
+            ClientToServer.SetBehaviorEnabled(
+                podId = podId,
+                behaviorId = behaviorId,
+                enabled = enabled,
+            ),
+        )
+    }
+
+    /**
      * Switch the UI's current pod. Persists the preference so the same pod
      * is restored on next launch. Ignored if [podId] isn't in the pod
      * catalog — callers should drive the UI from [pods].
@@ -368,6 +418,10 @@ class AppSession(
                             // on demand.
                             _modelsByBackend.value = emptyMap()
                             modelsInFlight.clear()
+                            // Same rationale for behaviors — the new session
+                            // will re-fetch from whichever pods come back.
+                            _behaviorsByPod.value = emptyMap()
+                            behaviorsRequested.clear()
                             // Transient drop while the user is actively using the
                             // app? Re-dial with a small backoff rather than sit
                             // silent until the next foreground cycle.
@@ -449,10 +503,14 @@ class AppSession(
                     .associateBy { it.podId }
                 _defaultPodId.value = event.defaultPodId
                 _selectedPodId.value = resolveFocusPodId()
+                // PodSummaries don't carry behavior catalogs — fire one
+                // ListBehaviors per visible pod on first discovery.
+                _pods.value.keys.forEach(::ensureBehaviorsFetched)
             }
             is ServerToClient.PodCreated -> {
                 if (!event.pod.archived) {
                     _pods.update { it + (event.pod.podId to event.pod) }
+                    ensureBehaviorsFetched(event.pod.podId)
                 }
                 if (_selectedPodId.value == null) {
                     _selectedPodId.value = resolveFocusPodId()
@@ -460,6 +518,8 @@ class AppSession(
             }
             is ServerToClient.PodArchived -> {
                 _pods.update { it - event.podId }
+                _behaviorsByPod.update { it - event.podId }
+                behaviorsRequested.remove(event.podId)
                 if (_selectedPodId.value == event.podId) {
                     _selectedPodId.value = resolveFocusPodId()
                 }
@@ -471,6 +531,39 @@ class AppSession(
             is ServerToClient.ModelsList -> {
                 modelsInFlight.remove(event.backend)
                 _modelsByBackend.update { it + (event.backend to event.models) }
+            }
+            is ServerToClient.BehaviorList -> {
+                _behaviorsByPod.update { it + (event.podId to event.behaviors) }
+            }
+            is ServerToClient.BehaviorCreated -> {
+                val podId = event.summary.podId
+                _behaviorsByPod.update { map ->
+                    val existing = map[podId].orEmpty()
+                    // Replace-or-append — BehaviorCreated is also the
+                    // success ack for UpdateBehavior in some server paths.
+                    val next = existing.filterNot { it.behaviorId == event.summary.behaviorId } +
+                        event.summary
+                    map + (podId to next)
+                }
+            }
+            is ServerToClient.BehaviorDeleted -> {
+                _behaviorsByPod.update { map ->
+                    val existing = map[event.podId] ?: return@update map
+                    map + (event.podId to existing.filterNot { it.behaviorId == event.behaviorId })
+                }
+            }
+            is ServerToClient.BehaviorStateChanged -> {
+                _behaviorsByPod.update { map ->
+                    val existing = map[event.podId] ?: return@update map
+                    map + (event.podId to existing.map { b ->
+                        if (b.behaviorId != event.behaviorId) b
+                        else b.copy(
+                            enabled = event.state.enabled,
+                            runCount = event.state.runCount,
+                            lastFiredAt = event.state.lastFiredAt,
+                        )
+                    })
+                }
             }
             is ServerToClient.Snapshot -> {
                 if (event.threadId == subscribedThreadId) {

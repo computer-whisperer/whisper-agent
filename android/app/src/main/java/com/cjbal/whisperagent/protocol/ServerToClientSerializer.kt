@@ -56,11 +56,14 @@ object ServerToClientSerializer : KSerializer<ServerToClient> {
     private const val IDX_DECISION = 30
     private const val IDX_NEW_THREAD_ID = 31
     private const val IDX_SUMMARY_TEXT = 32
+    private const val IDX_BEHAVIORS = 33
+    private const val IDX_BEHAVIOR_ID = 34
 
     private val tasksSerializer = ListSerializer(ThreadSummary.serializer())
     private val podsSerializer = ListSerializer(PodSummary.serializer())
     private val backendsSerializer = ListSerializer(BackendSummary.serializer())
     private val modelsSerializer = ListSerializer(ModelSummary.serializer())
+    private val behaviorsSerializer = ListSerializer(BehaviorSummary.serializer())
 
     override val descriptor: SerialDescriptor = buildClassSerialDescriptor("ServerToClient") {
         element("type", String.serializer().descriptor)
@@ -96,6 +99,15 @@ object ServerToClientSerializer : KSerializer<ServerToClient> {
         element("decision", SudoDecision.serializer().descriptor, isOptional = true)
         element("new_thread_id", String.serializer().descriptor, isOptional = true)
         element("summary_text", String.serializer().descriptor, isOptional = true)
+        element("behaviors", behaviorsSerializer.descriptor, isOptional = true)
+        element("behavior_id", String.serializer().descriptor, isOptional = true)
+        // Note: `summary` (IDX_SUMMARY) is shared between ThreadCreated and
+        // BehaviorCreated; `state` (IDX_STATE) is shared between
+        // ThreadStateChanged and BehaviorStateChanged. The decode loop
+        // picks the right deserializer at read time based on the already-
+        // seen `type` field — serde's internally-tagged enum emits `type`
+        // before the variant's struct fields, so by the time we hit a
+        // shared key the type is known.
     }
 
     override fun serialize(encoder: Encoder, value: ServerToClient) {
@@ -263,6 +275,41 @@ object ServerToClientSerializer : KSerializer<ServerToClient> {
                         descriptor, IDX_DECISION, SudoDecision.serializer(), value.decision,
                     )
                 }
+                is ServerToClient.BehaviorList -> {
+                    encodeStringElement(descriptor, IDX_TYPE, "behavior_list")
+                    value.correlationId?.let {
+                        encodeStringElement(descriptor, IDX_CORRELATION_ID, it)
+                    }
+                    encodeStringElement(descriptor, IDX_POD_ID, value.podId)
+                    encodeSerializableElement(
+                        descriptor, IDX_BEHAVIORS, behaviorsSerializer, value.behaviors,
+                    )
+                }
+                is ServerToClient.BehaviorCreated -> {
+                    encodeStringElement(descriptor, IDX_TYPE, "behavior_created")
+                    value.correlationId?.let {
+                        encodeStringElement(descriptor, IDX_CORRELATION_ID, it)
+                    }
+                    encodeSerializableElement(
+                        descriptor, IDX_SUMMARY, BehaviorSummary.serializer(), value.summary,
+                    )
+                }
+                is ServerToClient.BehaviorDeleted -> {
+                    encodeStringElement(descriptor, IDX_TYPE, "behavior_deleted")
+                    value.correlationId?.let {
+                        encodeStringElement(descriptor, IDX_CORRELATION_ID, it)
+                    }
+                    encodeStringElement(descriptor, IDX_POD_ID, value.podId)
+                    encodeStringElement(descriptor, IDX_BEHAVIOR_ID, value.behaviorId)
+                }
+                is ServerToClient.BehaviorStateChanged -> {
+                    encodeStringElement(descriptor, IDX_TYPE, "behavior_state_changed")
+                    encodeStringElement(descriptor, IDX_POD_ID, value.podId)
+                    encodeStringElement(descriptor, IDX_BEHAVIOR_ID, value.behaviorId)
+                    encodeSerializableElement(
+                        descriptor, IDX_STATE, BehaviorState.serializer(), value.state,
+                    )
+                }
                 is ServerToClient.Error -> {
                     encodeStringElement(descriptor, IDX_TYPE, "error")
                     value.correlationId?.let {
@@ -314,6 +361,10 @@ object ServerToClientSerializer : KSerializer<ServerToClient> {
             var decision: SudoDecision? = null
             var newThreadId: String? = null
             var summaryText: String? = null
+            var behaviors: List<BehaviorSummary>? = null
+            var behaviorSummary: BehaviorSummary? = null
+            var behaviorId: String? = null
+            var behaviorState: BehaviorState? = null
 
             loop@ while (true) {
                 when (val i = decodeElementIndex(descriptor)) {
@@ -322,12 +373,35 @@ object ServerToClientSerializer : KSerializer<ServerToClient> {
                     IDX_CORRELATION_ID -> correlationId = decodeStringElement(descriptor, i)
                     IDX_THREAD_ID -> threadId = decodeStringElement(descriptor, i)
                     IDX_TASKS -> tasks = decodeSerializableElement(descriptor, i, tasksSerializer)
-                    IDX_SUMMARY -> summary = decodeSerializableElement(
-                        descriptor, i, ThreadSummary.serializer(),
-                    )
-                    IDX_STATE -> state = decodeSerializableElement(
-                        descriptor, i, ThreadStateLabel.serializer(),
-                    )
+                    IDX_SUMMARY -> {
+                        // `summary` is shared between thread_created and
+                        // behavior_created; pick the matching deserializer
+                        // using the type read above (serde emits `type`
+                        // first). Unknown types decode as ThreadSummary
+                        // and will be dropped downstream if they don't fit.
+                        if (type == "behavior_created") {
+                            behaviorSummary = decodeSerializableElement(
+                                descriptor, i, BehaviorSummary.serializer(),
+                            )
+                        } else {
+                            summary = decodeSerializableElement(
+                                descriptor, i, ThreadSummary.serializer(),
+                            )
+                        }
+                    }
+                    IDX_STATE -> {
+                        // Same story as IDX_SUMMARY: `state` is shared with
+                        // behavior_state_changed.
+                        if (type == "behavior_state_changed") {
+                            behaviorState = decodeSerializableElement(
+                                descriptor, i, BehaviorState.serializer(),
+                            )
+                        } else {
+                            state = decodeSerializableElement(
+                                descriptor, i, ThreadStateLabel.serializer(),
+                            )
+                        }
+                    }
                     IDX_TITLE -> title = decodeStringElement(descriptor, i)
                     IDX_SNAPSHOT -> snapshot = decodeSerializableElement(
                         descriptor, i, ThreadSnapshot.serializer(),
@@ -367,6 +441,10 @@ object ServerToClientSerializer : KSerializer<ServerToClient> {
                     )
                     IDX_NEW_THREAD_ID -> newThreadId = decodeStringElement(descriptor, i)
                     IDX_SUMMARY_TEXT -> summaryText = decodeStringElement(descriptor, i)
+                    IDX_BEHAVIORS -> behaviors = decodeSerializableElement(
+                        descriptor, i, behaviorsSerializer,
+                    )
+                    IDX_BEHAVIOR_ID -> behaviorId = decodeStringElement(descriptor, i)
                     else -> throw SerializationException("unexpected element index $i")
                 }
             }
@@ -474,6 +552,25 @@ object ServerToClientSerializer : KSerializer<ServerToClient> {
                     functionId = requireNotNull(functionId) { "missing function_id" },
                     threadId = requireNotNull(threadId) { "missing thread_id" },
                     decision = requireNotNull(decision) { "missing decision" },
+                )
+                "behavior_list" -> ServerToClient.BehaviorList(
+                    podId = requireNotNull(podId) { "missing pod_id" },
+                    behaviors = behaviors ?: emptyList(),
+                    correlationId = correlationId,
+                )
+                "behavior_created" -> ServerToClient.BehaviorCreated(
+                    summary = requireNotNull(behaviorSummary) { "missing summary" },
+                    correlationId = correlationId,
+                )
+                "behavior_deleted" -> ServerToClient.BehaviorDeleted(
+                    podId = requireNotNull(podId) { "missing pod_id" },
+                    behaviorId = requireNotNull(behaviorId) { "missing behavior_id" },
+                    correlationId = correlationId,
+                )
+                "behavior_state_changed" -> ServerToClient.BehaviorStateChanged(
+                    podId = requireNotNull(podId) { "missing pod_id" },
+                    behaviorId = requireNotNull(behaviorId) { "missing behavior_id" },
+                    state = requireNotNull(behaviorState) { "missing state" },
                 )
                 "error" -> ServerToClient.Error(
                     correlationId = correlationId,
