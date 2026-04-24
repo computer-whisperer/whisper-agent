@@ -3045,22 +3045,36 @@ impl Scheduler {
         Ok(new_id)
     }
 
-    /// Archive `thread_id`: flip the persisted `archived` flag, touch
-    /// last_active, mark dirty for the next flush, and broadcast
-    /// `ThreadArchived` so clients can drop the thread off their
-    /// sidebars. Silent no-op when the thread is unknown — matches
-    /// the existing `ArchiveThread` dispatch semantics.
-    pub(crate) fn archive_thread(&mut self, thread_id: &str) {
-        let Some(task) = self.tasks.get_mut(thread_id) else {
-            return;
+    /// Archive `thread_id`: remove the thread from every in-memory
+    /// surface and move its JSON from `<pod>/threads/<id>.json` to
+    /// `<pod>/.archived/threads/<id>.json`. Shares the disk-move +
+    /// teardown path with `retention_sweep` so introspection tools
+    /// that walk `<pod>/threads/` never see archived threads. When
+    /// the thread is non-terminal, cancels any in-flight model/tool
+    /// work first so Function-registry entries and resource users
+    /// unwind cleanly before the thread is yanked from memory.
+    /// Silent no-op when the thread is unknown.
+    pub(crate) fn archive_thread(
+        &mut self,
+        thread_id: &str,
+        pending_io: &mut FuturesUnordered<SchedulerFuture>,
+    ) {
+        let (terminal, pod_id) = match self.tasks.get(thread_id) {
+            Some(task) => {
+                let terminal = matches!(
+                    task.public_state(),
+                    ThreadStateLabel::Completed
+                        | ThreadStateLabel::Failed
+                        | ThreadStateLabel::Cancelled
+                );
+                (terminal, task.pod_id.clone())
+            }
+            None => return,
         };
-        task.archived = true;
-        task.touch();
-        self.mark_dirty(thread_id);
-        self.router
-            .broadcast_task_list(ServerToClient::ThreadArchived {
-                thread_id: thread_id.to_string(),
-            });
+        if !terminal {
+            self.execute_cancel_thread(thread_id, pending_io);
+        }
+        self.sweep_thread(thread_id, &pod_id, RetentionAction::Archive);
     }
 
     /// Promote a `Failed` thread back to `Idle` so the user can send
@@ -3769,10 +3783,12 @@ impl Scheduler {
         }
     }
 
-    /// Inner helper for `retention_sweep`: removes the thread from
-    /// every in-memory surface (tasks map, pod membership, router
-    /// subscriptions, resource user sets), broadcasts `ThreadArchived`,
-    /// and spawns the disk op. Used only for behavior-spawned threads.
+    /// Inner helper: removes the thread from every in-memory surface
+    /// (tasks map, pod membership, router subscriptions, resource user
+    /// sets), broadcasts `ThreadArchived`, and spawns the disk op.
+    /// Shared between `retention_sweep` (terminal behavior threads)
+    /// and `archive_thread` (user-initiated archive of any thread,
+    /// after it has been cancelled if non-terminal).
     fn sweep_thread(&mut self, thread_id: &str, pod_id: &str, action: RetentionAction) {
         let pod_dir = match self.pods.get(pod_id) {
             Some(pod) => pod.dir.clone(),

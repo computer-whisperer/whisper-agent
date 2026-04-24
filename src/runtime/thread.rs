@@ -87,8 +87,6 @@ pub struct Thread {
     /// field existed load with an empty log.
     #[serde(default)]
     pub turn_log: TurnLog,
-    #[serde(default)]
-    pub archived: bool,
     /// Turns issued in the current user-message cycle; resets on user message.
     #[serde(default)]
     pub turns_in_cycle: u32,
@@ -315,7 +313,6 @@ impl Thread {
             conversation: Conversation::new(),
             total_usage: Usage::default(),
             turn_log: TurnLog::default(),
-            archived: false,
             turns_in_cycle: 0,
             scope,
             tool_surface,
@@ -421,7 +418,6 @@ impl Thread {
             conversation,
             total_usage,
             turn_log,
-            archived: false,
             turns_in_cycle: 0,
             scope: self.scope.clone(),
             tool_surface: self.tool_surface.clone(),
@@ -1229,7 +1225,6 @@ mod tests {
         assert_eq!(forked.total_usage.output_tokens, 2);
         assert_eq!(forked.id, "new");
         assert_eq!(forked.pod_id, "pod");
-        assert!(!forked.archived);
         assert_eq!(forked.turns_in_cycle, 0);
         assert!(forked.title.is_none());
         // The draft is the client's unsaved typing buffer on the

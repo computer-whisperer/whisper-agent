@@ -692,6 +692,20 @@ async fn load_pod(pod_dir: &Path, pod_id: &str) -> Result<(Pod, Vec<Thread>)> {
             if path.extension().and_then(|e| e.to_str()) != Some("json") {
                 continue;
             }
+            // Legacy archived threads written under the old
+            // soft-hide button behavior live at `threads/<id>.json`
+            // with `archived: true`. Move them to
+            // `.archived/threads/` on first load so introspection
+            // tools that walk `<pod>/threads/` no longer see them.
+            match migrate_archived_thread_json(pod_dir, &path).await {
+                Ok(true) => continue,
+                Ok(false) => {}
+                Err(e) => warn!(
+                    path = %path.display(),
+                    error = %e,
+                    "archived-thread migration failed; loading as normal"
+                ),
+            }
             match load_one(&path, pod_id).await {
                 Ok(task) => threads.push(task),
                 Err(e) => warn!(path = %path.display(), error = %e, "skip unreadable thread file"),
@@ -751,6 +765,43 @@ async fn load_one(path: &Path, pod_id: &str) -> Result<Thread> {
         task.fail("resume", "task was in-flight at last shutdown");
     }
     Ok(task)
+}
+
+/// If `path` is a thread JSON with `archived: true`, move it to
+/// `<pod_dir>/.archived/threads/<basename>` and return `Ok(true)`.
+/// Returns `Ok(false)` when the thread is not archived (normal load
+/// path). One-time migration for threads archived under the old
+/// soft-hide button behavior that left the JSON in `<pod>/threads/`.
+async fn migrate_archived_thread_json(pod_dir: &Path, path: &Path) -> Result<bool> {
+    let bytes = fs::read(path)
+        .await
+        .with_context(|| format!("read {}", path.display()))?;
+    let archived = serde_json::from_slice::<serde_json::Value>(&bytes)
+        .ok()
+        .as_ref()
+        .and_then(|v| v.get("archived"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    if !archived {
+        return Ok(false);
+    }
+    let dst_dir = pod_dir.join(".archived").join(THREADS_DIR);
+    fs::create_dir_all(&dst_dir)
+        .await
+        .with_context(|| format!("mkdir {}", dst_dir.display()))?;
+    let filename = path
+        .file_name()
+        .with_context(|| format!("no filename for {}", path.display()))?;
+    let dst = dst_dir.join(filename);
+    fs::rename(path, &dst)
+        .await
+        .with_context(|| format!("rename {} -> {}", path.display(), dst.display()))?;
+    info!(
+        from = %path.display(),
+        to = %dst.display(),
+        "migrated legacy archived thread JSON"
+    );
+    Ok(true)
 }
 
 fn normalize_legacy_host_env_binding(value: &mut serde_json::Value) {
@@ -1205,6 +1256,47 @@ mod tests {
         let loaded = p.load_all().await.unwrap();
         assert_eq!(loaded.threads.len(), 1);
         assert_eq!(loaded.threads[0].id, "real-pod");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn load_migrates_legacy_archived_thread_json_into_archived_subdir() {
+        // A thread JSON written under the old soft-hide button behavior
+        // lives at `<pod>/threads/<id>.json` with `archived: true`.
+        // load_all should move it to `<pod>/.archived/threads/` and
+        // not surface it as a loaded thread.
+        let dir = temp_dir();
+        let p = Persister::new(dir.clone()).await.unwrap();
+        let live = sample_task("live");
+        p.flush(&live).await.unwrap();
+
+        // Hand-craft a legacy archived sibling under the same pod.
+        // The `archived` field was dropped from Thread after the
+        // button-archive rework, so inject it straight into the JSON.
+        let mut archived = sample_task("live");
+        archived.id = "old-arch".into();
+        let mut value = serde_json::to_value(&archived).unwrap();
+        value
+            .as_object_mut()
+            .unwrap()
+            .insert("archived".into(), serde_json::Value::Bool(true));
+        let pod_dir = dir.join("live");
+        let legacy_path = pod_dir.join(THREADS_DIR).join("old-arch.json");
+        std::fs::write(&legacy_path, serde_json::to_vec(&value).unwrap()).unwrap();
+
+        let loaded = p.load_all().await.unwrap();
+        assert_eq!(loaded.threads.len(), 1);
+        assert_eq!(loaded.threads[0].id, "live");
+
+        // Legacy file is gone from threads/ and now lives under .archived/.
+        assert!(!legacy_path.exists());
+        assert!(
+            pod_dir
+                .join(".archived")
+                .join(THREADS_DIR)
+                .join("old-arch.json")
+                .exists()
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

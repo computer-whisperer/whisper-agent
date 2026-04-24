@@ -138,7 +138,7 @@ impl Scheduler {
                 }
             }
             ClientToServer::ArchiveThread { thread_id } => {
-                self.archive_thread(&thread_id);
+                self.archive_thread(&thread_id, pending_io);
             }
             ClientToServer::RecoverThread {
                 thread_id,
@@ -229,7 +229,7 @@ impl Scheduler {
             ) {
                 Ok(_) => {
                     if archive_original {
-                        self.archive_thread(&thread_id);
+                        self.archive_thread(&thread_id, pending_io);
                     }
                 }
                 Err(e) => {
@@ -270,12 +270,7 @@ impl Scheduler {
                 self.router.unsubscribe(conn_id, &thread_id);
             }
             ClientToServer::ListThreads { correlation_id } => {
-                let tasks = self
-                    .tasks
-                    .values()
-                    .filter(|t| !t.archived)
-                    .map(|t| t.summary())
-                    .collect();
+                let tasks = self.tasks.values().map(|t| t.summary()).collect();
                 self.router.send_to_client(
                     conn_id,
                     ServerToClient::ThreadList {
