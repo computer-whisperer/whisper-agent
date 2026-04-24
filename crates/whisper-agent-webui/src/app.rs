@@ -1828,6 +1828,17 @@ impl ChatApp {
             ServerToClient::ThreadStateChanged { thread_id, state } => {
                 if let Some(view) = self.tasks.get_mut(&thread_id) {
                     view.summary.state = state;
+                    // Any transition away from Working invalidates
+                    // transient stream decorations — a mid-args
+                    // tool-call placeholder that never got its
+                    // matching ToolCallBegin, or a prefill bar whose
+                    // turn just got cancelled. Leaving these on
+                    // screen is the "stuck spinner" bug.
+                    if state != ThreadStateLabel::Working {
+                        view.prefill_progress = None;
+                        view.items
+                            .retain(|it| !matches!(it, DisplayItem::ToolCallStreaming { .. }));
+                    }
                 }
             }
             ServerToClient::ThreadTitleUpdated { thread_id, title } => {
@@ -1972,7 +1983,15 @@ impl ChatApp {
                 tokens_total,
             } => {
                 if let Some(view) = self.tasks.get_mut(&thread_id) {
-                    view.prefill_progress = Some((tokens_processed, tokens_total));
+                    // Drop late stream events buffered in the
+                    // scheduler's channel when the thread has
+                    // already transitioned out of Working — without
+                    // this, a just-cancelled turn can have a
+                    // progress bar re-appear after the state change
+                    // arrived.
+                    if view.summary.state == ThreadStateLabel::Working {
+                        view.prefill_progress = Some((tokens_processed, tokens_total));
+                    }
                 }
             }
             ServerToClient::ThreadAssistantTextDelta { thread_id, delta } => {
@@ -2002,6 +2021,13 @@ impl ChatApp {
                 args_chars,
             } => {
                 if let Some(view) = self.tasks.get_mut(&thread_id) {
+                    // Guard against late stream events buffered in
+                    // the scheduler's channel arriving after the
+                    // thread left Working — otherwise a cancelled
+                    // turn can get a stale placeholder added back.
+                    if view.summary.state != ThreadStateLabel::Working {
+                        return;
+                    }
                     // Upsert: if we already have a streaming placeholder
                     // for this call, update its char count in place so
                     // the row doesn't re-order. Otherwise append a new

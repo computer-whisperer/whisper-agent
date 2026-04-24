@@ -16,6 +16,7 @@ import com.cjbal.whisperagent.protocol.SudoDecision
 import com.cjbal.whisperagent.protocol.ThreadBindingsRequest
 import com.cjbal.whisperagent.protocol.ThreadConfigOverride
 import com.cjbal.whisperagent.protocol.ThreadSnapshot
+import com.cjbal.whisperagent.protocol.ThreadStateLabel
 import com.cjbal.whisperagent.protocol.ThreadSummary
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
@@ -508,6 +509,15 @@ class AppSession(
                         else -> snap
                     }
                 }
+                // Transitions out of Working invalidate transient
+                // stream decorations — a mid-args tool-call
+                // placeholder that never got its ToolCallBegin, or
+                // a prefill bar from a just-cancelled turn. Clear
+                // them so the UI doesn't look stuck.
+                if (event.state != ThreadStateLabel.Working) {
+                    _streamingToolCalls.update { it - event.threadId }
+                    _prefillProgress.update { it - event.threadId }
+                }
             }
             is ServerToClient.ThreadTitleUpdated -> {
                 _threads.update { map ->
@@ -610,21 +620,29 @@ class AppSession(
             is ServerToClient.LoopComplete,
             -> reduceStreaming(event)
             is ServerToClient.PrefillProgress -> {
-                _prefillProgress.update {
-                    it + (event.threadId to PrefillProgress(
-                        tokensProcessed = event.tokensProcessed,
-                        tokensTotal = event.tokensTotal,
-                    ))
+                // Drop late stream events buffered in the scheduler
+                // that land after the thread has already left
+                // Working — without this, a just-cancelled turn's
+                // progress bar can re-appear post-transition.
+                if (_threads.value[event.threadId]?.state == ThreadStateLabel.Working) {
+                    _prefillProgress.update {
+                        it + (event.threadId to PrefillProgress(
+                            tokensProcessed = event.tokensProcessed,
+                            tokensTotal = event.tokensTotal,
+                        ))
+                    }
                 }
             }
             is ServerToClient.ToolCallStreaming -> {
-                _streamingToolCalls.update { outer ->
-                    val inner = outer[event.threadId].orEmpty() +
-                        (event.toolUseId to StreamingToolCall(
-                            name = event.name,
-                            argsChars = event.argsChars,
-                        ))
-                    outer + (event.threadId to inner)
+                if (_threads.value[event.threadId]?.state == ThreadStateLabel.Working) {
+                    _streamingToolCalls.update { outer ->
+                        val inner = outer[event.threadId].orEmpty() +
+                            (event.toolUseId to StreamingToolCall(
+                                name = event.name,
+                                argsChars = event.argsChars,
+                            ))
+                        outer + (event.threadId to inner)
+                    }
                 }
             }
             is ServerToClient.ToolCallBegin -> {
