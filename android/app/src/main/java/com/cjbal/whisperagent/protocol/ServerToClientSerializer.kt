@@ -60,6 +60,7 @@ object ServerToClientSerializer : KSerializer<ServerToClient> {
     private const val IDX_BEHAVIOR_ID = 34
     private const val IDX_TOKENS_PROCESSED = 35
     private const val IDX_TOKENS_TOTAL = 36
+    private const val IDX_ARGS_CHARS = 37
 
     private val tasksSerializer = ListSerializer(ThreadSummary.serializer())
     private val podsSerializer = ListSerializer(PodSummary.serializer())
@@ -105,6 +106,7 @@ object ServerToClientSerializer : KSerializer<ServerToClient> {
         element("behavior_id", String.serializer().descriptor, isOptional = true)
         element("tokens_processed", Int.serializer().descriptor, isOptional = true)
         element("tokens_total", Int.serializer().descriptor, isOptional = true)
+        element("args_chars", Int.serializer().descriptor, isOptional = true)
         // Note: `summary` (IDX_SUMMARY) is shared between ThreadCreated and
         // BehaviorCreated; `state` (IDX_STATE) is shared between
         // ThreadStateChanged and BehaviorStateChanged. The decode loop
@@ -190,6 +192,13 @@ object ServerToClientSerializer : KSerializer<ServerToClient> {
                     encodeStringElement(descriptor, IDX_THREAD_ID, value.threadId)
                     encodeIntElement(descriptor, IDX_TOKENS_PROCESSED, value.tokensProcessed)
                     encodeIntElement(descriptor, IDX_TOKENS_TOTAL, value.tokensTotal)
+                }
+                is ServerToClient.ToolCallStreaming -> {
+                    encodeStringElement(descriptor, IDX_TYPE, "thread_tool_call_streaming")
+                    encodeStringElement(descriptor, IDX_THREAD_ID, value.threadId)
+                    encodeStringElement(descriptor, IDX_TOOL_USE_ID, value.toolUseId)
+                    encodeStringElement(descriptor, IDX_NAME, value.name)
+                    encodeIntElement(descriptor, IDX_ARGS_CHARS, value.argsChars)
                 }
                 is ServerToClient.AssistantTextDelta -> {
                     encodeStringElement(descriptor, IDX_TYPE, "thread_assistant_text_delta")
@@ -377,6 +386,7 @@ object ServerToClientSerializer : KSerializer<ServerToClient> {
             var behaviorState: BehaviorState? = null
             var tokensProcessed: Int? = null
             var tokensTotal: Int? = null
+            var argsChars: Int? = null
 
             loop@ while (true) {
                 when (val i = decodeElementIndex(descriptor)) {
@@ -459,6 +469,7 @@ object ServerToClientSerializer : KSerializer<ServerToClient> {
                     IDX_BEHAVIOR_ID -> behaviorId = decodeStringElement(descriptor, i)
                     IDX_TOKENS_PROCESSED -> tokensProcessed = decodeIntElement(descriptor, i)
                     IDX_TOKENS_TOTAL -> tokensTotal = decodeIntElement(descriptor, i)
+                    IDX_ARGS_CHARS -> argsChars = decodeIntElement(descriptor, i)
                     else -> throw SerializationException("unexpected element index $i")
                 }
             }
@@ -510,6 +521,12 @@ object ServerToClientSerializer : KSerializer<ServerToClient> {
                     threadId = requireNotNull(threadId) { "missing thread_id" },
                     tokensProcessed = requireNotNull(tokensProcessed) { "missing tokens_processed" },
                     tokensTotal = requireNotNull(tokensTotal) { "missing tokens_total" },
+                )
+                "thread_tool_call_streaming" -> ServerToClient.ToolCallStreaming(
+                    threadId = requireNotNull(threadId) { "missing thread_id" },
+                    toolUseId = requireNotNull(toolUseId) { "missing tool_use_id" },
+                    name = requireNotNull(name) { "missing name" },
+                    argsChars = requireNotNull(argsChars) { "missing args_chars" },
                 )
                 "thread_assistant_text_delta" -> ServerToClient.AssistantTextDelta(
                     threadId = requireNotNull(threadId) { "missing thread_id" },

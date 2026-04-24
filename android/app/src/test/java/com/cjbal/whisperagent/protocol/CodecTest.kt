@@ -584,6 +584,19 @@ class CodecTest {
     // --- Prefill progress -----------------------------------------------------
 
     @Test
+    fun serverToClient_toolCallStreaming_roundTrip() {
+        val original = ServerToClient.ToolCallStreaming(
+            threadId = "t-99",
+            toolUseId = "toolu_abc",
+            name = "bash",
+            argsChars = 128,
+        )
+        val bytes = cbor.encodeToByteArray(ServerToClient.serializer(), original)
+        val decoded = Codec.decodeFromServer(bytes)
+        assertEquals(original, decoded)
+    }
+
+    @Test
     fun serverToClient_prefillProgress_roundTrip() {
         val original = ServerToClient.PrefillProgress(
             threadId = "t-42",

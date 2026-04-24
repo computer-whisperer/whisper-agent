@@ -25,6 +25,7 @@
 //! resume its chain-of-thought. Blocks tagged for a different backend are
 //! dropped — their opaque blob is meaningless here.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_stream::try_stream;
@@ -757,6 +758,20 @@ enum RspStreamEvent {
         #[serde(default)]
         delta: String,
     },
+    /// A new output item is starting. For `function_call` items this is
+    /// the earliest point we know the tool name — before any arguments
+    /// have streamed — so we can emit a placeholder for the UI.
+    #[serde(rename = "response.output_item.added")]
+    OutputItemAdded { item: RspOutputItem },
+    /// Streaming fragment of a function_call's arguments JSON. We use
+    /// it only to drive throttled `ToolCallStreaming` char counts; the
+    /// fully-parsed args still come through `OutputItemDone`.
+    #[serde(rename = "response.function_call_arguments.delta")]
+    FunctionCallArgumentsDelta {
+        item_id: String,
+        #[serde(default)]
+        delta: String,
+    },
     /// A fully-formed output item — message, function_call, reasoning.
     /// Accumulated into the final Completed's `content`.
     #[serde(rename = "response.output_item.done")]
@@ -784,8 +799,30 @@ enum RspStreamEvent {
 #[derive(Default)]
 struct RspStreamState {
     items: Vec<RspOutputItem>,
+    /// Pending function_call items seen via `response.output_item.added`
+    /// but not yet through `output_item.done`. Keyed by the item id
+    /// that `function_call_arguments.delta` events reference. Each entry
+    /// carries the `call_id` (the identifier surfaced on the wire in
+    /// subsequent `ToolCall` / `ThreadToolCallBegin` events) and the
+    /// running args-char count for throttled streaming updates.
+    streaming_tool_calls: HashMap<String, ResponsesStreamingCall>,
     done: bool,
 }
+
+/// Book-keeping for one in-flight `function_call` item during streaming.
+/// Lives in [`RspStreamState::streaming_tool_calls`] between the
+/// `output_item.added` that opened it and the `output_item.done` that
+/// finalizes it.
+struct ResponsesStreamingCall {
+    call_id: String,
+    name: String,
+    args_chars: u32,
+    last_emitted_chars: u32,
+}
+
+/// Matches the Anthropic driver's identical constant. Throttles the
+/// per-char-progress emission rate during streaming.
+const TOOL_STREAMING_CHAR_STEP: u32 = 32;
 
 impl RspStreamState {
     fn consume(&mut self, event: RspStreamEvent) -> Result<Vec<ModelEvent>, ModelError> {
@@ -802,7 +839,59 @@ impl RspStreamState {
                     out.push(ModelEvent::ThinkingDelta { text: delta });
                 }
             }
+            RspStreamEvent::OutputItemAdded { item } => {
+                // Surface the function_call placeholder the moment its
+                // name is known — the args may take seconds to stream
+                // through `function_call_arguments.delta`, and we'd
+                // rather the UI frame the row now than stay silent.
+                if let RspOutputItem::FunctionCall {
+                    id: Some(item_id),
+                    call_id,
+                    name,
+                    arguments,
+                } = &item
+                {
+                    let args_chars = arguments.len() as u32;
+                    self.streaming_tool_calls.insert(
+                        item_id.clone(),
+                        ResponsesStreamingCall {
+                            call_id: call_id.clone(),
+                            name: name.clone(),
+                            args_chars,
+                            last_emitted_chars: args_chars,
+                        },
+                    );
+                    out.push(ModelEvent::ToolCallStreaming {
+                        id: call_id.clone(),
+                        name: name.clone(),
+                        args_chars,
+                    });
+                }
+            }
+            RspStreamEvent::FunctionCallArgumentsDelta { item_id, delta } => {
+                if let Some(pending) = self.streaming_tool_calls.get_mut(&item_id) {
+                    pending.args_chars = pending.args_chars.saturating_add(delta.len() as u32);
+                    if pending.args_chars
+                        >= pending
+                            .last_emitted_chars
+                            .saturating_add(TOOL_STREAMING_CHAR_STEP)
+                    {
+                        pending.last_emitted_chars = pending.args_chars;
+                        out.push(ModelEvent::ToolCallStreaming {
+                            id: pending.call_id.clone(),
+                            name: pending.name.clone(),
+                            args_chars: pending.args_chars,
+                        });
+                    }
+                }
+            }
             RspStreamEvent::OutputItemDone { item } => {
+                // Retire any pending streaming entry for this item — the
+                // subsequent `ToolCall` event supersedes every
+                // `ToolCallStreaming` we emitted for the same call.
+                if let RspOutputItem::FunctionCall { id: Some(id), .. } = &item {
+                    self.streaming_tool_calls.remove(id);
+                }
                 // Emit a ToolCall event for function_call items so the
                 // downstream consumer (the scheduler) has symmetric
                 // coverage with the Anthropic adapter. Message /
@@ -811,6 +900,7 @@ impl RspStreamState {
                     call_id,
                     name,
                     arguments,
+                    ..
                 } = &item
                 {
                     let input: Value = if arguments.is_empty() {
@@ -1122,6 +1212,13 @@ enum RspOutputItem {
         content: Vec<RspOutputMessagePart>,
     },
     FunctionCall {
+        /// Item id, distinct from `call_id`. `function_call_arguments.delta`
+        /// events reference this field, not `call_id`. Optional because
+        /// some payloads (notably the `response.output` array on
+        /// `response.completed`) omit it; only `output_item.added` is
+        /// guaranteed to carry it.
+        #[serde(default)]
+        id: Option<String>,
         call_id: String,
         name: String,
         arguments: String,

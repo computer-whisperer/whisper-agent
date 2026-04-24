@@ -89,6 +89,8 @@ fun ThreadScreen(
     val pods by session.pods.collectAsStateWithLifecycle()
     val prefillByThread by session.prefillProgress.collectAsStateWithLifecycle()
     val prefill = prefillByThread[threadId]
+    val streamingToolCallsByThread by session.streamingToolCalls.collectAsStateWithLifecycle()
+    val streamingToolCalls = streamingToolCallsByThread[threadId].orEmpty()
     var draft by remember(threadId) { mutableStateOf("") }
 
     val isWorking = snapshot?.state == ThreadStateLabel.Working
@@ -222,6 +224,19 @@ fun ThreadScreen(
                             }
                         },
                     )
+                }
+                // In-flight tool-call placeholders. Sit at the tail of
+                // the list so stick-to-bottom keeps them visible; each
+                // is removed when its matching ThreadToolCallBegin
+                // lands and the scheduler pushes the full row into the
+                // persisted conversation.
+                streamingToolCalls.forEach { (toolUseId, call) ->
+                    item(key = "tc-streaming-$toolUseId") {
+                        ToolCallStreamingRow(
+                            name = call.name,
+                            argsChars = call.argsChars,
+                        )
+                    }
                 }
                 // Quiet total-usage footer once the conversation has started.
                 snapshot?.totalUsage?.let { usage ->
@@ -404,6 +419,46 @@ private fun formatTokens(n: Int): String = when {
     n < 1_000 -> n.toString()
     n < 1_000_000 -> "%.1fk".format(n / 1_000.0)
     else -> "%.1fM".format(n / 1_000_000.0)
+}
+
+/**
+ * Placeholder row for a tool call whose args JSON the model is still
+ * streaming. Shown while we know the tool's name but not its full
+ * args; replaced by the regular tool-use rendering inside
+ * [MessageRow] as soon as the scheduler dispatches the call and the
+ * persisted conversation catches up.
+ */
+@Composable
+private fun ToolCallStreamingRow(name: String, argsChars: Int) {
+    Surface(
+        shape = RoundedCornerShape(8.dp),
+        color = MaterialTheme.colorScheme.surfaceContainerHigh,
+        modifier = Modifier.fillMaxWidth(),
+    ) {
+        Row(
+            modifier = Modifier.padding(horizontal = 12.dp, vertical = 10.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            CircularProgressIndicator(
+                strokeWidth = 2.dp,
+                modifier = Modifier.size(14.dp),
+            )
+            Text(
+                text = name,
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onSurface,
+                modifier = Modifier.padding(start = 10.dp),
+            )
+            val suffix = if (argsChars == 0) "writing args…"
+            else "writing args · $argsChars chars"
+            Text(
+                text = suffix,
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.padding(start = 8.dp),
+            )
+        }
+    }
 }
 
 /**

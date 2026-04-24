@@ -36,6 +36,13 @@ const CACHE_TTL_1H: &str = "1h";
 /// inbound and have it re-extracted on outbound so the wire stays clean.
 const PROVIDER_TAG: &str = "anthropic";
 
+/// Minimum character growth between consecutive `ToolCallStreaming`
+/// emissions for the same tool-use block. 32 chars keeps updates
+/// perceptible (roughly every few JSON tokens) without one wire event
+/// per `input_json_delta` chunk, which can arrive byte-by-byte on
+/// long-argument tool calls.
+const TOOL_STREAMING_CHAR_STEP: u32 = 32;
+
 pub struct AnthropicClient {
     http: reqwest::Client,
     api_key: String,
@@ -604,6 +611,13 @@ enum OpenBlock {
         id: String,
         name: String,
         args_json: String,
+        /// Last `args_json.len()` we reported via
+        /// [`ModelEvent::ToolCallStreaming`]. Throttles streaming
+        /// updates so a rapid-fire `input_json_delta` burst doesn't
+        /// spam one wire event per byte — we only re-emit after the
+        /// buffer has grown by at least [`TOOL_STREAMING_CHAR_STEP`]
+        /// chars since the previous emission.
+        last_emitted_chars: u32,
     },
     /// A block type we don't model (e.g. `server_tool_use`). Deltas are
     /// ignored; the block is dropped at `content_block_stop`.
@@ -650,11 +664,25 @@ impl StreamState {
                         thinking,
                         signature,
                     },
-                    AnthropicWireBlock::ToolUse { id, name, input: _ } => OpenBlock::ToolUse {
-                        id,
-                        name,
-                        args_json: String::new(),
-                    },
+                    AnthropicWireBlock::ToolUse { id, name, input: _ } => {
+                        // Announce the tool call the moment we know its
+                        // name — args follow over many `input_json_delta`
+                        // events, and we want the UI to frame the row
+                        // immediately rather than stay silent for the
+                        // seconds it takes the model to stream a long
+                        // args JSON.
+                        out.push(ModelEvent::ToolCallStreaming {
+                            id: id.clone(),
+                            name: name.clone(),
+                            args_chars: 0,
+                        });
+                        OpenBlock::ToolUse {
+                            id,
+                            name,
+                            args_json: String::new(),
+                            last_emitted_chars: 0,
+                        }
+                    }
                     // Tool-result blocks don't appear on assistant turns;
                     // anything else (server_tool_use, etc.) we treat as
                     // opaque and drop.
@@ -688,15 +716,31 @@ impl StreamState {
                             .push_str(&sig_chunk);
                     }
                     (
-                        Some(OpenBlock::ToolUse { args_json, .. }),
+                        Some(OpenBlock::ToolUse {
+                            id,
+                            name,
+                            args_json,
+                            last_emitted_chars,
+                        }),
                         AnthropicDelta::InputJsonDelta {
                             partial_json: chunk,
                         },
                     ) => {
                         args_json.push_str(&chunk);
-                        // Per design: no live tool-arg streaming — wait until
-                        // content_block_stop so we emit a single ToolCall with
-                        // fully-parsed input.
+                        // No live *parsed* tool-arg streaming — we can't
+                        // partial-parse JSON reliably. But we can surface
+                        // a cumulative char count so the UI's placeholder
+                        // chip shows progress. Throttled by char-step to
+                        // keep the wire quiet.
+                        let total = args_json.len() as u32;
+                        if total >= last_emitted_chars.saturating_add(TOOL_STREAMING_CHAR_STEP) {
+                            *last_emitted_chars = total;
+                            out.push(ModelEvent::ToolCallStreaming {
+                                id: id.clone(),
+                                name: name.clone(),
+                                args_chars: total,
+                            });
+                        }
                     }
                     _ => {} // mismatched delta for current block — drop.
                 }
@@ -720,6 +764,7 @@ impl StreamState {
                     id,
                     name,
                     args_json,
+                    last_emitted_chars: _,
                 }) => {
                     let input: Value = if args_json.is_empty() {
                         Value::Object(Default::default())
@@ -1232,9 +1277,11 @@ mod tests {
     }
 
     #[test]
-    fn tool_use_emits_single_toolcall_after_args_assembled() {
-        // Args stream in as fragments; ToolCall event only fires after
-        // content_block_stop with the fully-parsed input.
+    fn tool_use_emits_streaming_start_then_toolcall_after_args_assembled() {
+        // Args stream in as fragments; a `ToolCallStreaming` fires
+        // immediately with args_chars=0 (so the UI can frame the row
+        // before the args finish). The fully-parsed `ToolCall` still
+        // lands once at `content_block_stop`.
         let events = [
             r#"{"type":"message_start","message":{"usage":{"input_tokens":1,"output_tokens":0}}}"#,
             r#"{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_1","name":"bash","input":{}}}"#,
@@ -1245,17 +1292,30 @@ mod tests {
             r#"{"type":"message_stop"}"#,
         ];
         let (evs, _) = feed_events(&events);
-        // No TextDelta or anything other than ToolCall + Completed.
-        assert_eq!(evs.len(), 2);
+        // Expect: ToolCallStreaming(0) → ToolCall → Completed.
+        // The two args fragments here total 15 chars, under the
+        // throttling step, so no intermediate streaming events.
         match &evs[0] {
+            ModelEvent::ToolCallStreaming {
+                id,
+                name,
+                args_chars,
+            } => {
+                assert_eq!(id, "toolu_1");
+                assert_eq!(name, "bash");
+                assert_eq!(*args_chars, 0);
+            }
+            other => panic!("expected ToolCallStreaming first, got {other:?}"),
+        }
+        match &evs[1] {
             ModelEvent::ToolCall { id, name, input } => {
                 assert_eq!(id, "toolu_1");
                 assert_eq!(name, "bash");
                 assert_eq!(input, &json!({"cmd": "ls"}));
             }
-            _ => panic!("expected ToolCall first"),
+            other => panic!("expected ToolCall second, got {other:?}"),
         }
-        match &evs[1] {
+        match evs.last().unwrap() {
             ModelEvent::Completed {
                 content,
                 stop_reason,
@@ -1267,8 +1327,41 @@ mod tests {
                 );
                 assert_eq!(stop_reason.as_deref(), Some("tool_use"));
             }
-            _ => panic!("expected Completed second"),
+            _ => panic!("expected Completed last"),
         }
+    }
+
+    #[test]
+    fn tool_use_emits_throttled_streaming_updates_for_long_args() {
+        // Long args JSON should produce multiple `ToolCallStreaming`
+        // emissions, one every ~`TOOL_STREAMING_CHAR_STEP` chars.
+        let big_arg = "a".repeat(200);
+        let fragment = format!(r#"{{"data":"{big_arg}"}}"#);
+        let partial = fragment.replace('"', "\\\"");
+        let delta = format!(
+            r#"{{"type":"content_block_delta","index":0,"delta":{{"type":"input_json_delta","partial_json":"{partial}"}}}}"#,
+        );
+        let events = [
+            r#"{"type":"message_start","message":{"usage":{"input_tokens":1}}}"#,
+            r#"{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_big","name":"bash","input":{}}}"#,
+            &delta,
+            r#"{"type":"content_block_stop","index":0}"#,
+            r#"{"type":"message_delta","delta":{"stop_reason":"tool_use"}}"#,
+            r#"{"type":"message_stop"}"#,
+        ];
+        let (evs, _) = feed_events(&events);
+        let streaming_counts: Vec<u32> = evs
+            .iter()
+            .filter_map(|e| match e {
+                ModelEvent::ToolCallStreaming { args_chars, .. } => Some(*args_chars),
+                _ => None,
+            })
+            .collect();
+        // First emission at 0, then at least one more after the big
+        // delta pushes past the char step.
+        assert!(streaming_counts.len() >= 2, "got {streaming_counts:?}");
+        assert_eq!(streaming_counts[0], 0);
+        assert!(streaming_counts.last().unwrap() > &32);
     }
 
     #[test]

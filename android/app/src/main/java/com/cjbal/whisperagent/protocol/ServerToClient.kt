@@ -94,6 +94,20 @@ sealed class ServerToClient {
         val tokensTotal: Int,
     ) : ServerToClient()
 
+    /**
+     * In-flight tool call placeholder. Model is still streaming args
+     * JSON; the scheduler hasn't dispatched this call yet. Clients
+     * render a name + spinner + char count; swap it out for the real
+     * tool-call row when [ToolCallBegin] fires for the same
+     * [toolUseId].
+     */
+    data class ToolCallStreaming(
+        val threadId: String,
+        val toolUseId: String,
+        val name: String,
+        val argsChars: Int,
+    ) : ServerToClient()
+
     data class AssistantTextDelta(
         val threadId: String,
         val delta: String,

@@ -134,6 +134,24 @@ pub enum ModelEvent {
         name: String,
         input: Value,
     },
+    /// In-progress tool call. Providers that can observe the tool name
+    /// before the arguments finish streaming emit this so clients can
+    /// show a placeholder chip (tool name + spinner + char count) during
+    /// the buffering window, instead of dead silence while the model
+    /// writes a large args blob. Throttled by senders — clients should
+    /// expect only periodic updates, not one per token.
+    ///
+    /// Emitted at least once when the tool-use block opens (with
+    /// `args_chars = 0`) and again periodically as args grow. The
+    /// subsequent `ToolCall` event carries the fully-parsed input and
+    /// supersedes every streaming update for the same `id`.
+    ToolCallStreaming {
+        id: String,
+        name: String,
+        /// Cumulative length of the raw args-JSON buffered so far. Not
+        /// a token count — providers don't expose those mid-stream.
+        args_chars: u32,
+    },
     /// Mid-prefill progress heartbeat. Emitted by providers that can observe
     /// how many prompt tokens have been ingested before the first output
     /// token arrives — today only the llama.cpp driver does, via a parallel

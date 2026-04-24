@@ -1356,6 +1356,22 @@ pub enum ServerToClient {
         /// Total prompt length the backend is working through.
         tokens_total: u32,
     },
+    /// In-flight tool-call placeholder. Emitted while the model is
+    /// still streaming its arguments JSON — before the scheduler has
+    /// dispatched the call and fired
+    /// [`ServerToClient::ThreadToolCallBegin`]. Lets the UI frame the
+    /// row with the tool's name and a running char count instead of
+    /// dead silence during a long args-JSON write. Clients drop the
+    /// placeholder on the matching `ThreadToolCallBegin` (same
+    /// `tool_use_id`). Ephemeral; not persisted.
+    ThreadToolCallStreaming {
+        thread_id: String,
+        tool_use_id: String,
+        name: String,
+        /// Cumulative length of the args-JSON buffered so far. Not a
+        /// token count — providers don't surface those mid-stream.
+        args_chars: u32,
+    },
     /// Streaming text fragment. Emitted repeatedly during a turn as the model
     /// produces text. Non-streaming backends synthesize a single delta
     /// carrying the full block so clients only ever handle one event type.

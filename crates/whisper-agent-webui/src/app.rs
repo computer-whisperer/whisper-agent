@@ -389,6 +389,16 @@ enum DisplayItem {
     Reasoning {
         text: String,
     },
+    /// Placeholder row shown while the model is still streaming a tool
+    /// call's args JSON. Swapped out for a real [`DisplayItem::ToolCall`]
+    /// the moment `ThreadToolCallBegin` lands for the same
+    /// `tool_use_id`. Purely ephemeral — never survives a snapshot
+    /// rebuild.
+    ToolCallStreaming {
+        tool_use_id: String,
+        name: String,
+        args_chars: u32,
+    },
     ToolCall {
         tool_use_id: String,
         name: String,
@@ -1985,6 +1995,40 @@ impl ChatApp {
                     }
                 }
             }
+            ServerToClient::ThreadToolCallStreaming {
+                thread_id,
+                tool_use_id,
+                name,
+                args_chars,
+            } => {
+                if let Some(view) = self.tasks.get_mut(&thread_id) {
+                    // Upsert: if we already have a streaming placeholder
+                    // for this call, update its char count in place so
+                    // the row doesn't re-order. Otherwise append a new
+                    // one at the tail.
+                    let existing = view.items.iter_mut().rev().find_map(|it| match it {
+                        DisplayItem::ToolCallStreaming {
+                            tool_use_id: id, ..
+                        } if *id == tool_use_id => Some(it),
+                        _ => None,
+                    });
+                    if let Some(DisplayItem::ToolCallStreaming {
+                        name: existing_name,
+                        args_chars: existing_chars,
+                        ..
+                    }) = existing
+                    {
+                        *existing_name = name;
+                        *existing_chars = args_chars;
+                    } else {
+                        view.items.push(DisplayItem::ToolCallStreaming {
+                            tool_use_id,
+                            name,
+                            args_chars,
+                        });
+                    }
+                }
+            }
             ServerToClient::ThreadToolCallBegin {
                 thread_id,
                 tool_use_id,
@@ -1998,6 +2042,17 @@ impl ChatApp {
                     // the `Role::ToolResult` message the server pushes
                     // once all tool calls of this turn resolve.
                     view.pending_tool_batch = true;
+                    // Remove any in-flight streaming placeholder for
+                    // this call; the full tool-call row below replaces
+                    // it with name + args + diff etc.
+                    view.items.retain(|it| {
+                        !matches!(
+                            it,
+                            DisplayItem::ToolCallStreaming {
+                                tool_use_id: id, ..
+                            } if *id == tool_use_id
+                        )
+                    });
                     view.items.push(build_tool_call_item(
                         tool_use_id,
                         name,
@@ -2947,6 +3002,7 @@ fn pending_tool_batch_flush_thread_id(msg: &ServerToClient) -> Option<&str> {
         | ServerToClient::ThreadToolResultMessage { thread_id, .. }
         | ServerToClient::ThreadAssistantBegin { thread_id, .. }
         | ServerToClient::ThreadPrefillProgress { thread_id, .. }
+        | ServerToClient::ThreadToolCallStreaming { thread_id, .. }
         | ServerToClient::ThreadAssistantTextDelta { thread_id, .. }
         | ServerToClient::ThreadAssistantReasoningDelta { thread_id, .. }
         | ServerToClient::ThreadAssistantEnd { thread_id, .. }
@@ -8118,6 +8174,7 @@ mod tests {
                 DisplayItem::AssistantText { .. } => "assistant_text",
                 DisplayItem::Reasoning { .. } => "reasoning",
                 DisplayItem::ToolCall { .. } => "tool_call",
+                DisplayItem::ToolCallStreaming { .. } => "tool_call_streaming",
                 DisplayItem::ToolResult { .. } => "tool_result",
                 DisplayItem::SystemNote { .. } => "system_note",
                 DisplayItem::SetupPrompt { .. } => "setup_prompt",

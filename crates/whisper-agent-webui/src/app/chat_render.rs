@@ -64,6 +64,7 @@ fn item_palette(item: &DisplayItem) -> (Color32, Color32) {
             ..
         } => (COLOR_ERROR, Color32::TRANSPARENT),
         DisplayItem::ToolCall { .. } => (COLOR_TOOL, Color32::TRANSPARENT),
+        DisplayItem::ToolCallStreaming { .. } => (COLOR_TOOL, Color32::TRANSPARENT),
         DisplayItem::ToolResult { is_error: true, .. } => (COLOR_ERROR, Color32::TRANSPARENT),
         DisplayItem::ToolResult { .. } => (COLOR_TOOL, Color32::TRANSPARENT),
         DisplayItem::SystemNote { is_error: true, .. } => (
@@ -150,6 +151,11 @@ pub(super) fn render_item(
                 streaming_output,
                 result.as_ref(),
             ),
+            DisplayItem::ToolCallStreaming {
+                tool_use_id,
+                name,
+                args_chars,
+            } => render_tool_call_streaming(ui, tool_use_id, name, *args_chars),
             DisplayItem::ToolResult {
                 tool_use_id,
                 name,
@@ -506,6 +512,34 @@ fn fmt_count(n: u32) -> String {
         out.push(*b as char);
     }
     out
+}
+
+#[allow(clippy::too_many_arguments)]
+/// Placeholder row while the model is streaming a tool-call's args
+/// JSON. Shows name + spinner + char count. Replaced by
+/// [`render_tool_call`] the moment the scheduler dispatches the call
+/// (via `ThreadToolCallBegin`) and the reducer swaps the list entry
+/// for a full [`DisplayItem::ToolCall`].
+fn render_tool_call_streaming(ui: &mut egui::Ui, _tool_use_id: &str, name: &str, args_chars: u32) {
+    ui.horizontal(|ui| {
+        // Custom spinner already animates; no extra request_repaint
+        // needed — egui repaints while any Spinner is on screen.
+        ui.add(egui::Spinner::new().size(12.0));
+        ui.add_space(4.0);
+        ui.label(RichText::new(name).color(COLOR_TOOL).strong().monospace());
+        ui.add_space(6.0);
+        let suffix = if args_chars == 0 {
+            "writing args…".to_string()
+        } else {
+            format!("writing args · {args_chars} chars")
+        };
+        ui.label(
+            RichText::new(suffix)
+                .color(Color32::from_gray(160))
+                .monospace()
+                .italics(),
+        );
+    });
 }
 
 #[allow(clippy::too_many_arguments)]

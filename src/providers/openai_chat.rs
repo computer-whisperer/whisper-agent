@@ -854,7 +854,18 @@ struct StreamToolCall {
     id: String,
     name: String,
     arguments: String,
+    /// Last `arguments.len()` reported via `ToolCallStreaming`.
+    /// `None` until the first streaming emission goes out (which
+    /// requires us to know the tool's name — no point telling the
+    /// UI about a tool it can't label). Throttles subsequent emissions
+    /// by [`TOOL_STREAMING_CHAR_STEP`].
+    last_emitted_chars: Option<u32>,
 }
+
+/// Matches Anthropic's throttle step — see that driver's identical
+/// constant. Controls how often `ToolCallStreaming` events fire during
+/// the args-JSON streaming phase of a tool call.
+const TOOL_STREAMING_CHAR_STEP: u32 = 32;
 
 impl ChatStreamState {
     /// Fold one decoded SSE frame into running state and emit whatever
@@ -883,7 +894,9 @@ impl ChatStreamState {
                 }
                 if let Some(tcs) = delta.tool_calls {
                     for tc in tcs {
-                        self.apply_tool_call_delta(tc);
+                        if let Some(streaming) = self.apply_tool_call_delta(tc) {
+                            out.push(streaming);
+                        }
                     }
                 }
             }
@@ -914,7 +927,11 @@ impl ChatStreamState {
         Ok(out)
     }
 
-    fn apply_tool_call_delta(&mut self, tc: OaStreamToolCallDelta) {
+    /// Returns a `ToolCallStreaming` event when this delta either opens a
+    /// newly-named tool call (first emission with `args_chars` equal to
+    /// whatever's accumulated so far) or advances the arg buffer past
+    /// the throttle step. Otherwise `None`.
+    fn apply_tool_call_delta(&mut self, tc: OaStreamToolCallDelta) -> Option<ModelEvent> {
         // Without an explicit index, treat fragments as the current open
         // call (index 0). Compat servers that omit `index` ship a single
         // call at a time, so this is safe in practice.
@@ -927,6 +944,7 @@ impl ChatStreamState {
             id: String::new(),
             name: String::new(),
             arguments: String::new(),
+            last_emitted_chars: None,
         });
         if let Some(id) = tc.id
             && !id.is_empty()
@@ -942,6 +960,27 @@ impl ChatStreamState {
             if let Some(args) = fn_delta.arguments {
                 entry.arguments.push_str(&args);
             }
+        }
+        // Can't surface an unnamed call — the UI has nothing to label
+        // the placeholder with. Wait for a later delta that carries
+        // the name, then first emission goes out.
+        if entry.name.is_empty() || entry.id.is_empty() {
+            return None;
+        }
+        let total = entry.arguments.len() as u32;
+        let should_emit = match entry.last_emitted_chars {
+            None => true,
+            Some(prev) => total >= prev.saturating_add(TOOL_STREAMING_CHAR_STEP),
+        };
+        if should_emit {
+            entry.last_emitted_chars = Some(total);
+            Some(ModelEvent::ToolCallStreaming {
+                id: entry.id.clone(),
+                name: entry.name.clone(),
+                args_chars: total,
+            })
+        } else {
+            None
         }
     }
 

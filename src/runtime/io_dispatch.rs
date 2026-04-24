@@ -1038,6 +1038,26 @@ async fn consume_stream(
                 // would duplicate the tool-call row in the webui.
                 any_delta_emitted = true;
             }
+            Ok(ModelEvent::ToolCallStreaming {
+                id,
+                name,
+                args_chars,
+            }) => {
+                // Placeholder events while the model streams args JSON.
+                // Forwarded verbatim so clients can frame the row
+                // early. Does not set `any_delta_emitted` — a
+                // rate-limit error right after these is still first
+                // event and retry-eligible.
+                let _ = stream_tx.send(StreamUpdate {
+                    thread_id: thread_id.to_string(),
+                    event: ServerToClient::ThreadToolCallStreaming {
+                        thread_id: thread_id.to_string(),
+                        tool_use_id: id,
+                        name,
+                        args_chars,
+                    },
+                });
+            }
             Ok(ModelEvent::PrefillProgress {
                 tokens_processed,
                 tokens_total,

@@ -121,6 +121,23 @@ class AppSession(
         _prefillProgress.asStateFlow()
 
     /**
+     * In-flight tool calls — the model is still streaming args JSON and
+     * the scheduler hasn't dispatched yet. Keyed by `tool_use_id`.
+     * Populated by [ServerToClient.ToolCallStreaming] events; cleared
+     * entry-by-entry on the matching [ServerToClient.ToolCallBegin]
+     * (scheduler has dispatched, full tool-call row now available), or
+     * wholesale on thread transitions and disconnect.
+     *
+     * A single thread can carry multiple concurrent placeholders (e.g.
+     * Anthropic parallel_tool_use), so the outer map groups by thread
+     * id and the inner map keys by tool_use_id.
+     */
+    private val _streamingToolCalls =
+        MutableStateFlow<Map<String, Map<String, StreamingToolCall>>>(emptyMap())
+    val streamingToolCalls: StateFlow<Map<String, Map<String, StreamingToolCall>>> =
+        _streamingToolCalls.asStateFlow()
+
+    /**
      * One-shot signal used by the UI to navigate to a freshly-created
      * thread. Emits the new thread id when the matching `ThreadCreated`
      * arrives for a `CreateThread` we issued.
@@ -435,6 +452,7 @@ class AppSession(
                             _behaviorsByPod.value = emptyMap()
                             behaviorsRequested.clear()
                             _prefillProgress.value = emptyMap()
+                            _streamingToolCalls.value = emptyMap()
                             // Transient drop while the user is actively using the
                             // app? Re-dial with a small backoff rather than sit
                             // silent until the next foreground cycle.
@@ -588,7 +606,6 @@ class AppSession(
             is ServerToClient.AssistantTextDelta,
             is ServerToClient.AssistantReasoningDelta,
             is ServerToClient.AssistantEnd,
-            is ServerToClient.ToolCallBegin,
             is ServerToClient.ToolCallEnd,
             is ServerToClient.LoopComplete,
             -> reduceStreaming(event)
@@ -599,6 +616,28 @@ class AppSession(
                         tokensTotal = event.tokensTotal,
                     ))
                 }
+            }
+            is ServerToClient.ToolCallStreaming -> {
+                _streamingToolCalls.update { outer ->
+                    val inner = outer[event.threadId].orEmpty() +
+                        (event.toolUseId to StreamingToolCall(
+                            name = event.name,
+                            argsChars = event.argsChars,
+                        ))
+                    outer + (event.threadId to inner)
+                }
+            }
+            is ServerToClient.ToolCallBegin -> {
+                // Scheduler has dispatched — drop the placeholder; the
+                // full tool-call row is now in the snapshot via the
+                // reduceStreaming path below.
+                _streamingToolCalls.update { outer ->
+                    val inner = outer[event.threadId] ?: return@update outer
+                    val next = inner - event.toolUseId
+                    if (next.isEmpty()) outer - event.threadId
+                    else outer + (event.threadId to next)
+                }
+                reduceStreaming(event)
             }
             is ServerToClient.SudoRequested -> {
                 _pendingSudo.update {
@@ -735,6 +774,17 @@ data class PendingSudo(
 data class PrefillProgress(
     val tokensProcessed: Int,
     val tokensTotal: Int,
+)
+
+/**
+ * An in-flight tool call whose arguments JSON the model is still
+ * streaming. The scheduler hasn't dispatched the call yet, so there's
+ * no full tool-call row in the conversation; this carries just enough
+ * for the UI to frame a placeholder (name + char count + spinner).
+ */
+data class StreamingToolCall(
+    val name: String,
+    val argsChars: Int,
 )
 
 // --- Snapshot mutation helpers --------------------------------------------------
