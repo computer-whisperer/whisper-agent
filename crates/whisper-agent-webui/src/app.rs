@@ -3856,6 +3856,14 @@ impl eframe::App for ChatApp {
                                 ui.add_space(6.0);
                             }
                         }
+                        // Transient prefill-progress bar. Only populated
+                        // by llamacpp-backed threads while the backend
+                        // is ingesting the prompt; cleared on first
+                        // delta. Sits at the tail of the chat log so
+                        // stick_to_bottom keeps it in view.
+                        if let Some((processed, total)) = view.prefill_progress {
+                            render_prefill_progress(ui, processed, total);
+                        }
                     });
                 }
             },
@@ -7847,6 +7855,63 @@ fn render_sudo_banners(
             });
         ui.add_space(4.0);
     }
+}
+
+/// Draw the transient prefill-progress indicator. Shows only while a
+/// llamacpp-backed turn is ingesting its prompt, cleared on first delta
+/// by the [`ChatApp::handle_wire`] reducers. Formatted like
+/// `prefilling 3,200 / 15,000 tokens · 21%` so the user can see both
+/// the absolute numbers (helps for "how big is my context?") and the
+/// fraction (helps for "how much longer?"). The bar itself carries no
+/// text because egui's built-in text rendering inside the bar clashes
+/// with the explicit label we already draw above it.
+fn render_prefill_progress(ui: &mut egui::Ui, processed: u32, total: u32) {
+    ui.add_space(4.0);
+    egui::Frame::group(ui.style())
+        .fill(Color32::from_rgb(32, 40, 52))
+        .show(ui, |ui| {
+            ui.vertical(|ui| {
+                let fraction = if total == 0 {
+                    0.0
+                } else {
+                    (processed as f32 / total as f32).clamp(0.0, 1.0)
+                };
+                let pct = (fraction * 100.0).round() as u32;
+                ui.label(
+                    RichText::new(format!(
+                        "prefilling {} / {} tokens · {}%",
+                        format_thousands(processed),
+                        format_thousands(total),
+                        pct,
+                    ))
+                    .color(Color32::from_rgb(180, 200, 230))
+                    .small(),
+                );
+                ui.add_space(2.0);
+                ui.add(
+                    egui::ProgressBar::new(fraction)
+                        .desired_height(6.0)
+                        .fill(Color32::from_rgb(90, 140, 220)),
+                );
+            });
+        });
+    ui.add_space(4.0);
+}
+
+/// Format a non-negative integer with comma thousand-separators.
+/// Standalone rather than pulled from a crate so the webui doesn't
+/// grow a dep for two callers.
+fn format_thousands(n: u32) -> String {
+    let s = n.to_string();
+    let bytes = s.as_bytes();
+    let mut out = String::with_capacity(s.len() + s.len() / 3);
+    for (i, b) in bytes.iter().enumerate() {
+        if i > 0 && (bytes.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(*b as char);
+    }
+    out
 }
 
 fn render_failure_banner(ui: &mut egui::Ui, view: &TaskView) {

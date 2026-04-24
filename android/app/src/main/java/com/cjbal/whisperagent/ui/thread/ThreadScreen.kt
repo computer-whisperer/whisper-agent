@@ -34,6 +34,7 @@ import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
+import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.OutlinedButton
@@ -86,6 +87,8 @@ fun ThreadScreen(
     val snapshot by session.activeSnapshot.collectAsStateWithLifecycle()
     val pendingSudoMap by session.pendingSudo.collectAsStateWithLifecycle()
     val pods by session.pods.collectAsStateWithLifecycle()
+    val prefillByThread by session.prefillProgress.collectAsStateWithLifecycle()
+    val prefill = prefillByThread[threadId]
     var draft by remember(threadId) { mutableStateOf("") }
 
     val isWorking = snapshot?.state == ThreadStateLabel.Working
@@ -232,6 +235,13 @@ fun ThreadScreen(
                         }
                     }
                 }
+            }
+
+            if (prefill != null) {
+                PrefillProgressRow(
+                    tokensProcessed = prefill.tokensProcessed,
+                    tokensTotal = prefill.tokensTotal,
+                )
             }
 
             if (isFailed) {
@@ -394,6 +404,59 @@ private fun formatTokens(n: Int): String = when {
     n < 1_000 -> n.toString()
     n < 1_000_000 -> "%.1fk".format(n / 1_000.0)
     else -> "%.1fM".format(n / 1_000_000.0)
+}
+
+/**
+ * Transient progress bar shown between the chat list and the compose
+ * box while a llamacpp-backed turn is prefilling its prompt. Driven
+ * by [AppSession.prefillProgress]; cleared on the first streaming
+ * delta or turn end, so this whole row disappears the moment the
+ * model starts producing output.
+ */
+@Composable
+private fun PrefillProgressRow(tokensProcessed: Int, tokensTotal: Int) {
+    val fraction = if (tokensTotal <= 0) 0f
+    else (tokensProcessed.toFloat() / tokensTotal).coerceIn(0f, 1f)
+    val pct = (fraction * 100f).toInt()
+    Surface(
+        shape = RoundedCornerShape(12.dp),
+        color = MaterialTheme.colorScheme.surfaceVariant,
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 12.dp, vertical = 4.dp),
+    ) {
+        Column(
+            modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp),
+            verticalArrangement = Arrangement.spacedBy(6.dp),
+        ) {
+            Text(
+                text = "prefilling ${formatThousands(tokensProcessed)} / " +
+                    "${formatThousands(tokensTotal)} tokens · $pct%",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            LinearProgressIndicator(
+                progress = { fraction },
+                modifier = Modifier.fillMaxWidth(),
+            )
+        }
+    }
+}
+
+/**
+ * Tiny thousand-separator helper. Standalone rather than pulling in a
+ * NumberFormat or locale-aware formatter — the progress line is
+ * developer-facing English and a comma is fine.
+ */
+private fun formatThousands(n: Int): String {
+    val s = n.toString()
+    if (s.length <= 3) return s
+    val sb = StringBuilder(s.length + s.length / 3)
+    for ((i, c) in s.withIndex()) {
+        if (i > 0 && (s.length - i) % 3 == 0) sb.append(',')
+        sb.append(c)
+    }
+    return sb.toString()
 }
 
 @Composable
