@@ -385,6 +385,15 @@ pub struct Scheduler {
     oauth_refresh_failure_counts: HashMap<String, u32>,
 
     tasks: HashMap<String, Thread>,
+    /// Per-thread cancel signal. Cloned into every dispatched I/O
+    /// future; firing it aborts the in-flight HTTP request (model
+    /// call or MCP invoke) instead of merely discarding the result
+    /// on return. Kept on the scheduler rather than on `Thread` so
+    /// it doesn't interfere with `Thread`'s `Clone + Serialize`
+    /// shape. Lifecycle matches `tasks`: insert on task-insert,
+    /// remove on task-remove. A Cancelled thread's token stays
+    /// fired for the thread's remaining lifetime.
+    cancel_tokens: HashMap<String, tokio_util::sync::CancellationToken>,
     /// Owns the connection registry, subscription map, audit log, and the
     /// `ThreadEvent → ServerToClient` translation layer.
     router: ThreadEventRouter,
@@ -524,6 +533,7 @@ impl Scheduler {
                 oauth_refresh_no_refresh_token_warned: HashSet::new(),
                 oauth_refresh_failure_counts: HashMap::new(),
                 tasks: HashMap::new(),
+                cancel_tokens: HashMap::new(),
                 router: ThreadEventRouter::new(audit, host_id),
                 resources,
                 next_op_id: 1,
@@ -605,6 +615,22 @@ impl Scheduler {
 
     pub(crate) fn task(&self, thread_id: &str) -> Option<&Thread> {
         self.tasks.get(thread_id)
+    }
+
+    /// Owned clone of the per-thread cancel token, or a fresh
+    /// never-fired token if the thread was removed mid-dispatch.
+    /// Callers in io_dispatch take one of these on entry and hand it
+    /// to the provider / tool future — the user's cancel signal then
+    /// reaches the inner HTTP request, not just the scheduler's
+    /// result sink.
+    pub(crate) fn cancel_token_or_default(
+        &self,
+        thread_id: &str,
+    ) -> tokio_util::sync::CancellationToken {
+        self.cancel_tokens
+            .get(thread_id)
+            .cloned()
+            .unwrap_or_default()
     }
 
     pub(crate) fn backend(&self, name: &str) -> Option<&BackendEntry> {
@@ -2277,6 +2303,8 @@ impl Scheduler {
             if let Some(pod) = self.pods.get_mut(&task.pod_id) {
                 pod.threads.insert(task.id.clone());
                 let task_id = task.id.clone();
+                self.cancel_tokens
+                    .insert(task_id.clone(), tokio_util::sync::CancellationToken::new());
                 self.tasks.insert(task_id.clone(), task);
                 if bindings_dirty {
                     self.mark_dirty(&task_id);
@@ -2850,6 +2878,10 @@ impl Scheduler {
         let backend_name = task.bindings.backend.clone();
         let shared_hosts = task.bindings.mcp_hosts.clone();
         let summary = task.summary();
+        self.cancel_tokens.insert(
+            thread_id.clone(),
+            tokio_util::sync::CancellationToken::new(),
+        );
         self.tasks.insert(thread_id.clone(), task);
         if let Some(pod) = self.pods.get_mut(&pod_id) {
             pod.threads.insert(thread_id.clone());
@@ -3753,6 +3785,7 @@ impl Scheduler {
             None => return,
         };
         self.tasks.remove(thread_id);
+        self.cancel_tokens.remove(thread_id);
         self.dirty.remove(thread_id);
         // Provisioning guard is now keyed per HostEnvId, not per thread
         // — shared across all threads that bind to the same deduped

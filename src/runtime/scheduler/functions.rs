@@ -1626,6 +1626,7 @@ impl Scheduler {
         use crate::runtime::io_dispatch::{SchedulerCompletion, SudoInnerCompletion};
         let route = self.route_tool(&thread_id, &tool_name);
         let pod_id = self.tasks.get(&thread_id).map(|t| t.pod_id.clone());
+        let cancel = self.cancel_token_or_default(&thread_id);
         let (pod_modify_ceiling, behaviors_ceiling) = match pod_id.as_deref() {
             Some(id) => match self.pods.get(id) {
                 Some(pod) => (
@@ -1659,7 +1660,7 @@ impl Scheduler {
                             });
                         }
                     };
-                    let outcome = crate::tools::builtin_tools::dispatch(
+                    let dispatch_fut = crate::tools::builtin_tools::dispatch(
                         snapshot.pod_dir,
                         snapshot.config,
                         snapshot.behavior_ids,
@@ -1667,8 +1668,20 @@ impl Scheduler {
                         behaviors_ceiling,
                         &tool_name,
                         args,
-                    )
-                    .await;
+                    );
+                    let outcome = tokio::select! {
+                        o = dispatch_fut => o,
+                        _ = cancel.cancelled() => {
+                            return SchedulerCompletion::SudoInner(SudoInnerCompletion {
+                                function_id,
+                                thread_id,
+                                decision,
+                                result: Err("cancelled".into()),
+                                pod_update: None,
+                                scheduler_command: None,
+                            });
+                        }
+                    };
                     SchedulerCompletion::SudoInner(SudoInnerCompletion {
                         function_id,
                         thread_id,
@@ -1683,7 +1696,7 @@ impl Scheduler {
                 session, real_name, ..
             }) => Box::pin(async move {
                 use futures::StreamExt;
-                let result = match session.invoke(&real_name, args).await {
+                let result = match session.invoke(&real_name, args, &cancel).await {
                     Ok(mut stream) => {
                         let mut last = None;
                         while let Some(event) = stream.next().await {
@@ -2237,7 +2250,12 @@ impl Scheduler {
                 if already_terminal {
                     None
                 } else {
-                    child.cancel();
+                    let mut cancel_events = Vec::new();
+                    child.cancel(&mut cancel_events);
+                    if let Some(token) = self.cancel_tokens.get(child_id) {
+                        token.cancel();
+                    }
+                    self.router.dispatch_events(child_id, cancel_events);
                     self.mark_dirty(child_id);
                     self.router
                         .broadcast_task_list(ServerToClient::ThreadStateChanged {
@@ -2294,7 +2312,17 @@ impl Scheduler {
             // defensively — a concurrent teardown could have removed it.
             return;
         };
-        task.cancel();
+        let mut cancel_events = Vec::new();
+        task.cancel(&mut cancel_events);
+        // Fire the per-thread cancel signal so any in-flight
+        // model/tool/MCP HTTP request aborts at the wire instead of
+        // running to completion and having its result discarded.
+        if let Some(token) = self.cancel_tokens.get(thread_id) {
+            token.cancel();
+        }
+        // Dispatch any synthesized ToolCallEnd events so live
+        // subscribers see the interrupted tool-call rows close out.
+        self.router.dispatch_events(thread_id, cancel_events);
         self.mark_dirty(thread_id);
         self.router
             .broadcast_task_list(ServerToClient::ThreadStateChanged {

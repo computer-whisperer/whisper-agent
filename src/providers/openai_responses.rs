@@ -32,6 +32,7 @@ use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::Mutex;
+use tokio_util::sync::CancellationToken;
 use whisper_agent_protocol::{
     ContentBlock, Message, ProviderReplay, Role, ToolResultContent, Usage,
 };
@@ -126,7 +127,11 @@ impl OpenAiResponsesClient {
     /// stream. Consolidates body construction, header/auth setup, and the
     /// error-status early return so both the streaming and buffered paths
     /// share one code path up through "first byte".
-    async fn send_request(&self, req: &ModelRequest<'_>) -> Result<reqwest::Response, ModelError> {
+    async fn send_request(
+        &self,
+        req: &ModelRequest<'_>,
+        cancel: &CancellationToken,
+    ) -> Result<reqwest::Response, ModelError> {
         let mut input: Vec<RspItem> = Vec::new();
         for m in req.messages {
             convert_message(m, &mut input);
@@ -157,7 +162,11 @@ impl OpenAiResponsesClient {
         let _ = req.max_tokens;
 
         let url = format!("{}/responses", self.base_url);
-        let (bearer, extra_headers) = self.prepare_headers().await?;
+        let prepare = self.prepare_headers();
+        let (bearer, extra_headers) = tokio::select! {
+            r = prepare => r?,
+            _ = cancel.cancelled() => return Err(ModelError::Cancelled),
+        };
         let mut builder = self
             .http
             .post(&url)
@@ -167,13 +176,17 @@ impl OpenAiResponsesClient {
         for (k, v) in &extra_headers {
             builder = builder.header(*k, v);
         }
-        let resp = builder
-            .send()
-            .await
-            .map_err(|e| ModelError::Transport(e.to_string()))?;
+        let send = builder.send();
+        let resp = tokio::select! {
+            r = send => r.map_err(|e| ModelError::Transport(e.to_string()))?,
+            _ = cancel.cancelled() => return Err(ModelError::Cancelled),
+        };
         let status = resp.status();
         if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
+            let body = tokio::select! {
+                b = resp.text() => b.unwrap_or_default(),
+                _ = cancel.cancelled() => return Err(ModelError::Cancelled),
+            };
             return Err(ModelError::Api {
                 status: status.as_u16(),
                 body,
@@ -182,15 +195,19 @@ impl OpenAiResponsesClient {
         Ok(resp)
     }
 
-    async fn do_create_message(&self, req: &ModelRequest<'_>) -> Result<ModelResponse, ModelError> {
-        let resp = self.send_request(req).await?;
+    async fn do_create_message(
+        &self,
+        req: &ModelRequest<'_>,
+        cancel: &CancellationToken,
+    ) -> Result<ModelResponse, ModelError> {
+        let resp = self.send_request(req, cancel).await?;
         // Buffer the full SSE stream and dig out the `response.completed` event
         // — its `response` field has the status / usage / incomplete_details
         // bits we still need even when using the streaming assembly.
-        let raw = resp
-            .text()
-            .await
-            .map_err(|e| ModelError::Transport(e.to_string()))?;
+        let raw = tokio::select! {
+            r = resp.text() => r.map_err(|e| ModelError::Transport(e.to_string()))?,
+            _ = cancel.cancelled() => return Err(ModelError::Cancelled),
+        };
         let parsed: RspResponse = extract_completed_response(&raw)?;
         let (content, stop_reason, usage) = finalize_response(
             parsed.output,
@@ -208,14 +225,23 @@ impl OpenAiResponsesClient {
     fn do_create_message_streaming<'a>(
         &'a self,
         req: &'a ModelRequest<'a>,
+        cancel: &'a CancellationToken,
     ) -> BoxStream<'a, Result<ModelEvent, ModelError>> {
         Box::pin(try_stream! {
-            let resp = self.send_request(req).await?;
+            let resp = self.send_request(req, cancel).await?;
             let mut bytes = resp.bytes_stream();
             let mut sse_buf: Vec<u8> = Vec::new();
             let mut state = RspStreamState::default();
-            while let Some(chunk) = bytes.next().await {
-                let chunk = chunk.map_err(|e| ModelError::Transport(e.to_string()))?;
+            loop {
+                let next = tokio::select! {
+                    n = bytes.next() => match n {
+                        Some(Ok(b)) => Ok(Some(b)),
+                        Some(Err(e)) => Err(ModelError::Transport(e.to_string())),
+                        None => Ok(None),
+                    },
+                    _ = cancel.cancelled() => Err(ModelError::Cancelled),
+                };
+                let Some(chunk) = next? else { break };
                 sse_buf.extend_from_slice(&chunk);
                 while let Some(event_payload) = take_sse_event(&mut sse_buf) {
                     let Some(raw) = parse_sse_data(&event_payload) else {
@@ -317,15 +343,17 @@ impl ModelProvider for OpenAiResponsesClient {
     fn create_message<'a>(
         &'a self,
         req: &'a ModelRequest<'a>,
+        cancel: &'a CancellationToken,
     ) -> BoxFuture<'a, Result<ModelResponse, ModelError>> {
-        Box::pin(self.do_create_message(req))
+        Box::pin(self.do_create_message(req, cancel))
     }
 
     fn create_message_streaming<'a>(
         &'a self,
         req: &'a ModelRequest<'a>,
+        cancel: &'a CancellationToken,
     ) -> BoxStream<'a, Result<ModelEvent, ModelError>> {
-        self.do_create_message_streaming(req)
+        self.do_create_message_streaming(req, cancel)
     }
 
     fn list_models<'a>(&'a self) -> BoxFuture<'a, Result<Vec<ModelInfo>, ModelError>> {

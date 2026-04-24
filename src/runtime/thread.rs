@@ -34,6 +34,33 @@ use crate::tools::mcp::{CallToolResult, ToolAnnotations};
 
 pub type OpId = u64;
 
+/// Reason text injected into synthesized `is_error` tool_result blocks
+/// when a user cancel interrupts an in-flight or queued tool call. Read
+/// by downstream consumers (compaction, cross-provider replay) that
+/// need to know the ToolUse didn't complete naturally.
+const CANCEL_REASON: &str = "cancelled";
+
+/// Build an `is_error` ToolResult for a ToolUse that never got its
+/// real result and push the matching [`ThreadEvent::ToolCallEnd`] into
+/// `events`. Shared by `Thread::cancel` and
+/// `Thread::synthesize_trailing_tool_results`.
+fn synth_interrupted_tool_result(
+    tool_use_id: &str,
+    synth_text: &str,
+    events: &mut Vec<ThreadEvent>,
+) -> ContentBlock {
+    events.push(ThreadEvent::ToolCallEnd {
+        tool_use_id: tool_use_id.to_string(),
+        result_preview: synth_text.to_string(),
+        is_error: true,
+    });
+    ContentBlock::ToolResult {
+        tool_use_id: tool_use_id.to_string(),
+        content: ToolResultContent::Text(synth_text.to_string()),
+        is_error: true,
+    }
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Thread {
     pub id: String,
@@ -624,7 +651,46 @@ impl Thread {
         }
     }
 
-    pub fn cancel(&mut self) {
+    /// Cancel this thread: close any trailing open ToolUse with an
+    /// `is_error` ToolResult, then transition to
+    /// [`ThreadInternalState::Cancelled`]. Synthesis events are pushed
+    /// into `events` for the caller to broadcast — webui tool-call
+    /// rows need the `ToolCallEnd` so they stop spinning.
+    ///
+    /// The `AwaitingTools` branch preserves already-completed tool
+    /// results (real work) and merges synthesized fillers for the
+    /// still-in-flight / still-queued ones into a single tool_result
+    /// message. Other states delegate to
+    /// [`Self::synthesize_trailing_tool_results`] as defensive heal
+    /// for any orphaned ToolUse a wedged state might leave behind.
+    pub fn cancel(&mut self, events: &mut Vec<ThreadEvent>) {
+        if let ThreadInternalState::AwaitingTools { completed, .. } = &mut self.internal {
+            let mut merged = std::mem::take(completed);
+            let matched: std::collections::HashSet<String> = merged
+                .iter()
+                .filter_map(|b| match b {
+                    ContentBlock::ToolResult { tool_use_id, .. } => Some(tool_use_id.clone()),
+                    _ => None,
+                })
+                .collect();
+            if let Some(last) = self.conversation.messages().last()
+                && last.role == Role::Assistant
+            {
+                let synth_text = format!("tool call interrupted: {CANCEL_REASON}");
+                for block in &last.content {
+                    if let ContentBlock::ToolUse { id, .. } = block
+                        && !matched.contains(id)
+                    {
+                        merged.push(synth_interrupted_tool_result(id, &synth_text, events));
+                    }
+                }
+            }
+            if !merged.is_empty() {
+                self.conversation.push(Message::tool_result_blocks(merged));
+            }
+        } else {
+            self.synthesize_trailing_tool_results(CANCEL_REASON, events);
+        }
         self.internal = ThreadInternalState::Cancelled;
         self.touch();
     }
@@ -678,19 +744,10 @@ impl Thread {
             return;
         }
         let synth_text = format!("tool call interrupted: {reason}");
-        let mut blocks: Vec<ContentBlock> = Vec::with_capacity(pending_ids.len());
-        for id in pending_ids {
-            events.push(ThreadEvent::ToolCallEnd {
-                tool_use_id: id.clone(),
-                result_preview: synth_text.clone(),
-                is_error: true,
-            });
-            blocks.push(ContentBlock::ToolResult {
-                tool_use_id: id,
-                content: ToolResultContent::Text(synth_text.clone()),
-                is_error: true,
-            });
-        }
+        let blocks: Vec<ContentBlock> = pending_ids
+            .iter()
+            .map(|id| synth_interrupted_tool_result(id, &synth_text, events))
+            .collect();
         self.conversation.push(Message::tool_result_blocks(blocks));
     }
 
@@ -1453,6 +1510,98 @@ mod tests {
         assert!(!task.recover(&mut events));
         assert!(matches!(task.internal, ThreadInternalState::NeedsModelCall));
 
+        assert!(events.is_empty());
+    }
+
+    #[test]
+    fn cancel_in_awaiting_tools_preserves_completed_and_synthesizes_missing() {
+        // Mid-tool-dispatch cancel: `completed` has one real result,
+        // one tool is in-flight, one is queued. After cancel the
+        // conversation must end with a single tool_result message
+        // carrying all three ids — preserved real result plus two
+        // is_error synthesized results.
+        let mut pending_io = HashMap::new();
+        pending_io.insert(9, "toolu_inflight".to_string());
+        let pending_dispatch = vec![ToolUseReq {
+            tool_use_id: "toolu_queued".into(),
+            name: "bash".into(),
+            input: serde_json::json!({}),
+        }];
+        let completed = vec![ContentBlock::ToolResult {
+            tool_use_id: "toolu_done".into(),
+            content: ToolResultContent::Text("real-result".into()),
+            is_error: false,
+        }];
+        let mut task = thread_awaiting_tools(pending_dispatch, pending_io, completed);
+
+        let mut events = Vec::new();
+        task.cancel(&mut events);
+
+        assert!(matches!(task.internal, ThreadInternalState::Cancelled));
+        // Two ToolCallEnd events — one per synthesized interrupted call.
+        assert_eq!(events.len(), 2);
+        let ended_ids: Vec<&str> = events
+            .iter()
+            .filter_map(|e| match e {
+                ThreadEvent::ToolCallEnd { tool_use_id, .. } => Some(tool_use_id.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(ended_ids.contains(&"toolu_inflight"));
+        assert!(ended_ids.contains(&"toolu_queued"));
+
+        let last = task.conversation.messages().last().unwrap();
+        assert_eq!(last.role, Role::ToolResult);
+        // Real result preserved verbatim; synthesized results are is_error.
+        let mut saw_real = false;
+        let mut saw_synth_inflight = false;
+        let mut saw_synth_queued = false;
+        for b in &last.content {
+            let ContentBlock::ToolResult {
+                tool_use_id,
+                is_error,
+                content,
+            } = b
+            else {
+                continue;
+            };
+            match tool_use_id.as_str() {
+                "toolu_done" => {
+                    assert!(!is_error);
+                    assert!(matches!(content, ToolResultContent::Text(t) if t == "real-result"));
+                    saw_real = true;
+                }
+                "toolu_inflight" => {
+                    assert!(*is_error);
+                    saw_synth_inflight = true;
+                }
+                "toolu_queued" => {
+                    assert!(*is_error);
+                    saw_synth_queued = true;
+                }
+                other => panic!("unexpected tool_use_id: {other}"),
+            }
+        }
+        assert!(saw_real && saw_synth_inflight && saw_synth_queued);
+    }
+
+    #[test]
+    fn cancel_in_awaiting_model_leaves_conversation_untouched() {
+        // A cancel during AwaitingModel happens before the assistant
+        // turn has been persisted (partial deltas are broadcast but
+        // not in the conversation). No synthesis needed — the
+        // conversation stays well-formed as-is.
+        let mut task = thread_with_two_turns();
+        task.internal = ThreadInternalState::AwaitingModel {
+            op_id: 1,
+            started_at: Utc::now(),
+        };
+        let before_len = task.conversation.messages().len();
+        let mut events = Vec::new();
+        task.cancel(&mut events);
+
+        assert!(matches!(task.internal, ThreadInternalState::Cancelled));
+        assert_eq!(task.conversation.messages().len(), before_len);
         assert!(events.is_empty());
     }
 

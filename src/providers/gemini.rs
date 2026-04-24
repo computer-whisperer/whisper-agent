@@ -31,6 +31,7 @@ use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::{Mutex, OnceCell};
+use tokio_util::sync::CancellationToken;
 use whisper_agent_protocol::{
     ContentBlock, Message, ProviderReplay, Role, ToolResultContent, Usage,
 };
@@ -188,64 +189,76 @@ impl GeminiClient {
             .cloned()
     }
 
-    async fn do_create_message(&self, req: &ModelRequest<'_>) -> Result<ModelResponse, ModelError> {
+    async fn do_create_message(
+        &self,
+        req: &ModelRequest<'_>,
+        cancel: &CancellationToken,
+    ) -> Result<ModelResponse, ModelError> {
         let inner = build_gemini_request(req);
         match &self.auth {
             ClientAuth::ApiKey(key) => {
-                // Non-streaming: we don't expose a streaming trait at the provider
-                // layer, and the public Gemini endpoint supports the unary variant
-                // without the `stream: true` requirement that the ChatGPT backend
-                // imposes.
                 let url = format!(
                     "{}/models/{}:generateContent?key={}",
                     self.base_url,
                     req.model,
                     urlencode(key)
                 );
-                let resp = self
-                    .http
-                    .post(&url)
-                    .json(&inner)
-                    .send()
-                    .await
-                    .map_err(|e| ModelError::Transport(e.to_string()))?;
+                let send = self.http.post(&url).json(&inner).send();
+                let resp = tokio::select! {
+                    r = send => r.map_err(|e| ModelError::Transport(e.to_string()))?,
+                    _ = cancel.cancelled() => return Err(ModelError::Cancelled),
+                };
                 let status = resp.status();
                 if !status.is_success() {
-                    let body = resp.text().await.unwrap_or_default();
+                    let body = tokio::select! {
+                        b = resp.text() => b.unwrap_or_default(),
+                        _ = cancel.cancelled() => return Err(ModelError::Cancelled),
+                    };
                     return Err(classify_http_error(status.as_u16(), body));
                 }
-                let parsed: GenerateContentResponse = resp
-                    .json()
-                    .await
-                    .map_err(|e| ModelError::Transport(e.to_string()))?;
+                let parsed: GenerateContentResponse = tokio::select! {
+                    r = resp.json() => r.map_err(|e| ModelError::Transport(e.to_string()))?,
+                    _ = cancel.cancelled() => return Err(ModelError::Cancelled),
+                };
                 Ok(parsed_to_model_response(parsed))
             }
             ClientAuth::GeminiCli { .. } => {
-                let project = self.codex_project().await?;
-                let bearer = self.oauth_bearer().await?;
+                let project = tokio::select! {
+                    r = self.codex_project() => r?,
+                    _ = cancel.cancelled() => return Err(ModelError::Cancelled),
+                };
+                let bearer = tokio::select! {
+                    r = self.oauth_bearer() => r?,
+                    _ = cancel.cancelled() => return Err(ModelError::Cancelled),
+                };
                 let envelope = CaGenerateContentRequest {
                     model: req.model,
                     project,
                     request: inner,
                 };
                 let url = format!("{}:generateContent", self.base_url);
-                let resp = self
+                let send = self
                     .http
                     .post(&url)
                     .bearer_auth(&bearer)
                     .json(&envelope)
-                    .send()
-                    .await
-                    .map_err(|e| ModelError::Transport(e.to_string()))?;
+                    .send();
+                let resp = tokio::select! {
+                    r = send => r.map_err(|e| ModelError::Transport(e.to_string()))?,
+                    _ = cancel.cancelled() => return Err(ModelError::Cancelled),
+                };
                 let status = resp.status();
                 if !status.is_success() {
-                    let body = resp.text().await.unwrap_or_default();
+                    let body = tokio::select! {
+                        b = resp.text() => b.unwrap_or_default(),
+                        _ = cancel.cancelled() => return Err(ModelError::Cancelled),
+                    };
                     return Err(classify_http_error(status.as_u16(), body));
                 }
-                let wrapped: CaGenerateContentResponse = resp
-                    .json()
-                    .await
-                    .map_err(|e| ModelError::Transport(e.to_string()))?;
+                let wrapped: CaGenerateContentResponse = tokio::select! {
+                    r = resp.json() => r.map_err(|e| ModelError::Transport(e.to_string()))?,
+                    _ = cancel.cancelled() => return Err(ModelError::Cancelled),
+                };
                 let inner = wrapped.response.ok_or_else(|| {
                     ModelError::Transport(
                         "Code Assist response missing `response` envelope field".into(),
@@ -259,6 +272,7 @@ impl GeminiClient {
     fn do_create_message_streaming<'a>(
         &'a self,
         req: &'a ModelRequest<'a>,
+        cancel: &'a CancellationToken,
     ) -> BoxStream<'a, Result<ModelEvent, ModelError>> {
         Box::pin(try_stream! {
             let inner = build_gemini_request(req);
@@ -270,16 +284,21 @@ impl GeminiClient {
                         req.model,
                         urlencode(key)
                     );
-                    self.http
-                        .post(&url)
-                        .json(&inner)
-                        .send()
-                        .await
-                        .map_err(|e| ModelError::Transport(e.to_string()))?
+                    let send = self.http.post(&url).json(&inner).send();
+                    tokio::select! {
+                        r = send => r.map_err(|e| ModelError::Transport(e.to_string())),
+                        _ = cancel.cancelled() => Err(ModelError::Cancelled),
+                    }?
                 }
                 ClientAuth::GeminiCli { .. } => {
-                    let project = self.codex_project().await?;
-                    let bearer = self.oauth_bearer().await?;
+                    let project = tokio::select! {
+                        r = self.codex_project() => r,
+                        _ = cancel.cancelled() => Err(ModelError::Cancelled),
+                    }?;
+                    let bearer = tokio::select! {
+                        r = self.oauth_bearer() => r,
+                        _ = cancel.cancelled() => Err(ModelError::Cancelled),
+                    }?;
                     let envelope = CaGenerateContentRequest {
                         model: req.model,
                         project,
@@ -289,13 +308,15 @@ impl GeminiClient {
                     // the same `streamGenerateContent` verb — envelope shape
                     // is identical to the unary path.
                     let url = format!("{}:streamGenerateContent?alt=sse", self.base_url);
-                    self.http
+                    let send = self.http
                         .post(&url)
                         .bearer_auth(&bearer)
                         .json(&envelope)
-                        .send()
-                        .await
-                        .map_err(|e| ModelError::Transport(e.to_string()))?
+                        .send();
+                    tokio::select! {
+                        r = send => r.map_err(|e| ModelError::Transport(e.to_string())),
+                        _ = cancel.cancelled() => Err(ModelError::Cancelled),
+                    }?
                 }
             };
             let status = resp.status();
@@ -308,8 +329,16 @@ impl GeminiClient {
             let mut bytes = resp.bytes_stream();
             let mut sse_buf: Vec<u8> = Vec::new();
             let mut state = GeminiStreamState::default();
-            while let Some(chunk) = bytes.next().await {
-                let chunk = chunk.map_err(|e| ModelError::Transport(e.to_string()))?;
+            loop {
+                let next = tokio::select! {
+                    n = bytes.next() => match n {
+                        Some(Ok(b)) => Ok(Some(b)),
+                        Some(Err(e)) => Err(ModelError::Transport(e.to_string())),
+                        None => Ok(None),
+                    },
+                    _ = cancel.cancelled() => Err(ModelError::Cancelled),
+                };
+                let Some(chunk) = next? else { break };
                 sse_buf.extend_from_slice(&chunk);
                 while let Some(event_payload) = take_sse_event(&mut sse_buf) {
                     let Some(raw) = parse_sse_data(&event_payload) else {
@@ -431,15 +460,17 @@ impl ModelProvider for GeminiClient {
     fn create_message<'a>(
         &'a self,
         req: &'a ModelRequest<'a>,
+        cancel: &'a CancellationToken,
     ) -> BoxFuture<'a, Result<ModelResponse, ModelError>> {
-        Box::pin(self.do_create_message(req))
+        Box::pin(self.do_create_message(req, cancel))
     }
 
     fn create_message_streaming<'a>(
         &'a self,
         req: &'a ModelRequest<'a>,
+        cancel: &'a CancellationToken,
     ) -> BoxStream<'a, Result<ModelEvent, ModelError>> {
-        self.do_create_message_streaming(req)
+        self.do_create_message_streaming(req, cancel)
     }
 
     fn list_models<'a>(&'a self) -> BoxFuture<'a, Result<Vec<ModelInfo>, ModelError>> {

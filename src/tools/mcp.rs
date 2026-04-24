@@ -17,6 +17,7 @@ use futures::{Stream, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use thiserror::Error;
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
 const PROTOCOL_VERSION: &str = "2025-06-18";
@@ -31,6 +32,12 @@ pub enum McpError {
     Rpc { code: i32, message: String },
     #[error("malformed response: {0}")]
     Malformed(String),
+    /// The caller's per-thread [`CancellationToken`] fired before or
+    /// during the RPC. Distinct from transport / RPC errors so the
+    /// scheduler can tell a user cancel apart from a genuine failure
+    /// and avoid marking the host-env `Lost`.
+    #[error("cancelled")]
+    Cancelled,
 }
 
 impl McpError {
@@ -54,7 +61,7 @@ impl McpError {
                 *status,
                 401 | 403 | 404 | 408 | 500 | 502 | 503 | 504 | 522 | 523 | 524
             ),
-            McpError::Rpc { .. } | McpError::Malformed(_) => false,
+            McpError::Rpc { .. } | McpError::Malformed(_) | McpError::Cancelled => false,
         }
     }
 }
@@ -209,10 +216,19 @@ impl McpSession {
     /// [`ToolEvent::Content`]s as output arrives (SSE transport only) and
     /// terminates with exactly one [`ToolEvent::Completed`]. A non-streaming
     /// tool yields only the `Completed` event.
+    ///
+    /// `cancel` is the caller's per-thread cancellation signal. It
+    /// aborts the call at three points:
+    /// 1. Before `send()` resolves — returns [`McpError::Cancelled`] after
+    ///    firing a best-effort `notifications/cancelled`.
+    /// 2. While reading the response body (non-streaming path).
+    /// 3. While the caller is driving the returned stream — the wrapper
+    ///    ends the stream early and fires `notifications/cancelled`.
     pub async fn invoke(
         &self,
         name: &str,
         arguments: Value,
+        cancel: &CancellationToken,
     ) -> Result<Pin<Box<dyn Stream<Item = ToolEvent> + Send>>, McpError> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let req = JsonRpcRequest {
@@ -236,7 +252,14 @@ impl McpSession {
         if let Some(tok) = &self.bearer {
             builder = builder.bearer_auth(tok);
         }
-        let resp = builder.send().await?;
+        let send = builder.send();
+        let resp = tokio::select! {
+            r = send => r?,
+            _ = cancel.cancelled() => {
+                self.best_effort_notify_cancelled(id, "client cancelled").await;
+                return Err(McpError::Cancelled);
+            }
+        };
         let status = resp.status();
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
@@ -253,9 +276,44 @@ impl McpSession {
             .to_string();
 
         if content_type.starts_with("text/event-stream") {
-            Ok(Box::pin(sse_tool_stream(resp)))
+            // Wrap the SSE body so the stream ends — and
+            // `notifications/cancelled` is sent best-effort — when the
+            // cancel token fires. Dropping the inner reqwest stream
+            // closes the TCP connection; the cancel notification is
+            // graceful belt-and-suspenders for hosts that watch it.
+            let inner = sse_tool_stream(resp);
+            let cancel = cancel.clone();
+            let http = self.http.clone();
+            let url = self.url.clone();
+            let bearer = self.bearer.clone();
+            Ok(Box::pin(stream! {
+                futures::pin_mut!(inner);
+                loop {
+                    tokio::select! {
+                        next = inner.next() => {
+                            match next {
+                                Some(ev) => yield ev,
+                                None => return,
+                            }
+                        }
+                        _ = cancel.cancelled() => {
+                            // Drop `inner` (closes the HTTP stream)
+                            // and fire notifications/cancelled so the
+                            // server can stop work promptly.
+                            best_effort_cancel(&http, &url, bearer.as_deref(), id).await;
+                            return;
+                        }
+                    }
+                }
+            }))
         } else {
-            let parsed: JsonRpcResponse = resp.json().await?;
+            let parsed: JsonRpcResponse = tokio::select! {
+                r = resp.json() => r?,
+                _ = cancel.cancelled() => {
+                    self.best_effort_notify_cancelled(id, "client cancelled").await;
+                    return Err(McpError::Cancelled);
+                }
+            };
             if let Some(e) = parsed.error {
                 return Err(McpError::Rpc {
                     code: e.code,
@@ -271,6 +329,18 @@ impl McpSession {
                 stream! { yield ToolEvent::Completed(tool_result); },
             ))
         }
+    }
+
+    /// Fire `notifications/cancelled` for an in-flight RPC id. Silently
+    /// swallows any failure — the host may already be gone, and the
+    /// cancel path must not fail regardless.
+    async fn best_effort_notify_cancelled(&self, id: u64, reason: &str) {
+        let _ = self
+            .notify(
+                "notifications/cancelled",
+                Some(json!({ "requestId": id, "reason": reason })),
+            )
+            .await;
     }
 
     async fn call(&self, method: &str, params: Option<Value>) -> Result<Value, McpError> {
@@ -351,6 +421,22 @@ impl McpSession {
         }
         Ok(())
     }
+}
+
+/// Free-function variant of `best_effort_notify_cancelled` that
+/// doesn't borrow `McpSession` — used by the cancellation-aware stream
+/// wrapper returned from `invoke`, which outlives the `&self` borrow.
+async fn best_effort_cancel(http: &reqwest::Client, url: &str, bearer: Option<&str>, id: u64) {
+    let body = serde_json::json!({
+        "jsonrpc": "2.0",
+        "method": "notifications/cancelled",
+        "params": { "requestId": id, "reason": "client cancelled" },
+    });
+    let mut builder = http.post(url).json(&body);
+    if let Some(tok) = bearer {
+        builder = builder.bearer_auth(tok);
+    }
+    let _ = builder.send().await;
 }
 
 /// Parse the `text/event-stream` body of a streaming `tools/call` into a

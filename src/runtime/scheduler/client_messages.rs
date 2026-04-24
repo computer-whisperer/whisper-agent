@@ -1016,6 +1016,7 @@ impl Scheduler {
                 for thread_id in &pod.threads {
                     let bindings = self.tasks.get(thread_id).map(|t| t.bindings.clone());
                     self.tasks.remove(thread_id);
+                    self.cancel_tokens.remove(thread_id);
                     self.dirty.remove(thread_id);
                     self.router.drop_thread(thread_id);
                     if let Some(bindings) = bindings {

@@ -855,6 +855,7 @@ fn model_call(scheduler: &Scheduler, thread_id: String, op_id: OpId) -> Schedule
         }
     };
     let stream_tx = scheduler.stream_sender();
+    let cancel = scheduler.cancel_token_or_default(&thread_id);
     Box::pin(async move {
         debug!(%thread_id, op_id, backend = %backend_name, model = %model_name, "dispatching streaming model call");
         let req = ModelRequest {
@@ -865,11 +866,12 @@ fn model_call(scheduler: &Scheduler, thread_id: String, op_id: OpId) -> Schedule
             messages: &owned_req.messages,
             cache_breakpoints: &owned_req.cache_breakpoints,
         };
-        let result = match stream_with_retry(provider.as_ref(), &req, &thread_id, &stream_tx).await
-        {
-            Ok(resp) => IoResult::ModelCall(Ok(resp)),
-            Err(e) => IoResult::ModelCall(Err(e.to_string())),
-        };
+        let result =
+            match stream_with_retry(provider.as_ref(), &req, &thread_id, &stream_tx, &cancel).await
+            {
+                Ok(resp) => IoResult::ModelCall(Ok(resp)),
+                Err(e) => IoResult::ModelCall(Err(e.to_string())),
+            };
         SchedulerCompletion::Io(IoCompletion {
             thread_id,
             op_id,
@@ -907,10 +909,15 @@ async fn stream_with_retry(
     req: &ModelRequest<'_>,
     thread_id: &str,
     stream_tx: &tokio::sync::mpsc::UnboundedSender<StreamUpdate>,
+    cancel: &tokio_util::sync::CancellationToken,
 ) -> Result<crate::providers::model::ModelResponse, crate::providers::model::ModelError> {
     let mut attempt = 0u32;
     loop {
-        match consume_stream(provider, req, thread_id, stream_tx).await {
+        // Fast-path: caller cancelled before (or between) attempts.
+        if cancel.is_cancelled() {
+            return Err(crate::providers::model::ModelError::Cancelled);
+        }
+        match consume_stream(provider, req, thread_id, stream_tx, cancel).await {
             Ok(resp) => return Ok(resp),
             Err(FirstEventError::RateLimited { retry_after, body })
                 if retry_after <= MAX_RATE_LIMIT_WAIT && attempt < MAX_FIRST_EVENT_RETRIES =>
@@ -921,7 +928,15 @@ async fn stream_with_retry(
                     wait_ms = retry_after.as_millis() as u64,
                     "model backend rate-limited on first event; waiting before retry"
                 );
-                tokio::time::sleep(retry_after).await;
+                // Honour cancel during the backoff sleep — the user
+                // shouldn't have to wait out a 30s rate-limit wait
+                // before their cancel takes effect.
+                tokio::select! {
+                    _ = tokio::time::sleep(retry_after) => {}
+                    _ = cancel.cancelled() => {
+                        return Err(crate::providers::model::ModelError::Cancelled);
+                    }
+                }
                 attempt += 1;
                 // Body is only needed when we give up — on retry
                 // success / further retries we discard it.
@@ -938,7 +953,12 @@ async fn stream_with_retry(
                     error = %e,
                     "transient model-call error on first event; retrying after backoff"
                 );
-                tokio::time::sleep(wait).await;
+                tokio::select! {
+                    _ = tokio::time::sleep(wait) => {}
+                    _ = cancel.cancelled() => {
+                        return Err(crate::providers::model::ModelError::Cancelled);
+                    }
+                }
                 attempt += 1;
             }
             Err(e) => return Err(e.into_model_error()),
@@ -984,8 +1004,9 @@ async fn consume_stream(
     req: &ModelRequest<'_>,
     thread_id: &str,
     stream_tx: &tokio::sync::mpsc::UnboundedSender<StreamUpdate>,
+    cancel: &tokio_util::sync::CancellationToken,
 ) -> Result<crate::providers::model::ModelResponse, FirstEventError> {
-    let mut stream = provider.create_message_streaming(req);
+    let mut stream = provider.create_message_streaming(req, cancel);
     let mut any_delta_emitted = false;
     while let Some(event) = stream.next().await {
         match event {
@@ -1052,6 +1073,7 @@ fn tool_call(
     input: serde_json::Value,
 ) -> SchedulerFuture {
     use crate::runtime::scheduler::ToolRoute;
+    let cancel = scheduler.cancel_token_or_default(&thread_id);
     match scheduler.route_tool(&thread_id, &name) {
         Some(ToolRoute::Builtin { pod_id }) => {
             // Snapshot pod dir + config now while we have the sync
@@ -1099,7 +1121,7 @@ fn tool_call(
                 });
             }
             Box::pin(async move {
-                let outcome = crate::tools::builtin_tools::dispatch(
+                let dispatch_fut = crate::tools::builtin_tools::dispatch(
                     snapshot.pod_dir,
                     snapshot.config,
                     snapshot.behavior_ids,
@@ -1107,8 +1129,28 @@ fn tool_call(
                     behaviors_cap,
                     &name,
                     input,
-                )
-                .await;
+                );
+                // Builtin tools don't talk to an external service we
+                // need to notify on cancel — dropping the future mid-
+                // await is enough. Most builtins are fast (file ops);
+                // for the few that do awaited work this interrupts at
+                // the next `.await` boundary.
+                let outcome = tokio::select! {
+                    o = dispatch_fut => o,
+                    _ = cancel.cancelled() => {
+                        return SchedulerCompletion::Io(IoCompletion {
+                            thread_id,
+                            op_id,
+                            result: IoResult::ToolCall {
+                                tool_use_id,
+                                result: Err("cancelled".into()),
+                            },
+                            pod_update: None,
+                            scheduler_command: None,
+                            host_env_lost: None,
+                        });
+                    }
+                };
                 let pod_update = outcome.pod_update;
                 let scheduler_command = outcome.scheduler_command;
                 let result = if outcome.result.is_error {
@@ -1157,7 +1199,7 @@ fn tool_call(
                 // a host-env concept (they're the thing that gets
                 // re-provisioned per thread).
                 let mut host_env_lost: Option<HostEnvLostSignal> = None;
-                let result = match mcp.invoke(&real_name, input).await {
+                let result = match mcp.invoke(&real_name, input, &cancel).await {
                     Ok(mut stream) => {
                         let mut last = None;
                         while let Some(event) = stream.next().await {
@@ -1178,10 +1220,21 @@ fn tool_call(
                         }
                         match last {
                             Some(r) => Ok(r),
+                            // Stream ended without Completed: either
+                            // the host closed mid-call, or the cancel
+                            // wrapper inside `invoke` ended the stream
+                            // after firing `notifications/cancelled`.
+                            // Either way the scheduler drops this
+                            // result when the thread is Cancelled.
                             None => Err("no Completed event in tool stream".to_string()),
                         }
                     }
                     Err(e) => {
+                        // Cancelled errors must NOT mark the host-env
+                        // Lost — `is_transport_lost` already returns
+                        // false for Cancelled, but we still want a
+                        // clean error message on the off chance the
+                        // result does reach the thread.
                         if mcp_host_id.is_host_env() && e.is_transport_lost() {
                             host_env_lost = Some(HostEnvLostSignal {
                                 mcp_host_id: mcp_host_id.clone(),

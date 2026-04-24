@@ -16,6 +16,7 @@ use std::time::Duration;
 use futures::stream::{Stream, StreamExt};
 use serde_json::Value;
 use thiserror::Error;
+use tokio_util::sync::CancellationToken;
 use whisper_agent_protocol::{ContentBlock, Message, Usage};
 
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
@@ -80,6 +81,12 @@ pub enum ModelError {
     /// surface as failures with the wait in the message.
     #[error("rate limited: retry after {retry_after:?}: {body}")]
     RateLimited { retry_after: Duration, body: String },
+    /// The per-thread `CancellationToken` fired mid-request. Providers
+    /// return this from both pre-request and mid-stream cancel paths so
+    /// the scheduler can tell a cancel apart from a transport failure —
+    /// cancels never retry and never surface as user-visible errors.
+    #[error("cancelled")]
+    Cancelled,
 }
 
 impl ModelError {
@@ -95,7 +102,7 @@ impl ModelError {
         match self {
             ModelError::Transport(_) => true,
             ModelError::Api { status, .. } => matches!(*status, 408 | 500..=599),
-            ModelError::RateLimited { .. } => false,
+            ModelError::RateLimited { .. } | ModelError::Cancelled => false,
         }
     }
 }
@@ -139,10 +146,22 @@ pub enum ModelEvent {
 
 /// Provider-agnostic model backend. Object-safe via explicit pinned-boxed futures
 /// (native `async fn in trait` isn't dyn-safe with `Send` bound without extra crates).
+///
+/// ## Cancellation
+///
+/// Every `create_message*` call takes a [`CancellationToken`]. When the
+/// user cancels the owning thread, the scheduler fires the token and the
+/// provider must abort: drop the in-flight reqwest future (which aborts
+/// at TCP level), stop consuming the response body, and return
+/// [`ModelError::Cancelled`]. Either pre-request or mid-stream is fine;
+/// the scheduler handles both the same way — the `Cancelled` outcome is
+/// swallowed silently because the thread is already in a terminal
+/// `Cancelled` state by the time the future resolves.
 pub trait ModelProvider: Send + Sync {
     fn create_message<'a>(
         &'a self,
         req: &'a ModelRequest<'a>,
+        cancel: &'a CancellationToken,
     ) -> BoxFuture<'a, Result<ModelResponse, ModelError>>;
 
     /// Streaming variant. Returns a stream of [`ModelEvent`]s ending in a
@@ -154,9 +173,10 @@ pub trait ModelProvider: Send + Sync {
     fn create_message_streaming<'a>(
         &'a self,
         req: &'a ModelRequest<'a>,
+        cancel: &'a CancellationToken,
     ) -> BoxStream<'a, Result<ModelEvent, ModelError>> {
         Box::pin(async_stream::try_stream! {
-            let resp = self.create_message(req).await?;
+            let resp = self.create_message(req, cancel).await?;
             // Synthesize per-block events so a non-streaming backend
             // flows through the same consumer code path as a streaming
             // one. Callers that only care about Completed still get the

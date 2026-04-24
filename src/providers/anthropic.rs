@@ -17,6 +17,7 @@ use async_stream::try_stream;
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use tokio_util::sync::CancellationToken;
 use whisper_agent_protocol::{ContentBlock, Message, ProviderReplay, ToolResultContent, Usage};
 
 use crate::providers::model::{
@@ -48,9 +49,13 @@ impl AnthropicClient {
         }
     }
 
-    async fn do_create_message(&self, req: &ModelRequest<'_>) -> Result<ModelResponse, ModelError> {
+    async fn do_create_message(
+        &self,
+        req: &ModelRequest<'_>,
+        cancel: &CancellationToken,
+    ) -> Result<ModelResponse, ModelError> {
         let body = build_request_body(req);
-        let resp = self
+        let send = self
             .http
             .post(API_URL)
             .header("x-api-key", &self.api_key)
@@ -58,21 +63,26 @@ impl AnthropicClient {
             .header("anthropic-beta", EXTENDED_CACHE_BETA)
             .header("content-type", "application/json")
             .json(&body)
-            .send()
-            .await
-            .map_err(|e| ModelError::Transport(e.to_string()))?;
+            .send();
+        let resp = tokio::select! {
+            r = send => r.map_err(|e| ModelError::Transport(e.to_string()))?,
+            _ = cancel.cancelled() => return Err(ModelError::Cancelled),
+        };
         let status = resp.status();
         if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
+            let body = tokio::select! {
+                b = resp.text() => b.unwrap_or_default(),
+                _ = cancel.cancelled() => return Err(ModelError::Cancelled),
+            };
             return Err(ModelError::Api {
                 status: status.as_u16(),
                 body,
             });
         }
-        let parsed: MessageResponse = resp
-            .json()
-            .await
-            .map_err(|e| ModelError::Transport(e.to_string()))?;
+        let parsed: MessageResponse = tokio::select! {
+            r = resp.json() => r.map_err(|e| ModelError::Transport(e.to_string()))?,
+            _ = cancel.cancelled() => return Err(ModelError::Cancelled),
+        };
         Ok(ModelResponse {
             content: parsed.content.into_iter().map(wire_to_block).collect(),
             stop_reason: parsed.stop_reason,
@@ -88,13 +98,14 @@ impl AnthropicClient {
     fn do_create_message_streaming<'a>(
         &'a self,
         req: &'a ModelRequest<'a>,
+        cancel: &'a CancellationToken,
     ) -> BoxStream<'a, Result<ModelEvent, ModelError>> {
         let mut body = build_request_body(req);
         body.stream = true;
         let http = self.http.clone();
         let api_key = self.api_key.clone();
         Box::pin(try_stream! {
-            let resp = http
+            let send = http
                 .post(API_URL)
                 .header("x-api-key", &api_key)
                 .header("anthropic-version", ANTHROPIC_VERSION)
@@ -102,9 +113,11 @@ impl AnthropicClient {
                 .header("content-type", "application/json")
                 .header("accept", "text/event-stream")
                 .json(&body)
-                .send()
-                .await
-                .map_err(|e| ModelError::Transport(e.to_string()))?;
+                .send();
+            let resp: reqwest::Response = tokio::select! {
+                r = send => r.map_err(|e| ModelError::Transport(e.to_string())),
+                _ = cancel.cancelled() => Err(ModelError::Cancelled),
+            }?;
             let status = resp.status();
             if !status.is_success() {
                 let err_body = resp.text().await.unwrap_or_default();
@@ -114,8 +127,19 @@ impl AnthropicClient {
             let mut bytes = resp.bytes_stream();
             let mut sse_buf: Vec<u8> = Vec::new();
             let mut state = StreamState::default();
-            while let Some(chunk) = bytes.next().await {
-                let chunk = chunk.map_err(|e| ModelError::Transport(e.to_string()))?;
+            loop {
+                // Dropping `bytes` when the cancel branch wins aborts
+                // the underlying reqwest stream — the remote sees a
+                // dropped connection and stops generating tokens.
+                let next = tokio::select! {
+                    n = bytes.next() => match n {
+                        Some(Ok(b)) => Ok(Some(b)),
+                        Some(Err(e)) => Err(ModelError::Transport(e.to_string())),
+                        None => Ok(None),
+                    },
+                    _ = cancel.cancelled() => Err(ModelError::Cancelled),
+                };
+                let Some(chunk) = next? else { break };
                 sse_buf.extend_from_slice(&chunk);
                 while let Some(event_payload) = take_sse_event(&mut sse_buf) {
                     let Some(raw) = parse_sse_data(&event_payload) else {
@@ -180,15 +204,17 @@ impl ModelProvider for AnthropicClient {
     fn create_message<'a>(
         &'a self,
         req: &'a ModelRequest<'a>,
+        cancel: &'a CancellationToken,
     ) -> BoxFuture<'a, Result<ModelResponse, ModelError>> {
-        Box::pin(self.do_create_message(req))
+        Box::pin(self.do_create_message(req, cancel))
     }
 
     fn create_message_streaming<'a>(
         &'a self,
         req: &'a ModelRequest<'a>,
+        cancel: &'a CancellationToken,
     ) -> BoxStream<'a, Result<ModelEvent, ModelError>> {
-        self.do_create_message_streaming(req)
+        self.do_create_message_streaming(req, cancel)
     }
 
     fn list_models<'a>(&'a self) -> BoxFuture<'a, Result<Vec<ModelInfo>, ModelError>> {
