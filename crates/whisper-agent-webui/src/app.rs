@@ -114,6 +114,8 @@ const SIDEBAR_DIM_COLOR: Color32 = Color32::from_gray(130);
 const SIDEBAR_DANGER_COLOR: Color32 = Color32::from_rgb(220, 90, 90);
 const SIDEBAR_WARNING_COLOR: Color32 = Color32::from_rgb(220, 170, 90);
 const SIDEBAR_ERROR_TEXT_COLOR: Color32 = Color32::from_rgb(220, 120, 120);
+/// Accent fill for the primary compose-action button (Send).
+const SEND_BUTTON_COLOR: Color32 = Color32::from_rgb(80, 140, 220);
 
 /// Recursive renderer for the JSON tree viewer. `path` uniquely
 /// identifies this node (so egui's persistent collapse state doesn't
@@ -3591,7 +3593,7 @@ impl eframe::App for ChatApp {
         let pod_hint: Option<String> = if composing && input_enabled {
             self.compose_target_pod_id().map(|pid| {
                 let display = self.pods.get(pid).map(|p| p.name.as_str()).unwrap_or(pid);
-                format!("Describe a new thread in `{display}`")
+                format!("Describe a new thread in `{display}` — Enter sends, Shift+Enter newline")
             })
         } else {
             None
@@ -3599,8 +3601,8 @@ impl eframe::App for ChatApp {
         let hint: &str = match (composing, input_enabled, pod_hint.as_deref()) {
             (_, false, _) => "(connecting)",
             (true, true, Some(s)) => s,
-            (true, true, None) => "Describe a new thread",
-            (false, true, _) => "Message this thread",
+            (true, true, None) => "Describe a new thread — Enter sends, Shift+Enter newline",
+            (false, true, _) => "Message this thread — Enter sends, Shift+Enter newline",
         };
 
         let show_picker =
@@ -3803,9 +3805,22 @@ impl eframe::App for ChatApp {
                     });
                 }
                 ui.add_space(4.0);
+                // Thread state drives Send ↔ Stop toggle and whether
+                // to hide the stand-alone Cancel button (redundant
+                // once Stop lives on the primary button).
+                let thread_state = self
+                    .selected
+                    .as_deref()
+                    .and_then(|tid| self.tasks.get(tid))
+                    .map(|v| v.summary.state);
+                let is_working = thread_state == Some(ThreadStateLabel::Working);
                 ui.horizontal(|ui| {
                     if let Some(thread_id) = self.selected.clone() {
-                        if ui.button("Cancel").clicked() {
+                        // While Working, the primary button toggles to
+                        // Stop and handles cancellation — hide the
+                        // redundant side button so there's a single
+                        // affordance.
+                        if !is_working && ui.button("Cancel").clicked() {
                             self.send(ClientToServer::CancelThread {
                                 thread_id: thread_id.clone(),
                             });
@@ -3842,17 +3857,122 @@ impl eframe::App for ChatApp {
                         ui.separator();
                     }
                     ui.add_enabled_ui(input_enabled, |ui| {
-                        let send_pressed = ui.button("Send").clicked();
-                        let response = ui.add_sized(
-                            [ui.available_width(), 28.0],
-                            TextEdit::singleline(&mut self.input).hint_text(hint),
+                        // Stable id so the focus check below can look up
+                        // the widget's state before the widget is added.
+                        let input_id = egui::Id::new("compose-input");
+                        // Pre-filter plain Enter so the TextEdit never
+                        // sees it: plain Enter submits, Shift+Enter (and
+                        // any other modifier combo) passes through to
+                        // insert a newline. Note: we can't use
+                        // `consume_key(Modifiers::NONE, Enter)` because
+                        // that uses `matches_logically`, which treats
+                        // `NONE` as "no required modifiers" and would
+                        // also eat Shift+Enter. Walk events manually
+                        // with an exact-modifiers match instead.
+                        // Gated on focus so we don't steal Enter from
+                        // other focused widgets (modal buttons etc).
+                        let has_focus = ui.memory(|m| m.focused() == Some(input_id));
+                        let enter_submit = has_focus
+                            && ui.input_mut(|i| {
+                                let mut found = false;
+                                i.events.retain(|ev| {
+                                    let hit = matches!(ev, egui::Event::Key {
+                                        key: egui::Key::Enter,
+                                        pressed: true,
+                                        modifiers,
+                                        ..
+                                    } if modifiers.matches_exact(egui::Modifiers::NONE));
+                                    found |= hit;
+                                    !hit
+                                });
+                                found
+                            });
+                        // Auto-grow multiline: `desired_rows` reports
+                        // the widget's natural height to the enclosing
+                        // `Panel::bottom`, which uses its content's
+                        // min-rect to decide next-frame panel size.
+                        // Counting '\n' is a wrap-agnostic approximation
+                        // — good enough for code-like input; true
+                        // wrap-aware measurement would need the galley
+                        // which isn't available until after the widget
+                        // is added. Once content exceeds `MAX_ROWS`,
+                        // TextEdit scrolls internally.
+                        const MIN_ROWS: usize = 2;
+                        const MAX_ROWS: usize = 12;
+                        let line_count = self.input.chars().filter(|&c| c == '\n').count() + 1;
+                        let rows = line_count.clamp(MIN_ROWS, MAX_ROWS);
+                        let can_submit = !self.input.trim().is_empty();
+                        // right_to_left + Align::BOTTOM places the
+                        // Send/Stop button at the right edge, aligned
+                        // to the bottom of the row height; the
+                        // TextEdit then fills the remaining width on
+                        // the left and drives the row height via its
+                        // `desired_rows`.
+                        let inner = ui.allocate_ui_with_layout(
+                            egui::vec2(ui.available_width(), 0.0),
+                            egui::Layout::right_to_left(egui::Align::BOTTOM),
+                            |ui| {
+                                let (label, fill, tooltip) = if is_working {
+                                    (
+                                        "Stop",
+                                        SIDEBAR_DANGER_COLOR,
+                                        "Cancel this turn (Stop generation).",
+                                    )
+                                } else {
+                                    (
+                                        "Send",
+                                        SEND_BUTTON_COLOR,
+                                        "Send (Enter). Shift+Enter for newline.",
+                                    )
+                                };
+                                // The button's internal label inherits
+                                // the surrounding layout's alignment
+                                // (Align::BOTTOM here), so drop it into
+                                // a fixed-size sub-ui with a centered
+                                // layout — that keeps the button rect
+                                // anchored bottom-right via the outer
+                                // layout while centering the text
+                                // within the button itself.
+                                let btn_size = egui::vec2(72.0, 28.0);
+                                let btn_resp = ui
+                                    .allocate_ui_with_layout(
+                                        btn_size,
+                                        egui::Layout::centered_and_justified(
+                                            egui::Direction::LeftToRight,
+                                        ),
+                                        |ui| {
+                                            let btn = egui::Button::new(
+                                                RichText::new(label).color(Color32::WHITE).strong(),
+                                            )
+                                            .fill(fill);
+                                            if is_working {
+                                                ui.add(btn)
+                                            } else {
+                                                ui.add_enabled(can_submit, btn)
+                                            }
+                                        },
+                                    )
+                                    .inner;
+                                let button_clicked = btn_resp.on_hover_text(tooltip).clicked();
+                                let response = ui.add(
+                                    TextEdit::multiline(&mut self.input)
+                                        .id(input_id)
+                                        .desired_rows(rows)
+                                        .desired_width(f32::INFINITY)
+                                        .hint_text(hint),
+                                );
+                                (button_clicked, response)
+                            },
                         );
+                        let (button_clicked, response) = inner.inner;
                         if response.changed() {
                             self.last_input_change_at = Some(ui.input(|i| i.time));
                         }
-                        let enter_pressed =
-                            response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                        if (send_pressed || enter_pressed) && input_enabled {
+                        if is_working {
+                            if button_clicked && let Some(tid) = self.selected.clone() {
+                                self.send(ClientToServer::CancelThread { thread_id: tid });
+                            }
+                        } else if (button_clicked || enter_submit) && can_submit {
                             self.submit();
                             response.request_focus();
                         }
