@@ -154,20 +154,31 @@ class AppSession(
     }
 
     fun subscribe(threadId: String) {
+        if (subscribedThreadId == threadId) return
+        // Tear down the previous subscription inline. We can't rely on the
+        // old ThreadScreen's onDispose: NavHost composes the new destination
+        // (running this subscribe) before the old one leaves composition, so
+        // by the time the old onDispose fires `subscribedThreadId` already
+        // points at the new thread. Dropping the sudo banner matches what
+        // the server does on UnsubscribeFromThread.
+        subscribedThreadId?.let { old ->
+            _pendingSudo.update { it - old }
+            wire.send(ClientToServer.UnsubscribeFromThread(old))
+        }
         subscribedThreadId = threadId
         _activeSnapshot.value = null
         wire.send(ClientToServer.SubscribeToThread(threadId))
     }
 
-    fun unsubscribe() {
-        val id = subscribedThreadId ?: return
+    fun unsubscribe(threadId: String) {
+        // Guards the cross-dispose race: when a newer ThreadScreen has
+        // already claimed `subscribedThreadId`, this call is the old
+        // ThreadScreen's late onDispose and must not wipe the new state.
+        if (subscribedThreadId != threadId) return
         subscribedThreadId = null
         _activeSnapshot.value = null
-        // Banner belongs to the thread you were just on — dropping it here
-        // matches what the server does on UnsubscribeFromThread (no more
-        // SudoRequested/SudoResolved for that thread until you re-subscribe).
-        _pendingSudo.update { it - id }
-        wire.send(ClientToServer.UnsubscribeFromThread(id))
+        _pendingSudo.update { it - threadId }
+        wire.send(ClientToServer.UnsubscribeFromThread(threadId))
     }
 
     fun submitUserMessage(text: String) {

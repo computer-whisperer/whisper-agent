@@ -47,7 +47,6 @@ import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
-import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -81,7 +80,7 @@ fun ThreadScreen(
 ) {
     DisposableEffect(threadId) {
         session.subscribe(threadId)
-        onDispose { session.unsubscribe() }
+        onDispose { session.unsubscribe(threadId) }
     }
 
     val snapshot by session.activeSnapshot.collectAsStateWithLifecycle()
@@ -150,33 +149,49 @@ fun ThreadScreen(
 
             val listState = rememberLazyListState()
 
+            // `followBottom` tracks "is the trailing edge of the list on
+            // screen?" — meaning the user is caught up and wants new
+            // content to keep auto-scrolling. The check pairs with the
+            // `scrollToItem(last, Int.MAX_VALUE)` call below: both sides
+            // agree that "the bottom" means the true last item's
+            // trailing edge aligned with the viewport's trailing edge.
+            // Checking the trailing edge (rather than mere visibility
+            // of the last-index item) stops a tall streaming message
+            // from fighting the user when they scroll mid-reply.
             var followBottom by remember(snapshot?.threadId) { mutableStateOf(true) }
             LaunchedEffect(listState) {
                 snapshotFlow {
                     val info = listState.layoutInfo
-                    val lastVisible = info.visibleItemsInfo.lastOrNull()
-                    lastVisible == null || lastVisible.index >= info.totalItemsCount - 1
+                    val last = info.visibleItemsInfo.lastOrNull()
+                    when {
+                        last == null -> true
+                        last.index < info.totalItemsCount - 1 -> false
+                        else -> (last.offset + last.size) <= info.viewportEndOffset
+                    }
                 }.collect { atBottom -> followBottom = atBottom }
             }
 
-            val contentMarker by remember(snapshot) {
-                derivedStateOf {
-                    val last = indexedMessages.lastOrNull()?.message
-                    val lastLen = last?.content?.sumOf { block ->
-                        when (block) {
-                            is ContentBlock.Text -> block.text.length
-                            is ContentBlock.Thinking -> block.thinking.length
-                            is ContentBlock.ToolResult -> block.previewText?.length ?: 0
-                            else -> 0
-                        }
-                    } ?: 0
-                    indexedMessages.size to lastLen
+            val lastBlockLen = indexedMessages.lastOrNull()?.message?.content?.sumOf { block ->
+                when (block) {
+                    is ContentBlock.Text -> block.text.length
+                    is ContentBlock.Thinking -> block.thinking.length
+                    is ContentBlock.ToolResult -> block.previewText?.length ?: 0
+                    else -> 0
                 }
-            }
+            } ?: 0
+            val contentMarker = indexedMessages.size to lastBlockLen
             LaunchedEffect(contentMarker) {
-                if (followBottom && indexedMessages.isNotEmpty()) {
-                    listState.scrollToItem(indexedMessages.size - 1)
-                }
+                if (!followBottom) return@LaunchedEffect
+                val total = listState.layoutInfo.totalItemsCount
+                if (total <= 0) return@LaunchedEffect
+                // Int.MAX_VALUE as scroll offset asks the lazy list to
+                // scroll the last item as far toward the start as it
+                // can. LazyList clamps that request so the item's
+                // trailing edge lands on the viewport's trailing edge —
+                // the chat-follows-bottom behaviour, regardless of
+                // whether the last message is a two-line stub or a
+                // page-long essay.
+                listState.scrollToItem(total - 1, Int.MAX_VALUE)
             }
 
             LazyColumn(
