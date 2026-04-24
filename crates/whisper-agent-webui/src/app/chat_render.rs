@@ -18,7 +18,7 @@
 
 use egui::{Color32, RichText};
 use egui_commonmark::{CommonMarkCache, CommonMarkViewer};
-use whisper_agent_protocol::Usage;
+use whisper_agent_protocol::{Attachment, ImageSource, Usage};
 
 use super::{DiffPayload, DisplayItem, FusedToolResult};
 
@@ -123,8 +123,12 @@ pub(super) fn render_item(
     let resp = frame.show(ui, |ui| {
         ui.set_min_width(ui.available_width());
         match item {
-            DisplayItem::User { text, msg_index } => {
-                if render_user(ui, cache, text, hovered_prev_frame) {
+            DisplayItem::User {
+                text,
+                msg_index,
+                attachments,
+            } => {
+                if render_user(ui, cache, text, attachments, *msg_index, hovered_prev_frame) {
                     event = Some(ChatItemEvent::ForkRequested {
                         msg_index: *msg_index,
                         seed_text: text.clone(),
@@ -238,6 +242,8 @@ fn render_user(
     ui: &mut egui::Ui,
     cache: &mut CommonMarkCache,
     text: &str,
+    attachments: &[Attachment],
+    msg_index: usize,
     row_hovered: bool,
 ) -> bool {
     // Role label sits above the body rather than inline so a multi-line
@@ -290,8 +296,52 @@ fn render_user(
             }
         }
     });
-    render_markdown(ui, cache, ("user", text), text);
+    if !text.is_empty() {
+        render_markdown(ui, cache, ("user", text), text);
+    }
+    render_user_attachments(ui, attachments, msg_index);
     fork_clicked
+}
+
+/// Inline thumbnail strip for the image attachments that travelled
+/// with a user message. Each image renders through egui's loader via
+/// a stable `bytes://history-{msg}-{i}` URI so the texture cache
+/// reuses decoded pixels across repaints. URL-source attachments
+/// render as a labelled placeholder — rendering would need a
+/// runtime fetch we don't do client-side.
+fn render_user_attachments(ui: &mut egui::Ui, attachments: &[Attachment], msg_index: usize) {
+    if attachments.is_empty() {
+        return;
+    }
+    ui.horizontal_wrapped(|ui| {
+        for (i, att) in attachments.iter().enumerate() {
+            match att {
+                Attachment::Image {
+                    source: ImageSource::Bytes { data, .. },
+                } => {
+                    let uri = format!("bytes://history-{msg_index}-{i}");
+                    ui.ctx().include_bytes(uri.clone(), data.clone());
+                    ui.add(
+                        egui::Image::new(uri)
+                            .max_size(egui::vec2(160.0, 160.0))
+                            .fit_to_exact_size(egui::vec2(160.0, 160.0)),
+                    );
+                }
+                Attachment::Image {
+                    source: ImageSource::Url { url },
+                } => {
+                    ui.add(
+                        egui::Label::new(
+                            RichText::new(format!("🌐 {url}"))
+                                .color(Color32::from_gray(160))
+                                .small(),
+                        )
+                        .truncate(),
+                    );
+                }
+            }
+        }
+    });
 }
 
 fn render_assistant_text(ui: &mut egui::Ui, cache: &mut CommonMarkCache, text: &str) {

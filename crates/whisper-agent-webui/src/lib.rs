@@ -55,6 +55,10 @@ mod web_entry {
                         // tablet mode.
                         cc.egui_ctx.set_zoom_factor(1.2);
                         super::fonts::install(&cc.egui_ctx);
+                        // Wire the `bytes://` image loader so inline
+                        // attachment thumbnails and conversation-history
+                        // images decode without hitting the network.
+                        egui_extras::install_image_loaders(&cc.egui_ctx);
                         let (inbound, send_fn) = open_websocket(cc.egui_ctx.clone());
                         Ok(Box::new(ChatApp::new(inbound, send_fn)))
                     }),

@@ -137,6 +137,10 @@ fn main() -> Result<()> {
         Box::new(move |cc| {
             let _ = ctx_for_creator.set(cc.egui_ctx.clone());
             cc.egui_ctx.set_zoom_factor(1.1);
+            // Wire the `bytes://` image loader so inline attachment
+            // thumbnails and conversation-history images decode
+            // without hitting the network.
+            egui_extras::install_image_loaders(&cc.egui_ctx);
 
             let mut root = RootApp::new(rt_for_creator, ctx_for_creator);
             // Skip the login form when both values are known AND the

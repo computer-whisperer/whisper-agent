@@ -33,16 +33,82 @@ use egui::{Color32, ComboBox, Grid, RichText, ScrollArea, TextEdit};
 use egui_commonmark::CommonMarkCache;
 use whisper_agent_protocol::sandbox::NetworkPolicy;
 use whisper_agent_protocol::{
-    AllowMap, BackendSummary, BehaviorConfig, BehaviorOrigin,
+    AllowMap, Attachment, BackendSummary, BehaviorConfig, BehaviorOrigin,
     BehaviorSnapshot as BehaviorSnapshotProto, BehaviorSummary, BehaviorThreadOverride,
     ClientToServer, ContentBlock, Conversation, FsEntry, FunctionKind, FunctionSummary,
     HostEnvBinding, HostEnvProviderInfo, HostEnvProviderOrigin, HostEnvReachability, HostEnvSpec,
-    Message, ModelSummary, NamedHostEnv, PodAllow, PodConfig, PodLimits, PodSummary,
-    ResourceSnapshot, ResourceStateLabel, RetentionPolicy, Role, ServerToClient,
+    ImageMime, ImageSource, Message, ModelSummary, NamedHostEnv, PodAllow, PodConfig, PodLimits,
+    PodSummary, ResourceSnapshot, ResourceStateLabel, RetentionPolicy, Role, ServerToClient,
     SharedMcpAuthInput, SharedMcpAuthPublic, SharedMcpHostInfo, ThreadBindings,
     ThreadBindingsRequest, ThreadConfigOverride, ThreadDefaults, ThreadStateLabel, ThreadSummary,
     ToolResultContent, TriggerSpec, TurnLog, Usage,
 };
+
+/// Image attachment staged in the compose area but not yet sent.
+/// Holds the lowered protocol `Attachment` plus a unique id so the
+/// thumbnail `Image` widget's cache key is stable across frames —
+/// egui's image loader keys by URI, and a duplicate pixel payload
+/// would otherwise collide on its bytes-hash.
+struct StagedAttachment {
+    id: u64,
+    attachment: Attachment,
+}
+
+impl StagedAttachment {
+    /// The `bytes://` URI the thumbnail renders through. Unique by id
+    /// so adding the same image twice doesn't share a single texture
+    /// (users can stage two copies deliberately).
+    fn thumbnail_uri(&self) -> String {
+        format!("bytes://compose-attachment-{}", self.id)
+    }
+
+    /// Raw bytes egui feeds into the loader for the URI above.
+    /// URL-source attachments have no bytes yet — a placeholder slot
+    /// stays for them until fetch-and-inline lands.
+    fn thumbnail_bytes(&self) -> Option<&[u8]> {
+        match &self.attachment {
+            Attachment::Image {
+                source: ImageSource::Bytes { data, .. },
+            } => Some(data.as_slice()),
+            Attachment::Image {
+                source: ImageSource::Url { .. },
+            } => None,
+        }
+    }
+}
+
+/// Sniff a `Content-Type` equivalent from the first few bytes of a
+/// dropped file. Avoids trusting filename extensions (images dropped
+/// from a screenshot tool often arrive without one) and keeps the
+/// MIME set tight — only our `ImageMime` variants are accepted,
+/// anything else becomes `None` and the drop is rejected at the
+/// compose-area boundary with a visible toast.
+fn sniff_image_mime(bytes: &[u8]) -> Option<ImageMime> {
+    if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        Some(ImageMime::Png)
+    } else if bytes.starts_with(&[0xff, 0xd8, 0xff]) {
+        Some(ImageMime::Jpeg)
+    } else if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        Some(ImageMime::Gif)
+    } else if bytes.len() >= 12 && bytes.starts_with(b"RIFF") && &bytes[8..12] == b"WEBP" {
+        Some(ImageMime::Webp)
+    } else if bytes.len() >= 12
+        && &bytes[4..8] == b"ftyp"
+        && matches!(
+            &bytes[8..12],
+            b"heic" | b"heix" | b"hevc" | b"hevx" | b"heim" | b"heis"
+        )
+    {
+        Some(ImageMime::Heic)
+    } else if bytes.len() >= 12
+        && &bytes[4..8] == b"ftyp"
+        && matches!(&bytes[8..12], b"mif1" | b"msf1")
+    {
+        Some(ImageMime::Heif)
+    } else {
+        None
+    }
+}
 
 /// Events pushed into [`Inbound`]. In addition to decoded wire messages we pipe in
 /// connection-level signals (open/close/error) so the UI can show a connection status
@@ -381,6 +447,13 @@ enum DisplayItem {
         /// multi-row assistant turns) so the fork action needs the
         /// real index to send to the server.
         msg_index: usize,
+        /// Image attachments that travelled with this user message,
+        /// in the order the compose pushed them onto the content
+        /// blocks. Empty for text-only messages and for
+        /// server-injected user content (behavior-trigger prompts,
+        /// compaction seeds). Rendered as an inline thumbnail strip
+        /// under the message text.
+        attachments: Vec<Attachment>,
     },
     AssistantText {
         text: String,
@@ -645,6 +718,17 @@ pub struct ChatApp {
     composing_new: bool,
 
     input: String,
+    /// Image attachments staged for the next send. Populated by the
+    /// compose area's drop handler, rendered as thumbnails below the
+    /// text input, and drained into the outbound `SendUserMessage` /
+    /// `CreateThread` when the user submits. Kept on `ChatApp` (not
+    /// per-`TaskView`) because drafts cross thread boundaries — the
+    /// staged attachments follow whatever the user ends up sending on.
+    compose_attachments: Vec<StagedAttachment>,
+    /// Monotonic counter for the stable id stamped on each staged
+    /// attachment so the thumbnail `Image` widget's cache key survives
+    /// reorder / removal without colliding on pixel-identical uploads.
+    next_attachment_id: u64,
     inbound: Inbound,
     send_fn: SendFn,
     list_requested: bool,
@@ -1533,6 +1617,8 @@ impl ChatApp {
             selected: None,
             composing_new: true,
             input: String::new(),
+            compose_attachments: Vec::new(),
+            next_attachment_id: 1,
             inbound,
             send_fn,
             list_requested: false,
@@ -1682,6 +1768,137 @@ impl ChatApp {
             .and_then(|list| list.first())
             .map(|m| m.id.clone())
             .unwrap_or_default()
+    }
+
+    /// `true` when the currently-selected compose model advertises
+    /// any input-side image MIME in its `ContentCapabilities`. Gates
+    /// the drop-to-attach affordance — rejecting the drop client-side
+    /// is a better failure mode than a 400 from upstream after the
+    /// bytes are on the wire. Falls back to `false` when we don't yet
+    /// have a model catalog entry for the selection (the server
+    /// hasn't replied to `ListModels`), matching the user-visible
+    /// "unknown → conservative" posture elsewhere in the picker.
+    fn current_model_accepts_images(&self) -> bool {
+        let model_id = self.effective_picker_model();
+        if model_id.is_empty() {
+            return false;
+        }
+        let backend = self.effective_picker_backend();
+        self.models_by_backend
+            .get(backend)
+            .and_then(|list| list.iter().find(|m| m.id == model_id))
+            .map(|m| !m.capabilities.input.image.is_empty())
+            .unwrap_or(false)
+    }
+
+    /// Render a compact thumbnail row for staged compose
+    /// attachments, sitting above the text input. Each thumbnail
+    /// carries an `×` overlay for one-click removal. No-op when
+    /// nothing is staged — the surrounding layout reclaims the
+    /// vertical space.
+    ///
+    /// The thumbnail uses egui's image loader through a
+    /// per-attachment `bytes://` URI; `ctx.include_bytes` registers
+    /// the raw payload with the loader once per frame, which is idempotent
+    /// on identical (uri, bytes) pairs and lets the texture cache reuse
+    /// the decoded image across frames.
+    fn render_compose_attachments(&mut self, ui: &mut egui::Ui) {
+        if self.compose_attachments.is_empty() {
+            return;
+        }
+        let mut remove_id: Option<u64> = None;
+        ui.horizontal_wrapped(|ui| {
+            for staged in &self.compose_attachments {
+                let uri = staged.thumbnail_uri();
+                if let Some(bytes) = staged.thumbnail_bytes() {
+                    // Register once per frame — egui's loader keys by URI
+                    // so this is cheap after the first frame.
+                    ui.ctx().include_bytes(uri.clone(), bytes.to_vec());
+                }
+                ui.group(|ui| {
+                    ui.vertical(|ui| {
+                        if staged.thumbnail_bytes().is_some() {
+                            ui.add(
+                                egui::Image::new(uri)
+                                    .max_size(egui::vec2(96.0, 96.0))
+                                    .fit_to_exact_size(egui::vec2(96.0, 96.0)),
+                            );
+                        } else {
+                            // URL-source attachment — no bytes to
+                            // render locally. Placeholder preserves
+                            // the compose layout.
+                            ui.add_sized(
+                                egui::vec2(96.0, 96.0),
+                                egui::Label::new(
+                                    RichText::new("🌐 URL").color(Color32::from_gray(160)),
+                                ),
+                            );
+                        }
+                        if ui.small_button("× remove").clicked() {
+                            remove_id = Some(staged.id);
+                        }
+                    });
+                });
+            }
+        });
+        if let Some(id) = remove_id {
+            self.compose_attachments.retain(|s| s.id != id);
+        }
+    }
+
+    /// Drain egui's per-frame drop queue into staged attachments.
+    /// Accepts any file whose bytes sniff to one of our supported
+    /// image MIMEs; silently drops anything else (logs via
+    /// `log::warn!`). No-op when the current model doesn't accept
+    /// images — the drop is ignored rather than staged-and-rejected
+    /// later, which would be confusing when the user sees the
+    /// thumbnail appear then vanish on send.
+    fn accept_dropped_files(&mut self, ctx: &egui::Context) {
+        let dropped: Vec<egui::DroppedFile> = ctx.input(|i| i.raw.dropped_files.clone());
+        if dropped.is_empty() {
+            return;
+        }
+        if !self.current_model_accepts_images() {
+            log::warn!(
+                "dropped {} file(s) but the current model doesn't accept image input; ignoring",
+                dropped.len()
+            );
+            return;
+        }
+        for file in dropped {
+            let bytes = if let Some(b) = file.bytes {
+                b.to_vec()
+            } else if let Some(path) = &file.path {
+                match std::fs::read(path) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        log::warn!("failed to read dropped file {}: {}", path.display(), e);
+                        continue;
+                    }
+                }
+            } else {
+                log::warn!("dropped file carried neither bytes nor a path; skipping");
+                continue;
+            };
+            let Some(mime) = sniff_image_mime(&bytes) else {
+                log::warn!(
+                    "dropped file {:?} didn't sniff to a supported image MIME; skipping",
+                    file.name
+                );
+                continue;
+            };
+            let id = self.next_attachment_id;
+            self.next_attachment_id += 1;
+            self.compose_attachments.push(StagedAttachment {
+                id,
+                attachment: Attachment::Image {
+                    source: ImageSource::Bytes {
+                        media_type: mime,
+                        data: bytes,
+                    },
+                },
+            });
+        }
     }
 
     fn request_models_for(&mut self, backend: &str) {
@@ -1944,7 +2161,7 @@ impl ChatApp {
             ServerToClient::ThreadUserMessage {
                 thread_id,
                 text,
-                attachments: _, // TODO(#9): render image thumbnails inline
+                attachments,
             } => {
                 // User-role message appended to the conversation.
                 // Fires for both user-typed follow-ups (the webui used
@@ -1956,7 +2173,11 @@ impl ChatApp {
                 if let Some(view) = self.tasks.get_mut(&thread_id) {
                     let msg_index = view.conv_message_count;
                     view.conv_message_count += 1;
-                    view.items.push(DisplayItem::User { text, msg_index });
+                    view.items.push(DisplayItem::User {
+                        text,
+                        msg_index,
+                        attachments,
+                    });
                 }
             }
             ServerToClient::ThreadToolResultMessage { thread_id, text } => {
@@ -2930,16 +3151,25 @@ impl ChatApp {
         }
         self.last_input_change_at = None;
         let trimmed = text.trim();
-        if trimmed.is_empty() {
+        // Empty text is only a send-blocker when the user also hasn't
+        // staged any attachments. An image-only compose is a valid
+        // send (user dropped a screenshot, wants the model to look at
+        // it without a caption).
+        if trimmed.is_empty() && self.compose_attachments.is_empty() {
             return;
         }
         if self.composing_new || self.selected.is_none() {
             let (config_override, bindings_request) = self.build_creation_override();
+            let initial_attachments = self
+                .compose_attachments
+                .drain(..)
+                .map(|s| s.attachment)
+                .collect();
             self.send(ClientToServer::CreateThread {
                 correlation_id: None,
                 pod_id: self.compose_pod_id.clone(),
                 initial_message: trimmed.to_string(),
-                initial_attachments: Vec::new(), // TODO(#9): paste/drop attachments here
+                initial_attachments,
                 config_override,
                 bindings_request,
             });
@@ -2952,10 +3182,15 @@ impl ChatApp {
             // here would double the message. Server-local echo
             // latency is negligible; the extra round-trip is a
             // millisecond at most.
+            let attachments = self
+                .compose_attachments
+                .drain(..)
+                .map(|s| s.attachment)
+                .collect();
             self.send(ClientToServer::SendUserMessage {
                 thread_id,
                 text: trimmed.to_string(),
-                attachments: Vec::new(), // TODO(#9): paste/drop attachments here
+                attachments,
             });
         }
     }
@@ -3140,13 +3375,36 @@ fn add_message_items(msg: &Message, msg_index: usize, out: &mut Vec<DisplayItem>
             }
         }
         Role::User => {
+            // Collapse a single User message's text + image content
+            // into one `DisplayItem::User` entry so they render as
+            // one speech bubble. A user turn with multiple text
+            // blocks (rare, but possible via fork-edit) fuses them
+            // with a blank line so rendered Markdown sees a stable
+            // shape.
+            let mut text_buf = String::new();
+            let mut attachments: Vec<Attachment> = Vec::new();
             for block in &msg.content {
-                if let ContentBlock::Text { text } = block {
-                    out.push(DisplayItem::User {
-                        text: text.clone(),
-                        msg_index,
-                    });
+                match block {
+                    ContentBlock::Text { text } => {
+                        if !text_buf.is_empty() {
+                            text_buf.push_str("\n\n");
+                        }
+                        text_buf.push_str(text);
+                    }
+                    ContentBlock::Image { source } => {
+                        attachments.push(Attachment::Image {
+                            source: source.clone(),
+                        });
+                    }
+                    _ => {}
                 }
+            }
+            if !text_buf.is_empty() || !attachments.is_empty() {
+                out.push(DisplayItem::User {
+                    text: text_buf,
+                    msg_index,
+                    attachments,
+                });
             }
         }
         Role::ToolResult => {
@@ -3446,6 +3704,7 @@ fn truncate(mut s: String, max: usize) -> String {
 impl eframe::App for ChatApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.drain_inbound();
+        self.accept_dropped_files(ui.ctx());
 
         egui::Panel::top("status_bar").show_inside(ui, |ui| {
             ui.horizontal(|ui| {
@@ -3863,6 +4122,7 @@ impl eframe::App for ChatApp {
                         ui.separator();
                     }
                     ui.add_enabled_ui(input_enabled, |ui| {
+                        self.render_compose_attachments(ui);
                         // Stable id so the focus check below can look up
                         // the widget's state before the widget is added.
                         let input_id = egui::Id::new("compose-input");
@@ -3907,7 +4167,11 @@ impl eframe::App for ChatApp {
                         const MAX_ROWS: usize = 12;
                         let line_count = self.input.chars().filter(|&c| c == '\n').count() + 1;
                         let rows = line_count.clamp(MIN_ROWS, MAX_ROWS);
-                        let can_submit = !self.input.trim().is_empty();
+                        // Send enables on any staged attachment even when
+                        // the text box is empty — image-only compose is a
+                        // legitimate send.
+                        let can_submit =
+                            !self.input.trim().is_empty() || !self.compose_attachments.is_empty();
                         // right_to_left + Align::BOTTOM places the
                         // Send/Stop button at the right edge, aligned
                         // to the bottom of the row height; the

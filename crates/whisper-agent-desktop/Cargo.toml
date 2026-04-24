@@ -20,6 +20,10 @@ whisper-agent-protocol = { workspace = true }
 # picks up the same rendering backend (glow) and clipboard integrations.
 eframe = { version = "0.34", default-features = false, features = ["default_fonts", "glow", "x11", "wayland"] }
 egui = "0.34"
+# Matches the webui crate — required so both entry points register the
+# same `bytes://` image loader for inline attachment thumbnails.
+egui_extras = { version = "0.34", default-features = false, features = ["image"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "gif"] }
 
 # Tokio hosts the WS task on a background thread; the UI runs on main.
 # `rt-multi-thread` keeps the runtime out of the way of any blocking

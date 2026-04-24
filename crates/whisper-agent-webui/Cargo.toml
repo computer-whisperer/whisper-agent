@@ -36,6 +36,16 @@ similar = { version = "2", default-features = false, features = ["text"] }
 # output) and no syntect-backed `better_syntax_highlighting` (keeps
 # the wasm bundle small — plain monospace on code blocks reads fine).
 egui_commonmark = { version = "0.23", default-features = false, features = ["pulldown_cmark"] }
+# Image rendering for compose attachments and inline conversation
+# thumbnails. `egui_extras::install_image_loaders` wires up the
+# `bytes://` URI scheme egui's `Image` widget consumes; the `image`
+# crate below decodes the actual bytes. Formats match our
+# `ImageMime` set — HEIC/HEIF aren't supported client-side today
+# (would need a heavy `libheif` dep), so they display as a generic
+# placeholder until the compose path explicitly rejects them or we
+# add transcoding.
+egui_extras = { version = "0.34", default-features = false, features = ["image"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "gif"] }
 # Cron + tz for the behavior-editor "next N fires" preview. Mirror the
 # server's parsers so what the editor shows matches what the scheduler
 # will fire. chrono's default features include `clock` + `wasmbind`,
