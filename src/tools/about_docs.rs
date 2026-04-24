@@ -232,6 +232,15 @@ Tools come from three sources; a tool's name prefix tells you which:
     or an ad-hoc config. See `behaviors`.
   - `sudo` — run a tool with explicit user approval. See `sudo`.
   - `about` / `describe_tool` / `find_tool` — documentation surfaces.
+  - `list_llm_providers` / `list_mcp_hosts` /
+    `list_host_env_providers` — enumerate the server-level registries
+    backing this pod. Each entry is tagged `in scope` when the pod's
+    `[allow]` table admits it (usable now) or `not in scope` when it's
+    registered on the server but would require editing `pod.toml`
+    (and therefore `pod_modify`) to bring into scope. Use these to
+    discover what model backends, shared MCP hosts, and sandbox
+    providers exist before picking one for a `dispatch_thread` or
+    before proposing a pod config edit.
 
 - **Host-env MCP** — tools from the sandbox this thread is bound to
   (e.g. `rustdev_bash`, `rustdev_read_file`). Names are prefixed with

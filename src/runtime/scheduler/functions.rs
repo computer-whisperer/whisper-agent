@@ -782,6 +782,28 @@ impl Scheduler {
             );
             return;
         }
+        if name == crate::tools::builtin_tools::LIST_MCP_HOSTS {
+            self.complete_list_mcp_hosts_call(
+                thread_id,
+                op_id,
+                tool_use_id,
+                input,
+                disposition,
+                pending_io,
+            );
+            return;
+        }
+        if name == crate::tools::builtin_tools::LIST_HOST_ENV_PROVIDERS {
+            self.complete_list_host_env_providers_call(
+                thread_id,
+                op_id,
+                tool_use_id,
+                input,
+                disposition,
+                pending_io,
+            );
+            return;
+        }
 
         let spec = match self.route_tool(thread_id, &name) {
             Some(ToolRoute::Builtin { .. }) => Function::BuiltinToolCall {
@@ -1215,6 +1237,18 @@ impl Scheduler {
             }
         };
 
+        // Resolve the caller's pod so we can annotate each backend
+        // with whether the pod's `[allow.backends]` admits it. Out-of-
+        // scope backends are still listed — the agent may want to
+        // know what exists at the server level even if adding one to
+        // `pod.toml` requires `pod_modify`.
+        let in_scope: std::collections::HashSet<String> = self
+            .tasks
+            .get(thread_id)
+            .and_then(|t| self.pods.get(&t.pod_id))
+            .map(|pod| pod.config.allow.backends.iter().cloned().collect())
+            .unwrap_or_default();
+
         // Always prepare the backend summary header — it's the cheap
         // part and callers expanding one backend still want the
         // roster for context.
@@ -1224,10 +1258,15 @@ impl Scheduler {
             .map(|(name, entry)| {
                 let default_model = entry.default_model.as_deref().unwrap_or("—");
                 let auth = entry.auth_mode.as_deref().unwrap_or("none");
+                let scope = if in_scope.contains(name) {
+                    "in scope"
+                } else {
+                    "not in scope"
+                };
                 (
                     name.clone(),
                     format!(
-                        "- `{name}` — kind={kind}, default_model={dm}, auth={auth}",
+                        "- `{name}` [{scope}] — kind={kind}, default_model={dm}, auth={auth}",
                         kind = entry.kind,
                         dm = default_model,
                     ),
@@ -1236,7 +1275,10 @@ impl Scheduler {
             .collect();
         backend_lines.sort_by(|a, b| a.0.cmp(&b.0));
         let mut header = String::new();
-        header.push_str("Configured LLM backends:\n");
+        header.push_str(
+            "Configured LLM backends (in scope = admitted by this pod's \
+             `[allow.backends]`; out-of-scope entries require pod_modify to add):\n",
+        );
         for (_, line) in &backend_lines {
             header.push_str(line);
             header.push('\n');
@@ -1332,6 +1374,191 @@ impl Scheduler {
                 },
             )
         }));
+    }
+
+    /// `list_mcp_hosts`-specific synchronous path. Reads the
+    /// scheduler's shared-MCP catalog snapshot (no tokens, public
+    /// auth classification only) and annotates each entry with
+    /// whether the current pod's `[allow.mcp_hosts]` admits it.
+    fn complete_list_mcp_hosts_call(
+        &mut self,
+        thread_id: &str,
+        op_id: crate::runtime::thread::OpId,
+        tool_use_id: String,
+        input: serde_json::Value,
+        disposition: crate::permission::Disposition,
+        pending_io: &mut FuturesUnordered<SchedulerFuture>,
+    ) {
+        if matches!(disposition, crate::permission::Disposition::Deny) {
+            pending_io.push(make_denial_future(
+                thread_id.to_string(),
+                tool_use_id,
+                op_id,
+                crate::tools::builtin_tools::LIST_MCP_HOSTS.to_string(),
+            ));
+            return;
+        }
+        if let Err(e) = crate::tools::builtin_tools::list_mcp_hosts::parse_args(input) {
+            pending_io.push(immediate_tool_error(
+                thread_id.to_string(),
+                op_id,
+                tool_use_id,
+                e,
+            ));
+            return;
+        }
+        let in_scope: std::collections::HashSet<String> = self
+            .tasks
+            .get(thread_id)
+            .and_then(|t| self.pods.get(&t.pod_id))
+            .map(|pod| pod.config.allow.mcp_hosts.iter().cloned().collect())
+            .unwrap_or_default();
+
+        let hosts = self.shared_mcp_hosts_snapshot();
+        let mut out = String::new();
+        out.push_str(
+            "Shared MCP hosts (in scope = listed in this pod's `[allow.mcp_hosts]`; \
+             out-of-scope entries require pod_modify to add):\n",
+        );
+        if hosts.is_empty() {
+            out.push_str("  (no shared MCP hosts configured on this server)\n");
+        } else {
+            for h in hosts {
+                let scope = if in_scope.contains(&h.name) {
+                    "in scope"
+                } else {
+                    "not in scope"
+                };
+                let auth = match &h.auth {
+                    whisper_agent_protocol::SharedMcpAuthPublic::None => "none".to_string(),
+                    whisper_agent_protocol::SharedMcpAuthPublic::Bearer => "bearer".to_string(),
+                    whisper_agent_protocol::SharedMcpAuthPublic::Oauth2 { issuer, .. } => {
+                        format!("oauth2 (issuer: {issuer})")
+                    }
+                };
+                let connected = if h.connected {
+                    "connected"
+                } else {
+                    "disconnected"
+                };
+                let origin = match h.origin {
+                    whisper_agent_protocol::HostEnvProviderOrigin::Seeded => "seeded",
+                    whisper_agent_protocol::HostEnvProviderOrigin::Manual => "manual",
+                    whisper_agent_protocol::HostEnvProviderOrigin::RuntimeOverlay => {
+                        "runtime_overlay"
+                    }
+                };
+                out.push_str(&format!(
+                    "- `{name}` [{scope}] — url={url}, auth={auth}, {connected}, origin={origin}\n",
+                    name = h.name,
+                    url = h.url,
+                ));
+            }
+        }
+        pending_io.push(immediate_tool_success(
+            thread_id.to_string(),
+            op_id,
+            tool_use_id,
+            out,
+        ));
+    }
+
+    /// `list_host_env_providers`-specific synchronous path. Reads the
+    /// scheduler's host-env catalog snapshot (no control-plane tokens,
+    /// only a `has_token` presence flag) and annotates each entry with
+    /// whether any of the current pod's `[[allow.host_env]]` entries
+    /// reference the provider.
+    fn complete_list_host_env_providers_call(
+        &mut self,
+        thread_id: &str,
+        op_id: crate::runtime::thread::OpId,
+        tool_use_id: String,
+        input: serde_json::Value,
+        disposition: crate::permission::Disposition,
+        pending_io: &mut FuturesUnordered<SchedulerFuture>,
+    ) {
+        if matches!(disposition, crate::permission::Disposition::Deny) {
+            pending_io.push(make_denial_future(
+                thread_id.to_string(),
+                tool_use_id,
+                op_id,
+                crate::tools::builtin_tools::LIST_HOST_ENV_PROVIDERS.to_string(),
+            ));
+            return;
+        }
+        if let Err(e) = crate::tools::builtin_tools::list_host_env_providers::parse_args(input) {
+            pending_io.push(immediate_tool_error(
+                thread_id.to_string(),
+                op_id,
+                tool_use_id,
+                e,
+            ));
+            return;
+        }
+        let in_scope: std::collections::HashSet<String> = self
+            .tasks
+            .get(thread_id)
+            .and_then(|t| self.pods.get(&t.pod_id))
+            .map(|pod| {
+                pod.config
+                    .allow
+                    .host_env
+                    .iter()
+                    .map(|e| e.provider.clone())
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let providers = self.host_env_provider_snapshot();
+        let mut out = String::new();
+        out.push_str(
+            "Host-env (sandbox) providers (in scope = referenced by at least one \
+             `[[allow.host_env]]` entry in this pod; out-of-scope entries require \
+             pod_modify to add):\n",
+        );
+        if providers.is_empty() {
+            out.push_str("  (no host-env providers registered on this server)\n");
+        } else {
+            for p in providers {
+                let scope = if in_scope.contains(&p.name) {
+                    "in scope"
+                } else {
+                    "not in scope"
+                };
+                let token = if p.has_token {
+                    "authenticated"
+                } else {
+                    "anonymous"
+                };
+                let reach = match &p.reachability {
+                    whisper_agent_protocol::HostEnvReachability::Unknown => "unknown".to_string(),
+                    whisper_agent_protocol::HostEnvReachability::Reachable { .. } => {
+                        "reachable".to_string()
+                    }
+                    whisper_agent_protocol::HostEnvReachability::Unreachable {
+                        last_error, ..
+                    } => format!("unreachable ({last_error})"),
+                };
+                let origin = match p.origin {
+                    whisper_agent_protocol::HostEnvProviderOrigin::Seeded => "seeded",
+                    whisper_agent_protocol::HostEnvProviderOrigin::Manual => "manual",
+                    whisper_agent_protocol::HostEnvProviderOrigin::RuntimeOverlay => {
+                        "runtime_overlay"
+                    }
+                };
+                out.push_str(&format!(
+                    "- `{name}` [{scope}] — url={url}, {token}, {reach}, origin={origin}\n",
+                    name = p.name,
+                    url = p.url,
+                ));
+            }
+        }
+        pending_io.push(immediate_tool_success(
+            thread_id.to_string(),
+            op_id,
+            tool_use_id,
+            out,
+        ));
     }
 
     /// `sudo`-specific registration path. Parses the tool args, refuses

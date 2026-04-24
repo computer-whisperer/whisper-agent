@@ -30,7 +30,9 @@ pub mod dispatch_thread;
 mod filesystem;
 pub mod find_tool;
 mod grep;
+pub mod list_host_env_providers;
 pub mod list_llm_providers;
+pub mod list_mcp_hosts;
 mod list_threads;
 mod pod_show_thread;
 pub mod sudo;
@@ -140,6 +142,8 @@ pub const SUDO: &str = "sudo";
 pub const DESCRIBE_TOOL: &str = "describe_tool";
 pub const FIND_TOOL: &str = "find_tool";
 pub const LIST_LLM_PROVIDERS: &str = "list_llm_providers";
+pub const LIST_MCP_HOSTS: &str = "list_mcp_hosts";
+pub const LIST_HOST_ENV_PROVIDERS: &str = "list_host_env_providers";
 
 /// True if `name` is a builtin pod tool. Used by the scheduler's router
 /// to branch the tool-call dispatch path.
@@ -162,6 +166,8 @@ pub fn is_builtin(name: &str) -> bool {
             | DESCRIBE_TOOL
             | FIND_TOOL
             | LIST_LLM_PROVIDERS
+            | LIST_MCP_HOSTS
+            | LIST_HOST_ENV_PROVIDERS
     )
 }
 
@@ -191,6 +197,8 @@ pub fn reserved_env_name_prefixes() -> Vec<&'static str> {
         DESCRIBE_TOOL,
         FIND_TOOL,
         LIST_LLM_PROVIDERS,
+        LIST_MCP_HOSTS,
+        LIST_HOST_ENV_PROVIDERS,
     ];
     let mut out: Vec<&'static str> = BUILTINS
         .iter()
@@ -221,6 +229,8 @@ pub fn descriptors() -> Vec<McpTool> {
         describe_tool::descriptor(),
         find_tool::descriptor(),
         list_llm_providers::descriptor(),
+        list_mcp_hosts::descriptor(),
+        list_host_env_providers::descriptor(),
     ]
 }
 
@@ -418,6 +428,16 @@ pub async fn dispatch(
         LIST_LLM_PROVIDERS => no_update_error(
             "list_llm_providers must be intercepted at the scheduler layer \
              (complete_list_llm_providers_call); reaching this arm is a bug"
+                .into(),
+        ),
+        LIST_MCP_HOSTS => no_update_error(
+            "list_mcp_hosts must be intercepted at the scheduler layer \
+             (complete_list_mcp_hosts_call); reaching this arm is a bug"
+                .into(),
+        ),
+        LIST_HOST_ENV_PROVIDERS => no_update_error(
+            "list_host_env_providers must be intercepted at the scheduler layer \
+             (complete_list_host_env_providers_call); reaching this arm is a bug"
                 .into(),
         ),
         other => no_update_error(format!("unknown builtin tool: {other}")),
