@@ -1941,7 +1941,11 @@ impl ChatApp {
                     view.summary.continued_from = Some(thread_id);
                 }
             }
-            ServerToClient::ThreadUserMessage { thread_id, text } => {
+            ServerToClient::ThreadUserMessage {
+                thread_id,
+                text,
+                attachments: _, // TODO(#9): render image thumbnails inline
+            } => {
                 // User-role message appended to the conversation.
                 // Fires for both user-typed follow-ups (the webui used
                 // to add these optimistically; that's now removed so
@@ -2935,6 +2939,7 @@ impl ChatApp {
                 correlation_id: None,
                 pod_id: self.compose_pod_id.clone(),
                 initial_message: trimmed.to_string(),
+                initial_attachments: Vec::new(), // TODO(#9): paste/drop attachments here
                 config_override,
                 bindings_request,
             });
@@ -2950,6 +2955,7 @@ impl ChatApp {
             self.send(ClientToServer::SendUserMessage {
                 thread_id,
                 text: trimmed.to_string(),
+                attachments: Vec::new(), // TODO(#9): paste/drop attachments here
             });
         }
     }

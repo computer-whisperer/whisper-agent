@@ -414,6 +414,7 @@ impl GeminiClient {
                         display_name: m.display_name,
                         context_window: m.input_token_limit,
                         max_output_tokens: m.output_token_limit,
+                        capabilities: crate::providers::model::gemini_vision_capabilities(),
                     })
                     .collect())
             }
@@ -429,6 +430,7 @@ impl GeminiClient {
                     display_name: Some(name.into()),
                     context_window: None,
                     max_output_tokens: None,
+                    capabilities: crate::providers::model::gemini_vision_capabilities(),
                 };
                 Ok(vec![
                     entry("gemini-3-pro-preview", "Gemini 3 Pro (preview)"),
@@ -607,6 +609,11 @@ fn convert_user_parts(blocks: &[ContentBlock], id_to_name: &HashMap<String, Stri
                     },
                 });
             }
+            ContentBlock::Image { source } => {
+                if let Some(part) = image_source_to_part(source) {
+                    parts.push(part);
+                }
+            }
             ContentBlock::ToolUse { .. }
             | ContentBlock::Thinking { .. }
             | ContentBlock::ToolSchema { .. } => {
@@ -677,9 +684,47 @@ fn convert_assistant_parts(
             ContentBlock::ToolResult { .. } | ContentBlock::ToolSchema { .. } => {
                 // Neither is valid on an assistant turn.
             }
+            ContentBlock::Image { .. } => {
+                // Model-emitted images (Gemini native image output) arrive on
+                // the inbound-parse side, not through this path — reaching
+                // here would mean a persisted assistant turn somehow carried
+                // an image block we persisted ourselves. Drop silently; v2
+                // output work fills this in.
+            }
         }
     }
     parts
+}
+
+/// Lower one of our image-source values into a Gemini `Part`. Bytes
+/// land as `inlineData` with a base64-encoded body; URL sources are
+/// dropped with a warning and surfaced to the model as a text part
+/// noting the missing attachment, since Gemini's wire format doesn't
+/// accept URL passthrough (only inline bytes or Files-API URIs). URL
+/// support through a fetch-and-inline pass is a v1.1 follow-up.
+fn image_source_to_part(src: &whisper_agent_protocol::ImageSource) -> Option<Part> {
+    use base64::Engine;
+    use base64::engine::general_purpose::STANDARD;
+    use whisper_agent_protocol::ImageSource;
+    match src {
+        ImageSource::Bytes { media_type, data } => Some(Part::InlineData {
+            inline_data: InlineData {
+                mime_type: media_type.as_mime_str().to_string(),
+                data: STANDARD.encode(data),
+            },
+        }),
+        ImageSource::Url { url } => {
+            tracing::warn!(
+                url = %url,
+                "Gemini does not support URL-sourced images; dropping attachment and \
+                 substituting a text note. Fetch-and-inline will be added post-v1."
+            );
+            Some(Part::Text {
+                text: format!("[Image URL attached but not viewable on this model: {url}]"),
+                thought: None,
+            })
+        }
+    }
 }
 
 fn tool_result_as_text(content: &ToolResultContent, is_error: bool) -> String {
@@ -763,6 +808,15 @@ pub(crate) fn parsed_to_model_response(parsed: GenerateContentResponse) -> Model
                 }
                 Part::FunctionResponse { .. } => {
                     // Models don't emit function responses — ignore if echoed.
+                }
+                Part::InlineData { .. } => {
+                    // Native image output (gemini-2.5-flash-image and
+                    // friends) would arrive here as an inlineData part on
+                    // the candidate. V1 is input-only — inbound image
+                    // parsing lands in the v2 output path, at which point
+                    // we'll decode into a `ContentBlock::Image`. For now,
+                    // drop so a thinking-model hallucination that emits
+                    // one doesn't confuse the scheduler.
                 }
             }
         }
@@ -948,6 +1002,11 @@ impl GeminiStreamState {
                     // Models don't emit function responses — ignore if
                     // echoed back to us.
                 }
+                Part::InlineData { .. } => {
+                    // Same story as the non-streaming parser — native
+                    // image output on the response side is v2 scope.
+                    self.close_open();
+                }
             }
         }
         out
@@ -1085,6 +1144,15 @@ pub(crate) enum Part {
         #[serde(rename = "functionResponse")]
         function_response: FunctionResponse,
     },
+    /// Inline base64-encoded image (or other media) data. Gemini's
+    /// `inlineData` part accepts user-supplied images as content in a
+    /// user turn and, on native-image-output models, also appears in
+    /// response parts. V1 uses it only on the outbound (user) side;
+    /// inbound parsing isn't wired up yet.
+    InlineData {
+        #[serde(rename = "inlineData")]
+        inline_data: InlineData,
+    },
     /// `thought: Some(true)` marks a reasoning part (Gemini 2.x thinking models).
     /// Serialization skips the field when `None` so we don't poke older models
     /// that don't recognize it.
@@ -1093,6 +1161,15 @@ pub(crate) enum Part {
         #[serde(skip_serializing_if = "Option::is_none", default)]
         thought: Option<bool>,
     },
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub(crate) struct InlineData {
+    #[serde(rename = "mimeType")]
+    pub(crate) mime_type: String,
+    /// Base64-encoded bytes. Gemini accepts the raw base64 string
+    /// here (no `data:` prefix, unlike OpenAI's data URL form).
+    pub(crate) data: String,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -1237,6 +1314,49 @@ mod tests {
             messages,
             cache_breakpoints: &[],
         }
+    }
+
+    #[test]
+    fn user_image_bytes_become_inline_data_part() {
+        use whisper_agent_protocol::{ImageMime, ImageSource};
+        let msg = Message::user_blocks(vec![
+            ContentBlock::Text {
+                text: "describe".into(),
+            },
+            ContentBlock::Image {
+                source: ImageSource::Bytes {
+                    media_type: ImageMime::Webp,
+                    data: vec![0x52, 0x49, 0x46, 0x46],
+                },
+            },
+        ]);
+        let id_to_name = HashMap::new();
+        let parts = convert_user_parts(&msg.content, &id_to_name);
+        assert_eq!(parts.len(), 2);
+        let json = serde_json::to_value(&parts).unwrap();
+        assert_eq!(json[0]["text"], "describe");
+        let inline = &json[1]["inlineData"];
+        assert_eq!(inline["mimeType"], "image/webp");
+        // 4 bytes "RIFF" → base64 "UklGRg=="
+        assert_eq!(inline["data"], "UklGRg==");
+    }
+
+    #[test]
+    fn user_image_url_becomes_text_fallback_on_gemini() {
+        // Gemini doesn't accept URL passthrough, so URL-sourced images
+        // get substituted for a text note until fetch-and-inline lands.
+        use whisper_agent_protocol::ImageSource;
+        let msg = Message::user_blocks(vec![ContentBlock::Image {
+            source: ImageSource::Url {
+                url: "https://example.com/cat.png".into(),
+            },
+        }]);
+        let parts = convert_user_parts(&msg.content, &HashMap::new());
+        assert_eq!(parts.len(), 1);
+        let Part::Text { text, .. } = &parts[0] else {
+            panic!("expected text fallback, got {:?}", parts[0]);
+        };
+        assert!(text.contains("https://example.com/cat.png"));
     }
 
     #[test]

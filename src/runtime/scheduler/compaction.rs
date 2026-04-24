@@ -102,7 +102,7 @@ impl Scheduler {
         }
         // Reuse send_user_message so title/state broadcasts and dirty
         // tracking run the same as any user follow-up.
-        self.send_user_message(thread_id, prompt_text, pending_io);
+        self.send_user_message(thread_id, prompt_text, Vec::new(), pending_io);
         self.step_until_blocked(thread_id, pending_io);
     }
 
@@ -376,7 +376,7 @@ impl Scheduler {
         // Seed the continuation with the filled-in template. This
         // kicks the thread's first model call.
         let seed_text = render_continuation_template(&continuation_template, &summary_text);
-        self.send_user_message(&new_thread_id, seed_text, pending_io);
+        self.send_user_message(&new_thread_id, seed_text, Vec::new(), pending_io);
         self.step_until_blocked(&new_thread_id, pending_io);
 
         // Emit the CompactThread Function's success terminal. The

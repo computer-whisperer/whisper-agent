@@ -61,12 +61,14 @@ impl Scheduler {
                 correlation_id,
                 pod_id,
                 initial_message,
+                initial_attachments,
                 config_override,
                 bindings_request,
             } => {
                 let spec = crate::functions::Function::CreateThread {
                     pod_id,
                     initial_message: Some(initial_message),
+                    initial_attachments,
                     parent: None,
                     wait_mode: crate::functions::WaitMode::ThreadCreated,
                     config_override,
@@ -92,10 +94,14 @@ impl Scheduler {
                     }
                 }
             }
-            ClientToServer::SendUserMessage { thread_id, text } => {
+            ClientToServer::SendUserMessage {
+                thread_id,
+                text,
+                attachments,
+            } => {
                 if self.tasks.contains_key(&thread_id) {
                     self.rebind_escalation_if_orphaned(&thread_id, conn_id);
-                    self.send_user_message(&thread_id, text, pending_io);
+                    self.send_user_message(&thread_id, text, attachments, pending_io);
                     self.step_until_blocked(&thread_id, pending_io);
                 } else {
                     self.router.send_to_client(
@@ -1231,6 +1237,7 @@ impl Scheduler {
                                     display_name: m.display_name,
                                     context_window: m.context_window,
                                     max_output_tokens: m.max_output_tokens,
+                                    capabilities: m.capabilities,
                                 })
                                 .collect();
                             let _ = outbound.send(ServerToClient::ModelsList {

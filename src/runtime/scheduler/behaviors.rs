@@ -155,7 +155,7 @@ impl Scheduler {
             pending_io,
         )?;
         self.mark_dirty(&thread_id);
-        self.send_user_message(&thread_id, rendered_prompt, pending_io);
+        self.send_user_message(&thread_id, rendered_prompt, Vec::new(), pending_io);
         self.step_until_blocked(&thread_id, pending_io);
         // Every fire (manual or trigger-driven) advances `last_fired_at`
         // — for cron, this is the cursor for the next evaluation; for

@@ -280,14 +280,18 @@ impl OpenAiChatClient {
         Ok(parsed
             .data
             .into_iter()
-            .map(|m| ModelInfo {
-                id: m.id,
-                display_name: None,
-                // OpenAI's /v1/models (both api.openai.com and
-                // compatible forks) returns bare ids — no context or
-                // output caps. Leave unknown.
-                context_window: None,
-                max_output_tokens: None,
+            .map(|m| {
+                let capabilities = crate::providers::model::openai_vision_capabilities(&m.id);
+                ModelInfo {
+                    id: m.id,
+                    display_name: None,
+                    // OpenAI's /v1/models (both api.openai.com and
+                    // compatible forks) returns bare ids — no context or
+                    // output caps. Leave unknown.
+                    context_window: None,
+                    max_output_tokens: None,
+                    capabilities,
+                }
             })
             .collect())
     }
@@ -370,34 +374,81 @@ fn convert_system_message(blocks: &[ContentBlock], out: &mut Vec<OaMessage>) {
     });
 }
 
-/// A user turn can be a plain text prompt OR a bundle of tool results. OpenAI
-/// represents tool results as standalone `role: "tool"` messages, so we may emit
-/// multiple output messages for one input.
+/// A user turn can be a plain text prompt, a bundle of tool results, or
+/// a multimodal text+image mix. OpenAI represents tool results as
+/// standalone `role: "tool"` messages; text-only user content goes out
+/// as `content: "..."`; mixed text+image turns as
+/// `content: [{type:"text",...}, {type:"image_url",...}]`.
+///
+/// We accumulate into two side buffers — plain text (`text_accum`) and
+/// a pending multimodal parts vector (`parts`). The first image block
+/// promotes the current text buffer into parts so ordering survives.
 fn convert_user_message(blocks: &[ContentBlock], out: &mut Vec<OaMessage>) {
     let mut text_accum = String::new();
-    for block in blocks {
-        match block {
-            ContentBlock::Text { text } => {
+    let mut parts: Option<Vec<OaContentPart>> = None;
+    let push_text =
+        |parts: &mut Option<Vec<OaContentPart>>, text_accum: &mut String, text: &str| {
+            if let Some(p) = parts.as_mut() {
+                p.push(OaContentPart::Text {
+                    text: text.to_string(),
+                });
+            } else {
                 if !text_accum.is_empty() {
                     text_accum.push('\n');
                 }
                 text_accum.push_str(text);
+            }
+        };
+    let flush_user = |parts: &mut Option<Vec<OaContentPart>>,
+                      text_accum: &mut String,
+                      out: &mut Vec<OaMessage>| {
+        if let Some(p) = parts.take() {
+            out.push(OaMessage {
+                role: "user".into(),
+                content: Some(OaContent::Parts(p)),
+                tool_calls: None,
+                tool_call_id: None,
+                reasoning_content: None,
+            });
+        } else if !text_accum.is_empty() {
+            out.push(OaMessage {
+                role: "user".into(),
+                content: Some(OaContent::Text(std::mem::take(text_accum))),
+                tool_calls: None,
+                tool_call_id: None,
+                reasoning_content: None,
+            });
+        }
+    };
+    for block in blocks {
+        match block {
+            ContentBlock::Text { text } => {
+                push_text(&mut parts, &mut text_accum, text);
+            }
+            ContentBlock::Image { source } => {
+                // First image promotes the accumulator — fold any
+                // already-buffered text into parts first so interleave
+                // order matches the source message.
+                if parts.is_none() {
+                    let mut p = Vec::new();
+                    if !text_accum.is_empty() {
+                        p.push(OaContentPart::Text {
+                            text: std::mem::take(&mut text_accum),
+                        });
+                    }
+                    parts = Some(p);
+                }
+                parts
+                    .as_mut()
+                    .expect("parts is Some")
+                    .push(image_source_to_content_part(source));
             }
             ContentBlock::ToolResult {
                 tool_use_id,
                 content,
                 is_error,
             } => {
-                // Flush any accumulated plain text first so ordering survives.
-                if !text_accum.is_empty() {
-                    out.push(OaMessage {
-                        role: "user".into(),
-                        content: Some(OaContent::Text(std::mem::take(&mut text_accum))),
-                        tool_calls: None,
-                        tool_call_id: None,
-                        reasoning_content: None,
-                    });
-                }
+                flush_user(&mut parts, &mut text_accum, out);
                 let text = tool_result_as_text(content, *is_error);
                 out.push(OaMessage {
                     role: "tool".into(),
@@ -414,15 +465,7 @@ fn convert_user_message(blocks: &[ContentBlock], out: &mut Vec<OaMessage>) {
             }
         }
     }
-    if !text_accum.is_empty() {
-        out.push(OaMessage {
-            role: "user".into(),
-            content: Some(OaContent::Text(text_accum)),
-            tool_calls: None,
-            tool_call_id: None,
-            reasoning_content: None,
-        });
-    }
+    flush_user(&mut parts, &mut text_accum, out);
 }
 
 fn convert_assistant_message(blocks: &[ContentBlock], out: &mut Vec<OaMessage>) {
@@ -459,6 +502,11 @@ fn convert_assistant_message(blocks: &[ContentBlock], out: &mut Vec<OaMessage>) 
             }
             ContentBlock::ToolResult { .. } | ContentBlock::ToolSchema { .. } => {
                 // Neither belongs on an assistant message.
+            }
+            ContentBlock::Image { .. } => {
+                // Assistant-side image output isn't part of Chat Completions —
+                // the `audio` assistant field exists but no image-output shape.
+                // Drop silently if a replayed assistant turn happens to carry one.
             }
         }
     }
@@ -533,6 +581,23 @@ fn content_as_text(c: OaContent) -> Option<String> {
     match c {
         OaContent::Text(s) => Some(s),
         OaContent::Null => None,
+        // Chat Completions responses don't deliver parts arrays today;
+        // the `OaContent::Parts` variant is outbound-only. If one ever
+        // shows up on an inbound path, a concatenated text view is the
+        // best we can do — images on the assistant side aren't modeled
+        // here anyway.
+        OaContent::Parts(parts) => {
+            let mut s = String::new();
+            for p in parts {
+                if let OaContentPart::Text { text } = p {
+                    if !s.is_empty() {
+                        s.push('\n');
+                    }
+                    s.push_str(&text);
+                }
+            }
+            if s.is_empty() { None } else { Some(s) }
+        }
     }
 }
 
@@ -668,15 +733,21 @@ struct OaMessage {
     reasoning_content: Option<String>,
 }
 
-/// Emitted as either a plain string or explicit JSON null. OpenAI requires `content`
-/// to be present on assistant messages even when only `tool_calls` are set, and
-/// various servers disagree on whether `null` or the field being absent is accepted.
-/// We emit `null` to match the OpenAI spec; `skip_serializing_if` on the field still
-/// omits it entirely when we want to (not currently used).
+/// Emitted as a plain string, explicit JSON null, or a sequence of
+/// typed parts. OpenAI requires `content` to be present on assistant
+/// messages even when only `tool_calls` are set, and various servers
+/// disagree on whether `null` or the field being absent is accepted.
+/// We emit `null` to match the OpenAI spec; `skip_serializing_if` on
+/// the field still omits it entirely when we want to (not currently
+/// used). The `Parts` variant carries multimodal user content (text
+/// interleaved with image_url parts) — Chat Completions accepts
+/// `content: [{type:"text",...}, {type:"image_url",...}, ...]` on user
+/// messages when any attachment is present.
 #[derive(Debug)]
 enum OaContent {
     Text(String),
     Null,
+    Parts(Vec<OaContentPart>),
 }
 
 impl Serialize for OaContent {
@@ -687,6 +758,7 @@ impl Serialize for OaContent {
         match self {
             OaContent::Text(t) => s.serialize_str(t),
             OaContent::Null => s.serialize_none(),
+            OaContent::Parts(p) => p.serialize(s),
         }
     }
 }
@@ -696,11 +768,56 @@ impl<'de> Deserialize<'de> for OaContent {
     where
         D: serde::Deserializer<'de>,
     {
+        // Chat Completions responses return `content` as a string (or
+        // null on tool-call-only turns) — server-emitted content-parts
+        // arrays don't show up today. If that ever changes we extend
+        // here; for now string-or-null keeps the path simple.
         let opt: Option<String> = Option::deserialize(d)?;
         Ok(match opt {
             Some(s) => OaContent::Text(s),
             None => OaContent::Null,
         })
+    }
+}
+
+/// One content part on a multimodal user message. OpenAI's Chat
+/// Completions content-array elements tag themselves via `type`;
+/// `text` carries a bare string, `image_url` carries a nested
+/// `{url, detail?}` object where `url` accepts either an https URL or
+/// a `data:image/...;base64,...` data URL.
+#[derive(Serialize, Debug)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum OaContentPart {
+    Text { text: String },
+    ImageUrl { image_url: OaImageUrl },
+}
+
+#[derive(Serialize, Debug)]
+struct OaImageUrl {
+    url: String,
+    // `detail` omitted for v1 — OpenAI defaults to "auto", which picks
+    // resolution based on image dimensions. A per-image override lands
+    // on the protocol once we surface it in the compose UI.
+}
+
+/// Lower one of our `ImageSource` values into the OpenAI content part.
+/// Bytes → base64 data URL; Url → url passthrough (OpenAI fetches).
+fn image_source_to_content_part(src: &whisper_agent_protocol::ImageSource) -> OaContentPart {
+    use base64::Engine;
+    use base64::engine::general_purpose::STANDARD;
+    use whisper_agent_protocol::ImageSource;
+    let url = match src {
+        ImageSource::Bytes { media_type, data } => {
+            format!(
+                "data:{};base64,{}",
+                media_type.as_mime_str(),
+                STANDARD.encode(data)
+            )
+        }
+        ImageSource::Url { url } => url.clone(),
+    };
+    OaContentPart::ImageUrl {
+        image_url: OaImageUrl { url },
     }
 }
 
@@ -1154,6 +1271,67 @@ mod tests {
         assert_eq!(out[0].role, "tool");
         assert_eq!(out[0].tool_call_id.as_deref(), Some("toolu_1"));
         assert_eq!(out[1].tool_call_id.as_deref(), Some("toolu_2"));
+    }
+
+    #[test]
+    fn user_with_image_emits_multimodal_parts_content() {
+        // Text + image user message should serialize as
+        // content: [{type:"text",...}, {type:"image_url",...}],
+        // not as a plain string. The image URL is a base64 data URL
+        // built from the inline bytes.
+        use whisper_agent_protocol::{ImageMime, ImageSource};
+        let blocks = vec![
+            ContentBlock::Text {
+                text: "describe this".into(),
+            },
+            ContentBlock::Image {
+                source: ImageSource::Bytes {
+                    media_type: ImageMime::Png,
+                    data: vec![137, 80, 78, 71],
+                },
+            },
+        ];
+        let mut out = Vec::new();
+        convert_user_message(&blocks, &mut out);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].role, "user");
+        let v = serde_json::to_value(&out[0]).unwrap();
+        let content = v["content"].as_array().expect("content is array");
+        assert_eq!(content.len(), 2);
+        assert_eq!(content[0]["type"], "text");
+        assert_eq!(content[0]["text"], "describe this");
+        assert_eq!(content[1]["type"], "image_url");
+        let url = content[1]["image_url"]["url"].as_str().unwrap();
+        assert!(url.starts_with("data:image/png;base64,"), "url={url}");
+        // 4-byte PNG magic → base64 "iVBORw==" (6 chars + 2 padding)
+        assert!(url.ends_with("iVBORw=="), "url={url}");
+    }
+
+    #[test]
+    fn user_image_url_source_passes_through() {
+        use whisper_agent_protocol::ImageSource;
+        let blocks = vec![ContentBlock::Image {
+            source: ImageSource::Url {
+                url: "https://example.com/cat.png".into(),
+            },
+        }];
+        let mut out = Vec::new();
+        convert_user_message(&blocks, &mut out);
+        let v = serde_json::to_value(&out[0]).unwrap();
+        let url = v["content"][0]["image_url"]["url"].as_str().unwrap();
+        assert_eq!(url, "https://example.com/cat.png");
+    }
+
+    #[test]
+    fn user_text_only_still_emits_string_content() {
+        // Regression guard: adding the Parts path must not change the
+        // wire shape for text-only user messages — they stay as a bare
+        // `content: "..."` string.
+        let blocks = vec![ContentBlock::Text { text: "hi".into() }];
+        let mut out = Vec::new();
+        convert_user_message(&blocks, &mut out);
+        let v = serde_json::to_value(&out[0]).unwrap();
+        assert_eq!(v["content"], serde_json::Value::String("hi".into()));
     }
 
     #[test]

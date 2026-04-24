@@ -10,3 +10,8 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 ciborium = { workspace = true }
 thiserror = { workspace = true }
+# Image bytes are stored raw in memory and serialized via a format-aware
+# helper: base64 for human-readable formats (disk JSON, debug dumps) so a
+# 2 MB image doesn't bloat to 8 MB of `[1, 2, 3, ...]`, raw bytes for CBOR
+# (the wire) so no encode overhead on the hot path.
+base64 = "0.22"

@@ -17,7 +17,9 @@ use futures::stream::{Stream, StreamExt};
 use serde_json::Value;
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
-use whisper_agent_protocol::{ContentBlock, Message, Usage};
+use whisper_agent_protocol::{
+    ContentBlock, ContentCapabilities, ImageMime, MediaSupport, Message, Usage,
+};
 
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 pub type BoxStream<'a, T> = Pin<Box<dyn Stream<Item = T> + Send + 'a>>;
@@ -82,6 +84,11 @@ pub struct ModelInfo {
     /// bound; [`ModelRequest::max_tokens`] is the caller's per-call
     /// choice within that bound.
     pub max_output_tokens: Option<u32>,
+    /// Multimodal capability declaration — which MIME types the model
+    /// accepts as input and emits as output. Adapters fill this in
+    /// from a per-model table (vision support varies across each
+    /// provider's catalog). Default is empty = text-only.
+    pub capabilities: ContentCapabilities,
 }
 
 #[derive(Debug, Error)]
@@ -285,6 +292,50 @@ pub enum UpdateAuthError {
     Invalid(String),
     #[error("failed to persist codex auth.json: {0}")]
     Io(String),
+}
+
+/// Standard JPEG/PNG/WebP/GIF vision set shared across Anthropic and
+/// OpenAI (Chat Completions + Responses). Gemini adds HEIC/HEIF on
+/// top of this.
+pub fn standard_vision_capabilities() -> ContentCapabilities {
+    ContentCapabilities {
+        input: MediaSupport::standard_image_input(),
+        output: MediaSupport::default(),
+    }
+}
+
+/// Vision capability lookup for an OpenAI model id. Covers both the
+/// Chat Completions and Responses catalogs — they share the same
+/// model namespace. Heuristic by id prefix because OpenAI doesn't
+/// publish per-model capability flags on `/v1/models`; refine later
+/// when the upstream adds one. Conservative when unsure — an unknown
+/// id lands as text-only rather than claiming vision that isn't there.
+pub fn openai_vision_capabilities(model_id: &str) -> ContentCapabilities {
+    let lower = model_id.to_ascii_lowercase();
+    let vision = lower.starts_with("gpt-4o")
+        || lower.starts_with("gpt-4.1")
+        || lower.starts_with("gpt-4-turbo")
+        || lower.starts_with("gpt-4-vision")
+        || lower.starts_with("gpt-5")
+        || lower.starts_with("o1")
+        || lower.starts_with("o3")
+        || lower.starts_with("o4")
+        || lower == "chatgpt-4o-latest";
+    if vision {
+        standard_vision_capabilities()
+    } else {
+        ContentCapabilities::default()
+    }
+}
+
+/// Gemini vision set — adds HEIC/HEIF on top of the standard four
+/// since Gemini's inline_data accepts them and we'd otherwise reject
+/// valid uploads at the scheduler edge.
+pub fn gemini_vision_capabilities() -> ContentCapabilities {
+    let mut caps = standard_vision_capabilities();
+    caps.input.image.push(ImageMime::Heic);
+    caps.input.image.push(ImageMime::Heif);
+    caps
 }
 
 /// Drain a `create_message_streaming` stream into a single [`ModelResponse`]

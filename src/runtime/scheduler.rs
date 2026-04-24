@@ -3107,6 +3107,7 @@ impl Scheduler {
         &mut self,
         thread_id: &str,
         text: String,
+        attachments: Vec<whisper_agent_protocol::Attachment>,
         pending_io: &mut FuturesUnordered<SchedulerFuture>,
     ) {
         self.mark_dirty(thread_id);
@@ -3169,7 +3170,7 @@ impl Scheduler {
         let pending_resources = self.pending_resources_for(thread_id);
         let new_state = {
             let task = self.tasks.get_mut(thread_id).expect("task exists");
-            task.submit_user_message(text.clone(), pending_resources);
+            task.submit_user_message(text.clone(), attachments.clone(), pending_resources);
             task.public_state()
         };
         // Emit the user message to subscribers BEFORE the state change
@@ -3180,6 +3181,7 @@ impl Scheduler {
             ServerToClient::ThreadUserMessage {
                 thread_id: thread_id.to_string(),
                 text,
+                attachments,
             },
         );
         self.router

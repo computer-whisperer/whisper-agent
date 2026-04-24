@@ -327,6 +327,7 @@ impl Scheduler {
             Function::CreateThread {
                 pod_id,
                 initial_message,
+                initial_attachments,
                 parent,
                 wait_mode,
                 config_override,
@@ -336,6 +337,7 @@ impl Scheduler {
                     id,
                     pod_id,
                     initial_message,
+                    initial_attachments,
                     parent,
                     wait_mode,
                     config_override,
@@ -923,6 +925,7 @@ impl Scheduler {
         let spec = Function::CreateThread {
             pod_id,
             initial_message: Some(args.prompt.clone()),
+            initial_attachments: Vec::new(),
             parent: Some(crate::functions::ParentLink {
                 thread_id: parent_thread_id.to_string(),
                 tool_use_id: tool_use_id.clone(),
@@ -2262,6 +2265,7 @@ impl Scheduler {
         id: FunctionId,
         pod_id: Option<crate::permission::PodId>,
         initial_message: Option<String>,
+        initial_attachments: Vec<whisper_agent_protocol::Attachment>,
         parent: Option<crate::functions::ParentLink>,
         wait_mode: crate::functions::WaitMode,
         config_override: Option<whisper_agent_protocol::ThreadConfigOverride>,
@@ -2319,7 +2323,13 @@ impl Scheduler {
         };
         self.mark_dirty(&thread_id);
         if let Some(text) = initial_message {
-            self.send_user_message(&thread_id, text, pending_io);
+            self.send_user_message(&thread_id, text, initial_attachments, pending_io);
+        } else if !initial_attachments.is_empty() {
+            // Attachments-without-text is a legitimate compose path (user
+            // dropped an image into a fresh thread without typing anything).
+            // Send with empty text so the Image block(s) still land on the
+            // first user turn.
+            self.send_user_message(&thread_id, String::new(), initial_attachments, pending_io);
         }
         self.step_until_blocked(&thread_id, pending_io);
 

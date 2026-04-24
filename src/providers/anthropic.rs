@@ -207,6 +207,11 @@ impl AnthropicClient {
                 // model-registry override.
                 context_window: None,
                 max_output_tokens: None,
+                // Every current Claude model (Haiku 3, Sonnet 3.5+,
+                // Opus 3+, 4.x) supports vision. Older models aren't
+                // listed on /v1/models anymore, so a blanket assignment
+                // here matches reality.
+                capabilities: crate::providers::model::standard_vision_capabilities(),
             })
             .collect())
     }
@@ -335,6 +340,7 @@ fn message_to_value(m: &Message, cache_last_block: bool) -> Value {
         for block in content.iter_mut() {
             if let Some(obj) = block.as_object_mut() {
                 fold_replay_to_wire(obj);
+                fix_image_block_for_wire(obj);
             }
         }
     }
@@ -379,6 +385,35 @@ fn wrap_text_blocks_in_system_reminder(v: &mut Value) {
             "text".into(),
             Value::String(format!("<system-reminder>\n{text}\n</system-reminder>")),
         );
+    }
+}
+
+/// Translate an `Image` content block from our normalized shape to
+/// Anthropic's wire shape. Two adjustments: rename `source.type` from
+/// `"bytes"` (our internal name) to `"base64"` (what Anthropic expects),
+/// and expand `media_type` from our enum value (`"png"`) to the full
+/// MIME string (`"image/png"`). `source.data` is already a base64
+/// string — `image_bytes_serde` handles that when serializing to
+/// human-readable JSON, so no re-encoding is needed here. URL sources
+/// pass through unchanged (our `{type:"url", url:...}` matches
+/// Anthropic exactly).
+///
+/// Scope: top-level image blocks on user turns. Tool-result images
+/// (nested under `ToolResultContent::Blocks`) aren't v1 scope — those
+/// need a recursive walk and won't reach here until v2 wires them up.
+fn fix_image_block_for_wire(obj: &mut serde_json::Map<String, Value>) {
+    if obj.get("type").and_then(Value::as_str) != Some("image") {
+        return;
+    }
+    let Some(source) = obj.get_mut("source").and_then(|s| s.as_object_mut()) else {
+        return;
+    };
+    if source.get("type").and_then(Value::as_str) == Some("bytes") {
+        source.insert("type".into(), Value::String("base64".into()));
+        if let Some(mt) = source.get("media_type").and_then(Value::as_str) {
+            let full = format!("image/{mt}");
+            source.insert("media_type".into(), Value::String(full));
+        }
     }
 }
 
@@ -935,6 +970,49 @@ mod tests {
                 is_error: false,
             }]),
         ]
+    }
+
+    #[test]
+    fn image_bytes_block_renders_anthropic_wire_shape() {
+        // ContentBlock::Image { Bytes { mime=png, data=<raw> } } should
+        // emit the Anthropic wire form: source.type="base64",
+        // media_type="image/png", data=<base64>. Covers the fix-up from
+        // our internal "bytes" tag + enum media_type → full MIME string.
+        use whisper_agent_protocol::{ImageMime, ImageSource};
+        let msg = Message::user_blocks(vec![
+            ContentBlock::Text {
+                text: "what's in this image?".into(),
+            },
+            ContentBlock::Image {
+                source: ImageSource::Bytes {
+                    media_type: ImageMime::Png,
+                    data: vec![137, 80, 78, 71, 13, 10, 26, 10],
+                },
+            },
+        ]);
+        let v = message_to_value(&msg, false);
+        let content = v.get("content").and_then(|c| c.as_array()).unwrap();
+        let image = &content[1];
+        assert_eq!(image["type"], "image");
+        assert_eq!(image["source"]["type"], "base64");
+        assert_eq!(image["source"]["media_type"], "image/png");
+        assert_eq!(image["source"]["data"], "iVBORw0KGgo=");
+    }
+
+    #[test]
+    fn image_url_block_renders_anthropic_wire_shape() {
+        use whisper_agent_protocol::ImageSource;
+        let msg = Message::user_blocks(vec![ContentBlock::Image {
+            source: ImageSource::Url {
+                url: "https://example.com/cat.jpg".into(),
+            },
+        }]);
+        let v = message_to_value(&msg, false);
+        let content = v.get("content").and_then(|c| c.as_array()).unwrap();
+        let image = &content[0];
+        assert_eq!(image["type"], "image");
+        assert_eq!(image["source"]["type"], "url");
+        assert_eq!(image["source"]["url"], "https://example.com/cat.jpg");
     }
 
     #[test]

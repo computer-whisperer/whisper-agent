@@ -318,13 +318,17 @@ impl OpenAiResponsesClient {
                 // Mirror Codex's own picker filter: only models the backend
                 // marks as user-visible AND usable via the Responses API.
                 .filter(|m| m.supported_in_api && m.visibility.as_deref() == Some("list"))
-                .map(|m| ModelInfo {
-                    id: m.slug,
-                    display_name: m.display_name,
-                    // Codex's /models payload carries display + visibility
-                    // but no numeric context/output caps; leave unknown.
-                    context_window: None,
-                    max_output_tokens: None,
+                .map(|m| {
+                    let capabilities = crate::providers::model::openai_vision_capabilities(&m.slug);
+                    ModelInfo {
+                        id: m.slug,
+                        display_name: m.display_name,
+                        // Codex's /models payload carries display + visibility
+                        // but no numeric context/output caps; leave unknown.
+                        context_window: None,
+                        max_output_tokens: None,
+                        capabilities,
+                    }
                 })
                 .collect())
         } else {
@@ -335,11 +339,15 @@ impl OpenAiResponsesClient {
             Ok(parsed
                 .data
                 .into_iter()
-                .map(|m| ModelInfo {
-                    id: m.id,
-                    display_name: None,
-                    context_window: None,
-                    max_output_tokens: None,
+                .map(|m| {
+                    let capabilities = crate::providers::model::openai_vision_capabilities(&m.id);
+                    ModelInfo {
+                        id: m.id,
+                        display_name: None,
+                        context_window: None,
+                        max_output_tokens: None,
+                        capabilities,
+                    }
                 })
                 .collect())
         }
@@ -447,11 +455,36 @@ fn convert_system_message(blocks: &[ContentBlock], out: &mut Vec<RspItem>) {
     });
 }
 
-/// A user turn is a mix of plain text and tool results. Responses wants tool
-/// results as standalone `function_call_output` items, so we emit those
-/// inline and flush accumulated text as a `message` item at the boundary.
+/// A user turn is a mix of plain text, tool results, and multimodal
+/// attachments. Responses wants tool results as standalone
+/// `function_call_output` items, so those come out inline; text and
+/// images land together on a single `message` item with a
+/// `content: [{InputText}, {InputImage}, ...]` parts vector.
+///
+/// The parts buffer is built eagerly when we hit the first image — we
+/// need it whether or not text shows up after. Pure text turns still
+/// emit one `InputText` part in their message (same shape they already
+/// had).
 fn convert_user_message(blocks: &[ContentBlock], out: &mut Vec<RspItem>) {
+    let mut parts: Vec<RspInputMessagePart> = Vec::new();
     let mut text_accum = String::new();
+    let fold_text = |parts: &mut Vec<RspInputMessagePart>, text_accum: &mut String| {
+        if !text_accum.is_empty() {
+            parts.push(RspInputMessagePart::InputText {
+                text: std::mem::take(text_accum),
+            });
+        }
+    };
+    let flush_message =
+        |parts: &mut Vec<RspInputMessagePart>, text_accum: &mut String, out: &mut Vec<RspItem>| {
+            fold_text(parts, text_accum);
+            if !parts.is_empty() {
+                out.push(RspItem::Message {
+                    role: "user",
+                    content: std::mem::take(parts),
+                });
+            }
+        };
     for block in blocks {
         match block {
             ContentBlock::Text { text } => {
@@ -460,12 +493,16 @@ fn convert_user_message(blocks: &[ContentBlock], out: &mut Vec<RspItem>) {
                 }
                 text_accum.push_str(text);
             }
+            ContentBlock::Image { source } => {
+                fold_text(&mut parts, &mut text_accum);
+                parts.push(image_source_to_input_part(source));
+            }
             ContentBlock::ToolResult {
                 tool_use_id,
                 content,
                 is_error,
             } => {
-                flush_user_text(&mut text_accum, out);
+                flush_message(&mut parts, &mut text_accum, out);
                 out.push(RspItem::FunctionCallOutput {
                     call_id: tool_use_id.clone(),
                     output: tool_result_as_text(content, *is_error),
@@ -478,19 +515,28 @@ fn convert_user_message(blocks: &[ContentBlock], out: &mut Vec<RspItem>) {
             }
         }
     }
-    flush_user_text(&mut text_accum, out);
+    flush_message(&mut parts, &mut text_accum, out);
 }
 
-fn flush_user_text(text_accum: &mut String, out: &mut Vec<RspItem>) {
-    if text_accum.is_empty() {
-        return;
+/// Lower an image source to the Responses API's `input_image` part.
+/// Bytes → base64 data URL; Url → https passthrough. File-id references
+/// aren't v1 scope — Files API integration is deferred until we hit a
+/// cost/size constraint that makes inline bytes impractical.
+fn image_source_to_input_part(src: &whisper_agent_protocol::ImageSource) -> RspInputMessagePart {
+    use base64::Engine;
+    use base64::engine::general_purpose::STANDARD;
+    use whisper_agent_protocol::ImageSource;
+    let url = match src {
+        ImageSource::Bytes { media_type, data } => format!(
+            "data:{};base64,{}",
+            media_type.as_mime_str(),
+            STANDARD.encode(data)
+        ),
+        ImageSource::Url { url } => url.clone(),
+    };
+    RspInputMessagePart::InputImage {
+        image_url: Some(url),
     }
-    out.push(RspItem::Message {
-        role: "user",
-        content: vec![RspInputMessagePart::InputText {
-            text: std::mem::take(text_accum),
-        }],
-    });
 }
 
 fn convert_assistant_message(blocks: &[ContentBlock], out: &mut Vec<RspItem>) {
@@ -546,6 +592,11 @@ fn convert_assistant_message(blocks: &[ContentBlock], out: &mut Vec<RspItem>) {
             }
             ContentBlock::ToolResult { .. } | ContentBlock::ToolSchema { .. } => {
                 // Neither belongs on an assistant message.
+            }
+            ContentBlock::Image { .. } => {
+                // Model-emitted images come from the `image_generation` built-in
+                // tool (not yet wired up on our side) — nothing reaches here
+                // from a persisted assistant turn today. Drop silently.
             }
         }
     }
@@ -1142,8 +1193,21 @@ enum RspItem {
 #[derive(Serialize, Debug)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum RspInputMessagePart {
-    InputText { text: String },
-    OutputText { text: String },
+    InputText {
+        text: String,
+    },
+    OutputText {
+        text: String,
+    },
+    /// Responses-API user-input image. Accepts either an `image_url`
+    /// (https URL or `data:image/...;base64,...` data URL) or a
+    /// `file_id` from the Files API. V1 uses `image_url` for both
+    /// inline bytes and user-supplied URLs; Files-API integration is
+    /// deferred until v2.
+    InputImage {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        image_url: Option<String>,
+    },
 }
 
 #[derive(Serialize, Debug)]
@@ -1327,6 +1391,48 @@ mod tests {
             serde_json::json!([
                 {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hello"}]}
             ])
+        );
+    }
+
+    #[test]
+    fn serializes_user_message_with_image_bytes() {
+        use whisper_agent_protocol::{ImageMime, ImageSource};
+        let msg = Message::user_blocks(vec![
+            ContentBlock::Text {
+                text: "what's here?".into(),
+            },
+            ContentBlock::Image {
+                source: ImageSource::Bytes {
+                    media_type: ImageMime::Jpeg,
+                    data: vec![0xff, 0xd8, 0xff, 0xe0],
+                },
+            },
+        ]);
+        let mut items = Vec::new();
+        convert_message(&msg, &mut items);
+        let json = serde_json::to_value(&items).unwrap();
+        let content = &json[0]["content"];
+        assert_eq!(content[0]["type"], "input_text");
+        assert_eq!(content[0]["text"], "what's here?");
+        assert_eq!(content[1]["type"], "input_image");
+        let url = content[1]["image_url"].as_str().unwrap();
+        assert!(url.starts_with("data:image/jpeg;base64,"), "url={url}");
+    }
+
+    #[test]
+    fn serializes_user_message_with_image_url() {
+        use whisper_agent_protocol::ImageSource;
+        let msg = Message::user_blocks(vec![ContentBlock::Image {
+            source: ImageSource::Url {
+                url: "https://example.com/a.png".into(),
+            },
+        }]);
+        let mut items = Vec::new();
+        convert_message(&msg, &mut items);
+        let json = serde_json::to_value(&items).unwrap();
+        assert_eq!(
+            json[0]["content"][0]["image_url"],
+            "https://example.com/a.png"
         );
     }
 

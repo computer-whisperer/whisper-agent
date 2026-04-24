@@ -23,7 +23,8 @@ pub use behavior::{
     CatchUp, Overlap, RetentionPolicy, TriggerSpec,
 };
 pub use conversation::{
-    ContentBlock, Conversation, Message, ProviderReplay, Role, ToolResultContent,
+    Attachment, ContentBlock, ContentCapabilities, Conversation, ImageMime, ImageSource,
+    MediaSupport, Message, ProviderReplay, Role, ToolResultContent,
 };
 pub use permission::{BehaviorOpsCap, DispatchCap, PodModifyCap};
 pub use pod::{
@@ -544,6 +545,18 @@ pub struct ModelSummary {
     /// when not exposed by the upstream.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_output_tokens: Option<u32>,
+    /// Which media kinds/MIMEs the model accepts and emits. Adapters
+    /// populate the input side from a per-model table; the output
+    /// side is empty today (v2 when Gemini / OpenAI-Responses image
+    /// output lands). Empty for models we haven't explicitly
+    /// classified — treat that as "text only" at the UI layer.
+    #[serde(default, skip_serializing_if = "ContentCapabilities_is_default")]
+    pub capabilities: ContentCapabilities,
+}
+
+#[allow(non_snake_case)]
+fn ContentCapabilities_is_default(c: &ContentCapabilities) -> bool {
+    c.input.is_empty() && c.output.is_empty()
 }
 
 // ---------- Resource registry ----------
@@ -787,6 +800,13 @@ pub enum ClientToServer {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pod_id: Option<String>,
         initial_message: String,
+        /// Media attached to the initial user message (images today,
+        /// audio/documents later). Rendered by the scheduler into
+        /// additional content blocks on the first user turn,
+        /// interleaved after the text. Empty on every pre-existing
+        /// client.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        initial_attachments: Vec<Attachment>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         config_override: Option<ThreadConfigOverride>,
         /// Override resource bindings (backend / sandbox / shared MCP hosts).
@@ -799,6 +819,11 @@ pub enum ClientToServer {
     SendUserMessage {
         thread_id: String,
         text: String,
+        /// Media attached to this user message. Rendered by the
+        /// scheduler as additional content blocks after the text.
+        /// Empty when the client sends a plain text-only turn.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        attachments: Vec<Attachment>,
     },
     /// Cancel a task. Stubbed for now — flips state to `Cancelled` without rolling back
     /// any in-flight tool work. Proper rollback semantics are a v0.3 problem.
@@ -1341,6 +1366,13 @@ pub enum ServerToClient {
     ThreadUserMessage {
         thread_id: String,
         text: String,
+        /// Media that was attached alongside the text, in the order
+        /// the scheduler placed them in the underlying content-block
+        /// sequence. Empty for server-injected messages (behavior
+        /// prompts, compaction seeds, etc.) and for text-only
+        /// `SendUserMessage` echoes.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        attachments: Vec<Attachment>,
     },
     /// A `Role::ToolResult` text message was appended to the
     /// conversation. Fires for async `dispatch_thread` callbacks

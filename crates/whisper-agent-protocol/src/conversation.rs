@@ -155,6 +155,226 @@ impl Message {
     }
 }
 
+/// Image MIME types we carry through the protocol. Kept as a closed
+/// enum (not a free-form string) so capability declarations
+/// (`ContentCapabilities::input.image`) can be compared by value and
+/// provider adapters get exhaustive matching when deciding how to
+/// translate. Covers the union of what the four backends actually
+/// accept today; anything outside this set gets rejected at the
+/// scheduler edge.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum ImageMime {
+    Jpeg,
+    Png,
+    Gif,
+    Webp,
+    /// Apple's HEIC/HEIF — accepted by Gemini, rejected by
+    /// Anthropic/OpenAI. Adapters that can't serve it must surface a
+    /// clear error before dispatch rather than forwarding a 400 from
+    /// upstream.
+    Heic,
+    Heif,
+}
+
+impl ImageMime {
+    pub fn as_mime_str(self) -> &'static str {
+        match self {
+            ImageMime::Jpeg => "image/jpeg",
+            ImageMime::Png => "image/png",
+            ImageMime::Gif => "image/gif",
+            ImageMime::Webp => "image/webp",
+            ImageMime::Heic => "image/heic",
+            ImageMime::Heif => "image/heif",
+        }
+    }
+
+    /// Parse a MIME string into the closed enum. Accepts the common
+    /// `image/jpg` alias as `Jpeg`. Returns `None` for anything we
+    /// don't carry — callers reject at that boundary.
+    pub fn from_mime_str(s: &str) -> Option<Self> {
+        match s.to_ascii_lowercase().as_str() {
+            "image/jpeg" | "image/jpg" => Some(ImageMime::Jpeg),
+            "image/png" => Some(ImageMime::Png),
+            "image/gif" => Some(ImageMime::Gif),
+            "image/webp" => Some(ImageMime::Webp),
+            "image/heic" => Some(ImageMime::Heic),
+            "image/heif" => Some(ImageMime::Heif),
+            _ => None,
+        }
+    }
+}
+
+/// Where the bytes of an image content block come from.
+///
+/// `Bytes` is the canonical form: every backend accepts inline image
+/// data (base64 / data URL / `inline_data`), so the scheduler can
+/// always dispatch a thread containing these. `Url` is a convenience
+/// for user-supplied web URLs — Anthropic and OpenAI pass it through
+/// natively; the Gemini adapter has to fetch-and-inline because
+/// Gemini doesn't accept URL image sources.
+///
+/// Data lives as raw bytes in memory. Adapters encode per-provider at
+/// send time (base64 for Anthropic / OpenAI Chat data URLs / OpenAI
+/// Responses, raw bytes then base64 for Gemini `inline_data`). We
+/// don't keep a base64 string around because the hot path is the
+/// outbound encode, not in-memory inspection.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ImageSource {
+    Bytes {
+        media_type: ImageMime,
+        #[serde(with = "image_bytes_serde")]
+        data: Vec<u8>,
+    },
+    Url {
+        url: String,
+    },
+}
+
+/// Format-aware (de)serialization for image byte buffers. Human-
+/// readable formats (disk JSON, debug dumps, YAML test fixtures) get
+/// a base64 string so a 2 MB image doesn't balloon to 8 MB of
+/// `[1, 2, 3, ...]`. Binary formats (CBOR on the wire) get native
+/// byte-string encoding — zero-copy on the wire, no encode overhead.
+mod image_bytes_serde {
+    use base64::Engine;
+    use base64::engine::general_purpose::STANDARD;
+    use serde::de::{self, Visitor};
+    use serde::{Deserializer, Serializer};
+    use std::fmt;
+
+    pub fn serialize<S: Serializer>(data: &[u8], s: S) -> Result<S::Ok, S::Error> {
+        if s.is_human_readable() {
+            s.serialize_str(&STANDARD.encode(data))
+        } else {
+            s.serialize_bytes(data)
+        }
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<u8>, D::Error> {
+        struct V;
+        impl<'de> Visitor<'de> for V {
+            type Value = Vec<u8>;
+            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                f.write_str("base64 string or raw byte buffer")
+            }
+            fn visit_str<E: de::Error>(self, v: &str) -> Result<Self::Value, E> {
+                STANDARD.decode(v).map_err(de::Error::custom)
+            }
+            fn visit_string<E: de::Error>(self, v: String) -> Result<Self::Value, E> {
+                self.visit_str(&v)
+            }
+            fn visit_bytes<E: de::Error>(self, v: &[u8]) -> Result<Self::Value, E> {
+                Ok(v.to_vec())
+            }
+            fn visit_byte_buf<E: de::Error>(self, v: Vec<u8>) -> Result<Self::Value, E> {
+                Ok(v)
+            }
+            fn visit_seq<A: de::SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+                // Tolerate the `[1, 2, 3]` shape any plain serde_bytes-less
+                // producer would emit — lets us read conversations that
+                // predated the format-aware serializer, or bytes that
+                // another JSON producer rendered as an int array.
+                let mut out = Vec::with_capacity(seq.size_hint().unwrap_or(0));
+                while let Some(b) = seq.next_element::<u8>()? {
+                    out.push(b);
+                }
+                Ok(out)
+            }
+        }
+        d.deserialize_any(V)
+    }
+}
+
+/// What a model is willing to ingest / emit on each media axis.
+/// Empty `image` / `audio` / `document` on the `input` side means
+/// "this model doesn't accept user-supplied media of that kind";
+/// empty on the `output` side means "won't emit it." The webui
+/// consults `input.image` to gate paste/drop, and scheduler-side
+/// pre-dispatch validation rejects attachments whose MIME isn't
+/// listed (cleaner 400 from us than a 400 bounced back from
+/// upstream after the bytes are on the wire).
+///
+/// Kept per-MIME (not a boolean) because providers actually
+/// diverge by MIME — Gemini accepts HEIC/HEIF, the others don't;
+/// Anthropic does GIF but OpenAI only does non-animated GIF. We
+/// store what the model accepts, not a lowest-common-denominator.
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
+pub struct ContentCapabilities {
+    #[serde(default, skip_serializing_if = "MediaSupport::is_empty")]
+    pub input: MediaSupport,
+    #[serde(default, skip_serializing_if = "MediaSupport::is_empty")]
+    pub output: MediaSupport,
+}
+
+/// Per-kind MIME listing for either the input or output side of a
+/// model. Audio / document variants are kept as forward-compatible
+/// placeholders — they serialize as empty vecs today and become real
+/// once their `AudioMime` / `DocumentMime` enums ship. Typed as
+/// `Vec<String>` for now to avoid churning the protocol when those
+/// lists grow; the one media kind we have typed (`image`) uses the
+/// strong enum.
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
+pub struct MediaSupport {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub image: Vec<ImageMime>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub audio: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub document: Vec<String>,
+}
+
+impl MediaSupport {
+    pub fn is_empty(&self) -> bool {
+        self.image.is_empty() && self.audio.is_empty() && self.document.is_empty()
+    }
+
+    /// Convenience for the common provider case: "this model accepts
+    /// JPEG, PNG, WEBP, GIF image input, nothing else." Gemini
+    /// overrides with HEIC/HEIF added.
+    pub fn standard_image_input() -> Self {
+        Self {
+            image: vec![
+                ImageMime::Jpeg,
+                ImageMime::Png,
+                ImageMime::Webp,
+                ImageMime::Gif,
+            ],
+            audio: Vec::new(),
+            document: Vec::new(),
+        }
+    }
+}
+
+/// Media a client attaches to an outbound user message or a thread-
+/// creation request. Restricted subset of [`ContentBlock`] — the
+/// scheduler unpacks each variant into the matching content-block kind
+/// when assembling the message, so the server never has to trust the
+/// client to send arbitrary content-block shapes (no `ToolUse` or
+/// `Thinking` on the wire from a client).
+///
+/// Kept as a `kind`-tagged enum rather than a wrapper struct so
+/// extending to audio / document attachments later is a new variant,
+/// not a schema migration.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum Attachment {
+    Image { source: ImageSource },
+}
+
+impl Attachment {
+    /// Lower an attachment into the content-block the scheduler pushes
+    /// onto the conversation. Kept as a method on `Attachment` so new
+    /// attachment kinds can't be added without also defining the
+    /// content-block mapping — they become compile errors here.
+    pub fn into_content_block(self) -> ContentBlock {
+        match self {
+            Attachment::Image { source } => ContentBlock::Image { source },
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ContentBlock {
@@ -188,6 +408,14 @@ pub enum ContentBlock {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         replay: Option<ProviderReplay>,
         thinking: String,
+    },
+    /// User-supplied or model-generated image. User-supplied side works
+    /// today; model-generated side is a placeholder for the v2 output path
+    /// (Gemini native image output, OpenAI Responses `image_generation`
+    /// tool) and isn't produced yet. Adapters translate `ImageSource`
+    /// into their provider-specific wire shape at send time.
+    Image {
+        source: ImageSource,
     },
     /// One entry in a tool manifest snapshot. Appears only as content
     /// on a `Role::Tools` message; provider adapters lift it into
@@ -563,6 +791,55 @@ mod tests {
         assert_eq!(conv.messages().len(), 2);
         assert_eq!(conv.messages()[0].role, Role::User);
         assert_eq!(conv.messages()[1].role, Role::ToolResult);
+    }
+
+    #[test]
+    fn image_source_bytes_roundtrips_as_base64_in_json() {
+        // Human-readable formats (disk JSON) encode the bytes as a
+        // compact base64 string, not an int-array. Verifies both
+        // directions of the format-aware helper.
+        let src = ImageSource::Bytes {
+            media_type: ImageMime::Png,
+            data: vec![137, 80, 78, 71, 13, 10, 26, 10],
+        };
+        let json = serde_json::to_string(&src).unwrap();
+        assert!(
+            json.contains("\"iVBORw0KGgo=\""),
+            "expected base64-encoded PNG magic bytes, got: {json}"
+        );
+        let back: ImageSource = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, src);
+    }
+
+    #[test]
+    fn image_source_bytes_roundtrips_through_cbor_as_raw_bytes() {
+        // Binary formats get native byte-string encoding — roundtrip is
+        // the behavior we care about; the exact CBOR shape is ciborium's
+        // implementation detail.
+        let src = ImageSource::Bytes {
+            media_type: ImageMime::Jpeg,
+            data: vec![0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10],
+        };
+        let mut buf = Vec::new();
+        ciborium::ser::into_writer(&src, &mut buf).unwrap();
+        let back: ImageSource = ciborium::de::from_reader(buf.as_slice()).unwrap();
+        assert_eq!(back, src);
+    }
+
+    #[test]
+    fn image_source_bytes_tolerates_legacy_int_array_json() {
+        // If a prior producer emitted the raw serde_bytes-less shape
+        // (int array) we still deserialize successfully — the
+        // human-readable Visitor accepts both forms.
+        let legacy = r#"{"type":"bytes","media_type":"png","data":[137,80,78,71]}"#;
+        let src: ImageSource = serde_json::from_str(legacy).unwrap();
+        match src {
+            ImageSource::Bytes { data, media_type } => {
+                assert_eq!(data, vec![137, 80, 78, 71]);
+                assert_eq!(media_type, ImageMime::Png);
+            }
+            other => panic!("expected Bytes, got {other:?}"),
+        }
     }
 
     #[test]

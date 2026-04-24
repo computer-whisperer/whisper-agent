@@ -78,6 +78,12 @@ pub enum Function {
         /// `None` routes to the server's default pod.
         pod_id: Option<PodId>,
         initial_message: Option<String>,
+        /// Media attached to the initial user message. Empty when
+        /// the caller is a server-side flow (behavior trigger,
+        /// dispatched child thread) that has no attachments to carry,
+        /// or a text-only client. Flows through to the first
+        /// `send_user_message` call on the newly-created thread.
+        initial_attachments: Vec<whisper_agent_protocol::Attachment>,
         parent: Option<ParentLink>,
         wait_mode: WaitMode,
         config_override: Option<ThreadConfigOverride>,

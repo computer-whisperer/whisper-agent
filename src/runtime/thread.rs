@@ -499,13 +499,37 @@ impl Thread {
     /// Apply a user-submitted message. Appends to the conversation and starts
     /// the loop (or re-starts after a completed/failed cycle).
     ///
+    /// `attachments` are media items the client bundled with the message
+    /// (images today, audio/documents later). They're lowered into
+    /// [`ContentBlock`]s and appended after the text block, in arrival
+    /// order — providers receive `[text, image1, image2, ...]` which
+    /// matches the "images come before prompt" guidance when the text
+    /// block itself is the question.
+    ///
     /// `pending_resources` is the subset of `bindings.*` ids the scheduler
     /// hasn't observed transition to Ready yet — empty means "go straight
     /// to NeedsModelCall." When non-empty the thread parks in
     /// `WaitingOnResources` and the scheduler nudges it via
     /// [`Self::clear_waiting_resource`] as each id flips Ready.
-    pub fn submit_user_message(&mut self, text: String, pending_resources: Vec<String>) {
-        self.conversation.push(Message::user_text(text));
+    pub fn submit_user_message(
+        &mut self,
+        text: String,
+        attachments: Vec<whisper_agent_protocol::Attachment>,
+        pending_resources: Vec<String>,
+    ) {
+        let msg = if attachments.is_empty() {
+            Message::user_text(text)
+        } else {
+            let mut blocks = Vec::with_capacity(1 + attachments.len());
+            if !text.is_empty() {
+                blocks.push(whisper_agent_protocol::ContentBlock::Text { text });
+            }
+            for a in attachments {
+                blocks.push(a.into_content_block());
+            }
+            Message::user_blocks(blocks)
+        };
+        self.conversation.push(msg);
         self.turns_in_cycle = 0;
         self.internal = if pending_resources.is_empty() {
             ThreadInternalState::NeedsModelCall
@@ -1677,7 +1701,7 @@ mod tests {
         let mut events = Vec::new();
         let interrupted = task.heal_to_idle("new_user_msg", &mut events);
         assert_eq!(interrupted, vec!["toolu_x".to_string()]);
-        task.submit_user_message("follow-up".into(), Vec::new());
+        task.submit_user_message("follow-up".into(), Vec::new(), Vec::new());
         assert!(matches!(task.internal, ThreadInternalState::NeedsModelCall));
         let msgs = task.conversation.messages();
         // [assistant[tool_use], tool_result, user]

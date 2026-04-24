@@ -4831,6 +4831,7 @@ dependencies = [
 name = "whisper-agent-protocol"
 version = "0.3.7"
 dependencies = [
+ "base64",
  "ciborium",
  "serde",
  "serde_json",
