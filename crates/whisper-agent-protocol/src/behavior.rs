@@ -212,8 +212,14 @@ pub enum CatchUp {
 pub struct BehaviorThreadOverride {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// Override for the spawned thread's per-request output cap (see
+    /// [`crate::ThreadConfig::max_tokens`]). `None` inherits from the
+    /// pod's `thread_defaults.max_tokens`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_tokens: Option<u32>,
+    /// Override for the spawned thread's per-cycle assistant turn
+    /// limit (see [`crate::ThreadConfig::max_turns`]). `None` inherits
+    /// from `thread_defaults.max_turns`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_turns: Option<u32>,
     /// Per-thread system prompt for behavior-spawned threads. `None`

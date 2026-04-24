@@ -412,6 +412,8 @@ impl GeminiClient {
                             .unwrap_or(&m.name)
                             .to_string(),
                         display_name: m.display_name,
+                        context_window: m.input_token_limit,
+                        max_output_tokens: m.output_token_limit,
                     })
                     .collect())
             }
@@ -420,36 +422,25 @@ impl GeminiClient {
                 // the set gemini-cli ships in VALID_GEMINI_MODELS. Users pick
                 // via config; `gemini-3-*-preview` variants require preview
                 // access on the account (the server returns a clear 403 if
-                // not).
+                // not). Context/output caps unknown on this route — the
+                // API-key route reports them but Code Assist doesn't.
+                let entry = |id: &str, name: &str| ModelInfo {
+                    id: id.into(),
+                    display_name: Some(name.into()),
+                    context_window: None,
+                    max_output_tokens: None,
+                };
                 Ok(vec![
-                    ModelInfo {
-                        id: "gemini-3-pro-preview".into(),
-                        display_name: Some("Gemini 3 Pro (preview)".into()),
-                    },
-                    ModelInfo {
-                        id: "gemini-3.1-pro-preview".into(),
-                        display_name: Some("Gemini 3.1 Pro (preview)".into()),
-                    },
-                    ModelInfo {
-                        id: "gemini-3-flash-preview".into(),
-                        display_name: Some("Gemini 3 Flash (preview)".into()),
-                    },
-                    ModelInfo {
-                        id: "gemini-3.1-flash-lite-preview".into(),
-                        display_name: Some("Gemini 3.1 Flash Lite (preview)".into()),
-                    },
-                    ModelInfo {
-                        id: "gemini-2.5-pro".into(),
-                        display_name: Some("Gemini 2.5 Pro".into()),
-                    },
-                    ModelInfo {
-                        id: "gemini-2.5-flash".into(),
-                        display_name: Some("Gemini 2.5 Flash".into()),
-                    },
-                    ModelInfo {
-                        id: "gemini-2.5-flash-lite".into(),
-                        display_name: Some("Gemini 2.5 Flash Lite".into()),
-                    },
+                    entry("gemini-3-pro-preview", "Gemini 3 Pro (preview)"),
+                    entry("gemini-3.1-pro-preview", "Gemini 3.1 Pro (preview)"),
+                    entry("gemini-3-flash-preview", "Gemini 3 Flash (preview)"),
+                    entry(
+                        "gemini-3.1-flash-lite-preview",
+                        "Gemini 3.1 Flash Lite (preview)",
+                    ),
+                    entry("gemini-2.5-pro", "Gemini 2.5 Pro"),
+                    entry("gemini-2.5-flash", "Gemini 2.5 Flash"),
+                    entry("gemini-2.5-flash-lite", "Gemini 2.5 Flash Lite"),
                 ])
             }
         }
@@ -1223,6 +1214,14 @@ struct ListedModel {
     display_name: Option<String>,
     #[serde(default)]
     supported_generation_methods: Vec<String>,
+    /// Max input tokens the model accepts. Gemini's `/v1beta/models`
+    /// publishes this as `inputTokenLimit`.
+    #[serde(default)]
+    input_token_limit: Option<u32>,
+    /// Max output tokens the model will generate. Published as
+    /// `outputTokenLimit`.
+    #[serde(default)]
+    output_token_limit: Option<u32>,
 }
 
 #[cfg(test)]
@@ -1238,6 +1237,47 @@ mod tests {
             messages,
             cache_breakpoints: &[],
         }
+    }
+
+    #[test]
+    fn list_models_parses_input_and_output_token_limits() {
+        // Gemini's /v1beta/models returns camelCase `inputTokenLimit`
+        // and `outputTokenLimit` per model. Confirm they land on the
+        // ListedModel struct so do_list_models can forward them into
+        // ModelInfo.context_window / max_output_tokens.
+        let json = r#"{
+            "models": [
+                {
+                    "name": "models/gemini-2.5-pro",
+                    "displayName": "Gemini 2.5 Pro",
+                    "supportedGenerationMethods": ["generateContent", "countTokens"],
+                    "inputTokenLimit": 1048576,
+                    "outputTokenLimit": 8192
+                }
+            ]
+        }"#;
+        let parsed: ListModelsResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed.models.len(), 1);
+        let m = &parsed.models[0];
+        assert_eq!(m.input_token_limit, Some(1048576));
+        assert_eq!(m.output_token_limit, Some(8192));
+    }
+
+    #[test]
+    fn list_models_omits_token_limits_gracefully() {
+        // Older / partial responses may lack the limit fields — they
+        // must deserialize to None rather than erroring.
+        let json = r#"{
+            "models": [
+                {
+                    "name": "models/legacy",
+                    "supportedGenerationMethods": ["generateContent"]
+                }
+            ]
+        }"#;
+        let parsed: ListModelsResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed.models[0].input_token_limit, None);
+        assert_eq!(parsed.models[0].output_token_limit, None);
     }
 
     #[test]

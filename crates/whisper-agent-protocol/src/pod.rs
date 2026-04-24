@@ -119,7 +119,14 @@ pub struct ThreadDefaults {
     pub model: String,
     /// Path relative to the pod directory.
     pub system_prompt_file: String,
+    /// Default per-request output cap for threads in this pod — the
+    /// ceiling on tokens the model may generate in a single response.
+    /// Threads inherit this into [`crate::ThreadConfig::max_tokens`]
+    /// and can override via [`crate::ThreadConfigOverride::max_tokens`].
+    /// Not the model's context window.
     pub max_tokens: u32,
+    /// Default per-cycle assistant turn limit. Threads inherit this
+    /// into [`crate::ThreadConfig::max_turns`].
     pub max_turns: u32,
     /// Names of `[[allow.host_env]]` entries threads in this pod bind
     /// to by default. Empty allowed (threads fall back to the bare

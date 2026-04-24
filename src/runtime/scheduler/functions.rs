@@ -1285,14 +1285,23 @@ impl Scheduler {
                         );
                     } else {
                         for m in models {
-                            match m.display_name {
-                                Some(dn) if !dn.is_empty() && dn != m.id => {
-                                    s.push_str(&format!("- `{}` — {}\n", m.id, dn));
+                            let head = match m.display_name {
+                                Some(ref dn) if !dn.is_empty() && dn != &m.id => {
+                                    format!("- `{}` — {}", m.id, dn)
                                 }
-                                _ => {
-                                    s.push_str(&format!("- `{}`\n", m.id));
+                                _ => format!("- `{}`", m.id),
+                            };
+                            let caps = match (m.context_window, m.max_output_tokens) {
+                                (Some(ctx), Some(out)) => {
+                                    format!(" (ctx {ctx}, max_out {out})")
                                 }
-                            }
+                                (Some(ctx), None) => format!(" (ctx {ctx})"),
+                                (None, Some(out)) => format!(" (max_out {out})"),
+                                (None, None) => String::new(),
+                            };
+                            s.push_str(&head);
+                            s.push_str(&caps);
+                            s.push('\n');
                         }
                     }
                     Ok(s)

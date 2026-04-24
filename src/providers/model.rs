@@ -24,6 +24,12 @@ pub type BoxStream<'a, T> = Pin<Box<dyn Stream<Item = T> + Send + 'a>>;
 
 pub struct ModelRequest<'a> {
     pub model: &'a str,
+    /// Per-request output cap — the maximum number of tokens the model
+    /// may generate in this single response. This is a ceiling on the
+    /// *response*, not the model's total input context window (for
+    /// that, see [`ModelInfo::context_window`]). Anthropic requires
+    /// this field; OpenAI's Responses API ignores it; others pass it
+    /// through as `max_output_tokens` / `max_completion_tokens`.
     pub max_tokens: u32,
     pub system_prompt: &'a str,
     pub tools: &'a [ToolSpec],
@@ -66,6 +72,16 @@ pub struct ModelResponse {
 pub struct ModelInfo {
     pub id: String,
     pub display_name: Option<String>,
+    /// Maximum input context the model will accept, in tokens. `None`
+    /// when the upstream `/models` endpoint doesn't publish it —
+    /// today Anthropic and both OpenAI routes don't, so their entries
+    /// land as `None`. Gemini and llama.cpp report the real number.
+    pub context_window: Option<u32>,
+    /// Provider-declared ceiling on output tokens per request. `None`
+    /// when not exposed by the upstream API. This is the hard upper
+    /// bound; [`ModelRequest::max_tokens`] is the caller's per-call
+    /// choice within that bound.
+    pub max_output_tokens: Option<u32>,
 }
 
 #[derive(Debug, Error)]

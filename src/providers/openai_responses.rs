@@ -321,6 +321,10 @@ impl OpenAiResponsesClient {
                 .map(|m| ModelInfo {
                     id: m.slug,
                     display_name: m.display_name,
+                    // Codex's /models payload carries display + visibility
+                    // but no numeric context/output caps; leave unknown.
+                    context_window: None,
+                    max_output_tokens: None,
                 })
                 .collect())
         } else {
@@ -334,6 +338,8 @@ impl OpenAiResponsesClient {
                 .map(|m| ModelInfo {
                     id: m.id,
                     display_name: None,
+                    context_window: None,
+                    max_output_tokens: None,
                 })
                 .collect())
         }

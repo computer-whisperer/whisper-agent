@@ -283,6 +283,11 @@ impl OpenAiChatClient {
             .map(|m| ModelInfo {
                 id: m.id,
                 display_name: None,
+                // OpenAI's /v1/models (both api.openai.com and
+                // compatible forks) returns bare ids — no context or
+                // output caps. Leave unknown.
+                context_window: None,
+                max_output_tokens: None,
             })
             .collect())
     }

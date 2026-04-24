@@ -202,6 +202,11 @@ impl AnthropicClient {
             .map(|m| ModelInfo {
                 id: m.id,
                 display_name: Some(m.display_name),
+                // Anthropic's /v1/models doesn't publish context or
+                // output limits; surface as unknown until we add a
+                // model-registry override.
+                context_window: None,
+                max_output_tokens: None,
             })
             .collect())
     }

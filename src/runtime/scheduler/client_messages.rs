@@ -1229,6 +1229,8 @@ impl Scheduler {
                                 .map(|m| ModelSummary {
                                     id: m.id,
                                     display_name: m.display_name,
+                                    context_window: m.context_window,
+                                    max_output_tokens: m.max_output_tokens,
                                 })
                                 .collect();
                             let _ = outbound.send(ServerToClient::ModelsList {

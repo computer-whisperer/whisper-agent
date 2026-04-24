@@ -216,8 +216,52 @@ impl ModelProvider for LlamaCppClient {
     }
 
     fn list_models<'a>(&'a self) -> BoxFuture<'a, Result<Vec<ModelInfo>, ModelError>> {
-        self.inner.list_models()
+        Box::pin(async move {
+            let mut models = self.inner.list_models().await?;
+            // llama.cpp serves one loaded model per server, so the same
+            // context window applies to every entry the /v1/models
+            // endpoint reports. /props exposes it as
+            // `default_generation_settings.n_ctx`.
+            if let Some(n_ctx) = self.fetch_n_ctx().await {
+                for m in &mut models {
+                    m.context_window = Some(n_ctx);
+                }
+            }
+            Ok(models)
+        })
     }
+}
+
+impl LlamaCppClient {
+    /// Fetch `default_generation_settings.n_ctx` from llama.cpp's
+    /// `/props` endpoint. Returns `None` on any failure (transport,
+    /// non-200, unparseable) — callers treat missing context window as
+    /// "unknown" rather than surfacing the error, since the model list
+    /// itself already succeeded.
+    async fn fetch_n_ctx(&self) -> Option<u32> {
+        let url = format!("{}/props", self.origin);
+        let resp = self.http.get(&url).send().await.ok()?;
+        if !resp.status().is_success() {
+            return None;
+        }
+        let parsed: PropsResponse = resp.json().await.ok()?;
+        parsed.default_generation_settings.n_ctx
+    }
+}
+
+/// Subset of `/props` — llama.cpp returns many more fields (build info,
+/// model metadata, tokenizer config) that we skip via serde's default
+/// ignore-extra-keys behavior.
+#[derive(Deserialize, Debug, Default)]
+struct PropsResponse {
+    #[serde(default)]
+    default_generation_settings: PropsGenSettings,
+}
+
+#[derive(Deserialize, Debug, Default)]
+struct PropsGenSettings {
+    #[serde(default)]
+    n_ctx: Option<u32>,
 }
 
 #[cfg(test)]
@@ -287,5 +331,30 @@ mod tests {
         assert!(slots[0].is_processing);
         assert_eq!(slots[0].n_past, Some(1024));
         assert_eq!(slots[0].n_prompt_tokens, Some(5120));
+    }
+
+    #[test]
+    fn parses_n_ctx_from_real_props_payload() {
+        // Trimmed /props response shape — llama.cpp surfaces many
+        // more keys (build_info, model_path, chat_template, …) that
+        // we rely on serde to ignore. The load-bearing parse is
+        // default_generation_settings.n_ctx.
+        let json = r#"{
+            "default_generation_settings": {
+                "n_ctx": 32768,
+                "n_predict": -1,
+                "temperature": 0.8
+            },
+            "total_slots": 1,
+            "chat_template": "{% for m in messages %}..."
+        }"#;
+        let parsed: PropsResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed.default_generation_settings.n_ctx, Some(32768));
+    }
+
+    #[test]
+    fn props_without_n_ctx_yields_none() {
+        let parsed: PropsResponse = serde_json::from_str("{}").unwrap();
+        assert_eq!(parsed.default_generation_settings.n_ctx, None);
     }
 }

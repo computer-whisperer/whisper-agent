@@ -118,7 +118,15 @@ pub struct TurnEntry {
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct ThreadConfig {
     pub model: String,
+    /// Per-request output cap: the maximum number of tokens the model
+    /// is allowed to generate in a single response. **Not** the
+    /// model's total context window — that's an upstream property of
+    /// the model itself, reported in `ModelSummary::context_window`
+    /// when the provider exposes it.
     pub max_tokens: u32,
+    /// Maximum assistant turns in a single user-message cycle before
+    /// the scheduler stops generating. Prevents runaway tool-loop
+    /// chains; resets each time the user sends a new message.
     pub max_turns: u32,
     /// Policy for compacting an overlong thread into a continuation.
     /// Inherits from the pod's `thread_defaults.compaction`; per-thread
@@ -131,8 +139,12 @@ pub struct ThreadConfig {
 pub struct ThreadConfigOverride {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// Override for [`ThreadConfig::max_tokens`] — the per-request
+    /// output cap on this thread. `None` inherits the pod default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_tokens: Option<u32>,
+    /// Override for [`ThreadConfig::max_turns`] — per-cycle assistant
+    /// turn limit. `None` inherits the pod default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_turns: Option<u32>,
     /// Creation-time choice of system prompt for the new thread.
@@ -522,6 +534,16 @@ pub struct ModelSummary {
     pub id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub display_name: Option<String>,
+    /// Maximum input context the model accepts, in tokens. `None`
+    /// means the provider's `/models` endpoint doesn't publish this
+    /// — today Anthropic and OpenAI both omit it, Gemini's API-key
+    /// route reports it, llama.cpp reports it via `/props`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_window: Option<u32>,
+    /// Provider-declared ceiling on output tokens per request. `None`
+    /// when not exposed by the upstream.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_output_tokens: Option<u32>,
 }
 
 // ---------- Resource registry ----------
