@@ -46,6 +46,13 @@ egui_commonmark = { version = "0.23", default-features = false, features = ["pul
 # add transcoding.
 egui_extras = { version = "0.34", default-features = false, features = ["image"] }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "gif"] }
+# Native + browser file picker. Drag-drop alone is easy to miss and
+# hard to diagnose when it silently fails; an explicit affordance
+# cuts the problem space in half (picker works but drop doesn't →
+# drag-drop plumbing bug; neither works → staging/capabilities bug).
+# `default-features = false` drops the GTK3 native backend in favor
+# of xdg-portal where available, keeping the native binary smaller.
+rfd = { version = "0.15", default-features = false, features = ["xdg-portal", "tokio"] }
 # Cron + tz for the behavior-editor "next N fires" preview. Mirror the
 # server's parsers so what the editor shows matches what the scheduler
 # will fire. chrono's default features include `clock` + `wasmbind`,
@@ -56,6 +63,15 @@ cron = { workspace = true }
 chrono = "0.4"
 chrono-tz = { workspace = true }
 whisper-agent-protocol = { workspace = true }
+
+# Native-only: rfd's `xdg-portal` backend needs an async runtime to
+# poll its futures. The desktop crate already runs a tokio runtime
+# for the WS task; wiring a small runtime here is the least-friction
+# option for file-picker plumbing. `rt` is the smallest feature that
+# gives us a single-threaded executor we can `block_on` inside a
+# background thread.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+tokio = { workspace = true, features = ["rt"] }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 wasm-bindgen = "0.2"

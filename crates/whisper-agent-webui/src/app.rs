@@ -44,6 +44,28 @@ use whisper_agent_protocol::{
     ToolResultContent, TriggerSpec, TurnLog, Usage,
 };
 
+/// Raw bytes picked up by the compose area before any MIME sniff or
+/// capability check has run. Drop-targeted and file-picker-targeted
+/// inputs both produce this shape so the downstream staging pipeline
+/// is one function, not two. `source_desc` feeds the user-facing hint
+/// on rejection so the reason can mention the filename.
+struct RawPick {
+    bytes: Vec<u8>,
+    source_desc: String,
+}
+
+/// Tri-state outcome of checking whether the currently-selected model
+/// accepts image input. "Unknown" (catalog hasn't replied yet, or the
+/// picker model isn't in the loaded list) is treated as permissive at
+/// stage-time — the server gets the final say, and a rejected attempt
+/// after the bytes are on the wire shows a clearer error than a
+/// silently-dropped paste. Known "no" is the only hard reject.
+enum ImageAcceptance {
+    Yes,
+    No,
+    Unknown,
+}
+
 /// Image attachment staged in the compose area but not yet sent.
 /// Holds the lowered protocol `Attachment` plus a unique id so the
 /// thumbnail `Image` widget's cache key is stable across frames —
@@ -719,16 +741,32 @@ pub struct ChatApp {
 
     input: String,
     /// Image attachments staged for the next send. Populated by the
-    /// compose area's drop handler, rendered as thumbnails below the
-    /// text input, and drained into the outbound `SendUserMessage` /
-    /// `CreateThread` when the user submits. Kept on `ChatApp` (not
-    /// per-`TaskView`) because drafts cross thread boundaries — the
-    /// staged attachments follow whatever the user ends up sending on.
+    /// compose area's drop handler and file-picker button, rendered
+    /// as thumbnails below the text input, and drained into the
+    /// outbound `SendUserMessage` / `CreateThread` when the user
+    /// submits. Kept on `ChatApp` (not per-`TaskView`) because drafts
+    /// cross thread boundaries — the staged attachments follow
+    /// whatever the user ends up sending on.
     compose_attachments: Vec<StagedAttachment>,
     /// Monotonic counter for the stable id stamped on each staged
     /// attachment so the thumbnail `Image` widget's cache key survives
     /// reorder / removal without colliding on pixel-identical uploads.
     next_attachment_id: u64,
+    /// Async-picker handoff queue. The file-picker runs off the UI
+    /// thread (native: tokio-driven via a background thread; wasm:
+    /// `wasm-bindgen-futures::spawn_local`); when a pick resolves, it
+    /// pushes a `RawPick` onto this queue and the UI drains it each
+    /// frame via the same staging pipeline that handles drops. Behind
+    /// an `Arc<Mutex>` rather than `Rc<RefCell>` because the native
+    /// picker thread isn't the UI thread.
+    pending_picks: std::sync::Arc<std::sync::Mutex<Vec<RawPick>>>,
+    /// Ephemeral status line rendered under the compose thumbnails.
+    /// `(message, expires_at_secs)` where the seconds reference egui's
+    /// frame time (`input.time`). Used to surface feedback on
+    /// attach-attempts that silently failed before — model capability
+    /// mismatches, unsupported MIME, read errors. Cleared automatically
+    /// once frame time passes `expires_at_secs`.
+    compose_hint: Option<(String, f64)>,
     inbound: Inbound,
     send_fn: SendFn,
     list_requested: bool,
@@ -1619,6 +1657,8 @@ impl ChatApp {
             input: String::new(),
             compose_attachments: Vec::new(),
             next_attachment_id: 1,
+            pending_picks: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            compose_hint: None,
             inbound,
             send_fn,
             list_requested: false,
@@ -1770,25 +1810,187 @@ impl ChatApp {
             .unwrap_or_default()
     }
 
-    /// `true` when the currently-selected compose model advertises
-    /// any input-side image MIME in its `ContentCapabilities`. Gates
-    /// the drop-to-attach affordance — rejecting the drop client-side
-    /// is a better failure mode than a 400 from upstream after the
-    /// bytes are on the wire. Falls back to `false` when we don't yet
-    /// have a model catalog entry for the selection (the server
-    /// hasn't replied to `ListModels`), matching the user-visible
-    /// "unknown → conservative" posture elsewhere in the picker.
-    fn current_model_accepts_images(&self) -> bool {
+    /// Tri-state capability check. Hard-reject only when the picker
+    /// model is in the loaded catalog AND its `capabilities.input.image`
+    /// is empty. "Unknown" (catalog not loaded yet, or picker model
+    /// isn't a known entry) is permissive — the server gets the final
+    /// say, and a post-send error is clearer than a silently-dropped
+    /// attachment during the catalog-fetch race on startup.
+    fn current_model_image_acceptance(&self) -> ImageAcceptance {
         let model_id = self.effective_picker_model();
         if model_id.is_empty() {
-            return false;
+            return ImageAcceptance::Unknown;
         }
         let backend = self.effective_picker_backend();
-        self.models_by_backend
+        let Some(summary) = self
+            .models_by_backend
             .get(backend)
             .and_then(|list| list.iter().find(|m| m.id == model_id))
-            .map(|m| !m.capabilities.input.image.is_empty())
-            .unwrap_or(false)
+        else {
+            return ImageAcceptance::Unknown;
+        };
+        if summary.capabilities.input.image.is_empty() {
+            ImageAcceptance::No
+        } else {
+            ImageAcceptance::Yes
+        }
+    }
+
+    /// Set a transient status line under the compose thumbnails. The
+    /// hint self-dismisses after ~4 s of egui frame time; a new hint
+    /// replaces any existing one so the latest feedback always wins.
+    fn set_compose_hint(&mut self, ctx: &egui::Context, message: impl Into<String>) {
+        let now = ctx.input(|i| i.time);
+        self.compose_hint = Some((message.into(), now + 4.0));
+    }
+
+    /// Single entry point for staging a raw byte-payload as an
+    /// attachment. Used by both drag-drop and the file-picker button
+    /// so the MIME-sniff / capability-check / hint-feedback paths are
+    /// identical across input sources. Surfacing a hint on every
+    /// outcome (success included) removes the "did anything happen?"
+    /// ambiguity the prior drop-silently-rejected implementation had.
+    fn stage_raw_pick(&mut self, pick: RawPick, ctx: &egui::Context) {
+        if pick.bytes.is_empty() {
+            self.set_compose_hint(ctx, format!("{} was empty; ignored", pick.source_desc));
+            return;
+        }
+        let Some(mime) = sniff_image_mime(&pick.bytes) else {
+            self.set_compose_hint(
+                ctx,
+                format!(
+                    "{} doesn't look like a supported image (jpeg / png / webp / gif)",
+                    pick.source_desc
+                ),
+            );
+            return;
+        };
+        match self.current_model_image_acceptance() {
+            ImageAcceptance::No => {
+                self.set_compose_hint(
+                    ctx,
+                    format!(
+                        "{} rejected — the selected model doesn't accept image input",
+                        pick.source_desc
+                    ),
+                );
+                return;
+            }
+            ImageAcceptance::Unknown | ImageAcceptance::Yes => {}
+        }
+        let id = self.next_attachment_id;
+        self.next_attachment_id += 1;
+        self.compose_attachments.push(StagedAttachment {
+            id,
+            attachment: Attachment::Image {
+                source: ImageSource::Bytes {
+                    media_type: mime,
+                    data: pick.bytes,
+                },
+            },
+        });
+        self.set_compose_hint(
+            ctx,
+            format!("attached {} as {}", pick.source_desc, mime.as_mime_str()),
+        );
+    }
+
+    /// Spawn the OS/browser file picker. Native runs rfd's
+    /// `AsyncFileDialog` on a background thread driven by a
+    /// single-threaded tokio runtime; wasm runs it via
+    /// `wasm_bindgen_futures::spawn_local`. Both paths push the
+    /// resolved bytes onto `pending_picks`, where the per-frame
+    /// drain in `update()` feeds them through `stage_raw_pick` (same
+    /// pipeline as drag-drop so the two diagnostics don't drift).
+    fn spawn_file_picker(&self, ctx: &egui::Context) {
+        let queue = self.pending_picks.clone();
+        let ctx_for_wake = ctx.clone();
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            std::thread::spawn(move || {
+                let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                else {
+                    log::error!("failed to build tokio current-thread runtime for file picker");
+                    return;
+                };
+                rt.block_on(async move {
+                    let Some(handle) = rfd::AsyncFileDialog::new()
+                        .set_title("Attach image")
+                        .add_filter("Image", &["png", "jpg", "jpeg", "webp", "gif"])
+                        .pick_file()
+                        .await
+                    else {
+                        return;
+                    };
+                    let name = handle.file_name();
+                    let bytes = handle.read().await;
+                    if let Ok(mut guard) = queue.lock() {
+                        guard.push(RawPick {
+                            bytes,
+                            source_desc: name,
+                        });
+                    }
+                    ctx_for_wake.request_repaint();
+                });
+            });
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            wasm_bindgen_futures::spawn_local(async move {
+                let Some(handle) = rfd::AsyncFileDialog::new()
+                    .set_title("Attach image")
+                    .add_filter("Image", &["png", "jpg", "jpeg", "webp", "gif"])
+                    .pick_file()
+                    .await
+                else {
+                    return;
+                };
+                let name = handle.file_name();
+                let bytes = handle.read().await;
+                if let Ok(mut guard) = queue.lock() {
+                    guard.push(RawPick {
+                        bytes,
+                        source_desc: name,
+                    });
+                }
+                ctx_for_wake.request_repaint();
+            });
+        }
+    }
+
+    /// Drain the file-picker handoff queue into staged attachments.
+    /// Called once per UI frame from `ui()`. No-op on the fast path
+    /// (empty queue), so the lock-per-frame cost is negligible.
+    fn ingest_pending_picks(&mut self, ctx: &egui::Context) {
+        let picks: Vec<RawPick> = match self.pending_picks.lock() {
+            Ok(mut guard) => std::mem::take(&mut *guard),
+            Err(_) => return,
+        };
+        for pick in picks {
+            self.stage_raw_pick(pick, ctx);
+        }
+    }
+
+    /// Render the ephemeral compose-area status line. Self-dismisses
+    /// once the expiry timestamp passes. Rendered immediately under
+    /// the thumbnail strip so the feedback sits visually close to the
+    /// thing that produced it.
+    fn render_compose_hint(&mut self, ui: &mut egui::Ui) {
+        let now = ui.ctx().input(|i| i.time);
+        let Some((message, expires)) = self.compose_hint.as_ref() else {
+            return;
+        };
+        if now > *expires {
+            self.compose_hint = None;
+            return;
+        }
+        ui.label(
+            RichText::new(message)
+                .color(Color32::from_gray(170))
+                .small(),
+        );
     }
 
     /// Render a compact thumbnail row for staged compose
@@ -1846,58 +2048,53 @@ impl ChatApp {
         }
     }
 
-    /// Drain egui's per-frame drop queue into staged attachments.
-    /// Accepts any file whose bytes sniff to one of our supported
-    /// image MIMEs; silently drops anything else (logs via
-    /// `log::warn!`). No-op when the current model doesn't accept
-    /// images — the drop is ignored rather than staged-and-rejected
-    /// later, which would be confusing when the user sees the
-    /// thumbnail appear then vanish on send.
+    /// Drain egui's per-frame drop queue into staged attachments via
+    /// the shared `stage_raw_pick` pipeline. Every outcome surfaces a
+    /// compose-area hint (success, wrong MIME, model doesn't accept,
+    /// read error) so drag-drop rejections stop looking like silent
+    /// failures. On native a dropped file carries `path`; on wasm it
+    /// carries `bytes` — cover both.
     fn accept_dropped_files(&mut self, ctx: &egui::Context) {
         let dropped: Vec<egui::DroppedFile> = ctx.input(|i| i.raw.dropped_files.clone());
         if dropped.is_empty() {
             return;
         }
-        if !self.current_model_accepts_images() {
-            log::warn!(
-                "dropped {} file(s) but the current model doesn't accept image input; ignoring",
-                dropped.len()
-            );
-            return;
-        }
         for file in dropped {
+            // egui's DroppedFile.name is a plain String (not Option) but
+            // is often empty on native drops — fall back to the path's
+            // file stem, and finally a generic label.
+            let source_desc = if !file.name.is_empty() {
+                file.name.clone()
+            } else if let Some(name) = file
+                .path
+                .as_ref()
+                .and_then(|p| p.file_name().map(|n| n.to_string_lossy().to_string()))
+            {
+                name
+            } else {
+                "dropped file".to_string()
+            };
             let bytes = if let Some(b) = file.bytes {
                 b.to_vec()
             } else if let Some(path) = &file.path {
                 match std::fs::read(path) {
                     Ok(b) => b,
                     Err(e) => {
-                        log::warn!("failed to read dropped file {}: {}", path.display(), e);
+                        self.set_compose_hint(
+                            ctx,
+                            format!("couldn't read {}: {}", path.display(), e),
+                        );
                         continue;
                     }
                 }
             } else {
-                log::warn!("dropped file carried neither bytes nor a path; skipping");
-                continue;
-            };
-            let Some(mime) = sniff_image_mime(&bytes) else {
-                log::warn!(
-                    "dropped file {:?} didn't sniff to a supported image MIME; skipping",
-                    file.name
+                self.set_compose_hint(
+                    ctx,
+                    format!("{source_desc} carried neither bytes nor a path; skipping"),
                 );
                 continue;
             };
-            let id = self.next_attachment_id;
-            self.next_attachment_id += 1;
-            self.compose_attachments.push(StagedAttachment {
-                id,
-                attachment: Attachment::Image {
-                    source: ImageSource::Bytes {
-                        media_type: mime,
-                        data: bytes,
-                    },
-                },
-            });
+            self.stage_raw_pick(RawPick { bytes, source_desc }, ctx);
         }
     }
 
@@ -3705,6 +3902,7 @@ impl eframe::App for ChatApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.drain_inbound();
         self.accept_dropped_files(ui.ctx());
+        self.ingest_pending_picks(ui.ctx());
 
         egui::Panel::top("status_bar").show_inside(ui, |ui| {
             ui.horizontal(|ui| {
@@ -4123,6 +4321,7 @@ impl eframe::App for ChatApp {
                     }
                     ui.add_enabled_ui(input_enabled, |ui| {
                         self.render_compose_attachments(ui);
+                        self.render_compose_hint(ui);
                         // Stable id so the focus check below can look up
                         // the widget's state before the widget is added.
                         let input_id = egui::Id::new("compose-input");
@@ -4224,6 +4423,29 @@ impl eframe::App for ChatApp {
                                     )
                                     .inner;
                                 let button_clicked = btn_resp.on_hover_text(tooltip).clicked();
+                                // Attach button sits to the left of Send
+                                // in the right-to-left layout, before the
+                                // TextEdit fills the remaining width.
+                                // Disabled while the thread is working so
+                                // users can't queue attachments mid-turn
+                                // (cancel first, then attach).
+                                let attach_enabled = !is_working;
+                                let attach_resp = ui.add_enabled(
+                                    attach_enabled,
+                                    egui::Button::new(RichText::new("📎").strong()).frame(true),
+                                );
+                                let attach_tooltip = match self.current_model_image_acceptance() {
+                                    ImageAcceptance::No => {
+                                        "Attach file (current model doesn't accept images)"
+                                    }
+                                    ImageAcceptance::Unknown => {
+                                        "Attach file (image support unknown — will try)"
+                                    }
+                                    ImageAcceptance::Yes => "Attach file",
+                                };
+                                if attach_resp.on_hover_text(attach_tooltip).clicked() {
+                                    self.spawn_file_picker(ui.ctx());
+                                }
                                 let response = ui.add(
                                     TextEdit::multiline(&mut self.input)
                                         .id(input_id)
