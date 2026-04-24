@@ -82,6 +82,18 @@ sealed class ServerToClient {
         val turn: Int,
     ) : ServerToClient()
 
+    /**
+     * Mid-prefill heartbeat from backends that can observe prompt
+     * ingestion (llamacpp via its `/slots` poller today). Silent for
+     * Anthropic / OpenAI / Gemini. Ephemeral: clients may render a
+     * progress bar until the first delta lands, nothing is persisted.
+     */
+    data class PrefillProgress(
+        val threadId: String,
+        val tokensProcessed: Int,
+        val tokensTotal: Int,
+    ) : ServerToClient()
+
     data class AssistantTextDelta(
         val threadId: String,
         val delta: String,

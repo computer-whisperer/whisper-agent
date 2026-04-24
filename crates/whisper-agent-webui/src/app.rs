@@ -534,6 +534,14 @@ struct TaskView {
     /// this thread *is* selected, `ChatApp.input` leads and this
     /// field tracks whatever the server last acknowledged.
     draft: String,
+    /// Latest `(tokens_processed, tokens_total)` reported by the
+    /// backend while prefilling the next assistant turn. Set by
+    /// `ThreadPrefillProgress` events (only emitted by the llamacpp
+    /// driver today), cleared the moment the first delta of that turn
+    /// arrives or the turn ends. Held here so a future UI pass can
+    /// render a transient progress bar without round-tripping to
+    /// state that's cleared on every snapshot rebuild.
+    prefill_progress: Option<(u32, u32)>,
 }
 
 /// Everything the thread-context inspector surfaces that isn't
@@ -595,6 +603,7 @@ impl TaskView {
             conv_message_count: 0,
             pending_tool_batch: false,
             draft: String::new(),
+            prefill_progress: None,
         }
     }
 
@@ -1939,9 +1948,26 @@ impl ChatApp {
                     push_tool_result_from_text(&mut view.items, &text);
                 }
             }
-            ServerToClient::ThreadAssistantBegin { .. } => {}
+            ServerToClient::ThreadAssistantBegin { thread_id, .. } => {
+                // A fresh assistant turn starts — drop any progress
+                // bar we were showing from an earlier turn so it
+                // can't bleed into this one.
+                if let Some(view) = self.tasks.get_mut(&thread_id) {
+                    view.prefill_progress = None;
+                }
+            }
+            ServerToClient::ThreadPrefillProgress {
+                thread_id,
+                tokens_processed,
+                tokens_total,
+            } => {
+                if let Some(view) = self.tasks.get_mut(&thread_id) {
+                    view.prefill_progress = Some((tokens_processed, tokens_total));
+                }
+            }
             ServerToClient::ThreadAssistantTextDelta { thread_id, delta } => {
                 if let Some(view) = self.tasks.get_mut(&thread_id) {
+                    view.prefill_progress = None;
                     if let Some(DisplayItem::AssistantText { text }) = view.items.last_mut() {
                         text.push_str(&delta);
                     } else {
@@ -1951,6 +1977,7 @@ impl ChatApp {
             }
             ServerToClient::ThreadAssistantReasoningDelta { thread_id, delta } => {
                 if let Some(view) = self.tasks.get_mut(&thread_id) {
+                    view.prefill_progress = None;
                     if let Some(DisplayItem::Reasoning { text }) = view.items.last_mut() {
                         text.push_str(&delta);
                     } else {
@@ -2919,6 +2946,7 @@ fn pending_tool_batch_flush_thread_id(msg: &ServerToClient) -> Option<&str> {
         ServerToClient::ThreadUserMessage { thread_id, .. }
         | ServerToClient::ThreadToolResultMessage { thread_id, .. }
         | ServerToClient::ThreadAssistantBegin { thread_id, .. }
+        | ServerToClient::ThreadPrefillProgress { thread_id, .. }
         | ServerToClient::ThreadAssistantTextDelta { thread_id, .. }
         | ServerToClient::ThreadAssistantReasoningDelta { thread_id, .. }
         | ServerToClient::ThreadAssistantEnd { thread_id, .. }

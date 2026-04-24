@@ -58,6 +58,8 @@ object ServerToClientSerializer : KSerializer<ServerToClient> {
     private const val IDX_SUMMARY_TEXT = 32
     private const val IDX_BEHAVIORS = 33
     private const val IDX_BEHAVIOR_ID = 34
+    private const val IDX_TOKENS_PROCESSED = 35
+    private const val IDX_TOKENS_TOTAL = 36
 
     private val tasksSerializer = ListSerializer(ThreadSummary.serializer())
     private val podsSerializer = ListSerializer(PodSummary.serializer())
@@ -101,6 +103,8 @@ object ServerToClientSerializer : KSerializer<ServerToClient> {
         element("summary_text", String.serializer().descriptor, isOptional = true)
         element("behaviors", behaviorsSerializer.descriptor, isOptional = true)
         element("behavior_id", String.serializer().descriptor, isOptional = true)
+        element("tokens_processed", Int.serializer().descriptor, isOptional = true)
+        element("tokens_total", Int.serializer().descriptor, isOptional = true)
         // Note: `summary` (IDX_SUMMARY) is shared between ThreadCreated and
         // BehaviorCreated; `state` (IDX_STATE) is shared between
         // ThreadStateChanged and BehaviorStateChanged. The decode loop
@@ -180,6 +184,12 @@ object ServerToClientSerializer : KSerializer<ServerToClient> {
                     encodeStringElement(descriptor, IDX_TYPE, "thread_assistant_begin")
                     encodeStringElement(descriptor, IDX_THREAD_ID, value.threadId)
                     encodeIntElement(descriptor, IDX_TURN, value.turn)
+                }
+                is ServerToClient.PrefillProgress -> {
+                    encodeStringElement(descriptor, IDX_TYPE, "thread_prefill_progress")
+                    encodeStringElement(descriptor, IDX_THREAD_ID, value.threadId)
+                    encodeIntElement(descriptor, IDX_TOKENS_PROCESSED, value.tokensProcessed)
+                    encodeIntElement(descriptor, IDX_TOKENS_TOTAL, value.tokensTotal)
                 }
                 is ServerToClient.AssistantTextDelta -> {
                     encodeStringElement(descriptor, IDX_TYPE, "thread_assistant_text_delta")
@@ -365,6 +375,8 @@ object ServerToClientSerializer : KSerializer<ServerToClient> {
             var behaviorSummary: BehaviorSummary? = null
             var behaviorId: String? = null
             var behaviorState: BehaviorState? = null
+            var tokensProcessed: Int? = null
+            var tokensTotal: Int? = null
 
             loop@ while (true) {
                 when (val i = decodeElementIndex(descriptor)) {
@@ -445,6 +457,8 @@ object ServerToClientSerializer : KSerializer<ServerToClient> {
                         descriptor, i, behaviorsSerializer,
                     )
                     IDX_BEHAVIOR_ID -> behaviorId = decodeStringElement(descriptor, i)
+                    IDX_TOKENS_PROCESSED -> tokensProcessed = decodeIntElement(descriptor, i)
+                    IDX_TOKENS_TOTAL -> tokensTotal = decodeIntElement(descriptor, i)
                     else -> throw SerializationException("unexpected element index $i")
                 }
             }
@@ -491,6 +505,11 @@ object ServerToClientSerializer : KSerializer<ServerToClient> {
                 "thread_assistant_begin" -> ServerToClient.AssistantBegin(
                     threadId = requireNotNull(threadId) { "missing thread_id" },
                     turn = requireNotNull(turn) { "missing turn" },
+                )
+                "thread_prefill_progress" -> ServerToClient.PrefillProgress(
+                    threadId = requireNotNull(threadId) { "missing thread_id" },
+                    tokensProcessed = requireNotNull(tokensProcessed) { "missing tokens_processed" },
+                    tokensTotal = requireNotNull(tokensTotal) { "missing tokens_total" },
                 )
                 "thread_assistant_text_delta" -> ServerToClient.AssistantTextDelta(
                     threadId = requireNotNull(threadId) { "missing thread_id" },

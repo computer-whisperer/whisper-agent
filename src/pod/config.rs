@@ -41,6 +41,7 @@ use crate::providers::anthropic::AnthropicClient;
 use crate::providers::codex_auth::CodexAuth;
 use crate::providers::gemini::{GEMINI_API_BASE, GEMINI_CODE_ASSIST_BASE, GeminiClient};
 use crate::providers::gemini_auth::GeminiAuth;
+use crate::providers::llamacpp::LlamaCppClient;
 use crate::providers::model::ModelProvider;
 use crate::providers::openai_chat::OpenAiChatClient;
 use crate::providers::openai_responses::{
@@ -246,6 +247,23 @@ pub enum BackendConfig {
         #[serde(default)]
         default_model: Option<String>,
     },
+    /// llama.cpp's native HTTP server. Uses the same `/v1/chat/completions`
+    /// wire shape as the generic `openai_chat` kind for the actual request,
+    /// but additionally polls llama.cpp's `/slots` endpoint during prefill
+    /// to emit real prefill-progress events — the only backend here that
+    /// can give UIs an honest "X of Y tokens ingested" progress bar.
+    /// Room for llama.cpp-specific extensions down the road
+    /// (GBNF-constrained tool calls, cache_prompt tuning, /tokenize, slot
+    /// save/restore) without polluting `openai_chat`.
+    #[serde(rename = "llamacpp")]
+    LlamaCpp {
+        /// Server origin, e.g. `http://localhost:8080`. The driver appends
+        /// `/v1/chat/completions` and `/slots` itself — do NOT include a
+        /// `/v1` suffix here.
+        base_url: String,
+        #[serde(default)]
+        default_model: Option<String>,
+    },
 }
 
 impl BackendConfig {
@@ -255,6 +273,7 @@ impl BackendConfig {
             BackendConfig::OpenAiChat { .. } => "openai_chat",
             BackendConfig::OpenAiResponses { .. } => "openai_responses",
             BackendConfig::Gemini { .. } => "gemini",
+            BackendConfig::LlamaCpp { .. } => "llamacpp",
         }
     }
 
@@ -265,7 +284,8 @@ impl BackendConfig {
             BackendConfig::Anthropic { default_model, .. }
             | BackendConfig::OpenAiChat { default_model, .. }
             | BackendConfig::OpenAiResponses { default_model, .. }
-            | BackendConfig::Gemini { default_model, .. } => default_model.as_deref(),
+            | BackendConfig::Gemini { default_model, .. }
+            | BackendConfig::LlamaCpp { default_model, .. } => default_model.as_deref(),
         }
     }
 
@@ -277,6 +297,7 @@ impl BackendConfig {
             | BackendConfig::OpenAiResponses { auth, .. }
             | BackendConfig::Gemini { auth, .. } => Some(auth.mode_name()),
             BackendConfig::OpenAiChat { auth, .. } => auth.as_ref().map(Auth::mode_name),
+            BackendConfig::LlamaCpp { .. } => None,
         }
     }
 
@@ -298,6 +319,9 @@ impl BackendConfig {
                 build_openai_responses(base_url.as_deref(), auth)
             }
             BackendConfig::Gemini { base_url, auth, .. } => build_gemini(base_url.as_deref(), auth),
+            BackendConfig::LlamaCpp { base_url, .. } => {
+                Ok(Arc::new(LlamaCppClient::new(base_url.clone())))
+            }
         }
     }
 }
@@ -413,6 +437,11 @@ auth = { mode = "api_key", env = "OPENAI_API_KEY" }
 [backends.local]
 kind = "openai_chat"
 base_url = "http://localhost:11434/v1"
+
+[backends.local-llamacpp]
+kind = "llamacpp"
+base_url = "http://localhost:8080"
+default_model = "qwen2.5-coder-7b"
 "#;
         let cfg: Config = toml::from_str(text).unwrap();
         cfg.validate().unwrap();
@@ -438,6 +467,17 @@ base_url = "http://localhost:11434/v1"
 
         match cfg.backends.get("local").unwrap() {
             BackendConfig::OpenAiChat { auth, .. } => assert!(auth.is_none()),
+            _ => panic!("wrong variant"),
+        }
+
+        match cfg.backends.get("local-llamacpp").unwrap() {
+            BackendConfig::LlamaCpp {
+                base_url,
+                default_model,
+            } => {
+                assert_eq!(base_url, "http://localhost:8080");
+                assert_eq!(default_model.as_deref(), Some("qwen2.5-coder-7b"));
+            }
             _ => panic!("wrong variant"),
         }
     }

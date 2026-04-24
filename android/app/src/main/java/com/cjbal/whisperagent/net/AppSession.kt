@@ -109,6 +109,18 @@ class AppSession(
     private val behaviorsRequested = mutableSetOf<String>()
 
     /**
+     * Latest prefill-progress heartbeat per thread — only populated
+     * for threads currently prefilling on a llamacpp backend. Cleared
+     * on the first streaming delta or when the turn ends. UI is
+     * expected to render a transient progress bar while an entry is
+     * present; absence of an entry means either prefill already
+     * finished or the backend doesn't report progress.
+     */
+    private val _prefillProgress = MutableStateFlow<Map<String, PrefillProgress>>(emptyMap())
+    val prefillProgress: StateFlow<Map<String, PrefillProgress>> =
+        _prefillProgress.asStateFlow()
+
+    /**
      * One-shot signal used by the UI to navigate to a freshly-created
      * thread. Emits the new thread id when the matching `ThreadCreated`
      * arrives for a `CreateThread` we issued.
@@ -422,6 +434,7 @@ class AppSession(
                             // will re-fetch from whichever pods come back.
                             _behaviorsByPod.value = emptyMap()
                             behaviorsRequested.clear()
+                            _prefillProgress.value = emptyMap()
                             // Transient drop while the user is actively using the
                             // app? Re-dial with a small backoff rather than sit
                             // silent until the next foreground cycle.
@@ -579,6 +592,14 @@ class AppSession(
             is ServerToClient.ToolCallEnd,
             is ServerToClient.LoopComplete,
             -> reduceStreaming(event)
+            is ServerToClient.PrefillProgress -> {
+                _prefillProgress.update {
+                    it + (event.threadId to PrefillProgress(
+                        tokensProcessed = event.tokensProcessed,
+                        tokensTotal = event.tokensTotal,
+                    ))
+                }
+            }
             is ServerToClient.SudoRequested -> {
                 _pendingSudo.update {
                     it + (event.threadId to PendingSudo(
@@ -617,6 +638,11 @@ class AppSession(
     private fun reduceStreaming(event: ServerToClient) {
         val eventThreadId = streamingEventThreadId(event) ?: return
         if (eventThreadId != subscribedThreadId) return
+        // Any non-progress event for this thread means prefill is over
+        // (or irrelevant) — clear the progress bar so it doesn't linger.
+        if (_prefillProgress.value.containsKey(eventThreadId)) {
+            _prefillProgress.update { it - eventThreadId }
+        }
         _activeSnapshot.update { snap ->
             if (snap == null) return@update null
             when (event) {
@@ -698,6 +724,17 @@ data class PendingSudo(
     val threadId: String,
     val toolName: String,
     val reason: String,
+)
+
+/**
+ * Mid-prefill progress for a thread. Emitted by llamacpp-backed threads
+ * while the backend ingests a long prompt; absent for other backends or
+ * after the first delta lands. UI is expected to render a transient
+ * progress bar while an entry is present.
+ */
+data class PrefillProgress(
+    val tokensProcessed: Int,
+    val tokensTotal: Int,
 )
 
 // --- Snapshot mutation helpers --------------------------------------------------

@@ -134,6 +134,17 @@ pub enum ModelEvent {
         name: String,
         input: Value,
     },
+    /// Mid-prefill progress heartbeat. Emitted by providers that can observe
+    /// how many prompt tokens have been ingested before the first output
+    /// token arrives — today only the llama.cpp driver does, via a parallel
+    /// `/slots` poller. Ephemeral: not persisted, just broadcast to
+    /// connected clients so long prefills show a progress bar instead of
+    /// dead air. Providers stop emitting once the first `TextDelta` /
+    /// `ThinkingDelta` / `ToolCall` has been sent on the same stream.
+    PrefillProgress {
+        tokens_processed: u32,
+        tokens_total: u32,
+    },
     /// Terminal event. `content` is the assistant-turn content block list the
     /// scheduler should persist. Deltas emitted before this are strictly for
     /// broadcast; the canonical state comes from here.

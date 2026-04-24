@@ -581,6 +581,20 @@ class CodecTest {
         assertEquals(original, decoded)
     }
 
+    // --- Prefill progress -----------------------------------------------------
+
+    @Test
+    fun serverToClient_prefillProgress_roundTrip() {
+        val original = ServerToClient.PrefillProgress(
+            threadId = "t-42",
+            tokensProcessed = 3200,
+            tokensTotal = 15000,
+        )
+        val bytes = cbor.encodeToByteArray(ServerToClient.serializer(), original)
+        val decoded = Codec.decodeFromServer(bytes)
+        assertEquals(original, decoded)
+    }
+
     // --- Smoke check on the old-broken shape ----------------------------------
 
     @Test

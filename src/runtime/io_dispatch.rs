@@ -1038,6 +1038,24 @@ async fn consume_stream(
                 // would duplicate the tool-call row in the webui.
                 any_delta_emitted = true;
             }
+            Ok(ModelEvent::PrefillProgress {
+                tokens_processed,
+                tokens_total,
+            }) => {
+                // Purely decorative heartbeat; does not set
+                // `any_delta_emitted` because the provider hasn't yet
+                // produced real output. If a rate-limit error arrives
+                // after one of these, we still treat it as first-event
+                // (retryable) rather than mid-stream (fatal).
+                let _ = stream_tx.send(StreamUpdate {
+                    thread_id: thread_id.to_string(),
+                    event: ServerToClient::ThreadPrefillProgress {
+                        thread_id: thread_id.to_string(),
+                        tokens_processed,
+                        tokens_total,
+                    },
+                });
+            }
             Ok(ModelEvent::Completed {
                 content,
                 stop_reason,

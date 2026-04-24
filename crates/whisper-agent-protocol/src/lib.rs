@@ -1340,6 +1340,22 @@ pub enum ServerToClient {
         thread_id: String,
         turn: u32,
     },
+    /// Mid-prefill progress heartbeat. Only emitted by backends that can
+    /// actually observe prefill — today, the `llamacpp` driver via its
+    /// `/slots` poller. Other backends are silent between
+    /// [`ServerToClient::ThreadAssistantBegin`] and the first
+    /// [`ServerToClient::ThreadAssistantTextDelta`] /
+    /// [`ServerToClient::ThreadAssistantReasoningDelta`]. Ephemeral:
+    /// clients render a transient progress bar while the stream of
+    /// these events is active and drop it on first delta. Nothing is
+    /// persisted.
+    ThreadPrefillProgress {
+        thread_id: String,
+        /// Prompt tokens ingested so far.
+        tokens_processed: u32,
+        /// Total prompt length the backend is working through.
+        tokens_total: u32,
+    },
     /// Streaming text fragment. Emitted repeatedly during a turn as the model
     /// produces text. Non-streaming backends synthesize a single delta
     /// carrying the full block so clients only ever handle one event type.
