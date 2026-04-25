@@ -37,6 +37,7 @@ pub enum ToolStreamItem {
 pub fn descriptors() -> Vec<Tool> {
     vec![
         read_file_descriptor(),
+        view_image_descriptor(),
         write_file_descriptor(),
         edit_file_descriptor(),
         bash_descriptor(),
@@ -60,6 +61,7 @@ pub fn call_stream(
     match name {
         "bash" => Ok(bash_stream(ws, args)),
         "read_file" => Ok(single(async move { read_file(&ws, args).await })),
+        "view_image" => Ok(single(async move { view_image(&ws, args).await })),
         "write_file" => Ok(single(async move { write_file(&ws, args).await })),
         "edit_file" => Ok(single(async move { edit_file(&ws, args).await })),
         "list_dir" => Ok(single(async move { list_dir(&ws, args).await })),
@@ -143,6 +145,14 @@ async fn read_file(workspace: &Arc<Workspace>, args: Value) -> CallToolResult {
         Ok(p) => p,
         Err(e) => return CallToolResult::error_text(e.to_string()),
     };
+    // Refuse before we send the model a stream of garbage. A binary file
+    // that happens to mostly decode as UTF-8 (or a giant minified blob)
+    // can wedge a model into a repetitive loop trying to make sense of
+    // it. The null-byte sniff is the same check `grep` uses to skip
+    // binaries — see `scan_file` below.
+    if let Some(kind) = sniff_binary(&path).await {
+        return CallToolResult::error_text(refuse_binary_message(&parsed.path, kind));
+    }
     // Whole-file fast path when no line slicing is requested.
     if parsed.offset.is_none() && parsed.limit.is_none() {
         return match tokio::fs::read_to_string(&path).await {
@@ -182,6 +192,222 @@ async fn read_file(workspace: &Arc<Workspace>, args: Value) -> CallToolResult {
         ));
     }
     CallToolResult::text(out)
+}
+
+/// What kind of binary content we sniffed at the head of a file.
+/// Drives the steering message read_file emits when refusing.
+#[derive(Debug, Clone, Copy)]
+enum BinaryKind {
+    Image(image::ImageFormat),
+    Other,
+}
+
+/// Read the first 8 KiB of `path` and decide whether the file is a
+/// binary blob that read_file should refuse. Returns `None` when the
+/// head looks like text (no NUL byte) or when the file can't be opened
+/// (we let the existing read_to_string error path produce that message).
+/// When the head *is* binary, also tries `image::guess_format` so the
+/// caller can name an image format in the steering message.
+async fn sniff_binary(path: &std::path::Path) -> Option<BinaryKind> {
+    use tokio::io::AsyncReadExt;
+    let mut f = tokio::fs::File::open(path).await.ok()?;
+    let mut head = [0u8; 8192];
+    let n = f.read(&mut head).await.ok()?;
+    let head = &head[..n];
+    if !head.contains(&0u8) {
+        return None;
+    }
+    let kind = match image::guess_format(head) {
+        Ok(fmt) => BinaryKind::Image(fmt),
+        Err(_) => BinaryKind::Other,
+    };
+    Some(kind)
+}
+
+/// Steering message returned when `read_file` refuses a binary file.
+/// Names `view_image` explicitly so the model knows where to go
+/// instead of retrying read_file with new offsets (the loop the user
+/// reported).
+fn refuse_binary_message(display: &std::path::Path, kind: BinaryKind) -> String {
+    match kind {
+        BinaryKind::Image(fmt) => format!(
+            "read_file({}): file looks like a binary image (format: {:?}) — use `view_image` to load it as an image attachment instead",
+            display.display(),
+            fmt,
+        ),
+        BinaryKind::Other => format!(
+            "read_file({}): file looks binary (NUL bytes in first 8 KiB); read_file is for UTF-8 text only",
+            display.display(),
+        ),
+    }
+}
+
+// ---------- view_image ----------
+
+/// Maximum image dimension on either axis. Anthropic accepts up to
+/// 8000px and OpenAI up to 4096px on Chat Completions, but token cost
+/// scales with pixel area — 2048 keeps the input cheap while staying
+/// well above readable resolution. Matches Codex's
+/// `codex-utils-image::MAX_DIMENSION`.
+const VIEW_IMAGE_MAX_DIMENSION: u32 = 2048;
+
+/// Refuse images bigger than this on disk. Generous enough for any
+/// legitimate screenshot or photo; small enough to prevent the agent
+/// from accidentally decoding a multi-gigabyte file (which would still
+/// resize down to 2048px afterwards but blows up RAM during decode).
+const VIEW_IMAGE_MAX_BYTES: u64 = 50 * 1024 * 1024;
+
+fn view_image_descriptor() -> Tool {
+    Tool {
+        name: "view_image".into(),
+        description: "Load an image file from the workspace and attach it to the conversation \
+                      so the model can see it. Use this whenever you need to look at a PNG / \
+                      JPEG / WebP / GIF — `read_file` refuses binary files. Large images are \
+                      resized to 2048px on the longest side to keep token cost bounded; \
+                      smaller images pass through untouched."
+            .into(),
+        input_schema: json!({
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "Path to the image — absolute, or relative to the workspace root."
+                }
+            },
+            "required": ["path"]
+        }),
+        annotations: Some(ToolAnnotations {
+            title: Some("View image".into()),
+            read_only_hint: Some(true),
+            destructive_hint: Some(false),
+            idempotent_hint: Some(true),
+            open_world_hint: Some(false),
+        }),
+    }
+}
+
+#[derive(Deserialize)]
+struct ViewImageArgs {
+    path: PathBuf,
+}
+
+async fn view_image(workspace: &Arc<Workspace>, args: Value) -> CallToolResult {
+    let parsed: ViewImageArgs = match serde_json::from_value(args) {
+        Ok(v) => v,
+        Err(e) => return CallToolResult::error_text(format!("invalid arguments: {e}")),
+    };
+    let path = match workspace.resolve(&parsed.path) {
+        Ok(p) => p,
+        Err(e) => return CallToolResult::error_text(e.to_string()),
+    };
+    let metadata = match tokio::fs::metadata(&path).await {
+        Ok(m) => m,
+        Err(e) => {
+            return CallToolResult::error_text(format!(
+                "view_image({}): {e}",
+                parsed.path.display()
+            ));
+        }
+    };
+    if !metadata.is_file() {
+        return CallToolResult::error_text(format!(
+            "view_image({}): not a regular file",
+            parsed.path.display()
+        ));
+    }
+    if metadata.len() > VIEW_IMAGE_MAX_BYTES {
+        return CallToolResult::error_text(format!(
+            "view_image({}): file is {} bytes; cap is {} bytes",
+            parsed.path.display(),
+            metadata.len(),
+            VIEW_IMAGE_MAX_BYTES,
+        ));
+    }
+    let bytes = match tokio::fs::read(&path).await {
+        Ok(b) => b,
+        Err(e) => {
+            return CallToolResult::error_text(format!(
+                "view_image({}): {e}",
+                parsed.path.display()
+            ));
+        }
+    };
+    // Decode + maybe-resize on a blocking pool — the `image` crate is
+    // CPU-bound and we don't want to stall the host's tokio executor on
+    // a multi-megabyte decode.
+    let display = parsed.path.clone();
+    let prepared = tokio::task::spawn_blocking(move || prepare_image(&bytes)).await;
+    let prepared = match prepared {
+        Ok(Ok(p)) => p,
+        Ok(Err(e)) => {
+            return CallToolResult::error_text(format!("view_image({}): {e}", display.display()));
+        }
+        Err(e) => {
+            return CallToolResult::error_text(format!(
+                "view_image({}): decode task panicked: {e}",
+                display.display()
+            ));
+        }
+    };
+    use base64::Engine;
+    let encoded = base64::engine::general_purpose::STANDARD.encode(&prepared.bytes);
+    CallToolResult::image(encoded, prepared.mime_type)
+}
+
+/// Output of [`prepare_image`]: bytes ready for base64 + the IANA MIME
+/// the agent runtime should advertise to the model.
+#[derive(Debug)]
+struct PreparedImage {
+    bytes: Vec<u8>,
+    mime_type: &'static str,
+}
+
+/// Decode `bytes`, downscale to [`VIEW_IMAGE_MAX_DIMENSION`] if either
+/// dimension exceeds it, otherwise pass the original bytes through
+/// unchanged. Returns an error string when the format isn't one we
+/// have features for or when decode fails.
+///
+/// Mirrors Codex's `load_for_prompt_bytes` shape — keep originals when
+/// the image is already in a supported format and small enough,
+/// re-encode as PNG (lossless) on the resize path so we don't double-
+/// quantize JPEG.
+fn prepare_image(bytes: &[u8]) -> Result<PreparedImage, String> {
+    use image::ImageFormat;
+    let format =
+        image::guess_format(bytes).map_err(|_| "could not detect image format".to_string())?;
+    let mime = match format {
+        ImageFormat::Png => "image/png",
+        ImageFormat::Jpeg => "image/jpeg",
+        ImageFormat::WebP => "image/webp",
+        ImageFormat::Gif => "image/gif",
+        other => {
+            return Err(format!(
+                "unsupported image format {other:?} (accepted: PNG, JPEG, WebP, GIF)"
+            ));
+        }
+    };
+    let decoded = image::load_from_memory_with_format(bytes, format)
+        .map_err(|e| format!("decode failed: {e}"))?;
+    let (w, h) = (decoded.width(), decoded.height());
+    if w.max(h) <= VIEW_IMAGE_MAX_DIMENSION {
+        return Ok(PreparedImage {
+            bytes: bytes.to_vec(),
+            mime_type: mime,
+        });
+    }
+    let resized = decoded.resize(
+        VIEW_IMAGE_MAX_DIMENSION,
+        VIEW_IMAGE_MAX_DIMENSION,
+        image::imageops::FilterType::Triangle,
+    );
+    let mut out = Vec::with_capacity(bytes.len());
+    resized
+        .write_to(&mut std::io::Cursor::new(&mut out), ImageFormat::Png)
+        .map_err(|e| format!("re-encode after resize failed: {e}"))?;
+    Ok(PreparedImage {
+        bytes: out,
+        mime_type: "image/png",
+    })
 }
 
 // ---------- write_file ----------
@@ -1943,6 +2169,11 @@ fn main() {
         while let Some(item) = stream.next().await {
             match item {
                 ToolStreamItem::Chunk(ContentBlock::Text { text }) => chunks.push(text),
+                // bash_stream only emits text chunks; image chunks are a
+                // tool-result shape used by view_image, not bash.
+                ToolStreamItem::Chunk(ContentBlock::Image { .. }) => {
+                    panic!("bash_stream emitted unexpected image chunk")
+                }
                 ToolStreamItem::Final(r) => {
                     final_result = Some(r);
                     break;
@@ -2013,12 +2244,124 @@ fn main() {
     }
 
     /// Collapse a `CallToolResult`'s `Text` blocks into a single `&str` for
-    /// test assertions. All content blocks in this crate are Text today, so
-    /// we just grab the first (every bash_stream Final has exactly one).
+    /// test assertions. Every bash_stream Final has exactly one Text block;
+    /// image blocks are produced by view_image, not by bash.
     fn final_tool_text(r: &CallToolResult) -> &str {
         match r.content.first() {
             Some(ContentBlock::Text { text }) => text.as_str(),
+            Some(ContentBlock::Image { .. }) => panic!("expected text result, got image"),
             None => "",
         }
+    }
+
+    // ---------- read_file binary refusal ----------
+
+    /// PNG magic bytes followed by a NUL — sufficient for both the
+    /// binary sniff (NUL in first 8 KiB) and `image::guess_format`
+    /// (PNG header).
+    fn fake_png_bytes() -> Vec<u8> {
+        let mut v = vec![0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
+        v.extend_from_slice(&[0u8; 64]);
+        v
+    }
+
+    #[tokio::test]
+    async fn read_file_refuses_binary_image_with_view_image_hint() {
+        let ws = test_workspace();
+        let path = ws.root().join("dummy.png");
+        std::fs::write(&path, fake_png_bytes()).unwrap();
+        let result = read_file(&ws, json!({ "path": "dummy.png" })).await;
+        assert_eq!(result.is_error, Some(true));
+        let body = final_tool_text(&result);
+        assert!(
+            body.contains("view_image"),
+            "expected steering to view_image; got {body:?}"
+        );
+        assert!(
+            body.contains("Png") || body.contains("PNG") || body.contains("image"),
+            "expected format hint; got {body:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn read_file_refuses_non_image_binary_generically() {
+        // Random bytes containing a NUL but no recognizable image
+        // signature.
+        let ws = test_workspace();
+        let path = ws.root().join("blob.bin");
+        let mut bytes = vec![1u8, 2, 3, 0, 4, 5];
+        bytes.extend_from_slice(&[0u8; 64]);
+        std::fs::write(&path, bytes).unwrap();
+        let result = read_file(&ws, json!({ "path": "blob.bin" })).await;
+        assert_eq!(result.is_error, Some(true));
+        let body = final_tool_text(&result);
+        assert!(
+            body.contains("binary"),
+            "expected generic binary message; got {body:?}"
+        );
+        assert!(
+            !body.contains("view_image"),
+            "non-image binary shouldn't suggest view_image; got {body:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn read_file_still_reads_text_with_high_bit_chars() {
+        // Non-ASCII UTF-8 (smart quotes, emoji) has no NUL byte, so the
+        // sniff must let it through.
+        let ws = test_workspace();
+        let path = ws.root().join("utf8.txt");
+        std::fs::write(&path, "héllo “world” 🎉").unwrap();
+        let result = read_file(&ws, json!({ "path": "utf8.txt" })).await;
+        assert!(result.is_error.is_none());
+        let body = final_tool_text(&result);
+        assert!(body.contains("héllo"));
+    }
+
+    // ---------- view_image: prepare_image ----------
+
+    /// Build a real PNG of the requested dimensions. Uses a single-color
+    /// fill so the encoded bytes are deterministic enough for size
+    /// assertions across runs.
+    fn make_png(w: u32, h: u32) -> Vec<u8> {
+        use image::{ImageBuffer, ImageFormat, Rgb};
+        let img: ImageBuffer<Rgb<u8>, _> = ImageBuffer::from_fn(w, h, |_, _| Rgb([10, 20, 30]));
+        let mut buf = Vec::new();
+        img.write_to(&mut std::io::Cursor::new(&mut buf), ImageFormat::Png)
+            .unwrap();
+        buf
+    }
+
+    #[test]
+    fn prepare_image_passes_through_small_png() {
+        let bytes = make_png(64, 64);
+        let prepared = prepare_image(&bytes).unwrap();
+        assert_eq!(prepared.mime_type, "image/png");
+        assert_eq!(prepared.bytes, bytes, "small images should not be re-encoded");
+    }
+
+    #[test]
+    fn prepare_image_resizes_oversize_image_to_png() {
+        let bytes = make_png(VIEW_IMAGE_MAX_DIMENSION + 200, 32);
+        let prepared = prepare_image(&bytes).unwrap();
+        assert_eq!(prepared.mime_type, "image/png");
+        // Decode the result and confirm the long axis was clamped.
+        let decoded = image::load_from_memory(&prepared.bytes).unwrap();
+        assert!(
+            decoded.width().max(decoded.height()) <= VIEW_IMAGE_MAX_DIMENSION,
+            "max dim {} > cap {}",
+            decoded.width().max(decoded.height()),
+            VIEW_IMAGE_MAX_DIMENSION
+        );
+    }
+
+    #[test]
+    fn prepare_image_rejects_non_image_bytes() {
+        let bytes = b"this is just some text, not an image".to_vec();
+        let err = prepare_image(&bytes).unwrap_err();
+        assert!(
+            err.contains("could not detect"),
+            "unexpected error: {err}"
+        );
     }
 }

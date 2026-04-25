@@ -274,6 +274,20 @@ pub trait ModelProvider: Send + Sync {
 
     fn list_models<'a>(&'a self) -> BoxFuture<'a, Result<Vec<ModelInfo>, ModelError>>;
 
+    /// Synchronous best-effort capability lookup for a known model id.
+    /// Used at tool-list assembly time to decide whether to advertise
+    /// image-producing tools (`view_image`, etc.) to the model.
+    ///
+    /// Default returns `ContentCapabilities::default()` — text-only.
+    /// Providers with per-model vision tables override (Anthropic
+    /// claims standard vision; OpenAI / Gemini consult their per-id
+    /// tables; llama.cpp delegates to its inner OpenAI-shaped client,
+    /// which today won't recognize any vision models — safe-but-
+    /// conservative default).
+    fn capabilities_for(&self, _model_id: &str) -> ContentCapabilities {
+        ContentCapabilities::default()
+    }
+
     /// Replace the Codex `auth.json` contents for this provider, writing
     /// the new bytes to the same on-disk path the provider was built
     /// with and swapping the in-memory auth state so subsequent

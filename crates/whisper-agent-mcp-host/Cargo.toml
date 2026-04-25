@@ -22,6 +22,13 @@ anyhow = { workspace = true }
 ignore = "0.4"
 globset = "0.4"
 regex = "1"
+# Image decode/encode for the `view_image` tool. Same crate + feature
+# set used by webui and desktop for paste/drop image handling, so the
+# workspace already pins the version.
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "gif"] }
+# Base64 for serializing image bytes back to the model in MCP image
+# content blocks. STANDARD-encoded.
+base64 = "0.22"
 subtle = { workspace = true }
 futures = "0.3"
 async-stream = "0.3"

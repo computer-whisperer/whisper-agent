@@ -317,6 +317,10 @@ impl ModelProvider for OpenAiChatClient {
     fn list_models<'a>(&'a self) -> BoxFuture<'a, Result<Vec<ModelInfo>, ModelError>> {
         Box::pin(self.do_list_models())
     }
+
+    fn capabilities_for(&self, model_id: &str) -> whisper_agent_protocol::ContentCapabilities {
+        crate::providers::model::openai_vision_capabilities(model_id)
+    }
 }
 
 // ---------- Message conversion ----------

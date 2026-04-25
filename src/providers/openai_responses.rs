@@ -375,6 +375,10 @@ impl ModelProvider for OpenAiResponsesClient {
         Box::pin(self.do_list_models())
     }
 
+    fn capabilities_for(&self, model_id: &str) -> whisper_agent_protocol::ContentCapabilities {
+        crate::providers::model::openai_vision_capabilities(model_id)
+    }
+
     /// Only meaningful for `ClientAuth::Codex` — API-key clients have
     /// nothing to rotate via this path and return `NotSupported`.
     /// For Codex: parse the pasted `auth.json` blob against the in-memory

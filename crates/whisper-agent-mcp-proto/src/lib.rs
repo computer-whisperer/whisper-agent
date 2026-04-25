@@ -176,10 +176,34 @@ impl CallToolResult {
             is_error: Some(true),
         }
     }
+
+    /// Wrap a single base64-encoded image as a successful tool result.
+    /// `mime_type` is the IANA media type (`image/png`, `image/jpeg`, …);
+    /// the agent runtime decodes and normalizes against its accepted
+    /// MIME set on the way in.
+    pub fn image(data: impl Into<String>, mime_type: impl Into<String>) -> Self {
+        Self {
+            content: vec![ContentBlock::Image {
+                data: data.into(),
+                mime_type: mime_type.into(),
+            }],
+            is_error: None,
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum ContentBlock {
-    Text { text: String },
+    Text {
+        text: String,
+    },
+    /// MCP 2025-06-18 image content. `data` is base64-encoded bytes;
+    /// `mime_type` carries the IANA media type. Field renamed to
+    /// `mimeType` on the wire to match the spec.
+    Image {
+        data: String,
+        #[serde(rename = "mimeType")]
+        mime_type: String,
+    },
 }

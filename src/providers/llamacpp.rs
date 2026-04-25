@@ -215,6 +215,16 @@ impl ModelProvider for LlamaCppClient {
         })
     }
 
+    fn capabilities_for(&self, model_id: &str) -> whisper_agent_protocol::ContentCapabilities {
+        // Delegate to the wrapped OpenAI-shaped client. Today this
+        // returns text-only for every llama.cpp model id (the OpenAI
+        // heuristic doesn't match `llama-3`, `qwen-vl`, etc.) so
+        // vision-capable local models won't see `view_image`. Refining
+        // this is a config-side concern — we'll need the user to
+        // declare per-model capabilities in the backend config.
+        self.inner.capabilities_for(model_id)
+    }
+
     fn list_models<'a>(&'a self) -> BoxFuture<'a, Result<Vec<ModelInfo>, ModelError>> {
         Box::pin(async move {
             let mut models = self.inner.list_models().await?;

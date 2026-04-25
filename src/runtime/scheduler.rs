@@ -1673,6 +1673,26 @@ impl Scheduler {
             .map(|p| p.config.allow.tools.clone())
             .unwrap_or_else(whisper_agent_protocol::AllowMap::deny_all);
         let escalation_available = task.scope.escalation.is_interactive();
+        // The runtime side of "MCP has no in-band signal for whether
+        // the client model accepts image input": ask the bound provider
+        // synchronously what the active model can consume, then drop
+        // image-producing tools (`view_image`) from the advertised set
+        // when the answer is "nothing". Belt-and-suspenders only — even
+        // if a tool sneaks through, the MCP image content the runtime
+        // surfaces back is structurally inert for a text-only model;
+        // the filter is purely to keep the model from trying.
+        let model_takes_images = self
+            .backends
+            .get(&task.bindings.backend)
+            .map(|entry| {
+                !entry
+                    .provider
+                    .capabilities_for(&task.config.model)
+                    .input
+                    .image
+                    .is_empty()
+            })
+            .unwrap_or(false);
         let mut out: Vec<AdmissibleTool> = Vec::new();
         let mut seen: HashSet<String> = HashSet::new();
 
@@ -1707,6 +1727,13 @@ impl Scheduler {
 
         for bound in self.bound_mcp_hosts(thread_id) {
             for tool in &bound.entry.tools {
+                // Hide `view_image` from text-only models. The tool
+                // still lives in the host catalog and would still
+                // dispatch if invoked — the filter is just to keep the
+                // tool out of sight so the model doesn't try.
+                if !model_takes_images && tool.name == "view_image" {
+                    continue;
+                }
                 let (public_name, category) = match bound.prefix {
                     Some(prefix) => (
                         format!("{prefix}_{}", tool.name),

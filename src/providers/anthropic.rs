@@ -237,6 +237,13 @@ impl ModelProvider for AnthropicClient {
     fn list_models<'a>(&'a self) -> BoxFuture<'a, Result<Vec<ModelInfo>, ModelError>> {
         Box::pin(self.do_list_models())
     }
+
+    fn capabilities_for(&self, _model_id: &str) -> whisper_agent_protocol::ContentCapabilities {
+        // Every Anthropic model the catalog exposes today accepts the
+        // standard JPEG/PNG/WebP/GIF set — `do_list_models` populates
+        // every entry with `standard_vision_capabilities`.
+        crate::providers::model::standard_vision_capabilities()
+    }
 }
 
 fn spec_to_anthropic_tool(t: &ToolSpec) -> AnthropicTool {
