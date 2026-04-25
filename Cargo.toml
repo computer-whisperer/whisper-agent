@@ -116,3 +116,7 @@ subtle = { workspace = true }
 # the S256 code_challenge presented on the authorization URL.
 rand = "0.9"
 sha2 = "0.10"
+# blake3 for chunk-id hashing in the knowledge-bucket layer. Multi-GB/s
+# throughput matters because the chunker hashes every source record on a
+# wikipedia-scale build — sha2 would bottleneck the chunking stage.
+blake3 = "1"
