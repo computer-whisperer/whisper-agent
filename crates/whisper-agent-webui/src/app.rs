@@ -22,10 +22,10 @@ mod wire_handler;
 use self::chat_render::{ChatItemEvent, render_item};
 use self::modals::{
     BehaviorEditorEvent, FileViewerEvent, ForkEvent, NewBehaviorEvent, NewPodEvent, PodEditorEvent,
-    ProviderEditorEvent, SettingsEvent, render_behavior_editor_modal, render_file_viewer_modal,
-    render_fork_modal, render_image_lightbox_modal, render_json_viewer_modal,
-    render_new_behavior_modal, render_new_pod_modal, render_pod_editor_modal,
-    render_provider_editor_modal, render_settings_modal,
+    ProviderEditorEvent, SettingsEvent, render_behavior_editor_modal, render_buckets_modal,
+    render_file_viewer_modal, render_fork_modal, render_image_lightbox_modal,
+    render_json_viewer_modal, render_new_behavior_modal, render_new_pod_modal,
+    render_pod_editor_modal, render_provider_editor_modal, render_settings_modal,
 };
 use self::widgets::{
     render_failure_banner, render_prefill_progress, render_resource_list, render_sudo_banners,
@@ -42,11 +42,11 @@ use egui_commonmark::CommonMarkCache;
 use whisper_agent_protocol::sandbox::NetworkPolicy;
 use whisper_agent_protocol::{
     AllowMap, Attachment, BackendSummary, BehaviorConfig, BehaviorOrigin, BehaviorSummary,
-    ClientToServer, FsEntry, FunctionKind, FunctionSummary, HostEnvProviderInfo, HostEnvSpec,
-    ImageMime, ImageSource, ModelSummary, NamedHostEnv, PodAllow, PodConfig, PodLimits, PodSummary,
-    ResourceSnapshot, ServerToClient, SharedMcpAuthPublic, SharedMcpHostInfo, ThreadBindings,
-    ThreadBindingsRequest, ThreadConfigOverride, ThreadDefaults, ThreadStateLabel, ThreadSummary,
-    Usage,
+    BucketSummary, ClientToServer, FsEntry, FunctionKind, FunctionSummary, HostEnvProviderInfo,
+    HostEnvSpec, ImageMime, ImageSource, ModelSummary, NamedHostEnv, PodAllow, PodConfig,
+    PodLimits, PodSummary, ResourceSnapshot, ServerToClient, SharedMcpAuthPublic,
+    SharedMcpHostInfo, ThreadBindings, ThreadBindingsRequest, ThreadConfigOverride, ThreadDefaults,
+    ThreadStateLabel, ThreadSummary, Usage,
 };
 
 /// Raw bytes picked up by the compose area before any MIME sniff or
@@ -878,6 +878,17 @@ pub struct ChatApp {
     /// when closed. The inner state holds which settings tab is
     /// currently selected.
     settings_modal: Option<SettingsModalState>,
+    /// Open state for the knowledge-buckets modal (toggled from the
+    /// 🗃 button in the top bar). `None` = closed.
+    buckets_modal: Option<BucketsModalState>,
+    /// Server's knowledge-bucket registry snapshot. Populated lazily
+    /// on first `ListBuckets` round-trip (triggered when the buckets
+    /// modal opens). Sorted by id; an empty list means the server has
+    /// no buckets configured.
+    buckets: Vec<BucketSummary>,
+    /// `true` once we've sent `ListBuckets` for this connection — keeps
+    /// the modal-open path from re-firing the request every frame.
+    buckets_requested: bool,
     /// Provider names whose Remove button has been clicked once and is
     /// waiting for confirmation. Two-click UX mirrors the pod archive
     /// and behavior delete flows. Cleared on confirm / outside click /
@@ -1231,6 +1242,12 @@ enum ProviderEditorMode {
     Add,
     Edit,
 }
+
+/// State for the knowledge-buckets management modal. Empty today —
+/// the slot's mere presence drives the modal's open/closed; create /
+/// edit / build form state grows here in slice 8c.
+#[derive(Default)]
+struct BucketsModalState {}
 
 /// State for the "Server settings" modal opened from the cog in the
 /// top bar. Host to one or more inner tabs; today only "LLM backends"
@@ -1725,6 +1742,9 @@ impl ChatApp {
             shared_mcp_hosts_requested: false,
             provider_editor_modal: None,
             settings_modal: None,
+            buckets_modal: None,
+            buckets: Vec::new(),
+            buckets_requested: false,
             provider_remove_armed: HashSet::new(),
             provider_remove_pending: HashMap::new(),
             collapsed_pods: HashSet::new(),
@@ -2211,6 +2231,12 @@ impl ChatApp {
                     });
                     self.functions_requested = true;
                 }
+                if !self.buckets_requested {
+                    self.send(ClientToServer::ListBuckets {
+                        correlation_id: None,
+                    });
+                    self.buckets_requested = true;
+                }
             }
             InboundEvent::ConnectionClosed { detail } => {
                 self.conn_status = ConnectionStatus::Closed;
@@ -2477,6 +2503,16 @@ impl eframe::App for ChatApp {
                         self.settings_modal = match self.settings_modal.take() {
                             Some(_) => None,
                             None => Some(SettingsModalState::default()),
+                        };
+                    }
+
+                    let bucket_btn = ui
+                        .button(RichText::new("🗃").small())
+                        .on_hover_text("Knowledge buckets");
+                    if bucket_btn.clicked() {
+                        self.buckets_modal = match self.buckets_modal.take() {
+                            Some(_) => None,
+                            None => Some(BucketsModalState::default()),
                         };
                     }
 
@@ -3275,6 +3311,11 @@ impl eframe::App for ChatApp {
             }
             self.send(wire);
         }
+        // Knowledge-buckets modal — read-only list in slice 8b.
+        // The modal renderer returns no events today (slice 8c grows
+        // create / build / delete actions), so the result is dropped.
+        let _ = render_buckets_modal(&ctx, &mut self.buckets_modal, &self.buckets);
+
         for event in render_settings_modal(
             &ctx,
             &mut self.settings_modal,

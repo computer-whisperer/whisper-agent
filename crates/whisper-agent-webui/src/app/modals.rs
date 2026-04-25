@@ -13,6 +13,7 @@
 //! `widgets`.
 
 mod behavior_editor;
+mod buckets;
 mod fork;
 mod new_behavior;
 mod new_pod;
@@ -22,6 +23,9 @@ mod settings;
 mod viewers;
 
 pub(super) use behavior_editor::{BehaviorEditorEvent, render_behavior_editor_modal};
+#[allow(unused_imports)]
+pub(super) use buckets::BucketsEvent;
+pub(super) use buckets::render_buckets_modal;
 pub(super) use fork::{ForkEvent, render_fork_modal};
 pub(super) use new_behavior::{NewBehaviorEvent, render_new_behavior_modal};
 pub(super) use new_pod::{NewPodEvent, render_new_pod_modal};

@@ -574,6 +574,9 @@ impl ChatApp {
             ServerToClient::HostEnvProvidersList { providers, .. } => {
                 self.host_env_providers = providers;
             }
+            ServerToClient::BucketsList { buckets, .. } => {
+                self.buckets = buckets;
+            }
             ServerToClient::PodList {
                 pods,
                 default_pod_id,
