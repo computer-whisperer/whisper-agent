@@ -1,0 +1,26 @@
+//! Modal dialogs and editor windows.
+//!
+//! One submodule per modal (or cluster of related modals). Each
+//! exposes a free render function plus, where the modal needs to
+//! dispatch wire messages or open another modal, an event enum the
+//! parent reduces back into `ChatApp` mutations.
+//!
+//! Pattern: state is passed in by reference (typically the
+//! `Option<...ModalState>` slot the modal lives in), no `ChatApp`
+//! access from inside the renderer. The parent (`app.rs`) owns the
+//! slots, opens them by writing `Some(...)`, and lets the renderer
+//! clear them on close. Mirrors the row-renderer convention in
+//! `widgets`.
+
+mod fork;
+mod new_behavior;
+mod new_pod;
+mod viewers;
+
+pub(super) use fork::{ForkEvent, render_fork_modal};
+pub(super) use new_behavior::{NewBehaviorEvent, render_new_behavior_modal};
+pub(super) use new_pod::{NewPodEvent, render_new_pod_modal};
+pub(super) use viewers::{
+    FileViewerEvent, render_file_viewer_modal, render_image_lightbox_modal,
+    render_json_viewer_modal,
+};

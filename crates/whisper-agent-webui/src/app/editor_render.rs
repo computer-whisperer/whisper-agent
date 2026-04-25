@@ -116,7 +116,8 @@ fn exceed_ceiling_hint(ui: &mut egui::Ui, message: &str) {
     ui.end_row();
 }
 
-use super::{SandboxEntryEditorState, spec_label};
+use super::SandboxEntryEditorState;
+use super::widgets::spec_label;
 
 // ====================================================================
 // Pod editor — structured form

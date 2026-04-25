@@ -13,15 +13,28 @@
 
 mod chat_render;
 mod editor_render;
+mod modals;
+mod widgets;
 
 use self::chat_render::{ChatItemEvent, render_item};
 use self::editor_render::{
-    behavior_summary_from_snapshot, hint, render_behavior_editor_prompt_tab,
+    behavior_summary_from_snapshot, render_behavior_editor_prompt_tab,
     render_behavior_editor_raw_tab, render_behavior_editor_retention_tab,
     render_behavior_editor_scope_tab, render_behavior_editor_thread_tab,
     render_behavior_editor_trigger_tab, render_pod_editor_allow_tab,
     render_pod_editor_defaults_tab, render_pod_editor_limits_tab, render_pod_editor_raw_tab,
-    render_sandbox_entry_modal, section_heading,
+    render_sandbox_entry_modal,
+};
+use self::modals::{
+    FileViewerEvent, ForkEvent, NewBehaviorEvent, NewPodEvent, render_file_viewer_modal,
+    render_fork_modal, render_image_lightbox_modal, render_json_viewer_modal,
+    render_new_behavior_modal, render_new_pod_modal,
+};
+use self::widgets::{
+    OAUTH_AVAILABLE, ProviderRowEvent, open_in_new_tab, render_backend_settings_row,
+    render_failure_banner, render_prefill_progress, render_provider_row, render_resource_list,
+    render_shared_mcp_host_row, render_sudo_banners, render_thread_context_inspector, state_chip,
+    webui_origin,
 };
 
 use std::cell::RefCell;
@@ -29,19 +42,17 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::rc::Rc;
 use std::time::Duration;
 
-use egui::{Color32, ComboBox, Grid, RichText, ScrollArea, TextEdit};
+use egui::{Color32, ComboBox, RichText, ScrollArea, TextEdit};
 use egui_commonmark::CommonMarkCache;
 use whisper_agent_protocol::sandbox::NetworkPolicy;
 use whisper_agent_protocol::{
     AllowMap, Attachment, BackendSummary, BehaviorConfig, BehaviorOrigin,
-    BehaviorSnapshot as BehaviorSnapshotProto, BehaviorSummary, BehaviorThreadOverride,
-    ClientToServer, ContentBlock, Conversation, FsEntry, FunctionKind, FunctionSummary,
-    HostEnvBinding, HostEnvProviderInfo, HostEnvProviderOrigin, HostEnvReachability, HostEnvSpec,
+    BehaviorSnapshot as BehaviorSnapshotProto, BehaviorSummary, ClientToServer, ContentBlock,
+    Conversation, FsEntry, FunctionKind, FunctionSummary, HostEnvProviderInfo, HostEnvSpec,
     ImageMime, ImageSource, Message, ModelSummary, NamedHostEnv, PodAllow, PodConfig, PodLimits,
-    PodSummary, ResourceSnapshot, ResourceStateLabel, RetentionPolicy, Role, ServerToClient,
-    SharedMcpAuthInput, SharedMcpAuthPublic, SharedMcpHostInfo, ThreadBindings,
-    ThreadBindingsRequest, ThreadConfigOverride, ThreadDefaults, ThreadStateLabel, ThreadSummary,
-    ToolResultContent, TriggerSpec, TurnLog, Usage,
+    PodSummary, ResourceSnapshot, Role, ServerToClient, SharedMcpAuthInput, SharedMcpAuthPublic,
+    SharedMcpHostInfo, ThreadBindings, ThreadBindingsRequest, ThreadConfigOverride, ThreadDefaults,
+    ThreadStateLabel, ThreadSummary, ToolResultContent, TurnLog, Usage,
 };
 
 /// Raw bytes picked up by the compose area before any MIME sniff or
@@ -416,16 +427,6 @@ fn format_relative_time(rfc3339: &str) -> String {
         return "yesterday".to_string();
     }
     format!("{days} d ago")
-}
-
-fn state_chip(state: ThreadStateLabel) -> (&'static str, Color32) {
-    match state {
-        ThreadStateLabel::Idle => ("idle", Color32::from_gray(160)),
-        ThreadStateLabel::Working => ("working", Color32::from_rgb(120, 180, 240)),
-        ThreadStateLabel::Completed => ("completed", Color32::from_rgb(120, 200, 140)),
-        ThreadStateLabel::Failed => ("failed", Color32::from_rgb(220, 110, 110)),
-        ThreadStateLabel::Cancelled => ("cancelled", Color32::from_rgb(180, 140, 140)),
-    }
 }
 
 /// Short human-readable label for a `FunctionKind`. Used in the
@@ -4670,17 +4671,92 @@ impl eframe::App for ChatApp {
         }
 
         let ctx = ui.ctx().clone();
-        self.render_fork_modal(&ctx);
-        self.render_new_pod_modal(&ctx);
+        if let Some(event) = render_fork_modal(&ctx, &mut self.fork_modal) {
+            match event {
+                ForkEvent::Confirmed {
+                    thread_id,
+                    from_message_index,
+                    archive_original,
+                    reset_capabilities,
+                    seed_text,
+                } => {
+                    let correlation_id = self.next_correlation_id();
+                    self.pending_fork_seed = Some((correlation_id.clone(), seed_text));
+                    self.send(ClientToServer::ForkThread {
+                        thread_id,
+                        from_message_index,
+                        archive_original,
+                        reset_capabilities,
+                        correlation_id: Some(correlation_id),
+                    });
+                }
+            }
+        }
+        let backends_empty = self.backends.is_empty();
+        if let Some(event) =
+            render_new_pod_modal(&ctx, &mut self.new_pod_modal, &self.pods, backends_empty)
+        {
+            match event {
+                NewPodEvent::Created { pod_id, name } => {
+                    let config = self.fresh_pod_config(name);
+                    self.send(ClientToServer::CreatePod {
+                        correlation_id: None,
+                        pod_id,
+                        config,
+                    });
+                }
+            }
+        }
         self.render_pod_editor_modal(&ctx);
-        self.render_new_behavior_modal(&ctx);
+        if let Some(event) =
+            render_new_behavior_modal(&ctx, &mut self.new_behavior_modal, &self.behaviors_by_pod)
+        {
+            match event {
+                NewBehaviorEvent::Created {
+                    pod_id,
+                    behavior_id,
+                    config,
+                } => {
+                    let correlation = self.next_correlation_id();
+                    if let Some(modal) = self.new_behavior_modal.as_mut() {
+                        modal.pending_correlation = Some(correlation.clone());
+                    }
+                    self.send(ClientToServer::CreateBehavior {
+                        correlation_id: Some(correlation),
+                        pod_id,
+                        behavior_id,
+                        config,
+                        prompt: String::new(),
+                    });
+                }
+            }
+        }
         self.render_behavior_editor_modal(&ctx);
         self.render_file_tree_modal(&ctx);
-        self.render_file_viewer_modal(&ctx);
-        self.render_json_viewer_modal(&ctx);
+        if let Some(event) = render_file_viewer_modal(&ctx, &mut self.file_viewer_modal) {
+            match event {
+                FileViewerEvent::SaveRequested {
+                    pod_id,
+                    path,
+                    content,
+                } => {
+                    let correlation = self.next_correlation_id();
+                    if let Some(modal) = self.file_viewer_modal.as_mut() {
+                        modal.pending_correlation = Some(correlation.clone());
+                    }
+                    self.send(ClientToServer::WritePodFile {
+                        correlation_id: Some(correlation),
+                        pod_id,
+                        path,
+                        content,
+                    });
+                }
+            }
+        }
+        render_json_viewer_modal(&ctx, &mut self.json_viewer_modal);
         self.render_provider_editor_modal(&ctx);
         self.render_settings_modal(&ctx);
-        self.render_image_lightbox_modal(&ctx);
+        render_image_lightbox_modal(&ctx);
 
         // Draft debounce tick. Schedule a repaint at the deadline so
         // the flush fires even if nothing else is driving frames.
@@ -5780,202 +5856,6 @@ impl ChatApp {
         }
     }
 
-    /// Render the fork-from-here confirm dialog. On confirm, fires
-    /// `ForkThread` with a correlation_id the `ThreadCreated`
-    /// handler matches against `pending_fork_seed` to seed the new
-    /// thread's draft.
-    fn render_fork_modal(&mut self, ctx: &egui::Context) {
-        let Some(mut modal) = self.fork_modal.take() else {
-            return;
-        };
-        let mut open = true;
-        let mut confirm_clicked = false;
-        let mut cancel_clicked = false;
-
-        egui::Window::new("Fork from this message")
-            .collapsible(false)
-            .resizable(false)
-            .default_width(380.0)
-            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-            .open(&mut open)
-            .show(ctx, |ui| {
-                ui.add_space(4.0);
-                ui.label(
-                    RichText::new(
-                        "Forks this thread at the selected user message. The new \
-                         thread shares the pod, bindings, config, and tool allowlist, \
-                         and starts with the conversation up to (but not including) \
-                         that message — ready for you to retype the prompt.",
-                    )
-                    .color(Color32::from_gray(190))
-                    .small(),
-                );
-                ui.add_space(8.0);
-                ui.checkbox(&mut modal.archive_original, "Archive the original thread");
-                ui.add_space(4.0);
-                ui.label(
-                    RichText::new(
-                        "Archived threads drop off the sidebar list but stay on disk; \
-                         they're still readable from the server's pod directory.",
-                    )
-                    .color(Color32::from_gray(140))
-                    .small(),
-                );
-                ui.add_space(8.0);
-                ui.checkbox(
-                    &mut modal.reset_capabilities,
-                    "Reset capabilities to pod defaults",
-                );
-                ui.add_space(4.0);
-                ui.label(
-                    RichText::new(
-                        "Unchecked: new thread inherits the source's live bindings, \
-                         scope, and config. Checked: re-derive from the pod's current \
-                         defaults — use this to pick up newly-added MCP hosts, sandbox \
-                         bindings, or cap changes made since the source thread was \
-                         created.",
-                    )
-                    .color(Color32::from_gray(140))
-                    .small(),
-                );
-                ui.add_space(10.0);
-                ui.separator();
-                ui.horizontal(|ui| {
-                    if ui.button("Fork").clicked() {
-                        confirm_clicked = true;
-                    }
-                    if ui.button("Cancel").clicked() {
-                        cancel_clicked = true;
-                    }
-                });
-            });
-
-        if confirm_clicked {
-            // The new thread id is minted server-side, so the seed
-            // text has to ride the correlation_id into the
-            // `ThreadCreated` handler rather than the `ForkThread`
-            // payload itself.
-            let correlation_id = self.next_correlation_id();
-            self.pending_fork_seed = Some((correlation_id.clone(), modal.seed_text.clone()));
-            self.send(ClientToServer::ForkThread {
-                thread_id: modal.thread_id.clone(),
-                from_message_index: modal.from_message_index,
-                archive_original: modal.archive_original,
-                reset_capabilities: modal.reset_capabilities,
-                correlation_id: Some(correlation_id),
-            });
-        } else if cancel_clicked || !open {
-            // Dropped.
-        } else {
-            self.fork_modal = Some(modal);
-        }
-    }
-
-    /// Render the "+ New pod" modal. The user picks an id + display
-    /// name; the new pod inherits the server default pod's config as
-    /// a template. The pod editor (opened from the per-pod "Edit"
-    /// button) is the place to change backends, shared MCP hosts, or
-    /// host envs afterwards.
-    fn render_new_pod_modal(&mut self, ctx: &egui::Context) {
-        let Some(mut modal) = self.new_pod_modal.take() else {
-            return;
-        };
-        let mut open = true;
-        let mut create_clicked = false;
-        let mut cancel_clicked = false;
-
-        egui::Window::new("New pod")
-            .collapsible(false)
-            .resizable(false)
-            .default_width(420.0)
-            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-            .open(&mut open)
-            .show(ctx, |ui| {
-                ui.add_space(4.0);
-                ui.horizontal(|ui| {
-                    ui.label("pod_id");
-                    ui.add(
-                        TextEdit::singleline(&mut modal.pod_id)
-                            .hint_text("directory name (e.g. 'whisper-dev')")
-                            .desired_width(f32::INFINITY),
-                    );
-                });
-                ui.label(
-                    RichText::new(
-                        "Becomes the pod's directory name on disk; immutable after \
-                         creation. Letters, numbers, dashes, underscores.",
-                    )
-                    .small()
-                    .color(Color32::from_gray(160)),
-                );
-                ui.add_space(6.0);
-                ui.horizontal(|ui| {
-                    ui.label("name");
-                    ui.add(
-                        TextEdit::singleline(&mut modal.name)
-                            .hint_text("display name (free text)")
-                            .desired_width(f32::INFINITY),
-                    );
-                });
-                if let Some(err) = &modal.error {
-                    ui.add_space(6.0);
-                    ui.colored_label(Color32::from_rgb(220, 80, 80), err);
-                }
-                ui.add_space(8.0);
-                ui.label(
-                    RichText::new(
-                        "The new pod inherits the server default pod's template \
-                         (backends, shared MCPs, host envs). Use the per-pod Edit \
-                         button to change any of these afterwards.",
-                    )
-                    .small()
-                    .color(Color32::from_gray(160)),
-                );
-                ui.add_space(8.0);
-                ui.separator();
-                ui.horizontal(|ui| {
-                    let create_enabled = !modal.pod_id.trim().is_empty()
-                        && !modal.name.trim().is_empty()
-                        && !self.backends.is_empty();
-                    if ui
-                        .add_enabled(create_enabled, egui::Button::new("Create"))
-                        .clicked()
-                    {
-                        create_clicked = true;
-                    }
-                    if ui.button("Cancel").clicked() {
-                        cancel_clicked = true;
-                    }
-                });
-            });
-
-        if create_clicked {
-            let pod_id = modal.pod_id.trim().to_string();
-            if let Err(msg) = validate_pod_id_client(&pod_id) {
-                modal.error = Some(msg.to_string());
-                self.new_pod_modal = Some(modal);
-                return;
-            }
-            if self.pods.contains_key(&pod_id) {
-                modal.error = Some(format!("pod `{pod_id}` already exists"));
-                self.new_pod_modal = Some(modal);
-                return;
-            }
-            let config = self.fresh_pod_config(modal.name.trim().to_string());
-            self.send(ClientToServer::CreatePod {
-                correlation_id: None,
-                pod_id,
-                config,
-            });
-            // Modal closes; PodCreated event will populate self.pods on
-            // the round-trip.
-        } else if cancel_clicked || !open {
-            // Modal closes.
-        } else {
-            self.new_pod_modal = Some(modal);
-        }
-    }
-
     /// Left-panel Providers tab. Lists registered host-env providers
     /// with origin + reachability badges and per-row Edit / Remove
     /// actions. "+ Add provider" at the top opens the add modal.
@@ -6020,7 +5900,38 @@ impl ChatApp {
         let providers = self.host_env_providers.clone();
         ScrollArea::vertical().show(ui, |ui| {
             for provider in &providers {
-                render_provider_row(ui, provider, self);
+                let pending = self.provider_remove_pending.get(&provider.name);
+                let removing = pending.is_some_and(|p| p.error.is_none());
+                let pending_error = pending.and_then(|p| p.error.as_deref());
+                let armed = self.provider_remove_armed.contains(&provider.name);
+                if let Some(event) =
+                    render_provider_row(ui, provider, armed, removing, pending_error)
+                {
+                    match event {
+                        ProviderRowEvent::EditRequested => {
+                            self.provider_editor_modal =
+                                Some(ProviderEditorModalState::new_edit(provider));
+                        }
+                        ProviderRowEvent::RemoveArmed => {
+                            self.provider_remove_armed.insert(provider.name.clone());
+                        }
+                        ProviderRowEvent::RemoveConfirmed => {
+                            let correlation = self.next_correlation_id();
+                            self.provider_remove_armed.remove(&provider.name);
+                            self.provider_remove_pending.insert(
+                                provider.name.clone(),
+                                ProviderRemovePending {
+                                    correlation: correlation.clone(),
+                                    error: None,
+                                },
+                            );
+                            self.send(ClientToServer::RemoveHostEnvProvider {
+                                correlation_id: Some(correlation),
+                                name: provider.name.clone(),
+                            });
+                        }
+                    }
+                }
                 ui.add_space(2.0);
                 ui.separator();
             }
@@ -6967,377 +6878,6 @@ impl ChatApp {
         }
     }
 
-    fn render_new_behavior_modal(&mut self, ctx: &egui::Context) {
-        let Some(mut modal) = self.new_behavior_modal.take() else {
-            return;
-        };
-        let mut open = true;
-        let mut create_clicked = false;
-        let mut cancel_clicked = false;
-        let saving = modal.pending_correlation.is_some();
-
-        egui::Window::new(format!("New behavior — {}", modal.pod_id))
-            .collapsible(false)
-            .resizable(false)
-            .default_width(420.0)
-            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-            .open(&mut open)
-            .show(ctx, |ui| {
-                ui.add_space(4.0);
-                ui.horizontal(|ui| {
-                    ui.label("behavior_id");
-                    ui.add(
-                        TextEdit::singleline(&mut modal.behavior_id)
-                            .hint_text("directory name (e.g. 'daily-ci-check')")
-                            .desired_width(f32::INFINITY),
-                    );
-                });
-                hint(
-                    ui,
-                    "Becomes the behavior's directory name under the pod; \
-                     immutable after creation.",
-                );
-                ui.add_space(6.0);
-                ui.horizontal(|ui| {
-                    ui.label("name");
-                    ui.add(
-                        TextEdit::singleline(&mut modal.name)
-                            .hint_text("display name (free text)")
-                            .desired_width(f32::INFINITY),
-                    );
-                });
-                if let Some(err) = &modal.error {
-                    ui.add_space(6.0);
-                    ui.colored_label(Color32::from_rgb(220, 80, 80), err);
-                }
-                ui.add_space(8.0);
-                hint(
-                    ui,
-                    "Starts as a manually-triggered behavior with an empty \
-                     prompt. Edit in the full editor to add a trigger, \
-                     override thread settings, or write the prompt.",
-                );
-                ui.add_space(8.0);
-                ui.separator();
-                ui.horizontal(|ui| {
-                    let enabled = !modal.behavior_id.trim().is_empty()
-                        && !modal.name.trim().is_empty()
-                        && !saving;
-                    if ui
-                        .add_enabled(enabled, egui::Button::new("Create"))
-                        .clicked()
-                    {
-                        create_clicked = true;
-                    }
-                    if ui.button("Cancel").clicked() {
-                        cancel_clicked = true;
-                    }
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if saving {
-                            ui.label(
-                                RichText::new("creating…")
-                                    .italics()
-                                    .color(Color32::from_gray(160)),
-                            );
-                        }
-                    });
-                });
-            });
-
-        if create_clicked {
-            let behavior_id = modal.behavior_id.trim().to_string();
-            if let Err(msg) = validate_behavior_id_client(&behavior_id) {
-                modal.error = Some(msg.to_string());
-                self.new_behavior_modal = Some(modal);
-                return;
-            }
-            let existing = self
-                .behaviors_by_pod
-                .get(&modal.pod_id)
-                .map(|list| list.iter().any(|b| b.behavior_id == behavior_id))
-                .unwrap_or(false);
-            if existing {
-                modal.error = Some(format!("behavior `{behavior_id}` already exists"));
-                self.new_behavior_modal = Some(modal);
-                return;
-            }
-            let correlation = self.next_correlation_id();
-            let config = BehaviorConfig {
-                name: modal.name.trim().to_string(),
-                description: None,
-                trigger: TriggerSpec::Manual,
-                thread: BehaviorThreadOverride::default(),
-                on_completion: RetentionPolicy::default(),
-                scope: Default::default(),
-            };
-            modal.pending_correlation = Some(correlation.clone());
-            modal.error = None;
-            self.send(ClientToServer::CreateBehavior {
-                correlation_id: Some(correlation),
-                pod_id: modal.pod_id.clone(),
-                behavior_id,
-                config,
-                prompt: String::new(),
-            });
-            self.new_behavior_modal = Some(modal);
-        } else if cancel_clicked || !open {
-            // Modal closes.
-        } else {
-            self.new_behavior_modal = Some(modal);
-        }
-    }
-
-    /// Render the generic pod-file text editor. Single-textarea modal
-    /// — no tabs, no sub-forms. Save/Revert/Close footer for
-    /// writable files; a read-only notice replaces the footer for
-    /// paths the server has flagged as runtime state. Content loads
-    /// Lightbox-style overlay that shows whichever attachment
-    /// thumbnail the user clicked at full size. Reads the URI from the
-    /// `ENLARGED_IMAGE_KEY` memory slot the chat-render thumbnail
-    /// strip writes; closing (X / Esc / click outside) clears the slot
-    /// so the next click opens the next image. The bytes are already
-    /// `include_bytes`-loaded against this URI, so the modal just
-    /// renders an `egui::Image` at fit-to-window scale — no second
-    /// decode pass.
-    fn render_image_lightbox_modal(&mut self, ctx: &egui::Context) {
-        let key = egui::Id::new(self::chat_render::ENLARGED_IMAGE_KEY);
-        let uri: Option<String> = ctx.memory(|mem| mem.data.get_temp::<String>(key));
-        let Some(uri) = uri else { return };
-
-        let screen = ctx.content_rect();
-        let max_h = (screen.height() - 80.0).max(240.0);
-        let max_w = (screen.width() - 80.0).max(320.0);
-        let mut open = true;
-        let mut dismiss = ctx.input(|i| i.key_pressed(egui::Key::Escape));
-
-        egui::Window::new("attachment")
-            .collapsible(false)
-            .resizable(false)
-            .title_bar(false)
-            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-            .max_width(max_w)
-            .max_height(max_h)
-            .open(&mut open)
-            .show(ctx, |ui| {
-                ui.vertical(|ui| {
-                    ui.horizontal(|ui| {
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if ui
-                                .button(RichText::new("✕").strong())
-                                .on_hover_text("Close (Esc)")
-                                .clicked()
-                            {
-                                dismiss = true;
-                            }
-                        });
-                    });
-                    ui.add(
-                        egui::Image::new(&uri)
-                            .max_size(egui::vec2(max_w - 24.0, max_h - 60.0))
-                            .fit_to_exact_size(egui::vec2(max_w - 24.0, max_h - 60.0)),
-                    );
-                });
-            });
-
-        if dismiss || !open {
-            ctx.memory_mut(|mem| mem.data.remove::<String>(key));
-        }
-    }
-
-    /// Render the read-only JSON tree viewer. Scalars render as
-    /// `key: value` one-liners; objects and arrays render as
-    /// collapsible headers with their sizes in the label, default-open
-    /// at the root and default-closed deeper. Strings are shown
-    /// in-line with a preview and a hover tooltip carrying the full
-    /// text, so long message content doesn't blow out the row height.
-    fn render_json_viewer_modal(&mut self, ctx: &egui::Context) {
-        let Some(modal) = self.json_viewer_modal.take() else {
-            return;
-        };
-
-        let title = format!("{} — {}", modal.path, modal.pod_id);
-        let screen = ctx.content_rect();
-        let max_h = (screen.height() - 60.0).max(280.0);
-        let max_w = (screen.width() - 60.0).max(420.0);
-        let mut open = true;
-        let mut close_clicked = false;
-
-        egui::Window::new(title)
-            .collapsible(false)
-            .resizable(true)
-            .default_width(720.0_f32.min(max_w))
-            .default_height(560.0_f32.min(max_h))
-            .max_width(max_w)
-            .max_height(max_h)
-            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-            .open(&mut open)
-            .show(ctx, |ui| {
-                egui::Panel::bottom("json_viewer_footer").show_inside(ui, |ui| {
-                    ui.add_space(6.0);
-                    if let Some(err) = modal.error.as_deref() {
-                        ui.colored_label(Color32::from_rgb(220, 80, 80), err);
-                        ui.add_space(4.0);
-                    }
-                    ui.separator();
-                    ui.horizontal(|ui| {
-                        ui.label(
-                            RichText::new("read-only JSON viewer")
-                                .small()
-                                .color(Color32::from_gray(160)),
-                        );
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if ui.button("Close").clicked() {
-                                close_clicked = true;
-                            }
-                        });
-                    });
-                });
-                egui::CentralPanel::default().show_inside(ui, |ui| {
-                    if let Some(value) = modal.parsed.as_ref() {
-                        egui::ScrollArea::vertical()
-                            .auto_shrink([false, false])
-                            .show(ui, |ui| {
-                                render_json_node(ui, "$", "(root)", value, 0);
-                            });
-                    } else if modal.error.is_none() {
-                        ui.add_space(24.0);
-                        ui.label(
-                            RichText::new("loading…")
-                                .italics()
-                                .color(Color32::from_gray(160)),
-                        );
-                    }
-                });
-            });
-
-        if close_clicked || !open {
-            return;
-        }
-        self.json_viewer_modal = Some(modal);
-    }
-
-    fn render_file_viewer_modal(&mut self, ctx: &egui::Context) {
-        let Some(mut modal) = self.file_viewer_modal.take() else {
-            return;
-        };
-
-        let mut open = true;
-        let mut save_clicked = false;
-        let mut revert_clicked = false;
-        let mut close_clicked = false;
-
-        let title = format!("{} — {}", modal.path, modal.pod_id);
-        let screen = ctx.content_rect();
-        let max_h = (screen.height() - 60.0).max(280.0);
-        let max_w = (screen.width() - 60.0).max(420.0);
-        let dirty = modal.is_dirty();
-        let has_data = modal.working.is_some();
-        // "saving" iff we have content and a correlation is in flight
-        // (a correlation-in-flight with no content yet = pending read).
-        let saving = modal.pending_correlation.is_some() && has_data;
-
-        egui::Window::new(title)
-            .collapsible(false)
-            .resizable(true)
-            .default_width(720.0_f32.min(max_w))
-            .default_height(560.0_f32.min(max_h))
-            .max_width(max_w)
-            .max_height(max_h)
-            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-            .open(&mut open)
-            .show(ctx, |ui| {
-                egui::Panel::bottom("file_viewer_footer").show_inside(ui, |ui| {
-                    if modal.readonly {
-                        ui.add_space(6.0);
-                        if let Some(err) = modal.error.as_deref() {
-                            ui.colored_label(Color32::from_rgb(220, 80, 80), err);
-                            ui.add_space(4.0);
-                        }
-                        ui.separator();
-                        ui.horizontal(|ui| {
-                            ui.label(
-                                RichText::new("read-only — runtime state owned by the scheduler")
-                                    .small()
-                                    .color(Color32::from_gray(160)),
-                            );
-                            ui.with_layout(
-                                egui::Layout::right_to_left(egui::Align::Center),
-                                |ui| {
-                                    if ui.button("Close").clicked() {
-                                        close_clicked = true;
-                                    }
-                                },
-                            );
-                        });
-                    } else {
-                        let actions = crate::editor::render_footer(
-                            ui,
-                            modal.error.as_deref(),
-                            has_data,
-                            dirty,
-                            saving,
-                        );
-                        save_clicked = actions.save;
-                        revert_clicked = actions.revert;
-                        close_clicked = actions.close;
-                    }
-                });
-                egui::CentralPanel::default().show_inside(ui, |ui| {
-                    let Some(working) = modal.working.as_mut() else {
-                        ui.add_space(24.0);
-                        if modal.error.is_none() {
-                            ui.label(
-                                RichText::new("loading…")
-                                    .italics()
-                                    .color(Color32::from_gray(160)),
-                            );
-                        }
-                        return;
-                    };
-                    egui::ScrollArea::vertical()
-                        .auto_shrink([false, false])
-                        .show(ui, |ui| {
-                            let mut edit = TextEdit::multiline(working)
-                                .code_editor()
-                                .desired_width(ui.available_width());
-                            if modal.readonly {
-                                edit = edit.interactive(false);
-                            }
-                            ui.add_sized(
-                                [ui.available_width(), ui.available_height().max(200.0)],
-                                edit,
-                            );
-                        });
-                });
-            });
-
-        if revert_clicked && let Some(b) = modal.baseline.clone() {
-            modal.working = Some(b);
-            modal.error = None;
-        }
-
-        if save_clicked
-            && modal.is_dirty()
-            && let Some(working) = modal.working.clone()
-        {
-            let correlation = self.next_correlation_id();
-            modal.pending_correlation = Some(correlation.clone());
-            modal.error = None;
-            self.send(ClientToServer::WritePodFile {
-                correlation_id: Some(correlation),
-                pod_id: modal.pod_id.clone(),
-                path: modal.path.clone(),
-                content: working,
-            });
-        }
-
-        if close_clicked || !open {
-            // Modal was taken out at the top — dropping = closed.
-            return;
-        }
-        self.file_viewer_modal = Some(modal);
-    }
-
     fn render_pod_editor_modal(&mut self, ctx: &egui::Context) {
         let Some(mut modal) = self.pod_editor_modal.take() else {
             return;
@@ -7920,849 +7460,6 @@ impl ChatApp {
             limits: PodLimits::default(),
         }
     }
-}
-
-/// One row in the Settings → LLM backends list. Shows name, kind,
-/// default model, and auth-mode badge; for `chatgpt_subscription`
-/// backends, a right-aligned "Rotate credentials" button that bubbles
-/// the backend name up through `rotate_request` so the caller can open
-/// the paste-`auth.json` sub-form. Never renders credential material.
-fn render_backend_settings_row(
-    ui: &mut egui::Ui,
-    backend: &BackendSummary,
-    rotate_request: &mut Option<String>,
-) {
-    ui.horizontal(|ui| {
-        ui.label(RichText::new(&backend.name).strong());
-        if backend.auth_mode.as_deref() == Some("chatgpt_subscription") {
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui
-                    .small_button("Rotate credentials")
-                    .on_hover_text("Paste a fresh ~/.codex/auth.json to rotate the ChatGPT subscription tokens")
-                    .clicked()
-                {
-                    *rotate_request = Some(backend.name.clone());
-                }
-            });
-        }
-    });
-    ui.horizontal_wrapped(|ui| {
-        ui.label(
-            RichText::new(format!("kind: {}", backend.kind))
-                .small()
-                .color(Color32::from_gray(170)),
-        );
-        ui.label(RichText::new("·").small().color(Color32::from_gray(120)));
-        let auth = backend.auth_mode.as_deref().unwrap_or("(none)");
-        ui.label(
-            RichText::new(format!("auth: {auth}"))
-                .small()
-                .color(Color32::from_gray(170)),
-        );
-        if let Some(model) = backend.default_model.as_deref() {
-            ui.label(RichText::new("·").small().color(Color32::from_gray(120)));
-            ui.label(
-                RichText::new(format!("default model: {model}"))
-                    .small()
-                    .color(Color32::from_gray(170)),
-            );
-        }
-    });
-}
-
-/// One shared-MCP-host entry in the settings list. Name + live status
-/// on the first line; URL, origin, auth-kind on the second; edit /
-/// remove buttons on the third. Remove uses a two-click guard.
-fn render_shared_mcp_host_row(
-    ui: &mut egui::Ui,
-    host: &SharedMcpHostInfo,
-    remove_armed: &mut HashSet<String>,
-    edit_request: &mut Option<SharedMcpHostInfo>,
-    remove_request: &mut Option<String>,
-) {
-    ui.horizontal(|ui| {
-        ui.label(RichText::new(&host.name).strong());
-        let (label, color) = if host.connected {
-            ("connected", Color32::from_rgb(0x88, 0xbb, 0x88))
-        } else if !host.last_error.is_empty() {
-            ("connect failed", Color32::from_rgb(0xd0, 0x70, 0x70))
-        } else {
-            ("not connected", Color32::from_gray(170))
-        };
-        ui.label(RichText::new(label).small().color(color));
-    });
-    ui.horizontal_wrapped(|ui| {
-        ui.label(
-            RichText::new(format!("url: {}", host.url))
-                .small()
-                .color(Color32::from_gray(170)),
-        );
-        ui.label(RichText::new("·").small().color(Color32::from_gray(120)));
-        let origin = match host.origin {
-            HostEnvProviderOrigin::Seeded => "seeded",
-            HostEnvProviderOrigin::Manual => "manual",
-            HostEnvProviderOrigin::RuntimeOverlay => "cli-overlay",
-        };
-        ui.label(
-            RichText::new(format!("origin: {origin}"))
-                .small()
-                .color(Color32::from_gray(170)),
-        );
-        ui.label(RichText::new("·").small().color(Color32::from_gray(120)));
-        let auth = match &host.auth {
-            SharedMcpAuthPublic::None => "anonymous".to_string(),
-            SharedMcpAuthPublic::Bearer => "bearer".to_string(),
-            SharedMcpAuthPublic::Oauth2 { issuer, .. } => format!("oauth2 ({issuer})"),
-        };
-        ui.label(
-            RichText::new(format!("auth: {auth}"))
-                .small()
-                .color(Color32::from_gray(170)),
-        );
-    });
-    if !host.last_error.is_empty() {
-        ui.label(
-            RichText::new(&host.last_error)
-                .small()
-                .color(Color32::from_rgb(0xd0, 0x70, 0x70)),
-        );
-    }
-    let is_overlay = matches!(host.origin, HostEnvProviderOrigin::RuntimeOverlay);
-    ui.horizontal(|ui| {
-        // Edit is disabled on both CLI overlays and OAuth entries:
-        // overlays can't mutate at runtime (shadowed by catalog);
-        // OAuth entries would have their tokens silently overwritten
-        // by the Bearer/Anonymous fields in the Edit form, wiping the
-        // whole authorization handshake. For OAuth, the only
-        // supported "edit" is remove + re-add (re-running the flow).
-        let is_oauth = matches!(host.auth, SharedMcpAuthPublic::Oauth2 { .. });
-        let edit_enabled = !is_overlay && !is_oauth;
-        let edit_hover = if is_overlay {
-            "CLI --shared-mcp-host overlays can't be edited at runtime"
-        } else if is_oauth {
-            "OAuth hosts can't be edited — remove and re-add to change URL or re-authorize"
-        } else {
-            "Edit url or auth"
-        };
-        if ui
-            .add_enabled(edit_enabled, egui::Button::new("Edit").small())
-            .on_hover_text(edit_hover)
-            .clicked()
-        {
-            *edit_request = Some(host.clone());
-        }
-        let armed = remove_armed.contains(&host.name);
-        let remove_label = if armed { "Confirm remove" } else { "Remove" };
-        let remove_hover = if is_overlay {
-            "CLI overlay — restart without the flag to unregister"
-        } else {
-            "Remove from catalog. Fails if any thread is currently using this host."
-        };
-        if ui
-            .add_enabled(!is_overlay, egui::Button::new(remove_label).small())
-            .on_hover_text(remove_hover)
-            .clicked()
-        {
-            if armed {
-                remove_armed.remove(&host.name);
-                *remove_request = Some(host.name.clone());
-            } else {
-                remove_armed.insert(host.name.clone());
-            }
-        }
-    });
-}
-
-/// The origin the webui is served from (e.g. `http://127.0.0.1:8080`).
-/// Used as the base for the OAuth redirect URI — we hand it to the
-/// server so it builds a redirect URL the browser will actually be
-/// able to reach. Only meaningful on the wasm32 (browser) target;
-/// desktop builds return an empty string and the UI gates the OAuth
-/// option off.
-#[cfg(target_arch = "wasm32")]
-fn webui_origin() -> String {
-    web_sys::window()
-        .and_then(|w| w.location().origin().ok())
-        .unwrap_or_default()
-}
-#[cfg(not(target_arch = "wasm32"))]
-fn webui_origin() -> String {
-    String::new()
-}
-
-/// Open `url` in a new browser tab. Used by the OAuth flow to hand
-/// the user off to the authorization server. No-op on desktop —
-/// native OAuth would route through the system browser via
-/// a crate like `webbrowser`, which we'll add when desktop needs it.
-#[cfg(target_arch = "wasm32")]
-fn open_in_new_tab(url: &str) {
-    if let Some(window) = web_sys::window() {
-        let _ = window.open_with_url_and_target(url, "_blank");
-    }
-}
-#[cfg(not(target_arch = "wasm32"))]
-fn open_in_new_tab(_url: &str) {}
-
-/// True when OAuth flows are actually usable — the webui is in a
-/// browser that can open a new tab + receive a redirect on the
-/// server's `/oauth/callback` route. False on desktop (no browser
-/// to drive the flow); the UI disables the OAuth radio option.
-#[cfg(target_arch = "wasm32")]
-const OAUTH_AVAILABLE: bool = true;
-#[cfg(not(target_arch = "wasm32"))]
-const OAUTH_AVAILABLE: bool = false;
-
-/// Persistent banner for a task that's entered the Failed state. Survives resnapshot
-/// because `failure` is captured from the snapshot itself rather than derived from
-/// the per-event items list.
-fn render_resource_list(ui: &mut egui::Ui, resources: &HashMap<String, ResourceSnapshot>) {
-    let mut host_envs: Vec<&ResourceSnapshot> = Vec::new();
-    let mut mcp_hosts: Vec<&ResourceSnapshot> = Vec::new();
-    let mut backends: Vec<&ResourceSnapshot> = Vec::new();
-    for r in resources.values() {
-        match r {
-            ResourceSnapshot::HostEnv { .. } => host_envs.push(r),
-            ResourceSnapshot::McpHost { .. } => mcp_hosts.push(r),
-            ResourceSnapshot::Backend { .. } => backends.push(r),
-        }
-    }
-    host_envs.sort_by_key(|r| r.id().to_string());
-    mcp_hosts.sort_by_key(|r| r.id().to_string());
-    backends.sort_by_key(|r| r.id().to_string());
-
-    ScrollArea::vertical().show(ui, |ui| {
-        egui::CollapsingHeader::new(format!("Host envs ({})", host_envs.len()))
-            .default_open(true)
-            .show(ui, |ui| {
-                for r in &host_envs {
-                    render_resource_row(ui, r);
-                }
-                if host_envs.is_empty() {
-                    ui.label(
-                        RichText::new("(none)")
-                            .color(Color32::from_gray(140))
-                            .small(),
-                    );
-                }
-            });
-        egui::CollapsingHeader::new(format!("MCP Hosts ({})", mcp_hosts.len()))
-            .default_open(true)
-            .show(ui, |ui| {
-                for r in &mcp_hosts {
-                    render_resource_row(ui, r);
-                }
-                if mcp_hosts.is_empty() {
-                    ui.label(
-                        RichText::new("(none)")
-                            .color(Color32::from_gray(140))
-                            .small(),
-                    );
-                }
-            });
-        egui::CollapsingHeader::new(format!("Backends ({})", backends.len()))
-            .default_open(true)
-            .show(ui, |ui| {
-                for r in &backends {
-                    render_resource_row(ui, r);
-                }
-                if backends.is_empty() {
-                    ui.label(
-                        RichText::new("(none)")
-                            .color(Color32::from_gray(140))
-                            .small(),
-                    );
-                }
-            });
-    });
-}
-
-fn render_resource_row(ui: &mut egui::Ui, resource: &ResourceSnapshot) {
-    let (label, sub, state, users) = match resource {
-        ResourceSnapshot::HostEnv {
-            id,
-            provider,
-            spec,
-            state,
-            users,
-            ..
-        } => {
-            let sub = format!("{provider} · {}", spec_label(spec));
-            (id.clone(), sub, *state, users.len())
-        }
-        ResourceSnapshot::McpHost {
-            id,
-            label,
-            url,
-            tools,
-            state,
-            users,
-            ..
-        } => (
-            label.clone(),
-            format!("{} · {} tools · {}", id, tools.len(), url),
-            *state,
-            users.len(),
-        ),
-        ResourceSnapshot::Backend {
-            name,
-            backend_kind,
-            default_model,
-            state,
-            users,
-            ..
-        } => {
-            let model = default_model.as_deref().unwrap_or("(no default)");
-            (
-                name.clone(),
-                format!("{backend_kind} · {model}"),
-                *state,
-                users.len(),
-            )
-        }
-    };
-    let (chip, chip_color) = resource_state_chip(state);
-    ui.horizontal(|ui| {
-        ui.label(RichText::new(label).strong());
-        ui.label(RichText::new(format!("[{chip}]")).color(chip_color).small());
-        ui.label(
-            RichText::new(format!("{users} users"))
-                .color(Color32::from_gray(160))
-                .small(),
-        );
-    });
-    if !sub.is_empty() {
-        ui.label(RichText::new(sub).color(Color32::from_gray(150)).small());
-    }
-    ui.add_space(4.0);
-}
-
-pub(super) fn spec_label(spec: &HostEnvSpec) -> String {
-    match spec {
-        HostEnvSpec::Container { image, .. } => format!("container: {image}"),
-        HostEnvSpec::Landlock { allowed_paths, .. } => {
-            format!("landlock · {} paths", allowed_paths.len())
-        }
-    }
-}
-
-/// One row in the Providers tab. Takes `&mut App` so Edit/Remove
-/// clicks can mutate modal state and dispatch protocol messages. The
-/// provider snapshot is read from a clone so this function doesn't
-/// hold a borrow against the live `host_env_providers` Vec.
-fn render_provider_row(ui: &mut egui::Ui, info: &HostEnvProviderInfo, app: &mut ChatApp) {
-    let (origin_chip, origin_color) = provider_origin_chip(info.origin);
-    let (reach_chip, reach_color, reach_detail) = provider_reachability_chip(&info.reachability);
-    ui.horizontal(|ui| {
-        ui.label(RichText::new(&info.name).strong());
-        ui.label(
-            RichText::new(format!("[{origin_chip}]"))
-                .color(origin_color)
-                .small(),
-        );
-        ui.label(
-            RichText::new(format!("[{reach_chip}]"))
-                .color(reach_color)
-                .small(),
-        );
-        if info.has_token {
-            ui.label(RichText::new("auth").color(Color32::from_gray(160)).small());
-        } else {
-            ui.label(
-                RichText::new("no auth")
-                    .color(Color32::from_rgb(180, 140, 90))
-                    .small(),
-            );
-        }
-    });
-    ui.label(
-        RichText::new(&info.url)
-            .color(Color32::from_gray(160))
-            .small()
-            .monospace(),
-    );
-    if let Some(detail) = &reach_detail {
-        ui.label(RichText::new(detail).color(reach_color).small());
-    }
-
-    // Actions. Runtime-overlay entries (CLI flags) can't be edited or
-    // removed via the UI — the corresponding server-side command
-    // refuses them. Show the buttons disabled with a hint so the user
-    // isn't confused.
-    let is_overlay = info.origin == HostEnvProviderOrigin::RuntimeOverlay;
-    // Clone the relevant bits out so the closures below can re-borrow
-    // `app` mutably without fighting a lingering immutable borrow.
-    let pending_error = app
-        .provider_remove_pending
-        .get(&info.name)
-        .and_then(|p| p.error.clone());
-    let removing = app
-        .provider_remove_pending
-        .get(&info.name)
-        .is_some_and(|p| p.error.is_none());
-    let armed = app.provider_remove_armed.contains(&info.name);
-
-    ui.horizontal(|ui| {
-        let edit_btn = ui.add_enabled(!is_overlay && !removing, egui::Button::new("Edit"));
-        if edit_btn.clicked() {
-            app.provider_editor_modal = Some(ProviderEditorModalState::new_edit(info));
-        }
-
-        let remove_label = if removing {
-            "Removing…"
-        } else if armed {
-            "Confirm remove"
-        } else {
-            "Remove"
-        };
-        let remove_btn = ui.add_enabled(!is_overlay && !removing, egui::Button::new(remove_label));
-        if remove_btn.clicked() {
-            if armed {
-                let correlation = app.next_correlation_id();
-                app.provider_remove_armed.remove(&info.name);
-                app.provider_remove_pending.insert(
-                    info.name.clone(),
-                    ProviderRemovePending {
-                        correlation: correlation.clone(),
-                        error: None,
-                    },
-                );
-                app.send(ClientToServer::RemoveHostEnvProvider {
-                    correlation_id: Some(correlation),
-                    name: info.name.clone(),
-                });
-            } else {
-                app.provider_remove_armed.insert(info.name.clone());
-            }
-        }
-        if is_overlay {
-            ui.label(
-                RichText::new("CLI-overlay (drop --host-env-provider flag to manage here)")
-                    .small()
-                    .color(Color32::from_gray(150)),
-            );
-        }
-    });
-    if let Some(err) = pending_error {
-        ui.label(
-            RichText::new(format!("remove failed: {err}"))
-                .small()
-                .color(Color32::from_rgb(220, 80, 80)),
-        );
-    }
-}
-
-fn provider_origin_chip(origin: HostEnvProviderOrigin) -> (&'static str, Color32) {
-    match origin {
-        HostEnvProviderOrigin::Seeded => ("seeded", Color32::from_rgb(140, 160, 200)),
-        HostEnvProviderOrigin::Manual => ("manual", Color32::from_rgb(140, 200, 160)),
-        HostEnvProviderOrigin::RuntimeOverlay => ("cli-overlay", Color32::from_rgb(200, 180, 120)),
-    }
-}
-
-fn provider_reachability_chip(r: &HostEnvReachability) -> (&'static str, Color32, Option<String>) {
-    match r {
-        HostEnvReachability::Unknown => ("probing", Color32::from_gray(150), None),
-        HostEnvReachability::Reachable { at } => (
-            "reachable",
-            Color32::from_rgb(120, 180, 120),
-            Some(format!("last probe OK · {at}")),
-        ),
-        HostEnvReachability::Unreachable { since, last_error } => (
-            "unreachable",
-            Color32::from_rgb(220, 110, 110),
-            Some(format!("since {since} · {last_error}")),
-        ),
-    }
-}
-
-fn resource_state_chip(state: ResourceStateLabel) -> (&'static str, Color32) {
-    match state {
-        ResourceStateLabel::Provisioning => ("provisioning", Color32::from_rgb(180, 160, 90)),
-        ResourceStateLabel::Ready => ("ready", Color32::from_rgb(120, 180, 120)),
-        ResourceStateLabel::Errored => ("errored", Color32::from_rgb(200, 110, 110)),
-        ResourceStateLabel::Lost => ("lost", Color32::from_rgb(210, 140, 90)),
-        ResourceStateLabel::TornDown => ("torn down", Color32::from_gray(140)),
-    }
-}
-
-/// Collapsible inspector at the top of the thread view. Surfaces
-/// everything a snapshot carries that isn't already visible as a
-/// conversation item: pod/thread identity, timestamps, bindings,
-/// sampling caps, approval policy, trigger origin, and the full
-/// system prompt. Collapsed by default — most sessions never open
-/// it. egui's `CollapsingHeader` persists open/closed state by
-/// `id_salt` so flipping the arrow survives repaints.
-fn render_thread_context_inspector(ui: &mut egui::Ui, thread_id: &str, view: &TaskView) {
-    let salt = format!("thread-context-{thread_id}");
-    egui::CollapsingHeader::new(
-        RichText::new("Thread context")
-            .small()
-            .color(Color32::from_gray(180)),
-    )
-    .id_salt(salt)
-    .default_open(false)
-    .show(ui, |ui| {
-        let inspector = &view.inspector;
-        Grid::new(format!("thread-context-grid-{thread_id}"))
-            .num_columns(2)
-            .min_col_width(120.0)
-            .spacing([12.0, 4.0])
-            .show(ui, |ui| {
-                kv_row(ui, "thread_id", thread_id);
-                kv_row(ui, "pod_id", &view.summary.pod_id);
-                kv_row(ui, "state", state_chip(view.summary.state).0);
-                if let Some(title) = view.summary.title.as_deref() {
-                    kv_row(ui, "title", title);
-                }
-                if !inspector.created_at.is_empty() {
-                    kv_row(ui, "created_at", &inspector.created_at);
-                }
-                if !view.summary.last_active.is_empty() {
-                    kv_row(ui, "last_active", &view.summary.last_active);
-                }
-                let backend_val = if view.backend.is_empty() {
-                    "(server default)".to_string()
-                } else {
-                    view.backend.clone()
-                };
-                let model_val = if view.model.is_empty() {
-                    "(backend default)".to_string()
-                } else {
-                    view.model.clone()
-                };
-                kv_row(ui, "backend", &backend_val);
-                kv_row(ui, "model", &model_val);
-                if inspector.max_tokens > 0 {
-                    kv_row(ui, "max_tokens", &inspector.max_tokens.to_string());
-                }
-                if inspector.max_turns > 0 {
-                    kv_row(ui, "max_turns", &inspector.max_turns.to_string());
-                }
-                let host_env_label = if inspector.bindings.host_env.is_empty() {
-                    "(none — shared MCPs only)".to_string()
-                } else {
-                    inspector
-                        .bindings
-                        .host_env
-                        .iter()
-                        .map(|b| match b {
-                            HostEnvBinding::Named { name } => name.clone(),
-                            HostEnvBinding::Inline { provider, .. } => {
-                                format!("(inline, provider = {provider})")
-                            }
-                        })
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                };
-                kv_row(ui, "host_env", &host_env_label);
-                let mcp_label = if inspector.bindings.mcp_hosts.is_empty() {
-                    "(none)".to_string()
-                } else {
-                    inspector.bindings.mcp_hosts.join(", ")
-                };
-                kv_row(ui, "mcp_hosts", &mcp_label);
-                kv_row(
-                    ui,
-                    "total_usage_in",
-                    &view.total_usage.input_tokens.to_string(),
-                );
-                kv_row(
-                    ui,
-                    "total_usage_out",
-                    &view.total_usage.output_tokens.to_string(),
-                );
-                if view.total_usage.cache_read_input_tokens > 0
-                    || view.total_usage.cache_creation_input_tokens > 0
-                {
-                    kv_row(
-                        ui,
-                        "cache (read/write)",
-                        &format!(
-                            "{}/{}",
-                            view.total_usage.cache_read_input_tokens,
-                            view.total_usage.cache_creation_input_tokens
-                        ),
-                    );
-                }
-            });
-
-        ui.add_space(6.0);
-        section_heading(ui, "Scope");
-        render_scope_summary(ui, thread_id, &inspector.scope);
-
-        if let Some(origin) = inspector.origin.as_ref() {
-            ui.add_space(6.0);
-            section_heading(ui, "Trigger origin");
-            Grid::new(format!("thread-origin-grid-{thread_id}"))
-                .num_columns(2)
-                .min_col_width(120.0)
-                .spacing([12.0, 4.0])
-                .show(ui, |ui| {
-                    kv_row(ui, "behavior_id", &origin.behavior_id);
-                    kv_row(ui, "fired_at", &origin.fired_at);
-                    if !origin.trigger_payload.is_null() {
-                        let payload_text = serde_json::to_string_pretty(&origin.trigger_payload)
-                            .unwrap_or_default();
-                        ui.label("trigger_payload");
-                        ui.add(
-                            TextEdit::multiline(&mut payload_text.as_str())
-                                .code_editor()
-                                .desired_rows(payload_text.lines().count().clamp(1, 8) as usize)
-                                .desired_width(f32::INFINITY),
-                        );
-                        ui.end_row();
-                    }
-                });
-        }
-
-        // System prompt + tool manifest used to render here; they now
-        // live as `Role::System` / `Role::Tools` messages at the head
-        // of the conversation and render inline in the chat log
-        // (default-collapsed).
-    });
-    ui.add_space(6.0);
-}
-
-/// Render one row of the inspector's key-value grid. Keys right-aligned
-/// in a muted tone, values left-aligned as plain text.
-fn kv_row(ui: &mut egui::Ui, key: &str, value: &str) {
-    ui.label(RichText::new(key).small().color(Color32::from_gray(160)));
-    ui.label(RichText::new(value).small());
-    ui.end_row();
-}
-
-/// Compact projection of a thread's `Scope` into the inspector. Shows
-/// the bindings-side admission sets, the typed caps, and whether the
-/// thread has an interactive escalation channel. Tool dispositions ride
-/// alongside the catalog in the chat log so they aren't duplicated
-/// here — the common "what can this thread do?" question is typically
-/// about bindings + caps, which the rest of the UI doesn't surface.
-fn render_scope_summary(
-    ui: &mut egui::Ui,
-    thread_id: &str,
-    scope: &whisper_agent_protocol::permission::Scope,
-) {
-    use whisper_agent_protocol::permission::{Escalation, SetOrAll};
-
-    fn fmt_set(set: &SetOrAll<String>) -> String {
-        match set {
-            SetOrAll::All => "(all)".to_string(),
-            SetOrAll::Only { items } if items.is_empty() => "(none)".to_string(),
-            SetOrAll::Only { items } => items.iter().cloned().collect::<Vec<_>>().join(", "),
-        }
-    }
-
-    Grid::new(format!("thread-scope-grid-{thread_id}"))
-        .num_columns(2)
-        .min_col_width(120.0)
-        .spacing([12.0, 4.0])
-        .show(ui, |ui| {
-            kv_row(ui, "backends", &fmt_set(&scope.backends));
-            kv_row(ui, "host_envs", &fmt_set(&scope.host_envs));
-            kv_row(ui, "mcp_hosts", &fmt_set(&scope.mcp_hosts));
-            kv_row(ui, "tools default", &format!("{:?}", scope.tools.default));
-            if !scope.tools.overrides.is_empty() {
-                let overrides = scope
-                    .tools
-                    .overrides
-                    .iter()
-                    .map(|(k, v)| format!("{k}={v:?}"))
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                kv_row(ui, "tools overrides", &overrides);
-            }
-            kv_row(ui, "pod_modify", &format!("{:?}", scope.pod_modify));
-            kv_row(ui, "dispatch", &format!("{:?}", scope.dispatch));
-            kv_row(ui, "behaviors", &format!("{:?}", scope.behaviors));
-            let esc = match scope.escalation {
-                Escalation::Interactive { .. } => "interactive",
-                Escalation::None => "autonomous",
-            };
-            kv_row(ui, "escalation", esc);
-        });
-}
-
-/// Render one three-way-approval banner per pending sudo for
-/// `thread_id`. Three buttons: Approve (once), Remember (approve +
-/// admit the tool name for the rest of the thread), Reject. Args are
-/// pretty-printed below the tool name so the user can see exactly what
-/// the model wants to run.
-fn render_sudo_banners(
-    ui: &mut egui::Ui,
-    thread_id: &str,
-    pending: &HashMap<u64, PendingSudo>,
-    reject_drafts: &mut HashMap<u64, String>,
-    decisions_out: &mut Vec<(
-        u64,
-        whisper_agent_protocol::permission::SudoDecision,
-        Option<String>,
-    )>,
-) {
-    use whisper_agent_protocol::permission::SudoDecision;
-
-    let mut ids: Vec<u64> = pending
-        .iter()
-        .filter_map(|(id, s)| (s.thread_id == thread_id).then_some(*id))
-        .collect();
-    ids.sort_unstable();
-
-    for function_id in ids {
-        let Some(s) = pending.get(&function_id) else {
-            continue;
-        };
-        egui::Frame::group(ui.style())
-            .fill(Color32::from_rgb(40, 40, 58))
-            .show(ui, |ui| {
-                ui.vertical(|ui| {
-                    ui.horizontal(|ui| {
-                        ui.label(
-                            RichText::new("sudo requested")
-                                .color(Color32::from_rgb(180, 200, 250))
-                                .strong(),
-                        );
-                        ui.label(
-                            RichText::new(format!("fn #{function_id}"))
-                                .small()
-                                .color(Color32::from_gray(180)),
-                        );
-                    });
-                    ui.add_space(2.0);
-                    ui.label(
-                        RichText::new(format!("tool: `{}`", s.tool_name))
-                            .color(Color32::from_rgb(220, 230, 250))
-                            .monospace(),
-                    );
-                    let args_text = serde_json::to_string_pretty(&s.args)
-                        .unwrap_or_else(|_| s.args.to_string());
-                    ui.add_space(2.0);
-                    egui::ScrollArea::vertical()
-                        .id_salt(("sudo_args_scroll", function_id))
-                        .max_height(200.0)
-                        .auto_shrink([false, true])
-                        .show(ui, |ui| {
-                            ui.label(
-                                RichText::new(args_text)
-                                    .small()
-                                    .monospace()
-                                    .color(Color32::from_gray(200)),
-                            );
-                        });
-                    if !s.reason.trim().is_empty() {
-                        ui.add_space(2.0);
-                        ui.label(
-                            RichText::new(format!("reason: {}", s.reason))
-                                .small()
-                                .color(Color32::from_gray(210)),
-                        );
-                    }
-                    ui.add_space(4.0);
-                    let draft = reject_drafts.entry(function_id).or_default();
-                    ui.horizontal(|ui| {
-                        if ui.button("Approve").clicked() {
-                            decisions_out.push((function_id, SudoDecision::ApproveOnce, None));
-                        }
-                        if ui.button("Remember").clicked() {
-                            decisions_out.push((function_id, SudoDecision::ApproveRemember, None));
-                        }
-                        if ui.button("Reject").clicked() {
-                            let reason = draft.trim();
-                            let reason = (!reason.is_empty()).then(|| reason.to_string());
-                            decisions_out.push((function_id, SudoDecision::Reject, reason));
-                        }
-                        ui.add(
-                            TextEdit::singleline(draft)
-                                .hint_text("reject reason (optional)")
-                                .desired_width(ui.available_width()),
-                        );
-                    });
-                });
-            });
-        ui.add_space(4.0);
-    }
-}
-
-/// Draw the transient prefill-progress indicator. Shows only while a
-/// llamacpp-backed turn is ingesting its prompt, cleared on first delta
-/// by the [`ChatApp::handle_wire`] reducers. Formatted like
-/// `prefilling 3,200 / 15,000 tokens · 21%` so the user can see both
-/// the absolute numbers (helps for "how big is my context?") and the
-/// fraction (helps for "how much longer?"). The bar itself carries no
-/// text because egui's built-in text rendering inside the bar clashes
-/// with the explicit label we already draw above it.
-fn render_prefill_progress(ui: &mut egui::Ui, processed: u32, total: u32) {
-    ui.add_space(4.0);
-    egui::Frame::group(ui.style())
-        .fill(Color32::from_rgb(32, 40, 52))
-        .show(ui, |ui| {
-            ui.vertical(|ui| {
-                let fraction = if total == 0 {
-                    0.0
-                } else {
-                    (processed as f32 / total as f32).clamp(0.0, 1.0)
-                };
-                let pct = (fraction * 100.0).round() as u32;
-                ui.label(
-                    RichText::new(format!(
-                        "prefilling {} / {} tokens · {}%",
-                        format_thousands(processed),
-                        format_thousands(total),
-                        pct,
-                    ))
-                    .color(Color32::from_rgb(180, 200, 230))
-                    .small(),
-                );
-                ui.add_space(2.0);
-                ui.add(
-                    egui::ProgressBar::new(fraction)
-                        .desired_height(6.0)
-                        .fill(Color32::from_rgb(90, 140, 220)),
-                );
-            });
-        });
-    ui.add_space(4.0);
-}
-
-/// Format a non-negative integer with comma thousand-separators.
-/// Standalone rather than pulled from a crate so the webui doesn't
-/// grow a dep for two callers.
-fn format_thousands(n: u32) -> String {
-    let s = n.to_string();
-    let bytes = s.as_bytes();
-    let mut out = String::with_capacity(s.len() + s.len() / 3);
-    for (i, b) in bytes.iter().enumerate() {
-        if i > 0 && (bytes.len() - i).is_multiple_of(3) {
-            out.push(',');
-        }
-        out.push(*b as char);
-    }
-    out
-}
-
-fn render_failure_banner(ui: &mut egui::Ui, view: &TaskView) {
-    let Some(detail) = view.failure.as_deref() else {
-        return;
-    };
-    if view.summary.state != ThreadStateLabel::Failed {
-        return;
-    }
-    egui::Frame::group(ui.style())
-        .fill(Color32::from_rgb(64, 28, 28))
-        .show(ui, |ui| {
-            ui.vertical(|ui| {
-                ui.label(
-                    RichText::new("thread failed")
-                        .color(Color32::from_rgb(240, 140, 140))
-                        .strong(),
-                );
-                ui.add_space(2.0);
-                ui.label(
-                    RichText::new(detail)
-                        .color(Color32::from_rgb(240, 210, 210))
-                        .monospace(),
-                );
-            });
-        });
-    ui.add_space(4.0);
 }
 
 #[cfg(test)]
