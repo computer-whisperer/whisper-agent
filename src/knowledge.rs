@@ -20,20 +20,30 @@
 //!   ([`MarkdownDir`], future MediaWiki / Arxiv / etc.).
 //! - [`chunker`] — [`Chunker`] trait + [`TokenBasedChunker`] for slicing
 //!   source records into chunks ready for embedding + indexing.
+//! - [`chunks`] — `chunks.bin` / `chunks.idx` storage format
+//!   (`ChunkStoreWriter` / `ChunkStoreReader`).
+//! - [`slot`] — slot directory ops (id generation, active-pointer
+//!   read/write, layout helpers).
+//! - [`disk_bucket`] — [`DiskBucket`], the disk-backed [`Bucket`] impl.
 
 pub mod bucket;
 pub mod chunker;
+pub mod chunks;
 pub mod config;
+pub mod disk_bucket;
 pub mod manifest;
+pub mod slot;
 pub mod source;
 pub mod types;
 
 pub use bucket::Bucket;
 pub use chunker::{Chunker, TokenBasedChunker};
+pub use chunks::{ChunkStoreReader, ChunkStoreWriter};
 pub use config::{
     BucketConfig, ChunkerConfig, CompactionConfig, DefaultsConfig, DensePathConfig, Quantization,
     RescanStrategy, SearchPathsConfig, ServingMode, SourceConfig, SparsePathConfig,
 };
+pub use disk_bucket::DiskBucket;
 pub use manifest::{
     EmbedderSnapshot, ServingSnapshot, SlotLineage, SlotManifest, SlotState, SlotStats,
     SparseSnapshot,
