@@ -124,20 +124,41 @@ pub enum McpContentBlock {
         #[serde(rename = "mimeType")]
         mime_type: String,
     },
+    /// MCP 2025-06-18 embedded-resource content — used by
+    /// `view_pdf` and any future non-image binary tool. The inner
+    /// resource carries either inline `text` or a base64 `blob`,
+    /// plus a stable `uri` identifier and optional `mimeType`.
+    Resource {
+        resource: McpEmbeddedResource,
+    },
+}
+
+#[derive(Deserialize, Debug, Clone)]
+pub struct McpEmbeddedResource {
+    #[serde(default)]
+    pub uri: String,
+    #[serde(default, rename = "mimeType")]
+    pub mime_type: Option<String>,
+    #[serde(default)]
+    pub text: Option<String>,
+    #[serde(default)]
+    pub blob: Option<String>,
 }
 
 impl McpContentBlock {
     /// Lower a single MCP transport block into a protocol
-    /// `ContentBlock`. Text is a direct rename; Image decodes the
-    /// base64 payload and normalizes the MIME into our closed
-    /// [`ImageMime`] set, falling back to a descriptive text block
-    /// when the MIME isn't in the set or the base64 is malformed.
-    /// Shared between the streaming `notifications/tools/output` path
-    /// and the terminal `tools/call` result.
+    /// `ContentBlock`. Text is a direct rename; Image and binary
+    /// Resource decode their base64 payloads and normalize MIMEs into
+    /// our closed enums, falling back to descriptive text blocks when
+    /// the MIME isn't accepted or the base64 is malformed. Shared
+    /// between the streaming `notifications/tools/output` path and the
+    /// terminal `tools/call` result.
     pub fn to_content_block(&self) -> whisper_agent_protocol::ContentBlock {
         use base64::Engine;
         use base64::engine::general_purpose::STANDARD;
-        use whisper_agent_protocol::{ContentBlock, ImageMime, ImageSource};
+        use whisper_agent_protocol::{
+            ContentBlock, DocumentMime, DocumentSource, ImageMime, ImageSource,
+        };
         match self {
             McpContentBlock::Text { text } => ContentBlock::Text { text: text.clone() },
             McpContentBlock::Image { data, mime_type } => {
@@ -158,34 +179,78 @@ impl McpContentBlock {
                     },
                 }
             }
+            McpContentBlock::Resource { resource } => {
+                // Inline text resources are already a `text` payload —
+                // surface them as a Text block so the model reads them
+                // as plain content rather than a media attachment.
+                if let Some(text) = &resource.text {
+                    return ContentBlock::Text { text: text.clone() };
+                }
+                let Some(blob) = &resource.blob else {
+                    return ContentBlock::Text {
+                        text: format!("[tool returned empty resource: uri={}]", resource.uri),
+                    };
+                };
+                let mime = resource.mime_type.as_deref().unwrap_or("");
+                let Some(media_type) = DocumentMime::from_mime_str(mime) else {
+                    return ContentBlock::Text {
+                        text: format!("[tool returned unsupported resource mime: {mime}]"),
+                    };
+                };
+                match STANDARD.decode(blob) {
+                    Ok(bytes) => ContentBlock::Document {
+                        source: DocumentSource::Bytes {
+                            media_type,
+                            data: bytes,
+                        },
+                    },
+                    Err(e) => ContentBlock::Text {
+                        text: format!("[tool returned malformed base64 resource: {e}]"),
+                    },
+                }
+            }
         }
     }
 }
 
 /// Concatenate the text-shaped portions of an MCP content vector.
-/// Image blocks (and any future non-text types) contribute a short
-/// `[image]` / `[n images]` marker so callers building a flat text
-/// summary — audit log lines, early-exit error envelopes — don't
-/// silently drop them.
+/// Image blocks and binary resources contribute short `[image]` /
+/// `[document]` markers so callers building a flat text summary —
+/// audit log lines, early-exit error envelopes — don't silently drop
+/// them.
 pub fn mcp_blocks_text_preview(blocks: &[McpContentBlock]) -> String {
     let mut out = String::new();
     let mut image_count = 0usize;
+    let mut document_count = 0usize;
     for b in blocks {
         match b {
             McpContentBlock::Text { text } => out.push_str(text),
             McpContentBlock::Image { .. } => image_count += 1,
+            McpContentBlock::Resource { resource } => {
+                if let Some(text) = &resource.text {
+                    out.push_str(text);
+                } else {
+                    document_count += 1;
+                }
+            }
         }
     }
-    match (out.is_empty(), image_count) {
-        (true, 0) | (false, 0) => out,
-        (true, 1) => "[image]".into(),
-        (true, n) => format!("[{n} images]"),
-        (false, 1) => {
-            out.push_str(" [+image]");
-            out
-        }
-        (false, n) => {
-            out.push_str(&format!(" [+{n} images]"));
+    let mut markers: Vec<String> = Vec::new();
+    if image_count == 1 {
+        markers.push("image".into());
+    } else if image_count > 1 {
+        markers.push(format!("{image_count} images"));
+    }
+    if document_count == 1 {
+        markers.push("document".into());
+    } else if document_count > 1 {
+        markers.push(format!("{document_count} documents"));
+    }
+    match (out.is_empty(), markers.is_empty()) {
+        (_, true) => out,
+        (true, false) => format!("[{}]", markers.join(", ")),
+        (false, false) => {
+            out.push_str(&format!(" [+{}]", markers.join(", ")));
             out
         }
     }

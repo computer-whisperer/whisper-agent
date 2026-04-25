@@ -501,6 +501,10 @@ fn convert_user_message(blocks: &[ContentBlock], out: &mut Vec<RspItem>) {
                 fold_text(&mut parts, &mut text_accum);
                 parts.push(image_source_to_input_part(source));
             }
+            ContentBlock::Document { source } => {
+                fold_text(&mut parts, &mut text_accum);
+                parts.push(document_source_to_input_part(source));
+            }
             ContentBlock::ToolResult {
                 tool_use_id,
                 content,
@@ -512,23 +516,28 @@ fn convert_user_message(blocks: &[ContentBlock], out: &mut Vec<RspItem>) {
                     output: tool_result_as_text(content, *is_error),
                 });
                 // Responses' `function_call_output` carries only a
-                // plain `output: string` — image attachments ride in a
-                // follow-up `role:user` message with `input_image`
-                // parts, matching the workaround used on Chat
-                // Completions' text-only `role:tool` message.
+                // plain `output: string` — image and document
+                // attachments ride in a follow-up `role:user` message
+                // with `input_image` / `input_file` parts, matching
+                // the workaround used on Chat Completions' text-only
+                // `role:tool` message.
                 let images = content.image_sources();
-                if !images.is_empty() {
-                    let mut image_parts: Vec<RspInputMessagePart> =
-                        Vec::with_capacity(images.len() + 1);
-                    image_parts.push(RspInputMessagePart::InputText {
-                        text: format!("[image output from tool call {tool_use_id} follows]"),
+                let documents = content.document_sources();
+                if !images.is_empty() || !documents.is_empty() {
+                    let mut media_parts: Vec<RspInputMessagePart> =
+                        Vec::with_capacity(images.len() + documents.len() + 1);
+                    media_parts.push(RspInputMessagePart::InputText {
+                        text: format!("[media output from tool call {tool_use_id} follows]"),
                     });
                     for src in images {
-                        image_parts.push(image_source_to_input_part(src));
+                        media_parts.push(image_source_to_input_part(src));
+                    }
+                    for src in documents {
+                        media_parts.push(document_source_to_input_part(src));
                     }
                     out.push(RspItem::Message {
                         role: "user",
-                        content: image_parts,
+                        content: media_parts,
                     });
                 }
             }
@@ -560,6 +569,38 @@ fn image_source_to_input_part(src: &whisper_agent_protocol::ImageSource) -> RspI
     };
     RspInputMessagePart::InputImage {
         image_url: Some(url),
+    }
+}
+
+/// Lower a document source to the Responses API's `input_file` part.
+/// Bytes → base64 data URL with a synthetic filename; Url → file_url
+/// passthrough. file_id (Files API) is reserved.
+fn document_source_to_input_part(
+    src: &whisper_agent_protocol::DocumentSource,
+) -> RspInputMessagePart {
+    use base64::Engine;
+    use base64::engine::general_purpose::STANDARD;
+    use whisper_agent_protocol::{DocumentMime, DocumentSource};
+    match src {
+        DocumentSource::Bytes { media_type, data } => RspInputMessagePart::InputFile {
+            filename: Some(format!(
+                "document.{}",
+                match media_type {
+                    DocumentMime::Pdf => "pdf",
+                }
+            )),
+            file_data: Some(format!(
+                "data:{};base64,{}",
+                media_type.as_mime_str(),
+                STANDARD.encode(data)
+            )),
+            file_url: None,
+        },
+        DocumentSource::Url { url } => RspInputMessagePart::InputFile {
+            filename: None,
+            file_data: None,
+            file_url: Some(url.clone()),
+        },
     }
 }
 
@@ -617,10 +658,11 @@ fn convert_assistant_message(blocks: &[ContentBlock], out: &mut Vec<RspItem>) {
             ContentBlock::ToolResult { .. } | ContentBlock::ToolSchema { .. } => {
                 // Neither belongs on an assistant message.
             }
-            ContentBlock::Image { .. } => {
+            ContentBlock::Image { .. } | ContentBlock::Document { .. } => {
                 // Model-emitted images come from the `image_generation` built-in
                 // tool (not yet wired up on our side) — nothing reaches here
-                // from a persisted assistant turn today. Drop silently.
+                // from a persisted assistant turn today. Documents are never
+                // model-emitted. Drop silently in both cases.
             }
         }
     }
@@ -1231,6 +1273,19 @@ enum RspInputMessagePart {
     InputImage {
         #[serde(skip_serializing_if = "Option::is_none")]
         image_url: Option<String>,
+    },
+    /// Responses-API user-input file (PDF). Mirrors `InputImage`:
+    /// either `file_data` (a `data:application/pdf;base64,...` URL,
+    /// usually with a `filename` companion field) or `file_url`
+    /// (https URL) or `file_id` (Files API). V1 inlines via
+    /// file_data; the other forms are reserved for later.
+    InputFile {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        filename: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        file_data: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        file_url: Option<String>,
     },
 }
 

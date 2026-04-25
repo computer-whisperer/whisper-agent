@@ -38,6 +38,7 @@ pub fn descriptors() -> Vec<Tool> {
     vec![
         read_file_descriptor(),
         view_image_descriptor(),
+        view_pdf_descriptor(),
         write_file_descriptor(),
         edit_file_descriptor(),
         bash_descriptor(),
@@ -62,6 +63,7 @@ pub fn call_stream(
         "bash" => Ok(bash_stream(ws, args)),
         "read_file" => Ok(single(async move { read_file(&ws, args).await })),
         "view_image" => Ok(single(async move { view_image(&ws, args).await })),
+        "view_pdf" => Ok(single(async move { view_pdf(&ws, args).await })),
         "write_file" => Ok(single(async move { write_file(&ws, args).await })),
         "edit_file" => Ok(single(async move { edit_file(&ws, args).await })),
         "list_dir" => Ok(single(async move { list_dir(&ws, args).await })),
@@ -199,21 +201,34 @@ async fn read_file(workspace: &Arc<Workspace>, args: Value) -> CallToolResult {
 #[derive(Debug, Clone, Copy)]
 enum BinaryKind {
     Image(image::ImageFormat),
+    Pdf,
     Other,
 }
 
+/// First four bytes of a PDF file — `%PDF`. Standard PDFs start with
+/// the version line `%PDF-1.x`; older "linearized" PDFs may have
+/// leading binary garbage but the magic is in the first ~1 KiB. We
+/// only sniff the very first bytes for simplicity.
+const PDF_MAGIC: &[u8] = b"%PDF-";
+
 /// Read the first 8 KiB of `path` and decide whether the file is a
 /// binary blob that read_file should refuse. Returns `None` when the
-/// head looks like text (no NUL byte) or when the file can't be opened
-/// (we let the existing read_to_string error path produce that message).
-/// When the head *is* binary, also tries `image::guess_format` so the
-/// caller can name an image format in the steering message.
+/// head looks like text (no NUL byte and no PDF magic) or when the
+/// file can't be opened (we let the existing read_to_string error
+/// path produce that message). When the head *is* binary, tries to
+/// name a known format so the steering message can point at the
+/// right tool.
 async fn sniff_binary(path: &std::path::Path) -> Option<BinaryKind> {
     use tokio::io::AsyncReadExt;
     let mut f = tokio::fs::File::open(path).await.ok()?;
     let mut head = [0u8; 8192];
     let n = f.read(&mut head).await.ok()?;
     let head = &head[..n];
+    // PDFs are technically all-printable-ASCII at the head (no NUL),
+    // so we check the magic bytes explicitly.
+    if head.starts_with(PDF_MAGIC) {
+        return Some(BinaryKind::Pdf);
+    }
     if !head.contains(&0u8) {
         return None;
     }
@@ -225,15 +240,18 @@ async fn sniff_binary(path: &std::path::Path) -> Option<BinaryKind> {
 }
 
 /// Steering message returned when `read_file` refuses a binary file.
-/// Names `view_image` explicitly so the model knows where to go
-/// instead of retrying read_file with new offsets (the loop the user
-/// reported).
+/// Names `view_image` / `view_pdf` explicitly so the model knows
+/// where to go instead of retrying read_file with new offsets.
 fn refuse_binary_message(display: &std::path::Path, kind: BinaryKind) -> String {
     match kind {
         BinaryKind::Image(fmt) => format!(
             "read_file({}): file looks like a binary image (format: {:?}) — use `view_image` to load it as an image attachment instead",
             display.display(),
             fmt,
+        ),
+        BinaryKind::Pdf => format!(
+            "read_file({}): file looks like a PDF — use `view_pdf` to attach it as a document the model can analyze",
+            display.display(),
         ),
         BinaryKind::Other => format!(
             "read_file({}): file looks binary (NUL bytes in first 8 KiB); read_file is for UTF-8 text only",
@@ -408,6 +426,96 @@ fn prepare_image(bytes: &[u8]) -> Result<PreparedImage, String> {
         bytes: out,
         mime_type: "image/png",
     })
+}
+
+// ---------- view_pdf ----------
+
+/// Refuse PDFs bigger than this on disk. Anthropic's API caps a single
+/// request at 32 MB, OpenAI at 50 MB, Gemini takes much larger files
+/// but the others are the binding constraint. We pick a value safely
+/// under the smallest cap to leave headroom for the rest of the
+/// request payload.
+const VIEW_PDF_MAX_BYTES: u64 = 25 * 1024 * 1024;
+
+fn view_pdf_descriptor() -> Tool {
+    Tool {
+        name: "view_pdf".into(),
+        description: "Load a PDF file from the workspace and attach it to the conversation so \
+                      the model can analyze its text + visual layout (charts, tables, diagrams). \
+                      `read_file` refuses PDFs because they're binary; this is the right tool \
+                      for them. Each provider does its own page rasterization + text \
+                      extraction server-side, so the model sees both modalities."
+            .into(),
+        input_schema: json!({
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "Path to the PDF — absolute, or relative to the workspace root."
+                }
+            },
+            "required": ["path"]
+        }),
+        annotations: Some(ToolAnnotations {
+            title: Some("View PDF".into()),
+            read_only_hint: Some(true),
+            destructive_hint: Some(false),
+            idempotent_hint: Some(true),
+            open_world_hint: Some(false),
+        }),
+    }
+}
+
+#[derive(Deserialize)]
+struct ViewPdfArgs {
+    path: PathBuf,
+}
+
+async fn view_pdf(workspace: &Arc<Workspace>, args: Value) -> CallToolResult {
+    let parsed: ViewPdfArgs = match serde_json::from_value(args) {
+        Ok(v) => v,
+        Err(e) => return CallToolResult::error_text(format!("invalid arguments: {e}")),
+    };
+    let path = match workspace.resolve(&parsed.path) {
+        Ok(p) => p,
+        Err(e) => return CallToolResult::error_text(e.to_string()),
+    };
+    let metadata = match tokio::fs::metadata(&path).await {
+        Ok(m) => m,
+        Err(e) => {
+            return CallToolResult::error_text(format!("view_pdf({}): {e}", parsed.path.display()));
+        }
+    };
+    if !metadata.is_file() {
+        return CallToolResult::error_text(format!(
+            "view_pdf({}): not a regular file",
+            parsed.path.display()
+        ));
+    }
+    if metadata.len() > VIEW_PDF_MAX_BYTES {
+        return CallToolResult::error_text(format!(
+            "view_pdf({}): file is {} bytes; cap is {} bytes",
+            parsed.path.display(),
+            metadata.len(),
+            VIEW_PDF_MAX_BYTES,
+        ));
+    }
+    let bytes = match tokio::fs::read(&path).await {
+        Ok(b) => b,
+        Err(e) => {
+            return CallToolResult::error_text(format!("view_pdf({}): {e}", parsed.path.display()));
+        }
+    };
+    if !bytes.starts_with(PDF_MAGIC) {
+        return CallToolResult::error_text(format!(
+            "view_pdf({}): file does not look like a PDF (missing %PDF- header)",
+            parsed.path.display(),
+        ));
+    }
+    use base64::Engine;
+    let encoded = base64::engine::general_purpose::STANDARD.encode(&bytes);
+    let uri = format!("file://{}", path.display());
+    CallToolResult::resource_blob(uri, "application/pdf", encoded)
 }
 
 // ---------- write_file ----------
@@ -2169,10 +2277,14 @@ fn main() {
         while let Some(item) = stream.next().await {
             match item {
                 ToolStreamItem::Chunk(ContentBlock::Text { text }) => chunks.push(text),
-                // bash_stream only emits text chunks; image chunks are a
-                // tool-result shape used by view_image, not bash.
+                // bash_stream only emits text chunks; image / resource
+                // chunks are tool-result shapes used by view_image /
+                // view_pdf, not bash.
                 ToolStreamItem::Chunk(ContentBlock::Image { .. }) => {
                     panic!("bash_stream emitted unexpected image chunk")
+                }
+                ToolStreamItem::Chunk(ContentBlock::Resource { .. }) => {
+                    panic!("bash_stream emitted unexpected resource chunk")
                 }
                 ToolStreamItem::Final(r) => {
                     final_result = Some(r);
@@ -2245,11 +2357,13 @@ fn main() {
 
     /// Collapse a `CallToolResult`'s `Text` blocks into a single `&str` for
     /// test assertions. Every bash_stream Final has exactly one Text block;
-    /// image blocks are produced by view_image, not by bash.
+    /// image and resource blocks are produced by view_image / view_pdf,
+    /// not by bash.
     fn final_tool_text(r: &CallToolResult) -> &str {
         match r.content.first() {
             Some(ContentBlock::Text { text }) => text.as_str(),
             Some(ContentBlock::Image { .. }) => panic!("expected text result, got image"),
+            Some(ContentBlock::Resource { .. }) => panic!("expected text result, got resource"),
             None => "",
         }
     }
@@ -2318,6 +2432,25 @@ fn main() {
         assert!(body.contains("héllo"));
     }
 
+    #[tokio::test]
+    async fn read_file_refuses_pdf_with_view_pdf_hint() {
+        // PDFs don't usually have NUL in the first 8 KiB — the sniff
+        // recognizes the `%PDF-` magic explicitly.
+        let ws = test_workspace();
+        let path = ws.root().join("doc.pdf");
+        let mut bytes = b"%PDF-1.4\n".to_vec();
+        bytes.extend_from_slice(b"%fake-pdf-tail-no-nul-bytes\n");
+        std::fs::write(&path, bytes).unwrap();
+        let result = read_file(&ws, json!({ "path": "doc.pdf" })).await;
+        assert_eq!(result.is_error, Some(true));
+        let body = final_tool_text(&result);
+        assert!(
+            body.contains("view_pdf"),
+            "expected view_pdf hint; got {body:?}"
+        );
+        assert!(!body.contains("view_image"));
+    }
+
     // ---------- view_image: prepare_image ----------
 
     /// Build a real PNG of the requested dimensions. Uses a single-color
@@ -2337,7 +2470,10 @@ fn main() {
         let bytes = make_png(64, 64);
         let prepared = prepare_image(&bytes).unwrap();
         assert_eq!(prepared.mime_type, "image/png");
-        assert_eq!(prepared.bytes, bytes, "small images should not be re-encoded");
+        assert_eq!(
+            prepared.bytes, bytes,
+            "small images should not be re-encoded"
+        );
     }
 
     #[test]
@@ -2359,9 +2495,81 @@ fn main() {
     fn prepare_image_rejects_non_image_bytes() {
         let bytes = b"this is just some text, not an image".to_vec();
         let err = prepare_image(&bytes).unwrap_err();
-        assert!(
-            err.contains("could not detect"),
-            "unexpected error: {err}"
-        );
+        assert!(err.contains("could not detect"), "unexpected error: {err}");
+    }
+
+    // ---------- view_pdf ----------
+
+    /// Smallest possible byte sequence that starts with a valid PDF
+    /// header. Real PDFs have an xref table and a `%%EOF` trailer; the
+    /// view_pdf tool only sniffs the header, so this is enough to
+    /// exercise the tool's golden path without pulling in a PDF
+    /// generator.
+    fn fake_pdf_bytes() -> Vec<u8> {
+        let mut v = b"%PDF-1.4\n".to_vec();
+        v.extend_from_slice(b"%minimal-stub-payload\n");
+        v.extend_from_slice(b"%%EOF\n");
+        v
+    }
+
+    /// Pull the single Resource block out of a Final result for
+    /// view_pdf assertions. Panics on any other shape.
+    fn final_resource(r: &CallToolResult) -> &whisper_agent_mcp_proto::EmbeddedResource {
+        match r.content.first() {
+            Some(ContentBlock::Resource { resource }) => resource,
+            other => panic!("expected resource result, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn view_pdf_returns_resource_blob_with_pdf_mime() {
+        let ws = test_workspace();
+        let bytes = fake_pdf_bytes();
+        let path = ws.root().join("doc.pdf");
+        std::fs::write(&path, &bytes).unwrap();
+        let result = view_pdf(&ws, json!({ "path": "doc.pdf" })).await;
+        assert!(result.is_error.is_none(), "unexpected error result");
+        let resource = final_resource(&result);
+        assert_eq!(resource.mime_type.as_deref(), Some("application/pdf"));
+        assert!(resource.uri.starts_with("file://"));
+        assert!(resource.text.is_none());
+        let blob = resource.blob.as_deref().expect("expected blob");
+        use base64::Engine;
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(blob)
+            .unwrap();
+        assert_eq!(decoded, bytes, "round-trip should preserve bytes");
+    }
+
+    #[tokio::test]
+    async fn view_pdf_rejects_non_pdf_bytes() {
+        let ws = test_workspace();
+        let path = ws.root().join("not-a-pdf.bin");
+        std::fs::write(&path, b"GIF89a... not a pdf").unwrap();
+        let result = view_pdf(&ws, json!({ "path": "not-a-pdf.bin" })).await;
+        assert_eq!(result.is_error, Some(true));
+        let body = match result.content.first() {
+            Some(ContentBlock::Text { text }) => text.as_str(),
+            other => panic!("expected text error result, got {other:?}"),
+        };
+        assert!(body.contains("not look like a PDF"));
+    }
+
+    #[tokio::test]
+    async fn view_pdf_rejects_directory_target() {
+        // Pre-flight rejection: target must be a regular file. Pointing
+        // at a directory is the cheap reproduction; the byte-cap branch
+        // is symmetric (separate metadata check) and not worth a 25 MB
+        // tempfile to exercise.
+        let ws = test_workspace();
+        let path = ws.root().join("not-a-file");
+        std::fs::create_dir(&path).unwrap();
+        let result = view_pdf(&ws, json!({ "path": "not-a-file" })).await;
+        assert_eq!(result.is_error, Some(true));
+        let body = match result.content.first() {
+            Some(ContentBlock::Text { text }) => text.as_str(),
+            other => panic!("expected text error result, got {other:?}"),
+        };
+        assert!(body.contains("not a regular file"));
     }
 }

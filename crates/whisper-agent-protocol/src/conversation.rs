@@ -232,6 +232,52 @@ pub enum ImageSource {
     },
 }
 
+/// Document MIME types the protocol carries. Today only PDF — every
+/// provider accepts PDFs natively (text + page images). Audio and
+/// other document formats stay as a future extension.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum DocumentMime {
+    Pdf,
+}
+
+impl DocumentMime {
+    pub fn as_mime_str(self) -> &'static str {
+        match self {
+            DocumentMime::Pdf => "application/pdf",
+        }
+    }
+
+    /// Parse a MIME string into the closed enum. Returns `None` for
+    /// anything we don't carry — callers reject at that boundary.
+    pub fn from_mime_str(s: &str) -> Option<Self> {
+        match s.to_ascii_lowercase().as_str() {
+            "application/pdf" => Some(DocumentMime::Pdf),
+            _ => None,
+        }
+    }
+}
+
+/// Where the bytes of a document content block come from. Mirrors
+/// [`ImageSource`] — `Bytes` is the canonical inline form, `Url` is
+/// used for provider-native URL passthrough (Anthropic, OpenAI
+/// Responses; the OpenAI Chat and Gemini adapters fetch-and-inline).
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum DocumentSource {
+    Bytes {
+        media_type: DocumentMime,
+        // The byte serializer is provider-agnostic and shared with
+        // images: base64 in human-readable formats, native bytes in
+        // CBOR. Reuse rather than duplicate.
+        #[serde(with = "image_bytes_serde")]
+        data: Vec<u8>,
+    },
+    Url {
+        url: String,
+    },
+}
+
 /// Format-aware (de)serialization for image byte buffers. Human-
 /// readable formats (disk JSON, debug dumps, YAML test fixtures) get
 /// a base64 string so a 2 MB image doesn't balloon to 8 MB of
@@ -309,12 +355,11 @@ pub struct ContentCapabilities {
 }
 
 /// Per-kind MIME listing for either the input or output side of a
-/// model. Audio / document variants are kept as forward-compatible
-/// placeholders — they serialize as empty vecs today and become real
-/// once their `AudioMime` / `DocumentMime` enums ship. Typed as
-/// `Vec<String>` for now to avoid churning the protocol when those
-/// lists grow; the one media kind we have typed (`image`) uses the
-/// strong enum.
+/// model. Audio is kept as a forward-compatible placeholder — it
+/// serializes as an empty vec today and becomes real once its
+/// `AudioMime` enum ships. Typed as `Vec<String>` for now to avoid
+/// churning the protocol when that list grows; image and document use
+/// strong enums.
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
 pub struct MediaSupport {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -322,7 +367,7 @@ pub struct MediaSupport {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub audio: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub document: Vec<String>,
+    pub document: Vec<DocumentMime>,
 }
 
 impl MediaSupport {
@@ -417,6 +462,16 @@ pub enum ContentBlock {
     Image {
         source: ImageSource,
     },
+    /// User-supplied or tool-returned document (PDF today). Each
+    /// provider does its own server-side decomposition into text +
+    /// per-page images; we carry the raw bytes (or URL) through and
+    /// adapters translate into the provider-specific document shape:
+    /// Anthropic `document` block, OpenAI Chat `file` block / OpenAI
+    /// Responses `input_file` block, Gemini `inline_data` part with
+    /// `application/pdf` MIME.
+    Document {
+        source: DocumentSource,
+    },
     /// One entry in a tool manifest snapshot. Appears only as content
     /// on a `Role::Tools` message; provider adapters lift it into
     /// their native `tools` request field (Anthropic `tools[]`,
@@ -474,6 +529,24 @@ impl ToolResultContent {
                 .iter()
                 .filter_map(|b| match b {
                     ContentBlock::Image { source } => Some(source),
+                    _ => None,
+                })
+                .collect(),
+        }
+    }
+
+    /// Borrow all document sources embedded in this tool result, in
+    /// order. Mirror of [`Self::image_sources`]: provider adapters
+    /// that can't carry documents inside their native tool-result
+    /// wire shape (OpenAI chat / responses, Gemini) splice a follow-
+    /// up user message carrying the document attachments.
+    pub fn document_sources(&self) -> Vec<&DocumentSource> {
+        match self {
+            ToolResultContent::Text(_) => Vec::new(),
+            ToolResultContent::Blocks(blocks) => blocks
+                .iter()
+                .filter_map(|b| match b {
+                    ContentBlock::Document { source } => Some(source),
                     _ => None,
                 })
                 .collect(),

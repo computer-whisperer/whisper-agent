@@ -348,7 +348,8 @@ fn message_to_value(m: &Message, cache_last_block: bool) -> Value {
             if let Some(obj) = block.as_object_mut() {
                 fold_replay_to_wire(obj);
                 fix_image_block_for_wire(obj);
-                fix_tool_result_nested_images(obj);
+                fix_document_block_for_wire(obj);
+                fix_tool_result_nested_media(obj);
             }
         }
     }
@@ -425,14 +426,43 @@ fn fix_image_block_for_wire(obj: &mut serde_json::Map<String, Value>) {
     }
 }
 
+/// Translate a `Document` content block from our normalized shape to
+/// Anthropic's wire shape. Same two adjustments as
+/// [`fix_image_block_for_wire`]: rename `source.type` from `"bytes"`
+/// to `"base64"`, and expand `media_type` from our enum string
+/// (`"pdf"`) to the IANA MIME (`"application/pdf"`). URL sources
+/// pass through unchanged — Anthropic's URL-source document shape
+/// already matches our `{type:"url", url:...}`.
+fn fix_document_block_for_wire(obj: &mut serde_json::Map<String, Value>) {
+    if obj.get("type").and_then(Value::as_str) != Some("document") {
+        return;
+    }
+    let Some(source) = obj.get_mut("source").and_then(|s| s.as_object_mut()) else {
+        return;
+    };
+    if source.get("type").and_then(Value::as_str) == Some("bytes") {
+        source.insert("type".into(), Value::String("base64".into()));
+        if let Some(mt) = source.get("media_type").and_then(Value::as_str) {
+            // DocumentMime serializes as e.g. "pdf" — Anthropic
+            // expects the full IANA MIME `application/pdf`.
+            let full = match mt {
+                "pdf" => "application/pdf".to_string(),
+                other => format!("application/{other}"),
+            };
+            source.insert("media_type".into(), Value::String(full));
+        }
+    }
+}
+
 /// Walk a `tool_result` block's `content` array (when present) and fix
-/// any nested image blocks into Anthropic's wire shape. Anthropic's
-/// `tool_result.content` natively accepts an array of `{type:"text"}`
-/// or `{type:"image"}` blocks, so all we need is to drop the right
-/// `source.type` / `source.media_type` strings on the nested images —
-/// the untagged `ToolResultContent::Blocks` enum already serialized the
-/// outer structure into the array shape.
-fn fix_tool_result_nested_images(obj: &mut serde_json::Map<String, Value>) {
+/// any nested image or document blocks into Anthropic's wire shape.
+/// Anthropic's `tool_result.content` natively accepts an array of
+/// `{type:"text"}`, `{type:"image"}`, or `{type:"document"}` blocks,
+/// so all we need is to drop the right `source.type` /
+/// `source.media_type` strings on the nested media — the untagged
+/// `ToolResultContent::Blocks` enum already serialized the outer
+/// structure into the array shape.
+fn fix_tool_result_nested_media(obj: &mut serde_json::Map<String, Value>) {
     if obj.get("type").and_then(Value::as_str) != Some("tool_result") {
         return;
     }
@@ -442,6 +472,7 @@ fn fix_tool_result_nested_images(obj: &mut serde_json::Map<String, Value>) {
     for inner in content.iter_mut() {
         if let Some(o) = inner.as_object_mut() {
             fix_image_block_for_wire(o);
+            fix_document_block_for_wire(o);
         }
     }
 }

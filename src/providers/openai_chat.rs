@@ -447,6 +447,24 @@ fn convert_user_message(blocks: &[ContentBlock], out: &mut Vec<OaMessage>) {
                     .expect("parts is Some")
                     .push(image_source_to_content_part(source));
             }
+            ContentBlock::Document { source } => {
+                // Same accumulator promotion as images: a document
+                // forces a parts array so the surrounding text stays
+                // inline with the document in source order.
+                if parts.is_none() {
+                    let mut p = Vec::new();
+                    if !text_accum.is_empty() {
+                        p.push(OaContentPart::Text {
+                            text: std::mem::take(&mut text_accum),
+                        });
+                    }
+                    parts = Some(p);
+                }
+                parts
+                    .as_mut()
+                    .expect("parts is Some")
+                    .push(document_source_to_content_part(source));
+            }
             ContentBlock::ToolResult {
                 tool_use_id,
                 content,
@@ -463,19 +481,23 @@ fn convert_user_message(blocks: &[ContentBlock], out: &mut Vec<OaMessage>) {
                 });
                 // Chat Completions' `role:tool` message carries only a
                 // plain string (no multimodal parts), so tool-result
-                // images ride in a follow-up `role:user` message whose
-                // content is a parts array. The text prefix keeps the
-                // message sensible if the model ever replays the
-                // conversation without tool context — it reads as "the
-                // last tool call also produced these images."
+                // images and documents ride in a follow-up `role:user`
+                // message whose content is a parts array. The text
+                // prefix keeps the message sensible if the model ever
+                // replays the conversation without tool context.
                 let images = content.image_sources();
-                if !images.is_empty() {
-                    let mut user_parts: Vec<OaContentPart> = Vec::with_capacity(images.len() + 1);
+                let documents = content.document_sources();
+                if !images.is_empty() || !documents.is_empty() {
+                    let mut user_parts: Vec<OaContentPart> =
+                        Vec::with_capacity(images.len() + documents.len() + 1);
                     user_parts.push(OaContentPart::Text {
-                        text: format!("[image output from tool call {tool_use_id} follows]"),
+                        text: format!("[media output from tool call {tool_use_id} follows]"),
                     });
                     for src in images {
                         user_parts.push(image_source_to_content_part(src));
+                    }
+                    for src in documents {
+                        user_parts.push(document_source_to_content_part(src));
                     }
                     out.push(OaMessage {
                         role: "user".into(),
@@ -531,10 +553,11 @@ fn convert_assistant_message(blocks: &[ContentBlock], out: &mut Vec<OaMessage>) 
             ContentBlock::ToolResult { .. } | ContentBlock::ToolSchema { .. } => {
                 // Neither belongs on an assistant message.
             }
-            ContentBlock::Image { .. } => {
-                // Assistant-side image output isn't part of Chat Completions —
-                // the `audio` assistant field exists but no image-output shape.
-                // Drop silently if a replayed assistant turn happens to carry one.
+            ContentBlock::Image { .. } | ContentBlock::Document { .. } => {
+                // Assistant-side media output isn't part of Chat Completions —
+                // the `audio` assistant field exists but no image- or document-
+                // output shape. Drop silently if a replayed assistant turn
+                // happens to carry one.
             }
         }
     }
@@ -812,12 +835,15 @@ impl<'de> Deserialize<'de> for OaContent {
 /// Completions content-array elements tag themselves via `type`;
 /// `text` carries a bare string, `image_url` carries a nested
 /// `{url, detail?}` object where `url` accepts either an https URL or
-/// a `data:image/...;base64,...` data URL.
+/// a `data:image/...;base64,...` data URL. `file` carries either a
+/// `file_id` (Files API upload) or a `{filename, file_data}` pair
+/// where `file_data` is a `data:application/pdf;base64,...` URL.
 #[derive(Serialize, Debug)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum OaContentPart {
     Text { text: String },
     ImageUrl { image_url: OaImageUrl },
+    File { file: OaFilePart },
 }
 
 #[derive(Serialize, Debug)]
@@ -826,6 +852,15 @@ struct OaImageUrl {
     // `detail` omitted for v1 — OpenAI defaults to "auto", which picks
     // resolution based on image dimensions. A per-image override lands
     // on the protocol once we surface it in the compose UI.
+}
+
+/// Inline-file payload for a Chat Completions `file` content part.
+/// We always inline (data URL) — the Files API path is reserved for
+/// repeat-PDF caching scenarios we don't have yet.
+#[derive(Serialize, Debug)]
+struct OaFilePart {
+    filename: String,
+    file_data: String,
 }
 
 /// Lower one of our `ImageSource` values into the OpenAI content part.
@@ -846,6 +881,40 @@ fn image_source_to_content_part(src: &whisper_agent_protocol::ImageSource) -> Oa
     };
     OaContentPart::ImageUrl {
         image_url: OaImageUrl { url },
+    }
+}
+
+/// Lower one of our `DocumentSource` values into the OpenAI Chat
+/// Completions `file` content part. Bytes become a `data:` URL with
+/// the document's MIME type and a synthetic filename (Chat Completions
+/// expects one even for inline data). Url isn't supported by Chat
+/// Completions for `file` parts — we'd have to fetch and inline. For
+/// now we render an empty payload note rather than silently dropping.
+fn document_source_to_content_part(src: &whisper_agent_protocol::DocumentSource) -> OaContentPart {
+    use base64::Engine;
+    use base64::engine::general_purpose::STANDARD;
+    use whisper_agent_protocol::DocumentSource;
+    match src {
+        DocumentSource::Bytes { media_type, data } => OaContentPart::File {
+            file: OaFilePart {
+                filename: format!("document.{}", document_extension(*media_type)),
+                file_data: format!(
+                    "data:{};base64,{}",
+                    media_type.as_mime_str(),
+                    STANDARD.encode(data)
+                ),
+            },
+        },
+        DocumentSource::Url { url } => OaContentPart::Text {
+            text: format!("[document URL not supported by this backend: {url}]"),
+        },
+    }
+}
+
+fn document_extension(mime: whisper_agent_protocol::DocumentMime) -> &'static str {
+    use whisper_agent_protocol::DocumentMime;
+    match mime {
+        DocumentMime::Pdf => "pdf",
     }
 }
 

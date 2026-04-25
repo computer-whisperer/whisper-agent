@@ -663,20 +663,30 @@ fn convert_user_parts(blocks: &[ContentBlock], id_to_name: &HashMap<String, Stri
                         response: serde_json::json!({ "content": text }),
                     },
                 });
-                // Tool-result images ride as additional inline_data
-                // parts on the same user turn — Gemini's
+                // Tool-result images and documents ride as additional
+                // inline_data parts on the same user turn — Gemini's
                 // functionResponse.response field is structured JSON
-                // (not multipart), so attachments can't nest inside it.
-                // Appending them as sibling parts keeps them attached
-                // to the same turn and preserves order.
+                // (not multipart), so attachments can't nest inside
+                // it. Appending them as sibling parts keeps them
+                // attached to the same turn and preserves order.
                 for src in content.image_sources() {
                     if let Some(part) = image_source_to_part(src) {
+                        parts.push(part);
+                    }
+                }
+                for src in content.document_sources() {
+                    if let Some(part) = document_source_to_part(src) {
                         parts.push(part);
                     }
                 }
             }
             ContentBlock::Image { source } => {
                 if let Some(part) = image_source_to_part(source) {
+                    parts.push(part);
+                }
+            }
+            ContentBlock::Document { source } => {
+                if let Some(part) = document_source_to_part(source) {
                     parts.push(part);
                 }
             }
@@ -761,6 +771,11 @@ fn convert_assistant_parts(
                     parts.push(part);
                 }
             }
+            ContentBlock::Document { .. } => {
+                // Documents aren't model-emitted — Gemini doesn't have
+                // a document-output modality. Drop silently if a
+                // replayed assistant turn happens to carry one.
+            }
         }
     }
     parts
@@ -825,6 +840,35 @@ fn image_source_to_part(src: &whisper_agent_protocol::ImageSource) -> Option<Par
             );
             Some(Part::Text {
                 text: format!("[Image URL attached but not viewable on this model: {url}]"),
+                thought: None,
+            })
+        }
+    }
+}
+
+/// Lower one of our document-source values into a Gemini `Part`.
+/// Bytes ride as `inlineData` with `application/pdf` MIME; URL
+/// sources degrade to a text note since Gemini's inline_data path
+/// won't fetch and the Files-API integration isn't wired up.
+fn document_source_to_part(src: &whisper_agent_protocol::DocumentSource) -> Option<Part> {
+    use base64::Engine;
+    use base64::engine::general_purpose::STANDARD;
+    use whisper_agent_protocol::DocumentSource;
+    match src {
+        DocumentSource::Bytes { media_type, data } => Some(Part::InlineData {
+            inline_data: InlineData {
+                mime_type: media_type.as_mime_str().to_string(),
+                data: STANDARD.encode(data),
+            },
+        }),
+        DocumentSource::Url { url } => {
+            tracing::warn!(
+                url = %url,
+                "Gemini does not support URL-sourced documents; dropping attachment and \
+                 substituting a text note."
+            );
+            Some(Part::Text {
+                text: format!("[Document URL attached but not viewable on this model: {url}]"),
                 thought: None,
             })
         }

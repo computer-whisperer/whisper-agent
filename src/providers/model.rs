@@ -321,12 +321,20 @@ pub enum UpdateAuthError {
     Io(String),
 }
 
-/// Standard JPEG/PNG/WebP/GIF vision set shared across Anthropic and
-/// OpenAI (Chat Completions + Responses). Gemini adds HEIC/HEIF on
-/// top of this.
+/// Standard JPEG/PNG/WebP/GIF + PDF vision set shared across
+/// Anthropic and OpenAI (Chat Completions + Responses). Gemini adds
+/// HEIC/HEIF on top of this. PDF input piggybacks on vision: every
+/// vision-capable model on these three providers accepts PDFs (the
+/// providers do server-side text extraction + page rasterization
+/// before the model sees the request), so we group them under one
+/// helper.
 pub fn standard_vision_capabilities() -> ContentCapabilities {
+    let mut input = MediaSupport::standard_image_input();
+    input
+        .document
+        .push(whisper_agent_protocol::DocumentMime::Pdf);
     ContentCapabilities {
-        input: MediaSupport::standard_image_input(),
+        input,
         output: MediaSupport::default(),
     }
 }

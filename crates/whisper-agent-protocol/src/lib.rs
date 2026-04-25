@@ -23,8 +23,8 @@ pub use behavior::{
     CatchUp, Overlap, RetentionPolicy, TriggerSpec,
 };
 pub use conversation::{
-    Attachment, ContentBlock, ContentCapabilities, Conversation, ImageMime, ImageSource,
-    MediaSupport, Message, ProviderReplay, Role, ToolResultContent,
+    Attachment, ContentBlock, ContentCapabilities, Conversation, DocumentMime, DocumentSource,
+    ImageMime, ImageSource, MediaSupport, Message, ProviderReplay, Role, ToolResultContent,
 };
 pub use permission::{BehaviorOpsCap, DispatchCap, PodModifyCap};
 pub use pod::{

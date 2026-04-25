@@ -190,6 +190,28 @@ impl CallToolResult {
             is_error: None,
         }
     }
+
+    /// Wrap a single base64-encoded binary resource (e.g. a PDF) as a
+    /// successful tool result. `uri` should be a stable identifier
+    /// (typically `file:///<path>`); `mime_type` is the IANA media
+    /// type (`application/pdf`).
+    pub fn resource_blob(
+        uri: impl Into<String>,
+        mime_type: impl Into<String>,
+        blob: impl Into<String>,
+    ) -> Self {
+        Self {
+            content: vec![ContentBlock::Resource {
+                resource: EmbeddedResource {
+                    uri: uri.into(),
+                    mime_type: Some(mime_type.into()),
+                    text: None,
+                    blob: Some(blob.into()),
+                },
+            }],
+            is_error: None,
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -206,4 +228,27 @@ pub enum ContentBlock {
         #[serde(rename = "mimeType")]
         mime_type: String,
     },
+    /// MCP 2025-06-18 embedded-resource content. Used for binary
+    /// payloads that aren't images — today, PDFs from `view_pdf`. The
+    /// inner [`EmbeddedResource`] carries either inline `text` or
+    /// base64-encoded `blob` bytes plus a stable `uri` identifier.
+    Resource {
+        resource: EmbeddedResource,
+    },
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EmbeddedResource {
+    pub uri: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mime_type: Option<String>,
+    /// Inline text content. Set when the resource is text; mutually
+    /// exclusive with `blob` per the MCP spec.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+    /// Base64-encoded bytes. Set when the resource is binary; mutually
+    /// exclusive with `text`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub blob: Option<String>,
 }

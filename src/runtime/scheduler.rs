@@ -1674,25 +1674,21 @@ impl Scheduler {
             .unwrap_or_else(whisper_agent_protocol::AllowMap::deny_all);
         let escalation_available = task.scope.escalation.is_interactive();
         // The runtime side of "MCP has no in-band signal for whether
-        // the client model accepts image input": ask the bound provider
-        // synchronously what the active model can consume, then drop
-        // image-producing tools (`view_image`) from the advertised set
-        // when the answer is "nothing". Belt-and-suspenders only — even
-        // if a tool sneaks through, the MCP image content the runtime
-        // surfaces back is structurally inert for a text-only model;
-        // the filter is purely to keep the model from trying.
-        let model_takes_images = self
+        // the client model accepts image / document input": ask the
+        // bound provider synchronously what the active model can
+        // consume, then drop media-producing tools (`view_image`,
+        // `view_pdf`) from the advertised set when the answer is
+        // "nothing". Belt-and-suspenders only — even if a tool sneaks
+        // through, the MCP media content the runtime surfaces back is
+        // structurally inert for a text-only model; the filter is
+        // purely to keep the model from trying.
+        let active_caps = self
             .backends
             .get(&task.bindings.backend)
-            .map(|entry| {
-                !entry
-                    .provider
-                    .capabilities_for(&task.config.model)
-                    .input
-                    .image
-                    .is_empty()
-            })
-            .unwrap_or(false);
+            .map(|entry| entry.provider.capabilities_for(&task.config.model))
+            .unwrap_or_default();
+        let model_takes_images = !active_caps.input.image.is_empty();
+        let model_takes_documents = !active_caps.input.document.is_empty();
         let mut out: Vec<AdmissibleTool> = Vec::new();
         let mut seen: HashSet<String> = HashSet::new();
 
@@ -1727,11 +1723,14 @@ impl Scheduler {
 
         for bound in self.bound_mcp_hosts(thread_id) {
             for tool in &bound.entry.tools {
-                // Hide `view_image` from text-only models. The tool
-                // still lives in the host catalog and would still
-                // dispatch if invoked — the filter is just to keep the
-                // tool out of sight so the model doesn't try.
+                // Hide media-producing tools from models that can't
+                // ingest the matching modality. Tools still live in
+                // the host catalog and dispatch if invoked — this
+                // filter is just to keep them out of sight.
                 if !model_takes_images && tool.name == "view_image" {
+                    continue;
+                }
+                if !model_takes_documents && tool.name == "view_pdf" {
                     continue;
                 }
                 let (public_name, category) = match bound.prefix {
