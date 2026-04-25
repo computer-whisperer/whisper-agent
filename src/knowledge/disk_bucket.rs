@@ -1,11 +1,13 @@
 //! [`DiskBucket`] — disk-backed implementation of the [`Bucket`] trait.
 //!
 //! Owns a bucket directory on disk plus the loaded state for the active
-//! slot (if any). Slice 4 wires the embedder into the build pipeline:
-//! chunks are batched and sent to an [`EmbeddingProvider`], vectors land
-//! in `vectors.bin`/`vectors.idx` alongside `chunks.bin`/`chunks.idx`.
-//! Search methods still return empty `Vec` (HNSW = slice 5; tantivy =
-//! slice 6); mutation methods still error pending the same.
+//! slot (if any). Slice 5 wires up the dense (HNSW) path: vectors get
+//! indexed at build time and the in-memory HNSW serves
+//! [`Bucket::dense_search`]. The HNSW is rebuilt from `vectors.bin` on
+//! slot load (no on-disk graph format yet); see
+//! [`crate::knowledge::DenseIndex`] for the serialize-later TODO. Sparse
+//! search still empty pending tantivy (slice 6); mutation methods still
+//! error pending the same.
 //!
 //! Concurrency model: queries take an [`Arc`]-shared snapshot of the
 //! active slot's [`LoadedSlot`] from the bucket's [`RwLock`]. Slot
@@ -26,11 +28,12 @@ use super::bucket::{BoxFuture, Bucket};
 use super::chunker::Chunker;
 use super::chunks::{ChunkStoreReader, ChunkStoreWriter};
 use super::config::{BucketConfig, ChunkerConfig};
+use super::dense::{DenseIndex, HnswParams};
 use super::manifest::{EmbedderSnapshot, ServingSnapshot, SlotManifest, SlotState, SlotStats};
 use super::slot;
 use super::source::SourceAdapter;
 use super::types::{
-    BucketError, BucketId, BucketStatus, Candidate, Chunk, ChunkId, NewChunk, SlotId,
+    BucketError, BucketId, BucketStatus, Candidate, Chunk, ChunkId, NewChunk, SearchPath, SlotId,
 };
 use super::vectors::{VectorStoreReader, VectorStoreWriter};
 use crate::providers::embedding::{EmbedRequest, EmbeddingProvider};
@@ -55,15 +58,15 @@ pub struct DiskBucket {
 }
 
 /// Loaded state for a single slot — everything a query needs to hit the
-/// active slot without going back to disk for index metadata. Slice 4
-/// adds the [`VectorStoreReader`] to the manifest+chunks duo from slice
-/// 3; future slices add the dense (HNSW) and sparse (tantivy) index
-/// handles.
+/// active slot without going back to disk for index metadata. Slice 5
+/// adds the [`DenseIndex`] to the manifest+chunks+vectors trio from
+/// slice 4; the sparse (tantivy) index handle lands in slice 6.
 #[derive(Debug)]
 struct LoadedSlot {
     manifest: SlotManifest,
     chunks: ChunkStoreReader,
     vectors: VectorStoreReader,
+    dense: DenseIndex,
 }
 
 impl DiskBucket {
@@ -197,6 +200,18 @@ impl DiskBucket {
             )));
         }
 
+        // Open readers for the new slot before we promote — promotion
+        // should never make a slot active that we can't immediately
+        // serve queries from.
+        let chunks = ChunkStoreReader::open(&chunks_bin, &chunks_idx).map_err(BucketError::Io)?;
+        let vectors =
+            VectorStoreReader::open(&vectors_bin, &vectors_idx).map_err(BucketError::Io)?;
+
+        // Build the dense index from the just-written vectors. Currently
+        // in-memory only; rebuild on slot load is fine at the scales we
+        // serve in slices 5–6.
+        let dense = DenseIndex::build(&vectors, HnswParams::default())?;
+
         // Update manifest with final stats and promote to ready.
         manifest.state = SlotState::Ready;
         manifest.build_completed_at = Some(chrono::Utc::now());
@@ -206,16 +221,11 @@ impl DiskBucket {
         manifest.stats.disk_size_bytes = total_dir_size(&slot_path).unwrap_or(0);
         write_manifest(&slot_path, &manifest)?;
 
-        // Open readers for the new slot before we promote — promotion
-        // should never make a slot active that we can't immediately
-        // serve queries from.
-        let chunks = ChunkStoreReader::open(&chunks_bin, &chunks_idx).map_err(BucketError::Io)?;
-        let vectors =
-            VectorStoreReader::open(&vectors_bin, &vectors_idx).map_err(BucketError::Io)?;
         let loaded = Arc::new(LoadedSlot {
             manifest,
             chunks,
             vectors,
+            dense,
         });
 
         // Atomic active-pointer flip; then swap the loaded state under
@@ -280,13 +290,52 @@ impl Bucket for DiskBucket {
 
     fn dense_search<'a>(
         &'a self,
-        _query_vec: &'a [f32],
-        _top_k: usize,
+        query_vec: &'a [f32],
+        top_k: usize,
         _cancel: &'a CancellationToken,
     ) -> BoxFuture<'a, Result<Vec<Candidate>, BucketError>> {
-        // HNSW comes online in slice 5. Vectors are now persisted but
-        // there's no index over them yet.
-        Box::pin(async move { Ok(Vec::new()) })
+        Box::pin(async move {
+            let Some(active) = self.active_snapshot() else {
+                return Ok(Vec::new());
+            };
+            // Validate query dimension against the slot's recorded
+            // embedder dimension. A mismatch means the caller is
+            // querying with a vector from a different embedder — fail
+            // explicitly rather than return junk.
+            let slot_dim = active.vectors.dimension();
+            if query_vec.len() as u32 != slot_dim {
+                return Err(BucketError::DimensionMismatch {
+                    query: query_vec.len() as u32,
+                    slot: slot_dim,
+                });
+            }
+
+            let hits = active.dense.search(query_vec, top_k);
+            let mut out = Vec::with_capacity(hits.len());
+            for (chunk_id, distance) in hits {
+                // Look up chunk text for inclusion in the candidate.
+                // A `None` here would mean vectors.idx and chunks.idx
+                // disagree on which chunk ids exist — a real
+                // structural failure worth surfacing.
+                let chunk = active
+                    .chunks
+                    .fetch(chunk_id)
+                    .map_err(BucketError::Io)?
+                    .ok_or_else(|| {
+                        BucketError::Other(format!(
+                            "dense hit {chunk_id} missing from chunks store",
+                        ))
+                    })?;
+                out.push(Candidate {
+                    bucket_id: self.id.clone(),
+                    chunk_id,
+                    chunk_text: chunk.text,
+                    source_score: distance,
+                    path: SearchPath::Dense,
+                });
+            }
+            Ok(out)
+        })
     }
 
     fn sparse_search<'a>(
@@ -449,10 +498,17 @@ fn load_slot(bucket_root: &Path, slot_id: &str) -> Result<LoadedSlot, BucketErro
         )));
     }
 
+    // Rebuild the dense index from persisted vectors. Negligible at
+    // workspace scales; a real cost at wikipedia scale (~30 min for
+    // 50M vectors) — HNSW persistence is a known follow-up slice when
+    // scale forces the issue.
+    let dense = DenseIndex::build(&vectors, HnswParams::default())?;
+
     Ok(LoadedSlot {
         manifest,
         chunks,
         vectors,
+        dense,
     })
 }
 
@@ -805,7 +861,90 @@ embedder = "tei_test"
     }
 
     #[tokio::test]
-    async fn search_methods_return_empty_pending_indexes() {
+    async fn dense_search_returns_exact_match_for_exact_query() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("notes");
+        fs::create_dir_all(&source).unwrap();
+        write_md(&source, "alpha.md", "alpha body");
+        write_md(&source, "beta.md", "beta body");
+        write_md(&source, "gamma.md", "gamma body");
+
+        let bucket_root = tmp.path().join("bucket");
+        let bucket = open_test_bucket(&bucket_root, &source);
+        let adapter = MarkdownDir::new(&source);
+        let chunker = TokenBasedChunker::from_config(&bucket.config().chunker);
+        let embedder: Arc<dyn EmbeddingProvider> = Arc::new(MockEmbedder::new(16));
+        let cancel = CancellationToken::new();
+        bucket
+            .build_slot(&adapter, &chunker, embedder, &cancel)
+            .await
+            .unwrap();
+
+        // Query with the same vector that "beta body" would have produced.
+        // MockEmbedder is deterministic in its input → output mapping, so
+        // we can re-derive the expected vector locally.
+        let beta_record = crate::knowledge::SourceRecord::new("ignored", "beta body");
+        let beta_chunks = chunker.chunk(&beta_record);
+        let query = MockEmbedder::fake_vector(&beta_chunks[0].text, 16);
+
+        let results = bucket.dense_search(&query, 3, &cancel).await.unwrap();
+        assert_eq!(results.len(), 3);
+        // Top result is the exact-match chunk
+        assert!(results[0].chunk_text.contains("beta body"));
+        assert!(results[0].source_score < 0.001);
+        assert_eq!(results[0].path, SearchPath::Dense);
+        assert_eq!(results[0].bucket_id, *bucket.id());
+
+        // Results sorted ascending by distance
+        for w in results.windows(2) {
+            assert!(w[0].source_score <= w[1].source_score);
+        }
+    }
+
+    #[tokio::test]
+    async fn dense_search_with_no_active_slot_returns_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("notes");
+        fs::create_dir_all(&source).unwrap();
+
+        let bucket_root = tmp.path().join("bucket");
+        let bucket = open_test_bucket(&bucket_root, &source);
+        let cancel = CancellationToken::new();
+        let results = bucket.dense_search(&[0.0; 4], 5, &cancel).await.unwrap();
+        assert!(results.is_empty());
+    }
+
+    #[tokio::test]
+    async fn dense_search_rejects_dimension_mismatch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("notes");
+        fs::create_dir_all(&source).unwrap();
+        write_md(&source, "doc.md", "hello");
+
+        let bucket_root = tmp.path().join("bucket");
+        let bucket = open_test_bucket(&bucket_root, &source);
+        let adapter = MarkdownDir::new(&source);
+        let chunker = TokenBasedChunker::from_config(&bucket.config().chunker);
+        let embedder: Arc<dyn EmbeddingProvider> = Arc::new(MockEmbedder::new(8));
+        let cancel = CancellationToken::new();
+        bucket
+            .build_slot(&adapter, &chunker, embedder, &cancel)
+            .await
+            .unwrap();
+
+        // Query with the wrong dimension
+        let err = bucket
+            .dense_search(&[0.0; 16], 5, &cancel)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            BucketError::DimensionMismatch { query: 16, slot: 8 }
+        ));
+    }
+
+    #[tokio::test]
+    async fn sparse_search_still_empty_pending_tantivy() {
         let tmp = tempfile::tempdir().unwrap();
         let source = tmp.path().join("notes");
         fs::create_dir_all(&source).unwrap();
@@ -822,8 +961,6 @@ embedder = "tei_test"
             .await
             .unwrap();
 
-        let dense = bucket.dense_search(&[0.0; 4], 10, &cancel).await.unwrap();
-        assert!(dense.is_empty());
         let sparse = bucket.sparse_search("anything", 10, &cancel).await.unwrap();
         assert!(sparse.is_empty());
     }

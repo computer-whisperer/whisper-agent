@@ -197,6 +197,13 @@ impl VectorStoreReader {
         let Some(&position) = self.index.get(&chunk_id) else {
             return Ok(None);
         };
+        Ok(Some(self.read_at_position(position)?))
+    }
+
+    /// Read the vector at a specific position (its index in the dense
+    /// `vectors.bin` array). Used by the HNSW build path which iterates
+    /// vectors in position order rather than by chunk id.
+    pub fn read_at_position(&self, position: u64) -> io::Result<Vec<f32>> {
         let dim = self.dimension as usize;
         let byte_offset = HEADER_SIZE + position * dim as u64 * 4;
 
@@ -210,7 +217,14 @@ impl VectorStoreReader {
         for chunk in bytes.chunks_exact(4) {
             out.push(f32::from_le_bytes(chunk.try_into().unwrap()));
         }
-        Ok(Some(out))
+        Ok(out)
+    }
+
+    /// Iterate `(chunk_id, position)` pairs in unspecified order. Used
+    /// by the HNSW builder to construct its position→chunk_id map
+    /// without an extra disk read.
+    pub fn iter_chunk_positions(&self) -> impl Iterator<Item = (ChunkId, u64)> + '_ {
+        self.index.iter().map(|(id, &pos)| (*id, pos))
     }
 }
 

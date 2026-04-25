@@ -32,6 +32,7 @@ pub mod bucket;
 pub mod chunker;
 pub mod chunks;
 pub mod config;
+pub mod dense;
 pub mod disk_bucket;
 pub mod manifest;
 pub mod slot;
@@ -46,6 +47,7 @@ pub use config::{
     BucketConfig, ChunkerConfig, CompactionConfig, DefaultsConfig, DensePathConfig, Quantization,
     RescanStrategy, SearchPathsConfig, ServingMode, SourceConfig, SparsePathConfig,
 };
+pub use dense::{DenseIndex, HnswParams};
 pub use disk_bucket::DiskBucket;
 pub use manifest::{
     EmbedderSnapshot, ServingSnapshot, SlotLineage, SlotManifest, SlotState, SlotStats,

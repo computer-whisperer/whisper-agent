@@ -120,6 +120,10 @@ sha2 = "0.10"
 # throughput matters because the chunker hashes every source record on a
 # wikipedia-scale build — sha2 would bottleneck the chunking stage.
 blake3 = "1"
+# HNSW dense-vector index for the knowledge-bucket layer. Rust-native,
+# supports the build + search + (eventual) persistence operations the
+# slot's dense path needs.
+hnsw_rs = "0.3"
 
 [dev-dependencies]
 # Tempdirs for source-adapter / chunker tests. Auto-cleanup via Drop.
