@@ -25,31 +25,36 @@ use tracing::warn;
 use whisper_agent_protocol::{BackendSummary, ServerToClient};
 
 use super::{ConnId, Scheduler};
-use crate::pod::config::{BackendConfig, Config};
+use crate::pod::config::Config;
 use crate::pod::resources::BackendId;
 use crate::runtime::io_dispatch::SchedulerFuture;
-use crate::runtime::scheduler::BackendEntry;
+use crate::runtime::scheduler::{BackendEntry, EmbeddingProviderEntry, RerankProviderEntry};
 
-/// Diff between the old and new backend catalog, by name.
+/// Diff between an old and new map of named config entries, by name.
+/// Generic over the entry value so we can reuse the same logic for
+/// backends, embedding providers, and rerank providers — all three are
+/// `BTreeMap<String, T>` where `T: PartialEq` and the field-level
+/// equality decides "changed".
 #[derive(Debug, Default)]
-struct BackendDiff {
+struct CatalogDiff {
     added: Vec<String>,
     removed: Vec<String>,
     changed: Vec<String>,
 }
 
-impl BackendDiff {
+impl CatalogDiff {
     fn is_noop(&self) -> bool {
         self.added.is_empty() && self.removed.is_empty() && self.changed.is_empty()
     }
 }
 
-fn diff_backends<'a, I>(old: I, new: &BTreeMap<String, BackendConfig>) -> BackendDiff
+fn diff_catalog<'a, I, T>(old: I, new: &BTreeMap<String, T>) -> CatalogDiff
 where
-    I: IntoIterator<Item = (&'a String, &'a BackendConfig)>,
+    I: IntoIterator<Item = (&'a String, &'a T)>,
+    T: PartialEq + 'a,
 {
-    let old_map: HashMap<&String, &BackendConfig> = old.into_iter().collect();
-    let mut diff = BackendDiff::default();
+    let old_map: HashMap<&String, &T> = old.into_iter().collect();
+    let mut diff = CatalogDiff::default();
     for (name, new_cfg) in new {
         match old_map.get(name) {
             None => diff.added.push(name.clone()),
@@ -211,11 +216,73 @@ impl Scheduler {
             );
         }
 
-        let diff = diff_backends(
+        // Same fail-fast build pass for embedding + rerank providers.
+        // Identical pattern: construct everything, surface any error
+        // before touching live state, and only then proceed to swap.
+        let mut new_embed_entries: HashMap<String, EmbeddingProviderEntry> = HashMap::new();
+        for (name, ecfg) in &new_cfg.embedding_providers {
+            let provider = match ecfg.build() {
+                Ok(p) => p,
+                Err(e) => {
+                    self.reply_error(
+                        conn_id,
+                        correlation_id,
+                        format!("build embedding provider `{name}`: {e}"),
+                    );
+                    return;
+                }
+            };
+            new_embed_entries.insert(
+                name.clone(),
+                EmbeddingProviderEntry {
+                    provider,
+                    kind: ecfg.kind().into(),
+                    auth_mode: ecfg.auth_mode().map(str::to_string),
+                    source: ecfg.clone(),
+                },
+            );
+        }
+        let mut new_rerank_entries: HashMap<String, RerankProviderEntry> = HashMap::new();
+        for (name, rcfg) in &new_cfg.rerank_providers {
+            let provider = match rcfg.build() {
+                Ok(p) => p,
+                Err(e) => {
+                    self.reply_error(
+                        conn_id,
+                        correlation_id,
+                        format!("build rerank provider `{name}`: {e}"),
+                    );
+                    return;
+                }
+            };
+            new_rerank_entries.insert(
+                name.clone(),
+                RerankProviderEntry {
+                    provider,
+                    kind: rcfg.kind().into(),
+                    auth_mode: rcfg.auth_mode().map(str::to_string),
+                    source: rcfg.clone(),
+                },
+            );
+        }
+
+        let diff = diff_catalog(
             self.backends
                 .iter()
                 .map(|(name, entry)| (name, &entry.source)),
             &new_cfg.backends,
+        );
+        let embed_diff = diff_catalog(
+            self.embedding_providers
+                .iter()
+                .map(|(name, entry)| (name, &entry.source)),
+            &new_cfg.embedding_providers,
+        );
+        let rerank_diff = diff_catalog(
+            self.rerank_providers
+                .iter()
+                .map(|(name, entry)| (name, &entry.source)),
+            &new_cfg.rerank_providers,
         );
 
         let mut cancel_list: Vec<String> = Vec::new();
@@ -251,7 +318,10 @@ impl Scheduler {
         }
 
         let restart_sections = restart_required_sections(&old_cfg, &new_cfg);
-        let write_needed = !diff.is_noop() || !restart_sections.is_empty();
+        let write_needed = !diff.is_noop()
+            || !embed_diff.is_noop()
+            || !rerank_diff.is_noop()
+            || !restart_sections.is_empty();
 
         for thread_id in &cancel_list {
             self.execute_cancel_thread(thread_id, pending_io);
@@ -272,6 +342,27 @@ impl Scheduler {
             }
         }
 
+        // Embedding / rerank providers don't yet have any users
+        // (knowledge buckets aren't built), so no thread-cancellation
+        // step is needed here. When buckets land they'll bind to a
+        // provider; this is where the cancellation list will widen.
+        for name in &embed_diff.removed {
+            self.embedding_providers.remove(name);
+        }
+        for name in embed_diff.added.iter().chain(embed_diff.changed.iter()) {
+            if let Some(entry) = new_embed_entries.remove(name) {
+                self.embedding_providers.insert(name.clone(), entry);
+            }
+        }
+        for name in &rerank_diff.removed {
+            self.rerank_providers.remove(name);
+        }
+        for name in rerank_diff.added.iter().chain(rerank_diff.changed.iter()) {
+            if let Some(entry) = new_rerank_entries.remove(name) {
+                self.rerank_providers.insert(name.clone(), entry);
+            }
+        }
+
         // Disk write follows the in-memory swap: the scheduler is
         // authoritative at runtime, so an order that left disk newer
         // than memory could revert the swap on restart while the
@@ -283,7 +374,7 @@ impl Scheduler {
                 conn_id,
                 correlation_id,
                 format!(
-                    "backends hot-swapped in memory, but writing {} failed: {e}. Retry the update or edit the file directly.",
+                    "provider catalogs hot-swapped in memory, but writing {} failed: {e}. Retry the update or edit the file directly.",
                     path.display(),
                 ),
             );
@@ -357,7 +448,7 @@ mod tests {
     fn empty_to_empty_is_noop() {
         let old: BTreeMap<String, BackendConfig> = BTreeMap::new();
         let new: BTreeMap<String, BackendConfig> = BTreeMap::new();
-        let diff = diff_backends(old.iter(), &new);
+        let diff = diff_catalog(old.iter(), &new);
         assert!(diff.is_noop());
     }
 
@@ -366,7 +457,7 @@ mod tests {
         let old: BTreeMap<String, BackendConfig> = BTreeMap::new();
         let mut new = BTreeMap::new();
         new.insert("cloud".into(), cfg_anthropic("k"));
-        let diff = diff_backends(old.iter(), &new);
+        let diff = diff_catalog(old.iter(), &new);
         assert_eq!(diff.added, vec!["cloud".to_string()]);
         assert!(diff.removed.is_empty());
         assert!(diff.changed.is_empty());
@@ -377,7 +468,7 @@ mod tests {
         let mut old = BTreeMap::new();
         old.insert("cloud".to_string(), cfg_anthropic("k"));
         let new: BTreeMap<String, BackendConfig> = BTreeMap::new();
-        let diff = diff_backends(old.iter(), &new);
+        let diff = diff_catalog(old.iter(), &new);
         assert_eq!(diff.removed, vec!["cloud".to_string()]);
         assert!(diff.added.is_empty());
         assert!(diff.changed.is_empty());
@@ -389,7 +480,7 @@ mod tests {
         old.insert("cloud".to_string(), cfg_anthropic("old-key"));
         let mut new = BTreeMap::new();
         new.insert("cloud".into(), cfg_anthropic("new-key"));
-        let diff = diff_backends(old.iter(), &new);
+        let diff = diff_catalog(old.iter(), &new);
         assert_eq!(diff.changed, vec!["cloud".to_string()]);
         assert!(diff.added.is_empty());
         assert!(diff.removed.is_empty());
@@ -401,7 +492,7 @@ mod tests {
         old.insert("cloud".to_string(), cfg_anthropic("same-key"));
         let mut new = BTreeMap::new();
         new.insert("cloud".into(), cfg_anthropic("same-key"));
-        let diff = diff_backends(old.iter(), &new);
+        let diff = diff_catalog(old.iter(), &new);
         assert!(diff.is_noop());
     }
 
@@ -421,7 +512,7 @@ mod tests {
         new.insert("d".into(), cfg_anthropic("k4")); // added
         // `b` removed
 
-        let diff = diff_backends(old.iter(), &new);
+        let diff = diff_catalog(old.iter(), &new);
         assert_eq!(diff.added, vec!["d".to_string()]);
         assert_eq!(diff.removed, vec!["b".to_string()]);
         assert_eq!(diff.changed, vec!["c".to_string()]);
@@ -463,5 +554,67 @@ fetch = "http://127.0.0.1:9831/mcp"
         let new: Config = toml::from_str(new_toml).unwrap();
         let sections = restart_required_sections(&old, &new);
         assert_eq!(sections, vec!["shared_mcp_hosts".to_string()]);
+    }
+
+    #[test]
+    fn restart_sections_does_not_flag_embedding_or_rerank_changes() {
+        // The whole point of these new sections is hot-swap parity with
+        // backends — adding them must not push the operator into a
+        // restart-required path.
+        let old_toml = r#"
+[backends.cloud]
+kind = "anthropic"
+auth = { mode = "api_key", value = "k1" }
+"#;
+        let new_toml = r#"
+[backends.cloud]
+kind = "anthropic"
+auth = { mode = "api_key", value = "k1" }
+
+[embedding_providers.local-bge]
+kind = "tei"
+endpoint = "http://localhost:8080"
+
+[rerank_providers.local-rerank]
+kind = "tei"
+endpoint = "http://localhost:8081"
+"#;
+        let old: Config = toml::from_str(old_toml).unwrap();
+        let new: Config = toml::from_str(new_toml).unwrap();
+        assert!(restart_required_sections(&old, &new).is_empty());
+    }
+
+    #[test]
+    fn diff_catalog_handles_embedding_provider_configs() {
+        // Generic diff function applied to embedding provider configs —
+        // exercises the diff plumbing the runtime swap path uses.
+        use crate::pod::config::EmbeddingProviderConfig;
+        let mut old = BTreeMap::new();
+        old.insert(
+            "local".to_string(),
+            EmbeddingProviderConfig::Tei {
+                endpoint: "http://localhost:8080".into(),
+                auth: None,
+            },
+        );
+        let mut new = BTreeMap::new();
+        new.insert(
+            "local".to_string(),
+            EmbeddingProviderConfig::Tei {
+                endpoint: "http://localhost:9090".into(), // changed
+                auth: None,
+            },
+        );
+        new.insert(
+            "remote".to_string(),
+            EmbeddingProviderConfig::Tei {
+                endpoint: "http://embed.internal".into(),
+                auth: None,
+            },
+        );
+        let diff = diff_catalog(old.iter(), &new);
+        assert_eq!(diff.added, vec!["remote".to_string()]);
+        assert_eq!(diff.changed, vec!["local".to_string()]);
+        assert!(diff.removed.is_empty());
     }
 }

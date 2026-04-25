@@ -55,7 +55,9 @@ use crate::pod::resources::{
     BackendId, CompleteHostEnvOutcome, HostEnvId, McpHostId, ResourceRegistry,
 };
 use crate::pod::{Pod, PodId};
+use crate::providers::embedding::EmbeddingProvider;
 use crate::providers::model::ModelProvider;
+use crate::providers::rerank::RerankProvider;
 use crate::runtime::audit::AuditLog;
 use crate::runtime::io_dispatch::{
     self, IoCompletion, ProvisionCompletion, ProvisionPhase, ProvisionResult, SchedulerCompletion,
@@ -223,6 +225,27 @@ pub struct BackendEntry {
     pub source: crate::pod::config::BackendConfig,
 }
 
+/// Entry in the scheduler's embedding-provider catalog. Mirrors
+/// [`BackendEntry`] minus the `default_model` slot — embedding providers
+/// like TEI serve a single model per process, so there's no per-call
+/// model choice to default. When OpenAI-shaped providers land they'll
+/// expose model selection via the request itself.
+pub struct EmbeddingProviderEntry {
+    pub provider: Arc<dyn EmbeddingProvider>,
+    pub kind: String,
+    pub auth_mode: Option<String>,
+    pub source: crate::pod::config::EmbeddingProviderConfig,
+}
+
+/// Entry in the scheduler's reranker catalog. Same shape as
+/// [`EmbeddingProviderEntry`].
+pub struct RerankProviderEntry {
+    pub provider: Arc<dyn RerankProvider>,
+    pub kind: String,
+    pub auth_mode: Option<String>,
+    pub source: crate::pod::config::RerankProviderConfig,
+}
+
 /// CLI-provided shared MCP host (`--shared-mcp-host name=url`). These
 /// are runtime-overlays: they don't land in the durable catalog, and
 /// they can't be edited through the WebUI (the catalog entry would
@@ -329,6 +352,13 @@ pub struct Scheduler {
     pods: HashMap<PodId, Pod>,
     /// Named backends: `ThreadConfig.backend` resolves against this map.
     backends: HashMap<String, BackendEntry>,
+    /// Named embedding providers — populated from `[embedding_providers.*]`.
+    /// Hot-swappable through the same config-edit path as `backends`. Empty
+    /// is valid: a server with no embedding providers can still drive chat
+    /// threads, it just can't host knowledge buckets.
+    embedding_providers: HashMap<String, EmbeddingProviderEntry>,
+    /// Named rerank providers — populated from `[rerank_providers.*]`.
+    rerank_providers: HashMap<String, RerankProviderEntry>,
     /// Path to the `whisper-agent.toml` the server was loaded from.
     /// `None` when started with the env-key fallback (no `--config`).
     /// Runtime config-edit handlers refuse to write back without it.
@@ -456,6 +486,8 @@ impl Scheduler {
         default_pod: Pod,
         host_id: String,
         backends: HashMap<String, BackendEntry>,
+        embedding_providers: HashMap<String, EmbeddingProviderEntry>,
+        rerank_providers: HashMap<String, RerankProviderEntry>,
         audit: AuditLog,
         host_env_registry: crate::tools::sandbox::HostEnvRegistry,
         host_env_catalog: crate::tools::host_env_catalog::CatalogStore,
@@ -522,6 +554,8 @@ impl Scheduler {
                 default_pod_id,
                 pods,
                 backends,
+                embedding_providers,
+                rerank_providers,
                 server_config_path,
                 persister: None,
                 host_env_registry,

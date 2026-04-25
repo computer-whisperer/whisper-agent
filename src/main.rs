@@ -11,7 +11,9 @@ use whisper_agent_protocol::sandbox::{HostEnvSpec, NetworkPolicy, PathAccess};
 
 use whisper_agent::pod::config::{Auth, BackendConfig, Config};
 use whisper_agent::providers::anthropic::AnthropicClient;
-use whisper_agent::runtime::scheduler::{BackendEntry, SharedHostOverlay};
+use whisper_agent::runtime::scheduler::{
+    BackendEntry, EmbeddingProviderEntry, RerankProviderEntry, SharedHostOverlay,
+};
 use whisper_agent::server::{self, ServerConfig};
 use whisper_agent::tools::host_env_catalog::{self, CatalogStore, new_seeded_entry};
 use whisper_agent::tools::sandbox::{self, HostEnvRegistry};
@@ -340,62 +342,107 @@ async fn run_serve(args: ServeArgs) -> Result<()> {
     // from a TOML config; CLI --shared-mcp-host flags layer on top (CLI wins
     // on name conflict).
     let resolved_config = resolve_config_path(args.config.clone())?;
-    let (backends, shared_host_map, toml_provider_entries, auth_clients, auth_admins) =
-        match &resolved_config {
-            Some(path) => {
-                info!(config = %path.display(), "loading backend catalog");
-                let cfg = Config::load(path).await?;
-                let mut map = HashMap::new();
-                for (name, bcfg) in &cfg.backends {
-                    let provider = bcfg
-                        .build()
-                        .with_context(|| format!("build backend `{name}`"))?;
-                    map.insert(
-                        name.clone(),
-                        BackendEntry {
-                            provider,
-                            kind: bcfg.kind().into(),
-                            default_model: bcfg.default_model().map(|s| s.to_string()),
-                            auth_mode: bcfg.auth_mode().map(str::to_string),
-                            source: bcfg.clone(),
-                        },
-                    );
-                }
-                (
-                    map,
-                    cfg.shared_mcp_hosts.into_iter().collect::<HashMap<_, _>>(),
-                    cfg.host_env_providers,
-                    cfg.auth.clients,
-                    cfg.auth.admins,
-                )
-            }
-            None => {
-                let key = args.anthropic_api_key.clone().ok_or_else(|| {
-                    anyhow!(
-                        "no --config provided and ANTHROPIC_API_KEY / --anthropic-api-key is unset"
-                    )
-                })?;
-                let source = BackendConfig::Anthropic {
-                    auth: Auth::ApiKey {
-                        value: Some(key.clone()),
-                        env: None,
-                    },
-                    default_model: Some(args.model.clone()),
-                };
-                let mut map = HashMap::new();
+    let (
+        backends,
+        embedding_providers,
+        rerank_providers,
+        shared_host_map,
+        toml_provider_entries,
+        auth_clients,
+        auth_admins,
+    ) = match &resolved_config {
+        Some(path) => {
+            info!(config = %path.display(), "loading backend catalog");
+            let cfg = Config::load(path).await?;
+            let mut map = HashMap::new();
+            for (name, bcfg) in &cfg.backends {
+                let provider = bcfg
+                    .build()
+                    .with_context(|| format!("build backend `{name}`"))?;
                 map.insert(
-                    DEFAULT_BACKEND_NAME.into(),
+                    name.clone(),
                     BackendEntry {
-                        provider: std::sync::Arc::new(AnthropicClient::new(key)),
-                        kind: "anthropic".into(),
-                        default_model: Some(args.model.clone()),
-                        auth_mode: Some("api_key".into()),
-                        source,
+                        provider,
+                        kind: bcfg.kind().into(),
+                        default_model: bcfg.default_model().map(|s| s.to_string()),
+                        auth_mode: bcfg.auth_mode().map(str::to_string),
+                        source: bcfg.clone(),
                     },
                 );
-                (map, HashMap::new(), Vec::new(), Vec::new(), Vec::new())
             }
-        };
+            let mut embed_map = HashMap::new();
+            for (name, ecfg) in &cfg.embedding_providers {
+                let provider = ecfg
+                    .build()
+                    .with_context(|| format!("build embedding provider `{name}`"))?;
+                embed_map.insert(
+                    name.clone(),
+                    EmbeddingProviderEntry {
+                        provider,
+                        kind: ecfg.kind().into(),
+                        auth_mode: ecfg.auth_mode().map(str::to_string),
+                        source: ecfg.clone(),
+                    },
+                );
+            }
+            let mut rerank_map = HashMap::new();
+            for (name, rcfg) in &cfg.rerank_providers {
+                let provider = rcfg
+                    .build()
+                    .with_context(|| format!("build rerank provider `{name}`"))?;
+                rerank_map.insert(
+                    name.clone(),
+                    RerankProviderEntry {
+                        provider,
+                        kind: rcfg.kind().into(),
+                        auth_mode: rcfg.auth_mode().map(str::to_string),
+                        source: rcfg.clone(),
+                    },
+                );
+            }
+            (
+                map,
+                embed_map,
+                rerank_map,
+                cfg.shared_mcp_hosts.into_iter().collect::<HashMap<_, _>>(),
+                cfg.host_env_providers,
+                cfg.auth.clients,
+                cfg.auth.admins,
+            )
+        }
+        None => {
+            let key = args.anthropic_api_key.clone().ok_or_else(|| {
+                anyhow!("no --config provided and ANTHROPIC_API_KEY / --anthropic-api-key is unset")
+            })?;
+            let source = BackendConfig::Anthropic {
+                auth: Auth::ApiKey {
+                    value: Some(key.clone()),
+                    env: None,
+                },
+                default_model: Some(args.model.clone()),
+            };
+            let mut map = HashMap::new();
+            map.insert(
+                DEFAULT_BACKEND_NAME.into(),
+                BackendEntry {
+                    provider: std::sync::Arc::new(AnthropicClient::new(key)),
+                    kind: "anthropic".into(),
+                    default_model: Some(args.model.clone()),
+                    auth_mode: Some("api_key".into()),
+                    source,
+                },
+            );
+            (
+                map,
+                HashMap::new(),
+                HashMap::new(),
+                HashMap::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+            )
+        }
+    };
     // Synthesized default pod's `thread_defaults.model` is the
     // alphabetically-first backend's `default_model` (matches the
     // backend chosen by `build_default_pod_config`). Empty when the
@@ -557,6 +604,8 @@ async fn run_serve(args: ServeArgs) -> Result<()> {
 
     let server_config = ServerConfig {
         backends,
+        embedding_providers,
+        rerank_providers,
         default_task_config: ThreadConfig {
             model: default_model,
             max_tokens: args.max_tokens,

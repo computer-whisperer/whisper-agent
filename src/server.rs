@@ -93,6 +93,14 @@ fn serve_embedded<E: RustEmbed>(path: &str) -> Response {
 pub struct ServerConfig {
     /// Named backends the scheduler can dispatch model calls to.
     pub backends: std::collections::HashMap<String, BackendEntry>,
+    /// Named embedding providers from `[embedding_providers.*]`. Empty
+    /// when the server boots without any — knowledge buckets become
+    /// inaccessible until at least one is registered.
+    pub embedding_providers:
+        std::collections::HashMap<String, crate::runtime::scheduler::EmbeddingProviderEntry>,
+    /// Named rerank providers from `[rerank_providers.*]`.
+    pub rerank_providers:
+        std::collections::HashMap<String, crate::runtime::scheduler::RerankProviderEntry>,
     /// Plain config (model, limits, policy) the synthesized default
     /// pod's `thread_defaults` table is built from.
     pub default_task_config: ThreadConfig,
@@ -215,6 +223,8 @@ pub async fn serve(listen: SocketAddr, config: ServerConfig) -> anyhow::Result<(
         default_pod,
         config.host_id,
         config.backends,
+        config.embedding_providers,
+        config.rerank_providers,
         audit,
         config.host_env_registry,
         config.host_env_catalog,

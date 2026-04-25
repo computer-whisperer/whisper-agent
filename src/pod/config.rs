@@ -39,6 +39,7 @@ use std::path::PathBuf;
 
 use crate::providers::anthropic::AnthropicClient;
 use crate::providers::codex_auth::CodexAuth;
+use crate::providers::embedding::EmbeddingProvider;
 use crate::providers::gemini::{GEMINI_API_BASE, GEMINI_CODE_ASSIST_BASE, GeminiClient};
 use crate::providers::gemini_auth::GeminiAuth;
 use crate::providers::llamacpp::LlamaCppClient;
@@ -47,6 +48,8 @@ use crate::providers::openai_chat::OpenAiChatClient;
 use crate::providers::openai_responses::{
     CHATGPT_CODEX_BASE, OPENAI_API_BASE, OpenAiResponsesClient,
 };
+use crate::providers::rerank::RerankProvider;
+use crate::providers::tei::{TeiEmbeddingClient, TeiRerankClient};
 
 #[derive(Deserialize, Debug, Clone)]
 pub struct Config {
@@ -75,6 +78,18 @@ pub struct Config {
     /// connections are rejected outright.
     #[serde(default)]
     pub auth: AuthConfig,
+    /// Optional `[embedding_providers.{name}]` tables — named hookups to
+    /// embedding inference servers (TEI today). Empty is valid: a server
+    /// with no embedding providers simply can't host knowledge buckets.
+    /// Hot-swappable through the same config-edit path as `[backends]`.
+    #[serde(default)]
+    pub embedding_providers: BTreeMap<String, EmbeddingProviderConfig>,
+    /// Optional `[rerank_providers.{name}]` tables — named hookups to
+    /// reranker inference servers. Independent of embedding providers
+    /// (TEI deploys one model per server, so embed and rerank are
+    /// always separate processes). Hot-swappable.
+    #[serde(default)]
+    pub rerank_providers: BTreeMap<String, RerankProviderConfig>,
 }
 
 /// Client-auth section. Tokens are stored in cleartext alongside other
@@ -321,6 +336,108 @@ impl BackendConfig {
             BackendConfig::Gemini { base_url, auth, .. } => build_gemini(base_url.as_deref(), auth),
             BackendConfig::LlamaCpp { base_url, .. } => {
                 Ok(Arc::new(LlamaCppClient::new(base_url.clone())))
+            }
+        }
+    }
+}
+
+/// Catalog entry for an embedding inference server. Today only TEI's
+/// native `/embed` shape is wired up; future variants (`openai`, `cohere`,
+/// `voyage`) plug in alongside.
+///
+/// ```toml
+/// [embedding_providers.local-bge]
+/// kind = "tei"
+/// endpoint = "http://localhost:8080"
+/// # auth optional — TEI accepts requests without one when started without `--api-key`
+///
+/// [embedding_providers.local-bge-secured]
+/// kind = "tei"
+/// endpoint = "http://embed.internal:8080"
+/// auth = { mode = "api_key", env = "TEI_EMBED_KEY" }
+/// ```
+#[derive(Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum EmbeddingProviderConfig {
+    Tei {
+        endpoint: String,
+        #[serde(default)]
+        auth: Option<Auth>,
+    },
+}
+
+impl EmbeddingProviderConfig {
+    pub fn kind(&self) -> &'static str {
+        match self {
+            EmbeddingProviderConfig::Tei { .. } => "tei",
+        }
+    }
+
+    pub fn endpoint(&self) -> &str {
+        match self {
+            EmbeddingProviderConfig::Tei { endpoint, .. } => endpoint,
+        }
+    }
+
+    pub fn auth_mode(&self) -> Option<&'static str> {
+        match self {
+            EmbeddingProviderConfig::Tei { auth, .. } => auth.as_ref().map(Auth::mode_name),
+        }
+    }
+
+    pub fn build(&self) -> Result<Arc<dyn EmbeddingProvider>> {
+        match self {
+            EmbeddingProviderConfig::Tei { endpoint, auth } => {
+                let key = match auth {
+                    Some(a) => Some(a.resolve_api_key().context("tei embedding auth")?),
+                    None => None,
+                };
+                Ok(Arc::new(TeiEmbeddingClient::new(endpoint.clone(), key)))
+            }
+        }
+    }
+}
+
+/// Catalog entry for a reranker inference server. Same TOML shape as
+/// [`EmbeddingProviderConfig`] — TEI's `/rerank` endpoint takes the same
+/// auth + endpoint configuration.
+#[derive(Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum RerankProviderConfig {
+    Tei {
+        endpoint: String,
+        #[serde(default)]
+        auth: Option<Auth>,
+    },
+}
+
+impl RerankProviderConfig {
+    pub fn kind(&self) -> &'static str {
+        match self {
+            RerankProviderConfig::Tei { .. } => "tei",
+        }
+    }
+
+    pub fn endpoint(&self) -> &str {
+        match self {
+            RerankProviderConfig::Tei { endpoint, .. } => endpoint,
+        }
+    }
+
+    pub fn auth_mode(&self) -> Option<&'static str> {
+        match self {
+            RerankProviderConfig::Tei { auth, .. } => auth.as_ref().map(Auth::mode_name),
+        }
+    }
+
+    pub fn build(&self) -> Result<Arc<dyn RerankProvider>> {
+        match self {
+            RerankProviderConfig::Tei { endpoint, auth } => {
+                let key = match auth {
+                    Some(a) => Some(a.resolve_api_key().context("tei rerank auth")?),
+                    None => None,
+                };
+                Ok(Arc::new(TeiRerankClient::new(endpoint.clone(), key)))
             }
         }
     }
@@ -588,5 +705,96 @@ auth = { mode = "api_key", value = "sk-test" }
             .resolve_api_key()
             .is_err()
         );
+    }
+
+    #[test]
+    fn parses_embedding_and_rerank_provider_sections() {
+        let text = r#"
+[backends.cloud]
+kind = "anthropic"
+auth = { mode = "api_key", value = "sk-test" }
+
+[embedding_providers.local-bge]
+kind = "tei"
+endpoint = "http://localhost:8080"
+
+[embedding_providers.secured]
+kind = "tei"
+endpoint = "https://embed.internal"
+auth = { mode = "api_key", env = "TEI_EMBED_KEY" }
+
+[rerank_providers.local-rerank]
+kind = "tei"
+endpoint = "http://localhost:8081"
+"#;
+        let cfg: Config = toml::from_str(text).unwrap();
+        cfg.validate().unwrap();
+
+        assert_eq!(cfg.embedding_providers.len(), 2);
+        match cfg.embedding_providers.get("local-bge").unwrap() {
+            EmbeddingProviderConfig::Tei { endpoint, auth } => {
+                assert_eq!(endpoint, "http://localhost:8080");
+                assert!(auth.is_none());
+            }
+        }
+        match cfg.embedding_providers.get("secured").unwrap() {
+            EmbeddingProviderConfig::Tei {
+                auth: Some(Auth::ApiKey { env, .. }),
+                ..
+            } => assert_eq!(env.as_deref(), Some("TEI_EMBED_KEY")),
+            _ => panic!("expected api-key auth via env"),
+        }
+        assert_eq!(cfg.rerank_providers.len(), 1);
+        match cfg.rerank_providers.get("local-rerank").unwrap() {
+            RerankProviderConfig::Tei { endpoint, auth } => {
+                assert_eq!(endpoint, "http://localhost:8081");
+                assert!(auth.is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn embedding_provider_kind_and_auth_mode_helpers() {
+        let plain = EmbeddingProviderConfig::Tei {
+            endpoint: "http://localhost:8080".into(),
+            auth: None,
+        };
+        assert_eq!(plain.kind(), "tei");
+        assert_eq!(plain.endpoint(), "http://localhost:8080");
+        assert!(plain.auth_mode().is_none());
+
+        let secured = EmbeddingProviderConfig::Tei {
+            endpoint: "http://embed.internal".into(),
+            auth: Some(Auth::ApiKey {
+                value: Some("k".into()),
+                env: None,
+            }),
+        };
+        assert_eq!(secured.auth_mode(), Some("api_key"));
+    }
+
+    #[test]
+    fn rerank_provider_kind_and_auth_mode_helpers() {
+        let cfg = RerankProviderConfig::Tei {
+            endpoint: "http://localhost:8081".into(),
+            auth: None,
+        };
+        assert_eq!(cfg.kind(), "tei");
+        assert!(cfg.auth_mode().is_none());
+    }
+
+    #[test]
+    fn embedding_and_rerank_sections_optional() {
+        // The new sections must be omittable — every existing config
+        // file in the wild predates them and must continue to parse.
+        let text = r#"
+[backends.cloud]
+kind = "anthropic"
+auth = { mode = "api_key", value = "sk-test" }
+"#;
+        let cfg: Config = toml::from_str(text).unwrap();
+        cfg.validate().unwrap();
+        assert!(cfg.embedding_providers.is_empty());
+        assert!(cfg.rerank_providers.is_empty());
     }
 }
