@@ -10,12 +10,14 @@
 
 use whisper_agent_protocol::{ClientToServer, ServerToClient, ThreadStateLabel};
 
+use super::conversion::{
+    append_streaming_output, build_tool_call_item, conversation_to_items, push_tool_result,
+    push_tool_result_from_text, snapshot_summary,
+};
 use super::editor_render::behavior_summary_from_snapshot;
 use super::widgets::open_in_new_tab;
 use super::{
     ChatApp, DisplayItem, PendingSudo, ServerConfigSaveSummary, TaskView, ThreadInspector,
-    append_streaming_output, build_tool_call_item, conversation_to_items, push_tool_result,
-    push_tool_result_from_text, snapshot_summary,
 };
 
 impl ChatApp {
