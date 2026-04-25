@@ -399,9 +399,18 @@ impl GeminiClient {
                     .filter(|m| {
                         // Surface only models that actually support generateContent —
                         // /v1beta/models also lists embedding, tuning, and audio models.
-                        m.supported_generation_methods
+                        let kept = m
+                            .supported_generation_methods
                             .iter()
-                            .any(|s| s == "generateContent")
+                            .any(|s| s == "generateContent");
+                        if !kept {
+                            tracing::debug!(
+                                model = %m.name,
+                                methods = ?m.supported_generation_methods,
+                                "gemini list_models: dropping model — no generateContent in supportedGenerationMethods"
+                            );
+                        }
+                        kept
                     })
                     .map(|m| ModelInfo {
                         // Trim the "models/" prefix so the id matches what users type
@@ -421,12 +430,26 @@ impl GeminiClient {
                     .collect())
             }
             ClientAuth::GeminiCli { .. } => {
-                // Code Assist doesn't expose a `/models` catalog, so we mirror
-                // the set gemini-cli ships in VALID_GEMINI_MODELS. Users pick
-                // via config; `gemini-3-*-preview` variants require preview
-                // access on the account (the server returns a clear 403 if
-                // not). Context/output caps unknown on this route — the
-                // API-key route reports them but Code Assist doesn't.
+                // Code Assist (`cloudcode-pa.googleapis.com/v1internal`)
+                // exposes no `/models` catalog — gemini-cli itself
+                // hardcodes its list (see `packages/core/src/config/
+                // models.ts` in google-gemini/gemini-cli), and the
+                // Code Assist backend only serves the chat-model set
+                // that gemini-cli officially supports. Image-output
+                // variants (`gemini-2.5-flash-image*`,
+                // `gemini-2.0-flash-preview-image-generation`) aren't
+                // served on this endpoint at all — selecting one
+                // returns a 404 "Requested entity was not found."
+                // To use image generation, configure a second Gemini
+                // backend with API-key auth.
+                //
+                // We mirror gemini-cli's chat model set rather than
+                // making the user guess at valid ids; preview variants
+                // require preview-access on the account (the server
+                // returns a clear 403 if not). Context/output caps
+                // come back `None` here because the Code Assist
+                // surface doesn't publish them — the API-key route
+                // does, via `inputTokenLimit` / `outputTokenLimit`.
                 let entry = |id: &str, name: &str| ModelInfo {
                     id: id.into(),
                     display_name: Some(name.into()),
