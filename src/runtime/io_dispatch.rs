@@ -1197,7 +1197,9 @@ fn tool_call(
                     // variant to decide how to record the turn. Builtin
                     // tool errors already carry a text block we can
                     // pass through.
-                    Err(join_text(&outcome.result.content))
+                    Err(crate::tools::mcp::mcp_blocks_text_preview(
+                        &outcome.result.content,
+                    ))
                 } else {
                     Ok(outcome.result)
                 };
@@ -1243,7 +1245,7 @@ fn tool_call(
                         while let Some(event) = stream.next().await {
                             match event {
                                 crate::tools::mcp::ToolEvent::Content(block) => {
-                                    let wire_block = mcp_block_to_wire(&block);
+                                    let wire_block = block.to_content_block();
                                     let _ = stream_tx.send(StreamUpdate {
                                         thread_id: stream_thread_id.clone(),
                                         event: ServerToClient::ThreadToolCallContent {
@@ -1309,30 +1311,6 @@ fn tool_call(
             })
         }),
     }
-}
-
-/// Translate an MCP transport content block into the protocol's
-/// conversational `ContentBlock` shape. The transport today only carries
-/// `Text`; additional MCP content types (image, audio, resource) map to
-/// equivalents here as they're added to both sides.
-fn mcp_block_to_wire(
-    b: &crate::tools::mcp::McpContentBlock,
-) -> whisper_agent_protocol::ContentBlock {
-    match b {
-        crate::tools::mcp::McpContentBlock::Text { text } => {
-            whisper_agent_protocol::ContentBlock::Text { text: text.clone() }
-        }
-    }
-}
-
-fn join_text(blocks: &[crate::tools::mcp::McpContentBlock]) -> String {
-    let mut out = String::new();
-    for b in blocks {
-        match b {
-            crate::tools::mcp::McpContentBlock::Text { text } => out.push_str(text),
-        }
-    }
-    out
 }
 
 /// Owned-by-value model request payload — the dispatched future outlives the

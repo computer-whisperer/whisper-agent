@@ -99,8 +99,16 @@ web-sys = { version = "0.3", features = [
     # button uses.
     "DragEvent",
     "DataTransfer",
+    "DataTransferItem",
+    "DataTransferItemList",
     "File",
     "FileList",
     "Blob",
+    # Clipboard paste: register a document-level `paste` handler so
+    # users can Ctrl+V an image into the compose area. We pull file-
+    # kind items out of the ClipboardEvent's DataTransfer and route
+    # them through the same AttachmentIngress the file-picker and
+    # drag-drop handlers feed.
+    "ClipboardEvent",
 ] }
 getrandom = { version = "0.4", features = ["wasm_js"] }

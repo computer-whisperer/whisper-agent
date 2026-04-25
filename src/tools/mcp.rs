@@ -109,7 +109,86 @@ impl ToolAnnotations {
 #[derive(Deserialize, Debug, Clone)]
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum McpContentBlock {
-    Text { text: String },
+    Text {
+        text: String,
+    },
+    /// MCP 2025-06-18 image content. `data` is base64-encoded bytes;
+    /// `mime_type` carries the IANA media type (`image/png`,
+    /// `image/jpeg`, ...). The runtime decodes + normalizes into
+    /// `ContentBlock::Image { source: ImageSource::Bytes }` when it
+    /// folds the tool result into the conversation; tools that return
+    /// a MIME outside our accepted set degrade to a text note rather
+    /// than error the call.
+    Image {
+        data: String,
+        #[serde(rename = "mimeType")]
+        mime_type: String,
+    },
+}
+
+impl McpContentBlock {
+    /// Lower a single MCP transport block into a protocol
+    /// `ContentBlock`. Text is a direct rename; Image decodes the
+    /// base64 payload and normalizes the MIME into our closed
+    /// [`ImageMime`] set, falling back to a descriptive text block
+    /// when the MIME isn't in the set or the base64 is malformed.
+    /// Shared between the streaming `notifications/tools/output` path
+    /// and the terminal `tools/call` result.
+    pub fn to_content_block(&self) -> whisper_agent_protocol::ContentBlock {
+        use base64::Engine;
+        use base64::engine::general_purpose::STANDARD;
+        use whisper_agent_protocol::{ContentBlock, ImageMime, ImageSource};
+        match self {
+            McpContentBlock::Text { text } => ContentBlock::Text { text: text.clone() },
+            McpContentBlock::Image { data, mime_type } => {
+                let Some(media_type) = ImageMime::from_mime_str(mime_type) else {
+                    return ContentBlock::Text {
+                        text: format!("[tool returned unsupported image mime: {mime_type}]"),
+                    };
+                };
+                match STANDARD.decode(data) {
+                    Ok(bytes) => ContentBlock::Image {
+                        source: ImageSource::Bytes {
+                            media_type,
+                            data: bytes,
+                        },
+                    },
+                    Err(e) => ContentBlock::Text {
+                        text: format!("[tool returned malformed base64 image: {e}]"),
+                    },
+                }
+            }
+        }
+    }
+}
+
+/// Concatenate the text-shaped portions of an MCP content vector.
+/// Image blocks (and any future non-text types) contribute a short
+/// `[image]` / `[n images]` marker so callers building a flat text
+/// summary — audit log lines, early-exit error envelopes — don't
+/// silently drop them.
+pub fn mcp_blocks_text_preview(blocks: &[McpContentBlock]) -> String {
+    let mut out = String::new();
+    let mut image_count = 0usize;
+    for b in blocks {
+        match b {
+            McpContentBlock::Text { text } => out.push_str(text),
+            McpContentBlock::Image { .. } => image_count += 1,
+        }
+    }
+    match (out.is_empty(), image_count) {
+        (true, 0) | (false, 0) => out,
+        (true, 1) => "[image]".into(),
+        (true, n) => format!("[{n} images]"),
+        (false, 1) => {
+            out.push_str(" [+image]");
+            out
+        }
+        (false, n) => {
+            out.push_str(&format!(" [+{n} images]"));
+            out
+        }
+    }
 }
 
 #[derive(Deserialize, Debug, Clone)]

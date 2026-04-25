@@ -69,7 +69,9 @@ mod web_entry {
                         // catch drops anywhere on the page and push
                         // through the same attachment-ingress the
                         // file-picker button uses.
-                        install_drop_handlers(app.attachment_ingress(cc.egui_ctx.clone()));
+                        let ingress = app.attachment_ingress(cc.egui_ctx.clone());
+                        install_drop_handlers(ingress.clone());
+                        install_paste_handler(ingress);
                         Ok(Box::new(app))
                     }),
                 )
@@ -253,6 +255,94 @@ mod web_entry {
             log::warn!("failed to install drop listener: {e:?}");
         }
         drop_cb.forget();
+    }
+
+    /// Install a document-level `paste` listener that extracts
+    /// image items from the clipboard and routes them through the
+    /// same attachment ingress as the file picker / drag-drop. Mirrors
+    /// the drag-drop takeover: egui's text-paste support sees the
+    /// clipboard's text payload, but it doesn't surface file/image
+    /// blobs, so we read those out of `ClipboardEvent.clipboardData`
+    /// directly.
+    ///
+    /// Note: we *don't* `preventDefault` here. egui still wants the
+    /// paste event for text typed into the compose area; suppressing
+    /// it would break Ctrl+V on plain text. Browsers happily deliver
+    /// the same event to multiple listeners.
+    fn install_paste_handler(ingress: AttachmentIngress) {
+        let Some(window) = web_sys::window() else {
+            log::warn!("install_paste_handler: no window; skipping");
+            return;
+        };
+        let Some(document) = window.document() else {
+            log::warn!("install_paste_handler: no document; skipping");
+            return;
+        };
+        let Some(body) = document.body() else {
+            log::warn!("install_paste_handler: no body; skipping");
+            return;
+        };
+
+        let cb = Closure::wrap(Box::new(move |e: web_sys::ClipboardEvent| {
+            let Some(dt) = e.clipboard_data() else {
+                return;
+            };
+            let items = dt.items();
+            let len = items.length();
+            for i in 0..len {
+                let Some(item) = items.get(i) else { continue };
+                if item.kind() != "file" {
+                    continue;
+                }
+                let mime = item.type_();
+                if !mime.starts_with("image/") {
+                    continue;
+                }
+                let Ok(Some(file)) = item.get_as_file() else {
+                    continue;
+                };
+                let name = if file.name().is_empty() {
+                    format!("clipboard-image.{}", mime_to_ext(&mime))
+                } else {
+                    file.name()
+                };
+                log::info!("paste: image kind={mime} name={name}");
+                let promise = file.array_buffer();
+                let ingress = ingress.clone();
+                wasm_bindgen_futures::spawn_local(async move {
+                    match wasm_bindgen_futures::JsFuture::from(promise).await {
+                        Ok(buffer) => {
+                            let array = js_sys::Uint8Array::new(&buffer);
+                            ingress.push(array.to_vec(), name);
+                        }
+                        Err(err) => {
+                            log::warn!("paste: failed to read clipboard image: {err:?}");
+                        }
+                    }
+                });
+            }
+        }) as Box<dyn FnMut(web_sys::ClipboardEvent)>);
+        if let Err(e) = body.add_event_listener_with_callback("paste", cb.as_ref().unchecked_ref())
+        {
+            log::warn!("failed to install paste listener: {e:?}");
+        }
+        cb.forget();
+    }
+
+    /// Best-effort MIME → extension lookup for naming pasted-from-
+    /// clipboard images (Chromium hands us a blank `File.name`).
+    /// Falls back to "bin" for anything we don't recognize, since the
+    /// downstream MIME sniffer reads the bytes anyway.
+    fn mime_to_ext(mime: &str) -> &'static str {
+        match mime {
+            "image/png" => "png",
+            "image/jpeg" => "jpg",
+            "image/gif" => "gif",
+            "image/webp" => "webp",
+            "image/heic" => "heic",
+            "image/heif" => "heif",
+            _ => "bin",
+        }
     }
 
     fn ws_url() -> String {

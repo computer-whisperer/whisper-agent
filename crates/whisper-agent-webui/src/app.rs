@@ -560,6 +560,10 @@ enum DisplayItem {
         name: String,
         text: String,
         is_error: bool,
+        /// Image sources embedded in the tool result. Rendered as
+        /// thumbnails under the expanded body. Empty for text-only
+        /// tool results (the common case).
+        attachments: Vec<ImageSource>,
     },
     SystemNote {
         text: String,
@@ -614,6 +618,9 @@ struct DiffPayload {
 pub(crate) struct FusedToolResult {
     pub text: String,
     pub is_error: bool,
+    /// Image sources from the tool result, rendered as thumbnails
+    /// under the expanded `ToolCall` body. Empty for text-only results.
+    pub attachments: Vec<ImageSource>,
 }
 
 struct TaskView {
@@ -2560,7 +2567,17 @@ impl ChatApp {
                 is_error,
             } => {
                 if let Some(view) = self.tasks.get_mut(&thread_id) {
-                    push_tool_result(&mut view.items, tool_use_id, result_preview, is_error);
+                    // Live streaming path carries only a short preview
+                    // string — full image attachments arrive on the
+                    // conversation replay, so pass empty attachments
+                    // here and let the ThreadSnapshot re-populate them.
+                    push_tool_result(
+                        &mut view.items,
+                        tool_use_id,
+                        result_preview,
+                        is_error,
+                        Vec::new(),
+                    );
                 }
             }
             ServerToClient::ThreadAssistantEnd {
@@ -3658,7 +3675,8 @@ fn add_message_items(msg: &Message, msg_index: usize, out: &mut Vec<DisplayItem>
                         is_error,
                     } => {
                         let text = tool_result_text(content);
-                        push_tool_result(out, tool_use_id.clone(), text, *is_error);
+                        let attachments = content.image_sources().into_iter().cloned().collect();
+                        push_tool_result(out, tool_use_id.clone(), text, *is_error, attachments);
                     }
                     _ => {}
                 }
@@ -3702,7 +3720,7 @@ fn add_message_items(msg: &Message, msg_index: usize, out: &mut Vec<DisplayItem>
 /// row so unknown text stays visible.
 fn push_tool_result_from_text(items: &mut Vec<DisplayItem>, text: &str) {
     if let Some((tool_use_id, result_body, is_error)) = parse_dispatch_notification(text) {
-        push_tool_result(items, tool_use_id, result_body, is_error);
+        push_tool_result(items, tool_use_id, result_body, is_error, Vec::new());
         return;
     }
     items.push(DisplayItem::SystemNote {
@@ -3754,6 +3772,7 @@ fn push_tool_result(
     tool_use_id: String,
     text: String,
     is_error: bool,
+    attachments: Vec<ImageSource>,
 ) {
     for item in items.iter_mut().rev() {
         match item {
@@ -3769,7 +3788,11 @@ fn push_tool_result(
                 // standalone-row path so the newer data isn't lost
                 // silently.
                 if result.is_none() {
-                    *result = Some(FusedToolResult { text, is_error });
+                    *result = Some(FusedToolResult {
+                        text,
+                        is_error,
+                        attachments,
+                    });
                     return;
                 }
                 break;
@@ -3798,6 +3821,7 @@ fn push_tool_result(
         name,
         text,
         is_error,
+        attachments,
     });
 }
 
@@ -4635,6 +4659,7 @@ impl eframe::App for ChatApp {
         self.render_json_viewer_modal(&ctx);
         self.render_provider_editor_modal(&ctx);
         self.render_settings_modal(&ctx);
+        self.render_image_lightbox_modal(&ctx);
 
         // Draft debounce tick. Schedule a repaint at the deadline so
         // the flush fires even if nothing else is driving frames.
@@ -7045,8 +7070,59 @@ impl ChatApp {
     /// — no tabs, no sub-forms. Save/Revert/Close footer for
     /// writable files; a read-only notice replaces the footer for
     /// paths the server has flagged as runtime state. Content loads
-    /// asynchronously (`ReadPodFile`); while in flight the body
-    /// renders a "loading…" placeholder.
+    /// Lightbox-style overlay that shows whichever attachment
+    /// thumbnail the user clicked at full size. Reads the URI from the
+    /// `ENLARGED_IMAGE_KEY` memory slot the chat-render thumbnail
+    /// strip writes; closing (X / Esc / click outside) clears the slot
+    /// so the next click opens the next image. The bytes are already
+    /// `include_bytes`-loaded against this URI, so the modal just
+    /// renders an `egui::Image` at fit-to-window scale — no second
+    /// decode pass.
+    fn render_image_lightbox_modal(&mut self, ctx: &egui::Context) {
+        let key = egui::Id::new(self::chat_render::ENLARGED_IMAGE_KEY);
+        let uri: Option<String> = ctx.memory(|mem| mem.data.get_temp::<String>(key));
+        let Some(uri) = uri else { return };
+
+        let screen = ctx.content_rect();
+        let max_h = (screen.height() - 80.0).max(240.0);
+        let max_w = (screen.width() - 80.0).max(320.0);
+        let mut open = true;
+        let mut dismiss = ctx.input(|i| i.key_pressed(egui::Key::Escape));
+
+        egui::Window::new("attachment")
+            .collapsible(false)
+            .resizable(false)
+            .title_bar(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .max_width(max_w)
+            .max_height(max_h)
+            .open(&mut open)
+            .show(ctx, |ui| {
+                ui.vertical(|ui| {
+                    ui.horizontal(|ui| {
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui
+                                .button(RichText::new("✕").strong())
+                                .on_hover_text("Close (Esc)")
+                                .clicked()
+                            {
+                                dismiss = true;
+                            }
+                        });
+                    });
+                    ui.add(
+                        egui::Image::new(&uri)
+                            .max_size(egui::vec2(max_w - 24.0, max_h - 60.0))
+                            .fit_to_exact_size(egui::vec2(max_w - 24.0, max_h - 60.0)),
+                    );
+                });
+            });
+
+        if dismiss || !open {
+            ctx.memory_mut(|mem| mem.data.remove::<String>(key));
+        }
+    }
+
     /// Render the read-only JSON tree viewer. Scalars render as
     /// `key: value` one-liners; objects and arrays render as
     /// collapsible headers with their sizes in the label, default-open

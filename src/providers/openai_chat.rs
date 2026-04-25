@@ -457,6 +457,30 @@ fn convert_user_message(blocks: &[ContentBlock], out: &mut Vec<OaMessage>) {
                     tool_call_id: Some(tool_use_id.clone()),
                     reasoning_content: None,
                 });
+                // Chat Completions' `role:tool` message carries only a
+                // plain string (no multimodal parts), so tool-result
+                // images ride in a follow-up `role:user` message whose
+                // content is a parts array. The text prefix keeps the
+                // message sensible if the model ever replays the
+                // conversation without tool context — it reads as "the
+                // last tool call also produced these images."
+                let images = content.image_sources();
+                if !images.is_empty() {
+                    let mut user_parts: Vec<OaContentPart> = Vec::with_capacity(images.len() + 1);
+                    user_parts.push(OaContentPart::Text {
+                        text: format!("[image output from tool call {tool_use_id} follows]"),
+                    });
+                    for src in images {
+                        user_parts.push(image_source_to_content_part(src));
+                    }
+                    out.push(OaMessage {
+                        role: "user".into(),
+                        content: Some(OaContent::Parts(user_parts)),
+                        tool_calls: None,
+                        tool_call_id: None,
+                        reasoning_content: None,
+                    });
+                }
             }
             ContentBlock::ToolUse { .. }
             | ContentBlock::Thinking { .. }
@@ -1305,6 +1329,42 @@ mod tests {
         assert!(url.starts_with("data:image/png;base64,"), "url={url}");
         // 4-byte PNG magic → base64 "iVBORw==" (6 chars + 2 padding)
         assert!(url.ends_with("iVBORw=="), "url={url}");
+    }
+
+    #[test]
+    fn tool_result_with_image_emits_followup_user_message() {
+        // role:tool messages can only carry a string `content`, so a
+        // tool result that includes images must be split into the
+        // text-only tool message + a follow-up user message whose
+        // content parts carry the image data URLs.
+        use whisper_agent_protocol::{ImageMime, ImageSource, ToolResultContent};
+        let blocks = vec![ContentBlock::ToolResult {
+            tool_use_id: "call_99".into(),
+            content: ToolResultContent::Blocks(vec![
+                ContentBlock::Text {
+                    text: "captured 1 screenshot".into(),
+                },
+                ContentBlock::Image {
+                    source: ImageSource::Bytes {
+                        media_type: ImageMime::Png,
+                        data: vec![137, 80, 78, 71],
+                    },
+                },
+            ]),
+            is_error: false,
+        }];
+        let mut out = Vec::new();
+        convert_user_message(&blocks, &mut out);
+        assert_eq!(out.len(), 2, "expected tool message + follow-up user");
+        assert_eq!(out[0].role, "tool");
+        assert_eq!(out[0].tool_call_id.as_deref(), Some("call_99"));
+        assert_eq!(out[1].role, "user");
+        let v = serde_json::to_value(&out[1]).unwrap();
+        let parts = v["content"].as_array().expect("parts array");
+        assert_eq!(parts[0]["type"], "text");
+        assert_eq!(parts[1]["type"], "image_url");
+        let url = parts[1]["image_url"]["url"].as_str().unwrap();
+        assert!(url.starts_with("data:image/png;base64,"), "url={url}");
     }
 
     #[test]

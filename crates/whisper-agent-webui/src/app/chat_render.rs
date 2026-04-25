@@ -165,7 +165,8 @@ pub(super) fn render_item(
                 name,
                 text,
                 is_error,
-            } => render_tool_result(ui, tool_use_id, name, text, *is_error),
+                attachments,
+            } => render_tool_result(ui, tool_use_id, name, text, *is_error, attachments),
             DisplayItem::SystemNote { text, is_error } => render_system_note(ui, text, *is_error),
             DisplayItem::SetupPrompt { text } => render_setup_prompt(ui, text),
             DisplayItem::SetupTools { count, text } => render_setup_tools(ui, *count, text),
@@ -304,32 +305,59 @@ fn render_user(
 }
 
 /// Inline thumbnail strip for the image attachments that travelled
-/// with a user message. Each image renders through egui's loader via
-/// a stable `bytes://history-{msg}-{i}` URI so the texture cache
-/// reuses decoded pixels across repaints. URL-source attachments
-/// render as a labelled placeholder — rendering would need a
-/// runtime fetch we don't do client-side.
+/// with a user message. Delegates to the shared
+/// [`render_image_strip`] with a `history-{msg}` URI namespace so
+/// per-message images stay cache-stable.
 fn render_user_attachments(ui: &mut egui::Ui, attachments: &[Attachment], msg_index: usize) {
     if attachments.is_empty() {
         return;
     }
+    let sources: Vec<&ImageSource> = attachments
+        .iter()
+        .map(|Attachment::Image { source }| source)
+        .collect();
+    render_image_strip(ui, &sources, &format!("history-{msg_index}"));
+}
+
+/// Inline thumbnail strip for a slice of image sources. Bytes sources
+/// render through egui's loader via a stable `bytes://{uri_prefix}-{i}`
+/// URI so the texture cache reuses decoded pixels across repaints;
+/// URL sources render as a labelled placeholder (we don't fetch
+/// client-side). `uri_prefix` must be unique across the view to avoid
+/// texture-cache collisions between different message positions —
+/// current callers use `history-{msg_index}` for user turns and
+/// `toolresult-{tool_use_id}` for tool-result rows.
+///
+/// Clicking a Bytes thumbnail stashes its URI into [`ENLARGED_IMAGE_KEY`]
+/// in egui memory; the app's top-level `update` reads that slot and
+/// shows the full image in a modal.
+fn render_image_strip(ui: &mut egui::Ui, sources: &[&ImageSource], uri_prefix: &str) {
+    if sources.is_empty() {
+        return;
+    }
     ui.horizontal_wrapped(|ui| {
-        for (i, att) in attachments.iter().enumerate() {
-            match att {
-                Attachment::Image {
-                    source: ImageSource::Bytes { data, .. },
-                } => {
-                    let uri = format!("bytes://history-{msg_index}-{i}");
+        for (i, src) in sources.iter().enumerate() {
+            match src {
+                ImageSource::Bytes { data, .. } => {
+                    let uri = format!("bytes://{uri_prefix}-{i}");
                     ui.ctx().include_bytes(uri.clone(), data.clone());
-                    ui.add(
-                        egui::Image::new(uri)
+                    let resp = ui.add(
+                        egui::Image::new(&uri)
                             .max_size(egui::vec2(160.0, 160.0))
-                            .fit_to_exact_size(egui::vec2(160.0, 160.0)),
+                            .fit_to_exact_size(egui::vec2(160.0, 160.0))
+                            .sense(egui::Sense::click()),
                     );
+                    if resp.hovered() {
+                        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                    }
+                    if resp.clicked() {
+                        ui.ctx().memory_mut(|mem| {
+                            mem.data
+                                .insert_temp(egui::Id::new(ENLARGED_IMAGE_KEY), uri.clone());
+                        });
+                    }
                 }
-                Attachment::Image {
-                    source: ImageSource::Url { url },
-                } => {
+                ImageSource::Url { url } => {
                     ui.add(
                         egui::Label::new(
                             RichText::new(format!("🌐 {url}"))
@@ -343,6 +371,13 @@ fn render_user_attachments(ui: &mut egui::Ui, attachments: &[Attachment], msg_in
         }
     });
 }
+
+/// Memory key under which the chat-thumbnail strip stashes the URI of
+/// the image the user just clicked. Read at the top of `ChatApp::ui`
+/// to drive the lightbox modal. Lives in `egui::Memory::data` as a
+/// temp value (cleared on app close) — the modal only needs it for
+/// the duration of the dismiss.
+pub(crate) const ENLARGED_IMAGE_KEY: &str = "whisper.enlarged_image_uri";
 
 fn render_assistant_text(ui: &mut egui::Ui, cache: &mut CommonMarkCache, text: &str) {
     // No role label — the gutter color carries it. This is the bulk
@@ -630,7 +665,7 @@ fn render_tool_call(
                 );
                 // One-line result preview in the collapsed header so
                 // the outcome is visible without expanding.
-                if let Some(FusedToolResult { text, is_error }) = result {
+                if let Some(FusedToolResult { text, is_error, .. }) = result {
                     let preview = first_line_preview(text, 80);
                     if !preview.is_empty() {
                         ui.add_space(8.0);
@@ -663,7 +698,12 @@ fn render_tool_call(
                         .small(),
                 );
             }
-            if let Some(FusedToolResult { text, is_error }) = result {
+            if let Some(FusedToolResult {
+                text,
+                is_error,
+                attachments,
+            }) = result
+            {
                 ui.add_space(6.0);
                 ui.label(
                     RichText::new("result")
@@ -676,7 +716,14 @@ fn render_tool_call(
                 } else {
                     Color32::from_gray(180)
                 };
-                ui.label(RichText::new(text).color(color).monospace().small());
+                if !text.is_empty() {
+                    ui.label(RichText::new(text).color(color).monospace().small());
+                }
+                if !attachments.is_empty() {
+                    ui.add_space(4.0);
+                    let refs: Vec<&ImageSource> = attachments.iter().collect();
+                    render_image_strip(ui, &refs, &format!("toolcall-{tool_use_id}"));
+                }
             } else if !streaming_output.is_empty() {
                 ui.add_space(6.0);
                 ui.label(
@@ -697,15 +744,16 @@ fn render_tool_call(
 
 /// Render a tool-result row. Always default-collapsed — the row
 /// renders as a one-line `name preview [status]` header; clicking
-/// expands to show the full result text. Matches the treatment of
-/// tool calls and reasoning rows so the chat stream stays quiet
-/// by default.
+/// expands to show the full result text and any image attachments.
+/// Matches the treatment of tool calls and reasoning rows so the
+/// chat stream stays quiet by default.
 fn render_tool_result(
     ui: &mut egui::Ui,
     tool_use_id: &str,
     name: &str,
     text: &str,
     is_error: bool,
+    attachments: &[ImageSource],
 ) {
     // Hash the result text into the persistent id so multiple
     // ToolResult rows that share a tool_use_id (sync ack + later
@@ -754,7 +802,14 @@ fn render_tool_result(
             } else {
                 Color32::from_gray(180)
             };
-            ui.label(RichText::new(text).color(color).monospace().small());
+            if !text.is_empty() {
+                ui.label(RichText::new(text).color(color).monospace().small());
+            }
+            if !attachments.is_empty() {
+                ui.add_space(4.0);
+                let refs: Vec<&ImageSource> = attachments.iter().collect();
+                render_image_strip(ui, &refs, &format!("toolresult-{tool_use_id}"));
+            }
         });
 }
 

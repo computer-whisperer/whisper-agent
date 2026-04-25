@@ -2024,14 +2024,7 @@ impl Scheduler {
                         self.apply_scheduler_command(&thread_id, command, pending_io);
                     }
                 }
-                let text = call_result
-                    .content
-                    .iter()
-                    .map(|b| match b {
-                        crate::tools::mcp::McpContentBlock::Text { text } => text.as_str(),
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\n");
+                let text = crate::tools::mcp::mcp_blocks_text_preview(&call_result.content);
                 if let Some((tool_name, args, reason)) = audit_ctx.clone() {
                     let inner_outcome = crate::server::thread_router::SudoInnerOutcome::Ok {
                         is_error: call_result.is_error,

@@ -1023,18 +1023,21 @@ impl Thread {
         // key for the conversation block either way.
         pending_io.remove(&op_id);
 
-        let (text, is_error, tool_name, args, err_msg) = match result {
+        let (content, preview, is_error, tool_name, args, err_msg) = match result {
             Ok(r) => {
-                let text = join_mcp_text(&r.content);
+                let content = mcp_content_to_tool_result(&r.content);
+                let preview = tool_result_preview(&content);
                 let tool_name = find_tool_name(&self.conversation, &tool_use_id);
                 let args = find_tool_args(&self.conversation, &tool_use_id);
-                (text, r.is_error, tool_name, args, None)
+                (content, preview, r.is_error, tool_name, args, None)
             }
             Err(msg) => {
+                let text = format!("tool invocation failed: {msg}");
                 let tool_name = find_tool_name(&self.conversation, &tool_use_id);
                 let args = find_tool_args(&self.conversation, &tool_use_id);
                 (
-                    format!("tool invocation failed: {msg}"),
+                    ToolResultContent::Text(text.clone()),
+                    text,
                     true,
                     tool_name,
                     args,
@@ -1045,7 +1048,7 @@ impl Thread {
 
         events.push(ThreadEvent::ToolCallEnd {
             tool_use_id: tool_use_id.clone(),
-            result_preview: truncate(text.clone(), 200),
+            result_preview: truncate(preview, 200),
             is_error,
         });
         events.push(ThreadEvent::AuditToolCall {
@@ -1057,7 +1060,7 @@ impl Thread {
 
         completed.push(ContentBlock::ToolResult {
             tool_use_id,
-            content: ToolResultContent::Text(text),
+            content,
             is_error,
         });
 
@@ -1110,14 +1113,64 @@ fn next_id(counter: &mut OpId) -> OpId {
     *counter
 }
 
-fn join_mcp_text(blocks: &[crate::tools::mcp::McpContentBlock]) -> String {
-    let mut out = String::new();
-    for b in blocks {
-        match b {
-            crate::tools::mcp::McpContentBlock::Text { text } => out.push_str(text),
+/// Fold an MCP-decoded content vector into our canonical
+/// [`ToolResultContent`]. Pure text flows out as `Text`; mixed text +
+/// images flow out as `Blocks` so provider adapters can translate each
+/// side to the appropriate wire shape. Image blocks whose declared MIME
+/// isn't in our accepted set (or whose payload fails to decode) degrade
+/// to a text note rather than erroring the call — tools can't always
+/// control what their transitive dependencies emit, and a lost
+/// thumbnail shouldn't kill a useful result.
+fn mcp_content_to_tool_result(blocks: &[crate::tools::mcp::McpContentBlock]) -> ToolResultContent {
+    use crate::tools::mcp::McpContentBlock;
+    if blocks
+        .iter()
+        .all(|b| matches!(b, McpContentBlock::Text { .. }))
+    {
+        let mut out = String::new();
+        for b in blocks {
+            if let McpContentBlock::Text { text } = b {
+                out.push_str(text);
+            }
+        }
+        return ToolResultContent::Text(out);
+    }
+    let out: Vec<ContentBlock> = blocks.iter().map(|b| b.to_content_block()).collect();
+    ToolResultContent::Blocks(out)
+}
+
+/// Short human-readable preview of a tool result, used for the
+/// `ToolCallEnd` event the webui renders as the collapsed-row label.
+/// Text results show their first line; block-form results summarize
+/// attachments alongside whatever leading text we have.
+fn tool_result_preview(content: &ToolResultContent) -> String {
+    match content {
+        ToolResultContent::Text(s) => s.clone(),
+        ToolResultContent::Blocks(blocks) => {
+            let mut text = String::new();
+            let mut image_count = 0usize;
+            for b in blocks {
+                match b {
+                    ContentBlock::Text { text: t } => {
+                        if !text.is_empty() {
+                            text.push('\n');
+                        }
+                        text.push_str(t);
+                    }
+                    ContentBlock::Image { .. } => image_count += 1,
+                    _ => {}
+                }
+            }
+            match (text.is_empty(), image_count) {
+                (true, 0) => String::new(),
+                (true, 1) => "[image]".into(),
+                (true, n) => format!("[{n} images]"),
+                (false, 0) => text,
+                (false, 1) => format!("{text} [+image]"),
+                (false, n) => format!("{text} [+{n} images]"),
+            }
         }
     }
-    out
 }
 
 fn find_tool_name(conv: &Conversation, tool_use_id: &str) -> String {
@@ -1687,6 +1740,70 @@ mod tests {
         assert!(ids.contains(&"toolu_orphan_b"));
         // One ToolCallEnd event per synthesized result.
         assert_eq!(events.len(), 2);
+    }
+
+    #[test]
+    fn mcp_text_only_result_lowers_to_text() {
+        use crate::tools::mcp::McpContentBlock;
+        let blocks = [McpContentBlock::Text { text: "ok".into() }];
+        match mcp_content_to_tool_result(&blocks) {
+            ToolResultContent::Text(s) => assert_eq!(s, "ok"),
+            other => panic!("expected Text, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn mcp_mixed_text_and_image_lowers_to_blocks() {
+        use crate::tools::mcp::McpContentBlock;
+        use base64::Engine;
+        use base64::engine::general_purpose::STANDARD;
+        let png_bytes = vec![0x89, b'P', b'N', b'G'];
+        let blocks = [
+            McpContentBlock::Text {
+                text: "screenshot:".into(),
+            },
+            McpContentBlock::Image {
+                data: STANDARD.encode(&png_bytes),
+                mime_type: "image/png".into(),
+            },
+        ];
+        match mcp_content_to_tool_result(&blocks) {
+            ToolResultContent::Blocks(bs) => {
+                assert_eq!(bs.len(), 2);
+                assert!(matches!(bs[0], ContentBlock::Text { ref text } if text == "screenshot:"));
+                let ContentBlock::Image {
+                    source:
+                        whisper_agent_protocol::ImageSource::Bytes {
+                            ref data,
+                            media_type,
+                        },
+                } = bs[1]
+                else {
+                    panic!("expected Image block, got {:?}", bs[1]);
+                };
+                assert_eq!(data, &png_bytes);
+                assert_eq!(media_type, whisper_agent_protocol::ImageMime::Png);
+            }
+            other => panic!("expected Blocks, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn mcp_unsupported_mime_falls_back_to_text_note() {
+        use crate::tools::mcp::McpContentBlock;
+        let blocks = [McpContentBlock::Image {
+            data: "AAAA".into(),
+            mime_type: "image/tiff".into(),
+        }];
+        match mcp_content_to_tool_result(&blocks) {
+            ToolResultContent::Blocks(bs) => {
+                let ContentBlock::Text { ref text } = bs[0] else {
+                    panic!("expected text fallback, got {:?}", bs[0]);
+                };
+                assert!(text.contains("image/tiff"), "got: {text}");
+            }
+            other => panic!("expected Blocks, got {other:?}"),
+        }
     }
 
     #[test]

@@ -460,6 +460,27 @@ pub enum ToolResultContent {
     Blocks(Vec<ContentBlock>),
 }
 
+impl ToolResultContent {
+    /// Borrow all image sources embedded in this tool result, in
+    /// order. Returns empty for the `Text` variant and for `Blocks`
+    /// variants that happen to carry only text. Provider adapters that
+    /// can't ride images inside their native tool-result wire shape
+    /// (OpenAI chat/responses, Gemini) use this to splice a follow-up
+    /// user message carrying the image attachments.
+    pub fn image_sources(&self) -> Vec<&ImageSource> {
+        match self {
+            ToolResultContent::Text(_) => Vec::new(),
+            ToolResultContent::Blocks(blocks) => blocks
+                .iter()
+                .filter_map(|b| match b {
+                    ContentBlock::Image { source } => Some(source),
+                    _ => None,
+                })
+                .collect(),
+        }
+    }
+}
+
 fn is_false(b: &bool) -> bool {
     !b
 }

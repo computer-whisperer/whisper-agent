@@ -100,8 +100,9 @@ max_turns = 50
 fn join_blocks(blocks: &[McpContentBlock]) -> String {
     let mut s = String::new();
     for b in blocks {
-        let McpContentBlock::Text { text } = b;
-        s.push_str(text);
+        if let McpContentBlock::Text { text } = b {
+            s.push_str(text);
+        }
     }
     s
 }

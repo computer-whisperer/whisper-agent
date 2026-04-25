@@ -608,6 +608,17 @@ fn convert_user_parts(blocks: &[ContentBlock], id_to_name: &HashMap<String, Stri
                         response: serde_json::json!({ "content": text }),
                     },
                 });
+                // Tool-result images ride as additional inline_data
+                // parts on the same user turn — Gemini's
+                // functionResponse.response field is structured JSON
+                // (not multipart), so attachments can't nest inside it.
+                // Appending them as sibling parts keeps them attached
+                // to the same turn and preserves order.
+                for src in content.image_sources() {
+                    if let Some(part) = image_source_to_part(src) {
+                        parts.push(part);
+                    }
+                }
             }
             ContentBlock::Image { source } => {
                 if let Some(part) = image_source_to_part(source) {
@@ -1339,6 +1350,42 @@ mod tests {
         assert_eq!(inline["mimeType"], "image/webp");
         // 4 bytes "RIFF" → base64 "UklGRg=="
         assert_eq!(inline["data"], "UklGRg==");
+    }
+
+    #[test]
+    fn tool_result_with_image_appends_inline_data_part() {
+        // Gemini's functionResponse.response is structured JSON, not
+        // multipart, so tool-result images ride as additional sibling
+        // inline_data parts on the same user turn alongside the
+        // functionResponse.
+        use whisper_agent_protocol::{ImageMime, ImageSource, ToolResultContent};
+        let blocks = vec![ContentBlock::ToolResult {
+            tool_use_id: "call_7".into(),
+            content: ToolResultContent::Blocks(vec![
+                ContentBlock::Text {
+                    text: "screenshot:".into(),
+                },
+                ContentBlock::Image {
+                    source: ImageSource::Bytes {
+                        media_type: ImageMime::Png,
+                        data: vec![137, 80, 78, 71],
+                    },
+                },
+            ]),
+            is_error: false,
+        }];
+        let mut id_to_name = HashMap::new();
+        id_to_name.insert("call_7".to_string(), "shell".to_string());
+        let parts = convert_user_parts(&blocks, &id_to_name);
+        // [functionResponse, inlineData]
+        assert_eq!(parts.len(), 2);
+        let json = serde_json::to_value(&parts).unwrap();
+        assert_eq!(json[0]["functionResponse"]["name"], "shell");
+        assert_eq!(
+            json[0]["functionResponse"]["response"]["content"],
+            "screenshot:"
+        );
+        assert_eq!(json[1]["inlineData"]["mimeType"], "image/png");
     }
 
     #[test]

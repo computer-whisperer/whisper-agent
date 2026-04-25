@@ -341,6 +341,7 @@ fn message_to_value(m: &Message, cache_last_block: bool) -> Value {
             if let Some(obj) = block.as_object_mut() {
                 fold_replay_to_wire(obj);
                 fix_image_block_for_wire(obj);
+                fix_tool_result_nested_images(obj);
             }
         }
     }
@@ -398,9 +399,9 @@ fn wrap_text_blocks_in_system_reminder(v: &mut Value) {
 /// pass through unchanged (our `{type:"url", url:...}` matches
 /// Anthropic exactly).
 ///
-/// Scope: top-level image blocks on user turns. Tool-result images
-/// (nested under `ToolResultContent::Blocks`) aren't v1 scope — those
-/// need a recursive walk and won't reach here until v2 wires them up.
+/// Called for both top-level image blocks on user turns and image
+/// blocks nested inside `tool_result.content` arrays (see
+/// [`fix_tool_result_nested_images`]).
 fn fix_image_block_for_wire(obj: &mut serde_json::Map<String, Value>) {
     if obj.get("type").and_then(Value::as_str) != Some("image") {
         return;
@@ -413,6 +414,27 @@ fn fix_image_block_for_wire(obj: &mut serde_json::Map<String, Value>) {
         if let Some(mt) = source.get("media_type").and_then(Value::as_str) {
             let full = format!("image/{mt}");
             source.insert("media_type".into(), Value::String(full));
+        }
+    }
+}
+
+/// Walk a `tool_result` block's `content` array (when present) and fix
+/// any nested image blocks into Anthropic's wire shape. Anthropic's
+/// `tool_result.content` natively accepts an array of `{type:"text"}`
+/// or `{type:"image"}` blocks, so all we need is to drop the right
+/// `source.type` / `source.media_type` strings on the nested images —
+/// the untagged `ToolResultContent::Blocks` enum already serialized the
+/// outer structure into the array shape.
+fn fix_tool_result_nested_images(obj: &mut serde_json::Map<String, Value>) {
+    if obj.get("type").and_then(Value::as_str) != Some("tool_result") {
+        return;
+    }
+    let Some(content) = obj.get_mut("content").and_then(|c| c.as_array_mut()) else {
+        return;
+    };
+    for inner in content.iter_mut() {
+        if let Some(o) = inner.as_object_mut() {
+            fix_image_block_for_wire(o);
         }
     }
 }
@@ -997,6 +1019,39 @@ mod tests {
         assert_eq!(image["source"]["type"], "base64");
         assert_eq!(image["source"]["media_type"], "image/png");
         assert_eq!(image["source"]["data"], "iVBORw0KGgo=");
+    }
+
+    #[test]
+    fn tool_result_with_image_renders_nested_anthropic_wire_shape() {
+        // A tool_result whose content is a Blocks([Text, Image]) array
+        // must surface to the wire as a tool_result block whose
+        // `content` is `[{type:"text",...}, {type:"image", source:
+        // {type:"base64", media_type:"image/jpeg", data:...}}]`.
+        use whisper_agent_protocol::{ImageMime, ImageSource, ToolResultContent};
+        let msg = Message::tool_result_blocks(vec![ContentBlock::ToolResult {
+            tool_use_id: "toolu_42".into(),
+            content: ToolResultContent::Blocks(vec![
+                ContentBlock::Text {
+                    text: "screenshot saved".into(),
+                },
+                ContentBlock::Image {
+                    source: ImageSource::Bytes {
+                        media_type: ImageMime::Jpeg,
+                        data: vec![0xff, 0xd8, 0xff, 0xe0],
+                    },
+                },
+            ]),
+            is_error: false,
+        }]);
+        let v = message_to_value(&msg, false);
+        let content = v.get("content").and_then(|c| c.as_array()).unwrap();
+        let tr = &content[0];
+        assert_eq!(tr["type"], "tool_result");
+        let inner = tr["content"].as_array().unwrap();
+        assert_eq!(inner[0]["type"], "text");
+        assert_eq!(inner[1]["type"], "image");
+        assert_eq!(inner[1]["source"]["type"], "base64");
+        assert_eq!(inner[1]["source"]["media_type"], "image/jpeg");
     }
 
     #[test]

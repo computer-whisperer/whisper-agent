@@ -507,6 +507,26 @@ fn convert_user_message(blocks: &[ContentBlock], out: &mut Vec<RspItem>) {
                     call_id: tool_use_id.clone(),
                     output: tool_result_as_text(content, *is_error),
                 });
+                // Responses' `function_call_output` carries only a
+                // plain `output: string` — image attachments ride in a
+                // follow-up `role:user` message with `input_image`
+                // parts, matching the workaround used on Chat
+                // Completions' text-only `role:tool` message.
+                let images = content.image_sources();
+                if !images.is_empty() {
+                    let mut image_parts: Vec<RspInputMessagePart> =
+                        Vec::with_capacity(images.len() + 1);
+                    image_parts.push(RspInputMessagePart::InputText {
+                        text: format!("[image output from tool call {tool_use_id} follows]"),
+                    });
+                    for src in images {
+                        image_parts.push(image_source_to_input_part(src));
+                    }
+                    out.push(RspItem::Message {
+                        role: "user",
+                        content: image_parts,
+                    });
+                }
             }
             ContentBlock::ToolUse { .. }
             | ContentBlock::Thinking { .. }
@@ -1434,6 +1454,42 @@ mod tests {
             json[0]["content"][0]["image_url"],
             "https://example.com/a.png"
         );
+    }
+
+    #[test]
+    fn tool_result_with_image_emits_followup_user_input_image() {
+        // function_call_output is `output: string`. Image tool results
+        // ride in a follow-up Message item with input_image parts.
+        use whisper_agent_protocol::{ImageMime, ImageSource, ToolResultContent};
+        let msg = Message::tool_result_blocks(vec![ContentBlock::ToolResult {
+            tool_use_id: "call_42".into(),
+            content: ToolResultContent::Blocks(vec![
+                ContentBlock::Text {
+                    text: "got it".into(),
+                },
+                ContentBlock::Image {
+                    source: ImageSource::Bytes {
+                        media_type: ImageMime::Png,
+                        data: vec![137, 80, 78, 71],
+                    },
+                },
+            ]),
+            is_error: false,
+        }]);
+        let mut items = Vec::new();
+        convert_message(&msg, &mut items);
+        let json = serde_json::to_value(&items).unwrap();
+        let arr = json.as_array().unwrap();
+        // [function_call_output, message{role:user, input_image}]
+        assert!(arr.len() >= 2, "got {arr:?}");
+        assert_eq!(arr[0]["type"], "function_call_output");
+        assert_eq!(arr[0]["call_id"], "call_42");
+        assert_eq!(arr[1]["role"], "user");
+        let parts = arr[1]["content"].as_array().unwrap();
+        assert_eq!(parts[0]["type"], "input_text");
+        assert_eq!(parts[1]["type"], "input_image");
+        let url = parts[1]["image_url"].as_str().unwrap();
+        assert!(url.starts_with("data:image/png;base64,"), "url={url}");
     }
 
     #[test]
