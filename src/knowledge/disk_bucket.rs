@@ -1,9 +1,11 @@
 //! [`DiskBucket`] — disk-backed implementation of the [`Bucket`] trait.
 //!
 //! Owns a bucket directory on disk plus the loaded state for the active
-//! slot (if any). Slice 3 supports the create/open + build + fetch path
-//! end-to-end. Search and mutation methods are stubbed pending embedding
-//! (slice 4), HNSW (slice 5), and tantivy (slice 6).
+//! slot (if any). Slice 4 wires the embedder into the build pipeline:
+//! chunks are batched and sent to an [`EmbeddingProvider`], vectors land
+//! in `vectors.bin`/`vectors.idx` alongside `chunks.bin`/`chunks.idx`.
+//! Search methods still return empty `Vec` (HNSW = slice 5; tantivy =
+//! slice 6); mutation methods still error pending the same.
 //!
 //! Concurrency model: queries take an [`Arc`]-shared snapshot of the
 //! active slot's [`LoadedSlot`] from the bucket's [`RwLock`]. Slot
@@ -30,6 +32,14 @@ use super::source::SourceAdapter;
 use super::types::{
     BucketError, BucketId, BucketStatus, Candidate, Chunk, ChunkId, NewChunk, SlotId,
 };
+use super::vectors::{VectorStoreReader, VectorStoreWriter};
+use crate::providers::embedding::{EmbedRequest, EmbeddingProvider};
+
+/// Number of chunks per `EmbeddingProvider::embed` call. TEI typically
+/// prefers small-to-medium batches (8–32) for steady throughput; 32 is
+/// a reasonable default. Configurable per-call eventually if measurement
+/// justifies it; for slice 4 it's a const at module level.
+const EMBED_BATCH_SIZE: usize = 32;
 
 #[derive(Debug)]
 pub struct DiskBucket {
@@ -45,13 +55,15 @@ pub struct DiskBucket {
 }
 
 /// Loaded state for a single slot — everything a query needs to hit the
-/// active slot without going back to disk for index metadata. Currently
-/// just the manifest + chunks reader; future slices add the dense and
-/// sparse index handles here.
+/// active slot without going back to disk for index metadata. Slice 4
+/// adds the [`VectorStoreReader`] to the manifest+chunks duo from slice
+/// 3; future slices add the dense (HNSW) and sparse (tantivy) index
+/// handles.
 #[derive(Debug)]
 struct LoadedSlot {
     manifest: SlotManifest,
     chunks: ChunkStoreReader,
+    vectors: VectorStoreReader,
 }
 
 impl DiskBucket {
@@ -74,22 +86,27 @@ impl DiskBucket {
         })
     }
 
-    /// Build a new slot from a source adapter + chunker. Synchronous —
-    /// runs on the calling thread. The slot is created, populated with
-    /// chunks, and promoted to active in one call. Returns the new
-    /// slot id.
+    /// Build a new slot from a source adapter + chunker + embedder. The
+    /// slot is created, populated with chunks and their embeddings, and
+    /// promoted to active in one call. Returns the new slot id.
     ///
-    /// `embedder_snapshot` is recorded into the manifest; for slice 3
-    /// no actual embedding happens, so callers pass a snapshot of the
-    /// embedder they *intend* to use (the value is only validated when
-    /// the dense path comes online in slice 4).
-    pub fn build_slot(
+    /// The embedder snapshot recorded in the manifest is derived from
+    /// `embedder.list_models()` at build start — its first model is the
+    /// one used. For multi-model providers (future OpenAI hookup), the
+    /// caller will eventually supply an explicit model id; for TEI's
+    /// single-model deployments, the first-and-only model is the right
+    /// answer.
+    pub async fn build_slot(
         &self,
         adapter: &dyn SourceAdapter,
         chunker: &dyn Chunker,
-        embedder_snapshot: EmbedderSnapshot,
+        embedder: Arc<dyn EmbeddingProvider>,
         cancel: &CancellationToken,
     ) -> Result<SlotId, BucketError> {
+        let embedder_snapshot =
+            derive_embedder_snapshot(&self.config.defaults.embedder, embedder.as_ref(), cancel)
+                .await?;
+
         let slot_id = slot::generate_slot_id();
         let slot_path = slot::slot_dir(&self.root, &slot_id);
         fs::create_dir_all(&slot_path).map_err(BucketError::Io)?;
@@ -105,7 +122,7 @@ impl DiskBucket {
             build_started_at: Some(now),
             build_completed_at: None,
             chunker_snapshot: chunker_snapshot_from_config(&self.config.chunker),
-            embedder: embedder_snapshot,
+            embedder: embedder_snapshot.clone(),
             sparse: None, // sparse path comes online in slice 6
             serving: ServingSnapshot {
                 mode: self.config.defaults.serving_mode,
@@ -116,54 +133,90 @@ impl DiskBucket {
         };
         write_manifest(&slot_path, &manifest)?;
 
-        // Build the chunk store. We tolerate per-record adapter errors
-        // (log + continue) but propagate writer errors (those are
-        // structural).
-        let bin_path = slot::chunks_bin_path(&slot_path);
-        let idx_path = slot::chunks_idx_path(&slot_path);
-        let mut writer = ChunkStoreWriter::create(&bin_path, &idx_path).map_err(BucketError::Io)?;
+        // Open writers.
+        let chunks_bin = slot::chunks_bin_path(&slot_path);
+        let chunks_idx = slot::chunks_idx_path(&slot_path);
+        let vectors_bin = slot::vectors_bin_path(&slot_path);
+        let vectors_idx = slot::vectors_idx_path(&slot_path);
 
+        let mut chunk_writer =
+            ChunkStoreWriter::create(&chunks_bin, &chunks_idx).map_err(BucketError::Io)?;
+        let mut vector_writer =
+            VectorStoreWriter::create(&vectors_bin, &vectors_idx, embedder_snapshot.dimension)
+                .map_err(BucketError::Io)?;
+
+        // Streaming pipeline: source → chunker → batched embed → both
+        // writers. We batch chunks (not records) because record sizes
+        // vary; batching at the chunk level keeps embed calls
+        // predictable.
+        let mut pending: Vec<NewChunk> = Vec::with_capacity(EMBED_BATCH_SIZE);
         let mut source_records: u64 = 0;
+
         for record in adapter.enumerate() {
             if cancel.is_cancelled() {
                 return Err(BucketError::Cancelled);
             }
-            let record = match record {
-                Ok(r) => r,
-                Err(e) => {
-                    // For slice 3, surface adapter errors as structural
-                    // failures. A future slice that wants partial-
-                    // recovery will route per-record errors to build.log
-                    // and continue — but we shouldn't silently drop
-                    // records before that path exists.
-                    return Err(BucketError::Other(format!("source error: {e}")));
-                }
-            };
+            let record = record.map_err(|e| BucketError::Other(format!("source error: {e}")))?;
             source_records += 1;
 
             for new_chunk in chunker.chunk(&record) {
-                let id =
-                    ChunkId::from_source(&new_chunk.source_record_hash, new_chunk.chunk_offset);
-                writer
-                    .append(id, &new_chunk.source_ref, &new_chunk.text)
-                    .map_err(BucketError::Io)?;
+                pending.push(new_chunk);
+                if pending.len() >= EMBED_BATCH_SIZE {
+                    flush_batch(
+                        &mut pending,
+                        &mut chunk_writer,
+                        &mut vector_writer,
+                        embedder.as_ref(),
+                        cancel,
+                    )
+                    .await?;
+                }
             }
         }
-        let chunk_count = writer.finalize().map_err(BucketError::Io)? as u64;
+
+        // Final partial batch.
+        if !pending.is_empty() {
+            flush_batch(
+                &mut pending,
+                &mut chunk_writer,
+                &mut vector_writer,
+                embedder.as_ref(),
+                cancel,
+            )
+            .await?;
+        }
+
+        let chunk_count = chunk_writer.finalize().map_err(BucketError::Io)? as u64;
+        let vector_count = vector_writer.finalize().map_err(BucketError::Io)? as u64;
+        if chunk_count != vector_count {
+            // Should never happen — flush_batch writes one vector per
+            // chunk in lockstep — but a structural divergence here
+            // would be a real bug worth surfacing.
+            return Err(BucketError::Other(format!(
+                "chunk/vector count mismatch: {chunk_count} chunks, {vector_count} vectors",
+            )));
+        }
 
         // Update manifest with final stats and promote to ready.
         manifest.state = SlotState::Ready;
         manifest.build_completed_at = Some(chrono::Utc::now());
         manifest.stats.source_records = source_records;
         manifest.stats.chunk_count = chunk_count;
+        manifest.stats.vector_count = vector_count;
         manifest.stats.disk_size_bytes = total_dir_size(&slot_path).unwrap_or(0);
         write_manifest(&slot_path, &manifest)?;
 
-        // Open the chunks reader for the new slot before we promote —
-        // promotion should never make a slot active that we can't
-        // immediately serve queries from.
-        let chunks = ChunkStoreReader::open(&bin_path, &idx_path).map_err(BucketError::Io)?;
-        let loaded = Arc::new(LoadedSlot { manifest, chunks });
+        // Open readers for the new slot before we promote — promotion
+        // should never make a slot active that we can't immediately
+        // serve queries from.
+        let chunks = ChunkStoreReader::open(&chunks_bin, &chunks_idx).map_err(BucketError::Io)?;
+        let vectors =
+            VectorStoreReader::open(&vectors_bin, &vectors_idx).map_err(BucketError::Io)?;
+        let loaded = Arc::new(LoadedSlot {
+            manifest,
+            chunks,
+            vectors,
+        });
 
         // Atomic active-pointer flip; then swap the loaded state under
         // the write lock so subsequent queries see the new slot.
@@ -186,6 +239,22 @@ impl DiskBucket {
     /// Test/inspection accessor. Returns the current active slot id, if any.
     pub fn active_slot_id(&self) -> Option<SlotId> {
         self.active_snapshot().map(|s| s.manifest.slot_id.clone())
+    }
+
+    /// Test/inspection accessor. Returns the dimension of the active
+    /// slot's vectors, if any.
+    pub fn active_dimension(&self) -> Option<u32> {
+        self.active_snapshot().map(|s| s.vectors.dimension())
+    }
+
+    /// Test/inspection accessor. Fetches a vector by chunk id from the
+    /// active slot, bypassing the (currently empty) search path. Useful
+    /// for exercising the build pipeline before HNSW lands.
+    pub fn fetch_vector(&self, chunk_id: ChunkId) -> Result<Option<Vec<f32>>, BucketError> {
+        let Some(active) = self.active_snapshot() else {
+            return Ok(None);
+        };
+        active.vectors.fetch(chunk_id).map_err(BucketError::Io)
     }
 
     pub fn root(&self) -> &Path {
@@ -215,8 +284,8 @@ impl Bucket for DiskBucket {
         _top_k: usize,
         _cancel: &'a CancellationToken,
     ) -> BoxFuture<'a, Result<Vec<Candidate>, BucketError>> {
-        // Dense path comes online in slice 4 (embedding) + slice 5 (HNSW).
-        // For now: no index, no candidates.
+        // HNSW comes online in slice 5. Vectors are now persisted but
+        // there's no index over them yet.
         Box::pin(async move { Ok(Vec::new()) })
     }
 
@@ -251,7 +320,7 @@ impl Bucket for DiskBucket {
     ) -> BoxFuture<'a, Result<Vec<ChunkId>, BucketError>> {
         Box::pin(async move {
             Err(BucketError::Other(
-                "insert: deferred until indexes land (slices 4–6)".to_string(),
+                "insert: deferred until indexes land (slices 5–6)".to_string(),
             ))
         })
     }
@@ -259,7 +328,7 @@ impl Bucket for DiskBucket {
     fn tombstone<'a>(&'a self, _chunk_ids: Vec<ChunkId>) -> BoxFuture<'a, Result<(), BucketError>> {
         Box::pin(async move {
             Err(BucketError::Other(
-                "tombstone: deferred until indexes land (slices 4–6)".to_string(),
+                "tombstone: deferred until indexes land (slices 5–6)".to_string(),
             ))
         })
     }
@@ -270,13 +339,72 @@ impl Bucket for DiskBucket {
     ) -> BoxFuture<'a, Result<(), BucketError>> {
         Box::pin(async move {
             Err(BucketError::Other(
-                "compact: deferred until indexes land (slices 4–6)".to_string(),
+                "compact: deferred until indexes land (slices 5–6)".to_string(),
             ))
         })
     }
 }
 
 // --- helpers ---
+
+async fn flush_batch(
+    pending: &mut Vec<NewChunk>,
+    chunks: &mut ChunkStoreWriter,
+    vectors: &mut VectorStoreWriter,
+    embedder: &dyn EmbeddingProvider,
+    cancel: &CancellationToken,
+) -> Result<(), BucketError> {
+    let texts: Vec<String> = pending.iter().map(|c| c.text.clone()).collect();
+    let req = EmbedRequest {
+        // TEI single-model deployments ignore the model field. Future
+        // OpenAI-shaped providers route on it; we'll surface model id
+        // selection through the bucket config when that lands.
+        model: "",
+        inputs: &texts,
+    };
+    let resp = embedder
+        .embed(&req, cancel)
+        .await
+        .map_err(|e| BucketError::Provider(e.to_string()))?;
+
+    if resp.embeddings.len() != pending.len() {
+        return Err(BucketError::Provider(format!(
+            "embedder returned {} vectors for {} inputs",
+            resp.embeddings.len(),
+            pending.len(),
+        )));
+    }
+
+    for (chunk, vector) in pending.iter().zip(resp.embeddings.iter()) {
+        let chunk_id = ChunkId::from_source(&chunk.source_record_hash, chunk.chunk_offset);
+        chunks
+            .append(chunk_id, &chunk.source_ref, &chunk.text)
+            .map_err(BucketError::Io)?;
+        vectors.append(chunk_id, vector).map_err(BucketError::Io)?;
+    }
+    pending.clear();
+    Ok(())
+}
+
+async fn derive_embedder_snapshot(
+    provider_name: &str,
+    embedder: &dyn EmbeddingProvider,
+    _cancel: &CancellationToken,
+) -> Result<EmbedderSnapshot, BucketError> {
+    let models = embedder
+        .list_models()
+        .await
+        .map_err(|e| BucketError::Provider(e.to_string()))?;
+    let model = models
+        .into_iter()
+        .next()
+        .ok_or_else(|| BucketError::Provider("embedder reports no available models".to_string()))?;
+    Ok(EmbedderSnapshot {
+        provider: provider_name.to_string(),
+        model_id: model.id,
+        dimension: model.dimension,
+    })
+}
 
 fn read_bucket_config(root: &Path) -> Result<BucketConfig, BucketError> {
     let path = slot::bucket_toml_path(root);
@@ -301,11 +429,31 @@ fn load_slot(bucket_root: &Path, slot_id: &str) -> Result<LoadedSlot, BucketErro
     })?;
     let manifest = SlotManifest::from_toml_str(&manifest_text)?;
 
-    let bin_path = slot::chunks_bin_path(&slot_path);
-    let idx_path = slot::chunks_idx_path(&slot_path);
-    let chunks = ChunkStoreReader::open(&bin_path, &idx_path).map_err(BucketError::Io)?;
+    let chunks_bin = slot::chunks_bin_path(&slot_path);
+    let chunks_idx = slot::chunks_idx_path(&slot_path);
+    let chunks = ChunkStoreReader::open(&chunks_bin, &chunks_idx).map_err(BucketError::Io)?;
 
-    Ok(LoadedSlot { manifest, chunks })
+    let vectors_bin = slot::vectors_bin_path(&slot_path);
+    let vectors_idx = slot::vectors_idx_path(&slot_path);
+    let vectors = VectorStoreReader::open(&vectors_bin, &vectors_idx).map_err(BucketError::Io)?;
+
+    // Sanity check: vector dimension must match the manifest's recorded
+    // embedder dimension. A mismatch means the on-disk vectors weren't
+    // produced by the manifest's embedder (the file got swapped or the
+    // build lied).
+    if vectors.dimension() != manifest.embedder.dimension {
+        return Err(BucketError::Config(format!(
+            "vectors.bin dimension {} does not match manifest embedder dimension {}",
+            vectors.dimension(),
+            manifest.embedder.dimension,
+        )));
+    }
+
+    Ok(LoadedSlot {
+        manifest,
+        chunks,
+        vectors,
+    })
 }
 
 fn write_manifest(slot_path: &Path, manifest: &SlotManifest) -> Result<(), BucketError> {
@@ -336,9 +484,82 @@ fn total_dir_size(dir: &Path) -> std::io::Result<u64> {
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::*;
     use crate::knowledge::{MarkdownDir, TokenBasedChunker};
+    use crate::providers::embedding::{
+        BoxFuture as ProviderBoxFuture, EmbedRequest as ProviderEmbedRequest, EmbeddingError,
+        EmbeddingModelInfo, EmbeddingResponse,
+    };
+
+    /// Deterministic mock embedder for tests. Produces a vector derived
+    /// from `blake3(text)` so the same input always yields the same
+    /// vector — useful for round-trip assertions and reproducible build
+    /// outputs.
+    struct MockEmbedder {
+        dimension: u32,
+        model_id: String,
+        embed_calls: AtomicUsize,
+    }
+
+    impl MockEmbedder {
+        fn new(dimension: u32) -> Self {
+            Self {
+                dimension,
+                model_id: "mock-embedder".to_string(),
+                embed_calls: AtomicUsize::new(0),
+            }
+        }
+
+        fn fake_vector(text: &str, dim: u32) -> Vec<f32> {
+            let hash = blake3::hash(text.as_bytes());
+            let bytes = hash.as_bytes();
+            (0..dim)
+                .map(|i| {
+                    let byte = bytes[(i as usize) % 32];
+                    // Map [0..256) into [-1, 1) for mildly realistic spread.
+                    (byte as f32) / 128.0 - 1.0
+                })
+                .collect()
+        }
+    }
+
+    impl EmbeddingProvider for MockEmbedder {
+        fn embed<'a>(
+            &'a self,
+            req: &'a ProviderEmbedRequest<'a>,
+            _cancel: &'a CancellationToken,
+        ) -> ProviderBoxFuture<'a, Result<EmbeddingResponse, EmbeddingError>> {
+            self.embed_calls.fetch_add(1, Ordering::SeqCst);
+            let dim = self.dimension;
+            Box::pin(async move {
+                let embeddings: Vec<Vec<f32>> = req
+                    .inputs
+                    .iter()
+                    .map(|text| Self::fake_vector(text, dim))
+                    .collect();
+                Ok(EmbeddingResponse {
+                    embeddings,
+                    usage: None,
+                })
+            })
+        }
+
+        fn list_models<'a>(
+            &'a self,
+        ) -> ProviderBoxFuture<'a, Result<Vec<EmbeddingModelInfo>, EmbeddingError>> {
+            let dim = self.dimension;
+            let id = self.model_id.clone();
+            Box::pin(async move {
+                Ok(vec![EmbeddingModelInfo {
+                    id,
+                    dimension: dim,
+                    max_input_tokens: Some(512),
+                }])
+            })
+        }
+    }
 
     fn write_md(dir: &Path, name: &str, body: &str) {
         let path = dir.join(name);
@@ -371,14 +592,6 @@ embedder = "tei_test"
         )
     }
 
-    fn sample_embedder_snapshot() -> EmbedderSnapshot {
-        EmbedderSnapshot {
-            provider: "tei_test".to_string(),
-            model_id: "test/embedding".to_string(),
-            dimension: 1024,
-        }
-    }
-
     fn open_test_bucket(bucket_root: &Path, source_path: &Path) -> DiskBucket {
         fs::create_dir_all(bucket_root).unwrap();
         fs::create_dir_all(slot::slots_dir(bucket_root)).unwrap();
@@ -402,6 +615,7 @@ embedder = "tei_test"
         assert_eq!(bucket.config().name, "Test Notes");
         assert!(matches!(bucket.status(), BucketStatus::NoActiveSlot));
         assert!(bucket.active_slot_id().is_none());
+        assert!(bucket.active_dimension().is_none());
     }
 
     #[test]
@@ -412,8 +626,8 @@ embedder = "tei_test"
         assert!(matches!(err, BucketError::Config(_)), "{err:?}");
     }
 
-    #[test]
-    fn build_slot_writes_chunks_and_promotes_active() {
+    #[tokio::test]
+    async fn build_slot_writes_chunks_and_vectors_and_promotes_active() {
         let tmp = tempfile::tempdir().unwrap();
         let source = tmp.path().join("notes");
         fs::create_dir_all(&source).unwrap();
@@ -425,35 +639,38 @@ embedder = "tei_test"
 
         let adapter = MarkdownDir::new(&source);
         let chunker = TokenBasedChunker::from_config(&bucket.config().chunker);
+        let embedder: Arc<dyn EmbeddingProvider> = Arc::new(MockEmbedder::new(16));
         let cancel = CancellationToken::new();
 
         let slot_id = bucket
-            .build_slot(&adapter, &chunker, sample_embedder_snapshot(), &cancel)
+            .build_slot(&adapter, &chunker, embedder, &cancel)
+            .await
             .unwrap();
 
-        // Active pointer flipped
+        // Active pointer flipped + dimension reflects the embedder
         assert_eq!(bucket.active_slot_id().as_deref(), Some(slot_id.as_str()));
+        assert_eq!(bucket.active_dimension(), Some(16));
         assert!(matches!(bucket.status(), BucketStatus::Ready));
 
-        // Slot directory exists with the expected files
+        // Slot directory exists with chunks AND vectors files
         let slot_path = slot::slot_dir(&bucket_root, &slot_id);
-        assert!(slot_path.is_dir());
-        assert!(slot::manifest_path(&slot_path).is_file());
         assert!(slot::chunks_bin_path(&slot_path).is_file());
         assert!(slot::chunks_idx_path(&slot_path).is_file());
+        assert!(slot::vectors_bin_path(&slot_path).is_file());
+        assert!(slot::vectors_idx_path(&slot_path).is_file());
 
-        // Manifest reflects ready state with stats populated
+        // Manifest reflects vector_count + embedder dimension
         let manifest_text = fs::read_to_string(slot::manifest_path(&slot_path)).unwrap();
         let manifest = SlotManifest::from_toml_str(&manifest_text).unwrap();
         assert_eq!(manifest.state, SlotState::Ready);
-        assert!(manifest.build_completed_at.is_some());
-        assert_eq!(manifest.stats.source_records, 2);
+        assert_eq!(manifest.embedder.model_id, "mock-embedder");
+        assert_eq!(manifest.embedder.dimension, 16);
+        assert_eq!(manifest.stats.chunk_count, manifest.stats.vector_count);
         assert!(manifest.stats.chunk_count >= 2); // at least one chunk per record
-        assert!(manifest.stats.disk_size_bytes > 0);
     }
 
     #[tokio::test]
-    async fn fetch_chunk_returns_persisted_text() {
+    async fn fetch_vector_returns_persisted_vector_for_chunk() {
         let tmp = tempfile::tempdir().unwrap();
         let source = tmp.path().join("notes");
         fs::create_dir_all(&source).unwrap();
@@ -467,23 +684,61 @@ embedder = "tei_test"
         let bucket = open_test_bucket(&bucket_root, &source);
         let adapter = MarkdownDir::new(&source);
         let chunker = TokenBasedChunker::from_config(&bucket.config().chunker);
+        let embedder: Arc<dyn EmbeddingProvider> = Arc::new(MockEmbedder::new(32));
         let cancel = CancellationToken::new();
         bucket
-            .build_slot(&adapter, &chunker, sample_embedder_snapshot(), &cancel)
+            .build_slot(&adapter, &chunker, embedder, &cancel)
+            .await
             .unwrap();
 
-        // Find the chunk id by re-running the chunker on a synthesized
-        // record matching what the adapter produced.
-        let record_text = "The quick brown fox jumps over the lazy dog.";
-        let record = crate::knowledge::SourceRecord::new("ignored", record_text);
+        // Synthesize a record matching what the adapter produced and
+        // chunk it the same way; the first chunk's id should be in the
+        // bucket.
+        let record = crate::knowledge::SourceRecord::new(
+            "ignored",
+            "The quick brown fox jumps over the lazy dog.",
+        );
         let new_chunks = chunker.chunk(&record);
         assert!(!new_chunks.is_empty());
         let chunk_id = ChunkId::from_source(&new_chunks[0].source_record_hash, 0);
 
+        let vec = bucket
+            .fetch_vector(chunk_id)
+            .unwrap()
+            .expect("vector present");
+        assert_eq!(vec.len(), 32);
+        // Mock vectors are deterministic from text, so re-derive and compare.
+        let expected = MockEmbedder::fake_vector(&new_chunks[0].text, 32);
+        assert_eq!(vec, expected);
+    }
+
+    #[tokio::test]
+    async fn fetch_chunk_works_alongside_vectors() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("notes");
+        fs::create_dir_all(&source).unwrap();
+        write_md(&source, "doc.md", "hi there");
+
+        let bucket_root = tmp.path().join("bucket");
+        let bucket = open_test_bucket(&bucket_root, &source);
+        let adapter = MarkdownDir::new(&source);
+        let chunker = TokenBasedChunker::from_config(&bucket.config().chunker);
+        let embedder: Arc<dyn EmbeddingProvider> = Arc::new(MockEmbedder::new(8));
+        let cancel = CancellationToken::new();
+        bucket
+            .build_slot(&adapter, &chunker, embedder, &cancel)
+            .await
+            .unwrap();
+
+        let record = crate::knowledge::SourceRecord::new("ignored", "hi there");
+        let new_chunks = chunker.chunk(&record);
+        let chunk_id = ChunkId::from_source(&new_chunks[0].source_record_hash, 0);
+
         let chunk = bucket.fetch_chunk(chunk_id).await.unwrap();
-        assert_eq!(chunk.id, chunk_id);
-        assert_eq!(chunk.text, new_chunks[0].text);
-        assert!(chunk.source_ref.source_id.ends_with("doc.md"));
+        assert_eq!(chunk.text, "hi there");
+
+        let vec = bucket.fetch_vector(chunk_id).unwrap().unwrap();
+        assert_eq!(vec.len(), 8);
     }
 
     #[tokio::test]
@@ -497,9 +752,11 @@ embedder = "tei_test"
         let bucket = open_test_bucket(&bucket_root, &source);
         let adapter = MarkdownDir::new(&source);
         let chunker = TokenBasedChunker::from_config(&bucket.config().chunker);
+        let embedder: Arc<dyn EmbeddingProvider> = Arc::new(MockEmbedder::new(4));
         let cancel = CancellationToken::new();
         bucket
-            .build_slot(&adapter, &chunker, sample_embedder_snapshot(), &cancel)
+            .build_slot(&adapter, &chunker, embedder, &cancel)
+            .await
             .unwrap();
 
         let bogus = ChunkId::from_source(&[42; 32], 999);
@@ -521,8 +778,8 @@ embedder = "tei_test"
         assert!(matches!(err, BucketError::NoActiveSlot(_)));
     }
 
-    #[test]
-    fn rebuilding_open_finds_active_slot() {
+    #[tokio::test]
+    async fn rebuilding_open_finds_active_slot_with_vectors() {
         let tmp = tempfile::tempdir().unwrap();
         let source = tmp.path().join("notes");
         fs::create_dir_all(&source).unwrap();
@@ -533,21 +790,22 @@ embedder = "tei_test"
             let bucket = open_test_bucket(&bucket_root, &source);
             let adapter = MarkdownDir::new(&source);
             let chunker = TokenBasedChunker::from_config(&bucket.config().chunker);
+            let embedder: Arc<dyn EmbeddingProvider> = Arc::new(MockEmbedder::new(12));
             let cancel = CancellationToken::new();
             bucket
-                .build_slot(&adapter, &chunker, sample_embedder_snapshot(), &cancel)
+                .build_slot(&adapter, &chunker, embedder, &cancel)
+                .await
                 .unwrap()
         };
 
-        // Re-open the bucket from disk; the active slot pointer should
-        // resolve and the new bucket reports Ready.
         let reopened = DiskBucket::open(&bucket_root, BucketId::pod("notes")).unwrap();
         assert_eq!(reopened.active_slot_id().as_deref(), Some(slot_id.as_str()));
+        assert_eq!(reopened.active_dimension(), Some(12));
         assert!(matches!(reopened.status(), BucketStatus::Ready));
     }
 
     #[tokio::test]
-    async fn search_methods_return_empty() {
+    async fn search_methods_return_empty_pending_indexes() {
         let tmp = tempfile::tempdir().unwrap();
         let source = tmp.path().join("notes");
         fs::create_dir_all(&source).unwrap();
@@ -557,15 +815,14 @@ embedder = "tei_test"
         let bucket = open_test_bucket(&bucket_root, &source);
         let adapter = MarkdownDir::new(&source);
         let chunker = TokenBasedChunker::from_config(&bucket.config().chunker);
+        let embedder: Arc<dyn EmbeddingProvider> = Arc::new(MockEmbedder::new(4));
         let cancel = CancellationToken::new();
         bucket
-            .build_slot(&adapter, &chunker, sample_embedder_snapshot(), &cancel)
-            .unwrap();
-
-        let dense = bucket
-            .dense_search(&[0.0; 1024], 10, &cancel)
+            .build_slot(&adapter, &chunker, embedder, &cancel)
             .await
             .unwrap();
+
+        let dense = bucket.dense_search(&[0.0; 4], 10, &cancel).await.unwrap();
         assert!(dense.is_empty());
         let sparse = bucket.sparse_search("anything", 10, &cancel).await.unwrap();
         assert!(sparse.is_empty());
@@ -586,8 +843,8 @@ embedder = "tei_test"
         assert!(bucket.compact(&cancel).await.is_err());
     }
 
-    #[test]
-    fn build_slot_cancellation_aborts_with_cancelled_error() {
+    #[tokio::test]
+    async fn build_slot_cancellation_aborts_with_cancelled_error() {
         let tmp = tempfile::tempdir().unwrap();
         let source = tmp.path().join("notes");
         fs::create_dir_all(&source).unwrap();
@@ -598,13 +855,79 @@ embedder = "tei_test"
         let bucket = open_test_bucket(&bucket_root, &source);
         let adapter = MarkdownDir::new(&source);
         let chunker = TokenBasedChunker::from_config(&bucket.config().chunker);
+        let embedder: Arc<dyn EmbeddingProvider> = Arc::new(MockEmbedder::new(4));
         let cancel = CancellationToken::new();
-        cancel.cancel(); // pre-cancelled
+        cancel.cancel();
         let err = bucket
-            .build_slot(&adapter, &chunker, sample_embedder_snapshot(), &cancel)
+            .build_slot(&adapter, &chunker, embedder, &cancel)
+            .await
             .unwrap_err();
         assert!(matches!(err, BucketError::Cancelled), "{err:?}");
-        // No active slot was promoted
         assert!(bucket.active_slot_id().is_none());
+    }
+
+    #[tokio::test]
+    async fn embedder_called_in_batches() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("notes");
+        fs::create_dir_all(&source).unwrap();
+
+        // Create enough markdown files to exceed two embed batches at
+        // BATCH_SIZE = 32. Each short file produces one chunk under the
+        // 50-token chunker. 80 files → 80 chunks → at least 3 batches.
+        for i in 0..80 {
+            write_md(
+                &source,
+                &format!("doc-{i:03}.md"),
+                &format!("content number {i}"),
+            );
+        }
+        let bucket_root = tmp.path().join("bucket");
+        let bucket = open_test_bucket(&bucket_root, &source);
+
+        let mock = Arc::new(MockEmbedder::new(8));
+        let embedder: Arc<dyn EmbeddingProvider> = mock.clone();
+        let adapter = MarkdownDir::new(&source);
+        let chunker = TokenBasedChunker::from_config(&bucket.config().chunker);
+        let cancel = CancellationToken::new();
+
+        bucket
+            .build_slot(&adapter, &chunker, embedder, &cancel)
+            .await
+            .unwrap();
+
+        let calls = mock.embed_calls.load(Ordering::SeqCst);
+        // 80 chunks at batch size 32 → ceil(80/32) = 3 calls.
+        assert_eq!(calls, 3, "expected 3 batched embed calls, got {calls}");
+    }
+
+    #[tokio::test]
+    async fn open_rejects_dimension_mismatch_between_manifest_and_vectors() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("notes");
+        fs::create_dir_all(&source).unwrap();
+        write_md(&source, "doc.md", "hello");
+
+        let bucket_root = tmp.path().join("bucket");
+        let bucket = open_test_bucket(&bucket_root, &source);
+        let adapter = MarkdownDir::new(&source);
+        let chunker = TokenBasedChunker::from_config(&bucket.config().chunker);
+        let embedder: Arc<dyn EmbeddingProvider> = Arc::new(MockEmbedder::new(8));
+        let cancel = CancellationToken::new();
+        let slot_id = bucket
+            .build_slot(&adapter, &chunker, embedder, &cancel)
+            .await
+            .unwrap();
+        drop(bucket);
+
+        // Hand-edit the manifest to claim a different dimension. Reopening
+        // should refuse rather than silently misinterpret vectors.bin.
+        let manifest_path = slot::manifest_path(&slot::slot_dir(&bucket_root, &slot_id));
+        let text = fs::read_to_string(&manifest_path).unwrap();
+        let edited = text.replace("dimension = 8", "dimension = 16");
+        fs::write(&manifest_path, edited).unwrap();
+
+        let err = DiskBucket::open(&bucket_root, BucketId::pod("notes")).unwrap_err();
+        assert!(matches!(err, BucketError::Config(_)), "{err:?}");
     }
 }

@@ -27,6 +27,8 @@ pub const BUCKET_TOML: &str = "bucket.toml";
 pub const MANIFEST_TOML: &str = "manifest.toml";
 pub const CHUNKS_BIN: &str = "chunks.bin";
 pub const CHUNKS_IDX: &str = "chunks.idx";
+pub const VECTORS_BIN: &str = "vectors.bin";
+pub const VECTORS_IDX: &str = "vectors.idx";
 pub const BUILD_STATE: &str = "build.state";
 pub const BUILD_LOG: &str = "build.log";
 
@@ -52,6 +54,14 @@ pub fn chunks_bin_path(slot_dir: &Path) -> PathBuf {
 
 pub fn chunks_idx_path(slot_dir: &Path) -> PathBuf {
     slot_dir.join(CHUNKS_IDX)
+}
+
+pub fn vectors_bin_path(slot_dir: &Path) -> PathBuf {
+    slot_dir.join(VECTORS_BIN)
+}
+
+pub fn vectors_idx_path(slot_dir: &Path) -> PathBuf {
+    slot_dir.join(VECTORS_IDX)
 }
 
 pub fn active_pointer_path(bucket_root: &Path) -> PathBuf {

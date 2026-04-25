@@ -22,6 +22,8 @@
 //!   source records into chunks ready for embedding + indexing.
 //! - [`chunks`] — `chunks.bin` / `chunks.idx` storage format
 //!   (`ChunkStoreWriter` / `ChunkStoreReader`).
+//! - [`vectors`] — `vectors.bin` / `vectors.idx` storage format
+//!   (`VectorStoreWriter` / `VectorStoreReader`).
 //! - [`slot`] — slot directory ops (id generation, active-pointer
 //!   read/write, layout helpers).
 //! - [`disk_bucket`] — [`DiskBucket`], the disk-backed [`Bucket`] impl.
@@ -35,6 +37,7 @@ pub mod manifest;
 pub mod slot;
 pub mod source;
 pub mod types;
+pub mod vectors;
 
 pub use bucket::Bucket;
 pub use chunker::{Chunker, TokenBasedChunker};
@@ -53,3 +56,4 @@ pub use types::{
     BucketError, BucketId, BucketScope, BucketStatus, BuildProgress, Candidate, Chunk, ChunkId,
     NewChunk, ParseBucketIdError, ParseChunkIdError, SearchPath, SlotId, SourceRef,
 };
+pub use vectors::{VectorStoreReader, VectorStoreWriter};
