@@ -711,6 +711,82 @@ pub struct ThreadSnapshot {
     pub scope: crate::permission::Scope,
 }
 
+// ---------- Knowledge buckets ----------
+
+/// Wire snapshot of a knowledge bucket as the server's bucket registry
+/// knows it. The `id` is the bucket's directory name and is permanent;
+/// `name` is the user-editable display label from `bucket.toml`.
+///
+/// `scope` is `"server"` today — pod-scoped buckets land in a follow-up
+/// slice, when this becomes a tagged enum. Until then a plain string is
+/// enough for the WebUI to label entries without locking the protocol
+/// shape down prematurely.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct BucketSummary {
+    pub id: String,
+    pub scope: String,
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// `"stored"`, `"linked"`, or `"managed"` — matches the
+    /// `bucket.toml [source]` tag.
+    pub source_kind: String,
+    /// Human-readable source target (path / archive). `None` for
+    /// `managed` buckets, which have no external source.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_detail: Option<String>,
+    /// Provider name from `bucket.toml [defaults] embedder` — matches an
+    /// entry in `embedding_providers.*` from the server config.
+    pub embedder_provider: String,
+    pub dense_enabled: bool,
+    pub sparse_enabled: bool,
+    /// RFC-3339 — `bucket.toml [created_at]`.
+    pub created_at: String,
+    /// `None` when the bucket has no slot yet (just created, never
+    /// built) or its only slot failed before reaching `Ready`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_slot: Option<ActiveSlotSummary>,
+}
+
+/// Wire snapshot of the bucket's active slot manifest, surfaced
+/// alongside the bucket. Heavy artifacts (chunks, vectors, dense /
+/// sparse indexes) are not exposed — only what the UI needs to show
+/// "is this bucket ready, how big is it, what did it index."
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct ActiveSlotSummary {
+    pub slot_id: String,
+    pub state: SlotStateLabel,
+    /// Embedder model id the slot was actually built against — captured
+    /// from the provider's `/info` at build time, not the config name.
+    /// Lets the UI flag drift if the provider has been silently
+    /// rebound to a different model.
+    pub embedder_model: String,
+    pub dimension: u32,
+    pub chunk_count: u64,
+    pub vector_count: u64,
+    pub disk_size_bytes: u64,
+    /// RFC-3339 — slot creation time (set when the build started).
+    pub created_at: String,
+    /// RFC-3339 — when the slot first reached `Ready`. `None` while
+    /// `state` is `Planning` or `Building`, or for slots that `Failed`
+    /// before completing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub built_at: Option<String>,
+}
+
+/// Lifecycle state of a slot. Mirrors the server-side
+/// `knowledge::manifest::SlotState`; serialized snake_case to match
+/// `manifest.toml`.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SlotStateLabel {
+    Planning,
+    Building,
+    Ready,
+    Failed,
+    Archived,
+}
+
 // ---------- Wire enums ----------
 
 /// Messages the client sends to the server.
@@ -1172,6 +1248,15 @@ pub enum ClientToServer {
         pod_id: String,
         path: String,
         content: String,
+    },
+
+    // --- Knowledge buckets (registry surface — read-only in slice 8a;
+    //     create/build/delete arrive in 8c). ---
+    /// Snapshot every bucket the registry knows about. Server responds
+    /// with `BucketsList`. Cheap; reads cached registry state, no I/O.
+    ListBuckets {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        correlation_id: Option<String>,
     },
 
     // --- Behavior registry (read-only in phase 1 — see
@@ -1716,6 +1801,17 @@ pub enum ServerToClient {
         correlation_id: Option<String>,
         pod_id: String,
         path: String,
+    },
+
+    // --- Knowledge buckets ---
+    /// Snapshot response to `ListBuckets`. Entries appear in id order
+    /// (bucket directory name). Empty when the server has no buckets
+    /// configured — the WebUI then offers the "create your first
+    /// bucket" affordance.
+    BucketsList {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        correlation_id: Option<String>,
+        buckets: Vec<BucketSummary>,
     },
 
     // --- Behavior registry ---

@@ -129,6 +129,13 @@ struct ServeArgs {
     #[arg(long, default_value = "pods")]
     pods_root: PathBuf,
 
+    /// Knowledge buckets root directory. Sibling of `pods_root`. Each
+    /// bucket is a subdirectory with a `bucket.toml` and a `slots/`
+    /// folder. Pass an empty string to boot with no bucket registry —
+    /// chat threads still work, knowledge-bucket operations don't.
+    #[arg(long, default_value = "buckets")]
+    buckets_root: PathBuf,
+
     /// System prompt to send to the model.
     #[arg(long, default_value = DEFAULT_SYSTEM_PROMPT)]
     system_prompt: String,
@@ -336,6 +343,11 @@ async fn run_serve(args: ServeArgs) -> Result<()> {
         None
     } else {
         Some(args.pods_root)
+    };
+    let buckets_root = if args.buckets_root.as_os_str().is_empty() {
+        None
+    } else {
+        Some(args.buckets_root)
     };
 
     // Resolve the backend catalog and shared-host map. Either source can come
@@ -618,6 +630,7 @@ async fn run_serve(args: ServeArgs) -> Result<()> {
         audit_log_path: args.audit_log,
         host_id: "default".into(),
         pods_root,
+        buckets_root,
         host_env_registry,
         host_env_catalog: catalog,
         shared_mcp_catalog: shared_mcp_catalog_store,

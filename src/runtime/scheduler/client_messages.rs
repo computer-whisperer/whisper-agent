@@ -324,6 +324,16 @@ impl Scheduler {
                     },
                 );
             }
+            ClientToServer::ListBuckets { correlation_id } => {
+                let buckets = self.bucket_registry.summaries();
+                self.router.send_to_client(
+                    conn_id,
+                    ServerToClient::BucketsList {
+                        correlation_id,
+                        buckets,
+                    },
+                );
+            }
             ClientToServer::AddHostEnvProvider {
                 correlation_id,
                 name,

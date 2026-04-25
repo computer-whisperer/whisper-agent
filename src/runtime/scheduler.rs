@@ -50,6 +50,7 @@ use whisper_agent_protocol::{
     ThreadBindingsRequest, ThreadConfigOverride, ThreadStateLabel,
 };
 
+use crate::knowledge::BucketRegistry;
 use crate::pod::persist::{LoadedState, Persister};
 use crate::pod::resources::{
     BackendId, CompleteHostEnvOutcome, HostEnvId, McpHostId, ResourceRegistry,
@@ -359,6 +360,12 @@ pub struct Scheduler {
     embedding_providers: HashMap<String, EmbeddingProviderEntry>,
     /// Named rerank providers — populated from `[rerank_providers.*]`.
     rerank_providers: HashMap<String, RerankProviderEntry>,
+    /// Server-scoped knowledge buckets discovered under `<buckets_root>/`
+    /// at startup. Empty / `root: None` when the server boots without a
+    /// buckets root configured — the rest of the scheduler degrades
+    /// gracefully (no bucket-targeted operations succeed, but chat
+    /// threads and pod CRUD are unaffected).
+    bucket_registry: BucketRegistry,
     /// Path to the `whisper-agent.toml` the server was loaded from.
     /// `None` when started with the env-key fallback (no `--config`).
     /// Runtime config-edit handlers refuse to write back without it.
@@ -488,6 +495,7 @@ impl Scheduler {
         backends: HashMap<String, BackendEntry>,
         embedding_providers: HashMap<String, EmbeddingProviderEntry>,
         rerank_providers: HashMap<String, RerankProviderEntry>,
+        bucket_registry: BucketRegistry,
         audit: AuditLog,
         host_env_registry: crate::tools::sandbox::HostEnvRegistry,
         host_env_catalog: crate::tools::host_env_catalog::CatalogStore,
@@ -556,6 +564,7 @@ impl Scheduler {
                 backends,
                 embedding_providers,
                 rerank_providers,
+                bucket_registry,
                 server_config_path,
                 persister: None,
                 host_env_registry,

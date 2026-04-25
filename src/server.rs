@@ -122,6 +122,10 @@ pub struct ServerConfig {
     pub host_id: String,
     /// Pods root directory. If `None`, persistence is disabled.
     pub pods_root: Option<PathBuf>,
+    /// Knowledge buckets root directory. Sibling of `pods_root`. When
+    /// `None`, the server boots with an empty bucket registry — chat
+    /// threads still work, knowledge-bucket operations don't.
+    pub buckets_root: Option<PathBuf>,
     /// Host-env provider catalog. Empty registry is a valid config —
     /// threads in such a server just have no host-env MCP connection.
     pub host_env_registry: crate::tools::sandbox::HostEnvRegistry,
@@ -219,12 +223,20 @@ pub async fn serve(listen: SocketAddr, config: ServerConfig) -> anyhow::Result<(
         default_system_prompt.clone(),
     );
 
+    let bucket_registry = match config.buckets_root.clone() {
+        Some(root) => crate::knowledge::BucketRegistry::load(root.clone())
+            .await
+            .with_context(|| format!("load buckets_root {}", root.display()))?,
+        None => crate::knowledge::BucketRegistry::default(),
+    };
+
     let (mut scheduler, stream_rx) = Scheduler::new(
         default_pod,
         config.host_id,
         config.backends,
         config.embedding_providers,
         config.rerank_providers,
+        bucket_registry,
         audit,
         config.host_env_registry,
         config.host_env_catalog,

@@ -36,6 +36,7 @@ pub mod dense;
 pub mod disk_bucket;
 pub mod manifest;
 pub mod query;
+pub mod registry;
 pub mod slot;
 pub mod source;
 pub mod sparse;
@@ -56,6 +57,7 @@ pub use manifest::{
     SparseSnapshot,
 };
 pub use query::{QueryEngine, QueryParams, RerankedCandidate};
+pub use registry::{BucketEntry, BucketRegistry};
 pub use source::{MarkdownDir, SourceAdapter, SourceError, SourceRecord};
 pub use sparse::{SparseIndex, SparseIndexBuilder};
 pub use types::{
