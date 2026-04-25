@@ -120,3 +120,7 @@ sha2 = "0.10"
 # throughput matters because the chunker hashes every source record on a
 # wikipedia-scale build — sha2 would bottleneck the chunking stage.
 blake3 = "1"
+
+[dev-dependencies]
+# Tempdirs for source-adapter / chunker tests. Auto-cleanup via Drop.
+tempfile = "3"
