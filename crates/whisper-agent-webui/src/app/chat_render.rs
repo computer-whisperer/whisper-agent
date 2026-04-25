@@ -58,6 +58,7 @@ fn item_palette(item: &DisplayItem) -> (Color32, Color32) {
             Color32::from_rgba_unmultiplied(120, 180, 240, 18),
         ),
         DisplayItem::AssistantText { .. } => (COLOR_AGENT, Color32::TRANSPARENT),
+        DisplayItem::AssistantImage { .. } => (COLOR_AGENT, Color32::TRANSPARENT),
         DisplayItem::Reasoning { .. } => (COLOR_REASONING, Color32::TRANSPARENT),
         DisplayItem::ToolCall {
             result: Some(FusedToolResult { is_error: true, .. }),
@@ -136,6 +137,7 @@ pub(super) fn render_item(
                 }
             }
             DisplayItem::AssistantText { text } => render_assistant_text(ui, cache, text),
+            DisplayItem::AssistantImage { source } => render_assistant_image(ui, idx, source),
             DisplayItem::Reasoning { text } => render_reasoning(ui, cache, text),
             DisplayItem::ToolCall {
                 tool_use_id,
@@ -383,6 +385,16 @@ fn render_assistant_text(ui: &mut egui::Ui, cache: &mut CommonMarkCache, text: &
     // No role label — the gutter color carries it. This is the bulk
     // of the conversation; we want it visually quiet.
     render_markdown(ui, cache, ("assistant", text), text);
+}
+
+/// Render a model-emitted image as a single-cell strip. Reuses
+/// [`render_image_strip`] so the click-to-enlarge lightbox plumbing
+/// works the same as compose attachments and tool-result images. The
+/// `idx` parameter namespaces the bytes:// URI per turn so two
+/// generations of the same image (e.g. an edit-image flow) don't
+/// collide in the texture cache.
+fn render_assistant_image(ui: &mut egui::Ui, idx: usize, source: &ImageSource) {
+    render_image_strip(ui, &[source], &format!("assistant-{idx}"));
 }
 
 fn render_reasoning(ui: &mut egui::Ui, cache: &mut CommonMarkCache, text: &str) {

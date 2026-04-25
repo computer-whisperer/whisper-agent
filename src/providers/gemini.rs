@@ -414,7 +414,9 @@ impl GeminiClient {
                         display_name: m.display_name,
                         context_window: m.input_token_limit,
                         max_output_tokens: m.output_token_limit,
-                        capabilities: crate::providers::model::gemini_vision_capabilities(),
+                        capabilities: crate::providers::model::gemini_capabilities_for(
+                            m.name.strip_prefix("models/").unwrap_or(&m.name),
+                        ),
                     })
                     .collect())
             }
@@ -430,7 +432,7 @@ impl GeminiClient {
                     display_name: Some(name.into()),
                     context_window: None,
                     max_output_tokens: None,
-                    capabilities: crate::providers::model::gemini_vision_capabilities(),
+                    capabilities: crate::providers::model::gemini_capabilities_for(id),
                 };
                 Ok(vec![
                     entry("gemini-3-pro-preview", "Gemini 3 Pro (preview)"),
@@ -512,8 +514,34 @@ pub(crate) fn build_gemini_request(req: &ModelRequest<'_>) -> GenerateContentReq
         tools,
         generation_config: Some(GenerationConfig {
             max_output_tokens: Some(req.max_tokens),
+            // Image-output models (`gemini-2.5-flash-image*`,
+            // `gemini-2.0-flash-preview-image-generation`) require
+            // `responseModalities: ["TEXT", "IMAGE"]` — calling them
+            // without it 400s. We send it whenever the model id
+            // matches the heuristic, never otherwise (text-only
+            // Gemini models *also* 400 if the field is set to
+            // include IMAGE). Other Gemini models leave the field
+            // omitted and stay text-only.
+            response_modalities: if model_emits_images(req.model) {
+                Some(vec!["TEXT".to_string(), "IMAGE".to_string()])
+            } else {
+                None
+            },
         }),
     }
+}
+
+/// Whether a Gemini model id is one of the image-output variants.
+/// Gemini's `/v1beta/models` response carries no explicit
+/// supportsImageOutput flag, so we match by the well-known names.
+/// Kept intentionally narrow — false positives here mean
+/// `responseModalities` lands on a text-only model and 400s the
+/// request, so the safer default is "no" for unfamiliar ids.
+pub(crate) fn model_emits_images(model: &str) -> bool {
+    // Match the live image-output names. The `-image` suffix and
+    // `-image-generation` substring catch both the previewed and the
+    // GA-tagged variants without listing every revision.
+    model.contains("-image-generation") || model.contains("-image")
 }
 
 fn build_tool_use_name_index(messages: &[Message]) -> HashMap<String, String> {
@@ -695,16 +723,54 @@ fn convert_assistant_parts(
             ContentBlock::ToolResult { .. } | ContentBlock::ToolSchema { .. } => {
                 // Neither is valid on an assistant turn.
             }
-            ContentBlock::Image { .. } => {
-                // Model-emitted images (Gemini native image output) arrive on
-                // the inbound-parse side, not through this path — reaching
-                // here would mean a persisted assistant turn somehow carried
-                // an image block we persisted ourselves. Drop silently; v2
-                // output work fills this in.
+            ContentBlock::Image { source } => {
+                // Re-emit native-image output blocks that were minted
+                // by Gemini on a prior turn so a follow-up assistant
+                // call sees the image it already produced. URL-source
+                // images on assistant turns are unusual but reuse the
+                // same lowering as user-side images (Gemini still
+                // can't fetch URLs, so they degrade to a text note).
+                if let Some(part) = image_source_to_part(source) {
+                    parts.push(part);
+                }
             }
         }
     }
     parts
+}
+
+/// Parse an inbound `inlineData` part into a normalized
+/// [`ContentBlock::Image`]. Used by both the non-streaming and
+/// streaming response parsers when the model emits a native image
+/// (gemini-2.5-flash-image*, gemini-2.0-flash-preview-image-generation).
+/// Returns `None` if the MIME isn't in our accepted set or the
+/// payload fails to base64-decode — we'd rather drop a malformed
+/// attachment than panic the assistant turn.
+fn inline_data_to_image_block(
+    inline_data: &InlineData,
+) -> Option<whisper_agent_protocol::ContentBlock> {
+    use base64::Engine;
+    use base64::engine::general_purpose::STANDARD;
+    use whisper_agent_protocol::{ContentBlock, ImageMime, ImageSource};
+    let media_type = ImageMime::from_mime_str(&inline_data.mime_type).or_else(|| {
+        tracing::warn!(
+            mime = %inline_data.mime_type,
+            "Gemini emitted an image with a MIME we don't carry; dropping"
+        );
+        None
+    })?;
+    let bytes = STANDARD
+        .decode(&inline_data.data)
+        .inspect_err(|e| {
+            tracing::warn!(error = %e, "Gemini inlineData base64 decode failed; dropping");
+        })
+        .ok()?;
+    Some(ContentBlock::Image {
+        source: ImageSource::Bytes {
+            media_type,
+            data: bytes,
+        },
+    })
 }
 
 /// Lower one of our image-source values into a Gemini `Part`. Bytes
@@ -820,14 +886,17 @@ pub(crate) fn parsed_to_model_response(parsed: GenerateContentResponse) -> Model
                 Part::FunctionResponse { .. } => {
                     // Models don't emit function responses — ignore if echoed.
                 }
-                Part::InlineData { .. } => {
-                    // Native image output (gemini-2.5-flash-image and
-                    // friends) would arrive here as an inlineData part on
-                    // the candidate. V1 is input-only — inbound image
-                    // parsing lands in the v2 output path, at which point
-                    // we'll decode into a `ContentBlock::Image`. For now,
-                    // drop so a thinking-model hallucination that emits
-                    // one doesn't confuse the scheduler.
+                Part::InlineData { inline_data } => {
+                    // Native image output (gemini-2.5-flash-image*,
+                    // gemini-2.0-flash-preview-image-generation). The
+                    // inline_data carries base64 + IANA mime; we
+                    // normalize into our `ImageSource::Bytes` so the
+                    // assistant turn round-trips through conversation
+                    // storage and the UI renderer alongside any text /
+                    // tool-use parts emitted in the same response.
+                    if let Some(block) = inline_data_to_image_block(&inline_data) {
+                        content.push(block);
+                    }
                 }
             }
         }
@@ -1013,10 +1082,24 @@ impl GeminiStreamState {
                     // Models don't emit function responses — ignore if
                     // echoed back to us.
                 }
-                Part::InlineData { .. } => {
-                    // Same story as the non-streaming parser — native
-                    // image output on the response side is v2 scope.
+                Part::InlineData { inline_data } => {
+                    // Native image output (gemini-2.5-flash-image*,
+                    // gemini-2.0-flash-preview-image-generation). Close
+                    // any open text/thinking block so the image lands
+                    // in document order, persist it on the assembled
+                    // turn content for the terminal `Completed` event,
+                    // and emit a live `ImageBlock` so connected webuis
+                    // can render the thumbnail without waiting on a
+                    // snapshot rebuild.
                     self.close_open();
+                    if let Some(ContentBlock::Image { source }) =
+                        inline_data_to_image_block(&inline_data)
+                    {
+                        out.push(ModelEvent::ImageBlock {
+                            source: source.clone(),
+                        });
+                        self.content.push(ContentBlock::Image { source });
+                    }
                 }
             }
         }
@@ -1214,6 +1297,13 @@ pub(crate) struct FunctionDeclaration {
 pub(crate) struct GenerationConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) max_output_tokens: Option<u32>,
+    /// Tells Gemini which response kinds the model is allowed to
+    /// emit — `["TEXT"]` is the default, image-output models require
+    /// `["TEXT", "IMAGE"]`. Omitted when `None` so text-only models
+    /// don't see the field at all (passing IMAGE on a model that
+    /// doesn't support it is a 400 from the API).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) response_modalities: Option<Vec<String>>,
 }
 
 #[derive(Deserialize, Debug)]
@@ -1385,6 +1475,100 @@ mod tests {
             json[0]["functionResponse"]["response"]["content"],
             "screenshot:"
         );
+        assert_eq!(json[1]["inlineData"]["mimeType"], "image/png");
+    }
+
+    #[test]
+    fn inbound_inline_data_lowers_to_assistant_image_block() {
+        // Round-trip the wire shape an image-output Gemini model emits:
+        // a candidate with one inlineData part (mime image/png, base64
+        // body) should land in our assistant content as a normalized
+        // ContentBlock::Image { ImageSource::Bytes }.
+        use base64::Engine;
+        use base64::engine::general_purpose::STANDARD;
+        let png = vec![137, 80, 78, 71, 13, 10, 26, 10];
+        let parsed = GenerateContentResponse {
+            candidates: vec![Candidate {
+                content: Some(Content {
+                    role: Some("model".into()),
+                    parts: vec![
+                        Part::Text {
+                            text: "here you go:".into(),
+                            thought: None,
+                        },
+                        Part::InlineData {
+                            inline_data: InlineData {
+                                mime_type: "image/png".into(),
+                                data: STANDARD.encode(&png),
+                            },
+                        },
+                    ],
+                }),
+                finish_reason: None,
+            }],
+            usage_metadata: None,
+        };
+        let resp = parsed_to_model_response(parsed);
+        assert_eq!(resp.content.len(), 2);
+        assert!(matches!(&resp.content[0], ContentBlock::Text { text } if text == "here you go:"));
+        let ContentBlock::Image {
+            source: whisper_agent_protocol::ImageSource::Bytes { data, media_type },
+        } = &resp.content[1]
+        else {
+            panic!("expected Image block, got {:?}", resp.content[1]);
+        };
+        assert_eq!(*data, png);
+        assert_eq!(*media_type, whisper_agent_protocol::ImageMime::Png);
+    }
+
+    #[test]
+    fn response_modalities_present_for_image_output_models() {
+        // Image-output models require responseModalities:
+        // ["TEXT","IMAGE"] in generationConfig — without it the API
+        // 400s with "model only supports image output mode."
+        let req = req(&[], &[], "gemini-2.5-flash-image");
+        let body = build_gemini_request(&req);
+        let json = serde_json::to_value(&body).unwrap();
+        let modalities = json["generationConfig"]["responseModalities"]
+            .as_array()
+            .expect("responseModalities should be present");
+        let kinds: Vec<&str> = modalities.iter().filter_map(|v| v.as_str()).collect();
+        assert!(kinds.contains(&"TEXT"));
+        assert!(kinds.contains(&"IMAGE"));
+    }
+
+    #[test]
+    fn response_modalities_omitted_for_text_only_models() {
+        // Setting IMAGE on a non-image model is a 400; field must be
+        // omitted entirely so text-only models stay unaffected.
+        let r = req(&[], &[], "gemini-2.5-flash");
+        let body = build_gemini_request(&r);
+        let json = serde_json::to_value(&body).unwrap();
+        assert!(json["generationConfig"].get("responseModalities").is_none());
+    }
+
+    #[test]
+    fn assistant_image_block_round_trips_as_inline_data() {
+        // A persisted assistant turn that carries a model-emitted image
+        // (e.g. the prior turn of a multi-turn image-edit flow) should
+        // re-emit the image as an inlineData part on the wire so the
+        // model sees what it produced.
+        use whisper_agent_protocol::{ImageMime, ImageSource};
+        let blocks = vec![
+            ContentBlock::Text {
+                text: "here:".into(),
+            },
+            ContentBlock::Image {
+                source: ImageSource::Bytes {
+                    media_type: ImageMime::Png,
+                    data: vec![137, 80, 78, 71],
+                },
+            },
+        ];
+        let parts = convert_assistant_parts(&blocks, &HashMap::new());
+        assert_eq!(parts.len(), 2);
+        let json = serde_json::to_value(&parts).unwrap();
+        assert_eq!(json[0]["text"], "here:");
         assert_eq!(json[1]["inlineData"]["mimeType"], "image/png");
     }
 

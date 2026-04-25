@@ -565,6 +565,15 @@ enum DisplayItem {
         /// tool results (the common case).
         attachments: Vec<ImageSource>,
     },
+    /// Model-emitted image attachment — rendered as a standalone row
+    /// in chronological order alongside `AssistantText` and `Reasoning`
+    /// so a turn that interleaves text + images displays the way the
+    /// model produced it. Sourced from `ServerToClient::ThreadAssistantImage`
+    /// during streaming and from `ContentBlock::Image` on
+    /// `Role::Assistant` during snapshot rebuilds.
+    AssistantImage {
+        source: ImageSource,
+    },
     SystemNote {
         text: String,
         is_error: bool,
@@ -2468,6 +2477,12 @@ impl ChatApp {
                     }
                 }
             }
+            ServerToClient::ThreadAssistantImage { thread_id, source } => {
+                if let Some(view) = self.tasks.get_mut(&thread_id) {
+                    view.prefill_progress = None;
+                    view.items.push(DisplayItem::AssistantImage { source });
+                }
+            }
             ServerToClient::ThreadAssistantReasoningDelta { thread_id, delta } => {
                 if let Some(view) = self.tasks.get_mut(&thread_id) {
                     view.prefill_progress = None;
@@ -3521,6 +3536,7 @@ fn pending_tool_batch_flush_thread_id(msg: &ServerToClient) -> Option<&str> {
         | ServerToClient::ThreadToolCallStreaming { thread_id, .. }
         | ServerToClient::ThreadAssistantTextDelta { thread_id, .. }
         | ServerToClient::ThreadAssistantReasoningDelta { thread_id, .. }
+        | ServerToClient::ThreadAssistantImage { thread_id, .. }
         | ServerToClient::ThreadAssistantEnd { thread_id, .. }
         | ServerToClient::ThreadLoopComplete { thread_id, .. }
         | ServerToClient::ThreadStateChanged { thread_id, .. }
@@ -3703,6 +3719,11 @@ fn add_message_items(msg: &Message, msg_index: usize, out: &mut Vec<DisplayItem>
                     ContentBlock::Thinking { thinking, .. } => {
                         out.push(DisplayItem::Reasoning {
                             text: thinking.clone(),
+                        });
+                    }
+                    ContentBlock::Image { source } => {
+                        out.push(DisplayItem::AssistantImage {
+                            source: source.clone(),
                         });
                     }
                     _ => {}
@@ -8919,6 +8940,7 @@ mod tests {
             .map(|i| match i {
                 DisplayItem::User { .. } => "user",
                 DisplayItem::AssistantText { .. } => "assistant_text",
+                DisplayItem::AssistantImage { .. } => "assistant_image",
                 DisplayItem::Reasoning { .. } => "reasoning",
                 DisplayItem::ToolCall { .. } => "tool_call",
                 DisplayItem::ToolCallStreaming { .. } => "tool_call_streaming",

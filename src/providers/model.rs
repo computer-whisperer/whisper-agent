@@ -175,6 +175,16 @@ pub enum ModelEvent {
         /// a token count — providers don't expose those mid-stream.
         args_chars: u32,
     },
+    /// A fully-formed assistant image block. Emitted once per
+    /// inline-data part the streaming parser sees. Image bytes don't
+    /// stream incrementally on any provider we target today — the
+    /// payload arrives whole — so a single event with the assembled
+    /// `ImageSource` is enough. Synthesizing path emits one for each
+    /// `ContentBlock::Image` in a non-streaming response so live and
+    /// snapshot-rebuild paths match.
+    ImageBlock {
+        source: whisper_agent_protocol::ImageSource,
+    },
     /// Mid-prefill progress heartbeat. Emitted by providers that can observe
     /// how many prompt tokens have been ingested before the first output
     /// token arrives — today only the llama.cpp driver does, via a parallel
@@ -247,6 +257,9 @@ pub trait ModelProvider: Send + Sync {
                             name: name.clone(),
                             input: input.clone(),
                         };
+                    }
+                    ContentBlock::Image { source } => {
+                        yield ModelEvent::ImageBlock { source: source.clone() };
                     }
                     _ => {}
                 }
@@ -335,6 +348,23 @@ pub fn gemini_vision_capabilities() -> ContentCapabilities {
     let mut caps = standard_vision_capabilities();
     caps.input.image.push(ImageMime::Heic);
     caps.input.image.push(ImageMime::Heif);
+    caps
+}
+
+/// Per-model Gemini capabilities. Always carries the Gemini vision
+/// input set; additionally advertises PNG output for the image-
+/// generation variants (`gemini-2.5-flash-image*`,
+/// `gemini-2.0-flash-preview-image-generation`) so the UI knows the
+/// model can return images and the scheduler can populate
+/// `responseModalities` correctly.
+pub fn gemini_capabilities_for(model_id: &str) -> ContentCapabilities {
+    let mut caps = gemini_vision_capabilities();
+    if crate::providers::gemini::model_emits_images(model_id) {
+        // Gemini's image-output models emit PNG (image/png in the
+        // inline_data MIME). They don't currently emit any other
+        // image MIMEs in the `image` modality response.
+        caps.output.image.push(ImageMime::Png);
+    }
     caps
 }
 

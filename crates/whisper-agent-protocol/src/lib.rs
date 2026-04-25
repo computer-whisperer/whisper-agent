@@ -1435,6 +1435,20 @@ pub enum ServerToClient {
         thread_id: String,
         delta: String,
     },
+    /// A model-emitted image attachment on the current assistant turn —
+    /// fired once per `inlineData` part for providers that can return
+    /// native image output (Gemini's `gemini-2.5-flash-image*` family
+    /// today; OpenAI's `image_generation` built-in tool will flow
+    /// through a different path). Bytes arrive whole, not as a stream
+    /// of deltas, so this event is one-shot per image. The persisted
+    /// `ContentBlock::Image` lands in the conversation snapshot via
+    /// `ThreadSnapshot`; this event is the live-update channel so
+    /// connected webuis can render the thumbnail immediately rather
+    /// than waiting on a snapshot rebuild.
+    ThreadAssistantImage {
+        thread_id: String,
+        source: ImageSource,
+    },
     /// Streaming chain-of-thought fragment — Anthropic extended-thinking,
     /// OpenAI Responses `reasoning`, Gemini `thought:true` text. Same
     /// accumulation rule as [`ThreadAssistantTextDelta`] but opens a

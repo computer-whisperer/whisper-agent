@@ -1030,6 +1030,21 @@ async fn consume_stream(
                     },
                 });
             }
+            Ok(ModelEvent::ImageBlock { source }) => {
+                // Live-update channel for model-emitted images.
+                // Persisted state still rides on `ModelEvent::Completed`
+                // — clients receiving this delta render the thumbnail
+                // immediately so the user sees the image as soon as
+                // the wire frame arrives, not after the next snapshot.
+                any_delta_emitted = true;
+                let _ = stream_tx.send(StreamUpdate {
+                    thread_id: thread_id.to_string(),
+                    event: ServerToClient::ThreadAssistantImage {
+                        thread_id: thread_id.to_string(),
+                        source,
+                    },
+                });
+            }
             Ok(ModelEvent::ToolCall { .. }) => {
                 // ToolCall events aren't broadcast as wire deltas — the
                 // thread state machine emits ThreadToolCallBegin when
