@@ -12,14 +12,20 @@
 //! clear them on close. Mirrors the row-renderer convention in
 //! `widgets`.
 
+mod behavior_editor;
 mod fork;
 mod new_behavior;
 mod new_pod;
+mod pod_editor;
+mod provider_editor;
 mod viewers;
 
+pub(super) use behavior_editor::{BehaviorEditorEvent, render_behavior_editor_modal};
 pub(super) use fork::{ForkEvent, render_fork_modal};
 pub(super) use new_behavior::{NewBehaviorEvent, render_new_behavior_modal};
 pub(super) use new_pod::{NewPodEvent, render_new_pod_modal};
+pub(super) use pod_editor::{PodEditorEvent, render_pod_editor_modal};
+pub(super) use provider_editor::{ProviderEditorEvent, render_provider_editor_modal};
 pub(super) use viewers::{
     FileViewerEvent, render_file_viewer_modal, render_image_lightbox_modal,
     render_json_viewer_modal,

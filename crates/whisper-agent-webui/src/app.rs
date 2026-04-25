@@ -17,18 +17,12 @@ mod modals;
 mod widgets;
 
 use self::chat_render::{ChatItemEvent, render_item};
-use self::editor_render::{
-    behavior_summary_from_snapshot, render_behavior_editor_prompt_tab,
-    render_behavior_editor_raw_tab, render_behavior_editor_retention_tab,
-    render_behavior_editor_scope_tab, render_behavior_editor_thread_tab,
-    render_behavior_editor_trigger_tab, render_pod_editor_allow_tab,
-    render_pod_editor_defaults_tab, render_pod_editor_limits_tab, render_pod_editor_raw_tab,
-    render_sandbox_entry_modal,
-};
+use self::editor_render::behavior_summary_from_snapshot;
 use self::modals::{
-    FileViewerEvent, ForkEvent, NewBehaviorEvent, NewPodEvent, render_file_viewer_modal,
-    render_fork_modal, render_image_lightbox_modal, render_json_viewer_modal,
-    render_new_behavior_modal, render_new_pod_modal,
+    BehaviorEditorEvent, FileViewerEvent, ForkEvent, NewBehaviorEvent, NewPodEvent, PodEditorEvent,
+    ProviderEditorEvent, render_behavior_editor_modal, render_file_viewer_modal, render_fork_modal,
+    render_image_lightbox_modal, render_json_viewer_modal, render_new_behavior_modal,
+    render_new_pod_modal, render_pod_editor_modal, render_provider_editor_modal,
 };
 use self::widgets::{
     OAUTH_AVAILABLE, ProviderRowEvent, open_in_new_tab, render_backend_settings_row,
@@ -4707,7 +4701,37 @@ impl eframe::App for ChatApp {
                 }
             }
         }
-        self.render_pod_editor_modal(&ctx);
+        for event in render_pod_editor_modal(
+            &ctx,
+            &mut self.pod_editor_modal,
+            &self.backends,
+            &self.resources,
+            &self.host_env_providers,
+            &self.models_by_backend,
+        ) {
+            match event {
+                PodEditorEvent::RequestModels(backend) => {
+                    self.request_models_for(&backend);
+                }
+                PodEditorEvent::SaveRequested { pod_id, toml_text } => {
+                    let correlation = self.next_correlation_id();
+                    if let Some(modal) = self.pod_editor_modal.as_mut() {
+                        modal.pending_correlation = Some(correlation.clone());
+                    }
+                    self.send(ClientToServer::UpdatePodConfig {
+                        correlation_id: Some(correlation),
+                        pod_id,
+                        toml_text,
+                    });
+                }
+                PodEditorEvent::RefreshRequested { pod_id } => {
+                    self.send(ClientToServer::GetPod {
+                        correlation_id: None,
+                        pod_id,
+                    });
+                }
+            }
+        }
         if let Some(event) =
             render_new_behavior_modal(&ctx, &mut self.new_behavior_modal, &self.behaviors_by_pod)
         {
@@ -4731,7 +4755,37 @@ impl eframe::App for ChatApp {
                 }
             }
         }
-        self.render_behavior_editor_modal(&ctx);
+        for event in render_behavior_editor_modal(
+            &ctx,
+            &mut self.behavior_editor_modal,
+            &self.backends,
+            &self.pod_configs,
+            &self.models_by_backend,
+        ) {
+            match event {
+                BehaviorEditorEvent::RequestModels(backend) => {
+                    self.request_models_for(&backend);
+                }
+                BehaviorEditorEvent::SaveRequested {
+                    pod_id,
+                    behavior_id,
+                    config,
+                    prompt,
+                } => {
+                    let correlation = self.next_correlation_id();
+                    if let Some(modal) = self.behavior_editor_modal.as_mut() {
+                        modal.pending_correlation = Some(correlation.clone());
+                    }
+                    self.send(ClientToServer::UpdateBehavior {
+                        correlation_id: Some(correlation),
+                        pod_id,
+                        behavior_id,
+                        config,
+                        prompt,
+                    });
+                }
+            }
+        }
         self.render_file_tree_modal(&ctx);
         if let Some(event) = render_file_viewer_modal(&ctx, &mut self.file_viewer_modal) {
             match event {
@@ -4754,7 +4808,31 @@ impl eframe::App for ChatApp {
             }
         }
         render_json_viewer_modal(&ctx, &mut self.json_viewer_modal);
-        self.render_provider_editor_modal(&ctx);
+        if let Some(event) = render_provider_editor_modal(&ctx, &mut self.provider_editor_modal) {
+            let correlation = self.next_correlation_id();
+            let wire = match event {
+                ProviderEditorEvent::AddRequested { name, url, token } => {
+                    ClientToServer::AddHostEnvProvider {
+                        correlation_id: Some(correlation.clone()),
+                        name,
+                        url,
+                        token,
+                    }
+                }
+                ProviderEditorEvent::UpdateRequested { name, url, token } => {
+                    ClientToServer::UpdateHostEnvProvider {
+                        correlation_id: Some(correlation.clone()),
+                        name,
+                        url,
+                        token,
+                    }
+                }
+            };
+            if let Some(modal) = self.provider_editor_modal.as_mut() {
+                modal.pending_correlation = Some(correlation);
+            }
+            self.send(wire);
+        }
         self.render_settings_modal(&ctx);
         render_image_lightbox_modal(&ctx);
 
@@ -6735,684 +6813,6 @@ impl ChatApp {
             let _ = sub;
         } else {
             modal.shared_mcp_editor = Some(sub);
-        }
-    }
-
-    /// Add / edit provider modal. Dispatches `AddHostEnvProvider` or
-    /// `UpdateHostEnvProvider` on Save, tracks the correlation so the
-    /// matching response / error routes back here.
-    fn render_provider_editor_modal(&mut self, ctx: &egui::Context) {
-        let Some(mut modal) = self.provider_editor_modal.take() else {
-            return;
-        };
-        let mut open = true;
-        let mut save_clicked = false;
-        let mut cancel_clicked = false;
-        let saving = modal.pending_correlation.is_some();
-        let title = match modal.mode {
-            ProviderEditorMode::Add => "Add host-env provider",
-            ProviderEditorMode::Edit => "Edit host-env provider",
-        };
-
-        egui::Window::new(title)
-            .collapsible(false)
-            .resizable(false)
-            .default_width(460.0)
-            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-            .open(&mut open)
-            .show(ctx, |ui| {
-                ui.add_space(4.0);
-                ui.horizontal(|ui| {
-                    ui.label("name");
-                    let name_edit = TextEdit::singleline(&mut modal.name)
-                        .hint_text("catalog name (e.g. 'landlock-laptop')")
-                        .desired_width(f32::INFINITY);
-                    // Edit mode: name is immutable — pod bindings
-                    // reference providers by name, so renaming would
-                    // dangle them. Rebuild by removing and re-adding
-                    // if truly needed.
-                    let editable = modal.mode == ProviderEditorMode::Add;
-                    ui.add_enabled(editable, name_edit);
-                });
-                if modal.mode == ProviderEditorMode::Edit {
-                    ui.label(
-                        RichText::new(
-                            "Name is fixed once set — pod bindings reference it. \
-                             Remove + re-add to rename.",
-                        )
-                        .small()
-                        .color(Color32::from_gray(150)),
-                    );
-                }
-                ui.add_space(6.0);
-                ui.horizontal(|ui| {
-                    ui.label("url");
-                    ui.add(
-                        TextEdit::singleline(&mut modal.url)
-                            .hint_text("http://host:port")
-                            .desired_width(f32::INFINITY),
-                    );
-                });
-                ui.add_space(6.0);
-                ui.horizontal(|ui| {
-                    ui.label("token");
-                    ui.add(
-                        TextEdit::singleline(&mut modal.token)
-                            .password(true)
-                            .hint_text(if modal.had_token {
-                                "leave blank to clear existing token"
-                            } else {
-                                "control-plane bearer (optional)"
-                            })
-                            .desired_width(f32::INFINITY),
-                    );
-                });
-                ui.label(
-                    RichText::new(
-                        "The token must match the daemon's --control-token-file \
-                         (or leave blank for a --no-auth dev daemon).",
-                    )
-                    .small()
-                    .color(Color32::from_gray(150)),
-                );
-                if let Some(err) = &modal.error {
-                    ui.add_space(6.0);
-                    ui.colored_label(Color32::from_rgb(220, 80, 80), err);
-                }
-                ui.add_space(8.0);
-                ui.separator();
-                ui.horizontal(|ui| {
-                    let save_enabled =
-                        !saving && !modal.name.trim().is_empty() && !modal.url.trim().is_empty();
-                    let label = if saving { "Saving…" } else { "Save" };
-                    if ui
-                        .add_enabled(save_enabled, egui::Button::new(label))
-                        .clicked()
-                    {
-                        save_clicked = true;
-                    }
-                    if ui.button("Cancel").clicked() {
-                        cancel_clicked = true;
-                    }
-                });
-            });
-
-        if save_clicked {
-            modal.error = None;
-            let correlation = self.next_correlation_id();
-            modal.pending_correlation = Some(correlation.clone());
-            let name = modal.name.trim().to_string();
-            let url = modal.url.trim().to_string();
-            let token_raw = modal.token.trim().to_string();
-            let token = if token_raw.is_empty() {
-                None
-            } else {
-                Some(token_raw)
-            };
-            match modal.mode {
-                ProviderEditorMode::Add => {
-                    self.send(ClientToServer::AddHostEnvProvider {
-                        correlation_id: Some(correlation),
-                        name,
-                        url,
-                        token,
-                    });
-                }
-                ProviderEditorMode::Edit => {
-                    self.send(ClientToServer::UpdateHostEnvProvider {
-                        correlation_id: Some(correlation),
-                        name,
-                        url,
-                        token,
-                    });
-                }
-            }
-            // Keep the modal open; it closes on the matching response
-            // (HostEnvProviderAdded / HostEnvProviderUpdated) or shows
-            // the server's error via the Error event handler.
-            self.provider_editor_modal = Some(modal);
-        } else if cancel_clicked || !open {
-            // Modal closes.
-        } else {
-            self.provider_editor_modal = Some(modal);
-        }
-    }
-
-    fn render_pod_editor_modal(&mut self, ctx: &egui::Context) {
-        let Some(mut modal) = self.pod_editor_modal.take() else {
-            return;
-        };
-
-        // Snapshot the catalogs the form needs into owned data so the
-        // inner closures don't have to borrow `self`. These are small
-        // (single-digit lists in practice) so the clone is cheap.
-        let backend_catalog: Vec<String> = self.backends.iter().map(|b| b.name.clone()).collect();
-        let shared_mcp_catalog: Vec<String> = self
-            .resources
-            .values()
-            .filter_map(|r| match r {
-                ResourceSnapshot::McpHost {
-                    label,
-                    per_task: false,
-                    ..
-                } => Some(label.clone()),
-                _ => None,
-            })
-            .collect();
-        let host_env_providers: Vec<HostEnvProviderInfo> = self.host_env_providers.clone();
-        // Snapshot model lists so the Defaults tab's model combo can
-        // render without borrowing `self`. Dedup-guarded fetches for
-        // the currently-selected backend fire every frame — egui
-        // repaints rapidly, and `request_models_for` short-circuits
-        // on the second visit.
-        if let Some(w) = modal.working.as_ref()
-            && !w.thread_defaults.backend.is_empty()
-        {
-            let b = w.thread_defaults.backend.clone();
-            self.request_models_for(&b);
-        }
-        let models_by_backend = self.models_by_backend.clone();
-
-        let mut open = true;
-        let mut save_clicked = false;
-        let mut cancel_clicked = false;
-        let mut revert_clicked = false;
-        let mut switch_to: Option<PodEditorTab> = None;
-        let mut sandbox_entry_open: Option<SandboxEntryEditorState> = None;
-        let mut sandbox_entry_delete: Option<usize> = None;
-
-        let title = format!("Edit pod — {}", modal.pod_id);
-        let screen = ctx.content_rect();
-        let max_h = (screen.height() - 60.0).max(280.0);
-        let max_w = (screen.width() - 60.0).max(420.0);
-        let dirty = modal.is_dirty();
-        let saving = modal.pending_correlation.is_some();
-        let sub_modal_open = modal.sandbox_entry_editor.is_some();
-
-        egui::Window::new(title)
-            .collapsible(false)
-            .resizable(true)
-            .default_width(720.0_f32.min(max_w))
-            .default_height(560.0_f32.min(max_h))
-            .max_width(max_w)
-            .max_height(max_h)
-            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-            .open(&mut open)
-            .show(ctx, |ui| {
-                // Disable the parent while the per-sandbox sub-modal is
-                // up so clicks on the parent don't interleave with the
-                // sub-modal's edits.
-                ui.add_enabled_ui(!sub_modal_open, |ui| {
-                    egui::Panel::bottom("pod_editor_footer").show_inside(ui, |ui| {
-                        let actions = crate::editor::render_footer(
-                            ui,
-                            modal.error.as_deref(),
-                            modal.working.is_some(),
-                            dirty,
-                            saving,
-                        );
-                        save_clicked = actions.save;
-                        revert_clicked = actions.revert;
-                        cancel_clicked = actions.close;
-                    });
-                    egui::Panel::top("pod_editor_tabs").show_inside(ui, |ui| {
-                        ui.add_space(4.0);
-                        ui.horizontal(|ui| {
-                            for tab in [
-                                PodEditorTab::Allow,
-                                PodEditorTab::Defaults,
-                                PodEditorTab::Limits,
-                                PodEditorTab::RawToml,
-                            ] {
-                                let active = modal.tab == tab;
-                                let label = if active {
-                                    RichText::new(tab.label()).strong()
-                                } else {
-                                    RichText::new(tab.label()).color(Color32::from_gray(170))
-                                };
-                                if ui.selectable_label(active, label).clicked() && !active {
-                                    switch_to = Some(tab);
-                                }
-                            }
-                        });
-                        ui.add_space(2.0);
-                        ui.separator();
-                    });
-                    egui::CentralPanel::default().show_inside(ui, |ui| {
-                        let Some(working) = modal.working.as_mut() else {
-                            ui.add_space(24.0);
-                            ui.label(
-                                RichText::new("loading pod config…")
-                                    .italics()
-                                    .color(Color32::from_gray(160)),
-                            );
-                            return;
-                        };
-                        egui::ScrollArea::vertical()
-                            .auto_shrink([false, false])
-                            .show(ui, |ui| match modal.tab {
-                                PodEditorTab::Allow => {
-                                    render_pod_editor_allow_tab(
-                                        ui,
-                                        working,
-                                        &backend_catalog,
-                                        &shared_mcp_catalog,
-                                        &host_env_providers,
-                                        &mut sandbox_entry_open,
-                                        &mut sandbox_entry_delete,
-                                    );
-                                }
-                                PodEditorTab::Defaults => {
-                                    render_pod_editor_defaults_tab(
-                                        ui,
-                                        working,
-                                        &backend_catalog,
-                                        &models_by_backend,
-                                    );
-                                }
-                                PodEditorTab::Limits => {
-                                    render_pod_editor_limits_tab(ui, working);
-                                }
-                                PodEditorTab::RawToml => {
-                                    render_pod_editor_raw_tab(
-                                        ui,
-                                        &mut modal.raw_buffer,
-                                        &mut modal.raw_dirty,
-                                    );
-                                }
-                            });
-                    });
-                });
-            });
-
-        // Sub-modal: per-sandbox-entry editor. Rendered after the parent
-        // so it's drawn above. The parent above is wrapped in an
-        // `add_enabled_ui(!sub_modal_open, ...)` so clicks pass through
-        // visually but don't interact while this is up.
-        if let Some(mut sub) = modal.sandbox_entry_editor.take() {
-            let mut sub_open = true;
-            let mut sub_save = false;
-            let mut sub_cancel = false;
-            render_sandbox_entry_modal(
-                ctx,
-                &mut sub,
-                &mut sub_open,
-                &mut sub_save,
-                &mut sub_cancel,
-                &self.host_env_providers,
-            );
-            if sub_save {
-                if sub.entry.name.trim().is_empty() {
-                    sub.error = Some("name is required".into());
-                    modal.sandbox_entry_editor = Some(sub);
-                } else if sub.entry.provider.trim().is_empty() {
-                    sub.error = Some("provider is required".into());
-                    modal.sandbox_entry_editor = Some(sub);
-                } else if let Some(working) = modal.working.as_mut() {
-                    let name = sub.entry.name.trim().to_string();
-                    // Reject duplicate names within the same allow.host_env table.
-                    let dup = working
-                        .allow
-                        .host_env
-                        .iter()
-                        .enumerate()
-                        .any(|(i, e)| e.name == name && Some(i) != sub.index);
-                    if dup {
-                        sub.error = Some(format!("a host env named `{name}` already exists"));
-                        modal.sandbox_entry_editor = Some(sub);
-                    } else {
-                        sub.entry.name = name.clone();
-                        match sub.index {
-                            Some(i) if i < working.allow.host_env.len() => {
-                                working.allow.host_env[i] = sub.entry;
-                            }
-                            _ => working.allow.host_env.push(sub.entry),
-                        }
-                        // Auto-pick the default for thread_defaults if
-                        // it's still empty — otherwise the server's
-                        // tightened validation rejects the save and the
-                        // user gets a confusing inline error before
-                        // they've even visited the Defaults tab.
-                        if working.thread_defaults.host_env.is_empty() {
-                            working.thread_defaults.host_env = vec![name];
-                        }
-                        modal.raw_dirty = false;
-                    }
-                }
-            } else if sub_cancel || !sub_open {
-                // Sub-modal closes.
-            } else {
-                modal.sandbox_entry_editor = Some(sub);
-            }
-        }
-        if let Some(idx) = sandbox_entry_delete
-            && let Some(working) = modal.working.as_mut()
-            && idx < working.allow.host_env.len()
-        {
-            // Also fix up thread_defaults.host_env: if it pointed at
-            // the deleted entry, pick the first remaining one (or
-            // empty when the allow list is now empty — the defaults
-            // picker renders a read-only "(shared MCPs only)" in
-            // that case). Leaves the form valid by construction
-            // instead of relying on a server-side error to surface
-            // a dangling reference.
-            let removed = working.allow.host_env.remove(idx);
-            // Drop the deleted entry from thread_defaults.host_env
-            // (list-shape, may contain zero or more names). If that
-            // empties the list and other allow entries remain, reseed
-            // with the first surviving one so the form stays valid by
-            // construction — mirrors the old single-value behavior.
-            working
-                .thread_defaults
-                .host_env
-                .retain(|n| n != &removed.name);
-            if working.thread_defaults.host_env.is_empty()
-                && let Some(fallback) = working.allow.host_env.first()
-            {
-                working.thread_defaults.host_env = vec![fallback.name.clone()];
-            }
-        }
-        if let Some(sub) = sandbox_entry_open {
-            modal.sandbox_entry_editor = Some(sub);
-        }
-
-        // Tab switch happens after the inner closure so we can do the
-        // raw->structured reparse without holding any UI borrows.
-        if let Some(target) = switch_to {
-            let leaving_raw = modal.tab == PodEditorTab::RawToml && target != PodEditorTab::RawToml;
-            let entering_raw = target == PodEditorTab::RawToml;
-            match crate::editor::sync_on_tab_switch::<PodConfig>(
-                leaving_raw,
-                entering_raw,
-                &mut modal.working,
-                &mut modal.raw_buffer,
-                &mut modal.raw_dirty,
-            ) {
-                Ok(()) => {
-                    modal.tab = target;
-                    modal.error = None;
-                }
-                Err(msg) => modal.error = Some(msg),
-            }
-        }
-
-        if save_clicked && let Some(working) = &modal.working {
-            let toml_text = if modal.tab == PodEditorTab::RawToml && modal.raw_dirty {
-                modal.raw_buffer.clone()
-            } else {
-                match toml::to_string_pretty(working) {
-                    Ok(s) => s,
-                    Err(e) => {
-                        modal.error = Some(format!("encode pod.toml: {e}"));
-                        self.pod_editor_modal = Some(modal);
-                        return;
-                    }
-                }
-            };
-            let correlation = self.next_correlation_id();
-            modal.pending_correlation = Some(correlation.clone());
-            modal.error = None;
-            self.send(ClientToServer::UpdatePodConfig {
-                correlation_id: Some(correlation),
-                pod_id: modal.pod_id.clone(),
-                toml_text,
-            });
-            self.pod_editor_modal = Some(modal);
-        } else if revert_clicked {
-            if let Some(baseline) = &modal.server_baseline {
-                modal.working = Some(baseline.clone());
-                modal.raw_buffer = toml::to_string_pretty(baseline).unwrap_or_default();
-                modal.raw_dirty = false;
-                modal.error = None;
-                modal.pending_correlation = None;
-            } else {
-                self.send(ClientToServer::GetPod {
-                    correlation_id: None,
-                    pod_id: modal.pod_id.clone(),
-                });
-                modal.working = None;
-                modal.error = None;
-                modal.pending_correlation = None;
-            }
-            self.pod_editor_modal = Some(modal);
-        } else if cancel_clicked || !open {
-            // Modal closes (drop modal).
-        } else {
-            self.pod_editor_modal = Some(modal);
-        }
-    }
-
-    /// Per-behavior editor modal. Structured tabs edit a working
-    /// `BehaviorConfig` + prompt; Raw TOML is the escape hatch for the
-    /// config (prompt has its own tab, not raw-TOML-editable). Save
-    /// ships both through `UpdateBehavior`.
-    fn render_behavior_editor_modal(&mut self, ctx: &egui::Context) {
-        let Some(mut modal) = self.behavior_editor_modal.take() else {
-            return;
-        };
-        let backend_catalog: Vec<String> = self.backends.iter().map(|b| b.name.clone()).collect();
-        let pod_backend_names: Vec<String> = self
-            .pod_configs
-            .get(&modal.pod_id)
-            .map(|cfg| cfg.allow.backends.clone())
-            .unwrap_or_default();
-        let pod_host_env_names: Vec<String> = self
-            .pod_configs
-            .get(&modal.pod_id)
-            .map(|cfg| cfg.allow.host_env.iter().map(|h| h.name.clone()).collect())
-            .unwrap_or_default();
-        let pod_mcp_host_names: Vec<String> = self
-            .pod_configs
-            .get(&modal.pod_id)
-            .map(|cfg| cfg.allow.mcp_hosts.clone())
-            .unwrap_or_default();
-        // Pod's default backend — used as the "effective" backend when
-        // the behavior doesn't override `bindings.backend`. The model
-        // combo reads it to decide which catalog entry's model list to
-        // show. Empty when the pod config hasn't landed yet; in that
-        // case the combo renders a "(pick a backend first)" hint.
-        let pod_default_backend: String = self
-            .pod_configs
-            .get(&modal.pod_id)
-            .map(|cfg| cfg.thread_defaults.backend.clone())
-            .unwrap_or_default();
-        // Fire ListModels for whichever backend the model combo is
-        // about to show against. Dedup-guarded, so running every frame
-        // costs a HashSet lookup after the first fetch.
-        let effective_backend_for_models = modal
-            .working_config
-            .as_ref()
-            .and_then(|c| c.thread.bindings.backend.clone())
-            .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| pod_default_backend.clone());
-        if !effective_backend_for_models.is_empty() {
-            self.request_models_for(&effective_backend_for_models);
-        }
-        let models_by_backend = self.models_by_backend.clone();
-
-        let mut save_clicked = false;
-        let mut revert_clicked = false;
-        let mut close_clicked = false;
-        let mut switch_to: Option<BehaviorEditorTab> = None;
-        let mut open = true;
-
-        let title = format!("Edit behavior — {}/{}", modal.pod_id, modal.behavior_id);
-        let screen = ctx.content_rect();
-        let max_h = (screen.height() - 60.0).max(280.0);
-        let max_w = (screen.width() - 60.0).max(420.0);
-        let dirty = modal.is_dirty();
-        let saving = modal.pending_correlation.is_some();
-        let has_data = modal.working_config.is_some();
-
-        egui::Window::new(title)
-            .collapsible(false)
-            .resizable(true)
-            .default_width(720.0_f32.min(max_w))
-            .default_height(560.0_f32.min(max_h))
-            .max_width(max_w)
-            .max_height(max_h)
-            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-            .open(&mut open)
-            .show(ctx, |ui| {
-                egui::Panel::bottom("behavior_editor_footer").show_inside(ui, |ui| {
-                    let actions = crate::editor::render_footer(
-                        ui,
-                        modal.error.as_deref(),
-                        has_data,
-                        dirty,
-                        saving,
-                    );
-                    save_clicked = actions.save;
-                    revert_clicked = actions.revert;
-                    close_clicked = actions.close;
-                });
-                egui::Panel::top("behavior_editor_tabs").show_inside(ui, |ui| {
-                    ui.add_space(4.0);
-                    ui.horizontal(|ui| {
-                        for tab in [
-                            BehaviorEditorTab::Trigger,
-                            BehaviorEditorTab::Thread,
-                            BehaviorEditorTab::Scope,
-                            BehaviorEditorTab::Retention,
-                            BehaviorEditorTab::Prompt,
-                            BehaviorEditorTab::RawToml,
-                        ] {
-                            let active = modal.tab == tab;
-                            let label = if active {
-                                RichText::new(tab.label()).strong()
-                            } else {
-                                RichText::new(tab.label()).color(Color32::from_gray(170))
-                            };
-                            if ui.selectable_label(active, label).clicked() && !active {
-                                switch_to = Some(tab);
-                            }
-                        }
-                    });
-                    ui.add_space(2.0);
-                    ui.separator();
-                });
-                egui::CentralPanel::default().show_inside(ui, |ui| {
-                    if modal.working_config.is_none() && modal.error.is_none() {
-                        ui.add_space(24.0);
-                        ui.label(
-                            RichText::new("loading behavior…")
-                                .italics()
-                                .color(Color32::from_gray(160)),
-                        );
-                        return;
-                    }
-                    egui::ScrollArea::vertical()
-                        .auto_shrink([false, false])
-                        .show(ui, |ui| match modal.tab {
-                            BehaviorEditorTab::Trigger => {
-                                if let Some(cfg) = modal.working_config.as_mut() {
-                                    render_behavior_editor_trigger_tab(ui, cfg);
-                                }
-                            }
-                            BehaviorEditorTab::Thread => {
-                                if let Some(cfg) = modal.working_config.as_mut() {
-                                    render_behavior_editor_thread_tab(
-                                        ui,
-                                        cfg,
-                                        &backend_catalog,
-                                        &pod_host_env_names,
-                                        &pod_mcp_host_names,
-                                        &models_by_backend,
-                                        &pod_default_backend,
-                                    );
-                                }
-                            }
-                            BehaviorEditorTab::Scope => {
-                                if let Some(cfg) = modal.working_config.as_mut() {
-                                    render_behavior_editor_scope_tab(
-                                        ui,
-                                        cfg,
-                                        &pod_backend_names,
-                                        &pod_host_env_names,
-                                        &pod_mcp_host_names,
-                                    );
-                                }
-                            }
-                            BehaviorEditorTab::Retention => {
-                                if let Some(cfg) = modal.working_config.as_mut() {
-                                    render_behavior_editor_retention_tab(ui, cfg);
-                                }
-                            }
-                            BehaviorEditorTab::Prompt => {
-                                render_behavior_editor_prompt_tab(ui, &mut modal.working_prompt);
-                            }
-                            BehaviorEditorTab::RawToml => {
-                                render_behavior_editor_raw_tab(
-                                    ui,
-                                    &mut modal.raw_buffer,
-                                    &mut modal.raw_dirty,
-                                );
-                            }
-                        });
-                });
-            });
-
-        // Tab switch (post-show so no UI borrow).
-        if let Some(target) = switch_to {
-            let leaving_raw =
-                modal.tab == BehaviorEditorTab::RawToml && target != BehaviorEditorTab::RawToml;
-            let entering_raw = target == BehaviorEditorTab::RawToml;
-            match crate::editor::sync_on_tab_switch::<BehaviorConfig>(
-                leaving_raw,
-                entering_raw,
-                &mut modal.working_config,
-                &mut modal.raw_buffer,
-                &mut modal.raw_dirty,
-            ) {
-                Ok(()) => {
-                    modal.tab = target;
-                    modal.error = None;
-                }
-                Err(msg) => modal.error = Some(msg),
-            }
-        }
-
-        if save_clicked && let Some(working) = &modal.working_config {
-            // If the raw tab has pending edits, reparse it and use
-            // that; otherwise serialize from working. Matches the pod
-            // editor's precedence.
-            let config = if modal.tab == BehaviorEditorTab::RawToml && modal.raw_dirty {
-                match toml::from_str::<BehaviorConfig>(&modal.raw_buffer) {
-                    Ok(c) => c,
-                    Err(e) => {
-                        modal.error = Some(format!("raw TOML doesn't parse: {e}"));
-                        self.behavior_editor_modal = Some(modal);
-                        return;
-                    }
-                }
-            } else {
-                working.clone()
-            };
-            let correlation = self.next_correlation_id();
-            modal.pending_correlation = Some(correlation.clone());
-            modal.error = None;
-            self.send(ClientToServer::UpdateBehavior {
-                correlation_id: Some(correlation),
-                pod_id: modal.pod_id.clone(),
-                behavior_id: modal.behavior_id.clone(),
-                config,
-                prompt: modal.working_prompt.clone(),
-            });
-            self.behavior_editor_modal = Some(modal);
-        } else if revert_clicked {
-            if let Some(baseline) = &modal.baseline_config {
-                modal.working_config = Some(baseline.clone());
-                modal.raw_buffer = toml::to_string_pretty(baseline).unwrap_or_default();
-                modal.raw_dirty = false;
-            }
-            modal.working_prompt = modal.baseline_prompt.clone();
-            modal.error = None;
-            modal.pending_correlation = None;
-            self.behavior_editor_modal = Some(modal);
-        } else if close_clicked || !open {
-            // Modal closes.
-        } else {
-            self.behavior_editor_modal = Some(modal);
         }
     }
 
