@@ -1,13 +1,11 @@
 //! [`DiskBucket`] — disk-backed implementation of the [`Bucket`] trait.
 //!
 //! Owns a bucket directory on disk plus the loaded state for the active
-//! slot (if any). Slice 5 wires up the dense (HNSW) path: vectors get
-//! indexed at build time and the in-memory HNSW serves
-//! [`Bucket::dense_search`]. The HNSW is rebuilt from `vectors.bin` on
-//! slot load (no on-disk graph format yet); see
-//! [`crate::knowledge::DenseIndex`] for the serialize-later TODO. Sparse
-//! search still empty pending tantivy (slice 6); mutation methods still
-//! error pending the same.
+//! slot (if any). Slice 6 lights up the sparse (BM25 via tantivy) path
+//! alongside the dense (HNSW) path from slice 5. Both indexes are built
+//! during `build_slot` and opened on slot load; both `dense_search` and
+//! `sparse_search` produce real candidates. Mutation methods still
+//! error pending the slot-mutation primitives slice.
 //!
 //! Concurrency model: queries take an [`Arc`]-shared snapshot of the
 //! active slot's [`LoadedSlot`] from the bucket's [`RwLock`]. Slot
@@ -29,9 +27,12 @@ use super::chunker::Chunker;
 use super::chunks::{ChunkStoreReader, ChunkStoreWriter};
 use super::config::{BucketConfig, ChunkerConfig};
 use super::dense::{DenseIndex, HnswParams};
-use super::manifest::{EmbedderSnapshot, ServingSnapshot, SlotManifest, SlotState, SlotStats};
+use super::manifest::{
+    EmbedderSnapshot, ServingSnapshot, SlotManifest, SlotState, SlotStats, SparseSnapshot,
+};
 use super::slot;
 use super::source::SourceAdapter;
+use super::sparse::{SparseIndex, SparseIndexBuilder};
 use super::types::{
     BucketError, BucketId, BucketStatus, Candidate, Chunk, ChunkId, NewChunk, SearchPath, SlotId,
 };
@@ -58,15 +59,17 @@ pub struct DiskBucket {
 }
 
 /// Loaded state for a single slot — everything a query needs to hit the
-/// active slot without going back to disk for index metadata. Slice 5
-/// adds the [`DenseIndex`] to the manifest+chunks+vectors trio from
-/// slice 4; the sparse (tantivy) index handle lands in slice 6.
+/// active slot without going back to disk for index metadata. Slice 6
+/// rounds out the dense+sparse pair: chunks + vectors + dense (HNSW) +
+/// sparse (tantivy). `sparse` is `None` when the bucket has the sparse
+/// path disabled or the slot was built before the sparse path landed.
 #[derive(Debug)]
 struct LoadedSlot {
     manifest: SlotManifest,
     chunks: ChunkStoreReader,
     vectors: VectorStoreReader,
     dense: DenseIndex,
+    sparse: Option<SparseIndex>,
 }
 
 impl DiskBucket {
@@ -114,6 +117,17 @@ impl DiskBucket {
         let slot_path = slot::slot_dir(&self.root, &slot_id);
         fs::create_dir_all(&slot_path).map_err(BucketError::Io)?;
 
+        // Sparse path enabled? Recorded in the manifest so slot load
+        // can skip opening the tantivy directory when it doesn't exist.
+        let sparse_enabled = self.config.search_paths.sparse.enabled;
+        let sparse_snapshot = if sparse_enabled {
+            Some(SparseSnapshot {
+                tokenizer: self.config.search_paths.sparse.tokenizer.clone(),
+            })
+        } else {
+            None
+        };
+
         // Initial manifest with state=Building. Persisted before any
         // heavy work so a crash mid-build leaves a slot directory we
         // can identify and clean up on next open.
@@ -126,7 +140,7 @@ impl DiskBucket {
             build_completed_at: None,
             chunker_snapshot: chunker_snapshot_from_config(&self.config.chunker),
             embedder: embedder_snapshot.clone(),
-            sparse: None, // sparse path comes online in slice 6
+            sparse: sparse_snapshot,
             serving: ServingSnapshot {
                 mode: self.config.defaults.serving_mode,
                 quantization: self.config.defaults.quantization,
@@ -141,17 +155,23 @@ impl DiskBucket {
         let chunks_idx = slot::chunks_idx_path(&slot_path);
         let vectors_bin = slot::vectors_bin_path(&slot_path);
         let vectors_idx = slot::vectors_idx_path(&slot_path);
+        let tantivy_dir = slot::tantivy_dir(&slot_path);
 
         let mut chunk_writer =
             ChunkStoreWriter::create(&chunks_bin, &chunks_idx).map_err(BucketError::Io)?;
         let mut vector_writer =
             VectorStoreWriter::create(&vectors_bin, &vectors_idx, embedder_snapshot.dimension)
                 .map_err(BucketError::Io)?;
+        let mut sparse_builder = if sparse_enabled {
+            Some(SparseIndexBuilder::create(&tantivy_dir)?)
+        } else {
+            None
+        };
 
-        // Streaming pipeline: source → chunker → batched embed → both
-        // writers. We batch chunks (not records) because record sizes
-        // vary; batching at the chunk level keeps embed calls
-        // predictable.
+        // Streaming pipeline: source → chunker → batched embed → all
+        // three writers (chunks, vectors, tantivy). We batch chunks (not
+        // records) because record sizes vary; batching at the chunk
+        // level keeps embed calls predictable.
         let mut pending: Vec<NewChunk> = Vec::with_capacity(EMBED_BATCH_SIZE);
         let mut source_records: u64 = 0;
 
@@ -169,6 +189,7 @@ impl DiskBucket {
                         &mut pending,
                         &mut chunk_writer,
                         &mut vector_writer,
+                        sparse_builder.as_mut(),
                         embedder.as_ref(),
                         cancel,
                     )
@@ -183,6 +204,7 @@ impl DiskBucket {
                 &mut pending,
                 &mut chunk_writer,
                 &mut vector_writer,
+                sparse_builder.as_mut(),
                 embedder.as_ref(),
                 cancel,
             )
@@ -199,6 +221,14 @@ impl DiskBucket {
                 "chunk/vector count mismatch: {chunk_count} chunks, {vector_count} vectors",
             )));
         }
+        if let Some(builder) = sparse_builder.take() {
+            let sparse_count = builder.finalize()? as u64;
+            if sparse_count != chunk_count {
+                return Err(BucketError::Other(format!(
+                    "chunk/sparse count mismatch: {chunk_count} chunks, {sparse_count} tantivy docs",
+                )));
+            }
+        }
 
         // Open readers for the new slot before we promote — promotion
         // should never make a slot active that we can't immediately
@@ -211,6 +241,13 @@ impl DiskBucket {
         // in-memory only; rebuild on slot load is fine at the scales we
         // serve in slices 5–6.
         let dense = DenseIndex::build(&vectors, HnswParams::default())?;
+
+        // Open the sparse index reader if we built one.
+        let sparse = if sparse_enabled {
+            Some(SparseIndex::open(&tantivy_dir)?)
+        } else {
+            None
+        };
 
         // Update manifest with final stats and promote to ready.
         manifest.state = SlotState::Ready;
@@ -226,6 +263,7 @@ impl DiskBucket {
             chunks,
             vectors,
             dense,
+            sparse,
         });
 
         // Atomic active-pointer flip; then swap the loaded state under
@@ -340,12 +378,43 @@ impl Bucket for DiskBucket {
 
     fn sparse_search<'a>(
         &'a self,
-        _query_text: &'a str,
-        _top_k: usize,
+        query_text: &'a str,
+        top_k: usize,
         _cancel: &'a CancellationToken,
     ) -> BoxFuture<'a, Result<Vec<Candidate>, BucketError>> {
-        // Sparse path comes online in slice 6 (tantivy).
-        Box::pin(async move { Ok(Vec::new()) })
+        Box::pin(async move {
+            let Some(active) = self.active_snapshot() else {
+                return Ok(Vec::new());
+            };
+            let Some(sparse) = active.sparse.as_ref() else {
+                // Sparse path disabled for this bucket — empty
+                // candidate list rather than an error, per the
+                // trait contract.
+                return Ok(Vec::new());
+            };
+
+            let hits = sparse.search(query_text, top_k)?;
+            let mut out = Vec::with_capacity(hits.len());
+            for (chunk_id, score) in hits {
+                let chunk = active
+                    .chunks
+                    .fetch(chunk_id)
+                    .map_err(BucketError::Io)?
+                    .ok_or_else(|| {
+                        BucketError::Other(format!(
+                            "sparse hit {chunk_id} missing from chunks store",
+                        ))
+                    })?;
+                out.push(Candidate {
+                    bucket_id: self.id.clone(),
+                    chunk_id,
+                    chunk_text: chunk.text,
+                    source_score: score,
+                    path: SearchPath::Sparse,
+                });
+            }
+            Ok(out)
+        })
     }
 
     fn fetch_chunk<'a>(&'a self, chunk_id: ChunkId) -> BoxFuture<'a, Result<Chunk, BucketError>> {
@@ -400,6 +469,7 @@ async fn flush_batch(
     pending: &mut Vec<NewChunk>,
     chunks: &mut ChunkStoreWriter,
     vectors: &mut VectorStoreWriter,
+    sparse: Option<&mut SparseIndexBuilder>,
     embedder: &dyn EmbeddingProvider,
     cancel: &CancellationToken,
 ) -> Result<(), BucketError> {
@@ -424,12 +494,16 @@ async fn flush_batch(
         )));
     }
 
+    let mut sparse = sparse;
     for (chunk, vector) in pending.iter().zip(resp.embeddings.iter()) {
         let chunk_id = ChunkId::from_source(&chunk.source_record_hash, chunk.chunk_offset);
         chunks
             .append(chunk_id, &chunk.source_ref, &chunk.text)
             .map_err(BucketError::Io)?;
         vectors.append(chunk_id, vector).map_err(BucketError::Io)?;
+        if let Some(builder) = sparse.as_deref_mut() {
+            builder.add(chunk_id, &chunk.text)?;
+        }
     }
     pending.clear();
     Ok(())
@@ -504,11 +578,21 @@ fn load_slot(bucket_root: &Path, slot_id: &str) -> Result<LoadedSlot, BucketErro
     // scale forces the issue.
     let dense = DenseIndex::build(&vectors, HnswParams::default())?;
 
+    // Sparse index — open if the slot manifest says it has one.
+    // Tantivy persistence is segment-based, so this is a real on-disk
+    // open (no rebuild equivalent needed; tantivy reload is fast).
+    let sparse = if manifest.sparse.is_some() {
+        Some(SparseIndex::open(&slot::tantivy_dir(&slot_path))?)
+    } else {
+        None
+    };
+
     Ok(LoadedSlot {
         manifest,
         chunks,
         vectors,
         dense,
+        sparse,
     })
 }
 
@@ -944,14 +1028,95 @@ embedder = "tei_test"
     }
 
     #[tokio::test]
-    async fn sparse_search_still_empty_pending_tantivy() {
+    async fn sparse_search_returns_bm25_hits() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("notes");
+        fs::create_dir_all(&source).unwrap();
+        write_md(
+            &source,
+            "alpha.md",
+            "the quick brown fox jumps over the lazy dog",
+        );
+        write_md(&source, "beta.md", "lorem ipsum dolor sit amet consectetur");
+        write_md(
+            &source,
+            "gamma.md",
+            "the rain in spain falls mainly on the plain",
+        );
+
+        let bucket_root = tmp.path().join("bucket");
+        let bucket = open_test_bucket(&bucket_root, &source);
+        let adapter = MarkdownDir::new(&source);
+        let chunker = TokenBasedChunker::from_config(&bucket.config().chunker);
+        let embedder: Arc<dyn EmbeddingProvider> = Arc::new(MockEmbedder::new(8));
+        let cancel = CancellationToken::new();
+        bucket
+            .build_slot(&adapter, &chunker, embedder, &cancel)
+            .await
+            .unwrap();
+
+        let results = bucket.sparse_search("fox", 5, &cancel).await.unwrap();
+        assert_eq!(results.len(), 1);
+        assert!(results[0].chunk_text.contains("fox"));
+        assert_eq!(results[0].path, SearchPath::Sparse);
+        assert_eq!(results[0].bucket_id, *bucket.id());
+        assert!(results[0].source_score > 0.0);
+    }
+
+    #[tokio::test]
+    async fn sparse_search_with_no_active_slot_returns_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("notes");
+        fs::create_dir_all(&source).unwrap();
+
+        let bucket_root = tmp.path().join("bucket");
+        let bucket = open_test_bucket(&bucket_root, &source);
+        let cancel = CancellationToken::new();
+        let results = bucket.sparse_search("anything", 5, &cancel).await.unwrap();
+        assert!(results.is_empty());
+    }
+
+    #[tokio::test]
+    async fn sparse_search_returns_empty_when_disabled() {
         let tmp = tempfile::tempdir().unwrap();
         let source = tmp.path().join("notes");
         fs::create_dir_all(&source).unwrap();
         write_md(&source, "doc.md", "hello world");
 
         let bucket_root = tmp.path().join("bucket");
-        let bucket = open_test_bucket(&bucket_root, &source);
+        // Bucket config with sparse disabled.
+        fs::create_dir_all(&bucket_root).unwrap();
+        fs::create_dir_all(slot::slots_dir(&bucket_root)).unwrap();
+        let toml = format!(
+            r#"
+name = "Sparse Off"
+created_at = "2026-04-25T10:23:11Z"
+
+[source]
+kind = "linked"
+adapter = "markdown_dir"
+path = "{}"
+
+[chunker]
+strategy = "token_based"
+chunk_tokens = 50
+overlap_tokens = 5
+
+[search_paths.dense]
+enabled = true
+
+[search_paths.sparse]
+enabled = false
+tokenizer = "default"
+
+[defaults]
+embedder = "tei_test"
+"#,
+            source.display(),
+        );
+        fs::write(slot::bucket_toml_path(&bucket_root), toml).unwrap();
+        let bucket = DiskBucket::open(&bucket_root, BucketId::pod("notes")).unwrap();
+
         let adapter = MarkdownDir::new(&source);
         let chunker = TokenBasedChunker::from_config(&bucket.config().chunker);
         let embedder: Arc<dyn EmbeddingProvider> = Arc::new(MockEmbedder::new(4));
@@ -961,8 +1126,44 @@ embedder = "tei_test"
             .await
             .unwrap();
 
-        let sparse = bucket.sparse_search("anything", 10, &cancel).await.unwrap();
-        assert!(sparse.is_empty());
+        let results = bucket.sparse_search("hello", 5, &cancel).await.unwrap();
+        assert!(results.is_empty());
+
+        // Tantivy directory shouldn't exist for a sparse-disabled slot.
+        let slot_id = bucket.active_slot_id().unwrap();
+        let tantivy = slot::tantivy_dir(&slot::slot_dir(&bucket_root, &slot_id));
+        assert!(
+            !tantivy.exists(),
+            "sparse-disabled slot must not create tantivy dir"
+        );
+    }
+
+    #[tokio::test]
+    async fn rebuilding_open_finds_sparse_index_too() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("notes");
+        fs::create_dir_all(&source).unwrap();
+        write_md(&source, "doc.md", "the quick brown fox");
+
+        let bucket_root = tmp.path().join("bucket");
+        {
+            let bucket = open_test_bucket(&bucket_root, &source);
+            let adapter = MarkdownDir::new(&source);
+            let chunker = TokenBasedChunker::from_config(&bucket.config().chunker);
+            let embedder: Arc<dyn EmbeddingProvider> = Arc::new(MockEmbedder::new(8));
+            let cancel = CancellationToken::new();
+            bucket
+                .build_slot(&adapter, &chunker, embedder, &cancel)
+                .await
+                .unwrap();
+        }
+
+        // Reopen and verify sparse search still works
+        let reopened = DiskBucket::open(&bucket_root, BucketId::pod("notes")).unwrap();
+        let cancel = CancellationToken::new();
+        let results = reopened.sparse_search("fox", 5, &cancel).await.unwrap();
+        assert_eq!(results.len(), 1);
+        assert!(results[0].chunk_text.contains("fox"));
     }
 
     #[tokio::test]

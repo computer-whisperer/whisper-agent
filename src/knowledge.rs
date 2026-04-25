@@ -37,6 +37,7 @@ pub mod disk_bucket;
 pub mod manifest;
 pub mod slot;
 pub mod source;
+pub mod sparse;
 pub mod types;
 pub mod vectors;
 
@@ -54,6 +55,7 @@ pub use manifest::{
     SparseSnapshot,
 };
 pub use source::{MarkdownDir, SourceAdapter, SourceError, SourceRecord};
+pub use sparse::{SparseIndex, SparseIndexBuilder};
 pub use types::{
     BucketError, BucketId, BucketScope, BucketStatus, BuildProgress, Candidate, Chunk, ChunkId,
     NewChunk, ParseBucketIdError, ParseChunkIdError, SearchPath, SlotId, SourceRef,

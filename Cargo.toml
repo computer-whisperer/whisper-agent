@@ -124,6 +124,11 @@ blake3 = "1"
 # supports the build + search + (eventual) persistence operations the
 # slot's dense path needs.
 hnsw_rs = "0.3"
+# BM25 / sparse-text index for the knowledge-bucket layer. Tantivy is
+# the de-facto Lucene-equivalent in Rust; segment-based, mature, and
+# composes cleanly with our slot directory layout (one tantivy
+# directory per slot).
+tantivy = "0.24"
 
 [dev-dependencies]
 # Tempdirs for source-adapter / chunker tests. Auto-cleanup via Drop.
