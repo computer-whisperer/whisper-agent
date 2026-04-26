@@ -13,17 +13,39 @@
 //! a dense in-memory layout that the HNSW index in slice 5 can wrap
 //! directly without a copy.
 //!
-//! Mutex-guarded sync IO for v1, like chunks. mmap upgrade is the
-//! natural follow-up when serving modes (RAM vs disk-backed) get wired
-//! end-to-end.
+//! Reader storage modes:
+//! - `LoadMode::Mmap` (disk-backed serving) — file is mmap'd, fetches
+//!   are slice indexes against the OS page cache. Concurrent queries
+//!   don't serialize on a Mutex; the working set lives in cache.
+//! - `LoadMode::Eager` (RAM-resident serving) — file is read in full
+//!   into a `Box<[u8]>` at open time. No disk I/O on subsequent
+//!   fetches; predictable latency, no eviction by other processes.
+//!
+//! Vector readers are only opened on finalized slots — the build path
+//! reads vectors back through the in-progress writer's positions, not
+//! through `VectorStoreReader`. Both modes are therefore safe to mmap;
+//! the `chunks.bin` reader has the analogous live-build complication
+//! and handles it via `ChunkStoreReader::open_with_shared_index`.
 
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
-use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
+use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+
+use memmap2::Mmap;
 
 use super::types::ChunkId;
+
+/// How the reader should hold the slot's `vectors.bin`. Translated from
+/// `manifest.serving.mode` at slot-open time. See module docs for the
+/// trade-offs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoadMode {
+    /// mmap the file; let the OS page cache handle hot/cold.
+    Mmap,
+    /// Read the entire file into a `Box<[u8]>` at open time.
+    Eager,
+}
 
 /// `vectors.bin` magic bytes — `b"VECT"`. Lets us detect a wrong-file or
 /// truncated header explicitly rather than getting confusing read errors
@@ -213,24 +235,82 @@ impl VectorStoreWriter {
 
 /// Random-access reader for `vectors.bin` / `vectors.idx`.
 ///
-/// `Send + Sync`. Concurrent fetches serialize through a Mutex on the
-/// file handle; the layout is friendly to a future mmap upgrade — the
-/// dense vector array starts at byte [`HEADER_SIZE`] and runs to EOF.
-#[derive(Debug)]
+/// `Send + Sync`. Backed by either an mmap (`LoadMode::Mmap`) or an
+/// eagerly-loaded buffer (`LoadMode::Eager`); both expose the same
+/// `&[u8]` view of the file's bytes, so `read_at_position` is a slice
+/// index + a small f32-decode loop, no syscall and no Mutex.
 pub struct VectorStoreReader {
-    bin: Mutex<File>,
+    storage: VectorStorage,
     dimension: u32,
     index: HashMap<ChunkId, u64>,
 }
 
-impl VectorStoreReader {
-    pub fn open(bin_path: &Path, idx_path: &Path) -> io::Result<Self> {
-        let mut bin = File::open(bin_path)?;
-        let dimension = read_header(&mut bin)?;
+enum VectorStorage {
+    /// `mmap`'d view of the file. The OS page cache handles hot/cold;
+    /// concurrent reads aren't serialized.
+    Mapped(Mmap),
+    /// Whole-file copy in process memory. Predictable latency, no
+    /// page-cache eviction by other processes.
+    Eager(Box<[u8]>),
+}
 
+impl VectorStorage {
+    fn bytes(&self) -> &[u8] {
+        match self {
+            VectorStorage::Mapped(m) => m,
+            VectorStorage::Eager(v) => v,
+        }
+    }
+}
+
+impl std::fmt::Debug for VectorStoreReader {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let kind = match &self.storage {
+            VectorStorage::Mapped(_) => "Mapped",
+            VectorStorage::Eager(_) => "Eager",
+        };
+        f.debug_struct("VectorStoreReader")
+            .field("storage", &kind)
+            .field("dimension", &self.dimension)
+            .field("count", &self.index.len())
+            .finish()
+    }
+}
+
+impl VectorStoreReader {
+    /// Open with the default mmap mode. Equivalent to
+    /// [`Self::open_with_mode`] with [`LoadMode::Mmap`]; kept as the
+    /// short name for tests and call sites that don't dispatch on
+    /// serving mode.
+    pub fn open(bin_path: &Path, idx_path: &Path) -> io::Result<Self> {
+        Self::open_with_mode(bin_path, idx_path, LoadMode::Mmap)
+    }
+
+    /// Open with an explicit load mode. Production slot-open paths
+    /// translate `manifest.serving.mode` into the appropriate
+    /// [`LoadMode`] and call this.
+    pub fn open_with_mode(bin_path: &Path, idx_path: &Path, mode: LoadMode) -> io::Result<Self> {
+        let storage = match mode {
+            LoadMode::Mmap => {
+                let file = File::open(bin_path)?;
+                // SAFETY: we hold the file open for the lifetime of
+                // `Mmap` (it's owned by `VectorStorage::Mapped`), and
+                // slot files are immutable post-build — no concurrent
+                // truncation / replacement is expected. A user racing
+                // `rm` on the slot dir during a query would be invalid
+                // either way.
+                let mmap = unsafe { Mmap::map(&file)? };
+                VectorStorage::Mapped(mmap)
+            }
+            LoadMode::Eager => {
+                let bytes = std::fs::read(bin_path)?;
+                VectorStorage::Eager(bytes.into_boxed_slice())
+            }
+        };
+        let dimension = read_header_bytes(storage.bytes())?;
         let index = read_idx(idx_path)?;
         Ok(Self {
-            bin: Mutex::new(bin),
+            storage,
             dimension,
             index,
         })
@@ -266,16 +346,23 @@ impl VectorStoreReader {
     /// vectors in position order rather than by chunk id.
     pub fn read_at_position(&self, position: u64) -> io::Result<Vec<f32>> {
         let dim = self.dimension as usize;
-        let byte_offset = HEADER_SIZE + position * dim as u64 * 4;
+        let byte_offset = (HEADER_SIZE + position * dim as u64 * 4) as usize;
+        let byte_end = byte_offset + dim * 4;
 
-        let mut bin = self.bin.lock().expect("vectors.bin mutex poisoned");
-        bin.seek(SeekFrom::Start(byte_offset))?;
-        let mut bytes = vec![0u8; dim * 4];
-        bin.read_exact(&mut bytes)?;
-        drop(bin);
+        let bytes = self.storage.bytes();
+        if byte_end > bytes.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                format!(
+                    "vectors.bin: position {position} reads past end ({byte_end} > {})",
+                    bytes.len(),
+                ),
+            ));
+        }
+        let slice = &bytes[byte_offset..byte_end];
 
         let mut out = Vec::with_capacity(dim);
-        for chunk in bytes.chunks_exact(4) {
+        for chunk in slice.chunks_exact(4) {
             out.push(f32::from_le_bytes(chunk.try_into().unwrap()));
         }
         Ok(out)
@@ -289,9 +376,14 @@ impl VectorStoreReader {
     }
 }
 
-fn read_header(bin: &mut File) -> io::Result<u32> {
-    let mut header = [0u8; HEADER_SIZE as usize];
-    bin.read_exact(&mut header)?;
+fn read_header_bytes(bytes: &[u8]) -> io::Result<u32> {
+    if bytes.len() < HEADER_SIZE as usize {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "vectors.bin: file shorter than header",
+        ));
+    }
+    let header = &bytes[..HEADER_SIZE as usize];
     if &header[0..4] != MAGIC {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -320,6 +412,12 @@ fn read_header(bin: &mut File) -> io::Result<u32> {
         ));
     }
     Ok(dimension)
+}
+
+fn read_header(bin: &mut File) -> io::Result<u32> {
+    let mut header = [0u8; HEADER_SIZE as usize];
+    bin.read_exact(&mut header)?;
+    read_header_bytes(&header)
 }
 
 fn read_idx(path: &Path) -> io::Result<HashMap<ChunkId, u64>> {
@@ -603,5 +701,60 @@ mod tests {
             }
             prev = Some(id);
         }
+    }
+
+    /// Both `LoadMode::Mmap` and `LoadMode::Eager` must produce
+    /// byte-equivalent fetch results — the storage layer is the only
+    /// thing that differs between disk-backed and RAM-resident
+    /// serving.
+    #[test]
+    fn mmap_and_eager_modes_return_identical_vectors() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin = tmp.path().join("vectors.bin");
+        let idx = tmp.path().join("vectors.idx");
+        let dim = 4;
+
+        let inputs: Vec<(ChunkId, Vec<f32>)> = (0..10)
+            .map(|i| {
+                (
+                    ChunkId::from_source(&[i as u8; 32], i),
+                    unit_vec(dim, i as u32),
+                )
+            })
+            .collect();
+
+        {
+            let mut w = VectorStoreWriter::create(&bin, &idx, dim).unwrap();
+            for (id, v) in &inputs {
+                w.append(*id, v).unwrap();
+            }
+            w.finalize().unwrap();
+        }
+
+        let mmap_reader = VectorStoreReader::open_with_mode(&bin, &idx, LoadMode::Mmap).unwrap();
+        let eager_reader = VectorStoreReader::open_with_mode(&bin, &idx, LoadMode::Eager).unwrap();
+
+        for (id, expected) in &inputs {
+            assert_eq!(&mmap_reader.fetch(*id).unwrap().unwrap(), expected);
+            assert_eq!(&eager_reader.fetch(*id).unwrap().unwrap(), expected);
+        }
+    }
+
+    /// Reading past EOF on an mmap'd file should produce a clean
+    /// `UnexpectedEof` rather than panic on slice bounds.
+    #[test]
+    fn read_at_position_past_end_errors() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin = tmp.path().join("vectors.bin");
+        let idx = tmp.path().join("vectors.idx");
+        let id = ChunkId::from_source(&[1; 32], 0);
+        {
+            let mut w = VectorStoreWriter::create(&bin, &idx, 4).unwrap();
+            w.append(id, &[0.1, 0.2, 0.3, 0.4]).unwrap();
+            w.finalize().unwrap();
+        }
+        let r = VectorStoreReader::open(&bin, &idx).unwrap();
+        let err = r.read_at_position(99).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
     }
 }

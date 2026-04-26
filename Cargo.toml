@@ -152,6 +152,13 @@ tokenizers = { version = "0.21", default-features = false, features = ["onig", "
 # model id via the embedder. Sync API is fine — resolution happens
 # once at slot-build start, not on the hot path.
 hf-hub = { version = "0.4", default-features = false, features = ["rustls-tls", "ureq"] }
+# memmap2 for the slot's chunks.bin / vectors.bin readers. Replaces a
+# `Mutex<File>` + seek+read per fetch — concurrent queries no longer
+# serialize on a single file handle, and a slot's working set lives
+# in the OS page cache. Used as the disk-backed serving mode; the RAM
+# mode is implemented by eagerly reading the whole file into a Vec at
+# slot-open time.
+memmap2 = "0.9"
 
 [dev-dependencies]
 # Tempdirs for source-adapter / chunker tests. Auto-cleanup via Drop.

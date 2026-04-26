@@ -6063,6 +6063,7 @@ dependencies = [
  "futures",
  "hf-hub",
  "hnsw_rs",
+ "memmap2",
  "mime_guess",
  "quick-xml",
  "rand 0.9.4",

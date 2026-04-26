@@ -11,8 +11,16 @@
 //! resumable on crash) while keeping query-time lookups fast without
 //! scanning the bin file at slot open.
 //!
-//! Mutex-guarded sync IO for v1. If concurrent fetch latency becomes a
-//! bottleneck, switch to mmap or `pread` without changing the public API.
+//! Reader storage modes for finalized slots:
+//! - `LoadMode::Mmap` — file is mmap'd; concurrent fetches don't
+//!   serialize on a Mutex, and the working set lives in the OS page
+//!   cache. The right default for disk-backed serving.
+//! - `LoadMode::Eager` — file is read in full into a `Box<[u8]>` at
+//!   open time. Predictable latency, no page-cache eviction.
+//!
+//! Live-build readers use [`ChunkStoreReader::open_with_shared_index`]
+//! and stay file-based — `chunks.bin` is still being appended to, so a
+//! fixed-size mmap snapshot would miss the writer's new records.
 
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
@@ -20,7 +28,10 @@ use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
 
+use memmap2::Mmap;
+
 use super::types::{Chunk, ChunkId, SourceRef};
+pub use super::vectors::LoadMode;
 
 /// Shared id→offset index. The writer mutates it on `append`; readers
 /// take read locks on `fetch`. Cloning the [`Arc`] is what gives a
@@ -249,21 +260,69 @@ fn write_record<W: Write>(w: &mut W, source_ref: &SourceRef, text: &str) -> io::
 /// a per-batch index copy). For fully-built slots the reader owns its
 /// own index, but the type stays the same for uniformity.
 ///
-/// File-handle access serializes through an internal [`Mutex`] (one
-/// seek + one read per fetch). Cheap at slice 3's scales; revisit
-/// (mmap or `pread`) if measurements show contention.
-#[derive(Debug)]
+/// Backed by either an mmap (`LoadMode::Mmap`), an eagerly-loaded
+/// buffer (`LoadMode::Eager`), or a `Mutex<File>` for live-build
+/// readers (where `chunks.bin` is still being appended to). The first
+/// two modes serve concurrent fetches without serialization; the third
+/// keeps the existing seek-based behavior.
 pub struct ChunkStoreReader {
-    bin: Mutex<File>,
+    storage: ChunkStorage,
     index: SharedChunkIndex,
 }
 
+enum ChunkStorage {
+    /// Finalized slot, mmap'd. Disk-backed serving mode.
+    Mapped(Mmap),
+    /// Finalized slot, eagerly-loaded. RAM-resident serving mode.
+    Eager(Box<[u8]>),
+    /// Live-build reader — file is still being appended by the
+    /// writer. Concurrent fetches serialize through this Mutex; tiny
+    /// cost compared to the build's overall wall-clock.
+    Live(Mutex<File>),
+}
+
+impl std::fmt::Debug for ChunkStoreReader {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let kind = match &self.storage {
+            ChunkStorage::Mapped(_) => "Mapped",
+            ChunkStorage::Eager(_) => "Eager",
+            ChunkStorage::Live(_) => "Live",
+        };
+        f.debug_struct("ChunkStoreReader")
+            .field("storage", &kind)
+            .finish_non_exhaustive()
+    }
+}
+
 impl ChunkStoreReader {
+    /// Open a finalized slot's chunk store with the default mmap mode.
+    /// Equivalent to [`Self::open_with_mode`] with [`LoadMode::Mmap`].
     pub fn open(bin_path: &Path, idx_path: &Path) -> io::Result<Self> {
-        let bin = File::open(bin_path)?;
+        Self::open_with_mode(bin_path, idx_path, LoadMode::Mmap)
+    }
+
+    /// Open a finalized slot's chunk store with an explicit load mode.
+    /// Production slot-open paths translate `manifest.serving.mode`
+    /// into a [`LoadMode`] and call this.
+    pub fn open_with_mode(bin_path: &Path, idx_path: &Path, mode: LoadMode) -> io::Result<Self> {
+        let storage = match mode {
+            LoadMode::Mmap => {
+                let file = File::open(bin_path)?;
+                // SAFETY: same contract as VectorStoreReader — the
+                // `Mmap` owns its file handle for its lifetime, and
+                // finalized slot files don't get mutated while a slot
+                // is active.
+                let mmap = unsafe { Mmap::map(&file)? };
+                ChunkStorage::Mapped(mmap)
+            }
+            LoadMode::Eager => {
+                let bytes = std::fs::read(bin_path)?;
+                ChunkStorage::Eager(bytes.into_boxed_slice())
+            }
+        };
         let index = read_idx(idx_path)?;
         Ok(Self {
-            bin: Mutex::new(bin),
+            storage,
             index: Arc::new(RwLock::new(index)),
         })
     }
@@ -273,10 +332,13 @@ impl ChunkStoreReader {
     /// `chunks.idx` doesn't yet exist; the build path obtains the
     /// shared index via [`ChunkStoreWriter::share_index`] and the
     /// reader sees subsequent appends through the same Arc.
+    ///
+    /// Stays file-based (no mmap): `chunks.bin` is still being
+    /// appended to, and a mmap snapshot would not see new records.
     pub fn open_with_shared_index(bin_path: &Path, index: SharedChunkIndex) -> io::Result<Self> {
         let bin = File::open(bin_path)?;
         Ok(Self {
-            bin: Mutex::new(bin),
+            storage: ChunkStorage::Live(Mutex::new(bin)),
             index,
         })
     }
@@ -318,19 +380,55 @@ impl ChunkStoreReader {
             return Ok(None);
         };
 
-        let mut bin = self.bin.lock().expect("chunks.bin mutex poisoned");
-        bin.seek(SeekFrom::Start(offset))?;
-
-        let mut len_bytes = [0u8; 4];
-        bin.read_exact(&mut len_bytes)?;
-        let body_len = u32::from_le_bytes(len_bytes) as usize;
-
-        let mut body = vec![0u8; body_len];
-        bin.read_exact(&mut body)?;
-        drop(bin); // release lock before parsing
+        let body = match &self.storage {
+            ChunkStorage::Mapped(m) => fetch_record_from_bytes(m, offset)?,
+            ChunkStorage::Eager(v) => fetch_record_from_bytes(v, offset)?,
+            ChunkStorage::Live(mu) => {
+                let mut bin = mu.lock().expect("chunks.bin mutex poisoned");
+                bin.seek(SeekFrom::Start(offset))?;
+                let mut len_bytes = [0u8; 4];
+                bin.read_exact(&mut len_bytes)?;
+                let body_len = u32::from_le_bytes(len_bytes) as usize;
+                let mut body = vec![0u8; body_len];
+                bin.read_exact(&mut body)?;
+                body
+            }
+        };
 
         parse_record(chunk_id, &body).map(Some)
     }
+}
+
+/// Pull one record's body out of a `&[u8]` view of `chunks.bin` at the
+/// given offset. The body's `body_len` 4-byte prefix is read from the
+/// slice, then the body bytes are copied into a `Vec<u8>` for parsing.
+/// (Avoiding the copy would require changing `parse_record` to work
+/// against a borrowed slice — a small win, defer until measurements
+/// show it.)
+fn fetch_record_from_bytes(bytes: &[u8], offset: u64) -> io::Result<Vec<u8>> {
+    let off = offset as usize;
+    if off + 4 > bytes.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            format!(
+                "chunks.bin: offset {offset} reads past end ({} bytes)",
+                bytes.len(),
+            ),
+        ));
+    }
+    let body_len = u32::from_le_bytes(bytes[off..off + 4].try_into().unwrap()) as usize;
+    let body_start = off + 4;
+    let body_end = body_start + body_len;
+    if body_end > bytes.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            format!(
+                "chunks.bin: record body at {offset} reads past end ({body_end} > {})",
+                bytes.len(),
+            ),
+        ));
+    }
+    Ok(bytes[body_start..body_end].to_vec())
 }
 
 /// Walk `chunks.bin` and return the byte offsets of every record's
@@ -781,5 +879,45 @@ mod tests {
         let r = ChunkStoreReader::open(&bin, &idx).unwrap();
         let err = r.fetch(id).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    /// Both `LoadMode::Mmap` and `LoadMode::Eager` must return
+    /// byte-equivalent chunks. The serving-mode dispatch only changes
+    /// where the bytes live, not what they decode to.
+    #[test]
+    fn mmap_and_eager_modes_return_identical_chunks() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin = tmp.path().join("chunks.bin");
+        let idx = tmp.path().join("chunks.idx");
+
+        let inputs: Vec<(ChunkId, &str, &str)> = (0..8)
+            .map(|i| {
+                (
+                    ChunkId::from_source(&[i as u8; 32], i as u64),
+                    "doc.md",
+                    "alpha bravo charlie delta echo foxtrot",
+                )
+            })
+            .collect();
+
+        {
+            let mut w = ChunkStoreWriter::create(&bin, &idx).unwrap();
+            for (id, src, text) in &inputs {
+                w.append(*id, &sref(src, None), text).unwrap();
+            }
+            w.finalize().unwrap();
+        }
+
+        let mmap_reader = ChunkStoreReader::open_with_mode(&bin, &idx, LoadMode::Mmap).unwrap();
+        let eager_reader = ChunkStoreReader::open_with_mode(&bin, &idx, LoadMode::Eager).unwrap();
+
+        for (id, _src, text) in &inputs {
+            let m = mmap_reader.fetch(*id).unwrap().unwrap();
+            let e = eager_reader.fetch(*id).unwrap().unwrap();
+            assert_eq!(m.id, e.id);
+            assert_eq!(m.text, e.text);
+            assert_eq!(m.text, *text);
+            assert_eq!(m.source_ref.source_id, e.source_ref.source_id);
+        }
     }
 }

@@ -25,8 +25,8 @@ use tokio_util::sync::CancellationToken;
 use super::bucket::{BoxFuture, Bucket};
 use super::build_state::{BuildStateRecord, BuildStateWriter};
 use super::chunker::Chunker;
-use super::chunks::{ChunkStoreReader, ChunkStoreWriter};
-use super::config::BucketConfig;
+use super::chunks::{ChunkStoreReader, ChunkStoreWriter, LoadMode};
+use super::config::{BucketConfig, ServingMode};
 use super::dense::{DenseIndex, HnswParams};
 use super::manifest::{
     ChunkerSnapshot, EmbedderSnapshot, ServingSnapshot, SlotManifest, SlotState, SlotStats,
@@ -998,9 +998,15 @@ impl DiskBucket {
             let _ = builder.finalize()?;
         }
 
-        let chunks = ChunkStoreReader::open(&chunks_bin, &chunks_idx).map_err(BucketError::Io)?;
-        let vectors =
-            VectorStoreReader::open(&vectors_bin, &vectors_idx).map_err(BucketError::Io)?;
+        // Match the slot's serving mode for the post-finalize readers
+        // — same dispatch as `load_slot` does on bucket open. The build
+        // path runs once at slot completion; readers stay live for the
+        // slot's serving lifetime.
+        let load_mode = serving_mode_to_load_mode(manifest.serving.mode);
+        let chunks = ChunkStoreReader::open_with_mode(&chunks_bin, &chunks_idx, load_mode)
+            .map_err(BucketError::Io)?;
+        let vectors = VectorStoreReader::open_with_mode(&vectors_bin, &vectors_idx, load_mode)
+            .map_err(BucketError::Io)?;
 
         // --- Phase: BuildingDense ---
         // HNSW is already built incrementally — this phase is now
@@ -1579,13 +1585,20 @@ fn load_slot(bucket_root: &Path, slot_id: &str) -> Result<LoadedSlot, BucketErro
     })?;
     let manifest = SlotManifest::from_toml_str(&manifest_text)?;
 
+    // Translate the manifest's serving mode into the storage layer's
+    // load mode. `Ram` → eager-load whole files; `Disk` → mmap. Both
+    // expose the same `&[u8]` view of the file for fetches.
+    let load_mode = serving_mode_to_load_mode(manifest.serving.mode);
+
     let chunks_bin = slot::chunks_bin_path(&slot_path);
     let chunks_idx = slot::chunks_idx_path(&slot_path);
-    let chunks = ChunkStoreReader::open(&chunks_bin, &chunks_idx).map_err(BucketError::Io)?;
+    let chunks = ChunkStoreReader::open_with_mode(&chunks_bin, &chunks_idx, load_mode)
+        .map_err(BucketError::Io)?;
 
     let vectors_bin = slot::vectors_bin_path(&slot_path);
     let vectors_idx = slot::vectors_idx_path(&slot_path);
-    let vectors = VectorStoreReader::open(&vectors_bin, &vectors_idx).map_err(BucketError::Io)?;
+    let vectors = VectorStoreReader::open_with_mode(&vectors_bin, &vectors_idx, load_mode)
+        .map_err(BucketError::Io)?;
 
     // Sanity check: vector dimension must match the manifest's recorded
     // embedder dimension. A mismatch means the on-disk vectors weren't
@@ -1641,6 +1654,19 @@ fn load_slot(bucket_root: &Path, slot_id: &str) -> Result<LoadedSlot, BucketErro
         dense: Arc::new(dense),
         sparse: sparse.map(|s| RwLock::new(Arc::new(s))),
     })
+}
+
+/// Translate the slot manifest's [`ServingMode`] into the storage
+/// layer's [`LoadMode`]. Single source of truth for the dispatch so
+/// `build_slot` and `load_slot` agree on what each mode means.
+///
+/// `ServingMode::Disk` → `LoadMode::Mmap` (lazy paging via OS cache).
+/// `ServingMode::Ram` → `LoadMode::Eager` (whole-file `Box<[u8]>`).
+fn serving_mode_to_load_mode(mode: ServingMode) -> LoadMode {
+    match mode {
+        ServingMode::Disk => LoadMode::Mmap,
+        ServingMode::Ram => LoadMode::Eager,
+    }
 }
 
 fn write_manifest(slot_path: &Path, manifest: &SlotManifest) -> Result<(), BucketError> {
@@ -1781,6 +1807,50 @@ embedder = "tei_test"
         fs::write(
             slot::bucket_toml_path(bucket_root),
             sample_bucket_toml(source_path),
+        )
+        .unwrap();
+        DiskBucket::open(bucket_root, BucketId::pod("notes")).unwrap()
+    }
+
+    /// Variant of [`sample_bucket_toml`] that pins
+    /// `[defaults] serving_mode = "disk"` so the build path's slot
+    /// manifest records `ServingMode::Disk` and the readers come up in
+    /// mmap mode.
+    fn sample_bucket_toml_with_serving_mode(source_path: &Path, mode: &str) -> String {
+        format!(
+            r#"
+name = "Test Notes"
+created_at = "2026-04-25T10:23:11Z"
+
+[source]
+kind = "linked"
+adapter = "markdown_dir"
+path = "{path}"
+
+[chunker]
+strategy = "token_based"
+chunk_tokens = 50
+overlap_tokens = 5
+
+[defaults]
+embedder = "tei_test"
+serving_mode = "{mode}"
+"#,
+            path = source_path.display(),
+            mode = mode,
+        )
+    }
+
+    fn open_test_bucket_with_serving_mode(
+        bucket_root: &Path,
+        source_path: &Path,
+        mode: &str,
+    ) -> DiskBucket {
+        fs::create_dir_all(bucket_root).unwrap();
+        fs::create_dir_all(slot::slots_dir(bucket_root)).unwrap();
+        fs::write(
+            slot::bucket_toml_path(bucket_root),
+            sample_bucket_toml_with_serving_mode(source_path, mode),
         )
         .unwrap();
         DiskBucket::open(bucket_root, BucketId::pod("notes")).unwrap()
@@ -3299,5 +3369,65 @@ embedder = "tei_test"
 
         let err = DiskBucket::open(&bucket_root, BucketId::pod("notes")).unwrap_err();
         assert!(matches!(err, BucketError::Config(_)), "{err:?}");
+    }
+
+    /// `[defaults] serving_mode` flows from `bucket.toml` into the slot
+    /// manifest, and a slot built with either `"ram"` or `"disk"`
+    /// returns matching dense + chunk results. This is the end-to-end
+    /// integration of the storage-layer `LoadMode` dispatch.
+    #[tokio::test]
+    async fn serving_mode_round_trips_for_both_ram_and_disk_modes() {
+        for mode in ["ram", "disk"] {
+            let tmp = tempfile::tempdir().unwrap();
+            let bucket_root = tmp.path().join("buckets/notes");
+            let source = tmp.path().join("source");
+            fs::create_dir_all(&source).unwrap();
+            for i in 0..10 {
+                write_md(
+                    &source,
+                    &format!("doc-{i:04}.md"),
+                    &format!("doc-{i:04} body content"),
+                );
+            }
+
+            let bucket = open_test_bucket_with_serving_mode(&bucket_root, &source, mode);
+            let adapter = MarkdownDir::new(&source);
+            let (chunker, chunker_snapshot) =
+                TokenBasedChunker::from_config(&bucket.config().chunker);
+            let embedder: Arc<dyn EmbeddingProvider> = Arc::new(MockEmbedder::new(8));
+            let cancel = CancellationToken::new();
+
+            let slot_id = bucket
+                .build_slot(
+                    &adapter,
+                    &chunker,
+                    chunker_snapshot,
+                    embedder,
+                    None,
+                    &cancel,
+                )
+                .await
+                .unwrap();
+            assert_eq!(bucket.active_slot_id().as_deref(), Some(slot_id.as_str()));
+
+            // Manifest must record the requested serving mode.
+            let manifest_path = slot::manifest_path(&slot::slot_dir(&bucket_root, &slot_id));
+            let manifest =
+                SlotManifest::from_toml_str(&fs::read_to_string(&manifest_path).unwrap()).unwrap();
+            let expected = match mode {
+                "ram" => crate::knowledge::ServingMode::Ram,
+                "disk" => crate::knowledge::ServingMode::Disk,
+                _ => unreachable!(),
+            };
+            assert_eq!(manifest.serving.mode, expected, "mode={mode}");
+
+            // Sparse query path works regardless of dense/vector storage.
+            let cancel_q = CancellationToken::new();
+            let hits = bucket
+                .sparse_search("doc-0003", 5, &cancel_q)
+                .await
+                .unwrap();
+            assert!(!hits.is_empty(), "mode={mode} produced no sparse hits");
+        }
     }
 }
