@@ -39,11 +39,15 @@ use super::types::{
 use super::vectors::{VectorStoreReader, VectorStoreWriter};
 use crate::providers::embedding::{EmbedRequest, EmbeddingProvider};
 
-/// Number of chunks per `EmbeddingProvider::embed` call. TEI typically
-/// prefers small-to-medium batches (8–32) for steady throughput; 32 is
-/// a reasonable default. Configurable per-call eventually if measurement
-/// justifies it; for slice 4 it's a const at module level.
-const EMBED_BATCH_SIZE: usize = 32;
+/// Number of chunks per `EmbeddingProvider::embed` call. Bumped to 128
+/// after the 5k simplewiki TEI smoke showed per-batch HTTP overhead
+/// dominating end-to-end embed throughput at 32; with 128 (still under
+/// TEI's `max_batch_tokens=65536` ÷ ~500-token chunks ≈ 130-chunk
+/// per-batch budget) the round-trip count drops 4× without obviously
+/// hurting per-batch latency on the test endpoint. Configurable per-call
+/// eventually if measurement justifies finer control; for now it's a
+/// const at module level.
+const EMBED_BATCH_SIZE: usize = 128;
 
 #[derive(Debug)]
 pub struct DiskBucket {
@@ -1210,13 +1214,15 @@ embedder = "tei_test"
         let source = tmp.path().join("notes");
         fs::create_dir_all(&source).unwrap();
 
-        // Create enough markdown files to exceed two embed batches at
-        // BATCH_SIZE = 32. Each short file produces one chunk under the
-        // 50-token chunker. 80 files → 80 chunks → at least 3 batches.
-        for i in 0..80 {
+        // Create enough markdown files to force at least three embed
+        // batches regardless of `EMBED_BATCH_SIZE` — each short file
+        // produces exactly one chunk under the 50-token chunker, so
+        // file count == chunk count.
+        let file_count = super::EMBED_BATCH_SIZE * 2 + 5;
+        for i in 0..file_count {
             write_md(
                 &source,
-                &format!("doc-{i:03}.md"),
+                &format!("doc-{i:04}.md"),
                 &format!("content number {i}"),
             );
         }
@@ -1235,7 +1241,8 @@ embedder = "tei_test"
             .unwrap();
 
         let calls = mock.embed_calls.load(Ordering::SeqCst);
-        // 80 chunks at batch size 32 → ceil(80/32) = 3 calls.
+        // file_count chunks at EMBED_BATCH_SIZE → exactly 3 calls
+        // (we wrote 2 full batches + a tail of 5).
         assert_eq!(calls, 3, "expected 3 batched embed calls, got {calls}");
     }
 
