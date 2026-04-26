@@ -7,7 +7,7 @@ This doc is intentionally short — slice list + what's next + dangling
 cleanup. Architecture decisions live in the design doc; commit messages
 have the per-slice detail.
 
-Last updated: **2026-04-25**.
+Last updated: **2026-04-26**.
 
 ## Slices landed
 
@@ -24,13 +24,51 @@ Last updated: **2026-04-25**.
 | 7   | multi-bucket query layer with reranker fusion                  | `94309de` |
 | 8a  | bucket registry + `ListBuckets` wire surface                   | `33c04e9` |
 | 8b  | WebUI knowledge-buckets modal — read-only bucket list          | `9e9925d` |
-| MW  | MediaWiki XML source adapter — streaming, bz2, raw wikitext    | (this slice) |
+| MW  | MediaWiki XML source adapter — streaming, bz2, raw wikitext    | `03d4a7e` |
+| —   | `build_simplewiki` one-off binary (driver for the validation)  | `9c0d864` |
 
-## Currently working
+## End-to-end validation (Simple English Wikipedia, mock embedder)
 
-Adapter just landed; next up is standing up a real Simple English
-Wikipedia bucket end-to-end (hand-write `bucket.toml`, drive the build,
-spot-check a few queries) to expose whatever the test fixtures didn't.
+Driven via `build_simplewiki` against
+`simplewiki-latest-pages-articles.xml.bz2` (331 MB compressed).
+Run on 2026-04-26:
+
+| Metric                  | Value             |
+|-------------------------|-------------------|
+| Source pages emitted    | 280,502           |
+| Source read errors      | 0                 |
+| Chunks indexed          | 685,236           |
+| Mock vector dim         | 384               |
+| Disk size (bucket)      | 2.5 GiB           |
+| chunks.bin              | 1.1 GiB           |
+| vectors.bin             | 1004 MiB          |
+| chunks.idx + vectors.idx| 27 MiB each       |
+| tantivy index           | 391 MiB           |
+| Build wall-clock        | 47 min            |
+| HNSW build (685k vec)   | ~46 min (dominant)|
+| Query latency           | 3–8 ms            |
+| Per-chunk disk          | ~3.7 KiB          |
+
+**Quality**: Sparse path (BM25 over raw wikitext) returns
+semantically dead-on results out of the box for tested queries
+("albert einstein theory of relativity", "world war two pacific
+theater", "python programming language", "octopus intelligence",
+"constitution of the united states") — every query's top-5 was
+on-topic. Validates the choice to defer wikitext → plaintext
+extraction; embeddings + BM25 tolerate the markup.
+
+**Surprises / things to follow up on:**
+- HNSW build is ~98% of total wall-clock at this scale. Wikipedia-
+  scale builds (~30M chunks) are flat-out infeasible without HNSW
+  persistence — the cleanup item below is now the gating constraint
+  for the next scale step, not just a future TODO.
+- Mock embedder makes the dense path semantically random; the
+  sparse path alone is doing all the work in the validation queries
+  above. A real TEI run is the natural next quality test, but is
+  blocked on a TEI server existing in the test environment.
+- Extrapolated full-enwiki size at this dim: ~130 GiB. With
+  Qwen3-Embedding-0.6B (1024-dim, 2.7× vector growth): ~250 GiB,
+  matching the design doc's ~300 GiB estimate.
 
 ## Deferred / not started
 
@@ -50,8 +88,10 @@ chronological — order may shuffle as the dataset reveals what hurts.
 ## Dangling cleanup (none blocking)
 
 - **HNSW persistence** — `DenseIndex::build` rebuilds from `vectors.bin` on
-  every slot load. Fine at workspace scale, ~30 min for 50M vectors at
-  enwiki scale. The first slot-load that hurts is when we cross it.
+  every slot load *and* dominates initial build wall-clock (~46 of 47 min
+  on the simplewiki validation run for 685k vectors). Wikipedia-scale
+  builds (~30M chunks) are infeasible without persistence. **Now the
+  gating constraint for the next scale step.**
 - **`tokenizers` crate integration** — `TokenBasedChunker` uses a
   `chars_per_token=4` heuristic. For chunk-id stability across embedder
   swaps the chunker has to use real BPE. Land before any "production"
