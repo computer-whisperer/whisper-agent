@@ -170,7 +170,6 @@ pub trait BuildObserver: Send + Sync {
     fn on_progress(&self, source_records: u64, chunks: u64);
 }
 
-#[derive(Debug)]
 pub struct DiskBucket {
     id: BucketId,
     root: PathBuf,
@@ -181,6 +180,27 @@ pub struct DiskBucket {
     /// inner `Arc` lets each query take a snapshot it can read from
     /// without holding the lock for the duration of the search.
     active: RwLock<Option<Arc<LoadedSlot>>>,
+    /// Embedding provider matching the active slot's recorded
+    /// `embedder.model_id`. Wired by the registry at bucket-open time
+    /// (or by tests via `set_embedder`); `Bucket::insert` errors out
+    /// when this is `None`.
+    embedder: RwLock<Option<Arc<dyn EmbeddingProvider>>>,
+    /// Single-writer guard for the mutation triad. `insert` holds
+    /// it for its full async span (embed → append → HNSW → tantivy)
+    /// so concurrent inserts serialize. `tombstone` mutations remain
+    /// independent — they only touch `tombstones.bin`, which has its
+    /// own internal serialization.
+    mutation_lock: tokio::sync::Mutex<()>,
+}
+
+impl std::fmt::Debug for DiskBucket {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DiskBucket")
+            .field("id", &self.id)
+            .field("root", &self.root)
+            .field("active", &self.active)
+            .finish_non_exhaustive()
+    }
 }
 
 /// Loaded state for a single slot — everything a query needs to hit the
@@ -205,6 +225,13 @@ pub struct DiskBucket {
 ///   tests, [`Bucket::tombstone`] takes the write lock briefly to
 ///   merge new ids in. The same handle persists across the slot's
 ///   lifetime.
+/// - `delta_chunks` is `None` until the first `Bucket::insert` runs
+///   against this slot (or until `load_slot` finds existing delta
+///   files on disk). Queries fall back to it after the base reader
+///   misses. The HNSW holds delta entries inline (fold-into-base, no
+///   separate delta graph in v1) so dense/sparse searches surface
+///   delta hits transparently — only the chunk-text fetch needs to
+///   consult the second store.
 struct LoadedSlot {
     manifest: SlotManifest,
     chunks: RwLock<Arc<ChunkStoreReader>>,
@@ -212,6 +239,7 @@ struct LoadedSlot {
     dense: Arc<DenseIndex>,
     sparse: Option<RwLock<Arc<SparseIndex>>>,
     tombstones: Arc<Tombstones>,
+    delta_chunks: RwLock<Option<Arc<ChunkStoreReader>>>,
 }
 
 impl std::fmt::Debug for LoadedSlot {
@@ -243,6 +271,26 @@ impl LoadedSlot {
     fn tombstones(&self) -> Arc<Tombstones> {
         self.tombstones.clone()
     }
+
+    fn delta_chunks(&self) -> Option<Arc<ChunkStoreReader>> {
+        self.delta_chunks
+            .read()
+            .expect("LoadedSlot.delta_chunks lock poisoned")
+            .clone()
+    }
+
+    /// Look up a chunk by id in base, then delta. Mirrors the lookup
+    /// order used by `dense_search` / `sparse_search` candidate
+    /// resolution.
+    fn fetch_chunk_any(&self, chunk_id: ChunkId) -> std::io::Result<Option<Chunk>> {
+        if let Some(c) = self.chunks().fetch(chunk_id)? {
+            return Ok(Some(c));
+        }
+        if let Some(delta) = self.delta_chunks() {
+            return delta.fetch(chunk_id);
+        }
+        Ok(None)
+    }
 }
 
 impl DiskBucket {
@@ -262,7 +310,27 @@ impl DiskBucket {
             root,
             config,
             active: RwLock::new(active),
+            embedder: RwLock::new(None),
+            mutation_lock: tokio::sync::Mutex::new(()),
         })
+    }
+
+    /// Inject the embedding provider that `Bucket::insert` will call
+    /// against. Should match the active slot's recorded
+    /// `embedder.model_id`; mismatch is detected at insert time, not
+    /// here. Replacing an already-set embedder is allowed (model
+    /// rotation) but the caller is responsible for ensuring it matches
+    /// the slot's expected dimension.
+    pub fn set_embedder(&self, embedder: Arc<dyn EmbeddingProvider>) {
+        let mut slot = self.embedder.write().expect("embedder lock poisoned");
+        *slot = Some(embedder);
+    }
+
+    fn embedder(&self) -> Option<Arc<dyn EmbeddingProvider>> {
+        self.embedder
+            .read()
+            .expect("embedder lock poisoned")
+            .clone()
     }
 
     /// Build a new slot from a source adapter + chunker + embedder. The
@@ -1060,6 +1128,7 @@ impl DiskBucket {
             dense,
             sparse: sparse.map(|s| RwLock::new(Arc::new(s))),
             tombstones,
+            delta_chunks: RwLock::new(None),
         });
 
         slot::set_active_slot(&self.root, slot_id)?;
@@ -1145,6 +1214,7 @@ impl DiskBucket {
                     dense: dense.clone(),
                     sparse: sparse_reader.map(RwLock::new),
                     tombstones,
+                    delta_chunks: RwLock::new(None),
                 });
                 {
                     let mut active = self.active.write().expect("active slot lock poisoned");
@@ -1306,7 +1376,6 @@ impl Bucket for DiskBucket {
             }
 
             let hits = active.dense.search(query_vec, top_k);
-            let chunks = active.chunks();
             let tombstones = active.tombstones();
             let mut out = Vec::with_capacity(hits.len());
             for (chunk_id, distance) in hits {
@@ -1315,13 +1384,13 @@ impl Bucket for DiskBucket {
                 if tombstones.contains(chunk_id) {
                     continue;
                 }
-                // Look up chunk text for inclusion in the candidate.
+                // Resolve chunk text from base, falling back to delta.
                 // A miss can happen during a mid-build query if HNSW
                 // already has a position whose chunk_id wasn't yet
                 // committed to the chunk-store snapshot — skip it
                 // rather than erroring; the next query after the
                 // missing chunk's batch will see consistent state.
-                let Some(chunk) = chunks.fetch(chunk_id).map_err(BucketError::Io)? else {
+                let Some(chunk) = active.fetch_chunk_any(chunk_id).map_err(BucketError::Io)? else {
                     continue;
                 };
                 out.push(Candidate {
@@ -1355,7 +1424,6 @@ impl Bucket for DiskBucket {
             };
 
             let hits = sparse.search(query_text, top_k)?;
-            let chunks = active.chunks();
             let tombstones = active.tombstones();
             let mut out = Vec::with_capacity(hits.len());
             for (chunk_id, score) in hits {
@@ -1368,8 +1436,8 @@ impl Bucket for DiskBucket {
                 }
                 // Same skip-on-miss as the dense path: a tantivy
                 // commit may have outpaced the chunks-store snapshot
-                // by one batch.
-                let Some(chunk) = chunks.fetch(chunk_id).map_err(BucketError::Io)? else {
+                // by one batch. Resolve from base, fall back to delta.
+                let Some(chunk) = active.fetch_chunk_any(chunk_id).map_err(BucketError::Io)? else {
                     continue;
                 };
                 out.push(Candidate {
@@ -1390,7 +1458,7 @@ impl Bucket for DiskBucket {
             let active = self
                 .active_snapshot()
                 .ok_or_else(|| BucketError::NoActiveSlot(self.id.clone()))?;
-            match active.chunks().fetch(chunk_id).map_err(BucketError::Io)? {
+            match active.fetch_chunk_any(chunk_id).map_err(BucketError::Io)? {
                 Some(chunk) => Ok(chunk),
                 None => Err(BucketError::Other(format!(
                     "chunk {chunk_id} not in active slot",
@@ -1401,13 +1469,115 @@ impl Bucket for DiskBucket {
 
     fn insert<'a>(
         &'a self,
-        _new_chunks: Vec<NewChunk>,
-        _cancel: &'a CancellationToken,
+        new_chunks: Vec<NewChunk>,
+        cancel: &'a CancellationToken,
     ) -> BoxFuture<'a, Result<Vec<ChunkId>, BucketError>> {
         Box::pin(async move {
-            Err(BucketError::Other(
-                "insert: deferred until indexes land (slices 5–6)".to_string(),
-            ))
+            if new_chunks.is_empty() {
+                return Ok(Vec::new());
+            }
+            let active = self
+                .active_snapshot()
+                .ok_or_else(|| BucketError::NoActiveSlot(self.id.clone()))?;
+            let embedder = self.embedder().ok_or_else(|| {
+                BucketError::Other(
+                    "insert requires an embedder; call set_embedder first".to_string(),
+                )
+            })?;
+
+            // Single-writer guard for the whole insert (embed + delta
+            // writes + HNSW + tantivy). Concurrent inserts queue here;
+            // queries are unaffected (they read the active snapshot).
+            let _guard = self.mutation_lock.lock().await;
+
+            // 1. Derive content-addressed chunk ids up front so we can
+            //    return them even if the embedder fails partway.
+            let chunk_ids: Vec<ChunkId> = new_chunks
+                .iter()
+                .map(|c| ChunkId::from_source(&c.source_record_hash, c.chunk_offset))
+                .collect();
+
+            // 2. Embed (network IO).
+            let texts: Vec<String> = new_chunks.iter().map(|c| c.text.clone()).collect();
+            let req = EmbedRequest {
+                model: "",
+                inputs: &texts,
+            };
+            let resp = embedder
+                .embed(&req, cancel)
+                .await
+                .map_err(|e| BucketError::Provider(e.to_string()))?;
+            if resp.embeddings.len() != new_chunks.len() {
+                return Err(BucketError::Provider(format!(
+                    "embedder returned {} vectors for {} inputs",
+                    resp.embeddings.len(),
+                    new_chunks.len(),
+                )));
+            }
+            let dim = active.manifest.embedder.dimension;
+            for v in &resp.embeddings {
+                if v.len() as u32 != dim {
+                    return Err(BucketError::DimensionMismatch {
+                        query: v.len() as u32,
+                        slot: dim,
+                    });
+                }
+            }
+
+            // 3. File IO + HNSW insert + tantivy on a blocking thread.
+            //    These are CPU/IO-bound and would otherwise park a
+            //    tokio worker.
+            let slot_path = slot::slot_dir(&self.root, &active.manifest.slot_id);
+            let load_mode = serving_mode_to_load_mode(active.manifest.serving.mode);
+            let sparse_enabled = active.sparse.is_some();
+            let dense = active.dense.clone();
+            let embeddings = resp.embeddings;
+            let chunk_ids_clone = chunk_ids.clone();
+            let new_delta_reader = tokio::task::spawn_blocking(
+                move || -> Result<Arc<ChunkStoreReader>, BucketError> {
+                    persist_insert_batch(
+                        &slot_path,
+                        &new_chunks,
+                        &chunk_ids_clone,
+                        &embeddings,
+                        &dense,
+                        sparse_enabled,
+                        load_mode,
+                        dim,
+                    )
+                },
+            )
+            .await
+            .map_err(|e| BucketError::Other(format!("insert task: {e}")))??;
+
+            // 4. Swap the active slot's delta-chunks reader so query-
+            //    time fetches resolve the just-inserted ids. The HNSW
+            //    is shared with `dense` (Arc cloned in step 3) so the
+            //    inserts already landed there during the blocking
+            //    work.
+            {
+                let mut slot_delta = active
+                    .delta_chunks
+                    .write()
+                    .expect("delta_chunks lock poisoned");
+                *slot_delta = Some(new_delta_reader);
+            }
+
+            // 5. Re-open the sparse reader. Tantivy's
+            //    `OnCommitWithDelay` reload policy doesn't pick up
+            //    a separate writer's commit synchronously enough for
+            //    a follow-up query in the same async span; the build
+            //    path solves this by re-opening after every commit
+            //    and we mirror that here.
+            if let Some(sparse_lock) = active.sparse.as_ref() {
+                let tantivy_dir =
+                    slot::tantivy_dir(&slot::slot_dir(&self.root, &active.manifest.slot_id));
+                let new_sparse = Arc::new(SparseIndex::open(&tantivy_dir)?);
+                let mut w = sparse_lock.write().expect("sparse lock poisoned");
+                *w = new_sparse;
+            }
+
+            Ok(chunk_ids)
         })
     }
 
@@ -1449,6 +1619,90 @@ impl Bucket for DiskBucket {
 }
 
 // --- helpers ---
+
+/// Blocking-thread helper for `Bucket::insert`. Appends one batch of
+/// pre-embedded chunks to the slot's delta layer:
+/// - opens the delta chunk + vector writers (creating files if absent,
+///   resuming an idx-tracked tail if present),
+/// - appends each (chunk, vector) to delta files and inserts the
+///   vector into the slot's HNSW with a position chosen to extend
+///   `dense.len()`,
+/// - finalizes both writers (rewrites the .idx so the next call's
+///   create_or_open_append picks up the new state),
+/// - opens a tantivy writer over the existing index, adds each chunk,
+///   commits, and drops it (releasing the index lock),
+/// - returns a freshly-opened delta chunk reader for the caller to
+///   swap into `LoadedSlot.delta_chunks`.
+///
+/// Callers must hold the bucket's `mutation_lock` for the duration
+/// (this function does not acquire it).
+#[allow(clippy::too_many_arguments)]
+fn persist_insert_batch(
+    slot_path: &Path,
+    new_chunks: &[NewChunk],
+    chunk_ids: &[ChunkId],
+    embeddings: &[Vec<f32>],
+    dense: &Arc<DenseIndex>,
+    sparse_enabled: bool,
+    load_mode: LoadMode,
+    dimension: u32,
+) -> Result<Arc<ChunkStoreReader>, BucketError> {
+    let chunks_bin = slot::delta_chunks_bin_path(slot_path);
+    let chunks_idx = slot::delta_chunks_idx_path(slot_path);
+    let vectors_bin = slot::delta_vectors_bin_path(slot_path);
+    let vectors_idx = slot::delta_vectors_idx_path(slot_path);
+
+    let mut chunk_writer = ChunkStoreWriter::create_or_open_append(&chunks_bin, &chunks_idx)
+        .map_err(BucketError::Io)?;
+    let mut vector_writer =
+        VectorStoreWriter::create_or_open_append(&vectors_bin, &vectors_idx, dimension)
+            .map_err(BucketError::Io)?;
+
+    // Position scheme matches `load_slot`: HNSW positions are an
+    // opaque address space — the base build occupies `0..base_count`,
+    // delta entries extend from `current_len` upward. `current_len`
+    // already accounts for any prior delta appends in this slot's
+    // lifetime.
+    let base_position = dense.len() as u64;
+    for (i, ((chunk, &id), vector)) in new_chunks
+        .iter()
+        .zip(chunk_ids.iter())
+        .zip(embeddings.iter())
+        .enumerate()
+    {
+        chunk_writer
+            .append(id, &chunk.source_ref, &chunk.text)
+            .map_err(BucketError::Io)?;
+        vector_writer.append(id, vector).map_err(BucketError::Io)?;
+        dense.insert(id, base_position + i as u64, vector);
+    }
+
+    // `finalize` flushes the bin and rewrites the .idx — both bins
+    // are durable on return so a crash here doesn't desync the
+    // chunk + vector stores.
+    chunk_writer.flush().map_err(BucketError::Io)?;
+    vector_writer.flush().map_err(BucketError::Io)?;
+    chunk_writer.finalize().map_err(BucketError::Io)?;
+    vector_writer.finalize().map_err(BucketError::Io)?;
+
+    // Tantivy: open writer over existing index, add docs, commit.
+    // The slot's existing `SparseIndex` reader uses
+    // `OnCommitWithDelay` and picks up the new docs automatically.
+    if sparse_enabled {
+        let tantivy_dir = slot::tantivy_dir(slot_path);
+        let mut sparse = SparseIndexBuilder::open_resume(&tantivy_dir)?;
+        for (chunk, &id) in new_chunks.iter().zip(chunk_ids.iter()) {
+            sparse.add(id, &chunk.text)?;
+        }
+        sparse.finalize()?;
+    }
+
+    // Re-open the delta chunks reader so the caller's swap surfaces
+    // the just-finalized records to subsequent queries.
+    let reader = ChunkStoreReader::open_with_mode(&chunks_bin, &chunks_idx, load_mode)
+        .map_err(BucketError::Io)?;
+    Ok(Arc::new(reader))
+}
 
 /// Construct fresh writers + bundle into [`BuildHandles`] for the
 /// fresh-build code paths (initial `build_slot` + resume from
@@ -1699,13 +1953,65 @@ fn load_slot(bucket_root: &Path, slot_id: &str) -> Result<LoadedSlot, BucketErro
     let tombstones =
         Arc::new(Tombstones::open(&slot::tombstones_path(&slot_path)).map_err(BucketError::Io)?);
 
+    // Stitch the delta layer in: if `delta_vectors.bin` exists, seed
+    // its rows into the just-loaded HNSW (positions chosen to extend
+    // the base address space — the HNSW position is just an opaque
+    // unique key, so `base_count + delta_local_pos` works), and open
+    // the matching delta chunks reader so query-time fetches can
+    // resolve delta chunk ids.
+    //
+    // The base HNSW dump is intentionally not refreshed on every
+    // insert (would be `O(GB)` per call at scale); reload pays the
+    // delta-seed cost instead. Compaction collapses delta back into a
+    // fresh base + dump.
+    let dense = Arc::new(dense);
+    let delta_vectors_bin = slot::delta_vectors_bin_path(&slot_path);
+    let delta_vectors_idx = slot::delta_vectors_idx_path(&slot_path);
+    let delta_chunks_bin = slot::delta_chunks_bin_path(&slot_path);
+    let delta_chunks_idx = slot::delta_chunks_idx_path(&slot_path);
+
+    let delta_chunks = if delta_chunks_bin.exists() && delta_chunks_idx.exists() {
+        Some(Arc::new(
+            ChunkStoreReader::open_with_mode(&delta_chunks_bin, &delta_chunks_idx, load_mode)
+                .map_err(BucketError::Io)?,
+        ))
+    } else {
+        None
+    };
+
+    if delta_vectors_bin.exists() && delta_vectors_idx.exists() {
+        let delta_vectors =
+            VectorStoreReader::open_with_mode(&delta_vectors_bin, &delta_vectors_idx, load_mode)
+                .map_err(BucketError::Io)?;
+        if delta_vectors.dimension() != manifest.embedder.dimension {
+            return Err(BucketError::Config(format!(
+                "delta_vectors.bin dimension {} does not match manifest embedder dimension {}",
+                delta_vectors.dimension(),
+                manifest.embedder.dimension,
+            )));
+        }
+        let base_count = dense.len() as u64;
+        let mut pairs: Vec<(u64, ChunkId)> = delta_vectors
+            .iter_chunk_positions()
+            .map(|(id, pos)| (pos, id))
+            .collect();
+        pairs.sort_by_key(|(pos, _)| *pos);
+        for (delta_pos, chunk_id) in pairs {
+            let vector = delta_vectors
+                .read_at_position(delta_pos)
+                .map_err(BucketError::Io)?;
+            dense.insert(chunk_id, base_count + delta_pos, &vector);
+        }
+    }
+
     Ok(LoadedSlot {
         manifest,
         chunks: RwLock::new(Arc::new(chunks)),
         vectors: Some(vectors),
-        dense: Arc::new(dense),
+        dense,
         sparse: sparse.map(|s| RwLock::new(Arc::new(s))),
         tombstones,
+        delta_chunks: RwLock::new(delta_chunks),
     })
 }
 
@@ -2408,7 +2714,7 @@ embedder = "tei_test"
     }
 
     #[tokio::test]
-    async fn insert_and_compact_error_until_indexes_land() {
+    async fn compact_still_errors_until_indexes_land() {
         let tmp = tempfile::tempdir().unwrap();
         let source = tmp.path().join("notes");
         fs::create_dir_all(&source).unwrap();
@@ -2416,9 +2722,191 @@ embedder = "tei_test"
         let bucket_root = tmp.path().join("bucket");
         let bucket = open_test_bucket(&bucket_root, &source);
         let cancel = CancellationToken::new();
-
-        assert!(bucket.insert(Vec::new(), &cancel).await.is_err());
         assert!(bucket.compact(&cancel).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn insert_empty_is_ok_even_without_slot_or_embedder() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("notes");
+        fs::create_dir_all(&source).unwrap();
+        let bucket_root = tmp.path().join("bucket");
+        let bucket = open_test_bucket(&bucket_root, &source);
+        let cancel = CancellationToken::new();
+        let ids = bucket.insert(Vec::new(), &cancel).await.unwrap();
+        assert!(ids.is_empty());
+    }
+
+    #[tokio::test]
+    async fn insert_errors_when_no_active_slot() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("notes");
+        fs::create_dir_all(&source).unwrap();
+        let bucket_root = tmp.path().join("bucket");
+        let bucket = open_test_bucket(&bucket_root, &source);
+        bucket.set_embedder(Arc::new(MockEmbedder::new(8)));
+        let cancel = CancellationToken::new();
+        let err = bucket
+            .insert(vec![sample_new_chunk("hello", [1u8; 32], 0)], &cancel)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, BucketError::NoActiveSlot(_)), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn insert_errors_when_no_embedder_set() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("notes");
+        fs::create_dir_all(&source).unwrap();
+        write_md(&source, "doc.md", "hello");
+        let bucket_root = tmp.path().join("bucket");
+        let bucket = open_test_bucket(&bucket_root, &source);
+        let adapter = MarkdownDir::new(&source);
+        let (chunker, chunker_snapshot) = TokenBasedChunker::from_config(&bucket.config().chunker);
+        let embedder: Arc<dyn EmbeddingProvider> = Arc::new(MockEmbedder::new(8));
+        let cancel = CancellationToken::new();
+        bucket
+            .build_slot(
+                &adapter,
+                &chunker,
+                chunker_snapshot,
+                embedder,
+                None,
+                &cancel,
+            )
+            .await
+            .unwrap();
+        // Notice: no set_embedder call after build.
+        let err = bucket
+            .insert(vec![sample_new_chunk("hello", [1u8; 32], 0)], &cancel)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, BucketError::Other(_)), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn insert_appears_in_sparse_and_dense_search() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("notes");
+        fs::create_dir_all(&source).unwrap();
+        write_md(&source, "alpha.md", "alpha body unrelated");
+        write_md(&source, "beta.md", "beta body unrelated");
+
+        let bucket_root = tmp.path().join("bucket");
+        let bucket = open_test_bucket(&bucket_root, &source);
+        let adapter = MarkdownDir::new(&source);
+        let (chunker, chunker_snapshot) = TokenBasedChunker::from_config(&bucket.config().chunker);
+        let embedder: Arc<dyn EmbeddingProvider> = Arc::new(MockEmbedder::new(8));
+        let cancel = CancellationToken::new();
+        bucket
+            .build_slot(
+                &adapter,
+                &chunker,
+                chunker_snapshot,
+                embedder.clone(),
+                None,
+                &cancel,
+            )
+            .await
+            .unwrap();
+        bucket.set_embedder(embedder);
+
+        let inserted = "fascinating brand new fact about quokkas";
+        let ids = bucket
+            .insert(vec![sample_new_chunk(inserted, [0xAB; 32], 0)], &cancel)
+            .await
+            .unwrap();
+        assert_eq!(ids.len(), 1);
+        let inserted_id = ids[0];
+
+        // Sparse: deterministic — a unique word ("quokkas") is in the
+        // newly inserted chunk and nowhere else.
+        let hits = bucket.sparse_search("quokkas", 5, &cancel).await.unwrap();
+        assert_eq!(hits.len(), 1, "expected the inserted chunk");
+        assert_eq!(hits[0].chunk_id, inserted_id);
+        assert!(hits[0].chunk_text.contains(inserted));
+
+        // Dense: query with the exact vector that was inserted; the
+        // chunk should be the closest hit (distance ~0).
+        let query = MockEmbedder::fake_vector(inserted, 8);
+        let dense = bucket.dense_search(&query, 3, &cancel).await.unwrap();
+        assert!(
+            dense.iter().any(|c| c.chunk_id == inserted_id),
+            "inserted chunk did not surface in dense search: {dense:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn insert_persists_across_bucket_reopen() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("notes");
+        fs::create_dir_all(&source).unwrap();
+        write_md(&source, "doc.md", "the only base chunk");
+
+        let bucket_root = tmp.path().join("bucket");
+        let inserted_id = {
+            let bucket = open_test_bucket(&bucket_root, &source);
+            let adapter = MarkdownDir::new(&source);
+            let (chunker, chunker_snapshot) =
+                TokenBasedChunker::from_config(&bucket.config().chunker);
+            let embedder: Arc<dyn EmbeddingProvider> = Arc::new(MockEmbedder::new(8));
+            let cancel = CancellationToken::new();
+            bucket
+                .build_slot(
+                    &adapter,
+                    &chunker,
+                    chunker_snapshot,
+                    embedder.clone(),
+                    None,
+                    &cancel,
+                )
+                .await
+                .unwrap();
+            bucket.set_embedder(embedder);
+            let ids = bucket
+                .insert(
+                    vec![sample_new_chunk(
+                        "rare token kangaroo-platypus",
+                        [0xCD; 32],
+                        0,
+                    )],
+                    &cancel,
+                )
+                .await
+                .unwrap();
+            ids[0]
+        };
+
+        // Re-open: delta files on disk are stitched into the loaded
+        // HNSW + the delta chunks reader, so queries still find the
+        // inserted chunk.
+        let reopened = DiskBucket::open(&bucket_root, BucketId::pod("notes")).unwrap();
+        let cancel = CancellationToken::new();
+        let hits = reopened
+            .sparse_search("kangaroo-platypus", 5, &cancel)
+            .await
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].chunk_id, inserted_id);
+
+        let query = MockEmbedder::fake_vector("rare token kangaroo-platypus", 8);
+        let dense = reopened.dense_search(&query, 3, &cancel).await.unwrap();
+        assert!(
+            dense.iter().any(|c| c.chunk_id == inserted_id),
+            "inserted chunk did not survive reopen in dense search",
+        );
+    }
+
+    fn sample_new_chunk(text: &str, hash: [u8; 32], offset: u64) -> NewChunk {
+        NewChunk {
+            text: text.to_string(),
+            source_ref: crate::knowledge::SourceRef {
+                source_id: "test-source".to_string(),
+                locator: None,
+            },
+            source_record_hash: hash,
+            chunk_offset: offset,
+        }
     }
 
     #[tokio::test]

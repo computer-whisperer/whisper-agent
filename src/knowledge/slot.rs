@@ -30,6 +30,10 @@ pub const CHUNKS_IDX: &str = "chunks.idx";
 pub const VECTORS_BIN: &str = "vectors.bin";
 pub const VECTORS_IDX: &str = "vectors.idx";
 pub const INDEX_TANTIVY: &str = "index.tantivy";
+pub const DELTA_CHUNKS_BIN: &str = "delta_chunks.bin";
+pub const DELTA_CHUNKS_IDX: &str = "delta_chunks.idx";
+pub const DELTA_VECTORS_BIN: &str = "delta_vectors.bin";
+pub const DELTA_VECTORS_IDX: &str = "delta_vectors.idx";
 pub const TOMBSTONES_BIN: &str = "tombstones.bin";
 pub const BUILD_STATE: &str = "build.state";
 pub const BUILD_LOG: &str = "build.log";
@@ -72,6 +76,22 @@ pub fn tantivy_dir(slot_dir: &Path) -> PathBuf {
 
 pub fn tombstones_path(slot_dir: &Path) -> PathBuf {
     slot_dir.join(TOMBSTONES_BIN)
+}
+
+pub fn delta_chunks_bin_path(slot_dir: &Path) -> PathBuf {
+    slot_dir.join(DELTA_CHUNKS_BIN)
+}
+
+pub fn delta_chunks_idx_path(slot_dir: &Path) -> PathBuf {
+    slot_dir.join(DELTA_CHUNKS_IDX)
+}
+
+pub fn delta_vectors_bin_path(slot_dir: &Path) -> PathBuf {
+    slot_dir.join(DELTA_VECTORS_BIN)
+}
+
+pub fn delta_vectors_idx_path(slot_dir: &Path) -> PathBuf {
+    slot_dir.join(DELTA_VECTORS_IDX)
 }
 
 pub fn active_pointer_path(bucket_root: &Path) -> PathBuf {

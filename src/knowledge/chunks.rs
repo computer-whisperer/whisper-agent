@@ -148,6 +148,33 @@ impl ChunkStoreWriter {
         })
     }
 
+    /// Open an existing `chunks.bin` / `chunks.idx` pair for appending,
+    /// or create them fresh if absent. The mutation path uses this to
+    /// re-engage the delta writer across `Bucket::insert` calls.
+    ///
+    /// Source of truth for the in-memory index is `chunks.idx`; we
+    /// don't re-scan the bin file. Each call must `finalize()` so the
+    /// next call sees an up-to-date `chunks.idx` — same contract as
+    /// the build path's per-batch durability barrier.
+    pub fn create_or_open_append(bin_path: &Path, idx_path: &Path) -> io::Result<Self> {
+        if !bin_path.exists() {
+            return Self::create(bin_path, idx_path);
+        }
+        let cursor = std::fs::metadata(bin_path)?.len();
+        let map = if idx_path.exists() {
+            read_idx(idx_path)?
+        } else {
+            HashMap::new()
+        };
+        let file = OpenOptions::new().append(true).open(bin_path)?;
+        Ok(Self {
+            bin: BufWriter::new(file),
+            idx_path: idx_path.to_path_buf(),
+            index: Arc::new(RwLock::new(map)),
+            cursor,
+        })
+    }
+
     /// Append a chunk and record its offset in the shared index.
     /// Returns the offset where the record was written.
     pub fn append(

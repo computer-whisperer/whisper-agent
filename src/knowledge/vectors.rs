@@ -215,6 +215,56 @@ impl VectorStoreWriter {
         Ok(())
     }
 
+    /// Open an existing `vectors.bin` / `vectors.idx` pair for
+    /// appending, or create them fresh if absent. Used by the mutation
+    /// path to re-engage the delta writer across `Bucket::insert` calls.
+    /// Each call must `finalize()` so the next call sees an up-to-date
+    /// `vectors.idx`.
+    ///
+    /// Validates the on-disk header dimension when an existing file is
+    /// found — a mismatch means the slot's embedder has somehow drifted
+    /// since the prior call.
+    pub fn create_or_open_append(
+        bin_path: &Path,
+        idx_path: &Path,
+        expected_dimension: u32,
+    ) -> io::Result<Self> {
+        if !bin_path.exists() {
+            return Self::create(bin_path, idx_path, expected_dimension);
+        }
+
+        let mut probe = File::open(bin_path)?;
+        let on_disk_dim = read_header(&mut probe)?;
+        drop(probe);
+        if on_disk_dim != expected_dimension {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "vectors.bin dimension {on_disk_dim} does not match expected {expected_dimension}",
+                ),
+            ));
+        }
+
+        let entries: Vec<(ChunkId, u64)> = if idx_path.exists() {
+            let map = read_idx(idx_path)?;
+            let mut e: Vec<(ChunkId, u64)> = map.into_iter().collect();
+            e.sort_by_key(|(_, pos)| *pos);
+            e
+        } else {
+            Vec::new()
+        };
+        let next_position = entries.len() as u64;
+
+        let file = OpenOptions::new().append(true).open(bin_path)?;
+        Ok(Self {
+            bin: BufWriter::new(file),
+            idx_path: idx_path.to_path_buf(),
+            dimension: expected_dimension,
+            next_position,
+            entries,
+        })
+    }
+
     /// Flush `vectors.bin` and write `vectors.idx`. Returns the number
     /// of vectors committed.
     pub fn finalize(mut self) -> io::Result<usize> {
