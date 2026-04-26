@@ -1589,19 +1589,43 @@ impl Bucket for DiskBucket {
             let active = self
                 .active_snapshot()
                 .ok_or_else(|| BucketError::NoActiveSlot(self.id.clone()))?;
+
+            // Tombstone now drives a tantivy writer in addition to the
+            // tombstones-file append, so it shares the same single-
+            // writer guard that `insert` uses. The query-side tombstone
+            // filter still applies — defensive against any in-flight
+            // queries that captured an Arc<LoadedSlot> snapshot before
+            // the sparse swap below — and is cheap enough to keep.
+            let _guard = self.mutation_lock.lock().await;
+
             let tombstones = active.tombstones();
-            // The append fsyncs; push it to a blocking thread so we
-            // don't park a tokio worker on disk latency.
-            tokio::task::spawn_blocking(move || tombstones.append(&chunk_ids))
-                .await
-                .map_err(|e| BucketError::Other(format!("tombstone task: {e}")))?
-                .map_err(BucketError::Io)?;
-            // Tantivy `delete_term` is deferred to the insert commit
-            // so it can share the writer-ownership pattern. Until
-            // then, the query-path filters in `dense_search` and
-            // `sparse_search` are the source of truth: tantivy still
-            // ranks tombstoned docs, we just drop the hit before
-            // returning it to the caller.
+            let slot_path = slot::slot_dir(&self.root, &active.manifest.slot_id);
+            let sparse_enabled = active.sparse.is_some();
+            let chunk_ids_for_blocking = chunk_ids.clone();
+            let slot_path_for_blocking = slot_path.clone();
+            tokio::task::spawn_blocking(move || -> Result<(), BucketError> {
+                tombstones
+                    .append(&chunk_ids_for_blocking)
+                    .map_err(BucketError::Io)?;
+                if sparse_enabled {
+                    let tantivy_dir = slot::tantivy_dir(&slot_path_for_blocking);
+                    let mut sparse = SparseIndexBuilder::open_resume(&tantivy_dir)?;
+                    sparse.delete_chunks(&chunk_ids_for_blocking);
+                    sparse.finalize()?;
+                }
+                Ok(())
+            })
+            .await
+            .map_err(|e| BucketError::Other(format!("tombstone task: {e}")))??;
+
+            // Re-open the slot's SparseIndex so a follow-up query
+            // sees the deletes (mirrors the post-insert swap).
+            if let Some(sparse_lock) = active.sparse.as_ref() {
+                let tantivy_dir = slot::tantivy_dir(&slot_path);
+                let new_sparse = Arc::new(SparseIndex::open(&tantivy_dir)?);
+                let mut w = sparse_lock.write().expect("sparse lock poisoned");
+                *w = new_sparse;
+            }
             Ok(())
         })
     }
@@ -3084,6 +3108,50 @@ embedder = "tei_test"
             "tombstoned chunk reappeared after reopen",
         );
         assert_eq!(after.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn tombstone_drops_doc_from_tantivy_index() {
+        // Verify the tantivy-side delete actually fires, not just the
+        // query-side filter. We open the on-disk SparseIndex directly
+        // and check `num_docs` before and after.
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("notes");
+        fs::create_dir_all(&source).unwrap();
+        write_md(&source, "alpha.md", "alpha solitary phrase");
+        write_md(&source, "beta.md", "beta solitary phrase");
+
+        let bucket_root = tmp.path().join("bucket");
+        let bucket = open_test_bucket(&bucket_root, &source);
+        let adapter = MarkdownDir::new(&source);
+        let (chunker, chunker_snapshot) = TokenBasedChunker::from_config(&bucket.config().chunker);
+        let embedder: Arc<dyn EmbeddingProvider> = Arc::new(MockEmbedder::new(8));
+        let cancel = CancellationToken::new();
+        bucket
+            .build_slot(
+                &adapter,
+                &chunker,
+                chunker_snapshot,
+                embedder,
+                None,
+                &cancel,
+            )
+            .await
+            .unwrap();
+
+        let slot_id = bucket.active_slot_id().unwrap();
+        let tantivy_dir = slot::tantivy_dir(&slot::slot_dir(&bucket_root, &slot_id));
+        let before = SparseIndex::open(&tantivy_dir).unwrap().len();
+        assert_eq!(before, 2);
+
+        let hits = bucket.sparse_search("alpha", 5, &cancel).await.unwrap();
+        assert_eq!(hits.len(), 1);
+        bucket.tombstone(vec![hits[0].chunk_id]).await.unwrap();
+
+        // Re-open the on-disk index from scratch — bypasses both the
+        // bucket's reader handle and the query-side tombstone filter.
+        let after = SparseIndex::open(&tantivy_dir).unwrap().len();
+        assert_eq!(after, 1, "tantivy did not delete the tombstoned doc");
     }
 
     #[tokio::test]

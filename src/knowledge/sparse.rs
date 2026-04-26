@@ -6,8 +6,10 @@
 //! segment files, schema, etc.
 //!
 //! Schema (slice 6):
-//! - `chunk_id` — `STORED` raw 32-byte blake3 digest. Retrieved at
-//!   query time to map hits back to chunk ids; not searchable.
+//! - `chunk_id` — `STORED | INDEXED` raw 32-byte blake3 digest.
+//!   Retrieved at query time to map hits back to chunk ids; also
+//!   indexed so `delete_term` can target a specific doc on tombstone
+//!   (and on resume's idempotent re-add).
 //! - `text`    — `TEXT` indexed chunk content. The chunk text also
 //!   lives in `chunks.bin` (durable storage), so we don't `STORED` it
 //!   here — saves disk and ram, at the cost of an extra `chunks.bin`
@@ -22,7 +24,7 @@ use std::path::Path;
 
 use tantivy::collector::TopDocs;
 use tantivy::query::QueryParser;
-use tantivy::schema::{Field, STORED, Schema, TEXT, Value};
+use tantivy::schema::{Field, INDEXED, STORED, Schema, TEXT, Value};
 use tantivy::{Index, IndexReader, IndexWriter, ReloadPolicy, TantivyDocument, Term};
 
 use super::types::{BucketError, ChunkId};
@@ -38,7 +40,7 @@ const FIELD_TEXT: &str = "text";
 
 fn build_schema() -> (Schema, Field, Field) {
     let mut builder = Schema::builder();
-    let chunk_id_field = builder.add_bytes_field(FIELD_CHUNK_ID, STORED);
+    let chunk_id_field = builder.add_bytes_field(FIELD_CHUNK_ID, STORED | INDEXED);
     let text_field = builder.add_text_field(FIELD_TEXT, TEXT);
     let schema = builder.build();
     (schema, chunk_id_field, text_field)
@@ -144,6 +146,16 @@ impl SparseIndexBuilder {
 
     pub fn is_empty(&self) -> bool {
         self.count == 0
+    }
+
+    /// Tombstone-side counterpart to [`Self::add`]: queue
+    /// `delete_term` calls for each id. Caller must `commit` /
+    /// `finalize` to make the deletes durable. No-op on empty input.
+    pub fn delete_chunks(&mut self, chunk_ids: &[ChunkId]) {
+        for id in chunk_ids {
+            let term = Term::from_field_bytes(self.chunk_id_field, &id.0);
+            self.writer.delete_term(term);
+        }
     }
 
     /// Commit pending writes without consuming the builder. Used at
