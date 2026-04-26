@@ -70,6 +70,45 @@ extraction; embeddings + BM25 tolerate the markup.
   Qwen3-Embedding-0.6B (1024-dim, 2.7× vector growth): ~250 GiB,
   matching the design doc's ~300 GiB estimate.
 
+## End-to-end validation (50k simplewiki, real TEI)
+
+Run on 2026-04-26 against `[embedding_providers.qwen3_embed_0_6b]`
+(Qwen/Qwen3-Embedding-0.6B at `http://10.1.0.198:8080`) and
+`[rerank_providers.bge_reranker_v2_m3]` (BAAI/bge-reranker-v2-m3 at
+`http://10.1.0.198:8081`), batch size 128.
+
+| Metric                  | Value             |
+|-------------------------|-------------------|
+| Pages emitted           | 50,000            |
+| Chunks indexed          | 133,356           |
+| Embedder dim            | 1024              |
+| Build wall-clock        | 31 min (1879s)    |
+| Embed throughput        | ~34 pages/s       |
+| HNSW build              | ~7 min            |
+| Disk size               | 833 MiB           |
+| Query latency           | 160–230 ms        |
+
+**Quality**: dense path now contributes 3–5 of the top-5 hits across
+all five sample queries (vs ~0 with the mock embedder). Most clear
+demo is "octopus intelligence and learning": dense finds octopus-
+camouflage and RNA-editing chunks that pure BM25 wouldn't surface
+from a keyword match. Top-5 was on-topic for every query.
+
+**Bug found + fixed**: TEI 1.9.3 ignores the `top_n` field on
+`/rerank` requests; `QueryEngine` was trusting the reranker to honor
+it. Fixed in `23ba44d` by capping locally after the rerank call —
+contract holds against any provider now.
+
+**Tuning**: `EMBED_BATCH_SIZE` bumped 32 → 128 (commit `2da2698`).
+At 32, per-batch HTTP overhead dominated; 128 gave a 2.6× end-to-end
+speedup on the 50k run with no observed downside. Still under TEI's
+130-chunk per-batch token budget for ~500-token chunks.
+
+**Full-simplewiki extrapolation** (TEI, batch=128):
+~2.3h embed + ~36 min HNSW = ~3 hours. Down from the ~7h projected
+at batch=32. Still gated by HNSW persistence for anything bigger
+than simplewiki.
+
 ## Deferred / not started
 
 Numbered loosely so the conversation can refer to slices, not
