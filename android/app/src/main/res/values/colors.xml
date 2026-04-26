@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Background fill for the adaptive launcher icon. Matches the
+         dark-navy backdrop of the source artwork (assets/icon/icon_v1.png)
+         so the chroma-keyed foreground reads naturally over it. -->
+    <color name="ic_launcher_background">#010A1E</color>
+</resources>

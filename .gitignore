@@ -8,6 +8,9 @@
 # Local secrets — cloud API keys, sourced into env for development
 CLOUD_KEYS.txt
 
+# Server config: copied from whisper-agent.toml.example by users; holds API keys.
+/whisper-agent.toml
+
 # wasm-pack output (generated, served by the whisper-agent server)
 crates/whisper-agent-webui/pkg/
 
