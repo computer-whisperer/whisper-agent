@@ -316,14 +316,33 @@ impl DiskBucket {
     }
 
     /// Inject the embedding provider that `Bucket::insert` will call
-    /// against. Should match the active slot's recorded
-    /// `embedder.model_id`; mismatch is detected at insert time, not
-    /// here. Replacing an already-set embedder is allowed (model
-    /// rotation) but the caller is responsible for ensuring it matches
-    /// the slot's expected dimension.
-    pub fn set_embedder(&self, embedder: Arc<dyn EmbeddingProvider>) {
+    /// against, along with its declared `model_id` for early
+    /// validation. When an active slot is loaded, the model_id is
+    /// cross-checked against `manifest.embedder.model_id` and a
+    /// mismatch surfaces immediately as `BucketError::Provider` —
+    /// without this check the next insert would silently produce
+    /// vectors against a different model than the rest of the index.
+    ///
+    /// Callers without a slot yet (fresh bucket) just store the
+    /// embedder; validation re-runs the next time `set_embedder` is
+    /// called against a slot. Replacing an already-set embedder is
+    /// allowed (model rotation) — the same model_id check applies.
+    pub fn set_embedder(
+        &self,
+        embedder: Arc<dyn EmbeddingProvider>,
+        model_id: &str,
+    ) -> Result<(), BucketError> {
+        if let Some(active) = self.active_snapshot() {
+            let slot_model = &active.manifest.embedder.model_id;
+            if slot_model != model_id {
+                return Err(BucketError::Provider(format!(
+                    "embedder model `{model_id}` does not match slot's recorded model `{slot_model}`",
+                )));
+            }
+        }
         let mut slot = self.embedder.write().expect("embedder lock poisoned");
         *slot = Some(embedder);
+        Ok(())
     }
 
     fn embedder(&self) -> Option<Arc<dyn EmbeddingProvider>> {
@@ -1577,6 +1596,17 @@ impl Bucket for DiskBucket {
                 *w = new_sparse;
             }
 
+            // 6. Persist updated delta_chunk_count to the slot's
+            //    manifest so future loads / observers see the live
+            //    count. The in-memory `LoadedSlot.manifest` stays
+            //    as-of-load; reading the on-disk manifest is the
+            //    authoritative live view for now.
+            let live_count = active.delta_chunks().map(|r| r.len() as u64).unwrap_or(0);
+            persist_stats(
+                &slot::slot_dir(&self.root, &active.manifest.slot_id),
+                |stats| stats.delta_chunk_count = live_count,
+            )?;
+
             Ok(chunk_ids)
         })
     }
@@ -1626,6 +1656,12 @@ impl Bucket for DiskBucket {
                 let mut w = sparse_lock.write().expect("sparse lock poisoned");
                 *w = new_sparse;
             }
+
+            // Persist the updated tombstone_count to the slot's
+            // manifest. Same staleness disclaimer as the insert path:
+            // in-memory manifest is load-time, on-disk is live.
+            let live_count = active.tombstones.len() as u64;
+            persist_stats(&slot_path, |stats| stats.tombstone_count = live_count)?;
             Ok(())
         })
     }
@@ -1662,10 +1698,11 @@ impl Bucket for DiskBucket {
             let cancel_for_blocking = cancel.clone();
             let new_slot_id_for_blocking = new_slot_id.clone();
             let new_slot_path_for_blocking = new_slot_path.clone();
+            let old_slot_path_for_blocking = old_slot_path.clone();
             let result = tokio::task::spawn_blocking(move || -> Result<(), BucketError> {
                 compact_into_new_slot(
                     &active_for_blocking,
-                    &old_slot_path,
+                    &old_slot_path_for_blocking,
                     &new_slot_path_for_blocking,
                     &new_slot_id_for_blocking,
                     &cancel_for_blocking,
@@ -1690,8 +1727,19 @@ impl Bucket for DiskBucket {
                 let mut active_guard = self.active.write().expect("active lock poisoned");
                 *active_guard = Some(loaded);
             }
-            // Old slot directory is intentionally left on disk for
-            // rollback / inspection; retention cleanup is a follow-up.
+
+            // Mark the demoted slot as Archived so operators / future
+            // retention sweeps can distinguish "ready slot we promoted
+            // away from" from "ready slot still serving." On-disk
+            // directory stays for rollback / inspection; physical
+            // cleanup is a follow-up.
+            if let Err(e) = mark_slot_archived(&old_slot_path) {
+                tracing::warn!(
+                    slot = %old_slot_id,
+                    error = %e,
+                    "post-compact: failed to mark old slot as archived",
+                );
+            }
             Ok(())
         })
     }
@@ -2285,6 +2333,37 @@ fn serving_mode_to_load_mode(mode: ServingMode) -> LoadMode {
         ServingMode::Disk => LoadMode::Mmap,
         ServingMode::Ram => LoadMode::Eager,
     }
+}
+
+/// Read a slot's manifest, mutate its [`SlotStats`] in place via the
+/// caller-supplied closure, and rewrite. Used by `insert` / `tombstone`
+/// to keep `delta_chunk_count` / `tombstone_count` fresh on disk. The
+/// in-memory `LoadedSlot.manifest` is intentionally not mutated — it
+/// stays as the load-time snapshot; the on-disk file is the live view.
+fn persist_stats(slot_path: &Path, update: impl FnOnce(&mut SlotStats)) -> Result<(), BucketError> {
+    let manifest_path = slot::manifest_path(slot_path);
+    let text = std::fs::read_to_string(&manifest_path).map_err(BucketError::Io)?;
+    let mut manifest = SlotManifest::from_toml_str(&text)?;
+    update(&mut manifest.stats);
+    write_manifest(slot_path, &manifest)?;
+    Ok(())
+}
+
+/// Read a slot's manifest, flip `state` to [`SlotState::Archived`], and
+/// rewrite. Used by the post-compact bookkeeping so the demoted slot
+/// surfaces as Archived instead of still claiming Ready. Idempotent —
+/// already-Archived stays Archived; missing manifest is a hard error
+/// the caller logs.
+fn mark_slot_archived(slot_path: &Path) -> Result<(), BucketError> {
+    let manifest_path = slot::manifest_path(slot_path);
+    let text = std::fs::read_to_string(&manifest_path).map_err(BucketError::Io)?;
+    let mut manifest = SlotManifest::from_toml_str(&text)?;
+    if manifest.state == SlotState::Archived {
+        return Ok(());
+    }
+    manifest.state = SlotState::Archived;
+    write_manifest(slot_path, &manifest)?;
+    Ok(())
 }
 
 fn write_manifest(slot_path: &Path, manifest: &SlotManifest) -> Result<(), BucketError> {
@@ -3033,6 +3112,13 @@ embedder = "tei_test"
         let lineage = manifest.lineage.expect("expected lineage");
         assert_eq!(lineage.prior_slot, original_slot_id);
         assert_eq!(lineage.compaction_dropped_chunks, 0);
+
+        // Old slot got marked Archived (dir still exists for rollback).
+        let old_manifest_path =
+            slot::manifest_path(&slot::slot_dir(&bucket_root, &original_slot_id));
+        let old_text = fs::read_to_string(&old_manifest_path).unwrap();
+        let old_manifest = SlotManifest::from_toml_str(&old_text).unwrap();
+        assert_eq!(old_manifest.state, SlotState::Archived);
         assert_eq!(manifest.stats.tombstone_count, 0);
         assert_eq!(manifest.stats.delta_chunk_count, 0);
     }
@@ -3063,7 +3149,7 @@ embedder = "tei_test"
             )
             .await
             .unwrap();
-        bucket.set_embedder(embedder);
+        bucket.set_embedder(embedder, "mock-embedder").unwrap();
 
         // Tombstone "alpha".
         let alpha_hits = bucket.sparse_search("alpha", 5, &cancel).await.unwrap();
@@ -3188,7 +3274,9 @@ embedder = "tei_test"
         fs::create_dir_all(&source).unwrap();
         let bucket_root = tmp.path().join("bucket");
         let bucket = open_test_bucket(&bucket_root, &source);
-        bucket.set_embedder(Arc::new(MockEmbedder::new(8)));
+        bucket
+            .set_embedder(Arc::new(MockEmbedder::new(8)), "mock-embedder")
+            .unwrap();
         let cancel = CancellationToken::new();
         let err = bucket
             .insert(vec![sample_new_chunk("hello", [1u8; 32], 0)], &cancel)
@@ -3253,7 +3341,7 @@ embedder = "tei_test"
             )
             .await
             .unwrap();
-        bucket.set_embedder(embedder);
+        bucket.set_embedder(embedder, "mock-embedder").unwrap();
 
         let inserted = "fascinating brand new fact about quokkas";
         let ids = bucket
@@ -3306,7 +3394,7 @@ embedder = "tei_test"
                 )
                 .await
                 .unwrap();
-            bucket.set_embedder(embedder);
+            bucket.set_embedder(embedder, "mock-embedder").unwrap();
             let ids = bucket
                 .insert(
                     vec![sample_new_chunk(
@@ -3572,6 +3660,155 @@ embedder = "tei_test"
         // bucket's reader handle and the query-side tombstone filter.
         let after = SparseIndex::open(&tantivy_dir).unwrap().len();
         assert_eq!(after, 1, "tantivy did not delete the tombstoned doc");
+    }
+
+    #[tokio::test]
+    async fn set_embedder_rejects_mismatched_model_id() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("notes");
+        fs::create_dir_all(&source).unwrap();
+        write_md(&source, "doc.md", "anything");
+
+        let bucket_root = tmp.path().join("bucket");
+        let bucket = open_test_bucket(&bucket_root, &source);
+        let adapter = MarkdownDir::new(&source);
+        let (chunker, chunker_snapshot) = TokenBasedChunker::from_config(&bucket.config().chunker);
+        let embedder: Arc<dyn EmbeddingProvider> = Arc::new(MockEmbedder::new(8));
+        let cancel = CancellationToken::new();
+        bucket
+            .build_slot(
+                &adapter,
+                &chunker,
+                chunker_snapshot,
+                embedder.clone(),
+                None,
+                &cancel,
+            )
+            .await
+            .unwrap();
+
+        // Slot recorded `mock-embedder`. Wiring up a different model id
+        // is rejected.
+        let err = bucket
+            .set_embedder(embedder.clone(), "different-model")
+            .unwrap_err();
+        assert!(matches!(err, BucketError::Provider(_)), "{err:?}");
+
+        // Matching model id is accepted.
+        bucket.set_embedder(embedder, "mock-embedder").unwrap();
+    }
+
+    #[tokio::test]
+    async fn set_embedder_with_no_active_slot_just_stores() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("notes");
+        fs::create_dir_all(&source).unwrap();
+        let bucket_root = tmp.path().join("bucket");
+        let bucket = open_test_bucket(&bucket_root, &source);
+        // No build yet, no active slot — set_embedder doesn't have a
+        // slot manifest to validate against; should accept.
+        bucket
+            .set_embedder(Arc::new(MockEmbedder::new(8)), "anything")
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn insert_persists_delta_chunk_count_to_manifest() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("notes");
+        fs::create_dir_all(&source).unwrap();
+        write_md(&source, "doc.md", "base content");
+
+        let bucket_root = tmp.path().join("bucket");
+        let bucket = open_test_bucket(&bucket_root, &source);
+        let adapter = MarkdownDir::new(&source);
+        let (chunker, chunker_snapshot) = TokenBasedChunker::from_config(&bucket.config().chunker);
+        let embedder: Arc<dyn EmbeddingProvider> = Arc::new(MockEmbedder::new(8));
+        let cancel = CancellationToken::new();
+        bucket
+            .build_slot(
+                &adapter,
+                &chunker,
+                chunker_snapshot,
+                embedder.clone(),
+                None,
+                &cancel,
+            )
+            .await
+            .unwrap();
+        bucket.set_embedder(embedder, "mock-embedder").unwrap();
+
+        let slot_id = bucket.active_slot_id().unwrap();
+        let manifest_path = slot::manifest_path(&slot::slot_dir(&bucket_root, &slot_id));
+
+        // Pre-insert: zero.
+        let m0 = SlotManifest::from_toml_str(&fs::read_to_string(&manifest_path).unwrap()).unwrap();
+        assert_eq!(m0.stats.delta_chunk_count, 0);
+
+        bucket
+            .insert(
+                vec![
+                    sample_new_chunk("first inserted", [0xAA; 32], 0),
+                    sample_new_chunk("second inserted", [0xBB; 32], 0),
+                ],
+                &cancel,
+            )
+            .await
+            .unwrap();
+        let m1 = SlotManifest::from_toml_str(&fs::read_to_string(&manifest_path).unwrap()).unwrap();
+        assert_eq!(m1.stats.delta_chunk_count, 2);
+
+        bucket
+            .insert(
+                vec![sample_new_chunk("third inserted", [0xCC; 32], 0)],
+                &cancel,
+            )
+            .await
+            .unwrap();
+        let m2 = SlotManifest::from_toml_str(&fs::read_to_string(&manifest_path).unwrap()).unwrap();
+        assert_eq!(m2.stats.delta_chunk_count, 3);
+    }
+
+    #[tokio::test]
+    async fn tombstone_persists_tombstone_count_to_manifest() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("notes");
+        fs::create_dir_all(&source).unwrap();
+        write_md(&source, "alpha.md", "alpha solitary phrase");
+        write_md(&source, "beta.md", "beta solitary phrase");
+
+        let bucket_root = tmp.path().join("bucket");
+        let bucket = open_test_bucket(&bucket_root, &source);
+        let adapter = MarkdownDir::new(&source);
+        let (chunker, chunker_snapshot) = TokenBasedChunker::from_config(&bucket.config().chunker);
+        let embedder: Arc<dyn EmbeddingProvider> = Arc::new(MockEmbedder::new(8));
+        let cancel = CancellationToken::new();
+        bucket
+            .build_slot(
+                &adapter,
+                &chunker,
+                chunker_snapshot,
+                embedder,
+                None,
+                &cancel,
+            )
+            .await
+            .unwrap();
+
+        let slot_id = bucket.active_slot_id().unwrap();
+        let manifest_path = slot::manifest_path(&slot::slot_dir(&bucket_root, &slot_id));
+        let m0 = SlotManifest::from_toml_str(&fs::read_to_string(&manifest_path).unwrap()).unwrap();
+        assert_eq!(m0.stats.tombstone_count, 0);
+
+        let alpha = bucket.sparse_search("alpha", 5, &cancel).await.unwrap();
+        bucket.tombstone(vec![alpha[0].chunk_id]).await.unwrap();
+        let m1 = SlotManifest::from_toml_str(&fs::read_to_string(&manifest_path).unwrap()).unwrap();
+        assert_eq!(m1.stats.tombstone_count, 1);
+
+        let beta = bucket.sparse_search("beta", 5, &cancel).await.unwrap();
+        bucket.tombstone(vec![beta[0].chunk_id]).await.unwrap();
+        let m2 = SlotManifest::from_toml_str(&fs::read_to_string(&manifest_path).unwrap()).unwrap();
+        assert_eq!(m2.stats.tombstone_count, 2);
     }
 
     #[tokio::test]
