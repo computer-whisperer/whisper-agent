@@ -600,7 +600,11 @@ impl ChatApp {
                     && correlation_id.as_deref() == modal.pending_query_correlation.as_deref()
                 {
                     modal.pending_query_correlation = None;
-                    modal.query_status = super::QueryStatus::Results { query, hits };
+                    modal.query_status = super::QueryStatus::Results {
+                        query,
+                        hits,
+                        expanded: std::collections::HashSet::new(),
+                    };
                 }
             }
             ServerToClient::BucketCreated {

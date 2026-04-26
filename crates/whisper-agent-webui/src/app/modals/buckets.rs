@@ -456,7 +456,7 @@ fn render_query_section(
         );
     });
 
-    match &modal.query_status {
+    match &mut modal.query_status {
         QueryStatus::Idle => {}
         QueryStatus::InFlight { query } => {
             ui.label(
@@ -473,7 +473,11 @@ fn render_query_section(
                     .color(Color32::from_rgb(220, 120, 120)),
             );
         }
-        QueryStatus::Results { query, hits } => {
+        QueryStatus::Results {
+            query,
+            hits,
+            expanded,
+        } => {
             ui.label(
                 RichText::new(format!("results for {query:?} — {} hit(s)", hits.len()))
                     .small()
@@ -482,56 +486,115 @@ fn render_query_section(
             ui.add_space(2.0);
             ScrollArea::vertical()
                 .id_salt("query-results")
-                .max_height(220.0)
+                .max_height(320.0)
                 .show(ui, |ui| {
                     for (i, h) in hits.iter().enumerate() {
-                        render_hit(ui, i + 1, h);
+                        render_hit(ui, i + 1, h, expanded);
                     }
                 });
         }
     }
 }
 
-fn render_hit(ui: &mut egui::Ui, rank: usize, h: &QueryHit) {
-    ui.horizontal(|ui| {
-        ui.label(RichText::new(format!("{rank:>2}.")).small().monospace());
+/// One result. Header row carries rank / via / scores; clicking it
+/// toggles an expanded panel below with the full chunk text. Snippet
+/// is shown collapsed; full text replaces it when expanded.
+fn render_hit(
+    ui: &mut egui::Ui,
+    rank: usize,
+    h: &QueryHit,
+    expanded: &mut std::collections::HashSet<String>,
+) {
+    let is_open = expanded.contains(&h.chunk_id);
+
+    // Header row — clickable as a single unit (the chevron + rank
+    // group acts as the toggle target).
+    let header_resp = ui
+        .horizontal(|ui| {
+            let chevron = if is_open { "▾" } else { "▸" };
+            let rank_text = RichText::new(format!("{chevron} {rank}."))
+                .strong()
+                .color(Color32::from_gray(220));
+            let toggle = ui
+                .add(egui::Label::new(rank_text).sense(egui::Sense::click()))
+                .on_hover_cursor(egui::CursorIcon::PointingHand);
+            ui.label(via_chip(&h.source_path));
+            ui.label(
+                RichText::new(format!("rerank {:.3}", h.rerank_score))
+                    .small()
+                    .color(Color32::from_rgb(120, 200, 120)),
+            );
+            ui.label(
+                RichText::new(format!("src {:.3}", h.source_score))
+                    .small()
+                    .color(Color32::from_gray(150)),
+            );
+            ui.label(
+                RichText::new(format!("· {}", short_chunk_id(&h.chunk_id)))
+                    .small()
+                    .monospace()
+                    .color(Color32::from_gray(130)),
+            );
+            toggle
+        })
+        .inner;
+
+    if header_resp.clicked() {
+        if is_open {
+            expanded.remove(&h.chunk_id);
+        } else {
+            expanded.insert(h.chunk_id.clone());
+        }
+    }
+
+    if is_open {
+        // Full chunk text in a faintly-bordered, scrollable monospace
+        // panel. Word-wrapped via egui's default Label wrap (no
+        // explicit wrap mode needed when label width fits the column).
+        egui::Frame::group(ui.style())
+            .stroke(egui::Stroke::new(1.0, Color32::from_gray(60)))
+            .inner_margin(8.0)
+            .show(ui, |ui| {
+                ScrollArea::vertical()
+                    .id_salt(format!("hit-body-{}", h.chunk_id))
+                    .max_height(220.0)
+                    .show(ui, |ui| {
+                        ui.label(
+                            RichText::new(&h.chunk_text)
+                                .monospace()
+                                .color(Color32::from_gray(220)),
+                        );
+                    });
+            });
+    } else {
+        let snippet = snippet_180(&h.chunk_text);
         ui.label(
-            RichText::new(format!("[{}]", h.bucket_id))
+            RichText::new(snippet)
                 .small()
-                .color(Color32::from_gray(150)),
+                .color(Color32::from_gray(200)),
         );
-        ui.label(
-            RichText::new(short_chunk_id(&h.chunk_id))
-                .small()
-                .monospace()
-                .color(Color32::from_gray(150)),
-        );
-        ui.label(
-            RichText::new(format!("via {}", h.source_path))
-                .small()
-                .color(Color32::from_gray(170)),
-        );
-        ui.label(
-            RichText::new(format!("rerank={:.3}", h.rerank_score))
-                .small()
-                .color(Color32::from_rgb(120, 200, 120)),
-        );
-        ui.label(
-            RichText::new(format!("src={:.3}", h.source_score))
-                .small()
-                .color(Color32::from_gray(170)),
-        );
-    });
-    let snippet = snippet_120(&h.chunk_text);
-    ui.label(
-        RichText::new(snippet)
-            .small()
-            .color(Color32::from_gray(200)),
-    );
-    ui.add_space(4.0);
+    }
+    ui.add_space(6.0);
 }
 
-fn snippet_120(s: &str) -> String {
+/// Color the via= label by source path so dense / sparse contributions
+/// are visually distinguishable at a glance. Path values are lowercased
+/// from the server-side `SearchPath` enum (`"dense"` / `"sparse"`);
+/// anything else falls back to the neutral grey.
+fn via_chip(path: &str) -> RichText {
+    let (label, color) = match path {
+        "dense" => ("via dense", Color32::from_rgb(140, 180, 220)),
+        "sparse" => ("via sparse", Color32::from_rgb(220, 180, 140)),
+        other => {
+            return RichText::new(format!("via {other}"))
+                .small()
+                .color(Color32::from_gray(170));
+        }
+    };
+    RichText::new(label).small().color(color)
+}
+
+fn snippet_180(s: &str) -> String {
     let one_line: String = s.replace('\n', " ");
     one_line.chars().take(180).collect::<String>()
 }

@@ -1353,6 +1353,11 @@ enum QueryStatus {
     Results {
         query: String,
         hits: Vec<whisper_agent_protocol::QueryHit>,
+        /// chunk_ids the user has clicked open. Keyed by chunk_id (not
+        /// hit index) so the expanded set survives re-render and stays
+        /// stable across hits arriving in different orders. Cleared
+        /// implicitly when a fresh `Results` lands.
+        expanded: HashSet<String>,
     },
     Error {
         message: String,
