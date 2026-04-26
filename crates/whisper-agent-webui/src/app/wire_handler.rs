@@ -414,6 +414,15 @@ impl ChatApp {
                     modal.pending_correlation = None;
                     return;
                 }
+                // Buckets modal in-flight query.
+                if let Some(modal) = self.buckets_modal.as_mut()
+                    && correlation_id.is_some()
+                    && modal.pending_query_correlation == correlation_id
+                {
+                    modal.pending_query_correlation = None;
+                    modal.query_status = super::QueryStatus::Error { message };
+                    return;
+                }
                 // Behavior editor pending save.
                 if let Some(modal) = self.behavior_editor_modal.as_mut()
                     && correlation_id.is_some()
@@ -576,6 +585,23 @@ impl ChatApp {
             }
             ServerToClient::BucketsList { buckets, .. } => {
                 self.buckets = buckets;
+            }
+            ServerToClient::QueryResults {
+                correlation_id,
+                query,
+                hits,
+            } => {
+                // Drop the result if the user has fired a follow-up
+                // search since this one was sent — comparing against
+                // the modal's stored correlation, not the modal's
+                // current input string (the user may have typed past
+                // the in-flight query).
+                if let Some(modal) = self.buckets_modal.as_mut()
+                    && correlation_id.as_deref() == modal.pending_query_correlation.as_deref()
+                {
+                    modal.pending_query_correlation = None;
+                    modal.query_status = super::QueryStatus::Results { query, hits };
+                }
             }
             ServerToClient::PodList {
                 pods,

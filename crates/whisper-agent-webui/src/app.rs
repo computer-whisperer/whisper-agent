@@ -21,9 +21,9 @@ mod wire_handler;
 
 use self::chat_render::{ChatItemEvent, render_item};
 use self::modals::{
-    BehaviorEditorEvent, FileViewerEvent, ForkEvent, NewBehaviorEvent, NewPodEvent, PodEditorEvent,
-    ProviderEditorEvent, SettingsEvent, render_behavior_editor_modal, render_buckets_modal,
-    render_file_viewer_modal, render_fork_modal, render_image_lightbox_modal,
+    BehaviorEditorEvent, BucketsEvent, FileViewerEvent, ForkEvent, NewBehaviorEvent, NewPodEvent,
+    PodEditorEvent, ProviderEditorEvent, SettingsEvent, render_behavior_editor_modal,
+    render_buckets_modal, render_file_viewer_modal, render_fork_modal, render_image_lightbox_modal,
     render_json_viewer_modal, render_new_behavior_modal, render_new_pod_modal,
     render_pod_editor_modal, render_provider_editor_modal, render_settings_modal,
 };
@@ -1243,11 +1243,51 @@ enum ProviderEditorMode {
     Edit,
 }
 
-/// State for the knowledge-buckets management modal. Empty today —
-/// the slot's mere presence drives the modal's open/closed; create /
-/// edit / build form state grows here in slice 8c.
+/// State for the knowledge-buckets management modal.
+///
+/// Slice 9 added the search surface: `selected_bucket` /
+/// `query_input` / `top_k` drive the form, and `query_status` carries
+/// the lifecycle of an in-flight or completed query (echoed so
+/// concurrent queries don't muddle their result panes). Slice 8c's
+/// create / edit / build form state grows alongside.
 #[derive(Default)]
-struct BucketsModalState {}
+struct BucketsModalState {
+    selected_bucket: Option<String>,
+    query_input: String,
+    top_k: u32,
+    query_status: QueryStatus,
+    /// Correlation id of the in-flight query, when one exists. Used
+    /// to ignore stale `QueryResults` that arrive after the user has
+    /// fired a follow-up search.
+    pending_query_correlation: Option<String>,
+}
+
+impl BucketsModalState {
+    fn fresh() -> Self {
+        Self {
+            top_k: 10,
+            ..Default::default()
+        }
+    }
+}
+
+/// Lifecycle of the search form's last-issued query. Renderer reads
+/// this to decide between hint / spinner / results / error display.
+#[derive(Default, Clone)]
+enum QueryStatus {
+    #[default]
+    Idle,
+    InFlight {
+        query: String,
+    },
+    Results {
+        query: String,
+        hits: Vec<whisper_agent_protocol::QueryHit>,
+    },
+    Error {
+        message: String,
+    },
+}
 
 /// State for the "Server settings" modal opened from the cog in the
 /// top bar. Host to one or more inner tabs; today only "LLM backends"
@@ -2512,7 +2552,7 @@ impl eframe::App for ChatApp {
                     if bucket_btn.clicked() {
                         self.buckets_modal = match self.buckets_modal.take() {
                             Some(_) => None,
-                            None => Some(BucketsModalState::default()),
+                            None => Some(BucketsModalState::fresh()),
                         };
                     }
 
@@ -3311,10 +3351,30 @@ impl eframe::App for ChatApp {
             }
             self.send(wire);
         }
-        // Knowledge-buckets modal — read-only list in slice 8b.
-        // The modal renderer returns no events today (slice 8c grows
-        // create / build / delete actions), so the result is dropped.
-        let _ = render_buckets_modal(&ctx, &mut self.buckets_modal, &self.buckets);
+        // Knowledge-buckets modal — read-only list (slice 8b) plus
+        // the search form (slice 9). Renderer emits `RunQuery` when
+        // the user submits a search; we mint a correlation, stamp it
+        // on the modal, and dispatch `QueryBuckets`.
+        for event in render_buckets_modal(&ctx, &mut self.buckets_modal, &self.buckets) {
+            match event {
+                BucketsEvent::RunQuery {
+                    bucket_id,
+                    query,
+                    top_k,
+                } => {
+                    let correlation = self.next_correlation_id();
+                    if let Some(modal) = self.buckets_modal.as_mut() {
+                        modal.pending_query_correlation = Some(correlation.clone());
+                    }
+                    self.send(ClientToServer::QueryBuckets {
+                        correlation_id: Some(correlation),
+                        bucket_ids: vec![bucket_id],
+                        query,
+                        top_k,
+                    });
+                }
+            }
+        }
 
         for event in render_settings_modal(
             &ctx,

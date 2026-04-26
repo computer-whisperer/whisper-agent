@@ -108,6 +108,15 @@ struct Args {
     /// default so accidental reruns don't nuke a long build.
     #[arg(long, default_value_t = false)]
     fresh: bool,
+
+    /// `[defaults] embedder` value to write into the synthesized
+    /// `bucket.toml`. The bucket registry uses this to look up the
+    /// embedding provider at query time, so it should match a
+    /// `[embedding_providers.<name>]` entry in the server config when
+    /// the bucket is meant to be queried through the WebUI. Defaults
+    /// to `"mock-embedder"` to match the binary's offline default.
+    #[arg(long, default_value = "mock-embedder")]
+    embedder_name: String,
 }
 
 #[tokio::main(flavor = "multi_thread")]
@@ -131,7 +140,7 @@ async fn main() -> Result<()> {
     }
     std::fs::create_dir_all(&bucket_dir).context("create bucket dir")?;
 
-    write_bucket_toml(&bucket_dir, &args.bucket_id)?;
+    write_bucket_toml(&bucket_dir, &args.bucket_id, &args.embedder_name)?;
 
     let bucket = DiskBucket::open(bucket_dir.clone(), BucketId::server(args.bucket_id.clone()))
         .context("DiskBucket::open")?;
@@ -216,7 +225,11 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-fn write_bucket_toml(bucket_dir: &std::path::Path, bucket_id: &str) -> Result<()> {
+fn write_bucket_toml(
+    bucket_dir: &std::path::Path,
+    bucket_id: &str,
+    embedder_name: &str,
+) -> Result<()> {
     let path = bucket_dir.join("bucket.toml");
     if path.exists() {
         return Ok(());
@@ -243,10 +256,11 @@ enabled = true
 tokenizer = "default"
 
 [defaults]
-embedder = "mock-embedder"
+embedder = "{embedder_name}"
 serving_mode = "ram"
 quantization = "f32"
 "#,
+        embedder_name = embedder_name,
         bucket_id = bucket_id,
         now = chrono::Utc::now().to_rfc3339(),
     );

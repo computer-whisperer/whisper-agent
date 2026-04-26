@@ -19,16 +19,20 @@
 //! fix it through the WebUI without rebooting the server.
 
 use std::collections::BTreeMap;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use tokio::fs;
+use tokio::sync::Mutex;
 use tracing::{info, warn};
 use whisper_agent_protocol::{ActiveSlotSummary, BucketSummary, SlotStateLabel};
 
 use super::config::{BucketConfig, SourceConfig};
+use super::disk_bucket::DiskBucket;
 use super::manifest::{SlotManifest, SlotState};
 use super::slot;
-use super::types::BucketError;
+use super::types::{BucketError, BucketId};
 
 /// In-memory entry the scheduler holds per bucket on disk.
 #[derive(Debug, Clone)]
@@ -54,6 +58,15 @@ pub struct BucketEntry {
 }
 
 /// Server-scoped knowledge buckets, keyed by bucket id (== directory name).
+///
+/// `loaded` is a separate cache from `buckets`: `buckets` holds the
+/// cheap config + manifest (loaded eagerly at startup), while `loaded`
+/// is the expensive `DiskBucket` view (open the chunk store, mmap
+/// vectors, rebuild the HNSW index) — populated lazily on first query
+/// and shared across subsequent ones. Pre-populating every bucket at
+/// startup would block server boot for minutes per wikipedia-scale
+/// bucket; deferring keeps boot fast and pushes the cost to the first
+/// query that actually needs it.
 #[derive(Debug, Clone, Default)]
 pub struct BucketRegistry {
     /// `None` when the server runs without a buckets root. The registry
@@ -61,6 +74,7 @@ pub struct BucketRegistry {
     /// scheduler doesn't need conditional plumbing.
     pub root: Option<PathBuf>,
     pub buckets: BTreeMap<String, BucketEntry>,
+    loaded: Arc<Mutex<HashMap<String, Arc<DiskBucket>>>>,
 }
 
 impl BucketRegistry {
@@ -115,12 +129,55 @@ impl BucketRegistry {
         Ok(Self {
             root: Some(root),
             buckets,
+            loaded: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
     /// Wire snapshot of every bucket, sorted by id (BTreeMap order).
     pub fn summaries(&self) -> Vec<BucketSummary> {
         self.buckets.values().map(entry_to_summary).collect()
+    }
+
+    /// Return a fully-loaded `DiskBucket` for `id`, populating the
+    /// scheduler-side cache on first request. The first call against
+    /// an unloaded bucket blocks on slot-load (HNSW rebuild); later
+    /// callers reuse the `Arc`.
+    ///
+    /// Concurrent first-loads of the same bucket are *not*
+    /// deduplicated — two callers racing on a cold cache may each
+    /// call `DiskBucket::open` and the second's result is discarded
+    /// when it tries to insert. Acceptable for v1; if HNSW rebuild
+    /// becomes hot path we can graduate to a per-bucket OnceCell.
+    pub async fn loaded_bucket(&self, id: &str) -> Result<Arc<DiskBucket>, BucketError> {
+        {
+            let g = self.loaded.lock().await;
+            if let Some(b) = g.get(id) {
+                return Ok(b.clone());
+            }
+        }
+
+        let entry = self
+            .buckets
+            .get(id)
+            .ok_or_else(|| BucketError::Other(format!("unknown bucket id: {id}")))?;
+        let dir = entry.dir.clone();
+        let id_owned = id.to_string();
+
+        // `DiskBucket::open` is sync but slow (HNSW rebuild). Push it
+        // off the runtime so we don't stall the scheduler thread.
+        let bucket =
+            tokio::task::spawn_blocking(move || DiskBucket::open(dir, BucketId::server(id_owned)))
+                .await
+                .map_err(|e| BucketError::Other(format!("spawn_blocking: {e}")))??;
+        let arc = Arc::new(bucket);
+
+        let mut g = self.loaded.lock().await;
+        if let Some(existing) = g.get(id) {
+            // Lost the race; throw away our load and use the winner.
+            return Ok(existing.clone());
+        }
+        g.insert(id.to_string(), arc.clone());
+        Ok(arc)
     }
 }
 

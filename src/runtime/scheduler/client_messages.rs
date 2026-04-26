@@ -334,6 +334,14 @@ impl Scheduler {
                     },
                 );
             }
+            ClientToServer::QueryBuckets {
+                correlation_id,
+                bucket_ids,
+                query,
+                top_k,
+            } => {
+                self.handle_query_buckets(conn_id, correlation_id, bucket_ids, query, top_k);
+            }
             ClientToServer::AddHostEnvProvider {
                 correlation_id,
                 name,
@@ -1292,5 +1300,143 @@ impl Scheduler {
                 self.resolve_sudo(conn_id, function_id, decision, reason, pending_io);
             }
         }
+    }
+
+    /// `QueryBuckets` body — extracted because the handler is large
+    /// (resolve providers, spawn the async query, format results) and
+    /// the giant match in `apply_client_message` already runs long.
+    fn handle_query_buckets(
+        &self,
+        conn_id: ConnId,
+        correlation_id: Option<String>,
+        bucket_ids: Vec<String>,
+        query: String,
+        top_k: u32,
+    ) {
+        use std::sync::Arc;
+
+        use tokio_util::sync::CancellationToken;
+        use whisper_agent_protocol::QueryHit;
+
+        use crate::knowledge::{Bucket, QueryEngine, QueryParams};
+
+        let send_err = |msg: String| {
+            self.router.send_to_client(
+                conn_id,
+                ServerToClient::Error {
+                    correlation_id: correlation_id.clone(),
+                    thread_id: None,
+                    message: msg,
+                },
+            );
+        };
+
+        // Validation: exactly one bucket id, non-empty query, non-zero
+        // top_k. Multi-bucket fan-out comes when the dimension-matching
+        // UX is figured out.
+        if bucket_ids.len() != 1 {
+            send_err(format!(
+                "QueryBuckets v1 supports exactly one bucket per call, got {}",
+                bucket_ids.len(),
+            ));
+            return;
+        }
+        if query.trim().is_empty() {
+            send_err("QueryBuckets: empty query".into());
+            return;
+        }
+        if top_k == 0 {
+            send_err("QueryBuckets: top_k must be > 0".into());
+            return;
+        }
+
+        let bucket_id = bucket_ids.into_iter().next().unwrap();
+        let entry = match self.bucket_registry.buckets.get(&bucket_id) {
+            Some(e) => e,
+            None => {
+                send_err(format!("unknown bucket id: {bucket_id}"));
+                return;
+            }
+        };
+
+        let embedder_name = entry.config.defaults.embedder.clone();
+        let embedder = match self.embedding_providers.get(&embedder_name) {
+            Some(e) => e.provider.clone(),
+            None => {
+                send_err(format!(
+                    "bucket `{bucket_id}` references embedder `{embedder_name}` which is not configured under [embedding_providers.*]",
+                ));
+                return;
+            }
+        };
+
+        // Reranker: pick any configured one. Per-bucket reranker
+        // selection lands when bucket.toml grows the field.
+        let reranker = match self.rerank_providers.values().next() {
+            Some(e) => e.provider.clone(),
+            None => {
+                send_err(
+                    "no reranker configured ([rerank_providers.*] is empty); QueryBuckets needs one"
+                        .into(),
+                );
+                return;
+            }
+        };
+
+        let Some(outbound) = self.router.outbound(conn_id) else {
+            return;
+        };
+        let registry = self.bucket_registry.clone();
+
+        // Detached task: HNSW rebuild on first load and the subsequent
+        // dense+sparse+rerank round trip both want to be off the
+        // scheduler thread.
+        tokio::spawn(async move {
+            let cancel = CancellationToken::new();
+            let bucket = match registry.loaded_bucket(&bucket_id).await {
+                Ok(b) => b,
+                Err(e) => {
+                    let _ = outbound.send(ServerToClient::Error {
+                        correlation_id,
+                        thread_id: None,
+                        message: format!("loaded_bucket({bucket_id}): {e}"),
+                    });
+                    return;
+                }
+            };
+            let engine = QueryEngine::new(embedder, reranker);
+            let buckets: Vec<Arc<dyn Bucket>> = vec![bucket];
+            let params = QueryParams {
+                top_k: top_k as usize,
+                ..Default::default()
+            };
+            match engine.query(&buckets, &query, &params, &cancel).await {
+                Ok(results) => {
+                    let hits: Vec<QueryHit> = results
+                        .into_iter()
+                        .map(|r| QueryHit {
+                            bucket_id: r.bucket_id.to_string(),
+                            chunk_id: r.chunk_id.to_string(),
+                            chunk_text: r.chunk_text,
+                            source_path: format!("{:?}", r.source_path).to_lowercase(),
+                            source_score: r.source_score,
+                            rerank_score: r.rerank_score,
+                        })
+                        .collect();
+                    let _ = outbound.send(ServerToClient::QueryResults {
+                        correlation_id,
+                        query,
+                        hits,
+                    });
+                }
+                Err(e) => {
+                    let _ = outbound.send(ServerToClient::Error {
+                        correlation_id,
+                        thread_id: None,
+                        message: format!("query failed: {e}"),
+                    });
+                }
+            }
+        });
     }
 }

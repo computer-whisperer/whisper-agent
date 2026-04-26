@@ -787,6 +787,23 @@ pub enum SlotStateLabel {
     Archived,
 }
 
+/// One reranked candidate returned by a `QueryBuckets` request.
+/// Mirrors the server-side `knowledge::query::RerankedCandidate` —
+/// `chunk_id` is hex, `source_path` is the retrieval path
+/// (`"dense"` or `"sparse"`) the candidate originated on, and
+/// `source_score`'s magnitude is path-and-provider-specific (compare
+/// only within a single response and only per-path; use
+/// `rerank_score` for ordering decisions).
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct QueryHit {
+    pub bucket_id: String,
+    pub chunk_id: String,
+    pub chunk_text: String,
+    pub source_path: String,
+    pub source_score: f32,
+    pub rerank_score: f32,
+}
+
 // ---------- Wire enums ----------
 
 /// Messages the client sends to the server.
@@ -1257,6 +1274,28 @@ pub enum ClientToServer {
     ListBuckets {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         correlation_id: Option<String>,
+    },
+    /// Run a hybrid (dense + sparse + reranker) query against one or
+    /// more buckets. Server resolves each bucket's embedder via its
+    /// `bucket.toml`'s `[defaults] embedder = "..."`, picks any
+    /// configured reranker (slice 9 punts on per-bucket reranker
+    /// selection), and responds with `QueryResults` or `Error`.
+    ///
+    /// First query against an unloaded bucket pays the slot-load cost
+    /// (HNSW rebuild from `vectors.bin`); subsequent queries hit the
+    /// scheduler-side bucket cache and return in milliseconds.
+    QueryBuckets {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        correlation_id: Option<String>,
+        /// Bucket ids to query across. Slice 9 supports exactly one;
+        /// multi-bucket fan-out (which already works in `QueryEngine`)
+        /// arrives once the dimension-matching UX is figured out.
+        bucket_ids: Vec<String>,
+        query: String,
+        /// Final result count returned to the caller after reranking.
+        /// `0` is rejected with `Error` rather than silently returning
+        /// nothing.
+        top_k: u32,
     },
 
     // --- Behavior registry (read-only in phase 1 — see
@@ -1812,6 +1851,16 @@ pub enum ServerToClient {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         correlation_id: Option<String>,
         buckets: Vec<BucketSummary>,
+    },
+    /// Response to a successful `QueryBuckets`. `query` echoes the
+    /// request so concurrent queries don't muddle their result panes
+    /// when ordering across the wire is non-deterministic. Hits are
+    /// already sorted by descending `rerank_score`.
+    QueryResults {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        correlation_id: Option<String>,
+        query: String,
+        hits: Vec<QueryHit>,
     },
 
     // --- Behavior registry ---
