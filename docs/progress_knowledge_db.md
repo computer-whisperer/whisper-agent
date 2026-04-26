@@ -26,6 +26,8 @@ Last updated: **2026-04-26**.
 | 8b  | WebUI knowledge-buckets modal — read-only bucket list          | `9e9925d` |
 | MW  | MediaWiki XML source adapter — streaming, bz2, raw wikitext    | `03d4a7e` |
 | —   | `build_simplewiki` one-off binary (driver for the validation)  | `9c0d864` |
+| 9   | `QueryBuckets` wire path + WebUI search form                   | `9c82346` |
+| HP  | HNSW persistence — dump on build, reload on open               | `1658a8f` |
 
 ## End-to-end validation (Simple English Wikipedia, mock embedder)
 
@@ -126,11 +128,11 @@ chronological — order may shuffle as the dataset reveals what hurts.
 
 ## Dangling cleanup (none blocking)
 
-- **HNSW persistence** — `DenseIndex::build` rebuilds from `vectors.bin` on
-  every slot load *and* dominates initial build wall-clock (~46 of 47 min
-  on the simplewiki validation run for 685k vectors). Wikipedia-scale
-  builds (~30M chunks) are infeasible without persistence. **Now the
-  gating constraint for the next scale step.**
+- ~~**HNSW persistence**~~ — landed in `1658a8f`. Slot open now reads
+  `dense.hnsw.{graph,data}` instead of rebuilding (~390× faster cold
+  load on simplewiki/tei_50k). Initial *build* wall-clock is unchanged
+  — full enwiki rebuild is still gated by build-side throughput, but
+  reuse across server restarts is solved.
 - **`tokenizers` crate integration** — `TokenBasedChunker` uses a
   `chars_per_token=4` heuristic. For chunk-id stability across embedder
   swaps the chunker has to use real BPE. Land before any "production"
