@@ -275,11 +275,17 @@ pub enum SearchPath {
 /// BM25 raw) — exposed for observability only; it's not comparable across
 /// paths or buckets, which is exactly why the reranker is the unification
 /// layer.
+///
+/// `source_ref` is the chunk's adapter-level provenance — file path for
+/// markdown_dir, article title for mediawiki_xml. Carried through so the
+/// LLM-facing surface (`knowledge_query` tool) and the WebUI can cite
+/// where each hit came from rather than just naming a chunk hash.
 #[derive(Debug, Clone)]
 pub struct Candidate {
     pub bucket_id: BucketId,
     pub chunk_id: ChunkId,
     pub chunk_text: String,
+    pub source_ref: SourceRef,
     pub source_score: f32,
     pub path: SearchPath,
 }

@@ -71,6 +71,8 @@ pub struct RerankedCandidate {
     pub bucket_id: BucketId,
     pub chunk_id: ChunkId,
     pub chunk_text: String,
+    /// Adapter-level provenance — see [`Candidate::source_ref`].
+    pub source_ref: super::types::SourceRef,
     pub source_score: f32,
     pub source_path: SearchPath,
     pub rerank_score: f32,
@@ -169,6 +171,7 @@ impl QueryEngine {
                 bucket_id: c.bucket_id.clone(),
                 chunk_id: c.chunk_id,
                 chunk_text: c.chunk_text.clone(),
+                source_ref: c.source_ref.clone(),
                 source_score: c.source_score,
                 source_path: c.path,
                 rerank_score: r.score,

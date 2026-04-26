@@ -507,39 +507,66 @@ fn render_hit(
 ) {
     let is_open = expanded.contains(&h.chunk_id);
 
-    // Header row — clickable as a single unit (the chevron + rank
-    // group acts as the toggle target).
-    let header_resp = ui
-        .horizontal(|ui| {
-            let chevron = if is_open { "▾" } else { "▸" };
-            let rank_text = RichText::new(format!("{chevron} {rank}."))
+    // Two-line header: source title on top (the thing the eye scans
+    // for "is this hit relevant"), metadata row below (chevron + via
+    // + scores + chunk-id tail). Clicking the source title toggles
+    // expand — large click target, matches what the eye reads first.
+    let title_label = if h.source_id.is_empty() {
+        format!("(no source id) — chunk {}", short_chunk_id(&h.chunk_id))
+    } else {
+        h.source_id.clone()
+    };
+    let title_color = if h.source_id.is_empty() {
+        Color32::from_gray(150)
+    } else {
+        Color32::from_rgb(180, 200, 230)
+    };
+    let title_resp = ui
+        .add(
+            egui::Label::new(
+                RichText::new(format!(
+                    "{chev} {rank}. {title}",
+                    chev = if is_open { "▾" } else { "▸" },
+                    title = title_label,
+                ))
                 .strong()
-                .color(Color32::from_gray(220));
-            let toggle = ui
-                .add(egui::Label::new(rank_text).sense(egui::Sense::click()))
-                .on_hover_cursor(egui::CursorIcon::PointingHand);
-            ui.label(via_chip(&h.source_path));
+                .color(title_color),
+            )
+            .sense(egui::Sense::click()),
+        )
+        .on_hover_cursor(egui::CursorIcon::PointingHand);
+
+    ui.horizontal(|ui| {
+        ui.add_space(16.0); // indent under the rank
+        ui.label(via_chip(&h.source_path));
+        ui.label(
+            RichText::new(format!("rerank {:.3}", h.rerank_score))
+                .small()
+                .color(Color32::from_rgb(120, 200, 120)),
+        );
+        ui.label(
+            RichText::new(format!("src {:.3}", h.source_score))
+                .small()
+                .color(Color32::from_gray(150)),
+        );
+        if let Some(loc) = h.source_locator.as_deref()
+            && !loc.is_empty()
+        {
             ui.label(
-                RichText::new(format!("rerank {:.3}", h.rerank_score))
-                    .small()
-                    .color(Color32::from_rgb(120, 200, 120)),
-            );
-            ui.label(
-                RichText::new(format!("src {:.3}", h.source_score))
+                RichText::new(format!("· {loc}"))
                     .small()
                     .color(Color32::from_gray(150)),
             );
-            ui.label(
-                RichText::new(format!("· {}", short_chunk_id(&h.chunk_id)))
-                    .small()
-                    .monospace()
-                    .color(Color32::from_gray(130)),
-            );
-            toggle
-        })
-        .inner;
+        }
+        ui.label(
+            RichText::new(format!("· {}", short_chunk_id(&h.chunk_id)))
+                .small()
+                .monospace()
+                .color(Color32::from_gray(130)),
+        );
+    });
 
-    if header_resp.clicked() {
+    if title_resp.clicked() {
         if is_open {
             expanded.remove(&h.chunk_id);
         } else {

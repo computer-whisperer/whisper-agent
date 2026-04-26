@@ -448,6 +448,7 @@ impl Bucket for DiskBucket {
                     bucket_id: self.id.clone(),
                     chunk_id,
                     chunk_text: chunk.text,
+                    source_ref: chunk.source_ref,
                     source_score: distance,
                     path: SearchPath::Dense,
                 });
@@ -489,6 +490,7 @@ impl Bucket for DiskBucket {
                     bucket_id: self.id.clone(),
                     chunk_id,
                     chunk_text: chunk.text,
+                    source_ref: chunk.source_ref,
                     source_score: score,
                     path: SearchPath::Sparse,
                 });

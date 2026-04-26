@@ -794,6 +794,13 @@ pub enum SlotStateLabel {
 /// `source_score`'s magnitude is path-and-provider-specific (compare
 /// only within a single response and only per-path; use
 /// `rerank_score` for ordering decisions).
+///
+/// `source_id` and `source_locator` carry the chunk's adapter-level
+/// provenance — for `markdown_dir` `source_id` is the file path; for
+/// `mediawiki_xml` it's the article title. `source_locator` is the
+/// chunker's per-chunk pointer into the record (`"chars 200-700"`).
+/// Both are surfaced so the WebUI can cite the source and the
+/// `knowledge_query` builtin can include it in tool output.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub struct QueryHit {
     pub bucket_id: String,
@@ -802,6 +809,10 @@ pub struct QueryHit {
     pub source_path: String,
     pub source_score: f32,
     pub rerank_score: f32,
+    #[serde(default)]
+    pub source_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_locator: Option<String>,
 }
 
 /// Source-of-truth descriptor for a bucket creation request. Mirrors the

@@ -1437,6 +1437,8 @@ impl Scheduler {
                             source_path: format!("{:?}", r.source_path).to_lowercase(),
                             source_score: r.source_score,
                             rerank_score: r.rerank_score,
+                            source_id: r.source_ref.source_id,
+                            source_locator: r.source_ref.locator,
                         })
                         .collect();
                     let _ = outbound.send(ServerToClient::QueryResults {
