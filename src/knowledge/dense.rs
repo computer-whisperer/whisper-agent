@@ -27,6 +27,7 @@
 //! buckets (~30M chunks) the duplicate is the price of being able to
 //! cold-start in seconds instead of hours.
 
+use std::io;
 use std::path::Path;
 use std::sync::RwLock;
 
@@ -39,6 +40,16 @@ use super::vectors::VectorStoreReader;
 /// File basename for the HNSW dump inside a slot directory. The
 /// hnsw_rs library appends `.hnsw.graph` and `.hnsw.data` to this.
 const DENSE_BASENAME: &str = "dense";
+
+/// Sidecar file name. Contains a single u64 (LE) — the number of
+/// chunks reflected in the accompanying `dense.hnsw.{graph,data}`
+/// dump. Written *after* the hnsw files; presence of this file is
+/// the signal that the dump is complete and trustworthy.
+///
+/// Resume reads this and compares to the last `BatchEmbedded`
+/// checkpoint in `build.state`: if they match, the dump can be
+/// loaded directly instead of rebuilding the HNSW from vectors.bin.
+const DENSE_SNAPSHOT_NAME: &str = "dense.snapshot";
 
 /// HNSW build parameters. Defaults match the design doc's targets
 /// (M=16, ef_construction=200) — appropriate for Qwen3-Embedding-0.6B
@@ -210,21 +221,35 @@ impl DenseIndex {
     /// final-build artifact a future slot-open uses to skip the
     /// rebuild.
     ///
-    /// Stale on-disk dumps are removed first so `file_dump` doesn't
-    /// silently fall back to a random-suffixed basename when prior
-    /// files exist (its anti-mmap-clobber default).
+    /// Stale on-disk dumps (including the sidecar) are removed first so
+    /// `file_dump` doesn't silently fall back to a random-suffixed
+    /// basename when prior files exist (its anti-mmap-clobber default),
+    /// and so a partial dump can never be mistaken for a complete one.
+    /// The sidecar is the *last* file written — its presence means the
+    /// hnsw files reflect the recorded chunk count.
     pub fn dump_to(&self, slot_dir: &Path) -> Result<(), BucketError> {
+        let snapshot_path = slot_dir.join(DENSE_SNAPSHOT_NAME);
+        if snapshot_path.exists() {
+            std::fs::remove_file(&snapshot_path).map_err(BucketError::Io)?;
+        }
         for ext in [".hnsw.graph", ".hnsw.data"] {
             let p = slot_dir.join(format!("{DENSE_BASENAME}{ext}"));
             if p.exists() {
                 std::fs::remove_file(&p).map_err(BucketError::Io)?;
             }
         }
-        let inner = self.inner.read().expect("DenseIndex lock poisoned");
-        inner
-            .hnsw
-            .file_dump(slot_dir, DENSE_BASENAME)
-            .map_err(|e| BucketError::Other(format!("hnsw file_dump: {e}")))?;
+        // Hold the read lock while dumping so concurrent inserts don't
+        // grow the HNSW between file_dump and reading get_nb_point —
+        // sidecar must reflect exactly what's in the dump files.
+        let snapshot_count = {
+            let inner = self.inner.read().expect("DenseIndex lock poisoned");
+            inner
+                .hnsw
+                .file_dump(slot_dir, DENSE_BASENAME)
+                .map_err(|e| BucketError::Other(format!("hnsw file_dump: {e}")))?;
+            inner.hnsw.get_nb_point() as u64
+        };
+        std::fs::write(&snapshot_path, snapshot_count.to_le_bytes()).map_err(BucketError::Io)?;
         Ok(())
     }
 
@@ -279,6 +304,63 @@ impl DenseIndex {
             inner: RwLock::new(DenseInner { hnsw, by_position }),
         })
     }
+
+    /// Load a dumped HNSW with a caller-supplied `by_position` table.
+    ///
+    /// Used by the resume path during a build, where `vectors.idx`
+    /// hasn't been written yet — the by_position list comes from
+    /// re-running the chunker over the durable Planned records.
+    /// Otherwise behaves identically to [`Self::load_from`]: the
+    /// hnsw_rs files must exist, and the dump's point count must
+    /// match `by_position.len()`.
+    pub fn load_from_with_positions(
+        slot_dir: &Path,
+        by_position: Vec<ChunkId>,
+    ) -> Result<Self, BucketError> {
+        let graph_path = slot_dir.join(format!("{DENSE_BASENAME}.hnsw.graph"));
+        let data_path = slot_dir.join(format!("{DENSE_BASENAME}.hnsw.data"));
+        if !graph_path.exists() || !data_path.exists() {
+            return Err(BucketError::Other(format!(
+                "hnsw dump not found in {} (looking for {DENSE_BASENAME}.hnsw.graph + .data)",
+                slot_dir.display(),
+            )));
+        }
+        let io: &'static mut HnswIo = Box::leak(Box::new(HnswIo::new(slot_dir, DENSE_BASENAME)));
+        let hnsw: Hnsw<'static, f32, DistL2> = io
+            .load_hnsw()
+            .map_err(|e| BucketError::Other(format!("hnsw load: {e}")))?;
+        let hnsw_count = hnsw.get_nb_point();
+        if hnsw_count != by_position.len() {
+            return Err(BucketError::Other(format!(
+                "hnsw dump count {hnsw_count} does not match expected count {}",
+                by_position.len(),
+            )));
+        }
+        Ok(Self {
+            inner: RwLock::new(DenseInner { hnsw, by_position }),
+        })
+    }
+}
+
+/// Read the sidecar `dense.snapshot` file written by [`DenseIndex::dump_to`].
+/// Returns `Ok(None)` when the sidecar is missing — that means either
+/// no dump has been written yet, or a partial dump landed without
+/// finishing. Either way the caller should fall back to rebuilding
+/// from vectors.bin rather than trusting the on-disk hnsw files.
+pub fn read_dump_snapshot(slot_dir: &Path) -> io::Result<Option<u64>> {
+    let path = slot_dir.join(DENSE_SNAPSHOT_NAME);
+    let bytes = match std::fs::read(&path) {
+        Ok(b) => b,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    if bytes.len() != 8 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("dense.snapshot has {} bytes, expected 8", bytes.len()),
+        ));
+    }
+    Ok(Some(u64::from_le_bytes(bytes.try_into().unwrap())))
 }
 
 #[cfg(test)]
@@ -403,6 +485,93 @@ mod tests {
         assert!(
             msg.contains("not found") || msg.contains("dump"),
             "unexpected error message: {msg}",
+        );
+    }
+
+    #[test]
+    fn dump_writes_sidecar_with_point_count() {
+        // dump_to() must write dense.snapshot last, with the LE u64
+        // matching the HNSW's point count. Resume relies on this for
+        // checkpoint matching.
+        let tmp = build_test_vectors(8, 17);
+        let vectors = open_reader(&tmp);
+        let built = DenseIndex::build(&vectors, HnswParams::default()).unwrap();
+        built.dump_to(tmp.path()).unwrap();
+
+        let snap = read_dump_snapshot(tmp.path()).unwrap();
+        assert_eq!(snap, Some(17));
+    }
+
+    #[test]
+    fn read_dump_snapshot_missing_returns_none() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert_eq!(read_dump_snapshot(tmp.path()).unwrap(), None);
+    }
+
+    #[test]
+    fn read_dump_snapshot_rejects_wrong_size() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("dense.snapshot"), b"oops").unwrap();
+        let err = read_dump_snapshot(tmp.path()).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn dump_clears_stale_sidecar_before_writing_files() {
+        // If a prior run wrote a sidecar but the current dump fails
+        // mid-write, no leftover sidecar can claim "the dump is OK".
+        // We simulate by manually planting a stale sidecar, then
+        // verifying dump_to() replaces it with the correct value.
+        let tmp = build_test_vectors(8, 5);
+        let vectors = open_reader(&tmp);
+        let built = DenseIndex::build(&vectors, HnswParams::default()).unwrap();
+
+        std::fs::write(tmp.path().join("dense.snapshot"), 999u64.to_le_bytes()).unwrap();
+        built.dump_to(tmp.path()).unwrap();
+        assert_eq!(read_dump_snapshot(tmp.path()).unwrap(), Some(5));
+    }
+
+    #[test]
+    fn load_from_with_positions_roundtrips() {
+        // The resume path uses load_from_with_positions because
+        // vectors.idx isn't written until finalize. Same hnsw, but
+        // by_position comes from chunk-id rederivation rather than
+        // disk.
+        let tmp = build_test_vectors(8, 20);
+        let vectors = open_reader(&tmp);
+        let built = DenseIndex::build(&vectors, HnswParams::default()).unwrap();
+        built.dump_to(tmp.path()).unwrap();
+
+        let mut pairs: Vec<(u64, ChunkId)> = vectors
+            .iter_chunk_positions()
+            .map(|(id, pos)| (pos, id))
+            .collect();
+        pairs.sort_by_key(|(pos, _)| *pos);
+        let by_position: Vec<ChunkId> = pairs.into_iter().map(|(_, id)| id).collect();
+
+        let loaded = DenseIndex::load_from_with_positions(tmp.path(), by_position).unwrap();
+        assert_eq!(loaded.len(), built.len());
+
+        let mut q = vec![0.0f32; 8];
+        q[3] = 4.0;
+        let from_built = built.search(&q, 1);
+        let from_loaded = loaded.search(&q, 1);
+        assert_eq!(from_built[0].0, from_loaded[0].0);
+    }
+
+    #[test]
+    fn load_from_with_positions_rejects_count_mismatch() {
+        let tmp = build_test_vectors(8, 10);
+        let vectors = open_reader(&tmp);
+        let built = DenseIndex::build(&vectors, HnswParams::default()).unwrap();
+        built.dump_to(tmp.path()).unwrap();
+
+        // Hand in a too-short by_position list — load must reject.
+        let too_short = vec![ChunkId::from_source(&[1; 32], 0); 5];
+        let err = DenseIndex::load_from_with_positions(tmp.path(), too_short).unwrap_err();
+        assert!(
+            err.to_string().contains("does not match"),
+            "unexpected error: {err}",
         );
     }
 

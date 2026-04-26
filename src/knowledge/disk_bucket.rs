@@ -50,6 +50,26 @@ use crate::providers::embedding::{EmbedRequest, EmbeddingProvider};
 /// const at module level.
 const EMBED_BATCH_SIZE: usize = 128;
 
+/// Dump the in-progress HNSW + sidecar every N batches so resume can
+/// pick up the dump instead of rebuilding the graph from vectors.bin
+/// (an `O(M N log N)` cost proportional to how far the prior attempt
+/// got). The dump itself blocks new appends for its duration since
+/// hnsw_rs serializes writes against the read lock — at scales where
+/// dumps are expensive, the embedder network roundtrips dominate
+/// anyway. Picked 32 batches (= 4096 chunks at EMBED_BATCH_SIZE=128)
+/// as a balance: small enough that workspace-scale builds get at
+/// least one dump if cancelled past the first few batches, large
+/// enough that wiki-scale builds do ~7k dumps over a multi-day build
+/// rather than hundreds of thousands.
+///
+/// Lowered to 1 in tests so the resume tests cover both fast-path
+/// (sidecar load) and fallback (rebuild) without needing to feed
+/// thousands of records through the build to trigger a real dump.
+#[cfg(not(test))]
+const DENSE_DUMP_BATCH_INTERVAL: u64 = 32;
+#[cfg(test)]
+const DENSE_DUMP_BATCH_INTERVAL: u64 = 1;
+
 /// Coarse build-stage tag passed to [`BuildObserver::on_phase`]. Mirrors
 /// the wire-side `BucketBuildPhase` so the scheduler can pass these
 /// through unmodified.
@@ -665,44 +685,76 @@ impl DiskBucket {
             None
         };
 
-        // Rebuild the in-memory HNSW for the chunks already on disk
+        // Hydrate the in-memory HNSW for the chunks already on disk
         // so subsequent inserts during the resumed Indexing phase
-        // continue at position `chunks_done`. We read each vector
-        // sequentially from vectors.bin via a position-only reader
-        // (no vectors.idx yet — that's written at finalize). This
-        // is the same M log N work the original build did up to
-        // this point; it's the cost of resume that's roughly
-        // proportional to how far the prior attempt got.
+        // continue at position `chunks_done`. Two paths:
+        //
+        //  1. Fast path — load the periodic dump if its sidecar
+        //     `dense.snapshot` reports exactly `chunks_done` points.
+        //     That's an O(file size) read; sub-second at workspace
+        //     scale, ~tens of seconds at wiki scale.
+        //
+        //  2. Fallback — sequentially read vectors.bin and re-insert
+        //     each vector into a fresh HNSW. O(M N log N) work
+        //     proportional to chunks_done; this is what every resume
+        //     paid before the periodic-dump landed, and it remains
+        //     the path used when the prior build crashed before any
+        //     dump finished, or after a BatchEmbedded for which no
+        //     dump has caught up yet.
+        //
+        // A sidecar value greater than `chunks_done` shouldn't
+        // happen (dump always lags BatchEmbedded log entries) but
+        // we treat it as "trust the log" and fall back to rebuild
+        // rather than load a dump that has more points than the
+        // log says are durable.
         let dense_for_resume: Option<Arc<DenseIndex>> = if chunks_done == 0 {
             None
         } else {
-            let dense = DenseIndex::empty(
-                HnswParams::default(),
-                (planned.len().saturating_mul(8)).max(1024),
-            );
-            let bin_path_for_thread = vectors_bin.clone();
-            let dim = embedder_snapshot.dimension;
-            let chunk_ids = resumed_chunk_ids.clone();
-            let dense = tokio::task::spawn_blocking(move || -> Result<DenseIndex, BucketError> {
-                let mut bin = std::fs::File::open(&bin_path_for_thread).map_err(BucketError::Io)?;
-                use std::io::{Read, Seek, SeekFrom};
-                for (position, chunk_id) in chunk_ids.iter().enumerate() {
-                    let byte_offset = 16u64 + position as u64 * dim as u64 * 4;
-                    bin.seek(SeekFrom::Start(byte_offset))
-                        .map_err(BucketError::Io)?;
-                    let mut bytes = vec![0u8; dim as usize * 4];
-                    bin.read_exact(&mut bytes).map_err(BucketError::Io)?;
-                    let mut v = Vec::with_capacity(dim as usize);
-                    for chunk in bytes.chunks_exact(4) {
-                        v.push(f32::from_le_bytes(chunk.try_into().unwrap()));
-                    }
-                    dense.insert(*chunk_id, position as u64, &v);
-                }
-                Ok(dense)
-            })
-            .await
-            .map_err(|e| BucketError::Other(format!("spawn_blocking dense rebuild: {e}")))??;
-            Some(Arc::new(dense))
+            let dump_snapshot =
+                super::dense::read_dump_snapshot(&slot_path).map_err(BucketError::Io)?;
+            if dump_snapshot == Some(chunks_done) {
+                let by_position = resumed_chunk_ids.clone();
+                let slot_path_for_thread = slot_path.clone();
+                let dense =
+                    tokio::task::spawn_blocking(move || -> Result<DenseIndex, BucketError> {
+                        DenseIndex::load_from_with_positions(&slot_path_for_thread, by_position)
+                    })
+                    .await
+                    .map_err(|e| BucketError::Other(format!("spawn_blocking dense load: {e}")))??;
+                Some(Arc::new(dense))
+            } else {
+                let dense = DenseIndex::empty(
+                    HnswParams::default(),
+                    (planned.len().saturating_mul(8)).max(1024),
+                );
+                let bin_path_for_thread = vectors_bin.clone();
+                let dim = embedder_snapshot.dimension;
+                let chunk_ids = resumed_chunk_ids.clone();
+                let dense =
+                    tokio::task::spawn_blocking(move || -> Result<DenseIndex, BucketError> {
+                        let mut bin =
+                            std::fs::File::open(&bin_path_for_thread).map_err(BucketError::Io)?;
+                        use std::io::{Read, Seek, SeekFrom};
+                        for (position, chunk_id) in chunk_ids.iter().enumerate() {
+                            let byte_offset = 16u64 + position as u64 * dim as u64 * 4;
+                            bin.seek(SeekFrom::Start(byte_offset))
+                                .map_err(BucketError::Io)?;
+                            let mut bytes = vec![0u8; dim as usize * 4];
+                            bin.read_exact(&mut bytes).map_err(BucketError::Io)?;
+                            let mut v = Vec::with_capacity(dim as usize);
+                            for chunk in bytes.chunks_exact(4) {
+                                v.push(f32::from_le_bytes(chunk.try_into().unwrap()));
+                            }
+                            dense.insert(*chunk_id, position as u64, &v);
+                        }
+                        Ok(dense)
+                    })
+                    .await
+                    .map_err(|e| {
+                        BucketError::Other(format!("spawn_blocking dense rebuild: {e}"))
+                    })??;
+                Some(Arc::new(dense))
+            }
         };
 
         let resume = ResumePoint {
@@ -821,6 +873,11 @@ impl DiskBucket {
         let install_during_build = !self.has_active_slot();
         let mut active_during_build: Option<Arc<LoadedSlot>> = None;
 
+        // Periodic-dump cadence: every DENSE_DUMP_BATCH_INTERVAL
+        // BatchEmbedded records, dump the HNSW + sidecar so resume
+        // can skip the M-N-log-N rebuild from vectors.bin.
+        let mut batches_since_dump: u64 = 0;
+
         for record in iter {
             if cancel.is_cancelled() {
                 return Err(BucketError::Cancelled);
@@ -874,6 +931,11 @@ impl DiskBucket {
                 // durable" itself durable.
                 build_state.sync().map_err(BucketError::Io)?;
                 batch_index += 1;
+                batches_since_dump += 1;
+                if batches_since_dump >= DENSE_DUMP_BATCH_INTERVAL {
+                    periodic_dump(slot_path, slot_id, &dense).await?;
+                    batches_since_dump = 0;
+                }
                 if let Some(obs) = observer {
                     obs.on_progress(records_completed, chunks_emitted);
                 }
@@ -943,20 +1005,7 @@ impl DiskBucket {
         // the phase tag so existing wire consumers / tests don't
         // break, even though counters don't tick.
         publish_phase(BuildPhase::BuildingDense, observer, &mut build_state)?;
-        let dense_for_dump = dense.clone();
-        let slot_path_for_dump = slot_path.to_path_buf();
-        let slot_id_for_warn = slot_id.to_string();
-        tokio::task::spawn_blocking(move || {
-            if let Err(e) = dense_for_dump.dump_to(&slot_path_for_dump) {
-                tracing::warn!(
-                    slot = %slot_id_for_warn,
-                    error = %e,
-                    "hnsw dump failed; slot is still usable but next open will rebuild from vectors",
-                );
-            }
-        })
-        .await
-        .map_err(|e| BucketError::Other(format!("spawn_blocking dense dump: {e}")))?;
+        periodic_dump(slot_path, slot_id, &dense).await?;
 
         // --- Phase: Finalizing ---
         publish_phase(BuildPhase::Finalizing, observer, &mut build_state)?;
@@ -1375,6 +1424,35 @@ fn open_fresh_handles(
         sparse_builder,
         build_state,
     })
+}
+
+/// Dump the in-progress (or just-finished) HNSW + sidecar on a
+/// `spawn_blocking` thread. Failures are warn-logged rather than
+/// returning an error — a missing dump means resume falls back to a
+/// sequential rebuild from vectors.bin, but doesn't lose any data.
+///
+/// Used both for periodic mid-build dumps (every
+/// [`DENSE_DUMP_BATCH_INTERVAL`] batches) and the end-of-build dump
+/// in the `BuildingDense` phase.
+async fn periodic_dump(
+    slot_path: &Path,
+    slot_id: &str,
+    dense: &Arc<DenseIndex>,
+) -> Result<(), BucketError> {
+    let dense_for_dump = dense.clone();
+    let slot_path_owned = slot_path.to_path_buf();
+    let slot_id_for_warn = slot_id.to_string();
+    tokio::task::spawn_blocking(move || {
+        if let Err(e) = dense_for_dump.dump_to(&slot_path_owned) {
+            tracing::warn!(
+                slot = %slot_id_for_warn,
+                error = %e,
+                "hnsw dump failed; slot is still usable but resume will rebuild from vectors",
+            );
+        }
+    })
+    .await
+    .map_err(|e| BucketError::Other(format!("spawn_blocking dense dump: {e}")))
 }
 
 /// Notify the observer of a phase transition and append the matching
@@ -2522,6 +2600,156 @@ embedder = "tei_test"
             !sparse_hits.is_empty(),
             "resumed slot must be queryable on sparse"
         );
+    }
+
+    #[tokio::test]
+    async fn resume_loads_periodic_dump_when_sidecar_matches_checkpoint() {
+        // The fast resume path: if dense.snapshot's chunk count matches
+        // the last BatchEmbedded's chunks_completed, resume should load
+        // the dump rather than rebuild the HNSW from vectors.bin. With
+        // DENSE_DUMP_BATCH_INTERVAL=1 in tests, every BatchEmbedded
+        // fires a dump, so the sidecar always matches the latest log
+        // entry on a clean cancel.
+        use crate::knowledge::build_state::{self, BuildStateRecord};
+        use crate::knowledge::dense::read_dump_snapshot;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("notes");
+        fs::create_dir_all(&source).unwrap();
+        let total_records = super::EMBED_BATCH_SIZE + 5;
+        for i in 0..total_records {
+            write_md(
+                &source,
+                &format!("doc-{i:04}.md"),
+                &format!("doc-{i:04} body content"),
+            );
+        }
+
+        let bucket_root = tmp.path().join("bucket");
+        let bucket = open_test_bucket(&bucket_root, &source);
+        let adapter = MarkdownDir::new(&source);
+        let chunker = TokenBasedChunker::from_config(&bucket.config().chunker);
+
+        let cancel = CancellationToken::new();
+        let cancelling = Arc::new(CancellingEmbedder::new(8, 1, cancel.clone()));
+        let _ = bucket
+            .build_slot(&adapter, &chunker, cancelling, None, &cancel)
+            .await
+            .unwrap_err();
+
+        let resumable = bucket.find_resumable_slot().unwrap().unwrap();
+        let slot_path = slot::slot_dir(&bucket_root, &resumable);
+
+        // Sidecar must exist after a single BatchEmbedded and match
+        // the checkpoint chunk count.
+        let snap = read_dump_snapshot(&slot_path)
+            .unwrap()
+            .expect("dense.snapshot must exist after a periodic dump");
+        let log = build_state::read_all(&slot_path.join(slot::BUILD_STATE)).unwrap();
+        let last_batch_chunks = log
+            .iter()
+            .rev()
+            .find_map(|r| match r {
+                BuildStateRecord::BatchEmbedded {
+                    chunks_completed, ..
+                } => Some(*chunks_completed),
+                _ => None,
+            })
+            .expect("at least one BatchEmbedded must be logged");
+        assert_eq!(
+            snap, last_batch_chunks,
+            "sidecar count must match last BatchEmbedded checkpoint",
+        );
+
+        // Resume picks the fast path. End-to-end success — same as the
+        // sequential-rebuild test, but proves the dump path is also
+        // exercised correctly.
+        let resume_cancel = CancellationToken::new();
+        let plain: Arc<dyn EmbeddingProvider> = Arc::new(MockEmbedder::new(8));
+        let resumed = bucket
+            .resume_slot(&resumable, &adapter, &chunker, plain, None, &resume_cancel)
+            .await
+            .unwrap();
+        assert_eq!(resumed, resumable);
+
+        let manifest = SlotManifest::from_toml_str(
+            &fs::read_to_string(slot::manifest_path(&slot_path)).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(manifest.state, SlotState::Ready);
+        assert_eq!(manifest.stats.chunk_count, total_records as u64);
+
+        // Dump still in place after final BuildingDense dump; sidecar
+        // must now reflect the full count.
+        let final_snap = read_dump_snapshot(&slot_path).unwrap().unwrap();
+        assert_eq!(final_snap, total_records as u64);
+    }
+
+    #[tokio::test]
+    async fn resume_falls_back_to_rebuild_when_sidecar_missing() {
+        use crate::knowledge::dense::read_dump_snapshot;
+        // Inverse of the fast-path test: if dense.snapshot is absent
+        // (simulating a build that crashed before any periodic dump
+        // landed, or a corrupted partial dump that left no sidecar),
+        // resume must still complete by rebuilding the HNSW from
+        // vectors.bin sequentially.
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("notes");
+        fs::create_dir_all(&source).unwrap();
+        let total_records = super::EMBED_BATCH_SIZE + 5;
+        for i in 0..total_records {
+            write_md(
+                &source,
+                &format!("doc-{i:04}.md"),
+                &format!("doc-{i:04} body content"),
+            );
+        }
+
+        let bucket_root = tmp.path().join("bucket");
+        let bucket = open_test_bucket(&bucket_root, &source);
+        let adapter = MarkdownDir::new(&source);
+        let chunker = TokenBasedChunker::from_config(&bucket.config().chunker);
+
+        let cancel = CancellationToken::new();
+        let cancelling = Arc::new(CancellingEmbedder::new(8, 1, cancel.clone()));
+        let _ = bucket
+            .build_slot(&adapter, &chunker, cancelling, None, &cancel)
+            .await
+            .unwrap_err();
+
+        let resumable = bucket.find_resumable_slot().unwrap().unwrap();
+        let slot_path = slot::slot_dir(&bucket_root, &resumable);
+
+        // Force the fallback path by deleting the sidecar (and the
+        // hnsw files for good measure — without the sidecar the load
+        // wouldn't be attempted anyway, but this also catches a
+        // regression where the resume code accidentally calls
+        // load_from_with_positions on stale graph files).
+        for f in ["dense.snapshot", "dense.hnsw.graph", "dense.hnsw.data"] {
+            let p = slot_path.join(f);
+            if p.exists() {
+                fs::remove_file(&p).unwrap();
+            }
+        }
+        assert!(
+            read_dump_snapshot(&slot_path).unwrap().is_none(),
+            "sidecar must be cleared",
+        );
+
+        let resume_cancel = CancellationToken::new();
+        let plain: Arc<dyn EmbeddingProvider> = Arc::new(MockEmbedder::new(8));
+        let resumed = bucket
+            .resume_slot(&resumable, &adapter, &chunker, plain, None, &resume_cancel)
+            .await
+            .unwrap();
+        assert_eq!(resumed, resumable);
+
+        let manifest = SlotManifest::from_toml_str(
+            &fs::read_to_string(slot::manifest_path(&slot_path)).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(manifest.state, SlotState::Ready);
+        assert_eq!(manifest.stats.chunk_count, total_records as u64);
     }
 
     #[tokio::test]
