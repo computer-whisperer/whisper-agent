@@ -79,6 +79,26 @@ pub enum BuildPhase {
     Finalizing,
 }
 
+/// Resume cursor passed into [`DiskBucket::run_after_planning`]. The
+/// fresh-build path uses [`ResumePoint::default`] (zeros across the
+/// board); the resume path fills it from `build.state`'s last
+/// `BatchEmbedded` checkpoint.
+#[derive(Debug, Clone, Copy, Default)]
+struct ResumePoint {
+    /// Number of source records the resumed writers already account
+    /// for. The indexing loop skips the first `records_completed`
+    /// records from the source iterator before re-engaging the
+    /// chunker.
+    records_completed: u64,
+    /// Cumulative chunk count already on disk in chunks.bin /
+    /// vectors.bin / tantivy. Carried into the next BatchEmbedded
+    /// record so its `chunks_completed` field stays monotonic.
+    chunks_emitted: u64,
+    /// Index for the next BatchEmbedded record. On resume, equals
+    /// `last_batch_index + 1` so checkpoint indexes don't repeat.
+    next_batch_index: u64,
+}
+
 /// Optional progress hook for `DiskBucket::build_slot`. The build calls
 /// `on_phase` exactly once per phase transition and `on_progress` after
 /// every chunk-batch flush during the `Indexing` phase. Implementations
@@ -201,8 +221,8 @@ impl DiskBucket {
         write_manifest(&slot_path, &manifest)?;
 
         // Append-only resume log. Created here even on first build so
-        // the file is in place from the start; resume code (Commit B)
-        // reads it back to find the last durable checkpoint.
+        // the file is in place from the start; resume code reads it
+        // back to find the last durable checkpoint.
         let build_state_path = slot_path.join(slot::BUILD_STATE);
         let mut build_state =
             BuildStateWriter::create_or_open(&build_state_path).map_err(BucketError::Io)?;
@@ -240,38 +260,424 @@ impl DiskBucket {
         manifest.state = SlotState::Building;
         write_manifest(&slot_path, &manifest)?;
 
-        // Open writers.
+        // Fresh writers — the slot dir is brand new.
         let chunks_bin = slot::chunks_bin_path(&slot_path);
         let chunks_idx = slot::chunks_idx_path(&slot_path);
         let vectors_bin = slot::vectors_bin_path(&slot_path);
         let vectors_idx = slot::vectors_idx_path(&slot_path);
         let tantivy_dir = slot::tantivy_dir(&slot_path);
 
-        let mut chunk_writer =
+        let chunk_writer =
             ChunkStoreWriter::create(&chunks_bin, &chunks_idx).map_err(BucketError::Io)?;
-        let mut vector_writer =
+        let vector_writer =
             VectorStoreWriter::create(&vectors_bin, &vectors_idx, embedder_snapshot.dimension)
                 .map_err(BucketError::Io)?;
-        let mut sparse_builder = if sparse_enabled {
+        let sparse_builder = if sparse_enabled {
             Some(SparseIndexBuilder::create(&tantivy_dir)?)
         } else {
             None
         };
 
+        self.run_after_planning(
+            &slot_id,
+            &slot_path,
+            manifest,
+            sparse_enabled,
+            chunk_writer,
+            vector_writer,
+            sparse_builder,
+            build_state,
+            adapter,
+            chunker,
+            embedder,
+            observer,
+            cancel,
+            ResumePoint::default(),
+            source_records,
+        )
+        .await
+    }
+
+    /// Resume an in-progress slot build, starting from the last
+    /// durable checkpoint in `build.state`.
+    ///
+    /// `slot_id` must name an existing slot directory under this
+    /// bucket whose manifest is in [`SlotState::Planning`] or
+    /// [`SlotState::Building`]. The slot's frozen chunker / embedder
+    /// snapshot must match the bucket's current config — a mismatch
+    /// means the user changed `bucket.toml` after the first attempt
+    /// and the existing slot can no longer be extended; that's a
+    /// loud error rather than a silent rebuild from scratch.
+    ///
+    /// Resume modes:
+    /// - `Planning` state: any prior `build.state` is discarded and
+    ///   the build restarts from Planning. (Planning is cheap; this
+    ///   keeps the resume code simple.)
+    /// - `Building` state: replay `build.state` to the last
+    ///   `BatchEmbedded` checkpoint, drift-check `Planned` records
+    ///   against fresh source content, truncate the chunks/vectors
+    ///   files to the checkpoint boundary, and continue from the
+    ///   next un-embedded record.
+    pub async fn resume_slot(
+        &self,
+        slot_id: &str,
+        adapter: &dyn SourceAdapter,
+        chunker: &dyn Chunker,
+        embedder: Arc<dyn EmbeddingProvider>,
+        observer: Option<&dyn BuildObserver>,
+        cancel: &CancellationToken,
+    ) -> Result<SlotId, BucketError> {
+        let slot_path = slot::slot_dir(&self.root, slot_id);
+        let manifest_text = fs::read_to_string(slot::manifest_path(&slot_path))
+            .map_err(|e| match e.kind() {
+                std::io::ErrorKind::NotFound => BucketError::Other(format!(
+                    "resume_slot: slot {slot_id} has no manifest.toml — slot does not exist?"
+                )),
+                _ => BucketError::Io(e),
+            })?;
+        let mut manifest = SlotManifest::from_toml_str(&manifest_text)?;
+
+        match manifest.state {
+            SlotState::Planning | SlotState::Building => {}
+            other => {
+                return Err(BucketError::Other(format!(
+                    "resume_slot: slot {slot_id} is in state {other:?}, not resumable"
+                )));
+            }
+        }
+
+        // Validate snapshots against current bucket config. The
+        // snapshot is *frozen at slot creation*; if the bucket's
+        // config has changed since, this slot's chunk/vector layout
+        // is no longer valid for continued building. A loud error
+        // beats silently producing a corrupt slot.
+        let current_chunker_snapshot = chunker_snapshot_from_config(&self.config.chunker);
+        if manifest.chunker_snapshot != current_chunker_snapshot {
+            return Err(BucketError::Other(format!(
+                "resume_slot: chunker config changed since slot {slot_id} was started; \
+                 delete the bucket and rebuild to use the new chunker"
+            )));
+        }
+        let embedder_snapshot =
+            derive_embedder_snapshot(&self.config.defaults.embedder, embedder.as_ref(), cancel)
+                .await?;
+        if manifest.embedder.dimension != embedder_snapshot.dimension {
+            return Err(BucketError::Other(format!(
+                "resume_slot: embedder dimension changed ({} → {}) since slot {slot_id} was started; \
+                 delete the bucket and rebuild",
+                manifest.embedder.dimension, embedder_snapshot.dimension,
+            )));
+        }
+
+        let sparse_enabled = self.config.search_paths.sparse.enabled;
+        let chunks_bin = slot::chunks_bin_path(&slot_path);
+        let chunks_idx = slot::chunks_idx_path(&slot_path);
+        let vectors_bin = slot::vectors_bin_path(&slot_path);
+        let vectors_idx = slot::vectors_idx_path(&slot_path);
+        let tantivy_dir = slot::tantivy_dir(&slot_path);
+        let build_state_path = slot_path.join(slot::BUILD_STATE);
+
+        // Planning state ⇒ discard any partial progress and restart
+        // from a clean slate inside the existing slot dir.
+        if manifest.state == SlotState::Planning {
+            for f in [&chunks_bin, &chunks_idx, &vectors_bin, &vectors_idx] {
+                if f.exists() {
+                    fs::remove_file(f).map_err(BucketError::Io)?;
+                }
+            }
+            if tantivy_dir.exists() {
+                fs::remove_dir_all(&tantivy_dir).map_err(BucketError::Io)?;
+            }
+            if build_state_path.exists() {
+                fs::remove_file(&build_state_path).map_err(BucketError::Io)?;
+            }
+            // Re-run the same setup the fresh-build path does.
+            let mut build_state = BuildStateWriter::create_or_open(&build_state_path)
+                .map_err(BucketError::Io)?;
+
+            publish_phase(BuildPhase::Planning, observer, &mut build_state)?;
+            let mut source_records: u64 = 0;
+            for record in adapter.enumerate() {
+                if cancel.is_cancelled() {
+                    return Err(BucketError::Cancelled);
+                }
+                let record =
+                    record.map_err(|e| BucketError::Other(format!("source error: {e}")))?;
+                build_state
+                    .append(&BuildStateRecord::Planned {
+                        source_id: record.source_id.clone(),
+                        content_hash: record.content_hash,
+                    })
+                    .map_err(BucketError::Io)?;
+                source_records += 1;
+                if let Some(obs) = observer {
+                    obs.on_progress(source_records, 0);
+                }
+            }
+            manifest.state = SlotState::Building;
+            write_manifest(&slot_path, &manifest)?;
+
+            let chunk_writer =
+                ChunkStoreWriter::create(&chunks_bin, &chunks_idx).map_err(BucketError::Io)?;
+            let vector_writer = VectorStoreWriter::create(
+                &vectors_bin,
+                &vectors_idx,
+                embedder_snapshot.dimension,
+            )
+            .map_err(BucketError::Io)?;
+            let sparse_builder = if sparse_enabled {
+                Some(SparseIndexBuilder::create(&tantivy_dir)?)
+            } else {
+                None
+            };
+            return self
+                .run_after_planning(
+                    slot_id,
+                    &slot_path,
+                    manifest,
+                    sparse_enabled,
+                    chunk_writer,
+                    vector_writer,
+                    sparse_builder,
+                    build_state,
+                    adapter,
+                    chunker,
+                    embedder,
+                    observer,
+                    cancel,
+                    ResumePoint::default(),
+                    source_records,
+                )
+                .await;
+        }
+
+        // Building state ⇒ replay build.state to find the resume point.
+        let prior_records = super::build_state::read_all(&build_state_path)
+            .map_err(BucketError::Io)?;
+        let planned: Vec<(String, [u8; 32])> = prior_records
+            .iter()
+            .filter_map(|r| match r {
+                BuildStateRecord::Planned {
+                    source_id,
+                    content_hash,
+                } => Some((source_id.clone(), *content_hash)),
+                _ => None,
+            })
+            .collect();
+        let last_batch = prior_records.iter().rev().find_map(|r| match r {
+            BuildStateRecord::BatchEmbedded {
+                batch_index,
+                source_records_completed,
+                chunks_completed,
+            } => Some((*batch_index, *source_records_completed, *chunks_completed)),
+            _ => None,
+        });
+        let (last_batch_index, records_done, chunks_done) =
+            last_batch.unwrap_or((u64::MAX, 0, 0)); // u64::MAX → 0 below
+
+        // Reopen build.state in append mode (existing entries stay).
+        let build_state =
+            BuildStateWriter::create_or_open(&build_state_path).map_err(BucketError::Io)?;
+
+        // Re-run chunker on the first `records_done` source records
+        // to derive their chunk_ids in insertion order. We feed those
+        // into the resumed writers' `entries` vec; the actual chunks
+        // are already on disk and we don't re-embed them.
+        let mut resumed_chunk_ids: Vec<ChunkId> = Vec::with_capacity(chunks_done as usize);
+        let records_to_skip = records_done.min(planned.len() as u64);
+        let mut iter = adapter.enumerate();
+        for i in 0..records_to_skip as usize {
+            if cancel.is_cancelled() {
+                return Err(BucketError::Cancelled);
+            }
+            let record = match iter.next() {
+                Some(Ok(r)) => r,
+                Some(Err(e)) => return Err(BucketError::Other(format!("source error: {e}"))),
+                None => {
+                    return Err(BucketError::Other(format!(
+                        "resume_slot: source ended after {i} records but build.state expected at least {records_to_skip}"
+                    )));
+                }
+            };
+            let (expected_source_id, expected_hash) = &planned[i];
+            if record.content_hash != *expected_hash {
+                return Err(BucketError::Other(format!(
+                    "resume_slot: source drift detected at record `{}` (was `{}` when planned); \
+                     delete the bucket and rebuild to ingest the changed source",
+                    record.source_id, expected_source_id,
+                )));
+            }
+            if record.source_id != *expected_source_id {
+                // Hash matched but source_id differs — a file was
+                // renamed without content changes. chunk_ids derive
+                // from content_hash alone so this doesn't break
+                // resume; just log it.
+                tracing::info!(
+                    bucket = %self.id,
+                    slot = %slot_id,
+                    expected = %expected_source_id,
+                    got = %record.source_id,
+                    "resume: source_id changed but content_hash matches; continuing"
+                );
+            }
+            for new_chunk in chunker.chunk(&record) {
+                resumed_chunk_ids.push(ChunkId::from_source(
+                    &new_chunk.source_record_hash,
+                    new_chunk.chunk_offset,
+                ));
+            }
+        }
+        // We don't need `iter` past this point — run_after_planning
+        // re-creates a fresh iterator and skips the same prefix.
+        drop(iter);
+        if (resumed_chunk_ids.len() as u64) != chunks_done {
+            return Err(BucketError::Other(format!(
+                "resume_slot: re-derived chunk count {} doesn't match build.state checkpoint {}",
+                resumed_chunk_ids.len(),
+                chunks_done,
+            )));
+        }
+
+        // Scan chunks.bin to compute byte offsets for the resumed
+        // entries; truncate the file at offsets[chunks_done].
+        let scan_offsets = if chunks_bin.exists() {
+            super::chunks::scan_record_offsets(&chunks_bin).map_err(BucketError::Io)?
+        } else {
+            vec![0]
+        };
+        if scan_offsets.len() < (chunks_done + 1) as usize {
+            return Err(BucketError::Other(format!(
+                "resume_slot: chunks.bin only has {} records, build.state checkpoint expects {}",
+                scan_offsets.len().saturating_sub(1),
+                chunks_done,
+            )));
+        }
+        let resume_offsets = &scan_offsets[..=(chunks_done as usize)];
+
+        let chunk_writer = if chunks_done == 0 {
+            // No checkpoint yet → fresh writers (file may exist but
+            // is empty/garbage; truncate it).
+            ChunkStoreWriter::create(&chunks_bin, &chunks_idx).map_err(BucketError::Io)?
+        } else {
+            ChunkStoreWriter::open_resume(
+                &chunks_bin,
+                &chunks_idx,
+                &resumed_chunk_ids,
+                resume_offsets,
+            )
+            .map_err(BucketError::Io)?
+        };
+        let vector_writer = if chunks_done == 0 {
+            VectorStoreWriter::create(&vectors_bin, &vectors_idx, embedder_snapshot.dimension)
+                .map_err(BucketError::Io)?
+        } else {
+            VectorStoreWriter::open_resume(
+                &vectors_bin,
+                &vectors_idx,
+                embedder_snapshot.dimension,
+                &resumed_chunk_ids,
+            )
+            .map_err(BucketError::Io)?
+        };
+        let sparse_builder = if sparse_enabled {
+            if tantivy_dir.exists() {
+                Some(SparseIndexBuilder::open_resume(&tantivy_dir)?)
+            } else {
+                Some(SparseIndexBuilder::create(&tantivy_dir)?)
+            }
+        } else {
+            None
+        };
+
+        let resume = ResumePoint {
+            records_completed: records_to_skip,
+            chunks_emitted: chunks_done,
+            next_batch_index: if last_batch_index == u64::MAX {
+                0
+            } else {
+                last_batch_index + 1
+            },
+        };
+
+        // The Planning phase already happened; we don't re-publish
+        // it. Republish Indexing so the observer sees we're back in
+        // the embedding loop on the resume path.
+        let source_records_total = planned.len() as u64;
+        self.run_after_planning(
+            slot_id,
+            &slot_path,
+            manifest,
+            sparse_enabled,
+            chunk_writer,
+            vector_writer,
+            sparse_builder,
+            build_state,
+            adapter,
+            chunker,
+            embedder,
+            observer,
+            cancel,
+            resume,
+            source_records_total,
+        )
+        .await
+    }
+
+    /// Walk the source from `resume.records_completed` onward,
+    /// chunk + embed each record, checkpoint at record-aligned batch
+    /// boundaries, then run BuildingDense and Finalizing. Shared
+    /// between the fresh-build and resume paths — both call this
+    /// with their respective writers and starting positions.
+    #[allow(clippy::too_many_arguments)]
+    async fn run_after_planning(
+        &self,
+        slot_id: &str,
+        slot_path: &Path,
+        mut manifest: SlotManifest,
+        sparse_enabled: bool,
+        mut chunk_writer: ChunkStoreWriter,
+        mut vector_writer: VectorStoreWriter,
+        mut sparse_builder: Option<SparseIndexBuilder>,
+        mut build_state: BuildStateWriter,
+        adapter: &dyn SourceAdapter,
+        chunker: &dyn Chunker,
+        embedder: Arc<dyn EmbeddingProvider>,
+        observer: Option<&dyn BuildObserver>,
+        cancel: &CancellationToken,
+        resume: ResumePoint,
+        source_records: u64,
+    ) -> Result<SlotId, BucketError> {
+        let chunks_bin = slot::chunks_bin_path(slot_path);
+        let chunks_idx = slot::chunks_idx_path(slot_path);
+        let vectors_bin = slot::vectors_bin_path(slot_path);
+        let vectors_idx = slot::vectors_idx_path(slot_path);
+        let tantivy_dir = slot::tantivy_dir(slot_path);
+
         // --- Phase: Indexing ---
-        // Walk the source again, this time chunking + embedding each
-        // record. Buffer all chunks for one record, then flush at the
-        // record boundary if the buffer has reached batch size. This
-        // keeps the resume granularity at "completed records" — every
-        // BatchEmbedded checkpoint corresponds to a count of fully
-        // embedded records, never a record split across batches.
+        // Buffer all chunks for one record, then flush at the record
+        // boundary if the buffer has reached batch size. Flush also
+        // commits tantivy and writes BatchEmbedded — these three
+        // (flush+commit+log) are the durability barrier resume relies
+        // on.
         publish_phase(BuildPhase::Indexing, observer, &mut build_state)?;
         let mut pending: Vec<NewChunk> = Vec::with_capacity(EMBED_BATCH_SIZE);
-        let mut records_completed: u64 = 0;
-        let mut chunks_emitted: u64 = 0;
-        let mut batch_index: u64 = 0;
+        let mut records_completed: u64 = resume.records_completed;
+        let mut chunks_emitted: u64 = resume.chunks_emitted;
+        let mut batch_index: u64 = resume.next_batch_index;
 
-        for record in adapter.enumerate() {
+        let mut iter = adapter.enumerate();
+        // Skip records the resume code already accounted for.
+        for _ in 0..resume.records_completed {
+            match iter.next() {
+                Some(Ok(_)) => {}
+                Some(Err(e)) => {
+                    return Err(BucketError::Other(format!("source error: {e}")))
+                }
+                None => break,
+            }
+        }
+
+        for record in iter {
             if cancel.is_cancelled() {
                 return Err(BucketError::Cancelled);
             }
@@ -293,6 +699,9 @@ impl DiskBucket {
                     cancel,
                 )
                 .await?;
+                if let Some(builder) = sparse_builder.as_mut() {
+                    builder.commit()?;
+                }
                 chunks_emitted += flushed;
                 build_state
                     .append(&BuildStateRecord::BatchEmbedded {
@@ -308,8 +717,7 @@ impl DiskBucket {
             }
         }
 
-        // Final partial batch — same record-boundary discipline; this
-        // is just the trailing records that didn't fill a full batch.
+        // Final partial batch.
         if !pending.is_empty() {
             let flushed = pending.len() as u64;
             flush_batch(
@@ -321,6 +729,9 @@ impl DiskBucket {
                 cancel,
             )
             .await?;
+            if let Some(builder) = sparse_builder.as_mut() {
+                builder.commit()?;
+            }
             chunks_emitted += flushed;
             build_state
                 .append(&BuildStateRecord::BatchEmbedded {
@@ -337,42 +748,27 @@ impl DiskBucket {
         let chunk_count = chunk_writer.finalize().map_err(BucketError::Io)? as u64;
         let vector_count = vector_writer.finalize().map_err(BucketError::Io)? as u64;
         if chunk_count != vector_count {
-            // Should never happen — flush_batch writes one vector per
-            // chunk in lockstep — but a structural divergence here
-            // would be a real bug worth surfacing.
             return Err(BucketError::Other(format!(
                 "chunk/vector count mismatch: {chunk_count} chunks, {vector_count} vectors",
             )));
         }
+        // Sparse: finalize commits any remaining writes; verify the
+        // committed doc count matches the chunk count via the reader.
+        // The builder's finalize-time count counts only docs added
+        // during this builder's lifetime, which on resume is less
+        // than the total — so we can't use that for the check.
         if let Some(builder) = sparse_builder.take() {
-            let sparse_count = builder.finalize()? as u64;
-            if sparse_count != chunk_count {
-                return Err(BucketError::Other(format!(
-                    "chunk/sparse count mismatch: {chunk_count} chunks, {sparse_count} tantivy docs",
-                )));
-            }
+            let _ = builder.finalize()?;
         }
 
-        // Open readers for the new slot before we promote — promotion
-        // should never make a slot active that we can't immediately
-        // serve queries from.
         let chunks = ChunkStoreReader::open(&chunks_bin, &chunks_idx).map_err(BucketError::Io)?;
         let vectors =
             VectorStoreReader::open(&vectors_bin, &vectors_idx).map_err(BucketError::Io)?;
 
         // --- Phase: BuildingDense ---
-        // Build the dense index from the just-written vectors and
-        // dump it to disk so the next slot open can skip the rebuild.
-        // The HNSW build is the dominant cost on real-scale runs (~7
-        // min for 50k vectors, multi-hour for full wikipedia) and is
-        // pure CPU, so push it onto a `spawn_blocking` thread to keep
-        // the runtime worker free for other tasks. Failure to dump
-        // is non-fatal — the slot is still usable (load_slot's
-        // fallback rebuilds), so we log and continue rather than
-        // tearing down the build.
         publish_phase(BuildPhase::BuildingDense, observer, &mut build_state)?;
-        let slot_path_for_dump = slot_path.clone();
-        let slot_id_for_warn = slot_id.clone();
+        let slot_path_for_dump = slot_path.to_path_buf();
+        let slot_id_for_warn = slot_id.to_string();
         let (dense, vectors) = tokio::task::spawn_blocking(move || {
             let dense = DenseIndex::build(&vectors, HnswParams::default())?;
             if let Err(e) = dense.dump_to(&slot_path_for_dump) {
@@ -390,21 +786,29 @@ impl DiskBucket {
         // --- Phase: Finalizing ---
         publish_phase(BuildPhase::Finalizing, observer, &mut build_state)?;
 
-        // Open the sparse index reader if we built one.
         let sparse = if sparse_enabled {
-            Some(SparseIndex::open(&tantivy_dir)?)
+            let idx = SparseIndex::open(&tantivy_dir)?;
+            // Cross-check: tantivy num_docs must equal the chunk
+            // count. Without this, a bad open-resume path could
+            // serve a slot whose dense and sparse indexes disagreed.
+            if (idx.len() as u64) != chunk_count {
+                return Err(BucketError::Other(format!(
+                    "tantivy num_docs ({}) does not match chunk_count ({chunk_count})",
+                    idx.len(),
+                )));
+            }
+            Some(idx)
         } else {
             None
         };
 
-        // Update manifest with final stats and promote to ready.
         manifest.state = SlotState::Ready;
         manifest.build_completed_at = Some(chrono::Utc::now());
         manifest.stats.source_records = source_records;
         manifest.stats.chunk_count = chunk_count;
         manifest.stats.vector_count = vector_count;
-        manifest.stats.disk_size_bytes = total_dir_size(&slot_path).unwrap_or(0);
-        write_manifest(&slot_path, &manifest)?;
+        manifest.stats.disk_size_bytes = total_dir_size(slot_path).unwrap_or(0);
+        write_manifest(slot_path, &manifest)?;
 
         let loaded = Arc::new(LoadedSlot {
             manifest,
@@ -414,21 +818,57 @@ impl DiskBucket {
             sparse,
         });
 
-        // Atomic active-pointer flip; then swap the loaded state under
-        // the write lock so subsequent queries see the new slot.
-        slot::set_active_slot(&self.root, &slot_id)?;
+        slot::set_active_slot(&self.root, slot_id)?;
         {
             let mut active = self.active.write().expect("active slot lock poisoned");
             *active = Some(loaded);
         }
 
-        // Final build.state record. Resume code looks for this to
-        // distinguish "build finished" from "build was interrupted".
         build_state
             .append(&BuildStateRecord::BuildCompleted)
             .map_err(BucketError::Io)?;
 
-        Ok(slot_id)
+        Ok(slot_id.to_string())
+    }
+
+    /// Find a slot eligible for resume — i.e. one whose manifest is
+    /// in `Planning` or `Building` state. If multiple exist, returns
+    /// the most recent (slot ids are timestamp-prefixed and sort
+    /// chronologically).
+    ///
+    /// Slots in `Failed` state are *not* returned — those represent
+    /// builds that crashed or were rejected and should not be
+    /// silently picked up by a fresh "Build" click.
+    pub fn find_resumable_slot(&self) -> Result<Option<SlotId>, BucketError> {
+        let slots_dir = slot::slots_dir(&self.root);
+        if !slots_dir.exists() {
+            return Ok(None);
+        }
+        let mut candidates: Vec<SlotId> = Vec::new();
+        for entry in fs::read_dir(&slots_dir).map_err(BucketError::Io)? {
+            let entry = entry.map_err(BucketError::Io)?;
+            let meta = entry.metadata().map_err(BucketError::Io)?;
+            if !meta.is_dir() {
+                continue;
+            }
+            let name = entry.file_name();
+            let Some(slot_id) = name.to_str() else { continue };
+            let manifest_path = slot::manifest_path(&entry.path());
+            let Ok(text) = fs::read_to_string(&manifest_path) else {
+                continue;
+            };
+            let Ok(manifest) = SlotManifest::from_toml_str(&text) else {
+                continue;
+            };
+            if matches!(
+                manifest.state,
+                SlotState::Planning | SlotState::Building
+            ) {
+                candidates.push(slot_id.to_string());
+            }
+        }
+        candidates.sort();
+        Ok(candidates.into_iter().last())
     }
 
     fn active_snapshot(&self) -> Option<Arc<LoadedSlot>> {
@@ -1565,6 +2005,305 @@ embedder = "tei_test"
                 .iter()
                 .any(|r| matches!(r, BuildStateRecord::BuildCompleted)),
             "cancelled build must not record BuildCompleted: {records:#?}"
+        );
+    }
+
+    /// Embedder that fires the cancel token once it has fielded
+    /// `cancel_after_calls` embed requests. Lets tests force a
+    /// mid-build cancellation deterministically without racing on
+    /// timing.
+    struct CancellingEmbedder {
+        inner: MockEmbedder,
+        cancel_after_calls: usize,
+        cancel: CancellationToken,
+    }
+
+    impl CancellingEmbedder {
+        fn new(dim: u32, cancel_after_calls: usize, cancel: CancellationToken) -> Self {
+            Self {
+                inner: MockEmbedder::new(dim),
+                cancel_after_calls,
+                cancel,
+            }
+        }
+    }
+
+    impl EmbeddingProvider for CancellingEmbedder {
+        fn embed<'a>(
+            &'a self,
+            req: &'a ProviderEmbedRequest<'a>,
+            cancel: &'a CancellationToken,
+        ) -> ProviderBoxFuture<'a, Result<EmbeddingResponse, EmbeddingError>> {
+            let inner = &self.inner;
+            let cancel_after = self.cancel_after_calls;
+            let token = self.cancel.clone();
+            Box::pin(async move {
+                // Run the underlying mock first so the batch lands.
+                let result = inner.embed(req, cancel).await;
+                let calls = inner.embed_calls.load(Ordering::SeqCst);
+                if calls >= cancel_after {
+                    token.cancel();
+                }
+                result
+            })
+        }
+
+        fn list_models<'a>(
+            &'a self,
+        ) -> ProviderBoxFuture<'a, Result<Vec<EmbeddingModelInfo>, EmbeddingError>> {
+            self.inner.list_models()
+        }
+    }
+
+    #[tokio::test]
+    async fn resume_completes_a_partially_built_slot() {
+        // End-to-end resume test:
+        // 1. Build a slot, cancel after the first batch lands.
+        // 2. Verify the slot is in Building state with a partial
+        //    build.state log.
+        // 3. Resume: should complete the slot, preserve the slot id,
+        //    and produce the same total chunk count as a fresh build.
+        // 4. Search the resumed slot to verify it's queryable.
+        use crate::knowledge::build_state::{self, BuildStateRecord};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("notes");
+        fs::create_dir_all(&source).unwrap();
+
+        // Enough records for at least 2 batches at EMBED_BATCH_SIZE=128.
+        let total_records = super::EMBED_BATCH_SIZE * 2 + 30;
+        for i in 0..total_records {
+            write_md(
+                &source,
+                &format!("doc-{i:04}.md"),
+                &format!("doc-{i:04} body content"),
+            );
+        }
+
+        let bucket_root = tmp.path().join("bucket");
+        let bucket = open_test_bucket(&bucket_root, &source);
+        let adapter = MarkdownDir::new(&source);
+        let chunker = TokenBasedChunker::from_config(&bucket.config().chunker);
+
+        // Cancel after exactly 1 batch — leaves ~128 records embedded
+        // and ~158 records still to do on resume.
+        let cancel = CancellationToken::new();
+        let cancelling = Arc::new(CancellingEmbedder::new(8, 1, cancel.clone()));
+        let _ = bucket
+            .build_slot(&adapter, &chunker, cancelling.clone(), None, &cancel)
+            .await
+            .unwrap_err();
+
+        // Find the partial slot and verify it's resumable.
+        let resumable = bucket.find_resumable_slot().unwrap().expect(
+            "find_resumable_slot must return the in-progress slot after cancel",
+        );
+
+        let slot_path = slot::slot_dir(&bucket_root, &resumable);
+        let manifest =
+            SlotManifest::from_toml_str(&fs::read_to_string(slot::manifest_path(&slot_path)).unwrap())
+                .unwrap();
+        assert_eq!(manifest.state, SlotState::Building);
+
+        let log_pre = build_state::read_all(&slot_path.join(slot::BUILD_STATE)).unwrap();
+        let pre_batches = log_pre
+            .iter()
+            .filter(|r| matches!(r, BuildStateRecord::BatchEmbedded { .. }))
+            .count();
+        assert!(pre_batches >= 1, "at least one batch should be checkpointed");
+        assert!(
+            !log_pre
+                .iter()
+                .any(|r| matches!(r, BuildStateRecord::BuildCompleted)),
+            "BuildCompleted must not appear in cancelled log"
+        );
+
+        // Resume with a fresh (non-cancelling) embedder.
+        let resume_cancel = CancellationToken::new();
+        let plain_embedder: Arc<dyn EmbeddingProvider> = Arc::new(MockEmbedder::new(8));
+        let resumed_slot_id = bucket
+            .resume_slot(
+                &resumable,
+                &adapter,
+                &chunker,
+                plain_embedder,
+                None,
+                &resume_cancel,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            resumed_slot_id, resumable,
+            "resume must keep the same slot id"
+        );
+        assert_eq!(bucket.active_slot_id().as_deref(), Some(resumable.as_str()));
+
+        // Verify the resumed slot's stats match a from-scratch
+        // build's stats (same chunker + source → same chunk count).
+        let manifest =
+            SlotManifest::from_toml_str(&fs::read_to_string(slot::manifest_path(&slot_path)).unwrap())
+                .unwrap();
+        assert_eq!(manifest.state, SlotState::Ready);
+        assert_eq!(manifest.stats.source_records, total_records as u64);
+        assert_eq!(manifest.stats.chunk_count, total_records as u64);
+        assert_eq!(manifest.stats.vector_count, total_records as u64);
+
+        let log_post =
+            build_state::read_all(&slot_path.join(slot::BUILD_STATE)).unwrap();
+        assert!(matches!(
+            log_post.last().unwrap(),
+            BuildStateRecord::BuildCompleted
+        ));
+
+        // The completed log should contain MORE BatchEmbedded entries
+        // than the pre-resume snapshot (resume added more batches).
+        let post_batches = log_post
+            .iter()
+            .filter(|r| matches!(r, BuildStateRecord::BatchEmbedded { .. }))
+            .count();
+        assert!(post_batches > pre_batches);
+
+        // Resumed slot is queryable on both paths.
+        let cancel_q = CancellationToken::new();
+        let q_text = "doc-0050 body content";
+        let q_record = crate::knowledge::SourceRecord::new("ignored", q_text);
+        let q_chunks = chunker.chunk(&q_record);
+        let query_vec = MockEmbedder::fake_vector(&q_chunks[0].text, 8);
+        let dense_hits = bucket.dense_search(&query_vec, 5, &cancel_q).await.unwrap();
+        assert!(!dense_hits.is_empty(), "resumed slot must be queryable on dense");
+        let sparse_hits = bucket.sparse_search("doc-0050", 5, &cancel_q).await.unwrap();
+        assert!(!sparse_hits.is_empty(), "resumed slot must be queryable on sparse");
+    }
+
+    #[tokio::test]
+    async fn resume_planning_state_restarts_from_scratch() {
+        // If the slot is in Planning state (cancelled before any
+        // chunks landed), resume should discard the partial build.state
+        // and restart cleanly.
+        use crate::knowledge::build_state::{self, BuildStateRecord};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("notes");
+        fs::create_dir_all(&source).unwrap();
+        write_md(&source, "a.md", "alpha");
+        write_md(&source, "b.md", "beta");
+
+        let bucket_root = tmp.path().join("bucket");
+        let bucket = open_test_bucket(&bucket_root, &source);
+        let adapter = MarkdownDir::new(&source);
+        let chunker = TokenBasedChunker::from_config(&bucket.config().chunker);
+
+        // Hand-craft a Planning-state slot directory: empty
+        // build.state, manifest with state=Planning, no chunks/vectors.
+        let slot_id = slot::generate_slot_id();
+        let slot_path = slot::slot_dir(&bucket_root, &slot_id);
+        fs::create_dir_all(&slot_path).unwrap();
+        let now = chrono::Utc::now();
+        let manifest = SlotManifest {
+            slot_id: slot_id.clone(),
+            state: SlotState::Planning,
+            created_at: now,
+            build_started_at: Some(now),
+            build_completed_at: None,
+            chunker_snapshot: bucket.config().chunker.clone(),
+            embedder: EmbedderSnapshot {
+                provider: bucket.config().defaults.embedder.clone(),
+                model_id: "mock-embedder".into(),
+                dimension: 4,
+            },
+            sparse: Some(SparseSnapshot {
+                tokenizer: bucket.config().search_paths.sparse.tokenizer.clone(),
+            }),
+            serving: ServingSnapshot {
+                mode: bucket.config().defaults.serving_mode,
+                quantization: bucket.config().defaults.quantization,
+            },
+            stats: SlotStats::default(),
+            lineage: None,
+        };
+        write_manifest(&slot_path, &manifest).unwrap();
+        // Half-written build.state with one Planned + no PhaseChanged
+        // (simulates planning interrupted right after one entry).
+        let bs_path = slot_path.join(slot::BUILD_STATE);
+        let mut bs = BuildStateWriter::create_or_open(&bs_path).unwrap();
+        bs.append(&BuildStateRecord::PhaseChanged {
+            phase: BuildPhase::Planning,
+        })
+        .unwrap();
+        bs.append(&BuildStateRecord::Planned {
+            source_id: "a.md".into(),
+            content_hash: [0xfe; 32], // deliberately wrong hash
+        })
+        .unwrap();
+        drop(bs);
+
+        let embedder: Arc<dyn EmbeddingProvider> = Arc::new(MockEmbedder::new(4));
+        let cancel = CancellationToken::new();
+        let returned = bucket
+            .resume_slot(&slot_id, &adapter, &chunker, embedder, None, &cancel)
+            .await
+            .unwrap();
+        assert_eq!(returned, slot_id);
+
+        // Build completed and the bogus Planned hash got replaced.
+        let log = build_state::read_all(&bs_path).unwrap();
+        assert!(matches!(
+            log.last().unwrap(),
+            BuildStateRecord::BuildCompleted
+        ));
+        let bad_hash = [0xfe; 32];
+        let still_has_bad = log.iter().any(|r| {
+            matches!(r, BuildStateRecord::Planned { content_hash, .. } if *content_hash == bad_hash)
+        });
+        assert!(
+            !still_has_bad,
+            "Planning restart must discard the prior bogus Planned entry"
+        );
+    }
+
+    #[tokio::test]
+    async fn resume_drift_errors_loudly() {
+        // Source content changing under a paused build is a hard
+        // error — the user must delete and rebuild rather than
+        // silently mixing old and new content in one slot.
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("notes");
+        fs::create_dir_all(&source).unwrap();
+        let total_records = super::EMBED_BATCH_SIZE + 5;
+        for i in 0..total_records {
+            write_md(
+                &source,
+                &format!("doc-{i:04}.md"),
+                &format!("doc-{i:04} body content"),
+            );
+        }
+        let bucket_root = tmp.path().join("bucket");
+        let bucket = open_test_bucket(&bucket_root, &source);
+        let adapter = MarkdownDir::new(&source);
+        let chunker = TokenBasedChunker::from_config(&bucket.config().chunker);
+
+        let cancel = CancellationToken::new();
+        let cancelling = Arc::new(CancellingEmbedder::new(8, 1, cancel.clone()));
+        let _ = bucket
+            .build_slot(&adapter, &chunker, cancelling, None, &cancel)
+            .await
+            .unwrap_err();
+        let resumable = bucket.find_resumable_slot().unwrap().unwrap();
+
+        // Mutate one of the source records that should already have
+        // been Planned (record 0) so resume sees content drift.
+        write_md(&source, "doc-0000.md", "DRIFTED CONTENT");
+
+        let resume_cancel = CancellationToken::new();
+        let plain: Arc<dyn EmbeddingProvider> = Arc::new(MockEmbedder::new(8));
+        let err = bucket
+            .resume_slot(&resumable, &adapter, &chunker, plain, None, &resume_cancel)
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("drift") || msg.contains("Drift"),
+            "expected drift error, got: {msg}"
         );
     }
 

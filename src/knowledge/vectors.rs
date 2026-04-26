@@ -18,7 +18,7 @@
 //! end-to-end.
 
 use std::collections::HashMap;
-use std::fs::File;
+use std::fs::{File, OpenOptions};
 use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -95,6 +95,54 @@ impl VectorStoreWriter {
             dimension,
             next_position: 0,
             entries: Vec::new(),
+        })
+    }
+
+    /// Reopen an existing `vectors.bin` for resumed appending. Verifies
+    /// the on-disk header matches `expected_dimension`, truncates the
+    /// file to `HEADER_SIZE + chunk_ids.len() * dim * 4` (dropping any
+    /// trailing partial vectors), and seeds the in-memory entries with
+    /// `chunk_ids` paired with sequential positions `0..len`.
+    ///
+    /// The caller supplies `chunk_ids` in the same insertion order they
+    /// were originally appended; positions are derived from order.
+    pub fn open_resume(
+        bin_path: &Path,
+        idx_path: &Path,
+        expected_dimension: u32,
+        chunk_ids: &[ChunkId],
+    ) -> io::Result<Self> {
+        // Verify header dimension matches the embedder we're about to
+        // continue building with. Header validation is the same one
+        // VectorStoreReader does — bad magic / version / quant all
+        // surface as InvalidData.
+        let mut probe = File::open(bin_path)?;
+        let on_disk_dim = read_header(&mut probe)?;
+        drop(probe);
+        if on_disk_dim != expected_dimension {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "vectors.bin dimension {on_disk_dim} does not match expected {expected_dimension}"
+                ),
+            ));
+        }
+
+        let len = chunk_ids.len() as u64;
+        let target_size = HEADER_SIZE + len * expected_dimension as u64 * 4;
+        let truncate = OpenOptions::new().write(true).open(bin_path)?;
+        truncate.set_len(target_size)?;
+        drop(truncate);
+
+        let file = OpenOptions::new().append(true).open(bin_path)?;
+        let entries: Vec<(ChunkId, u64)> =
+            chunk_ids.iter().copied().enumerate().map(|(i, id)| (id, i as u64)).collect();
+        Ok(Self {
+            bin: BufWriter::new(file),
+            idx_path: idx_path.to_path_buf(),
+            dimension: expected_dimension,
+            next_position: len,
+            entries,
         })
     }
 
@@ -432,6 +480,78 @@ mod tests {
         buf[4] = 99;
         std::fs::write(&bin, buf).unwrap();
         let err = VectorStoreReader::open(&bin, &idx).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn open_resume_truncates_and_continues_appending() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin = tmp.path().join("vectors.bin");
+        let idx = tmp.path().join("vectors.idx");
+        let dim = 4u32;
+
+        // First write 5 vectors and drop the writer pre-finalize
+        // (simulates crash). chunks.bin has 5 records on disk; idx
+        // file doesn't exist yet.
+        let ids: Vec<ChunkId> = (0..5)
+            .map(|i| ChunkId::from_source(&[i as u8; 32], i as u64))
+            .collect();
+        {
+            let mut w = VectorStoreWriter::create(&bin, &idx, dim).unwrap();
+            for (i, id) in ids.iter().enumerate() {
+                let v = vec![i as f32; dim as usize];
+                w.append(*id, &v).unwrap();
+            }
+        }
+        // Pre-resume file is HEADER + 5 * dim * 4 bytes.
+        let pre = std::fs::metadata(&bin).unwrap().len();
+        assert_eq!(pre, HEADER_SIZE + 5 * dim as u64 * 4);
+
+        // Resume keeping only first 3 vectors.
+        let keep = 3usize;
+        let mut w =
+            VectorStoreWriter::open_resume(&bin, &idx, dim, &ids[..keep]).unwrap();
+        // File got truncated.
+        let mid = std::fs::metadata(&bin).unwrap().len();
+        assert_eq!(mid, HEADER_SIZE + keep as u64 * dim as u64 * 4);
+
+        // Append two new vectors at the right positions.
+        let new_ids: Vec<ChunkId> = (10..12)
+            .map(|i| ChunkId::from_source(&[i as u8; 32], i as u64))
+            .collect();
+        for (i, id) in new_ids.iter().enumerate() {
+            let v = vec![100.0 + i as f32; dim as usize];
+            assert_eq!(w.append(*id, &v).unwrap(), keep as u64 + i as u64);
+        }
+        let count = w.finalize().unwrap();
+        assert_eq!(count, keep + new_ids.len());
+
+        // All kept vectors fetch correctly; truncated ones are gone.
+        let r = VectorStoreReader::open(&bin, &idx).unwrap();
+        for (i, id) in ids.iter().take(keep).enumerate() {
+            let v = r.fetch(*id).unwrap().unwrap();
+            assert_eq!(v, vec![i as f32; dim as usize]);
+        }
+        for id in &ids[keep..] {
+            assert!(r.fetch(*id).unwrap().is_none());
+        }
+        for (i, id) in new_ids.iter().enumerate() {
+            let v = r.fetch(*id).unwrap().unwrap();
+            assert_eq!(v, vec![100.0 + i as f32; dim as usize]);
+        }
+    }
+
+    #[test]
+    fn open_resume_rejects_dimension_mismatch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin = tmp.path().join("vectors.bin");
+        let idx = tmp.path().join("vectors.idx");
+        let id = ChunkId::from_source(&[1; 32], 0);
+        {
+            let mut w = VectorStoreWriter::create(&bin, &idx, 4).unwrap();
+            w.append(id, &[0.0; 4]).unwrap();
+        }
+        let err = VectorStoreWriter::open_resume(&bin, &idx, 8, &[id]).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
     }
 

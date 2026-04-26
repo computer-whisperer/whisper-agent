@@ -23,7 +23,7 @@ use std::path::Path;
 use tantivy::collector::TopDocs;
 use tantivy::query::QueryParser;
 use tantivy::schema::{Field, STORED, Schema, TEXT, Value};
-use tantivy::{Index, IndexReader, IndexWriter, ReloadPolicy, TantivyDocument};
+use tantivy::{Index, IndexReader, IndexWriter, ReloadPolicy, TantivyDocument, Term};
 
 use super::types::{BucketError, ChunkId};
 
@@ -66,8 +66,7 @@ impl std::fmt::Debug for SparseIndexBuilder {
 
 impl SparseIndexBuilder {
     /// Create a new tantivy index in `dir`. Directory must not already
-    /// contain a tantivy index; we don't reopen for append in slice 6
-    /// (that path comes with the mutation primitives).
+    /// contain a tantivy index.
     pub fn create(dir: &Path) -> Result<Self, BucketError> {
         std::fs::create_dir_all(dir).map_err(BucketError::Io)?;
         let (schema, chunk_id_field, text_field) = build_schema();
@@ -84,7 +83,51 @@ impl SparseIndexBuilder {
         })
     }
 
+    /// Reopen an existing tantivy index in `dir` for resumed appending.
+    /// Tantivy's segment-based commit machinery does the durability
+    /// work natively — we just open a fresh writer over the existing
+    /// index. The pre-existing committed segments stay; new
+    /// `add` calls produce new segments that land on the next commit.
+    ///
+    /// The resume code uses the `delete_then_add` discipline (each
+    /// [`Self::add`] of a chunk_id deletes any prior doc with the same
+    /// chunk_id first), so re-adding chunks already in the index is
+    /// idempotent. That's important when a partial-batch commit
+    /// landed before the BatchEmbedded build-state record fsynced.
+    pub fn open_resume(dir: &Path) -> Result<Self, BucketError> {
+        let index = Index::open_in_dir(dir)
+            .map_err(|e| BucketError::Other(format!("tantivy open_in_dir: {e}")))?;
+        let writer: IndexWriter = index
+            .writer(WRITER_MEMORY_BUDGET)
+            .map_err(|e| BucketError::Other(format!("tantivy writer: {e}")))?;
+        let schema = index.schema();
+        let chunk_id_field = schema
+            .get_field(FIELD_CHUNK_ID)
+            .map_err(|e| BucketError::Other(format!("missing field chunk_id: {e}")))?;
+        let text_field = schema
+            .get_field(FIELD_TEXT)
+            .map_err(|e| BucketError::Other(format!("missing field text: {e}")))?;
+        // `count` is the count of *additional* docs since open. The
+        // total committed size is whatever tantivy already knew about
+        // plus this. Resume-time chunk-count cross-checks therefore
+        // happen at the slot level (chunks.bin len), not via this
+        // counter alone.
+        Ok(Self {
+            writer,
+            chunk_id_field,
+            text_field,
+            count: 0,
+        })
+    }
+
+    /// Add a chunk to the index. Idempotent in the sense that the same
+    /// chunk_id called twice produces a single doc — the prior doc is
+    /// deleted first via `delete_term`. This is what lets resume
+    /// re-add chunks that may have been partially committed by an
+    /// interrupted prior attempt without producing duplicates.
     pub fn add(&mut self, chunk_id: ChunkId, text: &str) -> Result<(), BucketError> {
+        let term = Term::from_field_bytes(self.chunk_id_field, &chunk_id.0);
+        self.writer.delete_term(term);
         let mut doc = TantivyDocument::default();
         doc.add_bytes(self.chunk_id_field, chunk_id.0.as_slice());
         doc.add_text(self.text_field, text);
@@ -103,7 +146,20 @@ impl SparseIndexBuilder {
         self.count == 0
     }
 
-    /// Commit and return the document count.
+    /// Commit pending writes without consuming the builder. Used at
+    /// every chunk-batch boundary so that an interrupted build's
+    /// tantivy state is durable up to the same record count as the
+    /// chunks/vectors files.
+    pub fn commit(&mut self) -> Result<(), BucketError> {
+        self.writer
+            .commit()
+            .map_err(|e| BucketError::Other(format!("tantivy commit: {e}")))?;
+        Ok(())
+    }
+
+    /// Final commit. Returns the docs added during this builder's
+    /// lifetime — for resume, that's only the new docs (not the total
+    /// size).
     pub fn finalize(mut self) -> Result<usize, BucketError> {
         self.writer
             .commit()

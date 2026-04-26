@@ -15,7 +15,7 @@
 //! bottleneck, switch to mmap or `pread` without changing the public API.
 
 use std::collections::HashMap;
-use std::fs::File;
+use std::fs::{File, OpenOptions};
 use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -69,6 +69,59 @@ impl ChunkStoreWriter {
             idx_path: idx_path.to_path_buf(),
             entries: Vec::new(),
             cursor: 0,
+        })
+    }
+
+    /// Reopen an existing `chunks.bin` for resumed appending. Truncates
+    /// the file to `record_offsets.last()` (the byte offset just past
+    /// the last record we want to keep), seeds the in-memory entries
+    /// list from `chunk_ids` paired with `record_offsets[..len-1]`, and
+    /// opens the file in append mode for further writes.
+    ///
+    /// Caller invariants:
+    /// - `chunk_ids.len() == record_offsets.len() - 1` (one offset per
+    ///   record + one trailing EOF offset).
+    /// - The chunk_ids are in the same insertion order they were
+    ///   originally appended.
+    /// - The bin file already contains records aligned with
+    ///   `record_offsets` (typically obtained from
+    ///   [`scan_record_offsets`]).
+    pub fn open_resume(
+        bin_path: &Path,
+        idx_path: &Path,
+        chunk_ids: &[ChunkId],
+        record_offsets: &[u64],
+    ) -> io::Result<Self> {
+        if record_offsets.len() != chunk_ids.len() + 1 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "open_resume: expected {} offsets ({}+1), got {}",
+                    chunk_ids.len() + 1,
+                    chunk_ids.len(),
+                    record_offsets.len(),
+                ),
+            ));
+        }
+        let cursor = *record_offsets.last().unwrap();
+        // Truncate any trailing partial record, then open in append
+        // mode. set_len does both shrink and grow as needed; we only
+        // shrink here.
+        let truncate = OpenOptions::new().write(true).open(bin_path)?;
+        truncate.set_len(cursor)?;
+        drop(truncate);
+
+        let file = OpenOptions::new().append(true).open(bin_path)?;
+        let entries: Vec<(ChunkId, u64)> = chunk_ids
+            .iter()
+            .copied()
+            .zip(record_offsets[..chunk_ids.len()].iter().copied())
+            .collect();
+        Ok(Self {
+            bin: BufWriter::new(file),
+            idx_path: idx_path.to_path_buf(),
+            entries,
+            cursor,
         })
     }
 
@@ -193,6 +246,43 @@ impl ChunkStoreReader {
         drop(bin); // release lock before parsing
 
         parse_record(chunk_id, &body).map(Some)
+    }
+}
+
+/// Walk `chunks.bin` and return the byte offsets of every record's
+/// start, in insertion order, with a trailing offset for "just past the
+/// last record" (i.e. EOF on a clean file).
+///
+/// Resume code uses this to truncate the bin to a known boundary
+/// without parsing record bodies — only the 4-byte length prefix of
+/// each record is consumed. Cost is one sequential read of the file
+/// minus the body bytes.
+///
+/// Stops at the first short read after a record boundary (which is the
+/// normal EOF condition); a *partial* trailing record (fewer bytes
+/// than its length prefix declares) is reported via
+/// `io::ErrorKind::UnexpectedEof` so the resume code can decide to
+/// truncate it.
+pub fn scan_record_offsets(bin_path: &Path) -> io::Result<Vec<u64>> {
+    let mut file = BufReader::new(File::open(bin_path)?);
+    let mut offsets = Vec::new();
+    let mut cursor: u64 = 0;
+    loop {
+        offsets.push(cursor);
+        let mut len_bytes = [0u8; 4];
+        match file.read_exact(&mut len_bytes) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
+                // Clean EOF at the start of a record. The last entry
+                // we just pushed is the "just past last record" offset.
+                return Ok(offsets);
+            }
+            Err(e) => return Err(e),
+        }
+        let body_len = u32::from_le_bytes(len_bytes) as u64;
+        // Skip the body. seek_relative is a BufReader-friendly forward-only seek.
+        file.seek_relative(body_len as i64)?;
+        cursor += 4 + body_len;
     }
 }
 
@@ -444,6 +534,106 @@ mod tests {
         let r = ChunkStoreReader::open(&bin, &idx).unwrap();
         let chunk = r.fetch(id).unwrap().unwrap();
         assert_eq!(chunk.text, text);
+    }
+
+    #[test]
+    fn scan_record_offsets_walks_to_eof() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin = tmp.path().join("chunks.bin");
+        let idx = tmp.path().join("chunks.idx");
+
+        let texts = ["short", "a slightly longer body", "third"];
+        let ids: Vec<ChunkId> = (0..texts.len())
+            .map(|i| ChunkId::from_source(&[i as u8; 32], i as u64))
+            .collect();
+        {
+            let mut w = ChunkStoreWriter::create(&bin, &idx).unwrap();
+            for (id, t) in ids.iter().zip(texts.iter()) {
+                w.append(*id, &sref("doc", None), t).unwrap();
+            }
+            w.finalize().unwrap();
+        }
+
+        let offsets = scan_record_offsets(&bin).unwrap();
+        assert_eq!(offsets.len(), texts.len() + 1);
+        assert_eq!(offsets[0], 0);
+        // Each subsequent offset is strictly greater than its predecessor.
+        for w in offsets.windows(2) {
+            assert!(w[0] < w[1]);
+        }
+        // Last offset matches actual file length.
+        let file_len = std::fs::metadata(&bin).unwrap().len();
+        assert_eq!(*offsets.last().unwrap(), file_len);
+    }
+
+    #[test]
+    fn open_resume_truncates_and_continues_appending() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin = tmp.path().join("chunks.bin");
+        let idx = tmp.path().join("chunks.idx");
+
+        // First build: write 5 records, simulate-crash before finalize
+        // (drop the writer without calling finalize).
+        let ids: Vec<ChunkId> = (0..5)
+            .map(|i| ChunkId::from_source(&[i as u8; 32], i as u64))
+            .collect();
+        {
+            let mut w = ChunkStoreWriter::create(&bin, &idx).unwrap();
+            for (i, id) in ids.iter().enumerate() {
+                w.append(*id, &sref("doc", None), &format!("text-{i}"))
+                    .unwrap();
+            }
+            // Drop without finalize: chunks.bin has data, chunks.idx absent.
+        }
+        assert!(!idx.exists(), "idx file must not exist pre-finalize");
+
+        // Simulate "an extra trailing record was written but not
+        // checkpointed". Resume should truncate it.
+        // Here we just claim 3 of 5 are durable; resume truncates 4–5.
+        let offsets = scan_record_offsets(&bin).unwrap();
+        let keep = 3;
+        let resume_offsets = offsets[..=keep].to_vec();
+        let resume_ids = ids[..keep].to_vec();
+        let mut w =
+            ChunkStoreWriter::open_resume(&bin, &idx, &resume_ids, &resume_offsets).unwrap();
+
+        // Append two more (different ids) and finalize.
+        let new_ids: Vec<ChunkId> = (10..12)
+            .map(|i| ChunkId::from_source(&[i as u8; 32], i as u64))
+            .collect();
+        for (i, id) in new_ids.iter().enumerate() {
+            w.append(*id, &sref("doc", None), &format!("new-{i}"))
+                .unwrap();
+        }
+        let final_count = w.finalize().unwrap();
+        assert_eq!(final_count, keep + new_ids.len());
+
+        // All kept ids and new ids are fetchable; truncated ids are not.
+        let r = ChunkStoreReader::open(&bin, &idx).unwrap();
+        for (i, id) in ids.iter().take(keep).enumerate() {
+            let chunk = r.fetch(*id).unwrap().unwrap();
+            assert_eq!(chunk.text, format!("text-{i}"));
+        }
+        for id in &ids[keep..] {
+            assert!(r.fetch(*id).unwrap().is_none(), "truncated id reappeared");
+        }
+        for (i, id) in new_ids.iter().enumerate() {
+            let chunk = r.fetch(*id).unwrap().unwrap();
+            assert_eq!(chunk.text, format!("new-{i}"));
+        }
+    }
+
+    #[test]
+    fn open_resume_rejects_offset_count_mismatch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin = tmp.path().join("chunks.bin");
+        let idx = tmp.path().join("chunks.idx");
+        // Empty file is fine for this check.
+        File::create(&bin).unwrap();
+        let id = ChunkId::from_source(&[1; 32], 0);
+        let err =
+            ChunkStoreWriter::open_resume(&bin, &idx, &[id], &[0]).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
     }
 
     #[test]

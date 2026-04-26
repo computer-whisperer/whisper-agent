@@ -342,6 +342,23 @@ impl Scheduler {
             }
         };
 
+        // Resume detection: if a prior build was interrupted (Pause
+        // or crash), its slot directory is still on disk in
+        // Planning/Building state. Pick that up rather than starting
+        // a parallel slot.
+        let resume_slot_id = match bucket.find_resumable_slot() {
+            Ok(opt) => opt,
+            Err(e) => {
+                self.send_bucket_error(
+                    conn_id,
+                    correlation_id,
+                    "start_bucket_build",
+                    format!("resumable-slot scan failed: {e}"),
+                );
+                return;
+            }
+        };
+
         let cancel = CancellationToken::new();
         self.active_bucket_builds.insert(id.clone(), cancel.clone());
 
@@ -377,6 +394,7 @@ impl Scheduler {
             task_tx,
             conn_id,
             correlation_id,
+            resume_slot_id,
         ));
     }
 
@@ -500,6 +518,7 @@ async fn run_build(
     task_tx: mpsc::UnboundedSender<BucketTaskUpdate>,
     requester_conn: ConnId,
     correlation_id: Option<String>,
+    resume_slot_id: Option<String>,
 ) {
     let progress = Arc::new(ProgressShared::default());
     let observer_arc: Arc<dyn BuildObserver> = Arc::new(ProgressObserver {
@@ -537,21 +556,41 @@ async fn run_build(
     // Run the build inside spawn_blocking + block_on so the runtime
     // workers stay free during the multi-minute HNSW build phase. The
     // observer is dyn-dispatched; the cost is negligible per call.
+    //
+    // Dispatches to either the fresh `build_slot` path or
+    // `resume_slot` based on whether the scheduler found an
+    // in-progress slot to pick up.
     let bucket_for_build = bucket.clone();
     let observer_for_build = observer_arc.clone();
     let cancel_for_build = cancel.clone();
     let handle = tokio::runtime::Handle::current();
     let result = tokio::task::spawn_blocking(move || {
         handle.block_on(async move {
-            bucket_for_build
-                .build_slot(
-                    adapter.as_ref(),
-                    chunker.as_ref(),
-                    embedder,
-                    Some(observer_for_build.as_ref()),
-                    &cancel_for_build,
-                )
-                .await
+            match resume_slot_id {
+                Some(slot_id) => {
+                    bucket_for_build
+                        .resume_slot(
+                            &slot_id,
+                            adapter.as_ref(),
+                            chunker.as_ref(),
+                            embedder,
+                            Some(observer_for_build.as_ref()),
+                            &cancel_for_build,
+                        )
+                        .await
+                }
+                None => {
+                    bucket_for_build
+                        .build_slot(
+                            adapter.as_ref(),
+                            chunker.as_ref(),
+                            embedder,
+                            Some(observer_for_build.as_ref()),
+                            &cancel_for_build,
+                        )
+                        .await
+                }
+            }
         })
     })
     .await;

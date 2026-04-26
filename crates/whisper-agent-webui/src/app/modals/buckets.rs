@@ -771,7 +771,11 @@ fn render_row_actions(
 ) {
     ui.horizontal(|ui| {
         if in_flight_build {
-            if ui.button("Cancel build").clicked() {
+            // "Pause" rather than "Cancel" — the server preserves
+            // partial slot state on disk (build.state log + chunks +
+            // vectors), and a subsequent Build click picks up where
+            // we left off rather than starting from scratch.
+            if ui.button("Pause build").clicked() {
                 events.push(BucketsEvent::CancelBuild { id: b.id.clone() });
             }
         } else if ui
@@ -781,6 +785,9 @@ fn render_row_actions(
             )
             .clicked()
         {
+            // The server detects an in-progress slot from a previous
+            // pause/crash and resumes it; otherwise this starts a
+            // fresh slot.
             events.push(BucketsEvent::StartBuild { id: b.id.clone() });
         }
 
