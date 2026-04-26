@@ -1,0 +1,150 @@
+# whisper-agent.toml — server configuration.
+#
+# Copy this file to one of:
+#   ./whisper-agent.toml                                  (in-tree dev: scripts/dev.sh picks this up)
+#   $XDG_CONFIG_HOME/whisper-agent/whisper-agent.toml     (per-user)
+#   $HOME/.config/whisper-agent/whisper-agent.toml        (per-user fallback)
+#   /etc/whisper-agent/whisper-agent.toml                 (Docker / k8s — mounted in)
+# or pass an explicit path with `whisper-agent serve --config <path>`.
+#
+# Search precedence: --config > XDG > HOME > cwd. The first existing file wins.
+# A server with zero backends is invalid; everything else here is optional.
+
+
+# -----------------------------------------------------------------------------
+# Backends — the catalog of LLM endpoints the server can route conversations to.
+# -----------------------------------------------------------------------------
+#
+# Each `[backends.<name>]` table is a named alias. `<name>` is what shows up in
+# the webui's backend picker and what threads bind to. `kind` selects the wire
+# format (anthropic | openai_chat | openai_responses | gemini | llamacpp).
+#
+# `auth` is a tagged union. The two common shapes:
+#   auth = { mode = "api_key", value = "sk-..." }              # inline literal
+#   auth = { mode = "api_key", env   = "ANTHROPIC_API_KEY" }   # read from env
+#
+# Subscription auth is also supported (`mode = "chatgpt_subscription"` for
+# openai_responses, `mode = "google_oauth"` for gemini). See src/pod/config.rs.
+
+[backends.anthropic]
+kind          = "anthropic"
+default_model = "claude-sonnet-4-6"
+auth          = { mode = "api_key", env = "ANTHROPIC_API_KEY" }
+
+# Optional additional backends — uncomment to enable.
+
+# [backends.openai]
+# kind          = "openai_chat"
+# base_url      = "https://api.openai.com/v1"
+# default_model = "gpt-4o"
+# auth          = { mode = "api_key", env = "OPENAI_API_KEY" }
+
+# [backends.openai-responses]
+# kind          = "openai_responses"
+# default_model = "gpt-5"
+# auth          = { mode = "api_key", env = "OPENAI_API_KEY" }
+
+# [backends.gemini]
+# kind          = "gemini"
+# default_model = "gemini-2.5-pro"
+# auth          = { mode = "api_key", env = "GEMINI_API_KEY" }
+
+# Local llama.cpp server (no auth — the driver speaks llama.cpp's native HTTP
+# API; do NOT include a `/v1` suffix on base_url).
+# [backends.local-llamacpp]
+# kind          = "llamacpp"
+# base_url      = "http://localhost:8080"
+# default_model = "qwen3-coder-30b"
+
+# Local Ollama / LM Studio / any openai-compatible endpoint (no auth needed).
+# [backends.local-ollama]
+# kind          = "openai_chat"
+# base_url      = "http://localhost:11434/v1"
+# default_model = "llama3.2"
+
+
+# -----------------------------------------------------------------------------
+# Secrets — env vars exported to sibling daemons (web-search, etc.).
+# -----------------------------------------------------------------------------
+#
+# `whisper-agent config env` emits these as `export KEY='VALUE'` lines for
+# scripts/dev.sh to source before launching the search/fetch sidecars.
+
+[secrets]
+# Brave Search API key — required for the web-search MCP daemon. Without it,
+# scripts/dev.sh and the Docker entrypoint silently skip starting that daemon
+# (the rest of the agent works fine; the model just won't have a `web_search`
+# tool). Get one at https://brave.com/search/api/.
+# BRAVE_API_KEY = "BSA..."
+
+
+# -----------------------------------------------------------------------------
+# Shared MCP hosts — singleton MCP servers all threads can dial.
+# -----------------------------------------------------------------------------
+#
+# scripts/dev.sh registers `fetch` and `search` automatically via CLI flags
+# (--shared-mcp-host name=url), so leave this empty for in-tree development.
+# Populate it for production deployments where you run the sidecars elsewhere.
+
+# [shared_mcp_hosts]
+# fetch  = "http://127.0.0.1:9830/mcp"
+# search = "http://127.0.0.1:9831/mcp"
+
+
+# -----------------------------------------------------------------------------
+# Host-env providers — sandbox daemons that provision per-thread MCP hosts.
+# -----------------------------------------------------------------------------
+#
+# Each `[[host_env_providers]]` entry registers a `whisper-agent-sandbox`-shaped
+# daemon. Pods opt threads into one by name in their `[[allow.host_env]]` table.
+# scripts/dev.sh registers `local-landlock` automatically and synthesizes a
+# default pod that uses it; configure here only if you have additional managed
+# hosts (e.g. one per remote machine the AUR package is installed on).
+#
+# `token_file` points at a file whose single-line contents match the
+# `--control-token-file` the daemon was started with. The file at
+# /var/lib/whisper-agent/sandbox-control-token (created by the AUR install) is
+# the typical source on managed hosts.
+
+# [[host_env_providers]]
+# name       = "host-alpha"
+# url        = "http://alpha.internal:9820"
+# token_file = "/etc/whisper-agent/host-alpha.token"
+
+
+# -----------------------------------------------------------------------------
+# Embedding / rerank providers — for knowledge buckets (optional).
+# -----------------------------------------------------------------------------
+#
+# Hookups to TEI inference servers. Required only if you want to use the
+# in-server knowledge-bucket retrieval features. See docs/design_knowledge_db.md.
+
+# [embedding_providers.local-bge]
+# kind     = "tei"
+# endpoint = "http://localhost:8080"
+
+# [rerank_providers.local-bge-reranker]
+# kind     = "tei"
+# endpoint = "http://localhost:8081"
+
+
+# -----------------------------------------------------------------------------
+# Client auth — bearer tokens for non-loopback access.
+# -----------------------------------------------------------------------------
+#
+# Loopback connections (127.0.0.1, ::1) always bypass auth — set this up only
+# if you expose the server on a non-loopback address. When the server binds a
+# non-loopback listen and `[auth]` is empty, all external connections are
+# rejected outright.
+#
+# Two lists. `clients` get chat access; `admins` additionally can rotate
+# provider credentials and edit the running config from the webui's Settings
+# tab. Generate tokens with e.g. `openssl rand -base64 32`.
+
+# [[auth.clients]]
+# name  = "my-laptop"
+# token = "REPLACE_WITH_A_LONG_RANDOM_STRING"
+
+# [[auth.admins]]
+# name  = "me"
+# token = "REPLACE_WITH_A_DIFFERENT_LONG_RANDOM_STRING"
