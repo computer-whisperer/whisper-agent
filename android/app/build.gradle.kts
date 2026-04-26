@@ -5,6 +5,21 @@ plugins {
     alias(libs.plugins.kotlin.compose)
 }
 
+// CI exports versionCode/versionName via -P flags (or ORG_GRADLE_PROJECT_*
+// env vars), derived from the git tag. Local builds fall back to the
+// placeholder values below — fine for `assembleDebug`, but every released
+// APK must have a strictly-increasing versionCode or Android refuses the
+// over-the-top install.
+val appVersionCode: Int = (project.findProperty("versionCode") as String?)?.toInt() ?: 1
+val appVersionName: String = (project.findProperty("versionName") as String?) ?: "0.1.0-dev"
+
+// Release signing is env-driven so the workflow can supply credentials
+// without committing them. When ANDROID_KEYSTORE_PATH is unset (every
+// local build), no `release` signing config is registered and
+// `assembleRelease` produces an unsigned APK — use `assembleDebug` for
+// anything you actually want to install during development.
+val releaseKeystorePath: String? = System.getenv("ANDROID_KEYSTORE_PATH")
+
 android {
     namespace = "com.cjbal.whisperagent"
     compileSdk = 35
@@ -13,14 +28,28 @@ android {
         applicationId = "com.cjbal.whisperagent"
         minSdk = 26
         targetSdk = 35
-        versionCode = 1
-        versionName = "0.1.0"
+        versionCode = appVersionCode
+        versionName = appVersionName
+    }
+
+    if (releaseKeystorePath != null) {
+        signingConfigs {
+            create("release") {
+                storeFile = file(releaseKeystorePath)
+                storePassword = System.getenv("ANDROID_KEYSTORE_PASSWORD")
+                keyAlias = System.getenv("ANDROID_KEY_ALIAS")
+                keyPassword = System.getenv("ANDROID_KEY_PASSWORD")
+            }
+        }
     }
 
     buildTypes {
         release {
             isMinifyEnabled = false
             proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
+            if (releaseKeystorePath != null) {
+                signingConfig = signingConfigs.getByName("release")
+            }
         }
     }
 
