@@ -134,8 +134,8 @@ impl DenseIndex {
 
     /// Insert one vector at `position` (the index into vectors.bin).
     /// Takes a write lock for the brief duration of the HNSW insert
-    /// + by_position update. Caller is responsible for monotonically
-    /// increasing positions starting from 0; gaps are tolerated but
+    /// and by_position update. Caller is responsible for monotonically
+    /// increasing positions starting from 0; gaps are tolerated but the
     /// rest of the codebase doesn't currently produce them.
     pub fn insert(&self, chunk_id: ChunkId, position: u64, vector: &[f32]) {
         let mut inner = self.inner.write().expect("DenseIndex lock poisoned");
@@ -177,10 +177,7 @@ impl DenseIndex {
     }
 
     pub fn len(&self) -> usize {
-        self.inner
-            .read()
-            .map(|i| i.by_position.len())
-            .unwrap_or(0)
+        self.inner.read().map(|i| i.by_position.len()).unwrap_or(0)
     }
 
     pub fn is_empty(&self) -> bool {

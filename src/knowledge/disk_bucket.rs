@@ -177,9 +177,11 @@ impl LoadedSlot {
     }
 
     fn sparse(&self) -> Option<Arc<SparseIndex>> {
-        self.sparse
-            .as_ref()
-            .map(|lock| lock.read().expect("LoadedSlot.sparse lock poisoned").clone())
+        self.sparse.as_ref().map(|lock| {
+            lock.read()
+                .expect("LoadedSlot.sparse lock poisoned")
+                .clone()
+        })
     }
 }
 
@@ -293,6 +295,10 @@ impl DiskBucket {
                 obs.on_progress(source_records, 0);
             }
         }
+        // Durability boundary: make every Planned record survive a
+        // crash before we promote the manifest to Building. The next
+        // sync happens per-batch during Indexing.
+        build_state.sync().map_err(BucketError::Io)?;
 
         // Promote manifest to Building once planning is done. Writing
         // here (rather than at the very start of build_slot) lets the
@@ -370,8 +376,8 @@ impl DiskBucket {
         cancel: &CancellationToken,
     ) -> Result<SlotId, BucketError> {
         let slot_path = slot::slot_dir(&self.root, slot_id);
-        let manifest_text = fs::read_to_string(slot::manifest_path(&slot_path))
-            .map_err(|e| match e.kind() {
+        let manifest_text =
+            fs::read_to_string(slot::manifest_path(&slot_path)).map_err(|e| match e.kind() {
                 std::io::ErrorKind::NotFound => BucketError::Other(format!(
                     "resume_slot: slot {slot_id} has no manifest.toml — slot does not exist?"
                 )),
@@ -410,6 +416,23 @@ impl DiskBucket {
                 manifest.embedder.dimension, embedder_snapshot.dimension,
             )));
         }
+        // Same dim, different model = silently mixed vectors. Vectors
+        // already on disk came from the prior model; vectors we'd
+        // append now would come from the new model. Even if the
+        // arithmetic happens to typecheck, the index is corrupt for
+        // queries (different models live in different vector spaces).
+        if manifest.embedder.model_id != embedder_snapshot.model_id
+            || manifest.embedder.provider != embedder_snapshot.provider
+        {
+            return Err(BucketError::Other(format!(
+                "resume_slot: embedder identity changed ({}/{} → {}/{}) since slot {slot_id} was started; \
+                 delete the bucket and rebuild",
+                manifest.embedder.provider,
+                manifest.embedder.model_id,
+                embedder_snapshot.provider,
+                embedder_snapshot.model_id,
+            )));
+        }
 
         let sparse_enabled = self.config.search_paths.sparse.enabled;
         let chunks_bin = slot::chunks_bin_path(&slot_path);
@@ -434,8 +457,8 @@ impl DiskBucket {
                 fs::remove_file(&build_state_path).map_err(BucketError::Io)?;
             }
             // Re-run the same setup the fresh-build path does.
-            let mut build_state = BuildStateWriter::create_or_open(&build_state_path)
-                .map_err(BucketError::Io)?;
+            let mut build_state =
+                BuildStateWriter::create_or_open(&build_state_path).map_err(BucketError::Io)?;
 
             publish_phase(BuildPhase::Planning, observer, &mut build_state)?;
             let mut source_records: u64 = 0;
@@ -456,17 +479,15 @@ impl DiskBucket {
                     obs.on_progress(source_records, 0);
                 }
             }
+            build_state.sync().map_err(BucketError::Io)?;
             manifest.state = SlotState::Building;
             write_manifest(&slot_path, &manifest)?;
 
             let chunk_writer =
                 ChunkStoreWriter::create(&chunks_bin, &chunks_idx).map_err(BucketError::Io)?;
-            let vector_writer = VectorStoreWriter::create(
-                &vectors_bin,
-                &vectors_idx,
-                embedder_snapshot.dimension,
-            )
-            .map_err(BucketError::Io)?;
+            let vector_writer =
+                VectorStoreWriter::create(&vectors_bin, &vectors_idx, embedder_snapshot.dimension)
+                    .map_err(BucketError::Io)?;
             let sparse_builder = if sparse_enabled {
                 Some(SparseIndexBuilder::create(&tantivy_dir)?)
             } else {
@@ -494,8 +515,8 @@ impl DiskBucket {
         }
 
         // Building state ⇒ replay build.state to find the resume point.
-        let prior_records = super::build_state::read_all(&build_state_path)
-            .map_err(BucketError::Io)?;
+        let prior_records =
+            super::build_state::read_all(&build_state_path).map_err(BucketError::Io)?;
         let planned: Vec<(String, [u8; 32])> = prior_records
             .iter()
             .filter_map(|r| match r {
@@ -514,8 +535,7 @@ impl DiskBucket {
             } => Some((*batch_index, *source_records_completed, *chunks_completed)),
             _ => None,
         });
-        let (last_batch_index, records_done, chunks_done) =
-            last_batch.unwrap_or((u64::MAX, 0, 0)); // u64::MAX → 0 below
+        let (last_batch_index, records_done, chunks_done) = last_batch.unwrap_or((u64::MAX, 0, 0)); // u64::MAX → 0 below
 
         // Reopen build.state in append mode (existing entries stay).
         let build_state =
@@ -528,7 +548,9 @@ impl DiskBucket {
         let mut resumed_chunk_ids: Vec<ChunkId> = Vec::with_capacity(chunks_done as usize);
         let records_to_skip = records_done.min(planned.len() as u64);
         let mut iter = adapter.enumerate();
-        for i in 0..records_to_skip as usize {
+        for (i, (expected_source_id, expected_hash)) in
+            planned.iter().take(records_to_skip as usize).enumerate()
+        {
             if cancel.is_cancelled() {
                 return Err(BucketError::Cancelled);
             }
@@ -541,7 +563,6 @@ impl DiskBucket {
                     )));
                 }
             };
-            let (expected_source_id, expected_hash) = &planned[i];
             if record.content_hash != *expected_hash {
                 return Err(BucketError::Other(format!(
                     "resume_slot: source drift detected at record `{}` (was `{}` when planned); \
@@ -654,7 +675,8 @@ impl DiskBucket {
                 use std::io::{Read, Seek, SeekFrom};
                 for (position, chunk_id) in chunk_ids.iter().enumerate() {
                     let byte_offset = 16u64 + position as u64 * dim as u64 * 4;
-                    bin.seek(SeekFrom::Start(byte_offset)).map_err(BucketError::Io)?;
+                    bin.seek(SeekFrom::Start(byte_offset))
+                        .map_err(BucketError::Io)?;
                     let mut bytes = vec![0u8; dim as usize * 4];
                     bin.read_exact(&mut bytes).map_err(BucketError::Io)?;
                     let mut v = Vec::with_capacity(dim as usize);
@@ -777,9 +799,7 @@ impl DiskBucket {
         for _ in 0..resume.records_completed {
             match iter.next() {
                 Some(Ok(_)) => {}
-                Some(Err(e)) => {
-                    return Err(BucketError::Other(format!("source error: {e}")))
-                }
+                Some(Err(e)) => return Err(BucketError::Other(format!("source error: {e}"))),
                 None => break,
             }
         }
@@ -832,6 +852,12 @@ impl DiskBucket {
                         chunks_completed: chunks_emitted,
                     })
                     .map_err(BucketError::Io)?;
+                // Durability barrier: BatchEmbedded is the resume
+                // checkpoint. The chunks/vectors/sparse writers have
+                // already flushed + committed above; this fsync makes
+                // the log entry stating "everything up to here is
+                // durable" itself durable.
+                build_state.sync().map_err(BucketError::Io)?;
                 batch_index += 1;
                 if let Some(obs) = observer {
                     obs.on_progress(records_completed, chunks_emitted);
@@ -877,6 +903,7 @@ impl DiskBucket {
                     chunks_completed: chunks_emitted,
                 })
                 .map_err(BucketError::Io)?;
+            build_state.sync().map_err(BucketError::Io)?;
             if let Some(obs) = observer {
                 obs.on_progress(records_completed, chunks_emitted);
             }
@@ -959,6 +986,7 @@ impl DiskBucket {
         build_state
             .append(&BuildStateRecord::BuildCompleted)
             .map_err(BucketError::Io)?;
+        build_state.sync().map_err(BucketError::Io)?;
 
         Ok(slot_id.to_string())
     }
@@ -1023,7 +1051,7 @@ impl DiskBucket {
                     chunks: RwLock::new(chunks_reader),
                     vectors: None,
                     dense: dense.clone(),
-                    sparse: sparse_reader.map(|s| RwLock::new(s)),
+                    sparse: sparse_reader.map(RwLock::new),
                 });
                 {
                     let mut active = self.active.write().expect("active slot lock poisoned");
@@ -1036,8 +1064,10 @@ impl DiskBucket {
             // and grows automatically via flush_batch's insert.
             Some(slot) => {
                 {
-                    let mut chunks_lock =
-                        slot.chunks.write().expect("LoadedSlot.chunks lock poisoned");
+                    let mut chunks_lock = slot
+                        .chunks
+                        .write()
+                        .expect("LoadedSlot.chunks lock poisoned");
                     *chunks_lock = chunks_reader;
                 }
                 if let (Some(new), Some(lock)) = (sparse_reader, slot.sparse.as_ref()) {
@@ -1070,7 +1100,9 @@ impl DiskBucket {
                 continue;
             }
             let name = entry.file_name();
-            let Some(slot_id) = name.to_str() else { continue };
+            let Some(slot_id) = name.to_str() else {
+                continue;
+            };
             let manifest_path = slot::manifest_path(&entry.path());
             let Ok(text) = fs::read_to_string(&manifest_path) else {
                 continue;
@@ -1078,10 +1110,7 @@ impl DiskBucket {
             let Ok(manifest) = SlotManifest::from_toml_str(&text) else {
                 continue;
             };
-            if matches!(
-                manifest.state,
-                SlotState::Planning | SlotState::Building
-            ) {
+            if matches!(manifest.state, SlotState::Planning | SlotState::Building) {
                 candidates.push(slot_id.to_string());
             }
         }
@@ -1106,7 +1135,8 @@ impl DiskBucket {
     /// works even during a build when `vectors.idx` doesn't exist
     /// yet (the embedder dimension is frozen at slot creation).
     pub fn active_dimension(&self) -> Option<u32> {
-        self.active_snapshot().map(|s| s.manifest.embedder.dimension)
+        self.active_snapshot()
+            .map(|s| s.manifest.embedder.dimension)
     }
 
     /// Test/inspection accessor. Fetches a vector by chunk id from the
@@ -1144,13 +1174,15 @@ impl Bucket for DiskBucket {
                 SlotState::Building | SlotState::Planning => BucketStatus::Building {
                     slot_id: slot.manifest.slot_id.clone(),
                     progress: super::types::BuildProgress {
-                        // The fine-grained progress lives in
-                        // build.state on disk; this status is just
-                        // "yes, queries hit a slot that's still
-                        // being built." Callers wanting per-batch
-                        // counts subscribe to BucketBuildProgress
-                        // events.
-                        stage: "indexing".to_string(),
+                        // Coarse stage string driven by the manifest
+                        // state. Fine BuildPhase progresses via
+                        // wire-side BucketBuildProgress events; this
+                        // status() result is just "yes, queries hit a
+                        // slot that's still being built."
+                        stage: match slot.manifest.state {
+                            SlotState::Planning => "planning".to_string(),
+                            _ => "indexing".to_string(),
+                        },
                         completed: slot.dense.len() as u64,
                         total: None,
                     },
@@ -2353,14 +2385,16 @@ embedder = "tei_test"
             .unwrap_err();
 
         // Find the partial slot and verify it's resumable.
-        let resumable = bucket.find_resumable_slot().unwrap().expect(
-            "find_resumable_slot must return the in-progress slot after cancel",
-        );
+        let resumable = bucket
+            .find_resumable_slot()
+            .unwrap()
+            .expect("find_resumable_slot must return the in-progress slot after cancel");
 
         let slot_path = slot::slot_dir(&bucket_root, &resumable);
-        let manifest =
-            SlotManifest::from_toml_str(&fs::read_to_string(slot::manifest_path(&slot_path)).unwrap())
-                .unwrap();
+        let manifest = SlotManifest::from_toml_str(
+            &fs::read_to_string(slot::manifest_path(&slot_path)).unwrap(),
+        )
+        .unwrap();
         assert_eq!(manifest.state, SlotState::Building);
 
         let log_pre = build_state::read_all(&slot_path.join(slot::BUILD_STATE)).unwrap();
@@ -2368,7 +2402,10 @@ embedder = "tei_test"
             .iter()
             .filter(|r| matches!(r, BuildStateRecord::BatchEmbedded { .. }))
             .count();
-        assert!(pre_batches >= 1, "at least one batch should be checkpointed");
+        assert!(
+            pre_batches >= 1,
+            "at least one batch should be checkpointed"
+        );
         assert!(
             !log_pre
                 .iter()
@@ -2398,16 +2435,16 @@ embedder = "tei_test"
 
         // Verify the resumed slot's stats match a from-scratch
         // build's stats (same chunker + source → same chunk count).
-        let manifest =
-            SlotManifest::from_toml_str(&fs::read_to_string(slot::manifest_path(&slot_path)).unwrap())
-                .unwrap();
+        let manifest = SlotManifest::from_toml_str(
+            &fs::read_to_string(slot::manifest_path(&slot_path)).unwrap(),
+        )
+        .unwrap();
         assert_eq!(manifest.state, SlotState::Ready);
         assert_eq!(manifest.stats.source_records, total_records as u64);
         assert_eq!(manifest.stats.chunk_count, total_records as u64);
         assert_eq!(manifest.stats.vector_count, total_records as u64);
 
-        let log_post =
-            build_state::read_all(&slot_path.join(slot::BUILD_STATE)).unwrap();
+        let log_post = build_state::read_all(&slot_path.join(slot::BUILD_STATE)).unwrap();
         assert!(matches!(
             log_post.last().unwrap(),
             BuildStateRecord::BuildCompleted
@@ -2428,9 +2465,18 @@ embedder = "tei_test"
         let q_chunks = chunker.chunk(&q_record);
         let query_vec = MockEmbedder::fake_vector(&q_chunks[0].text, 8);
         let dense_hits = bucket.dense_search(&query_vec, 5, &cancel_q).await.unwrap();
-        assert!(!dense_hits.is_empty(), "resumed slot must be queryable on dense");
-        let sparse_hits = bucket.sparse_search("doc-0050", 5, &cancel_q).await.unwrap();
-        assert!(!sparse_hits.is_empty(), "resumed slot must be queryable on sparse");
+        assert!(
+            !dense_hits.is_empty(),
+            "resumed slot must be queryable on dense"
+        );
+        let sparse_hits = bucket
+            .sparse_search("doc-0050", 5, &cancel_q)
+            .await
+            .unwrap();
+        assert!(
+            !sparse_hits.is_empty(),
+            "resumed slot must be queryable on sparse"
+        );
     }
 
     #[tokio::test]
@@ -2565,6 +2611,60 @@ embedder = "tei_test"
         );
     }
 
+    #[tokio::test]
+    async fn resume_rejects_embedder_identity_change() {
+        // Same dimension, different model_id ⇒ silently mixed
+        // vectors. Resume must error rather than continue extending
+        // a slot whose existing vectors came from a different model.
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("notes");
+        fs::create_dir_all(&source).unwrap();
+        let total_records = super::EMBED_BATCH_SIZE + 5;
+        for i in 0..total_records {
+            write_md(
+                &source,
+                &format!("doc-{i:04}.md"),
+                &format!("doc-{i:04} body content"),
+            );
+        }
+        let bucket_root = tmp.path().join("bucket");
+        let bucket = open_test_bucket(&bucket_root, &source);
+        let adapter = MarkdownDir::new(&source);
+        let chunker = TokenBasedChunker::from_config(&bucket.config().chunker);
+
+        let cancel = CancellationToken::new();
+        let cancelling = Arc::new(CancellingEmbedder::new(8, 1, cancel.clone()));
+        let _ = bucket
+            .build_slot(&adapter, &chunker, cancelling, None, &cancel)
+            .await
+            .unwrap_err();
+        let resumable = bucket.find_resumable_slot().unwrap().unwrap();
+
+        // Same dim (8), but a fresh model id.
+        let different_model = Arc::new(MockEmbedder {
+            dimension: 8,
+            model_id: "different-mock".to_string(),
+            embed_calls: AtomicUsize::new(0),
+        });
+        let resume_cancel = CancellationToken::new();
+        let err = bucket
+            .resume_slot(
+                &resumable,
+                &adapter,
+                &chunker,
+                different_model,
+                None,
+                &resume_cancel,
+            )
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("embedder identity changed"),
+            "expected identity error, got: {msg}"
+        );
+    }
+
     /// Build observer that pauses the build right after the first
     /// Indexing batch fully lands + installs in the active slot.
     /// Triggers off `on_progress` *only when the current phase is
@@ -2658,7 +2758,13 @@ embedder = "tei_test"
             let chunker = TokenBasedChunker::from_config(&bucket_for_task.config().chunker);
             let observer: &dyn BuildObserver = &*pause_for_task;
             bucket_for_task
-                .build_slot(&adapter, &chunker, embedder, Some(observer), &cancel_for_task)
+                .build_slot(
+                    &adapter,
+                    &chunker,
+                    embedder,
+                    Some(observer),
+                    &cancel_for_task,
+                )
                 .await
         });
 
@@ -2700,12 +2806,13 @@ embedder = "tei_test"
         assert!(matches!(bucket.status(), BucketStatus::Ready));
 
         // After completion the trailing batch is also queryable.
-        let q_record2 =
-            crate::knowledge::SourceRecord::new("ignored", "doc-0131 body content");
+        let q_record2 = crate::knowledge::SourceRecord::new("ignored", "doc-0131 body content");
         let q_chunks2 = chunker_for_query.chunk(&q_record2);
         let query_vec2 = MockEmbedder::fake_vector(&q_chunks2[0].text, 8);
-        let dense_hits_post =
-            bucket.dense_search(&query_vec2, 5, &cancel_q).await.unwrap();
+        let dense_hits_post = bucket
+            .dense_search(&query_vec2, 5, &cancel_q)
+            .await
+            .unwrap();
         assert!(!dense_hits_post.is_empty());
         let sparse_hits_post = bucket
             .sparse_search("doc-0131", 5, &cancel_q)

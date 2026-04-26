@@ -81,10 +81,11 @@ pub enum BuildStateRecord {
 
 /// Append-only writer for `build.state`. Opens the file in append
 /// mode (creating if absent), so existing entries from a prior build
-/// attempt are preserved. Each `append` call writes one jsonl line
-/// and `fsync`s the underlying file before returning — the cost
-/// per-record is one syscall, dominated by the embedder/HNSW work
-/// that surrounds it.
+/// attempt are preserved. `append` is buffered and cheap — call
+/// [`Self::sync`] at durability boundaries (end of Planning, after
+/// each `BatchEmbedded`, after `BuildCompleted`) so a crash leaves a
+/// resume-correct file. Per-record fsync would be 6.8M syscalls
+/// during planning at full-wikipedia scale, none of them load-bearing.
 pub struct BuildStateWriter {
     file: BufWriter<File>,
 }
@@ -100,13 +101,22 @@ impl BuildStateWriter {
         })
     }
 
-    /// Append one record as a jsonl line and fsync.
+    /// Append one record as a jsonl line. Buffered; no fsync. Caller
+    /// must invoke [`Self::sync`] at durability boundaries (see the
+    /// type-level docs for which records require sync).
     pub fn append(&mut self, record: &BuildStateRecord) -> io::Result<()> {
         // serde_json::to_writer doesn't append a newline; we add one
         // ourselves so each record lands on its own line.
         serde_json::to_writer(&mut self.file, record)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         self.file.write_all(b"\n")?;
+        Ok(())
+    }
+
+    /// Flush the BufWriter to the OS file, then `sync_data()` to push
+    /// it to durable storage. After this returns, every record passed
+    /// to [`Self::append`] before this call survives a crash.
+    pub fn sync(&mut self) -> io::Result<()> {
         self.file.flush()?;
         self.file.get_ref().sync_data()?;
         Ok(())

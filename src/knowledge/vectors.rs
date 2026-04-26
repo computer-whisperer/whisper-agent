@@ -135,8 +135,12 @@ impl VectorStoreWriter {
         drop(truncate);
 
         let file = OpenOptions::new().append(true).open(bin_path)?;
-        let entries: Vec<(ChunkId, u64)> =
-            chunk_ids.iter().copied().enumerate().map(|(i, id)| (id, i as u64)).collect();
+        let entries: Vec<(ChunkId, u64)> = chunk_ids
+            .iter()
+            .copied()
+            .enumerate()
+            .map(|(i, id)| (id, i as u64))
+            .collect();
         Ok(Self {
             bin: BufWriter::new(file),
             idx_path: idx_path.to_path_buf(),
@@ -518,8 +522,7 @@ mod tests {
 
         // Resume keeping only first 3 vectors.
         let keep = 3usize;
-        let mut w =
-            VectorStoreWriter::open_resume(&bin, &idx, dim, &ids[..keep]).unwrap();
+        let mut w = VectorStoreWriter::open_resume(&bin, &idx, dim, &ids[..keep]).unwrap();
         // File got truncated.
         let mid = std::fs::metadata(&bin).unwrap().len();
         assert_eq!(mid, HEADER_SIZE + keep as u64 * dim as u64 * 4);

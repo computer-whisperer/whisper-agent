@@ -667,8 +667,7 @@ mod tests {
         // Empty file is fine for this check.
         File::create(&bin).unwrap();
         let id = ChunkId::from_source(&[1; 32], 0);
-        let err =
-            ChunkStoreWriter::open_resume(&bin, &idx, &[id], &[0]).unwrap_err();
+        let err = ChunkStoreWriter::open_resume(&bin, &idx, &[id], &[0]).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
     }
 
