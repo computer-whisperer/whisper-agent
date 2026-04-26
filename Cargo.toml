@@ -129,6 +129,17 @@ hnsw_rs = "0.3"
 # composes cleanly with our slot directory layout (one tantivy
 # directory per slot).
 tantivy = "0.24"
+# Streaming XML parser for the MediaWiki source adapter — wikipedia
+# dumps are far too large to parse with a DOM-style API. quick-xml
+# exposes pull-style events that let us walk a 22 GB enwiki dump
+# page-by-page while holding only one page in memory.
+quick-xml = "0.39"
+# bz2 decompression for the MediaWiki adapter — wikipedia ships its
+# dumps as `.xml.bz2`. The C-backed `bzip2` crate gives a streaming
+# `Read` impl over the compressed file; we wrap it in `BufReader`
+# before handing to quick-xml so chunked decompression overlaps with
+# parsing.
+bzip2 = "0.5"
 
 [dev-dependencies]
 # Tempdirs for source-adapter / chunker tests. Auto-cleanup via Drop.

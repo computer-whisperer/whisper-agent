@@ -14,8 +14,10 @@
 //! collect into `Vec`.
 
 pub mod markdown_dir;
+pub mod mediawiki_xml;
 
 pub use markdown_dir::MarkdownDir;
+pub use mediawiki_xml::MediaWikiXml;
 
 use thiserror::Error;
 

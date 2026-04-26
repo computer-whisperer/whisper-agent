@@ -24,21 +24,13 @@ Last updated: **2026-04-25**.
 | 7   | multi-bucket query layer with reranker fusion                  | `94309de` |
 | 8a  | bucket registry + `ListBuckets` wire surface                   | `33c04e9` |
 | 8b  | WebUI knowledge-buckets modal — read-only bucket list          | `9e9925d` |
+| MW  | MediaWiki XML source adapter — streaming, bz2, raw wikitext    | (this slice) |
 
 ## Currently working
 
-**MediaWiki XML source adapter.** Goal: get a representative dataset
-(Simple English Wikipedia first, full enwiki as stretch) so the pipeline
-can be validated end-to-end at non-toy scale and the query path can be
-tired-kicked against real content.
-
-Agreed defaults:
-- Streaming `quick-xml` parser
-- bz2 streaming via the `bzip2` crate (Wikipedia ships `.xml.bz2`)
-- Pass raw wikitext through to the chunker (no plaintext extraction
-  yet — defer until RAG quality matters)
-- Default to ns=0 (main articles) only
-- Drop redirects and empty pages
+Adapter just landed; next up is standing up a real Simple English
+Wikipedia bucket end-to-end (hand-write `bucket.toml`, drive the build,
+spot-check a few queries) to expose whatever the test fixtures didn't.
 
 ## Deferred / not started
 

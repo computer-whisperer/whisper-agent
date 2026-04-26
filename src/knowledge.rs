@@ -58,7 +58,7 @@ pub use manifest::{
 };
 pub use query::{QueryEngine, QueryParams, RerankedCandidate};
 pub use registry::{BucketEntry, BucketRegistry};
-pub use source::{MarkdownDir, SourceAdapter, SourceError, SourceRecord};
+pub use source::{MarkdownDir, MediaWikiXml, SourceAdapter, SourceError, SourceRecord};
 pub use sparse::{SparseIndex, SparseIndexBuilder};
 pub use types::{
     BucketError, BucketId, BucketScope, BucketStatus, BuildProgress, Candidate, Chunk, ChunkId,
