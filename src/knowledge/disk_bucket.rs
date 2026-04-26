@@ -32,7 +32,7 @@ use super::manifest::{
     EmbedderSnapshot, ServingSnapshot, SlotManifest, SlotState, SlotStats, SparseSnapshot,
 };
 use super::slot;
-use super::source::SourceAdapter;
+use super::source::{SourceAdapter, SourceError, SourceRecord};
 use super::sparse::{SparseIndex, SparseIndexBuilder};
 use super::types::{
     BucketError, BucketId, BucketStatus, Candidate, Chunk, ChunkId, NewChunk, SearchPath, SlotId,
@@ -77,6 +77,34 @@ pub enum BuildPhase {
     /// Open readers, write final manifest, atomic active-slot pointer
     /// flip. Sub-second on every build measured so far.
     Finalizing,
+}
+
+/// Boxed source iterator threaded through the build pipeline. Naming
+/// the type once keeps the struct definitions below readable.
+type SourceIter<'a> = Box<dyn Iterator<Item = Result<SourceRecord, SourceError>> + Send + 'a>;
+
+/// Mutable owned state driven forward by [`DiskBucket::run_after_planning`]:
+/// the manifest, the four index writers, and the build-state log. Bundled
+/// so the function signature stays tractable.
+struct BuildHandles {
+    manifest: SlotManifest,
+    chunk_writer: ChunkStoreWriter,
+    vector_writer: VectorStoreWriter,
+    sparse_builder: Option<SparseIndexBuilder>,
+    build_state: BuildStateWriter,
+}
+
+/// External services + cancellation token + the active source iterator
+/// (already advanced past `resume.records_completed` records when
+/// resuming a Building-state slot). Passed by value into
+/// [`DiskBucket::run_after_planning`] so the iterator's borrow of the
+/// caller's `adapter` stays explicit at the call site.
+struct BuildServices<'a> {
+    iter: SourceIter<'a>,
+    chunker: &'a dyn Chunker,
+    embedder: Arc<dyn EmbeddingProvider>,
+    observer: Option<&'a dyn BuildObserver>,
+    cancel: &'a CancellationToken,
 }
 
 /// Resume cursor passed into [`DiskBucket::run_after_planning`]. The
@@ -271,13 +299,60 @@ impl DiskBucket {
         let mut build_state =
             BuildStateWriter::create_or_open(&build_state_path).map_err(BucketError::Io)?;
 
-        // --- Phase: Planning ---
-        // Walk the source once to enumerate records and write Planned
-        // entries with content_hash. Chunking happens in the next phase.
-        // The two-pass design gives us a record-count denominator before
-        // any embedding starts, and it gives the resume path a stable
-        // record list to drift-check against.
-        publish_phase(BuildPhase::Planning, observer, &mut build_state)?;
+        let source_records = self.do_planning_phase(
+            &slot_path,
+            &mut manifest,
+            adapter,
+            &mut build_state,
+            observer,
+            cancel,
+        )?;
+
+        // Fresh writers — the slot dir is brand new.
+        let handles = open_fresh_handles(
+            &slot_path,
+            manifest,
+            embedder_snapshot.dimension,
+            sparse_enabled,
+            build_state,
+        )?;
+
+        self.run_after_planning(
+            &slot_id,
+            &slot_path,
+            handles,
+            BuildServices {
+                iter: adapter.enumerate(),
+                chunker,
+                embedder,
+                observer,
+                cancel,
+            },
+            ResumePoint::default(),
+            source_records,
+        )
+        .await
+    }
+
+    /// Walk the source once, append a `Planned` record per source
+    /// record with its content hash, sync the log, and promote the
+    /// manifest from `Planning` → `Building`. Shared between
+    /// fresh-build and resume-from-Planning code paths.
+    ///
+    /// The single sync at end-of-loop is the resume invariant for
+    /// this phase: after this returns, every `Planned` line is
+    /// durable. Per-record fsync isn't worth the syscall budget
+    /// (Planning crashes just replan).
+    fn do_planning_phase(
+        &self,
+        slot_path: &Path,
+        manifest: &mut SlotManifest,
+        adapter: &dyn SourceAdapter,
+        build_state: &mut BuildStateWriter,
+        observer: Option<&dyn BuildObserver>,
+        cancel: &CancellationToken,
+    ) -> Result<u64, BucketError> {
+        publish_phase(BuildPhase::Planning, observer, build_state)?;
         let mut source_records: u64 = 0;
         for record in adapter.enumerate() {
             if cancel.is_cancelled() {
@@ -295,9 +370,6 @@ impl DiskBucket {
                 obs.on_progress(source_records, 0);
             }
         }
-        // Durability boundary: make every Planned record survive a
-        // crash before we promote the manifest to Building. The next
-        // sync happens per-batch during Indexing.
         build_state.sync().map_err(BucketError::Io)?;
 
         // Promote manifest to Building once planning is done. Writing
@@ -306,44 +378,8 @@ impl DiskBucket {
         // (state=Planning) from "planning finished, embedding was
         // interrupted" (state=Building).
         manifest.state = SlotState::Building;
-        write_manifest(&slot_path, &manifest)?;
-
-        // Fresh writers — the slot dir is brand new.
-        let chunks_bin = slot::chunks_bin_path(&slot_path);
-        let chunks_idx = slot::chunks_idx_path(&slot_path);
-        let vectors_bin = slot::vectors_bin_path(&slot_path);
-        let vectors_idx = slot::vectors_idx_path(&slot_path);
-        let tantivy_dir = slot::tantivy_dir(&slot_path);
-
-        let chunk_writer =
-            ChunkStoreWriter::create(&chunks_bin, &chunks_idx).map_err(BucketError::Io)?;
-        let vector_writer =
-            VectorStoreWriter::create(&vectors_bin, &vectors_idx, embedder_snapshot.dimension)
-                .map_err(BucketError::Io)?;
-        let sparse_builder = if sparse_enabled {
-            Some(SparseIndexBuilder::create(&tantivy_dir)?)
-        } else {
-            None
-        };
-
-        self.run_after_planning(
-            &slot_id,
-            &slot_path,
-            manifest,
-            sparse_enabled,
-            chunk_writer,
-            vector_writer,
-            sparse_builder,
-            build_state,
-            adapter,
-            chunker,
-            embedder,
-            observer,
-            cancel,
-            ResumePoint::default(),
-            source_records,
-        )
-        .await
+        write_manifest(slot_path, manifest)?;
+        Ok(source_records)
     }
 
     /// Resume an in-progress slot build, starting from the last
@@ -456,58 +492,35 @@ impl DiskBucket {
             if build_state_path.exists() {
                 fs::remove_file(&build_state_path).map_err(BucketError::Io)?;
             }
-            // Re-run the same setup the fresh-build path does.
             let mut build_state =
                 BuildStateWriter::create_or_open(&build_state_path).map_err(BucketError::Io)?;
-
-            publish_phase(BuildPhase::Planning, observer, &mut build_state)?;
-            let mut source_records: u64 = 0;
-            for record in adapter.enumerate() {
-                if cancel.is_cancelled() {
-                    return Err(BucketError::Cancelled);
-                }
-                let record =
-                    record.map_err(|e| BucketError::Other(format!("source error: {e}")))?;
-                build_state
-                    .append(&BuildStateRecord::Planned {
-                        source_id: record.source_id.clone(),
-                        content_hash: record.content_hash,
-                    })
-                    .map_err(BucketError::Io)?;
-                source_records += 1;
-                if let Some(obs) = observer {
-                    obs.on_progress(source_records, 0);
-                }
-            }
-            build_state.sync().map_err(BucketError::Io)?;
-            manifest.state = SlotState::Building;
-            write_manifest(&slot_path, &manifest)?;
-
-            let chunk_writer =
-                ChunkStoreWriter::create(&chunks_bin, &chunks_idx).map_err(BucketError::Io)?;
-            let vector_writer =
-                VectorStoreWriter::create(&vectors_bin, &vectors_idx, embedder_snapshot.dimension)
-                    .map_err(BucketError::Io)?;
-            let sparse_builder = if sparse_enabled {
-                Some(SparseIndexBuilder::create(&tantivy_dir)?)
-            } else {
-                None
-            };
+            let source_records = self.do_planning_phase(
+                &slot_path,
+                &mut manifest,
+                adapter,
+                &mut build_state,
+                observer,
+                cancel,
+            )?;
+            let handles = open_fresh_handles(
+                &slot_path,
+                manifest,
+                embedder_snapshot.dimension,
+                sparse_enabled,
+                build_state,
+            )?;
             return self
                 .run_after_planning(
                     slot_id,
                     &slot_path,
-                    manifest,
-                    sparse_enabled,
-                    chunk_writer,
-                    vector_writer,
-                    sparse_builder,
-                    build_state,
-                    adapter,
-                    chunker,
-                    embedder,
-                    observer,
-                    cancel,
+                    handles,
+                    BuildServices {
+                        iter: adapter.enumerate(),
+                        chunker,
+                        embedder,
+                        observer,
+                        cancel,
+                    },
                     ResumePoint::default(),
                     source_records,
                 )
@@ -590,9 +603,9 @@ impl DiskBucket {
                 ));
             }
         }
-        // We don't need `iter` past this point — run_after_planning
-        // re-creates a fresh iterator and skips the same prefix.
-        drop(iter);
+        // `iter` is now positioned at record `records_to_skip`.
+        // We hand it off to run_after_planning rather than dropping
+        // and re-walking.
         if (resumed_chunk_ids.len() as u64) != chunks_done {
             return Err(BucketError::Other(format!(
                 "resume_slot: re-derived chunk count {} doesn't match build.state checkpoint {}",
@@ -707,20 +720,24 @@ impl DiskBucket {
         // it. Republish Indexing so the observer sees we're back in
         // the embedding loop on the resume path.
         let source_records_total = planned.len() as u64;
-        self.run_after_planning(
-            slot_id,
-            &slot_path,
+        let handles = BuildHandles {
             manifest,
-            sparse_enabled,
             chunk_writer,
             vector_writer,
             sparse_builder,
             build_state,
-            adapter,
-            chunker,
-            embedder,
-            observer,
-            cancel,
+        };
+        self.run_after_planning(
+            slot_id,
+            &slot_path,
+            handles,
+            BuildServices {
+                iter,
+                chunker,
+                embedder,
+                observer,
+                cancel,
+            },
             resume,
             source_records_total,
         )
@@ -732,25 +749,36 @@ impl DiskBucket {
     /// boundaries, then run BuildingDense and Finalizing. Shared
     /// between the fresh-build and resume paths — both call this
     /// with their respective writers and starting positions.
-    #[allow(clippy::too_many_arguments)]
+    ///
+    /// `services.iter` must already be advanced past
+    /// `resume.records_completed` records when resuming a Building
+    /// slot; for fresh builds (and resume from Planning) the iterator
+    /// is fresh and `resume.records_completed == 0`.
     async fn run_after_planning(
         &self,
         slot_id: &str,
         slot_path: &Path,
-        mut manifest: SlotManifest,
-        sparse_enabled: bool,
-        mut chunk_writer: ChunkStoreWriter,
-        mut vector_writer: VectorStoreWriter,
-        mut sparse_builder: Option<SparseIndexBuilder>,
-        mut build_state: BuildStateWriter,
-        adapter: &dyn SourceAdapter,
-        chunker: &dyn Chunker,
-        embedder: Arc<dyn EmbeddingProvider>,
-        observer: Option<&dyn BuildObserver>,
-        cancel: &CancellationToken,
+        handles: BuildHandles,
+        services: BuildServices<'_>,
         resume: ResumePoint,
         source_records: u64,
     ) -> Result<SlotId, BucketError> {
+        let BuildHandles {
+            mut manifest,
+            mut chunk_writer,
+            mut vector_writer,
+            mut sparse_builder,
+            mut build_state,
+        } = handles;
+        let BuildServices {
+            iter,
+            chunker,
+            embedder,
+            observer,
+            cancel,
+        } = services;
+        let sparse_enabled = self.config.search_paths.sparse.enabled;
+
         let chunks_bin = slot::chunks_bin_path(slot_path);
         let chunks_idx = slot::chunks_idx_path(slot_path);
         let vectors_bin = slot::vectors_bin_path(slot_path);
@@ -793,17 +821,6 @@ impl DiskBucket {
         let install_during_build = !self.has_active_slot();
         let mut active_during_build: Option<Arc<LoadedSlot>> = None;
 
-        let chunks_bin_for_install = chunks_bin.clone();
-        let mut iter = adapter.enumerate();
-        // Skip records the resume code already accounted for.
-        for _ in 0..resume.records_completed {
-            match iter.next() {
-                Some(Ok(_)) => {}
-                Some(Err(e)) => return Err(BucketError::Other(format!("source error: {e}"))),
-                None => break,
-            }
-        }
-
         for record in iter {
             if cancel.is_cancelled() {
                 return Err(BucketError::Cancelled);
@@ -836,9 +853,7 @@ impl DiskBucket {
                 }
                 chunks_emitted += flushed;
                 self.update_active_during_build(
-                    &chunks_bin_for_install,
-                    &tantivy_dir,
-                    sparse_enabled,
+                    slot_path,
                     &chunk_writer,
                     &dense,
                     &manifest,
@@ -887,9 +902,7 @@ impl DiskBucket {
             }
             chunks_emitted += flushed;
             self.update_active_during_build(
-                &chunks_bin_for_install,
-                &tantivy_dir,
-                sparse_enabled,
+                slot_path,
                 &chunk_writer,
                 &dense,
                 &manifest,
@@ -1014,12 +1027,9 @@ impl DiskBucket {
     /// `install_during_build` is false — that's the rebuild-vs-
     /// existing-slot case where the prior active slot must keep
     /// serving until the new slot promotes.
-    #[allow(clippy::too_many_arguments)]
     fn update_active_during_build(
         &self,
-        chunks_bin: &Path,
-        tantivy_dir: &Path,
-        sparse_enabled: bool,
+        slot_path: &Path,
         chunk_writer: &ChunkStoreWriter,
         dense: &Arc<DenseIndex>,
         manifest: &SlotManifest,
@@ -1030,15 +1040,17 @@ impl DiskBucket {
             return Ok(());
         }
         // Build the live chunks reader from the writer's snapshot.
+        let chunks_bin = slot::chunks_bin_path(slot_path);
         let snapshot = chunk_writer.snapshot_index();
         let chunks_reader = Arc::new(
-            ChunkStoreReader::open_with_map(chunks_bin, snapshot).map_err(BucketError::Io)?,
+            ChunkStoreReader::open_with_map(&chunks_bin, snapshot).map_err(BucketError::Io)?,
         );
         // Reload sparse if the bucket has it — tantivy commits per
         // batch already (Commit B), so re-opening picks up the
         // freshest committed segments.
-        let sparse_reader = if sparse_enabled {
-            Some(Arc::new(SparseIndex::open(tantivy_dir)?))
+        let sparse_reader = if self.config.search_paths.sparse.enabled {
+            let tantivy_dir = slot::tantivy_dir(slot_path);
+            Some(Arc::new(SparseIndex::open(&tantivy_dir)?))
         } else {
             None
         };
@@ -1331,6 +1343,40 @@ impl Bucket for DiskBucket {
 }
 
 // --- helpers ---
+
+/// Construct fresh writers + bundle into [`BuildHandles`] for the
+/// fresh-build code paths (initial `build_slot` + resume from
+/// `Planning` state). The slot dir already exists; this only opens
+/// the per-index writers.
+fn open_fresh_handles(
+    slot_path: &Path,
+    manifest: SlotManifest,
+    dimension: u32,
+    sparse_enabled: bool,
+    build_state: BuildStateWriter,
+) -> Result<BuildHandles, BucketError> {
+    let chunks_bin = slot::chunks_bin_path(slot_path);
+    let chunks_idx = slot::chunks_idx_path(slot_path);
+    let vectors_bin = slot::vectors_bin_path(slot_path);
+    let vectors_idx = slot::vectors_idx_path(slot_path);
+    let tantivy_dir = slot::tantivy_dir(slot_path);
+    let chunk_writer =
+        ChunkStoreWriter::create(&chunks_bin, &chunks_idx).map_err(BucketError::Io)?;
+    let vector_writer = VectorStoreWriter::create(&vectors_bin, &vectors_idx, dimension)
+        .map_err(BucketError::Io)?;
+    let sparse_builder = if sparse_enabled {
+        Some(SparseIndexBuilder::create(&tantivy_dir)?)
+    } else {
+        None
+    };
+    Ok(BuildHandles {
+        manifest,
+        chunk_writer,
+        vector_writer,
+        sparse_builder,
+        build_state,
+    })
+}
 
 /// Notify the observer of a phase transition and append the matching
 /// `PhaseChanged` record to `build.state`. The pair is published
