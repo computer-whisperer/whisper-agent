@@ -88,19 +88,26 @@ jobs:
         uses: gradle/actions/setup-gradle@v4
         with:
           cache-read-only: true
-          build-root-directory: android
 
       # Derive an Android `versionCode` from the semver tag so each release
       # APK installs over the previous one. `0.3.9` → 309. The formula
       # (major*10000 + minor*100 + patch) leaves headroom for major≤209,
       # minor≤99, patch≤99 — well clear of Android's 2.1B versionCode cap.
+      # Prerelease suffixes (e.g. `v0.4.0-rc1`) are kept in versionName for
+      # display but stripped before splitting on `.` so the math stays valid.
       - name: Compute version
         id: version
         run: |
           tag="${GITHUB_REF_NAME}"
           version="${tag#v}"
-          IFS='.' read -r major minor patch <<< "$version"
+          core="${version%%-*}"
+          IFS='.' read -r major minor patch <<< "$core"
           version_code=$((10#$major * 10000 + 10#$minor * 100 + 10#$patch))
+          # Android requires versionCode ≥ 1. Floor handles the v0.0.0
+          # corner case (test tags) without disturbing real releases.
+          if [ "$version_code" -lt 1 ]; then
+            version_code=1
+          fi
           echo "name=$version" >> "$GITHUB_OUTPUT"
           echo "code=$version_code" >> "$GITHUB_OUTPUT"
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
