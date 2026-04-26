@@ -20,6 +20,7 @@
 
 mod behaviors;
 mod bindings;
+mod buckets;
 mod client_messages;
 mod compaction;
 mod config_updates;
@@ -461,6 +462,20 @@ pub struct Scheduler {
     /// lives on the scheduler's run loop.
     stream_tx: mpsc::UnboundedSender<StreamUpdate>,
 
+    /// In-flight bucket builds, keyed by bucket id. The token is the
+    /// build task's cancel handle; firing it from the
+    /// `CancelBucketBuild` handler stops the build at the next
+    /// chunk-batch boundary or HNSW build entry. The entry is removed
+    /// when the build task terminates (success / error / cancel) and
+    /// emits its `BucketBuildEnded`. Capped to one in-flight build
+    /// per bucket; concurrent `StartBucketBuild` for the same id is
+    /// rejected.
+    active_bucket_builds: HashMap<String, tokio_util::sync::CancellationToken>,
+    /// Sender for `BucketTaskUpdate`s pushed from detached build
+    /// tasks back to the scheduler loop. The matching receiver is
+    /// returned from `Scheduler::new` and drained by the run loop.
+    bucket_task_tx: mpsc::UnboundedSender<buckets::BucketTaskUpdate>,
+
     /// In-flight Function registry. Populated synchronously by
     /// `register_function`; each entry is removed when its Function
     /// terminates (success / error / cancel). Non-persistent.
@@ -502,7 +517,11 @@ impl Scheduler {
         shared_mcp_catalog: crate::tools::shared_mcp_catalog::CatalogStore,
         shared_mcp_overlays: Vec<SharedHostOverlay>,
         server_config_path: Option<PathBuf>,
-    ) -> anyhow::Result<(Self, mpsc::UnboundedReceiver<StreamUpdate>)> {
+    ) -> anyhow::Result<(
+        Self,
+        mpsc::UnboundedReceiver<StreamUpdate>,
+        mpsc::UnboundedReceiver<buckets::BucketTaskUpdate>,
+    )> {
         let mut resources = ResourceRegistry::new();
         for (name, entry) in &backends {
             resources.insert_backend(
@@ -557,6 +576,7 @@ impl Scheduler {
         pods.insert(default_pod_id.clone(), default_pod);
 
         let (stream_tx, stream_rx) = mpsc::unbounded_channel();
+        let (bucket_task_tx, bucket_task_rx) = mpsc::unbounded_channel();
         Ok((
             Self {
                 default_pod_id,
@@ -584,11 +604,14 @@ impl Scheduler {
                 dirty_behaviors: HashSet::new(),
                 provisioning_in_flight: HashSet::new(),
                 stream_tx,
+                active_bucket_builds: HashMap::new(),
+                bucket_task_tx,
                 active_functions: HashMap::new(),
                 next_function_id: 1,
                 admin_connections: HashSet::new(),
             },
             stream_rx,
+            bucket_task_rx,
         ))
     }
 
@@ -598,6 +621,14 @@ impl Scheduler {
     /// router.
     pub(crate) fn stream_sender(&self) -> mpsc::UnboundedSender<StreamUpdate> {
         self.stream_tx.clone()
+    }
+
+    /// Clone of the bucket-task sender. Detached build tasks grab one
+    /// at spawn time and push terminal/Broadcast updates back to the
+    /// scheduler loop, which applies registry mutations under
+    /// `&mut self`.
+    pub(crate) fn bucket_task_sender(&self) -> mpsc::UnboundedSender<buckets::BucketTaskUpdate> {
+        self.bucket_task_tx.clone()
     }
 
     /// Read-only access to the Phase 1a shadow registry. Currently only used by
@@ -4147,6 +4178,7 @@ pub async fn run(
     mut scheduler: Scheduler,
     mut inbox: mpsc::UnboundedReceiver<SchedulerMsg>,
     mut stream_rx: mpsc::UnboundedReceiver<StreamUpdate>,
+    mut bucket_task_rx: mpsc::UnboundedReceiver<buckets::BucketTaskUpdate>,
 ) {
     let mut pending_io: FuturesUnordered<SchedulerFuture> = FuturesUnordered::new();
     let mut gc_ticker = tokio::time::interval(Duration::from_secs(GC_TICK_SECS));
@@ -4232,6 +4264,9 @@ pub async fn run(
                 // unsubscribed thread's deltas cost us nothing beyond
                 // the channel push.
                 scheduler.router.broadcast_to_subscribers(&update.thread_id, update.event);
+            }
+            Some(update) = bucket_task_rx.recv() => {
+                scheduler.apply_bucket_task_update(update).await;
             }
             _ = gc_ticker.tick() => {
                 scheduler.gc_tick();

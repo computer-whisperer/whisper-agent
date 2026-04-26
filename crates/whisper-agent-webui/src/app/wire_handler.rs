@@ -603,6 +603,96 @@ impl ChatApp {
                     modal.query_status = super::QueryStatus::Results { query, hits };
                 }
             }
+            ServerToClient::BucketCreated {
+                correlation_id,
+                summary,
+            } => {
+                // Insert / replace the bucket entry. Insertion is
+                // BTreeMap-ordered server-side; we keep the wire-side
+                // Vec sorted by id to match.
+                upsert_bucket(&mut self.buckets, summary);
+                if let Some(modal) = self.buckets_modal.as_mut()
+                    && let Some(form) = modal.creating.as_ref()
+                    && form
+                        .pending_correlation
+                        .as_deref()
+                        .is_some_and(|c| Some(c) == correlation_id.as_deref())
+                {
+                    // Form was pending this correlation — close it.
+                    modal.creating = None;
+                }
+            }
+            ServerToClient::BucketDeleted { id, .. } => {
+                self.buckets.retain(|b| b.id != id);
+                if let Some(modal) = self.buckets_modal.as_mut() {
+                    modal.build_progress.remove(&id);
+                    modal.build_errors.remove(&id);
+                    if modal.delete_armed.as_deref() == Some(&id) {
+                        modal.delete_armed = None;
+                    }
+                    if modal.selected_bucket.as_deref() == Some(&id) {
+                        modal.selected_bucket = None;
+                    }
+                }
+            }
+            ServerToClient::BucketBuildStarted { bucket_id, .. } => {
+                if let Some(modal) = self.buckets_modal.as_mut() {
+                    modal.build_progress.insert(
+                        bucket_id,
+                        super::BuildProgressView {
+                            phase: whisper_agent_protocol::BucketBuildPhase::Indexing,
+                            source_records: 0,
+                            chunks: 0,
+                        },
+                    );
+                }
+            }
+            ServerToClient::BucketBuildProgress {
+                bucket_id,
+                phase,
+                source_records,
+                chunks,
+                ..
+            } => {
+                if let Some(modal) = self.buckets_modal.as_mut() {
+                    modal.build_progress.insert(
+                        bucket_id,
+                        super::BuildProgressView {
+                            phase,
+                            source_records,
+                            chunks,
+                        },
+                    );
+                }
+            }
+            ServerToClient::BucketBuildEnded {
+                bucket_id,
+                outcome,
+                summary,
+                ..
+            } => {
+                if let Some(modal) = self.buckets_modal.as_mut() {
+                    modal.build_progress.remove(&bucket_id);
+                    match &outcome {
+                        whisper_agent_protocol::BucketBuildOutcome::Success => {
+                            modal.build_errors.remove(&bucket_id);
+                        }
+                        whisper_agent_protocol::BucketBuildOutcome::Cancelled => {
+                            modal
+                                .build_errors
+                                .insert(bucket_id.clone(), "build cancelled".into());
+                        }
+                        whisper_agent_protocol::BucketBuildOutcome::Error { message } => {
+                            modal
+                                .build_errors
+                                .insert(bucket_id.clone(), message.clone());
+                        }
+                    }
+                }
+                if let Some(s) = summary {
+                    upsert_bucket(&mut self.buckets, s);
+                }
+            }
             ServerToClient::PodList {
                 pods,
                 default_pod_id,
@@ -1143,6 +1233,23 @@ impl ChatApp {
             }
         }
     }
+}
+
+/// Insert or replace a bucket in the wire-side cache, keeping it sorted
+/// by id (matches the server's `BTreeMap` ordering so the WebUI list
+/// is stable across `BucketsList` snapshots and incremental updates).
+fn upsert_bucket(
+    buckets: &mut Vec<whisper_agent_protocol::BucketSummary>,
+    incoming: whisper_agent_protocol::BucketSummary,
+) {
+    if let Some(existing) = buckets.iter_mut().find(|b| b.id == incoming.id) {
+        *existing = incoming;
+        return;
+    }
+    let pos = buckets
+        .binary_search_by(|b| b.id.as_str().cmp(incoming.id.as_str()))
+        .unwrap_or_else(|p| p);
+    buckets.insert(pos, incoming);
 }
 
 /// Thread id of a `ServerToClient` event for the purpose of flushing a

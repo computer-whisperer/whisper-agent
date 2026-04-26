@@ -394,7 +394,7 @@ embedder = "tei_test"
         let chunker = TokenBasedChunker::from_config(&bucket.config().chunker);
         let cancel = CancellationToken::new();
         bucket
-            .build_slot(&adapter, &chunker, embedder, &cancel)
+            .build_slot(&adapter, &chunker, embedder, None, &cancel)
             .await
             .unwrap();
         Arc::new(bucket)

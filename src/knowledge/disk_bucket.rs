@@ -49,6 +49,39 @@ use crate::providers::embedding::{EmbedRequest, EmbeddingProvider};
 /// const at module level.
 const EMBED_BATCH_SIZE: usize = 128;
 
+/// Coarse build-stage tag passed to [`BuildObserver::on_phase`]. Mirrors
+/// the wire-side `BucketBuildPhase` so the scheduler can pass these
+/// through unmodified.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BuildPhase {
+    /// Streaming source → chunks → embeds → writers. The long-tail of
+    /// `Indexing` is dominated by embedder round-trips on real provider
+    /// runs, by chunker work on the mock embedder.
+    Indexing,
+    /// HNSW graph construction over the just-written vectors. Single
+    /// call, runs on a `spawn_blocking` thread so the runtime worker
+    /// stays free; counters don't tick during this phase.
+    BuildingDense,
+    /// Open readers, write final manifest, atomic active-slot pointer
+    /// flip. Sub-second on every build measured so far.
+    Finalizing,
+}
+
+/// Optional progress hook for `DiskBucket::build_slot`. The build calls
+/// `on_phase` exactly once per phase transition and `on_progress` after
+/// every chunk-batch flush during the `Indexing` phase. Implementations
+/// must be cheap and non-blocking — the observer runs on the same task
+/// driving the build, so a slow callback directly slows the build.
+///
+/// `None` for the observer parameter means "no progress hook"; the
+/// build runs identically to the pre-observer code path.
+pub trait BuildObserver: Send + Sync {
+    fn on_phase(&self, phase: BuildPhase);
+    /// Cumulative counters since build start. Both values monotonically
+    /// increase. Called at end of each chunk-batch flush.
+    fn on_progress(&self, source_records: u64, chunks: u64);
+}
+
 #[derive(Debug)]
 pub struct DiskBucket {
     id: BucketId,
@@ -111,6 +144,7 @@ impl DiskBucket {
         adapter: &dyn SourceAdapter,
         chunker: &dyn Chunker,
         embedder: Arc<dyn EmbeddingProvider>,
+        observer: Option<&dyn BuildObserver>,
         cancel: &CancellationToken,
     ) -> Result<SlotId, BucketError> {
         let embedder_snapshot =
@@ -178,6 +212,11 @@ impl DiskBucket {
         // level keeps embed calls predictable.
         let mut pending: Vec<NewChunk> = Vec::with_capacity(EMBED_BATCH_SIZE);
         let mut source_records: u64 = 0;
+        let mut chunks_emitted: u64 = 0;
+
+        if let Some(obs) = observer {
+            obs.on_phase(BuildPhase::Indexing);
+        }
 
         for record in adapter.enumerate() {
             if cancel.is_cancelled() {
@@ -189,6 +228,7 @@ impl DiskBucket {
             for new_chunk in chunker.chunk(&record) {
                 pending.push(new_chunk);
                 if pending.len() >= EMBED_BATCH_SIZE {
+                    let flushed = pending.len() as u64;
                     flush_batch(
                         &mut pending,
                         &mut chunk_writer,
@@ -198,12 +238,17 @@ impl DiskBucket {
                         cancel,
                     )
                     .await?;
+                    chunks_emitted += flushed;
+                    if let Some(obs) = observer {
+                        obs.on_progress(source_records, chunks_emitted);
+                    }
                 }
             }
         }
 
         // Final partial batch.
         if !pending.is_empty() {
+            let flushed = pending.len() as u64;
             flush_batch(
                 &mut pending,
                 &mut chunk_writer,
@@ -213,6 +258,10 @@ impl DiskBucket {
                 cancel,
             )
             .await?;
+            chunks_emitted += flushed;
+            if let Some(obs) = observer {
+                obs.on_progress(source_records, chunks_emitted);
+            }
         }
 
         let chunk_count = chunk_writer.finalize().map_err(BucketError::Io)? as u64;
@@ -243,16 +292,34 @@ impl DiskBucket {
 
         // Build the dense index from the just-written vectors and
         // dump it to disk so the next slot open can skip the rebuild.
-        // Failure to dump is non-fatal — the slot is still usable
-        // (load_slot's fallback rebuilds), so we log and continue
-        // rather than tearing down the build.
-        let dense = DenseIndex::build(&vectors, HnswParams::default())?;
-        if let Err(e) = dense.dump_to(&slot_path) {
-            tracing::warn!(
-                slot = %slot_id,
-                error = %e,
-                "hnsw dump failed; slot is still usable but next open will rebuild from vectors",
-            );
+        // The HNSW build is the dominant cost on real-scale runs (~7
+        // min for 50k vectors, multi-hour for full wikipedia) and is
+        // pure CPU, so push it onto a `spawn_blocking` thread to keep
+        // the runtime worker free for other tasks. Failure to dump
+        // is non-fatal — the slot is still usable (load_slot's
+        // fallback rebuilds), so we log and continue rather than
+        // tearing down the build.
+        if let Some(obs) = observer {
+            obs.on_phase(BuildPhase::BuildingDense);
+        }
+        let slot_path_for_dump = slot_path.clone();
+        let slot_id_for_warn = slot_id.clone();
+        let (dense, vectors) = tokio::task::spawn_blocking(move || {
+            let dense = DenseIndex::build(&vectors, HnswParams::default())?;
+            if let Err(e) = dense.dump_to(&slot_path_for_dump) {
+                tracing::warn!(
+                    slot = %slot_id_for_warn,
+                    error = %e,
+                    "hnsw dump failed; slot is still usable but next open will rebuild from vectors",
+                );
+            }
+            Ok::<_, BucketError>((dense, vectors))
+        })
+        .await
+        .map_err(|e| BucketError::Other(format!("spawn_blocking dense build: {e}")))??;
+
+        if let Some(obs) = observer {
+            obs.on_phase(BuildPhase::Finalizing);
         }
 
         // Open the sparse index reader if we built one.
@@ -816,7 +883,7 @@ embedder = "tei_test"
         let cancel = CancellationToken::new();
 
         let slot_id = bucket
-            .build_slot(&adapter, &chunker, embedder, &cancel)
+            .build_slot(&adapter, &chunker, embedder, None, &cancel)
             .await
             .unwrap();
 
@@ -860,7 +927,7 @@ embedder = "tei_test"
         let embedder: Arc<dyn EmbeddingProvider> = Arc::new(MockEmbedder::new(32));
         let cancel = CancellationToken::new();
         bucket
-            .build_slot(&adapter, &chunker, embedder, &cancel)
+            .build_slot(&adapter, &chunker, embedder, None, &cancel)
             .await
             .unwrap();
 
@@ -899,7 +966,7 @@ embedder = "tei_test"
         let embedder: Arc<dyn EmbeddingProvider> = Arc::new(MockEmbedder::new(8));
         let cancel = CancellationToken::new();
         bucket
-            .build_slot(&adapter, &chunker, embedder, &cancel)
+            .build_slot(&adapter, &chunker, embedder, None, &cancel)
             .await
             .unwrap();
 
@@ -928,7 +995,7 @@ embedder = "tei_test"
         let embedder: Arc<dyn EmbeddingProvider> = Arc::new(MockEmbedder::new(4));
         let cancel = CancellationToken::new();
         bucket
-            .build_slot(&adapter, &chunker, embedder, &cancel)
+            .build_slot(&adapter, &chunker, embedder, None, &cancel)
             .await
             .unwrap();
 
@@ -966,7 +1033,7 @@ embedder = "tei_test"
             let embedder: Arc<dyn EmbeddingProvider> = Arc::new(MockEmbedder::new(12));
             let cancel = CancellationToken::new();
             bucket
-                .build_slot(&adapter, &chunker, embedder, &cancel)
+                .build_slot(&adapter, &chunker, embedder, None, &cancel)
                 .await
                 .unwrap()
         };
@@ -993,7 +1060,7 @@ embedder = "tei_test"
         let embedder: Arc<dyn EmbeddingProvider> = Arc::new(MockEmbedder::new(16));
         let cancel = CancellationToken::new();
         bucket
-            .build_slot(&adapter, &chunker, embedder, &cancel)
+            .build_slot(&adapter, &chunker, embedder, None, &cancel)
             .await
             .unwrap();
 
@@ -1045,7 +1112,7 @@ embedder = "tei_test"
         let embedder: Arc<dyn EmbeddingProvider> = Arc::new(MockEmbedder::new(8));
         let cancel = CancellationToken::new();
         bucket
-            .build_slot(&adapter, &chunker, embedder, &cancel)
+            .build_slot(&adapter, &chunker, embedder, None, &cancel)
             .await
             .unwrap();
 
@@ -1084,7 +1151,7 @@ embedder = "tei_test"
         let embedder: Arc<dyn EmbeddingProvider> = Arc::new(MockEmbedder::new(8));
         let cancel = CancellationToken::new();
         bucket
-            .build_slot(&adapter, &chunker, embedder, &cancel)
+            .build_slot(&adapter, &chunker, embedder, None, &cancel)
             .await
             .unwrap();
 
@@ -1155,7 +1222,7 @@ embedder = "tei_test"
         let embedder: Arc<dyn EmbeddingProvider> = Arc::new(MockEmbedder::new(4));
         let cancel = CancellationToken::new();
         bucket
-            .build_slot(&adapter, &chunker, embedder, &cancel)
+            .build_slot(&adapter, &chunker, embedder, None, &cancel)
             .await
             .unwrap();
 
@@ -1186,7 +1253,7 @@ embedder = "tei_test"
             let embedder: Arc<dyn EmbeddingProvider> = Arc::new(MockEmbedder::new(8));
             let cancel = CancellationToken::new();
             bucket
-                .build_slot(&adapter, &chunker, embedder, &cancel)
+                .build_slot(&adapter, &chunker, embedder, None, &cancel)
                 .await
                 .unwrap();
         }
@@ -1230,7 +1297,7 @@ embedder = "tei_test"
         let cancel = CancellationToken::new();
         cancel.cancel();
         let err = bucket
-            .build_slot(&adapter, &chunker, embedder, &cancel)
+            .build_slot(&adapter, &chunker, embedder, None, &cancel)
             .await
             .unwrap_err();
         assert!(matches!(err, BucketError::Cancelled), "{err:?}");
@@ -1265,7 +1332,7 @@ embedder = "tei_test"
         let cancel = CancellationToken::new();
 
         bucket
-            .build_slot(&adapter, &chunker, embedder, &cancel)
+            .build_slot(&adapter, &chunker, embedder, None, &cancel)
             .await
             .unwrap();
 
@@ -1289,7 +1356,7 @@ embedder = "tei_test"
         let embedder: Arc<dyn EmbeddingProvider> = Arc::new(MockEmbedder::new(8));
         let cancel = CancellationToken::new();
         let slot_id = bucket
-            .build_slot(&adapter, &chunker, embedder, &cancel)
+            .build_slot(&adapter, &chunker, embedder, None, &cancel)
             .await
             .unwrap();
         drop(bucket);

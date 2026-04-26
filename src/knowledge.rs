@@ -51,7 +51,7 @@ pub use config::{
     RescanStrategy, SearchPathsConfig, ServingMode, SourceConfig, SparsePathConfig,
 };
 pub use dense::{DenseIndex, HnswParams};
-pub use disk_bucket::DiskBucket;
+pub use disk_bucket::{BuildObserver, BuildPhase, DiskBucket};
 pub use manifest::{
     EmbedderSnapshot, ServingSnapshot, SlotLineage, SlotManifest, SlotState, SlotStats,
     SparseSnapshot,

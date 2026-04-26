@@ -21,11 +21,12 @@ mod wire_handler;
 
 use self::chat_render::{ChatItemEvent, render_item};
 use self::modals::{
-    BehaviorEditorEvent, BucketsEvent, FileViewerEvent, ForkEvent, NewBehaviorEvent, NewPodEvent,
-    PodEditorEvent, ProviderEditorEvent, SettingsEvent, render_behavior_editor_modal,
-    render_buckets_modal, render_file_viewer_modal, render_fork_modal, render_image_lightbox_modal,
-    render_json_viewer_modal, render_new_behavior_modal, render_new_pod_modal,
-    render_pod_editor_modal, render_provider_editor_modal, render_settings_modal,
+    BehaviorEditorEvent, BucketsEvent, BuildProgressView, FileViewerEvent, ForkEvent,
+    NewBehaviorEvent, NewPodEvent, PodEditorEvent, ProviderEditorEvent, SettingsEvent,
+    render_behavior_editor_modal, render_buckets_modal, render_file_viewer_modal,
+    render_fork_modal, render_image_lightbox_modal, render_json_viewer_modal,
+    render_new_behavior_modal, render_new_pod_modal, render_pod_editor_modal,
+    render_provider_editor_modal, render_settings_modal,
 };
 use self::widgets::{
     render_failure_banner, render_prefill_progress, render_resource_list, render_sudo_banners,
@@ -1247,9 +1248,10 @@ enum ProviderEditorMode {
 ///
 /// Slice 9 added the search surface: `selected_bucket` /
 /// `query_input` / `top_k` drive the form, and `query_status` carries
-/// the lifecycle of an in-flight or completed query (echoed so
-/// concurrent queries don't muddle their result panes). Slice 8c's
-/// create / edit / build form state grows alongside.
+/// the lifecycle of an in-flight or completed query. Slice 8c added
+/// `creating` (the +New bucket form), `delete_armed` (two-click delete
+/// state), `build_progress` (live counters per in-flight build) and
+/// `build_errors` (last-failed-build message per bucket).
 #[derive(Default)]
 struct BucketsModalState {
     selected_bucket: Option<String>,
@@ -1260,6 +1262,21 @@ struct BucketsModalState {
     /// to ignore stale `QueryResults` that arrive after the user has
     /// fired a follow-up search.
     pending_query_correlation: Option<String>,
+    /// `Some` when the +New bucket form is open; `None` when collapsed.
+    creating: Option<CreateBucketForm>,
+    /// Bucket id whose Delete button is "armed" — clicked once, waiting
+    /// for a confirming second click. Cleared whenever the user starts
+    /// a different action.
+    delete_armed: Option<String>,
+    /// Live build progress per bucket id. Inserted on
+    /// `BucketBuildStarted`, updated on `BucketBuildProgress`, removed
+    /// on `BucketBuildEnded`.
+    build_progress: HashMap<String, BuildProgressView>,
+    /// Sticky last-failed-build error message per bucket id. Cleared
+    /// when a successful build for the same bucket lands or the user
+    /// dismisses it (no UI for that yet — it gets overwritten by the
+    /// next attempt).
+    build_errors: HashMap<String, String>,
 }
 
 impl BucketsModalState {
@@ -1269,6 +1286,59 @@ impl BucketsModalState {
             ..Default::default()
         }
     }
+}
+
+/// In-progress new-bucket form state. Lives inside
+/// `BucketsModalState::creating` so it survives re-render frames.
+#[derive(Clone)]
+struct CreateBucketForm {
+    id: String,
+    name: String,
+    description: String,
+    embedder: String,
+    source_kind: SourceKindChoice,
+    /// Holds either archive_path (stored) or path (linked); ignored
+    /// for managed.
+    source_detail: String,
+    chunk_tokens: u32,
+    overlap_tokens: u32,
+    dense_enabled: bool,
+    sparse_enabled: bool,
+    /// `Some` while a `CreateBucket` is in flight; the renderer hides
+    /// the Create button + shows a spinner. The empty-string sentinel
+    /// is set by the renderer on click; the parent overwrites with
+    /// the real correlation id after dispatching.
+    pending_correlation: Option<String>,
+    /// Inline error message from a failed create attempt. Sticky
+    /// until the next click on Create.
+    error: Option<String>,
+}
+
+impl Default for CreateBucketForm {
+    fn default() -> Self {
+        Self {
+            id: String::new(),
+            name: String::new(),
+            description: String::new(),
+            embedder: String::new(),
+            source_kind: SourceKindChoice::Linked,
+            source_detail: String::new(),
+            chunk_tokens: 500,
+            overlap_tokens: 50,
+            dense_enabled: true,
+            sparse_enabled: true,
+            pending_correlation: None,
+            error: None,
+        }
+    }
+}
+
+#[derive(Copy, Clone, Eq, PartialEq, Default)]
+enum SourceKindChoice {
+    Stored,
+    #[default]
+    Linked,
+    Managed,
 }
 
 /// Lifecycle of the search form's last-issued query. Renderer reads
@@ -3371,6 +3441,46 @@ impl eframe::App for ChatApp {
                         bucket_ids: vec![bucket_id],
                         query,
                         top_k,
+                    });
+                }
+                BucketsEvent::CreateBucket { id, config } => {
+                    let correlation = self.next_correlation_id();
+                    if let Some(modal) = self.buckets_modal.as_mut()
+                        && let Some(form) = modal.creating.as_mut()
+                    {
+                        form.pending_correlation = Some(correlation.clone());
+                    }
+                    self.send(ClientToServer::CreateBucket {
+                        correlation_id: Some(correlation),
+                        id,
+                        config,
+                    });
+                }
+                BucketsEvent::DeleteBucket { id } => {
+                    let correlation = self.next_correlation_id();
+                    self.send(ClientToServer::DeleteBucket {
+                        correlation_id: Some(correlation),
+                        id,
+                    });
+                }
+                BucketsEvent::StartBuild { id } => {
+                    let correlation = self.next_correlation_id();
+                    if let Some(modal) = self.buckets_modal.as_mut() {
+                        // Optimistically clear any prior error so the
+                        // user doesn't see a stale "last build error"
+                        // line during the new attempt.
+                        modal.build_errors.remove(&id);
+                    }
+                    self.send(ClientToServer::StartBucketBuild {
+                        correlation_id: Some(correlation),
+                        id,
+                    });
+                }
+                BucketsEvent::CancelBuild { id } => {
+                    let correlation = self.next_correlation_id();
+                    self.send(ClientToServer::CancelBucketBuild {
+                        correlation_id: Some(correlation),
+                        id,
                     });
                 }
             }

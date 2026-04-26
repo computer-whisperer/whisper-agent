@@ -141,6 +141,19 @@ impl ThreadEventRouter {
         }
     }
 
+    /// Snapshot every connected client's outbound sender. Used by
+    /// detached tasks (knowledge-bucket builds today) that need to
+    /// fan-out periodic events without holding `&self` for the
+    /// duration. New connections that join after the snapshot is
+    /// taken won't receive subsequent events from the same task —
+    /// that's a deliberate tradeoff to keep the build task self-
+    /// contained; clients re-subscribing pick up the eventual
+    /// terminal state via a normal `ListBuckets` or the registry's
+    /// own broadcast on completion.
+    pub(crate) fn clients_snapshot(&self) -> Vec<mpsc::UnboundedSender<ServerToClient>> {
+        self.clients.values().cloned().collect()
+    }
+
     pub(crate) fn broadcast_to_subscribers(&self, thread_id: &str, event: ServerToClient) {
         let Some(subs) = self.subscriptions.get(thread_id) else {
             return;

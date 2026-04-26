@@ -21,10 +21,9 @@
 use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use tokio::fs;
-use tokio::sync::Mutex;
 use tracing::{info, warn};
 use whisper_agent_protocol::{ActiveSlotSummary, BucketSummary, SlotStateLabel};
 
@@ -138,6 +137,65 @@ impl BucketRegistry {
         self.buckets.values().map(entry_to_summary).collect()
     }
 
+    /// Insert a fresh bucket into the registry — caller has already
+    /// written `bucket.toml` under `<root>/<id>/` and validated `id`
+    /// for filesystem safety. Used by the scheduler's `CreateBucket`
+    /// handler; tests construct entries directly.
+    ///
+    /// Errors if `id` already exists in the registry (the on-disk
+    /// directory may pre-date the in-memory entry, so the caller
+    /// should also check the filesystem).
+    pub fn insert_entry(&mut self, entry: BucketEntry) -> Result<(), BucketError> {
+        if self.buckets.contains_key(&entry.id) {
+            return Err(BucketError::Other(format!(
+                "bucket id `{}` already in registry",
+                entry.id,
+            )));
+        }
+        self.buckets.insert(entry.id.clone(), entry);
+        Ok(())
+    }
+
+    /// Drop the registry's in-memory entry for `id` and evict any
+    /// cached `DiskBucket`. The caller is responsible for removing
+    /// the on-disk directory afterwards. Returns whether the entry
+    /// existed.
+    pub fn remove_entry(&mut self, id: &str) -> bool {
+        let removed = self.buckets.remove(id).is_some();
+        self.evict_loaded(id);
+        removed
+    }
+
+    /// Drop a cached `DiskBucket` for `id` without touching the
+    /// `buckets` map. Used by `refresh_entry` after a rebuild and by
+    /// the delete path. Cheap — O(1) hashmap remove under a short-
+    /// held mutex.
+    pub fn evict_loaded(&self, id: &str) {
+        let mut g = self.loaded.lock().expect("loaded mutex poisoned");
+        g.remove(id);
+    }
+
+    /// Re-read the bucket's `bucket.toml` + active-slot manifest from
+    /// disk and replace the in-memory entry. Called after a build
+    /// completes so the next `summaries()` reflects the new active
+    /// slot. Also evicts the cached `DiskBucket` so the next query
+    /// re-opens against the fresh slot.
+    pub async fn refresh_entry(&mut self, id: &str) -> Result<(), BucketError> {
+        let dir = match self.buckets.get(id) {
+            Some(e) => e.dir.clone(),
+            None => {
+                let root = self.root.as_ref().ok_or_else(|| {
+                    BucketError::Other("registry has no root; cannot refresh".to_string())
+                })?;
+                root.join(id)
+            }
+        };
+        let entry = load_one(&dir, id).await?;
+        self.buckets.insert(id.to_string(), entry);
+        self.evict_loaded(id);
+        Ok(())
+    }
+
     /// Return a fully-loaded `DiskBucket` for `id`, populating the
     /// scheduler-side cache on first request. The first call against
     /// an unloaded bucket blocks on slot-load (HNSW rebuild); later
@@ -150,7 +208,7 @@ impl BucketRegistry {
     /// becomes hot path we can graduate to a per-bucket OnceCell.
     pub async fn loaded_bucket(&self, id: &str) -> Result<Arc<DiskBucket>, BucketError> {
         {
-            let g = self.loaded.lock().await;
+            let g = self.loaded.lock().expect("loaded mutex poisoned");
             if let Some(b) = g.get(id) {
                 return Ok(b.clone());
             }
@@ -171,7 +229,7 @@ impl BucketRegistry {
                 .map_err(|e| BucketError::Other(format!("spawn_blocking: {e}")))??;
         let arc = Arc::new(bucket);
 
-        let mut g = self.loaded.lock().await;
+        let mut g = self.loaded.lock().expect("loaded mutex poisoned");
         if let Some(existing) = g.get(id) {
             // Lost the race; throw away our load and use the winner.
             return Ok(existing.clone());
@@ -179,6 +237,14 @@ impl BucketRegistry {
         g.insert(id.to_string(), arc.clone());
         Ok(arc)
     }
+}
+
+/// Public re-export of the registry's per-entry loader. The scheduler
+/// uses this from `CreateBucket` after writing a fresh `bucket.toml`
+/// to round-trip through the same parser the registry uses at
+/// startup.
+pub async fn load_one_pub(dir: &Path, id: &str) -> Result<BucketEntry, BucketError> {
+    load_one(dir, id).await
 }
 
 async fn load_one(dir: &Path, id: &str) -> Result<BucketEntry, BucketError> {
@@ -253,7 +319,10 @@ async fn dir_size(dir: &Path) -> std::io::Result<u64> {
     Ok(total)
 }
 
-fn entry_to_summary(entry: &BucketEntry) -> BucketSummary {
+/// Project a registry entry to its wire-summary form. Exposed so
+/// scheduler handlers can build a `BucketCreated` / `BucketBuildEnded`
+/// payload without re-walking the whole registry.
+pub fn entry_to_summary(entry: &BucketEntry) -> BucketSummary {
     let cfg = &entry.config;
     let (source_kind, source_detail) = match &cfg.source {
         SourceConfig::Stored { archive_path, .. } => (

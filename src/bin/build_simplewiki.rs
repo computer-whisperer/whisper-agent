@@ -178,7 +178,7 @@ async fn main() -> Result<()> {
     );
     let t0 = Instant::now();
     let slot_id = bucket
-        .build_slot(&source, &chunker, embedder.clone(), &cancel)
+        .build_slot(&source, &chunker, embedder.clone(), None, &cancel)
         .await
         .context("build_slot")?;
     let build_dur = t0.elapsed();

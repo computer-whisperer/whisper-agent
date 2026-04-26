@@ -342,6 +342,22 @@ impl Scheduler {
             } => {
                 self.handle_query_buckets(conn_id, correlation_id, bucket_ids, query, top_k);
             }
+            ClientToServer::CreateBucket {
+                correlation_id,
+                id,
+                config,
+            } => {
+                self.handle_create_bucket(conn_id, correlation_id, id, config);
+            }
+            ClientToServer::DeleteBucket { correlation_id, id } => {
+                self.handle_delete_bucket(conn_id, correlation_id, id);
+            }
+            ClientToServer::StartBucketBuild { correlation_id, id } => {
+                self.handle_start_bucket_build(conn_id, correlation_id, id);
+            }
+            ClientToServer::CancelBucketBuild { correlation_id, id } => {
+                self.handle_cancel_bucket_build(conn_id, correlation_id, id);
+            }
             ClientToServer::AddHostEnvProvider {
                 correlation_id,
                 name,

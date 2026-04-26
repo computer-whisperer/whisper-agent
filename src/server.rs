@@ -230,7 +230,7 @@ pub async fn serve(listen: SocketAddr, config: ServerConfig) -> anyhow::Result<(
         None => crate::knowledge::BucketRegistry::default(),
     };
 
-    let (mut scheduler, stream_rx) = Scheduler::new(
+    let (mut scheduler, stream_rx, bucket_task_rx) = Scheduler::new(
         default_pod,
         config.host_id,
         config.backends,
@@ -278,7 +278,10 @@ pub async fn serve(listen: SocketAddr, config: ServerConfig) -> anyhow::Result<(
 
     let (inbox_tx, inbox_rx) = mpsc::unbounded_channel::<SchedulerMsg>();
     let scheduler_handle = tokio::spawn(crate::runtime::scheduler::run(
-        scheduler, inbox_rx, stream_rx,
+        scheduler,
+        inbox_rx,
+        stream_rx,
+        bucket_task_rx,
     ));
 
     let auth_state = Arc::new(AuthState::new(

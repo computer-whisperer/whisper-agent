@@ -7,7 +7,7 @@ This doc is intentionally short — slice list + what's next + dangling
 cleanup. Architecture decisions live in the design doc; commit messages
 have the per-slice detail.
 
-Last updated: **2026-04-26**.
+Last updated: **2026-04-27**.
 
 ## Slices landed
 
@@ -28,6 +28,7 @@ Last updated: **2026-04-26**.
 | —   | `build_simplewiki` one-off binary (driver for the validation)  | `9c0d864` |
 | 9   | `QueryBuckets` wire path + WebUI search form                   | `9c82346` |
 | HP  | HNSW persistence — dump on build, reload on open               | `1658a8f` |
+| 8c  | WebUI bucket lifecycle — Create / Delete / StartBuild / Cancel + progress events | _this slice_ |
 
 ## End-to-end validation (Simple English Wikipedia, mock embedder)
 
@@ -118,8 +119,6 @@ chronological — order may shuffle as the dataset reveals what hurts.
 
 | #   | Title                                                          | Why deferred |
 |-----|----------------------------------------------------------------|--------------|
-| 8c  | WebUI bucket lifecycle — Create / Delete / StartBuild + progress events | Hand-writing `bucket.toml` + driving `build_slot` from tests is enough to stand up a wikipedia bucket today; the form / progress UI can come once we know what real builds need to surface. |
-| 9   | WebUI query panel — bucket multi-select + ranked results       | Built on top of `QueryEngine`. Useful as soon as a real bucket exists to query against — likely the next user-facing slice after MediaWiki. |
 | 10+ | `knowledge_query` builtin tool                                 | Wire `QueryEngine` into the runtime tool catalog so an agent can call it. Needs scope/permission gating per `[allow.knowledge_buckets]`. |
 | 10+ | `managed` source kind + `knowledge_modify` tool                | For pod memory / agent-authored notes. Mutations via `Bucket::insert` / `Bucket::tombstone`. |
 | 10+ | Compaction triggers (delta-ratio / tombstone-ratio thresholds, manual) | Deferred until mutation path exists; until then there's no delta layer to compact. |
@@ -142,7 +141,17 @@ chronological — order may shuffle as the dataset reveals what hurts.
   measured at scale.
 - **GC pass for orphaned slot directories** — cancelled / failed builds
   leave `slots/<id>/` on disk. Need a sweep on registry load (or a
-  `compact` op) to clean these up.
+  `compact` op) to clean these up. More relevant now that the WebUI
+  Cancel button is live and routinely produces failed slots.
+- **Resumable / incremental builds** — wikipedia-scale builds run
+  multi-hour; today a Cancel or crash forces starting over. Want the
+  build pipeline to checkpoint chunk progress so a resumed build picks
+  up where the previous attempt left off. In-scope soon per the user
+  call-out at slice 8c.
+- **`build_simplewiki` binary** — now obsolete for non-stress-testing
+  flows; the WebUI lifecycle covers everything it did. Keep around
+  for batch / scripted scenarios but consider deleting once the wiki
+  bench harness has a more permanent home.
 - **`MockEmbedder` / `MockReranker` duplicated inline** in
   `disk_bucket.rs` and `query.rs` test modules. Move to a shared
   `test_support` mod when a third call site appears.

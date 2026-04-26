@@ -804,6 +804,79 @@ pub struct QueryHit {
     pub rerank_score: f32,
 }
 
+/// Source-of-truth descriptor for a bucket creation request. Mirrors the
+/// server-side `SourceConfig` enum but kept narrow to what the WebUI form
+/// captures — no compaction / rescan tunables yet (those default at
+/// bucket-toml synthesis time and can be edited later through raw TOML).
+///
+/// `adapter` is a free-form string; the server validates it against the
+/// adapters it actually knows how to build (`mediawiki_xml` for `stored`,
+/// `markdown_dir` for `linked`). Sending an unknown combo lands an
+/// `Error` at create time rather than a parse failure on next registry
+/// load.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum BucketSourceInput {
+    Stored {
+        adapter: String,
+        archive_path: String,
+    },
+    Linked {
+        adapter: String,
+        path: String,
+    },
+    Managed {},
+}
+
+/// Form payload for `CreateBucket`. The server synthesizes a fresh
+/// `bucket.toml` from this and writes it under
+/// `<buckets_root>/<id>/bucket.toml`. Defaults that aren't user-tunable
+/// at v1 (compaction thresholds, serving mode, quantization) are filled
+/// in server-side rather than asking the WebUI to surface every knob.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct BucketCreateInput {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    pub source: BucketSourceInput,
+    /// Provider name from `[embedding_providers.*]` server config.
+    pub embedder: String,
+    pub chunk_tokens: u32,
+    pub overlap_tokens: u32,
+    pub dense_enabled: bool,
+    pub sparse_enabled: bool,
+}
+
+/// Coarse phase tag emitted by `BucketBuildProgress`. The build pipeline
+/// has more sub-stages internally (per-batch embed calls, vector store
+/// flushes); this rolls them into the three the UI actually wants to
+/// distinguish — long streaming phase, the dominant HNSW build, then the
+/// quick finalize-and-promote tail.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum BucketBuildPhase {
+    /// Source → chunks → embed → write. `chunks` ticks up here.
+    Indexing,
+    /// HNSW graph build over the just-written vectors. The single
+    /// dominant cost on wikipedia-scale builds; counters don't move
+    /// during this phase, only the phase tag does.
+    BuildingDense,
+    /// Open readers, write final manifest, atomic active-pointer flip.
+    /// Sub-second on every build measured so far.
+    Finalizing,
+}
+
+/// Terminal state for a build, carried by `BucketBuildEnded`. `Error`
+/// folds in the failure reason so the UI doesn't need a sibling event
+/// for it.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(tag = "tag", rename_all = "snake_case")]
+pub enum BucketBuildOutcome {
+    Success,
+    Error { message: String },
+    Cancelled,
+}
+
 // ---------- Wire enums ----------
 
 /// Messages the client sends to the server.
@@ -1267,8 +1340,7 @@ pub enum ClientToServer {
         content: String,
     },
 
-    // --- Knowledge buckets (registry surface — read-only in slice 8a;
-    //     create/build/delete arrive in 8c). ---
+    // --- Knowledge buckets ---
     /// Snapshot every bucket the registry knows about. Server responds
     /// with `BucketsList`. Cheap; reads cached registry state, no I/O.
     ListBuckets {
@@ -1296,6 +1368,51 @@ pub enum ClientToServer {
         /// `0` is rejected with `Error` rather than silently returning
         /// nothing.
         top_k: u32,
+    },
+    /// Create a new bucket. Server validates `id` (filesystem-safe ASCII)
+    /// and the embedder reference, synthesizes `bucket.toml` from
+    /// `config`, writes it under `<buckets_root>/<id>/`, inserts the
+    /// entry into the in-memory registry, and broadcasts
+    /// `BucketCreated`. The freshly-created bucket has no active slot
+    /// yet — `StartBucketBuild` is a separate call.
+    CreateBucket {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        correlation_id: Option<String>,
+        id: String,
+        config: BucketCreateInput,
+    },
+    /// Remove a bucket from the registry and rmdir its directory. Cancels
+    /// any in-flight build for the same id first. Idempotent on the wire
+    /// (deleting an unknown id returns `Error`); broadcasts `BucketDeleted`
+    /// on success so peer clients drop their local entry.
+    DeleteBucket {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        correlation_id: Option<String>,
+        id: String,
+    },
+    /// Kick off a slot build for `id`. The build runs as a detached
+    /// background task off the scheduler thread (HNSW build is
+    /// `spawn_blocking`'d so it doesn't pin a runtime worker).
+    /// Refusal is immediate via `Error` (already-building, unknown
+    /// bucket, missing embedder, missing source archive); acceptance is
+    /// signalled by a `BucketBuildStarted` broadcast carrying the new
+    /// slot id, followed by periodic `BucketBuildProgress` updates and a
+    /// terminal `BucketBuildEnded`.
+    StartBucketBuild {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        correlation_id: Option<String>,
+        id: String,
+    },
+    /// Cancel an in-flight build for `id`. Fires the build task's
+    /// cancellation token; the task observes it at the next chunk-batch
+    /// boundary or HNSW build entry, finalizes the failed slot, and
+    /// emits `BucketBuildEnded { outcome: Cancelled }`. Idempotent —
+    /// cancelling when no build is running returns `Error` rather than
+    /// silently succeeding so the UI can keep its model honest.
+    CancelBucketBuild {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        correlation_id: Option<String>,
+        id: String,
     },
 
     // --- Behavior registry (read-only in phase 1 — see
@@ -1861,6 +1978,55 @@ pub enum ServerToClient {
         correlation_id: Option<String>,
         query: String,
         hits: Vec<QueryHit>,
+    },
+    /// A bucket was created (via `CreateBucket`). Broadcast so peer
+    /// clients can fold the new entry into their list view without a
+    /// `ListBuckets` round-trip.
+    BucketCreated {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        correlation_id: Option<String>,
+        summary: BucketSummary,
+    },
+    /// A bucket was removed (via `DeleteBucket`). Broadcast so peer
+    /// clients drop the row + any open progress UI keyed off this id.
+    BucketDeleted {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        correlation_id: Option<String>,
+        id: String,
+    },
+    /// A `StartBucketBuild` was accepted and the build task started.
+    /// Broadcast so every client paints the row as building, not just
+    /// the requester. `slot_id` is the freshly-minted slot id; it stays
+    /// stable across the build's lifetime.
+    BucketBuildStarted {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        correlation_id: Option<String>,
+        bucket_id: String,
+        slot_id: String,
+    },
+    /// Periodic progress tick during a build. Throttled to ~1Hz on the
+    /// server side so this stream stays cheap regardless of how fast
+    /// chunks land. Counters monotonically increase within a single
+    /// build and reset implicitly when a new build starts.
+    BucketBuildProgress {
+        bucket_id: String,
+        slot_id: String,
+        phase: BucketBuildPhase,
+        source_records: u64,
+        chunks: u64,
+    },
+    /// Terminal event for a build. `summary` carries the bucket's new
+    /// snapshot when the build succeeded (so clients can update the row
+    /// without `ListBuckets`); `None` when the slot never reached
+    /// Ready (cancelled / failed mid-build).
+    BucketBuildEnded {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        correlation_id: Option<String>,
+        bucket_id: String,
+        slot_id: String,
+        outcome: BucketBuildOutcome,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        summary: Option<BucketSummary>,
     },
 
     // --- Behavior registry ---

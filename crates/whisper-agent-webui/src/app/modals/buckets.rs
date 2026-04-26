@@ -1,27 +1,48 @@
 //! Knowledge-buckets management modal.
 //!
-//! Hosts two surfaces today: a read-only list of buckets in the
-//! registry (slice 8b) and a query form against the selected bucket
-//! (slice 9). The Create / Build / Delete actions for slice 8c will
-//! grow into the same modal — keeping everything bucket-related in
-//! one place avoids fanning out the navigation surface.
+//! Now hosts the full lifecycle (slice 8c): a create form, search
+//! against ready buckets, per-row Build / Cancel / Delete (two-click
+//! confirm) controls, and live build-progress display. Keeps everything
+//! bucket-related in one modal so the navigation surface stays narrow.
 
 use egui::{Color32, ComboBox, RichText, ScrollArea, TextEdit};
-use whisper_agent_protocol::{BucketSummary, QueryHit, SlotStateLabel};
+use whisper_agent_protocol::{
+    BucketBuildPhase, BucketCreateInput, BucketSourceInput, BucketSummary, QueryHit, SlotStateLabel,
+};
 
-use super::super::{BucketsModalState, QueryStatus};
+use super::super::{BucketsModalState, CreateBucketForm, QueryStatus, SourceKindChoice};
 
-/// Side-channel actions a `render_buckets_modal` call can emit.
-/// `RunQuery` is the slice-9 addition; the slice-8c create/build/
-/// delete events grow alongside it.
+/// Side-channel actions a `render_buckets_modal` call can emit. The
+/// caller mints correlation ids and dispatches the matching wire op.
 pub(crate) enum BucketsEvent {
-    /// User clicked Search. Caller mints a correlation, stamps it on
-    /// the modal, and dispatches `ClientToServer::QueryBuckets`.
     RunQuery {
         bucket_id: String,
         query: String,
         top_k: u32,
     },
+    /// Submit-create from the form. The caller validates / mints
+    /// correlation; the form keeps `pending_correlation` so it shows
+    /// a saving state until the wire response lands.
+    CreateBucket {
+        id: String,
+        config: BucketCreateInput,
+    },
+    /// User confirmed delete (second click on the armed Delete button).
+    DeleteBucket { id: String },
+    /// "Build" pressed on a bucket row.
+    StartBuild { id: String },
+    /// "Cancel" pressed on a building row.
+    CancelBuild { id: String },
+}
+
+/// Per-bucket progress snapshot the modal carries while a build is in
+/// flight. Keyed by bucket id in the parent's
+/// `BucketsModalState::build_progress`.
+#[derive(Clone)]
+pub(crate) struct BuildProgressView {
+    pub(crate) phase: BucketBuildPhase,
+    pub(crate) source_records: u64,
+    pub(crate) chunks: u64,
 }
 
 pub(crate) fn render_buckets_modal(
@@ -39,31 +60,36 @@ pub(crate) fn render_buckets_modal(
         .collapsible(false)
         .resizable(true)
         .default_width(720.0)
-        .default_height(560.0)
+        .default_height(620.0)
         .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
         .open(&mut open)
         .show(ctx, |ui| {
-            if buckets.is_empty() {
-                ui.add_space(8.0);
-                ui.label(
-                    RichText::new(
-                        "No buckets configured yet. Create one by adding a \
-                         <buckets_root>/<id>/bucket.toml on the server.",
-                    )
-                    .color(Color32::from_gray(160)),
-                );
-                ui.add_space(4.0);
-                ui.label(
-                    RichText::new("Inline create / build actions arrive in the next slice.")
-                        .small()
-                        .color(Color32::from_gray(140)),
-                );
-                return;
+            // Top bar: + New bucket toggle.
+            ui.horizontal(|ui| {
+                let label = if modal.creating.is_some() {
+                    "− Cancel new"
+                } else {
+                    "+ New bucket"
+                };
+                if ui.button(label).clicked() {
+                    modal.creating = match modal.creating.take() {
+                        Some(_) => None,
+                        None => Some(CreateBucketForm::default()),
+                    };
+                }
+            });
+
+            if modal.creating.is_some() {
+                ui.separator();
+                render_create_section(ui, &mut modal, &mut events);
             }
 
+            ui.separator();
+            ui.add_space(4.0);
+
             // Auto-select the first ready bucket on first open so the
-            // user can type and search immediately. Skipped if the
-            // user has manually picked already.
+            // user can type and search immediately, but only if any
+            // ready bucket exists yet.
             if modal.selected_bucket.is_none()
                 && let Some(first_ready) = buckets.iter().find(|b| {
                     b.active_slot
@@ -75,6 +101,7 @@ pub(crate) fn render_buckets_modal(
             }
 
             render_query_section(ui, &mut modal, buckets, &mut events);
+
             ui.separator();
             ui.add_space(4.0);
             ui.label(
@@ -82,14 +109,23 @@ pub(crate) fn render_buckets_modal(
                     .small()
                     .color(Color32::from_gray(150)),
             );
-            ScrollArea::vertical().show(ui, |ui| {
-                for (i, b) in buckets.iter().enumerate() {
-                    if i > 0 {
-                        ui.separator();
+
+            if buckets.is_empty() {
+                ui.label(
+                    RichText::new("No buckets yet — use \"+ New bucket\" above to create one.")
+                        .small()
+                        .color(Color32::from_gray(160)),
+                );
+            } else {
+                ScrollArea::vertical().show(ui, |ui| {
+                    for (i, b) in buckets.iter().enumerate() {
+                        if i > 0 {
+                            ui.separator();
+                        }
+                        render_bucket_row(ui, &mut modal, b, &mut events);
                     }
-                    render_bucket_row(ui, b);
-                }
-            });
+                });
+            }
         });
 
     if open {
@@ -97,6 +133,242 @@ pub(crate) fn render_buckets_modal(
     }
     events
 }
+
+// ---------- create form ----------
+
+fn render_create_section(
+    ui: &mut egui::Ui,
+    modal: &mut BucketsModalState,
+    events: &mut Vec<BucketsEvent>,
+) {
+    let Some(form) = modal.creating.as_mut() else {
+        return;
+    };
+    let saving = form.pending_correlation.is_some();
+
+    ui.label(
+        RichText::new("New bucket")
+            .small()
+            .color(Color32::from_gray(150)),
+    );
+
+    egui::Grid::new("create-bucket-grid")
+        .num_columns(2)
+        .spacing([12.0, 6.0])
+        .show(ui, |ui| {
+            ui.label(RichText::new("id").small());
+            ui.add_enabled(
+                !saving,
+                TextEdit::singleline(&mut form.id)
+                    .desired_width(280.0)
+                    .hint_text("filesystem-safe id, e.g. notes_2026"),
+            );
+            ui.end_row();
+
+            ui.label(RichText::new("name").small());
+            ui.add_enabled(
+                !saving,
+                TextEdit::singleline(&mut form.name)
+                    .desired_width(360.0)
+                    .hint_text("display name"),
+            );
+            ui.end_row();
+
+            ui.label(RichText::new("description").small());
+            ui.add_enabled(
+                !saving,
+                TextEdit::singleline(&mut form.description).desired_width(360.0),
+            );
+            ui.end_row();
+
+            ui.label(RichText::new("embedder").small());
+            ui.add_enabled(
+                !saving,
+                TextEdit::singleline(&mut form.embedder)
+                    .desired_width(280.0)
+                    .hint_text("provider name from [embedding_providers.X]"),
+            );
+            ui.end_row();
+
+            ui.label(RichText::new("source kind").small());
+            ui.horizontal(|ui| {
+                ui.add_enabled_ui(!saving, |ui| {
+                    ui.selectable_value(&mut form.source_kind, SourceKindChoice::Stored, "stored");
+                    ui.selectable_value(&mut form.source_kind, SourceKindChoice::Linked, "linked");
+                    ui.selectable_value(
+                        &mut form.source_kind,
+                        SourceKindChoice::Managed,
+                        "managed",
+                    );
+                });
+            });
+            ui.end_row();
+
+            match form.source_kind {
+                SourceKindChoice::Stored => {
+                    ui.label(RichText::new("source.adapter").small());
+                    ui.label(
+                        RichText::new("mediawiki_xml")
+                            .small()
+                            .color(Color32::from_gray(160)),
+                    );
+                    ui.end_row();
+                    ui.label(RichText::new("source.archive_path").small());
+                    ui.add_enabled(
+                        !saving,
+                        TextEdit::singleline(&mut form.source_detail)
+                            .desired_width(420.0)
+                            .hint_text("/path/to/dump.xml.bz2 (must exist on the server)"),
+                    );
+                    ui.end_row();
+                }
+                SourceKindChoice::Linked => {
+                    ui.label(RichText::new("source.adapter").small());
+                    ui.label(
+                        RichText::new("markdown_dir")
+                            .small()
+                            .color(Color32::from_gray(160)),
+                    );
+                    ui.end_row();
+                    ui.label(RichText::new("source.path").small());
+                    ui.add_enabled(
+                        !saving,
+                        TextEdit::singleline(&mut form.source_detail)
+                            .desired_width(420.0)
+                            .hint_text("/path/to/notes (server-side directory)"),
+                    );
+                    ui.end_row();
+                }
+                SourceKindChoice::Managed => {
+                    ui.label(RichText::new("").small());
+                    ui.label(
+                        RichText::new("no external source — content authored via the API")
+                            .small()
+                            .color(Color32::from_gray(160)),
+                    );
+                    ui.end_row();
+                }
+            }
+
+            ui.label(RichText::new("chunk tokens").small());
+            ui.add_enabled(
+                !saving,
+                egui::DragValue::new(&mut form.chunk_tokens)
+                    .range(50..=4096)
+                    .speed(10.0),
+            );
+            ui.end_row();
+
+            ui.label(RichText::new("overlap tokens").small());
+            ui.add_enabled(
+                !saving,
+                egui::DragValue::new(&mut form.overlap_tokens)
+                    .range(0..=512)
+                    .speed(5.0),
+            );
+            ui.end_row();
+
+            ui.label(RichText::new("paths").small());
+            ui.horizontal(|ui| {
+                ui.add_enabled_ui(!saving, |ui| {
+                    ui.checkbox(&mut form.dense_enabled, "dense");
+                    ui.checkbox(&mut form.sparse_enabled, "sparse");
+                });
+            });
+            ui.end_row();
+        });
+
+    if let Some(err) = form.error.as_deref() {
+        ui.label(
+            RichText::new(format!("error: {err}"))
+                .small()
+                .color(Color32::from_rgb(220, 120, 120)),
+        );
+    }
+
+    ui.horizontal(|ui| {
+        let create_clicked = ui
+            .add_enabled(!saving, egui::Button::new("Create"))
+            .clicked();
+        if saving {
+            ui.spinner();
+            ui.label(
+                RichText::new("creating…")
+                    .small()
+                    .color(Color32::from_gray(160)),
+            );
+        }
+
+        if create_clicked && let Some(input) = build_create_input(form) {
+            // Mark as pending; the parent stamps the correlation id
+            // after dispatching the wire op.
+            form.pending_correlation = Some(String::new());
+            form.error = None;
+            events.push(BucketsEvent::CreateBucket {
+                id: form.id.trim().to_string(),
+                config: input,
+            });
+        }
+    });
+}
+
+/// Sanity-check the form locally; the server does authoritative
+/// validation. Errors here are inline to keep the round-trip count
+/// down for obviously-wrong forms.
+fn build_create_input(form: &mut CreateBucketForm) -> Option<BucketCreateInput> {
+    if form.id.trim().is_empty() {
+        form.error = Some("id is required".into());
+        return None;
+    }
+    if form.name.trim().is_empty() {
+        form.error = Some("name is required".into());
+        return None;
+    }
+    if form.embedder.trim().is_empty() {
+        form.error = Some("embedder is required".into());
+        return None;
+    }
+    let source = match form.source_kind {
+        SourceKindChoice::Stored => {
+            if form.source_detail.trim().is_empty() {
+                form.error = Some("archive_path is required for kind=stored".into());
+                return None;
+            }
+            BucketSourceInput::Stored {
+                adapter: "mediawiki_xml".into(),
+                archive_path: form.source_detail.trim().to_string(),
+            }
+        }
+        SourceKindChoice::Linked => {
+            if form.source_detail.trim().is_empty() {
+                form.error = Some("path is required for kind=linked".into());
+                return None;
+            }
+            BucketSourceInput::Linked {
+                adapter: "markdown_dir".into(),
+                path: form.source_detail.trim().to_string(),
+            }
+        }
+        SourceKindChoice::Managed => BucketSourceInput::Managed {},
+    };
+    let description = if form.description.trim().is_empty() {
+        None
+    } else {
+        Some(form.description.trim().to_string())
+    };
+    Some(BucketCreateInput {
+        name: form.name.trim().to_string(),
+        description,
+        source,
+        embedder: form.embedder.trim().to_string(),
+        chunk_tokens: form.chunk_tokens,
+        overlap_tokens: form.overlap_tokens,
+        dense_enabled: form.dense_enabled,
+        sparse_enabled: form.sparse_enabled,
+    })
+}
+
+// ---------- query section (unchanged from slice 9, lifted as-is) ----------
 
 fn render_query_section(
     ui: &mut egui::Ui,
@@ -272,7 +544,14 @@ fn short_chunk_id(s: &str) -> String {
     }
 }
 
-fn render_bucket_row(ui: &mut egui::Ui, b: &BucketSummary) {
+// ---------- per-row render with Build / Cancel / Delete ----------
+
+fn render_bucket_row(
+    ui: &mut egui::Ui,
+    modal: &mut BucketsModalState,
+    b: &BucketSummary,
+    events: &mut Vec<BucketsEvent>,
+) {
     ui.horizontal(|ui| {
         ui.label(RichText::new(&b.name).strong());
         ui.label(
@@ -312,8 +591,9 @@ fn render_bucket_row(ui: &mut egui::Ui, b: &BucketSummary) {
         ui.label(RichText::new(sparse).small().color(Color32::from_gray(180)));
     });
 
+    let in_flight_build = modal.build_progress.contains_key(&b.id);
     match &b.active_slot {
-        None => {
+        None if !in_flight_build => {
             ui.label(
                 RichText::new("no active slot — bucket has not been built yet")
                     .small()
@@ -321,6 +601,7 @@ fn render_bucket_row(ui: &mut egui::Ui, b: &BucketSummary) {
                     .color(Color32::from_gray(160)),
             );
         }
+        None => {} // building, render below
         Some(slot) => {
             ui.horizontal_wrapped(|ui| {
                 ui.label(RichText::new("slot").small().color(Color32::from_gray(150)));
@@ -353,7 +634,88 @@ fn render_bucket_row(ui: &mut egui::Ui, b: &BucketSummary) {
             });
         }
     }
+
+    if let Some(progress) = modal.build_progress.get(&b.id) {
+        render_build_progress(ui, progress);
+    }
+
+    if let Some(err) = modal.build_errors.get(&b.id) {
+        ui.label(
+            RichText::new(format!("last build error: {err}"))
+                .small()
+                .color(Color32::from_rgb(220, 120, 120)),
+        );
+    }
+
+    render_row_actions(ui, modal, b, in_flight_build, events);
     ui.add_space(2.0);
+}
+
+fn render_build_progress(ui: &mut egui::Ui, p: &BuildProgressView) {
+    let phase = match p.phase {
+        BucketBuildPhase::Indexing => "indexing",
+        BucketBuildPhase::BuildingDense => "building HNSW",
+        BucketBuildPhase::Finalizing => "finalizing",
+    };
+    ui.horizontal_wrapped(|ui| {
+        ui.spinner();
+        ui.label(
+            RichText::new(format!(
+                "{phase} · {} pages · {} chunks",
+                format_count(p.source_records),
+                format_count(p.chunks),
+            ))
+            .small()
+            .color(Color32::from_rgb(180, 180, 100)),
+        );
+    });
+}
+
+fn render_row_actions(
+    ui: &mut egui::Ui,
+    modal: &mut BucketsModalState,
+    b: &BucketSummary,
+    in_flight_build: bool,
+    events: &mut Vec<BucketsEvent>,
+) {
+    ui.horizontal(|ui| {
+        if in_flight_build {
+            if ui.button("Cancel build").clicked() {
+                events.push(BucketsEvent::CancelBuild { id: b.id.clone() });
+            }
+        } else if ui
+            .add_enabled(
+                !matches!(b.source_kind.as_str(), "managed"),
+                egui::Button::new("Build"),
+            )
+            .clicked()
+        {
+            events.push(BucketsEvent::StartBuild { id: b.id.clone() });
+        }
+
+        // Two-click delete: first click arms; second click confirms.
+        // Click on any other button (or anywhere outside the row)
+        // wouldn't disarm — the simplest gating is "armed only sticks
+        // for this same render pass + the next click on the row".
+        let armed = modal.delete_armed.as_deref() == Some(b.id.as_str());
+        let label = if armed { "Confirm delete" } else { "Delete" };
+        let button = egui::Button::new(if armed {
+            RichText::new(label).color(Color32::from_rgb(220, 120, 120))
+        } else {
+            RichText::new(label)
+        });
+        if ui.add(button).clicked() {
+            if armed {
+                modal.delete_armed = None;
+                events.push(BucketsEvent::DeleteBucket { id: b.id.clone() });
+            } else {
+                modal.delete_armed = Some(b.id.clone());
+            }
+        }
+        if armed && ui.small_button(RichText::new("(cancel)").small()).clicked() {
+            modal.delete_armed = None;
+        }
+    });
 }
 
 fn meta_chip(ui: &mut egui::Ui, label: &str, value: &str) {
