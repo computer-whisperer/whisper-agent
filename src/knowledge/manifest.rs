@@ -10,9 +10,11 @@
 //! See `docs/design_knowledge_db.md` § "Configuration schemas" for the
 //! canonical reference.
 
+use std::path::PathBuf;
+
 use serde::{Deserialize, Serialize};
 
-use super::config::{ChunkerConfig, Quantization, ServingMode};
+use super::config::{Quantization, ServingMode};
 use super::types::SlotId;
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
@@ -37,10 +39,11 @@ pub struct SlotManifest {
     pub build_completed_at: Option<chrono::DateTime<chrono::Utc>>,
 
     /// Frozen snapshot of the chunker config that produced this slot's
-    /// chunks. The chunker is what determines chunk-id stability — if a
-    /// new chunker is needed, build a new slot rather than mutating an
+    /// chunks, including the *resolved* tokenizer (kind + content hash).
+    /// The chunker is what determines chunk-id stability — if a new
+    /// chunker is needed, build a new slot rather than mutating an
     /// existing one.
-    pub chunker_snapshot: ChunkerConfig,
+    pub chunker_snapshot: ChunkerSnapshot,
 
     pub embedder: EmbedderSnapshot,
 
@@ -99,6 +102,45 @@ pub struct EmbedderSnapshot {
     pub provider: String,
     pub model_id: String,
     pub dimension: u32,
+}
+
+/// Frozen chunker snapshot for the slot manifest. Carries the chunking
+/// parameters plus the *resolved* tokenizer — the kind + content hash of
+/// whatever `tokenizer.json` (or heuristic ratio) the slot was built
+/// against. Distinct from
+/// [`ChunkerConfig`](super::config::ChunkerConfig) because the user-config
+/// allows the unresolved `Auto` variant; once a slot is built, the
+/// snapshot records the concrete result that was used.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct ChunkerSnapshot {
+    /// Strategy id — currently always `"token_based"`. Future strategies
+    /// (e.g. `"markdown_aware"`) would extend this; the field exists for
+    /// forward-compat.
+    pub strategy: String,
+    pub chunk_tokens: u32,
+    #[serde(default)]
+    pub overlap_tokens: u32,
+    pub tokenizer: TokenizerSnapshot,
+}
+
+/// Resolved tokenizer identity for a built slot. The content_hash is
+/// `blake3` over the raw `tokenizer.json` bytes — drift detection on
+/// resume can compare against this to catch a tokenizer file being
+/// edited under an in-progress build.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum TokenizerSnapshot {
+    HfModel {
+        model_id: String,
+        content_hash: String,
+    },
+    Path {
+        path: PathBuf,
+        content_hash: String,
+    },
+    Heuristic {
+        chars_per_token: u32,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
@@ -178,6 +220,9 @@ build_completed_at = "2026-04-29T03:14:00Z"
 strategy = "token_based"
 chunk_tokens = 500
 overlap_tokens = 50
+[chunker_snapshot.tokenizer]
+kind = "heuristic"
+chars_per_token = 4
 
 [embedder]
 provider = "tei_qwen3_embed_0_6b"
@@ -205,12 +250,12 @@ ram_size_bytes = 56789123456
         assert_eq!(m.state, SlotState::Ready);
         assert!(m.build_started_at.is_some());
         assert!(m.build_completed_at.is_some());
+        assert_eq!(m.chunker_snapshot.strategy, "token_based");
+        assert_eq!(m.chunker_snapshot.chunk_tokens, 500);
+        assert_eq!(m.chunker_snapshot.overlap_tokens, 50);
         assert!(matches!(
-            m.chunker_snapshot,
-            ChunkerConfig::TokenBased {
-                chunk_tokens: 500,
-                overlap_tokens: 50,
-            }
+            m.chunker_snapshot.tokenizer,
+            TokenizerSnapshot::Heuristic { chars_per_token: 4 },
         ));
         assert_eq!(m.embedder.provider, "tei_qwen3_embed_0_6b");
         assert_eq!(m.embedder.model_id, "Qwen/Qwen3-Embedding-0.6B");
@@ -235,6 +280,9 @@ created_at = "2026-04-25T10:00:00Z"
 [chunker_snapshot]
 strategy = "token_based"
 chunk_tokens = 500
+[chunker_snapshot.tokenizer]
+kind = "heuristic"
+chars_per_token = 4
 
 [embedder]
 provider = "tei"
@@ -266,6 +314,9 @@ build_completed_at = "2026-05-15T03:45:00Z"
 [chunker_snapshot]
 strategy = "token_based"
 chunk_tokens = 500
+[chunker_snapshot.tokenizer]
+kind = "heuristic"
+chars_per_token = 4
 
 [embedder]
 provider = "tei"
@@ -300,6 +351,9 @@ build_completed_at = "2026-04-29T03:14:00Z"
 strategy = "token_based"
 chunk_tokens = 500
 overlap_tokens = 50
+[chunker_snapshot.tokenizer]
+kind = "heuristic"
+chars_per_token = 4
 
 [embedder]
 provider = "tei"
@@ -334,6 +388,9 @@ unexpected_field = "nope"
 [chunker_snapshot]
 strategy = "token_based"
 chunk_tokens = 500
+[chunker_snapshot.tokenizer]
+kind = "heuristic"
+chars_per_token = 4
 
 [embedder]
 provider = "tei"
@@ -357,6 +414,9 @@ created_at = "2026-04-25T10:00:00Z"
 [chunker_snapshot]
 strategy = "token_based"
 chunk_tokens = 500
+[chunker_snapshot.tokenizer]
+kind = "heuristic"
+chars_per_token = 4
 
 [embedder]
 provider = "tei"

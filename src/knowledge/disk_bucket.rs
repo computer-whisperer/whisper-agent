@@ -26,10 +26,11 @@ use super::bucket::{BoxFuture, Bucket};
 use super::build_state::{BuildStateRecord, BuildStateWriter};
 use super::chunker::Chunker;
 use super::chunks::{ChunkStoreReader, ChunkStoreWriter};
-use super::config::{BucketConfig, ChunkerConfig};
+use super::config::BucketConfig;
 use super::dense::{DenseIndex, HnswParams};
 use super::manifest::{
-    EmbedderSnapshot, ServingSnapshot, SlotManifest, SlotState, SlotStats, SparseSnapshot,
+    ChunkerSnapshot, EmbedderSnapshot, ServingSnapshot, SlotManifest, SlotState, SlotStats,
+    SparseSnapshot,
 };
 use super::slot;
 use super::source::{SourceAdapter, SourceError, SourceRecord};
@@ -267,6 +268,7 @@ impl DiskBucket {
         &self,
         adapter: &dyn SourceAdapter,
         chunker: &dyn Chunker,
+        chunker_snapshot: ChunkerSnapshot,
         embedder: Arc<dyn EmbeddingProvider>,
         observer: Option<&dyn BuildObserver>,
         cancel: &CancellationToken,
@@ -300,7 +302,7 @@ impl DiskBucket {
             created_at: now,
             build_started_at: Some(now),
             build_completed_at: None,
-            chunker_snapshot: chunker_snapshot_from_config(&self.config.chunker),
+            chunker_snapshot,
             embedder: embedder_snapshot.clone(),
             sparse: sparse_snapshot,
             serving: ServingSnapshot {
@@ -422,11 +424,13 @@ impl DiskBucket {
     ///   against fresh source content, truncate the chunks/vectors
     ///   files to the checkpoint boundary, and continue from the
     ///   next un-embedded record.
+    #[allow(clippy::too_many_arguments)]
     pub async fn resume_slot(
         &self,
         slot_id: &str,
         adapter: &dyn SourceAdapter,
         chunker: &dyn Chunker,
+        chunker_snapshot: ChunkerSnapshot,
         embedder: Arc<dyn EmbeddingProvider>,
         observer: Option<&dyn BuildObserver>,
         cancel: &CancellationToken,
@@ -455,11 +459,10 @@ impl DiskBucket {
         // config has changed since, this slot's chunk/vector layout
         // is no longer valid for continued building. A loud error
         // beats silently producing a corrupt slot.
-        let current_chunker_snapshot = chunker_snapshot_from_config(&self.config.chunker);
-        if manifest.chunker_snapshot != current_chunker_snapshot {
+        if manifest.chunker_snapshot != chunker_snapshot {
             return Err(BucketError::Other(format!(
-                "resume_slot: chunker config changed since slot {slot_id} was started; \
-                 delete the bucket and rebuild to use the new chunker"
+                "resume_slot: chunker snapshot changed since slot {slot_id} was started \
+                 (params or tokenizer); delete the bucket and rebuild to use the new chunker"
             )));
         }
         let embedder_snapshot =
@@ -1647,10 +1650,6 @@ fn write_manifest(slot_path: &Path, manifest: &SlotManifest) -> Result<(), Bucke
     Ok(())
 }
 
-fn chunker_snapshot_from_config(config: &ChunkerConfig) -> ChunkerConfig {
-    config.clone()
-}
-
 fn total_dir_size(dir: &Path) -> std::io::Result<u64> {
     let mut total = 0u64;
     for entry in fs::read_dir(dir)? {
@@ -1822,12 +1821,19 @@ embedder = "tei_test"
         let bucket = open_test_bucket(&bucket_root, &source);
 
         let adapter = MarkdownDir::new(&source);
-        let chunker = TokenBasedChunker::from_config(&bucket.config().chunker);
+        let (chunker, chunker_snapshot) = TokenBasedChunker::from_config(&bucket.config().chunker);
         let embedder: Arc<dyn EmbeddingProvider> = Arc::new(MockEmbedder::new(16));
         let cancel = CancellationToken::new();
 
         let slot_id = bucket
-            .build_slot(&adapter, &chunker, embedder, None, &cancel)
+            .build_slot(
+                &adapter,
+                &chunker,
+                chunker_snapshot.clone(),
+                embedder,
+                None,
+                &cancel,
+            )
             .await
             .unwrap();
 
@@ -1867,11 +1873,18 @@ embedder = "tei_test"
         let bucket_root = tmp.path().join("bucket");
         let bucket = open_test_bucket(&bucket_root, &source);
         let adapter = MarkdownDir::new(&source);
-        let chunker = TokenBasedChunker::from_config(&bucket.config().chunker);
+        let (chunker, chunker_snapshot) = TokenBasedChunker::from_config(&bucket.config().chunker);
         let embedder: Arc<dyn EmbeddingProvider> = Arc::new(MockEmbedder::new(32));
         let cancel = CancellationToken::new();
         bucket
-            .build_slot(&adapter, &chunker, embedder, None, &cancel)
+            .build_slot(
+                &adapter,
+                &chunker,
+                chunker_snapshot.clone(),
+                embedder,
+                None,
+                &cancel,
+            )
             .await
             .unwrap();
 
@@ -1906,11 +1919,18 @@ embedder = "tei_test"
         let bucket_root = tmp.path().join("bucket");
         let bucket = open_test_bucket(&bucket_root, &source);
         let adapter = MarkdownDir::new(&source);
-        let chunker = TokenBasedChunker::from_config(&bucket.config().chunker);
+        let (chunker, chunker_snapshot) = TokenBasedChunker::from_config(&bucket.config().chunker);
         let embedder: Arc<dyn EmbeddingProvider> = Arc::new(MockEmbedder::new(8));
         let cancel = CancellationToken::new();
         bucket
-            .build_slot(&adapter, &chunker, embedder, None, &cancel)
+            .build_slot(
+                &adapter,
+                &chunker,
+                chunker_snapshot.clone(),
+                embedder,
+                None,
+                &cancel,
+            )
             .await
             .unwrap();
 
@@ -1935,11 +1955,18 @@ embedder = "tei_test"
         let bucket_root = tmp.path().join("bucket");
         let bucket = open_test_bucket(&bucket_root, &source);
         let adapter = MarkdownDir::new(&source);
-        let chunker = TokenBasedChunker::from_config(&bucket.config().chunker);
+        let (chunker, chunker_snapshot) = TokenBasedChunker::from_config(&bucket.config().chunker);
         let embedder: Arc<dyn EmbeddingProvider> = Arc::new(MockEmbedder::new(4));
         let cancel = CancellationToken::new();
         bucket
-            .build_slot(&adapter, &chunker, embedder, None, &cancel)
+            .build_slot(
+                &adapter,
+                &chunker,
+                chunker_snapshot.clone(),
+                embedder,
+                None,
+                &cancel,
+            )
             .await
             .unwrap();
 
@@ -1973,11 +2000,19 @@ embedder = "tei_test"
         let slot_id = {
             let bucket = open_test_bucket(&bucket_root, &source);
             let adapter = MarkdownDir::new(&source);
-            let chunker = TokenBasedChunker::from_config(&bucket.config().chunker);
+            let (chunker, chunker_snapshot) =
+                TokenBasedChunker::from_config(&bucket.config().chunker);
             let embedder: Arc<dyn EmbeddingProvider> = Arc::new(MockEmbedder::new(12));
             let cancel = CancellationToken::new();
             bucket
-                .build_slot(&adapter, &chunker, embedder, None, &cancel)
+                .build_slot(
+                    &adapter,
+                    &chunker,
+                    chunker_snapshot.clone(),
+                    embedder,
+                    None,
+                    &cancel,
+                )
                 .await
                 .unwrap()
         };
@@ -2000,11 +2035,18 @@ embedder = "tei_test"
         let bucket_root = tmp.path().join("bucket");
         let bucket = open_test_bucket(&bucket_root, &source);
         let adapter = MarkdownDir::new(&source);
-        let chunker = TokenBasedChunker::from_config(&bucket.config().chunker);
+        let (chunker, chunker_snapshot) = TokenBasedChunker::from_config(&bucket.config().chunker);
         let embedder: Arc<dyn EmbeddingProvider> = Arc::new(MockEmbedder::new(16));
         let cancel = CancellationToken::new();
         bucket
-            .build_slot(&adapter, &chunker, embedder, None, &cancel)
+            .build_slot(
+                &adapter,
+                &chunker,
+                chunker_snapshot.clone(),
+                embedder,
+                None,
+                &cancel,
+            )
             .await
             .unwrap();
 
@@ -2055,11 +2097,18 @@ embedder = "tei_test"
         let bucket_root = tmp.path().join("bucket");
         let bucket = open_test_bucket(&bucket_root, &source);
         let adapter = MarkdownDir::new(&source);
-        let chunker = TokenBasedChunker::from_config(&bucket.config().chunker);
+        let (chunker, chunker_snapshot) = TokenBasedChunker::from_config(&bucket.config().chunker);
         let embedder: Arc<dyn EmbeddingProvider> = Arc::new(MockEmbedder::new(8));
         let cancel = CancellationToken::new();
         bucket
-            .build_slot(&adapter, &chunker, embedder, None, &cancel)
+            .build_slot(
+                &adapter,
+                &chunker,
+                chunker_snapshot.clone(),
+                embedder,
+                None,
+                &cancel,
+            )
             .await
             .unwrap();
 
@@ -2094,11 +2143,18 @@ embedder = "tei_test"
         let bucket_root = tmp.path().join("bucket");
         let bucket = open_test_bucket(&bucket_root, &source);
         let adapter = MarkdownDir::new(&source);
-        let chunker = TokenBasedChunker::from_config(&bucket.config().chunker);
+        let (chunker, chunker_snapshot) = TokenBasedChunker::from_config(&bucket.config().chunker);
         let embedder: Arc<dyn EmbeddingProvider> = Arc::new(MockEmbedder::new(8));
         let cancel = CancellationToken::new();
         bucket
-            .build_slot(&adapter, &chunker, embedder, None, &cancel)
+            .build_slot(
+                &adapter,
+                &chunker,
+                chunker_snapshot.clone(),
+                embedder,
+                None,
+                &cancel,
+            )
             .await
             .unwrap();
 
@@ -2165,11 +2221,18 @@ embedder = "tei_test"
         let bucket = DiskBucket::open(&bucket_root, BucketId::pod("notes")).unwrap();
 
         let adapter = MarkdownDir::new(&source);
-        let chunker = TokenBasedChunker::from_config(&bucket.config().chunker);
+        let (chunker, chunker_snapshot) = TokenBasedChunker::from_config(&bucket.config().chunker);
         let embedder: Arc<dyn EmbeddingProvider> = Arc::new(MockEmbedder::new(4));
         let cancel = CancellationToken::new();
         bucket
-            .build_slot(&adapter, &chunker, embedder, None, &cancel)
+            .build_slot(
+                &adapter,
+                &chunker,
+                chunker_snapshot.clone(),
+                embedder,
+                None,
+                &cancel,
+            )
             .await
             .unwrap();
 
@@ -2196,11 +2259,19 @@ embedder = "tei_test"
         {
             let bucket = open_test_bucket(&bucket_root, &source);
             let adapter = MarkdownDir::new(&source);
-            let chunker = TokenBasedChunker::from_config(&bucket.config().chunker);
+            let (chunker, chunker_snapshot) =
+                TokenBasedChunker::from_config(&bucket.config().chunker);
             let embedder: Arc<dyn EmbeddingProvider> = Arc::new(MockEmbedder::new(8));
             let cancel = CancellationToken::new();
             bucket
-                .build_slot(&adapter, &chunker, embedder, None, &cancel)
+                .build_slot(
+                    &adapter,
+                    &chunker,
+                    chunker_snapshot.clone(),
+                    embedder,
+                    None,
+                    &cancel,
+                )
                 .await
                 .unwrap();
         }
@@ -2239,12 +2310,19 @@ embedder = "tei_test"
         let bucket_root = tmp.path().join("bucket");
         let bucket = open_test_bucket(&bucket_root, &source);
         let adapter = MarkdownDir::new(&source);
-        let chunker = TokenBasedChunker::from_config(&bucket.config().chunker);
+        let (chunker, chunker_snapshot) = TokenBasedChunker::from_config(&bucket.config().chunker);
         let embedder: Arc<dyn EmbeddingProvider> = Arc::new(MockEmbedder::new(4));
         let cancel = CancellationToken::new();
         cancel.cancel();
         let err = bucket
-            .build_slot(&adapter, &chunker, embedder, None, &cancel)
+            .build_slot(
+                &adapter,
+                &chunker,
+                chunker_snapshot.clone(),
+                embedder,
+                None,
+                &cancel,
+            )
             .await
             .unwrap_err();
         assert!(matches!(err, BucketError::Cancelled), "{err:?}");
@@ -2275,11 +2353,18 @@ embedder = "tei_test"
         let mock = Arc::new(MockEmbedder::new(8));
         let embedder: Arc<dyn EmbeddingProvider> = mock.clone();
         let adapter = MarkdownDir::new(&source);
-        let chunker = TokenBasedChunker::from_config(&bucket.config().chunker);
+        let (chunker, chunker_snapshot) = TokenBasedChunker::from_config(&bucket.config().chunker);
         let cancel = CancellationToken::new();
 
         bucket
-            .build_slot(&adapter, &chunker, embedder, None, &cancel)
+            .build_slot(
+                &adapter,
+                &chunker,
+                chunker_snapshot.clone(),
+                embedder,
+                None,
+                &cancel,
+            )
             .await
             .unwrap();
 
@@ -2307,11 +2392,18 @@ embedder = "tei_test"
         let bucket_root = tmp.path().join("bucket");
         let bucket = open_test_bucket(&bucket_root, &source);
         let adapter = MarkdownDir::new(&source);
-        let chunker = TokenBasedChunker::from_config(&bucket.config().chunker);
+        let (chunker, chunker_snapshot) = TokenBasedChunker::from_config(&bucket.config().chunker);
         let embedder: Arc<dyn EmbeddingProvider> = Arc::new(MockEmbedder::new(4));
         let cancel = CancellationToken::new();
         let slot_id = bucket
-            .build_slot(&adapter, &chunker, embedder, None, &cancel)
+            .build_slot(
+                &adapter,
+                &chunker,
+                chunker_snapshot.clone(),
+                embedder,
+                None,
+                &cancel,
+            )
             .await
             .unwrap();
 
@@ -2391,12 +2483,19 @@ embedder = "tei_test"
         let bucket_root = tmp.path().join("bucket");
         let bucket = open_test_bucket(&bucket_root, &source);
         let adapter = MarkdownDir::new(&source);
-        let chunker = TokenBasedChunker::from_config(&bucket.config().chunker);
+        let (chunker, chunker_snapshot) = TokenBasedChunker::from_config(&bucket.config().chunker);
         let embedder: Arc<dyn EmbeddingProvider> = Arc::new(MockEmbedder::new(4));
         let cancel = CancellationToken::new();
         cancel.cancel();
         let _ = bucket
-            .build_slot(&adapter, &chunker, embedder, None, &cancel)
+            .build_slot(
+                &adapter,
+                &chunker,
+                chunker_snapshot.clone(),
+                embedder,
+                None,
+                &cancel,
+            )
             .await
             .unwrap_err();
 
@@ -2496,14 +2595,21 @@ embedder = "tei_test"
         let bucket_root = tmp.path().join("bucket");
         let bucket = open_test_bucket(&bucket_root, &source);
         let adapter = MarkdownDir::new(&source);
-        let chunker = TokenBasedChunker::from_config(&bucket.config().chunker);
+        let (chunker, chunker_snapshot) = TokenBasedChunker::from_config(&bucket.config().chunker);
 
         // Cancel after exactly 1 batch — leaves ~128 records embedded
         // and ~158 records still to do on resume.
         let cancel = CancellationToken::new();
         let cancelling = Arc::new(CancellingEmbedder::new(8, 1, cancel.clone()));
         let _ = bucket
-            .build_slot(&adapter, &chunker, cancelling.clone(), None, &cancel)
+            .build_slot(
+                &adapter,
+                &chunker,
+                chunker_snapshot.clone(),
+                cancelling.clone(),
+                None,
+                &cancel,
+            )
             .await
             .unwrap_err();
 
@@ -2544,6 +2650,7 @@ embedder = "tei_test"
                 &resumable,
                 &adapter,
                 &chunker,
+                chunker_snapshot.clone(),
                 plain_embedder,
                 None,
                 &resume_cancel,
@@ -2628,12 +2735,19 @@ embedder = "tei_test"
         let bucket_root = tmp.path().join("bucket");
         let bucket = open_test_bucket(&bucket_root, &source);
         let adapter = MarkdownDir::new(&source);
-        let chunker = TokenBasedChunker::from_config(&bucket.config().chunker);
+        let (chunker, chunker_snapshot) = TokenBasedChunker::from_config(&bucket.config().chunker);
 
         let cancel = CancellationToken::new();
         let cancelling = Arc::new(CancellingEmbedder::new(8, 1, cancel.clone()));
         let _ = bucket
-            .build_slot(&adapter, &chunker, cancelling, None, &cancel)
+            .build_slot(
+                &adapter,
+                &chunker,
+                chunker_snapshot.clone(),
+                cancelling,
+                None,
+                &cancel,
+            )
             .await
             .unwrap_err();
 
@@ -2667,7 +2781,15 @@ embedder = "tei_test"
         let resume_cancel = CancellationToken::new();
         let plain: Arc<dyn EmbeddingProvider> = Arc::new(MockEmbedder::new(8));
         let resumed = bucket
-            .resume_slot(&resumable, &adapter, &chunker, plain, None, &resume_cancel)
+            .resume_slot(
+                &resumable,
+                &adapter,
+                &chunker,
+                chunker_snapshot.clone(),
+                plain,
+                None,
+                &resume_cancel,
+            )
             .await
             .unwrap();
         assert_eq!(resumed, resumable);
@@ -2708,12 +2830,19 @@ embedder = "tei_test"
         let bucket_root = tmp.path().join("bucket");
         let bucket = open_test_bucket(&bucket_root, &source);
         let adapter = MarkdownDir::new(&source);
-        let chunker = TokenBasedChunker::from_config(&bucket.config().chunker);
+        let (chunker, chunker_snapshot) = TokenBasedChunker::from_config(&bucket.config().chunker);
 
         let cancel = CancellationToken::new();
         let cancelling = Arc::new(CancellingEmbedder::new(8, 1, cancel.clone()));
         let _ = bucket
-            .build_slot(&adapter, &chunker, cancelling, None, &cancel)
+            .build_slot(
+                &adapter,
+                &chunker,
+                chunker_snapshot.clone(),
+                cancelling,
+                None,
+                &cancel,
+            )
             .await
             .unwrap_err();
 
@@ -2739,7 +2868,15 @@ embedder = "tei_test"
         let resume_cancel = CancellationToken::new();
         let plain: Arc<dyn EmbeddingProvider> = Arc::new(MockEmbedder::new(8));
         let resumed = bucket
-            .resume_slot(&resumable, &adapter, &chunker, plain, None, &resume_cancel)
+            .resume_slot(
+                &resumable,
+                &adapter,
+                &chunker,
+                chunker_snapshot.clone(),
+                plain,
+                None,
+                &resume_cancel,
+            )
             .await
             .unwrap();
         assert_eq!(resumed, resumable);
@@ -2768,7 +2905,7 @@ embedder = "tei_test"
         let bucket_root = tmp.path().join("bucket");
         let bucket = open_test_bucket(&bucket_root, &source);
         let adapter = MarkdownDir::new(&source);
-        let chunker = TokenBasedChunker::from_config(&bucket.config().chunker);
+        let (chunker, chunker_snapshot) = TokenBasedChunker::from_config(&bucket.config().chunker);
 
         // Hand-craft a Planning-state slot directory: empty
         // build.state, manifest with state=Planning, no chunks/vectors.
@@ -2782,7 +2919,7 @@ embedder = "tei_test"
             created_at: now,
             build_started_at: Some(now),
             build_completed_at: None,
-            chunker_snapshot: bucket.config().chunker.clone(),
+            chunker_snapshot: chunker_snapshot.clone(),
             embedder: EmbedderSnapshot {
                 provider: bucket.config().defaults.embedder.clone(),
                 model_id: "mock-embedder".into(),
@@ -2817,7 +2954,15 @@ embedder = "tei_test"
         let embedder: Arc<dyn EmbeddingProvider> = Arc::new(MockEmbedder::new(4));
         let cancel = CancellationToken::new();
         let returned = bucket
-            .resume_slot(&slot_id, &adapter, &chunker, embedder, None, &cancel)
+            .resume_slot(
+                &slot_id,
+                &adapter,
+                &chunker,
+                chunker_snapshot.clone(),
+                embedder,
+                None,
+                &cancel,
+            )
             .await
             .unwrap();
         assert_eq!(returned, slot_id);
@@ -2857,12 +3002,19 @@ embedder = "tei_test"
         let bucket_root = tmp.path().join("bucket");
         let bucket = open_test_bucket(&bucket_root, &source);
         let adapter = MarkdownDir::new(&source);
-        let chunker = TokenBasedChunker::from_config(&bucket.config().chunker);
+        let (chunker, chunker_snapshot) = TokenBasedChunker::from_config(&bucket.config().chunker);
 
         let cancel = CancellationToken::new();
         let cancelling = Arc::new(CancellingEmbedder::new(8, 1, cancel.clone()));
         let _ = bucket
-            .build_slot(&adapter, &chunker, cancelling, None, &cancel)
+            .build_slot(
+                &adapter,
+                &chunker,
+                chunker_snapshot.clone(),
+                cancelling,
+                None,
+                &cancel,
+            )
             .await
             .unwrap_err();
         let resumable = bucket.find_resumable_slot().unwrap().unwrap();
@@ -2874,7 +3026,15 @@ embedder = "tei_test"
         let resume_cancel = CancellationToken::new();
         let plain: Arc<dyn EmbeddingProvider> = Arc::new(MockEmbedder::new(8));
         let err = bucket
-            .resume_slot(&resumable, &adapter, &chunker, plain, None, &resume_cancel)
+            .resume_slot(
+                &resumable,
+                &adapter,
+                &chunker,
+                chunker_snapshot.clone(),
+                plain,
+                None,
+                &resume_cancel,
+            )
             .await
             .unwrap_err();
         let msg = err.to_string();
@@ -2903,12 +3063,19 @@ embedder = "tei_test"
         let bucket_root = tmp.path().join("bucket");
         let bucket = open_test_bucket(&bucket_root, &source);
         let adapter = MarkdownDir::new(&source);
-        let chunker = TokenBasedChunker::from_config(&bucket.config().chunker);
+        let (chunker, chunker_snapshot) = TokenBasedChunker::from_config(&bucket.config().chunker);
 
         let cancel = CancellationToken::new();
         let cancelling = Arc::new(CancellingEmbedder::new(8, 1, cancel.clone()));
         let _ = bucket
-            .build_slot(&adapter, &chunker, cancelling, None, &cancel)
+            .build_slot(
+                &adapter,
+                &chunker,
+                chunker_snapshot.clone(),
+                cancelling,
+                None,
+                &cancel,
+            )
             .await
             .unwrap_err();
         let resumable = bucket.find_resumable_slot().unwrap().unwrap();
@@ -2925,6 +3092,7 @@ embedder = "tei_test"
                 &resumable,
                 &adapter,
                 &chunker,
+                chunker_snapshot.clone(),
                 different_model,
                 None,
                 &resume_cancel,
@@ -3017,7 +3185,7 @@ embedder = "tei_test"
 
         let bucket_root = tmp.path().join("bucket");
         let bucket = Arc::new(open_test_bucket(&bucket_root, &source));
-        let chunker_for_query = TokenBasedChunker::from_config(&bucket.config().chunker);
+        let (chunker_for_query, _) = TokenBasedChunker::from_config(&bucket.config().chunker);
         let pause = Arc::new(PauseAfterFirstBatch::new());
         let embedder: Arc<dyn EmbeddingProvider> = Arc::new(MockEmbedder::new(8));
 
@@ -3028,12 +3196,14 @@ embedder = "tei_test"
         let source_for_task = source.clone();
         let build_task = tokio::spawn(async move {
             let adapter = MarkdownDir::new(&source_for_task);
-            let chunker = TokenBasedChunker::from_config(&bucket_for_task.config().chunker);
+            let (chunker, chunker_snapshot) =
+                TokenBasedChunker::from_config(&bucket_for_task.config().chunker);
             let observer: &dyn BuildObserver = &*pause_for_task;
             bucket_for_task
                 .build_slot(
                     &adapter,
                     &chunker,
+                    chunker_snapshot,
                     embedder,
                     Some(observer),
                     &cancel_for_task,
@@ -3104,11 +3274,18 @@ embedder = "tei_test"
         let bucket_root = tmp.path().join("bucket");
         let bucket = open_test_bucket(&bucket_root, &source);
         let adapter = MarkdownDir::new(&source);
-        let chunker = TokenBasedChunker::from_config(&bucket.config().chunker);
+        let (chunker, chunker_snapshot) = TokenBasedChunker::from_config(&bucket.config().chunker);
         let embedder: Arc<dyn EmbeddingProvider> = Arc::new(MockEmbedder::new(8));
         let cancel = CancellationToken::new();
         let slot_id = bucket
-            .build_slot(&adapter, &chunker, embedder, None, &cancel)
+            .build_slot(
+                &adapter,
+                &chunker,
+                chunker_snapshot.clone(),
+                embedder,
+                None,
+                &cancel,
+            )
             .await
             .unwrap();
         drop(bucket);

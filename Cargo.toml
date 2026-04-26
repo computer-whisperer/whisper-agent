@@ -140,7 +140,24 @@ quick-xml = "0.39"
 # before handing to quick-xml so chunked decompression overlaps with
 # parsing.
 bzip2 = "0.5"
+# Real BPE tokenizer for chunk-boundary stability across embedder
+# rotations. The chunker takes token-level offsets from `Encoding` and
+# slices the source text at exact token-count boundaries — chunk text
+# is always a contiguous substring of the source. `onig` (the default
+# regex backend) pulls in a C dep we don't need; `unstable_wasm` flag
+# disables it.
+tokenizers = { version = "0.21", default-features = false, features = ["onig", "esaxx_fast"] }
+# HuggingFace Hub client for auto-fetching `tokenizer.json` when the
+# bucket's chunker is set to `tokenizer = "auto"` and resolves to a
+# model id via the embedder. Sync API is fine — resolution happens
+# once at slot-build start, not on the hot path.
+hf-hub = { version = "0.4", default-features = false, features = ["rustls-tls", "ureq"] }
 
 [dev-dependencies]
 # Tempdirs for source-adapter / chunker tests. Auto-cleanup via Drop.
 tempfile = "3"
+# `ahash` is transitive via the `tokenizers` crate; the chunker tests
+# build a `WordLevel` vocab map directly, and the builder requires an
+# `AHashMap` (not `std::HashMap`). Listed explicitly so test code can
+# name the type.
+ahash = "0.8"

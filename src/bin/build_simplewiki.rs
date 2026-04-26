@@ -36,7 +36,7 @@ use clap::Parser;
 use tokio_util::sync::CancellationToken;
 use whisper_agent::knowledge::{
     Bucket, BucketId, DiskBucket, MediaWikiXml, QueryEngine, QueryParams, SourceAdapter,
-    SourceError, SourceRecord, TokenBasedChunker,
+    SourceError, SourceRecord, resolve_chunker,
 };
 use whisper_agent::providers::embedding::{
     BoxFuture as EmbedBoxFuture, EmbedRequest, EmbeddingError, EmbeddingModelInfo,
@@ -163,7 +163,18 @@ async fn main() -> Result<()> {
             mock_embedder.clone()
         }
     };
-    let chunker = TokenBasedChunker::new(500, 50);
+    // build_simplewiki is a stress-test driver — go straight through
+    // the production resolver so it picks up the embedder's tokenizer
+    // when running against real TEI, and falls back to heuristic with
+    // the mock embedder.
+    let model_id = match embedder.list_models().await {
+        Ok(models) => models.first().map(|m| m.id.clone()),
+        Err(_) => None,
+    };
+    let resolved = resolve_chunker(&bucket.config().chunker, model_id.as_deref())
+        .context("resolve_chunker")?;
+    let chunker = resolved.chunker;
+    let chunker_snapshot = resolved.snapshot;
     let source = LoggingSource::new(MediaWikiXml::new(&args.archive), args.max_pages);
 
     eprintln!(
@@ -178,7 +189,14 @@ async fn main() -> Result<()> {
     );
     let t0 = Instant::now();
     let slot_id = bucket
-        .build_slot(&source, &chunker, embedder.clone(), None, &cancel)
+        .build_slot(
+            &source,
+            chunker.as_ref(),
+            chunker_snapshot,
+            embedder.clone(),
+            None,
+            &cancel,
+        )
         .await
         .context("build_slot")?;
     let build_dur = t0.elapsed();

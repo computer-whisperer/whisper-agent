@@ -394,10 +394,17 @@ embedder = "tei_test"
         .unwrap();
         let bucket = DiskBucket::open(bucket_root, bucket_id).unwrap();
         let adapter = MarkdownDir::new(source);
-        let chunker = TokenBasedChunker::from_config(&bucket.config().chunker);
+        let (chunker, chunker_snapshot) = TokenBasedChunker::from_config(&bucket.config().chunker);
         let cancel = CancellationToken::new();
         bucket
-            .build_slot(&adapter, &chunker, embedder, None, &cancel)
+            .build_slot(
+                &adapter,
+                &chunker,
+                chunker_snapshot.clone(),
+                embedder,
+                None,
+                &cancel,
+            )
             .await
             .unwrap();
         Arc::new(bucket)

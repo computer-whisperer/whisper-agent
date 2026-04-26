@@ -30,10 +30,10 @@ use whisper_agent_protocol::{
 };
 
 use super::{ConnId, Scheduler};
-use crate::knowledge::{BucketError, BucketId, ChunkerConfig};
+use crate::knowledge::{BucketError, BucketId};
 use crate::knowledge::{
     BuildObserver, BuildPhase, Chunker, DiskBucket, MarkdownDir, MediaWikiXml, SourceAdapter,
-    TokenBasedChunker, registry::entry_to_summary,
+    registry::entry_to_summary, resolve_chunker,
 };
 use crate::providers::embedding::EmbeddingProvider;
 use crate::server::thread_router::ThreadEventRouter;
@@ -322,8 +322,6 @@ impl Scheduler {
                 return;
             }
         };
-        let chunker = build_chunker(&entry.config.chunker);
-
         // Open the DiskBucket once — cheap when no active slot exists
         // (the common case for first-build); re-opens an existing
         // active slot for rebuild flows. Don't pay the HNSW load cost
@@ -383,11 +381,12 @@ impl Scheduler {
 
         let snapshot = self.router.clients_snapshot();
         let task_tx = self.bucket_task_sender();
+        let chunker_config = entry.config.chunker.clone();
         tokio::spawn(run_build(
             bucket,
             embedder,
             adapter,
-            chunker,
+            chunker_config,
             cancel,
             id,
             snapshot,
@@ -511,7 +510,7 @@ async fn run_build(
     bucket: Arc<DiskBucket>,
     embedder: Arc<dyn EmbeddingProvider>,
     adapter: Box<dyn SourceAdapter + Send + Sync>,
-    chunker: Box<dyn Chunker + Send + Sync>,
+    chunker_config: crate::knowledge::ChunkerConfig,
     cancel: CancellationToken,
     bucket_id: String,
     snapshot: Vec<mpsc::UnboundedSender<ServerToClient>>,
@@ -557,14 +556,38 @@ async fn run_build(
     // workers stay free during the multi-minute HNSW build phase. The
     // observer is dyn-dispatched; the cost is negligible per call.
     //
-    // Dispatches to either the fresh `build_slot` path or
-    // `resume_slot` based on whether the scheduler found an
-    // in-progress slot to pick up.
+    // Chunker resolution lives inside the blocking section: hf-hub uses
+    // sync I/O for tokenizer.json fetch, and we want it on a worker
+    // thread (not the scheduler tick). list_models is async though, so
+    // we await it first to get the embedder's reported model id; the
+    // result feeds `resolve_chunker` for the `tokenizer = "auto"` case.
+    let embedder_model_id = match embedder.list_models().await {
+        Ok(models) => models.first().map(|m| m.id.clone()),
+        Err(e) => {
+            // Best-effort — falling back to heuristic when the embedder
+            // can't be queried is fine; build still proceeds.
+            tracing::warn!(
+                bucket_id = %bucket_id,
+                error = %e,
+                "list_models failed at build start; chunker will fall back to heuristic if `tokenizer = \"auto\"`",
+            );
+            None
+        }
+    };
+
     let bucket_for_build = bucket.clone();
     let observer_for_build = observer_arc.clone();
     let cancel_for_build = cancel.clone();
     let handle = tokio::runtime::Handle::current();
     let result = tokio::task::spawn_blocking(move || {
+        let resolved = match resolve_chunker(&chunker_config, embedder_model_id.as_deref()) {
+            Ok(r) => r,
+            Err(e) => return Err(BucketError::Other(format!("chunker resolution: {e}"))),
+        };
+        let chunker_box = resolved.chunker;
+        let chunker_snapshot = resolved.snapshot;
+        let chunker_ref: &(dyn Chunker + Send + Sync) = chunker_box.as_ref();
+
         handle.block_on(async move {
             match resume_slot_id {
                 Some(slot_id) => {
@@ -572,7 +595,8 @@ async fn run_build(
                         .resume_slot(
                             &slot_id,
                             adapter.as_ref(),
-                            chunker.as_ref(),
+                            chunker_ref,
+                            chunker_snapshot,
                             embedder,
                             Some(observer_for_build.as_ref()),
                             &cancel_for_build,
@@ -583,7 +607,8 @@ async fn run_build(
                     bucket_for_build
                         .build_slot(
                             adapter.as_ref(),
-                            chunker.as_ref(),
+                            chunker_ref,
+                            chunker_snapshot,
                             embedder,
                             Some(observer_for_build.as_ref()),
                             &cancel_for_build,
@@ -829,14 +854,5 @@ fn build_adapter(
         SourceConfig::Managed {} => {
             Err("managed buckets have no source adapter to build from".into())
         }
-    }
-}
-
-fn build_chunker(config: &ChunkerConfig) -> Box<dyn Chunker + Send + Sync> {
-    match config {
-        ChunkerConfig::TokenBased {
-            chunk_tokens,
-            overlap_tokens,
-        } => Box::new(TokenBasedChunker::new(*chunk_tokens, *overlap_tokens)),
     }
 }

@@ -110,8 +110,9 @@ pub enum RescanStrategy {
 
 /// Chunking strategy + parameters. Tagged on `strategy`.
 ///
-/// Frozen into each new slot at build time (see
-/// [`SlotManifest::chunker_snapshot`](super::manifest::SlotManifest)).
+/// Resolved into a runnable chunker plus a frozen
+/// [`ChunkerSnapshot`](super::manifest::ChunkerSnapshot) at slot-build
+/// time via [`resolve_chunker`](super::chunker::resolve_chunker).
 /// Changes to this field in `bucket.toml` only affect *new* slot builds —
 /// existing slots remain on the chunker config they were built with, which
 /// is what makes chunk ids stable across embedder rotations.
@@ -122,6 +123,8 @@ pub enum ChunkerConfig {
         chunk_tokens: u32,
         #[serde(default)]
         overlap_tokens: u32,
+        #[serde(default)]
+        tokenizer: TokenizerSource,
     },
 }
 
@@ -130,6 +133,7 @@ impl Default for ChunkerConfig {
         ChunkerConfig::TokenBased {
             chunk_tokens: 500,
             overlap_tokens: 50,
+            tokenizer: TokenizerSource::default(),
         }
     }
 }
@@ -140,6 +144,43 @@ impl ChunkerConfig {
             ChunkerConfig::TokenBased { .. } => "token_based",
         }
     }
+}
+
+/// Where the chunker's tokenizer comes from. The default — `Auto` — asks
+/// the bucket's configured embedder for its model id at slot-build time
+/// and fetches `tokenizer.json` from the HuggingFace Hub. Explicit values
+/// (`HfModel`, `Path`) override that. `Heuristic` skips real BPE entirely
+/// and falls back to a `chars_per_token` ratio — useful for tests, dev
+/// loops without a tokenizer file on disk, and tiny buckets where chunk
+/// quality doesn't matter.
+///
+/// Per the design doc, the chunker's tokenizer is **independent of the
+/// embedder** in steady state — chunk-ids stay stable across embedder
+/// rotations as long as the chunker config doesn't change. The `Auto`
+/// variant resolves once at slot-build and freezes the result into the
+/// slot manifest, so subsequent embedder rotations don't invalidate
+/// chunk-ids unless the user also edits the chunker config.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, serde::Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum TokenizerSource {
+    /// Resolve from the bucket's configured embedder via
+    /// `EmbeddingProvider::list_models()`. On any resolution failure
+    /// (no network, model has no `tokenizer.json`, embedder doesn't
+    /// expose a model id), falls back to [`TokenizerSource::Heuristic`]
+    /// with `chars_per_token = 4` and a `tracing::warn`.
+    #[default]
+    Auto,
+    /// Explicit HuggingFace model id (e.g. `Qwen/Qwen3-Embedding-0.6B`).
+    /// Fetched and cached via `hf-hub` at slot-build start. Hard error
+    /// on resolution failure — explicit means explicit.
+    HfModel { model_id: String },
+    /// Local `tokenizer.json` path. Hard error if the file can't be read
+    /// or parsed.
+    Path { path: PathBuf },
+    /// Char-window heuristic — no tokenizer, just `chars_per_token`
+    /// applied to a sliding window. Always succeeds; used as the
+    /// auto-resolution fallback.
+    Heuristic { chars_per_token: u32 },
 }
 
 /// Per-bucket flags for whether dense and sparse retrieval are exposed.

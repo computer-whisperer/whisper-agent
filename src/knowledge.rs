@@ -45,17 +45,18 @@ pub mod types;
 pub mod vectors;
 
 pub use bucket::Bucket;
-pub use chunker::{Chunker, TokenBasedChunker};
+pub use chunker::{Chunker, ResolveError, ResolvedChunker, TokenBasedChunker, resolve_chunker};
 pub use chunks::{ChunkStoreReader, ChunkStoreWriter};
 pub use config::{
     BucketConfig, ChunkerConfig, CompactionConfig, DefaultsConfig, DensePathConfig, Quantization,
     RescanStrategy, SearchPathsConfig, ServingMode, SourceConfig, SparsePathConfig,
+    TokenizerSource,
 };
 pub use dense::{DenseIndex, HnswParams};
 pub use disk_bucket::{BuildObserver, BuildPhase, DiskBucket};
 pub use manifest::{
-    EmbedderSnapshot, ServingSnapshot, SlotLineage, SlotManifest, SlotState, SlotStats,
-    SparseSnapshot,
+    ChunkerSnapshot, EmbedderSnapshot, ServingSnapshot, SlotLineage, SlotManifest, SlotState,
+    SlotStats, SparseSnapshot, TokenizerSnapshot,
 };
 pub use query::{QueryEngine, QueryParams, RerankedCandidate};
 pub use registry::{BucketEntry, BucketRegistry};
