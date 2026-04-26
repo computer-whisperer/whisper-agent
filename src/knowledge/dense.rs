@@ -28,6 +28,7 @@
 //! cold-start in seconds instead of hours.
 
 use std::path::Path;
+use std::sync::RwLock;
 
 use hnsw_rs::hnswio::HnswIo;
 use hnsw_rs::prelude::*;
@@ -71,76 +72,119 @@ impl Default for HnswParams {
 
 /// In-memory dense index over a slot's vectors.
 ///
-/// Owns the `Hnsw` graph and a position→chunk_id translation table. Not
-/// persisted in slice 5 — rebuilt from `vectors.bin`/`vectors.idx` at
-/// slot load. The trade-off is: faster slice 5 (no file format to
-/// design) at the cost of slot-load time. Acceptable for workspace
-/// buckets (<10k chunks → milliseconds); becomes a real cost at
-/// wikipedia scale (50M chunks → ~30 minutes), at which point we add
-/// HNSW persistence as its own slice.
+/// Owns the `Hnsw` graph and a position→chunk_id translation table.
+/// Mutable interior — `insert` takes a write lock, `search` takes a
+/// read lock. This is what makes per-batch incremental insert during a
+/// build work while queries against the same slot stay concurrent.
+///
+/// Persisted to `<slot>/dense.hnsw.{graph,data}` via [`Self::dump_to`].
+/// On slot reload, [`Self::load_from`] reads those files; if they're
+/// missing or stale, [`Self::build`] reconstructs from
+/// `vectors.bin`/`vectors.idx`.
 pub struct DenseIndex {
-    /// `'static` because Hnsw owns its inserted data via internal
-    /// reference-counting; we don't keep external references alive.
-    hnsw: Hnsw<'static, f32, DistL2>,
+    /// Hnsw graph + by_position table held under one RwLock so
+    /// inserts are atomic across both. Cheap reads (RwLock::read +
+    /// hnsw.search internally read-only) — query latency is
+    /// dominated by the search itself, not the lock.
+    inner: RwLock<DenseInner>,
+}
 
+/// `'static` because Hnsw owns its inserted data via internal
+/// reference-counting; we don't keep external references alive.
+struct DenseInner {
+    hnsw: Hnsw<'static, f32, DistL2>,
     /// `by_position[d_id]` is the chunk id corresponding to HNSW data
-    /// id `d_id`. Built from `VectorStoreReader::iter_chunk_positions`
-    /// at construction time.
+    /// id `d_id`. Grown to position+1 on each insert; entries between
+    /// the old length and the new position are filled with the zero
+    /// chunk id (not normally observable since search results are
+    /// filtered by position validity).
     by_position: Vec<ChunkId>,
 }
 
 impl std::fmt::Debug for DenseIndex {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let len = self.inner.read().map(|i| i.by_position.len()).unwrap_or(0);
         f.debug_struct("DenseIndex")
-            .field("len", &self.by_position.len())
+            .field("len", &len)
             .finish_non_exhaustive()
     }
 }
 
 impl DenseIndex {
+    /// Construct an empty index, sized with `max_elements_hint` as a
+    /// hint to hnsw_rs's internal allocator. Inserts beyond the hint
+    /// still work — hnsw_rs treats it as a sizing suggestion, not a
+    /// hard cap — but undersizing forces reallocation. Tune to the
+    /// expected chunk count when known; over-estimate is cheap.
+    pub fn empty(params: HnswParams, max_elements_hint: usize) -> Self {
+        let hnsw: Hnsw<'static, f32, DistL2> = Hnsw::new(
+            params.max_nb_connection,
+            max_elements_hint.max(1),
+            params.max_layer,
+            params.ef_construction,
+            DistL2 {},
+        );
+        Self {
+            inner: RwLock::new(DenseInner {
+                hnsw,
+                by_position: Vec::new(),
+            }),
+        }
+    }
+
+    /// Insert one vector at `position` (the index into vectors.bin).
+    /// Takes a write lock for the brief duration of the HNSW insert
+    /// + by_position update. Caller is responsible for monotonically
+    /// increasing positions starting from 0; gaps are tolerated but
+    /// rest of the codebase doesn't currently produce them.
+    pub fn insert(&self, chunk_id: ChunkId, position: u64, vector: &[f32]) {
+        let mut inner = self.inner.write().expect("DenseIndex lock poisoned");
+        inner.hnsw.insert((vector, position as usize));
+        if inner.by_position.len() <= position as usize {
+            // Pad with the zero chunk id; HNSW's filter_map in search
+            // still produces correct results because we only return
+            // by_position[d_id] entries that came from real inserts
+            // (any d_id we didn't insert wouldn't appear in HNSW
+            // search output).
+            inner
+                .by_position
+                .resize(position as usize + 1, ChunkId([0; 32]));
+        }
+        inner.by_position[position as usize] = chunk_id;
+    }
+
     /// Build a fresh index from a vectors store. Reads each vector
-    /// once in position order and inserts into the HNSW graph.
+    /// once in position order and inserts into the HNSW graph. Used
+    /// on slot reload when a dump is missing/stale.
     pub fn build(vectors: &VectorStoreReader, params: HnswParams) -> Result<Self, BucketError> {
         let count = vectors.len();
 
-        // Construct the position→chunk_id translation. iter_chunk_positions
-        // returns pairs in unspecified order; sort by position so
-        // by_position[i] is the chunk at HNSW data id i.
         let mut pairs: Vec<(u64, ChunkId)> = vectors
             .iter_chunk_positions()
             .map(|(id, pos)| (pos, id))
             .collect();
         pairs.sort_by_key(|(pos, _)| *pos);
-        let by_position: Vec<ChunkId> = pairs.into_iter().map(|(_, id)| id).collect();
-        debug_assert_eq!(by_position.len(), count);
 
-        // Hnsw::new requires max_elements > 0 even for an empty index.
-        // Use 1 as the floor — empty indexes are valid but search will
-        // short-circuit via is_empty.
-        let hnsw: Hnsw<'static, f32, DistL2> = Hnsw::new(
-            params.max_nb_connection,
-            count.max(1),
-            params.max_layer,
-            params.ef_construction,
-            DistL2 {},
-        );
-
-        for position in 0..count as u64 {
+        let index = Self::empty(params, count);
+        for (position, chunk_id) in pairs.iter().copied() {
             let vector = vectors
                 .read_at_position(position)
                 .map_err(BucketError::Io)?;
-            hnsw.insert((vector.as_slice(), position as usize));
+            index.insert(chunk_id, position, &vector);
         }
-
-        Ok(Self { hnsw, by_position })
+        debug_assert_eq!(index.len(), count);
+        Ok(index)
     }
 
     pub fn len(&self) -> usize {
-        self.by_position.len()
+        self.inner
+            .read()
+            .map(|i| i.by_position.len())
+            .unwrap_or(0)
     }
 
     pub fn is_empty(&self) -> bool {
-        self.by_position.is_empty()
+        self.len() == 0
     }
 
     /// Search for the `top_k` nearest neighbours of `query`. Returns
@@ -151,21 +195,23 @@ impl DenseIndex {
     /// `max(top_k * 2, 64)` — generous enough to keep recall high at
     /// workspace scales without paying much for the over-fetch.
     pub fn search(&self, query: &[f32], top_k: usize) -> Vec<(ChunkId, f32)> {
-        if self.is_empty() || top_k == 0 {
+        let inner = self.inner.read().expect("DenseIndex lock poisoned");
+        if inner.by_position.is_empty() || top_k == 0 {
             return Vec::new();
         }
         let ef = (top_k * 2).max(64);
-        let neighbours = self.hnsw.search(query, top_k, ef);
+        let neighbours = inner.hnsw.search(query, top_k, ef);
         neighbours
             .into_iter()
-            .filter_map(|n| self.by_position.get(n.d_id).map(|&id| (id, n.distance)))
+            .filter_map(|n| inner.by_position.get(n.d_id).map(|&id| (id, n.distance)))
             .collect()
     }
 
-    /// Dump the in-memory HNSW graph to `slot_dir` so a future open
-    /// can skip the rebuild. Writes `dense.hnsw.graph` and
-    /// `dense.hnsw.data` (the latter duplicates the vectors already in
-    /// `vectors.bin` — see the module docstring for the trade-off).
+    /// Dump the in-memory HNSW graph to `slot_dir`. Writes
+    /// `dense.hnsw.graph` and `dense.hnsw.data`. Used both as a
+    /// per-checkpoint barrier during long builds and as the
+    /// final-build artifact a future slot-open uses to skip the
+    /// rebuild.
     ///
     /// Stale on-disk dumps are removed first so `file_dump` doesn't
     /// silently fall back to a random-suffixed basename when prior
@@ -177,7 +223,9 @@ impl DenseIndex {
                 std::fs::remove_file(&p).map_err(BucketError::Io)?;
             }
         }
-        self.hnsw
+        let inner = self.inner.read().expect("DenseIndex lock poisoned");
+        inner
+            .hnsw
             .file_dump(slot_dir, DENSE_BASENAME)
             .map_err(|e| BucketError::Other(format!("hnsw file_dump: {e}")))?;
         Ok(())
@@ -222,10 +270,6 @@ impl DenseIndex {
         pairs.sort_by_key(|(pos, _)| *pos);
         let by_position: Vec<ChunkId> = pairs.into_iter().map(|(_, id)| id).collect();
 
-        // Sanity check: HNSW node count must match the position table.
-        // A mismatch means the dump and `vectors.bin` came from
-        // different builds (partial write, file swap, etc.) — fall
-        // through to a rebuild rather than serving wrong-id results.
         let hnsw_count = hnsw.get_nb_point();
         if hnsw_count != by_position.len() {
             return Err(BucketError::Other(format!(
@@ -234,7 +278,9 @@ impl DenseIndex {
             )));
         }
 
-        Ok(Self { hnsw, by_position })
+        Ok(Self {
+            inner: RwLock::new(DenseInner { hnsw, by_position }),
+        })
     }
 }
 

@@ -180,6 +180,15 @@ impl VectorStoreWriter {
         Ok(pos)
     }
 
+    /// Flush buffered writes to disk and `sync_data`. Called at
+    /// every build-batch boundary so the BatchEmbedded log entry
+    /// only lands after the corresponding vectors are durable.
+    pub fn flush(&mut self) -> io::Result<()> {
+        self.bin.flush()?;
+        self.bin.get_ref().sync_data()?;
+        Ok(())
+    }
+
     /// Flush `vectors.bin` and write `vectors.idx`. Returns the number
     /// of vectors committed.
     pub fn finalize(mut self) -> io::Result<usize> {

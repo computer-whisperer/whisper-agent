@@ -140,6 +140,25 @@ impl ChunkStoreWriter {
         Ok(offset)
     }
 
+    /// Flush buffered writes to the underlying file and `sync_data`.
+    /// Live readers opened via [`ChunkStoreReader::open_with_map`]
+    /// only see data that's flushed to disk, so the build path calls
+    /// this at every batch boundary as part of the durability
+    /// barrier.
+    pub fn flush(&mut self) -> io::Result<()> {
+        self.bin.flush()?;
+        self.bin.get_ref().sync_data()?;
+        Ok(())
+    }
+
+    /// Snapshot the current `(chunk_id, offset)` entries as a map
+    /// for live-view readers during an in-progress build. The map
+    /// is owned (cloned out of the writer's internal vec) so the
+    /// reader can outlive subsequent appends.
+    pub fn snapshot_index(&self) -> HashMap<ChunkId, u64> {
+        self.entries.iter().copied().collect()
+    }
+
     pub fn len(&self) -> usize {
         self.entries.len()
     }
@@ -209,6 +228,23 @@ impl ChunkStoreReader {
     pub fn open(bin_path: &Path, idx_path: &Path) -> io::Result<Self> {
         let bin = File::open(bin_path)?;
         let index = read_idx(idx_path)?;
+        Ok(Self {
+            bin: Mutex::new(bin),
+            index,
+        })
+    }
+
+    /// Open a live-view reader over `chunks.bin` using a caller-
+    /// supplied index map. Used during in-progress builds when
+    /// `chunks.idx` doesn't yet exist — the build path snapshots
+    /// the writer's in-memory index and constructs a reader that
+    /// can answer queries against the bytes flushed so far.
+    ///
+    /// The map is consumed (moved into the reader); subsequent
+    /// build appends produce a new snapshot via
+    /// [`ChunkStoreWriter::snapshot_index`].
+    pub fn open_with_map(bin_path: &Path, index: HashMap<ChunkId, u64>) -> io::Result<Self> {
+        let bin = File::open(bin_path)?;
         Ok(Self {
             bin: Mutex::new(bin),
             index,
