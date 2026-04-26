@@ -1632,12 +1632,67 @@ impl Bucket for DiskBucket {
 
     fn compact<'a>(
         &'a self,
-        _cancel: &'a CancellationToken,
+        cancel: &'a CancellationToken,
     ) -> BoxFuture<'a, Result<(), BucketError>> {
         Box::pin(async move {
-            Err(BucketError::Other(
-                "compact: deferred until indexes land (slices 5–6)".to_string(),
-            ))
+            let active = self
+                .active_snapshot()
+                .ok_or_else(|| BucketError::NoActiveSlot(self.id.clone()))?;
+            if active.manifest.state != SlotState::Ready {
+                return Err(BucketError::Other(format!(
+                    "compact requires the active slot to be Ready (got {:?})",
+                    active.manifest.state,
+                )));
+            }
+
+            // Hold the mutation lock for the whole compaction so no
+            // insert/tombstone interleaves. Queries continue to hit
+            // the old active snapshot through their own Arc clones;
+            // they don't observe the new slot until the active
+            // pointer swap below.
+            let _guard = self.mutation_lock.lock().await;
+
+            let old_slot_id = active.manifest.slot_id.clone();
+            let old_slot_path = slot::slot_dir(&self.root, &old_slot_id);
+            let new_slot_id = slot::generate_slot_id();
+            let new_slot_path = slot::slot_dir(&self.root, &new_slot_id);
+            std::fs::create_dir_all(&new_slot_path).map_err(BucketError::Io)?;
+
+            let active_for_blocking = active.clone();
+            let cancel_for_blocking = cancel.clone();
+            let new_slot_id_for_blocking = new_slot_id.clone();
+            let new_slot_path_for_blocking = new_slot_path.clone();
+            let result = tokio::task::spawn_blocking(move || -> Result<(), BucketError> {
+                compact_into_new_slot(
+                    &active_for_blocking,
+                    &old_slot_path,
+                    &new_slot_path_for_blocking,
+                    &new_slot_id_for_blocking,
+                    &cancel_for_blocking,
+                )
+            })
+            .await
+            .map_err(|e| BucketError::Other(format!("compact task: {e}")))?;
+
+            // On cancel/error, remove the half-written slot dir so a
+            // future compact can reuse the directory layout cleanly.
+            if let Err(e) = result {
+                let _ = std::fs::remove_dir_all(&new_slot_path);
+                return Err(e);
+            }
+
+            // Atomic active pointer swap. Existing query Arcs keep
+            // serving against the old slot until they drop; new
+            // queries see the new slot.
+            slot::set_active_slot(&self.root, &new_slot_id)?;
+            let loaded = Arc::new(load_slot(&self.root, &new_slot_id)?);
+            {
+                let mut active_guard = self.active.write().expect("active lock poisoned");
+                *active_guard = Some(loaded);
+            }
+            // Old slot directory is intentionally left on disk for
+            // rollback / inspection; retention cleanup is a follow-up.
+            Ok(())
         })
     }
 }
@@ -1726,6 +1781,186 @@ fn persist_insert_batch(
     let reader = ChunkStoreReader::open_with_mode(&chunks_bin, &chunks_idx, load_mode)
         .map_err(BucketError::Io)?;
     Ok(Arc::new(reader))
+}
+
+/// Blocking-thread helper for `Bucket::compact`. Walks the slot's
+/// surviving chunks (base ∪ delta − tombstones), rewrites them into
+/// `new_slot_path`, and dumps the HNSW for fast reload. Caller is
+/// responsible for swapping the active-slot pointer afterwards.
+///
+/// HNSW is rebuilt incrementally as we iterate (one `insert` per
+/// surviving chunk). Compaction is never on the query hot path so
+/// the per-insert cost is fine; the outcome is a fresh dump that
+/// future opens load with a single `load_from`.
+///
+/// Cancellation is checked at each chunk boundary. On cancel the
+/// caller cleans up the half-written slot dir.
+fn compact_into_new_slot(
+    old: &LoadedSlot,
+    old_slot_path: &Path,
+    new_slot_path: &Path,
+    new_slot_id: &SlotId,
+    cancel: &CancellationToken,
+) -> Result<(), BucketError> {
+    let dim = old.manifest.embedder.dimension;
+    let sparse_enabled = old.sparse.is_some();
+    let load_mode = serving_mode_to_load_mode(old.manifest.serving.mode);
+    let tombstones = old.tombstones();
+
+    // Writers for the new slot.
+    let mut chunk_writer = ChunkStoreWriter::create(
+        &slot::chunks_bin_path(new_slot_path),
+        &slot::chunks_idx_path(new_slot_path),
+    )
+    .map_err(BucketError::Io)?;
+    let mut vector_writer = VectorStoreWriter::create(
+        &slot::vectors_bin_path(new_slot_path),
+        &slot::vectors_idx_path(new_slot_path),
+        dim,
+    )
+    .map_err(BucketError::Io)?;
+    let mut sparse_builder = if sparse_enabled {
+        Some(SparseIndexBuilder::create(&slot::tantivy_dir(
+            new_slot_path,
+        ))?)
+    } else {
+        None
+    };
+    // Generous size hint: surviving count is bounded above by base +
+    // delta. Over-estimate is cheap.
+    let dense_hint = old.dense.len();
+    let dense = DenseIndex::empty(HnswParams::default(), dense_hint);
+
+    let base_vectors = old
+        .vectors
+        .as_ref()
+        .ok_or_else(|| BucketError::Other("compact: old slot has no vectors reader".to_string()))?;
+
+    let mut surviving: u64 = 0;
+    let mut dropped: u64 = 0;
+
+    // Walk base.
+    for (id, _pos) in base_vectors.iter_chunk_positions() {
+        if cancel.is_cancelled() {
+            return Err(BucketError::Cancelled);
+        }
+        if tombstones.contains(id) {
+            dropped += 1;
+            continue;
+        }
+        let vector = base_vectors
+            .fetch(id)
+            .map_err(BucketError::Io)?
+            .ok_or_else(|| BucketError::Other(format!("compact: base vector missing for {id}")))?;
+        let chunk = old
+            .fetch_chunk_any(id)
+            .map_err(BucketError::Io)?
+            .ok_or_else(|| BucketError::Other(format!("compact: chunk text missing for {id}")))?;
+        chunk_writer
+            .append(id, &chunk.source_ref, &chunk.text)
+            .map_err(BucketError::Io)?;
+        vector_writer.append(id, &vector).map_err(BucketError::Io)?;
+        if let Some(b) = sparse_builder.as_mut() {
+            b.add(id, &chunk.text)?;
+        }
+        dense.insert(id, surviving, &vector);
+        surviving += 1;
+    }
+
+    // Walk delta if present.
+    let delta_vectors_bin = slot::delta_vectors_bin_path(old_slot_path);
+    let delta_vectors_idx = slot::delta_vectors_idx_path(old_slot_path);
+    let delta_chunks_bin = slot::delta_chunks_bin_path(old_slot_path);
+    let delta_chunks_idx = slot::delta_chunks_idx_path(old_slot_path);
+    if delta_vectors_bin.exists() && delta_vectors_idx.exists() {
+        let delta_vectors =
+            VectorStoreReader::open_with_mode(&delta_vectors_bin, &delta_vectors_idx, load_mode)
+                .map_err(BucketError::Io)?;
+        let delta_chunks =
+            ChunkStoreReader::open_with_mode(&delta_chunks_bin, &delta_chunks_idx, load_mode)
+                .map_err(BucketError::Io)?;
+        for (id, _pos) in delta_vectors.iter_chunk_positions() {
+            if cancel.is_cancelled() {
+                return Err(BucketError::Cancelled);
+            }
+            if tombstones.contains(id) {
+                dropped += 1;
+                continue;
+            }
+            let vector = delta_vectors
+                .fetch(id)
+                .map_err(BucketError::Io)?
+                .ok_or_else(|| {
+                    BucketError::Other(format!("compact: delta vector missing for {id}"))
+                })?;
+            let chunk = delta_chunks
+                .fetch(id)
+                .map_err(BucketError::Io)?
+                .ok_or_else(|| {
+                    BucketError::Other(format!("compact: delta chunk text missing for {id}"))
+                })?;
+            chunk_writer
+                .append(id, &chunk.source_ref, &chunk.text)
+                .map_err(BucketError::Io)?;
+            vector_writer.append(id, &vector).map_err(BucketError::Io)?;
+            if let Some(b) = sparse_builder.as_mut() {
+                b.add(id, &chunk.text)?;
+            }
+            dense.insert(id, surviving, &vector);
+            surviving += 1;
+        }
+    }
+
+    chunk_writer.flush().map_err(BucketError::Io)?;
+    chunk_writer.finalize().map_err(BucketError::Io)?;
+    vector_writer.flush().map_err(BucketError::Io)?;
+    vector_writer.finalize().map_err(BucketError::Io)?;
+    if let Some(b) = sparse_builder {
+        b.finalize()?;
+    }
+
+    // Dump the freshly built HNSW so the next slot load can use the
+    // fast `load_from` path. Failure to dump is logged but not fatal
+    // — load_slot will rebuild from `vectors.bin`.
+    if let Err(e) = dense.dump_to(new_slot_path) {
+        tracing::warn!(
+            slot = %new_slot_id,
+            error = %e,
+            "post-compact hnsw dump failed; next open will rebuild from vectors.bin",
+        );
+    }
+
+    // Manifest for the compacted slot — reuses the old slot's frozen
+    // chunker/embedder/sparse/serving snapshots, fresh stats, and
+    // sets `lineage` so we can trace back to the source slot.
+    let now = chrono::Utc::now();
+    let manifest = SlotManifest {
+        slot_id: new_slot_id.clone(),
+        state: SlotState::Ready,
+        created_at: now,
+        build_started_at: Some(now),
+        build_completed_at: Some(now),
+        chunker_snapshot: old.manifest.chunker_snapshot.clone(),
+        embedder: old.manifest.embedder.clone(),
+        sparse: old.manifest.sparse.clone(),
+        serving: old.manifest.serving.clone(),
+        stats: SlotStats {
+            source_records: 0,
+            chunk_count: surviving,
+            vector_count: surviving,
+            delta_chunk_count: 0,
+            tombstone_count: 0,
+            disk_size_bytes: total_dir_size(new_slot_path).unwrap_or(0),
+            ram_size_bytes: 0,
+        },
+        lineage: Some(super::manifest::SlotLineage {
+            prior_slot: old.manifest.slot_id.clone(),
+            compacted_at: now,
+            compaction_dropped_chunks: dropped,
+        }),
+    };
+    write_manifest(new_slot_path, &manifest)?;
+    Ok(())
 }
 
 /// Construct fresh writers + bundle into [`BuildHandles`] for the
@@ -2738,15 +2973,200 @@ embedder = "tei_test"
     }
 
     #[tokio::test]
-    async fn compact_still_errors_until_indexes_land() {
+    async fn compact_errors_when_no_active_slot() {
         let tmp = tempfile::tempdir().unwrap();
         let source = tmp.path().join("notes");
         fs::create_dir_all(&source).unwrap();
-
         let bucket_root = tmp.path().join("bucket");
         let bucket = open_test_bucket(&bucket_root, &source);
         let cancel = CancellationToken::new();
-        assert!(bucket.compact(&cancel).await.is_err());
+        let err = bucket.compact(&cancel).await.unwrap_err();
+        assert!(matches!(err, BucketError::NoActiveSlot(_)), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn compact_with_no_delta_no_tombstones_produces_fresh_slot_with_lineage() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("notes");
+        fs::create_dir_all(&source).unwrap();
+        write_md(&source, "alpha.md", "alpha solitary phrase");
+        write_md(&source, "beta.md", "beta solitary phrase");
+
+        let bucket_root = tmp.path().join("bucket");
+        let bucket = open_test_bucket(&bucket_root, &source);
+        let adapter = MarkdownDir::new(&source);
+        let (chunker, chunker_snapshot) = TokenBasedChunker::from_config(&bucket.config().chunker);
+        let embedder: Arc<dyn EmbeddingProvider> = Arc::new(MockEmbedder::new(8));
+        let cancel = CancellationToken::new();
+        bucket
+            .build_slot(
+                &adapter,
+                &chunker,
+                chunker_snapshot,
+                embedder,
+                None,
+                &cancel,
+            )
+            .await
+            .unwrap();
+        let original_slot_id = bucket.active_slot_id().unwrap();
+
+        bucket.compact(&cancel).await.unwrap();
+
+        let new_slot_id = bucket.active_slot_id().unwrap();
+        assert_ne!(
+            new_slot_id, original_slot_id,
+            "compact should swap to a new slot id",
+        );
+
+        // Both docs still queryable.
+        let hits = bucket.sparse_search("alpha", 5, &cancel).await.unwrap();
+        assert_eq!(hits.len(), 1);
+        assert!(hits[0].chunk_text.contains("alpha"));
+        let hits = bucket.sparse_search("beta", 5, &cancel).await.unwrap();
+        assert_eq!(hits.len(), 1);
+
+        // Lineage manifest points back at the original slot.
+        let new_manifest_path = slot::manifest_path(&slot::slot_dir(&bucket_root, &new_slot_id));
+        let toml = fs::read_to_string(&new_manifest_path).unwrap();
+        let manifest = SlotManifest::from_toml_str(&toml).unwrap();
+        let lineage = manifest.lineage.expect("expected lineage");
+        assert_eq!(lineage.prior_slot, original_slot_id);
+        assert_eq!(lineage.compaction_dropped_chunks, 0);
+        assert_eq!(manifest.stats.tombstone_count, 0);
+        assert_eq!(manifest.stats.delta_chunk_count, 0);
+    }
+
+    #[tokio::test]
+    async fn compact_drops_tombstoned_and_keeps_inserted_chunks() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("notes");
+        fs::create_dir_all(&source).unwrap();
+        write_md(&source, "alpha.md", "alpha solitary phrase");
+        write_md(&source, "beta.md", "beta solitary phrase");
+        write_md(&source, "gamma.md", "gamma solitary phrase");
+
+        let bucket_root = tmp.path().join("bucket");
+        let bucket = open_test_bucket(&bucket_root, &source);
+        let adapter = MarkdownDir::new(&source);
+        let (chunker, chunker_snapshot) = TokenBasedChunker::from_config(&bucket.config().chunker);
+        let embedder: Arc<dyn EmbeddingProvider> = Arc::new(MockEmbedder::new(8));
+        let cancel = CancellationToken::new();
+        bucket
+            .build_slot(
+                &adapter,
+                &chunker,
+                chunker_snapshot,
+                embedder.clone(),
+                None,
+                &cancel,
+            )
+            .await
+            .unwrap();
+        bucket.set_embedder(embedder);
+
+        // Tombstone "alpha".
+        let alpha_hits = bucket.sparse_search("alpha", 5, &cancel).await.unwrap();
+        assert_eq!(alpha_hits.len(), 1);
+        let alpha_id = alpha_hits[0].chunk_id;
+        bucket.tombstone(vec![alpha_id]).await.unwrap();
+
+        // Insert a fresh chunk via the delta layer.
+        let inserted_text = "delta-only fresh chunk distinctword";
+        let inserted_ids = bucket
+            .insert(
+                vec![NewChunk {
+                    text: inserted_text.to_string(),
+                    source_ref: crate::knowledge::SourceRef {
+                        source_id: "test".to_string(),
+                        locator: None,
+                    },
+                    source_record_hash: [0xCD; 32],
+                    chunk_offset: 0,
+                }],
+                &cancel,
+            )
+            .await
+            .unwrap();
+        assert_eq!(inserted_ids.len(), 1);
+        let inserted_id = inserted_ids[0];
+
+        // Compact.
+        bucket.compact(&cancel).await.unwrap();
+
+        // Tombstoned chunk gone.
+        let alpha_after = bucket.sparse_search("alpha", 5, &cancel).await.unwrap();
+        assert!(
+            alpha_after.iter().all(|c| c.chunk_id != alpha_id),
+            "tombstoned chunk survived compact: {alpha_after:?}",
+        );
+
+        // Inserted (delta) chunk preserved with same id.
+        let delta_after = bucket
+            .sparse_search("distinctword", 5, &cancel)
+            .await
+            .unwrap();
+        assert_eq!(delta_after.len(), 1);
+        assert_eq!(delta_after[0].chunk_id, inserted_id);
+
+        // Surviving base chunks preserved.
+        let beta = bucket.sparse_search("beta", 5, &cancel).await.unwrap();
+        assert_eq!(beta.len(), 1);
+        let gamma = bucket.sparse_search("gamma", 5, &cancel).await.unwrap();
+        assert_eq!(gamma.len(), 1);
+
+        // Manifest reports the dropped count.
+        let new_slot_id = bucket.active_slot_id().unwrap();
+        let toml = fs::read_to_string(slot::manifest_path(&slot::slot_dir(
+            &bucket_root,
+            &new_slot_id,
+        )))
+        .unwrap();
+        let manifest = SlotManifest::from_toml_str(&toml).unwrap();
+        assert_eq!(manifest.lineage.unwrap().compaction_dropped_chunks, 1);
+        assert_eq!(manifest.stats.chunk_count, 3); // beta + gamma + inserted
+        assert_eq!(manifest.stats.tombstone_count, 0);
+        assert_eq!(manifest.stats.delta_chunk_count, 0);
+    }
+
+    #[tokio::test]
+    async fn compact_survives_bucket_reopen() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("notes");
+        fs::create_dir_all(&source).unwrap();
+        write_md(&source, "alpha.md", "alpha base content");
+
+        let bucket_root = tmp.path().join("bucket");
+        let post_compact_slot_id = {
+            let bucket = open_test_bucket(&bucket_root, &source);
+            let adapter = MarkdownDir::new(&source);
+            let (chunker, chunker_snapshot) =
+                TokenBasedChunker::from_config(&bucket.config().chunker);
+            let embedder: Arc<dyn EmbeddingProvider> = Arc::new(MockEmbedder::new(8));
+            let cancel = CancellationToken::new();
+            bucket
+                .build_slot(
+                    &adapter,
+                    &chunker,
+                    chunker_snapshot,
+                    embedder,
+                    None,
+                    &cancel,
+                )
+                .await
+                .unwrap();
+            bucket.compact(&cancel).await.unwrap();
+            bucket.active_slot_id().unwrap()
+        };
+
+        let reopened = DiskBucket::open(&bucket_root, BucketId::pod("notes")).unwrap();
+        assert_eq!(
+            reopened.active_slot_id().as_deref(),
+            Some(post_compact_slot_id.as_str())
+        );
+        let cancel = CancellationToken::new();
+        let hits = reopened.sparse_search("alpha", 5, &cancel).await.unwrap();
+        assert_eq!(hits.len(), 1);
     }
 
     #[tokio::test]
