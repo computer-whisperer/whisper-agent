@@ -1039,15 +1039,10 @@ impl DiskBucket {
         if !install_during_build {
             return Ok(());
         }
-        // Build the live chunks reader from the writer's snapshot.
-        let chunks_bin = slot::chunks_bin_path(slot_path);
-        let snapshot = chunk_writer.snapshot_index();
-        let chunks_reader = Arc::new(
-            ChunkStoreReader::open_with_map(&chunks_bin, snapshot).map_err(BucketError::Io)?,
-        );
-        // Reload sparse if the bucket has it — tantivy commits per
-        // batch already (Commit B), so re-opening picks up the
-        // freshest committed segments.
+
+        // Tantivy doesn't expose a live-segment view, so on every
+        // call we re-open the index to pick up the latest committed
+        // segments from this batch.
         let sparse_reader = if self.config.search_paths.sparse.enabled {
             let tantivy_dir = slot::tantivy_dir(slot_path);
             Some(Arc::new(SparseIndex::open(&tantivy_dir)?))
@@ -1056,8 +1051,18 @@ impl DiskBucket {
         };
 
         match active_during_build {
-            // First batch — construct + install.
+            // First batch — construct + install. The chunks reader
+            // shares the writer's index Arc, so subsequent appends
+            // become visible automatically; we never replace it.
             None => {
+                let chunks_bin = slot::chunks_bin_path(slot_path);
+                let chunks_reader = Arc::new(
+                    ChunkStoreReader::open_with_shared_index(
+                        &chunks_bin,
+                        chunk_writer.share_index(),
+                    )
+                    .map_err(BucketError::Io)?,
+                );
                 let slot = Arc::new(LoadedSlot {
                     manifest: manifest.clone(),
                     chunks: RwLock::new(chunks_reader),
@@ -1071,17 +1076,11 @@ impl DiskBucket {
                 }
                 *active_during_build = Some(slot);
             }
-            // Subsequent batches — update the existing slot's
-            // chunks + sparse readers in place. dense is shared
-            // and grows automatically via flush_batch's insert.
+            // Subsequent batches — chunks reader sees new entries
+            // through the shared index, dense graph grows in place,
+            // only sparse needs a fresh reader to see the latest
+            // committed tantivy segments.
             Some(slot) => {
-                {
-                    let mut chunks_lock = slot
-                        .chunks
-                        .write()
-                        .expect("LoadedSlot.chunks lock poisoned");
-                    *chunks_lock = chunks_reader;
-                }
                 if let (Some(new), Some(lock)) = (sparse_reader, slot.sparse.as_ref()) {
                     let mut sparse_lock = lock.write().expect("LoadedSlot.sparse lock poisoned");
                     *sparse_lock = new;

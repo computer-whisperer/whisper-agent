@@ -18,9 +18,14 @@ use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex, RwLock};
 
 use super::types::{Chunk, ChunkId, SourceRef};
+
+/// Shared id→offset index. The writer mutates it on `append`; readers
+/// take read locks on `fetch`. Cloning the [`Arc`] is what gives a
+/// live-view reader during a build — no map copy required.
+pub type SharedChunkIndex = Arc<RwLock<HashMap<ChunkId, u64>>>;
 
 /// Format-version byte at the head of every record. Bump if the record
 /// layout changes; the reader rejects unknown versions explicitly.
@@ -50,14 +55,18 @@ const RECORD_VERSION: u8 = 1;
 // the in-memory HashMap doesn't depend on the order, but stable on-disk
 // output makes byte-for-byte comparison useful in tests and audits.
 
-/// Streams chunks into `chunks.bin` during a build, accumulates the
-/// `(chunk_id, offset)` pairs, and writes `chunks.idx` on
+/// Streams chunks into `chunks.bin` during a build, maintains the
+/// shared id→offset index, and writes the sorted `chunks.idx` on
 /// [`finalize`](Self::finalize).
+///
+/// The index ([`SharedChunkIndex`]) is grown in place on `append` and
+/// can be cloned out via [`Self::share_index`] for a live reader
+/// during the build. No per-batch snapshot copy.
 #[derive(Debug)]
 pub struct ChunkStoreWriter {
     bin: BufWriter<File>,
     idx_path: PathBuf,
-    entries: Vec<(ChunkId, u64)>,
+    index: SharedChunkIndex,
     cursor: u64,
 }
 
@@ -67,16 +76,16 @@ impl ChunkStoreWriter {
         Ok(Self {
             bin: BufWriter::new(file),
             idx_path: idx_path.to_path_buf(),
-            entries: Vec::new(),
+            index: Arc::new(RwLock::new(HashMap::new())),
             cursor: 0,
         })
     }
 
     /// Reopen an existing `chunks.bin` for resumed appending. Truncates
     /// the file to `record_offsets.last()` (the byte offset just past
-    /// the last record we want to keep), seeds the in-memory entries
-    /// list from `chunk_ids` paired with `record_offsets[..len-1]`, and
-    /// opens the file in append mode for further writes.
+    /// the last record we want to keep), seeds the shared index from
+    /// `chunk_ids` paired with `record_offsets[..len-1]`, and opens
+    /// the file in append mode for further writes.
     ///
     /// Caller invariants:
     /// - `chunk_ids.len() == record_offsets.len() - 1` (one offset per
@@ -112,21 +121,24 @@ impl ChunkStoreWriter {
         drop(truncate);
 
         let file = OpenOptions::new().append(true).open(bin_path)?;
-        let entries: Vec<(ChunkId, u64)> = chunk_ids
+        let mut map = HashMap::with_capacity(chunk_ids.len());
+        for (id, off) in chunk_ids
             .iter()
             .copied()
             .zip(record_offsets[..chunk_ids.len()].iter().copied())
-            .collect();
+        {
+            map.insert(id, off);
+        }
         Ok(Self {
             bin: BufWriter::new(file),
             idx_path: idx_path.to_path_buf(),
-            entries,
+            index: Arc::new(RwLock::new(map)),
             cursor,
         })
     }
 
-    /// Append a chunk and record its offset for the index. Returns the
-    /// offset where the record was written.
+    /// Append a chunk and record its offset in the shared index.
+    /// Returns the offset where the record was written.
     pub fn append(
         &mut self,
         chunk_id: ChunkId,
@@ -136,14 +148,17 @@ impl ChunkStoreWriter {
         let offset = self.cursor;
         let written = write_record(&mut self.bin, source_ref, text)?;
         self.cursor += written;
-        self.entries.push((chunk_id, offset));
+        self.index
+            .write()
+            .expect("ChunkStoreWriter index lock poisoned")
+            .insert(chunk_id, offset);
         Ok(offset)
     }
 
     /// Flush buffered writes to the underlying file and `sync_data`.
-    /// Live readers opened via [`ChunkStoreReader::open_with_map`]
-    /// only see data that's flushed to disk, so the build path calls
-    /// this at every batch boundary as part of the durability
+    /// Live readers opened via [`ChunkStoreReader::open_with_shared_index`]
+    /// only see record bytes that have been flushed; the build path
+    /// calls this at every batch boundary as part of the durability
     /// barrier.
     pub fn flush(&mut self) -> io::Result<()> {
         self.bin.flush()?;
@@ -151,20 +166,25 @@ impl ChunkStoreWriter {
         Ok(())
     }
 
-    /// Snapshot the current `(chunk_id, offset)` entries as a map
-    /// for live-view readers during an in-progress build. The map
-    /// is owned (cloned out of the writer's internal vec) so the
-    /// reader can outlive subsequent appends.
-    pub fn snapshot_index(&self) -> HashMap<ChunkId, u64> {
-        self.entries.iter().copied().collect()
+    /// Clone the shared index handle for a live-view reader. Subsequent
+    /// `append` calls grow the same map; the reader sees them as soon
+    /// as the write lock is released. No per-batch copy.
+    pub fn share_index(&self) -> SharedChunkIndex {
+        Arc::clone(&self.index)
     }
 
     pub fn len(&self) -> usize {
-        self.entries.len()
+        self.index
+            .read()
+            .expect("ChunkStoreWriter index lock poisoned")
+            .len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
+        self.index
+            .read()
+            .expect("ChunkStoreWriter index lock poisoned")
+            .is_empty()
     }
 
     /// Flush `chunks.bin` and write `chunks.idx`. Returns the number of
@@ -175,15 +195,23 @@ impl ChunkStoreWriter {
         // open the next file — helps on Windows; harmless on Unix.
         drop(self.bin);
 
-        self.entries.sort_by_key(|(id, _)| *id);
+        // Collect into a Vec to sort. Live readers may still be holding
+        // an Arc clone; we don't mutate the map here, just iterate.
+        let map = self
+            .index
+            .read()
+            .expect("ChunkStoreWriter index lock poisoned");
+        let mut entries: Vec<(ChunkId, u64)> = map.iter().map(|(k, v)| (*k, *v)).collect();
+        drop(map);
+        entries.sort_by_key(|(id, _)| *id);
         let mut idx = BufWriter::new(File::create(&self.idx_path)?);
-        idx.write_all(&(self.entries.len() as u64).to_le_bytes())?;
-        for (id, offset) in &self.entries {
+        idx.write_all(&(entries.len() as u64).to_le_bytes())?;
+        for (id, offset) in &entries {
             idx.write_all(&id.0)?;
             idx.write_all(&offset.to_le_bytes())?;
         }
         idx.flush()?;
-        Ok(self.entries.len())
+        Ok(entries.len())
     }
 }
 
@@ -215,13 +243,19 @@ fn write_record<W: Write>(w: &mut W, source_ref: &SourceRef, text: &str) -> io::
 
 /// Random-access reader for `chunks.bin` / `chunks.idx`.
 ///
-/// `Send + Sync`. Concurrent fetches serialize through an internal Mutex
-/// for the file handle (one seek + one read per fetch). Cheap at slice
-/// 3's scales; revisit (mmap or `pread`) if measurements show contention.
+/// `Send + Sync`. The id→offset index is held behind an [`Arc`] +
+/// [`RwLock`] so a reader constructed via
+/// [`Self::open_with_shared_index`] sees writer appends live (without
+/// a per-batch index copy). For fully-built slots the reader owns its
+/// own index, but the type stays the same for uniformity.
+///
+/// File-handle access serializes through an internal [`Mutex`] (one
+/// seek + one read per fetch). Cheap at slice 3's scales; revisit
+/// (mmap or `pread`) if measurements show contention.
 #[derive(Debug)]
 pub struct ChunkStoreReader {
     bin: Mutex<File>,
-    index: HashMap<ChunkId, u64>,
+    index: SharedChunkIndex,
 }
 
 impl ChunkStoreReader {
@@ -230,20 +264,16 @@ impl ChunkStoreReader {
         let index = read_idx(idx_path)?;
         Ok(Self {
             bin: Mutex::new(bin),
-            index,
+            index: Arc::new(RwLock::new(index)),
         })
     }
 
-    /// Open a live-view reader over `chunks.bin` using a caller-
-    /// supplied index map. Used during in-progress builds when
-    /// `chunks.idx` doesn't yet exist — the build path snapshots
-    /// the writer's in-memory index and constructs a reader that
-    /// can answer queries against the bytes flushed so far.
-    ///
-    /// The map is consumed (moved into the reader); subsequent
-    /// build appends produce a new snapshot via
-    /// [`ChunkStoreWriter::snapshot_index`].
-    pub fn open_with_map(bin_path: &Path, index: HashMap<ChunkId, u64>) -> io::Result<Self> {
+    /// Open a live-view reader over `chunks.bin` sharing an
+    /// in-progress writer's index. Used during a build when
+    /// `chunks.idx` doesn't yet exist; the build path obtains the
+    /// shared index via [`ChunkStoreWriter::share_index`] and the
+    /// reader sees subsequent appends through the same Arc.
+    pub fn open_with_shared_index(bin_path: &Path, index: SharedChunkIndex) -> io::Result<Self> {
         let bin = File::open(bin_path)?;
         Ok(Self {
             bin: Mutex::new(bin),
@@ -252,21 +282,39 @@ impl ChunkStoreReader {
     }
 
     pub fn len(&self) -> usize {
-        self.index.len()
+        self.index
+            .read()
+            .expect("ChunkStoreReader index lock poisoned")
+            .len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.index.is_empty()
+        self.index
+            .read()
+            .expect("ChunkStoreReader index lock poisoned")
+            .is_empty()
     }
 
     pub fn contains(&self, chunk_id: ChunkId) -> bool {
-        self.index.contains_key(&chunk_id)
+        self.index
+            .read()
+            .expect("ChunkStoreReader index lock poisoned")
+            .contains_key(&chunk_id)
     }
 
     /// Fetch a chunk by id. Returns `Ok(None)` when the chunk isn't in
     /// the index; `Err` for IO or format errors during the read.
     pub fn fetch(&self, chunk_id: ChunkId) -> io::Result<Option<Chunk>> {
-        let Some(&offset) = self.index.get(&chunk_id) else {
+        // Briefly hold the read lock just for the lookup; release
+        // before any I/O so concurrent appends aren't blocked on us.
+        let offset = {
+            let map = self
+                .index
+                .read()
+                .expect("ChunkStoreReader index lock poisoned");
+            map.get(&chunk_id).copied()
+        };
+        let Some(offset) = offset else {
             return Ok(None);
         };
 
@@ -669,6 +717,46 @@ mod tests {
         let id = ChunkId::from_source(&[1; 32], 0);
         let err = ChunkStoreWriter::open_resume(&bin, &idx, &[id], &[0]).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn shared_index_reader_sees_writer_appends_live() {
+        // The whole point of share_index / open_with_shared_index:
+        // a reader constructed once at the start of a build observes
+        // writer.append() results without any per-batch index copy.
+        let tmp = tempfile::tempdir().unwrap();
+        let bin = tmp.path().join("chunks.bin");
+        let idx = tmp.path().join("chunks.idx");
+
+        let mut w = ChunkStoreWriter::create(&bin, &idx).unwrap();
+
+        // Append the first record + flush so its bytes are on disk.
+        let id_a = ChunkId::from_source(&[1; 32], 0);
+        w.append(id_a, &sref("a.md", None), "alpha").unwrap();
+        w.flush().unwrap();
+
+        // Open the live-view reader. Sharing happens here.
+        let r = ChunkStoreReader::open_with_shared_index(&bin, w.share_index()).unwrap();
+        assert_eq!(r.len(), 1);
+        assert_eq!(r.fetch(id_a).unwrap().unwrap().text, "alpha");
+
+        // Append more records and flush. The reader sees them
+        // through the same Arc — no re-construction.
+        let id_b = ChunkId::from_source(&[2; 32], 0);
+        let id_c = ChunkId::from_source(&[3; 32], 0);
+        w.append(id_b, &sref("b.md", None), "beta").unwrap();
+        w.append(id_c, &sref("c.md", None), "gamma").unwrap();
+        w.flush().unwrap();
+
+        assert_eq!(r.len(), 3);
+        assert_eq!(r.fetch(id_b).unwrap().unwrap().text, "beta");
+        assert_eq!(r.fetch(id_c).unwrap().unwrap().text, "gamma");
+
+        // Finalize doesn't break the live reader (it still holds an
+        // Arc into the same map). The map is read-only post-finalize.
+        let n = w.finalize().unwrap();
+        assert_eq!(n, 3);
+        assert_eq!(r.fetch(id_a).unwrap().unwrap().text, "alpha");
     }
 
     #[test]
