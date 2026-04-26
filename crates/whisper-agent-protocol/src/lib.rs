@@ -860,12 +860,17 @@ pub struct BucketCreateInput {
 
 /// Coarse phase tag emitted by `BucketBuildProgress`. The build pipeline
 /// has more sub-stages internally (per-batch embed calls, vector store
-/// flushes); this rolls them into the three the UI actually wants to
-/// distinguish — long streaming phase, the dominant HNSW build, then the
-/// quick finalize-and-promote tail.
+/// flushes); this rolls them into the four the UI actually wants to
+/// distinguish — record enumeration, the long streaming phase, the
+/// dominant HNSW build, then the quick finalize-and-promote tail.
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum BucketBuildPhase {
+    /// Walking the source, hashing each record, recording `Planned`
+    /// entries in `build.state`. Cheap relative to `Indexing`;
+    /// produces the record-count total that makes the indexing
+    /// progress bar meaningful.
+    Planning,
     /// Source → chunks → embed → write. `chunks` ticks up here.
     Indexing,
     /// HNSW graph build over the just-written vectors. The single

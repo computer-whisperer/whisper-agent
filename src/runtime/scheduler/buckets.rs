@@ -615,17 +615,19 @@ struct ProgressSnapshot {
 
 fn phase_to_u8(p: BuildPhase) -> u8 {
     match p {
-        BuildPhase::Indexing => 0,
-        BuildPhase::BuildingDense => 1,
-        BuildPhase::Finalizing => 2,
+        BuildPhase::Planning => 0,
+        BuildPhase::Indexing => 1,
+        BuildPhase::BuildingDense => 2,
+        BuildPhase::Finalizing => 3,
     }
 }
 
 fn phase_from_u8(b: u8) -> BucketBuildPhase {
     match b {
-        1 => BucketBuildPhase::BuildingDense,
-        2 => BucketBuildPhase::Finalizing,
-        _ => BucketBuildPhase::Indexing,
+        1 => BucketBuildPhase::Indexing,
+        2 => BucketBuildPhase::BuildingDense,
+        3 => BucketBuildPhase::Finalizing,
+        _ => BucketBuildPhase::Planning,
     }
 }
 

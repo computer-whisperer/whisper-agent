@@ -23,6 +23,7 @@ use std::sync::{Arc, RwLock};
 use tokio_util::sync::CancellationToken;
 
 use super::bucket::{BoxFuture, Bucket};
+use super::build_state::{BuildStateRecord, BuildStateWriter};
 use super::chunker::Chunker;
 use super::chunks::{ChunkStoreReader, ChunkStoreWriter};
 use super::config::{BucketConfig, ChunkerConfig};
@@ -52,8 +53,19 @@ const EMBED_BATCH_SIZE: usize = 128;
 /// Coarse build-stage tag passed to [`BuildObserver::on_phase`]. Mirrors
 /// the wire-side `BucketBuildPhase` so the scheduler can pass these
 /// through unmodified.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// `serde` is derived so the same enum can be embedded in `build.state`
+/// records without a parallel definition. Variant names are
+/// snake-cased on the wire to match the wire enum's serialization.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum BuildPhase {
+    /// Walking the source adapter, hashing each record, and writing
+    /// `Planned` entries to `build.state`. Cheap relative to embedding
+    /// (minutes for full wikipedia); produces the record-count
+    /// denominator that lets the UI estimate completion during
+    /// `Indexing`.
+    Planning,
     /// Streaming source → chunks → embeds → writers. The long-tail of
     /// `Indexing` is dominated by embedder round-trips on real provider
     /// runs, by chunker work on the mock embedder.
@@ -166,13 +178,13 @@ impl DiskBucket {
             None
         };
 
-        // Initial manifest with state=Building. Persisted before any
+        // Initial manifest with state=Planning. Persisted before any
         // heavy work so a crash mid-build leaves a slot directory we
-        // can identify and clean up on next open.
+        // can identify (and resume from, in Commit B) on next open.
         let now = chrono::Utc::now();
         let mut manifest = SlotManifest {
             slot_id: slot_id.clone(),
-            state: SlotState::Building,
+            state: SlotState::Planning,
             created_at: now,
             build_started_at: Some(now),
             build_completed_at: None,
@@ -186,6 +198,46 @@ impl DiskBucket {
             stats: SlotStats::default(),
             lineage: None,
         };
+        write_manifest(&slot_path, &manifest)?;
+
+        // Append-only resume log. Created here even on first build so
+        // the file is in place from the start; resume code (Commit B)
+        // reads it back to find the last durable checkpoint.
+        let build_state_path = slot_path.join(slot::BUILD_STATE);
+        let mut build_state =
+            BuildStateWriter::create_or_open(&build_state_path).map_err(BucketError::Io)?;
+
+        // --- Phase: Planning ---
+        // Walk the source once to enumerate records and write Planned
+        // entries with content_hash. Chunking happens in the next phase.
+        // The two-pass design gives us a record-count denominator before
+        // any embedding starts, and it gives the resume path a stable
+        // record list to drift-check against.
+        publish_phase(BuildPhase::Planning, observer, &mut build_state)?;
+        let mut source_records: u64 = 0;
+        for record in adapter.enumerate() {
+            if cancel.is_cancelled() {
+                return Err(BucketError::Cancelled);
+            }
+            let record = record.map_err(|e| BucketError::Other(format!("source error: {e}")))?;
+            build_state
+                .append(&BuildStateRecord::Planned {
+                    source_id: record.source_id.clone(),
+                    content_hash: record.content_hash,
+                })
+                .map_err(BucketError::Io)?;
+            source_records += 1;
+            if let Some(obs) = observer {
+                obs.on_progress(source_records, 0);
+            }
+        }
+
+        // Promote manifest to Building once planning is done. Writing
+        // here (rather than at the very start of build_slot) lets the
+        // resume code distinguish "planning was interrupted, redo it"
+        // (state=Planning) from "planning finished, embedding was
+        // interrupted" (state=Building).
+        manifest.state = SlotState::Building;
         write_manifest(&slot_path, &manifest)?;
 
         // Open writers.
@@ -206,47 +258,58 @@ impl DiskBucket {
             None
         };
 
-        // Streaming pipeline: source → chunker → batched embed → all
-        // three writers (chunks, vectors, tantivy). We batch chunks (not
-        // records) because record sizes vary; batching at the chunk
-        // level keeps embed calls predictable.
+        // --- Phase: Indexing ---
+        // Walk the source again, this time chunking + embedding each
+        // record. Buffer all chunks for one record, then flush at the
+        // record boundary if the buffer has reached batch size. This
+        // keeps the resume granularity at "completed records" — every
+        // BatchEmbedded checkpoint corresponds to a count of fully
+        // embedded records, never a record split across batches.
+        publish_phase(BuildPhase::Indexing, observer, &mut build_state)?;
         let mut pending: Vec<NewChunk> = Vec::with_capacity(EMBED_BATCH_SIZE);
-        let mut source_records: u64 = 0;
+        let mut records_completed: u64 = 0;
         let mut chunks_emitted: u64 = 0;
-
-        if let Some(obs) = observer {
-            obs.on_phase(BuildPhase::Indexing);
-        }
+        let mut batch_index: u64 = 0;
 
         for record in adapter.enumerate() {
             if cancel.is_cancelled() {
                 return Err(BucketError::Cancelled);
             }
             let record = record.map_err(|e| BucketError::Other(format!("source error: {e}")))?;
-            source_records += 1;
 
             for new_chunk in chunker.chunk(&record) {
                 pending.push(new_chunk);
-                if pending.len() >= EMBED_BATCH_SIZE {
-                    let flushed = pending.len() as u64;
-                    flush_batch(
-                        &mut pending,
-                        &mut chunk_writer,
-                        &mut vector_writer,
-                        sparse_builder.as_mut(),
-                        embedder.as_ref(),
-                        cancel,
-                    )
-                    .await?;
-                    chunks_emitted += flushed;
-                    if let Some(obs) = observer {
-                        obs.on_progress(source_records, chunks_emitted);
-                    }
+            }
+            records_completed += 1;
+
+            if pending.len() >= EMBED_BATCH_SIZE {
+                let flushed = pending.len() as u64;
+                flush_batch(
+                    &mut pending,
+                    &mut chunk_writer,
+                    &mut vector_writer,
+                    sparse_builder.as_mut(),
+                    embedder.as_ref(),
+                    cancel,
+                )
+                .await?;
+                chunks_emitted += flushed;
+                build_state
+                    .append(&BuildStateRecord::BatchEmbedded {
+                        batch_index,
+                        source_records_completed: records_completed,
+                        chunks_completed: chunks_emitted,
+                    })
+                    .map_err(BucketError::Io)?;
+                batch_index += 1;
+                if let Some(obs) = observer {
+                    obs.on_progress(records_completed, chunks_emitted);
                 }
             }
         }
 
-        // Final partial batch.
+        // Final partial batch — same record-boundary discipline; this
+        // is just the trailing records that didn't fill a full batch.
         if !pending.is_empty() {
             let flushed = pending.len() as u64;
             flush_batch(
@@ -259,8 +322,15 @@ impl DiskBucket {
             )
             .await?;
             chunks_emitted += flushed;
+            build_state
+                .append(&BuildStateRecord::BatchEmbedded {
+                    batch_index,
+                    source_records_completed: records_completed,
+                    chunks_completed: chunks_emitted,
+                })
+                .map_err(BucketError::Io)?;
             if let Some(obs) = observer {
-                obs.on_progress(source_records, chunks_emitted);
+                obs.on_progress(records_completed, chunks_emitted);
             }
         }
 
@@ -290,6 +360,7 @@ impl DiskBucket {
         let vectors =
             VectorStoreReader::open(&vectors_bin, &vectors_idx).map_err(BucketError::Io)?;
 
+        // --- Phase: BuildingDense ---
         // Build the dense index from the just-written vectors and
         // dump it to disk so the next slot open can skip the rebuild.
         // The HNSW build is the dominant cost on real-scale runs (~7
@@ -299,9 +370,7 @@ impl DiskBucket {
         // is non-fatal — the slot is still usable (load_slot's
         // fallback rebuilds), so we log and continue rather than
         // tearing down the build.
-        if let Some(obs) = observer {
-            obs.on_phase(BuildPhase::BuildingDense);
-        }
+        publish_phase(BuildPhase::BuildingDense, observer, &mut build_state)?;
         let slot_path_for_dump = slot_path.clone();
         let slot_id_for_warn = slot_id.clone();
         let (dense, vectors) = tokio::task::spawn_blocking(move || {
@@ -318,9 +387,8 @@ impl DiskBucket {
         .await
         .map_err(|e| BucketError::Other(format!("spawn_blocking dense build: {e}")))??;
 
-        if let Some(obs) = observer {
-            obs.on_phase(BuildPhase::Finalizing);
-        }
+        // --- Phase: Finalizing ---
+        publish_phase(BuildPhase::Finalizing, observer, &mut build_state)?;
 
         // Open the sparse index reader if we built one.
         let sparse = if sparse_enabled {
@@ -353,6 +421,12 @@ impl DiskBucket {
             let mut active = self.active.write().expect("active slot lock poisoned");
             *active = Some(loaded);
         }
+
+        // Final build.state record. Resume code looks for this to
+        // distinguish "build finished" from "build was interrupted".
+        build_state
+            .append(&BuildStateRecord::BuildCompleted)
+            .map_err(BucketError::Io)?;
 
         Ok(slot_id)
     }
@@ -546,6 +620,24 @@ impl Bucket for DiskBucket {
 }
 
 // --- helpers ---
+
+/// Notify the observer of a phase transition and append the matching
+/// `PhaseChanged` record to `build.state`. The pair is published
+/// together so the live UI signal and the resume log can never disagree
+/// on what phase is current.
+fn publish_phase(
+    phase: BuildPhase,
+    observer: Option<&dyn BuildObserver>,
+    build_state: &mut BuildStateWriter,
+) -> Result<(), BucketError> {
+    if let Some(obs) = observer {
+        obs.on_phase(phase);
+    }
+    build_state
+        .append(&BuildStateRecord::PhaseChanged { phase })
+        .map_err(BucketError::Io)?;
+    Ok(())
+}
 
 async fn flush_batch(
     pending: &mut Vec<NewChunk>,
@@ -1342,6 +1434,138 @@ embedder = "tei_test"
         // file_count chunks at EMBED_BATCH_SIZE → exactly 3 calls
         // (we wrote 2 full batches + a tail of 5).
         assert_eq!(calls, 3, "expected 3 batched embed calls, got {calls}");
+    }
+
+    #[tokio::test]
+    async fn build_writes_full_build_state_log() {
+        // End-to-end verification of the resume log: a successful
+        // build emits the full sequence of records (Planning →
+        // Planned×N → Indexing → BatchEmbedded×M → BuildingDense →
+        // Finalizing → BuildCompleted) in the right order. Resume
+        // code (Commit B) consumes this exact format.
+        use crate::knowledge::build_state::{self, BuildStateRecord};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("notes");
+        fs::create_dir_all(&source).unwrap();
+        write_md(&source, "alpha.md", "alpha body");
+        write_md(&source, "beta.md", "beta body");
+
+        let bucket_root = tmp.path().join("bucket");
+        let bucket = open_test_bucket(&bucket_root, &source);
+        let adapter = MarkdownDir::new(&source);
+        let chunker = TokenBasedChunker::from_config(&bucket.config().chunker);
+        let embedder: Arc<dyn EmbeddingProvider> = Arc::new(MockEmbedder::new(4));
+        let cancel = CancellationToken::new();
+        let slot_id = bucket
+            .build_slot(&adapter, &chunker, embedder, None, &cancel)
+            .await
+            .unwrap();
+
+        let path = slot::slot_dir(&bucket_root, &slot_id).join(slot::BUILD_STATE);
+        let records = build_state::read_all(&path).unwrap();
+
+        // Planning + 2 Planned + Indexing + ≥1 BatchEmbedded + BuildingDense + Finalizing + BuildCompleted.
+        assert!(
+            records.len() >= 8,
+            "expected at least 8 records, got {}: {records:#?}",
+            records.len()
+        );
+
+        // Phases land in the documented order.
+        let phases: Vec<BuildPhase> = records
+            .iter()
+            .filter_map(|r| match r {
+                BuildStateRecord::PhaseChanged { phase } => Some(*phase),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            phases,
+            vec![
+                BuildPhase::Planning,
+                BuildPhase::Indexing,
+                BuildPhase::BuildingDense,
+                BuildPhase::Finalizing,
+            ]
+        );
+
+        // Two source records → two Planned entries.
+        let planned_count = records
+            .iter()
+            .filter(|r| matches!(r, BuildStateRecord::Planned { .. }))
+            .count();
+        assert_eq!(planned_count, 2);
+
+        // Last record must be BuildCompleted.
+        assert!(matches!(
+            records.last().unwrap(),
+            BuildStateRecord::BuildCompleted
+        ));
+
+        // BatchEmbedded carries the running record/chunk counts.
+        let batches: Vec<&BuildStateRecord> = records
+            .iter()
+            .filter(|r| matches!(r, BuildStateRecord::BatchEmbedded { .. }))
+            .collect();
+        assert!(!batches.is_empty(), "at least one batch should be recorded");
+        let last = batches.last().unwrap();
+        match last {
+            BuildStateRecord::BatchEmbedded {
+                source_records_completed,
+                chunks_completed,
+                ..
+            } => {
+                assert_eq!(*source_records_completed, 2);
+                assert!(*chunks_completed >= 2);
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelled_build_leaves_log_without_build_completed() {
+        // The Cancelled path must not leave a BuildCompleted record
+        // — that's the marker the resume path uses to decide whether
+        // to redo work. A cancelled build looks the same as a crashed
+        // build to the resume code.
+        use crate::knowledge::build_state::{self, BuildStateRecord};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("notes");
+        fs::create_dir_all(&source).unwrap();
+        write_md(&source, "doc.md", "hello");
+        let bucket_root = tmp.path().join("bucket");
+        let bucket = open_test_bucket(&bucket_root, &source);
+        let adapter = MarkdownDir::new(&source);
+        let chunker = TokenBasedChunker::from_config(&bucket.config().chunker);
+        let embedder: Arc<dyn EmbeddingProvider> = Arc::new(MockEmbedder::new(4));
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let _ = bucket
+            .build_slot(&adapter, &chunker, embedder, None, &cancel)
+            .await
+            .unwrap_err();
+
+        // Cancellation fires before the slot is promoted, but the
+        // slot directory and build.state already exist. Find them.
+        let slots_dir = slot::slots_dir(&bucket_root);
+        let entry = fs::read_dir(&slots_dir)
+            .unwrap()
+            .find_map(|e| {
+                let e = e.ok()?;
+                let m = e.metadata().ok()?;
+                if m.is_dir() { Some(e.path()) } else { None }
+            })
+            .expect("partial slot dir");
+        let path = entry.join(slot::BUILD_STATE);
+        let records = build_state::read_all(&path).unwrap();
+        assert!(
+            !records
+                .iter()
+                .any(|r| matches!(r, BuildStateRecord::BuildCompleted)),
+            "cancelled build must not record BuildCompleted: {records:#?}"
+        );
     }
 
     #[tokio::test]

@@ -29,6 +29,7 @@
 //! - [`disk_bucket`] — [`DiskBucket`], the disk-backed [`Bucket`] impl.
 
 pub mod bucket;
+pub mod build_state;
 pub mod chunker;
 pub mod chunks;
 pub mod config;

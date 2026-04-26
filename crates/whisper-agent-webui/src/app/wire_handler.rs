@@ -644,7 +644,7 @@ impl ChatApp {
                     modal.build_progress.insert(
                         bucket_id,
                         super::BuildProgressView {
-                            phase: whisper_agent_protocol::BucketBuildPhase::Indexing,
+                            phase: whisper_agent_protocol::BucketBuildPhase::Planning,
                             source_records: 0,
                             chunks: 0,
                         },
