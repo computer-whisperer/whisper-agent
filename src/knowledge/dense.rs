@@ -1,10 +1,11 @@
 //! Dense (HNSW over embeddings) index for a slot.
 //!
 //! Wraps the `hnsw_rs` crate to provide build + search operations over
-//! a slot's persisted vectors. The HNSW graph is rebuilt on slot load
-//! (no on-disk persistence in slice 5 — vectors.bin is the durable
-//! input; rebuild cost is negligible at workspace scales and a known
-//! TODO for the eventual wikipedia-scale slot-load path).
+//! a slot's persisted vectors. The graph is dumped to disk after build
+//! ([`DenseIndex::dump_to`]) and reloaded on slot open
+//! ([`DenseIndex::load_from`]); a fresh build via [`DenseIndex::build`]
+//! is the fallback when the dump is missing or stale (e.g. a slot
+//! built before persistence landed, or a partial-write recovery).
 //!
 //! Distance: [`DistL2`]. Works for any vectors (mock or real) without
 //! requiring unit-norm. We'll switch to `DistDot` (or `DistCosine`)
@@ -13,15 +14,30 @@
 //! vectors.
 //!
 //! HNSW data ids are vector positions (the index into `vectors.bin`).
-//! The position→chunk_id mapping is rebuilt at build time from
+//! The position→chunk_id mapping is rebuilt at load time from
 //! `vectors.idx` entries; this avoids a parallel persistent file
 //! and keeps `vectors.idx` as the single source of truth for chunk
 //! identity.
+//!
+//! On-disk layout: hnsw_rs dumps two sibling files,
+//! `<basename>.hnsw.graph` (adjacency lists, ~16 edges/node × layer
+//! count) and `<basename>.hnsw.data` (vectors duplicated from
+//! `vectors.bin` — yes, the duplication is the cost of avoiding a
+//! ~1-min-per-million-vectors HNSW rebuild). For wikipedia-scale
+//! buckets (~30M chunks) the duplicate is the price of being able to
+//! cold-start in seconds instead of hours.
 
+use std::path::Path;
+
+use hnsw_rs::hnswio::HnswIo;
 use hnsw_rs::prelude::*;
 
 use super::types::{BucketError, ChunkId};
 use super::vectors::VectorStoreReader;
+
+/// File basename for the HNSW dump inside a slot directory. The
+/// hnsw_rs library appends `.hnsw.graph` and `.hnsw.data` to this.
+const DENSE_BASENAME: &str = "dense";
 
 /// HNSW build parameters. Defaults match the design doc's targets
 /// (M=16, ef_construction=200) — appropriate for Qwen3-Embedding-0.6B
@@ -145,6 +161,81 @@ impl DenseIndex {
             .filter_map(|n| self.by_position.get(n.d_id).map(|&id| (id, n.distance)))
             .collect()
     }
+
+    /// Dump the in-memory HNSW graph to `slot_dir` so a future open
+    /// can skip the rebuild. Writes `dense.hnsw.graph` and
+    /// `dense.hnsw.data` (the latter duplicates the vectors already in
+    /// `vectors.bin` — see the module docstring for the trade-off).
+    ///
+    /// Stale on-disk dumps are removed first so `file_dump` doesn't
+    /// silently fall back to a random-suffixed basename when prior
+    /// files exist (its anti-mmap-clobber default).
+    pub fn dump_to(&self, slot_dir: &Path) -> Result<(), BucketError> {
+        for ext in [".hnsw.graph", ".hnsw.data"] {
+            let p = slot_dir.join(format!("{DENSE_BASENAME}{ext}"));
+            if p.exists() {
+                std::fs::remove_file(&p).map_err(BucketError::Io)?;
+            }
+        }
+        self.hnsw
+            .file_dump(slot_dir, DENSE_BASENAME)
+            .map_err(|e| BucketError::Other(format!("hnsw file_dump: {e}")))?;
+        Ok(())
+    }
+
+    /// Load a previously-dumped HNSW from `slot_dir`, pairing it with
+    /// the `vectors`'s `chunk_id`-by-position table so search results
+    /// can map back to chunk ids the same way `build` does.
+    ///
+    /// Returns `BucketError::Other` (with a `not found` substring) when
+    /// the dump files are missing — callers that want a "load or
+    /// rebuild" semantic should match on this and fall back to
+    /// [`Self::build`].
+    pub fn load_from(slot_dir: &Path, vectors: &VectorStoreReader) -> Result<Self, BucketError> {
+        let graph_path = slot_dir.join(format!("{DENSE_BASENAME}.hnsw.graph"));
+        let data_path = slot_dir.join(format!("{DENSE_BASENAME}.hnsw.data"));
+        if !graph_path.exists() || !data_path.exists() {
+            return Err(BucketError::Other(format!(
+                "hnsw dump not found in {} (looking for {DENSE_BASENAME}.hnsw.graph + .data)",
+                slot_dir.display(),
+            )));
+        }
+
+        // The hnsw_rs `load_hnsw` signature constrains the returned
+        // Hnsw to outlive its HnswIo source. We need `Hnsw<'static>`
+        // for `DenseIndex` to stay loadable into a long-lived
+        // registry cache, so we leak the HnswIo (a ~100-byte struct
+        // with a PathBuf, basename, and an Arc counter) to give it
+        // 'static. One-time, slot-load-only allocation; doesn't
+        // accumulate across query traffic.
+        let io: &'static mut HnswIo = Box::leak(Box::new(HnswIo::new(slot_dir, DENSE_BASENAME)));
+        let hnsw: Hnsw<'static, f32, DistL2> = io
+            .load_hnsw()
+            .map_err(|e| BucketError::Other(format!("hnsw load: {e}")))?;
+
+        // Rebuild the position→chunk_id table from vectors.idx —
+        // same shape as `build`, just without inserting into HNSW.
+        let mut pairs: Vec<(u64, ChunkId)> = vectors
+            .iter_chunk_positions()
+            .map(|(id, pos)| (pos, id))
+            .collect();
+        pairs.sort_by_key(|(pos, _)| *pos);
+        let by_position: Vec<ChunkId> = pairs.into_iter().map(|(_, id)| id).collect();
+
+        // Sanity check: HNSW node count must match the position table.
+        // A mismatch means the dump and `vectors.bin` came from
+        // different builds (partial write, file swap, etc.) — fall
+        // through to a rebuild rather than serving wrong-id results.
+        let hnsw_count = hnsw.get_nb_point();
+        if hnsw_count != by_position.len() {
+            return Err(BucketError::Other(format!(
+                "hnsw dump count {hnsw_count} does not match vectors.idx count {} — dump is stale",
+                by_position.len(),
+            )));
+        }
+
+        Ok(Self { hnsw, by_position })
+    }
 }
 
 #[cfg(test)]
@@ -236,6 +327,63 @@ mod tests {
         let vectors = open_reader(&tmp);
         let index = DenseIndex::build(&vectors, HnswParams::default()).unwrap();
         assert!(index.search(&[0.0; 8], 0).is_empty());
+    }
+
+    #[test]
+    fn dump_and_load_roundtrip_returns_same_top_neighbour() {
+        let tmp = build_test_vectors(8, 50);
+        let vectors = open_reader(&tmp);
+        let built = DenseIndex::build(&vectors, HnswParams::default()).unwrap();
+        built.dump_to(tmp.path()).unwrap();
+        assert!(tmp.path().join("dense.hnsw.graph").exists());
+        assert!(tmp.path().join("dense.hnsw.data").exists());
+
+        let loaded = DenseIndex::load_from(tmp.path(), &vectors).unwrap();
+        assert_eq!(loaded.len(), built.len());
+
+        // Same exact-match query both indexes should agree on.
+        let mut query = vec![0.0f32; 8];
+        query[5] = 6.0;
+        let from_built = built.search(&query, 1);
+        let from_loaded = loaded.search(&query, 1);
+        assert_eq!(from_built[0].0, from_loaded[0].0);
+        assert!(from_loaded[0].1 < 0.001);
+    }
+
+    #[test]
+    fn load_from_missing_dump_returns_error() {
+        let tmp = build_test_vectors(8, 10);
+        let vectors = open_reader(&tmp);
+        // No dump_to call; load should fail with a descriptive error.
+        let err = DenseIndex::load_from(tmp.path(), &vectors).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("not found") || msg.contains("dump"),
+            "unexpected error message: {msg}",
+        );
+    }
+
+    #[test]
+    fn dump_overwrites_existing_files() {
+        let tmp = build_test_vectors(8, 20);
+        let vectors = open_reader(&tmp);
+        let built = DenseIndex::build(&vectors, HnswParams::default()).unwrap();
+        built.dump_to(tmp.path()).unwrap();
+        // Second dump on the same dir must succeed (and not silently
+        // create dense-XXX.hnsw.* with a random suffix — that
+        // happens when we don't pre-clean).
+        built.dump_to(tmp.path()).unwrap();
+        // Exactly one pair of files; no random-suffixed siblings.
+        let entries: Vec<_> = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
+            .filter(|n| n.contains("hnsw"))
+            .collect();
+        assert_eq!(
+            entries.len(),
+            2,
+            "expected exactly dense.hnsw.graph + .data, got {entries:?}",
+        );
     }
 
     #[test]

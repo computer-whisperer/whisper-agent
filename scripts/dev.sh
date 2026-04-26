@@ -188,4 +188,5 @@ echo "    open http://$LISTEN_SERVER/ in a browser"
     --default-host-env-workspace "$SANDBOX" \
     --audit-log "$SANDBOX/audit.jsonl" \
     --pods-root "$SANDBOX/pods" \
+    --buckets-root "$SANDBOX/buckets" \
     "${SHARED_HOST_ARGS[@]}"

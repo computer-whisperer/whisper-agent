@@ -241,10 +241,19 @@ impl DiskBucket {
         let vectors =
             VectorStoreReader::open(&vectors_bin, &vectors_idx).map_err(BucketError::Io)?;
 
-        // Build the dense index from the just-written vectors. Currently
-        // in-memory only; rebuild on slot load is fine at the scales we
-        // serve in slices 5–6.
+        // Build the dense index from the just-written vectors and
+        // dump it to disk so the next slot open can skip the rebuild.
+        // Failure to dump is non-fatal — the slot is still usable
+        // (load_slot's fallback rebuilds), so we log and continue
+        // rather than tearing down the build.
         let dense = DenseIndex::build(&vectors, HnswParams::default())?;
+        if let Err(e) = dense.dump_to(&slot_path) {
+            tracing::warn!(
+                slot = %slot_id,
+                error = %e,
+                "hnsw dump failed; slot is still usable but next open will rebuild from vectors",
+            );
+        }
 
         // Open the sparse index reader if we built one.
         let sparse = if sparse_enabled {
@@ -576,11 +585,31 @@ fn load_slot(bucket_root: &Path, slot_id: &str) -> Result<LoadedSlot, BucketErro
         )));
     }
 
-    // Rebuild the dense index from persisted vectors. Negligible at
-    // workspace scales; a real cost at wikipedia scale (~30 min for
-    // 50M vectors) — HNSW persistence is a known follow-up slice when
-    // scale forces the issue.
-    let dense = DenseIndex::build(&vectors, HnswParams::default())?;
+    // Try the persisted HNSW dump first; rebuild from vectors as a
+    // fallback for slots built before persistence existed (or
+    // recovered from a partial write where the dump is missing /
+    // count-mismatched).
+    let dense = match DenseIndex::load_from(&slot_path, &vectors) {
+        Ok(d) => d,
+        Err(e) => {
+            tracing::info!(
+                slot = %slot_id,
+                error = %e,
+                "hnsw dump unavailable; rebuilding from vectors.bin",
+            );
+            let rebuilt = DenseIndex::build(&vectors, HnswParams::default())?;
+            // Opportunistically write the dump for next time. Don't
+            // fail the load if it doesn't stick.
+            if let Err(dump_err) = rebuilt.dump_to(&slot_path) {
+                tracing::warn!(
+                    slot = %slot_id,
+                    error = %dump_err,
+                    "post-rebuild hnsw dump failed; next open will rebuild again",
+                );
+            }
+            rebuilt
+        }
+    };
 
     // Sparse index — open if the slot manifest says it has one.
     // Tantivy persistence is segment-based, so this is a real on-disk
