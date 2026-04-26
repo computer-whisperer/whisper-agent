@@ -306,6 +306,7 @@ mod tests {
                         },
                     },
                 ],
+                knowledge_buckets: Vec::new(),
                 tools: AllowMap {
                     default: Disposition::Allow,
                     overrides: [("bash".to_string(), Disposition::Deny)]

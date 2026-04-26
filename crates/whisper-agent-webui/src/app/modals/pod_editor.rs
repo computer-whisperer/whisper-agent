@@ -44,6 +44,7 @@ pub(crate) fn render_pod_editor_modal(
     resources: &HashMap<String, ResourceSnapshot>,
     host_env_providers: &[HostEnvProviderInfo],
     models_by_backend: &HashMap<String, Vec<ModelSummary>>,
+    buckets: &[whisper_agent_protocol::BucketSummary],
 ) -> Vec<PodEditorEvent> {
     let mut events = Vec::new();
     let Some(mut modal) = slot.take() else {
@@ -66,6 +67,7 @@ pub(crate) fn render_pod_editor_modal(
         })
         .collect();
     let host_env_providers_owned: Vec<HostEnvProviderInfo> = host_env_providers.to_vec();
+    let bucket_catalog: Vec<String> = buckets.iter().map(|b| b.id.clone()).collect();
     // Fire ListModels for whichever backend the model combo is about
     // to show against. Dedup-guarded by the caller.
     if let Some(w) = modal.working.as_ref()
@@ -161,6 +163,7 @@ pub(crate) fn render_pod_editor_modal(
                                     &backend_catalog,
                                     &shared_mcp_catalog,
                                     &host_env_providers_owned,
+                                    &bucket_catalog,
                                     &mut sandbox_entry_open,
                                     &mut sandbox_entry_delete,
                                 );

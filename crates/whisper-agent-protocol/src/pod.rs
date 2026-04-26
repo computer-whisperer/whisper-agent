@@ -36,6 +36,15 @@ pub struct PodAllow {
     pub mcp_hosts: Vec<String>,
     #[serde(default)]
     pub host_env: Vec<NamedHostEnv>,
+    /// Server-scope knowledge bucket ids this pod's threads are
+    /// allowed to query through `knowledge_query`. Bare names refer
+    /// to server-scope buckets — pod-scope buckets aren't a thing
+    /// yet (deferred slice). Default is empty: a pod must explicitly
+    /// grant access before its threads can read from any bucket,
+    /// matching the `[allow.backends]` / `[allow.mcp_hosts]`
+    /// default-deny pattern.
+    #[serde(default)]
+    pub knowledge_buckets: Vec<String>,
     /// Tool gate — default disposition for unlisted tools plus per-tool
     /// overrides. Replaces the old `thread_defaults.approval_policy`
     /// preset enum; threads in the pod inherit this map as their

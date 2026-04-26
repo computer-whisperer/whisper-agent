@@ -3301,6 +3301,7 @@ impl eframe::App for ChatApp {
             &self.resources,
             &self.host_env_providers,
             &self.models_by_backend,
+            &self.buckets,
         ) {
             match event {
                 PodEditorEvent::RequestModels(backend) => {
@@ -3629,6 +3630,7 @@ impl ChatApp {
                 backends: backend_names,
                 mcp_hosts: Vec::new(),
                 host_env: Vec::<NamedHostEnv>::new(),
+                knowledge_buckets: Vec::new(),
                 tools: AllowMap::allow_all(),
                 caps: Default::default(),
             },

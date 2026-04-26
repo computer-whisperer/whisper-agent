@@ -160,6 +160,7 @@ mod tests {
                         },
                     },
                 ],
+                knowledge_buckets: Vec::new(),
                 tools: crate::permission::AllowMap::allow_all(),
                 caps: Default::default(),
             },

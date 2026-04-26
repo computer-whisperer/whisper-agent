@@ -58,6 +58,10 @@ pub fn build_default_pod_config(
             backends: backend_names.to_vec(),
             mcp_hosts: shared_host_names.to_vec(),
             host_env: host_env_entries,
+            // Auto-synthesized default pod has no buckets in scope —
+            // operator wires `[allow.knowledge_buckets]` per-pod when
+            // they want a thread to read from a server bucket.
+            knowledge_buckets: Vec::new(),
             // Default pod starts with the equivalent of the old
             // AutoApproveAll preset — every tool admitted without a
             // prompt. Real pods tighten this by editing pod.toml.

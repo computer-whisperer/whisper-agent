@@ -130,12 +130,14 @@ use super::widgets::spec_label;
 // via its baseline diff.
 // ====================================================================
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn render_pod_editor_allow_tab(
     ui: &mut egui::Ui,
     working: &mut PodConfig,
     backend_catalog: &[String],
     shared_mcp_catalog: &[String],
     host_env_providers: &[HostEnvProviderInfo],
+    bucket_catalog: &[String],
     sandbox_open: &mut Option<SandboxEntryEditorState>,
     sandbox_delete: &mut Option<usize>,
 ) {
@@ -225,6 +227,38 @@ pub(super) fn render_pod_editor_allow_tab(
                         }
                     } else {
                         working.allow.mcp_hosts.retain(|m| m != name);
+                    }
+                }
+            }
+        });
+    }
+
+    ui.add_space(10.0);
+    section_heading(ui, "Allowed knowledge buckets");
+    hint(
+        ui,
+        "Bucket ids that threads in this pod may query through the \
+         `knowledge_query` tool. Empty list = no buckets reachable. The \
+         tool errors with a clear message if the agent calls it without \
+         any bucket in scope.",
+    );
+    if bucket_catalog.is_empty() {
+        ui.label(
+            RichText::new("(no buckets exist on this server yet)")
+                .italics()
+                .color(Color32::from_gray(160)),
+        );
+    } else {
+        ui.horizontal_wrapped(|ui| {
+            for name in bucket_catalog {
+                let mut on = working.allow.knowledge_buckets.iter().any(|b| b == name);
+                if ui.checkbox(&mut on, name).changed() {
+                    if on {
+                        if !working.allow.knowledge_buckets.iter().any(|b| b == name) {
+                            working.allow.knowledge_buckets.push(name.clone());
+                        }
+                    } else {
+                        working.allow.knowledge_buckets.retain(|b| b != name);
                     }
                 }
             }

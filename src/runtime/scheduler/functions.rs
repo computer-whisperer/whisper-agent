@@ -806,6 +806,17 @@ impl Scheduler {
             );
             return;
         }
+        if name == crate::tools::builtin_tools::KNOWLEDGE_QUERY {
+            self.complete_knowledge_query_call(
+                thread_id,
+                op_id,
+                tool_use_id,
+                input,
+                disposition,
+                pending_io,
+            );
+            return;
+        }
 
         let spec = match self.route_tool(thread_id, &name) {
             Some(ToolRoute::Builtin { .. }) => Function::BuiltinToolCall {
@@ -1562,6 +1573,219 @@ impl Scheduler {
             tool_use_id,
             out,
         ));
+    }
+
+    /// `knowledge_query`-specific path. Resolves the pod's
+    /// `[allow.knowledge_buckets]`, intersects with the caller's
+    /// optional `buckets` arg, then runs `QueryEngine` over the
+    /// admitted set on a detached future so the multi-second HNSW +
+    /// embedder + reranker round-trip doesn't block the scheduler.
+    fn complete_knowledge_query_call(
+        &mut self,
+        thread_id: &str,
+        op_id: crate::runtime::thread::OpId,
+        tool_use_id: String,
+        input: serde_json::Value,
+        disposition: crate::permission::Disposition,
+        pending_io: &mut FuturesUnordered<SchedulerFuture>,
+    ) {
+        if matches!(disposition, crate::permission::Disposition::Deny) {
+            pending_io.push(make_denial_future(
+                thread_id.to_string(),
+                tool_use_id,
+                op_id,
+                crate::tools::builtin_tools::KNOWLEDGE_QUERY.to_string(),
+            ));
+            return;
+        }
+        let args = match crate::tools::builtin_tools::knowledge_query::parse_args(input) {
+            Ok(a) => a,
+            Err(e) => {
+                pending_io.push(immediate_tool_error(
+                    thread_id.to_string(),
+                    op_id,
+                    tool_use_id,
+                    e,
+                ));
+                return;
+            }
+        };
+        let top_k = args
+            .top_k
+            .unwrap_or(crate::tools::builtin_tools::knowledge_query::DEFAULT_TOP_K);
+
+        // Resolve in-scope buckets from the pod's allow list.
+        let in_scope: Vec<String> = self
+            .tasks
+            .get(thread_id)
+            .and_then(|t| self.pods.get(&t.pod_id))
+            .map(|pod| pod.config.allow.knowledge_buckets.clone())
+            .unwrap_or_default();
+
+        if in_scope.is_empty() {
+            pending_io.push(immediate_tool_error(
+                thread_id.to_string(),
+                op_id,
+                tool_use_id,
+                "knowledge_query: this pod's `[allow.knowledge_buckets]` is empty. \
+                 Ask the operator to add bucket ids before retry."
+                    .into(),
+            ));
+            return;
+        }
+
+        // Intersect the explicit `buckets` arg (if any) with the in-
+        // scope set. Out-of-scope names error with what IS in scope so
+        // the model can correct in one round-trip.
+        let target_ids: Vec<String> = if args.buckets.is_empty() {
+            in_scope.clone()
+        } else {
+            let scope_set: std::collections::HashSet<&String> = in_scope.iter().collect();
+            let bad: Vec<&String> = args
+                .buckets
+                .iter()
+                .filter(|b| !scope_set.contains(b))
+                .collect();
+            if !bad.is_empty() {
+                let bad_list = bad
+                    .iter()
+                    .map(|s| format!("`{s}`"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let scope_list = in_scope
+                    .iter()
+                    .map(|s| format!("`{s}`"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                pending_io.push(immediate_tool_error(
+                    thread_id.to_string(),
+                    op_id,
+                    tool_use_id,
+                    format!(
+                        "knowledge_query: bucket(s) {bad_list} not in this pod's \
+                         `[allow.knowledge_buckets]`. In scope: {scope_list}."
+                    ),
+                ));
+                return;
+            }
+            args.buckets.clone()
+        };
+
+        // Resolve embedder + reranker. Different buckets may want
+        // different embedders (each slot has the dimension baked into
+        // its manifest); the reranker is global. We pick per-bucket
+        // embedders inside the future after the buckets are loaded;
+        // for the launch-time check we just need *some* embedder
+        // to exist. Reranker is required.
+        let reranker = match self.rerank_providers.values().next() {
+            Some(r) => r.provider.clone(),
+            None => {
+                pending_io.push(immediate_tool_error(
+                    thread_id.to_string(),
+                    op_id,
+                    tool_use_id,
+                    "knowledge_query: no rerank providers configured \
+                     (`[rerank_providers.*]`). Knowledge queries need a reranker."
+                        .into(),
+                ));
+                return;
+            }
+        };
+
+        // Validate each target bucket exists in the registry up-front
+        // so the failure message is "unknown bucket" with the bad id,
+        // not a generic load error from inside the future.
+        let mut bucket_configs: Vec<(String, String)> = Vec::with_capacity(target_ids.len());
+        for id in &target_ids {
+            let entry = match self.bucket_registry.buckets.get(id) {
+                Some(e) => e,
+                None => {
+                    pending_io.push(immediate_tool_error(
+                        thread_id.to_string(),
+                        op_id,
+                        tool_use_id,
+                        format!(
+                            "knowledge_query: bucket `{id}` is in the pod's allow list \
+                             but no longer exists in the registry — likely deleted \
+                             out from under the pod config. Update `[allow.knowledge_buckets]`."
+                        ),
+                    ));
+                    return;
+                }
+            };
+            bucket_configs.push((id.clone(), entry.config.defaults.embedder.clone()));
+        }
+
+        // Resolve each bucket's embedder by its bucket.toml `defaults.embedder`.
+        // All embedded query buckets must agree on the embedder for the
+        // dense path to fuse cleanly, but mismatched dimensions only
+        // skip the dense path silently (see QueryEngine). For the v1
+        // tool we still pick a single embedder per call — the first
+        // bucket's. Future: per-bucket dispatch with per-embedder
+        // dispatch fanning out. Today this is consistent with the
+        // WebUI handler's behavior.
+        let primary_embedder_name = bucket_configs[0].1.clone();
+        let embedder = match self.embedding_providers.get(&primary_embedder_name) {
+            Some(e) => e.provider.clone(),
+            None => {
+                pending_io.push(immediate_tool_error(
+                    thread_id.to_string(),
+                    op_id,
+                    tool_use_id,
+                    format!(
+                        "knowledge_query: bucket `{}` references embedder `{}` which is \
+                         not configured under `[embedding_providers.*]`.",
+                        bucket_configs[0].0, primary_embedder_name,
+                    ),
+                ));
+                return;
+            }
+        };
+
+        let registry = self.bucket_registry.clone();
+        let thread_id_s = thread_id.to_string();
+        let query_text = args.query.clone();
+        pending_io.push(Box::pin(async move {
+            let cancel = tokio_util::sync::CancellationToken::new();
+
+            // Load each bucket. First-load pays the slot-load cost;
+            // hot loads come from the cache.
+            let mut buckets: Vec<std::sync::Arc<dyn crate::knowledge::Bucket>> =
+                Vec::with_capacity(target_ids.len());
+            for id in &target_ids {
+                match registry.loaded_bucket(id).await {
+                    Ok(b) => buckets.push(b),
+                    Err(e) => {
+                        return tool_error_completion(
+                            thread_id_s,
+                            op_id,
+                            tool_use_id,
+                            format!("knowledge_query: load bucket `{id}` failed: {e}"),
+                        );
+                    }
+                }
+            }
+
+            let engine = crate::knowledge::QueryEngine::new(embedder, reranker);
+            let params = crate::knowledge::QueryParams {
+                top_k: top_k as usize,
+                ..Default::default()
+            };
+            let hits = match engine.query(&buckets, &query_text, &params, &cancel).await {
+                Ok(h) => h,
+                Err(e) => {
+                    return tool_error_completion(
+                        thread_id_s,
+                        op_id,
+                        tool_use_id,
+                        format!("knowledge_query failed: {e}"),
+                    );
+                }
+            };
+
+            let body = format_hits(&query_text, &target_ids, &hits);
+            tool_success_completion(thread_id_s, op_id, tool_use_id, body)
+        }));
     }
 
     /// `sudo`-specific registration path. Parses the tool args, refuses
@@ -2676,6 +2900,127 @@ fn immediate_tool_success(
             },
         )
     })
+}
+
+/// Like `immediate_tool_success` but produces the inner
+/// `SchedulerCompletion` directly — for use from inside an `async
+/// move` block already pushed onto `pending_io` as a `Box::pin`. The
+/// outer future returns this completion as its terminal value.
+fn tool_success_completion(
+    parent_thread_id: String,
+    op_id: crate::runtime::thread::OpId,
+    tool_use_id: String,
+    text: String,
+) -> crate::runtime::io_dispatch::SchedulerCompletion {
+    crate::runtime::io_dispatch::SchedulerCompletion::Io(
+        crate::runtime::io_dispatch::IoCompletion {
+            thread_id: parent_thread_id,
+            op_id,
+            result: crate::runtime::thread::IoResult::ToolCall {
+                tool_use_id,
+                result: Ok(crate::tools::mcp::CallToolResult {
+                    content: vec![crate::tools::mcp::McpContentBlock::Text { text }],
+                    is_error: false,
+                }),
+            },
+            pod_update: None,
+            scheduler_command: None,
+            host_env_lost: None,
+        },
+    )
+}
+
+/// Like `immediate_tool_error` but produces the inner
+/// `SchedulerCompletion` directly. See `tool_success_completion`.
+fn tool_error_completion(
+    parent_thread_id: String,
+    op_id: crate::runtime::thread::OpId,
+    tool_use_id: String,
+    message: String,
+) -> crate::runtime::io_dispatch::SchedulerCompletion {
+    crate::runtime::io_dispatch::SchedulerCompletion::Io(
+        crate::runtime::io_dispatch::IoCompletion {
+            thread_id: parent_thread_id,
+            op_id,
+            result: crate::runtime::thread::IoResult::ToolCall {
+                tool_use_id,
+                result: Err(message),
+            },
+            pod_update: None,
+            scheduler_command: None,
+            host_env_lost: None,
+        },
+    )
+}
+
+/// Format reranked hits for the `knowledge_query` tool response. One
+/// header line then per-hit: source title, retrieval-path tag,
+/// scores, locator (if any), then a snippet of the chunk text capped
+/// at `SNIPPET_CHARS` to keep the per-call response bounded.
+fn format_hits(
+    query: &str,
+    queried_buckets: &[String],
+    hits: &[crate::knowledge::RerankedCandidate],
+) -> String {
+    use crate::knowledge::SearchPath;
+
+    let bucket_list = queried_buckets
+        .iter()
+        .map(|b| format!("`{b}`"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let mut out = format!(
+        "Query: {query:?}\nQueried buckets: {bucket_list}\nHits: {}\n\n",
+        hits.len()
+    );
+    if hits.is_empty() {
+        out.push_str("(no hits — try rephrasing or widening the query)\n");
+        return out;
+    }
+    for (i, h) in hits.iter().enumerate() {
+        let path = match h.source_path {
+            SearchPath::Dense => "dense",
+            SearchPath::Sparse => "sparse",
+        };
+        let locator = h
+            .source_ref
+            .locator
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .map(|s| format!(" • {s}"))
+            .unwrap_or_default();
+        let title = if h.source_ref.source_id.is_empty() {
+            format!(
+                "(no source id) — chunk {}",
+                short_id(&h.chunk_id.to_string())
+            )
+        } else {
+            h.source_ref.source_id.clone()
+        };
+        // Send the full chunk text. The chunker is the natural bound on
+        // per-hit size — chunks default to ~500 tokens (~2000 chars),
+        // so even top_k=20 stays under ~10k tokens of tool output.
+        // Truncating here just hid the answer when it landed past the
+        // first paragraph (e.g. "melting point of lead" landed in the
+        // second half of the lede chunk and wasn't visible to the model).
+        out.push_str(&format!(
+            "{rank}. [{bucket}] {title}\n   via {path}, rerank={rerank:.3}, src={src:.3}{locator}\n\n{text}\n\n",
+            rank = i + 1,
+            bucket = h.bucket_id,
+            rerank = h.rerank_score,
+            src = h.source_score,
+            text = h.chunk_text,
+        ));
+    }
+    out
+}
+
+fn short_id(s: &str) -> String {
+    if s.len() > 12 {
+        format!("{}…", &s[..12])
+    } else {
+        s.to_string()
+    }
 }
 
 /// Truncate a multi-line/multi-sentence description for `find_tool`'s
