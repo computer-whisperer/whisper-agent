@@ -151,8 +151,13 @@ impl QueryEngine {
             .await
             .map_err(|e| BucketError::Provider(e.to_string()))?;
 
-        let mut out = Vec::with_capacity(resp.results.len());
-        for r in resp.results {
+        // Defensive truncation: the request asks the reranker for
+        // `top_n = params.top_k`, but not every server honors it
+        // (observed: TEI 1.9.3 ignores top_n and returns scores for
+        // every document). The contract here is "capped at top_k", so
+        // enforce it locally regardless.
+        let mut out = Vec::with_capacity(params.top_k.min(resp.results.len()));
+        for r in resp.results.into_iter().take(params.top_k) {
             let Some(c) = deduped.get(r.index as usize) else {
                 return Err(BucketError::Provider(format!(
                     "reranker returned out-of-range index {} for {} documents",

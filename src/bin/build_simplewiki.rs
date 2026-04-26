@@ -46,6 +46,7 @@ use whisper_agent::providers::rerank::{
     BoxFuture as RerankBoxFuture, RerankError, RerankModelInfo, RerankProvider, RerankRequest,
     RerankResponse, RerankResult,
 };
+use whisper_agent::providers::tei::{TeiEmbeddingClient, TeiRerankClient};
 
 #[derive(Parser, Debug)]
 #[command(about = "Build a knowledge bucket from a MediaWiki XML dump.")]
@@ -74,8 +75,24 @@ struct Args {
     /// Embedding dimension for the mock embedder. Picks a number
     /// representative of small open-source embedders; not load-bearing
     /// since the dense path is meaningless without a real embedder.
+    /// Ignored when --tei-embedder-url is set.
     #[arg(long, default_value_t = 384)]
     mock_embedder_dim: u32,
+
+    /// TEI `/embed` endpoint URL. When set, replaces the deterministic
+    /// mock embedder with a real call-out to TEI for every chunk batch.
+    /// E.g. `http://10.1.0.198:8080`. Required to validate the dense
+    /// retrieval path; the mock embedder produces semantically random
+    /// vectors so dense hits look meaningless.
+    #[arg(long)]
+    tei_embedder_url: Option<String>,
+
+    /// TEI `/rerank` endpoint URL. When set, replaces the whitespace-
+    /// overlap mock reranker with a real call-out to TEI for the
+    /// reranker fusion stage. Independent of `--tei-embedder-url` —
+    /// can mix-and-match for ablation runs.
+    #[arg(long)]
+    tei_reranker_url: Option<String>,
 
     /// Sample query to run after the build. Not a flag-takes-vec because
     /// quoting multi-arg queries from the shell is simpler with one
@@ -120,7 +137,23 @@ async fn main() -> Result<()> {
         .context("DiskBucket::open")?;
 
     let cancel = CancellationToken::new();
-    let mock = Arc::new(MockEmbedder::new(args.mock_embedder_dim));
+    let mock_embedder = Arc::new(MockEmbedder::new(args.mock_embedder_dim));
+    // Pick the real or mock embedder. We keep `mock_embedder` around
+    // for its `embed_calls` counter even when not used as the bucket
+    // embedder — it just stays at 0 in that case.
+    let embedder: Arc<dyn EmbeddingProvider> = match &args.tei_embedder_url {
+        Some(url) => {
+            eprintln!("using TEI embedder at {url}");
+            Arc::new(TeiEmbeddingClient::new(url.clone(), None))
+        }
+        None => {
+            eprintln!(
+                "using mock embedder (dim={}); dense path will be semantically random",
+                args.mock_embedder_dim,
+            );
+            mock_embedder.clone()
+        }
+    };
     let chunker = TokenBasedChunker::new(500, 50);
     let source = LoggingSource::new(MediaWikiXml::new(&args.archive), args.max_pages);
 
@@ -136,7 +169,7 @@ async fn main() -> Result<()> {
     );
     let t0 = Instant::now();
     let slot_id = bucket
-        .build_slot(&source, &chunker, mock.clone(), &cancel)
+        .build_slot(&source, &chunker, embedder.clone(), &cancel)
         .await
         .context("build_slot")?;
     let build_dur = t0.elapsed();
@@ -144,7 +177,7 @@ async fn main() -> Result<()> {
     let pages_emitted = source.kept.load(Ordering::SeqCst);
     let pages_skipped = source.skipped.load(Ordering::SeqCst);
     let read_errors = source.errors.load(Ordering::SeqCst);
-    let embed_calls = mock.embed_calls.load(Ordering::SeqCst);
+    let embed_calls = mock_embedder.embed_calls.load(Ordering::SeqCst);
     let bucket_disk_size = dir_size(&bucket_dir).unwrap_or(0);
 
     eprintln!();
@@ -163,10 +196,17 @@ async fn main() -> Result<()> {
     if !args.query.is_empty() {
         eprintln!();
         eprintln!("=== sample queries ===");
-        let engine = QueryEngine::new(
-            mock.clone() as Arc<dyn EmbeddingProvider>,
-            Arc::new(MockReranker),
-        );
+        let reranker: Arc<dyn RerankProvider> = match &args.tei_reranker_url {
+            Some(url) => {
+                eprintln!("using TEI reranker at {url}");
+                Arc::new(TeiRerankClient::new(url.clone(), None))
+            }
+            None => {
+                eprintln!("using mock reranker (whitespace-token overlap)");
+                Arc::new(MockReranker)
+            }
+        };
+        let engine = QueryEngine::new(embedder.clone(), reranker);
         let buckets: Vec<Arc<dyn Bucket>> = vec![Arc::new(bucket)];
         for q in &args.query {
             run_query(&engine, &buckets, q, args.top_k, &cancel).await?;
