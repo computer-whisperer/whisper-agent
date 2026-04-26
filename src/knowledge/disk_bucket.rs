@@ -35,6 +35,7 @@ use super::manifest::{
 use super::slot;
 use super::source::{SourceAdapter, SourceError, SourceRecord};
 use super::sparse::{SparseIndex, SparseIndexBuilder};
+use super::tombstones::Tombstones;
 use super::types::{
     BucketError, BucketId, BucketStatus, Candidate, Chunk, ChunkId, NewChunk, SearchPath, SlotId,
 };
@@ -199,12 +200,18 @@ pub struct DiskBucket {
 ///   queries take read locks.
 /// - `sparse` is replaced per build-batch (after each tantivy
 ///   commit) so the reader sees the latest committed segments.
+/// - `tombstones` ([`Tombstones`]) holds its own internal `RwLock` /
+///   `Mutex`; queries take the read lock for `O(log N)` membership
+///   tests, [`Bucket::tombstone`] takes the write lock briefly to
+///   merge new ids in. The same handle persists across the slot's
+///   lifetime.
 struct LoadedSlot {
     manifest: SlotManifest,
     chunks: RwLock<Arc<ChunkStoreReader>>,
     vectors: Option<VectorStoreReader>,
     dense: Arc<DenseIndex>,
     sparse: Option<RwLock<Arc<SparseIndex>>>,
+    tombstones: Arc<Tombstones>,
 }
 
 impl std::fmt::Debug for LoadedSlot {
@@ -231,6 +238,10 @@ impl LoadedSlot {
                 .expect("LoadedSlot.sparse lock poisoned")
                 .clone()
         })
+    }
+
+    fn tombstones(&self) -> Arc<Tombstones> {
+        self.tombstones.clone()
     }
 }
 
@@ -1040,12 +1051,15 @@ impl DiskBucket {
         manifest.stats.disk_size_bytes = total_dir_size(slot_path).unwrap_or(0);
         write_manifest(slot_path, &manifest)?;
 
+        let tombstones =
+            Arc::new(Tombstones::open(&slot::tombstones_path(slot_path)).map_err(BucketError::Io)?);
         let loaded = Arc::new(LoadedSlot {
             manifest,
             chunks: RwLock::new(Arc::new(chunks)),
             vectors: Some(vectors),
             dense,
             sparse: sparse.map(|s| RwLock::new(Arc::new(s))),
+            tombstones,
         });
 
         slot::set_active_slot(&self.root, slot_id)?;
@@ -1121,12 +1135,16 @@ impl DiskBucket {
                     )
                     .map_err(BucketError::Io)?,
                 );
+                let tombstones = Arc::new(
+                    Tombstones::open(&slot::tombstones_path(slot_path)).map_err(BucketError::Io)?,
+                );
                 let slot = Arc::new(LoadedSlot {
                     manifest: manifest.clone(),
                     chunks: RwLock::new(chunks_reader),
                     vectors: None,
                     dense: dense.clone(),
                     sparse: sparse_reader.map(RwLock::new),
+                    tombstones,
                 });
                 {
                     let mut active = self.active.write().expect("active slot lock poisoned");
@@ -1289,8 +1307,14 @@ impl Bucket for DiskBucket {
 
             let hits = active.dense.search(query_vec, top_k);
             let chunks = active.chunks();
+            let tombstones = active.tombstones();
             let mut out = Vec::with_capacity(hits.len());
             for (chunk_id, distance) in hits {
+                // Drop tombstoned hits before fetching chunk text;
+                // physical removal happens at compaction.
+                if tombstones.contains(chunk_id) {
+                    continue;
+                }
                 // Look up chunk text for inclusion in the candidate.
                 // A miss can happen during a mid-build query if HNSW
                 // already has a position whose chunk_id wasn't yet
@@ -1332,8 +1356,16 @@ impl Bucket for DiskBucket {
 
             let hits = sparse.search(query_text, top_k)?;
             let chunks = active.chunks();
+            let tombstones = active.tombstones();
             let mut out = Vec::with_capacity(hits.len());
             for (chunk_id, score) in hits {
+                // Tombstoned chunks may still be in tantivy until the
+                // delete-by-term path lands with the insert commit;
+                // until then the query-side filter is the source of
+                // truth.
+                if tombstones.contains(chunk_id) {
+                    continue;
+                }
                 // Same skip-on-miss as the dense path: a tantivy
                 // commit may have outpaced the chunks-store snapshot
                 // by one batch.
@@ -1379,11 +1411,28 @@ impl Bucket for DiskBucket {
         })
     }
 
-    fn tombstone<'a>(&'a self, _chunk_ids: Vec<ChunkId>) -> BoxFuture<'a, Result<(), BucketError>> {
+    fn tombstone<'a>(&'a self, chunk_ids: Vec<ChunkId>) -> BoxFuture<'a, Result<(), BucketError>> {
         Box::pin(async move {
-            Err(BucketError::Other(
-                "tombstone: deferred until indexes land (slices 5–6)".to_string(),
-            ))
+            if chunk_ids.is_empty() {
+                return Ok(());
+            }
+            let active = self
+                .active_snapshot()
+                .ok_or_else(|| BucketError::NoActiveSlot(self.id.clone()))?;
+            let tombstones = active.tombstones();
+            // The append fsyncs; push it to a blocking thread so we
+            // don't park a tokio worker on disk latency.
+            tokio::task::spawn_blocking(move || tombstones.append(&chunk_ids))
+                .await
+                .map_err(|e| BucketError::Other(format!("tombstone task: {e}")))?
+                .map_err(BucketError::Io)?;
+            // Tantivy `delete_term` is deferred to the insert commit
+            // so it can share the writer-ownership pattern. Until
+            // then, the query-path filters in `dense_search` and
+            // `sparse_search` are the source of truth: tantivy still
+            // ranks tombstoned docs, we just drop the hit before
+            // returning it to the caller.
+            Ok(())
         })
     }
 
@@ -1647,12 +1696,16 @@ fn load_slot(bucket_root: &Path, slot_id: &str) -> Result<LoadedSlot, BucketErro
         None
     };
 
+    let tombstones =
+        Arc::new(Tombstones::open(&slot::tombstones_path(&slot_path)).map_err(BucketError::Io)?);
+
     Ok(LoadedSlot {
         manifest,
         chunks: RwLock::new(Arc::new(chunks)),
         vectors: Some(vectors),
         dense: Arc::new(dense),
         sparse: sparse.map(|s| RwLock::new(Arc::new(s))),
+        tombstones,
     })
 }
 
@@ -2355,7 +2408,7 @@ embedder = "tei_test"
     }
 
     #[tokio::test]
-    async fn mutation_methods_error_until_indexes_land() {
+    async fn insert_and_compact_error_until_indexes_land() {
         let tmp = tempfile::tempdir().unwrap();
         let source = tmp.path().join("notes");
         fs::create_dir_all(&source).unwrap();
@@ -2365,8 +2418,184 @@ embedder = "tei_test"
         let cancel = CancellationToken::new();
 
         assert!(bucket.insert(Vec::new(), &cancel).await.is_err());
-        assert!(bucket.tombstone(Vec::new()).await.is_err());
         assert!(bucket.compact(&cancel).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn tombstone_empty_is_ok_even_without_slot() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("notes");
+        fs::create_dir_all(&source).unwrap();
+        let bucket_root = tmp.path().join("bucket");
+        let bucket = open_test_bucket(&bucket_root, &source);
+        // Empty list short-circuits before the active-slot check;
+        // there's nothing to durably record.
+        bucket.tombstone(Vec::new()).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn tombstone_errors_when_no_active_slot() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("notes");
+        fs::create_dir_all(&source).unwrap();
+        let bucket_root = tmp.path().join("bucket");
+        let bucket = open_test_bucket(&bucket_root, &source);
+        let err = bucket
+            .tombstone(vec![ChunkId([0xAA; 32])])
+            .await
+            .unwrap_err();
+        assert!(matches!(err, BucketError::NoActiveSlot(_)), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn tombstone_filters_dense_search_results() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("notes");
+        fs::create_dir_all(&source).unwrap();
+        write_md(&source, "alpha.md", "alpha body");
+        write_md(&source, "beta.md", "beta body");
+        write_md(&source, "gamma.md", "gamma body");
+
+        let bucket_root = tmp.path().join("bucket");
+        let bucket = open_test_bucket(&bucket_root, &source);
+        let adapter = MarkdownDir::new(&source);
+        let (chunker, chunker_snapshot) = TokenBasedChunker::from_config(&bucket.config().chunker);
+        let embedder: Arc<dyn EmbeddingProvider> = Arc::new(MockEmbedder::new(16));
+        let cancel = CancellationToken::new();
+        bucket
+            .build_slot(
+                &adapter,
+                &chunker,
+                chunker_snapshot.clone(),
+                embedder,
+                None,
+                &cancel,
+            )
+            .await
+            .unwrap();
+
+        // Pull a real chunk id out of a search to avoid duplicating the
+        // chunker's id derivation in the test.
+        let beta_record = crate::knowledge::SourceRecord::new("ignored", "beta body");
+        let beta_chunks = chunker.chunk(&beta_record);
+        let query = MockEmbedder::fake_vector(&beta_chunks[0].text, 16);
+
+        let before = bucket.dense_search(&query, 3, &cancel).await.unwrap();
+        let target = before
+            .iter()
+            .find(|c| c.chunk_text.contains("beta body"))
+            .expect("expected beta hit before tombstone")
+            .chunk_id;
+
+        bucket.tombstone(vec![target]).await.unwrap();
+
+        let after = bucket.dense_search(&query, 3, &cancel).await.unwrap();
+        assert!(
+            after.iter().all(|c| c.chunk_id != target),
+            "tombstoned chunk leaked into dense results: {after:?}",
+        );
+        assert!(
+            after.iter().all(|c| !c.chunk_text.contains("beta body")),
+            "tombstoned text leaked into dense results: {after:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn tombstone_filters_sparse_search_results() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("notes");
+        fs::create_dir_all(&source).unwrap();
+        write_md(
+            &source,
+            "alpha.md",
+            "the quick brown fox jumps over the lazy dog",
+        );
+        write_md(&source, "beta.md", "another fox in another sentence");
+        write_md(
+            &source,
+            "gamma.md",
+            "the rain in spain falls mainly on the plain",
+        );
+
+        let bucket_root = tmp.path().join("bucket");
+        let bucket = open_test_bucket(&bucket_root, &source);
+        let adapter = MarkdownDir::new(&source);
+        let (chunker, chunker_snapshot) = TokenBasedChunker::from_config(&bucket.config().chunker);
+        let embedder: Arc<dyn EmbeddingProvider> = Arc::new(MockEmbedder::new(8));
+        let cancel = CancellationToken::new();
+        bucket
+            .build_slot(
+                &adapter,
+                &chunker,
+                chunker_snapshot.clone(),
+                embedder,
+                None,
+                &cancel,
+            )
+            .await
+            .unwrap();
+
+        let before = bucket.sparse_search("fox", 5, &cancel).await.unwrap();
+        assert_eq!(before.len(), 2, "expected both fox docs before tombstone");
+        let target = before[0].chunk_id;
+
+        bucket.tombstone(vec![target]).await.unwrap();
+
+        let after = bucket.sparse_search("fox", 5, &cancel).await.unwrap();
+        assert!(
+            after.iter().all(|c| c.chunk_id != target),
+            "tombstoned chunk leaked into sparse results",
+        );
+        assert_eq!(
+            after.len(),
+            before.len() - 1,
+            "exactly one chunk should drop out",
+        );
+    }
+
+    #[tokio::test]
+    async fn tombstone_persists_across_bucket_reopen() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("notes");
+        fs::create_dir_all(&source).unwrap();
+        write_md(&source, "alpha.md", "the quick brown fox");
+        write_md(&source, "beta.md", "another fox sentence");
+
+        let bucket_root = tmp.path().join("bucket");
+        let target = {
+            let bucket = open_test_bucket(&bucket_root, &source);
+            let adapter = MarkdownDir::new(&source);
+            let (chunker, chunker_snapshot) =
+                TokenBasedChunker::from_config(&bucket.config().chunker);
+            let embedder: Arc<dyn EmbeddingProvider> = Arc::new(MockEmbedder::new(8));
+            let cancel = CancellationToken::new();
+            bucket
+                .build_slot(
+                    &adapter,
+                    &chunker,
+                    chunker_snapshot.clone(),
+                    embedder,
+                    None,
+                    &cancel,
+                )
+                .await
+                .unwrap();
+            let hits = bucket.sparse_search("fox", 5, &cancel).await.unwrap();
+            assert_eq!(hits.len(), 2);
+            let target = hits[0].chunk_id;
+            bucket.tombstone(vec![target]).await.unwrap();
+            target
+        };
+
+        // Reopen — tombstones come back from `tombstones.bin`.
+        let reopened = DiskBucket::open(&bucket_root, BucketId::pod("notes")).unwrap();
+        let cancel = CancellationToken::new();
+        let after = reopened.sparse_search("fox", 5, &cancel).await.unwrap();
+        assert!(
+            after.iter().all(|c| c.chunk_id != target),
+            "tombstoned chunk reappeared after reopen",
+        );
+        assert_eq!(after.len(), 1);
     }
 
     #[tokio::test]

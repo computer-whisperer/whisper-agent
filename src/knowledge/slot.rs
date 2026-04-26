@@ -30,6 +30,7 @@ pub const CHUNKS_IDX: &str = "chunks.idx";
 pub const VECTORS_BIN: &str = "vectors.bin";
 pub const VECTORS_IDX: &str = "vectors.idx";
 pub const INDEX_TANTIVY: &str = "index.tantivy";
+pub const TOMBSTONES_BIN: &str = "tombstones.bin";
 pub const BUILD_STATE: &str = "build.state";
 pub const BUILD_LOG: &str = "build.log";
 
@@ -67,6 +68,10 @@ pub fn vectors_idx_path(slot_dir: &Path) -> PathBuf {
 
 pub fn tantivy_dir(slot_dir: &Path) -> PathBuf {
     slot_dir.join(INDEX_TANTIVY)
+}
+
+pub fn tombstones_path(slot_dir: &Path) -> PathBuf {
+    slot_dir.join(TOMBSTONES_BIN)
 }
 
 pub fn active_pointer_path(bucket_root: &Path) -> PathBuf {

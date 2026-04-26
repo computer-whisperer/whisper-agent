@@ -41,6 +41,7 @@ pub mod registry;
 pub mod slot;
 pub mod source;
 pub mod sparse;
+pub mod tombstones;
 pub mod types;
 pub mod vectors;
 
