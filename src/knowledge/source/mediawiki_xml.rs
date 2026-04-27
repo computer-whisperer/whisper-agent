@@ -6,8 +6,19 @@
 //! Why streaming: a current `enwiki-latest-pages-articles.xml.bz2` is
 //! ~22 GB compressed / ~95 GB uncompressed. DOM parsing is not an
 //! option; we walk events with `quick-xml` and hold only one page in
-//! memory at a time. The bz2 path uses `bzip2::read::BzDecoder` so
-//! decompression streams in lockstep with parsing.
+//! memory at a time. The bz2 path uses `bzip2::read::MultiBzDecoder`
+//! so decompression streams in lockstep with parsing.
+//!
+//! `MultiBzDecoder` (rather than `BzDecoder`) because the canonical
+//! Wikipedia dumps are **multistream** archives — a sequence of
+//! independent bz2 streams concatenated end-to-end (the index file
+//! published alongside lets clients seek to a specific stream for
+//! random-access decompression). The first stream typically contains
+//! just `<siteinfo>` and no pages; subsequent streams hold pages in
+//! batches. A plain `BzDecoder` would stop at the end of the first
+//! stream, yielding zero pages on a real Wikipedia dump. Single-
+//! stream `.xml.bz2` files (hand-converted, or older non-multistream
+//! exports) are a strict subset and decode the same way.
 //!
 //! Filtering rules baked into v1 — all tunable later via config:
 //! - **Namespace 0 only.** Drops `Talk:` / `User:` / `Template:` etc.
@@ -81,7 +92,10 @@ fn open_reader(path: &Path) -> Result<Box<dyn BufRead + Send>, SourceError> {
         },
     })?;
     if is_bz2(path) {
-        let decoder = bzip2::read::BzDecoder::new(BufReader::new(file));
+        // MultiBzDecoder transparently spans the concatenated bz2
+        // streams that make up a Wikipedia "multistream" dump; on a
+        // single-stream file it behaves identically to BzDecoder.
+        let decoder = bzip2::read::MultiBzDecoder::new(BufReader::new(file));
         Ok(Box::new(BufReader::new(decoder)))
     } else {
         Ok(Box::new(BufReader::new(file)))
@@ -377,6 +391,24 @@ Line three: {{infobox}}</text>
         enc.finish().unwrap();
     }
 
+    /// Encode `chunks` as independent bz2 streams concatenated end-to-
+    /// end — the format the canonical
+    /// `<lang>wiki-<id>-pages-articles-multistream.xml.bz2` files use.
+    /// `MultiBzDecoder` should span them transparently; a plain
+    /// `BzDecoder` would stop at the end of `chunks[0]`.
+    fn write_fixture_multistream_bz2_to(path: &Path, chunks: &[&str]) {
+        let mut f = File::create(path).unwrap();
+        for chunk in chunks {
+            let mut buf = Vec::new();
+            {
+                let mut enc = bzip2::write::BzEncoder::new(&mut buf, bzip2::Compression::default());
+                enc.write_all(chunk.as_bytes()).unwrap();
+                enc.finish().unwrap();
+            }
+            f.write_all(&buf).unwrap();
+        }
+    }
+
     fn collect(adapter: &MediaWikiXml) -> Vec<SourceRecord> {
         adapter
             .enumerate()
@@ -520,5 +552,26 @@ Line three: {{infobox}}</text>
         );
         let records = collect(&MediaWikiXml::new(&path));
         assert!(records.is_empty());
+    }
+
+    /// Real Wikipedia dumps are *multistream* bz2 — independent
+    /// streams concatenated end-to-end. The first stream typically
+    /// holds only `<siteinfo>` (no pages); pages start in subsequent
+    /// streams. A plain `BzDecoder` stops at the end of the first
+    /// stream and yields zero pages on a real dump. This regression
+    /// test forces the multistream layout via two synthetic streams
+    /// and asserts the iterator pulls pages out of the second one.
+    #[test]
+    fn multistream_bz2_yields_pages_from_later_streams() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("multi.xml.bz2");
+
+        let header = r#"<?xml version="1.0"?><mediawiki xmlns="http://www.mediawiki.org/xml/export-0.11/"><siteinfo><sitename>X</sitename></siteinfo>"#;
+        let pages = r#"<page><title>Apollo</title><ns>0</ns><revision><text>The Apollo program ran from 1961 to 1972.</text></revision></page><page><title>Saturn V</title><ns>0</ns><revision><text>Saturn V was the rocket that took astronauts to the Moon.</text></revision></page></mediawiki>"#;
+        write_fixture_multistream_bz2_to(&path, &[header, pages]);
+
+        let records = collect(&MediaWikiXml::new(&path));
+        let titles: Vec<_> = records.iter().map(|r| r.source_id.as_str()).collect();
+        assert_eq!(titles, vec!["Apollo", "Saturn V"]);
     }
 }
