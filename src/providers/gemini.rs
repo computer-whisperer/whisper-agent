@@ -657,30 +657,33 @@ fn convert_user_parts(blocks: &[ContentBlock], id_to_name: &HashMap<String, Stri
                 // plain string. Wrap under "content" so we preserve arbitrary
                 // tool output (including error markers) without forcing the
                 // tool output to fit a model-chosen schema.
-                parts.push(Part::FunctionResponse {
-                    function_response: FunctionResponse {
-                        name,
-                        response: serde_json::json!({ "content": text }),
-                    },
-                });
-                // Tool-result images and documents ride as additional
-                // inline_data parts on the same user turn — Gemini's
-                // functionResponse.response field is structured JSON
-                // (not multipart), so attachments can't nest inside
-                // it. Appending them as sibling parts keeps them
-                // attached to the same turn and preserves order.
+                // Tool-result images and documents nest *inside* the
+                // FunctionResponse via its `parts` field — sibling
+                // inlineData on the same Content reads as detached
+                // model output to thinking-capable Gemini models and
+                // triggers "Image part is missing a thought_signature"
+                // 400s. Order is preserved within the nested vec.
+                // Tool-side parts never carry a model-side
+                // thoughtSignature, so we always pass `None` to the
+                // image/document lowering helpers.
+                let mut nested = Vec::new();
                 for src in content.image_sources() {
-                    // Tool-result images come from the user turn — no
-                    // model-side thought_signature applies.
                     if let Some(part) = image_source_to_part(src, None) {
-                        parts.push(part);
+                        nested.push(part);
                     }
                 }
                 for src in content.document_sources() {
                     if let Some(part) = document_source_to_part(src) {
-                        parts.push(part);
+                        nested.push(part);
                     }
                 }
+                parts.push(Part::FunctionResponse {
+                    function_response: FunctionResponse {
+                        name,
+                        response: serde_json::json!({ "content": text }),
+                        parts: nested,
+                    },
+                });
             }
             ContentBlock::Image { source, .. } => {
                 // User-side images never carry a thought_signature
@@ -1410,6 +1413,19 @@ pub(crate) struct FunctionCall {
 pub(crate) struct FunctionResponse {
     pub(crate) name: String,
     pub(crate) response: Value,
+    /// Multimodal parts that ride inside the function response — used
+    /// to attach images (and other binary attachments) returned by a
+    /// tool. Per Gemini's "multimodal function responses" spec
+    /// (Gemini 3 series and forward), tool-result media must nest
+    /// here rather than appear as sibling `inlineData` parts on the
+    /// same Content. Sibling parts get treated as detached model
+    /// output, which on thinking models triggers "Image part is
+    /// missing a thought_signature" 400s. Each entry is a
+    /// `Part::InlineData` whose `inline_data` carries the media; we
+    /// always emit `thought_signature: None` here since these parts
+    /// originate from the user side.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) parts: Vec<Part>,
 }
 
 #[derive(Serialize, Debug)]
@@ -1577,11 +1593,14 @@ mod tests {
     }
 
     #[test]
-    fn tool_result_with_image_appends_inline_data_part() {
-        // Gemini's functionResponse.response is structured JSON, not
-        // multipart, so tool-result images ride as additional sibling
-        // inline_data parts on the same user turn alongside the
-        // functionResponse.
+    fn tool_result_with_image_nests_inline_data_inside_function_response() {
+        // Per Gemini's "multimodal function responses" wire shape
+        // (Gemini 3 series and forward), tool-result images must nest
+        // inside `functionResponse.parts`, NOT ride as sibling
+        // inlineData parts on the same Content. Sibling parts get
+        // treated as detached model output and trip the API's
+        // "Image part is missing a thought_signature" 400 on
+        // thinking-capable models.
         use whisper_agent_protocol::{ImageMime, ImageSource, ToolResultContent};
         let blocks = vec![ContentBlock::ToolResult {
             tool_use_id: "call_7".into(),
@@ -1602,15 +1621,42 @@ mod tests {
         let mut id_to_name = HashMap::new();
         id_to_name.insert("call_7".to_string(), "shell".to_string());
         let parts = convert_user_parts(&blocks, &id_to_name);
-        // [functionResponse, inlineData]
-        assert_eq!(parts.len(), 2);
+        // Single FunctionResponse part — no sibling inlineData.
+        assert_eq!(parts.len(), 1);
         let json = serde_json::to_value(&parts).unwrap();
-        assert_eq!(json[0]["functionResponse"]["name"], "shell");
-        assert_eq!(
-            json[0]["functionResponse"]["response"]["content"],
-            "screenshot:"
-        );
-        assert_eq!(json[1]["inlineData"]["mimeType"], "image/png");
+        let fr = &json[0]["functionResponse"];
+        assert_eq!(fr["name"], "shell");
+        assert_eq!(fr["response"]["content"], "screenshot:");
+        // Image rides nested under functionResponse.parts[0].inlineData.
+        let nested = fr["parts"].as_array().expect("parts must be present");
+        assert_eq!(nested.len(), 1);
+        assert_eq!(nested[0]["inlineData"]["mimeType"], "image/png");
+        // 4 bytes 0x89 0x50 0x4E 0x47 → base64 "iVBORw=="
+        assert_eq!(nested[0]["inlineData"]["data"], "iVBORw==");
+        // Nested tool-result media must not carry a thoughtSignature
+        // — the model never signed it, and emitting one would be a
+        // cross-provider/spurious blob.
+        assert!(nested[0].get("thoughtSignature").is_none());
+    }
+
+    #[test]
+    fn tool_result_text_only_omits_nested_parts() {
+        // Verify the non-multimodal case still serializes cleanly:
+        // text-only tool results must not emit an empty `parts` array
+        // on the wire (the field is `skip_serializing_if =
+        // "Vec::is_empty"`). Otherwise older Gemini models that
+        // don't recognize the field could 400.
+        use whisper_agent_protocol::ToolResultContent;
+        let blocks = vec![ContentBlock::ToolResult {
+            tool_use_id: "call_x".into(),
+            content: ToolResultContent::Text("ok".into()),
+            is_error: false,
+        }];
+        let mut id_to_name = HashMap::new();
+        id_to_name.insert("call_x".into(), "shell".into());
+        let parts = convert_user_parts(&blocks, &id_to_name);
+        let json = serde_json::to_value(&parts).unwrap();
+        assert!(json[0]["functionResponse"].get("parts").is_none());
     }
 
     #[test]
