@@ -238,6 +238,13 @@ impl Scheduler {
             token.cancel();
         }
 
+        // Stop the per-tracked-bucket feed worker, if any. Stored /
+        // linked / managed buckets don't have one — `remove` is a
+        // no-op in that case.
+        if let Some(token) = self.active_feed_workers.remove(&id) {
+            token.cancel();
+        }
+
         // Drop the in-memory entry + cached DiskBucket. Sync — both
         // operations are O(1) under a short-held mutex.
         self.bucket_registry.remove_entry(&id);
