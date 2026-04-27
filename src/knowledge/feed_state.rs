@@ -67,6 +67,22 @@ pub struct FeedState {
     /// freshly-created tracked bucket whose initial build hasn't run.
     #[serde(default)]
     pub current_base_snapshot_id: Option<String>,
+
+    /// Most recent delta id whose content has been applied to the
+    /// active slot's index. The per-bucket feed worker advances this
+    /// after a successful tombstone+insert pass; queries up to this
+    /// delta are guaranteed to reflect Wikipedia's state at that
+    /// point.
+    ///
+    /// In the *current* slice the field is advanced as soon as the
+    /// delta has been *downloaded* (the application step lands in a
+    /// follow-up); the cursor's purpose during that window is to bound
+    /// `list_deltas_since` against an ever-growing directory listing,
+    /// not to make a correctness guarantee. The field's name reflects
+    /// its post-T4c semantics so the on-disk format doesn't churn when
+    /// the application slice lands.
+    #[serde(default)]
+    pub last_applied_delta_id: Option<String>,
 }
 
 impl FeedState {
@@ -125,6 +141,18 @@ impl FeedState {
     /// `String`.
     pub fn set_current_base(&mut self, id: SnapshotId) {
         self.current_base_snapshot_id = Some(id.0);
+    }
+
+    /// Typed accessor for the last-applied delta cursor.
+    pub fn last_applied_delta(&self) -> Option<DeltaId> {
+        self.last_applied_delta_id
+            .as_ref()
+            .map(|s| DeltaId::new(s.clone()))
+    }
+
+    /// Typed setter for the last-applied delta cursor.
+    pub fn set_last_applied_delta(&mut self, id: DeltaId) {
+        self.last_applied_delta_id = Some(id.0);
     }
 }
 
