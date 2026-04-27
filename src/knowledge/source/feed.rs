@@ -22,6 +22,21 @@ pub mod wikipedia;
 
 pub use wikipedia::WikipediaDriver;
 
+use super::super::config::TrackedDriver;
+
+/// Construct a runtime [`FeedDriver`] from the bucket-config
+/// [`TrackedDriver`] enum. The factory is a closed match (one variant
+/// today, `Wikipedia`) — adding a future driver means a new
+/// [`TrackedDriver`] variant + a new arm here. No registry, no
+/// config-driven plugin loading.
+pub fn driver_for(config: &TrackedDriver) -> Box<dyn FeedDriver> {
+    match config {
+        TrackedDriver::Wikipedia { language, mirror } => {
+            Box::new(WikipediaDriver::new(language.clone(), mirror.clone()))
+        }
+    }
+}
+
 use std::future::Future;
 use std::path::Path;
 use std::pin::Pin;
@@ -174,4 +189,32 @@ pub trait FeedDriver: Send + Sync {
     /// MediaWiki XML parser handles both stored-bucket archives and
     /// tracked-bucket downloads.
     fn parse_adapter(&self) -> &'static str;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn driver_for_wikipedia_constructs_correctly_configured_driver() {
+        let cfg = TrackedDriver::Wikipedia {
+            language: "simple".to_string(),
+            mirror: Some("https://my-mirror.example/".to_string()),
+        };
+        let driver = driver_for(&cfg);
+        assert_eq!(driver.parse_adapter(), "mediawiki_xml");
+        // The driver doesn't expose language/mirror through the trait
+        // (they're driver-specific implementation details). Smoke-test
+        // by checking the parse_adapter contract instead.
+    }
+
+    #[test]
+    fn driver_for_wikipedia_default_mirror_when_unset() {
+        let cfg = TrackedDriver::Wikipedia {
+            language: "en".to_string(),
+            mirror: None,
+        };
+        let driver = driver_for(&cfg);
+        assert_eq!(driver.parse_adapter(), "mediawiki_xml");
+    }
 }

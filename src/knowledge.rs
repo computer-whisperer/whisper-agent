@@ -35,6 +35,7 @@ pub mod chunks;
 pub mod config;
 pub mod dense;
 pub mod disk_bucket;
+pub mod feed_state;
 pub mod manifest;
 pub mod query;
 pub mod registry;
@@ -51,17 +52,21 @@ pub use chunks::{ChunkStoreReader, ChunkStoreWriter};
 pub use config::{
     BucketConfig, ChunkerConfig, CompactionConfig, DefaultsConfig, DensePathConfig, Quantization,
     RescanStrategy, SearchPathsConfig, ServingMode, SourceConfig, SparsePathConfig,
-    TokenizerSource,
+    TokenizerSource, TrackedCadence, TrackedDriver,
 };
 pub use dense::{DenseIndex, HnswParams};
 pub use disk_bucket::{BuildObserver, BuildPhase, DiskBucket};
+pub use feed_state::{FeedState, FeedStateError, base_cache_dir, delta_cache_dir, feed_state_path};
 pub use manifest::{
     ChunkerSnapshot, EmbedderSnapshot, ServingSnapshot, SlotLineage, SlotManifest, SlotState,
     SlotStats, SparseSnapshot, TokenizerSnapshot,
 };
 pub use query::{QueryEngine, QueryParams, RerankedCandidate};
 pub use registry::{BucketEntry, BucketRegistry};
-pub use source::{MarkdownDir, MediaWikiXml, SourceAdapter, SourceError, SourceRecord};
+pub use source::{
+    DeltaId, FeedDriver, FeedError, MarkdownDir, MediaWikiXml, SnapshotId, SourceAdapter,
+    SourceError, SourceRecord, WikipediaDriver,
+};
 pub use sparse::{SparseIndex, SparseIndexBuilder};
 pub use types::{
     BucketError, BucketId, BucketScope, BucketStatus, BuildProgress, Candidate, Chunk, ChunkId,
