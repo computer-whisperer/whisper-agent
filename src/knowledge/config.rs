@@ -53,11 +53,17 @@ impl BucketConfig {
 /// Source-of-truth for a bucket's content. Tagged on `kind`.
 ///
 /// - `stored` — a reproducible archive on disk we own (wikipedia XML dump,
-///   arxiv PDF cache). Re-ingestable any time.
+///   arxiv PDF cache). Re-ingestable any time. The user owns the archive's
+///   currency.
 /// - `linked` — a path or URL pointing at content we don't own. Tolerates
 ///   the target moving or being edited; chunks are snapshotted into the
 ///   bucket on ingest so queries remain serviceable when the source
 ///   drifts.
+/// - `tracked` — a self-maintained feed (Wikipedia today; future Wikidata,
+///   arxiv-feed). The system owns the snapshot's currency, polling the feed
+///   on a configured cadence. Built on top of the `stored` machinery: shares
+///   parsers and slot lifecycle, distinguished by the acquisition layer (a
+///   [`FeedDriver`](super::source::feed::FeedDriver)).
 /// - `managed` — content authored exclusively through the API
 ///   (pod memory, agent-authored notes). No external source; mutations
 ///   come via [`Bucket::insert`](super::Bucket::insert) /
@@ -82,6 +88,14 @@ pub enum SourceConfig {
         rescan_strategy: RescanStrategy,
     },
     Managed {},
+    Tracked {
+        #[serde(flatten)]
+        driver: TrackedDriver,
+        #[serde(default)]
+        delta_cadence: TrackedCadence,
+        #[serde(default = "TrackedCadence::default_resync")]
+        resync_cadence: TrackedCadence,
+    },
 }
 
 impl SourceConfig {
@@ -90,7 +104,68 @@ impl SourceConfig {
             SourceConfig::Stored { .. } => "stored",
             SourceConfig::Linked { .. } => "linked",
             SourceConfig::Managed { .. } => "managed",
+            SourceConfig::Tracked { .. } => "tracked",
         }
+    }
+}
+
+/// Driver-specific config for `[source] kind = "tracked"`. Tagged on
+/// `driver`. Closed enum: v1 ships `wikipedia`, future variants land
+/// one-at-a-time as needs surface (Wikidata, arxiv-feed, …). No
+/// config-driven plugin loading.
+///
+/// Driver-specific knobs live on each variant — `language`, `mirror` for
+/// Wikipedia; whatever the next driver needs on its own. Cadence fields
+/// (`delta_cadence`, `resync_cadence`) are *not* driver-specific and live
+/// on the surrounding [`SourceConfig::Tracked`] variant.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(tag = "driver", rename_all = "snake_case")]
+pub enum TrackedDriver {
+    Wikipedia {
+        /// Wiki language code, e.g. `"en"`, `"de"`, `"simple"`. Maps to
+        /// `<lang>wiki` in the dumps.wikimedia.org URL conventions.
+        language: String,
+        /// Optional mirror override; defaults to
+        /// `https://dumps.wikimedia.org` if omitted.
+        #[serde(default)]
+        mirror: Option<String>,
+    },
+}
+
+impl TrackedDriver {
+    pub fn name(&self) -> &'static str {
+        match self {
+            TrackedDriver::Wikipedia { .. } => "wikipedia",
+        }
+    }
+}
+
+/// How often the per-bucket feed worker polls for deltas, and how often
+/// the background resync rebuilds against a fresh base snapshot. Same
+/// vocabulary used for both fields; the meaningful values for each are
+/// driver-dependent (Wikipedia publishes daily incrementals + monthly
+/// bases, so `Daily` / `Monthly` are the practical defaults — but the
+/// feed worker silently coalesces if the driver has nothing to offer).
+///
+/// `Manual` disables the schedule entirely; the user can still kick a
+/// poll/resync via the WebUI button.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TrackedCadence {
+    #[default]
+    Daily,
+    Weekly,
+    Monthly,
+    Quarterly,
+    Manual,
+}
+
+impl TrackedCadence {
+    /// Default for `resync_cadence`. The default for `delta_cadence` is
+    /// the `Default::default()` impl above (`Daily`), matching Wikipedia's
+    /// incremental-dump cadence.
+    fn default_resync() -> Self {
+        TrackedCadence::Monthly
     }
 }
 
@@ -488,6 +563,148 @@ embedder = "tei"
         assert_eq!(cfg.compaction.tombstone_ratio_threshold, 0.10);
         assert_eq!(cfg.compaction.min_interval, "6h");
         assert_eq!(cfg.compaction.max_interval, "30d");
+    }
+
+    #[test]
+    fn parses_tracked_wikipedia_full_config() {
+        let toml = r#"
+name = "Wikipedia (English)"
+created_at = "2026-04-26T10:00:00Z"
+
+[source]
+kind = "tracked"
+driver = "wikipedia"
+language = "en"
+mirror = "https://my-mirror.example/wikidumps"
+delta_cadence = "daily"
+resync_cadence = "monthly"
+
+[defaults]
+embedder = "tei_qwen3_embed_0_6b"
+"#;
+        let cfg = BucketConfig::from_toml_str(toml).unwrap();
+        assert_eq!(cfg.source.kind(), "tracked");
+        let SourceConfig::Tracked {
+            driver,
+            delta_cadence,
+            resync_cadence,
+        } = &cfg.source
+        else {
+            panic!("expected Tracked, got {:?}", cfg.source);
+        };
+        assert_eq!(driver.name(), "wikipedia");
+        let TrackedDriver::Wikipedia { language, mirror } = driver;
+        assert_eq!(language, "en");
+        assert_eq!(
+            mirror.as_deref(),
+            Some("https://my-mirror.example/wikidumps")
+        );
+        assert_eq!(*delta_cadence, TrackedCadence::Daily);
+        assert_eq!(*resync_cadence, TrackedCadence::Monthly);
+    }
+
+    #[test]
+    fn parses_tracked_wikipedia_minimal_with_defaults() {
+        let toml = r#"
+name = "Wikipedia (English)"
+created_at = "2026-04-26T10:00:00Z"
+
+[source]
+kind = "tracked"
+driver = "wikipedia"
+language = "en"
+
+[defaults]
+embedder = "tei_qwen3_embed_0_6b"
+"#;
+        let cfg = BucketConfig::from_toml_str(toml).unwrap();
+        let SourceConfig::Tracked {
+            driver,
+            delta_cadence,
+            resync_cadence,
+        } = &cfg.source
+        else {
+            panic!("expected Tracked");
+        };
+        let TrackedDriver::Wikipedia { mirror, .. } = driver;
+        assert!(mirror.is_none(), "mirror defaults to None");
+        // Defaults: daily deltas, monthly resync.
+        assert_eq!(*delta_cadence, TrackedCadence::Daily);
+        assert_eq!(*resync_cadence, TrackedCadence::Monthly);
+    }
+
+    #[test]
+    fn parses_tracked_with_manual_cadences() {
+        let toml = r#"
+name = "Wikipedia (manual)"
+created_at = "2026-04-26T10:00:00Z"
+
+[source]
+kind = "tracked"
+driver = "wikipedia"
+language = "simple"
+delta_cadence = "manual"
+resync_cadence = "manual"
+
+[defaults]
+embedder = "tei"
+"#;
+        let cfg = BucketConfig::from_toml_str(toml).unwrap();
+        let SourceConfig::Tracked {
+            delta_cadence,
+            resync_cadence,
+            ..
+        } = &cfg.source
+        else {
+            panic!("expected Tracked");
+        };
+        assert_eq!(*delta_cadence, TrackedCadence::Manual);
+        assert_eq!(*resync_cadence, TrackedCadence::Manual);
+    }
+
+    #[test]
+    fn rejects_tracked_unknown_driver() {
+        let toml = r#"
+name = "Bad"
+created_at = "2026-04-26T10:00:00Z"
+[source]
+kind = "tracked"
+driver = "nonexistent_feed"
+language = "en"
+[defaults]
+embedder = "tei"
+"#;
+        BucketConfig::from_toml_str(toml).unwrap_err();
+    }
+
+    #[test]
+    fn rejects_tracked_wikipedia_missing_language() {
+        let toml = r#"
+name = "Bad"
+created_at = "2026-04-26T10:00:00Z"
+[source]
+kind = "tracked"
+driver = "wikipedia"
+[defaults]
+embedder = "tei"
+"#;
+        BucketConfig::from_toml_str(toml).unwrap_err();
+    }
+
+    #[test]
+    fn rejects_tracked_unknown_cadence() {
+        let toml = r#"
+name = "Bad"
+created_at = "2026-04-26T10:00:00Z"
+[source]
+kind = "tracked"
+driver = "wikipedia"
+language = "en"
+delta_cadence = "every_thursday"
+[defaults]
+embedder = "tei"
+"#;
+        BucketConfig::from_toml_str(toml).unwrap_err();
     }
 
     #[test]

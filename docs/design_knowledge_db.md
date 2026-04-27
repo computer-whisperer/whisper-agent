@@ -32,17 +32,23 @@ Companion docs: [`design_pod_thread_scheduler.md`](design_pod_thread_scheduler.m
 | 2026-04-25 | **Live (auto-injection) mode is deferred — initial implementation is the explicit `knowledge_query` tool plus a basic webui search panel.** | The webui search lets us kick the tires on retrieval quality and tune thresholds before binding any of it to agentic threads. Live mode is additive once the foundation is solid; nothing in the architecture is blocked by deferring it. |
 | 2026-04-25 | Indexing CPU runs on a **dedicated OS thread per active build**, not on the tokio runtime.        | HNSW build + chunking would otherwise starve the scheduler. Single-owner write discipline; main runtime communicates via mpsc. See [Runtime model](#runtime-model-where-cpu-runs). |
 | 2026-04-25 | Retrieval `Bucket::search` runs inline on a tokio worker for v1; revisit only if a search exceeds ~5 ms. | HNSW search is single-digit µs RAM-resident, ~1–3 ms even with bad memory locality. API stays `async fn` so a future move to `spawn_blocking` is a contained change. |
+| 2026-04-26 | **A fourth source kind, `tracked`** — self-maintained feed where the system owns base + delta state against an external archive, polled on a configured cadence. Joins `stored` / `linked` / `managed`. | `stored` is "user hands us a frozen archive URL." `tracked` is "user names a feed family; system handles acquisition + currency." Different lifecycles and different state shape — squashing them obscures both. See [Tracked sources](#tracked-sources-self-maintained-feeds). |
+| 2026-04-26 | **Closed `FeedDriver` enum, one variant per source family.** v1 ships `wikipedia`. | Closed enum keeps trait dispatch trivial and avoids any config-driven plugin loading. New drivers (Wikidata, arxiv-feed, ...) are added one at a time as needs surface. |
+| 2026-04-26 | **Background monthly resync default-on for tracked buckets** — with a per-bucket toggle and an explicit "Resync now" UI button. | Daily incrementals can drift over time (silent log/oversight events, schema bumps); periodic resync against a fresh base snapshot is the correctness reset. Default-on so users don't have to know about this; toggleable + manual-trigger so an operator can take over when the build cost (e.g. ~4 days for enwiki on 0.6B, ~13 days for all-wiki) is inconvenient. |
+| 2026-04-26 | **Turnkey UI for tracked-bucket creation.** A "Create tracked bucket" affordance produces the right `bucket.toml` from a small form per driver; the user is not expected to know URL conventions or schedule formats. | The whole point of `tracked` + closed-enum drivers is shipping a 1-click experience for buckets the system knows how to maintain. If users still have to hand-author the toml, the abstraction has failed. Hand-authored toml stays supported for scripted setups. |
 
 Open forks tracked in [Open questions](#open-questions).
 
 ## What we're building
 
-A "knowledge bucket" is a configurable, queryable index built from a source. Two flavors of source:
+A "knowledge bucket" is a configurable, queryable index built from a source. Four flavors of source:
 
-- **Stored** — we own a reproducible archive (wikipedia XML dump, arxiv PDFs we've cached). The archive lives on disk under our control; we can re-ingest from it any time.
+- **Stored** — we own a reproducible archive that the user pointed us at (a wikipedia XML dump file, an arxiv PDF cache). The archive lives on disk under our control; we can re-ingest from it any time. We don't manage its currency — what the user gave us is what the bucket reflects.
 - **Linked** — we have a pointer (a workspace path, a URL) that we recorded with a hash at scan time. The target may move, change, or disappear. We tolerate all three by snapshotting chunk text into the bucket when we ingest.
+- **Tracked** — a self-maintained feed: the user names a feed family (Wikipedia, future Wikidata / arxiv-feed) and the system handles acquisition + currency. Maintains a base snapshot on disk plus an applied-delta cursor, polling the feed on a configured cadence. Built on top of the `stored` machinery (shares parsers and slot lifecycle); distinguished by who owns the snapshot's currency. See [Tracked sources](#tracked-sources-self-maintained-feeds).
+- **Managed** — content authored exclusively through the API (pod memory, agent-authored notes). No external source layer; mutations come via [`Bucket::insert`](#the-bucket-trait) / [`Bucket::tombstone`](#the-bucket-trait).
 
-Both flavors expose the same shape downstream: a query returns ranked `(score, chunk_text, source_ref)` triples. The `source_ref` is best-effort — for stored buckets it deterministically resolves; for linked buckets it may dangle, in which case the cached chunk text is what the LLM gets.
+All four flavors expose the same shape downstream: a query returns ranked `(score, chunk_text, source_ref)` triples. The `source_ref` is best-effort — for stored / tracked buckets it deterministically resolves; for linked buckets it may dangle, in which case the cached chunk text is what the LLM gets; managed buckets carry only the API-supplied source ref.
 
 Buckets live at two scopes, by analogy with backends and behaviors:
 
@@ -528,6 +534,15 @@ archive_path = "source/enwiki-2026-04-15.xml.bz2"
 # [source]
 # kind = "managed"
 
+# Tracked variant (self-maintained feed — system owns base + delta currency):
+# [source]
+# kind           = "tracked"
+# driver         = "wikipedia"   # closed enum; one variant per supported feed family
+# language       = "en"          # driver-specific knob
+# delta_cadence  = "daily"       # daily | weekly | manual
+# resync_cadence = "monthly"     # monthly | quarterly | manual
+# # mirror = "https://dumps.wikimedia.org"   # optional override
+
 # --- Chunker: strategy + params ---
 
 [chunker]
@@ -777,8 +792,9 @@ Three ways changes arrive at a bucket:
 1. **Source rescan** for linked buckets. Walks the source, computes per-record hashes, diffs against the slot's known state, produces inserts (new/changed records) and tombstones (removed records). Triggered manually, on pod start (config flag), or by an external event. Pure rebuild from scratch is fine for small workspace buckets where it's faster than diff-walk.
 2. **External event notification** for stored buckets that update. A wikipedia delta-dump arrives → an admin task ingests it as inserts + tombstones. Arxiv RSS fires → new-paper inserts. The notification mechanism is out of scope for v1; for now these run as scheduled jobs or admin actions.
 3. **LLM-driven via `knowledge_modify` tool**. For pod memory specifically: a builtin tool exposing `insert(text, source_ref)` / `tombstone(chunk_id)` against the pod's memory bucket. The LLM uses this to record durable notes, update existing entries, and clean out stale ones. Gated by the pod's `[allow.tools]` table the same way other tools are.
+4. **Tracked-bucket scheduler** for `tracked` buckets. A per-bucket worker wakes on the configured `delta_cadence`, asks the driver for new deltas since `last_applied_delta_id`, downloads each, parses through the same source adapter the bucket uses for its base, and applies inserts / tombstones via the same mutation API. Background monthly resync (configurable via `resync_cadence`) builds a fresh slot off the latest base snapshot and rotates when ready. See [Tracked sources](#tracked-sources-self-maintained-feeds).
 
-All three converge to the same `Bucket::insert` / `Bucket::tombstone` API. They differ only in initiator and frequency.
+All four converge to the same `Bucket::insert` / `Bucket::tombstone` API. They differ only in initiator and frequency.
 
 ### Why no file-watching for linked buckets
 
@@ -851,6 +867,143 @@ Initial adapters:
 - `Arxiv` — arxiv metadata + PDF extraction. Adds a PDF-extract dependency (probably `pdf-extract` or `lopdf`); needs investigation.
 
 Adapters are pluggable per-bucket via `bucket.toml`; new source types don't change the rest of the pipeline.
+
+## Tracked sources: self-maintained feeds
+
+The fourth source kind. Where `stored` is "user hands us a frozen archive URL" and `linked` is "user hands us a path that may move," `tracked` is "user names a *feed family* (Wikipedia today; future Wikidata, arxiv-feed) and the system handles acquisition + currency." The system maintains a base snapshot + applied-delta cursor on disk, polling the feed on a configured cadence.
+
+The data layer is identical to `stored`: same `MediaWikiXml` parser, same chunker, same slot lifecycle. The only addition is the **acquisition layer** — the `FeedDriver` trait — and the per-bucket scheduler that exercises it.
+
+### The FeedDriver trait
+
+A closed enum of supported feeds. Each variant knows the URL conventions, version layout, and delta semantics of one source family:
+
+```rust
+trait FeedDriver: Send + Sync {
+    /// Latest available base snapshot id (e.g. "20260401" for Wikipedia).
+    async fn latest_base(&self) -> Result<SnapshotId, FeedError>;
+
+    /// Download the base snapshot to `dest`. Idempotent: if `dest` already
+    /// exists with the right size + checksum, no-op.
+    async fn fetch_base(&self, id: &SnapshotId, dest: &Path) -> Result<(), FeedError>;
+
+    /// List delta ids posted after `since`, sorted ascending by timestamp.
+    /// `None` means "list everything since the base snapshot."
+    async fn list_deltas_since(&self, since: Option<&DeltaId>) -> Result<Vec<DeltaId>, FeedError>;
+
+    /// Download one delta to `dest`. Idempotent.
+    async fn fetch_delta(&self, id: &DeltaId, dest: &Path) -> Result<(), FeedError>;
+
+    /// Source-adapter id used to parse this driver's downloads (e.g.
+    /// `"mediawiki_xml"`). Acquisition and parsing are orthogonal: the same
+    /// MediaWiki XML parser handles both stored-bucket archives and
+    /// tracked-bucket downloads.
+    fn parse_adapter(&self) -> &'static str;
+}
+```
+
+Closed enum dispatch:
+
+```rust
+enum FeedDriverImpl {
+    Wikipedia(WikipediaDriver),
+}
+```
+
+Adding `Wikidata` later means a new variant + a new file; no config-driven plugin loading.
+
+### WikipediaDriver
+
+Wraps `https://dumps.wikimedia.org` URL conventions:
+
+- **Base** — `/<lang>wiki/<YYYYMMDD>/<lang>wiki-<YYYYMMDD>-pages-articles-multistream.xml.bz2` — monthly cadence, ~24 GB compressed for enwiki.
+- **Deltas** — `/other/incr/<lang>wiki/<YYYYMMDD>/<lang>wiki-<YYYYMMDD>-pages-meta-hist-incr.xml.bz2` — daily cadence with ~12h posting latency, ~810 MB/day for enwiki.
+
+The incremental dump service self-describes as *"experimental — at any time it may not be working for a day, a week, or a month."* The driver retries with exponential backoff and surfaces `last_error` to the bucket UI; if the delta service is down for an extended period, the next monthly resync provides correctness reset.
+
+Both base and delta files are MediaWiki XML — same format the existing `MediaWikiXml` source adapter already streams. The driver's only contribution beyond URL building is HTTP fetch with checksum verification (md5sums.txt is published alongside each dump) and retry/backoff policy.
+
+### On-disk layout for tracked buckets
+
+```
+<root>/knowledge/<bucket>/
+  bucket.toml
+  source-cache/                       # tracked-bucket only
+    base/
+      20260401/
+        enwiki-20260401-pages-articles-multistream.xml.bz2
+    deltas/
+      20260402/enwiki-20260402-pages-meta-hist-incr.xml.bz2
+      20260403/...
+  feed-state.toml                     # tracked-bucket only
+  slots/
+    01HVAB.../
+    active                            # symlink to current slot
+```
+
+`source-cache/` is **bucket-scoped**, not slot-scoped — a slot rebuild reuses the cached base download. This matters both for monthly resync (no re-download of the same base) and for reproducible re-builds during development.
+
+`feed-state.toml` carries the per-bucket cursor — small, frequently rewritten:
+
+```toml
+current_base_snapshot_id = "20260401"
+last_applied_delta_id    = "20260424"
+last_check_at            = "2026-04-26T11:30:00Z"
+last_check_outcome       = "ok"             # ok | retry | error
+last_error               = ""
+```
+
+Retention on `source-cache/deltas/`: keep N days post-application (default 30; ~25 GB for enwiki) for debug + reproducibility. Configurable per bucket; never auto-deleted while still pending application.
+
+### Update flow: applying daily deltas
+
+A scheduler-owned per-bucket `feed_worker` runs on the configured `delta_cadence`:
+
+1. Wake (cadence trigger or manual button).
+2. `driver.list_deltas_since(last_applied_delta_id)` → ordered list.
+3. For each delta in order:
+   - `driver.fetch_delta(...)` → `source-cache/deltas/<id>/`
+   - Parse via the bucket's source adapter.
+   - For each `<page>` in the delta XML: emit `tombstone(old_chunk_ids_for_page)` + `insert(new_chunks)` through the existing mutation API.
+   - On success, update `feed-state.toml.last_applied_delta_id` (append-then-rename for crash safety).
+4. Compaction triggers fire normally off the existing 20%-delta / 10%-tombstone heuristics in `bucket.toml`.
+
+Crash recovery: on worker startup, re-read `last_applied_delta_id` and resume from the next id. Because delta application produces fresh `chunk_id`s by content hash, re-running a partially-applied delta is idempotent (insert dedupes by chunk_id; tombstones are sorted-set inserts).
+
+### Background monthly resync
+
+A separate schedule (configurable via `resync_cadence`, default `monthly`) builds a fresh slot off the latest base snapshot:
+
+1. `driver.latest_base()` → if unchanged from `current_base_snapshot_id`, no-op.
+2. `driver.fetch_base(...)` → `source-cache/base/<id>/`.
+3. Plan a new slot in `building` state — same code path as initial build, input is the new base file.
+4. While building, the active slot continues serving + applying daily deltas.
+5. New slot reaches `ready` → catch up on deltas accumulated during the build (driver lists deltas since the new base's snapshot date, applies them via the same mutation flow).
+6. Slot rotation promotes the new slot; old slot archived per the existing 7-day retention.
+
+Default-on; per-bucket toggle in `bucket.toml` (`resync_cadence = "manual"` disables) and an explicit "Resync now" button in the UI for ad-hoc triggering.
+
+Resync is the correctness reset: silent log/oversight events that don't surface cleanly in daily incrementals get caught by re-ingesting from the authoritative monthly base.
+
+### Turnkey UI
+
+A "Create tracked bucket" affordance in the WebUI takes a small form per driver. For Wikipedia:
+
+- Language code (default `en`).
+- Optional mirror override.
+- Optional delta / resync cadence overrides (defaults are sane).
+- Estimated size + build time displayed prominently — an enwiki initial build is ~24 GB download + ~4 days continuous embed on Qwen3-Embedding-0.6B; all-wiki is ~13 days.
+
+The system writes `bucket.toml`, places the bucket in the registry, and queues the initial base download + build automatically. Hand-authored toml stays supported for power users / scripted setups.
+
+### Implementation prerequisites
+
+Two existing dangling-cleanup items become load-bearing once the WebUI exposes a one-click Wikipedia bucket:
+
+- **Resumable builds** (chunking + embedding checkpoint in `build.state`). An enwiki initial build is multi-day; a crash mid-build that forces starting over is unacceptable for a turnkey button. Already in scope per `progress_knowledge_db.md`.
+- **Real BPE tokenizer integration** (`tokenizers` crate) for `TokenBasedChunker`. The current `chars_per_token=4` heuristic is fine for stress-testing but would burn chunks on a "production" Wikipedia bucket. Already flagged in the progress doc as "Land before any production bucket gets built."
+
+Both can be sequenced before the user-clickable UI lands without slowing the data-model side of tracked sources (the toml schema, `FeedDriver` trait, `WikipediaDriver` URL/listing logic, on-disk layout) — those land independently and are testable without a real ingest.
 
 ## Query path
 

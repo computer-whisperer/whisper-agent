@@ -854,5 +854,15 @@ fn build_adapter(
         SourceConfig::Managed {} => {
             Err("managed buckets have no source adapter to build from".into())
         }
+        SourceConfig::Tracked { .. } => {
+            // Tracked buckets reuse `MediaWikiXml` (and future adapters)
+            // for parsing once their `FeedDriver` has fetched a base
+            // snapshot or delta into `source-cache/`. The build-adapter
+            // dispatch lands in the slice that wires the driver runtime;
+            // until then the user-facing path through `StartBucketBuild`
+            // refuses to touch tracked buckets so the bucket sits in
+            // `Ready { no slot }` state harmlessly.
+            Err("tracked buckets are not yet buildable — feed driver wiring is pending".into())
+        }
     }
 }

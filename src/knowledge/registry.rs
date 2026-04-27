@@ -333,6 +333,17 @@ pub fn entry_to_summary(entry: &BucketEntry) -> BucketSummary {
             ("linked".to_string(), Some(path.display().to_string()))
         }
         SourceConfig::Managed {} => ("managed".to_string(), None),
+        SourceConfig::Tracked { driver, .. } => {
+            // Surface "wikipedia: en", "wikipedia: de", … so the WebUI
+            // bucket list can show what feed each tracked bucket follows
+            // without exposing internal cadence / mirror state.
+            let detail = match driver {
+                super::config::TrackedDriver::Wikipedia { language, .. } => {
+                    format!("wikipedia: {language}")
+                }
+            };
+            ("tracked".to_string(), Some(detail))
+        }
     };
     BucketSummary {
         id: entry.id.clone(),
