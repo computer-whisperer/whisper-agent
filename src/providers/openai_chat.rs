@@ -429,7 +429,7 @@ fn convert_user_message(blocks: &[ContentBlock], out: &mut Vec<OaMessage>) {
             ContentBlock::Text { text } => {
                 push_text(&mut parts, &mut text_accum, text);
             }
-            ContentBlock::Image { source } => {
+            ContentBlock::Image { source, .. } => {
                 // First image promotes the accumulator — fold any
                 // already-buffered text into parts first so interleave
                 // order matches the source message.
@@ -1386,6 +1386,7 @@ mod tests {
                     media_type: ImageMime::Png,
                     data: vec![137, 80, 78, 71],
                 },
+                replay: None,
             },
         ];
         let mut out = Vec::new();
@@ -1422,6 +1423,7 @@ mod tests {
                         media_type: ImageMime::Png,
                         data: vec![137, 80, 78, 71],
                     },
+                    replay: None,
                 },
             ]),
             is_error: false,
@@ -1447,6 +1449,7 @@ mod tests {
             source: ImageSource::Url {
                 url: "https://example.com/cat.png".into(),
             },
+            replay: None,
         }];
         let mut out = Vec::new();
         convert_user_message(&blocks, &mut out);

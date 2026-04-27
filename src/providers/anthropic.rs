@@ -1048,6 +1048,7 @@ mod tests {
                     media_type: ImageMime::Png,
                     data: vec![137, 80, 78, 71, 13, 10, 26, 10],
                 },
+                replay: None,
             },
         ]);
         let v = message_to_value(&msg, false);
@@ -1077,6 +1078,7 @@ mod tests {
                         media_type: ImageMime::Jpeg,
                         data: vec![0xff, 0xd8, 0xff, 0xe0],
                     },
+                    replay: None,
                 },
             ]),
             is_error: false,
@@ -1099,6 +1101,7 @@ mod tests {
             source: ImageSource::Url {
                 url: "https://example.com/cat.jpg".into(),
             },
+            replay: None,
         }]);
         let v = message_to_value(&msg, false);
         let content = v.get("content").and_then(|c| c.as_array()).unwrap();

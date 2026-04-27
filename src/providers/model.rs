@@ -258,7 +258,7 @@ pub trait ModelProvider: Send + Sync {
                             input: input.clone(),
                         };
                     }
-                    ContentBlock::Image { source } => {
+                    ContentBlock::Image { source, .. } => {
                         yield ModelEvent::ImageBlock { source: source.clone() };
                     }
                     _ => {}

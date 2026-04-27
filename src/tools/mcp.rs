@@ -173,6 +173,7 @@ impl McpContentBlock {
                             media_type,
                             data: bytes,
                         },
+                        replay: None,
                     },
                     Err(e) => ContentBlock::Text {
                         text: format!("[tool returned malformed base64 image: {e}]"),

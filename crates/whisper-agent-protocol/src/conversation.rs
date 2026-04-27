@@ -415,7 +415,10 @@ impl Attachment {
     /// content-block mapping — they become compile errors here.
     pub fn into_content_block(self) -> ContentBlock {
         match self {
-            Attachment::Image { source } => ContentBlock::Image { source },
+            Attachment::Image { source } => ContentBlock::Image {
+                source,
+                replay: None,
+            },
         }
     }
 }
@@ -461,6 +464,15 @@ pub enum ContentBlock {
     /// into their provider-specific wire shape at send time.
     Image {
         source: ImageSource,
+        /// Provider-tagged opaque blob carried forward for reasoning
+        /// replay on model-emitted images — Gemini's native-image-output
+        /// path attaches a `thoughtSignature` to its `inlineData` part
+        /// that must be echoed back on the next assistant turn or the API
+        /// 400s with "Image part is missing a thought_signature." `None`
+        /// for user-supplied images and providers that don't sign image
+        /// parts.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        replay: Option<ProviderReplay>,
     },
     /// User-supplied or tool-returned document (PDF today). Each
     /// provider does its own server-side decomposition into text +
@@ -528,7 +540,7 @@ impl ToolResultContent {
             ToolResultContent::Blocks(blocks) => blocks
                 .iter()
                 .filter_map(|b| match b {
-                    ContentBlock::Image { source } => Some(source),
+                    ContentBlock::Image { source, .. } => Some(source),
                     _ => None,
                 })
                 .collect(),

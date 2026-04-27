@@ -670,7 +670,9 @@ fn convert_user_parts(blocks: &[ContentBlock], id_to_name: &HashMap<String, Stri
                 // it. Appending them as sibling parts keeps them
                 // attached to the same turn and preserves order.
                 for src in content.image_sources() {
-                    if let Some(part) = image_source_to_part(src) {
+                    // Tool-result images come from the user turn — no
+                    // model-side thought_signature applies.
+                    if let Some(part) = image_source_to_part(src, None) {
                         parts.push(part);
                     }
                 }
@@ -680,8 +682,12 @@ fn convert_user_parts(blocks: &[ContentBlock], id_to_name: &HashMap<String, Stri
                     }
                 }
             }
-            ContentBlock::Image { source } => {
-                if let Some(part) = image_source_to_part(source) {
+            ContentBlock::Image { source, .. } => {
+                // User-side images never carry a thought_signature
+                // (they originate from the operator, not the model), so
+                // pass `None` regardless of any replay metadata that
+                // happened to ride along.
+                if let Some(part) = image_source_to_part(source, None) {
                     parts.push(part);
                 }
             }
@@ -760,14 +766,26 @@ fn convert_assistant_parts(
             ContentBlock::ToolResult { .. } | ContentBlock::ToolSchema { .. } => {
                 // Neither is valid on an assistant turn.
             }
-            ContentBlock::Image { source } => {
+            ContentBlock::Image { source, replay } => {
                 // Re-emit native-image output blocks that were minted
                 // by Gemini on a prior turn so a follow-up assistant
                 // call sees the image it already produced. URL-source
                 // images on assistant turns are unusual but reuse the
                 // same lowering as user-side images (Gemini still
                 // can't fetch URLs, so they degrade to a text note).
-                if let Some(part) = image_source_to_part(source) {
+                //
+                // Echo the gemini-tagged thought_signature back on the
+                // sibling inlineData part so chain-of-thought resumes
+                // — without it Gemini 400s with "Image part is missing
+                // a thought_signature." Foreign-tagged blobs are
+                // dropped, matching the policy used for ToolUse above.
+                let thought_signature = replay
+                    .as_ref()
+                    .filter(|r| r.provider == PROVIDER_TAG)
+                    .and_then(|r| r.data.get("thought_signature"))
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
+                if let Some(part) = image_source_to_part(source, thought_signature) {
                     parts.push(part);
                 }
             }
@@ -788,8 +806,14 @@ fn convert_assistant_parts(
 /// Returns `None` if the MIME isn't in our accepted set or the
 /// payload fails to base64-decode — we'd rather drop a malformed
 /// attachment than panic the assistant turn.
+///
+/// `thought_signature` (when supplied by the part wrapper) is
+/// preserved as a gemini-tagged [`ProviderReplay`] so the next
+/// outbound assistant turn can echo it back — without that round-trip
+/// the API 400s with "Image part is missing a thought_signature."
 fn inline_data_to_image_block(
     inline_data: &InlineData,
+    thought_signature: Option<&str>,
 ) -> Option<whisper_agent_protocol::ContentBlock> {
     use base64::Engine;
     use base64::engine::general_purpose::STANDARD;
@@ -807,11 +831,16 @@ fn inline_data_to_image_block(
             tracing::warn!(error = %e, "Gemini inlineData base64 decode failed; dropping");
         })
         .ok()?;
+    let replay = thought_signature.map(|sig| ProviderReplay {
+        provider: PROVIDER_TAG.into(),
+        data: serde_json::json!({"thought_signature": sig}),
+    });
     Some(ContentBlock::Image {
         source: ImageSource::Bytes {
             media_type,
             data: bytes,
         },
+        replay,
     })
 }
 
@@ -821,7 +850,10 @@ fn inline_data_to_image_block(
 /// noting the missing attachment, since Gemini's wire format doesn't
 /// accept URL passthrough (only inline bytes or Files-API URIs). URL
 /// support through a fetch-and-inline pass is a v1.1 follow-up.
-fn image_source_to_part(src: &whisper_agent_protocol::ImageSource) -> Option<Part> {
+fn image_source_to_part(
+    src: &whisper_agent_protocol::ImageSource,
+    thought_signature: Option<String>,
+) -> Option<Part> {
     use base64::Engine;
     use base64::engine::general_purpose::STANDARD;
     use whisper_agent_protocol::ImageSource;
@@ -831,6 +863,7 @@ fn image_source_to_part(src: &whisper_agent_protocol::ImageSource) -> Option<Par
                 mime_type: media_type.as_mime_str().to_string(),
                 data: STANDARD.encode(data),
             },
+            thought_signature,
         }),
         ImageSource::Url { url } => {
             tracing::warn!(
@@ -860,6 +893,7 @@ fn document_source_to_part(src: &whisper_agent_protocol::DocumentSource) -> Opti
                 mime_type: media_type.as_mime_str().to_string(),
                 data: STANDARD.encode(data),
             },
+            thought_signature: None,
         }),
         DocumentSource::Url { url } => {
             tracing::warn!(
@@ -957,15 +991,24 @@ pub(crate) fn parsed_to_model_response(parsed: GenerateContentResponse) -> Model
                 Part::FunctionResponse { .. } => {
                     // Models don't emit function responses — ignore if echoed.
                 }
-                Part::InlineData { inline_data } => {
+                Part::InlineData {
+                    inline_data,
+                    thought_signature,
+                } => {
                     // Native image output (gemini-2.5-flash-image*,
                     // gemini-2.0-flash-preview-image-generation). The
                     // inline_data carries base64 + IANA mime; we
                     // normalize into our `ImageSource::Bytes` so the
                     // assistant turn round-trips through conversation
                     // storage and the UI renderer alongside any text /
-                    // tool-use parts emitted in the same response.
-                    if let Some(block) = inline_data_to_image_block(&inline_data) {
+                    // tool-use parts emitted in the same response. Any
+                    // `thoughtSignature` rides on the part wrapper —
+                    // capture it as a gemini-tagged replay so the
+                    // follow-up turn can echo it back (otherwise
+                    // Gemini 400s when it sees the image again).
+                    if let Some(block) =
+                        inline_data_to_image_block(&inline_data, thought_signature.as_deref())
+                    {
                         content.push(block);
                     }
                 }
@@ -1153,7 +1196,10 @@ impl GeminiStreamState {
                     // Models don't emit function responses — ignore if
                     // echoed back to us.
                 }
-                Part::InlineData { inline_data } => {
+                Part::InlineData {
+                    inline_data,
+                    thought_signature,
+                } => {
                     // Native image output (gemini-2.5-flash-image*,
                     // gemini-2.0-flash-preview-image-generation). Close
                     // any open text/thinking block so the image lands
@@ -1161,15 +1207,21 @@ impl GeminiStreamState {
                     // turn content for the terminal `Completed` event,
                     // and emit a live `ImageBlock` so connected webuis
                     // can render the thumbnail without waiting on a
-                    // snapshot rebuild.
+                    // snapshot rebuild. The `thoughtSignature` (when
+                    // present) is preserved on the persisted block so
+                    // the follow-up assistant turn can echo it back —
+                    // the live `ImageBlock` event carries only the
+                    // pixels since UIs don't need the signature.
                     self.close_open();
-                    if let Some(ContentBlock::Image { source }) =
-                        inline_data_to_image_block(&inline_data)
+                    if let Some(block @ ContentBlock::Image { .. }) =
+                        inline_data_to_image_block(&inline_data, thought_signature.as_deref())
                     {
-                        out.push(ModelEvent::ImageBlock {
-                            source: source.clone(),
-                        });
-                        self.content.push(ContentBlock::Image { source });
+                        if let ContentBlock::Image { source, .. } = &block {
+                            out.push(ModelEvent::ImageBlock {
+                                source: source.clone(),
+                            });
+                        }
+                        self.content.push(block);
                     }
                 }
             }
@@ -1312,11 +1364,21 @@ pub(crate) enum Part {
     /// Inline base64-encoded image (or other media) data. Gemini's
     /// `inlineData` part accepts user-supplied images as content in a
     /// user turn and, on native-image-output models, also appears in
-    /// response parts. V1 uses it only on the outbound (user) side;
-    /// inbound parsing isn't wired up yet.
+    /// response parts. The optional `thoughtSignature` rides as a
+    /// sibling field on the part wrapper (mirroring the `FunctionCall`
+    /// shape) — Gemini attaches it to model-emitted images on
+    /// thinking-capable image-output models and 400s on the next turn
+    /// if it isn't echoed back ("Image part is missing a
+    /// thought_signature").
     InlineData {
         #[serde(rename = "inlineData")]
         inline_data: InlineData,
+        #[serde(
+            rename = "thoughtSignature",
+            default,
+            skip_serializing_if = "Option::is_none"
+        )]
+        thought_signature: Option<String>,
     },
     /// `thought: Some(true)` marks a reasoning part (Gemini 2.x thinking models).
     /// Serialization skips the field when `None` so we don't poke older models
@@ -1500,6 +1562,7 @@ mod tests {
                     media_type: ImageMime::Webp,
                     data: vec![0x52, 0x49, 0x46, 0x46],
                 },
+                replay: None,
             },
         ]);
         let id_to_name = HashMap::new();
@@ -1531,6 +1594,7 @@ mod tests {
                         media_type: ImageMime::Png,
                         data: vec![137, 80, 78, 71],
                     },
+                    replay: None,
                 },
             ]),
             is_error: false,
@@ -1572,6 +1636,7 @@ mod tests {
                                 mime_type: "image/png".into(),
                                 data: STANDARD.encode(&png),
                             },
+                            thought_signature: None,
                         },
                     ],
                 }),
@@ -1584,6 +1649,7 @@ mod tests {
         assert!(matches!(&resp.content[0], ContentBlock::Text { text } if text == "here you go:"));
         let ContentBlock::Image {
             source: whisper_agent_protocol::ImageSource::Bytes { data, media_type },
+            ..
         } = &resp.content[1]
         else {
             panic!("expected Image block, got {:?}", resp.content[1]);
@@ -1634,6 +1700,7 @@ mod tests {
                     media_type: ImageMime::Png,
                     data: vec![137, 80, 78, 71],
                 },
+                replay: None,
             },
         ];
         let parts = convert_assistant_parts(&blocks, &HashMap::new());
@@ -1652,6 +1719,7 @@ mod tests {
             source: ImageSource::Url {
                 url: "https://example.com/cat.png".into(),
             },
+            replay: None,
         }]);
         let parts = convert_user_parts(&msg.content, &HashMap::new());
         assert_eq!(parts.len(), 1);
@@ -1879,6 +1947,122 @@ mod tests {
             }
             _ => panic!("expected ToolUse"),
         }
+    }
+
+    #[test]
+    fn parses_thought_signature_on_inline_data_into_image_replay() {
+        // Native-image-output Gemini models attach a thoughtSignature
+        // as a sibling field on the inlineData part — the same shape
+        // FunctionCall parts use. Inbound, that blob must land on the
+        // ContentBlock::Image's replay tagged "gemini" so the next
+        // assistant turn can echo it back. Without the round-trip,
+        // Gemini 400s on the follow-up call with "Image part is
+        // missing a thought_signature."
+        use base64::Engine;
+        use base64::engine::general_purpose::STANDARD;
+        let png = vec![137u8, 80, 78, 71, 13, 10, 26, 10];
+        let body = format!(
+            r#"{{
+                "candidates": [{{
+                    "content": {{"role": "model", "parts": [
+                        {{
+                            "inlineData": {{
+                                "mimeType": "image/png",
+                                "data": "{}"
+                            }},
+                            "thoughtSignature": "img-sig"
+                        }}
+                    ]}},
+                    "finishReason": "STOP"
+                }}]
+            }}"#,
+            STANDARD.encode(&png)
+        );
+        let parsed: GenerateContentResponse = serde_json::from_str(&body).unwrap();
+        let r = parsed_to_model_response(parsed);
+        assert_eq!(r.content.len(), 1);
+        match &r.content[0] {
+            ContentBlock::Image { source, replay } => {
+                assert!(matches!(
+                    source,
+                    whisper_agent_protocol::ImageSource::Bytes { .. }
+                ));
+                let r = replay
+                    .as_ref()
+                    .expect("thoughtSignature should populate replay");
+                assert_eq!(r.provider, "gemini");
+                assert_eq!(r.data, serde_json::json!({"thought_signature": "img-sig"}));
+            }
+            other => panic!("expected Image, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn outbound_echoes_image_thought_signature_and_strips_foreign() {
+        // Mirror of the ToolUse round-trip below, scoped to images: a
+        // persisted assistant Image carrying a gemini-tagged replay
+        // must put thoughtSignature back on the inlineData part. A
+        // foreign-tagged replay (e.g. anthropic signature on a
+        // model-switched conversation) must be dropped silently to
+        // avoid cross-provider signature contamination.
+        use whisper_agent_protocol::{ImageMime, ImageSource};
+        let msgs = vec![Message::assistant_blocks(vec![
+            ContentBlock::Image {
+                source: ImageSource::Bytes {
+                    media_type: ImageMime::Png,
+                    data: vec![137, 80, 78, 71],
+                },
+                replay: Some(ProviderReplay {
+                    provider: "gemini".into(),
+                    data: serde_json::json!({"thought_signature": "img-sig"}),
+                }),
+            },
+            ContentBlock::Image {
+                source: ImageSource::Bytes {
+                    media_type: ImageMime::Png,
+                    data: vec![137, 80, 78, 71],
+                },
+                replay: Some(ProviderReplay {
+                    provider: "anthropic".into(),
+                    data: serde_json::json!({"signature": "anth-blob"}),
+                }),
+            },
+        ])];
+        let body = build_gemini_request(&req(&msgs, &[], "x"));
+        let v = serde_json::to_value(&body).unwrap();
+        let parts = &v["contents"][0]["parts"];
+        // Native blob echoed as a sibling of inlineData.
+        assert_eq!(parts[0]["thoughtSignature"], "img-sig");
+        assert_eq!(parts[0]["inlineData"]["mimeType"], "image/png");
+        // Foreign blob stripped — only inlineData remains.
+        assert!(parts[1].get("thoughtSignature").is_none());
+        assert_eq!(parts[1]["inlineData"]["mimeType"], "image/png");
+    }
+
+    #[test]
+    fn user_image_inline_data_omits_thought_signature_field() {
+        // User-supplied images never carry a model-side signature.
+        // The inlineData part must not emit a `thoughtSignature` key
+        // at all (the field is `skip_serializing_if = "Option::is_none"`),
+        // since spurious signatures from earlier providers must not
+        // leak onto user turns.
+        use whisper_agent_protocol::{ImageMime, ImageSource};
+        let msg = Message::user_blocks(vec![ContentBlock::Image {
+            source: ImageSource::Bytes {
+                media_type: ImageMime::Png,
+                data: vec![137, 80, 78, 71],
+            },
+            // Even if a stale replay rides along on a user turn, the
+            // user-side adapter drops it — verified separately below.
+            replay: Some(ProviderReplay {
+                provider: "gemini".into(),
+                data: serde_json::json!({"thought_signature": "should-not-leak"}),
+            }),
+        }]);
+        let parts = convert_user_parts(&msg.content, &HashMap::new());
+        let json = serde_json::to_value(&parts).unwrap();
+        assert_eq!(json[0]["inlineData"]["mimeType"], "image/png");
+        assert!(json[0].get("thoughtSignature").is_none());
     }
 
     #[test]

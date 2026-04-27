@@ -129,7 +129,7 @@ pub(super) fn add_message_items(msg: &Message, msg_index: usize, out: &mut Vec<D
                         }
                         text_buf.push_str(text);
                     }
-                    ContentBlock::Image { source } => {
+                    ContentBlock::Image { source, .. } => {
                         attachments.push(Attachment::Image {
                             source: source.clone(),
                         });
@@ -196,7 +196,7 @@ pub(super) fn add_message_items(msg: &Message, msg_index: usize, out: &mut Vec<D
                             text: thinking.clone(),
                         });
                     }
-                    ContentBlock::Image { source } => {
+                    ContentBlock::Image { source, .. } => {
                         out.push(DisplayItem::AssistantImage {
                             source: source.clone(),
                         });

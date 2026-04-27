@@ -497,7 +497,7 @@ fn convert_user_message(blocks: &[ContentBlock], out: &mut Vec<RspItem>) {
                 }
                 text_accum.push_str(text);
             }
-            ContentBlock::Image { source } => {
+            ContentBlock::Image { source, .. } => {
                 fold_text(&mut parts, &mut text_accum);
                 parts.push(image_source_to_input_part(source));
             }
@@ -1485,6 +1485,7 @@ mod tests {
                     media_type: ImageMime::Jpeg,
                     data: vec![0xff, 0xd8, 0xff, 0xe0],
                 },
+                replay: None,
             },
         ]);
         let mut items = Vec::new();
@@ -1505,6 +1506,7 @@ mod tests {
             source: ImageSource::Url {
                 url: "https://example.com/a.png".into(),
             },
+            replay: None,
         }]);
         let mut items = Vec::new();
         convert_message(&msg, &mut items);
@@ -1531,6 +1533,7 @@ mod tests {
                         media_type: ImageMime::Png,
                         data: vec![137, 80, 78, 71],
                     },
+                    replay: None,
                 },
             ]),
             is_error: false,

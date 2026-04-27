@@ -1777,6 +1777,7 @@ mod tests {
                             ref data,
                             media_type,
                         },
+                    ..
                 } = bs[1]
                 else {
                     panic!("expected Image block, got {:?}", bs[1]);
