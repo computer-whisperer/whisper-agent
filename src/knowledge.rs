@@ -36,6 +36,7 @@ pub mod config;
 pub mod dense;
 pub mod disk_bucket;
 pub mod feed_state;
+pub mod feed_worker;
 pub mod manifest;
 pub mod query;
 pub mod registry;
@@ -57,6 +58,7 @@ pub use config::{
 pub use dense::{DenseIndex, HnswParams};
 pub use disk_bucket::{BuildObserver, BuildPhase, DiskBucket};
 pub use feed_state::{FeedState, FeedStateError, base_cache_dir, delta_cache_dir, feed_state_path};
+pub use feed_worker::{FeedWorker, NoopObserver, TickOutcome, WorkerObserver, cadence_to_duration};
 pub use manifest::{
     ChunkerSnapshot, EmbedderSnapshot, ServingSnapshot, SlotLineage, SlotManifest, SlotState,
     SlotStats, SparseSnapshot, TokenizerSnapshot,
