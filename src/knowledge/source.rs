@@ -13,9 +13,11 @@
 //! can graduate to a `futures::Stream` without changing call sites that
 //! collect into `Vec`.
 
+pub mod feed;
 pub mod markdown_dir;
 pub mod mediawiki_xml;
 
+pub use feed::{DeltaId, FeedDriver, FeedError, SnapshotId, WikipediaDriver};
 pub use markdown_dir::MarkdownDir;
 pub use mediawiki_xml::MediaWikiXml;
 
