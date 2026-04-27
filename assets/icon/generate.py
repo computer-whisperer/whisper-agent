@@ -33,6 +33,7 @@ outer-edge tone.
 from __future__ import annotations
 
 import io
+import math
 import re
 import shutil
 import subprocess
@@ -45,23 +46,29 @@ from PIL import Image, ImageDraw
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SRC = REPO_ROOT / "assets" / "icon" / "icon_v1.svg"
 
-# Resolution we render the bg-stripped SVG at before cropping for the
-# favicons. Larger than any output size so the auto-crop bbox is tight
-# (sub-pixel halo gets averaged down on the resize) and the final
-# downsample carries enough antialiasing detail.
+# Resolution we render the SVG at before cropping for the favicons.
+# Larger than any output size so the auto-crop bbox is tight (sub-pixel
+# halo gets averaged down on the resize) and the final downsample
+# carries enough antialiasing detail.
 FAVICON_HIRES = 1024
 
-# Pixels with alpha at or below this count as background when computing
-# the favicon crop. The halo gradient fades to alpha 0 at its outer
-# edge but rounding leaves a few pixels at single-digit alpha — we
-# treat those as crop-out-able so the favicon hugs the mascot rather
-# than the technically-non-empty halo bounds.
+# Pixels with alpha at or below this count as background when finding
+# the mascot's tight bbox. The halo gradient fades to alpha 0 at its
+# outer edge but rounding can leave a few pixels at single-digit alpha
+# — we treat those as crop-out-able so the bbox hugs the mascot rather
+# than the technically-non-empty halo tail.
 FAVICON_ALPHA_THRESHOLD = 8
 
-# Padding ratio around the cropped mascot bbox before resize. Small —
-# the favicon should fill the tab/PWA tile without bleeding. 0.06 = 6%
-# of the bbox's longer axis on each side.
-FAVICON_CROP_PADDING = 0.06
+# Multiplier added to the mascot bbox's circumscribing-circle radius
+# before masking. Zero is the natural fit (the circle just touches the
+# mascot's outermost extents); a small bump (e.g. 0.02) gives an
+# antialiasing buffer at the tangent points without visible padding.
+FAVICON_CIRCLE_PADDING = 0.0
+
+# Supersampling factor for the circular mask. PIL's `ImageDraw.ellipse`
+# isn't antialiased at native resolution, so we draw at ssaa× and
+# downsample with LANCZOS for a smooth edge.
+FAVICON_MASK_SSAA = 4
 
 # Density buckets for legacy mipmap fallbacks. Modern launchers (API 26+)
 # pull the adaptive icon XML from mipmap-anydpi-v26/ instead, but we still
@@ -130,26 +137,57 @@ def alpha_bbox(img: Image.Image, threshold: int) -> tuple[int, int, int, int]:
     return (int(cmin), int(rmin), int(cmax) + 1, int(rmax) + 1)
 
 
-def square_padded_crop(
-    img: Image.Image, bbox: tuple[int, int, int, int], padding_ratio: float
+def circle_mask_crop(
+    full: Image.Image,
+    bbox: tuple[int, int, int, int],
+    padding: float,
+    ssaa: int,
 ) -> Image.Image:
-    """Center `bbox` inside a square crop of `img` with `padding_ratio`
-    breathing room added (relative to the longer axis). The result is
-    clamped to image bounds — if the bbox is near a corner the square
-    may not be perfectly centered, but the favicon is square already so
-    that case never triggers in practice."""
+    """Mask `full` to a circle that circumscribes `bbox`, then crop to
+    the circle's square bbox.
+
+    The circle's diameter is the diagonal of `bbox` (so the mascot fits
+    snugly inside without clipping at corners), optionally scaled by
+    `1 + padding`. The mask is drawn at ssaa× resolution and
+    downsampled for a smooth edge — PIL's native ellipse rasterization
+    isn't antialiased.
+    """
     x0, y0, x1, y1 = bbox
-    w, h = x1 - x0, y1 - y0
-    side = max(w, h)
-    side = int(round(side * (1 + 2 * padding_ratio)))
-    cx, cy = (x0 + x1) / 2, (y0 + y1) / 2
-    half = side / 2
-    iw, ih = img.size
-    sx0 = max(0, int(round(cx - half)))
-    sy0 = max(0, int(round(cy - half)))
-    sx1 = min(iw, sx0 + side)
-    sy1 = min(ih, sy0 + side)
-    return img.crop((sx0, sy0, sx1, sy1))
+    cx = (x0 + x1) / 2
+    cy = (y0 + y1) / 2
+    radius = math.hypot(x1 - x0, y1 - y0) / 2 * (1 + padding)
+
+    iw, ih = full.size
+    big = Image.new("L", (iw * ssaa, ih * ssaa), 0)
+    ImageDraw.Draw(big).ellipse(
+        (
+            int(round((cx - radius) * ssaa)),
+            int(round((cy - radius) * ssaa)),
+            int(round((cx + radius) * ssaa)),
+            int(round((cy + radius) * ssaa)),
+        ),
+        fill=255,
+    )
+    mask = big.resize((iw, ih), Image.LANCZOS)
+
+    # The full SVG render fills every pixel with alpha 255 (the bg rect
+    # covers the whole canvas), so installing the mask as the alpha
+    # channel cleanly reveals the dark gradient + halo + mascot inside
+    # the circle and clears the rest to transparent.
+    masked = full.copy()
+    masked.putalpha(mask)
+
+    r_int = int(math.ceil(radius))
+    cx_int = int(round(cx))
+    cy_int = int(round(cy))
+    return masked.crop(
+        (
+            max(0, cx_int - r_int),
+            max(0, cy_int - r_int),
+            min(iw, cx_int + r_int),
+            min(ih, cy_int + r_int),
+        )
+    )
 
 
 # Match the canvas-filling background rect by its `fill="url(#bg)"`
@@ -198,29 +236,28 @@ def main() -> int:
     svg_full_bytes = svg_full.encode("utf-8")
 
     # --- webui favicons --------------------------------------------------
-    # Browser tabs and PWA tiles read best when the icon is transparent
-    # behind the mascot (rather than carrying the SVG's full
-    # radial-gradient backdrop, which ends up looking like a hard
-    # square frame against the browser chrome) and tightly cropped
-    # (the SVG's hand-authored padding is dialed for adaptive-icon
-    # safe-zone fit, not for 32-px favicons).
-    #
-    # Render the bg-stripped SVG at high res, auto-crop to the mascot's
-    # alpha bbox + a small breathing-room ratio, then resize down. The
-    # 192 doubles as the apple-touch-icon (linked from index.html /
-    # login.html alongside the 32).
+    # Browser tabs and PWA tiles read best as a tight circular badge:
+    # the dark navy gradient + halo glow inside a circle, transparent
+    # corners outside. We use the bg-stripped render only to find the
+    # mascot's true bbox, then mask the *full* SVG render to a circle
+    # that circumscribes that bbox. Result: dark backdrop preserved
+    # inside the circle, no square frame against browser chrome, no
+    # padding around the mascot.
     webui_assets = REPO_ROOT / "crates" / "whisper-agent-webui" / "assets"
     webui_assets.mkdir(parents=True, exist_ok=True)
-    fav_hires = Image.open(io.BytesIO(render_svg_bytes(svg_fg, FAVICON_HIRES))).convert(
+    fav_full = Image.open(io.BytesIO(render_svg_bytes(svg_full_bytes, FAVICON_HIRES))).convert(
         "RGBA"
     )
-    bbox = alpha_bbox(fav_hires, FAVICON_ALPHA_THRESHOLD)
-    fav_cropped = square_padded_crop(fav_hires, bbox, FAVICON_CROP_PADDING)
-    fav_cropped.resize((32, 32), Image.LANCZOS).save(webui_assets / "favicon.png")
-    fav_cropped.resize((192, 192), Image.LANCZOS).save(webui_assets / "favicon-192.png")
+    fav_fg = Image.open(io.BytesIO(render_svg_bytes(svg_fg, FAVICON_HIRES))).convert("RGBA")
+    bbox = alpha_bbox(fav_fg, FAVICON_ALPHA_THRESHOLD)
+    fav_circle = circle_mask_crop(
+        fav_full, bbox, FAVICON_CIRCLE_PADDING, FAVICON_MASK_SSAA
+    )
+    fav_circle.resize((32, 32), Image.LANCZOS).save(webui_assets / "favicon.png")
+    fav_circle.resize((192, 192), Image.LANCZOS).save(webui_assets / "favicon-192.png")
     print(
-        f"wrote {webui_assets/'favicon.png'} (32x32) — cropped from "
-        f"{FAVICON_HIRES}px hires, bbox {bbox}, side {fav_cropped.size[0]}px"
+        f"wrote {webui_assets/'favicon.png'} (32x32) — masked to circle "
+        f"diam {fav_circle.size[0]}px from mascot bbox {bbox}"
     )
     print(f"wrote {webui_assets/'favicon-192.png'} (192x192)")
 
