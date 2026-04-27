@@ -280,7 +280,9 @@ fn view_image_descriptor() -> Tool {
         name: "view_image".into(),
         description: "Load an image file from the workspace and attach it to the conversation \
                       so the model can see it. Use this whenever you need to look at a PNG / \
-                      JPEG / WebP / GIF — `read_file` refuses binary files. Large images are \
+                      JPEG / WebP / GIF / SVG — `read_file` refuses binary files. SVGs are \
+                      rasterized to PNG (text labels render against system fonts; embedded \
+                      external images and font/asset URLs are not fetched). Large images are \
                       resized to 2048px on the longest side to keep token cost bounded; \
                       smaller images pass through untouched."
             .into(),
@@ -391,6 +393,18 @@ struct PreparedImage {
 /// quantize JPEG.
 fn prepare_image(bytes: &[u8]) -> Result<PreparedImage, String> {
     use image::ImageFormat;
+    // SVGs are rendered to PNG via resvg before the raster path —
+    // providers don't accept image/svg+xml on the wire, and `image`
+    // doesn't decode SVG either, so we have to do the conversion
+    // here. svgz (gzipped SVG) lands here too; usvg decompresses it
+    // for us in `rasterize_svg`.
+    if looks_like_svg(bytes) {
+        let png = rasterize_svg(bytes)?;
+        return Ok(PreparedImage {
+            bytes: png,
+            mime_type: "image/png",
+        });
+    }
     let format =
         image::guess_format(bytes).map_err(|_| "could not detect image format".to_string())?;
     let mime = match format {
@@ -400,7 +414,7 @@ fn prepare_image(bytes: &[u8]) -> Result<PreparedImage, String> {
         ImageFormat::Gif => "image/gif",
         other => {
             return Err(format!(
-                "unsupported image format {other:?} (accepted: PNG, JPEG, WebP, GIF)"
+                "unsupported image format {other:?} (accepted: PNG, JPEG, WebP, GIF, SVG)"
             ));
         }
     };
@@ -426,6 +440,95 @@ fn prepare_image(bytes: &[u8]) -> Result<PreparedImage, String> {
         bytes: out,
         mime_type: "image/png",
     })
+}
+
+/// Cheap leading-bytes probe for SVG / SVGZ. SVG is XML, so the
+/// document starts with one of: a UTF-8 BOM (`EF BB BF`), an XML
+/// prolog (`<?xml`), or a bare `<svg` root element — possibly
+/// preceded by whitespace. SVGZ is gzip-compressed SVG (magic
+/// `1F 8B`); usvg's parser decompresses it for us, so we accept it
+/// here too. Cheap leading-bytes match is enough — if we get a false
+/// positive, `rasterize_svg` errors cleanly when usvg rejects the
+/// parse.
+fn looks_like_svg(bytes: &[u8]) -> bool {
+    // Gzip-wrapped SVG (`.svgz`).
+    if bytes.starts_with(&[0x1f, 0x8b]) {
+        return true;
+    }
+    // Skip BOM + leading whitespace before sniffing the XML head.
+    let head = bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(bytes);
+    let head = head
+        .iter()
+        .position(|b| !b.is_ascii_whitespace())
+        .map(|i| &head[i..])
+        .unwrap_or(&[]);
+    head.starts_with(b"<?xml") || head.starts_with(b"<svg")
+}
+
+/// Rasterize an SVG (or gzipped SVGZ) byte slice into a PNG byte
+/// vector, scaling the render so the longest output axis is at most
+/// [`VIEW_IMAGE_MAX_DIMENSION`]. Renders directly at the target size
+/// — vector → raster in a single pass, no second resize step.
+///
+/// Security posture: `<image href="...">` elements cannot reach out
+/// to disk or pull from `data:` URLs. Both legs of the
+/// `ImageHrefResolver` return `None`, so embedded raster bytes and
+/// nested SVG references render as empty rather than fetching from
+/// the workspace (which would be a sandbox escape).
+///
+/// Text rendering uses the system fontdb. SVGs that name a font
+/// the host doesn't have fall back to whatever fontdb chooses;
+/// glyph fidelity is best-effort, not load-bearing for the bytes
+/// that come back.
+fn rasterize_svg(bytes: &[u8]) -> Result<Vec<u8>, String> {
+    use std::sync::Arc;
+    // Load system fonts so text-bearing diagrams render with
+    // recognizable glyphs. fontdb is shared by reference inside
+    // usvg, so this lookup runs once per call.
+    let mut fontdb = resvg::usvg::fontdb::Database::new();
+    fontdb.load_system_fonts();
+    // Deny-all href resolver — SVG must not be a vector for
+    // file/network exfiltration via `<image href=...>`. The default
+    // resolver reads from disk; we replace both legs with no-ops so
+    // embedded raster bytes and nested SVG refs render as empty.
+    let opt = resvg::usvg::Options {
+        image_href_resolver: resvg::usvg::ImageHrefResolver {
+            resolve_data: Box::new(|_mime, _data, _opts| None),
+            resolve_string: Box::new(|_href, _opts| None),
+        },
+        fontdb: Arc::new(fontdb),
+        ..Default::default()
+    };
+
+    let tree =
+        resvg::usvg::Tree::from_data(bytes, &opt).map_err(|e| format!("SVG parse failed: {e}"))?;
+
+    let size = tree.size();
+    let (svg_w, svg_h) = (size.width(), size.height());
+    if !(svg_w.is_finite() && svg_h.is_finite()) || svg_w <= 0.0 || svg_h <= 0.0 {
+        return Err(format!(
+            "SVG has unusable intrinsic size ({svg_w} x {svg_h}); add a viewBox or width/height"
+        ));
+    }
+    // Scale the render so the longest axis fits VIEW_IMAGE_MAX_DIMENSION.
+    // No upscaling — small SVGs render at their declared size.
+    let max_axis = svg_w.max(svg_h);
+    let scale = if max_axis > VIEW_IMAGE_MAX_DIMENSION as f32 {
+        VIEW_IMAGE_MAX_DIMENSION as f32 / max_axis
+    } else {
+        1.0
+    };
+    let out_w = (svg_w * scale).round().max(1.0) as u32;
+    let out_h = (svg_h * scale).round().max(1.0) as u32;
+
+    let mut pixmap = resvg::tiny_skia::Pixmap::new(out_w, out_h)
+        .ok_or_else(|| format!("could not allocate pixmap {out_w}x{out_h} for SVG render"))?;
+    let transform = resvg::tiny_skia::Transform::from_scale(scale, scale);
+    resvg::render(&tree, transform, &mut pixmap.as_mut());
+
+    pixmap
+        .encode_png()
+        .map_err(|e| format!("PNG encode failed: {e}"))
 }
 
 // ---------- view_pdf ----------
@@ -2496,6 +2599,106 @@ fn main() {
         let bytes = b"this is just some text, not an image".to_vec();
         let err = prepare_image(&bytes).unwrap_err();
         assert!(err.contains("could not detect"), "unexpected error: {err}");
+    }
+
+    /// Build a minimal SVG of declared `w x h` user units. The body
+    /// is one solid-fill rectangle so resvg has actual geometry to
+    /// rasterize — an empty `<svg>` would round-trip as a blank
+    /// pixmap, which is fine but doesn't exercise the renderer.
+    fn make_svg(w: u32, h: u32) -> Vec<u8> {
+        // Note: `r##"..."##` (two `#`s) so the inline `"#102030"` color
+        // in the SVG body doesn't terminate the raw string early.
+        format!(
+            r##"<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="{w}" height="{h}" viewBox="0 0 {w} {h}">
+  <rect width="100%" height="100%" fill="#102030"/>
+</svg>"##
+        )
+        .into_bytes()
+    }
+
+    #[test]
+    fn prepare_image_rasterizes_small_svg_to_png() {
+        let bytes = make_svg(64, 48);
+        let prepared = prepare_image(&bytes).unwrap();
+        assert_eq!(prepared.mime_type, "image/png");
+        // Output decodes as a valid PNG with the declared SVG dimensions —
+        // small SVGs render 1:1, no scaling.
+        let decoded = image::load_from_memory(&prepared.bytes).unwrap();
+        assert_eq!(decoded.width(), 64);
+        assert_eq!(decoded.height(), 48);
+    }
+
+    #[test]
+    fn prepare_image_rasterizes_prolog_less_svg() {
+        // SVGs without an `<?xml ?>` prolog are common (browsers and
+        // most editors emit them this way for inline embedding).
+        // `looks_like_svg` must recognize a bare `<svg` root, possibly
+        // with leading whitespace, and route through the rasterizer.
+        // `br##"..."##` so the inline `"#abcdef"` color in the body
+        // doesn't terminate the raw byte string early.
+        let body = br##"
+  <svg xmlns="http://www.w3.org/2000/svg" width="48" height="48" viewBox="0 0 48 48">
+    <circle cx="24" cy="24" r="20" fill="#abcdef"/>
+  </svg>"##;
+        let prepared = prepare_image(body).unwrap();
+        assert_eq!(prepared.mime_type, "image/png");
+        let decoded = image::load_from_memory(&prepared.bytes).unwrap();
+        assert_eq!(decoded.width(), 48);
+        assert_eq!(decoded.height(), 48);
+    }
+
+    #[test]
+    fn prepare_image_resizes_oversize_svg_to_png() {
+        // An SVG declaring 4096x256 should rasterize within the 2048px
+        // long-axis cap. The render scales in one pass — no second
+        // raster-resize round trip — so the aspect ratio is preserved.
+        let bytes = make_svg(VIEW_IMAGE_MAX_DIMENSION * 2, 256);
+        let prepared = prepare_image(&bytes).unwrap();
+        assert_eq!(prepared.mime_type, "image/png");
+        let decoded = image::load_from_memory(&prepared.bytes).unwrap();
+        assert!(
+            decoded.width().max(decoded.height()) <= VIEW_IMAGE_MAX_DIMENSION,
+            "max dim {} > cap {}",
+            decoded.width().max(decoded.height()),
+            VIEW_IMAGE_MAX_DIMENSION
+        );
+        // Aspect ratio (16:1) must survive the down-render.
+        assert_eq!(decoded.width(), VIEW_IMAGE_MAX_DIMENSION);
+        assert_eq!(decoded.height(), 128);
+    }
+
+    #[test]
+    fn prepare_image_svg_does_not_fetch_external_image_refs() {
+        // Lock in the security posture: an SVG `<image>` element with
+        // a path-like href must NOT cause resvg to read from disk.
+        // We point at a path that almost certainly exists so a
+        // regression (re-enabling the default resolver) would actually
+        // succeed at the read and produce a reachable image, making
+        // the divergence visible. The render must still complete, just
+        // without the embedded raster.
+        let body = br##"<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink"
+     width="40" height="40" viewBox="0 0 40 40">
+  <image href="/etc/hostname" width="40" height="40"/>
+</svg>"##;
+        let prepared = prepare_image(body).expect("must render even with denied href");
+        assert_eq!(prepared.mime_type, "image/png");
+        // PNG decodes cleanly; we don't assert on pixel values
+        // because what matters is that no I/O happened during render.
+        let decoded = image::load_from_memory(&prepared.bytes).unwrap();
+        assert_eq!(decoded.width(), 40);
+        assert_eq!(decoded.height(), 40);
+    }
+
+    #[test]
+    fn prepare_image_rejects_malformed_svg() {
+        // Looks like SVG to the sniffer but the body is unparseable.
+        // The router shouldn't fall back to image::guess_format —
+        // it should surface the SVG parse error directly.
+        let bytes = b"<?xml version=\"1.0\"?><svg>not closed".to_vec();
+        let err = prepare_image(&bytes).unwrap_err();
+        assert!(err.contains("SVG parse failed"), "unexpected error: {err}");
     }
 
     // ---------- view_pdf ----------

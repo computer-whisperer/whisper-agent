@@ -26,6 +26,12 @@ regex = "1"
 # set used by webui and desktop for paste/drop image handling, so the
 # workspace already pins the version.
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "gif"] }
+# SVG rasterization for `view_image` — providers don't accept
+# image/svg+xml on the wire, so we render to PNG at the tool boundary.
+# `text` + `system-fonts` let labels render against OS fonts; raster
+# image embeds and the default `raster-images` feature stay off so
+# `<image href=...>` can't reach out to disk or network during render.
+resvg = { version = "0.47", default-features = false, features = ["text", "system-fonts"] }
 # Base64 for serializing image bytes back to the model in MCP image
 # content blocks. STANDARD-encoded.
 base64 = "0.22"
