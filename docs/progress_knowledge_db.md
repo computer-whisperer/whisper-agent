@@ -122,6 +122,37 @@ speedup on the 50k run with no observed downside. Still under TEI's
 at batch=32. Still gated by HNSW persistence for anything bigger
 than simplewiki.
 
+## End-to-end validation (full simplewiki, real TEI, tracked-source)
+
+Run on 2026-04-27 against the same Qwen3-Embedding-0.6B + bge-reranker-v2-m3
+endpoints, this time as a tracked-source bucket (`wikipedia_simple` →
+`WikipediaDriver` → cached `simplewiki-20260401-pages-articles-multistream.xml.bz2`).
+First run on the post-pipeline-rework code (pipelined embedder +
+content-hash dedup + BPE chunker + multistream bz2 + mmap readers).
+
+| Metric                  | Value             |
+|-------------------------|-------------------|
+| Source pages emitted    | 280,502           |
+| Chunks indexed          | 870,996           |
+| Embedder dim            | 1024              |
+| Build wall-clock        | 2h 28m            |
+| Bucket disk size        | 9.4 GiB           |
+| chunks.bin              | 1.14 GiB          |
+| vectors.bin             | 3.57 GiB          |
+| dense.hnsw (data+graph) | 4.16 GiB          |
+| index.tantivy           | 435 MiB           |
+| build.state             | 38 MiB            |
+| Per-chunk disk          | ~11.4 KiB         |
+| chunk_count == vector_count | ✓ (dedup verified after fix in `9564927`) |
+
+**Quality**: WebUI search is dead-on across hand-typed queries — the
+content-hash dedup that fixed the 870996/873035 mismatch in the
+previous attempt also cleared up the resulting query-time confusion.
+
+**Extrapolation to full enwiki** (Qwen3-0.6B, all-namespaces ≈ ~30M
+chunks, ~35× this run): ~3.6 days at this throughput. Pre-quantization,
+disk would be ~340 GiB — close to the design doc's 300 GiB estimate.
+
 ## Deferred / not started
 
 Numbered loosely so the conversation can refer to slices, not
