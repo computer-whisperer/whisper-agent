@@ -189,6 +189,18 @@ pub trait FeedDriver: Send + Sync {
     /// MediaWiki XML parser handles both stored-bucket archives and
     /// tracked-bucket downloads.
     fn parse_adapter(&self) -> &'static str;
+
+    /// Filename the driver wants for a given base snapshot — relative
+    /// to the per-snapshot cache dir, no path components. Exposed on
+    /// the trait so the build runtime can compose
+    /// `base_cache_dir(bucket, id).join(driver.base_filename(id))`
+    /// without needing to know the URL conventions of any specific
+    /// feed family. The same filename is what the parse-adapter will
+    /// be opening on the next pipeline step.
+    fn base_filename(&self, id: &SnapshotId) -> String;
+
+    /// Same as [`base_filename`](Self::base_filename) but for a delta.
+    fn delta_filename(&self, id: &DeltaId) -> String;
 }
 
 #[cfg(test)]

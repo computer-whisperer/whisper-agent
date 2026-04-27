@@ -860,12 +860,20 @@ pub struct BucketCreateInput {
 
 /// Coarse phase tag emitted by `BucketBuildProgress`. The build pipeline
 /// has more sub-stages internally (per-batch embed calls, vector store
-/// flushes); this rolls them into the four the UI actually wants to
-/// distinguish — record enumeration, the long streaming phase, the
-/// dominant HNSW build, then the quick finalize-and-promote tail.
+/// flushes); this rolls them into the five the UI actually wants to
+/// distinguish — optional download for tracked buckets, record
+/// enumeration, the long streaming phase, the dominant HNSW build,
+/// then the quick finalize-and-promote tail.
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum BucketBuildPhase {
+    /// `kind = "tracked"` only — the feed driver is fetching the base
+    /// snapshot into the bucket's `source-cache/` directory before any
+    /// indexing work begins. Per-byte progress is not yet surfaced;
+    /// expect minutes to hours depending on dataset (~24 GB for
+    /// enwiki). Stored / linked / managed buckets skip this phase
+    /// entirely.
+    Downloading,
     /// Walking the source, hashing each record, recording `Planned`
     /// entries in `build.state`. Cheap relative to `Indexing`;
     /// produces the record-count total that makes the indexing

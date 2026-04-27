@@ -82,6 +82,11 @@ const DENSE_DUMP_BATCH_INTERVAL: u64 = 1;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BuildPhase {
+    /// `kind = "tracked"` only — feed driver is fetching the base
+    /// snapshot before any indexing work starts. Emitted from the
+    /// scheduler's run_build prelude, not from inside `build_slot`
+    /// itself; `build.state` records never carry this variant.
+    Downloading,
     /// Walking the source adapter, hashing each record, and writing
     /// `Planned` entries to `build.state`. Cheap relative to embedding
     /// (minutes for full wikipedia); produces the record-count

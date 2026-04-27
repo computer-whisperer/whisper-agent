@@ -743,6 +743,7 @@ fn render_bucket_row(
 
 fn render_build_progress(ui: &mut egui::Ui, p: &BuildProgressView) {
     let phase = match p.phase {
+        BucketBuildPhase::Downloading => "downloading",
         BucketBuildPhase::Planning => "planning",
         BucketBuildPhase::Indexing => "indexing",
         BucketBuildPhase::BuildingDense => "building HNSW",

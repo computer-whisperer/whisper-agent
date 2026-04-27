@@ -32,8 +32,9 @@ use whisper_agent_protocol::{
 use super::{ConnId, Scheduler};
 use crate::knowledge::{BucketError, BucketId};
 use crate::knowledge::{
-    BuildObserver, BuildPhase, Chunker, DiskBucket, MarkdownDir, MediaWikiXml, SourceAdapter,
-    registry::entry_to_summary, resolve_chunker,
+    BuildObserver, BuildPhase, Chunker, DiskBucket, FeedDriver, FeedState, MarkdownDir,
+    MediaWikiXml, SnapshotId, SourceAdapter, base_cache_dir, registry::entry_to_summary,
+    resolve_chunker, source::feed::driver_for,
 };
 use crate::providers::embedding::EmbeddingProvider;
 use crate::server::thread_router::ThreadEventRouter;
@@ -315,8 +316,8 @@ impl Scheduler {
                 return;
             }
         };
-        let adapter = match build_adapter(&entry.config.source) {
-            Ok(a) => a,
+        let source = match build_source(&entry.config.source) {
+            Ok(s) => s,
             Err(e) => {
                 self.send_bucket_error(conn_id, correlation_id, "start_bucket_build", e);
                 return;
@@ -382,10 +383,12 @@ impl Scheduler {
         let snapshot = self.router.clients_snapshot();
         let task_tx = self.bucket_task_sender();
         let chunker_config = entry.config.chunker.clone();
+        let bucket_dir = entry.dir.clone();
         tokio::spawn(run_build(
             bucket,
             embedder,
-            adapter,
+            source,
+            bucket_dir,
             chunker_config,
             cancel,
             id,
@@ -509,7 +512,8 @@ fn broadcast_all(router: &ThreadEventRouter, event: ServerToClient) {
 async fn run_build(
     bucket: Arc<DiskBucket>,
     embedder: Arc<dyn EmbeddingProvider>,
-    adapter: Box<dyn SourceAdapter + Send + Sync>,
+    source: BuildSource,
+    bucket_dir: std::path::PathBuf,
     chunker_config: crate::knowledge::ChunkerConfig,
     cancel: CancellationToken,
     bucket_id: String,
@@ -572,6 +576,33 @@ async fn run_build(
                 "list_models failed at build start; chunker will fall back to heuristic if `tokenizer = \"auto\"`",
             );
             None
+        }
+    };
+
+    // Source resolution. For stored / linked, this is a no-op handoff.
+    // For tracked, the driver fetches the base snapshot into the
+    // bucket's source-cache and persists the snapshot id to
+    // feed-state.toml — Downloading phase fires here, before any
+    // chunking or embedding starts.
+    let adapter = match resolve_source(source, &bucket_dir, observer_arc.as_ref(), &cancel).await {
+        Ok(a) => a,
+        Err(e) => {
+            progress.done.store(true, Ordering::Release);
+            let _ = emitter.await;
+            let outcome = match e {
+                BucketError::Cancelled => BucketBuildOutcome::Cancelled,
+                other => BucketBuildOutcome::Error {
+                    message: other.to_string(),
+                },
+            };
+            let _ = task_tx.send(BucketTaskUpdate::BuildEnded {
+                bucket_id,
+                slot_id: String::new(),
+                outcome,
+                requester_conn: Some(requester_conn),
+                correlation_id,
+            });
+            return;
         }
     };
 
@@ -677,12 +708,19 @@ struct ProgressSnapshot {
     phase: BucketBuildPhase,
 }
 
+// Phase ↔ u8 mapping. Planning is encoded as 0 so the AtomicU8's
+// `default()` zero-init lands on Planning — the right "we haven't
+// emitted anything yet" state for stored / linked / managed builds
+// where Downloading doesn't apply. Downloading lives at a higher
+// number; tracked builds publish it explicitly from the run_build
+// prelude before any other phase fires.
 fn phase_to_u8(p: BuildPhase) -> u8 {
     match p {
         BuildPhase::Planning => 0,
         BuildPhase::Indexing => 1,
         BuildPhase::BuildingDense => 2,
         BuildPhase::Finalizing => 3,
+        BuildPhase::Downloading => 4,
     }
 }
 
@@ -691,6 +729,7 @@ fn phase_from_u8(b: u8) -> BucketBuildPhase {
         1 => BucketBuildPhase::Indexing,
         2 => BucketBuildPhase::BuildingDense,
         3 => BucketBuildPhase::Finalizing,
+        4 => BucketBuildPhase::Downloading,
         _ => BucketBuildPhase::Planning,
     }
 }
@@ -831,9 +870,85 @@ fn toml_quote(s: &str) -> String {
     format!("\"{escaped}\"")
 }
 
-fn build_adapter(
-    source: &crate::knowledge::SourceConfig,
-) -> Result<Box<dyn SourceAdapter + Send + Sync>, String> {
+/// Build-time view of a bucket's source. `Ready` carries an already-
+/// constructed `SourceAdapter` (the stored / linked path); `Tracked`
+/// carries the feed driver so the run_build prelude can download the
+/// base snapshot first, then construct a `MediaWikiXml` adapter
+/// against the cached file.
+enum BuildSource {
+    Ready(Box<dyn SourceAdapter + Send + Sync>),
+    Tracked { driver: Box<dyn FeedDriver> },
+}
+
+/// Async preamble to the build pipeline. For stored / linked, the
+/// adapter is already constructed — this is a no-op handoff. For
+/// tracked, the driver is consulted: if `feed-state.toml` already
+/// records a `current_base_snapshot_id`, we reuse it (subsequent
+/// rebuilds operate on the same base; only an explicit Resync advances
+/// to a newer one); otherwise we ask the driver for `latest_base()`.
+/// Either way we then fetch the base into `source-cache/base/<id>/`
+/// and write the snapshot id back to `feed-state.toml` before
+/// returning a `MediaWikiXml` adapter pointing at the downloaded file.
+///
+/// Phase=Downloading is published via the observer for the duration of
+/// the fetch so the UI can distinguish download from indexing.
+async fn resolve_source(
+    source: BuildSource,
+    bucket_dir: &Path,
+    observer: &dyn BuildObserver,
+    cancel: &CancellationToken,
+) -> Result<Box<dyn SourceAdapter + Send + Sync>, BucketError> {
+    match source {
+        BuildSource::Ready(adapter) => Ok(adapter),
+        BuildSource::Tracked { driver } => {
+            observer.on_phase(BuildPhase::Downloading);
+
+            let mut state = FeedState::load(bucket_dir)
+                .map_err(|e| BucketError::Other(format!("feed-state load: {e}")))?;
+
+            let snapshot_id: SnapshotId = match state.current_base() {
+                Some(id) => id,
+                None => driver
+                    .latest_base(cancel)
+                    .await
+                    .map_err(|e| BucketError::Other(format!("feed driver latest_base: {e}")))?,
+            };
+
+            let dest_dir = base_cache_dir(bucket_dir, &snapshot_id);
+            let dest = dest_dir.join(driver.base_filename(&snapshot_id));
+            driver
+                .fetch_base(&snapshot_id, &dest, cancel)
+                .await
+                .map_err(|e| match e {
+                    crate::knowledge::FeedError::Cancelled => BucketError::Cancelled,
+                    other => BucketError::Other(format!("feed driver fetch_base: {other}")),
+                })?;
+
+            // Persist the snapshot id only after the file is in place —
+            // a partial write should never produce a state file
+            // claiming a base we don't actually have.
+            state.set_current_base(snapshot_id.clone());
+            state
+                .save_atomic(bucket_dir)
+                .map_err(|e| BucketError::Other(format!("feed-state save: {e}")))?;
+
+            // The parser is selected by the driver. Today every driver
+            // points at "mediawiki_xml"; the lookup keeps the door open
+            // for future drivers (e.g. wikidata-rdf) without forcing a
+            // hardcoded match here.
+            match driver.parse_adapter() {
+                "mediawiki_xml" => Ok(Box::new(MediaWikiXml::new(&dest))),
+                other => Err(BucketError::Other(format!(
+                    "tracked driver `{}` reports parse_adapter `{other}`, \
+                     which has no matching SourceAdapter binding",
+                    driver.parse_adapter(),
+                ))),
+            }
+        }
+    }
+}
+
+fn build_source(source: &crate::knowledge::SourceConfig) -> Result<BuildSource, String> {
     use crate::knowledge::SourceConfig;
     match source {
         SourceConfig::Stored {
@@ -843,26 +958,239 @@ fn build_adapter(
             if adapter != "mediawiki_xml" {
                 return Err(format!("unsupported stored adapter `{adapter}`"));
             }
-            Ok(Box::new(MediaWikiXml::new(archive_path)))
+            Ok(BuildSource::Ready(Box::new(MediaWikiXml::new(
+                archive_path,
+            ))))
         }
         SourceConfig::Linked { adapter, path, .. } => {
             if adapter != "markdown_dir" {
                 return Err(format!("unsupported linked adapter `{adapter}`"));
             }
-            Ok(Box::new(MarkdownDir::new(path)))
+            Ok(BuildSource::Ready(Box::new(MarkdownDir::new(path))))
         }
         SourceConfig::Managed {} => {
             Err("managed buckets have no source adapter to build from".into())
         }
-        SourceConfig::Tracked { .. } => {
-            // Tracked buckets reuse `MediaWikiXml` (and future adapters)
-            // for parsing once their `FeedDriver` has fetched a base
-            // snapshot or delta into `source-cache/`. The build-adapter
-            // dispatch lands in the slice that wires the driver runtime;
-            // until then the user-facing path through `StartBucketBuild`
-            // refuses to touch tracked buckets so the bucket sits in
-            // `Ready { no slot }` state harmlessly.
-            Err("tracked buckets are not yet buildable — feed driver wiring is pending".into())
+        SourceConfig::Tracked { driver, .. } => {
+            // The cadence fields (delta_cadence, resync_cadence) are
+            // consumed by the per-bucket worker, not the initial-build
+            // path — only the driver itself matters here.
+            Ok(BuildSource::Tracked {
+                driver: driver_for(driver),
+            })
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    use crate::knowledge::DeltaId;
+    use crate::knowledge::source::feed::BoxFuture;
+
+    /// Shared call log so a test holding an `Arc` can inspect calls
+    /// after the driver has been moved into a `BuildSource`.
+    type CallLog = Arc<Mutex<Vec<String>>>;
+
+    /// Synthetic `FeedDriver` for resolve_source tests. Records every
+    /// method call into a caller-shared log so assertions can verify
+    /// call ordering / arguments without spinning up a real HTTP
+    /// server.
+    struct FakeDriver {
+        latest: SnapshotId,
+        payload: Vec<u8>,
+        log: CallLog,
+    }
+
+    impl FakeDriver {
+        fn new(latest: &str, payload: &[u8]) -> (Self, CallLog) {
+            let log: CallLog = Arc::new(Mutex::new(Vec::new()));
+            (
+                Self {
+                    latest: SnapshotId::new(latest),
+                    payload: payload.to_vec(),
+                    log: log.clone(),
+                },
+                log,
+            )
+        }
+    }
+
+    impl FeedDriver for FakeDriver {
+        fn latest_base<'a>(
+            &'a self,
+            _cancel: &'a CancellationToken,
+        ) -> BoxFuture<'a, Result<SnapshotId, crate::knowledge::FeedError>> {
+            Box::pin(async move {
+                self.log.lock().unwrap().push("latest_base".into());
+                Ok(self.latest.clone())
+            })
+        }
+
+        fn fetch_base<'a>(
+            &'a self,
+            id: &'a SnapshotId,
+            dest: &'a Path,
+            _cancel: &'a CancellationToken,
+        ) -> BoxFuture<'a, Result<(), crate::knowledge::FeedError>> {
+            let payload = self.payload.clone();
+            Box::pin(async move {
+                self.log.lock().unwrap().push(format!(
+                    "fetch_base({},{})",
+                    id.as_str(),
+                    dest.display()
+                ));
+                if let Some(parent) = dest.parent() {
+                    tokio::fs::create_dir_all(parent).await.unwrap();
+                }
+                tokio::fs::write(dest, &payload).await.unwrap();
+                Ok(())
+            })
+        }
+
+        fn list_deltas_since<'a>(
+            &'a self,
+            _since: Option<&'a DeltaId>,
+            _cancel: &'a CancellationToken,
+        ) -> BoxFuture<'a, Result<Vec<DeltaId>, crate::knowledge::FeedError>> {
+            Box::pin(async move { Ok(Vec::new()) })
+        }
+
+        fn fetch_delta<'a>(
+            &'a self,
+            _id: &'a DeltaId,
+            _dest: &'a Path,
+            _cancel: &'a CancellationToken,
+        ) -> BoxFuture<'a, Result<(), crate::knowledge::FeedError>> {
+            Box::pin(async move { Ok(()) })
+        }
+
+        fn parse_adapter(&self) -> &'static str {
+            "mediawiki_xml"
+        }
+
+        fn base_filename(&self, id: &SnapshotId) -> String {
+            format!("fake-{}.xml.bz2", id.as_str())
+        }
+
+        fn delta_filename(&self, id: &DeltaId) -> String {
+            format!("fake-delta-{}.xml.bz2", id.as_str())
+        }
+    }
+
+    #[derive(Default)]
+    struct PhaseRecorder {
+        phases: Mutex<Vec<BuildPhase>>,
+    }
+
+    impl BuildObserver for PhaseRecorder {
+        fn on_phase(&self, phase: BuildPhase) {
+            self.phases.lock().unwrap().push(phase);
+        }
+        fn on_progress(&self, _source_records: u64, _chunks: u64) {}
+    }
+
+    #[tokio::test]
+    async fn resolve_source_ready_passes_adapter_through_unchanged() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Use a markdown_dir adapter as a stand-in — the assertion is
+        // about pass-through, not about what kind of adapter rides
+        // along.
+        let adapter: Box<dyn SourceAdapter + Send + Sync> = Box::new(MarkdownDir::new(tmp.path()));
+        let observer = PhaseRecorder::default();
+        let cancel = CancellationToken::new();
+        let _adapter = resolve_source(BuildSource::Ready(adapter), tmp.path(), &observer, &cancel)
+            .await
+            .unwrap();
+        // Ready path doesn't emit a Downloading phase.
+        assert!(observer.phases.lock().unwrap().is_empty());
+        // No feed-state file should have been created.
+        assert!(!tmp.path().join("feed-state.toml").exists());
+    }
+
+    #[tokio::test]
+    async fn resolve_source_tracked_downloads_writes_feed_state_and_returns_adapter() {
+        let tmp = tempfile::tempdir().unwrap();
+        let payload = b"<?xml version=\"1.0\"?><mediawiki></mediawiki>";
+        let (driver, log) = FakeDriver::new("20260401", payload);
+        let driver: Box<dyn FeedDriver> = Box::new(driver);
+        let observer = PhaseRecorder::default();
+        let cancel = CancellationToken::new();
+
+        let _adapter = resolve_source(
+            BuildSource::Tracked { driver },
+            tmp.path(),
+            &observer,
+            &cancel,
+        )
+        .await
+        .unwrap();
+
+        // Phase=Downloading was emitted exactly once.
+        assert_eq!(
+            observer.phases.lock().unwrap().as_slice(),
+            &[BuildPhase::Downloading]
+        );
+
+        // Empty feed-state caused latest_base to be consulted, then fetch_base.
+        let calls = log.lock().unwrap().clone();
+        assert_eq!(calls.first().map(|s| s.as_str()), Some("latest_base"));
+        assert!(
+            calls.iter().any(|c| c.starts_with("fetch_base(20260401")),
+            "expected fetch_base(20260401, ...) in {calls:?}"
+        );
+
+        // feed-state.toml was written with the chosen snapshot id.
+        let state = FeedState::load(tmp.path()).unwrap();
+        assert_eq!(state.current_base(), Some(SnapshotId::new("20260401")));
+
+        // The base file landed in the right cache directory under the
+        // driver's chosen filename.
+        let expected_path = tmp
+            .path()
+            .join("source-cache/base/20260401/fake-20260401.xml.bz2");
+        assert!(
+            expected_path.exists(),
+            "missing {}",
+            expected_path.display()
+        );
+        assert_eq!(std::fs::read(&expected_path).unwrap(), payload);
+    }
+
+    #[tokio::test]
+    async fn resolve_source_tracked_reuses_existing_snapshot_id_when_recorded() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Pre-record a snapshot id — resolve_source should reuse it
+        // rather than calling latest_base.
+        let mut state = FeedState::default();
+        state.set_current_base(SnapshotId::new("20260301"));
+        state.save_atomic(tmp.path()).unwrap();
+
+        let (driver, log) = FakeDriver::new("20260401", b"payload");
+        let driver: Box<dyn FeedDriver> = Box::new(driver);
+        let observer = PhaseRecorder::default();
+        let cancel = CancellationToken::new();
+
+        let _adapter = resolve_source(
+            BuildSource::Tracked { driver },
+            tmp.path(),
+            &observer,
+            &cancel,
+        )
+        .await
+        .unwrap();
+
+        let calls = log.lock().unwrap().clone();
+        assert!(
+            !calls.iter().any(|c| c == "latest_base"),
+            "latest_base should not be called when state has a snapshot id; got {calls:?}"
+        );
+        assert!(calls.iter().any(|c| c.starts_with("fetch_base(20260301")));
+
+        // State unchanged — still pointing at the recorded snapshot.
+        let after = FeedState::load(tmp.path()).unwrap();
+        assert_eq!(after.current_base(), Some(SnapshotId::new("20260301")));
     }
 }

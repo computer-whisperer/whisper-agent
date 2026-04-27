@@ -302,6 +302,22 @@ impl FeedDriver for WikipediaDriver {
     fn parse_adapter(&self) -> &'static str {
         PARSE_ADAPTER
     }
+
+    fn base_filename(&self, id: &SnapshotId) -> String {
+        format!(
+            "{}wiki-{}-pages-articles-multistream.xml.bz2",
+            self.language,
+            id.as_str(),
+        )
+    }
+
+    fn delta_filename(&self, id: &DeltaId) -> String {
+        format!(
+            "{}wiki-{}-pages-meta-hist-incr.xml.bz2",
+            self.language,
+            id.as_str(),
+        )
+    }
 }
 
 /// Extract `YYYYMMDD` directory entries from a `mod_dir` Apache index.
