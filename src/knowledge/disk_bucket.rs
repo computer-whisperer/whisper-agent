@@ -16,6 +16,7 @@
 //! `docs/design_knowledge_db.md` § "Concurrency model" for the full
 //! shape this scales toward.
 
+use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
@@ -54,13 +55,46 @@ use crate::providers::embedding::{EmbedRequest, EmbeddingProvider};
 /// measurement justifies finer control; for now it's a const at
 /// module level.
 ///
-/// `flush_batch` enforces this as a per-API-call cap by splitting
-/// oversized pending buffers into sub-batches of `EMBED_BATCH_SIZE`.
-/// That matters because a single Wikipedia article can produce 200+
-/// chunks at the default chunker config, so an `if pending.len() >=
-/// EMBED_BATCH_SIZE` flush trigger isn't enough on its own to bound
-/// the per-API-call payload.
+/// `embed_batch` enforces this as a per-API-call cap by splitting
+/// oversized jobs into sub-batches of `EMBED_BATCH_SIZE`. That matters
+/// because a single Wikipedia article can produce 200+ chunks at the
+/// default chunker config, so an `if pending.len() >= EMBED_BATCH_SIZE`
+/// flush trigger isn't enough on its own to bound the per-API-call
+/// payload.
 const EMBED_BATCH_SIZE: usize = 128;
+
+/// Number of `EmbeddingProvider::embed` requests allowed in flight
+/// concurrently from one build. The build pipeline streams batches:
+/// chunker stage → bounded channel → embedder pool → bounded channel
+/// → writer. With this many in-flight requests, TEI's queue can pack
+/// the next batch onto the GPU while the previous one's response
+/// streams back, hiding round-trip latency. 4 was picked as a safe
+/// starting point — well under TEI's default `max_concurrent_requests
+/// = 512`, and bounded enough that the in-memory backlog of pending
+/// batches stays small (~4 batches × ~128 chunks × ~5 KB / chunk ≈
+/// 2.5 MB peak). Tune up if `nvidia-smi` shows the GPU still idle
+/// between batches.
+///
+/// Tests run with `1` so cancel-mid-build behavior matches the old
+/// serial pipeline: a `CancellingEmbedder` firing the token after
+/// the first batch wouldn't deterministically halt progression with
+/// more than one in-flight call — the next batches would also
+/// commit before the cancel propagated.
+#[cfg(not(test))]
+const EMBED_PARALLELISM: usize = 4;
+#[cfg(test)]
+const EMBED_PARALLELISM: usize = 1;
+
+/// Capacity of the chunker→embedder and embedder→writer channels.
+/// Small enough that the in-memory backlog stays bounded; large
+/// enough that brief stalls in one stage don't immediately starve
+/// the others. Set to `1` in tests so cancel-after-send catches the
+/// next iteration's check (cap > 1 would let the chunker keep
+/// pre-emitting batches before yielding).
+#[cfg(not(test))]
+const PIPELINE_CHANNEL_CAPACITY: usize = 2;
+#[cfg(test)]
+const PIPELINE_CHANNEL_CAPACITY: usize = 1;
 
 /// Dump the in-progress HNSW + sidecar every N batches so resume can
 /// pick up the dump instead of rebuilding the graph from vectors.bin
@@ -686,6 +720,26 @@ impl DiskBucket {
         });
         let (last_batch_index, records_done, chunks_done) = last_batch.unwrap_or((u64::MAX, 0, 0)); // u64::MAX → 0 below
 
+        // Surface "we're alive" to the observer immediately. The
+        // preamble below (chunker re-walk + HNSW rebuild from
+        // vectors.bin) can take many minutes at wiki scale; without
+        // this, the UI stays on whatever phase it was last in until
+        // run_after_planning emits its own publish_phase, looking
+        // identical to a silently-failed resume. We don't write a
+        // build.state phase_changed here — that lands inside
+        // run_after_planning where it's a real durability barrier.
+        if let Some(obs) = observer {
+            obs.on_phase(BuildPhase::Indexing);
+            obs.on_progress(0, 0);
+        }
+        tracing::info!(
+            slot = %slot_id,
+            records_to_replay = records_done.min(planned.len() as u64),
+            chunks_to_rebuild = chunks_done,
+            last_batch_index = last_batch_index,
+            "resume_slot: starting preamble (chunker re-walk + HNSW rebuild)",
+        );
+
         // Reopen build.state in append mode (existing entries stay).
         let build_state =
             BuildStateWriter::create_or_open(&build_state_path).map_err(BucketError::Io)?;
@@ -694,9 +748,17 @@ impl DiskBucket {
         // to derive their chunk_ids in insertion order. We feed those
         // into the resumed writers' `entries` vec; the actual chunks
         // are already on disk and we don't re-embed them.
+        //
+        // Mirror the build pipeline's content-hash dedup (see the
+        // chunker stage in `run_after_planning`): records whose
+        // content_hash was already seen produced no chunks during
+        // the original build, so we must skip them here too — the
+        // resumed `entries` vec needs to reflect what's actually on
+        // disk, not what was consumed from the source.
         let mut resumed_chunk_ids: Vec<ChunkId> = Vec::with_capacity(chunks_done as usize);
         let records_to_skip = records_done.min(planned.len() as u64);
         let mut iter = adapter.enumerate();
+        let mut seen_hashes: HashSet<[u8; 32]> = HashSet::new();
         for (i, (expected_source_id, expected_hash)) in
             planned.iter().take(records_to_skip as usize).enumerate()
         {
@@ -732,13 +794,42 @@ impl DiskBucket {
                     "resume: source_id changed but content_hash matches; continuing"
                 );
             }
+            if !seen_hashes.insert(record.content_hash) {
+                continue;
+            }
             for new_chunk in chunker.chunk(&record) {
                 resumed_chunk_ids.push(ChunkId::from_source(
                     &new_chunk.source_record_hash,
                     new_chunk.chunk_offset,
                 ));
             }
+            // Tick the observer so the UI's source/chunk counters
+            // climb during the re-walk instead of staying at 0 for
+            // minutes. Cheap per-iteration store; the throttled
+            // emitter coalesces.
+            if let Some(obs) = observer {
+                obs.on_progress((i as u64) + 1, resumed_chunk_ids.len() as u64);
+            }
+            // Coarse-grained log every ~5% of records so terminal
+            // users without the UI can see the re-walk progressing.
+            if records_to_skip > 0
+                && ((i as u64) + 1).is_multiple_of(records_to_skip.max(20).div_ceil(20))
+            {
+                tracing::info!(
+                    slot = %slot_id,
+                    records = (i as u64) + 1,
+                    of = records_to_skip,
+                    chunks = resumed_chunk_ids.len(),
+                    "resume_slot: chunker re-walk progress",
+                );
+            }
         }
+        tracing::info!(
+            slot = %slot_id,
+            records = records_to_skip,
+            chunks = resumed_chunk_ids.len(),
+            "resume_slot: chunker re-walk complete",
+        );
         // `iter` is now positioned at record `records_to_skip`.
         // We hand it off to run_after_planning rather than dropping
         // and re-walking.
@@ -829,6 +920,11 @@ impl DiskBucket {
             let dump_snapshot =
                 super::dense::read_dump_snapshot(&slot_path).map_err(BucketError::Io)?;
             if dump_snapshot == Some(chunks_done) {
+                tracing::info!(
+                    slot = %slot_id,
+                    chunks = chunks_done,
+                    "resume_slot: loading HNSW dump (fast path)",
+                );
                 let by_position = resumed_chunk_ids.clone();
                 let slot_path_for_thread = slot_path.clone();
                 let dense =
@@ -837,8 +933,19 @@ impl DiskBucket {
                     })
                     .await
                     .map_err(|e| BucketError::Other(format!("spawn_blocking dense load: {e}")))??;
+                tracing::info!(
+                    slot = %slot_id,
+                    chunks = chunks_done,
+                    "resume_slot: HNSW dump load complete",
+                );
                 Some(Arc::new(dense))
             } else {
+                tracing::info!(
+                    slot = %slot_id,
+                    chunks = chunks_done,
+                    dump_snapshot = ?dump_snapshot,
+                    "resume_slot: dense.snapshot lags BatchEmbedded checkpoint; rebuilding HNSW from vectors.bin",
+                );
                 let dense = DenseIndex::empty(
                     HnswParams::default(),
                     (planned.len().saturating_mul(8)).max(1024),
@@ -846,8 +953,11 @@ impl DiskBucket {
                 let bin_path_for_thread = vectors_bin.clone();
                 let dim = embedder_snapshot.dimension;
                 let chunk_ids = resumed_chunk_ids.clone();
+                let slot_id_for_thread = slot_id.to_string();
+                let log_step = chunk_ids.len().max(20).div_ceil(20);
                 let dense =
                     tokio::task::spawn_blocking(move || -> Result<DenseIndex, BucketError> {
+                        let total = chunk_ids.len();
                         let mut bin =
                             std::fs::File::open(&bin_path_for_thread).map_err(BucketError::Io)?;
                         use std::io::{Read, Seek, SeekFrom};
@@ -862,6 +972,14 @@ impl DiskBucket {
                                 v.push(f32::from_le_bytes(chunk.try_into().unwrap()));
                             }
                             dense.insert(*chunk_id, position as u64, &v);
+                            if (position + 1).is_multiple_of(log_step) {
+                                tracing::info!(
+                                    slot = %slot_id_for_thread,
+                                    inserted = position + 1,
+                                    of = total,
+                                    "resume_slot: HNSW rebuild progress",
+                                );
+                            }
                         }
                         Ok(dense)
                     })
@@ -869,6 +987,11 @@ impl DiskBucket {
                     .map_err(|e| {
                         BucketError::Other(format!("spawn_blocking dense rebuild: {e}"))
                     })??;
+                tracing::info!(
+                    slot = %slot_id,
+                    chunks = chunks_done,
+                    "resume_slot: HNSW rebuild complete",
+                );
                 Some(Arc::new(dense))
             }
         };
@@ -954,19 +1077,33 @@ impl DiskBucket {
         let tantivy_dir = slot::tantivy_dir(slot_path);
 
         // --- Phase: Indexing ---
-        // Buffer all chunks for one record, then flush at the record
-        // boundary if the buffer has reached batch size. flush_batch
-        // writes to chunks/vectors/tantivy AND inserts into the
-        // dense (HNSW) graph in lockstep. Following the flush we
-        // sync chunks/vectors, commit tantivy, optionally update the
-        // active LoadedSlot's per-batch-replaceable views, and log
-        // BatchEmbedded — that whole sequence is the durability
-        // barrier resume relies on.
+        //
+        // Three-stage pipeline driven concurrently on this task via
+        // `try_join!`:
+        //
+        //   chunker stage  → bounded chan ──▶ EmbedJob
+        //   embedder pool  → buffered(N)  ──▶ EmbeddedBatch (in input order)
+        //   writer stage   → indexes + BatchEmbedded checkpoint
+        //
+        // The embedder pool keeps up to EMBED_PARALLELISM client
+        // requests in flight against TEI; TEI's queue then packs them
+        // onto the GPU. With one in-flight request the GPU sat idle
+        // whenever the build was chunking or fsync'ing — which was
+        // most of the time. `futures::buffered` preserves input
+        // order on the output stream, so the writer commits batches
+        // strictly in `batch_index` order even when later requests
+        // finish first; resume semantics (BatchEmbedded entries are
+        // monotonic) don't change.
+        //
+        // Cancellation: chunker checks the token per record; the
+        // embedder forwards it into each `embedder.embed()`; if any
+        // stage errors, `try_join!` drops the others — closed
+        // channels then propagate end-of-stream and the surviving
+        // futures unwind cleanly.
         publish_phase(BuildPhase::Indexing, observer, &mut build_state)?;
-        let mut pending: Vec<NewChunk> = Vec::with_capacity(EMBED_BATCH_SIZE);
         let mut records_completed: u64 = resume.records_completed;
         let mut chunks_emitted: u64 = resume.chunks_emitted;
-        let mut batch_index: u64 = resume.next_batch_index;
+        let starting_batch_index: u64 = resume.next_batch_index;
 
         // Empty HNSW + per-batch dense inserts. Sized hint is
         // generous — actual chunk count is unknown until the
@@ -994,37 +1131,153 @@ impl DiskBucket {
         // can skip the M-N-log-N rebuild from vectors.bin.
         let mut batches_since_dump: u64 = 0;
 
-        for record in iter {
-            if cancel.is_cancelled() {
-                return Err(BucketError::Cancelled);
-            }
-            let record = record.map_err(|e| BucketError::Other(format!("source error: {e}")))?;
+        let (chunk_tx, chunk_rx) =
+            tokio::sync::mpsc::channel::<EmbedJob>(PIPELINE_CHANNEL_CAPACITY);
+        let (embedded_tx, mut embedded_rx) =
+            tokio::sync::mpsc::channel::<EmbeddedBatch>(PIPELINE_CHANNEL_CAPACITY);
 
-            for new_chunk in chunker.chunk(&record) {
-                pending.push(new_chunk);
+        // Stage 1: chunker. Owns `iter`; borrows `chunker` and
+        // `cancel`. Sends one `EmbedJob` per filled buffer + a
+        // final partial. Returns Ok on cancel rather than Err — the
+        // writer's post-loop cancel check is what surfaces the
+        // Cancelled error. Returning Err here would short-circuit
+        // `try_join!` and drop the in-flight downstream stages
+        // before they could commit batches that *did* land in the
+        // queue, so resume would have less to pick up than it
+        // should.
+        let chunker_starting_records = records_completed;
+        let chunker_fut = async move {
+            let mut pending: Vec<NewChunk> = Vec::with_capacity(EMBED_BATCH_SIZE);
+            let mut local_records = chunker_starting_records;
+            let mut local_batch_index = starting_batch_index;
+            let mut cancelled = false;
+            // Two source records with the same `content_hash` (literal
+            // bit-identical text — common at wiki scale: redirect
+            // targets, stub boilerplate, identical short articles)
+            // produce identical `ChunkId`s. `ChunkStoreWriter` keys
+            // its index by ChunkId in a HashMap (silently overwriting
+            // dupes), while `VectorStoreWriter` pushes to a Vec
+            // (keeping all dupes), so a build that sees N collisions
+            // ends with `vector_count == chunk_count + N` and trips
+            // the post-build invariant. Dedup at the source level
+            // also saves chunker work and one embedder request per
+            // duplicate batch.
+            let mut seen_hashes: HashSet<[u8; 32]> = HashSet::new();
+            for record in iter {
+                if cancel.is_cancelled() {
+                    cancelled = true;
+                    break;
+                }
+                let record =
+                    record.map_err(|e| BucketError::Other(format!("source error: {e}")))?;
+                local_records += 1;
+                if !seen_hashes.insert(record.content_hash) {
+                    // Identical content already chunked & embedded.
+                    // Advancing `local_records` (not skipping it)
+                    // keeps the consumed-count aligned with the
+                    // planned record stream so resume's re-walk
+                    // skips the same iterator items.
+                    continue;
+                }
+                for new_chunk in chunker.chunk(&record) {
+                    pending.push(new_chunk);
+                }
+                if pending.len() >= EMBED_BATCH_SIZE {
+                    let chunks = std::mem::take(&mut pending);
+                    let job = EmbedJob {
+                        batch_index: local_batch_index,
+                        chunks,
+                        records_completed_at_end: local_records,
+                    };
+                    if chunk_tx.send(job).await.is_err() {
+                        // Downstream cascade collapsed (writer
+                        // errored). Nothing more we can do here.
+                        return Ok::<(), BucketError>(());
+                    }
+                    local_batch_index += 1;
+                    // Cancel could have fired *during* the send's
+                    // await (channel full → yielded → embedder
+                    // ran a CancellingEmbedder.embed → token
+                    // cancelled). Catching it here matches the old
+                    // serial loop's "check between batches" cadence.
+                    if cancel.is_cancelled() {
+                        cancelled = true;
+                        break;
+                    }
+                }
             }
-            records_completed += 1;
+            if !cancelled && !pending.is_empty() {
+                let chunks = std::mem::take(&mut pending);
+                let job = EmbedJob {
+                    batch_index: local_batch_index,
+                    chunks,
+                    records_completed_at_end: local_records,
+                };
+                let _ = chunk_tx.send(job).await;
+            }
+            // Dropping the sender closes the channel, signaling EOS
+            // to the embedder pool.
+            drop(chunk_tx);
+            Ok::<(), BucketError>(())
+        };
 
-            if pending.len() >= EMBED_BATCH_SIZE {
-                let flushed = pending.len() as u64;
+        // Stage 2: embedder pool. Pulls `EmbedJob`s from the
+        // chunker, dispatches up to EMBED_PARALLELISM concurrent
+        // `embedder.embed()` calls via `buffered(N)`, and forwards
+        // results in input order to the writer.
+        let embedder_for_pool = embedder.clone();
+        let cancel_for_pool = cancel.clone();
+        let embedder_fut = async move {
+            use futures::StreamExt;
+            let stream = futures::stream::unfold(chunk_rx, |mut rx| async move {
+                rx.recv().await.map(|job| (job, rx))
+            })
+            .map(|job| {
+                let embedder = embedder_for_pool.clone();
+                let cancel = cancel_for_pool.clone();
+                async move { embed_batch(embedder.as_ref(), &cancel, job).await }
+            })
+            .buffered(EMBED_PARALLELISM);
+            tokio::pin!(stream);
+            while let Some(result) = stream.next().await {
+                let batch = result?;
+                if embedded_tx.send(batch).await.is_err() {
+                    return Err::<(), BucketError>(BucketError::Cancelled);
+                }
+            }
+            drop(embedded_tx);
+            Ok(())
+        };
+
+        // Stage 3: writer. Borrows the writers + build_state from
+        // the surrounding fn so we don't move them across the join
+        // (we need them again post-loop to finalize). Cancellation
+        // is observed *after* draining whatever batches are already
+        // in the embedded queue — that preserves the old serial
+        // semantics where a flush-in-progress when cancel fires
+        // still commits its batch (so resume has a checkpoint to
+        // pick up from). The chunker's per-record cancel check is
+        // what stops new batches from being produced; once the
+        // upstream cascade drops `embedded_tx`, this loop sees `None`
+        // and exits.
+        let writer_fut = async {
+            while let Some(batch) = embedded_rx.recv().await {
                 let base_position = chunks_emitted;
-                flush_batch(
-                    &mut pending,
+                let meta = apply_embedded_batch(
+                    batch,
                     &mut chunk_writer,
                     &mut vector_writer,
                     sparse_builder.as_mut(),
                     dense.as_ref(),
                     base_position,
-                    embedder.as_ref(),
-                    cancel,
-                )
-                .await?;
+                )?;
                 chunk_writer.flush().map_err(BucketError::Io)?;
                 vector_writer.flush().map_err(BucketError::Io)?;
                 if let Some(builder) = sparse_builder.as_mut() {
                     builder.commit()?;
                 }
-                chunks_emitted += flushed;
+                chunks_emitted += meta.chunk_count;
+                records_completed = meta.records_completed_at_end;
                 self.update_active_during_build(
                     slot_path,
                     &chunk_writer,
@@ -1035,18 +1288,17 @@ impl DiskBucket {
                 )?;
                 build_state
                     .append(&BuildStateRecord::BatchEmbedded {
-                        batch_index,
+                        batch_index: meta.batch_index,
                         source_records_completed: records_completed,
                         chunks_completed: chunks_emitted,
                     })
                     .map_err(BucketError::Io)?;
                 // Durability barrier: BatchEmbedded is the resume
-                // checkpoint. The chunks/vectors/sparse writers have
-                // already flushed + committed above; this fsync makes
-                // the log entry stating "everything up to here is
-                // durable" itself durable.
+                // checkpoint. Writers have already flushed +
+                // committed above; this fsync makes the log entry
+                // stating "everything up to here is durable" itself
+                // durable.
                 build_state.sync().map_err(BucketError::Io)?;
-                batch_index += 1;
                 batches_since_dump += 1;
                 if batches_since_dump >= DENSE_DUMP_BATCH_INTERVAL {
                     periodic_dump(slot_path, slot_id, &dense).await?;
@@ -1056,49 +1308,16 @@ impl DiskBucket {
                     obs.on_progress(records_completed, chunks_emitted);
                 }
             }
-        }
+            // Channel closed cleanly. Promote a cancel observed
+            // mid-stream to a build-level Cancelled error so the
+            // top-level result is honest about why we stopped.
+            if cancel.is_cancelled() {
+                return Err::<(), BucketError>(BucketError::Cancelled);
+            }
+            Ok(())
+        };
 
-        // Final partial batch.
-        if !pending.is_empty() {
-            let flushed = pending.len() as u64;
-            let base_position = chunks_emitted;
-            flush_batch(
-                &mut pending,
-                &mut chunk_writer,
-                &mut vector_writer,
-                sparse_builder.as_mut(),
-                dense.as_ref(),
-                base_position,
-                embedder.as_ref(),
-                cancel,
-            )
-            .await?;
-            chunk_writer.flush().map_err(BucketError::Io)?;
-            vector_writer.flush().map_err(BucketError::Io)?;
-            if let Some(builder) = sparse_builder.as_mut() {
-                builder.commit()?;
-            }
-            chunks_emitted += flushed;
-            self.update_active_during_build(
-                slot_path,
-                &chunk_writer,
-                &dense,
-                &manifest,
-                install_during_build,
-                &mut active_during_build,
-            )?;
-            build_state
-                .append(&BuildStateRecord::BatchEmbedded {
-                    batch_index,
-                    source_records_completed: records_completed,
-                    chunks_completed: chunks_emitted,
-                })
-                .map_err(BucketError::Io)?;
-            build_state.sync().map_err(BucketError::Io)?;
-            if let Some(obs) = observer {
-                obs.on_progress(records_completed, chunks_emitted);
-            }
-        }
+        tokio::try_join!(chunker_fut, embedder_fut, writer_fut)?;
 
         let chunk_count = chunk_writer.finalize().map_err(BucketError::Io)? as u64;
         let vector_count = vector_writer.finalize().map_err(BucketError::Io)? as u64;
@@ -2107,34 +2326,43 @@ fn publish_phase(
     Ok(())
 }
 
-/// Flush a buffered batch through every index. The order matters for
-/// the durability barrier:
-/// 1. Embed (async network I/O against the provider).
-/// 2. For each chunk, write to all four indexes — chunks.bin,
-///    vectors.bin, tantivy, dense (HNSW). Position numbers for
-///    dense are derived from `base_position + offset_in_batch`.
-/// 3. Caller is responsible for `flush()`-ing chunks/vectors and
-///    `commit()`-ing tantivy after this returns, before logging the
-///    BatchEmbedded checkpoint.
-#[allow(clippy::too_many_arguments)]
-async fn flush_batch(
-    pending: &mut Vec<NewChunk>,
-    chunks: &mut ChunkStoreWriter,
-    vectors: &mut VectorStoreWriter,
-    sparse: Option<&mut SparseIndexBuilder>,
-    dense: &DenseIndex,
-    base_position: u64,
+/// One pre-embed unit handed off from the chunker stage to the
+/// embedder pool. `batch_index` is monotonic across the whole indexing
+/// phase (carried into the BatchEmbedded checkpoint); the writer stage
+/// commits batches in this order regardless of which embedder request
+/// completes first.
+struct EmbedJob {
+    batch_index: u64,
+    chunks: Vec<NewChunk>,
+    /// Cumulative source-record count after this batch's records were
+    /// chunked. Goes straight into `BatchEmbedded.source_records_completed`
+    /// when the writer commits the batch.
+    records_completed_at_end: u64,
+}
+
+/// Output of the embedder pool, keeping per-job ordering metadata so
+/// the writer can checkpoint without recomputing. `embeddings[i]`
+/// corresponds to `chunks[i]`.
+struct EmbeddedBatch {
+    batch_index: u64,
+    chunks: Vec<NewChunk>,
+    embeddings: Vec<Vec<f32>>,
+    records_completed_at_end: u64,
+}
+
+/// Run the embedder for one job. Splits oversized payloads into
+/// sub-batches of `EMBED_BATCH_SIZE` so a single API call never
+/// exceeds the provider's `max_client_batch_size` (and likely the
+/// `max_batch_tokens` budget too). Sub-batches inside one job are
+/// serial — concurrency lives at the *across-jobs* level, dispatched
+/// by the embedder stage's `buffered(N)`.
+async fn embed_batch(
     embedder: &dyn EmbeddingProvider,
     cancel: &CancellationToken,
-) -> Result<(), BucketError> {
-    // Split the embedder call into sub-batches of EMBED_BATCH_SIZE so
-    // a pending buffer that overshot the flush threshold (a single
-    // chunky Wikipedia article can produce 200+ chunks in one go)
-    // doesn't exceed the provider's per-request batch cap. The
-    // on-disk batch boundary remains one logical batch — only the
-    // API call gets fan-out.
-    let mut all_embeddings: Vec<Vec<f32>> = Vec::with_capacity(pending.len());
-    for window in pending.chunks(EMBED_BATCH_SIZE) {
+    job: EmbedJob,
+) -> Result<EmbeddedBatch, BucketError> {
+    let mut all_embeddings: Vec<Vec<f32>> = Vec::with_capacity(job.chunks.len());
+    for window in job.chunks.chunks(EMBED_BATCH_SIZE) {
         let texts: Vec<String> = window.iter().map(|c| c.text.clone()).collect();
         let req = EmbedRequest {
             // TEI single-model deployments ignore the model field.
@@ -2157,17 +2385,49 @@ async fn flush_batch(
         }
         all_embeddings.extend(resp.embeddings);
     }
-
-    if all_embeddings.len() != pending.len() {
+    if all_embeddings.len() != job.chunks.len() {
         return Err(BucketError::Provider(format!(
             "embedder returned {} vectors total for {} inputs across sub-batches",
             all_embeddings.len(),
-            pending.len(),
+            job.chunks.len(),
         )));
     }
+    Ok(EmbeddedBatch {
+        batch_index: job.batch_index,
+        chunks: job.chunks,
+        embeddings: all_embeddings,
+        records_completed_at_end: job.records_completed_at_end,
+    })
+}
 
-    let mut sparse = sparse;
-    for (offset, (chunk, vector)) in pending.iter().zip(all_embeddings.iter()).enumerate() {
+/// Apply one embedded batch to all four indexes (chunks, vectors,
+/// sparse, dense) in lockstep. Returns the chunk count so the caller
+/// can advance `chunks_emitted` without re-counting. Order matters for
+/// the durability barrier:
+/// 1. Embed (async network I/O against the provider).
+/// 2. For each chunk, write to all four indexes — chunks.bin,
+///    vectors.bin, tantivy, dense (HNSW). Position numbers for
+///    dense are derived from `base_position + offset_in_batch`.
+/// 3. Caller is responsible for `flush()`-ing chunks/vectors and
+///    `commit()`-ing tantivy after this returns, before logging the
+///    BatchEmbedded checkpoint.
+fn apply_embedded_batch(
+    batch: EmbeddedBatch,
+    chunks: &mut ChunkStoreWriter,
+    vectors: &mut VectorStoreWriter,
+    mut sparse: Option<&mut SparseIndexBuilder>,
+    dense: &DenseIndex,
+    base_position: u64,
+) -> Result<EmbeddedBatchMeta, BucketError> {
+    if batch.embeddings.len() != batch.chunks.len() {
+        return Err(BucketError::Provider(format!(
+            "embedded batch length mismatch: {} vectors vs {} chunks",
+            batch.embeddings.len(),
+            batch.chunks.len(),
+        )));
+    }
+    let chunk_count = batch.chunks.len() as u64;
+    for (offset, (chunk, vector)) in batch.chunks.iter().zip(batch.embeddings.iter()).enumerate() {
         let chunk_id = ChunkId::from_source(&chunk.source_record_hash, chunk.chunk_offset);
         chunks
             .append(chunk_id, &chunk.source_ref, &chunk.text)
@@ -2181,8 +2441,20 @@ async fn flush_batch(
         // slot finds this chunk.
         dense.insert(chunk_id, base_position + offset as u64, vector);
     }
-    pending.clear();
-    Ok(())
+    Ok(EmbeddedBatchMeta {
+        batch_index: batch.batch_index,
+        chunk_count,
+        records_completed_at_end: batch.records_completed_at_end,
+    })
+}
+
+/// Bookkeeping returned by [`apply_embedded_batch`] so the writer loop
+/// can advance counters and write the BatchEmbedded checkpoint without
+/// having to keep the moved-from [`EmbeddedBatch`] alive.
+struct EmbeddedBatchMeta {
+    batch_index: u64,
+    chunk_count: u64,
+    records_completed_at_end: u64,
 }
 
 async fn derive_embedder_snapshot(
@@ -2441,7 +2713,7 @@ mod tests {
         model_id: String,
         embed_calls: AtomicUsize,
         /// Largest `inputs.len()` observed across all `embed()` calls.
-        /// Used by `flush_batch_splits_oversized_pending_into_subbatches`
+        /// Used by `embed_batch_splits_oversized_jobs_into_subbatches`
         /// to enforce that no single API call ever exceeds the
         /// per-call cap.
         max_inputs_in_call: AtomicUsize,
@@ -3927,8 +4199,69 @@ embedder = "tei_test"
         assert_eq!(calls, 3, "expected 3 batched embed calls, got {calls}");
     }
 
+    /// Two files with **identical content** have the same
+    /// `content_hash` and therefore the same `ChunkId` for every
+    /// chunk position. Without source-level dedup, `chunks.idx`
+    /// (a HashMap) silently overwrites on the duplicate while
+    /// `vectors.idx` (a Vec) keeps both — the post-build invariant
+    /// `chunk_count == vector_count` then trips at finalize.
+    ///
+    /// Regression for the overnight simplewiki run that hit ~2k
+    /// duplicate-content articles (redirects, stub boilerplate)
+    /// and surfaced as `chunk/vector count mismatch: 870996
+    /// chunks, 873035 vectors`.
+    #[tokio::test]
+    async fn duplicate_content_records_dedupe_to_match_chunk_and_vector_counts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("notes");
+        fs::create_dir_all(&source).unwrap();
+
+        // 5 unique-content files + 3 deliberate duplicates of the
+        // first one. Chunker produces one chunk per short file, so
+        // expected unique count = 5.
+        write_md(&source, "alpha.md", "alpha content body");
+        write_md(&source, "beta.md", "beta content body");
+        write_md(&source, "gamma.md", "gamma content body");
+        write_md(&source, "delta.md", "delta content body");
+        write_md(&source, "epsilon.md", "epsilon content body");
+        write_md(&source, "alpha-dup1.md", "alpha content body");
+        write_md(&source, "alpha-dup2.md", "alpha content body");
+        write_md(&source, "alpha-dup3.md", "alpha content body");
+
+        let bucket_root = tmp.path().join("bucket");
+        let bucket = open_test_bucket(&bucket_root, &source);
+        let adapter = MarkdownDir::new(&source);
+        let (chunker, chunker_snapshot) = TokenBasedChunker::from_config(&bucket.config().chunker);
+        let embedder: Arc<dyn EmbeddingProvider> = Arc::new(MockEmbedder::new(8));
+        let cancel = CancellationToken::new();
+
+        let slot_id = bucket
+            .build_slot(
+                &adapter,
+                &chunker,
+                chunker_snapshot,
+                embedder,
+                None,
+                &cancel,
+            )
+            .await
+            .expect("build must not error on duplicate-content sources");
+
+        let manifest_path = slot::manifest_path(&slot::slot_dir(&bucket_root, &slot_id));
+        let manifest =
+            SlotManifest::from_toml_str(&fs::read_to_string(&manifest_path).unwrap()).unwrap();
+        assert_eq!(
+            manifest.stats.chunk_count, manifest.stats.vector_count,
+            "chunks and vectors must stay in lockstep across duplicate-content sources",
+        );
+        assert_eq!(
+            manifest.stats.chunk_count, 5,
+            "5 unique-content files → 5 chunks (3 alpha duplicates skipped)",
+        );
+    }
+
     /// A single source record producing more than `EMBED_BATCH_SIZE`
-    /// chunks must still respect the per-API-call cap — `flush_batch`
+    /// chunks must still respect the per-API-call cap — `embed_batch`
     /// splits the embedder traffic into sub-batches of
     /// `EMBED_BATCH_SIZE` so we never exceed the provider's
     /// `max_client_batch_size` (TEI defaults to 256).
@@ -3938,7 +4271,7 @@ embedder = "tei_test"
     /// were getting sent to TEI in a single 267-item embed call,
     /// tripping `batch size 267 > maximum allowed batch size 256`.
     #[tokio::test]
-    async fn flush_batch_splits_oversized_pending_into_subbatches() {
+    async fn embed_batch_splits_oversized_jobs_into_subbatches() {
         let tmp = tempfile::tempdir().unwrap();
         let source = tmp.path().join("notes");
         fs::create_dir_all(&source).unwrap();
