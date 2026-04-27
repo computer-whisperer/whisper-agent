@@ -42,14 +42,24 @@ use super::types::{
 use super::vectors::{VectorStoreReader, VectorStoreWriter};
 use crate::providers::embedding::{EmbedRequest, EmbeddingProvider};
 
-/// Number of chunks per `EmbeddingProvider::embed` call. Bumped to 128
-/// after the 5k simplewiki TEI smoke showed per-batch HTTP overhead
-/// dominating end-to-end embed throughput at 32; with 128 (still under
-/// TEI's `max_batch_tokens=65536` ÷ ~500-token chunks ≈ 130-chunk
-/// per-batch budget) the round-trip count drops 4× without obviously
-/// hurting per-batch latency on the test endpoint. Configurable per-call
-/// eventually if measurement justifies finer control; for now it's a
-/// const at module level.
+/// Number of chunks per `EmbeddingProvider::embed` call AND target
+/// flush size for the on-disk batch (chunks.bin / vectors.bin /
+/// tantivy commit). Bumped to 128 after the 5k simplewiki TEI smoke
+/// showed per-batch HTTP overhead dominating end-to-end embed
+/// throughput at 32; with 128 (still under TEI's
+/// `max_batch_tokens=65536` ÷ ~500-token chunks ≈ 130-chunk per-batch
+/// budget AND under TEI's typical `max_client_batch_size=256`) the
+/// round-trip count drops 4× without obviously hurting per-batch
+/// latency on the test endpoint. Configurable per-call eventually if
+/// measurement justifies finer control; for now it's a const at
+/// module level.
+///
+/// `flush_batch` enforces this as a per-API-call cap by splitting
+/// oversized pending buffers into sub-batches of `EMBED_BATCH_SIZE`.
+/// That matters because a single Wikipedia article can produce 200+
+/// chunks at the default chunker config, so an `if pending.len() >=
+/// EMBED_BATCH_SIZE` flush trigger isn't enough on its own to bound
+/// the per-API-call payload.
 const EMBED_BATCH_SIZE: usize = 128;
 
 /// Dump the in-progress HNSW + sidecar every N batches so resume can
@@ -2117,29 +2127,47 @@ async fn flush_batch(
     embedder: &dyn EmbeddingProvider,
     cancel: &CancellationToken,
 ) -> Result<(), BucketError> {
-    let texts: Vec<String> = pending.iter().map(|c| c.text.clone()).collect();
-    let req = EmbedRequest {
-        // TEI single-model deployments ignore the model field. Future
-        // OpenAI-shaped providers route on it; we'll surface model id
-        // selection through the bucket config when that lands.
-        model: "",
-        inputs: &texts,
-    };
-    let resp = embedder
-        .embed(&req, cancel)
-        .await
-        .map_err(|e| BucketError::Provider(e.to_string()))?;
+    // Split the embedder call into sub-batches of EMBED_BATCH_SIZE so
+    // a pending buffer that overshot the flush threshold (a single
+    // chunky Wikipedia article can produce 200+ chunks in one go)
+    // doesn't exceed the provider's per-request batch cap. The
+    // on-disk batch boundary remains one logical batch — only the
+    // API call gets fan-out.
+    let mut all_embeddings: Vec<Vec<f32>> = Vec::with_capacity(pending.len());
+    for window in pending.chunks(EMBED_BATCH_SIZE) {
+        let texts: Vec<String> = window.iter().map(|c| c.text.clone()).collect();
+        let req = EmbedRequest {
+            // TEI single-model deployments ignore the model field.
+            // Future OpenAI-shaped providers route on it; we'll
+            // surface model id selection through the bucket config
+            // when that lands.
+            model: "",
+            inputs: &texts,
+        };
+        let resp = embedder
+            .embed(&req, cancel)
+            .await
+            .map_err(|e| BucketError::Provider(e.to_string()))?;
+        if resp.embeddings.len() != window.len() {
+            return Err(BucketError::Provider(format!(
+                "embedder returned {} vectors for {} inputs",
+                resp.embeddings.len(),
+                window.len(),
+            )));
+        }
+        all_embeddings.extend(resp.embeddings);
+    }
 
-    if resp.embeddings.len() != pending.len() {
+    if all_embeddings.len() != pending.len() {
         return Err(BucketError::Provider(format!(
-            "embedder returned {} vectors for {} inputs",
-            resp.embeddings.len(),
+            "embedder returned {} vectors total for {} inputs across sub-batches",
+            all_embeddings.len(),
             pending.len(),
         )));
     }
 
     let mut sparse = sparse;
-    for (offset, (chunk, vector)) in pending.iter().zip(resp.embeddings.iter()).enumerate() {
+    for (offset, (chunk, vector)) in pending.iter().zip(all_embeddings.iter()).enumerate() {
         let chunk_id = ChunkId::from_source(&chunk.source_record_hash, chunk.chunk_offset);
         chunks
             .append(chunk_id, &chunk.source_ref, &chunk.text)
@@ -2412,6 +2440,11 @@ mod tests {
         dimension: u32,
         model_id: String,
         embed_calls: AtomicUsize,
+        /// Largest `inputs.len()` observed across all `embed()` calls.
+        /// Used by `flush_batch_splits_oversized_pending_into_subbatches`
+        /// to enforce that no single API call ever exceeds the
+        /// per-call cap.
+        max_inputs_in_call: AtomicUsize,
     }
 
     impl MockEmbedder {
@@ -2420,6 +2453,7 @@ mod tests {
                 dimension,
                 model_id: "mock-embedder".to_string(),
                 embed_calls: AtomicUsize::new(0),
+                max_inputs_in_call: AtomicUsize::new(0),
             }
         }
 
@@ -2443,6 +2477,8 @@ mod tests {
             _cancel: &'a CancellationToken,
         ) -> ProviderBoxFuture<'a, Result<EmbeddingResponse, EmbeddingError>> {
             self.embed_calls.fetch_add(1, Ordering::SeqCst);
+            self.max_inputs_in_call
+                .fetch_max(req.inputs.len(), Ordering::SeqCst);
             let dim = self.dimension;
             Box::pin(async move {
                 let embeddings: Vec<Vec<f32>> = req
@@ -3891,6 +3927,74 @@ embedder = "tei_test"
         assert_eq!(calls, 3, "expected 3 batched embed calls, got {calls}");
     }
 
+    /// A single source record producing more than `EMBED_BATCH_SIZE`
+    /// chunks must still respect the per-API-call cap — `flush_batch`
+    /// splits the embedder traffic into sub-batches of
+    /// `EMBED_BATCH_SIZE` so we never exceed the provider's
+    /// `max_client_batch_size` (TEI defaults to 256).
+    ///
+    /// Regression for the simplewiki integration: long Wikipedia
+    /// articles produce 200+ chunks at the default chunker config and
+    /// were getting sent to TEI in a single 267-item embed call,
+    /// tripping `batch size 267 > maximum allowed batch size 256`.
+    #[tokio::test]
+    async fn flush_batch_splits_oversized_pending_into_subbatches() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("notes");
+        fs::create_dir_all(&source).unwrap();
+
+        // One file long enough to produce 3× EMBED_BATCH_SIZE chunks.
+        // chunker config in `sample_bucket_toml` is chunk_tokens=50 +
+        // overlap_tokens=5; the heuristic-tokenizer path uses
+        // chars_per_token=4 → ~180 effective chars per chunk after
+        // overlap. Pad generously so the chunker emits well over
+        // EMBED_BATCH_SIZE chunks.
+        let target_chunks = super::EMBED_BATCH_SIZE * 3 + 11;
+        let chars_per_chunk = 200;
+        let body: String = (0..(target_chunks * chars_per_chunk))
+            .map(|i| char::from(b'a' + (i % 26) as u8))
+            .collect();
+        write_md(&source, "huge.md", &body);
+
+        let bucket_root = tmp.path().join("bucket");
+        let bucket = open_test_bucket(&bucket_root, &source);
+
+        let mock = Arc::new(MockEmbedder::new(8));
+        let embedder: Arc<dyn EmbeddingProvider> = mock.clone();
+        let adapter = MarkdownDir::new(&source);
+        let (chunker, chunker_snapshot) = TokenBasedChunker::from_config(&bucket.config().chunker);
+        let cancel = CancellationToken::new();
+
+        bucket
+            .build_slot(
+                &adapter,
+                &chunker,
+                chunker_snapshot.clone(),
+                embedder,
+                None,
+                &cancel,
+            )
+            .await
+            .unwrap();
+
+        // No assertion on the exact batch count (depends on heuristic
+        // chunker tokenization), but every embed call must be ≤
+        // EMBED_BATCH_SIZE — the property the test exists to enforce.
+        let max_seen = mock.max_inputs_in_call.load(Ordering::SeqCst);
+        assert!(
+            max_seen <= super::EMBED_BATCH_SIZE,
+            "embed call exceeded EMBED_BATCH_SIZE ({}): max seen {max_seen}",
+            super::EMBED_BATCH_SIZE,
+        );
+        // Sanity: we did call the embedder, and we did exceed one
+        // batch (otherwise the test isn't meaningful).
+        let calls = mock.embed_calls.load(Ordering::SeqCst);
+        assert!(
+            calls > 1,
+            "expected multiple embed calls for an oversized record, got {calls}"
+        );
+    }
+
     #[tokio::test]
     async fn build_writes_full_build_state_log() {
         // End-to-end verification of the resume log: a successful
@@ -4602,6 +4706,7 @@ embedder = "tei_test"
             dimension: 8,
             model_id: "different-mock".to_string(),
             embed_calls: AtomicUsize::new(0),
+            max_inputs_in_call: AtomicUsize::new(0),
         });
         let resume_cancel = CancellationToken::new();
         let err = bucket
