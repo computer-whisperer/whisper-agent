@@ -28,7 +28,17 @@ Last updated: **2026-04-27**.
 | —   | `build_simplewiki` one-off binary (driver for the validation)  | `9c0d864` |
 | 9   | `QueryBuckets` wire path + WebUI search form                   | `9c82346` |
 | HP  | HNSW persistence — dump on build, reload on open               | `1658a8f` |
-| 8c  | WebUI bucket lifecycle — Create / Delete / StartBuild / Cancel + progress events | _this slice_ |
+| 8c  | WebUI bucket lifecycle — Create / Delete / StartBuild / Cancel + progress events | `da52b6a` |
+| 8d  | `source_ref` plumbed through `QueryHit` + display in UI        | `fec561a` |
+| 8e  | WebUI search results — expandable + color-coded retrieval path | `436e8be` |
+| KQ  | `knowledge_query` builtin tool + per-pod `[allow.knowledge_buckets]` scope | `797331e` |
+| R   | Resumable builds — `build.state` log, `resume_slot`, queryable-during-build, periodic mid-build HNSW dumps, planning-phase factoring | `da0c5c5..3f6ec38` |
+| BPE | Real BPE chunker with hf-hub auto-fetch + heuristic fallback   | `70edc51` |
+| MMAP| `mmap` chunks/vectors readers + `ServingMode` dispatch         | `8429d07` |
+| M   | Mutation triad — `insert` / `tombstone` / `compact` + delta layer + reload-aware slot + pre-release hardening | `9ff15cb..c666f7f` |
+| T   | Tracked source kind — config variant, `FeedDriver` + `WikipediaDriver`, feed-state file, build-pipeline wiring, `FeedWorker` (cadence + delta polling) | `28f18d4..8add262` |
+| W   | Wiki-scale fixes — multistream `bz2` decoder, embed-call cap, content-hash dedup, pipelined chunker→embedder→writer with concurrent embed requests, resume preamble observability | `fa64527..9564927` |
+| RC  | Replay in-flight build progress to freshly-connected clients   | `fd587bb` |
 
 ## End-to-end validation (Simple English Wikipedia, mock embedder)
 
@@ -119,11 +129,11 @@ chronological — order may shuffle as the dataset reveals what hurts.
 
 | #   | Title                                                          | Why deferred |
 |-----|----------------------------------------------------------------|--------------|
-| 10+ | `knowledge_query` builtin tool                                 | Wire `QueryEngine` into the runtime tool catalog so an agent can call it. Needs scope/permission gating per `[allow.knowledge_buckets]`. |
-| 10+ | `managed` source kind + `knowledge_modify` tool                | For pod memory / agent-authored notes. Mutations via `Bucket::insert` / `Bucket::tombstone`. |
-| 10+ | Compaction triggers (delta-ratio / tombstone-ratio thresholds, manual) | Deferred until mutation path exists; until then there's no delta layer to compact. |
+| 10+ | `knowledge_modify` tool + managed-bucket mutation surface      | `Bucket::insert` / `Bucket::tombstone` exist, and `SourceConfig::Managed` is in the config enum. Missing: an LLM-callable tool that exercises them on a managed bucket — pod-memory affordance. |
+| 10+ | Auto-compaction triggers (delta-ratio / tombstone-ratio thresholds, scheduled) | `Bucket::compact` is callable manually; auto-trigger heuristics still TBD. Real thresholds need observation on actual mutating buckets; should also have time-based triggers (e.g. compact pod memory daily). |
 | 10+ | Live-mode post-turn relevance nudge                            | Per design doc § "Live retrieval mode". Cross-cuts scheduler — not load-bearing for v1. |
 | 10+ | Per-pod buckets (`<pods_root>/<pod>/buckets/`)                 | Server-scope is enough until multi-pod isolation is a felt need. Today's `BucketScope::Pod` enum variant is unwired. |
+| 10+ | Background monthly resync for tracked buckets                  | Per design doc § "Background monthly resync". `FeedWorker` does daily delta polling; the periodic full-rebuild reset against a fresh base snapshot is not yet wired. |
 
 ## Dangling cleanup (none blocking)
 
@@ -132,22 +142,22 @@ chronological — order may shuffle as the dataset reveals what hurts.
   load on simplewiki/tei_50k). Initial *build* wall-clock is unchanged
   — full enwiki rebuild is still gated by build-side throughput, but
   reuse across server restarts is solved.
-- **`tokenizers` crate integration** — `TokenBasedChunker` uses a
-  `chars_per_token=4` heuristic. For chunk-id stability across embedder
-  swaps the chunker has to use real BPE. Land before any "production"
-  bucket gets built.
-- **mmap upgrade for `chunks.bin` / `vectors.bin`** — currently
-  `Mutex<File>`. Profile before changing; query latency hasn't been
-  measured at scale.
+- ~~**`tokenizers` crate integration**~~ — landed in `70edc51`. Real
+  BPE via `hf-hub` auto-fetch with the char-heuristic kept as offline
+  fallback. Chunk ids now stable across embedder rotations as the
+  design intended.
+- ~~**mmap upgrade for `chunks.bin` / `vectors.bin`**~~ — landed in
+  `8429d07`. Reader path uses `mmap` with a `ServingMode` dispatch so
+  RAM-resident vs disk-backed buckets share the file format.
+- ~~**Resumable / incremental builds**~~ — landed in the `R` slice
+  group (`da0c5c5..3f6ec38`). `build.state` log + `resume_slot` +
+  periodic mid-build HNSW dumps + queryable-during-build all in.
+  Cancel / crash now picks up at the last `BatchEmbedded` checkpoint
+  instead of restarting from zero.
 - **GC pass for orphaned slot directories** — cancelled / failed builds
   leave `slots/<id>/` on disk. Need a sweep on registry load (or a
   `compact` op) to clean these up. More relevant now that the WebUI
   Cancel button is live and routinely produces failed slots.
-- **Resumable / incremental builds** — wikipedia-scale builds run
-  multi-hour; today a Cancel or crash forces starting over. Want the
-  build pipeline to checkpoint chunk progress so a resumed build picks
-  up where the previous attempt left off. In-scope soon per the user
-  call-out at slice 8c.
 - **`build_simplewiki` binary** — now obsolete for non-stress-testing
   flows; the WebUI lifecycle covers everything it did. Keep around
   for batch / scripted scenarios but consider deleting once the wiki
