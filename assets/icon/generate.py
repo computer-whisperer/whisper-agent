@@ -32,16 +32,36 @@ outer-edge tone.
 
 from __future__ import annotations
 
+import io
 import re
 import shutil
 import subprocess
 import sys
 from pathlib import Path
 
+import numpy as np
 from PIL import Image, ImageDraw
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SRC = REPO_ROOT / "assets" / "icon" / "icon_v1.svg"
+
+# Resolution we render the bg-stripped SVG at before cropping for the
+# favicons. Larger than any output size so the auto-crop bbox is tight
+# (sub-pixel halo gets averaged down on the resize) and the final
+# downsample carries enough antialiasing detail.
+FAVICON_HIRES = 1024
+
+# Pixels with alpha at or below this count as background when computing
+# the favicon crop. The halo gradient fades to alpha 0 at its outer
+# edge but rounding leaves a few pixels at single-digit alpha — we
+# treat those as crop-out-able so the favicon hugs the mascot rather
+# than the technically-non-empty halo bounds.
+FAVICON_ALPHA_THRESHOLD = 8
+
+# Padding ratio around the cropped mascot bbox before resize. Small —
+# the favicon should fill the tab/PWA tile without bleeding. 0.06 = 6%
+# of the bbox's longer axis on each side.
+FAVICON_CROP_PADDING = 0.06
 
 # Density buckets for legacy mipmap fallbacks. Modern launchers (API 26+)
 # pull the adaptive icon XML from mipmap-anydpi-v26/ instead, but we still
@@ -76,6 +96,60 @@ def render_svg(svg_bytes: bytes, out: Path, size: int) -> None:
         raise RuntimeError(
             f"resvg failed (exit {proc.returncode}): {proc.stderr.decode().strip()}"
         )
+
+
+def render_svg_bytes(svg_bytes: bytes, size: int) -> bytes:
+    """Rasterize SVG to PNG bytes at `size`×`size` via resvg, stdin → stdout.
+    Used for the favicon path where we crop in-memory before writing."""
+    proc = subprocess.run(
+        ["resvg", "--width", str(size), "--height", str(size), "-", "-c"],
+        input=svg_bytes,
+        capture_output=True,
+        check=False,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"resvg failed (exit {proc.returncode}): {proc.stderr.decode().strip()}"
+        )
+    return proc.stdout
+
+
+def alpha_bbox(img: Image.Image, threshold: int) -> tuple[int, int, int, int]:
+    """Tight bbox of pixels whose alpha exceeds `threshold`. Returns
+    (left, top, right, bottom) in PIL crop convention. Skips faintly
+    semi-transparent pixels (e.g. halo gradient tails) that
+    `Image.getbbox` would otherwise pull into the bounds."""
+    arr = np.array(img.convert("RGBA"))
+    alpha = arr[:, :, 3]
+    rows = np.any(alpha > threshold, axis=1)
+    cols = np.any(alpha > threshold, axis=0)
+    if not rows.any():
+        raise RuntimeError("alpha_bbox: image is fully transparent")
+    rmin, rmax = np.where(rows)[0][[0, -1]]
+    cmin, cmax = np.where(cols)[0][[0, -1]]
+    return (int(cmin), int(rmin), int(cmax) + 1, int(rmax) + 1)
+
+
+def square_padded_crop(
+    img: Image.Image, bbox: tuple[int, int, int, int], padding_ratio: float
+) -> Image.Image:
+    """Center `bbox` inside a square crop of `img` with `padding_ratio`
+    breathing room added (relative to the longer axis). The result is
+    clamped to image bounds — if the bbox is near a corner the square
+    may not be perfectly centered, but the favicon is square already so
+    that case never triggers in practice."""
+    x0, y0, x1, y1 = bbox
+    w, h = x1 - x0, y1 - y0
+    side = max(w, h)
+    side = int(round(side * (1 + 2 * padding_ratio)))
+    cx, cy = (x0 + x1) / 2, (y0 + y1) / 2
+    half = side / 2
+    iw, ih = img.size
+    sx0 = max(0, int(round(cx - half)))
+    sy0 = max(0, int(round(cy - half)))
+    sx1 = min(iw, sx0 + side)
+    sy1 = min(ih, sy0 + side)
+    return img.crop((sx0, sy0, sx1, sy1))
 
 
 # Match the canvas-filling background rect by its `fill="url(#bg)"`
@@ -124,13 +198,30 @@ def main() -> int:
     svg_full_bytes = svg_full.encode("utf-8")
 
     # --- webui favicons --------------------------------------------------
-    # Two sizes cover most browser/PWA needs; the 192 doubles as the
-    # apple-touch-icon (also linked from index.html / login.html).
+    # Browser tabs and PWA tiles read best when the icon is transparent
+    # behind the mascot (rather than carrying the SVG's full
+    # radial-gradient backdrop, which ends up looking like a hard
+    # square frame against the browser chrome) and tightly cropped
+    # (the SVG's hand-authored padding is dialed for adaptive-icon
+    # safe-zone fit, not for 32-px favicons).
+    #
+    # Render the bg-stripped SVG at high res, auto-crop to the mascot's
+    # alpha bbox + a small breathing-room ratio, then resize down. The
+    # 192 doubles as the apple-touch-icon (linked from index.html /
+    # login.html alongside the 32).
     webui_assets = REPO_ROOT / "crates" / "whisper-agent-webui" / "assets"
     webui_assets.mkdir(parents=True, exist_ok=True)
-    render_svg(svg_full_bytes, webui_assets / "favicon.png", 32)
-    render_svg(svg_full_bytes, webui_assets / "favicon-192.png", 192)
-    print(f"wrote {webui_assets/'favicon.png'} (32x32)")
+    fav_hires = Image.open(io.BytesIO(render_svg_bytes(svg_fg, FAVICON_HIRES))).convert(
+        "RGBA"
+    )
+    bbox = alpha_bbox(fav_hires, FAVICON_ALPHA_THRESHOLD)
+    fav_cropped = square_padded_crop(fav_hires, bbox, FAVICON_CROP_PADDING)
+    fav_cropped.resize((32, 32), Image.LANCZOS).save(webui_assets / "favicon.png")
+    fav_cropped.resize((192, 192), Image.LANCZOS).save(webui_assets / "favicon-192.png")
+    print(
+        f"wrote {webui_assets/'favicon.png'} (32x32) — cropped from "
+        f"{FAVICON_HIRES}px hires, bbox {bbox}, side {fav_cropped.size[0]}px"
+    )
     print(f"wrote {webui_assets/'favicon-192.png'} (192x192)")
 
     # --- Android legacy mipmap PNGs --------------------------------------
