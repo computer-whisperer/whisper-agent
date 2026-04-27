@@ -1246,12 +1246,19 @@ enum RspItem {
     /// Replay item for chain-of-thought continuity. Echoed into `input` on
     /// turns that follow a reasoning-model response so the server can
     /// resume its internal reasoning state.
+    ///
+    /// `summary` is always serialized — even when empty — because the
+    /// Responses API requires the field to be present on every
+    /// reasoning item (the server 400s with "Missing required
+    /// parameter: 'input[N].summary'" if the field is absent). The
+    /// captured value is empty when the prior response was a pure
+    /// reasoning turn that surfaced no visible summary text but still
+    /// carried `id` + `encrypted_content` for replay.
     Reasoning {
         #[serde(skip_serializing_if = "Option::is_none")]
         id: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         encrypted_content: Option<String>,
-        #[serde(skip_serializing_if = "Vec::is_empty")]
         summary: Vec<RspReasoningPart>,
     },
 }
@@ -1797,6 +1804,37 @@ data: {"type":"response.failed","response":{"status":"failed"},"error":{"message
         assert_eq!(v["id"], "rs_1");
         assert_eq!(v["encrypted_content"], "ec-blob");
         assert_eq!(v["summary"][0]["type"], "summary_text");
+    }
+
+    #[test]
+    fn reasoning_item_serializes_summary_field_even_when_empty() {
+        // Captured reasoning replays often carry id + encrypted_content
+        // but no summary parts (a thinking turn that didn't surface
+        // visible summary text). The Responses API requires `summary`
+        // to be present on every reasoning input item — omitting it
+        // 400s with "Missing required parameter: 'input[N].summary'."
+        // Lock in the empty-array serialization so the field can never
+        // disappear from the wire again.
+        let native = ProviderReplay {
+            provider: "openai_responses".into(),
+            data: serde_json::json!({
+                "id": "rs_42",
+                "encrypted_content": "ec-blob",
+            }),
+        };
+        let item = thinking_to_reasoning_item(Some(&native)).expect("should echo");
+        let v = serde_json::to_value(&item).unwrap();
+        assert_eq!(v["type"], "reasoning");
+        assert_eq!(v["id"], "rs_42");
+        assert_eq!(v["encrypted_content"], "ec-blob");
+        let summary = v
+            .get("summary")
+            .expect("summary must be present on the wire");
+        assert!(
+            summary.is_array(),
+            "summary must be an array, got {summary:?}"
+        );
+        assert_eq!(summary.as_array().unwrap().len(), 0);
     }
 
     #[test]
