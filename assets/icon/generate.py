@@ -1,10 +1,15 @@
 #!/usr/bin/env python3
 """
-Generate webui favicons + Android launcher icons from icon_v1.png.
+Generate webui favicons + Android launcher icons from icon_v1.svg.
 
-Re-run this from the repo root after updating icon_v1.png:
+Re-run from the repo root after editing icon_v1.svg:
 
     python3 assets/icon/generate.py
+
+Requires `resvg` on PATH — the same engine the agent uses for the
+view_image tool's SVG rasterization, so what gets shipped here matches
+what the model sees when it loads the source. Install via
+`cargo install resvg` if it's missing.
 
 What it produces:
 
@@ -16,23 +21,27 @@ What it produces:
     android/app/src/main/res/mipmap-xxxhdpi/
         ic_launcher_foreground.png                            adaptive fg @ 432
 
-The chroma-key step samples the four corners of icon_v1.png to detect the
-dark-navy background, then maps every pixel within a soft distance band to
-fully-transparent. Stopgap quality — the edges have some halo on close
-inspection but the launcher mask hides it.
+The full SVG (with the radial-gradient backdrop) drives the favicons and
+the legacy / round mipmaps. The adaptive-icon foreground is rendered from
+a transient copy with the background `<rect>` stripped — the halo glow
+above stays in so the launcher mask reads as a soft falloff rather than a
+hard mascot cutout. The Android background layer is a solid color
+declared in `res/values/colors.xml` (`#010A1E`), matching the SVG's
+outer-edge tone.
 """
 
 from __future__ import annotations
 
-import os
+import re
+import shutil
+import subprocess
 import sys
 from pathlib import Path
 
-import numpy as np
-from PIL import Image
+from PIL import Image, ImageDraw
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-SRC = REPO_ROOT / "assets" / "icon" / "icon_v1.png"
+SRC = REPO_ROOT / "assets" / "icon" / "icon_v1.svg"
 
 # Density buckets for legacy mipmap fallbacks. Modern launchers (API 26+)
 # pull the adaptive icon XML from mipmap-anydpi-v26/ instead, but we still
@@ -45,63 +54,54 @@ LEGACY_SIZES = {
     "xxxhdpi": 192,
 }
 
-# Adaptive-icon foreground canvas at xxxhdpi: 108dp × 4 dp/px = 432.
-# Android masks the outer 18dp on each side, so the visible safe area is
-# the central 66dp × 66dp = 264 × 264 px circle/squircle. We center the
-# mascot in a 280×280 box (slightly larger than the safe zone, so a bit
-# of the hexagon may bleed into the mask region — acceptable for v1).
+# Adaptive-icon foreground canvas at xxxhdpi: 108dp × 4 dp/px = 432px.
+# Android masks ~18dp on each edge, leaving a 72dp visible disk and a
+# 66dp safe-zone guarantee for content. The SVG's hand-authored padding
+# already keeps the mascot well within the 264px safe zone at this size,
+# so we render the bg-stripped SVG directly at 432×432 without an extra
+# inset pass.
 ADAPTIVE_FG_SIZE = 432
-ADAPTIVE_FG_INNER = 280
 
 
-def detect_background(img: Image.Image, sample: int = 24) -> tuple[int, int, int]:
-    """Average RGB across the four corners — the icon's solid-fill region."""
-    arr = np.array(img.convert("RGB"))
-    h, w = arr.shape[:2]
-    corners = np.concatenate(
-        [
-            arr[:sample, :sample].reshape(-1, 3),
-            arr[:sample, w - sample :].reshape(-1, 3),
-            arr[h - sample :, :sample].reshape(-1, 3),
-            arr[h - sample :, w - sample :].reshape(-1, 3),
-        ]
+def render_svg(svg_bytes: bytes, out: Path, size: int) -> None:
+    """Rasterize an SVG (passed as raw bytes) to a square PNG at `size`px
+    via resvg's stdin → file mode. Raises if resvg exits non-zero."""
+    proc = subprocess.run(
+        ["resvg", "--width", str(size), "--height", str(size), "-", str(out)],
+        input=svg_bytes,
+        capture_output=True,
+        check=False,
     )
-    return tuple(int(c) for c in corners.mean(axis=0))
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"resvg failed (exit {proc.returncode}): {proc.stderr.decode().strip()}"
+        )
 
 
-def chroma_key(
-    img: Image.Image, bg: tuple[int, int, int], inner: float = 35.0, outer: float = 90.0
-) -> Image.Image:
-    """Replace `bg`-similar pixels with transparency, soft falloff between
-    `inner` (full transparent) and `outer` (full opaque) RGB distance."""
-    arr = np.array(img.convert("RGBA")).astype(np.int32)
-    dr = arr[:, :, 0] - bg[0]
-    dg = arr[:, :, 1] - bg[1]
-    db = arr[:, :, 2] - bg[2]
-    distance = np.sqrt(dr * dr + dg * dg + db * db)
-    # Soft falloff: distance<inner → 0, distance>outer → 255, between → linear ramp.
-    alpha = np.clip((distance - inner) / (outer - inner) * 255.0, 0, 255).astype(np.uint8)
-    arr[:, :, 3] = alpha
-    return Image.fromarray(arr.astype(np.uint8), "RGBA")
+# Match the canvas-filling background rect by its `fill="url(#bg)"`
+# reference — the SVG's hand-author owns layer naming, so a literal
+# substitution is dead simple and stays self-checking via the assertion
+# below if the SVG ever loses that anchor.
+_BG_RECT_RE = re.compile(r'\s*<rect[^>]*fill="url\(#bg\)"[^>]*/>\s*\n?')
 
 
-def fit_into(canvas_size: int, inner_size: int, art: Image.Image) -> Image.Image:
-    """Place `art` (preserving aspect) into a transparent square `canvas_size`,
-    scaled so the longer edge fits in `inner_size`."""
-    art = art.copy()
-    art.thumbnail((inner_size, inner_size), Image.LANCZOS)
-    canvas = Image.new("RGBA", (canvas_size, canvas_size), (0, 0, 0, 0))
-    x = (canvas_size - art.width) // 2
-    y = (canvas_size - art.height) // 2
-    canvas.paste(art, (x, y), art)
-    return canvas
+def strip_background(svg_text: str) -> str:
+    """Return a copy of `svg_text` with the full-canvas bg rect removed.
+    The halo `<circle fill="url(#halo)">` and the mascot layers are
+    preserved — we want the soft glow in the adaptive foreground, just
+    not the opaque navy sheet behind it."""
+    stripped = _BG_RECT_RE.sub("\n", svg_text, count=1)
+    if stripped == svg_text:
+        raise RuntimeError(
+            'could not find bg <rect fill="url(#bg)"/> in icon_v1.svg — '
+            "did the SVG structure change? update strip_background to match."
+        )
+    return stripped
 
 
 def round_mask(size: int) -> Image.Image:
     """Circular alpha mask the launcher fallback PNGs use."""
     mask = Image.new("L", (size, size), 0)
-    from PIL import ImageDraw
-
     ImageDraw.Draw(mask).ellipse((0, 0, size, size), fill=255)
     return mask
 
@@ -110,23 +110,26 @@ def main() -> int:
     if not SRC.exists():
         print(f"missing source: {SRC}", file=sys.stderr)
         return 1
+    if shutil.which("resvg") is None:
+        print(
+            "resvg not on PATH. Install via `cargo install resvg` or your "
+            "distro's package manager (Arch: librsvg + rust-resvg, Debian: "
+            "the cargo route is the most reliable).",
+            file=sys.stderr,
+        )
+        return 1
 
-    src = Image.open(SRC).convert("RGBA")
-    bg = detect_background(src)
-    print(f"detected background: rgb{bg}")
-
-    # Foreground = chroma-keyed art (mascot only, transparent elsewhere).
-    fg = chroma_key(src, bg)
+    svg_full = SRC.read_text(encoding="utf-8")
+    svg_fg = strip_background(svg_full).encode("utf-8")
+    svg_full_bytes = svg_full.encode("utf-8")
 
     # --- webui favicons --------------------------------------------------
-    # Use the original (with background) for the favicon so the icon reads
-    # at a glance against any browser-tab backdrop. Two sizes cover most
-    # browser/PWA needs.
+    # Two sizes cover most browser/PWA needs; the 192 doubles as the
+    # apple-touch-icon (also linked from index.html / login.html).
     webui_assets = REPO_ROOT / "crates" / "whisper-agent-webui" / "assets"
     webui_assets.mkdir(parents=True, exist_ok=True)
-    src_square = src.resize((512, 512), Image.LANCZOS)
-    src_square.resize((32, 32), Image.LANCZOS).save(webui_assets / "favicon.png")
-    src_square.resize((192, 192), Image.LANCZOS).save(webui_assets / "favicon-192.png")
+    render_svg(svg_full_bytes, webui_assets / "favicon.png", 32)
+    render_svg(svg_full_bytes, webui_assets / "favicon-192.png", 192)
     print(f"wrote {webui_assets/'favicon.png'} (32x32)")
     print(f"wrote {webui_assets/'favicon-192.png'} (192x192)")
 
@@ -137,23 +140,23 @@ def main() -> int:
     for density, px in LEGACY_SIZES.items():
         d = res_root / f"mipmap-{density}"
         d.mkdir(parents=True, exist_ok=True)
-        # Square: source-with-bg, scaled.
-        sq = src.resize((px, px), Image.LANCZOS)
-        sq.save(d / "ic_launcher.png")
-        # Round: same content, alpha-masked to a circle.
-        rd = sq.copy()
+        # Square: full SVG (with bg gradient), rendered at native size.
+        render_svg(svg_full_bytes, d / "ic_launcher.png", px)
+        # Round: re-open the square PNG we just wrote and slap on a
+        # circular alpha mask. The radial gradient's darker corners
+        # disappear cleanly under the mask.
+        rd = Image.open(d / "ic_launcher.png").convert("RGBA")
         rd.putalpha(round_mask(px))
         rd.save(d / "ic_launcher_round.png")
     print(f"wrote ic_launcher.png + ic_launcher_round.png at {len(LEGACY_SIZES)} densities")
 
     # --- Android adaptive icon foreground --------------------------------
-    # Foreground only — the chroma-keyed mascot, centered in a transparent
-    # 432×432 canvas with safe-zone padding. Background layer is a color
-    # resource referenced from the adaptive XML (no PNG needed).
-    fg_canvas = fit_into(ADAPTIVE_FG_SIZE, ADAPTIVE_FG_INNER, fg)
+    # Foreground only — the bg-stripped SVG, rendered at 432×432. The
+    # launcher composites this over the navy bg color in
+    # res/values/colors.xml (#010A1E).
     xxxh = res_root / "mipmap-xxxhdpi"
     xxxh.mkdir(parents=True, exist_ok=True)
-    fg_canvas.save(xxxh / "ic_launcher_foreground.png")
+    render_svg(svg_fg, xxxh / "ic_launcher_foreground.png", ADAPTIVE_FG_SIZE)
     print(f"wrote {xxxh/'ic_launcher_foreground.png'} ({ADAPTIVE_FG_SIZE}x{ADAPTIVE_FG_SIZE})")
 
     return 0
