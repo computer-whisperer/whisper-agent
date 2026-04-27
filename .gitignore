@@ -28,3 +28,11 @@ crates/whisper-agent-webui/pkg/
 # makepkg outputs under packaging/aur/ (source tarball + built packages)
 packaging/aur/*.pkg.tar.zst
 packaging/aur/*.tar.gz
+
+# Knowledge bucket runtime artifacts. The user's bucket.toml is the
+# config we want to track; everything else under <bucket>/ is generated
+# at build / index / download time and is per-deployment local.
+/buckets/*/slots/
+/buckets/*/source-cache/
+/buckets/*/feed-state.toml
+/buckets/*/*.partial
