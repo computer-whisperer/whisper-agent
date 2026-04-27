@@ -51,17 +51,25 @@ const PROGRESS_THROTTLE: Duration = Duration::from_millis(1000);
 /// `&mut Scheduler` so registry mutations stay linearizable with the
 /// rest of the scheduler.
 ///
-/// Currently a single-variant enum because per-tick `BucketBuildProgress`
-/// events fan out via the client-snapshot path (taken at task start) —
-/// only the terminal event needs the scheduler-loop's `&mut self` to
-/// refresh the registry. Kept as an enum so adding more task→loop
-/// signals later doesn't churn the channel type.
+/// `Progress` ticks are channeled (rather than fanned out via a frozen
+/// client snapshot inside the build task) so the scheduler can broadcast
+/// each tick to the *currently-connected* clients via the live router.
+/// That's what lets a client that joins mid-build see ongoing progress
+/// instead of silence until the terminal `BuildEnded`.
 pub enum BucketTaskUpdate {
+    /// Per-tick progress sample. Throttled by the build task's emitter
+    /// loop; the scheduler turns each into a `BucketBuildProgress`
+    /// broadcast via `router.broadcast_task_list` so it reaches every
+    /// client connected at the moment of the tick.
+    Progress {
+        bucket_id: String,
+        snapshot: ProgressSnapshot,
+    },
     /// Build completed (success / error / cancel). The loop refreshes
     /// the registry entry on success, broadcasts `BucketBuildEnded`
     /// with the fresh summary, echoes the terminal event to the
     /// requester with their `correlation_id`, and unregisters the
-    /// build from `active_bucket_builds`.
+    /// build from `active_bucket_builds` and `active_bucket_progress`.
     BuildEnded {
         bucket_id: String,
         slot_id: String,
@@ -368,6 +376,16 @@ impl Scheduler {
         let cancel = CancellationToken::new();
         self.active_bucket_builds.insert(id.clone(), cancel.clone());
 
+        // Shared progress state. The build task ticks the atomics; the
+        // scheduler reads them to (a) replay current state to a client
+        // that joins mid-build, and (b) build each `BucketBuildProgress`
+        // broadcast from the `Progress` channel update. Stored on the
+        // scheduler keyed by bucket id so a fresh `RegisterClient` can
+        // walk in-flight builds without going through the build task.
+        let progress = Arc::new(ProgressShared::default());
+        self.active_bucket_progress
+            .insert(id.clone(), progress.clone());
+
         // Synchronous BuildStarted ack. slot_id is unknown until the
         // build's first phase callback; carry an empty slot_id until
         // the BuildEnded event lands the real one. UI ignores this
@@ -387,7 +405,6 @@ impl Scheduler {
             },
         );
 
-        let snapshot = self.router.clients_snapshot();
         let task_tx = self.bucket_task_sender();
         let chunker_config = entry.config.chunker.clone();
         let bucket_dir = entry.dir.clone();
@@ -399,7 +416,7 @@ impl Scheduler {
             chunker_config,
             cancel,
             id,
-            snapshot,
+            progress,
             task_tx,
             conn_id,
             correlation_id,
@@ -432,10 +449,54 @@ impl Scheduler {
         }
     }
 
+    /// Replay current state for every in-flight build to one client
+    /// (the one that just connected). Without this, a fresh client
+    /// sees `active_slot.state = Building` from `ListBuckets` but no
+    /// phase / counters until the *next* terminal `BucketBuildEnded`
+    /// — `Started` was missed because the build began before the
+    /// client connected, and `Progress` ticks already-broadcast went
+    /// to other clients.
+    pub(crate) fn replay_active_builds_to_client(&self, conn_id: ConnId) {
+        for (bucket_id, progress) in &self.active_bucket_progress {
+            self.router.send_to_client(
+                conn_id,
+                ServerToClient::BucketBuildStarted {
+                    correlation_id: None,
+                    bucket_id: bucket_id.clone(),
+                    slot_id: String::new(),
+                },
+            );
+            let snap = progress.snapshot();
+            self.router.send_to_client(
+                conn_id,
+                ServerToClient::BucketBuildProgress {
+                    bucket_id: bucket_id.clone(),
+                    slot_id: String::new(),
+                    phase: snap.phase,
+                    source_records: snap.source_records,
+                    chunks: snap.chunks,
+                },
+            );
+        }
+    }
+
     /// Drain a `BucketTaskUpdate` from the channel. Called from the
     /// scheduler loop's `select!` arm.
     pub(crate) async fn apply_bucket_task_update(&mut self, update: BucketTaskUpdate) {
         match update {
+            BucketTaskUpdate::Progress {
+                bucket_id,
+                snapshot,
+            } => {
+                let event = ServerToClient::BucketBuildProgress {
+                    bucket_id,
+                    slot_id: String::new(), // slot_id surfaces on Ended; stays empty here
+                    phase: snapshot.phase,
+                    source_records: snapshot.source_records,
+                    chunks: snapshot.chunks,
+                };
+                self.router.broadcast_task_list(event);
+            }
             BucketTaskUpdate::BuildEnded {
                 bucket_id,
                 slot_id,
@@ -444,6 +505,7 @@ impl Scheduler {
                 correlation_id,
             } => {
                 self.active_bucket_builds.remove(&bucket_id);
+                self.active_bucket_progress.remove(&bucket_id);
                 let summary = if matches!(outcome, BucketBuildOutcome::Success) {
                     match self.bucket_registry.refresh_entry(&bucket_id).await {
                         Ok(()) => self
@@ -524,23 +586,25 @@ async fn run_build(
     chunker_config: crate::knowledge::ChunkerConfig,
     cancel: CancellationToken,
     bucket_id: String,
-    snapshot: Vec<mpsc::UnboundedSender<ServerToClient>>,
+    progress: Arc<ProgressShared>,
     task_tx: mpsc::UnboundedSender<BucketTaskUpdate>,
     requester_conn: ConnId,
     correlation_id: Option<String>,
     resume_slot_id: Option<String>,
 ) {
-    let progress = Arc::new(ProgressShared::default());
     let observer_arc: Arc<dyn BuildObserver> = Arc::new(ProgressObserver {
         shared: progress.clone(),
     });
 
     // Throttle / emit task: reads `progress` every PROGRESS_THROTTLE
-    // and dispatches a BucketBuildProgress through the snapshot. Stops
-    // when the build flips `done`.
-    let snapshot_for_emit = snapshot.clone();
+    // and pushes a `Progress` update through `task_tx`. The scheduler
+    // loop turns each into a `BucketBuildProgress` broadcast against
+    // the *currently-connected* clients — so a client that joins
+    // mid-build picks up subsequent ticks without any special wiring
+    // here. Stops when the build flips `done`.
     let bucket_id_for_emit = bucket_id.clone();
     let progress_for_emit = progress.clone();
+    let task_tx_for_emit = task_tx.clone();
     let emitter = tokio::spawn(async move {
         let mut interval = tokio::time::interval(PROGRESS_THROTTLE);
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -550,16 +614,10 @@ async fn run_build(
                 break;
             }
             let snap = progress_for_emit.snapshot();
-            let event = ServerToClient::BucketBuildProgress {
+            let _ = task_tx_for_emit.send(BucketTaskUpdate::Progress {
                 bucket_id: bucket_id_for_emit.clone(),
-                slot_id: String::new(), // slot_id not surfaced during build; carried on Ended
-                phase: snap.phase,
-                source_records: snap.source_records,
-                chunks: snap.chunks,
-            };
-            for tx in &snapshot_for_emit {
-                let _ = tx.send(event.clone());
-            }
+                snapshot: snap,
+            });
         }
     });
 
@@ -690,7 +748,7 @@ async fn run_build(
 }
 
 #[derive(Default)]
-struct ProgressShared {
+pub struct ProgressShared {
     source_records: AtomicU64,
     chunks: AtomicU64,
     /// Phase encoded as a u8 (0=Indexing, 1=BuildingDense, 2=Finalizing)
@@ -700,7 +758,7 @@ struct ProgressShared {
 }
 
 impl ProgressShared {
-    fn snapshot(&self) -> ProgressSnapshot {
+    pub fn snapshot(&self) -> ProgressSnapshot {
         ProgressSnapshot {
             source_records: self.source_records.load(Ordering::Acquire),
             chunks: self.chunks.load(Ordering::Acquire),
@@ -709,10 +767,10 @@ impl ProgressShared {
     }
 }
 
-struct ProgressSnapshot {
-    source_records: u64,
-    chunks: u64,
-    phase: BucketBuildPhase,
+pub struct ProgressSnapshot {
+    pub source_records: u64,
+    pub chunks: u64,
+    pub phase: BucketBuildPhase,
 }
 
 // Phase ↔ u8 mapping. Planning is encoded as 0 so the AtomicU8's

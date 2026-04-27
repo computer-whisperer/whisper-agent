@@ -472,6 +472,15 @@ pub struct Scheduler {
     /// per bucket; concurrent `StartBucketBuild` for the same id is
     /// rejected.
     active_bucket_builds: HashMap<String, tokio_util::sync::CancellationToken>,
+    /// Live progress state for every in-flight bucket build, keyed by
+    /// bucket id. Mirrors `active_bucket_builds`'s lifetime: inserted
+    /// in `handle_start_bucket_build`, removed in
+    /// `apply_bucket_task_update`'s `BuildEnded` arm. The build task
+    /// shares this `Arc` and ticks the atomics; the scheduler reads it
+    /// when a fresh client connects (so they see ongoing progress
+    /// instead of a stale `Building` row with zero counters).
+    active_bucket_progress:
+        HashMap<String, std::sync::Arc<crate::runtime::scheduler::buckets::ProgressShared>>,
     /// Cancellation tokens for the per-tracked-bucket
     /// [`FeedWorker`](crate::knowledge::FeedWorker) tasks spawned at
     /// scheduler-construction time. Keyed by bucket id; entries
@@ -618,6 +627,7 @@ impl Scheduler {
                 provisioning_in_flight: HashSet::new(),
                 stream_tx,
                 active_bucket_builds: HashMap::new(),
+                active_bucket_progress: HashMap::new(),
                 active_feed_workers,
                 bucket_task_tx,
                 active_functions: HashMap::new(),
@@ -2505,6 +2515,11 @@ impl Scheduler {
                 if is_admin {
                     self.admin_connections.insert(conn_id);
                 }
+                // Replay in-flight bucket builds so a freshly-connected
+                // client sees their `Started` + current `Progress`
+                // snapshot rather than waiting until the next terminal
+                // `BuildEnded`.
+                self.replay_active_builds_to_client(conn_id);
             }
             SchedulerMsg::UnregisterClient { conn_id } => {
                 self.router.unregister_client(conn_id);
