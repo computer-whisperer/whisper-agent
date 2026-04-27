@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="crates/whisper-agent-webui/assets/favicon-192.png" alt="whisper-agent" width="128" height="128">
+</p>
+
 # whisper-agent
 
 A self-hosted, headless agent loop. The conversation runs on a server you control; tools that touch the outside world (filesystems, processes, web fetches, search) cross a network boundary into separate MCP servers, never running in-process with the loop.

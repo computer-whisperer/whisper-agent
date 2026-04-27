@@ -50,6 +50,19 @@ use whisper_agent_protocol::{
     ThreadStateLabel, ThreadSummary, Usage,
 };
 
+/// Brand icon shown in the top-bar header. Embedded at compile time so
+/// the egui canvas doesn't pay an HTTP round-trip for the mark on first
+/// paint; the same PNG is also served as the PWA / apple-touch-icon
+/// favicon, so the visual identity is consistent across browser-tab,
+/// PWA tile, and in-app header. Refresh by editing
+/// `assets/icon/icon_v1.svg` and re-running `assets/icon/generate.py`.
+const APP_ICON_PNG: &[u8] = include_bytes!("../assets/favicon-192.png");
+/// Stable URI under which the icon bytes get registered with egui's
+/// loader chain. Fixed (not content-hashed like the user-side image
+/// strip) because there's exactly one app icon, and a stable URI keeps
+/// egui's texture cache hit on every frame.
+const APP_ICON_URI: &str = "bytes://app-icon-v1";
+
 /// Raw bytes picked up by the compose area before any MIME sniff or
 /// capability check has run. Drop-targeted and file-picker-targeted
 /// inputs both produce this shape so the downstream staging pipeline
@@ -2562,6 +2575,14 @@ impl eframe::App for ChatApp {
 
         egui::Panel::top("status_bar").show_inside(ui, |ui| {
             ui.horizontal(|ui| {
+                // Register the embedded icon bytes once per frame and
+                // render it inline before the title. `include_bytes`
+                // is first-write-wins on the URI, so this is a no-op
+                // after the first frame; `Image::max_height(24.0)`
+                // matches the heading's cap-height so the badge sits
+                // visually flush with the "whisper-agent" text.
+                ui.ctx().include_bytes(APP_ICON_URI, APP_ICON_PNG);
+                ui.add(egui::Image::new(APP_ICON_URI).max_height(24.0));
                 ui.heading("whisper-agent");
                 ui.label(
                     RichText::new(concat!("v", env!("CARGO_PKG_VERSION")))
