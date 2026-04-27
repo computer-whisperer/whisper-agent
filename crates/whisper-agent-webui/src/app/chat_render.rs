@@ -322,26 +322,37 @@ fn render_user_attachments(ui: &mut egui::Ui, attachments: &[Attachment], msg_in
 }
 
 /// Inline thumbnail strip for a slice of image sources. Bytes sources
-/// render through egui's loader via a stable `bytes://{uri_prefix}-{i}`
-/// URI so the texture cache reuses decoded pixels across repaints;
-/// URL sources render as a labelled placeholder (we don't fetch
-/// client-side). `uri_prefix` must be unique across the view to avoid
-/// texture-cache collisions between different message positions —
-/// current callers use `history-{msg_index}` for user turns and
-/// `toolresult-{tool_use_id}` for tool-result rows.
+/// render through egui's loader via a content-addressed
+/// `bytes://image-{hash}` URI so distinct images never share a cache
+/// slot and identical images dedupe naturally. URL sources render as
+/// a labelled placeholder (we don't fetch client-side).
+///
+/// Why content-addressed: egui's `DefaultBytesLoader::insert` uses
+/// `entry().or_insert_with_key(...)` — first-write-wins. Reusing a
+/// URI with new bytes is silently a no-op, so any position-based key
+/// (e.g. `assistant-{display_item_idx}`) breaks as soon as two
+/// different images land on the same key across thread switches,
+/// snapshot rebuilds, or re-renders. Hashing the bytes guarantees
+/// the URI tracks the content, so `include_bytes` is always either
+/// a fresh insert or a stable identity.
+///
+/// `uri_prefix` is kept on the signature for backward-compatible
+/// debug logging only — the URI's identity comes from the hash. The
+/// trailing index `i` likewise just disambiguates within a strip if
+/// callers ever pass two byte-identical images side by side.
 ///
 /// Clicking a Bytes thumbnail stashes its URI into [`ENLARGED_IMAGE_KEY`]
 /// in egui memory; the app's top-level `update` reads that slot and
 /// shows the full image in a modal.
-fn render_image_strip(ui: &mut egui::Ui, sources: &[&ImageSource], uri_prefix: &str) {
+fn render_image_strip(ui: &mut egui::Ui, sources: &[&ImageSource], _uri_prefix: &str) {
     if sources.is_empty() {
         return;
     }
     ui.horizontal_wrapped(|ui| {
-        for (i, src) in sources.iter().enumerate() {
+        for src in sources.iter() {
             match src {
                 ImageSource::Bytes { data, .. } => {
-                    let uri = format!("bytes://{uri_prefix}-{i}");
+                    let uri = bytes_image_uri(data);
                     ui.ctx().include_bytes(uri.clone(), data.clone());
                     let resp = ui.add(
                         egui::Image::new(&uri)
@@ -390,11 +401,26 @@ fn render_assistant_text(ui: &mut egui::Ui, cache: &mut CommonMarkCache, text: &
 /// Render a model-emitted image as a single-cell strip. Reuses
 /// [`render_image_strip`] so the click-to-enlarge lightbox plumbing
 /// works the same as compose attachments and tool-result images. The
-/// `idx` parameter namespaces the bytes:// URI per turn so two
-/// generations of the same image (e.g. an edit-image flow) don't
-/// collide in the texture cache.
+/// `idx` is passed through as a debug-only namespace prefix —
+/// `render_image_strip` derives the actual cache identity from a
+/// content hash of the bytes (egui's bytes-loader is first-write-wins
+/// per URI, so position-based keys break on multi-image conversations).
 fn render_assistant_image(ui: &mut egui::Ui, idx: usize, source: &ImageSource) {
     render_image_strip(ui, &[source], &format!("assistant-{idx}"));
+}
+
+/// Hash an image's raw bytes into a stable `bytes://image-{hash}` URI.
+/// Used as the cache key fed to `egui::Context::include_bytes` so
+/// distinct images never share a slot (egui's default bytes loader
+/// silently drops repeat inserts on the same URI). SipHash via
+/// `DefaultHasher` is plenty here — we only need uniqueness across
+/// the few hundred images a chat session might display, not
+/// collision resistance against an attacker.
+fn bytes_image_uri(data: &[u8]) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    data.hash(&mut h);
+    format!("bytes://image-{:016x}", h.finish())
 }
 
 fn render_reasoning(ui: &mut egui::Ui, cache: &mut CommonMarkCache, text: &str) {
