@@ -273,6 +273,11 @@ pub async fn serve(listen: SocketAddr, config: ServerConfig) -> anyhow::Result<(
             .await
             .with_context(|| "load persisted state")?;
         scheduler.load_state(loaded);
+        // Pods are now in the scheduler; fold each pod's
+        // `<pod_dir>/buckets/` into the bucket registry as pod-scope
+        // entries. Per-pod failures are logged inside; this call doesn't
+        // surface errors because they shouldn't gate server boot.
+        scheduler.register_pod_buckets().await;
         scheduler = scheduler.with_persister(persister);
     }
 

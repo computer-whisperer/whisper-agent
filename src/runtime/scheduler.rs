@@ -2387,6 +2387,35 @@ impl Scheduler {
         self
     }
 
+    /// Walk every loaded pod and fold its `<pod_dir>/buckets/` directory
+    /// into the bucket registry as pod-scope entries. Should be called
+    /// after [`Scheduler::load_state`] so the pods already exist in
+    /// memory; safe to call when the bucket registry has no `root` (the
+    /// pod's `buckets/` walk runs independently).
+    ///
+    /// Per-pod failures are logged and skipped so a single bad pod
+    /// directory doesn't keep the rest of the registry from coming up.
+    pub async fn register_pod_buckets(&mut self) {
+        let pods: Vec<(String, std::path::PathBuf)> = self
+            .pods
+            .values()
+            .map(|p| (p.id.clone(), p.dir.clone()))
+            .collect();
+        for (pod_id, pod_dir) in pods {
+            if let Err(e) = self
+                .bucket_registry
+                .register_pod_buckets(&pod_id, &pod_dir)
+                .await
+            {
+                warn!(
+                    pod = %pod_id,
+                    error = %e,
+                    "register_pod_buckets failed; pod-scope buckets unavailable",
+                );
+            }
+        }
+    }
+
     /// Seed the scheduler with pods + threads loaded from disk. The persister
     /// should have already transitioned any in-flight internal states to
     /// Failed before handoff. Pods loaded here win over the default pod

@@ -753,14 +753,19 @@ pub struct ThreadSnapshot {
 /// knows it. The `id` is the bucket's directory name and is permanent;
 /// `name` is the user-editable display label from `bucket.toml`.
 ///
-/// `scope` is `"server"` today — pod-scoped buckets land in a follow-up
-/// slice, when this becomes a tagged enum. Until then a plain string is
-/// enough for the WebUI to label entries without locking the protocol
-/// shape down prematurely.
+/// `scope` is `"server"` for buckets under `<buckets_root>/` and
+/// `"pod"` for buckets under `<pods_root>/<pod_id>/buckets/`. The
+/// shape is a string (not a tagged enum) so the wire stays additive
+/// when more scopes appear; clients case-match on the literal.
+/// `pod_id` carries the owning pod for `scope == "pod"` and is
+/// omitted otherwise — server-scope buckets are not pod-owned.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct BucketSummary {
     pub id: String,
     pub scope: String,
+    /// Owning pod when `scope == "pod"`. `None` for server-scope.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pod_id: Option<String>,
     pub name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,

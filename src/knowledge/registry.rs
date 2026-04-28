@@ -9,9 +9,13 @@
 //! The query path opens those lazily when a request actually targets the
 //! bucket.
 //!
-//! Today every entry is `BucketScope::Server` — pod-scoped buckets
-//! (under `<pods_root>/<pod>/buckets/`) land in a follow-up slice when
-//! the per-pod plumbing exists.
+//! Pod-scoped buckets live under `<pods_root>/<pod_id>/buckets/` and are
+//! tracked in a separate sub-registry per pod. Server boot loads the
+//! global server-scope buckets first via [`BucketRegistry::load`] and
+//! then folds each loaded pod's buckets in via
+//! [`BucketRegistry::register_pod_buckets`]. Two different pods can hold
+//! buckets with the same directory name without collision; the
+//! registry keys them by `(pod_id, name)`.
 //!
 //! Malformed buckets (missing `bucket.toml`, parse error, dangling
 //! `slots/active` pointer) are skipped with a warning. A single bad
@@ -31,14 +35,24 @@ use super::config::{BucketConfig, SourceConfig};
 use super::disk_bucket::DiskBucket;
 use super::manifest::{SlotManifest, SlotState};
 use super::slot;
-use super::types::{BucketError, BucketId};
+use super::types::{BucketError, BucketId, BucketScope};
 
 /// In-memory entry the scheduler holds per bucket on disk.
 #[derive(Debug, Clone)]
 pub struct BucketEntry {
-    /// Bucket directory name. Authoritative id; matches the dir under
-    /// `<buckets_root>/`.
+    /// Bucket directory name. Authoritative within its scope; matches
+    /// the dir under `<buckets_root>/` for server scope or under
+    /// `<pods_root>/<pod_id>/buckets/` for pod scope. Bucket names
+    /// scope-locally — `pod_a` and `pod_b` can both have a `memory`
+    /// bucket without colliding.
     pub id: String,
+    /// Whether this bucket lives under the server's buckets root or
+    /// under a specific pod's `buckets/` directory.
+    pub scope: BucketScope,
+    /// Owning pod when `scope == BucketScope::Pod`. `None` for server
+    /// scope. Used at lookup time to disambiguate pod-scope entries
+    /// across pods.
+    pub pod_id: Option<String>,
     /// Absolute path to the bucket directory.
     pub dir: PathBuf,
     pub config: BucketConfig,
@@ -56,23 +70,36 @@ pub struct BucketEntry {
     pub active_slot_disk_size_bytes: Option<u64>,
 }
 
-/// Server-scoped knowledge buckets, keyed by bucket id (== directory name).
+/// Knowledge buckets known to the server, partitioned by scope.
 ///
-/// `loaded` is a separate cache from `buckets`: `buckets` holds the
+/// `buckets` holds server-scope entries — buckets directly under
+/// `<buckets_root>/`, keyed by directory name. `pod_buckets` holds
+/// pod-scope entries — buckets under `<pods_root>/<pod_id>/buckets/`,
+/// keyed by `(pod_id, bucket_name)` so two pods can both name a
+/// bucket `memory` without colliding.
+///
+/// `loaded` is a separate cache from the entry maps: the maps hold the
 /// cheap config + manifest (loaded eagerly at startup), while `loaded`
 /// is the expensive `DiskBucket` view (open the chunk store, mmap
 /// vectors, rebuild the HNSW index) — populated lazily on first query
 /// and shared across subsequent ones. Pre-populating every bucket at
 /// startup would block server boot for minutes per wikipedia-scale
 /// bucket; deferring keeps boot fast and pushes the cost to the first
-/// query that actually needs it.
+/// query that actually needs it. Today the loaded cache is keyed by
+/// the server-scope bucket id only; pod-scope load wiring lands in a
+/// follow-up slice alongside the scoped query path.
 #[derive(Debug, Clone, Default)]
 pub struct BucketRegistry {
     /// `None` when the server runs without a buckets root. The registry
     /// is still constructible (`BucketRegistry::default()`) so the
     /// scheduler doesn't need conditional plumbing.
     pub root: Option<PathBuf>,
+    /// Server-scope entries, keyed by bucket directory name.
     pub buckets: BTreeMap<String, BucketEntry>,
+    /// Pod-scope entries, keyed by pod id then bucket directory name.
+    /// Folded in via [`BucketRegistry::register_pod_buckets`] once the
+    /// pod registry is loaded.
+    pub pod_buckets: BTreeMap<String, BTreeMap<String, BucketEntry>>,
     loaded: Arc<Mutex<HashMap<String, Arc<DiskBucket>>>>,
 }
 
@@ -110,7 +137,7 @@ impl BucketRegistry {
             if id.starts_with('.') {
                 continue;
             }
-            match load_one(&path, &id).await {
+            match load_one(&path, &id, BucketScope::Server, None).await {
                 Ok(entry) => {
                     // Sweep orphaned slot directories — partial /
                     // failed / superseded build attempts that no
@@ -140,13 +167,107 @@ impl BucketRegistry {
         Ok(Self {
             root: Some(root),
             buckets,
+            pod_buckets: BTreeMap::new(),
             loaded: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
-    /// Wire snapshot of every bucket, sorted by id (BTreeMap order).
+    /// Walk `<pod_dir>/buckets/*/bucket.toml` and register each as a
+    /// pod-scope entry under `pod_id`. The `<pod_dir>/buckets` directory
+    /// is created on demand so a pod that has never owned a bucket
+    /// behaves the same as one that has — both end up with an empty
+    /// inner map. Idempotent: re-registering the same pod replaces its
+    /// previous entry set.
+    ///
+    /// Failures while loading a single bucket are logged and skipped
+    /// (matching server-scope `load`). The whole call returns `Err` only
+    /// if `<pod_dir>/buckets` itself can't be created or read.
+    pub async fn register_pod_buckets(
+        &mut self,
+        pod_id: &str,
+        pod_dir: &Path,
+    ) -> Result<(), BucketError> {
+        let buckets_dir = pod_dir.join("buckets");
+        fs::create_dir_all(&buckets_dir)
+            .await
+            .map_err(BucketError::Io)?;
+        let mut inner: BTreeMap<String, BucketEntry> = BTreeMap::new();
+
+        let mut entries = fs::read_dir(&buckets_dir).await.map_err(BucketError::Io)?;
+        while let Some(entry) = entries.next_entry().await.map_err(BucketError::Io)? {
+            let path = entry.path();
+            let ft = match entry.file_type().await {
+                Ok(ft) => ft,
+                Err(e) => {
+                    warn!(
+                        path = %path.display(),
+                        error = %e,
+                        "pod buckets: skipping unreadable entry",
+                    );
+                    continue;
+                }
+            };
+            if !ft.is_dir() {
+                continue;
+            }
+            let Some(id) = path
+                .file_name()
+                .and_then(|s| s.to_str())
+                .map(str::to_string)
+            else {
+                warn!(
+                    path = %path.display(),
+                    "pod buckets: skipping non-utf8 directory name",
+                );
+                continue;
+            };
+            if id.starts_with('.') {
+                continue;
+            }
+            match load_one(&path, &id, BucketScope::Pod, Some(pod_id.to_string())).await {
+                Ok(entry) => {
+                    if let Err(e) = super::gc::gc_orphan_slots(&path, &id) {
+                        warn!(
+                            pod = %pod_id,
+                            bucket = %id,
+                            error = %e,
+                            "gc: orphan-slot sweep failed; bucket loaded anyway",
+                        );
+                    }
+                    inner.insert(id, entry);
+                }
+                Err(e) => {
+                    warn!(
+                        pod = %pod_id,
+                        bucket = %id,
+                        error = %e,
+                        "skipping malformed pod bucket",
+                    );
+                }
+            }
+        }
+
+        info!(
+            pod = %pod_id,
+            buckets_dir = %buckets_dir.display(),
+            count = inner.len(),
+            "registered pod-scope knowledge buckets",
+        );
+        self.pod_buckets.insert(pod_id.to_string(), inner);
+        Ok(())
+    }
+
+    /// Wire snapshot of every bucket the registry knows about. Server-
+    /// scope entries come first (BTreeMap order), followed by pod-scope
+    /// entries grouped by pod (BTreeMap order on pod_id, then on bucket
+    /// name within each pod). Clients re-sort if they want a different
+    /// presentation order.
     pub fn summaries(&self) -> Vec<BucketSummary> {
-        self.buckets.values().map(entry_to_summary).collect()
+        let mut out: Vec<BucketSummary> = self.buckets.values().map(entry_to_summary).collect();
+        for inner in self.pod_buckets.values() {
+            out.extend(inner.values().map(entry_to_summary));
+        }
+        out
     }
 
     /// Insert a fresh bucket into the registry — caller has already
@@ -202,7 +323,7 @@ impl BucketRegistry {
                 root.join(id)
             }
         };
-        let entry = load_one(&dir, id).await?;
+        let entry = load_one(&dir, id, BucketScope::Server, None).await?;
         self.buckets.insert(id.to_string(), entry);
         self.evict_loaded(id);
         Ok(())
@@ -254,12 +375,18 @@ impl BucketRegistry {
 /// Public re-export of the registry's per-entry loader. The scheduler
 /// uses this from `CreateBucket` after writing a fresh `bucket.toml`
 /// to round-trip through the same parser the registry uses at
-/// startup.
+/// startup. `CreateBucket` only handles server-scope today, so the
+/// public form hard-codes that scope.
 pub async fn load_one_pub(dir: &Path, id: &str) -> Result<BucketEntry, BucketError> {
-    load_one(dir, id).await
+    load_one(dir, id, BucketScope::Server, None).await
 }
 
-async fn load_one(dir: &Path, id: &str) -> Result<BucketEntry, BucketError> {
+async fn load_one(
+    dir: &Path,
+    id: &str,
+    scope: BucketScope,
+    pod_id: Option<String>,
+) -> Result<BucketEntry, BucketError> {
     let bucket_toml = slot::bucket_toml_path(dir);
     let raw_toml = fs::read_to_string(&bucket_toml).await.map_err(|e| {
         BucketError::Config(format!(
@@ -289,6 +416,8 @@ async fn load_one(dir: &Path, id: &str) -> Result<BucketEntry, BucketError> {
 
     Ok(BucketEntry {
         id: id.to_string(),
+        scope,
+        pod_id,
         dir: dir.to_path_buf(),
         config,
         raw_toml,
@@ -352,7 +481,8 @@ pub fn entry_to_summary(entry: &BucketEntry) -> BucketSummary {
     };
     BucketSummary {
         id: entry.id.clone(),
-        scope: "server".to_string(),
+        scope: entry.scope.as_str().to_string(),
+        pod_id: entry.pod_id.clone(),
         name: cfg.name.clone(),
         description: cfg.description.clone(),
         source_kind,
@@ -441,6 +571,7 @@ embedder = "tei_local"
         let summary = &reg.summaries()[0];
         assert_eq!(summary.id, "notes");
         assert_eq!(summary.scope, "server");
+        assert!(summary.pod_id.is_none());
         assert_eq!(summary.name, "Notes");
         assert_eq!(summary.source_kind, "linked");
         assert_eq!(summary.embedder_provider, "tei_local");
@@ -504,5 +635,114 @@ embedder = "tei_local"
             .unwrap();
         assert_eq!(reg.buckets.len(), 1);
         assert!(reg.summaries()[0].active_slot.is_none());
+    }
+
+    #[tokio::test]
+    async fn register_pod_buckets_creates_buckets_subdir_when_absent() {
+        // A pod that has never owned a bucket should still register
+        // cleanly — the side effect is an empty inner map and a fresh
+        // `<pod_dir>/buckets/` on disk.
+        let tmp = tempfile::tempdir().unwrap();
+        let buckets_root = tmp.path().join("buckets_root");
+        let mut reg = BucketRegistry::load(buckets_root).await.unwrap();
+        let pod_dir = tmp.path().join("pods").join("alpha");
+        std::fs::create_dir_all(&pod_dir).unwrap();
+        reg.register_pod_buckets("alpha", &pod_dir).await.unwrap();
+        assert!(reg.pod_buckets.contains_key("alpha"));
+        assert!(reg.pod_buckets["alpha"].is_empty());
+        assert!(pod_dir.join("buckets").is_dir());
+    }
+
+    #[tokio::test]
+    async fn register_pod_buckets_loads_entries_with_pod_scope() {
+        let tmp = tempfile::tempdir().unwrap();
+        let buckets_root = tmp.path().join("buckets_root");
+        let mut reg = BucketRegistry::load(buckets_root).await.unwrap();
+
+        let pod_dir = tmp.path().join("pods").join("alpha");
+        let pod_buckets = pod_dir.join("buckets");
+        std::fs::create_dir_all(&pod_buckets).unwrap();
+        write_minimal_bucket(&pod_buckets, "memory");
+
+        reg.register_pod_buckets("alpha", &pod_dir).await.unwrap();
+        let inner = reg.pod_buckets.get("alpha").expect("pod registered");
+        assert_eq!(inner.len(), 1);
+        let entry = inner.get("memory").expect("memory bucket loaded");
+        assert!(matches!(entry.scope, BucketScope::Pod));
+        assert_eq!(entry.pod_id.as_deref(), Some("alpha"));
+        assert_eq!(entry.dir, pod_buckets.join("memory"));
+    }
+
+    #[tokio::test]
+    async fn summaries_include_server_then_pod_entries() {
+        let tmp = tempfile::tempdir().unwrap();
+        let buckets_root = tmp.path().join("buckets_root");
+        std::fs::create_dir_all(&buckets_root).unwrap();
+        write_minimal_bucket(&buckets_root, "world");
+        let mut reg = BucketRegistry::load(buckets_root).await.unwrap();
+
+        let pod_dir = tmp.path().join("pods").join("alpha");
+        let pod_buckets = pod_dir.join("buckets");
+        std::fs::create_dir_all(&pod_buckets).unwrap();
+        write_minimal_bucket(&pod_buckets, "memory");
+        reg.register_pod_buckets("alpha", &pod_dir).await.unwrap();
+
+        let summaries = reg.summaries();
+        assert_eq!(summaries.len(), 2);
+        // Server scope first.
+        assert_eq!(summaries[0].id, "world");
+        assert_eq!(summaries[0].scope, "server");
+        assert!(summaries[0].pod_id.is_none());
+        // Pod scope second, with pod_id surfaced.
+        assert_eq!(summaries[1].id, "memory");
+        assert_eq!(summaries[1].scope, "pod");
+        assert_eq!(summaries[1].pod_id.as_deref(), Some("alpha"));
+    }
+
+    #[tokio::test]
+    async fn register_pod_buckets_keeps_two_pods_with_same_bucket_name_separate() {
+        let tmp = tempfile::tempdir().unwrap();
+        let buckets_root = tmp.path().join("buckets_root");
+        let mut reg = BucketRegistry::load(buckets_root).await.unwrap();
+
+        for pod in ["alpha", "beta"] {
+            let pod_dir = tmp.path().join("pods").join(pod);
+            let pod_buckets = pod_dir.join("buckets");
+            std::fs::create_dir_all(&pod_buckets).unwrap();
+            write_minimal_bucket(&pod_buckets, "memory");
+            reg.register_pod_buckets(pod, &pod_dir).await.unwrap();
+        }
+
+        assert_eq!(reg.pod_buckets.len(), 2);
+        assert_eq!(reg.pod_buckets["alpha"].len(), 1);
+        assert_eq!(reg.pod_buckets["beta"].len(), 1);
+        assert_eq!(
+            reg.pod_buckets["alpha"]["memory"].pod_id.as_deref(),
+            Some("alpha"),
+        );
+        assert_eq!(
+            reg.pod_buckets["beta"]["memory"].pod_id.as_deref(),
+            Some("beta"),
+        );
+    }
+
+    #[tokio::test]
+    async fn re_registering_a_pod_replaces_its_previous_entries() {
+        let tmp = tempfile::tempdir().unwrap();
+        let buckets_root = tmp.path().join("buckets_root");
+        let mut reg = BucketRegistry::load(buckets_root).await.unwrap();
+
+        let pod_dir = tmp.path().join("pods").join("alpha");
+        let pod_buckets = pod_dir.join("buckets");
+        std::fs::create_dir_all(&pod_buckets).unwrap();
+        write_minimal_bucket(&pod_buckets, "memory");
+        reg.register_pod_buckets("alpha", &pod_dir).await.unwrap();
+        assert_eq!(reg.pod_buckets["alpha"].len(), 1);
+
+        // Drop the bucket on disk and re-register: the in-memory map
+        // should follow disk truth, not accumulate.
+        std::fs::remove_dir_all(pod_buckets.join("memory")).unwrap();
+        reg.register_pod_buckets("alpha", &pod_dir).await.unwrap();
+        assert!(reg.pod_buckets["alpha"].is_empty());
     }
 }

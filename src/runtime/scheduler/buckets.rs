@@ -184,8 +184,13 @@ impl Scheduler {
                 return;
             }
         };
+        // CreateBucket only handles server-scope today; pod-scope
+        // creation arrives in a follow-up slice alongside the per-pod
+        // lifecycle wire ops.
         let entry = crate::knowledge::BucketEntry {
             id: id.clone(),
+            scope: crate::knowledge::BucketScope::Server,
+            pod_id: None,
             dir: bucket_dir,
             config: parsed_config,
             raw_toml: toml_text,
