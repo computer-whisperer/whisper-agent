@@ -1309,6 +1309,10 @@ struct CreateBucketForm {
     name: String,
     description: String,
     embedder: String,
+    /// Owning scope: `None` ⇒ server-scope (`<buckets_root>/<id>/`),
+    /// `Some(pod_id)` ⇒ pod-scope (`<pods_root>/<pod_id>/buckets/<id>/`).
+    /// Selected from a dropdown of known pods plus a "(server)" entry.
+    pod_id: Option<String>,
     source_kind: SourceKindChoice,
     /// Holds either archive_path (stored) or path (linked); ignored
     /// for managed.
@@ -1334,6 +1338,7 @@ impl Default for CreateBucketForm {
             name: String::new(),
             description: String::new(),
             embedder: String::new(),
+            pod_id: None,
             source_kind: SourceKindChoice::Linked,
             source_detail: String::new(),
             chunk_tokens: 500,
@@ -3452,10 +3457,21 @@ impl eframe::App for ChatApp {
         // the search form (slice 9). Renderer emits `RunQuery` when
         // the user submits a search; we mint a correlation, stamp it
         // on the modal, and dispatch `QueryBuckets`.
-        for event in render_buckets_modal(&ctx, &mut self.buckets_modal, &self.buckets) {
+        let pods_for_modal: Vec<PodSummary> = {
+            let mut v: Vec<PodSummary> = self.pods.values().cloned().collect();
+            v.sort_by(|a, b| a.pod_id.cmp(&b.pod_id));
+            v
+        };
+        for event in render_buckets_modal(
+            &ctx,
+            &mut self.buckets_modal,
+            &self.buckets,
+            &pods_for_modal,
+        ) {
             match event {
                 BucketsEvent::RunQuery {
                     bucket_id,
+                    pod_id,
                     query,
                     top_k,
                 } => {
@@ -3466,16 +3482,12 @@ impl eframe::App for ChatApp {
                     self.send(ClientToServer::QueryBuckets {
                         correlation_id: Some(correlation),
                         bucket_ids: vec![bucket_id],
-                        // WebUI today drives only server-scope buckets
-                        // through the lifecycle ops; pod-scope ops are
-                        // accepted by the wire but rejected by the
-                        // server until PB3b lands.
-                        pod_id: None,
+                        pod_id,
                         query,
                         top_k,
                     });
                 }
-                BucketsEvent::CreateBucket { id, config } => {
+                BucketsEvent::CreateBucket { id, pod_id, config } => {
                     let correlation = self.next_correlation_id();
                     if let Some(modal) = self.buckets_modal.as_mut()
                         && let Some(form) = modal.creating.as_mut()
@@ -3485,19 +3497,19 @@ impl eframe::App for ChatApp {
                     self.send(ClientToServer::CreateBucket {
                         correlation_id: Some(correlation),
                         id,
-                        pod_id: None,
+                        pod_id,
                         config,
                     });
                 }
-                BucketsEvent::DeleteBucket { id } => {
+                BucketsEvent::DeleteBucket { id, pod_id } => {
                     let correlation = self.next_correlation_id();
                     self.send(ClientToServer::DeleteBucket {
                         correlation_id: Some(correlation),
                         id,
-                        pod_id: None,
+                        pod_id,
                     });
                 }
-                BucketsEvent::StartBuild { id } => {
+                BucketsEvent::StartBuild { id, pod_id } => {
                     let correlation = self.next_correlation_id();
                     if let Some(modal) = self.buckets_modal.as_mut() {
                         // Optimistically clear any prior error so the
@@ -3508,18 +3520,18 @@ impl eframe::App for ChatApp {
                     self.send(ClientToServer::StartBucketBuild {
                         correlation_id: Some(correlation),
                         id,
-                        pod_id: None,
+                        pod_id,
                     });
                 }
-                BucketsEvent::CancelBuild { id } => {
+                BucketsEvent::CancelBuild { id, pod_id } => {
                     let correlation = self.next_correlation_id();
                     self.send(ClientToServer::CancelBucketBuild {
                         correlation_id: Some(correlation),
                         id,
-                        pod_id: None,
+                        pod_id,
                     });
                 }
-                BucketsEvent::PollFeedNow { id } => {
+                BucketsEvent::PollFeedNow { id, pod_id } => {
                     // Fire-and-forget — server's trigger buffer is
                     // bounded at 1, so a click during an in-flight
                     // poll coalesces server-side. We don't surface
@@ -3531,10 +3543,10 @@ impl eframe::App for ChatApp {
                     self.send(ClientToServer::PollFeedNow {
                         correlation_id: Some(correlation),
                         id,
-                        pod_id: None,
+                        pod_id,
                     });
                 }
-                BucketsEvent::ResyncBucket { id } => {
+                BucketsEvent::ResyncBucket { id, pod_id } => {
                     // Same wire shape as StartBuild — the server
                     // broadcasts BucketBuildStarted/Progress/Ended
                     // through the existing build-progress channels,
@@ -3545,7 +3557,7 @@ impl eframe::App for ChatApp {
                     self.send(ClientToServer::ResyncBucket {
                         correlation_id: Some(correlation),
                         id,
-                        pod_id: None,
+                        pod_id,
                     });
                 }
             }

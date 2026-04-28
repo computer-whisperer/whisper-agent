@@ -7,16 +7,24 @@
 
 use egui::{Color32, ComboBox, RichText, ScrollArea, TextEdit};
 use whisper_agent_protocol::{
-    BucketBuildPhase, BucketCreateInput, BucketSourceInput, BucketSummary, QueryHit, SlotStateLabel,
+    BucketBuildPhase, BucketCreateInput, BucketSourceInput, BucketSummary, PodSummary, QueryHit,
+    SlotStateLabel,
 };
 
 use super::super::{BucketsModalState, CreateBucketForm, QueryStatus, SourceKindChoice};
 
 /// Side-channel actions a `render_buckets_modal` call can emit. The
 /// caller mints correlation ids and dispatches the matching wire op.
+///
+/// Every variant carries `pod_id: Option<String>` so the dispatcher
+/// can route to the correct sub-registry: `None` ⇒ server-scope,
+/// `Some(pod)` ⇒ pod-scope. Row-action events read it from the
+/// originating `BucketSummary.pod_id`; the create form reads it from
+/// the form's pod-scope ComboBox.
 pub(crate) enum BucketsEvent {
     RunQuery {
         bucket_id: String,
+        pod_id: Option<String>,
         query: String,
         top_k: u32,
     },
@@ -25,23 +33,24 @@ pub(crate) enum BucketsEvent {
     /// a saving state until the wire response lands.
     CreateBucket {
         id: String,
+        pod_id: Option<String>,
         config: BucketCreateInput,
     },
     /// User confirmed delete (second click on the armed Delete button).
-    DeleteBucket { id: String },
+    DeleteBucket { id: String, pod_id: Option<String> },
     /// "Build" pressed on a bucket row.
-    StartBuild { id: String },
+    StartBuild { id: String, pod_id: Option<String> },
     /// "Cancel" pressed on a building row.
-    CancelBuild { id: String },
+    CancelBuild { id: String, pod_id: Option<String> },
     /// "Poll now" pressed on a tracked-bucket row — manually wake
     /// the feed worker rather than waiting for the next cadence
     /// tick. Only emitted for `source_kind = "tracked"` buckets.
-    PollFeedNow { id: String },
+    PollFeedNow { id: String, pod_id: Option<String> },
     /// "Resync now" pressed on a tracked-bucket row — rebuild the
     /// bucket off the driver's current `latest_base()`. Server
     /// short-circuits if already at latest. Only emitted for
     /// `source_kind = "tracked"` buckets with no in-flight build.
-    ResyncBucket { id: String },
+    ResyncBucket { id: String, pod_id: Option<String> },
 }
 
 /// Per-bucket progress snapshot the modal carries while a build is in
@@ -63,6 +72,7 @@ pub(crate) fn render_buckets_modal(
     ctx: &egui::Context,
     slot: &mut Option<BucketsModalState>,
     buckets: &[BucketSummary],
+    pods: &[PodSummary],
 ) -> Vec<BucketsEvent> {
     let mut events: Vec<BucketsEvent> = Vec::new();
     let Some(mut modal) = slot.take() else {
@@ -95,7 +105,7 @@ pub(crate) fn render_buckets_modal(
 
             if modal.creating.is_some() {
                 ui.separator();
-                render_create_section(ui, &mut modal, &mut events);
+                render_create_section(ui, &mut modal, pods, &mut events);
             }
 
             ui.separator();
@@ -153,6 +163,7 @@ pub(crate) fn render_buckets_modal(
 fn render_create_section(
     ui: &mut egui::Ui,
     modal: &mut BucketsModalState,
+    pods: &[PodSummary],
     events: &mut Vec<BucketsEvent>,
 ) {
     let Some(form) = modal.creating.as_mut() else {
@@ -177,6 +188,31 @@ fn render_create_section(
                     .desired_width(280.0)
                     .hint_text("filesystem-safe id, e.g. notes_2026"),
             );
+            ui.end_row();
+
+            // Scope: server (`None`) vs. pod-scope. Pod-scope buckets
+            // live under `<pods_root>/<pod_id>/buckets/<id>/` and are
+            // private to that pod's threads (auto-allowed without a
+            // `[allow.knowledge_buckets]` grant).
+            ui.label(RichText::new("scope").small());
+            ui.add_enabled_ui(!saving, |ui| {
+                let selected_label = match form.pod_id.as_deref() {
+                    None => "(server)".to_string(),
+                    Some(pid) => pid.to_string(),
+                };
+                ComboBox::from_id_salt("create-bucket-scope")
+                    .selected_text(selected_label)
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut form.pod_id, None, "(server)");
+                        for p in pods {
+                            ui.selectable_value(
+                                &mut form.pod_id,
+                                Some(p.pod_id.clone()),
+                                &p.pod_id,
+                            );
+                        }
+                    });
+            });
             ui.end_row();
 
             ui.label(RichText::new("name").small());
@@ -320,6 +356,7 @@ fn render_create_section(
             form.error = None;
             events.push(BucketsEvent::CreateBucket {
                 id: form.id.trim().to_string(),
+                pod_id: form.pod_id.clone(),
                 config: input,
             });
         }
@@ -447,8 +484,19 @@ fn render_query_section(
         if submit && let Some(bucket_id) = modal.selected_bucket.clone() {
             let q = modal.query_input.trim().to_string();
             if !q.is_empty() {
+                // Resolve the selected bucket back to its `BucketSummary`
+                // so the wire op carries the correct scope. Pod-scope
+                // buckets named the same as a server-scope bucket would
+                // route to the wrong sub-registry without this — the
+                // ready-list iterator above is the authoritative source
+                // of which (id, pod_id) pair the user actually picked.
+                let pod_id = ready
+                    .iter()
+                    .find(|b| b.id == bucket_id)
+                    .and_then(|b| b.pod_id.clone());
                 events.push(BucketsEvent::RunQuery {
                     bucket_id,
+                    pod_id,
                     query: q.clone(),
                     top_k: modal.top_k,
                 });
@@ -833,7 +881,10 @@ fn render_row_actions(
             // vectors), and a subsequent Build click picks up where
             // we left off rather than starting from scratch.
             if ui.button("Pause build").clicked() {
-                events.push(BucketsEvent::CancelBuild { id: b.id.clone() });
+                events.push(BucketsEvent::CancelBuild {
+                    id: b.id.clone(),
+                    pod_id: b.pod_id.clone(),
+                });
             }
         } else if ui
             .add_enabled(
@@ -845,7 +896,10 @@ fn render_row_actions(
             // The server detects an in-progress slot from a previous
             // pause/crash and resumes it; otherwise this starts a
             // fresh slot.
-            events.push(BucketsEvent::StartBuild { id: b.id.clone() });
+            events.push(BucketsEvent::StartBuild {
+                id: b.id.clone(),
+                pod_id: b.pod_id.clone(),
+            });
         }
 
         // "Poll now" — tracked buckets only, no in-flight build.
@@ -863,7 +917,10 @@ fn render_row_actions(
                 )
                 .clicked()
         {
-            events.push(BucketsEvent::PollFeedNow { id: b.id.clone() });
+            events.push(BucketsEvent::PollFeedNow {
+                id: b.id.clone(),
+                pod_id: b.pod_id.clone(),
+            });
         }
 
         // "Resync now" — tracked buckets only, no in-flight build.
@@ -882,7 +939,10 @@ fn render_row_actions(
                 )
                 .clicked()
         {
-            events.push(BucketsEvent::ResyncBucket { id: b.id.clone() });
+            events.push(BucketsEvent::ResyncBucket {
+                id: b.id.clone(),
+                pod_id: b.pod_id.clone(),
+            });
         }
 
         // Two-click delete: first click arms; second click confirms.
@@ -899,7 +959,10 @@ fn render_row_actions(
         if ui.add(button).clicked() {
             if armed {
                 modal.delete_armed = None;
-                events.push(BucketsEvent::DeleteBucket { id: b.id.clone() });
+                events.push(BucketsEvent::DeleteBucket {
+                    id: b.id.clone(),
+                    pod_id: b.pod_id.clone(),
+                });
             } else {
                 modal.delete_armed = Some(b.id.clone());
             }
