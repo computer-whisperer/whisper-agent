@@ -644,13 +644,15 @@ impl Scheduler {
                 }
                 match self.remove_shared_mcp_host(&name) {
                     Ok(()) => {
-                        self.router.send_to_client(
-                            conn_id,
-                            ServerToClient::SharedMcpHostRemoved {
+                        // Broadcast — symmetric with Add/Update so a
+                        // second connected client's settings modal
+                        // drops the entry from its list without a
+                        // reload.
+                        self.router
+                            .broadcast_catalog(ServerToClient::SharedMcpHostRemoved {
                                 correlation_id,
                                 name,
-                            },
-                        );
+                            });
                     }
                     Err(e) => {
                         self.router.send_to_client(

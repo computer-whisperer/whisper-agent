@@ -1249,7 +1249,12 @@ impl Scheduler {
                         host,
                     }
                 };
-                self.router.send_to_client(conn_id, reply);
+                // Broadcast so a second connected client's settings
+                // modal also picks up the new/updated entry without a
+                // reload. Only the originating connection's editor
+                // matches the correlation_id and closes its form;
+                // others just refresh their `shared_mcp_hosts` list.
+                self.router.broadcast_catalog(reply);
             }
             Err(message) => {
                 let verb = match op {
@@ -1568,13 +1573,12 @@ impl Scheduler {
                 // a reload.
                 self.emit_mcp_host_updated(&id);
                 let host = self.shared_mcp_host_info(&name).expect("just inserted");
-                self.router.send_to_client(
-                    conn_id,
-                    ServerToClient::SharedMcpHostAdded {
+                // Same broadcast rationale as the non-OAuth Add path.
+                self.router
+                    .broadcast_catalog(ServerToClient::SharedMcpHostAdded {
                         correlation_id,
                         host,
-                    },
-                );
+                    });
             }
             Err(message) => {
                 self.router.send_to_client(

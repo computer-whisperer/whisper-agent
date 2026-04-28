@@ -114,6 +114,20 @@ impl ThreadEventRouter {
         }
     }
 
+    /// Broadcast a catalog event (host-env provider / shared-MCP-host
+    /// add/update/remove) to every connected client. Same fan-out as
+    /// the other broadcast methods; named separately so add/update
+    /// callers don't have to dress up a catalog mutation as a
+    /// resource-tier event. Correlation-id-scoped behaviour (e.g.
+    /// closing the originating editor on save success) is opt-in on
+    /// the receiving side: clients without a matching pending
+    /// correlation just refresh their list.
+    pub(crate) fn broadcast_catalog(&self, event: ServerToClient) {
+        for tx in self.clients.values() {
+            let _ = tx.send(event.clone());
+        }
+    }
+
     /// Snapshot of every connected client's outbound channel. Used by code
     /// that broadcasts from a detached `tokio::spawn` (currently pod CRUD,
     /// which awaits async file I/O before fanning out the result).
