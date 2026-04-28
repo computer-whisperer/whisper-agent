@@ -178,7 +178,7 @@ the f32 baseline (clean, zero deltas).
 |---------|---------|-------------------|----------------|--------|-------|---------|
 | f32     | 8.8 GiB | 2h 28m            | 1.000 (ref)    | —      | —     | 15/15   |
 | f16     | 7.1 GiB | 2h 24m            | **0.960**      | 1.000  | 0.800 | 10/15   |
-| int8    | 6.3 GiB | 10h 49m           | **0.920**      | 1.000  | 0.000 | 12/15   |
+| int8    | 6.3 GiB | 2h 22m            | **0.920**      | 1.000  | 0.000 | 12/15   |
 
 f16 quality matches expectations (~1–4% top-10 noise floor). int8 has
 one outlier query ("human immune system white blood cells") with
@@ -193,15 +193,19 @@ f16/int8 (118k delta chunks + 107k tombstones). Switched to the
 backup `wikipedia_simple.bak` (clean snapshot, 0 deltas) for the
 real numbers above. Recall comparisons need identical content sets.
 
+**Build wall-clock gotcha**: the int8 manifest reports
+`build_started_at = 05:03 UTC` and `build_completed_at = 15:52 UTC`,
+which would suggest a ~10h 49m build. But the bucket dir was
+pre-staged at 05:03; the *actual* TEI traffic didn't begin until the
+operator kicked off the build at ~13:30 UTC the next morning. True
+wall-clock is ~2h 22m, in line with f16/f32. The
+`build_started_at` field tracks the first slot-creation moment, not
+the first embedder request — worth a follow-up to make this less
+misleading on next inspection.
+
 **Disk-size note**: f16 saves only ~19% and int8 ~28% of total bucket
 disk because `dense.hnsw.{graph,data}` is still f32 — the HNSW-side
 quantization deferred item below would compound these savings.
-
-**Surprise — int8 build was 4× slower** than f32/f16 (10h 49m vs
-~2h 25m). f16 and f32 are tracking the embedder; int8 is doing
-something extra in the index path. Worth a profile pass before
-committing to int8 for the all-wiki run; symmetric per-vector
-quantization shouldn't impose this much overhead.
 
 ## Deferred / not started
 
@@ -213,7 +217,7 @@ chronological — order may shuffle as the dataset reveals what hurts.
 | 10+ | Auto-compaction triggers (delta-ratio / tombstone-ratio thresholds, scheduled) | `Bucket::compact` is callable manually; auto-trigger heuristics still TBD. Real thresholds need observation on actual mutating buckets; should also have time-based triggers (e.g. compact pod memory daily). |
 | 10+ | Live-mode post-turn relevance nudge                            | Per design doc § "Live retrieval mode". Cross-cuts scheduler — not load-bearing for v1. |
 | 10+ | Per-pod buckets (`<pods_root>/<pod>/buckets/`)                 | Server-scope is enough until multi-pod isolation is a felt need. Today's `BucketScope::Pod` enum variant is unwired. |
-| 10+ | int8 in HNSW data (dataset-wide shared scale)                  | f16 in HNSW landed in slice `HQ`; further halving for int8 buckets requires a shared scale (per-vector scale doesn't fit hnsw_rs's typed `T`). Would quarter `dense.hnsw.data` for int8 buckets vs f32. Manifest schema bump + `VectorStoreWriter::create` shared-scale codepath; defer until int8 build slowdown is investigated. |
+| 10+ | int8 in HNSW data (dataset-wide shared scale)                  | f16 in HNSW landed in slice `HQ`; further halving for int8 buckets requires a shared scale (per-vector scale doesn't fit hnsw_rs's typed `T`). Would quarter `dense.hnsw.data` for int8 buckets vs f32. Manifest schema bump + `VectorStoreWriter::create` shared-scale codepath. Open question: does int8-everywhere cost more recall than f16-everywhere? Worth measuring before investing in the shared-scale codepath. |
 
 ## Dangling cleanup (none blocking)
 
@@ -255,20 +259,18 @@ chronological — order may shuffle as the dataset reveals what hurts.
   futures; total query latency is now max-of-per-bucket instead of
   sum-of-per-bucket. Relevant once a pod has multiple buckets in
   scope (e.g. memory + wikipedia).
-- **Scheduler-thread block on `DiskBucket::open`** — `handle_start_bucket_build`
-  (`scheduler/buckets.rs:346`) and `handle_resync_bucket` (`:539`) call
-  `DiskBucket::open` synchronously on the scheduler task. On
-  `wikipedia_simple` the HNSW load is ~12s, blocking other scheduler
-  work for that window when a build/resync is kicked off. The fix is
-  to move `DiskBucket::open` + `find_resumable_slot` into the spawned
-  `run_build` future (under `spawn_blocking`); the wire handlers should
-  only validate + broadcast + spawn. Identified during the 30s-boot
-  hang investigation; cleanup deferred so the overnight quant builds
-  could proceed.
-- **int8 build wall-clock 4× slower than f32/f16** — observed in the
-  2026-04-28 quant spot-test (10h 49m vs ~2h 25m). Embedder is the
-  same; suspect a non-vectorized hot path in the int8 vector-write
-  loop. Worth profiling before using int8 at enwiki scale.
+- ~~**Scheduler-thread block on `DiskBucket::open`**~~ — landed in
+  `12bda29`. `handle_start_bucket_build` and `handle_resync_bucket`
+  no longer call `DiskBucket::open` on the scheduler task; both
+  the open and the resumable-slot scan run inside `run_build`'s
+  `spawn_blocking`, with errors flowing through the existing
+  `BuildEnded { Error }` path.
+- **`build_started_at` is creation time, not first-embedder time**
+  — the int8 manifest's apparent ~10h build (05:03 → 15:52 UTC) was
+  actually 2h 22m of TEI traffic; the field stamps when the slot dir
+  was created, which can predate the actual build dispatch by hours.
+  Cosmetic but misleading in postmortems; consider stamping
+  `build_started_at` from `run_build`'s entry point instead.
 
 ## Pointers
 
