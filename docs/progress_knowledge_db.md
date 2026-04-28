@@ -55,6 +55,7 @@ Last updated: **2026-04-29**.
 | HQ  | HNSW-side f16 quantization — `DistF16L2`, enum-dispatched `DenseInner::{F32, F16}`, plumbed through `DenseIndex::{empty, build, load_from*}`. Halves `dense.hnsw.data` for any quantized bucket. Drive-by: resume rebuild path stride bug (was hardcoded f32) | `0a29cb8` |
 | HQ8 | HNSW-side int8 quantization — `DistInt8L2` (i32 arithmetic, scale-cancels-out), `DenseInner::Int8` with calibrated dataset-wide scale, `dense.int8_scale` sidecar. Quarters `dense.hnsw.data` for int8 buckets vs f32. First-batch calibration in the streaming build path; first-256-sample calibration in `DenseIndex::build` and the resume rebuild path. | `5ac7b6a` |
 | PB1 | Pod-scope bucket discovery — `BucketEntry.{scope,pod_id}`, `BucketRegistry.pod_buckets` per-pod sub-registry, `register_pod_buckets` walks `<pod_dir>/buckets/`, scheduler boot folds each loaded pod in, `BucketSummary.pod_id` on the wire. ListBuckets surfaces pod-scope entries; query / lifecycle wire ops land in follow-ups. | `91ded94` |
+| PB2 | Pod-scope query path — `loaded_bucket_pod` + scope-keyed cache, `find_entry(scope, pod_id, name)`, `resolve_query_targets` resolver with `pod:`/`server:` prefix grammar (bare names auto-disambiguate against pod's own pod-scope buckets ∪ server-scope allow list; ambiguity errors with the disambiguating prefix). Wired through `knowledge_query` and `knowledge_modify`. 10 resolver unit tests. | `8e6ff40` |
 
 ## End-to-end validation (Simple English Wikipedia, mock embedder)
 
@@ -218,7 +219,7 @@ chronological — order may shuffle as the dataset reveals what hurts.
 |-----|----------------------------------------------------------------|--------------|
 | 10+ | Auto-compaction triggers (delta-ratio / tombstone-ratio thresholds, scheduled) | `Bucket::compact` is callable manually; auto-trigger heuristics still TBD. Real thresholds need observation on actual mutating buckets; should also have time-based triggers (e.g. compact pod memory daily). |
 | 10+ | Live-mode post-turn relevance nudge                            | Per design doc § "Live retrieval mode". Cross-cuts scheduler — not load-bearing for v1. |
-| 10+ | Per-pod buckets — query path (`knowledge_query` resolves pod-scope), lifecycle ops (`CreateBucket`/etc. with `pod_id`), WebUI scope toggle | Foundation landed in `PB1` — registry holds pod-scope entries and ListBuckets surfaces them. Outstanding: `loaded_bucket_scoped` lookup, scoped wire IDs on `QueryBuckets`/lifecycle ops, and an UI surface for creating into a pod. Allow-list semantics for pod-scope (auto-allow this-pod, explicit grant for cross-pod) still TBD. |
+| 10+ | Per-pod buckets — lifecycle ops (`CreateBucket`/etc. with `pod_id`), WebUI scope toggle, scoped wire IDs on `QueryBuckets` | Foundation + LLM-tool query path landed in `PB1`/`PB2`. Outstanding: scoped strings on `QueryBuckets`/`CreateBucket`/`DeleteBucket`/`StartBucketBuild`/`CancelBucketBuild`/`ResyncBucket`/`PollFeedNow`, plus a WebUI scope selector in the create form. |
 
 ## Dangling cleanup (none blocking)
 
