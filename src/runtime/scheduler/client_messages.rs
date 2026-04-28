@@ -1414,7 +1414,7 @@ impl Scheduler {
         use tokio_util::sync::CancellationToken;
         use whisper_agent_protocol::QueryHit;
 
-        use crate::knowledge::{Bucket, QueryEngine, QueryParams};
+        use crate::knowledge::{Bucket, BucketScope, QueryEngine, QueryParams};
 
         let send_err = |msg: String| {
             self.router.send_to_client(
@@ -1426,19 +1426,6 @@ impl Scheduler {
                 },
             );
         };
-
-        // Pod-scope wire ops parse and reach here, but handler logic
-        // for them lands in PB3b. Reject with a clear message so the
-        // wire schema is forward-compatible without surprising silent
-        // server-scope fallbacks.
-        if pod_id.is_some() {
-            send_err(
-                "QueryBuckets: `pod_id` is not yet supported through this wire path. \
-                 Server-scope buckets only — pod-scope query lifecycle lands in a follow-up."
-                    .into(),
-            );
-            return;
-        }
 
         // Validation: exactly one bucket id, non-empty query, non-zero
         // top_k. Multi-bucket fan-out comes when the dimension-matching
@@ -1460,10 +1447,24 @@ impl Scheduler {
         }
 
         let bucket_id = bucket_ids.into_iter().next().unwrap();
-        let entry = match self.bucket_registry.buckets.get(&bucket_id) {
+        // Scope-aware lookup: server-scope hits the top-level map;
+        // pod-scope walks `pod_buckets[pod_id]`. Same-named buckets in
+        // server vs. a pod are distinct entries, so the routing here is
+        // load-bearing.
+        let scope = match pod_id {
+            Some(_) => BucketScope::Pod,
+            None => BucketScope::Server,
+        };
+        let entry = match self
+            .bucket_registry
+            .find_entry(scope, pod_id.as_deref(), &bucket_id)
+        {
             Some(e) => e,
             None => {
-                send_err(format!("unknown bucket id: {bucket_id}"));
+                send_err(match &pod_id {
+                    Some(pid) => format!("unknown bucket id: {bucket_id} (pod `{pid}`)"),
+                    None => format!("unknown bucket id: {bucket_id}"),
+                });
                 return;
             }
         };
@@ -1496,19 +1497,29 @@ impl Scheduler {
             return;
         };
         let registry = self.bucket_registry.clone();
+        let pod_id_for_load = pod_id.clone();
 
         // Detached task: HNSW rebuild on first load and the subsequent
         // dense+sparse+rerank round trip both want to be off the
         // scheduler thread.
         tokio::spawn(async move {
             let cancel = CancellationToken::new();
-            let bucket = match registry.loaded_bucket(&bucket_id).await {
+            let load_result = match pod_id_for_load.as_deref() {
+                Some(pid) => registry.loaded_bucket_pod(pid, &bucket_id).await,
+                None => registry.loaded_bucket(&bucket_id).await,
+            };
+            let bucket = match load_result {
                 Ok(b) => b,
                 Err(e) => {
                     let _ = outbound.send(ServerToClient::Error {
                         correlation_id,
                         thread_id: None,
-                        message: format!("loaded_bucket({bucket_id}): {e}"),
+                        message: match &pod_id_for_load {
+                            Some(pid) => {
+                                format!("loaded_bucket(pod={pid}, name={bucket_id}): {e}")
+                            }
+                            None => format!("loaded_bucket({bucket_id}): {e}"),
+                        },
                     });
                     return;
                 }
