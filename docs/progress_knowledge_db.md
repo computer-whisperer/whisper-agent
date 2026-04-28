@@ -43,6 +43,9 @@ Last updated: **2026-04-27**.
 | PN  | "Poll now" wire path — bounded trigger channel, scheduler dispatch, WebUI button | `bb29d77` |
 | BS  | `Bucket::insert` per-API-call cap fix — apply_delta no longer blows past TEI's `max_client_batch_size` | `ec6a9f7` |
 | RS  | Background resync — manual + scheduled. `resolve_resync_source`, `reset_delta_cursor_to`, `BuildIntent::Resync`, `last_resync_at` persistence, FeedWorker resync arm, "Resync now" button | `07bdc26..9c4d7c3` |
+| Q1  | `recall_eval` binary — dense-recall@K harness for quantization regression testing | `025be2a` |
+| Q2a | f16 quantization in vectors.bin — half on-disk vector size, ~1% recall noise floor | `26541e3` |
+| Q3  | int8 quantization in vectors.bin — symmetric per-vector scale, ~4× compression | `5e91517` |
 
 ## End-to-end validation (Simple English Wikipedia, mock embedder)
 
@@ -168,7 +171,7 @@ chronological — order may shuffle as the dataset reveals what hurts.
 | 10+ | Auto-compaction triggers (delta-ratio / tombstone-ratio thresholds, scheduled) | `Bucket::compact` is callable manually; auto-trigger heuristics still TBD. Real thresholds need observation on actual mutating buckets; should also have time-based triggers (e.g. compact pod memory daily). |
 | 10+ | Live-mode post-turn relevance nudge                            | Per design doc § "Live retrieval mode". Cross-cuts scheduler — not load-bearing for v1. |
 | 10+ | Per-pod buckets (`<pods_root>/<pod>/buckets/`)                 | Server-scope is enough until multi-pod isolation is a felt need. Today's `BucketScope::Pod` enum variant is unwired. |
-| 10+ | Quantization (f32 → f16 vectors)                               | Per design doc — halves on-disk vector footprint and HNSW RAM at minor recall cost; deferred while query-quality validation prioritized real-data testing on full-precision vectors. |
+| 10+ | HNSW-side quantization (f16 / int8 in dense.hnsw.data)         | vectors.bin already supports f16/int8 via Q2a/Q3; the HNSW dump still holds f32 because the in-memory `Hnsw<'static, f32, DistL2>` is hardcoded. Halving / quartering `dense.hnsw.data` is the larger remaining win at enwiki scale. Wait until `recall_eval` against an actual quantized bucket build informs whether the additional refactor (custom `Distance<f16>` + enum dispatch in DenseIndex) is worth it. |
 
 ## Dangling cleanup (none blocking)
 
