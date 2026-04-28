@@ -1210,6 +1210,15 @@ impl ChatApp {
                     editor.fetch_correlation = None;
                 }
             }
+            ServerToClient::FeedPollAccepted { .. } => {
+                // Server acknowledged the manual "Poll now" trigger.
+                // No UI state to update — the user infers success
+                // by watching the bucket's stats refresh on the
+                // next ListBuckets / build event. If we add a
+                // per-tick wire broadcast in the future, surface
+                // it on the row instead of relying on
+                // ListBuckets.
+            }
             ServerToClient::ServerConfigUpdateResult {
                 cancelled_threads,
                 restart_required_sections,

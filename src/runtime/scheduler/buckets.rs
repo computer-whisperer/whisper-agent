@@ -249,8 +249,8 @@ impl Scheduler {
         // Stop the per-tracked-bucket feed worker, if any. Stored /
         // linked / managed buckets don't have one — `remove` is a
         // no-op in that case.
-        if let Some(token) = self.active_feed_workers.remove(&id) {
-            token.cancel();
+        if let Some(control) = self.active_feed_workers.remove(&id) {
+            control.cancel.cancel();
         }
 
         // Drop the in-memory entry + cached DiskBucket. Sync — both
@@ -447,6 +447,57 @@ impl Scheduler {
                 );
             }
         }
+    }
+
+    pub(super) fn handle_poll_feed_now(
+        &mut self,
+        conn_id: ConnId,
+        correlation_id: Option<String>,
+        id: String,
+    ) {
+        let Some(control) = self.active_feed_workers.get(&id) else {
+            // No feed worker — either an unknown bucket id or the
+            // bucket isn't tracked. Same error surface in either
+            // case; the UI button is only shown for tracked buckets,
+            // so this hitting in production means a stale UI.
+            self.send_bucket_error(
+                conn_id,
+                correlation_id,
+                "poll_feed_now",
+                format!("no feed worker for `{id}` (not a tracked bucket?)"),
+            );
+            return;
+        };
+        // `try_send` semantics: if the trigger buffer (capacity 1) is
+        // already full, a poll is already pending or in flight — the
+        // user's click coalesces silently with the prior trigger.
+        // We still ack `Accepted` because the user's intent ("a poll
+        // happens soon") will be served by that pending trigger.
+        match control.trigger.try_send(()) {
+            Ok(()) => {}
+            Err(tokio::sync::mpsc::error::TrySendError::Full(())) => {
+                // Already pending; treat as accepted.
+            }
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(())) => {
+                // The worker task has exited (panic or shutdown).
+                // This shouldn't normally happen — DeleteBucket
+                // removes the entry before the channel closes.
+                self.send_bucket_error(
+                    conn_id,
+                    correlation_id.clone(),
+                    "poll_feed_now",
+                    format!("feed worker for `{id}` has stopped"),
+                );
+                return;
+            }
+        }
+        self.router.send_to_client(
+            conn_id,
+            ServerToClient::FeedPollAccepted {
+                correlation_id,
+                bucket_id: id,
+            },
+        );
     }
 
     /// Replay current state for every in-flight build to one client

@@ -59,7 +59,9 @@ pub use config::{
 pub use dense::{DenseIndex, HnswParams};
 pub use disk_bucket::{BuildObserver, BuildPhase, DeltaApplyStats, DiskBucket};
 pub use feed_state::{FeedState, FeedStateError, base_cache_dir, delta_cache_dir, feed_state_path};
-pub use feed_worker::{FeedWorker, NoopObserver, TickOutcome, WorkerObserver, cadence_to_duration};
+pub use feed_worker::{
+    FeedWorker, FeedWorkerControl, NoopObserver, TickOutcome, WorkerObserver, cadence_to_duration,
+};
 pub use manifest::{
     ChunkerSnapshot, EmbedderSnapshot, ServingSnapshot, SlotLineage, SlotManifest, SlotState,
     SlotStats, SparseSnapshot, TokenizerSnapshot,

@@ -1438,6 +1438,23 @@ pub enum ClientToServer {
         correlation_id: Option<String>,
         id: String,
     },
+    /// Manually trigger a tracked-bucket feed worker to poll its
+    /// driver immediately rather than waiting for the next cadence
+    /// tick. Idempotent on the wire — a poll already in flight
+    /// coalesces silently (the trigger channel is bounded at 1).
+    /// Refusal (`Error`) for unknown bucket id or for non-tracked
+    /// buckets that don't have a worker. Acceptance is signalled
+    /// synchronously via an empty-body success ack; the resulting
+    /// `TickOutcome` lands through the worker's normal observer
+    /// path (today's wiring is `NoopObserver` in production, so
+    /// callers infer success from the bucket's updated state on
+    /// the next `ListBuckets` rather than a per-tick wire event —
+    /// per-tick broadcasting is a follow-up).
+    PollFeedNow {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        correlation_id: Option<String>,
+        id: String,
+    },
 
     // --- Behavior registry (read-only in phase 1 — see
     //     docs/design_behaviors.md). Create / update / delete / run arrive
@@ -2051,6 +2068,17 @@ pub enum ServerToClient {
         outcome: BucketBuildOutcome,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         summary: Option<BucketSummary>,
+    },
+    /// `PollFeedNow` was accepted — the worker has been signalled.
+    /// Sent only to the requesting client (it's an ack of *their*
+    /// click), not broadcast. The actual `TickOutcome` of the
+    /// triggered poll lands through the worker's normal observer
+    /// path — UI consumers refresh the bucket via `ListBuckets` to
+    /// see the post-poll state.
+    FeedPollAccepted {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        correlation_id: Option<String>,
+        bucket_id: String,
     },
 
     // --- Behavior registry ---

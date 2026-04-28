@@ -16,20 +16,29 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
 use crate::knowledge::config::{SourceConfig, TrackedDriver};
 use crate::knowledge::source::feed::driver_for;
 use crate::knowledge::{
-    BucketRegistry, FeedWorker, NoopObserver, WorkerObserver, cadence_to_duration,
+    BucketRegistry, FeedWorker, FeedWorkerControl, NoopObserver, WorkerObserver,
+    cadence_to_duration,
 };
 use crate::runtime::scheduler::EmbeddingProviderEntry;
 
+/// Capacity of the per-worker manual-trigger channel. One in flight
+/// at a time — extra `try_send` calls drop on a full buffer, which
+/// is the desired "poll already pending" semantics for the
+/// `PollFeedNow` UI button.
+const TRIGGER_CHANNEL_CAPACITY: usize = 1;
+
 /// Walk the registry, spawn one [`FeedWorker`] per tracked bucket,
-/// and return their cancellation tokens keyed by bucket id. The
-/// scheduler stores the result and pulls a token out on
-/// `DeleteBucket` to stop the corresponding worker.
+/// and return their control handles keyed by bucket id. The scheduler
+/// stores the result and uses each handle to drive lifecycle (`cancel`
+/// on `DeleteBucket`) and manual triggering (`trigger.try_send(())` on
+/// `PollFeedNow`).
 ///
 /// Stored / linked / managed buckets are skipped — only `tracked`
 /// buckets get a worker. Tracked buckets whose configured embedder
@@ -39,7 +48,7 @@ use crate::runtime::scheduler::EmbeddingProviderEntry;
 pub fn spawn_for_registry(
     registry: &BucketRegistry,
     embedding_providers: &HashMap<String, EmbeddingProviderEntry>,
-) -> HashMap<String, CancellationToken> {
+) -> HashMap<String, FeedWorkerControl> {
     spawn_for_registry_with_observer(registry, embedding_providers, Arc::new(NoopObserver))
 }
 
@@ -50,8 +59,8 @@ pub fn spawn_for_registry_with_observer(
     registry: &BucketRegistry,
     embedding_providers: &HashMap<String, EmbeddingProviderEntry>,
     observer: Arc<dyn WorkerObserver>,
-) -> HashMap<String, CancellationToken> {
-    let mut tokens: HashMap<String, CancellationToken> = HashMap::new();
+) -> HashMap<String, FeedWorkerControl> {
+    let mut controls: HashMap<String, FeedWorkerControl> = HashMap::new();
     for (id, entry) in &registry.buckets {
         let SourceConfig::Tracked {
             driver: driver_cfg,
@@ -72,6 +81,7 @@ pub fn spawn_for_registry_with_observer(
             continue;
         };
         let cancel = CancellationToken::new();
+        let (trigger_tx, trigger_rx) = mpsc::channel::<()>(TRIGGER_CHANNEL_CAPACITY);
         let driver = driver_for(driver_cfg);
         let interval = cadence_to_duration(*delta_cadence);
         let driver_name = match driver_cfg {
@@ -93,11 +103,18 @@ pub fn spawn_for_registry_with_observer(
             observer.clone(),
             registry.clone(),
             provider_entry.provider.clone(),
+            trigger_rx,
         );
         tokio::spawn(worker.run());
-        tokens.insert(id.clone(), cancel);
+        controls.insert(
+            id.clone(),
+            FeedWorkerControl {
+                cancel,
+                trigger: trigger_tx,
+            },
+        );
     }
-    tokens
+    controls
 }
 
 #[cfg(test)]
@@ -258,16 +275,16 @@ embedder = "test_embedder"
         .await;
 
         let providers = embedders_with_test_entry("test_embedder");
-        let tokens = spawn_for_registry(&registry, &providers);
+        let controls = spawn_for_registry(&registry, &providers);
 
-        assert_eq!(tokens.len(), 1, "only the tracked bucket gets a worker");
-        assert!(tokens.contains_key("wiki_simple"));
-        assert!(!tokens.contains_key("my_notes"));
+        assert_eq!(controls.len(), 1, "only the tracked bucket gets a worker");
+        assert!(controls.contains_key("wiki_simple"));
+        assert!(!controls.contains_key("my_notes"));
 
         // Clean up — cancel the worker so the spawned task winds down
         // cleanly and the test process doesn't leave it hanging.
-        for token in tokens.values() {
-            token.cancel();
+        for control in controls.values() {
+            control.cancel.cancel();
         }
     }
 
@@ -290,9 +307,9 @@ embedder = "test_embedder"
         // Empty catalog — bucket's `embedder = "test_embedder"` won't
         // resolve.
         let providers = HashMap::new();
-        let tokens = spawn_for_registry(&registry, &providers);
+        let controls = spawn_for_registry(&registry, &providers);
         assert!(
-            tokens.is_empty(),
+            controls.is_empty(),
             "no workers should spawn when the configured embedder is missing",
         );
     }
@@ -312,12 +329,12 @@ embedder = "test_embedder"
         let recording = Arc::new(Recording::default());
         let observer = Arc::new(ObserverBox(recording.clone()));
         let providers = embedders_with_test_entry("test_embedder");
-        let tokens = spawn_for_registry_with_observer(&registry, &providers, observer);
-        assert_eq!(tokens.len(), 1);
+        let controls = spawn_for_registry_with_observer(&registry, &providers, observer);
+        assert_eq!(controls.len(), 1);
 
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        for token in tokens.values() {
-            token.cancel();
+        for control in controls.values() {
+            control.cancel.cancel();
         }
         // Yield enough for the worker tasks to finish their idle-then-
         // cancel handshake.

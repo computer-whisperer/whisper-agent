@@ -33,6 +33,10 @@ pub(crate) enum BucketsEvent {
     StartBuild { id: String },
     /// "Cancel" pressed on a building row.
     CancelBuild { id: String },
+    /// "Poll now" pressed on a tracked-bucket row — manually wake
+    /// the feed worker rather than waiting for the next cadence
+    /// tick. Only emitted for `source_kind = "tracked"` buckets.
+    PollFeedNow { id: String },
 }
 
 /// Per-bucket progress snapshot the modal carries while a build is in
@@ -790,6 +794,24 @@ fn render_row_actions(
             // pause/crash and resumes it; otherwise this starts a
             // fresh slot.
             events.push(BucketsEvent::StartBuild { id: b.id.clone() });
+        }
+
+        // "Poll now" — tracked buckets only, no in-flight build.
+        // Wakes the per-bucket FeedWorker rather than waiting for
+        // the daily cadence tick. Server's trigger channel is
+        // bounded at 1 so multiple rapid clicks coalesce server-
+        // side; the UI just fires-and-forgets.
+        if !in_flight_build
+            && b.source_kind.as_str() == "tracked"
+            && ui
+                .button("Poll now")
+                .on_hover_text(
+                    "Wake the feed worker to poll for new deltas immediately, \
+                     instead of waiting for the next cadence tick.",
+                )
+                .clicked()
+        {
+            events.push(BucketsEvent::PollFeedNow { id: b.id.clone() });
         }
 
         // Two-click delete: first click arms; second click confirms.

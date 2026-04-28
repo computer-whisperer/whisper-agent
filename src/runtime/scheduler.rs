@@ -481,13 +481,15 @@ pub struct Scheduler {
     /// instead of a stale `Building` row with zero counters).
     active_bucket_progress:
         HashMap<String, std::sync::Arc<crate::runtime::scheduler::buckets::ProgressShared>>,
-    /// Cancellation tokens for the per-tracked-bucket
+    /// Control handles for the per-tracked-bucket
     /// [`FeedWorker`](crate::knowledge::FeedWorker) tasks spawned at
     /// scheduler-construction time. Keyed by bucket id; entries
     /// present only for buckets whose source is
     /// [`SourceConfig::Tracked`]. `DeleteBucket` pops the matching
-    /// entry and fires `cancel()` to wind the worker down.
-    active_feed_workers: HashMap<String, tokio_util::sync::CancellationToken>,
+    /// entry and fires `cancel()` to wind the worker down;
+    /// `PollFeedNow` `try_send`s the trigger to wake the worker
+    /// without waiting for the next cadence tick.
+    active_feed_workers: HashMap<String, crate::knowledge::FeedWorkerControl>,
     /// Sender for `BucketTaskUpdate`s pushed from detached build
     /// tasks back to the scheduler loop. The matching receiver is
     /// returned from `Scheduler::new` and drained by the run loop.

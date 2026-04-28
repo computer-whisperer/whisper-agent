@@ -3510,6 +3510,20 @@ impl eframe::App for ChatApp {
                         id,
                     });
                 }
+                BucketsEvent::PollFeedNow { id } => {
+                    // Fire-and-forget — server's trigger buffer is
+                    // bounded at 1, so a click during an in-flight
+                    // poll coalesces server-side. We don't surface
+                    // the server's `FeedPollAccepted` ack in the UI
+                    // today; the user infers success by watching
+                    // the bucket's stats refresh on the next
+                    // ListBuckets.
+                    let correlation = self.next_correlation_id();
+                    self.send(ClientToServer::PollFeedNow {
+                        correlation_id: Some(correlation),
+                        id,
+                    });
+                }
             }
         }
 

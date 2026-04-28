@@ -358,6 +358,9 @@ impl Scheduler {
             ClientToServer::CancelBucketBuild { correlation_id, id } => {
                 self.handle_cancel_bucket_build(conn_id, correlation_id, id);
             }
+            ClientToServer::PollFeedNow { correlation_id, id } => {
+                self.handle_poll_feed_now(conn_id, correlation_id, id);
+            }
             ClientToServer::AddHostEnvProvider {
                 correlation_id,
                 name,

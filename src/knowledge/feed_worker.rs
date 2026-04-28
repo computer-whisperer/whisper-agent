@@ -42,6 +42,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
+use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
@@ -159,6 +160,23 @@ pub struct FeedWorker {
     /// don't store one here — `apply_one_delta` reads it from the
     /// loaded bucket when calling `set_embedder`.
     embedder: Arc<dyn EmbeddingProvider>,
+    /// Manual-trigger receiver. The scheduler holds the matching
+    /// sender and `try_send`s a unit on the "Poll now" wire message;
+    /// the worker treats it as another wakeup source alongside the
+    /// cadence timer. Bounded at capacity 1 so multiple rapid
+    /// triggers coalesce — there's no value in queuing them since
+    /// the worker rolls all available deltas into one tick anyway.
+    trigger: mpsc::Receiver<()>,
+}
+
+/// Spawn-side handle returned alongside a fresh [`FeedWorker`]. The
+/// scheduler holds these to drive lifecycle (`cancel.cancel()` on
+/// `DeleteBucket`) and manual triggering (`trigger.try_send(())` on
+/// `PollFeedNow`).
+#[derive(Debug, Clone)]
+pub struct FeedWorkerControl {
+    pub cancel: CancellationToken,
+    pub trigger: mpsc::Sender<()>,
 }
 
 impl FeedWorker {
@@ -172,6 +190,7 @@ impl FeedWorker {
         observer: Arc<dyn WorkerObserver>,
         registry: BucketRegistry,
         embedder: Arc<dyn EmbeddingProvider>,
+        trigger: mpsc::Receiver<()>,
     ) -> Self {
         Self {
             bucket_id: bucket_id.into(),
@@ -182,6 +201,7 @@ impl FeedWorker {
             observer,
             registry,
             embedder,
+            trigger,
         }
     }
 
@@ -193,7 +213,7 @@ impl FeedWorker {
     /// Returns when the cancellation token fires. The caller (the
     /// scheduler) decides whether to spawn this on a runtime task or
     /// hold the future directly.
-    pub async fn run(self) {
+    pub async fn run(mut self) {
         info!(
             bucket_id = %self.bucket_id,
             interval_secs = self.interval.map(|d| d.as_secs()).unwrap_or(0),
@@ -201,25 +221,36 @@ impl FeedWorker {
         );
 
         let mut tick_index: u64 = 0;
+
+        // Manual cadence still emits one Idle tick at startup so
+        // observers see the worker is alive even before any trigger
+        // fires. Cadence-driven workers don't need this — their first
+        // real tick lands within `interval`.
+        if self.interval.is_none() {
+            self.observer.on_tick(tick_index, TickOutcome::Idle);
+            tick_index += 1;
+        }
+
         loop {
-            match self.interval {
-                Some(d) => {
-                    tokio::select! {
-                        biased;
-                        _ = self.cancel.cancelled() => break,
-                        _ = tokio::time::sleep(d) => {}
+            // Wakeup sources, in priority order:
+            //  1. cancellation (always wins)
+            //  2. cadence timer (when `interval` is Some)
+            //  3. manual "Poll now" trigger (always live)
+            //
+            // Manual cadence (`interval = None`) substitutes a
+            // never-resolving future for the timer arm, so the loop
+            // sits on trigger/cancel until something fires.
+            let interval = self.interval;
+            tokio::select! {
+                biased;
+                _ = self.cancel.cancelled() => break,
+                _ = async move {
+                    match interval {
+                        Some(d) => tokio::time::sleep(d).await,
+                        None => std::future::pending::<()>().await,
                     }
-                }
-                None => {
-                    // Manual cadence: emit one Idle tick and then block
-                    // on cancellation. Future slice will replace the
-                    // pending future with a wake-on-trigger channel —
-                    // until then `tick_index` doesn't advance because
-                    // the loop terminates here.
-                    self.observer.on_tick(tick_index, TickOutcome::Idle);
-                    self.cancel.cancelled().await;
-                    break;
-                }
+                } => {}
+                _ = self.trigger.recv() => {}
             }
 
             let outcome = self.poll_once().await;
@@ -452,6 +483,16 @@ mod tests {
         Arc::new(StubEmbedder)
     }
 
+    /// Make a fresh trigger channel; the test holds onto the sender
+    /// for the duration of the worker's run so the channel stays
+    /// open. A sender that's been dropped causes `recv()` to return
+    /// `None` immediately — the select! arm would then fire on every
+    /// loop iteration, defeating the whole purpose of waiting on the
+    /// timer or cancel arm.
+    fn fresh_trigger() -> (mpsc::Sender<()>, mpsc::Receiver<()>) {
+        mpsc::channel::<()>(1)
+    }
+
     #[derive(Default)]
     struct RecordingObserver {
         ticks: Mutex<Vec<(u64, TickOutcome)>>,
@@ -591,6 +632,7 @@ mod tests {
         let (driver, _log) = ScriptedDriver::new(vec![], vec![]);
         let observer = Arc::new(RecordingObserver::default());
         let cancel = CancellationToken::new();
+        let (_trigger_tx, trigger_rx) = fresh_trigger();
         let worker = FeedWorker::new(
             "test_bucket",
             tmp.path().to_path_buf(),
@@ -600,6 +642,7 @@ mod tests {
             observer.clone(),
             BucketRegistry::default(),
             stub_embedder(),
+            trigger_rx,
         );
         let handle = tokio::spawn(worker.run());
 
@@ -633,6 +676,7 @@ mod tests {
         let (driver, _log) = ScriptedDriver::new(vec![], vec![]);
         let observer = Arc::new(RecordingObserver::default());
         let cancel = CancellationToken::new();
+        let (_trigger_tx, trigger_rx) = fresh_trigger();
         let worker = FeedWorker::new(
             "manual_bucket",
             tmp.path().to_path_buf(),
@@ -642,6 +686,7 @@ mod tests {
             observer.clone(),
             BucketRegistry::default(),
             stub_embedder(),
+            trigger_rx,
         );
         let handle = tokio::spawn(worker.run());
 
@@ -661,6 +706,7 @@ mod tests {
         let observer = Arc::new(RecordingObserver::default());
         let cancel = CancellationToken::new();
         cancel.cancel();
+        let (_trigger_tx, trigger_rx) = fresh_trigger();
         let worker = FeedWorker::new(
             "early_cancel",
             tmp.path().to_path_buf(),
@@ -670,6 +716,7 @@ mod tests {
             observer.clone(),
             BucketRegistry::default(),
             stub_embedder(),
+            trigger_rx,
         );
         worker.run().await;
         assert!(
@@ -710,6 +757,7 @@ mod tests {
         );
         let observer = Arc::new(RecordingObserver::default());
         let cancel = CancellationToken::new();
+        let (_trigger_tx, trigger_rx) = fresh_trigger();
         let worker = FeedWorker::new(
             "test_bucket",
             tmp.path().to_path_buf(),
@@ -719,6 +767,7 @@ mod tests {
             observer.clone(),
             BucketRegistry::default(),
             stub_embedder(),
+            trigger_rx,
         );
         let handle = tokio::spawn(worker.run());
 
@@ -779,6 +828,7 @@ mod tests {
             ScriptedDriver::new(vec![DeltaId::new("20260420")], b"never read".to_vec());
         let observer = Arc::new(RecordingObserver::default());
         let cancel = CancellationToken::new();
+        let (_trigger_tx, trigger_rx) = fresh_trigger();
         let worker = FeedWorker::new(
             "test_bucket",
             tmp.path().to_path_buf(),
@@ -788,6 +838,7 @@ mod tests {
             observer.clone(),
             BucketRegistry::default(),
             stub_embedder(),
+            trigger_rx,
         );
         let handle = tokio::spawn(worker.run());
 
@@ -803,6 +854,83 @@ mod tests {
         assert!(
             log.lock().unwrap().is_empty(),
             "driver should not be called when no base is recorded",
+        );
+    }
+
+    /// Manual "Poll now" trigger short-circuits the cadence wait. Set
+    /// the cadence to a value that won't fire within the test window
+    /// (1 hour) and verify a `try_send` on the trigger surfaces a tick
+    /// promptly. Empty driver listing → `Polled{0,0,..}` per tick;
+    /// each trigger produces one such tick.
+    #[tokio::test]
+    async fn manual_trigger_wakes_worker_before_cadence_elapses() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_feed_state_with_base(tmp.path(), "20260401");
+
+        let (driver, _log) = ScriptedDriver::new(vec![], vec![]);
+        let observer = Arc::new(RecordingObserver::default());
+        let cancel = CancellationToken::new();
+        let (trigger_tx, trigger_rx) = fresh_trigger();
+        let worker = FeedWorker::new(
+            "test_bucket",
+            tmp.path().to_path_buf(),
+            Box::new(driver),
+            Some(Duration::from_secs(3600)), // long enough that cadence won't fire
+            cancel.clone(),
+            observer.clone(),
+            BucketRegistry::default(),
+            stub_embedder(),
+            trigger_rx,
+        );
+        let handle = tokio::spawn(worker.run());
+
+        // Give the loop one yield to enter the select! arm before
+        // sending the trigger.
+        tokio::task::yield_now().await;
+        trigger_tx.try_send(()).expect("trigger send");
+        // Yield a few times for the worker to drain the trigger,
+        // run poll_once, and call observer.on_tick.
+        for _ in 0..50 {
+            tokio::task::yield_now().await;
+            if !observer.ticks.lock().unwrap().is_empty() {
+                break;
+            }
+        }
+        cancel.cancel();
+        handle.await.unwrap();
+
+        let ticks = observer.ticks.lock().unwrap().clone();
+        assert!(
+            !ticks.is_empty(),
+            "trigger should produce at least one tick before cadence",
+        );
+        assert!(
+            matches!(
+                ticks[0].1,
+                TickOutcome::Polled {
+                    listed: 0,
+                    fetched: 0,
+                    ..
+                }
+            ),
+            "trigger-driven tick should be Polled{{0,0,..}} on empty driver: {ticks:?}",
+        );
+    }
+
+    /// Buffer-full triggers coalesce — `try_send` returns `Err`
+    /// without blocking. The semantics for "Poll now" is "either a
+    /// poll is in flight or one is queued"; multiple rapid clicks
+    /// shouldn't queue indefinitely.
+    #[tokio::test]
+    async fn manual_trigger_coalesces_rapid_sends() {
+        let (tx, _rx) = fresh_trigger();
+        // First send fills the bounded-1 buffer.
+        tx.try_send(()).expect("first send");
+        // Subsequent sends fail-fast with TrySendError::Full.
+        let result = tx.try_send(());
+        assert!(
+            matches!(result, Err(mpsc::error::TrySendError::Full(()))),
+            "second send on a full buffer should be Err(Full), got {result:?}",
         );
     }
 }
