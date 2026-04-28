@@ -147,7 +147,22 @@ pub fn gc_orphan_slots(bucket_dir: &Path, bucket_id: &str) -> Result<GcReport, B
         }
 
         let dir = slot::slot_dir(bucket_dir, &entry.slot_id);
-        let bytes = total_dir_bytes(&dir).unwrap_or(0);
+        // Bytes are read from the manifest's recorded stat rather
+        // than computed via a recursive walk. Walking a partial
+        // build's slot dir blocks the boot path on tens of thousands
+        // of tantivy segment files (this GC runs inside
+        // `BucketRegistry::load`, before HTTP comes up). Manifest
+        // stats are accurate as of build completion; for orphaned
+        // mid-build slots they undercount, but `bytes_freed` is a
+        // log/observability nicety, not a correctness signal.
+        let bytes = match &entry.state {
+            SlotClassification::Manifest(_) => fs::read_to_string(slot::manifest_path(&dir))
+                .ok()
+                .and_then(|t| SlotManifest::from_toml_str(&t).ok())
+                .map(|m| m.stats.disk_size_bytes)
+                .unwrap_or(0),
+            SlotClassification::NoManifest | SlotClassification::UnparseableManifest => 0,
+        };
         match fs::remove_dir_all(&dir) {
             Ok(()) => {
                 debug!(
@@ -199,24 +214,6 @@ enum SlotClassification {
     UnparseableManifest,
 }
 
-/// Best-effort recursive byte size of `dir`. I/O errors (a deleted
-/// file mid-walk, etc.) collapse to `None` so the GC report's
-/// `bytes_freed` falls back to 0 rather than aborting the sweep.
-fn total_dir_bytes(dir: &Path) -> Option<u64> {
-    let mut total: u64 = 0;
-    let entries = fs::read_dir(dir).ok()?;
-    for entry in entries {
-        let entry = entry.ok()?;
-        let meta = entry.metadata().ok()?;
-        if meta.is_dir() {
-            total += total_dir_bytes(&entry.path())?;
-        } else {
-            total += meta.len();
-        }
-    }
-    Some(total)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -262,6 +259,53 @@ mod tests {
         .unwrap();
         // Add a non-empty file so bytes_freed is exercised.
         fs::write(dir.join("placeholder.bin"), [0u8; 64]).unwrap();
+        slot_id.to_string()
+    }
+
+    /// Same as `make_slot` but with a non-zero `disk_size_bytes` in
+    /// the manifest's stats — for exercising the byte-counting path
+    /// that GC now reads from the manifest rather than the disk.
+    fn make_slot_with_disk_size(
+        bucket_dir: &Path,
+        slot_id: &str,
+        state: SlotState,
+        disk_size_bytes: u64,
+    ) -> String {
+        let dir = slot::slot_dir(bucket_dir, slot_id);
+        fs::create_dir_all(&dir).unwrap();
+        let manifest = SlotManifest {
+            slot_id: slot_id.to_string(),
+            state,
+            created_at: chrono::Utc::now(),
+            build_started_at: None,
+            build_completed_at: None,
+            chunker_snapshot: ChunkerSnapshot {
+                strategy: "token_based".into(),
+                chunk_tokens: 500,
+                overlap_tokens: 50,
+                tokenizer: TokenizerSnapshot::Heuristic { chars_per_token: 4 },
+            },
+            embedder: EmbedderSnapshot {
+                provider: "test".into(),
+                model_id: "test-model".into(),
+                dimension: 8,
+            },
+            sparse: None,
+            serving: ServingSnapshot {
+                mode: crate::knowledge::ServingMode::Disk,
+                quantization: crate::knowledge::Quantization::F32,
+            },
+            stats: SlotStats {
+                disk_size_bytes,
+                ..SlotStats::default()
+            },
+            lineage: None,
+        };
+        fs::write(
+            slot::manifest_path(&dir),
+            manifest.to_toml_string().unwrap(),
+        )
+        .unwrap();
         slot_id.to_string()
     }
 
@@ -390,17 +434,46 @@ mod tests {
     }
 
     #[test]
-    fn bytes_freed_reflects_recursive_dir_size() {
+    fn bytes_freed_uses_manifest_stat_not_walk() {
+        // GC reads `bytes_freed` from the slot's manifest stats
+        // (set at build time) rather than walking the disk —
+        // walking blocked the boot path on tantivy-segment-heavy
+        // buckets. A Failed slot with `disk_size_bytes = 12_345`
+        // in its manifest should report exactly that, regardless
+        // of the actual on-disk size.
+        let tmp = tempfile::tempdir().unwrap();
+        let slot_id = make_slot_with_disk_size(tmp.path(), SLOT_OLD, SlotState::Failed, 12_345);
+        // Sanity: the slot exists and is in the failed state.
+        assert_eq!(slot_id, SLOT_OLD);
+        // Throw an extra MB of unaccounted data into the dir to
+        // demonstrate the report doesn't depend on walking.
+        fs::write(
+            slot::slot_dir(tmp.path(), SLOT_OLD).join("ignored.bin"),
+            vec![0u8; 1_000_000],
+        )
+        .unwrap();
+
+        let report = gc_orphan_slots(tmp.path(), "test_bucket").unwrap();
+        assert_eq!(report.removed, vec![SLOT_OLD.to_string()]);
+        assert_eq!(
+            report.bytes_freed, 12_345,
+            "should reflect the manifest stat, not the actual on-disk size",
+        );
+    }
+
+    #[test]
+    fn bytes_freed_zero_for_orphan_without_manifest() {
         let tmp = tempfile::tempdir().unwrap();
         let dir = slot::slot_dir(tmp.path(), SLOT_OLD);
         fs::create_dir_all(dir.join("nested")).unwrap();
         fs::write(dir.join("nested").join("a.bin"), [0u8; 100]).unwrap();
         fs::write(dir.join("b.bin"), [0u8; 200]).unwrap();
-        // No manifest = orphan = removed.
 
         let report = gc_orphan_slots(tmp.path(), "test_bucket").unwrap();
         assert_eq!(report.removed, vec![SLOT_OLD.to_string()]);
-        assert_eq!(report.bytes_freed, 300);
+        // No manifest = no recorded size = 0. Acceptable since
+        // bytes_freed is observability, not a correctness signal.
+        assert_eq!(report.bytes_freed, 0);
     }
 
     #[test]

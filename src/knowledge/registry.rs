@@ -269,9 +269,19 @@ async fn load_one(dir: &Path, id: &str) -> Result<BucketEntry, BucketError> {
     })?;
     let config = BucketConfig::from_toml_str(&raw_toml)?;
 
+    // Disk size is read from the manifest's recorded stat rather
+    // than recomputed via a recursive directory walk. A simplewiki-
+    // sized slot (post-mutation) holds tens of thousands of tantivy
+    // segment files; walking them at boot blocked HTTP startup for
+    // ~50s on the test sandbox. The manifest stat is set once at
+    // build / compaction completion — slightly stale after
+    // intervening inserts / tombstones / delta applies, but accurate
+    // enough for the UI's "active slot: 9.4 GiB" display. A `Refresh`
+    // op (or a future end-of-apply_delta hook) can recompute when
+    // freshness matters.
     let (active_slot, active_slot_disk_size_bytes) = match read_active_manifest(dir).await? {
-        Some((manifest, slot_path)) => {
-            let size = dir_size(&slot_path).await.unwrap_or(0);
+        Some((manifest, _slot_path)) => {
+            let size = manifest.stats.disk_size_bytes;
             (Some(manifest), Some(size))
         }
         None => (None, None),
@@ -312,23 +322,6 @@ async fn read_active_manifest(
     };
     let manifest = SlotManifest::from_toml_str(&text)?;
     Ok(Some((manifest, slot_path)))
-}
-
-async fn dir_size(dir: &Path) -> std::io::Result<u64> {
-    let mut total: u64 = 0;
-    let mut stack = vec![dir.to_path_buf()];
-    while let Some(p) = stack.pop() {
-        let mut entries = fs::read_dir(&p).await?;
-        while let Some(entry) = entries.next_entry().await? {
-            let md = entry.metadata().await?;
-            if md.is_dir() {
-                stack.push(entry.path());
-            } else {
-                total += md.len();
-            }
-        }
-    }
-    Ok(total)
 }
 
 /// Project a registry entry to its wire-summary form. Exposed so
