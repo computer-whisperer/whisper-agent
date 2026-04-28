@@ -52,7 +52,7 @@ Last updated: **2026-04-28**.
 | BT  | Boot-time fs-walk fix — replaced recursive `dir_size`/`total_dir_bytes` walks with manifest stat reads, eliminating ~50s startup hang | `0dfa1ba` |
 | KM  | `knowledge_modify` — LLM-callable insert/tombstone for managed buckets, EmptySource bootstrap, scope-gated | `efeebb7..591ad65` |
 | MQ  | Multi-bucket query fan-out — `join_all` across per-bucket dense+sparse futures; max-of-per-bucket latency | `a5ff7d2` |
-| HQ  | HNSW-side f16 quantization — `DistF16L2`, enum-dispatched `DenseInner::{F32, F16}`, plumbed through `DenseIndex::{empty, build, load_from*}`. Halves `dense.hnsw.data` for any quantized bucket. | _pending_ |
+| HQ  | HNSW-side f16 quantization — `DistF16L2`, enum-dispatched `DenseInner::{F32, F16}`, plumbed through `DenseIndex::{empty, build, load_from*}`. Halves `dense.hnsw.data` for any quantized bucket. Drive-by: resume rebuild path stride bug (was hardcoded f32) | `0a29cb8` |
 
 ## End-to-end validation (Simple English Wikipedia, mock embedder)
 
