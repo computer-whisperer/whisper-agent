@@ -25,7 +25,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::bucket::{BoxFuture, Bucket};
 use super::build_state::{BuildStateRecord, BuildStateWriter};
-use super::chunker::Chunker;
+use super::chunker::{Chunker, resolve_chunker};
 use super::chunks::{ChunkStoreReader, ChunkStoreWriter, LoadMode};
 use super::config::{BucketConfig, ServingMode};
 use super::dense::{DenseIndex, HnswParams};
@@ -1596,6 +1596,149 @@ impl DiskBucket {
     pub fn config(&self) -> &BucketConfig {
         &self.config
     }
+
+    /// Apply one tracked-bucket daily delta against the active slot.
+    ///
+    /// `adapter` is the source adapter for the delta archive — for a
+    /// Wikipedia tracked bucket this is
+    /// [`MediaWikiXml`](super::source::MediaWikiXml) constructed over
+    /// the downloaded `pages-meta-hist-incr.xml.bz2`. Decoupling the
+    /// adapter from the method body keeps `apply_delta` agnostic to
+    /// the driver's archive format and makes it testable with
+    /// synthetic in-memory adapters.
+    ///
+    /// For each record the adapter yields, derive the new chunk_ids
+    /// from the page's text. If those chunk_ids are already live in
+    /// the slot (chunks index ∋ id, tombstones ∌ id), the page is at
+    /// this revision already → skip (idempotency). Otherwise
+    /// tombstone every `ChunkId` ever associated with the page's
+    /// `source_id` (looked up via
+    /// [`SourceIndex`](super::source_index::SourceIndex)), then
+    /// insert the freshly chunked content.
+    ///
+    /// Idempotency is what lets the caller (the
+    /// [`FeedWorker`](super::feed_worker::FeedWorker)) advance the
+    /// `last_applied_delta_id` cursor *only* on success without
+    /// risking double-application on retry: re-running this against
+    /// the same delta is cheap and produces the same end state.
+    ///
+    /// Per-page (not batched). One embedder round-trip per page that
+    /// changed, which is fine for simplewiki-scale dailies. Cross-page
+    /// batching is the planned follow-up for enwiki-scale dailies
+    /// where ~100k page edits per day would otherwise pay 100k
+    /// embedder round-trips.
+    ///
+    /// Edge cases not handled in v1:
+    /// - **Page deletions** — `pages-meta-hist-incr` doesn't carry
+    ///   them; deletions live in `stub-meta-hist-incr` / log dumps
+    ///   that the driver doesn't fetch yet.
+    /// - **Revert to a tombstoned-but-still-on-disk earlier revision**
+    ///   — the existing chunks are tombstoned; insert doesn't
+    ///   un-tombstone, so we re-chunk and re-insert under fresh
+    ///   delta entries. Compaction collapses the duplication.
+    /// - **Concurrent slot rotation** — `active_snapshot()` is
+    ///   captured at entry; if compaction or a rebuild rotates the
+    ///   active slot mid-apply, subsequent `tombstone` / `insert`
+    ///   calls hit the new active slot, while the in-memory
+    ///   `source_index` reads come from the captured snapshot. The
+    ///   FeedWorker is single-task per bucket today and compaction
+    ///   isn't auto-triggered, so this combination is rare.
+    pub async fn apply_delta(
+        &self,
+        adapter: &dyn SourceAdapter,
+        cancel: &CancellationToken,
+    ) -> Result<DeltaApplyStats, BucketError> {
+        let active = self
+            .active_snapshot()
+            .ok_or_else(|| BucketError::NoActiveSlot(self.id.clone()))?;
+
+        // Build the chunker from the bucket's *current* config and
+        // verify its frozen snapshot still matches the active slot's
+        // — if they disagree (chunker config edited under us), chunk
+        // ids would drift and applying the delta would silently
+        // corrupt id stability. Rebuild is the only safe response.
+        let embedder_model_id = active.manifest.embedder.model_id.clone();
+        let resolved = resolve_chunker(&self.config.chunker, Some(&embedder_model_id))
+            .map_err(|e| BucketError::Other(format!("chunker resolve: {e}")))?;
+        if resolved.snapshot != active.manifest.chunker_snapshot {
+            return Err(BucketError::Other(
+                "bucket chunker config has drifted from the active slot's snapshot; \
+                 rebuild required before deltas can be applied"
+                    .to_string(),
+            ));
+        }
+
+        let mut stats = DeltaApplyStats::default();
+        // Captured at entry — these readers are consulted for the
+        // idempotency check. See "Concurrent slot rotation" above
+        // for the TOCTOU caveat.
+        let active_chunks = active.chunks();
+        let active_delta = active.delta_chunks();
+        let active_tombstones = active.tombstones();
+        let source_index = active.source_index();
+
+        for record_result in adapter.enumerate() {
+            if cancel.is_cancelled() {
+                return Err(BucketError::Cancelled);
+            }
+            let record = record_result
+                .map_err(|e| BucketError::Other(format!("delta source error: {e}")))?;
+            let new_chunks = resolved.chunker.chunk(&record);
+            if new_chunks.is_empty() {
+                stats.pages_skipped_empty += 1;
+                continue;
+            }
+            // All chunks for one record share the same source_record_hash,
+            // so checking the first id is sufficient: if the page is
+            // already at this revision, every other new id will also be
+            // present and live (or every other will be missing — they
+            // can't be partially present).
+            let first_id = ChunkId::from_source(
+                &new_chunks[0].source_record_hash,
+                new_chunks[0].chunk_offset,
+            );
+            let already_present = active_chunks.contains(first_id)
+                || active_delta.as_ref().is_some_and(|d| d.contains(first_id));
+            if already_present && !active_tombstones.contains(first_id) {
+                stats.pages_unchanged += 1;
+                continue;
+            }
+
+            let chunk_count = new_chunks.len() as u64;
+            let old_ids = source_index.get(&record.source_id);
+            if !old_ids.is_empty() {
+                stats.chunks_tombstoned += old_ids.len() as u64;
+                self.tombstone(old_ids).await?;
+            }
+            self.insert(new_chunks, cancel).await?;
+            stats.pages_applied += 1;
+            stats.chunks_inserted += chunk_count;
+        }
+
+        Ok(stats)
+    }
+}
+
+/// Counters reported by [`DiskBucket::apply_delta`] for observability /
+/// telemetry — the [`FeedWorker`](super::feed_worker::FeedWorker)
+/// surfaces these on each tick. `pages_applied + pages_unchanged +
+/// pages_skipped_empty` should equal the count of `<page>` elements
+/// the parser yielded.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct DeltaApplyStats {
+    /// Pages whose new revision actually changed the index — these
+    /// drove tombstone+insert calls.
+    pub pages_applied: u64,
+    /// Pages whose new chunk_ids were already live in the slot
+    /// (idempotency hit). No work done.
+    pub pages_unchanged: u64,
+    /// Pages the chunker emitted no chunks for (empty / whitespace-
+    /// only `<text>` after wiki filters).
+    pub pages_skipped_empty: u64,
+    /// Total chunk_ids tombstoned across all applied pages.
+    pub chunks_tombstoned: u64,
+    /// Total fresh chunks inserted across all applied pages.
+    pub chunks_inserted: u64,
 }
 
 impl Bucket for DiskBucket {
@@ -5371,5 +5514,214 @@ embedder = "tei_test"
                 .unwrap();
             assert!(!hits.is_empty(), "mode={mode} produced no sparse hits");
         }
+    }
+
+    /// Synthetic [`SourceAdapter`] for `apply_delta` tests — wraps a
+    /// fixed list of records, no IO. The "delta" is just whatever
+    /// [`SourceRecord`]s the test stuffs in.
+    struct CannedDeltaAdapter {
+        records: Vec<SourceRecord>,
+    }
+
+    impl SourceAdapter for CannedDeltaAdapter {
+        fn enumerate(
+            &self,
+        ) -> Box<dyn Iterator<Item = Result<SourceRecord, SourceError>> + Send + '_> {
+            Box::new(self.records.clone().into_iter().map(Ok))
+        }
+    }
+
+    fn delta_record(source_id: &str, text: &str) -> SourceRecord {
+        SourceRecord::new(source_id, text)
+    }
+
+    /// Apply a delta with one entirely new page (source_id not in
+    /// the bucket). Tombstone path is empty; insert path lands the
+    /// new chunks; subsequent search finds them.
+    #[tokio::test]
+    async fn apply_delta_inserts_chunks_for_new_page() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("notes");
+        fs::create_dir_all(&source).unwrap();
+        write_md(&source, "alpha.md", "alpha base content");
+
+        let bucket_root = tmp.path().join("bucket");
+        let bucket = open_test_bucket(&bucket_root, &source);
+        let adapter = MarkdownDir::new(&source);
+        let (chunker, chunker_snapshot) = TokenBasedChunker::from_config(&bucket.config().chunker);
+        let embedder: Arc<dyn EmbeddingProvider> = Arc::new(MockEmbedder::new(8));
+        let cancel = CancellationToken::new();
+        bucket
+            .build_slot(
+                &adapter,
+                &chunker,
+                chunker_snapshot,
+                embedder.clone(),
+                None,
+                &cancel,
+            )
+            .await
+            .unwrap();
+        bucket.set_embedder(embedder, "mock-embedder").unwrap();
+
+        let delta = CannedDeltaAdapter {
+            records: vec![delta_record(
+                "fresh-page.md",
+                "rare token quokka coastline expedition",
+            )],
+        };
+        let stats = bucket.apply_delta(&delta, &cancel).await.unwrap();
+
+        assert_eq!(stats.pages_applied, 1);
+        assert_eq!(stats.pages_unchanged, 0);
+        assert_eq!(stats.chunks_tombstoned, 0);
+        assert!(stats.chunks_inserted >= 1);
+
+        // Sparse search proves the insert landed and is queryable.
+        let hits = bucket.sparse_search("quokka", 5, &cancel).await.unwrap();
+        assert_eq!(hits.len(), 1, "expected the freshly-applied chunk");
+        assert_eq!(hits[0].source_ref.source_id, "fresh-page.md");
+    }
+
+    /// Apply a delta where one page already exists in the base — old
+    /// chunks tombstoned, new chunks inserted, queries reflect the
+    /// new content and not the old.
+    #[tokio::test]
+    async fn apply_delta_replaces_existing_page_via_tombstone_then_insert() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("notes");
+        fs::create_dir_all(&source).unwrap();
+        write_md(
+            &source,
+            "alpha.md",
+            "alpha original distinctive-token-vampire",
+        );
+        write_md(&source, "beta.md", "beta untouched body");
+
+        let bucket_root = tmp.path().join("bucket");
+        let bucket = open_test_bucket(&bucket_root, &source);
+        let adapter = MarkdownDir::new(&source);
+        let (chunker, chunker_snapshot) = TokenBasedChunker::from_config(&bucket.config().chunker);
+        let embedder: Arc<dyn EmbeddingProvider> = Arc::new(MockEmbedder::new(8));
+        let cancel = CancellationToken::new();
+        bucket
+            .build_slot(
+                &adapter,
+                &chunker,
+                chunker_snapshot,
+                embedder.clone(),
+                None,
+                &cancel,
+            )
+            .await
+            .unwrap();
+        bucket.set_embedder(embedder, "mock-embedder").unwrap();
+
+        // Sanity: the original token is queryable before we apply.
+        let pre = bucket
+            .sparse_search("distinctive-token-vampire", 5, &cancel)
+            .await
+            .unwrap();
+        assert_eq!(pre.len(), 1, "original token should be in base");
+
+        let delta = CannedDeltaAdapter {
+            records: vec![delta_record(
+                // Source id MUST match how MarkdownDir produced it
+                // for the base build, so source_index lookup hits.
+                source
+                    .join("alpha.md")
+                    .to_string_lossy()
+                    .into_owned()
+                    .as_str(),
+                "alpha revised distinctive-token-werewolf",
+            )],
+        };
+        let stats = bucket.apply_delta(&delta, &cancel).await.unwrap();
+        assert_eq!(stats.pages_applied, 1);
+        assert_eq!(stats.pages_unchanged, 0);
+        assert!(
+            stats.chunks_tombstoned >= 1,
+            "expected tombstones for the prior alpha chunks, got {stats:?}",
+        );
+        assert!(stats.chunks_inserted >= 1);
+
+        // Old token disappears — its chunks have been tombstoned and
+        // tantivy delete commit ran inside `Bucket::tombstone`.
+        let after_old = bucket
+            .sparse_search("distinctive-token-vampire", 5, &cancel)
+            .await
+            .unwrap();
+        assert!(
+            after_old.is_empty(),
+            "old token should be gone after delta apply: {after_old:?}",
+        );
+
+        // New token is queryable.
+        let after_new = bucket
+            .sparse_search("distinctive-token-werewolf", 5, &cancel)
+            .await
+            .unwrap();
+        assert_eq!(after_new.len(), 1, "new token should surface");
+
+        // Untouched page survived.
+        let beta = bucket.sparse_search("untouched", 5, &cancel).await.unwrap();
+        assert_eq!(beta.len(), 1);
+    }
+
+    /// Re-applying the same delta is a no-op: every page lands in
+    /// `pages_unchanged`, no tombstone or insert traffic. This is the
+    /// idempotency contract the FeedWorker relies on to advance its
+    /// cursor only on success without risking double-application on
+    /// retry.
+    #[tokio::test]
+    async fn apply_delta_is_idempotent_on_repeated_apply() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("notes");
+        fs::create_dir_all(&source).unwrap();
+        write_md(&source, "alpha.md", "alpha base body");
+
+        let bucket_root = tmp.path().join("bucket");
+        let bucket = open_test_bucket(&bucket_root, &source);
+        let adapter = MarkdownDir::new(&source);
+        let (chunker, chunker_snapshot) = TokenBasedChunker::from_config(&bucket.config().chunker);
+        let embedder: Arc<dyn EmbeddingProvider> = Arc::new(MockEmbedder::new(8));
+        let cancel = CancellationToken::new();
+        bucket
+            .build_slot(
+                &adapter,
+                &chunker,
+                chunker_snapshot,
+                embedder.clone(),
+                None,
+                &cancel,
+            )
+            .await
+            .unwrap();
+        bucket.set_embedder(embedder, "mock-embedder").unwrap();
+
+        let delta = CannedDeltaAdapter {
+            records: vec![delta_record(
+                "new-page.md",
+                "first-application unique-marker-narwhal",
+            )],
+        };
+        let first = bucket.apply_delta(&delta, &cancel).await.unwrap();
+        assert_eq!(first.pages_applied, 1);
+        assert_eq!(first.pages_unchanged, 0);
+
+        // Second pass: same records → all pages are already-live → no
+        // mutations happen.
+        let second = bucket.apply_delta(&delta, &cancel).await.unwrap();
+        assert_eq!(second.pages_applied, 0);
+        assert_eq!(second.pages_unchanged, 1);
+        assert_eq!(second.chunks_tombstoned, 0);
+        assert_eq!(second.chunks_inserted, 0);
+
+        // Single hit still — no duplicate insert.
+        let hits = bucket
+            .sparse_search("unique-marker-narwhal", 5, &cancel)
+            .await
+            .unwrap();
+        assert_eq!(hits.len(), 1);
     }
 }
