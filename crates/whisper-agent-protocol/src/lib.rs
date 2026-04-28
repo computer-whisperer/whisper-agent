@@ -543,6 +543,33 @@ pub struct ThreadSummary {
     pub dispatched_by: Option<String>,
 }
 
+/// Entry in an `EmbeddingProvidersList` response. Mirrors
+/// `BackendSummary`'s shape minus `default_model`: TEI-shaped
+/// providers serve a single model per endpoint, so there's no
+/// per-call model choice to default. The bucket-creation form uses
+/// this to populate the `embedder` dropdown so users don't have to
+/// remember the exact name from `[embedding_providers.*]`.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct EmbeddingProviderInfo {
+    /// Provider name from `[embedding_providers.*]`. Matches the
+    /// string a `bucket.toml [defaults] embedder` line would carry.
+    pub name: String,
+    /// Which protocol this provider speaks (`"tei"` today; future
+    /// drivers land as new variants on
+    /// `EmbeddingProviderConfig`). Surfaced so the UI can label the
+    /// dropdown entry without hard-coding.
+    pub kind: String,
+    /// HTTP endpoint the provider is configured against. Useful
+    /// when multiple TEI entries point at different model servers
+    /// (e.g. small + large embedder) and the user needs to
+    /// distinguish them by URL.
+    pub endpoint: String,
+    /// Auth mode the provider was built with, if any. None when
+    /// the provider runs unauthenticated (typical for local TEI).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_mode: Option<String>,
+}
+
 /// Entry in a `BackendsList` response.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct BackendSummary {
@@ -1151,6 +1178,13 @@ pub enum ClientToServer {
     // --- Model catalog ---
     /// Request the list of configured backends. Cheap / synchronous on the server.
     ListBackends {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        correlation_id: Option<String>,
+    },
+    /// Request the list of configured `[embedding_providers.*]` entries.
+    /// Cheap / synchronous on the server. Used by the bucket-creation
+    /// form to populate the `embedder` dropdown.
+    ListEmbeddingProviders {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         correlation_id: Option<String>,
     },
@@ -1884,6 +1918,13 @@ pub enum ServerToClient {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         correlation_id: Option<String>,
         backends: Vec<BackendSummary>,
+    },
+    /// Response to `ListEmbeddingProviders`. Entries appear in
+    /// name-sorted order.
+    EmbeddingProvidersList {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        correlation_id: Option<String>,
+        providers: Vec<EmbeddingProviderInfo>,
     },
     ModelsList {
         #[serde(default, skip_serializing_if = "Option::is_none")]

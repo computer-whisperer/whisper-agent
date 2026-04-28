@@ -43,9 +43,9 @@ use egui_commonmark::CommonMarkCache;
 use whisper_agent_protocol::sandbox::NetworkPolicy;
 use whisper_agent_protocol::{
     AllowMap, Attachment, BackendSummary, BehaviorConfig, BehaviorOrigin, BehaviorSummary,
-    BucketSummary, ClientToServer, FsEntry, FunctionKind, FunctionSummary, HostEnvProviderInfo,
-    HostEnvSpec, ImageMime, ImageSource, ModelSummary, NamedHostEnv, PodAllow, PodConfig,
-    PodLimits, PodSummary, ResourceSnapshot, ServerToClient, SharedMcpAuthPublic,
+    BucketSummary, ClientToServer, EmbeddingProviderInfo, FsEntry, FunctionKind, FunctionSummary,
+    HostEnvProviderInfo, HostEnvSpec, ImageMime, ImageSource, ModelSummary, NamedHostEnv, PodAllow,
+    PodConfig, PodLimits, PodSummary, ResourceSnapshot, ServerToClient, SharedMcpAuthPublic,
     SharedMcpHostInfo, ThreadBindings, ThreadBindingsRequest, ThreadConfigOverride, ThreadDefaults,
     ThreadStateLabel, ThreadSummary, Usage,
 };
@@ -820,6 +820,17 @@ pub struct ChatApp {
     // --- Model-backend catalog ---
     backends: Vec<BackendSummary>,
     backends_requested: bool,
+    /// Cached list of `[embedding_providers.*]` entries from the
+    /// server. Populated on first `ListEmbeddingProviders` reply and
+    /// kept until the connection drops. Drives the bucket-creation
+    /// form's `embedder` dropdown so users don't have to remember
+    /// the name.
+    embedding_providers: Vec<EmbeddingProviderInfo>,
+    /// Dedup flag — only one outbound `ListEmbeddingProviders` per
+    /// session. Embedding-provider config can change with a server
+    /// restart (catalog reload), but mid-session edits aren't
+    /// supported anywhere; refreshing per-modal-open is overkill.
+    embedding_providers_requested: bool,
     /// Cached model lists keyed by backend name.
     models_by_backend: HashMap<String, Vec<ModelSummary>>,
     /// Backends we've already sent a ListModels request for — dedup so UI changes
@@ -1858,6 +1869,8 @@ impl ChatApp {
             list_requested: false,
             backends: Vec::new(),
             backends_requested: false,
+            embedding_providers: Vec::new(),
+            embedding_providers_requested: false,
             models_by_backend: HashMap::new(),
             models_requested: HashSet::new(),
             picker_backend: None,
@@ -2333,6 +2346,12 @@ impl ChatApp {
                         correlation_id: None,
                     });
                     self.backends_requested = true;
+                }
+                if !self.embedding_providers_requested {
+                    self.send(ClientToServer::ListEmbeddingProviders {
+                        correlation_id: None,
+                    });
+                    self.embedding_providers_requested = true;
                 }
                 if !self.resources_requested {
                     self.send(ClientToServer::ListResources {
@@ -3467,6 +3486,7 @@ impl eframe::App for ChatApp {
             &mut self.buckets_modal,
             &self.buckets,
             &pods_for_modal,
+            &self.embedding_providers,
         ) {
             match event {
                 BucketsEvent::RunQuery {

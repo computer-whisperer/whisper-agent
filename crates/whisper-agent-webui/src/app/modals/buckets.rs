@@ -7,8 +7,8 @@
 
 use egui::{Color32, ComboBox, RichText, ScrollArea, TextEdit};
 use whisper_agent_protocol::{
-    BucketBuildPhase, BucketCreateInput, BucketSourceInput, BucketSummary, PodSummary, QueryHit,
-    SlotStateLabel,
+    BucketBuildPhase, BucketCreateInput, BucketSourceInput, BucketSummary, EmbeddingProviderInfo,
+    PodSummary, QueryHit, SlotStateLabel,
 };
 
 use super::super::{BucketsModalState, CreateBucketForm, QueryStatus, SourceKindChoice};
@@ -73,6 +73,7 @@ pub(crate) fn render_buckets_modal(
     slot: &mut Option<BucketsModalState>,
     buckets: &[BucketSummary],
     pods: &[PodSummary],
+    embedding_providers: &[EmbeddingProviderInfo],
 ) -> Vec<BucketsEvent> {
     let mut events: Vec<BucketsEvent> = Vec::new();
     let Some(mut modal) = slot.take() else {
@@ -105,7 +106,7 @@ pub(crate) fn render_buckets_modal(
 
             if modal.creating.is_some() {
                 ui.separator();
-                render_create_section(ui, &mut modal, pods, &mut events);
+                render_create_section(ui, &mut modal, pods, embedding_providers, &mut events);
             }
 
             ui.separator();
@@ -164,6 +165,7 @@ fn render_create_section(
     ui: &mut egui::Ui,
     modal: &mut BucketsModalState,
     pods: &[PodSummary],
+    embedding_providers: &[EmbeddingProviderInfo],
     events: &mut Vec<BucketsEvent>,
 ) {
     let Some(form) = modal.creating.as_mut() else {
@@ -231,13 +233,43 @@ fn render_create_section(
             );
             ui.end_row();
 
+            // Embedder — populated from `ListEmbeddingProviders`. The
+            // combobox label shows `name (kind)` so users with multiple
+            // TEI endpoints (e.g. small + large model) can distinguish
+            // them. If the catalog hasn't arrived yet (or is empty),
+            // fall back to a TextEdit so a freshly-spun-up server with
+            // no providers configured still surfaces a typeable field
+            // rather than an empty disabled control.
             ui.label(RichText::new("embedder").small());
-            ui.add_enabled(
-                !saving,
-                TextEdit::singleline(&mut form.embedder)
-                    .desired_width(280.0)
-                    .hint_text("provider name from [embedding_providers.X]"),
-            );
+            ui.add_enabled_ui(!saving, |ui| {
+                if embedding_providers.is_empty() {
+                    ui.add(
+                        TextEdit::singleline(&mut form.embedder)
+                            .desired_width(280.0)
+                            .hint_text("no [embedding_providers.*] configured"),
+                    );
+                } else {
+                    let selected_label = if form.embedder.is_empty() {
+                        "(select a provider)".to_string()
+                    } else {
+                        match embedding_providers.iter().find(|p| p.name == form.embedder) {
+                            Some(p) => format!("{} ({})", p.name, p.kind),
+                            None => format!("{} (unknown)", form.embedder),
+                        }
+                    };
+                    ComboBox::from_id_salt("create-bucket-embedder")
+                        .selected_text(selected_label)
+                        .show_ui(ui, |ui| {
+                            for p in embedding_providers {
+                                ui.selectable_value(
+                                    &mut form.embedder,
+                                    p.name.clone(),
+                                    format!("{} ({})", p.name, p.kind),
+                                );
+                            }
+                        });
+                }
+            });
             ui.end_row();
 
             ui.label(RichText::new("source kind").small());

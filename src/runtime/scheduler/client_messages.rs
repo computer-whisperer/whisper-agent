@@ -13,7 +13,9 @@
 
 use futures::stream::FuturesUnordered;
 use tracing::warn;
-use whisper_agent_protocol::{BackendSummary, ClientToServer, ModelSummary, ServerToClient};
+use whisper_agent_protocol::{
+    BackendSummary, ClientToServer, EmbeddingProviderInfo, ModelSummary, ServerToClient,
+};
 
 use super::{ConnId, Scheduler};
 use crate::functions::RejectReason;
@@ -334,6 +336,32 @@ impl Scheduler {
                     ServerToClient::BackendsList {
                         correlation_id,
                         backends,
+                    },
+                );
+            }
+            ClientToServer::ListEmbeddingProviders { correlation_id } => {
+                // The scheduler's `embedding_providers` map is keyed by
+                // the same name a `bucket.toml [defaults] embedder` line
+                // would carry, so what the WebUI dropdown shows lines
+                // up 1:1 with what `CreateBucket` will accept on
+                // submission. Sorted by name so the dropdown order is
+                // deterministic across reconnects.
+                let mut providers: Vec<EmbeddingProviderInfo> = self
+                    .embedding_providers
+                    .iter()
+                    .map(|(name, entry)| EmbeddingProviderInfo {
+                        name: name.clone(),
+                        kind: entry.kind.clone(),
+                        endpoint: entry.source.endpoint().to_string(),
+                        auth_mode: entry.auth_mode.clone(),
+                    })
+                    .collect();
+                providers.sort_by(|a, b| a.name.cmp(&b.name));
+                self.router.send_to_client(
+                    conn_id,
+                    ServerToClient::EmbeddingProvidersList {
+                        correlation_id,
+                        providers,
                     },
                 );
             }

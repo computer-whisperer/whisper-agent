@@ -562,6 +562,9 @@ impl ChatApp {
                     self.request_models_for(&first);
                 }
             }
+            ServerToClient::EmbeddingProvidersList { providers, .. } => {
+                self.embedding_providers = providers;
+            }
             ServerToClient::ModelsList {
                 backend, models, ..
             } => {
