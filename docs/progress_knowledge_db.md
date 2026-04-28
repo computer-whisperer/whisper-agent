@@ -47,6 +47,10 @@ Last updated: **2026-04-27**.
 | Q2a | f16 quantization in vectors.bin — half on-disk vector size, ~1% recall noise floor | `26541e3` |
 | Q3  | int8 quantization in vectors.bin — symmetric per-vector scale, ~4× compression | `5e91517` |
 | GC  | Orphan-slot GC at registry load — Failed / no-manifest / superseded Planning/Building dirs swept; active + resumable preserved | `91a08bc` |
+| ETA | Elapsed-time stopwatch on build progress rows — wire surface, replay-aware, scales s→m→h→d | `abda41b` |
+| AB  | apply_delta batch — hoisted per-page tombstone+insert into one tantivy commit pair, saturated embedder | `6c25f4e` |
+| BT  | Boot-time fs-walk fix — replaced recursive `dir_size`/`total_dir_bytes` walks with manifest stat reads, eliminating ~50s startup hang | `0dfa1ba` |
+| KM  | `knowledge_modify` — LLM-callable insert/tombstone for managed buckets, EmptySource bootstrap, scope-gated | `efeebb7..591ad65` |
 
 ## End-to-end validation (Simple English Wikipedia, mock embedder)
 
@@ -168,7 +172,6 @@ chronological — order may shuffle as the dataset reveals what hurts.
 
 | #   | Title                                                          | Why deferred |
 |-----|----------------------------------------------------------------|--------------|
-| 10+ | `knowledge_modify` tool + managed-bucket mutation surface      | `Bucket::insert` / `Bucket::tombstone` exist, and `SourceConfig::Managed` is in the config enum. Missing: an LLM-callable tool that exercises them on a managed bucket — pod-memory affordance. |
 | 10+ | Auto-compaction triggers (delta-ratio / tombstone-ratio thresholds, scheduled) | `Bucket::compact` is callable manually; auto-trigger heuristics still TBD. Real thresholds need observation on actual mutating buckets; should also have time-based triggers (e.g. compact pod memory daily). |
 | 10+ | Live-mode post-turn relevance nudge                            | Per design doc § "Live retrieval mode". Cross-cuts scheduler — not load-bearing for v1. |
 | 10+ | Per-pod buckets (`<pods_root>/<pod>/buckets/`)                 | Server-scope is enough until multi-pod isolation is a felt need. Today's `BucketScope::Pod` enum variant is unwired. |
