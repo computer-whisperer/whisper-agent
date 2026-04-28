@@ -488,24 +488,29 @@ pub struct Scheduler {
     /// lives on the scheduler's run loop.
     stream_tx: mpsc::UnboundedSender<StreamUpdate>,
 
-    /// In-flight bucket builds, keyed by bucket id. The token is the
-    /// build task's cancel handle; firing it from the
+    /// In-flight bucket builds, keyed by `BucketKey` so server-scope and
+    /// pod-scope buckets coexist without collision (two pods can each
+    /// have a bucket named `memory` building concurrently). The token
+    /// is the build task's cancel handle; firing it from the
     /// `CancelBucketBuild` handler stops the build at the next
     /// chunk-batch boundary or HNSW build entry. The entry is removed
     /// when the build task terminates (success / error / cancel) and
     /// emits its `BucketBuildEnded`. Capped to one in-flight build
-    /// per bucket; concurrent `StartBucketBuild` for the same id is
+    /// per bucket; concurrent `StartBucketBuild` for the same key is
     /// rejected.
-    active_bucket_builds: HashMap<String, tokio_util::sync::CancellationToken>,
+    active_bucket_builds:
+        HashMap<crate::runtime::scheduler::buckets::BucketKey, tokio_util::sync::CancellationToken>,
     /// Live progress state for every in-flight bucket build, keyed by
-    /// bucket id. Mirrors `active_bucket_builds`'s lifetime: inserted
+    /// `BucketKey`. Mirrors `active_bucket_builds`'s lifetime: inserted
     /// in `handle_start_bucket_build`, removed in
     /// `apply_bucket_task_update`'s `BuildEnded` arm. The build task
     /// shares this `Arc` and ticks the atomics; the scheduler reads it
     /// when a fresh client connects (so they see ongoing progress
     /// instead of a stale `Building` row with zero counters).
-    active_bucket_progress:
-        HashMap<String, std::sync::Arc<crate::runtime::scheduler::buckets::ProgressShared>>,
+    active_bucket_progress: HashMap<
+        crate::runtime::scheduler::buckets::BucketKey,
+        std::sync::Arc<crate::runtime::scheduler::buckets::ProgressShared>,
+    >,
     /// Control handles for the per-tracked-bucket
     /// [`FeedWorker`](crate::knowledge::FeedWorker) tasks spawned at
     /// scheduler-construction time. Keyed by bucket id; entries

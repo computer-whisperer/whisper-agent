@@ -342,6 +342,65 @@ impl BucketRegistry {
         Ok(())
     }
 
+    /// Pod-scope counterpart to [`Self::insert_entry`]. The caller has
+    /// already written `bucket.toml` under
+    /// `<pods_root>/<pod_id>/buckets/<id>/`. Errors if a bucket with
+    /// the same name already exists in this pod.
+    pub fn insert_pod_entry(&mut self, entry: BucketEntry) -> Result<(), BucketError> {
+        let pod_id = entry.pod_id.clone().ok_or_else(|| {
+            BucketError::Other("insert_pod_entry called with non-pod entry".to_string())
+        })?;
+        let inner = self.pod_buckets.entry(pod_id.clone()).or_default();
+        if inner.contains_key(&entry.id) {
+            return Err(BucketError::Other(format!(
+                "bucket id `{}` already in pod `{}`",
+                entry.id, pod_id,
+            )));
+        }
+        inner.insert(entry.id.clone(), entry);
+        Ok(())
+    }
+
+    /// Pod-scope counterpart to [`Self::remove_entry`]. Drops the
+    /// in-memory entry under `pod_id`/`name` and evicts the cached
+    /// `DiskBucket`. Returns whether the entry existed.
+    pub fn remove_pod_entry(&mut self, pod_id: &str, name: &str) -> bool {
+        let removed = match self.pod_buckets.get_mut(pod_id) {
+            Some(inner) => inner.remove(name).is_some(),
+            None => false,
+        };
+        self.evict_loaded_pod(pod_id, name);
+        removed
+    }
+
+    /// Pod-scope counterpart to [`Self::evict_loaded`].
+    pub fn evict_loaded_pod(&self, pod_id: &str, name: &str) {
+        let mut g = self.loaded_pod.lock().expect("loaded_pod mutex poisoned");
+        g.remove(&(pod_id.to_string(), name.to_string()));
+    }
+
+    /// Pod-scope counterpart to [`Self::refresh_entry`]. Re-reads
+    /// `bucket.toml` + active-slot manifest from
+    /// `<pods_root>/<pod_id>/buckets/<name>/` and replaces the entry.
+    pub async fn refresh_pod_entry(&mut self, pod_id: &str, name: &str) -> Result<(), BucketError> {
+        let dir = match self.pod_buckets.get(pod_id).and_then(|m| m.get(name)) {
+            Some(e) => e.dir.clone(),
+            None => {
+                return Err(BucketError::Other(format!(
+                    "refresh_pod_entry: unknown pod `{pod_id}` / bucket `{name}` (caller should \
+                     populate the entry first)"
+                )));
+            }
+        };
+        let entry = load_one(&dir, name, BucketScope::Pod, Some(pod_id.to_string())).await?;
+        self.pod_buckets
+            .entry(pod_id.to_string())
+            .or_default()
+            .insert(name.to_string(), entry);
+        self.evict_loaded_pod(pod_id, name);
+        Ok(())
+    }
+
     /// Return a fully-loaded `DiskBucket` for `id`, populating the
     /// scheduler-side cache on first request. The first call against
     /// an unloaded bucket blocks on slot-load (HNSW rebuild); later

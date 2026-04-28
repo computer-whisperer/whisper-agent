@@ -46,6 +46,31 @@ use crate::server::thread_router::ThreadEventRouter;
 /// rhythm.
 const PROGRESS_THROTTLE: Duration = Duration::from_millis(1000);
 
+/// Scope-aware key for the in-flight-build maps and per-build progress
+/// state. Server-scope buckets share a global namespace
+/// (`pod_id = None`); pod-scope buckets are keyed by their owning pod
+/// so two pods naming a bucket `memory` don't collide.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(super) struct BucketKey {
+    pub pod_id: Option<String>,
+    pub name: String,
+}
+
+impl BucketKey {
+    pub fn server(name: impl Into<String>) -> Self {
+        Self {
+            pod_id: None,
+            name: name.into(),
+        }
+    }
+    pub fn from_optional(pod_id: Option<String>, name: impl Into<String>) -> Self {
+        Self {
+            pod_id,
+            name: name.into(),
+        }
+    }
+}
+
 /// Updates a detached build task pushes back into the scheduler loop.
 /// The loop drains these from `bucket_task_rx` and applies them under
 /// `&mut Scheduler` so registry mutations stay linearizable with the
@@ -63,6 +88,11 @@ pub enum BucketTaskUpdate {
     /// client connected at the moment of the tick.
     Progress {
         bucket_id: String,
+        /// Owning pod for pod-scope builds; `None` for server-scope.
+        /// Carried through so the broadcast event can label the tick
+        /// correctly and the scheduler can key into
+        /// `active_bucket_progress` for follow-up lookups.
+        pod_id: Option<String>,
         snapshot: ProgressSnapshot,
     },
     /// Build completed (success / error / cancel). The loop refreshes
@@ -72,6 +102,7 @@ pub enum BucketTaskUpdate {
     /// build from `active_bucket_builds` and `active_bucket_progress`.
     BuildEnded {
         bucket_id: String,
+        pod_id: Option<String>,
         slot_id: String,
         outcome: BucketBuildOutcome,
         requester_conn: Option<ConnId>,
@@ -88,17 +119,6 @@ impl Scheduler {
         pod_id: Option<String>,
         config: BucketCreateInput,
     ) {
-        if pod_id.is_some() {
-            self.send_bucket_error(
-                conn_id,
-                correlation_id,
-                "create_bucket",
-                "pod-scope CreateBucket is not yet implemented through the wire — \
-                 create buckets manually under `<pods_root>/<pod_id>/buckets/<id>/` for now"
-                    .into(),
-            );
-            return;
-        }
         if let Err(e) = validate_bucket_id(&id) {
             self.send_bucket_error(conn_id, correlation_id, "create_bucket", e);
             return;
@@ -138,16 +158,40 @@ impl Scheduler {
             return;
         }
 
-        let Some(root) = self.bucket_registry.root.clone() else {
-            self.send_bucket_error(
-                conn_id,
-                correlation_id,
-                "create_bucket",
-                "server was started without --buckets-root; cannot create buckets".into(),
-            );
-            return;
+        // Resolve the bucket's parent dir from scope. Server-scope
+        // wants `<buckets_root>/<id>/`; pod-scope wants
+        // `<pods_root>/<pod_id>/buckets/<id>/`. Either source of
+        // truth must already be initialized for creation to succeed.
+        let (scope, bucket_dir) = match pod_id.as_deref() {
+            None => {
+                let Some(root) = self.bucket_registry.root.clone() else {
+                    self.send_bucket_error(
+                        conn_id,
+                        correlation_id,
+                        "create_bucket",
+                        "server was started without --buckets-root; cannot create server-scope buckets"
+                            .into(),
+                    );
+                    return;
+                };
+                (crate::knowledge::BucketScope::Server, root.join(&id))
+            }
+            Some(pid) => {
+                let Some(pod) = self.pods.get(pid) else {
+                    self.send_bucket_error(
+                        conn_id,
+                        correlation_id,
+                        "create_bucket",
+                        format!("unknown pod id `{pid}`"),
+                    );
+                    return;
+                };
+                (
+                    crate::knowledge::BucketScope::Pod,
+                    pod.dir.join("buckets").join(&id),
+                )
+            }
         };
-        let bucket_dir = root.join(&id);
         if bucket_dir.exists() {
             self.send_bucket_error(
                 conn_id,
@@ -196,20 +240,29 @@ impl Scheduler {
                 return;
             }
         };
-        // CreateBucket only handles server-scope today; pod-scope
-        // creation arrives in a follow-up slice alongside the per-pod
-        // lifecycle wire ops.
         let entry = crate::knowledge::BucketEntry {
             id: id.clone(),
-            scope: crate::knowledge::BucketScope::Server,
-            pod_id: None,
-            dir: bucket_dir,
+            scope,
+            pod_id: pod_id.clone(),
+            dir: bucket_dir.clone(),
             config: parsed_config,
             raw_toml: toml_text,
             active_slot: None,
             active_slot_disk_size_bytes: None,
         };
-        if let Err(e) = self.bucket_registry.insert_entry(entry.clone()) {
+        let insert_result = match scope {
+            crate::knowledge::BucketScope::Server => {
+                self.bucket_registry.insert_entry(entry.clone())
+            }
+            crate::knowledge::BucketScope::Pod => {
+                self.bucket_registry.insert_pod_entry(entry.clone())
+            }
+        };
+        if let Err(e) = insert_result {
+            // Roll back the on-disk dir so the operator isn't stuck
+            // with a half-created bucket the registry doesn't know
+            // about.
+            let _ = std::fs::remove_dir_all(&bucket_dir);
             self.send_bucket_error(
                 conn_id,
                 correlation_id,
@@ -241,58 +294,79 @@ impl Scheduler {
         id: String,
         pod_id: Option<String>,
     ) {
-        if pod_id.is_some() {
-            self.send_bucket_error(
-                conn_id,
-                correlation_id,
-                "delete_bucket",
-                "pod-scope DeleteBucket is not yet implemented through the wire — \
-                 remove the bucket directory under `<pods_root>/<pod_id>/buckets/<id>/` \
-                 manually and restart the server for now"
-                    .into(),
-            );
-            return;
-        }
         if let Err(e) = validate_bucket_id(&id) {
             self.send_bucket_error(conn_id, correlation_id, "delete_bucket", e);
             return;
         }
-        let dir = match self.bucket_registry.buckets.get(&id) {
-            Some(e) => e.dir.clone(),
-            None => {
-                self.send_bucket_error(
-                    conn_id,
-                    correlation_id,
-                    "delete_bucket",
-                    format!("unknown bucket id `{id}`"),
-                );
-                return;
-            }
+        let dir = match pod_id.as_deref() {
+            None => match self.bucket_registry.buckets.get(&id) {
+                Some(e) => e.dir.clone(),
+                None => {
+                    self.send_bucket_error(
+                        conn_id,
+                        correlation_id,
+                        "delete_bucket",
+                        format!("unknown bucket id `{id}`"),
+                    );
+                    return;
+                }
+            },
+            Some(pid) => match self
+                .bucket_registry
+                .pod_buckets
+                .get(pid)
+                .and_then(|m| m.get(&id))
+            {
+                Some(e) => e.dir.clone(),
+                None => {
+                    self.send_bucket_error(
+                        conn_id,
+                        correlation_id,
+                        "delete_bucket",
+                        format!("unknown pod-scope bucket `{pid}`/`{id}`"),
+                    );
+                    return;
+                }
+            },
         };
 
         // Cancel any in-flight build first. The build task observes
         // the token and emits its own `BucketBuildEnded { Cancelled }`.
-        if let Some(token) = self.active_bucket_builds.remove(&id) {
+        let key = BucketKey::from_optional(pod_id.clone(), id.clone());
+        if let Some(token) = self.active_bucket_builds.remove(&key) {
             token.cancel();
         }
 
-        // Stop the per-tracked-bucket feed worker, if any. Stored /
-        // linked / managed buckets don't have one — `remove` is a
-        // no-op in that case.
-        if let Some(control) = self.active_feed_workers.remove(&id) {
+        // Stop the per-tracked-bucket feed worker, if any. Today the
+        // feed-worker registry is server-scope only (pod-scope tracked
+        // sources aren't wired); the lookup is a no-op for pod-scope
+        // buckets, but we still gate it to avoid mistakenly stopping a
+        // server-scope worker named the same as the pod's bucket.
+        if pod_id.is_none()
+            && let Some(control) = self.active_feed_workers.remove(&id)
+        {
             control.cancel.cancel();
         }
 
         // Drop the in-memory entry + cached DiskBucket. Sync — both
         // operations are O(1) under a short-held mutex.
-        self.bucket_registry.remove_entry(&id);
+        match pod_id.as_deref() {
+            None => {
+                self.bucket_registry.remove_entry(&id);
+            }
+            Some(pid) => {
+                self.bucket_registry.remove_pod_entry(pid, &id);
+            }
+        }
 
         // rmdir runs detached so the response isn't gated on it.
         let dir_for_rm = dir.clone();
         let id_for_log = id.clone();
+        let pod_id_for_log = pod_id.clone();
         tokio::spawn(async move {
             if let Err(e) = tokio::fs::remove_dir_all(&dir_for_rm).await {
                 warn!(
+                    pod = ?pod_id_for_log,
                     bucket = %id_for_log,
                     path = %dir_for_rm.display(),
                     error = %e,
@@ -304,7 +378,7 @@ impl Scheduler {
         let ev = ServerToClient::BucketDeleted {
             correlation_id: None,
             id: id.clone(),
-            pod_id: None,
+            pod_id: pod_id.clone(),
         };
         self.router.broadcast_task_list_except(ev, conn_id);
         self.router.send_to_client(
@@ -312,7 +386,7 @@ impl Scheduler {
             ServerToClient::BucketDeleted {
                 correlation_id,
                 id,
-                pod_id: None,
+                pod_id,
             },
         );
     }
@@ -324,20 +398,12 @@ impl Scheduler {
         id: String,
         pod_id: Option<String>,
     ) {
-        if pod_id.is_some() {
-            self.send_bucket_error(
-                conn_id,
-                correlation_id,
-                "start_bucket_build",
-                "pod-scope StartBucketBuild is not yet implemented through the wire.".into(),
-            );
-            return;
-        }
         if let Err(e) = validate_bucket_id(&id) {
             self.send_bucket_error(conn_id, correlation_id, "start_bucket_build", e);
             return;
         }
-        if self.active_bucket_builds.contains_key(&id) {
+        let key = BucketKey::from_optional(pod_id.clone(), id.clone());
+        if self.active_bucket_builds.contains_key(&key) {
             self.send_bucket_error(
                 conn_id,
                 correlation_id,
@@ -346,17 +412,36 @@ impl Scheduler {
             );
             return;
         }
-        let entry = match self.bucket_registry.buckets.get(&id) {
-            Some(e) => e.clone(),
-            None => {
-                self.send_bucket_error(
-                    conn_id,
-                    correlation_id,
-                    "start_bucket_build",
-                    format!("unknown bucket id `{id}`"),
-                );
-                return;
-            }
+        let entry = match pod_id.as_deref() {
+            None => match self.bucket_registry.buckets.get(&id) {
+                Some(e) => e.clone(),
+                None => {
+                    self.send_bucket_error(
+                        conn_id,
+                        correlation_id,
+                        "start_bucket_build",
+                        format!("unknown bucket id `{id}`"),
+                    );
+                    return;
+                }
+            },
+            Some(pid) => match self
+                .bucket_registry
+                .pod_buckets
+                .get(pid)
+                .and_then(|m| m.get(&id))
+            {
+                Some(e) => e.clone(),
+                None => {
+                    self.send_bucket_error(
+                        conn_id,
+                        correlation_id,
+                        "start_bucket_build",
+                        format!("unknown pod-scope bucket `{pid}`/`{id}`"),
+                    );
+                    return;
+                }
+            },
         };
         let embedder = match self
             .embedding_providers
@@ -392,18 +477,19 @@ impl Scheduler {
         // round-trip is sub-ms.
 
         let cancel = CancellationToken::new();
-        self.active_bucket_builds.insert(id.clone(), cancel.clone());
+        self.active_bucket_builds
+            .insert(key.clone(), cancel.clone());
 
         // Shared progress state. The build task ticks the atomics; the
         // scheduler reads them to (a) replay current state to a client
         // that joins mid-build, and (b) build each `BucketBuildProgress`
-        // broadcast from the `Progress` channel update. Stored on the
-        // scheduler keyed by bucket id so a fresh `RegisterClient` can
-        // walk in-flight builds without going through the build task.
+        // broadcast from the `Progress` channel update. Keyed by the
+        // scoped `BucketKey` so a fresh `RegisterClient` can walk
+        // in-flight builds without going through the build task.
         let progress = Arc::new(ProgressShared::default());
         let started_at = progress.started_at().to_rfc3339();
         self.active_bucket_progress
-            .insert(id.clone(), progress.clone());
+            .insert(key.clone(), progress.clone());
 
         // Synchronous BuildStarted ack. slot_id is unknown until the
         // build's first phase callback; carry an empty slot_id until
@@ -412,7 +498,7 @@ impl Scheduler {
         let started = ServerToClient::BucketBuildStarted {
             correlation_id: None,
             bucket_id: id.clone(),
-            pod_id: None,
+            pod_id: pod_id.clone(),
             slot_id: String::new(),
             started_at: Some(started_at.clone()),
         };
@@ -422,7 +508,7 @@ impl Scheduler {
             ServerToClient::BucketBuildStarted {
                 correlation_id: correlation_id.clone(),
                 bucket_id: id.clone(),
-                pod_id: None,
+                pod_id: pod_id.clone(),
                 slot_id: String::new(),
                 started_at: Some(started_at),
             },
@@ -438,6 +524,7 @@ impl Scheduler {
             chunker_config,
             cancel,
             id,
+            pod_id,
             progress,
             task_tx,
             Some(conn_id),
@@ -453,16 +540,8 @@ impl Scheduler {
         id: String,
         pod_id: Option<String>,
     ) {
-        if pod_id.is_some() {
-            self.send_bucket_error(
-                conn_id,
-                correlation_id,
-                "cancel_bucket_build",
-                "pod-scope CancelBucketBuild is not yet implemented through the wire.".into(),
-            );
-            return;
-        }
-        match self.active_bucket_builds.get(&id) {
+        let key = BucketKey::from_optional(pod_id.clone(), id.clone());
+        match self.active_bucket_builds.get(&key) {
             Some(token) => {
                 // Cancellation is observed at the next chunk-batch
                 // boundary or HNSW build entry; the build task emits
@@ -471,11 +550,15 @@ impl Scheduler {
                 token.cancel();
             }
             None => {
+                let label = match pod_id.as_deref() {
+                    None => format!("`{id}`"),
+                    Some(pid) => format!("`{pid}`/`{id}`"),
+                };
                 self.send_bucket_error(
                     conn_id,
                     correlation_id,
                     "cancel_bucket_build",
-                    format!("no in-flight build for `{id}`"),
+                    format!("no in-flight build for {label}"),
                 );
             }
         }
@@ -521,7 +604,8 @@ impl Scheduler {
             refuse(self, e);
             return;
         }
-        if self.active_bucket_builds.contains_key(&id) {
+        let key = BucketKey::server(id.clone());
+        if self.active_bucket_builds.contains_key(&key) {
             refuse(self, format!("build already in flight for `{id}`"));
             return;
         }
@@ -581,12 +665,13 @@ impl Scheduler {
         // skipped inside `run_build` for `BuildIntent::Resync`.
 
         let cancel = CancellationToken::new();
-        self.active_bucket_builds.insert(id.clone(), cancel.clone());
+        self.active_bucket_builds
+            .insert(key.clone(), cancel.clone());
 
         let progress = Arc::new(ProgressShared::default());
         let started_at = progress.started_at().to_rfc3339();
         self.active_bucket_progress
-            .insert(id.clone(), progress.clone());
+            .insert(key.clone(), progress.clone());
 
         // Broadcast `BucketBuildStarted` to all subscribers so the UI
         // lights up regardless of who triggered. For wire-driven
@@ -637,6 +722,8 @@ impl Scheduler {
             chunker_config,
             cancel,
             id,
+            // Resync remains server-scope only (gated above).
+            None,
             progress,
             task_tx,
             requester,
@@ -715,14 +802,14 @@ impl Scheduler {
     /// client connected, and `Progress` ticks already-broadcast went
     /// to other clients.
     pub(crate) fn replay_active_builds_to_client(&self, conn_id: ConnId) {
-        for (bucket_id, progress) in &self.active_bucket_progress {
+        for (key, progress) in &self.active_bucket_progress {
             let started_at = progress.started_at().to_rfc3339();
             self.router.send_to_client(
                 conn_id,
                 ServerToClient::BucketBuildStarted {
                     correlation_id: None,
-                    bucket_id: bucket_id.clone(),
-                    pod_id: None,
+                    bucket_id: key.name.clone(),
+                    pod_id: key.pod_id.clone(),
                     slot_id: String::new(),
                     started_at: Some(started_at.clone()),
                 },
@@ -731,8 +818,8 @@ impl Scheduler {
             self.router.send_to_client(
                 conn_id,
                 ServerToClient::BucketBuildProgress {
-                    bucket_id: bucket_id.clone(),
-                    pod_id: None,
+                    bucket_id: key.name.clone(),
+                    pod_id: key.pod_id.clone(),
                     slot_id: String::new(),
                     phase: snap.phase,
                     source_records: snap.source_records,
@@ -749,11 +836,12 @@ impl Scheduler {
         match update {
             BucketTaskUpdate::Progress {
                 bucket_id,
+                pod_id,
                 snapshot,
             } => {
                 let event = ServerToClient::BucketBuildProgress {
                     bucket_id,
-                    pod_id: None,
+                    pod_id,
                     slot_id: String::new(), // slot_id surfaces on Ended; stays empty here
                     phase: snapshot.phase,
                     source_records: snapshot.source_records,
@@ -764,28 +852,53 @@ impl Scheduler {
             }
             BucketTaskUpdate::BuildEnded {
                 bucket_id,
+                pod_id,
                 slot_id,
                 outcome,
                 requester_conn,
                 correlation_id,
             } => {
-                self.active_bucket_builds.remove(&bucket_id);
-                self.active_bucket_progress.remove(&bucket_id);
+                let key = BucketKey::from_optional(pod_id.clone(), bucket_id.clone());
+                self.active_bucket_builds.remove(&key);
+                self.active_bucket_progress.remove(&key);
                 let summary = if matches!(outcome, BucketBuildOutcome::Success) {
-                    match self.bucket_registry.refresh_entry(&bucket_id).await {
-                        Ok(()) => self
+                    match pod_id.as_deref() {
+                        None => match self.bucket_registry.refresh_entry(&bucket_id).await {
+                            Ok(()) => self
+                                .bucket_registry
+                                .buckets
+                                .get(&bucket_id)
+                                .map(entry_to_summary),
+                            Err(e) => {
+                                warn!(
+                                    bucket = %bucket_id,
+                                    error = %e,
+                                    "post-build refresh failed; ListBuckets will be stale until next refresh",
+                                );
+                                None
+                            }
+                        },
+                        Some(pid) => match self
                             .bucket_registry
-                            .buckets
-                            .get(&bucket_id)
-                            .map(entry_to_summary),
-                        Err(e) => {
-                            warn!(
-                                bucket = %bucket_id,
-                                error = %e,
-                                "post-build refresh failed; ListBuckets will be stale until next refresh",
-                            );
-                            None
-                        }
+                            .refresh_pod_entry(pid, &bucket_id)
+                            .await
+                        {
+                            Ok(()) => self
+                                .bucket_registry
+                                .pod_buckets
+                                .get(pid)
+                                .and_then(|m| m.get(&bucket_id))
+                                .map(entry_to_summary),
+                            Err(e) => {
+                                warn!(
+                                    pod = %pid,
+                                    bucket = %bucket_id,
+                                    error = %e,
+                                    "post-build refresh failed; ListBuckets will be stale until next refresh",
+                                );
+                                None
+                            }
+                        },
                     }
                 } else {
                     None
@@ -794,7 +907,7 @@ impl Scheduler {
                 let ended = ServerToClient::BucketBuildEnded {
                     correlation_id: None,
                     bucket_id: bucket_id.clone(),
-                    pod_id: None,
+                    pod_id: pod_id.clone(),
                     slot_id: slot_id.clone(),
                     outcome: outcome.clone(),
                     summary: summary.clone(),
@@ -807,7 +920,7 @@ impl Scheduler {
                         ServerToClient::BucketBuildEnded {
                             correlation_id,
                             bucket_id,
-                            pod_id: None,
+                            pod_id,
                             slot_id,
                             outcome,
                             summary,
@@ -869,6 +982,7 @@ async fn run_build(
     chunker_config: crate::knowledge::ChunkerConfig,
     cancel: CancellationToken,
     bucket_id: String,
+    pod_id: Option<String>,
     progress: Arc<ProgressShared>,
     task_tx: mpsc::UnboundedSender<BucketTaskUpdate>,
     requester_conn: Option<ConnId>,
@@ -886,6 +1000,7 @@ async fn run_build(
     // mid-build picks up subsequent ticks without any special wiring
     // here. Stops when the build flips `done`.
     let bucket_id_for_emit = bucket_id.clone();
+    let pod_id_for_emit = pod_id.clone();
     let progress_for_emit = progress.clone();
     let task_tx_for_emit = task_tx.clone();
     let emitter = tokio::spawn(async move {
@@ -899,6 +1014,7 @@ async fn run_build(
             let snap = progress_for_emit.snapshot();
             let _ = task_tx_for_emit.send(BucketTaskUpdate::Progress {
                 bucket_id: bucket_id_for_emit.clone(),
+                pod_id: pod_id_for_emit.clone(),
                 snapshot: snap,
             });
         }
@@ -956,6 +1072,7 @@ async fn run_build(
                     );
                     let _ = task_tx.send(BucketTaskUpdate::BuildEnded {
                         bucket_id,
+                        pod_id,
                         slot_id: String::new(),
                         outcome: BucketBuildOutcome::Success,
                         requester_conn,
@@ -978,6 +1095,7 @@ async fn run_build(
                     };
                     let _ = task_tx.send(BucketTaskUpdate::BuildEnded {
                         bucket_id,
+                        pod_id,
                         slot_id: String::new(),
                         outcome,
                         requester_conn,
@@ -994,6 +1112,7 @@ async fn run_build(
             let _ = emitter.await;
             let _ = task_tx.send(BucketTaskUpdate::BuildEnded {
                 bucket_id,
+                pod_id,
                 slot_id: String::new(),
                 outcome: BucketBuildOutcome::Error {
                     message: format!(
@@ -1023,6 +1142,7 @@ async fn run_build(
                     };
                     let _ = task_tx.send(BucketTaskUpdate::BuildEnded {
                         bucket_id,
+                        pod_id,
                         slot_id: String::new(),
                         outcome,
                         requester_conn,
@@ -1039,17 +1159,20 @@ async fn run_build(
     let handle = tokio::runtime::Handle::current();
     let bucket_dir_for_build = bucket_dir.clone();
     let bucket_id_for_build = bucket_id.clone();
+    let typed_id = match pod_id.as_deref() {
+        None => BucketId::server(bucket_id_for_build),
+        Some(_) => BucketId::pod(bucket_id_for_build),
+    };
     let result = tokio::task::spawn_blocking(move || {
         // Open the DiskBucket inside `spawn_blocking` so the HNSW
         // load — which can run ~12s on a multi-GiB bucket — never
         // touches the scheduler task. Re-opens an existing active
         // slot for rebuild flows; cheap when no active slot exists
         // (the common first-build case).
-        let bucket =
-            match DiskBucket::open(bucket_dir_for_build, BucketId::server(bucket_id_for_build)) {
-                Ok(b) => Arc::new(b),
-                Err(e) => return Err(BucketError::Other(format!("open failed: {e}"))),
-            };
+        let bucket = match DiskBucket::open(bucket_dir_for_build, typed_id) {
+            Ok(b) => Arc::new(b),
+            Err(e) => return Err(BucketError::Other(format!("open failed: {e}"))),
+        };
 
         // Resume detection runs only for Normal intent. Resync
         // builds always start a fresh slot — any Planning/Building
@@ -1164,6 +1287,7 @@ async fn run_build(
 
     let _ = task_tx.send(BucketTaskUpdate::BuildEnded {
         bucket_id,
+        pod_id,
         slot_id,
         outcome,
         requester_conn,
