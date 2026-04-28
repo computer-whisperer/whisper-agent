@@ -1,12 +1,13 @@
 //! Persistent embedding-vector storage for a slot.
 //!
 //! Two files per slot, paralleling the chunks layout:
-//! - `vectors.bin` — fixed 16-byte header, then `N × dim × bytes_per_dim`
-//!   bytes of vectors back-to-back. `bytes_per_dim` is determined by
-//!   the slot's [`VectorQuant`] choice: 4 for f32, 2 for f16. No per-
-//!   record framing — vectors are uniform-size for a given slot, so
-//!   `vectors.bin[16 + pos*stride .. +stride]` is the vector at
-//!   position `pos`, where `stride = dim * bytes_per_dim`.
+//! - `vectors.bin` — fixed 16-byte header, then `N × stride` bytes of
+//!   vectors back-to-back. `stride = record_header_bytes + dim *
+//!   bytes_per_dim` is determined by the slot's [`VectorQuant`]
+//!   choice: f32 = 4×dim, f16 = 2×dim, int8 = 4 + dim (the leading
+//!   4 bytes are a per-vector f32 scale factor). No per-record
+//!   framing beyond the optional scale, so `vectors.bin[16 +
+//!   pos*stride .. +stride]` is the vector at position `pos`.
 //! - `vectors.idx` — sorted `(chunk_id, position)` entries. Position is
 //!   the index into the dense vector array, not a byte offset.
 //!
@@ -65,14 +66,17 @@ const HEADER_SIZE: u64 = 16;
 ///
 /// `F32` (4 bytes/dim, native) is the original format. `F16` (2 bytes/
 /// dim via [`half::f16`]) trades ~1% recall for half the on-disk
-/// vector footprint and half the HNSW data-file size. `Int8` is a
-/// reserved value for a future per-vector-scale quantization slice.
+/// vector footprint. `Int8` (1 byte/dim + 4 bytes/vector scale)
+/// trades ~2-5% recall for ~4× compression, using symmetric per-vector
+/// quantization: each vector's scalars are divided by `max_abs(v) / 127`
+/// at write time and clamped to `i8`. Decode multiplies by the stored
+/// scale on read.
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VectorQuant {
     F32 = 0,
     F16 = 1,
-    // Int8 = 2,   // future
+    Int8 = 2,
 }
 
 impl VectorQuant {
@@ -81,15 +85,35 @@ impl VectorQuant {
         match self {
             VectorQuant::F32 => 4,
             VectorQuant::F16 => 2,
+            VectorQuant::Int8 => 1,
         }
     }
 
+    /// Per-record metadata bytes preceding the `dim × bytes_per_dim`
+    /// scalar payload. Used by Int8 to store the per-vector scale
+    /// factor as a leading f32; F32/F16 have no per-record header.
+    pub fn record_header_bytes(self) -> usize {
+        match self {
+            VectorQuant::F32 | VectorQuant::F16 => 0,
+            VectorQuant::Int8 => 4,
+        }
+    }
+
+    /// On-disk stride per stored vector — the size of one record in
+    /// `vectors.bin`. Used everywhere position-to-byte arithmetic
+    /// happens (read_at_position, open_resume truncation,
+    /// create_or_open_append).
+    pub fn record_stride(self, dim: usize) -> usize {
+        self.record_header_bytes() + dim * self.bytes_per_dim()
+    }
+
     /// Round-trip from the on-disk header byte. `Err` for unknown /
-    /// reserved values (today's `Int8 = 2` and beyond).
+    /// reserved values.
     pub fn from_header_byte(b: u8) -> io::Result<Self> {
         match b {
             0 => Ok(VectorQuant::F32),
             1 => Ok(VectorQuant::F16),
+            2 => Ok(VectorQuant::Int8),
             other => Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("vectors.bin: unsupported quantization variant {other}"),
@@ -103,12 +127,7 @@ impl From<super::config::Quantization> for VectorQuant {
         match q {
             super::config::Quantization::F32 => VectorQuant::F32,
             super::config::Quantization::F16 => VectorQuant::F16,
-            // `Int8` config value is parseable but not yet wired into
-            // the vector pipeline. Map to F32 for now so an int8-
-            // configured bucket builds (and reads back) as f32 rather
-            // than crashing — when the int8 path lands, this arm
-            // becomes a real branch.
-            super::config::Quantization::Int8 => VectorQuant::F32,
+            super::config::Quantization::Int8 => VectorQuant::Int8,
         }
     }
 }
@@ -116,12 +135,15 @@ impl From<super::config::Quantization> for VectorQuant {
 // vectors.bin layout:
 //   [4 bytes] magic = b"VECT"
 //   [1 byte]  format_version (= 1)
-//   [1 byte]  quantization (0 = f32, 1 = f16)
+//   [1 byte]  quantization (0 = f32, 1 = f16, 2 = int8)
 //   [2 bytes] reserved (zero)
 //   [4 bytes] dimension (u32 LE)
 //   [4 bytes] reserved (zero, future use)
 //   ── header ends at offset 16 ──
-//   [N × dim × bytes_per_dim] vectors back-to-back, native LE.
+//   N records back-to-back. Per-record layout:
+//     F32 / F16: [dim × bytes_per_dim] scalar payload, native LE.
+//     Int8:      [4 bytes scale (f32 LE)][dim × i8] — symmetric
+//                per-vector quantization, decode as `q as f32 * scale`.
 //
 // vectors.idx layout:
 //   [8 bytes] entry count (u64 LE)
@@ -208,7 +230,7 @@ impl VectorStoreWriter {
         }
 
         let len = chunk_ids.len() as u64;
-        let stride = expected_dimension as u64 * on_disk_quant.bytes_per_dim() as u64;
+        let stride = on_disk_quant.record_stride(expected_dimension as usize) as u64;
         let target_size = HEADER_SIZE + len * stride;
         let truncate = OpenOptions::new().write(true).open(bin_path)?;
         truncate.set_len(target_size)?;
@@ -268,6 +290,22 @@ impl VectorStoreWriter {
                 for value in vector {
                     let h = half::f16::from_f32(*value);
                     self.bin.write_all(&h.to_le_bytes())?;
+                }
+            }
+            VectorQuant::Int8 => {
+                // Symmetric per-vector quantization. `scale` is chosen
+                // so the vector's max-abs value lands at i8::MAX (127);
+                // smaller values get proportionally scaled. The all-
+                // zero edge case fixes scale at a sentinel non-zero
+                // value so decode still produces zeros — without this,
+                // dividing by 0 below would NaN.
+                let max_abs = vector.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
+                let scale = if max_abs > 0.0 { max_abs / 127.0 } else { 1.0 };
+                self.bin.write_all(&scale.to_le_bytes())?;
+                let inv = 1.0 / scale;
+                for value in vector {
+                    let q = (value * inv).round().clamp(-127.0, 127.0) as i8;
+                    self.bin.write_all(&[q as u8])?;
                 }
             }
         }
@@ -486,8 +524,7 @@ impl VectorStoreReader {
     /// dim=1024), and the caller is read-once-per-position.
     pub fn read_at_position(&self, position: u64) -> io::Result<Vec<f32>> {
         let dim = self.dimension as usize;
-        let bytes_per_dim = self.quant.bytes_per_dim();
-        let stride = dim * bytes_per_dim;
+        let stride = self.quant.record_stride(dim);
         let byte_offset = (HEADER_SIZE as usize) + (position as usize) * stride;
         let byte_end = byte_offset + stride;
 
@@ -514,6 +551,13 @@ impl VectorStoreReader {
                 for chunk in slice.chunks_exact(2) {
                     let h = half::f16::from_le_bytes(chunk.try_into().unwrap());
                     out.push(h.to_f32());
+                }
+            }
+            VectorQuant::Int8 => {
+                let scale = f32::from_le_bytes(slice[0..4].try_into().unwrap());
+                for &b in &slice[4..] {
+                    let q = b as i8;
+                    out.push(q as f32 * scale);
                 }
             }
         }
@@ -626,6 +670,70 @@ mod tests {
         // halving is asserted, not just believed.
         let on_disk = std::fs::metadata(&bin).unwrap().len();
         assert_eq!(on_disk, 16 + 4 * 2);
+    }
+
+    #[test]
+    fn roundtrip_single_vector_int8() {
+        // Symmetric per-vector int8 quantization: max-abs maps to ±127.
+        // Pick a vector whose values span a useful range so the
+        // quantization step is exercised end-to-end.
+        let tmp = tempfile::tempdir().unwrap();
+        let bin = tmp.path().join("vectors.bin");
+        let idx = tmp.path().join("vectors.idx");
+
+        let id = ChunkId::from_source(&[1; 32], 0);
+        let v = vec![0.1, 0.5, -0.3, 0.7];
+        let max_abs = 0.7f32;
+        let scale = max_abs / 127.0;
+        // Quantization error per scalar is at most scale/2.
+        let tol = scale * 0.6;
+
+        {
+            let mut w = VectorStoreWriter::create(&bin, &idx, 4, VectorQuant::Int8).unwrap();
+            assert_eq!(w.append(id, &v).unwrap(), 0);
+            assert_eq!(w.finalize().unwrap(), 1);
+        }
+
+        let r = VectorStoreReader::open(&bin, &idx).unwrap();
+        assert_eq!(r.dimension(), 4);
+        assert_eq!(r.quant(), VectorQuant::Int8);
+        let fetched = r.fetch(id).unwrap().unwrap();
+        for (i, (got, want)) in fetched.iter().zip(v.iter()).enumerate() {
+            let diff = (got - want).abs();
+            assert!(
+                diff < tol,
+                "dim {i}: got {got}, want {want}, diff {diff}, tol {tol}"
+            );
+        }
+
+        // On-disk size: header + 1 record × (4 byte scale + 4 dims × 1 byte).
+        let on_disk = std::fs::metadata(&bin).unwrap().len();
+        assert_eq!(on_disk, 16 + 4 + 4);
+    }
+
+    #[test]
+    fn int8_all_zero_vector_decodes_as_zero() {
+        // The zero edge case: max_abs = 0 would NaN if we naively
+        // divided. Writer fixes scale at 1.0 in that case; decode
+        // must still produce all zeros.
+        let tmp = tempfile::tempdir().unwrap();
+        let bin = tmp.path().join("vectors.bin");
+        let idx = tmp.path().join("vectors.idx");
+
+        let id = ChunkId::from_source(&[2; 32], 0);
+        let v = vec![0.0f32; 8];
+
+        {
+            let mut w = VectorStoreWriter::create(&bin, &idx, 8, VectorQuant::Int8).unwrap();
+            w.append(id, &v).unwrap();
+            w.finalize().unwrap();
+        }
+
+        let r = VectorStoreReader::open(&bin, &idx).unwrap();
+        let fetched = r.fetch(id).unwrap().unwrap();
+        for got in &fetched {
+            assert_eq!(*got, 0.0);
+        }
     }
 
     #[test]
