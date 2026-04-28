@@ -399,6 +399,13 @@ pub struct SharedMcpHostInfo {
     /// OAuth tokens) is never sent to the client; the UI gets just
     /// enough to render "anonymous" / "bearer-auth" / etc.
     pub auth: SharedMcpAuthPublic,
+    /// Tool-name prefix override. Three-state: `None` (omitted) means
+    /// "use `name` as the prefix" (default — the model sees
+    /// `{name}_{tool}`); `Some("")` means "no prefix" (model sees the
+    /// bare server-side tool name — equivalent to the legacy behaviour);
+    /// `Some(p)` means "use `p` as the prefix".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prefix: Option<String>,
     /// Whether the server currently holds a connected MCP session for
     /// this host. `true` means `tools/list` has succeeded at least once;
     /// `false` means the connect attempt failed and the entry is
@@ -470,6 +477,35 @@ pub enum SharedMcpAuthInput {
         /// reverse-proxied) without any infer-from-Host guesswork.
         redirect_base: String,
     },
+}
+
+/// Client-supplied prefix override on `AddSharedMcpHost` /
+/// `UpdateSharedMcpHost`. Tagged union keyed by `kind`; `Unchanged` is
+/// the default, so callers can omit the field entirely. On `Add`,
+/// `Unchanged` is treated as `Default` (there is no existing entry to
+/// preserve). On `Update`, `Unchanged` leaves the catalog's prefix
+/// field as it stood. Maps to the catalog's three-state
+/// `prefix: Option<String>` storage:
+///
+/// - `Default` ↔ stored as `None` (resolved to the catalog `name`
+///   when listing tools).
+/// - `None` ↔ stored as `Some("")` (model sees the bare server-side
+///   tool name — equivalent to legacy unprefixed behaviour for shared
+///   MCPs).
+/// - `Custom` ↔ stored as `Some(value)`.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum SharedMcpPrefixInput {
+    /// Don't touch the catalog's prefix field. On `Add`, behaves like
+    /// `Default`.
+    #[default]
+    Unchanged,
+    /// Use the catalog `name` as the tool-name prefix.
+    Default,
+    /// Disable prefixing — bare tool names on the model side.
+    None,
+    /// Use `value` as the tool-name prefix.
+    Custom { value: String },
 }
 
 /// Lightweight per-task summary. Broadcast to every connected client and used by
@@ -1206,6 +1242,13 @@ pub enum ClientToServer {
         url: String,
         #[serde(default)]
         auth: SharedMcpAuthInput,
+        /// Tool-name prefix. Defaults to `Unchanged`, which on `Add`
+        /// resolves to "use `name` as the prefix". Pass `None` to
+        /// disable prefixing for this host (legacy bare-name behaviour);
+        /// pass `Custom { value }` to use a different prefix than the
+        /// catalog name.
+        #[serde(default)]
+        prefix: SharedMcpPrefixInput,
     },
 
     /// Replace url / auth on an existing shared-MCP-host entry. Opens a
@@ -1224,6 +1267,11 @@ pub enum ClientToServer {
         /// can't see. To clear auth, pass `Some(SharedMcpAuthInput::None)`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         auth: Option<SharedMcpAuthInput>,
+        /// `Unchanged` (the default) leaves the catalog's prefix
+        /// field as it stood. Other variants replace it; see
+        /// [`SharedMcpPrefixInput`] for the mapping.
+        #[serde(default)]
+        prefix: SharedMcpPrefixInput,
     },
 
     /// Remove a shared MCP host. Refused when any live thread currently

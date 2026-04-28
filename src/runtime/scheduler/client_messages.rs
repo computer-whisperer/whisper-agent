@@ -49,6 +49,39 @@ pub(super) fn shared_mcp_auth_from_direct_input(
     }
 }
 
+/// Resolve a wire-shape `SharedMcpPrefixInput` for an `AddSharedMcpHost`
+/// into the catalog's three-state `prefix: Option<String>`. `Unchanged`
+/// has no meaning for a fresh insert (there is no existing prefix to
+/// preserve), so it collapses to `Default = None`, which the catalog
+/// resolves to "use the host name as the prefix" at lookup time.
+pub(super) fn shared_mcp_prefix_for_add(
+    input: whisper_agent_protocol::SharedMcpPrefixInput,
+) -> Option<String> {
+    use whisper_agent_protocol::SharedMcpPrefixInput;
+    match input {
+        SharedMcpPrefixInput::Unchanged | SharedMcpPrefixInput::Default => None,
+        SharedMcpPrefixInput::None => Some(String::new()),
+        SharedMcpPrefixInput::Custom { value } => Some(value),
+    }
+}
+
+/// Resolve a wire-shape `SharedMcpPrefixInput` for an
+/// `UpdateSharedMcpHost`. `Unchanged` becomes outer-`None` ("leave the
+/// catalog field as-is") so a URL/auth edit doesn't clobber a custom
+/// prefix the operator previously set; everything else maps to the
+/// same three-state shape used on Add, wrapped in `Some(...)`.
+pub(super) fn shared_mcp_prefix_for_update(
+    input: whisper_agent_protocol::SharedMcpPrefixInput,
+) -> Option<Option<String>> {
+    use whisper_agent_protocol::SharedMcpPrefixInput;
+    match input {
+        SharedMcpPrefixInput::Unchanged => None,
+        SharedMcpPrefixInput::Default => Some(None),
+        SharedMcpPrefixInput::None => Some(Some(String::new())),
+        SharedMcpPrefixInput::Custom { value } => Some(Some(value)),
+    }
+}
+
 impl Scheduler {
     pub(super) fn apply_client_message(
         &mut self,
@@ -455,6 +488,7 @@ impl Scheduler {
                 name,
                 url,
                 auth,
+                prefix,
             } => {
                 if !self.admin_connections.contains(&conn_id) {
                     self.router.send_to_client(
@@ -480,6 +514,7 @@ impl Scheduler {
                     );
                     return;
                 }
+                let prefix_value = shared_mcp_prefix_for_add(prefix);
                 // Route on the auth variant: Oauth2Start dispatches
                 // the discovery+DCR+authz-URL pipeline; direct
                 // None/Bearer go straight to the synchronous connect
@@ -496,6 +531,7 @@ impl Scheduler {
                             url,
                             scope,
                             redirect_base,
+                            prefix_value,
                             pending_io,
                         );
                     }
@@ -509,7 +545,9 @@ impl Scheduler {
                                 name,
                                 url,
                                 catalog_auth,
-                                crate::runtime::io_dispatch::SharedMcpOp::Add,
+                                crate::runtime::io_dispatch::SharedMcpOp::Add {
+                                    prefix: prefix_value,
+                                },
                             ),
                         );
                     }
@@ -520,6 +558,7 @@ impl Scheduler {
                 name,
                 url,
                 auth,
+                prefix,
             } => {
                 if !self.admin_connections.contains(&conn_id) {
                     self.router.send_to_client(
@@ -572,6 +611,7 @@ impl Scheduler {
                             return;
                         }
                     };
+                let prefix_update = shared_mcp_prefix_for_update(prefix);
                 pending_io.push(
                     crate::runtime::io_dispatch::build_shared_mcp_connect_future(
                         conn_id,
@@ -579,7 +619,9 @@ impl Scheduler {
                         name,
                         url,
                         effective_auth,
-                        crate::runtime::io_dispatch::SharedMcpOp::Update,
+                        crate::runtime::io_dispatch::SharedMcpOp::Update {
+                            prefix: prefix_update,
+                        },
                     ),
                 );
             }

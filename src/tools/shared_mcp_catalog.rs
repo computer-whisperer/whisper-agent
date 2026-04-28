@@ -154,9 +154,32 @@ pub struct CatalogEntry {
     pub url: String,
     #[serde(default, skip_serializing_if = "SharedMcpAuth::is_none")]
     pub auth: SharedMcpAuth,
+    /// Tool-name prefix override. The model sees `{prefix}_{tool}`
+    /// when this resolves to `Some(prefix)`, and the bare `tool` name
+    /// when it resolves to `None`. Three-state — see [`Self::effective_prefix`]:
+    /// - field absent (`None`): default to `name` as the prefix
+    /// - `Some("")`: no prefix (legacy bare-name behaviour)
+    /// - `Some(s)`: explicit override
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prefix: Option<String>,
     pub origin: CatalogOrigin,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+}
+
+impl CatalogEntry {
+    /// Resolve the effective tool-name prefix. `None` means no prefix
+    /// at all (model sees bare tool names); `Some(s)` means tools are
+    /// advertised as `{s}_{tool}`. Implements the three-state semantics
+    /// of `prefix`: unset → default to `name`, `Some("")` → no prefix,
+    /// `Some(s)` → custom.
+    pub fn effective_prefix(&self) -> Option<&str> {
+        match &self.prefix {
+            None => Some(self.name.as_str()),
+            Some(s) if s.is_empty() => None,
+            Some(s) => Some(s.as_str()),
+        }
+    }
 }
 
 /// On-disk wrapper. Uses `[[host]]` rather than `[[provider]]` so the
@@ -251,16 +274,19 @@ impl CatalogStore {
         Ok(true)
     }
 
-    /// Replace `url` and `auth` on an existing entry. `origin` and
-    /// `created_at` are preserved; `updated_at` advances to `now`.
-    /// Passing `auth = None` leaves the existing auth untouched —
-    /// callers that want to clear auth should pass
-    /// `Some(SharedMcpAuth::None)`.
+    /// Replace `url`, optionally `auth`, and optionally `prefix` on an
+    /// existing entry. `origin` and `created_at` are preserved;
+    /// `updated_at` advances to `now`. Passing `auth = None` /
+    /// `prefix = None` leaves the corresponding field untouched —
+    /// callers that want to clear them should pass `Some(...)` with the
+    /// cleared value (e.g. `Some(SharedMcpAuth::None)` to clear auth,
+    /// `Some(None)` to clear the prefix override and revert to default).
     pub fn update(
         &mut self,
         name: &str,
         url: String,
         auth: Option<SharedMcpAuth>,
+        prefix: Option<Option<String>>,
         now: DateTime<Utc>,
     ) -> Result<()> {
         let entry = self
@@ -271,6 +297,9 @@ impl CatalogStore {
         entry.url = url;
         if let Some(new_auth) = auth {
             entry.auth = new_auth;
+        }
+        if let Some(new_prefix) = prefix {
+            entry.prefix = new_prefix;
         }
         entry.updated_at = now;
         self.save()
@@ -378,12 +407,14 @@ pub fn new_manual_entry(
     name: String,
     url: String,
     auth: SharedMcpAuth,
+    prefix: Option<String>,
     now: DateTime<Utc>,
 ) -> CatalogEntry {
     CatalogEntry {
         name,
         url,
         auth,
+        prefix,
         origin: CatalogOrigin::Manual,
         created_at: now,
         updated_at: now,
@@ -394,12 +425,14 @@ pub fn new_seeded_entry(
     name: String,
     url: String,
     auth: SharedMcpAuth,
+    prefix: Option<String>,
     now: DateTime<Utc>,
 ) -> CatalogEntry {
     CatalogEntry {
         name,
         url,
         auth,
+        prefix,
         origin: CatalogOrigin::Seeded,
         created_at: now,
         updated_at: now,
@@ -460,6 +493,7 @@ mod tests {
                 SharedMcpAuth::Bearer {
                     token: "xoxb-secret".into(),
                 },
+                None,
                 now(),
             ))
             .unwrap();
@@ -468,6 +502,7 @@ mod tests {
                 "fetch".into(),
                 "http://127.0.0.1:9830/mcp".into(),
                 SharedMcpAuth::None,
+                None,
                 now(),
             ))
             .unwrap();
@@ -490,6 +525,7 @@ mod tests {
                 "a".into(),
                 "http://a".into(),
                 SharedMcpAuth::Bearer { token: "t".into() },
+                None,
                 now(),
             ))
             .unwrap();
@@ -518,6 +554,7 @@ mod tests {
                 "a".into(),
                 "http://a".into(),
                 SharedMcpAuth::None,
+                None,
                 now(),
             ))
             .unwrap();
@@ -527,6 +564,7 @@ mod tests {
                 "a".into(),
                 "http://changed".into(),
                 SharedMcpAuth::None,
+                None,
                 now(),
             ))
             .unwrap();
@@ -547,12 +585,15 @@ mod tests {
                 SharedMcpAuth::Bearer {
                     token: "keepme".into(),
                 },
+                None,
                 original,
             ))
             .unwrap();
         let later = original + chrono::Duration::hours(1);
         // url-only edit — auth argument is None, so the token survives.
-        store.update("a", "http://b".into(), None, later).unwrap();
+        store
+            .update("a", "http://b".into(), None, None, later)
+            .unwrap();
         let e = store.get("a").unwrap();
         assert_eq!(e.url, "http://b");
         assert_eq!(
@@ -576,11 +617,18 @@ mod tests {
                 "a".into(),
                 "http://a".into(),
                 SharedMcpAuth::Bearer { token: "t".into() },
+                None,
                 now(),
             ))
             .unwrap();
         store
-            .update("a", "http://a".into(), Some(SharedMcpAuth::None), now())
+            .update(
+                "a",
+                "http://a".into(),
+                Some(SharedMcpAuth::None),
+                None,
+                now(),
+            )
             .unwrap();
         assert_eq!(store.get("a").unwrap().auth, SharedMcpAuth::None);
     }
@@ -595,6 +643,7 @@ mod tests {
                 "a".into(),
                 "http://a".into(),
                 SharedMcpAuth::None,
+                None,
                 now(),
             ))
             .unwrap();
@@ -630,6 +679,7 @@ mod tests {
                 scope: Some("mcp".into()),
                 resource: "https://mcp.example.com/mcp".into(),
             })),
+            None,
             now(),
         )
     }
@@ -694,6 +744,7 @@ mod tests {
                 "svc".into(),
                 "http://mcp".into(),
                 SharedMcpAuth::Bearer { token: "b".into() },
+                None,
                 now(),
             ))
             .unwrap();
@@ -716,6 +767,7 @@ mod tests {
                 "anon".into(),
                 "http://a".into(),
                 SharedMcpAuth::None,
+                None,
                 now(),
             ))
             .unwrap();
@@ -725,5 +777,59 @@ mod tests {
             "anonymous entry should not serialize auth kind: {disk}"
         );
         assert!(disk.contains("anon"));
+    }
+
+    #[test]
+    fn effective_prefix_three_state() {
+        let mut e = new_manual_entry(
+            "gmail".into(),
+            "http://x".into(),
+            SharedMcpAuth::None,
+            None,
+            now(),
+        );
+        // Default: prefix unset → use the catalog name.
+        assert_eq!(e.effective_prefix(), Some("gmail"));
+        // Explicit empty string → no prefix at all.
+        e.prefix = Some(String::new());
+        assert_eq!(e.effective_prefix(), None);
+        // Explicit override.
+        e.prefix = Some("g".into());
+        assert_eq!(e.effective_prefix(), Some("g"));
+    }
+
+    #[test]
+    fn update_can_set_and_clear_prefix_override() {
+        let dir = scratch_dir();
+        let path = dir.join(CATALOG_FILENAME);
+        let mut store = CatalogStore::load(path).unwrap();
+        store
+            .insert(new_manual_entry(
+                "h".into(),
+                "http://h".into(),
+                SharedMcpAuth::None,
+                None,
+                now(),
+            ))
+            .unwrap();
+        // Set a custom override.
+        store
+            .update("h", "http://h".into(), None, Some(Some("hh".into())), now())
+            .unwrap();
+        assert_eq!(store.get("h").unwrap().prefix.as_deref(), Some("hh"));
+        // Clear back to default (None == use name).
+        store
+            .update("h", "http://h".into(), None, Some(None), now())
+            .unwrap();
+        assert_eq!(store.get("h").unwrap().prefix, None);
+        assert_eq!(store.get("h").unwrap().effective_prefix(), Some("h"));
+        // Outer-None leaves prefix untouched.
+        store
+            .update("h", "http://h".into(), None, Some(Some("hh".into())), now())
+            .unwrap();
+        store
+            .update("h", "http://other".into(), None, None, now())
+            .unwrap();
+        assert_eq!(store.get("h").unwrap().prefix.as_deref(), Some("hh"));
     }
 }

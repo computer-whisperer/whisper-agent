@@ -580,6 +580,7 @@ async fn run_serve(args: ServeArgs) -> Result<()> {
                 name.clone(),
                 url.clone(),
                 shared_mcp_catalog::SharedMcpAuth::None,
+                None,
                 now,
             ))?;
         shared_mcp_catalog::log_seed_result(name, inserted);

@@ -153,11 +153,16 @@ pub(crate) struct SudoInnerCompletion {
 
 /// Which Add/Update operation the completion applies to. The
 /// scheduler uses this to decide the reply event and whether the
-/// catalog write is an `insert` or `update`.
-#[derive(Debug, Clone, Copy)]
+/// catalog write is an `insert` or `update`. Also carries the prefix
+/// intent: `Add` always names a concrete value (resolved from the
+/// wire's `SharedMcpPrefixInput::Unchanged` to `Default = None`) so
+/// the insert is unambiguous; `Update` uses outer-`None` to mean
+/// "leave the catalog's prefix untouched" (mirroring how `auth` is
+/// optional on `UpdateSharedMcpHost`).
+#[derive(Debug, Clone)]
 pub(crate) enum SharedMcpOp {
-    Add,
-    Update,
+    Add { prefix: Option<String> },
+    Update { prefix: Option<Option<String>> },
 }
 
 /// Result delivered to the scheduler loop after a runtime
@@ -196,6 +201,10 @@ pub(crate) struct OauthStartCompletion {
     pub(crate) url: String,
     pub(crate) redirect_uri: String,
     pub(crate) scope: Option<String>,
+    /// Echoed verbatim from the originating `AddSharedMcpHost` so the
+    /// scheduler can stash it on the pending flow without an extra
+    /// lookup. Three-state per `CatalogEntry::prefix`.
+    pub(crate) prefix: Option<String>,
     pub(crate) result: Result<OauthStartData, String>,
 }
 
@@ -233,6 +242,9 @@ pub(crate) struct OauthCompleteCompletion {
     pub(crate) client_secret: Option<String>,
     pub(crate) resource: String,
     pub(crate) scope: Option<String>,
+    /// Operator-selected tool-name prefix for the catalog entry.
+    /// Three-state per `CatalogEntry::prefix`.
+    pub(crate) prefix: Option<String>,
     pub(crate) result: Result<OauthCompleteData, String>,
 }
 
@@ -248,6 +260,7 @@ pub(crate) struct OauthCompleteData {
 /// Discovery + DCR + authz URL build. Runs off-thread so a slow AS
 /// can't stall the scheduler loop. `redirect_base` comes from the
 /// webui (its own origin); we append `/oauth/callback`.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn build_oauth_start_future(
     conn_id: crate::runtime::scheduler::ConnId,
     correlation_id: Option<String>,
@@ -255,6 +268,7 @@ pub(crate) fn build_oauth_start_future(
     url: String,
     scope: Option<String>,
     redirect_base: String,
+    prefix: Option<String>,
 ) -> SchedulerFuture {
     let redirect_uri = format!("{}/oauth/callback", redirect_base.trim_end_matches('/'));
     Box::pin(async move {
@@ -268,6 +282,7 @@ pub(crate) fn build_oauth_start_future(
                     url,
                     redirect_uri,
                     scope,
+                    prefix,
                     result: Err(format!("init http client: {e}")),
                 });
             }
@@ -339,6 +354,7 @@ pub(crate) fn build_oauth_start_future(
             url,
             redirect_uri,
             scope,
+            prefix,
             result: start,
         })
     })
@@ -362,6 +378,7 @@ pub(crate) fn build_oauth_complete_future(
     client_secret: Option<String>,
     resource: String,
     scope: Option<String>,
+    prefix: Option<String>,
     code: String,
     code_verifier: String,
     redirect_uri: String,
@@ -382,6 +399,7 @@ pub(crate) fn build_oauth_complete_future(
                     client_secret,
                     resource,
                     scope,
+                    prefix,
                     result: Err(format!("init http client: {e}")),
                 });
             }
@@ -435,6 +453,7 @@ pub(crate) fn build_oauth_complete_future(
             client_secret,
             resource,
             scope,
+            prefix,
             result: complete,
         })
     })

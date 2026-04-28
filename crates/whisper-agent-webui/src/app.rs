@@ -3596,6 +3596,10 @@ impl eframe::App for ChatApp {
                         name,
                         url,
                         auth,
+                        // Editor doesn't expose prefix yet; server
+                        // resolves `Unchanged` to `Default` (use the
+                        // host name as the prefix) on Add.
+                        prefix: whisper_agent_protocol::SharedMcpPrefixInput::Unchanged,
                     });
                 }
                 SettingsEvent::UpdateSharedMcpHost { name, url, auth } => {
@@ -3610,6 +3614,10 @@ impl eframe::App for ChatApp {
                         name,
                         url,
                         auth,
+                        // Editor doesn't expose prefix yet; `Unchanged`
+                        // tells the server to leave the catalog's
+                        // existing prefix override alone.
+                        prefix: whisper_agent_protocol::SharedMcpPrefixInput::Unchanged,
                     });
                 }
                 SettingsEvent::OpenAddProvider => {

@@ -94,17 +94,36 @@ pub enum ToolRoute {
     },
 }
 
+/// Whether a `BoundMcp` came from a thread's host-env binding or from
+/// its shared-MCP-host binding. Drives `ToolCategory` selection in
+/// `admissible_and_askable_tools`. Decoupled from `prefix` because
+/// shared MCPs can carry a prefix too once a catalog override is set,
+/// and the listing categorization should still reflect the source kind
+/// rather than the prefix presence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BoundMcpKind {
+    HostEnv,
+    Shared,
+}
+
 /// An MCP host entry the scheduler is routing a specific thread's tool
 /// call through, paired with the prefix the model sees on every tool
 /// this MCP advertises. `prefix: Some(name)` means the model sees
 /// `{name}_{tool}` and the MCP receives the bare `tool`; `prefix: None`
-/// is pass-through (shared MCPs and — by convention — the reserved
-/// Inline host-env path).
+/// is pass-through (the reserved Inline host-env path, and shared MCPs
+/// whose catalog entry explicitly disables prefixing via the empty
+/// string).
 struct BoundMcp<'a> {
     entry: &'a crate::pod::resources::McpHostEntry,
-    /// Prefix applied to tool names for host-env MCPs. `None` for
-    /// shared MCPs (tools unprefixed on the wire).
+    /// Prefix applied to tool names. For host-env MCPs this is the env
+    /// binding name; for shared MCPs it's the catalog entry's
+    /// `effective_prefix()` (defaults to the host name unless the
+    /// catalog overrides it). `None` means tools are exposed bare.
     prefix: Option<&'a str>,
+    /// Whether this binding is a host-env MCP or a shared MCP. Used
+    /// to categorize the tool in listings and to keep that
+    /// categorization stable when the prefix shape changes.
+    kind: BoundMcpKind,
     /// Human-meaningful source name — the host-env binding name for
     /// host-env MCPs, the shared catalog host name for shared MCPs.
     /// Used for listing categorization; distinct from `entry.id` which
@@ -289,6 +308,12 @@ pub(crate) struct PendingOauthFlow {
     /// silently — the catalog entry still lands.
     pub(crate) conn_id: ConnId,
     pub(crate) correlation_id: Option<String>,
+    /// Tool-name prefix the operator selected on `AddSharedMcpHost`.
+    /// Echoed verbatim from the wire request and stashed here so the
+    /// catalog write at `apply_oauth_complete_completion` time can
+    /// honor it. Three-state per `CatalogEntry::prefix` (None =
+    /// default to `name`, Some("") = no prefix, Some(s) = custom).
+    pub(crate) prefix: Option<String>,
     /// Wall-clock deadline. Flows older than this are swept by
     /// `sweep_expired_oauth_flows` on the GC tick so a user who
     /// opened the authorization window and walked away doesn't leave
@@ -1026,6 +1051,11 @@ impl Scheduler {
         let auth = catalog_entry
             .map(|e| e.auth.public())
             .unwrap_or(whisper_agent_protocol::SharedMcpAuthPublic::None);
+        // Catalog stores prefix as `Option<String>`. Echo it on the
+        // wire as-is — `None` means "default to name", `Some("")` means
+        // "no prefix", `Some(s)` means "custom". CLI overlays don't
+        // appear in the catalog so they always render as default.
+        let prefix = catalog_entry.and_then(|e| e.prefix.clone());
         let url = catalog_entry
             .map(|e| e.url.clone())
             .or_else(|| {
@@ -1053,6 +1083,7 @@ impl Scheduler {
             url,
             origin: self.shared_mcp_host_origin(name),
             auth,
+            prefix,
             connected,
             last_error,
         })
@@ -1157,19 +1188,29 @@ impl Scheduler {
                 // way can't leave a live registry entry the catalog
                 // doesn't reflect.
                 let now = chrono::Utc::now();
-                let catalog_write = match op {
-                    SharedMcpOp::Add => self.shared_mcp_catalog.insert(
-                        crate::tools::shared_mcp_catalog::new_manual_entry(
-                            name.clone(),
+                let (catalog_write, is_add) = match &op {
+                    SharedMcpOp::Add { prefix } => (
+                        self.shared_mcp_catalog.insert(
+                            crate::tools::shared_mcp_catalog::new_manual_entry(
+                                name.clone(),
+                                url.clone(),
+                                auth.clone(),
+                                prefix.clone(),
+                                now,
+                            ),
+                        ),
+                        true,
+                    ),
+                    SharedMcpOp::Update { prefix } => (
+                        self.shared_mcp_catalog.update(
+                            &name,
                             url.clone(),
-                            auth.clone(),
+                            Some(auth.clone()),
+                            prefix.clone(),
                             now,
                         ),
+                        false,
                     ),
-                    SharedMcpOp::Update => {
-                        self.shared_mcp_catalog
-                            .update(&name, url.clone(), Some(auth.clone()), now)
-                    }
                 };
                 if let Err(e) = catalog_write {
                     self.router.send_to_client(
@@ -1191,22 +1232,23 @@ impl Scheduler {
                     .collect();
                 self.resources.populate_mcp_tools(&id, tools, annotations);
                 let host = self.shared_mcp_host_info(&name).expect("just applied");
-                let reply = match op {
-                    SharedMcpOp::Add => ServerToClient::SharedMcpHostAdded {
+                let reply = if is_add {
+                    ServerToClient::SharedMcpHostAdded {
                         correlation_id,
                         host,
-                    },
-                    SharedMcpOp::Update => ServerToClient::SharedMcpHostUpdated {
+                    }
+                } else {
+                    ServerToClient::SharedMcpHostUpdated {
                         correlation_id,
                         host,
-                    },
+                    }
                 };
                 self.router.send_to_client(conn_id, reply);
             }
             Err(message) => {
                 let verb = match op {
-                    SharedMcpOp::Add => "add_shared_mcp_host",
-                    SharedMcpOp::Update => "update_shared_mcp_host",
+                    SharedMcpOp::Add { .. } => "add_shared_mcp_host",
+                    SharedMcpOp::Update { .. } => "update_shared_mcp_host",
                 };
                 self.router.send_to_client(
                     conn_id,
@@ -1275,6 +1317,7 @@ impl Scheduler {
         url: String,
         scope: Option<String>,
         redirect_base: String,
+        prefix: Option<String>,
         pending_io: &mut FuturesUnordered<SchedulerFuture>,
     ) {
         pending_io.push(crate::runtime::io_dispatch::build_oauth_start_future(
@@ -1284,6 +1327,7 @@ impl Scheduler {
             url,
             scope,
             redirect_base,
+            prefix,
         ));
     }
 
@@ -1301,6 +1345,7 @@ impl Scheduler {
             url,
             redirect_uri,
             scope,
+            prefix,
             result,
         } = completion;
         match result {
@@ -1334,6 +1379,7 @@ impl Scheduler {
                         redirect_uri,
                         conn_id,
                         correlation_id: correlation_id.clone(),
+                        prefix,
                         expires_at,
                     },
                 );
@@ -1411,6 +1457,7 @@ impl Scheduler {
             flow.client_secret,
             flow.resource,
             flow.scope,
+            flow.prefix,
             code,
             flow.pkce_verifier,
             flow.redirect_uri,
@@ -1439,6 +1486,7 @@ impl Scheduler {
             client_secret,
             resource,
             scope,
+            prefix,
             result,
         } = completion;
         match result {
@@ -1475,6 +1523,7 @@ impl Scheduler {
                         name.clone(),
                         url.clone(),
                         auth,
+                        prefix,
                         now,
                     ),
                 ) {
@@ -1845,19 +1894,17 @@ impl Scheduler {
                 if !model_takes_documents && tool.name == "view_pdf" {
                     continue;
                 }
-                let (public_name, category) = match bound.prefix {
-                    Some(prefix) => (
-                        format!("{prefix}_{}", tool.name),
-                        ToolCategory::HostEnv {
-                            env_name: prefix.to_string(),
-                        },
-                    ),
-                    None => (
-                        tool.name.clone(),
-                        ToolCategory::SharedMcp {
-                            host_name: bound.source_name.clone(),
-                        },
-                    ),
+                let public_name = match bound.prefix {
+                    Some(prefix) => format!("{prefix}_{}", tool.name),
+                    None => tool.name.clone(),
+                };
+                let category = match bound.kind {
+                    BoundMcpKind::HostEnv => ToolCategory::HostEnv {
+                        env_name: bound.source_name.clone(),
+                    },
+                    BoundMcpKind::Shared => ToolCategory::SharedMcp {
+                        host_name: bound.source_name.clone(),
+                    },
                 };
                 let admission = classify(&public_name);
                 let requires_escalation = match admission {
@@ -2054,15 +2101,26 @@ impl Scheduler {
             out.push(BoundMcp {
                 entry,
                 prefix,
+                kind: BoundMcpKind::HostEnv,
                 source_name,
             });
         }
         for name in &task.bindings.mcp_hosts {
             let id = McpHostId::shared(name);
             if let Some(entry) = self.resources.mcp_hosts.get(&id) {
+                // Resolve the effective prefix from the catalog. CLI
+                // overlays (no catalog entry) default to the host name
+                // — same as a fresh catalog entry without an override
+                // would resolve to. Empty-string prefix in the catalog
+                // means "bare names" (legacy unprefixed behaviour).
+                let prefix = match self.shared_mcp_catalog.get(name) {
+                    Some(catalog_entry) => catalog_entry.effective_prefix(),
+                    None => Some(name.as_str()),
+                };
                 out.push(BoundMcp {
                     entry,
-                    prefix: None,
+                    prefix,
+                    kind: BoundMcpKind::Shared,
                     source_name: name.clone(),
                 });
             }
