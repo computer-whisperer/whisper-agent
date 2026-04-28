@@ -383,6 +383,7 @@ impl Scheduler {
         // scheduler keyed by bucket id so a fresh `RegisterClient` can
         // walk in-flight builds without going through the build task.
         let progress = Arc::new(ProgressShared::default());
+        let started_at = progress.started_at().to_rfc3339();
         self.active_bucket_progress
             .insert(id.clone(), progress.clone());
 
@@ -394,6 +395,7 @@ impl Scheduler {
             correlation_id: None,
             bucket_id: id.clone(),
             slot_id: String::new(),
+            started_at: Some(started_at.clone()),
         };
         self.router.broadcast_task_list_except(started, conn_id);
         self.router.send_to_client(
@@ -402,6 +404,7 @@ impl Scheduler {
                 correlation_id: correlation_id.clone(),
                 bucket_id: id.clone(),
                 slot_id: String::new(),
+                started_at: Some(started_at),
             },
         );
 
@@ -552,6 +555,7 @@ impl Scheduler {
         self.active_bucket_builds.insert(id.clone(), cancel.clone());
 
         let progress = Arc::new(ProgressShared::default());
+        let started_at = progress.started_at().to_rfc3339();
         self.active_bucket_progress
             .insert(id.clone(), progress.clone());
 
@@ -566,6 +570,7 @@ impl Scheduler {
                     correlation_id: None,
                     bucket_id: id.clone(),
                     slot_id: String::new(),
+                    started_at: Some(started_at.clone()),
                 };
                 self.router.broadcast_task_list_except(started, conn);
                 self.router.send_to_client(
@@ -574,6 +579,7 @@ impl Scheduler {
                         correlation_id: correlation_id.clone(),
                         bucket_id: id.clone(),
                         slot_id: String::new(),
+                        started_at: Some(started_at),
                     },
                 );
             }
@@ -582,6 +588,7 @@ impl Scheduler {
                     correlation_id: None,
                     bucket_id: id.clone(),
                     slot_id: String::new(),
+                    started_at: Some(started_at),
                 };
                 broadcast_all(&self.router, started);
                 tracing::info!(bucket_id = %id, "scheduled resync started");
@@ -668,12 +675,14 @@ impl Scheduler {
     /// to other clients.
     pub(crate) fn replay_active_builds_to_client(&self, conn_id: ConnId) {
         for (bucket_id, progress) in &self.active_bucket_progress {
+            let started_at = progress.started_at().to_rfc3339();
             self.router.send_to_client(
                 conn_id,
                 ServerToClient::BucketBuildStarted {
                     correlation_id: None,
                     bucket_id: bucket_id.clone(),
                     slot_id: String::new(),
+                    started_at: Some(started_at.clone()),
                 },
             );
             let snap = progress.snapshot();
@@ -685,6 +694,7 @@ impl Scheduler {
                     phase: snap.phase,
                     source_records: snap.source_records,
                     chunks: snap.chunks,
+                    started_at: Some(started_at),
                 },
             );
         }
@@ -704,6 +714,7 @@ impl Scheduler {
                     phase: snapshot.phase,
                     source_records: snapshot.source_records,
                     chunks: snapshot.chunks,
+                    started_at: Some(snapshot.started_at.to_rfc3339()),
                 };
                 self.router.broadcast_task_list(event);
             }
@@ -1086,7 +1097,6 @@ async fn run_build(
     });
 }
 
-#[derive(Default)]
 pub struct ProgressShared {
     source_records: AtomicU64,
     chunks: AtomicU64,
@@ -1094,6 +1104,25 @@ pub struct ProgressShared {
     /// so the throttled emitter can read without a lock.
     phase: AtomicU8,
     done: AtomicBool,
+    /// Wall-clock time the build was dispatched. Set once at
+    /// construction; the UI uses it to render an elapsed-time stopwatch
+    /// and an ETA later. Replayed verbatim to clients that join
+    /// mid-build via `replay_active_builds_to_client` so a fresh
+    /// connection sees the *original* started_at, not the moment its
+    /// connection landed.
+    started_at: chrono::DateTime<chrono::Utc>,
+}
+
+impl Default for ProgressShared {
+    fn default() -> Self {
+        Self {
+            source_records: AtomicU64::new(0),
+            chunks: AtomicU64::new(0),
+            phase: AtomicU8::new(0),
+            done: AtomicBool::new(false),
+            started_at: chrono::Utc::now(),
+        }
+    }
 }
 
 impl ProgressShared {
@@ -1102,7 +1131,12 @@ impl ProgressShared {
             source_records: self.source_records.load(Ordering::Acquire),
             chunks: self.chunks.load(Ordering::Acquire),
             phase: phase_from_u8(self.phase.load(Ordering::Acquire)),
+            started_at: self.started_at,
         }
+    }
+
+    pub fn started_at(&self) -> chrono::DateTime<chrono::Utc> {
+        self.started_at
     }
 }
 
@@ -1110,6 +1144,7 @@ pub struct ProgressSnapshot {
     pub source_records: u64,
     pub chunks: u64,
     pub phase: BucketBuildPhase,
+    pub started_at: chrono::DateTime<chrono::Utc>,
 }
 
 // Phase ↔ u8 mapping. Planning is encoded as 0 so the AtomicU8's

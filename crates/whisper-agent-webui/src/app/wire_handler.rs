@@ -639,7 +639,11 @@ impl ChatApp {
                     }
                 }
             }
-            ServerToClient::BucketBuildStarted { bucket_id, .. } => {
+            ServerToClient::BucketBuildStarted {
+                bucket_id,
+                started_at,
+                ..
+            } => {
                 if let Some(modal) = self.buckets_modal.as_mut() {
                     modal.build_progress.insert(
                         bucket_id,
@@ -647,6 +651,7 @@ impl ChatApp {
                             phase: whisper_agent_protocol::BucketBuildPhase::Planning,
                             source_records: 0,
                             chunks: 0,
+                            started_at,
                         },
                     );
                 }
@@ -656,15 +661,25 @@ impl ChatApp {
                 phase,
                 source_records,
                 chunks,
+                started_at,
                 ..
             } => {
                 if let Some(modal) = self.buckets_modal.as_mut() {
+                    // Preserve the existing started_at if the server
+                    // omitted it on this tick (e.g. a pre-stopwatch
+                    // server, or a defensive None fallback). The
+                    // anchor only matters once.
+                    let prior = modal
+                        .build_progress
+                        .get(&bucket_id)
+                        .and_then(|p| p.started_at.clone());
                     modal.build_progress.insert(
                         bucket_id,
                         super::BuildProgressView {
                             phase,
                             source_records,
                             chunks,
+                            started_at: started_at.or(prior),
                         },
                     );
                 }

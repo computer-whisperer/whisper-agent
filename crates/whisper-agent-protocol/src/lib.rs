@@ -2062,6 +2062,14 @@ pub enum ServerToClient {
         correlation_id: Option<String>,
         bucket_id: String,
         slot_id: String,
+        /// Wall-clock dispatch time, RFC3339 in UTC (`String` rather
+        /// than `chrono::DateTime` so the protocol crate stays
+        /// chrono-free). Clients use it to render an elapsed-time
+        /// stopwatch on the build row. Replayed verbatim to clients
+        /// that join mid-build, so the timer reflects the original
+        /// dispatch — not the moment the client connected.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        started_at: Option<String>,
     },
     /// Periodic progress tick during a build. Throttled to ~1Hz on the
     /// server side so this stream stays cheap regardless of how fast
@@ -2073,6 +2081,12 @@ pub enum ServerToClient {
         phase: BucketBuildPhase,
         source_records: u64,
         chunks: u64,
+        /// Same as [`BucketBuildStarted::started_at`] — RFC3339-in-UTC
+        /// String, repeated on every progress tick so a client that
+        /// joins mid-build also gets the timer anchor through the next
+        /// progress tick (not just the synthetic Started replay).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        started_at: Option<String>,
     },
     /// Terminal event for a build. `summary` carries the bucket's new
     /// snapshot when the build succeeded (so clients can update the row

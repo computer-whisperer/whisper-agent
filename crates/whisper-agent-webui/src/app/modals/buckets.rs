@@ -52,6 +52,11 @@ pub(crate) struct BuildProgressView {
     pub(crate) phase: BucketBuildPhase,
     pub(crate) source_records: u64,
     pub(crate) chunks: u64,
+    /// RFC3339 wall-clock dispatch time, as forwarded by the server's
+    /// `BucketBuildStarted` / `BucketBuildProgress`. `None` for very
+    /// old servers that pre-date the field; UI renders no elapsed
+    /// stopwatch when missing.
+    pub(crate) started_at: Option<String>,
 }
 
 pub(crate) fn render_buckets_modal(
@@ -758,18 +763,60 @@ fn render_build_progress(ui: &mut egui::Ui, p: &BuildProgressView) {
         BucketBuildPhase::BuildingDense => "building HNSW",
         BucketBuildPhase::Finalizing => "finalizing",
     };
+    let elapsed_str = p
+        .started_at
+        .as_deref()
+        .map(format_build_elapsed)
+        .filter(|s| !s.is_empty());
+    let body = match elapsed_str {
+        Some(elapsed) => format!(
+            "{phase} · {} pages · {} chunks · {elapsed}",
+            format_count(p.source_records),
+            format_count(p.chunks),
+        ),
+        None => format!(
+            "{phase} · {} pages · {} chunks",
+            format_count(p.source_records),
+            format_count(p.chunks),
+        ),
+    };
     ui.horizontal_wrapped(|ui| {
         ui.spinner();
         ui.label(
-            RichText::new(format!(
-                "{phase} · {} pages · {} chunks",
-                format_count(p.source_records),
-                format_count(p.chunks),
-            ))
-            .small()
-            .color(Color32::from_rgb(180, 180, 100)),
+            RichText::new(body)
+                .small()
+                .color(Color32::from_rgb(180, 180, 100)),
         );
     });
+}
+
+/// Format build elapsed time at a granularity that scales from
+/// seconds (smoke runs) through days (enwiki). Multi-day builds want
+/// `2d 14h`, not `60840:21`.
+fn format_build_elapsed(started_at_rfc3339: &str) -> String {
+    use chrono::{DateTime, Utc};
+    let Ok(parsed) = DateTime::parse_from_rfc3339(started_at_rfc3339) else {
+        return String::new();
+    };
+    let secs = (Utc::now() - parsed.with_timezone(&Utc)).num_seconds();
+    if secs < 0 {
+        // Clock skew between server and client — surface as 0s.
+        return "0s elapsed".to_string();
+    }
+    let s = secs % 60;
+    let m = (secs / 60) % 60;
+    let h = (secs / 3600) % 24;
+    let d = secs / 86400;
+    let body = if d > 0 {
+        format!("{d}d {h}h")
+    } else if h > 0 {
+        format!("{h}h {m}m")
+    } else if m > 0 {
+        format!("{m}m {s}s")
+    } else {
+        format!("{s}s")
+    };
+    format!("{body} elapsed")
 }
 
 fn render_row_actions(
@@ -915,5 +962,52 @@ fn format_bytes(bytes: u64) -> String {
         format!("{:.1} KiB", bytes as f64 / KIB as f64)
     } else {
         format!("{bytes} B")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::{Duration, Utc};
+
+    #[test]
+    fn elapsed_formatter_seconds() {
+        let started = (Utc::now() - Duration::seconds(7)).to_rfc3339();
+        let s = format_build_elapsed(&started);
+        // Tolerance for the s/s+1 rounding boundary; we just want
+        // "single-digit seconds, ends with `s elapsed`".
+        assert!(s.ends_with("s elapsed"), "got `{s}`");
+        let prefix: &str = s.split_whitespace().next().unwrap();
+        let n: i64 = prefix.trim_end_matches('s').parse().unwrap();
+        assert!((6..=9).contains(&n), "expected ~7s, got `{s}`");
+    }
+
+    #[test]
+    fn elapsed_formatter_minutes_seconds() {
+        let started = (Utc::now() - Duration::seconds(125)).to_rfc3339();
+        let s = format_build_elapsed(&started);
+        // 2m 5s ± 1s rounding. Just check shape.
+        assert!(s.starts_with("2m") && s.ends_with("s elapsed"), "got `{s}`");
+    }
+
+    #[test]
+    fn elapsed_formatter_hours() {
+        let started = (Utc::now() - Duration::seconds(3 * 3600 + 240)).to_rfc3339();
+        let s = format_build_elapsed(&started);
+        assert!(s.starts_with("3h") && s.ends_with("m elapsed"), "got `{s}`");
+    }
+
+    #[test]
+    fn elapsed_formatter_days() {
+        let started = (Utc::now() - Duration::seconds(2 * 86400 + 5 * 3600)).to_rfc3339();
+        let s = format_build_elapsed(&started);
+        assert!(s.starts_with("2d") && s.ends_with("h elapsed"), "got `{s}`");
+    }
+
+    #[test]
+    fn elapsed_formatter_unparseable_input_is_empty() {
+        // Empty result lets the caller's `.filter(|s| !s.is_empty())`
+        // suppress the elapsed segment for malformed input.
+        assert_eq!(format_build_elapsed("not a date"), "");
     }
 }
