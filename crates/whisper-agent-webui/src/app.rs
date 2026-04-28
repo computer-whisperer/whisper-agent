@@ -1292,16 +1292,25 @@ struct BucketsModalState {
     /// for a confirming second click. Cleared whenever the user starts
     /// a different action.
     delete_armed: Option<String>,
-    /// Live build progress per bucket id. Inserted on
-    /// `BucketBuildStarted`, updated on `BucketBuildProgress`, removed
-    /// on `BucketBuildEnded`.
-    build_progress: HashMap<String, BuildProgressView>,
-    /// Sticky last-failed-build error message per bucket id. Cleared
-    /// when a successful build for the same bucket lands or the user
-    /// dismisses it (no UI for that yet — it gets overwritten by the
-    /// next attempt).
-    build_errors: HashMap<String, String>,
+    /// Live build progress, keyed by `(pod_id, bucket_id)`. Inserted
+    /// on `BucketBuildStarted`, updated on `BucketBuildProgress`,
+    /// removed on `BucketBuildEnded`. The key carries pod scope so a
+    /// pod-scope build's progress doesn't land in a same-named
+    /// server-scope row (and vice-versa) — same-named buckets across
+    /// scopes can coexist after PB3b.
+    build_progress: HashMap<BucketRowKey, BuildProgressView>,
+    /// Sticky last-failed-build error message, keyed by `(pod_id,
+    /// bucket_id)`. Cleared when a successful build for the same
+    /// bucket lands or the user dismisses it (no UI for that yet —
+    /// it gets overwritten by the next attempt).
+    build_errors: HashMap<BucketRowKey, String>,
 }
+
+/// `(pod_id, bucket_id)` pair used to key per-bucket UI state across
+/// the WebUI's bucket modal. Tuple rather than a named struct because
+/// it composes naturally with `HashMap` and the two callers (modal +
+/// wire-handler) construct it in only a handful of places.
+type BucketRowKey = (Option<String>, String);
 
 impl BucketsModalState {
     fn fresh() -> Self {
@@ -3594,7 +3603,7 @@ impl eframe::App for ChatApp {
                         // Optimistically clear any prior error so the
                         // user doesn't see a stale "last build error"
                         // line during the new attempt.
-                        modal.build_errors.remove(&id);
+                        modal.build_errors.remove(&(pod_id.clone(), id.clone()));
                     }
                     self.send(ClientToServer::StartBucketBuild {
                         correlation_id: Some(correlation),

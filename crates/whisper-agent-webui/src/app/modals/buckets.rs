@@ -918,7 +918,8 @@ fn render_bucket_row(
         ui.label(RichText::new(sparse).small().color(Color32::from_gray(180)));
     });
 
-    let in_flight_build = modal.build_progress.contains_key(&b.id);
+    let row_key = (b.pod_id.clone(), b.id.clone());
+    let in_flight_build = modal.build_progress.contains_key(&row_key);
     match &b.active_slot {
         None if !in_flight_build => {
             ui.label(
@@ -962,11 +963,11 @@ fn render_bucket_row(
         }
     }
 
-    if let Some(progress) = modal.build_progress.get(&b.id) {
+    if let Some(progress) = modal.build_progress.get(&row_key) {
         render_build_progress(ui, progress);
     }
 
-    if let Some(err) = modal.build_errors.get(&b.id) {
+    if let Some(err) = modal.build_errors.get(&row_key) {
         ui.label(
             RichText::new(format!("last build error: {err}"))
                 .small()

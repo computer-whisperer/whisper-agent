@@ -629,11 +629,12 @@ impl ChatApp {
                     modal.creating = None;
                 }
             }
-            ServerToClient::BucketDeleted { id, .. } => {
-                self.buckets.retain(|b| b.id != id);
+            ServerToClient::BucketDeleted { id, pod_id, .. } => {
+                self.buckets.retain(|b| !(b.id == id && b.pod_id == pod_id));
                 if let Some(modal) = self.buckets_modal.as_mut() {
-                    modal.build_progress.remove(&id);
-                    modal.build_errors.remove(&id);
+                    let key = (pod_id.clone(), id.clone());
+                    modal.build_progress.remove(&key);
+                    modal.build_errors.remove(&key);
                     if modal.delete_armed.as_deref() == Some(&id) {
                         modal.delete_armed = None;
                     }
@@ -644,12 +645,13 @@ impl ChatApp {
             }
             ServerToClient::BucketBuildStarted {
                 bucket_id,
+                pod_id,
                 started_at,
                 ..
             } => {
                 if let Some(modal) = self.buckets_modal.as_mut() {
                     modal.build_progress.insert(
-                        bucket_id,
+                        (pod_id, bucket_id),
                         super::BuildProgressView {
                             phase: whisper_agent_protocol::BucketBuildPhase::Planning,
                             source_records: 0,
@@ -661,6 +663,7 @@ impl ChatApp {
             }
             ServerToClient::BucketBuildProgress {
                 bucket_id,
+                pod_id,
                 phase,
                 source_records,
                 chunks,
@@ -672,12 +675,13 @@ impl ChatApp {
                     // omitted it on this tick (e.g. a pre-stopwatch
                     // server, or a defensive None fallback). The
                     // anchor only matters once.
+                    let key = (pod_id, bucket_id);
                     let prior = modal
                         .build_progress
-                        .get(&bucket_id)
+                        .get(&key)
                         .and_then(|p| p.started_at.clone());
                     modal.build_progress.insert(
-                        bucket_id,
+                        key,
                         super::BuildProgressView {
                             phase,
                             source_records,
@@ -689,25 +693,23 @@ impl ChatApp {
             }
             ServerToClient::BucketBuildEnded {
                 bucket_id,
+                pod_id,
                 outcome,
                 summary,
                 ..
             } => {
                 if let Some(modal) = self.buckets_modal.as_mut() {
-                    modal.build_progress.remove(&bucket_id);
+                    let key = (pod_id.clone(), bucket_id.clone());
+                    modal.build_progress.remove(&key);
                     match &outcome {
                         whisper_agent_protocol::BucketBuildOutcome::Success => {
-                            modal.build_errors.remove(&bucket_id);
+                            modal.build_errors.remove(&key);
                         }
                         whisper_agent_protocol::BucketBuildOutcome::Cancelled => {
-                            modal
-                                .build_errors
-                                .insert(bucket_id.clone(), "build cancelled".into());
+                            modal.build_errors.insert(key, "build cancelled".into());
                         }
                         whisper_agent_protocol::BucketBuildOutcome::Error { message } => {
-                            modal
-                                .build_errors
-                                .insert(bucket_id.clone(), message.clone());
+                            modal.build_errors.insert(key, message.clone());
                         }
                     }
                 }
