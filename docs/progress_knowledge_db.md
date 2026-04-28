@@ -39,6 +39,10 @@ Last updated: **2026-04-27**.
 | T   | Tracked source kind — config variant, `FeedDriver` + `WikipediaDriver`, feed-state file, build-pipeline wiring, `FeedWorker` (cadence + delta polling) | `28f18d4..8add262` |
 | W   | Wiki-scale fixes — multistream `bz2` decoder, embed-call cap, content-hash dedup, pipelined chunker→embedder→writer with concurrent embed requests, resume preamble observability | `fa64527..9564927` |
 | RC  | Replay in-flight build progress to freshly-connected clients   | `fd587bb` |
+| DA  | Delta application — `Bucket::apply_delta`, `SourceIndex` reverse-lookup, FeedWorker drives apply per tick | `7702d34..82b1bcd` |
+| PN  | "Poll now" wire path — bounded trigger channel, scheduler dispatch, WebUI button | `bb29d77` |
+| BS  | `Bucket::insert` per-API-call cap fix — apply_delta no longer blows past TEI's `max_client_batch_size` | `ec6a9f7` |
+| RS  | Background resync — manual + scheduled. `resolve_resync_source`, `reset_delta_cursor_to`, `BuildIntent::Resync`, `last_resync_at` persistence, FeedWorker resync arm, "Resync now" button | `07bdc26..9c4d7c3` |
 
 ## End-to-end validation (Simple English Wikipedia, mock embedder)
 
@@ -164,7 +168,7 @@ chronological — order may shuffle as the dataset reveals what hurts.
 | 10+ | Auto-compaction triggers (delta-ratio / tombstone-ratio thresholds, scheduled) | `Bucket::compact` is callable manually; auto-trigger heuristics still TBD. Real thresholds need observation on actual mutating buckets; should also have time-based triggers (e.g. compact pod memory daily). |
 | 10+ | Live-mode post-turn relevance nudge                            | Per design doc § "Live retrieval mode". Cross-cuts scheduler — not load-bearing for v1. |
 | 10+ | Per-pod buckets (`<pods_root>/<pod>/buckets/`)                 | Server-scope is enough until multi-pod isolation is a felt need. Today's `BucketScope::Pod` enum variant is unwired. |
-| 10+ | Background monthly resync for tracked buckets                  | Per design doc § "Background monthly resync". `FeedWorker` does daily delta polling; the periodic full-rebuild reset against a fresh base snapshot is not yet wired. |
+| 10+ | Quantization (f32 → f16 vectors)                               | Per design doc — halves on-disk vector footprint and HNSW RAM at minor recall cost; deferred while query-quality validation prioritized real-data testing on full-precision vectors. |
 
 ## Dangling cleanup (none blocking)
 
