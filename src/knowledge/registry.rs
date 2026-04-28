@@ -112,6 +112,18 @@ impl BucketRegistry {
             }
             match load_one(&path, &id).await {
                 Ok(entry) => {
+                    // Sweep orphaned slot directories — partial /
+                    // failed / superseded build attempts that no
+                    // longer reference the active slot. Failures are
+                    // non-fatal: a broken slots dir shouldn't keep
+                    // the bucket out of the registry.
+                    if let Err(e) = super::gc::gc_orphan_slots(&path, &id) {
+                        warn!(
+                            bucket = %id,
+                            error = %e,
+                            "gc: orphan-slot sweep failed; bucket loaded anyway",
+                        );
+                    }
                     buckets.insert(id, entry);
                 }
                 Err(e) => {

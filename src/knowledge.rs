@@ -37,6 +37,7 @@ pub mod dense;
 pub mod disk_bucket;
 pub mod feed_state;
 pub mod feed_worker;
+pub mod gc;
 pub mod manifest;
 pub mod query;
 pub mod registry;
@@ -62,6 +63,7 @@ pub use feed_state::{FeedState, FeedStateError, base_cache_dir, delta_cache_dir,
 pub use feed_worker::{
     FeedWorker, FeedWorkerControl, NoopObserver, TickOutcome, WorkerObserver, cadence_to_duration,
 };
+pub use gc::{GcReport, gc_orphan_slots};
 pub use manifest::{
     ChunkerSnapshot, EmbedderSnapshot, ServingSnapshot, SlotLineage, SlotManifest, SlotState,
     SlotStats, SparseSnapshot, TokenizerSnapshot,
