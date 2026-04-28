@@ -7,7 +7,7 @@ This doc is intentionally short — slice list + what's next + dangling
 cleanup. Architecture decisions live in the design doc; commit messages
 have the per-slice detail.
 
-Last updated: **2026-04-27**.
+Last updated: **2026-04-28**.
 
 ## Slices landed
 
@@ -166,6 +166,42 @@ previous attempt also cleared up the resulting query-time confusion.
 chunks, ~35× this run): ~3.6 days at this throughput. Pre-quantization,
 disk would be ~340 GiB — close to the design doc's 300 GiB estimate.
 
+## Quantization spot-test (full simplewiki, real TEI)
+
+Run on 2026-04-28. Three buckets built from the same pinned base
+snapshot (`simplewiki-20260401`), same 870,996 chunks each, queried
+with the built-in 15-query simplewiki list via `recall_eval` against
+the f32 baseline (clean, zero deltas).
+
+| variant | disk    | build wall-clock | mean recall@10 | median | min   | perfect |
+|---------|---------|-------------------|----------------|--------|-------|---------|
+| f32     | 8.8 GiB | 2h 28m            | 1.000 (ref)    | —      | —     | 15/15   |
+| f16     | 7.1 GiB | 2h 24m            | **0.960**      | 1.000  | 0.800 | 10/15   |
+| int8    | 6.3 GiB | 10h 49m           | **0.920**      | 1.000  | 0.000 | 12/15   |
+
+f16 quality matches expectations (~1–4% top-10 noise floor). int8 has
+one outlier query ("human immune system white blood cells") with
+recall@10 = 0.00 that recovers to recall@50 = 0.88 — top-K cutoff
+shuffle from quant noise, not semantic divergence; for typical RAG
+flows that pull more candidates and rerank, this is fine.
+
+**Methodology gotcha**: a first pass against the live `wikipedia_simple`
+(which had delta `20260427` applied) gave bogus recall numbers (mean
+0.63) because that bucket's content set differs from the pure-base
+f16/int8 (118k delta chunks + 107k tombstones). Switched to the
+backup `wikipedia_simple.bak` (clean snapshot, 0 deltas) for the
+real numbers above. Recall comparisons need identical content sets.
+
+**Disk-size note**: f16 saves only ~19% and int8 ~28% of total bucket
+disk because `dense.hnsw.{graph,data}` is still f32 — the HNSW-side
+quantization deferred item below would compound these savings.
+
+**Surprise — int8 build was 4× slower** than f32/f16 (10h 49m vs
+~2h 25m). f16 and f32 are tracking the embedder; int8 is doing
+something extra in the index path. Worth a profile pass before
+committing to int8 for the all-wiki run; symmetric per-vector
+quantization shouldn't impose this much overhead.
+
 ## Deferred / not started
 
 Numbered loosely so the conversation can refer to slices, not
@@ -176,7 +212,7 @@ chronological — order may shuffle as the dataset reveals what hurts.
 | 10+ | Auto-compaction triggers (delta-ratio / tombstone-ratio thresholds, scheduled) | `Bucket::compact` is callable manually; auto-trigger heuristics still TBD. Real thresholds need observation on actual mutating buckets; should also have time-based triggers (e.g. compact pod memory daily). |
 | 10+ | Live-mode post-turn relevance nudge                            | Per design doc § "Live retrieval mode". Cross-cuts scheduler — not load-bearing for v1. |
 | 10+ | Per-pod buckets (`<pods_root>/<pod>/buckets/`)                 | Server-scope is enough until multi-pod isolation is a felt need. Today's `BucketScope::Pod` enum variant is unwired. |
-| 10+ | HNSW-side quantization (f16 / int8 in dense.hnsw.data)         | vectors.bin already supports f16/int8 via Q2a/Q3; the HNSW dump still holds f32 because the in-memory `Hnsw<'static, f32, DistL2>` is hardcoded. Halving / quartering `dense.hnsw.data` is the larger remaining win at enwiki scale. Wait until `recall_eval` against an actual quantized bucket build informs whether the additional refactor (custom `Distance<f16>` + enum dispatch in DenseIndex) is worth it. |
+| 10+ | HNSW-side quantization (f16 / int8 in dense.hnsw.data)         | vectors.bin already supports f16/int8 via Q2a/Q3; the HNSW dump still holds f32 because the in-memory `Hnsw<'static, f32, DistL2>` is hardcoded. Halving / quartering `dense.hnsw.data` is the larger remaining win at enwiki scale. Recall_eval (2026-04-28) confirmed both quants land in the acceptable range (f16 0.96, int8 0.92 mean recall@10) — gating condition met. The remaining refactor (custom `Distance<f16>` + enum dispatch in `DenseIndex`) is now the bigger lever for full-enwiki disk + RAM budget. |
 
 ## Dangling cleanup (none blocking)
 
@@ -218,6 +254,20 @@ chronological — order may shuffle as the dataset reveals what hurts.
   futures; total query latency is now max-of-per-bucket instead of
   sum-of-per-bucket. Relevant once a pod has multiple buckets in
   scope (e.g. memory + wikipedia).
+- **Scheduler-thread block on `DiskBucket::open`** — `handle_start_bucket_build`
+  (`scheduler/buckets.rs:346`) and `handle_resync_bucket` (`:539`) call
+  `DiskBucket::open` synchronously on the scheduler task. On
+  `wikipedia_simple` the HNSW load is ~12s, blocking other scheduler
+  work for that window when a build/resync is kicked off. The fix is
+  to move `DiskBucket::open` + `find_resumable_slot` into the spawned
+  `run_build` future (under `spawn_blocking`); the wire handlers should
+  only validate + broadcast + spawn. Identified during the 30s-boot
+  hang investigation; cleanup deferred so the overnight quant builds
+  could proceed.
+- **int8 build wall-clock 4× slower than f32/f16** — observed in the
+  2026-04-28 quant spot-test (10h 49m vs ~2h 25m). Embedder is the
+  same; suspect a non-vectorized hot path in the int8 vector-write
+  loop. Worth profiling before using int8 at enwiki scale.
 
 ## Pointers
 

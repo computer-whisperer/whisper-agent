@@ -338,40 +338,13 @@ impl Scheduler {
                 return;
             }
         };
-        // Open the DiskBucket once — cheap when no active slot exists
-        // (the common case for first-build); re-opens an existing
-        // active slot for rebuild flows. Don't pay the HNSW load cost
-        // if we can avoid it: a rebuild with no existing slot is fine,
-        // but a real slot-load happens only on the next query path.
-        let bucket = match DiskBucket::open(entry.dir.clone(), BucketId::server(id.clone())) {
-            Ok(b) => Arc::new(b),
-            Err(e) => {
-                self.send_bucket_error(
-                    conn_id,
-                    correlation_id,
-                    "start_bucket_build",
-                    format!("open failed: {e}"),
-                );
-                return;
-            }
-        };
-
-        // Resume detection: if a prior build was interrupted (Pause
-        // or crash), its slot directory is still on disk in
-        // Planning/Building state. Pick that up rather than starting
-        // a parallel slot.
-        let resume_slot_id = match bucket.find_resumable_slot() {
-            Ok(opt) => opt,
-            Err(e) => {
-                self.send_bucket_error(
-                    conn_id,
-                    correlation_id,
-                    "start_bucket_build",
-                    format!("resumable-slot scan failed: {e}"),
-                );
-                return;
-            }
-        };
+        // `DiskBucket::open` (and the resumable-slot scan that follows
+        // it) used to run here on the scheduler task. On a multi-GiB
+        // bucket the HNSW load that happens inside `open` blocked the
+        // scheduler for ~12s after a click on Build. Both calls now
+        // live inside `run_build`'s `spawn_blocking` block — the
+        // scheduler tick is freed immediately and the click → ack
+        // round-trip is sub-ms.
 
         let cancel = CancellationToken::new();
         self.active_bucket_builds.insert(id.clone(), cancel.clone());
@@ -412,7 +385,6 @@ impl Scheduler {
         let chunker_config = entry.config.chunker.clone();
         let bucket_dir = entry.dir.clone();
         tokio::spawn(run_build(
-            bucket,
             embedder,
             source,
             bucket_dir,
@@ -423,7 +395,6 @@ impl Scheduler {
             task_tx,
             Some(conn_id),
             correlation_id,
-            resume_slot_id,
             BuildIntent::Normal,
         ));
     }
@@ -536,20 +507,13 @@ impl Scheduler {
                 return;
             }
         };
-        let bucket = match DiskBucket::open(entry.dir.clone(), BucketId::server(id.clone())) {
-            Ok(b) => Arc::new(b),
-            Err(e) => {
-                refuse(self, format!("open failed: {e}"));
-                return;
-            }
-        };
-
-        // Resync intentionally does *not* reuse a resumable slot —
-        // a fresh base demands a fresh build pipeline, and any
-        // resumable slot left from a prior interrupted build was
-        // built off the *old* base. The orphaned slot directory will
-        // be picked up by the future GC pass (see dangling cleanup
-        // in `progress_knowledge_db.md`).
+        // `DiskBucket::open` is deferred into `run_build`'s
+        // `spawn_blocking` — the HNSW load can be ~12s on a multi-GiB
+        // bucket and we don't want it on the scheduler task. Resync
+        // intentionally does *not* reuse a resumable slot (a fresh
+        // base demands a fresh pipeline; any leftover Planning/Building
+        // slot was built off the old base), so the resume-slot scan is
+        // skipped inside `run_build` for `BuildIntent::Resync`.
 
         let cancel = CancellationToken::new();
         self.active_bucket_builds.insert(id.clone(), cancel.clone());
@@ -599,7 +563,6 @@ impl Scheduler {
         let chunker_config = entry.config.chunker.clone();
         let bucket_dir = entry.dir.clone();
         tokio::spawn(run_build(
-            bucket,
             embedder,
             source,
             bucket_dir,
@@ -610,7 +573,6 @@ impl Scheduler {
             task_tx,
             requester,
             correlation_id,
-            None, // never resume — see comment above
             BuildIntent::Resync,
         ));
     }
@@ -817,7 +779,6 @@ pub enum BuildIntent {
 
 #[allow(clippy::too_many_arguments)]
 async fn run_build(
-    bucket: Arc<DiskBucket>,
     embedder: Arc<dyn EmbeddingProvider>,
     source: BuildSource,
     bucket_dir: std::path::PathBuf,
@@ -828,7 +789,6 @@ async fn run_build(
     task_tx: mpsc::UnboundedSender<BucketTaskUpdate>,
     requester_conn: Option<ConnId>,
     correlation_id: Option<String>,
-    resume_slot_id: Option<String>,
     intent: BuildIntent,
 ) {
     let observer_arc: Arc<dyn BuildObserver> = Arc::new(ProgressObserver {
@@ -990,11 +950,41 @@ async fn run_build(
         }
     };
 
-    let bucket_for_build = bucket.clone();
     let observer_for_build = observer_arc.clone();
     let cancel_for_build = cancel.clone();
     let handle = tokio::runtime::Handle::current();
+    let bucket_dir_for_build = bucket_dir.clone();
+    let bucket_id_for_build = bucket_id.clone();
     let result = tokio::task::spawn_blocking(move || {
+        // Open the DiskBucket inside `spawn_blocking` so the HNSW
+        // load — which can run ~12s on a multi-GiB bucket — never
+        // touches the scheduler task. Re-opens an existing active
+        // slot for rebuild flows; cheap when no active slot exists
+        // (the common first-build case).
+        let bucket =
+            match DiskBucket::open(bucket_dir_for_build, BucketId::server(bucket_id_for_build)) {
+                Ok(b) => Arc::new(b),
+                Err(e) => return Err(BucketError::Other(format!("open failed: {e}"))),
+            };
+
+        // Resume detection runs only for Normal intent. Resync
+        // builds always start a fresh slot — any Planning/Building
+        // slot left over from a prior interrupted build was built
+        // off the *old* base and would be inconsistent with the
+        // new one.
+        let resume_slot_id = if matches!(intent, BuildIntent::Normal) {
+            match bucket.find_resumable_slot() {
+                Ok(opt) => opt,
+                Err(e) => {
+                    return Err(BucketError::Other(format!(
+                        "resumable-slot scan failed: {e}"
+                    )));
+                }
+            }
+        } else {
+            None
+        };
+
         let resolved = match resolve_chunker(&chunker_config, embedder_model_id.as_deref()) {
             Ok(r) => r,
             Err(e) => return Err(BucketError::Other(format!("chunker resolution: {e}"))),
@@ -1006,7 +996,7 @@ async fn run_build(
         handle.block_on(async move {
             match resume_slot_id {
                 Some(slot_id) => {
-                    bucket_for_build
+                    bucket
                         .resume_slot(
                             &slot_id,
                             adapter.as_ref(),
@@ -1019,7 +1009,7 @@ async fn run_build(
                         .await
                 }
                 None => {
-                    bucket_for_build
+                    bucket
                         .build_slot(
                             adapter.as_ref(),
                             chunker_ref,
