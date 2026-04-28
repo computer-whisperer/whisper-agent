@@ -100,8 +100,20 @@ pub struct BucketRegistry {
     /// Folded in via [`BucketRegistry::register_pod_buckets`] once the
     /// pod registry is loaded.
     pub pod_buckets: BTreeMap<String, BTreeMap<String, BucketEntry>>,
+    /// Lazy `DiskBucket` cache for server-scope buckets, keyed by
+    /// bucket name.
     loaded: Arc<Mutex<HashMap<String, Arc<DiskBucket>>>>,
+    /// Lazy `DiskBucket` cache for pod-scope buckets, keyed by
+    /// `(pod_id, bucket_name)` so two pods with the same bucket name
+    /// don't share a cache entry.
+    loaded_pod: PodLoadedCache,
 }
+
+/// Type alias for the pod-scope `DiskBucket` cache. The
+/// `(pod_id, bucket_name)` key keeps two pods' identically-named
+/// buckets distinct; the alias avoids the very-complex-type clippy
+/// lint at the field site.
+type PodLoadedCache = Arc<Mutex<HashMap<(String, String), Arc<DiskBucket>>>>;
 
 impl BucketRegistry {
     /// Walk `root/*/bucket.toml` and build a registry. Missing or
@@ -169,6 +181,7 @@ impl BucketRegistry {
             buckets,
             pod_buckets: BTreeMap::new(),
             loaded: Arc::new(Mutex::new(HashMap::new())),
+            loaded_pod: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
@@ -369,6 +382,66 @@ impl BucketRegistry {
         }
         g.insert(id.to_string(), arc.clone());
         Ok(arc)
+    }
+
+    /// Pod-scope counterpart to [`Self::loaded_bucket`]. Looks up
+    /// `(pod_id, name)` in the pod sub-registry, opens the bucket
+    /// (HNSW load via `spawn_blocking`), and caches the result keyed
+    /// by `(pod_id, name)` so two pods with the same bucket name don't
+    /// share an entry.
+    pub async fn loaded_bucket_pod(
+        &self,
+        pod_id: &str,
+        name: &str,
+    ) -> Result<Arc<DiskBucket>, BucketError> {
+        let key = (pod_id.to_string(), name.to_string());
+        {
+            let g = self.loaded_pod.lock().expect("loaded_pod mutex poisoned");
+            if let Some(b) = g.get(&key) {
+                return Ok(b.clone());
+            }
+        }
+
+        let entry = self
+            .pod_buckets
+            .get(pod_id)
+            .and_then(|m| m.get(name))
+            .ok_or_else(|| {
+                BucketError::Other(format!(
+                    "unknown pod-scope bucket: pod={pod_id}, name={name}"
+                ))
+            })?;
+        let dir = entry.dir.clone();
+        let id_owned = name.to_string();
+
+        let bucket =
+            tokio::task::spawn_blocking(move || DiskBucket::open(dir, BucketId::pod(id_owned)))
+                .await
+                .map_err(|e| BucketError::Other(format!("spawn_blocking: {e}")))??;
+        let arc = Arc::new(bucket);
+
+        let mut g = self.loaded_pod.lock().expect("loaded_pod mutex poisoned");
+        if let Some(existing) = g.get(&key) {
+            return Ok(existing.clone());
+        }
+        g.insert(key, arc.clone());
+        Ok(arc)
+    }
+
+    /// Unified lookup for a bucket entry by scope. `pod_id` must be
+    /// `Some` for `BucketScope::Pod` and is ignored for
+    /// `BucketScope::Server`. Returns `None` if no matching entry
+    /// exists in the relevant sub-registry.
+    pub fn find_entry(
+        &self,
+        scope: BucketScope,
+        pod_id: Option<&str>,
+        name: &str,
+    ) -> Option<&BucketEntry> {
+        match scope {
+            BucketScope::Server => self.buckets.get(name),
+            BucketScope::Pod => self.pod_buckets.get(pod_id?).and_then(|m| m.get(name)),
+        }
     }
 }
 

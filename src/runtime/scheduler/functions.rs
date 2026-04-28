@@ -1625,61 +1625,68 @@ impl Scheduler {
             .top_k
             .unwrap_or(crate::tools::builtin_tools::knowledge_query::DEFAULT_TOP_K);
 
-        // Resolve in-scope buckets from the pod's allow list.
-        let in_scope: Vec<String> = self
-            .tasks
-            .get(thread_id)
-            .and_then(|t| self.pods.get(&t.pod_id))
+        // Caller pod id — required to derive the pod-scope in-scope
+        // set and to construct typed `pod` targets.
+        let caller_pod_id = match self.tasks.get(thread_id).map(|t| t.pod_id.clone()) {
+            Some(p) => p,
+            None => {
+                pending_io.push(immediate_tool_error(
+                    thread_id.to_string(),
+                    op_id,
+                    tool_use_id,
+                    "knowledge_query: thread has no pod (bug)".into(),
+                ));
+                return;
+            }
+        };
+
+        // In-scope sets:
+        // - server: pod's `[allow.knowledge_buckets]` (today's allow list
+        //   refers to server-scope ids).
+        // - pod: every pod-scope bucket the registry knows under this
+        //   pod. A pod's own pod-scope buckets are auto-allowed; no
+        //   explicit grant needed.
+        let in_scope_server: Vec<String> = self
+            .pods
+            .get(&caller_pod_id)
             .map(|pod| pod.config.allow.knowledge_buckets.clone())
             .unwrap_or_default();
+        let in_scope_pod: Vec<String> = self
+            .bucket_registry
+            .pod_buckets
+            .get(&caller_pod_id)
+            .map(|m| m.keys().cloned().collect())
+            .unwrap_or_default();
 
-        if in_scope.is_empty() {
+        if in_scope_server.is_empty() && in_scope_pod.is_empty() {
             pending_io.push(immediate_tool_error(
                 thread_id.to_string(),
                 op_id,
                 tool_use_id,
-                "knowledge_query: this pod's `[allow.knowledge_buckets]` is empty. \
-                 Ask the operator to add bucket ids before retry."
+                "knowledge_query: this pod has no buckets in scope. \
+                 Add server-scope grants under `[allow.knowledge_buckets]`, \
+                 or create a pod-scope bucket under `<pod_dir>/buckets/`."
                     .into(),
             ));
             return;
         }
 
-        // Intersect the explicit `buckets` arg (if any) with the in-
-        // scope set. Out-of-scope names error with what IS in scope so
-        // the model can correct in one round-trip.
-        let target_ids: Vec<String> = if args.buckets.is_empty() {
-            in_scope.clone()
-        } else {
-            let scope_set: std::collections::HashSet<&String> = in_scope.iter().collect();
-            let bad: Vec<&String> = args
-                .buckets
-                .iter()
-                .filter(|b| !scope_set.contains(b))
-                .collect();
-            if !bad.is_empty() {
-                let bad_list = bad
-                    .iter()
-                    .map(|s| format!("`{s}`"))
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                let scope_list = in_scope
-                    .iter()
-                    .map(|s| format!("`{s}`"))
-                    .collect::<Vec<_>>()
-                    .join(", ");
+        let targets = match resolve_query_targets(
+            &args.buckets,
+            &in_scope_server,
+            &in_scope_pod,
+            &caller_pod_id,
+        ) {
+            Ok(t) => t,
+            Err(msg) => {
                 pending_io.push(immediate_tool_error(
                     thread_id.to_string(),
                     op_id,
                     tool_use_id,
-                    format!(
-                        "knowledge_query: bucket(s) {bad_list} not in this pod's \
-                         `[allow.knowledge_buckets]`. In scope: {scope_list}."
-                    ),
+                    format!("knowledge_query: {msg}"),
                 ));
                 return;
             }
-            args.buckets.clone()
         };
 
         // Resolve embedder + reranker. Different buckets may want
@@ -1703,28 +1710,34 @@ impl Scheduler {
             }
         };
 
-        // Validate each target bucket exists in the registry up-front
-        // so the failure message is "unknown bucket" with the bad id,
-        // not a generic load error from inside the future.
-        let mut bucket_configs: Vec<(String, String)> = Vec::with_capacity(target_ids.len());
-        for id in &target_ids {
-            let entry = match self.bucket_registry.buckets.get(id) {
-                Some(e) => e,
-                None => {
-                    pending_io.push(immediate_tool_error(
-                        thread_id.to_string(),
-                        op_id,
-                        tool_use_id,
-                        format!(
-                            "knowledge_query: bucket `{id}` is in the pod's allow list \
-                             but no longer exists in the registry — likely deleted \
-                             out from under the pod config. Update `[allow.knowledge_buckets]`."
-                        ),
-                    ));
-                    return;
-                }
-            };
-            bucket_configs.push((id.clone(), entry.config.defaults.embedder.clone()));
+        // Validate each target's entry exists in the registry up-front
+        // so the failure message names the bad ref, not a generic load
+        // error from inside the future.
+        let mut bucket_configs: Vec<(QueryTarget, String)> = Vec::with_capacity(targets.len());
+        for tgt in &targets {
+            let entry =
+                match self
+                    .bucket_registry
+                    .find_entry(tgt.scope, tgt.pod_id.as_deref(), &tgt.name)
+                {
+                    Some(e) => e,
+                    None => {
+                        let scope_label = tgt.scope.as_str();
+                        pending_io.push(immediate_tool_error(
+                            thread_id.to_string(),
+                            op_id,
+                            tool_use_id,
+                            format!(
+                                "knowledge_query: bucket `{scope_label}:{}` is in scope but \
+                             no longer exists in the registry — likely deleted out from \
+                             under the pod config.",
+                                tgt.name,
+                            ),
+                        ));
+                        return;
+                    }
+                };
+            bucket_configs.push((tgt.clone(), entry.config.defaults.embedder.clone()));
         }
 
         // Resolve each bucket's embedder by its bucket.toml `defaults.embedder`.
@@ -1739,14 +1752,17 @@ impl Scheduler {
         let embedder = match self.embedding_providers.get(&primary_embedder_name) {
             Some(e) => e.provider.clone(),
             None => {
+                let primary = &bucket_configs[0].0;
                 pending_io.push(immediate_tool_error(
                     thread_id.to_string(),
                     op_id,
                     tool_use_id,
                     format!(
-                        "knowledge_query: bucket `{}` references embedder `{}` which is \
+                        "knowledge_query: bucket `{}:{}` references embedder `{}` which is \
                          not configured under `[embedding_providers.*]`.",
-                        bucket_configs[0].0, primary_embedder_name,
+                        primary.scope.as_str(),
+                        primary.name,
+                        primary_embedder_name,
                     ),
                 ));
                 return;
@@ -1756,22 +1772,42 @@ impl Scheduler {
         let registry = self.bucket_registry.clone();
         let thread_id_s = thread_id.to_string();
         let query_text = args.query.clone();
+        let display_targets: Vec<String> = targets
+            .iter()
+            .map(|t| format!("{}:{}", t.scope.as_str(), t.name))
+            .collect();
         pending_io.push(Box::pin(async move {
             let cancel = tokio_util::sync::CancellationToken::new();
 
-            // Load each bucket. First-load pays the slot-load cost;
-            // hot loads come from the cache.
+            // Load each bucket from the right scope's cache. First-load
+            // pays the slot-load cost; hot loads come from the cache.
             let mut buckets: Vec<std::sync::Arc<dyn crate::knowledge::Bucket>> =
-                Vec::with_capacity(target_ids.len());
-            for id in &target_ids {
-                match registry.loaded_bucket(id).await {
+                Vec::with_capacity(targets.len());
+            for tgt in &targets {
+                let load = match tgt.scope {
+                    crate::knowledge::BucketScope::Server => {
+                        registry.loaded_bucket(&tgt.name).await
+                    }
+                    crate::knowledge::BucketScope::Pod => {
+                        let pod = tgt
+                            .pod_id
+                            .as_deref()
+                            .expect("pod-scope target carries pod_id");
+                        registry.loaded_bucket_pod(pod, &tgt.name).await
+                    }
+                };
+                match load {
                     Ok(b) => buckets.push(b),
                     Err(e) => {
                         return tool_error_completion(
                             thread_id_s,
                             op_id,
                             tool_use_id,
-                            format!("knowledge_query: load bucket `{id}` failed: {e}"),
+                            format!(
+                                "knowledge_query: load bucket `{}:{}` failed: {e}",
+                                tgt.scope.as_str(),
+                                tgt.name,
+                            ),
                         );
                     }
                 }
@@ -1794,7 +1830,7 @@ impl Scheduler {
                 }
             };
 
-            let body = format_hits(&query_text, &target_ids, &hits);
+            let body = format_hits(&query_text, &display_targets, &hits);
             tool_success_completion(thread_id_s, op_id, tool_use_id, body)
         }));
     }
@@ -1838,42 +1874,60 @@ impl Scheduler {
             }
         };
 
-        // Same pod-scope check as knowledge_query — the bucket id
-        // must be in `[allow.knowledge_buckets]`. The source-kind
-        // check (managed-only) happens inside the bucket method,
-        // not here, so that error message names the actual kind.
-        let in_scope: Vec<String> = self
-            .tasks
-            .get(thread_id)
-            .and_then(|t| self.pods.get(&t.pod_id))
+        // Pod-scope resolution mirrors knowledge_query — single target,
+        // same `pod:` / `server:` prefix grammar. Bare names disambiguate
+        // against the pod's own pod-scope buckets (auto-allowed) plus its
+        // `[allow.knowledge_buckets]` server grants.
+        let caller_pod_id = match self.tasks.get(thread_id).map(|t| t.pod_id.clone()) {
+            Some(p) => p,
+            None => {
+                pending_io.push(immediate_tool_error(
+                    thread_id.to_string(),
+                    op_id,
+                    tool_use_id,
+                    "knowledge_modify: thread has no pod (bug)".into(),
+                ));
+                return;
+            }
+        };
+        let in_scope_server: Vec<String> = self
+            .pods
+            .get(&caller_pod_id)
             .map(|pod| pod.config.allow.knowledge_buckets.clone())
             .unwrap_or_default();
-        if !in_scope.iter().any(|b| b == &args.bucket_id) {
-            let scope_list = if in_scope.is_empty() {
-                "(empty — ask the operator to populate `[allow.knowledge_buckets]`)".to_string()
-            } else {
-                in_scope
-                    .iter()
-                    .map(|s| format!("`{s}`"))
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            };
-            pending_io.push(immediate_tool_error(
-                thread_id.to_string(),
-                op_id,
-                tool_use_id,
-                format!(
-                    "knowledge_modify: bucket `{}` not in this pod's \
-                     `[allow.knowledge_buckets]`. In scope: {scope_list}.",
-                    args.bucket_id,
-                ),
-            ));
-            return;
-        }
+        let in_scope_pod: Vec<String> = self
+            .bucket_registry
+            .pod_buckets
+            .get(&caller_pod_id)
+            .map(|m| m.keys().cloned().collect())
+            .unwrap_or_default();
+
+        let mut targets = match resolve_query_targets(
+            std::slice::from_ref(&args.bucket_id),
+            &in_scope_server,
+            &in_scope_pod,
+            &caller_pod_id,
+        ) {
+            Ok(t) => t,
+            Err(msg) => {
+                pending_io.push(immediate_tool_error(
+                    thread_id.to_string(),
+                    op_id,
+                    tool_use_id,
+                    format!("knowledge_modify: {msg}"),
+                ));
+                return;
+            }
+        };
+        let target = targets.pop().expect("resolver returns one target per arg");
 
         // Validate bucket exists in the registry up-front for a
         // clearer error than the future's load failure.
-        let entry = match self.bucket_registry.buckets.get(&args.bucket_id) {
+        let entry = match self.bucket_registry.find_entry(
+            target.scope,
+            target.pod_id.as_deref(),
+            &target.name,
+        ) {
             Some(e) => e.clone(),
             None => {
                 pending_io.push(immediate_tool_error(
@@ -1881,10 +1935,11 @@ impl Scheduler {
                     op_id,
                     tool_use_id,
                     format!(
-                        "knowledge_modify: bucket `{}` is in the pod's allow list but no \
-                         longer exists in the registry — likely deleted. Update \
-                         `[allow.knowledge_buckets]`.",
-                        args.bucket_id,
+                        "knowledge_modify: bucket `{}:{}` is in scope but no longer \
+                         exists in the registry — likely deleted out from under the \
+                         pod config.",
+                        target.scope.as_str(),
+                        target.name,
                     ),
                 ));
                 return;
@@ -1906,9 +1961,11 @@ impl Scheduler {
                     op_id,
                     tool_use_id,
                     format!(
-                        "knowledge_modify: bucket `{}` references embedder `{}` which is \
-                         not configured under `[embedding_providers.*]`.",
-                        args.bucket_id, entry.config.defaults.embedder,
+                        "knowledge_modify: bucket `{}:{}` references embedder `{}` which \
+                         is not configured under `[embedding_providers.*]`.",
+                        target.scope.as_str(),
+                        target.name,
+                        entry.config.defaults.embedder,
                     ),
                 ));
                 return;
@@ -1917,21 +1974,34 @@ impl Scheduler {
 
         let registry = self.bucket_registry.clone();
         let thread_id_s = thread_id.to_string();
-        let bucket_id = args.bucket_id.clone();
+        let bucket_label = format!("{}:{}", target.scope.as_str(), target.name);
         let source_id = args.source_id.clone();
         let action = args.action.clone();
         let content = args.content.unwrap_or_default();
         let embedder_name = entry.config.defaults.embedder.clone();
+        let target_for_load = target.clone();
         pending_io.push(Box::pin(async move {
             let cancel = tokio_util::sync::CancellationToken::new();
-            let bucket = match registry.loaded_bucket(&bucket_id).await {
+            let load = match target_for_load.scope {
+                crate::knowledge::BucketScope::Server => {
+                    registry.loaded_bucket(&target_for_load.name).await
+                }
+                crate::knowledge::BucketScope::Pod => {
+                    let pod = target_for_load
+                        .pod_id
+                        .as_deref()
+                        .expect("pod-scope target carries pod_id");
+                    registry.loaded_bucket_pod(pod, &target_for_load.name).await
+                }
+            };
+            let bucket = match load {
                 Ok(b) => b,
                 Err(e) => {
                     return tool_error_completion(
                         thread_id_s,
                         op_id,
                         tool_use_id,
-                        format!("knowledge_modify: load bucket `{bucket_id}` failed: {e}"),
+                        format!("knowledge_modify: load bucket `{bucket_label}` failed: {e}"),
                     );
                 }
             };
@@ -1944,7 +2014,7 @@ impl Scheduler {
                     thread_id_s,
                     op_id,
                     tool_use_id,
-                    format!("knowledge_modify: set_embedder on `{bucket_id}` failed: {e}"),
+                    format!("knowledge_modify: set_embedder on `{bucket_label}` failed: {e}"),
                 );
             }
             match action {
@@ -1955,7 +2025,7 @@ impl Scheduler {
                             op_id,
                             tool_use_id,
                             format!(
-                                "Inserted `{source_id}` into `{bucket_id}` ({n} chunk{}).",
+                                "Inserted `{source_id}` into `{bucket_label}` ({n} chunk{}).",
                                 if n == 1 { "" } else { "s" },
                             ),
                         ),
@@ -1974,7 +2044,7 @@ impl Scheduler {
                             op_id,
                             tool_use_id,
                             format!(
-                                "Tombstone `{source_id}` in `{bucket_id}`: no-op \
+                                "Tombstone `{source_id}` in `{bucket_label}`: no-op \
                                  (source not found, already absent).",
                             ),
                         ),
@@ -1983,7 +2053,7 @@ impl Scheduler {
                             op_id,
                             tool_use_id,
                             format!(
-                                "Tombstoned `{source_id}` in `{bucket_id}` ({n} chunk{}).",
+                                "Tombstoned `{source_id}` in `{bucket_label}` ({n} chunk{}).",
                                 if n == 1 { "" } else { "s" },
                             ),
                         ),
@@ -3015,6 +3085,179 @@ impl Scheduler {
     }
 }
 
+/// Resolved target of a `knowledge_query` (or `knowledge_modify`)
+/// call after parsing the model's bucket-name args against the caller
+/// pod's in-scope sets. Carries the typed scope discriminator and the
+/// owning pod for `BucketScope::Pod`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct QueryTarget {
+    pub scope: crate::knowledge::BucketScope,
+    pub pod_id: Option<String>,
+    pub name: String,
+}
+
+impl QueryTarget {
+    fn server(name: impl Into<String>) -> Self {
+        Self {
+            scope: crate::knowledge::BucketScope::Server,
+            pod_id: None,
+            name: name.into(),
+        }
+    }
+    fn pod(pod_id: impl Into<String>, name: impl Into<String>) -> Self {
+        Self {
+            scope: crate::knowledge::BucketScope::Pod,
+            pod_id: Some(pod_id.into()),
+            name: name.into(),
+        }
+    }
+}
+
+/// One model-supplied bucket reference, after splitting off any
+/// `server:` / `pod:` prefix. Bare references defer scope resolution
+/// to the caller's in-scope sets.
+enum ParsedBucketRef<'a> {
+    Bare(&'a str),
+    Server(&'a str),
+    Pod(&'a str),
+}
+
+fn parse_bucket_arg(s: &str) -> ParsedBucketRef<'_> {
+    if let Some(rest) = s.strip_prefix("server:") {
+        ParsedBucketRef::Server(rest)
+    } else if let Some(rest) = s.strip_prefix("pod:") {
+        ParsedBucketRef::Pod(rest)
+    } else {
+        ParsedBucketRef::Bare(s)
+    }
+}
+
+/// Resolve a `knowledge_query` `buckets` arg against the caller pod's
+/// allow-list (`in_scope_server`) and the pod's own pod-scope bucket
+/// names (`in_scope_pod`). Returns the typed targets in argument order.
+///
+/// Resolution rules:
+/// - Empty `args_buckets` ⇒ union of both in-scope sets.
+/// - `server:foo` ⇒ must appear in `in_scope_server`.
+/// - `pod:foo` ⇒ must appear in `in_scope_pod`.
+/// - Bare `foo` ⇒ exactly one of pod or server scope must contain it;
+///   ambiguity errors with the disambiguating prefix in the message.
+///
+/// Unresolved names (typos, scope grant missing) collect into a single
+/// error so the model gets one round-trip to fix everything.
+pub(super) fn resolve_query_targets(
+    args_buckets: &[String],
+    in_scope_server: &[String],
+    in_scope_pod: &[String],
+    caller_pod_id: &str,
+) -> Result<Vec<QueryTarget>, String> {
+    if args_buckets.is_empty() {
+        let mut out = Vec::with_capacity(in_scope_server.len() + in_scope_pod.len());
+        for n in in_scope_server {
+            out.push(QueryTarget::server(n));
+        }
+        for n in in_scope_pod {
+            out.push(QueryTarget::pod(caller_pod_id, n));
+        }
+        return Ok(out);
+    }
+
+    let pod_set: std::collections::HashSet<&str> =
+        in_scope_pod.iter().map(String::as_str).collect();
+    let server_set: std::collections::HashSet<&str> =
+        in_scope_server.iter().map(String::as_str).collect();
+
+    let mut targets = Vec::with_capacity(args_buckets.len());
+    let mut bad: Vec<String> = Vec::new();
+    let mut ambiguous: Vec<String> = Vec::new();
+
+    for raw in args_buckets {
+        match parse_bucket_arg(raw) {
+            ParsedBucketRef::Server(name) => {
+                if server_set.contains(name) {
+                    targets.push(QueryTarget::server(name));
+                } else {
+                    bad.push(raw.clone());
+                }
+            }
+            ParsedBucketRef::Pod(name) => {
+                if pod_set.contains(name) {
+                    targets.push(QueryTarget::pod(caller_pod_id, name));
+                } else {
+                    bad.push(raw.clone());
+                }
+            }
+            ParsedBucketRef::Bare(name) => {
+                let in_pod = pod_set.contains(name);
+                let in_server = server_set.contains(name);
+                if in_pod && in_server {
+                    ambiguous.push(name.to_string());
+                } else if in_pod {
+                    targets.push(QueryTarget::pod(caller_pod_id, name));
+                } else if in_server {
+                    targets.push(QueryTarget::server(name));
+                } else {
+                    bad.push(raw.clone());
+                }
+            }
+        }
+    }
+
+    if !ambiguous.is_empty() {
+        let list = ambiguous
+            .iter()
+            .map(|n| format!("`{n}`"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(format!(
+            "bucket name(s) {list} exist in both server and pod scope; \
+             prefix with `server:` or `pod:` to disambiguate."
+        ));
+    }
+    if !bad.is_empty() {
+        let bad_list = bad
+            .iter()
+            .map(|s| format!("`{s}`"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(format!(
+            "bucket(s) {bad_list} not in scope. {}",
+            format_in_scope(in_scope_server, in_scope_pod),
+        ));
+    }
+    Ok(targets)
+}
+
+/// Human-readable summary of what the caller pod can see, used in
+/// out-of-scope error messages so the model can correct in one
+/// round-trip.
+fn format_in_scope(server: &[String], pod: &[String]) -> String {
+    let s_part = if server.is_empty() {
+        "no server-scope grants".to_string()
+    } else {
+        format!(
+            "server-scope: [{}]",
+            server
+                .iter()
+                .map(|s| format!("`{s}`"))
+                .collect::<Vec<_>>()
+                .join(", "),
+        )
+    };
+    let p_part = if pod.is_empty() {
+        "no pod-scope buckets".to_string()
+    } else {
+        format!(
+            "pod-scope: [{}]",
+            pod.iter()
+                .map(|s| format!("`{s}`"))
+                .collect::<Vec<_>>()
+                .join(", "),
+        )
+    };
+    format!("In scope: {s_part}; {p_part}.")
+}
+
 /// Map the wire-level [`crate::permission::SudoDecision`] to the
 /// audit-log [`crate::runtime::audit::SudoDecisionTag`]. They're the
 /// same three variants; the indirection keeps the audit module from
@@ -3305,5 +3548,140 @@ mod tests {
         });
         let e = outcome_to_sync_tool_result(&outcome).expect_err("inner failure is Err");
         assert!(e.contains("allowlist"));
+    }
+
+    // -- knowledge_query bucket-target resolver --
+
+    fn s(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn resolve_targets_empty_args_returns_union() {
+        let out = resolve_query_targets(&[], &s(&["wikipedia"]), &s(&["memory"]), "alpha").unwrap();
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0], QueryTarget::server("wikipedia"));
+        assert_eq!(out[1], QueryTarget::pod("alpha", "memory"));
+    }
+
+    #[test]
+    fn resolve_targets_empty_args_with_empty_scopes_returns_empty() {
+        // Caller decides whether empty is OK; the resolver itself
+        // doesn't error here (the call sites do their own gate).
+        let out = resolve_query_targets(&[], &[], &[], "alpha").unwrap();
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn resolve_targets_bare_name_pod_only() {
+        let out = resolve_query_targets(
+            &s(&["memory"]),
+            &s(&["wikipedia"]),
+            &s(&["memory"]),
+            "alpha",
+        )
+        .unwrap();
+        assert_eq!(out, vec![QueryTarget::pod("alpha", "memory")]);
+    }
+
+    #[test]
+    fn resolve_targets_bare_name_server_only() {
+        let out = resolve_query_targets(
+            &s(&["wikipedia"]),
+            &s(&["wikipedia"]),
+            &s(&["memory"]),
+            "alpha",
+        )
+        .unwrap();
+        assert_eq!(out, vec![QueryTarget::server("wikipedia")]);
+    }
+
+    #[test]
+    fn resolve_targets_bare_name_in_both_scopes_is_ambiguous() {
+        let err = resolve_query_targets(&s(&["notes"]), &s(&["notes"]), &s(&["notes"]), "alpha")
+            .unwrap_err();
+        assert!(err.contains("ambiguous") || err.contains("both server and pod"));
+        assert!(err.contains("`notes`"));
+    }
+
+    #[test]
+    fn resolve_targets_explicit_prefix_disambiguates_collision() {
+        // Same name in both scopes — prefix forces resolution.
+        let out =
+            resolve_query_targets(&s(&["pod:notes"]), &s(&["notes"]), &s(&["notes"]), "alpha")
+                .unwrap();
+        assert_eq!(out, vec![QueryTarget::pod("alpha", "notes")]);
+
+        let out = resolve_query_targets(
+            &s(&["server:notes"]),
+            &s(&["notes"]),
+            &s(&["notes"]),
+            "alpha",
+        )
+        .unwrap();
+        assert_eq!(out, vec![QueryTarget::server("notes")]);
+    }
+
+    #[test]
+    fn resolve_targets_explicit_pod_prefix_must_be_in_pod_scope() {
+        let err = resolve_query_targets(
+            &s(&["pod:wikipedia"]),
+            &s(&["wikipedia"]),
+            &s(&["memory"]),
+            "alpha",
+        )
+        .unwrap_err();
+        assert!(err.contains("not in scope"));
+        assert!(err.contains("`pod:wikipedia`"));
+    }
+
+    #[test]
+    fn resolve_targets_explicit_server_prefix_must_be_in_allow_list() {
+        let err = resolve_query_targets(
+            &s(&["server:memory"]),
+            &s(&["wikipedia"]),
+            &s(&["memory"]),
+            "alpha",
+        )
+        .unwrap_err();
+        assert!(err.contains("not in scope"));
+        assert!(err.contains("`server:memory`"));
+    }
+
+    #[test]
+    fn resolve_targets_unknown_bare_name_errors_with_in_scope_summary() {
+        let err = resolve_query_targets(
+            &s(&["nonsense"]),
+            &s(&["wikipedia"]),
+            &s(&["memory"]),
+            "alpha",
+        )
+        .unwrap_err();
+        assert!(err.contains("`nonsense`"));
+        // Both scope summaries should appear so the model has the full
+        // picture without a second round-trip.
+        assert!(err.contains("server-scope"));
+        assert!(err.contains("pod-scope"));
+        assert!(err.contains("`wikipedia`"));
+        assert!(err.contains("`memory`"));
+    }
+
+    #[test]
+    fn resolve_targets_preserves_arg_order() {
+        let out = resolve_query_targets(
+            &s(&["memory", "wikipedia", "pod:memory"]),
+            &s(&["wikipedia"]),
+            &s(&["memory"]),
+            "alpha",
+        )
+        .unwrap();
+        assert_eq!(
+            out,
+            vec![
+                QueryTarget::pod("alpha", "memory"),
+                QueryTarget::server("wikipedia"),
+                QueryTarget::pod("alpha", "memory"),
+            ],
+        );
     }
 }
