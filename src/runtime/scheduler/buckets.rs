@@ -1408,7 +1408,14 @@ fn build_source(source: &crate::knowledge::SourceConfig) -> Result<BuildSource, 
             Ok(BuildSource::Ready(Box::new(MarkdownDir::new(path))))
         }
         SourceConfig::Managed {} => {
-            Err("managed buckets have no source adapter to build from".into())
+            // A managed bucket's "build" produces an empty slot — no
+            // base chunks. Subsequent `knowledge_modify` inserts land
+            // in that slot's delta layer just like any other mutation.
+            // Without this StartBuild path, the bucket would have no
+            // active slot for `Bucket::insert` to bind to.
+            Ok(BuildSource::Ready(Box::new(
+                crate::knowledge::source::EmptySource,
+            )))
         }
         SourceConfig::Tracked { driver, .. } => {
             // The cadence fields (delta_cadence, resync_cadence) are

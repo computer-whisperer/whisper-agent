@@ -817,6 +817,17 @@ impl Scheduler {
             );
             return;
         }
+        if name == crate::tools::builtin_tools::KNOWLEDGE_MODIFY {
+            self.complete_knowledge_modify_call(
+                thread_id,
+                op_id,
+                tool_use_id,
+                input,
+                disposition,
+                pending_io,
+            );
+            return;
+        }
 
         let spec = match self.route_tool(thread_id, &name) {
             Some(ToolRoute::Builtin { .. }) => Function::BuiltinToolCall {
@@ -1785,6 +1796,206 @@ impl Scheduler {
 
             let body = format_hits(&query_text, &target_ids, &hits);
             tool_success_completion(thread_id_s, op_id, tool_use_id, body)
+        }));
+    }
+
+    /// `knowledge_modify`-specific path. Same pod-scope gate as
+    /// `complete_knowledge_query_call`; the bucket's source-kind
+    /// check happens inside [`DiskBucket::insert_record`] /
+    /// [`DiskBucket::tombstone_by_source`] (only `managed` buckets
+    /// accept LLM-driven mutations). Dispatches to a detached future
+    /// because the embed + index work can take seconds for large
+    /// `content` payloads, and the scheduler thread should not pin
+    /// on it.
+    fn complete_knowledge_modify_call(
+        &mut self,
+        thread_id: &str,
+        op_id: crate::runtime::thread::OpId,
+        tool_use_id: String,
+        input: serde_json::Value,
+        disposition: crate::permission::Disposition,
+        pending_io: &mut FuturesUnordered<SchedulerFuture>,
+    ) {
+        if matches!(disposition, crate::permission::Disposition::Deny) {
+            pending_io.push(make_denial_future(
+                thread_id.to_string(),
+                tool_use_id,
+                op_id,
+                crate::tools::builtin_tools::KNOWLEDGE_MODIFY.to_string(),
+            ));
+            return;
+        }
+        let args = match crate::tools::builtin_tools::knowledge_modify::parse_args(input) {
+            Ok(a) => a,
+            Err(e) => {
+                pending_io.push(immediate_tool_error(
+                    thread_id.to_string(),
+                    op_id,
+                    tool_use_id,
+                    e,
+                ));
+                return;
+            }
+        };
+
+        // Same pod-scope check as knowledge_query — the bucket id
+        // must be in `[allow.knowledge_buckets]`. The source-kind
+        // check (managed-only) happens inside the bucket method,
+        // not here, so that error message names the actual kind.
+        let in_scope: Vec<String> = self
+            .tasks
+            .get(thread_id)
+            .and_then(|t| self.pods.get(&t.pod_id))
+            .map(|pod| pod.config.allow.knowledge_buckets.clone())
+            .unwrap_or_default();
+        if !in_scope.iter().any(|b| b == &args.bucket_id) {
+            let scope_list = if in_scope.is_empty() {
+                "(empty — ask the operator to populate `[allow.knowledge_buckets]`)".to_string()
+            } else {
+                in_scope
+                    .iter()
+                    .map(|s| format!("`{s}`"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            };
+            pending_io.push(immediate_tool_error(
+                thread_id.to_string(),
+                op_id,
+                tool_use_id,
+                format!(
+                    "knowledge_modify: bucket `{}` not in this pod's \
+                     `[allow.knowledge_buckets]`. In scope: {scope_list}.",
+                    args.bucket_id,
+                ),
+            ));
+            return;
+        }
+
+        // Validate bucket exists in the registry up-front for a
+        // clearer error than the future's load failure.
+        let entry = match self.bucket_registry.buckets.get(&args.bucket_id) {
+            Some(e) => e.clone(),
+            None => {
+                pending_io.push(immediate_tool_error(
+                    thread_id.to_string(),
+                    op_id,
+                    tool_use_id,
+                    format!(
+                        "knowledge_modify: bucket `{}` is in the pod's allow list but no \
+                         longer exists in the registry — likely deleted. Update \
+                         `[allow.knowledge_buckets]`.",
+                        args.bucket_id,
+                    ),
+                ));
+                return;
+            }
+        };
+
+        // Insert needs a live embedder; tombstone doesn't. Resolve
+        // the embedder up-front for both paths to keep the failure
+        // mode simple ("missing embedder" surfaces at args time, not
+        // mid-future), even though the tombstone path won't call it.
+        let embedder = match self
+            .embedding_providers
+            .get(&entry.config.defaults.embedder)
+        {
+            Some(p) => p.provider.clone(),
+            None => {
+                pending_io.push(immediate_tool_error(
+                    thread_id.to_string(),
+                    op_id,
+                    tool_use_id,
+                    format!(
+                        "knowledge_modify: bucket `{}` references embedder `{}` which is \
+                         not configured under `[embedding_providers.*]`.",
+                        args.bucket_id, entry.config.defaults.embedder,
+                    ),
+                ));
+                return;
+            }
+        };
+
+        let registry = self.bucket_registry.clone();
+        let thread_id_s = thread_id.to_string();
+        let bucket_id = args.bucket_id.clone();
+        let source_id = args.source_id.clone();
+        let action = args.action.clone();
+        let content = args.content.unwrap_or_default();
+        let embedder_name = entry.config.defaults.embedder.clone();
+        pending_io.push(Box::pin(async move {
+            let cancel = tokio_util::sync::CancellationToken::new();
+            let bucket = match registry.loaded_bucket(&bucket_id).await {
+                Ok(b) => b,
+                Err(e) => {
+                    return tool_error_completion(
+                        thread_id_s,
+                        op_id,
+                        tool_use_id,
+                        format!("knowledge_modify: load bucket `{bucket_id}` failed: {e}"),
+                    );
+                }
+            };
+            // The bucket may have a stale embedder from a prior
+            // `set_embedder` call (or none if just opened). Re-bind
+            // each time — `set_embedder` short-circuits when the
+            // model id matches, so this is cheap on the hot path.
+            if let Err(e) = bucket.set_embedder(embedder, &embedder_name) {
+                return tool_error_completion(
+                    thread_id_s,
+                    op_id,
+                    tool_use_id,
+                    format!("knowledge_modify: set_embedder on `{bucket_id}` failed: {e}"),
+                );
+            }
+            match action {
+                crate::tools::builtin_tools::knowledge_modify::KnowledgeModifyAction::Insert => {
+                    match bucket.insert_record(&source_id, &content, &cancel).await {
+                        Ok(n) => tool_success_completion(
+                            thread_id_s,
+                            op_id,
+                            tool_use_id,
+                            format!(
+                                "Inserted `{source_id}` into `{bucket_id}` ({n} chunk{}).",
+                                if n == 1 { "" } else { "s" },
+                            ),
+                        ),
+                        Err(e) => tool_error_completion(
+                            thread_id_s,
+                            op_id,
+                            tool_use_id,
+                            format!("knowledge_modify insert failed: {e}"),
+                        ),
+                    }
+                }
+                crate::tools::builtin_tools::knowledge_modify::KnowledgeModifyAction::Tombstone => {
+                    match bucket.tombstone_by_source(&source_id).await {
+                        Ok(0) => tool_success_completion(
+                            thread_id_s,
+                            op_id,
+                            tool_use_id,
+                            format!(
+                                "Tombstone `{source_id}` in `{bucket_id}`: no-op \
+                                 (source not found, already absent).",
+                            ),
+                        ),
+                        Ok(n) => tool_success_completion(
+                            thread_id_s,
+                            op_id,
+                            tool_use_id,
+                            format!(
+                                "Tombstoned `{source_id}` in `{bucket_id}` ({n} chunk{}).",
+                                if n == 1 { "" } else { "s" },
+                            ),
+                        ),
+                        Err(e) => tool_error_completion(
+                            thread_id_s,
+                            op_id,
+                            tool_use_id,
+                            format!("knowledge_modify tombstone failed: {e}"),
+                        ),
+                    }
+                }
+            }
         }));
     }
 

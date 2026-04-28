@@ -20,6 +20,7 @@ pub mod mediawiki_xml;
 pub use feed::{DeltaId, FeedDriver, FeedError, SnapshotId, WikipediaDriver};
 pub use markdown_dir::MarkdownDir;
 pub use mediawiki_xml::MediaWikiXml;
+// `EmptySource` is local to this module — exported below alongside the trait.
 
 use thiserror::Error;
 
@@ -74,6 +75,19 @@ pub trait SourceAdapter: Send + Sync {
     /// continuous-stream adapters (future: arxiv RSS, etc.) are out of
     /// scope here and would model differently.
     fn enumerate(&self) -> Box<dyn Iterator<Item = Result<SourceRecord, SourceError>> + Send + '_>;
+}
+
+/// Empty source adapter. Used to bootstrap a `kind = "managed"` bucket:
+/// `StartBucketBuild` runs the normal build pipeline against this
+/// adapter, producing a slot with zero base chunks. Subsequent
+/// LLM-driven `knowledge_modify` inserts land in that slot's delta
+/// layer just like any other mutation.
+pub struct EmptySource;
+
+impl SourceAdapter for EmptySource {
+    fn enumerate(&self) -> Box<dyn Iterator<Item = Result<SourceRecord, SourceError>> + Send + '_> {
+        Box::new(std::iter::empty())
+    }
 }
 
 #[derive(Debug, Error)]

@@ -71,8 +71,8 @@ pub use manifest::{
 pub use query::{QueryEngine, QueryParams, RerankedCandidate};
 pub use registry::{BucketEntry, BucketRegistry};
 pub use source::{
-    DeltaId, FeedDriver, FeedError, MarkdownDir, MediaWikiXml, SnapshotId, SourceAdapter,
-    SourceError, SourceRecord, WikipediaDriver,
+    DeltaId, EmptySource, FeedDriver, FeedError, MarkdownDir, MediaWikiXml, SnapshotId,
+    SourceAdapter, SourceError, SourceRecord, WikipediaDriver,
 };
 pub use source_index::SourceIndex;
 pub use sparse::{SparseIndex, SparseIndexBuilder};

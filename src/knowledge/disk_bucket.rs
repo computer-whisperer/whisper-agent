@@ -1757,6 +1757,111 @@ impl DiskBucket {
 
         Ok(stats)
     }
+
+    /// LLM-facing wrapper around [`Bucket::insert`]. Resolves the
+    /// bucket's chunker against its frozen slot snapshot, chunks the
+    /// caller-supplied `content` as a single
+    /// [`SourceRecord`](super::source::SourceRecord) under
+    /// `source_id`, and inserts the chunks. Returns the number of
+    /// chunks inserted.
+    ///
+    /// **Managed-only.** Returns
+    /// [`BucketError::Other`] when called against a non-managed
+    /// bucket — this is the safety gate for the
+    /// [`knowledge_modify`](crate::tools::builtin_tools::knowledge_modify)
+    /// LLM tool. The system path (FeedWorker `apply_delta` against
+    /// tracked sources) bypasses this method and goes directly through
+    /// [`Bucket::insert`], which has no source-kind restriction.
+    ///
+    /// **Idempotency.** Errors if `source_id` is already present in
+    /// the slot's source-index. Callers (the LLM tool) tombstone
+    /// first, then insert. Auto-replace would surprise the model
+    /// when an `insert` to a name it thought was free silently
+    /// clobbers prior content.
+    pub async fn insert_record(
+        &self,
+        source_id: &str,
+        content: &str,
+        cancel: &CancellationToken,
+    ) -> Result<u64, BucketError> {
+        if !matches!(
+            self.config.source,
+            super::config::SourceConfig::Managed { .. }
+        ) {
+            return Err(BucketError::Other(format!(
+                "insert_record: bucket `{}` is `{}`, not `managed` — only managed buckets \
+                 accept LLM-driven inserts",
+                self.id,
+                self.config.source.kind(),
+            )));
+        }
+        let active = self
+            .active_snapshot()
+            .ok_or_else(|| BucketError::NoActiveSlot(self.id.clone()))?;
+        let source_index = active.source_index();
+        if !source_index.get(source_id).is_empty() {
+            return Err(BucketError::Other(format!(
+                "insert_record: `source_id` `{source_id}` already exists in bucket `{}`. \
+                 Tombstone it first if you want to replace it.",
+                self.id,
+            )));
+        }
+
+        let embedder_model_id = active.manifest.embedder.model_id.clone();
+        let resolved = resolve_chunker(&self.config.chunker, Some(&embedder_model_id))
+            .map_err(|e| BucketError::Other(format!("chunker resolve: {e}")))?;
+        if resolved.snapshot != active.manifest.chunker_snapshot {
+            return Err(BucketError::Other(
+                "insert_record: bucket chunker config has drifted from the active slot's \
+                 snapshot; rebuild required before inserts can be applied"
+                    .to_string(),
+            ));
+        }
+
+        let record = super::source::SourceRecord::new(source_id, content);
+        let new_chunks = resolved.chunker.chunk(&record);
+        if new_chunks.is_empty() {
+            return Err(BucketError::Other(format!(
+                "insert_record: chunker produced 0 chunks for `{source_id}` (content empty \
+                 after tokenization?)"
+            )));
+        }
+        let chunk_count = new_chunks.len() as u64;
+        <Self as Bucket>::insert(self, new_chunks, cancel).await?;
+        Ok(chunk_count)
+    }
+
+    /// LLM-facing wrapper around [`Bucket::tombstone`]. Looks up
+    /// every chunk_id associated with `source_id` via the active
+    /// slot's source-index and tombstones them in one call.
+    /// Returns the number of chunks tombstoned (0 when the source
+    /// id was already absent — idempotent no-op success).
+    ///
+    /// Same managed-only safety gate as [`Self::insert_record`].
+    pub async fn tombstone_by_source(&self, source_id: &str) -> Result<u64, BucketError> {
+        if !matches!(
+            self.config.source,
+            super::config::SourceConfig::Managed { .. }
+        ) {
+            return Err(BucketError::Other(format!(
+                "tombstone_by_source: bucket `{}` is `{}`, not `managed` — only managed \
+                 buckets accept LLM-driven tombstones",
+                self.id,
+                self.config.source.kind(),
+            )));
+        }
+        let active = self
+            .active_snapshot()
+            .ok_or_else(|| BucketError::NoActiveSlot(self.id.clone()))?;
+        let source_index = active.source_index();
+        let chunk_ids = source_index.get(source_id);
+        if chunk_ids.is_empty() {
+            return Ok(0);
+        }
+        let count = chunk_ids.len() as u64;
+        <Self as Bucket>::tombstone(self, chunk_ids).await?;
+        Ok(count)
+    }
 }
 
 /// Counters reported by [`DiskBucket::apply_delta`] for observability /
@@ -3084,6 +3189,36 @@ embedder = "tei_test"
         )
         .unwrap();
         DiskBucket::open(bucket_root, BucketId::pod("notes")).unwrap()
+    }
+
+    fn sample_managed_bucket_toml() -> String {
+        r#"
+name = "Pod Memory"
+created_at = "2026-04-28T00:00:00Z"
+
+[source]
+kind = "managed"
+
+[chunker]
+strategy = "token_based"
+chunk_tokens = 50
+overlap_tokens = 5
+
+[defaults]
+embedder = "tei_test"
+"#
+        .to_string()
+    }
+
+    fn open_managed_test_bucket(bucket_root: &Path) -> DiskBucket {
+        fs::create_dir_all(bucket_root).unwrap();
+        fs::create_dir_all(slot::slots_dir(bucket_root)).unwrap();
+        fs::write(
+            slot::bucket_toml_path(bucket_root),
+            sample_managed_bucket_toml(),
+        )
+        .unwrap();
+        DiskBucket::open(bucket_root, BucketId::pod("memory")).unwrap()
     }
 
     /// Variant of [`sample_bucket_toml`] that pins
@@ -5861,5 +5996,167 @@ embedder = "tei_test"
             "expected ≤{expected_max} embed calls (one per EMBED_BATCH_SIZE-sized window); \
              got {calls} for {target_records} pages — apply_delta is calling embedder per-page",
         );
+    }
+
+    /// Managed bucket end-to-end: create empty slot via `EmptySource`,
+    /// insert a record, verify it's queryable, tombstone it, verify
+    /// it's gone.
+    #[tokio::test]
+    async fn managed_bucket_insert_record_and_tombstone_by_source() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bucket_root = tmp.path().join("bucket");
+        let bucket = open_managed_test_bucket(&bucket_root);
+        let (chunker, chunker_snapshot) = TokenBasedChunker::from_config(&bucket.config().chunker);
+        let embedder: Arc<dyn EmbeddingProvider> = Arc::new(MockEmbedder::new(8));
+        let cancel = CancellationToken::new();
+
+        // Bootstrap: build empty slot off EmptySource.
+        bucket
+            .build_slot(
+                &crate::knowledge::EmptySource,
+                &chunker,
+                chunker_snapshot,
+                embedder.clone(),
+                None,
+                &cancel,
+            )
+            .await
+            .unwrap();
+        bucket.set_embedder(embedder, "mock-embedder").unwrap();
+
+        // Insert a record.
+        let n = bucket
+            .insert_record(
+                "memo-2026-04-28",
+                "octopus camouflage RNA editing distinctive-marker-quokka",
+                &cancel,
+            )
+            .await
+            .unwrap();
+        assert!(n >= 1, "expected ≥1 chunk inserted, got {n}");
+
+        // Sparse search proves the chunk is queryable.
+        let hits = bucket
+            .sparse_search("distinctive-marker-quokka", 5, &cancel)
+            .await
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].source_ref.source_id, "memo-2026-04-28");
+
+        // Tombstone by source.
+        let n = bucket.tombstone_by_source("memo-2026-04-28").await.unwrap();
+        assert!(n >= 1);
+
+        // Search now returns nothing.
+        let after = bucket
+            .sparse_search("distinctive-marker-quokka", 5, &cancel)
+            .await
+            .unwrap();
+        assert!(
+            after.is_empty(),
+            "expected the chunk to be gone, got {after:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn insert_record_rejects_non_managed_bucket() {
+        // A linked bucket should refuse `insert_record` even though
+        // `Bucket::insert` would technically work — this is the
+        // safety gate for the LLM-driven knowledge_modify tool.
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("notes");
+        fs::create_dir_all(&source).unwrap();
+        write_md(&source, "seed.md", "seed content");
+
+        let bucket_root = tmp.path().join("bucket");
+        let bucket = open_test_bucket(&bucket_root, &source);
+        let adapter = MarkdownDir::new(&source);
+        let (chunker, chunker_snapshot) = TokenBasedChunker::from_config(&bucket.config().chunker);
+        let embedder: Arc<dyn EmbeddingProvider> = Arc::new(MockEmbedder::new(8));
+        let cancel = CancellationToken::new();
+        bucket
+            .build_slot(
+                &adapter,
+                &chunker,
+                chunker_snapshot,
+                embedder.clone(),
+                None,
+                &cancel,
+            )
+            .await
+            .unwrap();
+        bucket.set_embedder(embedder, "mock-embedder").unwrap();
+
+        let err = bucket
+            .insert_record("agent-note", "some content", &cancel)
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("not `managed`") && msg.contains("linked"),
+            "expected source-kind error, got {msg}",
+        );
+    }
+
+    #[tokio::test]
+    async fn insert_record_rejects_duplicate_source_id() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bucket_root = tmp.path().join("bucket");
+        let bucket = open_managed_test_bucket(&bucket_root);
+        let (chunker, chunker_snapshot) = TokenBasedChunker::from_config(&bucket.config().chunker);
+        let embedder: Arc<dyn EmbeddingProvider> = Arc::new(MockEmbedder::new(8));
+        let cancel = CancellationToken::new();
+        bucket
+            .build_slot(
+                &crate::knowledge::EmptySource,
+                &chunker,
+                chunker_snapshot,
+                embedder.clone(),
+                None,
+                &cancel,
+            )
+            .await
+            .unwrap();
+        bucket.set_embedder(embedder, "mock-embedder").unwrap();
+
+        bucket
+            .insert_record("note-1", "first version content", &cancel)
+            .await
+            .unwrap();
+
+        let err = bucket
+            .insert_record("note-1", "second version content", &cancel)
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("already exists"),
+            "expected duplicate-source error, got {msg}",
+        );
+    }
+
+    #[tokio::test]
+    async fn tombstone_by_source_is_idempotent_for_missing_source() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bucket_root = tmp.path().join("bucket");
+        let bucket = open_managed_test_bucket(&bucket_root);
+        let (chunker, chunker_snapshot) = TokenBasedChunker::from_config(&bucket.config().chunker);
+        let embedder: Arc<dyn EmbeddingProvider> = Arc::new(MockEmbedder::new(8));
+        let cancel = CancellationToken::new();
+        bucket
+            .build_slot(
+                &crate::knowledge::EmptySource,
+                &chunker,
+                chunker_snapshot,
+                embedder.clone(),
+                None,
+                &cancel,
+            )
+            .await
+            .unwrap();
+        bucket.set_embedder(embedder, "mock-embedder").unwrap();
+
+        let n = bucket.tombstone_by_source("never-existed").await.unwrap();
+        assert_eq!(n, 0, "tombstone of unknown source should no-op");
     }
 }
