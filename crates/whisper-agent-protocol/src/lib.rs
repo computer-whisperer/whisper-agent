@@ -1455,6 +1455,24 @@ pub enum ClientToServer {
         correlation_id: Option<String>,
         id: String,
     },
+    /// Manually trigger a *resync* for a tracked bucket — rebuild the
+    /// active slot off the driver's current `latest_base()`. If the
+    /// recorded `current_base_snapshot_id` already matches `latest_base`,
+    /// the server short-circuits with `BucketBuildEnded { Success }` and
+    /// no rebuild fires. Otherwise the new base is downloaded and a
+    /// fresh slot is built off it; on success, the FeedWorker's delta
+    /// cursor is reset to the new snapshot id so deltas after the new
+    /// base get re-applied via the existing daily-poll path. Refusal
+    /// (`Error`) for unknown bucket id, non-tracked source kind, or an
+    /// in-flight build for the same bucket. Acceptance signalled the
+    /// same way as `StartBucketBuild` — a `BucketBuildStarted`
+    /// broadcast followed by `BucketBuildProgress` ticks and a terminal
+    /// `BucketBuildEnded`.
+    ResyncBucket {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        correlation_id: Option<String>,
+        id: String,
+    },
 
     // --- Behavior registry (read-only in phase 1 — see
     //     docs/design_behaviors.md). Create / update / delete / run arrive

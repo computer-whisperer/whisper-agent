@@ -421,6 +421,7 @@ impl Scheduler {
             conn_id,
             correlation_id,
             resume_slot_id,
+            BuildIntent::Normal,
         ));
     }
 
@@ -447,6 +448,150 @@ impl Scheduler {
                 );
             }
         }
+    }
+
+    /// Manually trigger a resync — same plumbing as
+    /// `handle_start_bucket_build` but with [`BuildIntent::Resync`],
+    /// gated to tracked buckets only. Rejection paths (unknown id,
+    /// non-tracked, in-flight build, missing embedder) all surface as
+    /// `Error` synchronously; acceptance broadcasts `BucketBuildStarted`
+    /// the same way an initial build does, so the UI's existing
+    /// progress wiring lights up unchanged.
+    pub(super) fn handle_resync_bucket(
+        &mut self,
+        conn_id: ConnId,
+        correlation_id: Option<String>,
+        id: String,
+    ) {
+        if let Err(e) = validate_bucket_id(&id) {
+            self.send_bucket_error(conn_id, correlation_id, "resync_bucket", e);
+            return;
+        }
+        if self.active_bucket_builds.contains_key(&id) {
+            self.send_bucket_error(
+                conn_id,
+                correlation_id,
+                "resync_bucket",
+                format!("build already in flight for `{id}`"),
+            );
+            return;
+        }
+        let entry = match self.bucket_registry.buckets.get(&id) {
+            Some(e) => e.clone(),
+            None => {
+                self.send_bucket_error(
+                    conn_id,
+                    correlation_id,
+                    "resync_bucket",
+                    format!("unknown bucket id `{id}`"),
+                );
+                return;
+            }
+        };
+        // Resync only makes sense for tracked sources — they're the
+        // only kind with a driver capable of advancing to a fresh
+        // base. Reject non-tracked at the wire layer rather than
+        // letting `run_build` produce a confusing error mid-task.
+        if !matches!(
+            entry.config.source,
+            crate::knowledge::SourceConfig::Tracked { .. }
+        ) {
+            self.send_bucket_error(
+                conn_id,
+                correlation_id,
+                "resync_bucket",
+                format!(
+                    "bucket `{id}` is not tracked (source kind: {}) — resync requires a tracked driver",
+                    entry.config.source.kind(),
+                ),
+            );
+            return;
+        }
+        let embedder = match self
+            .embedding_providers
+            .get(&entry.config.defaults.embedder)
+        {
+            Some(p) => p.provider.clone(),
+            None => {
+                self.send_bucket_error(
+                    conn_id,
+                    correlation_id,
+                    "resync_bucket",
+                    format!(
+                        "embedder `{}` not configured",
+                        entry.config.defaults.embedder
+                    ),
+                );
+                return;
+            }
+        };
+        let source = match build_source(&entry.config.source) {
+            Ok(s) => s,
+            Err(e) => {
+                self.send_bucket_error(conn_id, correlation_id, "resync_bucket", e);
+                return;
+            }
+        };
+        let bucket = match DiskBucket::open(entry.dir.clone(), BucketId::server(id.clone())) {
+            Ok(b) => Arc::new(b),
+            Err(e) => {
+                self.send_bucket_error(
+                    conn_id,
+                    correlation_id,
+                    "resync_bucket",
+                    format!("open failed: {e}"),
+                );
+                return;
+            }
+        };
+
+        // Resync intentionally does *not* reuse a resumable slot —
+        // a fresh base demands a fresh build pipeline, and any
+        // resumable slot left from a prior interrupted build was
+        // built off the *old* base. The orphaned slot directory will
+        // be picked up by the future GC pass (see dangling cleanup
+        // in `progress_knowledge_db.md`).
+
+        let cancel = CancellationToken::new();
+        self.active_bucket_builds.insert(id.clone(), cancel.clone());
+
+        let progress = Arc::new(ProgressShared::default());
+        self.active_bucket_progress
+            .insert(id.clone(), progress.clone());
+
+        let started = ServerToClient::BucketBuildStarted {
+            correlation_id: None,
+            bucket_id: id.clone(),
+            slot_id: String::new(),
+        };
+        self.router.broadcast_task_list_except(started, conn_id);
+        self.router.send_to_client(
+            conn_id,
+            ServerToClient::BucketBuildStarted {
+                correlation_id: correlation_id.clone(),
+                bucket_id: id.clone(),
+                slot_id: String::new(),
+            },
+        );
+
+        let task_tx = self.bucket_task_sender();
+        let chunker_config = entry.config.chunker.clone();
+        let bucket_dir = entry.dir.clone();
+        tokio::spawn(run_build(
+            bucket,
+            embedder,
+            source,
+            bucket_dir,
+            chunker_config,
+            cancel,
+            id,
+            progress,
+            task_tx,
+            conn_id,
+            correlation_id,
+            None, // never resume — see comment above
+            BuildIntent::Resync,
+        ));
     }
 
     pub(super) fn handle_poll_feed_now(
@@ -628,6 +773,23 @@ fn broadcast_all(router: &ThreadEventRouter, event: ServerToClient) {
     }
 }
 
+/// Distinguishes a normal (initial / rebuild / resume) build from a
+/// resync. Resync uses [`resolve_resync_source`] (always calls
+/// `latest_base()`) instead of [`resolve_source`] (reuses the recorded
+/// snapshot id), short-circuits to `Success` when the recorded base is
+/// already at latest, and on success calls [`reset_delta_cursor_to`]
+/// so the FeedWorker's next delta tick lists deltas strictly after
+/// the new base.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BuildIntent {
+    /// Initial build, manual rebuild, or resume — uses the recorded
+    /// `current_base_snapshot_id` for tracked sources.
+    Normal,
+    /// Manual or scheduled resync — advance to the driver's
+    /// `latest_base()`.
+    Resync,
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_build(
     bucket: Arc<DiskBucket>,
@@ -642,6 +804,7 @@ async fn run_build(
     requester_conn: ConnId,
     correlation_id: Option<String>,
     resume_slot_id: Option<String>,
+    intent: BuildIntent,
 ) {
     let observer_arc: Arc<dyn BuildObserver> = Arc::new(ProgressObserver {
         shared: progress.clone(),
@@ -696,29 +859,109 @@ async fn run_build(
     };
 
     // Source resolution. For stored / linked, this is a no-op handoff.
-    // For tracked, the driver fetches the base snapshot into the
-    // bucket's source-cache and persists the snapshot id to
+    // For tracked Normal builds, the driver fetches the base snapshot
+    // into the bucket's source-cache and persists the snapshot id to
     // feed-state.toml — Downloading phase fires here, before any
     // chunking or embedding starts.
-    let adapter = match resolve_source(source, &bucket_dir, observer_arc.as_ref(), &cancel).await {
-        Ok(a) => a,
-        Err(e) => {
+    //
+    // For Resync intent on a tracked bucket, `resolve_resync_source`
+    // *always* consults `latest_base()` and may short-circuit to a
+    // no-op success when the recorded snapshot is already current.
+    // Stored / linked sources can't be resync'd (they have no driver);
+    // we surface that as an error rather than silently treating it as
+    // a Normal rebuild — the wire layer should have caught it before
+    // dispatching here.
+    let (adapter, resync_new_snapshot_id) = match (intent, source) {
+        (BuildIntent::Resync, BuildSource::Tracked { driver }) => {
+            match resolve_resync_source(driver, &bucket_dir, observer_arc.as_ref(), &cancel).await {
+                Ok(ResyncResolution::AlreadyAtLatest { snapshot_id }) => {
+                    // No work to do. Stop the emitter and emit a
+                    // synthetic Success with empty slot_id so the UI's
+                    // BuildEnded handler closes the in-flight row.
+                    progress.done.store(true, Ordering::Release);
+                    let _ = emitter.await;
+                    tracing::info!(
+                        bucket_id = %bucket_id,
+                        snapshot_id = %snapshot_id,
+                        "resync no-op: bucket already at latest base",
+                    );
+                    let _ = task_tx.send(BucketTaskUpdate::BuildEnded {
+                        bucket_id,
+                        slot_id: String::new(),
+                        outcome: BucketBuildOutcome::Success,
+                        requester_conn: Some(requester_conn),
+                        correlation_id,
+                    });
+                    return;
+                }
+                Ok(ResyncResolution::Build {
+                    adapter,
+                    new_snapshot_id,
+                }) => (adapter, Some(new_snapshot_id)),
+                Err(e) => {
+                    progress.done.store(true, Ordering::Release);
+                    let _ = emitter.await;
+                    let outcome = match e {
+                        BucketError::Cancelled => BucketBuildOutcome::Cancelled,
+                        other => BucketBuildOutcome::Error {
+                            message: other.to_string(),
+                        },
+                    };
+                    let _ = task_tx.send(BucketTaskUpdate::BuildEnded {
+                        bucket_id,
+                        slot_id: String::new(),
+                        outcome,
+                        requester_conn: Some(requester_conn),
+                        correlation_id,
+                    });
+                    return;
+                }
+            }
+        }
+        (BuildIntent::Resync, source) => {
+            // Caller dispatched a resync against a non-tracked bucket
+            // — this is a wire-layer bug; surface it loudly.
             progress.done.store(true, Ordering::Release);
             let _ = emitter.await;
-            let outcome = match e {
-                BucketError::Cancelled => BucketBuildOutcome::Cancelled,
-                other => BucketBuildOutcome::Error {
-                    message: other.to_string(),
-                },
-            };
             let _ = task_tx.send(BucketTaskUpdate::BuildEnded {
                 bucket_id,
                 slot_id: String::new(),
-                outcome,
+                outcome: BucketBuildOutcome::Error {
+                    message: format!(
+                        "resync requested for non-tracked bucket (source kind: {})",
+                        match source {
+                            BuildSource::Ready(_) => "stored/linked",
+                            BuildSource::Tracked { .. } => unreachable!(),
+                        }
+                    ),
+                },
                 requester_conn: Some(requester_conn),
                 correlation_id,
             });
             return;
+        }
+        (BuildIntent::Normal, source) => {
+            match resolve_source(source, &bucket_dir, observer_arc.as_ref(), &cancel).await {
+                Ok(a) => (a, None),
+                Err(e) => {
+                    progress.done.store(true, Ordering::Release);
+                    let _ = emitter.await;
+                    let outcome = match e {
+                        BucketError::Cancelled => BucketBuildOutcome::Cancelled,
+                        other => BucketBuildOutcome::Error {
+                            message: other.to_string(),
+                        },
+                    };
+                    let _ = task_tx.send(BucketTaskUpdate::BuildEnded {
+                        bucket_id,
+                        slot_id: String::new(),
+                        outcome,
+                        requester_conn: Some(requester_conn),
+                        correlation_id,
+                    });
+                    return;
+                }
+            }
         }
     };
 
@@ -772,7 +1015,7 @@ async fn run_build(
     progress.done.store(true, Ordering::Release);
     let _ = emitter.await;
 
-    let (outcome, slot_id) = match result {
+    let (mut outcome, slot_id) = match result {
         Ok(Ok(slot_id)) => (BucketBuildOutcome::Success, slot_id),
         Ok(Err(BucketError::Cancelled)) => (BucketBuildOutcome::Cancelled, String::new()),
         Ok(Err(e)) => (
@@ -788,6 +1031,31 @@ async fn run_build(
             String::new(),
         ),
     };
+
+    // Resync post-success: reset the delta cursor to the new base
+    // snapshot id so the next FeedWorker tick lists deltas strictly
+    // after the new base. Both ids share `YYYYMMDD` lexicographic
+    // ordering with `list_deltas_since`'s `since` arg, so reuse is
+    // exact, not approximate. If the cursor reset itself fails we
+    // demote the outcome to Error — silently leaving the cursor on
+    // its old value would cause the next poll to re-apply every
+    // delta since the *old* base, which is more confusing than
+    // surfacing the error and letting the operator retry.
+    if matches!(outcome, BucketBuildOutcome::Success)
+        && let Some(new_id) = resync_new_snapshot_id.as_ref()
+    {
+        if let Err(e) = reset_delta_cursor_to(&bucket_dir, new_id) {
+            outcome = BucketBuildOutcome::Error {
+                message: format!("resync built new slot but cursor reset failed: {e}"),
+            };
+        } else {
+            tracing::info!(
+                bucket_id = %bucket_id,
+                snapshot_id = %new_id,
+                "resync complete: new slot active, delta cursor reset",
+            );
+        }
+    }
 
     let _ = task_tx.send(BucketTaskUpdate::BuildEnded {
         bucket_id,
@@ -1107,7 +1375,6 @@ fn build_source(source: &crate::knowledge::SourceConfig) -> Result<BuildSource, 
 /// skip the rebuild without touching disk. `Build` carries a fresh
 /// adapter pointing at the just-downloaded base file plus the new
 /// snapshot id (so the caller can advance the delta cursor on success).
-#[allow(dead_code)] // `Build.adapter` consumed in slice 2b.
 enum ResyncResolution {
     AlreadyAtLatest {
         snapshot_id: SnapshotId,
@@ -1133,7 +1400,6 @@ enum ResyncResolution {
 ///
 /// Phase=Downloading is published via the observer for the duration of
 /// the fetch — same UI affordance as the initial-build path.
-#[allow(dead_code)] // Wired in slice 2b.
 async fn resolve_resync_source(
     driver: Box<dyn FeedDriver>,
     bucket_dir: &Path,
@@ -1203,7 +1469,6 @@ async fn resolve_resync_source(
 /// build: re-applying them to the new slot is idempotent (apply_delta's
 /// "first chunk_id already live" check), and skipping ones already
 /// folded into the new base is a no-op.
-#[allow(dead_code)] // Wired in slice 2b.
 fn reset_delta_cursor_to(
     bucket_dir: &Path,
     new_snapshot_id: &SnapshotId,

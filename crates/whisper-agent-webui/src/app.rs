@@ -3524,6 +3524,19 @@ impl eframe::App for ChatApp {
                         id,
                     });
                 }
+                BucketsEvent::ResyncBucket { id } => {
+                    // Same wire shape as StartBuild — the server
+                    // broadcasts BucketBuildStarted/Progress/Ended
+                    // through the existing build-progress channels,
+                    // so the modal's in-flight UI lights up
+                    // unchanged. AlreadyAtLatest short-circuits to
+                    // BucketBuildEnded { Success } with empty slot_id.
+                    let correlation = self.next_correlation_id();
+                    self.send(ClientToServer::ResyncBucket {
+                        correlation_id: Some(correlation),
+                        id,
+                    });
+                }
             }
         }
 

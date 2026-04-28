@@ -37,6 +37,11 @@ pub(crate) enum BucketsEvent {
     /// the feed worker rather than waiting for the next cadence
     /// tick. Only emitted for `source_kind = "tracked"` buckets.
     PollFeedNow { id: String },
+    /// "Resync now" pressed on a tracked-bucket row — rebuild the
+    /// bucket off the driver's current `latest_base()`. Server
+    /// short-circuits if already at latest. Only emitted for
+    /// `source_kind = "tracked"` buckets with no in-flight build.
+    ResyncBucket { id: String },
 }
 
 /// Per-bucket progress snapshot the modal carries while a build is in
@@ -812,6 +817,25 @@ fn render_row_actions(
                 .clicked()
         {
             events.push(BucketsEvent::PollFeedNow { id: b.id.clone() });
+        }
+
+        // "Resync now" — tracked buckets only, no in-flight build.
+        // Rebuilds the bucket off the driver's current `latest_base()`
+        // (a months-fresh snapshot for Wikipedia). Server short-
+        // circuits if the recorded base is already at latest, so
+        // a stray click on an already-current bucket is cheap.
+        if !in_flight_build
+            && b.source_kind.as_str() == "tracked"
+            && ui
+                .button("Resync now")
+                .on_hover_text(
+                    "Rebuild this bucket off the driver's latest base snapshot. \
+                     Multi-hour to multi-day for Wikipedia-scale buckets — see the \
+                     bucket's expected build time before clicking.",
+                )
+                .clicked()
+        {
+            events.push(BucketsEvent::ResyncBucket { id: b.id.clone() });
         }
 
         // Two-click delete: first click arms; second click confirms.
