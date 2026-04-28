@@ -141,6 +141,12 @@ impl WorkerObserver for NoopObserver {
 /// values forcing paused-time gymnastics.
 pub struct FeedWorker {
     bucket_id: String,
+    /// Owning pod for pod-scope tracked buckets; `None` for
+    /// server-scope. Drives whether `apply_one_delta` resolves through
+    /// `loaded_bucket` (server) or `loaded_bucket_pod` (pod), and
+    /// rides along on resync-request payloads so the scheduler can
+    /// dispatch back to the correct sub-registry.
+    pod_id: Option<String>,
     bucket_dir: PathBuf,
     driver: Box<dyn FeedDriver>,
     interval: Option<Duration>,
@@ -149,9 +155,10 @@ pub struct FeedWorker {
     /// Registry handle for resolving the bucket on first apply. The
     /// worker doesn't pre-load — first-tick HNSW open at boot would
     /// be expensive at enwiki scale — so we lean on the registry's
-    /// lazy `loaded_bucket`. The clone shares the registry's
-    /// internal `Arc<Mutex>` cache, so one bucket is opened once
-    /// across the worker, scheduler queries, and any other consumer.
+    /// lazy `loaded_bucket` / `loaded_bucket_pod`. The clone shares
+    /// the registry's internal `Arc<Mutex>` cache, so one bucket is
+    /// opened once across the worker, scheduler queries, and any
+    /// other consumer.
     registry: BucketRegistry,
     /// Embedder snapshot for this bucket, captured at spawn time.
     /// Reconfiguring the bucket's `[embedding_providers.<name>]`
@@ -173,14 +180,16 @@ pub struct FeedWorker {
     /// `feed_state.last_resync_at + resync_interval` so a server
     /// restart doesn't reset the resync clock.
     resync_interval: Option<Duration>,
-    /// Outbound channel to the scheduler, where each `String` is a
-    /// bucket id requesting a scheduled resync. The scheduler drains
-    /// the channel and dispatches `handle_resync_bucket` with no
-    /// requester. Unbounded: a stuck scheduler can't be unblocked by
-    /// dropping resync requests, and the channel has at most one
-    /// outstanding message per worker (we don't retry until next
-    /// cadence fire).
-    resync_request_tx: mpsc::UnboundedSender<String>,
+    /// Outbound channel to the scheduler. Each message is a
+    /// `(pod_id, bucket_id)` pair requesting a scheduled resync; the
+    /// scheduler drains the channel and dispatches
+    /// `handle_resync_bucket` with no requester. `pod_id == None`
+    /// means server-scope; `Some(pod)` is pod-scope and routes through
+    /// the pod sub-registry. Unbounded: a stuck scheduler can't be
+    /// unblocked by dropping resync requests, and the channel has at
+    /// most one outstanding message per worker (we don't retry until
+    /// next cadence fire).
+    resync_request_tx: mpsc::UnboundedSender<(Option<String>, String)>,
 }
 
 /// One iteration of the run-loop's `select!` picks among several
@@ -207,6 +216,7 @@ impl FeedWorker {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         bucket_id: impl Into<String>,
+        pod_id: Option<String>,
         bucket_dir: PathBuf,
         driver: Box<dyn FeedDriver>,
         interval: Option<Duration>,
@@ -216,10 +226,11 @@ impl FeedWorker {
         embedder: Arc<dyn EmbeddingProvider>,
         trigger: mpsc::Receiver<()>,
         resync_interval: Option<Duration>,
-        resync_request_tx: mpsc::UnboundedSender<String>,
+        resync_request_tx: mpsc::UnboundedSender<(Option<String>, String)>,
     ) -> Self {
         Self {
             bucket_id: bucket_id.into(),
+            pod_id,
             bucket_dir,
             driver,
             interval,
@@ -362,15 +373,18 @@ impl FeedWorker {
                     // succeeds, `last_resync_at` advances; if it
                     // can't run (e.g. embedder unavailable), the
                     // next tick tries again.
-                    if let Err(e) = self.resync_request_tx.send(self.bucket_id.clone()) {
+                    let payload = (self.pod_id.clone(), self.bucket_id.clone());
+                    if let Err(e) = self.resync_request_tx.send(payload) {
                         warn!(
                             bucket_id = %self.bucket_id,
+                            pod_id = ?self.pod_id,
                             error = %e,
                             "resync_request channel send failed (scheduler stopped?)",
                         );
                     } else {
                         info!(
                             bucket_id = %self.bucket_id,
+                            pod_id = ?self.pod_id,
                             "scheduled resync requested",
                         );
                     }
@@ -516,7 +530,14 @@ impl FeedWorker {
         &self,
         delta_path: &Path,
     ) -> Result<DeltaApplyStats, super::types::BucketError> {
-        let bucket = self.registry.loaded_bucket(&self.bucket_id).await?;
+        let bucket = match self.pod_id.as_deref() {
+            Some(pid) => {
+                self.registry
+                    .loaded_bucket_pod(pid, &self.bucket_id)
+                    .await?
+            }
+            None => self.registry.loaded_bucket(&self.bucket_id).await?,
+        };
         let model_id = bucket.active_embedder_model_id().ok_or_else(|| {
             super::types::BucketError::Other(
                 "active slot has no recorded embedder; bucket needs an initial build before \
@@ -615,8 +636,8 @@ mod tests {
     /// `send()` on it returns `Err`, which the worker logs but doesn't
     /// fail on. Tests that DO exercise the resync arm should hold
     /// onto the receiver.
-    fn fresh_resync_request_tx() -> mpsc::UnboundedSender<String> {
-        let (tx, _rx) = mpsc::unbounded_channel::<String>();
+    fn fresh_resync_request_tx() -> mpsc::UnboundedSender<(Option<String>, String)> {
+        let (tx, _rx) = mpsc::unbounded_channel::<(Option<String>, String)>();
         tx
     }
 
@@ -812,6 +833,7 @@ mod tests {
         let (_trigger_tx, trigger_rx) = fresh_trigger();
         let worker = FeedWorker::new(
             "test_bucket",
+            None,
             tmp.path().to_path_buf(),
             Box::new(driver),
             Some(Duration::from_millis(25)),
@@ -858,6 +880,7 @@ mod tests {
         let (_trigger_tx, trigger_rx) = fresh_trigger();
         let worker = FeedWorker::new(
             "manual_bucket",
+            None,
             tmp.path().to_path_buf(),
             Box::new(driver),
             None,
@@ -890,6 +913,7 @@ mod tests {
         let (_trigger_tx, trigger_rx) = fresh_trigger();
         let worker = FeedWorker::new(
             "early_cancel",
+            None,
             tmp.path().to_path_buf(),
             Box::new(driver),
             Some(Duration::from_secs(86_400)),
@@ -943,6 +967,7 @@ mod tests {
         let (_trigger_tx, trigger_rx) = fresh_trigger();
         let worker = FeedWorker::new(
             "test_bucket",
+            None,
             tmp.path().to_path_buf(),
             Box::new(driver),
             Some(Duration::from_millis(50)),
@@ -1016,6 +1041,7 @@ mod tests {
         let (_trigger_tx, trigger_rx) = fresh_trigger();
         let worker = FeedWorker::new(
             "test_bucket",
+            None,
             tmp.path().to_path_buf(),
             Box::new(driver),
             Some(Duration::from_millis(25)),
@@ -1060,6 +1086,7 @@ mod tests {
         let (trigger_tx, trigger_rx) = fresh_trigger();
         let worker = FeedWorker::new(
             "test_bucket",
+            None,
             tmp.path().to_path_buf(),
             Box::new(driver),
             Some(Duration::from_secs(3600)), // long enough that cadence won't fire

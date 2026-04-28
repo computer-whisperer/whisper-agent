@@ -57,15 +57,17 @@ pub(super) struct BucketKey {
 }
 
 impl BucketKey {
-    pub fn server(name: impl Into<String>) -> Self {
-        Self {
-            pod_id: None,
-            name: name.into(),
-        }
-    }
     pub fn from_optional(pod_id: Option<String>, name: impl Into<String>) -> Self {
         Self {
             pod_id,
+            name: name.into(),
+        }
+    }
+
+    #[cfg(test)]
+    pub fn server(name: impl Into<String>) -> Self {
+        Self {
+            pod_id: None,
             name: name.into(),
         }
     }
@@ -337,14 +339,11 @@ impl Scheduler {
             token.cancel();
         }
 
-        // Stop the per-tracked-bucket feed worker, if any. Today the
-        // feed-worker registry is server-scope only (pod-scope tracked
-        // sources aren't wired); the lookup is a no-op for pod-scope
-        // buckets, but we still gate it to avoid mistakenly stopping a
-        // server-scope worker named the same as the pod's bucket.
-        if pod_id.is_none()
-            && let Some(control) = self.active_feed_workers.remove(&id)
-        {
+        // Stop the per-tracked-bucket feed worker, if any. Looked up
+        // by scope-aware `BucketKey` so a server-scope worker named
+        // the same as a pod's bucket isn't mistakenly stopped.
+        let worker_key = BucketKey::from_optional(pod_id.clone(), id.clone());
+        if let Some(control) = self.active_feed_workers.remove(&worker_key) {
             control.cancel.cancel();
         }
 
@@ -585,34 +584,52 @@ impl Scheduler {
         id: String,
         pod_id: Option<String>,
     ) {
+        let pod_id_for_log = pod_id.clone();
         let refuse = |scheduler: &mut Scheduler, msg: String| match requester {
             Some(conn) => {
                 scheduler.send_bucket_error(conn, correlation_id.clone(), "resync_bucket", msg);
             }
             None => {
-                warn!(bucket_id = %id, error = %msg, "scheduled resync rejected");
+                warn!(
+                    bucket_id = %id,
+                    pod_id = ?pod_id_for_log,
+                    error = %msg,
+                    "scheduled resync rejected",
+                );
             }
         };
-        if pod_id.is_some() {
-            refuse(
-                self,
-                "pod-scope ResyncBucket is not yet implemented through the wire.".to_string(),
-            );
-            return;
-        }
         if let Err(e) = validate_bucket_id(&id) {
             refuse(self, e);
             return;
         }
-        let key = BucketKey::server(id.clone());
+        let scope = match pod_id {
+            Some(_) => crate::knowledge::BucketScope::Pod,
+            None => crate::knowledge::BucketScope::Server,
+        };
+        let key = BucketKey::from_optional(pod_id.clone(), id.clone());
         if self.active_bucket_builds.contains_key(&key) {
-            refuse(self, format!("build already in flight for `{id}`"));
+            refuse(
+                self,
+                match &pod_id {
+                    Some(pid) => format!("build already in flight for `{id}` (pod `{pid}`)"),
+                    None => format!("build already in flight for `{id}`"),
+                },
+            );
             return;
         }
-        let entry = match self.bucket_registry.buckets.get(&id) {
+        let entry = match self
+            .bucket_registry
+            .find_entry(scope, pod_id.as_deref(), &id)
+        {
             Some(e) => e.clone(),
             None => {
-                refuse(self, format!("unknown bucket id `{id}`"));
+                refuse(
+                    self,
+                    match &pod_id {
+                        Some(pid) => format!("unknown bucket id `{id}` (pod `{pid}`)"),
+                        None => format!("unknown bucket id `{id}`"),
+                    },
+                );
                 return;
             }
         };
@@ -683,7 +700,7 @@ impl Scheduler {
                 let started = ServerToClient::BucketBuildStarted {
                     correlation_id: None,
                     bucket_id: id.clone(),
-                    pod_id: None,
+                    pod_id: pod_id.clone(),
                     slot_id: String::new(),
                     started_at: Some(started_at.clone()),
                 };
@@ -693,7 +710,7 @@ impl Scheduler {
                     ServerToClient::BucketBuildStarted {
                         correlation_id: correlation_id.clone(),
                         bucket_id: id.clone(),
-                        pod_id: None,
+                        pod_id: pod_id.clone(),
                         slot_id: String::new(),
                         started_at: Some(started_at),
                     },
@@ -703,12 +720,16 @@ impl Scheduler {
                 let started = ServerToClient::BucketBuildStarted {
                     correlation_id: None,
                     bucket_id: id.clone(),
-                    pod_id: None,
+                    pod_id: pod_id.clone(),
                     slot_id: String::new(),
                     started_at: Some(started_at),
                 };
                 broadcast_all(&self.router, started);
-                tracing::info!(bucket_id = %id, "scheduled resync started");
+                tracing::info!(
+                    bucket_id = %id,
+                    pod_id = ?pod_id,
+                    "scheduled resync started",
+                );
             }
         }
 
@@ -722,8 +743,7 @@ impl Scheduler {
             chunker_config,
             cancel,
             id,
-            // Resync remains server-scope only (gated above).
-            None,
+            pod_id,
             progress,
             task_tx,
             requester,
@@ -739,16 +759,8 @@ impl Scheduler {
         id: String,
         pod_id: Option<String>,
     ) {
-        if pod_id.is_some() {
-            self.send_bucket_error(
-                conn_id,
-                correlation_id,
-                "poll_feed_now",
-                "pod-scope PollFeedNow is not yet implemented through the wire.".into(),
-            );
-            return;
-        }
-        let Some(control) = self.active_feed_workers.get(&id) else {
+        let key = BucketKey::from_optional(pod_id.clone(), id.clone());
+        let Some(control) = self.active_feed_workers.get(&key) else {
             // No feed worker — either an unknown bucket id or the
             // bucket isn't tracked. Same error surface in either
             // case; the UI button is only shown for tracked buckets,
@@ -757,7 +769,12 @@ impl Scheduler {
                 conn_id,
                 correlation_id,
                 "poll_feed_now",
-                format!("no feed worker for `{id}` (not a tracked bucket?)"),
+                match &pod_id {
+                    Some(pid) => {
+                        format!("no feed worker for `{id}` (pod `{pid}`, not a tracked bucket?)")
+                    }
+                    None => format!("no feed worker for `{id}` (not a tracked bucket?)"),
+                },
             );
             return;
         };
@@ -789,7 +806,7 @@ impl Scheduler {
             ServerToClient::FeedPollAccepted {
                 correlation_id,
                 bucket_id: id,
-                pod_id: None,
+                pod_id,
             },
         );
     }

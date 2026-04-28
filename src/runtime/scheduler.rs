@@ -513,13 +513,15 @@ pub struct Scheduler {
     >,
     /// Control handles for the per-tracked-bucket
     /// [`FeedWorker`](crate::knowledge::FeedWorker) tasks spawned at
-    /// scheduler-construction time. Keyed by bucket id; entries
-    /// present only for buckets whose source is
+    /// scheduler-construction time. Keyed by `BucketKey` so server-
+    /// scope and pod-scope tracked buckets coexist without collision;
+    /// entries present only for buckets whose source is
     /// [`SourceConfig::Tracked`]. `DeleteBucket` pops the matching
     /// entry and fires `cancel()` to wind the worker down;
     /// `PollFeedNow` `try_send`s the trigger to wake the worker
     /// without waiting for the next cadence tick.
-    active_feed_workers: HashMap<String, crate::knowledge::FeedWorkerControl>,
+    active_feed_workers:
+        HashMap<crate::runtime::scheduler::buckets::BucketKey, crate::knowledge::FeedWorkerControl>,
     /// Sender for `BucketTaskUpdate`s pushed from detached build
     /// tasks back to the scheduler loop. The matching receiver is
     /// returned from `Scheduler::new` and drained by the run loop.
@@ -570,7 +572,7 @@ impl Scheduler {
         Self,
         mpsc::UnboundedReceiver<StreamUpdate>,
         mpsc::UnboundedReceiver<buckets::BucketTaskUpdate>,
-        mpsc::UnboundedReceiver<String>,
+        mpsc::UnboundedReceiver<(Option<String>, String)>,
     )> {
         let mut resources = ResourceRegistry::new();
         for (name, entry) in &backends {
@@ -628,11 +630,13 @@ impl Scheduler {
         let (stream_tx, stream_rx) = mpsc::unbounded_channel();
         let (bucket_task_tx, bucket_task_rx) = mpsc::unbounded_channel();
         // Outbound channel from FeedWorker resync-cadence ticks back
-        // to this scheduler's run loop, where each request becomes a
-        // `handle_resync_bucket(None, ..)` dispatch. Unbounded so a
+        // to this scheduler's run loop. Each message is a
+        // `(pod_id, bucket_id)` pair; the recv arm dispatches via
+        // `handle_resync_bucket` with no requester. Unbounded so a
         // briefly-busy scheduler can't drop scheduled fires; volume
         // is at most once per bucket per resync cadence.
-        let (resync_request_tx, resync_request_rx) = mpsc::unbounded_channel::<String>();
+        let (resync_request_tx, resync_request_rx) =
+            mpsc::unbounded_channel::<(Option<String>, String)>();
         // Spawn one feed worker per tracked-source bucket. Workers
         // tick on cadence; their cancellation tokens are stored on
         // the scheduler so `DeleteBucket` can stop them. Skipped for
@@ -4338,7 +4342,7 @@ pub async fn run(
     mut inbox: mpsc::UnboundedReceiver<SchedulerMsg>,
     mut stream_rx: mpsc::UnboundedReceiver<StreamUpdate>,
     mut bucket_task_rx: mpsc::UnboundedReceiver<buckets::BucketTaskUpdate>,
-    mut resync_request_rx: mpsc::UnboundedReceiver<String>,
+    mut resync_request_rx: mpsc::UnboundedReceiver<(Option<String>, String)>,
 ) {
     let mut pending_io: FuturesUnordered<SchedulerFuture> = FuturesUnordered::new();
     let mut gc_ticker = tokio::time::interval(Duration::from_secs(GC_TICK_SECS));
@@ -4428,15 +4432,14 @@ pub async fn run(
             Some(update) = bucket_task_rx.recv() => {
                 scheduler.apply_bucket_task_update(update).await;
             }
-            Some(bucket_id) = resync_request_rx.recv() => {
+            Some((pod_id, bucket_id)) = resync_request_rx.recv() => {
                 // Scheduled resync trigger from a FeedWorker's
                 // resync-cadence arm. Dispatch with no requester —
                 // refusals (in-flight build, missing embedder, etc.)
-                // log instead of surfacing as wire errors.
-                // Scheduled resync is always server-scope; pod-scope tracked-source
-                // workers (and the channel that would carry their resync triggers)
-                // don't exist yet.
-                scheduler.handle_resync_bucket(None, None, bucket_id, None);
+                // log instead of surfacing as wire errors. `pod_id`
+                // is the worker's owning scope: `None` for server-
+                // scope, `Some` for pod-scope.
+                scheduler.handle_resync_bucket(None, None, bucket_id, pod_id);
             }
             _ = gc_ticker.tick() => {
                 scheduler.gc_tick();

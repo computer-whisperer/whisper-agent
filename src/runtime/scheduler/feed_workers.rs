@@ -23,10 +23,11 @@ use tracing::{info, warn};
 use crate::knowledge::config::{SourceConfig, TrackedDriver};
 use crate::knowledge::source::feed::driver_for;
 use crate::knowledge::{
-    BucketRegistry, FeedWorker, FeedWorkerControl, NoopObserver, WorkerObserver,
+    BucketEntry, BucketRegistry, FeedWorker, FeedWorkerControl, NoopObserver, WorkerObserver,
     cadence_to_duration,
 };
 use crate::runtime::scheduler::EmbeddingProviderEntry;
+use crate::runtime::scheduler::buckets::BucketKey;
 
 /// Capacity of the per-worker manual-trigger channel. One in flight
 /// at a time — extra `try_send` calls drop on a full buffer, which
@@ -34,11 +35,11 @@ use crate::runtime::scheduler::EmbeddingProviderEntry;
 /// `PollFeedNow` UI button.
 const TRIGGER_CHANNEL_CAPACITY: usize = 1;
 
-/// Walk the registry, spawn one [`FeedWorker`] per tracked bucket,
-/// and return their control handles keyed by bucket id. The scheduler
-/// stores the result and uses each handle to drive lifecycle (`cancel`
-/// on `DeleteBucket`) and manual triggering (`trigger.try_send(())` on
-/// `PollFeedNow`).
+/// Walk the registry, spawn one [`FeedWorker`] per tracked bucket
+/// (server-scope and pod-scope), and return their control handles
+/// keyed by [`BucketKey`]. The scheduler stores the result and uses
+/// each handle to drive lifecycle (`cancel` on `DeleteBucket`) and
+/// manual triggering (`trigger.try_send(())` on `PollFeedNow`).
 ///
 /// Stored / linked / managed buckets are skipped — only `tracked`
 /// buckets get a worker. Tracked buckets whose configured embedder
@@ -48,8 +49,8 @@ const TRIGGER_CHANNEL_CAPACITY: usize = 1;
 pub fn spawn_for_registry(
     registry: &BucketRegistry,
     embedding_providers: &HashMap<String, EmbeddingProviderEntry>,
-    resync_request_tx: mpsc::UnboundedSender<String>,
-) -> HashMap<String, FeedWorkerControl> {
+    resync_request_tx: mpsc::UnboundedSender<(Option<String>, String)>,
+) -> HashMap<BucketKey, FeedWorkerControl> {
     spawn_for_registry_with_observer(
         registry,
         embedding_providers,
@@ -64,69 +65,114 @@ pub fn spawn_for_registry(
 pub fn spawn_for_registry_with_observer(
     registry: &BucketRegistry,
     embedding_providers: &HashMap<String, EmbeddingProviderEntry>,
-    resync_request_tx: mpsc::UnboundedSender<String>,
+    resync_request_tx: mpsc::UnboundedSender<(Option<String>, String)>,
     observer: Arc<dyn WorkerObserver>,
-) -> HashMap<String, FeedWorkerControl> {
-    let mut controls: HashMap<String, FeedWorkerControl> = HashMap::new();
+) -> HashMap<BucketKey, FeedWorkerControl> {
+    let mut controls: HashMap<BucketKey, FeedWorkerControl> = HashMap::new();
     for (id, entry) in &registry.buckets {
-        let SourceConfig::Tracked {
-            driver: driver_cfg,
-            delta_cadence,
-            resync_cadence,
-            ..
-        } = &entry.config.source
-        else {
-            continue;
-        };
-        let embedder_name = &entry.config.defaults.embedder;
-        let Some(provider_entry) = embedding_providers.get(embedder_name) else {
-            warn!(
-                bucket_id = %id,
-                embedder = %embedder_name,
-                "tracked bucket's configured embedder is not in the provider catalog; \
-                 skipping feed worker spawn",
-            );
-            continue;
-        };
-        let cancel = CancellationToken::new();
-        let (trigger_tx, trigger_rx) = mpsc::channel::<()>(TRIGGER_CHANNEL_CAPACITY);
-        let driver = driver_for(driver_cfg);
-        let interval = cadence_to_duration(*delta_cadence);
-        let resync_interval = cadence_to_duration(*resync_cadence);
-        let driver_name = match driver_cfg {
-            TrackedDriver::Wikipedia { language, .. } => format!("wikipedia:{language}"),
-        };
-        info!(
-            bucket_id = %id,
-            driver = %driver_name,
-            embedder = %embedder_name,
-            interval_secs = interval.map(|d| d.as_secs()).unwrap_or(0),
-            resync_interval_secs = resync_interval.map(|d| d.as_secs()).unwrap_or(0),
-            "spawning feed worker for tracked bucket",
-        );
-        let worker = FeedWorker::new(
-            id.clone(),
-            entry.dir.clone(),
-            driver,
-            interval,
-            cancel.clone(),
-            observer.clone(),
-            registry.clone(),
-            provider_entry.provider.clone(),
-            trigger_rx,
-            resync_interval,
-            resync_request_tx.clone(),
-        );
-        tokio::spawn(worker.run());
-        controls.insert(
-            id.clone(),
-            FeedWorkerControl {
-                cancel,
-                trigger: trigger_tx,
-            },
-        );
+        if let Some((key, control)) = spawn_one(
+            id,
+            None,
+            entry,
+            registry,
+            embedding_providers,
+            &resync_request_tx,
+            &observer,
+        ) {
+            controls.insert(key, control);
+        }
+    }
+    for (pod_id, inner) in &registry.pod_buckets {
+        for (id, entry) in inner {
+            if let Some((key, control)) = spawn_one(
+                id,
+                Some(pod_id.clone()),
+                entry,
+                registry,
+                embedding_providers,
+                &resync_request_tx,
+                &observer,
+            ) {
+                controls.insert(key, control);
+            }
+        }
     }
     controls
+}
+
+/// Spawn one [`FeedWorker`] for a single registry entry. Returns
+/// `None` for non-tracked sources or when the configured embedder
+/// is missing from the catalog (both logged and skipped). Shared by
+/// the server-scope and pod-scope walks in
+/// [`spawn_for_registry_with_observer`].
+fn spawn_one(
+    id: &str,
+    pod_id: Option<String>,
+    entry: &BucketEntry,
+    registry: &BucketRegistry,
+    embedding_providers: &HashMap<String, EmbeddingProviderEntry>,
+    resync_request_tx: &mpsc::UnboundedSender<(Option<String>, String)>,
+    observer: &Arc<dyn WorkerObserver>,
+) -> Option<(BucketKey, FeedWorkerControl)> {
+    let SourceConfig::Tracked {
+        driver: driver_cfg,
+        delta_cadence,
+        resync_cadence,
+        ..
+    } = &entry.config.source
+    else {
+        return None;
+    };
+    let embedder_name = &entry.config.defaults.embedder;
+    let Some(provider_entry) = embedding_providers.get(embedder_name) else {
+        warn!(
+            bucket_id = %id,
+            pod_id = ?pod_id,
+            embedder = %embedder_name,
+            "tracked bucket's configured embedder is not in the provider catalog; \
+             skipping feed worker spawn",
+        );
+        return None;
+    };
+    let cancel = CancellationToken::new();
+    let (trigger_tx, trigger_rx) = mpsc::channel::<()>(TRIGGER_CHANNEL_CAPACITY);
+    let driver = driver_for(driver_cfg);
+    let interval = cadence_to_duration(*delta_cadence);
+    let resync_interval = cadence_to_duration(*resync_cadence);
+    let driver_name = match driver_cfg {
+        TrackedDriver::Wikipedia { language, .. } => format!("wikipedia:{language}"),
+    };
+    info!(
+        bucket_id = %id,
+        pod_id = ?pod_id,
+        driver = %driver_name,
+        embedder = %embedder_name,
+        interval_secs = interval.map(|d| d.as_secs()).unwrap_or(0),
+        resync_interval_secs = resync_interval.map(|d| d.as_secs()).unwrap_or(0),
+        "spawning feed worker for tracked bucket",
+    );
+    let worker = FeedWorker::new(
+        id.to_string(),
+        pod_id.clone(),
+        entry.dir.clone(),
+        driver,
+        interval,
+        cancel.clone(),
+        observer.clone(),
+        registry.clone(),
+        provider_entry.provider.clone(),
+        trigger_rx,
+        resync_interval,
+        resync_request_tx.clone(),
+    );
+    tokio::spawn(worker.run());
+    Some((
+        BucketKey::from_optional(pod_id, id.to_string()),
+        FeedWorkerControl {
+            cancel,
+            trigger: trigger_tx,
+        },
+    ))
 }
 
 #[cfg(test)]
@@ -287,12 +333,12 @@ embedder = "test_embedder"
         .await;
 
         let providers = embedders_with_test_entry("test_embedder");
-        let (resync_tx, _resync_rx) = mpsc::unbounded_channel::<String>();
+        let (resync_tx, _resync_rx) = mpsc::unbounded_channel::<(Option<String>, String)>();
         let controls = spawn_for_registry(&registry, &providers, resync_tx);
 
         assert_eq!(controls.len(), 1, "only the tracked bucket gets a worker");
-        assert!(controls.contains_key("wiki_simple"));
-        assert!(!controls.contains_key("my_notes"));
+        assert!(controls.contains_key(&BucketKey::server("wiki_simple")));
+        assert!(!controls.contains_key(&BucketKey::server("my_notes")));
 
         // Clean up — cancel the worker so the spawned task winds down
         // cleanly and the test process doesn't leave it hanging.
@@ -320,7 +366,7 @@ embedder = "test_embedder"
         // Empty catalog — bucket's `embedder = "test_embedder"` won't
         // resolve.
         let providers = HashMap::new();
-        let (resync_tx, _resync_rx) = mpsc::unbounded_channel::<String>();
+        let (resync_tx, _resync_rx) = mpsc::unbounded_channel::<(Option<String>, String)>();
         let controls = spawn_for_registry(&registry, &providers, resync_tx);
         assert!(
             controls.is_empty(),
@@ -343,7 +389,7 @@ embedder = "test_embedder"
         let recording = Arc::new(Recording::default());
         let observer = Arc::new(ObserverBox(recording.clone()));
         let providers = embedders_with_test_entry("test_embedder");
-        let (resync_tx, _resync_rx) = mpsc::unbounded_channel::<String>();
+        let (resync_tx, _resync_rx) = mpsc::unbounded_channel::<(Option<String>, String)>();
         let controls = spawn_for_registry_with_observer(&registry, &providers, resync_tx, observer);
         assert_eq!(controls.len(), 1);
 
