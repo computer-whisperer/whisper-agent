@@ -35,6 +35,7 @@ use super::manifest::{
 };
 use super::slot;
 use super::source::{SourceAdapter, SourceError, SourceRecord};
+use super::source_index::SourceIndex;
 use super::sparse::{SparseIndex, SparseIndexBuilder};
 use super::tombstones::Tombstones;
 use super::types::{
@@ -289,6 +290,12 @@ struct LoadedSlot {
     sparse: Option<RwLock<Arc<SparseIndex>>>,
     tombstones: Arc<Tombstones>,
     delta_chunks: RwLock<Option<Arc<ChunkStoreReader>>>,
+    /// `source_id → Vec<ChunkId>` for tombstone-then-insert delta
+    /// application. Built at slot open by walking base + delta chunks
+    /// (see [`SourceIndex::build`]), mutated on `Bucket::insert`,
+    /// untouched on `Bucket::tombstone` (the index is an accumulator —
+    /// see the [`source_index`](super::source_index) module docs).
+    source_index: Arc<SourceIndex>,
 }
 
 impl std::fmt::Debug for LoadedSlot {
@@ -326,6 +333,10 @@ impl LoadedSlot {
             .read()
             .expect("LoadedSlot.delta_chunks lock poisoned")
             .clone()
+    }
+
+    fn source_index(&self) -> Arc<SourceIndex> {
+        self.source_index.clone()
     }
 
     /// Look up a chunk by id in base, then delta. Mirrors the lookup
@@ -1374,6 +1385,11 @@ impl DiskBucket {
 
         let tombstones =
             Arc::new(Tombstones::open(&slot::tombstones_path(slot_path)).map_err(BucketError::Io)?);
+        // Source-id reverse index for delta application. Build now
+        // off the just-finalized chunks rather than re-walking on the
+        // next slot reopen — the chunks reader is already in memory
+        // and the post-build install is the natural seam.
+        let source_index = Arc::new(SourceIndex::build(&chunks, None)?);
         let loaded = Arc::new(LoadedSlot {
             manifest,
             chunks: RwLock::new(Arc::new(chunks)),
@@ -1382,6 +1398,7 @@ impl DiskBucket {
             sparse: sparse.map(|s| RwLock::new(Arc::new(s))),
             tombstones,
             delta_chunks: RwLock::new(None),
+            source_index,
         });
 
         slot::set_active_slot(&self.root, slot_id)?;
@@ -1468,6 +1485,15 @@ impl DiskBucket {
                     sparse: sparse_reader.map(RwLock::new),
                     tombstones,
                     delta_chunks: RwLock::new(None),
+                    // Empty during the build — `apply_delta` against an
+                    // in-progress slot is out of scope (FeedWorker
+                    // applies deltas only against ready slots, and a
+                    // resync's "apply deltas to the prior active slot
+                    // while a new slot builds" path uses the prior
+                    // slot's already-populated index, not this one).
+                    // Post-build install rebuilds it from finalized
+                    // chunks.
+                    source_index: Arc::new(SourceIndex::empty()),
                 });
                 {
                     let mut active = self.active.write().expect("active slot lock poisoned");
@@ -1745,9 +1771,16 @@ impl Bucket for DiskBucket {
 
             // 1. Derive content-addressed chunk ids up front so we can
             //    return them even if the embedder fails partway.
+            //    Capture each chunk's source_id alongside so step 4a
+            //    can update the slot's source_index *after* the
+            //    blocking persist consumes `new_chunks`.
             let chunk_ids: Vec<ChunkId> = new_chunks
                 .iter()
                 .map(|c| ChunkId::from_source(&c.source_record_hash, c.chunk_offset))
+                .collect();
+            let source_ids: Vec<String> = new_chunks
+                .iter()
+                .map(|c| c.source_ref.source_id.clone())
                 .collect();
 
             // 2. Embed (network IO).
@@ -1814,6 +1847,17 @@ impl Bucket for DiskBucket {
                     .write()
                     .expect("delta_chunks lock poisoned");
                 *slot_delta = Some(new_delta_reader);
+            }
+
+            // 4a. Mirror the freshly-inserted chunks into the slot's
+            //    `source_index` so the next `apply_delta` lookup for
+            //    these source_ids sees them. The index is a pure
+            //    accumulator (see `source_index` module docs); no
+            //    removal is needed when this insert later gets
+            //    tombstoned by a subsequent delta application.
+            let source_index = active.source_index();
+            for (sid, id) in source_ids.iter().zip(chunk_ids.iter()) {
+                source_index.add(sid, *id);
             }
 
             // 5. Re-open the sparse reader. Tantivy's
@@ -2616,14 +2660,27 @@ fn load_slot(bucket_root: &Path, slot_id: &str) -> Result<LoadedSlot, BucketErro
         }
     }
 
+    // Build the source-id reverse index for delta application. Walks
+    // base chunks + delta chunks once. At simplewiki scale (~870k base
+    // chunks) this is a few seconds with a warm page cache; for
+    // wikipedia-scale slots a persistent sidecar is the planned
+    // follow-up. Slot-open is unconditional today — no callers need
+    // the index lazy, and the cost is small enough to pay up front.
+    let chunks_arc = Arc::new(chunks);
+    let source_index = Arc::new(SourceIndex::build(
+        chunks_arc.as_ref(),
+        delta_chunks.as_deref(),
+    )?);
+
     Ok(LoadedSlot {
         manifest,
-        chunks: RwLock::new(Arc::new(chunks)),
+        chunks: RwLock::new(chunks_arc),
         vectors: Some(vectors),
         dense,
         sparse: sparse.map(|s| RwLock::new(Arc::new(s))),
         tombstones,
         delta_chunks: RwLock::new(delta_chunks),
+        source_index,
     })
 }
 

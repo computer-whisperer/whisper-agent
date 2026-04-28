@@ -42,6 +42,7 @@ pub mod query;
 pub mod registry;
 pub mod slot;
 pub mod source;
+pub mod source_index;
 pub mod sparse;
 pub mod tombstones;
 pub mod types;
@@ -69,6 +70,7 @@ pub use source::{
     DeltaId, FeedDriver, FeedError, MarkdownDir, MediaWikiXml, SnapshotId, SourceAdapter,
     SourceError, SourceRecord, WikipediaDriver,
 };
+pub use source_index::SourceIndex;
 pub use sparse::{SparseIndex, SparseIndexBuilder};
 pub use types::{
     BucketError, BucketId, BucketScope, BucketStatus, BuildProgress, Candidate, Chunk, ChunkId,

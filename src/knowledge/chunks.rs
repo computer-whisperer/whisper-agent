@@ -424,6 +424,46 @@ impl ChunkStoreReader {
 
         parse_record(chunk_id, &body).map(Some)
     }
+
+    /// Walk every record paired with its `chunk_id`, in `chunks.bin`
+    /// insertion order. Returns just `(ChunkId, source_id)` — locator
+    /// and chunk text are skipped on parse, so this is materially
+    /// cheaper than calling [`fetch`](Self::fetch) per record at slot
+    /// open. Used by [`SourceIndex`](super::source_index::SourceIndex)
+    /// to seed the in-memory `source_id → Vec<ChunkId>` map.
+    pub fn iter_chunk_source_ids(&self) -> io::Result<Vec<(ChunkId, String)>> {
+        // Invert idx: offset → chunk_id, sorted ascending by offset so
+        // the bin is read sequentially (mmap- and page-cache-friendly).
+        let inverse: Vec<(u64, ChunkId)> = {
+            let map = self
+                .index
+                .read()
+                .expect("ChunkStoreReader index lock poisoned");
+            let mut v: Vec<(u64, ChunkId)> = map.iter().map(|(k, v)| (*v, *k)).collect();
+            v.sort_by_key(|(o, _)| *o);
+            v
+        };
+
+        let mut out: Vec<(ChunkId, String)> = Vec::with_capacity(inverse.len());
+        for (offset, chunk_id) in inverse {
+            let body = match &self.storage {
+                ChunkStorage::Mapped(m) => fetch_record_from_bytes(m, offset)?,
+                ChunkStorage::Eager(v) => fetch_record_from_bytes(v, offset)?,
+                ChunkStorage::Live(mu) => {
+                    let mut bin = mu.lock().expect("chunks.bin mutex poisoned");
+                    bin.seek(SeekFrom::Start(offset))?;
+                    let mut len_bytes = [0u8; 4];
+                    bin.read_exact(&mut len_bytes)?;
+                    let body_len = u32::from_le_bytes(len_bytes) as usize;
+                    let mut body = vec![0u8; body_len];
+                    bin.read_exact(&mut body)?;
+                    body
+                }
+            };
+            out.push((chunk_id, parse_source_id_only(&body)?));
+        }
+        Ok(out)
+    }
 }
 
 /// Pull one record's body out of a `&[u8]` view of `chunks.bin` at the
@@ -535,6 +575,24 @@ fn parse_record(chunk_id: ChunkId, body: &[u8]) -> io::Result<Chunk> {
         text,
         source_ref: SourceRef { source_id, locator },
     })
+}
+
+/// Cheap variant of [`parse_record`] that consumes only the version,
+/// has-locator flag, and source_id fields from a record body — the
+/// locator and text bytes are left unread. Used by
+/// [`ChunkStoreReader::iter_chunk_source_ids`] for the `SourceIndex`
+/// build pass, where the chunk text is irrelevant.
+fn parse_source_id_only(body: &[u8]) -> io::Result<String> {
+    let mut cur = 0usize;
+    let version = take_u8(body, &mut cur)?;
+    if version != RECORD_VERSION {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("unknown chunks.bin record version: {version}"),
+        ));
+    }
+    let _has_locator = take_u8(body, &mut cur)?;
+    take_str(body, &mut cur)
 }
 
 fn take_u8(body: &[u8], cur: &mut usize) -> io::Result<u8> {
