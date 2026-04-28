@@ -51,6 +51,7 @@ Last updated: **2026-04-27**.
 | AB  | apply_delta batch — hoisted per-page tombstone+insert into one tantivy commit pair, saturated embedder | `6c25f4e` |
 | BT  | Boot-time fs-walk fix — replaced recursive `dir_size`/`total_dir_bytes` walks with manifest stat reads, eliminating ~50s startup hang | `0dfa1ba` |
 | KM  | `knowledge_modify` — LLM-callable insert/tombstone for managed buckets, EmptySource bootstrap, scope-gated | `efeebb7..591ad65` |
+| MQ  | Multi-bucket query fan-out — `join_all` across per-bucket dense+sparse futures; max-of-per-bucket latency | `a5ff7d2` |
 
 ## End-to-end validation (Simple English Wikipedia, mock embedder)
 
@@ -212,10 +213,11 @@ chronological — order may shuffle as the dataset reveals what hurts.
 - **Per-bucket tantivy tokenizer config** — `bucket.toml`'s
   `search_paths.sparse.tokenizer` is parsed but ignored at slot-build
   time. Wire through when we have multiple options worth swapping.
-- **Multi-bucket parallel fan-out in `QueryEngine`** — currently
-  sequential across buckets, parallel within (dense + sparse). Bound by
-  bucket count, not chunk count, so cheap to leave until a multi-bucket
-  query is observably slow.
+- ~~**Multi-bucket parallel fan-out in `QueryEngine`**~~ — landed in
+  `a5ff7d2`. `futures::future::join_all` across per-bucket search
+  futures; total query latency is now max-of-per-bucket instead of
+  sum-of-per-bucket. Relevant once a pod has multiple buckets in
+  scope (e.g. memory + wikipedia).
 
 ## Pointers
 
