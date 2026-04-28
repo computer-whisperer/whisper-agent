@@ -237,22 +237,28 @@ impl FeedWorker {
     /// fire. Reads `feed_state.last_resync_at` so a server restart
     /// doesn't reset the resync clock — important for monthly
     /// cadences against deploy strategies that recreate the pod
-    /// regularly. `None` last_resync_at maps to `Duration::ZERO`
-    /// (fire immediately) since "never resynced" is "infinitely
-    /// overdue."
+    /// regularly.
+    ///
+    /// `None` last_resync_at maps to a *full interval* of sleep, not
+    /// zero. "Never resynced" is the steady state for a freshly-built
+    /// tracked bucket (build path doesn't stamp `last_resync_at` —
+    /// only an explicit Resync run does), so treating `None` as
+    /// "infinitely overdue" would auto-fire a multi-hour rebuild on
+    /// every server boot. Operators who *want* an immediate resync
+    /// click the manual button.
     fn initial_resync_sleep(
         state: &FeedState,
         interval: Duration,
         now: chrono::DateTime<chrono::Utc>,
     ) -> Duration {
         match state.last_resync_at {
-            None => Duration::ZERO,
+            None => interval,
             Some(last) => {
                 let span = match chrono::Duration::from_std(interval) {
                     Ok(d) => d,
                     // Cadence overflow chrono — not realistic for any
                     // configured value, but be defensive.
-                    Err(_) => return Duration::ZERO,
+                    Err(_) => return interval,
                 };
                 let due = last + span;
                 if due <= now {
@@ -725,17 +731,18 @@ mod tests {
     }
 
     #[test]
-    fn initial_resync_sleep_is_zero_when_never_resynced() {
+    fn initial_resync_sleep_defers_a_full_interval_when_never_resynced() {
+        // Regression: `None` last_resync_at used to map to ZERO and
+        // auto-fire a multi-hour rebuild on every server boot for any
+        // bucket built before the resync feature shipped. Now it
+        // defers a full interval — operators click the manual Resync
+        // button when they want an immediate one.
         let state = FeedState::default();
-        let sleep = FeedWorker::initial_resync_sleep(
-            &state,
-            Duration::from_secs(60 * 60 * 24),
-            chrono::Utc::now(),
-        );
+        let interval = Duration::from_secs(60 * 60 * 24);
+        let sleep = FeedWorker::initial_resync_sleep(&state, interval, chrono::Utc::now());
         assert_eq!(
-            sleep,
-            Duration::ZERO,
-            "no last_resync_at should mean fire immediately"
+            sleep, interval,
+            "no last_resync_at should defer first auto-resync by one full interval"
         );
     }
 
