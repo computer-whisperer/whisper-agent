@@ -893,6 +893,13 @@ pub struct QueryHit {
 /// `markdown_dir` for `linked`). Sending an unknown combo lands an
 /// `Error` at create time rather than a parse failure on next registry
 /// load.
+///
+/// `Tracked` carries the same info that lands in the `[source]` block
+/// of a tracked bucket's `bucket.toml`. The nested `driver` enum mirrors
+/// `crate::knowledge::TrackedDriver` server-side; cadences map onto
+/// `crate::knowledge::TrackedCadence`. The server's
+/// `synthesize_bucket_toml` flattens these back into the on-disk TOML
+/// shape (`driver = "wikipedia"`, `language = "en"`, …).
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum BucketSourceInput {
@@ -905,6 +912,45 @@ pub enum BucketSourceInput {
         path: String,
     },
     Managed {},
+    Tracked {
+        driver: TrackedDriverInput,
+        delta_cadence: TrackedCadenceInput,
+        resync_cadence: TrackedCadenceInput,
+    },
+}
+
+/// Wire shape for the `[source].driver` field of a tracked bucket.
+/// One variant per supported driver. The server's
+/// `synthesize_bucket_toml` renders the variant's `driver` tag and
+/// flattens the per-variant fields (`language`, `mirror`, …) under
+/// the `[source]` table.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(tag = "driver", rename_all = "snake_case")]
+pub enum TrackedDriverInput {
+    Wikipedia {
+        /// Wiki language code (`"en"`, `"de"`, `"simple"`, …); maps
+        /// to `<lang>wiki` in `dumps.wikimedia.org` URL conventions.
+        language: String,
+        /// Optional mirror override; defaults to
+        /// `https://dumps.wikimedia.org` when omitted.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        mirror: Option<String>,
+    },
+}
+
+/// Wire shape for `delta_cadence` / `resync_cadence` on a tracked
+/// bucket. Mirrors `crate::knowledge::TrackedCadence`. `Manual` means
+/// the worker only ticks on an explicit "Poll now" / "Resync now"
+/// trigger from the UI; the four time-based variants drive the
+/// auto-cadence loops.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TrackedCadenceInput {
+    Daily,
+    Weekly,
+    Monthly,
+    Quarterly,
+    Manual,
 }
 
 /// Form payload for `CreateBucket`. The server synthesizes a fresh

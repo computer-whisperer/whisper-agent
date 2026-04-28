@@ -8,10 +8,13 @@
 use egui::{Color32, ComboBox, RichText, ScrollArea, TextEdit};
 use whisper_agent_protocol::{
     BucketBuildPhase, BucketCreateInput, BucketSourceInput, BucketSummary, EmbeddingProviderInfo,
-    PodSummary, QueryHit, SlotStateLabel,
+    PodSummary, QueryHit, SlotStateLabel, TrackedCadenceInput, TrackedDriverInput,
 };
 
-use super::super::{BucketsModalState, CreateBucketForm, QueryStatus, SourceKindChoice};
+use super::super::{
+    BucketsModalState, CreateBucketForm, QueryStatus, SourceKindChoice, TrackedCadenceChoice,
+    TrackedDriverChoice,
+};
 
 /// Side-channel actions a `render_buckets_modal` call can emit. The
 /// caller mints correlation ids and dispatches the matching wire op.
@@ -51,6 +54,39 @@ pub(crate) enum BucketsEvent {
     /// short-circuits if already at latest. Only emitted for
     /// `source_kind = "tracked"` buckets with no in-flight build.
     ResyncBucket { id: String, pod_id: Option<String> },
+}
+
+/// All cadence variants in dropdown order. Daily / Weekly / Monthly /
+/// Quarterly / Manual matches the wire enum's declaration order; the
+/// form's two cadence ComboBoxes (delta + resync) iterate this slice.
+const TRACKED_CADENCE_CHOICES: [TrackedCadenceChoice; 5] = [
+    TrackedCadenceChoice::Daily,
+    TrackedCadenceChoice::Weekly,
+    TrackedCadenceChoice::Monthly,
+    TrackedCadenceChoice::Quarterly,
+    TrackedCadenceChoice::Manual,
+];
+
+/// Driver-picker label. Pulled out so the driver list grows in one
+/// place when a second tracked driver lands.
+fn tracked_driver_label(driver: TrackedDriverChoice) -> &'static str {
+    match driver {
+        TrackedDriverChoice::Wikipedia => "wikipedia",
+    }
+}
+
+/// Translate the form's UI cadence enum to the wire type. One-to-one
+/// mapping; lives here rather than as a `From` impl because both
+/// types are `Copy` enums and a small free fn keeps the form-side
+/// dispatch readable.
+fn cadence_to_wire(c: TrackedCadenceChoice) -> TrackedCadenceInput {
+    match c {
+        TrackedCadenceChoice::Daily => TrackedCadenceInput::Daily,
+        TrackedCadenceChoice::Weekly => TrackedCadenceInput::Weekly,
+        TrackedCadenceChoice::Monthly => TrackedCadenceInput::Monthly,
+        TrackedCadenceChoice::Quarterly => TrackedCadenceInput::Quarterly,
+        TrackedCadenceChoice::Manual => TrackedCadenceInput::Manual,
+    }
 }
 
 /// Per-bucket progress snapshot the modal carries while a build is in
@@ -282,6 +318,11 @@ fn render_create_section(
                         SourceKindChoice::Managed,
                         "managed",
                     );
+                    ui.selectable_value(
+                        &mut form.source_kind,
+                        SourceKindChoice::Tracked,
+                        "tracked",
+                    );
                 });
             });
             ui.end_row();
@@ -328,6 +369,79 @@ fn render_create_section(
                             .small()
                             .color(Color32::from_gray(160)),
                     );
+                    ui.end_row();
+                }
+                SourceKindChoice::Tracked => {
+                    // Driver picker — one entry today (Wikipedia); when
+                    // a second driver lands, add another arm to
+                    // `TrackedDriverChoice` and the wire type and the
+                    // dropdown picks it up automatically.
+                    ui.label(RichText::new("source.driver").small());
+                    ui.add_enabled_ui(!saving, |ui| {
+                        ComboBox::from_id_salt("create-bucket-driver")
+                            .selected_text(tracked_driver_label(form.tracked_driver))
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(
+                                    &mut form.tracked_driver,
+                                    TrackedDriverChoice::Wikipedia,
+                                    "wikipedia",
+                                );
+                            });
+                    });
+                    ui.end_row();
+
+                    match form.tracked_driver {
+                        TrackedDriverChoice::Wikipedia => {
+                            ui.label(RichText::new("source.language").small());
+                            ui.add_enabled(
+                                !saving,
+                                TextEdit::singleline(&mut form.tracked_language)
+                                    .desired_width(120.0)
+                                    .hint_text("en, simple, de, …"),
+                            );
+                            ui.end_row();
+
+                            ui.label(RichText::new("source.mirror").small());
+                            ui.add_enabled(
+                                !saving,
+                                TextEdit::singleline(&mut form.tracked_mirror)
+                                    .desired_width(360.0)
+                                    .hint_text("(optional) https://dumps.wikimedia.org"),
+                            );
+                            ui.end_row();
+                        }
+                    }
+
+                    ui.label(RichText::new("source.delta_cadence").small());
+                    ui.add_enabled_ui(!saving, |ui| {
+                        ComboBox::from_id_salt("create-bucket-delta-cadence")
+                            .selected_text(form.tracked_delta_cadence.label())
+                            .show_ui(ui, |ui| {
+                                for c in TRACKED_CADENCE_CHOICES {
+                                    ui.selectable_value(
+                                        &mut form.tracked_delta_cadence,
+                                        c,
+                                        c.label(),
+                                    );
+                                }
+                            });
+                    });
+                    ui.end_row();
+
+                    ui.label(RichText::new("source.resync_cadence").small());
+                    ui.add_enabled_ui(!saving, |ui| {
+                        ComboBox::from_id_salt("create-bucket-resync-cadence")
+                            .selected_text(form.tracked_resync_cadence.label())
+                            .show_ui(ui, |ui| {
+                                for c in TRACKED_CADENCE_CHOICES {
+                                    ui.selectable_value(
+                                        &mut form.tracked_resync_cadence,
+                                        c,
+                                        c.label(),
+                                    );
+                                }
+                            });
+                    });
                     ui.end_row();
                 }
             }
@@ -433,6 +547,35 @@ fn build_create_input(form: &mut CreateBucketForm) -> Option<BucketCreateInput> 
             }
         }
         SourceKindChoice::Managed => BucketSourceInput::Managed {},
+        SourceKindChoice::Tracked => {
+            let driver = match form.tracked_driver {
+                TrackedDriverChoice::Wikipedia => {
+                    if form.tracked_language.trim().is_empty() {
+                        form.error =
+                            Some("language is required for kind=tracked driver=wikipedia".into());
+                        return None;
+                    }
+                    let mirror = form.tracked_mirror.trim();
+                    let mirror = if mirror.is_empty() {
+                        None
+                    } else if !(mirror.starts_with("http://") || mirror.starts_with("https://")) {
+                        form.error = Some("mirror must be an http(s):// URL when set".into());
+                        return None;
+                    } else {
+                        Some(mirror.to_string())
+                    };
+                    TrackedDriverInput::Wikipedia {
+                        language: form.tracked_language.trim().to_string(),
+                        mirror,
+                    }
+                }
+            };
+            BucketSourceInput::Tracked {
+                driver,
+                delta_cadence: cadence_to_wire(form.tracked_delta_cadence),
+                resync_cadence: cadence_to_wire(form.tracked_resync_cadence),
+            }
+        }
     };
     let description = if form.description.trim().is_empty() {
         None

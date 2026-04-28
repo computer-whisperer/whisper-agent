@@ -27,6 +27,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::warn;
 use whisper_agent_protocol::{
     BucketBuildOutcome, BucketBuildPhase, BucketCreateInput, BucketSourceInput, ServerToClient,
+    TrackedCadenceInput, TrackedDriverInput,
 };
 
 use super::{ConnId, Scheduler};
@@ -1460,6 +1461,21 @@ fn validate_source(source: &BucketSourceInput) -> Result<(), String> {
             }
         }
         BucketSourceInput::Managed {} => {}
+        BucketSourceInput::Tracked { driver, .. } => match driver {
+            TrackedDriverInput::Wikipedia { language, mirror } => {
+                if language.trim().is_empty() {
+                    return Err("source.language must not be empty for driver=wikipedia".into());
+                }
+                if let Some(m) = mirror.as_deref()
+                    && !m.is_empty()
+                    && !(m.starts_with("http://") || m.starts_with("https://"))
+                {
+                    return Err(format!(
+                        "source.mirror `{m}` must be an http(s):// URL when set"
+                    ));
+                }
+            }
+        },
     }
     Ok(())
 }
@@ -1485,6 +1501,11 @@ fn synthesize_bucket_toml(config: &BucketCreateInput) -> String {
             toml_quote(path),
         ),
         BucketSourceInput::Managed {} => "[source]\nkind = \"managed\"\n".to_string(),
+        BucketSourceInput::Tracked {
+            driver,
+            delta_cadence,
+            resync_cadence,
+        } => render_tracked_source_block(driver, *delta_cadence, *resync_cadence),
     };
     format!(
         "name = {name}\n{description}created_at = \"{now}\"\n\n\
@@ -1511,6 +1532,51 @@ fn synthesize_bucket_toml(config: &BucketCreateInput) -> String {
         sparse = config.sparse_enabled,
         embedder = toml_quote(&config.embedder),
     )
+}
+
+/// Render the `[source]` block for a tracked-kind bucket. Mirrors
+/// the TOML shape that `crate::knowledge::SourceConfig::Tracked`
+/// parses: `kind`, then the driver-specific fields flattened
+/// alongside (`driver = "wikipedia"`, `language`, optional `mirror`),
+/// then the cadence fields.
+fn render_tracked_source_block(
+    driver: &TrackedDriverInput,
+    delta_cadence: TrackedCadenceInput,
+    resync_cadence: TrackedCadenceInput,
+) -> String {
+    let mut s = String::from("[source]\nkind = \"tracked\"\n");
+    match driver {
+        TrackedDriverInput::Wikipedia { language, mirror } => {
+            s.push_str("driver = \"wikipedia\"\n");
+            s.push_str(&format!("language = {}\n", toml_quote(language)));
+            if let Some(m) = mirror.as_deref().filter(|m| !m.is_empty()) {
+                s.push_str(&format!("mirror = {}\n", toml_quote(m)));
+            }
+        }
+    }
+    s.push_str(&format!(
+        "delta_cadence = \"{}\"\n",
+        tracked_cadence_str(delta_cadence),
+    ));
+    s.push_str(&format!(
+        "resync_cadence = \"{}\"\n",
+        tracked_cadence_str(resync_cadence),
+    ));
+    s
+}
+
+/// Wire-cadence → TOML literal. The string values match
+/// `#[serde(rename_all = "snake_case")]` on
+/// `crate::knowledge::TrackedCadence`, so the synthesized TOML
+/// round-trips through `BucketConfig::from_toml_str`.
+fn tracked_cadence_str(c: TrackedCadenceInput) -> &'static str {
+    match c {
+        TrackedCadenceInput::Daily => "daily",
+        TrackedCadenceInput::Weekly => "weekly",
+        TrackedCadenceInput::Monthly => "monthly",
+        TrackedCadenceInput::Quarterly => "quarterly",
+        TrackedCadenceInput::Manual => "manual",
+    }
 }
 
 /// Quote a string for TOML basic-string inclusion. Bucket fields are
@@ -2096,6 +2162,84 @@ mod tests {
 
         let after = FeedState::load(tmp.path()).unwrap();
         assert_eq!(after.current_base(), Some(SnapshotId::new("20260401")));
+    }
+
+    /// Verifies the synthesized TOML for a `Tracked` bucket round-trips
+    /// through `BucketConfig::from_toml_str` — same parser the registry
+    /// uses at startup. Catches a class of bugs where the wire enum's
+    /// rename (`snake_case`) drifts from what the TOML grammar expects.
+    #[test]
+    fn synthesize_tracked_bucket_toml_round_trips() {
+        let cfg = BucketCreateInput {
+            name: "Wikipedia (simple)".to_string(),
+            description: Some("simple english wiki".to_string()),
+            source: BucketSourceInput::Tracked {
+                driver: TrackedDriverInput::Wikipedia {
+                    language: "simple".to_string(),
+                    mirror: Some("https://example.com/dumps".to_string()),
+                },
+                delta_cadence: TrackedCadenceInput::Daily,
+                resync_cadence: TrackedCadenceInput::Monthly,
+            },
+            embedder: "qwen3_embed_0_6b".to_string(),
+            chunk_tokens: 500,
+            overlap_tokens: 50,
+            dense_enabled: true,
+            sparse_enabled: true,
+        };
+        let toml_text = synthesize_bucket_toml(&cfg);
+        let parsed = crate::knowledge::BucketConfig::from_toml_str(&toml_text)
+            .expect("synthesized TOML must parse");
+        let crate::knowledge::SourceConfig::Tracked {
+            driver,
+            delta_cadence,
+            resync_cadence,
+        } = &parsed.source
+        else {
+            panic!("expected Tracked source, got {:?}", parsed.source);
+        };
+        let crate::knowledge::TrackedDriver::Wikipedia { language, mirror } = driver;
+        assert_eq!(language, "simple");
+        assert_eq!(mirror.as_deref(), Some("https://example.com/dumps"));
+        assert_eq!(*delta_cadence, crate::knowledge::TrackedCadence::Daily);
+        assert_eq!(*resync_cadence, crate::knowledge::TrackedCadence::Monthly);
+    }
+
+    /// `mirror = None` should omit the field entirely so the TOML
+    /// parser falls back to the driver's default
+    /// (`https://dumps.wikimedia.org`). Empty-string is treated as
+    /// "unset" by the form, so we should never emit `mirror = ""`.
+    #[test]
+    fn synthesize_tracked_omits_mirror_when_unset() {
+        let cfg = BucketCreateInput {
+            name: "Wikipedia (en)".to_string(),
+            description: None,
+            source: BucketSourceInput::Tracked {
+                driver: TrackedDriverInput::Wikipedia {
+                    language: "en".to_string(),
+                    mirror: None,
+                },
+                delta_cadence: TrackedCadenceInput::Manual,
+                resync_cadence: TrackedCadenceInput::Manual,
+            },
+            embedder: "qwen3_embed_0_6b".to_string(),
+            chunk_tokens: 500,
+            overlap_tokens: 50,
+            dense_enabled: true,
+            sparse_enabled: true,
+        };
+        let toml_text = synthesize_bucket_toml(&cfg);
+        assert!(
+            !toml_text.contains("mirror"),
+            "mirror should be omitted when None; got:\n{toml_text}"
+        );
+        let parsed = crate::knowledge::BucketConfig::from_toml_str(&toml_text)
+            .expect("synthesized TOML must parse");
+        let crate::knowledge::SourceConfig::Tracked { driver, .. } = &parsed.source else {
+            panic!("expected Tracked source");
+        };
+        let crate::knowledge::TrackedDriver::Wikipedia { mirror, .. } = driver;
+        assert!(mirror.is_none(), "parsed mirror must be None");
     }
 
     #[test]

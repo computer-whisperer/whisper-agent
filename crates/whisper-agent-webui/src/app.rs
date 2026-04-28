@@ -1326,8 +1326,24 @@ struct CreateBucketForm {
     pod_id: Option<String>,
     source_kind: SourceKindChoice,
     /// Holds either archive_path (stored) or path (linked); ignored
-    /// for managed.
+    /// for managed and tracked.
     source_detail: String,
+    /// Selected driver for `kind=tracked`. Ignored for other source
+    /// kinds. Today only `Wikipedia` exists; future drivers add new
+    /// variants and gate which sub-fields the form surfaces.
+    tracked_driver: TrackedDriverChoice,
+    /// `kind=tracked, driver=wikipedia` — language code (`"en"`,
+    /// `"simple"`, `"de"`, …). Empty default: the user must fill it
+    /// before submitting.
+    tracked_language: String,
+    /// `kind=tracked, driver=wikipedia` — optional mirror override.
+    /// Empty ⇒ defaults to `https://dumps.wikimedia.org` server-side.
+    tracked_mirror: String,
+    /// `kind=tracked` — how often the feed worker polls for deltas.
+    tracked_delta_cadence: TrackedCadenceChoice,
+    /// `kind=tracked` — how often the background resync rebuilds
+    /// against a fresh base snapshot. Wikipedia publishes monthly.
+    tracked_resync_cadence: TrackedCadenceChoice,
     chunk_tokens: u32,
     overlap_tokens: u32,
     dense_enabled: bool,
@@ -1352,6 +1368,11 @@ impl Default for CreateBucketForm {
             pod_id: None,
             source_kind: SourceKindChoice::Linked,
             source_detail: String::new(),
+            tracked_driver: TrackedDriverChoice::default(),
+            tracked_language: String::new(),
+            tracked_mirror: String::new(),
+            tracked_delta_cadence: TrackedCadenceChoice::Daily,
+            tracked_resync_cadence: TrackedCadenceChoice::Monthly,
             chunk_tokens: 500,
             overlap_tokens: 50,
             dense_enabled: true,
@@ -1368,6 +1389,44 @@ enum SourceKindChoice {
     #[default]
     Linked,
     Managed,
+    Tracked,
+}
+
+/// Wire-shape mirror of `whisper_agent_protocol::TrackedDriverInput`,
+/// kept on the form so the user's selection survives re-render
+/// frames. The form's driver ComboBox writes into this and
+/// `build_create_input` translates back to the wire type.
+#[derive(Copy, Clone, Eq, PartialEq, Default)]
+enum TrackedDriverChoice {
+    #[default]
+    Wikipedia,
+}
+
+/// UI mirror of `whisper_agent_protocol::TrackedCadenceInput`. Same
+/// vocabulary used for both `delta_cadence` and `resync_cadence` —
+/// the meaningful values for each are driver-dependent (Wikipedia
+/// publishes daily incrementals + monthly bases) but the enum is
+/// shared.
+#[derive(Copy, Clone, Eq, PartialEq, Default)]
+enum TrackedCadenceChoice {
+    #[default]
+    Daily,
+    Weekly,
+    Monthly,
+    Quarterly,
+    Manual,
+}
+
+impl TrackedCadenceChoice {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Daily => "daily",
+            Self::Weekly => "weekly",
+            Self::Monthly => "monthly",
+            Self::Quarterly => "quarterly",
+            Self::Manual => "manual",
+        }
+    }
 }
 
 /// Lifecycle of the search form's last-issued query. Renderer reads
