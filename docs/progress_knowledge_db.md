@@ -46,6 +46,7 @@ Last updated: **2026-04-27**.
 | Q1  | `recall_eval` binary — dense-recall@K harness for quantization regression testing | `025be2a` |
 | Q2a | f16 quantization in vectors.bin — half on-disk vector size, ~1% recall noise floor | `26541e3` |
 | Q3  | int8 quantization in vectors.bin — symmetric per-vector scale, ~4× compression | `5e91517` |
+| GC  | Orphan-slot GC at registry load — Failed / no-manifest / superseded Planning/Building dirs swept; active + resumable preserved | `91a08bc` |
 
 ## End-to-end validation (Simple English Wikipedia, mock embedder)
 
@@ -192,10 +193,12 @@ chronological — order may shuffle as the dataset reveals what hurts.
   periodic mid-build HNSW dumps + queryable-during-build all in.
   Cancel / crash now picks up at the last `BatchEmbedded` checkpoint
   instead of restarting from zero.
-- **GC pass for orphaned slot directories** — cancelled / failed builds
-  leave `slots/<id>/` on disk. Need a sweep on registry load (or a
-  `compact` op) to clean these up. More relevant now that the WebUI
-  Cancel button is live and routinely produces failed slots.
+- ~~**GC pass for orphaned slot directories**~~ — landed in `91a08bc`.
+  `gc_orphan_slots` runs at `BucketRegistry::load`; removes Failed,
+  no-manifest, unparseable-manifest, and superseded
+  Planning/Building slots. Active and most-recent resumable are
+  always preserved; Ready/Archived are owned by a separate retention
+  sweep.
 - **`build_simplewiki` binary** — now obsolete for non-stress-testing
   flows; the WebUI lifecycle covers everything it did. Keep around
   for batch / scripted scenarios but consider deleting once the wiki
