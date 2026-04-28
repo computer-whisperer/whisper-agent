@@ -167,6 +167,30 @@ pub struct FeedWorker {
     /// triggers coalesce — there's no value in queuing them since
     /// the worker rolls all available deltas into one tick anyway.
     trigger: mpsc::Receiver<()>,
+    /// Cadence between scheduled resyncs (`None` = `TrackedCadence::Manual`,
+    /// no scheduled fire — manual "Resync now" still works through
+    /// the wire path). Worker computes the first fire-time from
+    /// `feed_state.last_resync_at + resync_interval` so a server
+    /// restart doesn't reset the resync clock.
+    resync_interval: Option<Duration>,
+    /// Outbound channel to the scheduler, where each `String` is a
+    /// bucket id requesting a scheduled resync. The scheduler drains
+    /// the channel and dispatches `handle_resync_bucket` with no
+    /// requester. Unbounded: a stuck scheduler can't be unblocked by
+    /// dropping resync requests, and the channel has at most one
+    /// outstanding message per worker (we don't retry until next
+    /// cadence fire).
+    resync_request_tx: mpsc::UnboundedSender<String>,
+}
+
+/// One iteration of the run-loop's `select!` picks among several
+/// wake-up sources. The arm that fires drives different post-wakeup
+/// work — pulled into an enum so the existing `select!` block stays a
+/// clean exhaustive match.
+enum WakeReason {
+    Cancelled,
+    DeltaPoll,
+    ResyncDue,
 }
 
 /// Spawn-side handle returned alongside a fresh [`FeedWorker`]. The
@@ -191,6 +215,8 @@ impl FeedWorker {
         registry: BucketRegistry,
         embedder: Arc<dyn EmbeddingProvider>,
         trigger: mpsc::Receiver<()>,
+        resync_interval: Option<Duration>,
+        resync_request_tx: mpsc::UnboundedSender<String>,
     ) -> Self {
         Self {
             bucket_id: bucket_id.into(),
@@ -202,6 +228,39 @@ impl FeedWorker {
             registry,
             embedder,
             trigger,
+            resync_interval,
+            resync_request_tx,
+        }
+    }
+
+    /// Compute the duration to wait before the first scheduled resync
+    /// fire. Reads `feed_state.last_resync_at` so a server restart
+    /// doesn't reset the resync clock — important for monthly
+    /// cadences against deploy strategies that recreate the pod
+    /// regularly. `None` last_resync_at maps to `Duration::ZERO`
+    /// (fire immediately) since "never resynced" is "infinitely
+    /// overdue."
+    fn initial_resync_sleep(
+        state: &FeedState,
+        interval: Duration,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Duration {
+        match state.last_resync_at {
+            None => Duration::ZERO,
+            Some(last) => {
+                let span = match chrono::Duration::from_std(interval) {
+                    Ok(d) => d,
+                    // Cadence overflow chrono — not realistic for any
+                    // configured value, but be defensive.
+                    Err(_) => return Duration::ZERO,
+                };
+                let due = last + span;
+                if due <= now {
+                    Duration::ZERO
+                } else {
+                    (due - now).to_std().unwrap_or(Duration::ZERO)
+                }
+            }
         }
     }
 
@@ -217,6 +276,7 @@ impl FeedWorker {
         info!(
             bucket_id = %self.bucket_id,
             interval_secs = self.interval.map(|d| d.as_secs()).unwrap_or(0),
+            resync_interval_secs = self.resync_interval.map(|d| d.as_secs()).unwrap_or(0),
             "feed worker started",
         );
 
@@ -231,38 +291,89 @@ impl FeedWorker {
             tick_index += 1;
         }
 
+        // Scheduled resync sleep is one-shot, re-armed after each
+        // fire. Initial duration is computed from feed-state so a
+        // server restart resumes the schedule rather than resetting.
+        // Held in a Box<Pin> so the select! arm can borrow it
+        // mutably across iterations.
+        let initial_resync = match self.resync_interval {
+            Some(d) => match FeedState::load(&self.bucket_dir) {
+                Ok(state) => Self::initial_resync_sleep(&state, d, chrono::Utc::now()),
+                Err(e) => {
+                    // Fall back to "fire after one full interval" if
+                    // we can't read the state — better than firing
+                    // immediately on every restart.
+                    warn!(
+                        bucket_id = %self.bucket_id,
+                        error = %e,
+                        "feed-state load for resync schedule failed; using full interval as fallback",
+                    );
+                    d
+                }
+            },
+            None => Duration::ZERO, // unused — arm is gated by resync_interval.is_some()
+        };
+        let mut next_resync = Box::pin(tokio::time::sleep(initial_resync));
+
         loop {
             // Wakeup sources, in priority order:
             //  1. cancellation (always wins)
-            //  2. cadence timer (when `interval` is Some)
+            //  2. cadence timer (delta poll, when `interval` is Some)
             //  3. manual "Poll now" trigger (always live)
-            //
-            // Manual cadence (`interval = None`) substitutes a
-            // never-resolving future for the timer arm, so the loop
-            // sits on trigger/cancel until something fires.
+            //  4. resync cadence timer (when `resync_interval` is Some)
             let interval = self.interval;
-            tokio::select! {
+            let has_resync = self.resync_interval.is_some();
+            let reason = tokio::select! {
                 biased;
-                _ = self.cancel.cancelled() => break,
+                _ = self.cancel.cancelled() => WakeReason::Cancelled,
                 _ = async move {
                     match interval {
                         Some(d) => tokio::time::sleep(d).await,
                         None => std::future::pending::<()>().await,
                     }
-                } => {}
-                _ = self.trigger.recv() => {}
+                } => WakeReason::DeltaPoll,
+                _ = self.trigger.recv() => WakeReason::DeltaPoll,
+                _ = &mut next_resync, if has_resync => WakeReason::ResyncDue,
+            };
+
+            match reason {
+                WakeReason::Cancelled => break,
+                WakeReason::DeltaPoll => {
+                    let outcome = self.poll_once().await;
+                    self.observer.on_tick(tick_index, outcome.clone());
+                    tick_index += 1;
+                    debug!(
+                        bucket_id = %self.bucket_id,
+                        ?outcome,
+                        "feed worker tick complete",
+                    );
+                }
+                WakeReason::ResyncDue => {
+                    // Fire-and-forget — scheduler owns concurrency
+                    // (rejects if a build is already in flight) and
+                    // logs failures. We re-arm for another full
+                    // interval regardless: if the resync runs and
+                    // succeeds, `last_resync_at` advances; if it
+                    // can't run (e.g. embedder unavailable), the
+                    // next tick tries again.
+                    if let Err(e) = self.resync_request_tx.send(self.bucket_id.clone()) {
+                        warn!(
+                            bucket_id = %self.bucket_id,
+                            error = %e,
+                            "resync_request channel send failed (scheduler stopped?)",
+                        );
+                    } else {
+                        info!(
+                            bucket_id = %self.bucket_id,
+                            "scheduled resync requested",
+                        );
+                    }
+                    let interval = self
+                        .resync_interval
+                        .expect("ResyncDue fired with resync_interval=None");
+                    next_resync = Box::pin(tokio::time::sleep(interval));
+                }
             }
-
-            let outcome = self.poll_once().await;
-
-            self.observer.on_tick(tick_index, outcome.clone());
-            tick_index += 1;
-
-            debug!(
-                bucket_id = %self.bucket_id,
-                ?outcome,
-                "feed worker tick complete",
-            );
         }
 
         info!(bucket_id = %self.bucket_id, "feed worker stopped");
@@ -493,6 +604,16 @@ mod tests {
         mpsc::channel::<()>(1)
     }
 
+    /// Resync-request sender for tests that don't exercise the
+    /// scheduled-resync arm. Receiver is dropped immediately — any
+    /// `send()` on it returns `Err`, which the worker logs but doesn't
+    /// fail on. Tests that DO exercise the resync arm should hold
+    /// onto the receiver.
+    fn fresh_resync_request_tx() -> mpsc::UnboundedSender<String> {
+        let (tx, _rx) = mpsc::unbounded_channel::<String>();
+        tx
+    }
+
     #[derive(Default)]
     struct RecordingObserver {
         ticks: Mutex<Vec<(u64, TickOutcome)>>,
@@ -604,6 +725,55 @@ mod tests {
     }
 
     #[test]
+    fn initial_resync_sleep_is_zero_when_never_resynced() {
+        let state = FeedState::default();
+        let sleep = FeedWorker::initial_resync_sleep(
+            &state,
+            Duration::from_secs(60 * 60 * 24),
+            chrono::Utc::now(),
+        );
+        assert_eq!(
+            sleep,
+            Duration::ZERO,
+            "no last_resync_at should mean fire immediately"
+        );
+    }
+
+    #[test]
+    fn initial_resync_sleep_is_zero_when_overdue() {
+        // Last resync was 10 days ago, cadence is daily — overdue.
+        let state = FeedState {
+            last_resync_at: Some(chrono::Utc::now() - chrono::Duration::days(10)),
+            ..FeedState::default()
+        };
+        let sleep = FeedWorker::initial_resync_sleep(
+            &state,
+            Duration::from_secs(60 * 60 * 24),
+            chrono::Utc::now(),
+        );
+        assert_eq!(sleep, Duration::ZERO, "overdue should fire immediately");
+    }
+
+    #[test]
+    fn initial_resync_sleep_is_remaining_window_when_recent() {
+        let now = chrono::Utc::now();
+        // Last resync was 2 hours ago, cadence is daily — sleep ~22h.
+        let state = FeedState {
+            last_resync_at: Some(now - chrono::Duration::hours(2)),
+            ..FeedState::default()
+        };
+        let sleep =
+            FeedWorker::initial_resync_sleep(&state, Duration::from_secs(60 * 60 * 24), now);
+        // 22h ± a small slop for chrono rounding.
+        let expected = Duration::from_secs(22 * 60 * 60);
+        let diff = sleep.abs_diff(expected);
+        assert!(
+            diff < Duration::from_secs(5),
+            "expected ~22h, got {sleep:?} (diff {diff:?})"
+        );
+    }
+
+    #[test]
     fn cadence_to_duration_maps_each_variant() {
         assert_eq!(
             cadence_to_duration(TrackedCadence::Daily),
@@ -643,6 +813,8 @@ mod tests {
             BucketRegistry::default(),
             stub_embedder(),
             trigger_rx,
+            None,
+            fresh_resync_request_tx(),
         );
         let handle = tokio::spawn(worker.run());
 
@@ -687,6 +859,8 @@ mod tests {
             BucketRegistry::default(),
             stub_embedder(),
             trigger_rx,
+            None,
+            fresh_resync_request_tx(),
         );
         let handle = tokio::spawn(worker.run());
 
@@ -717,6 +891,8 @@ mod tests {
             BucketRegistry::default(),
             stub_embedder(),
             trigger_rx,
+            None,
+            fresh_resync_request_tx(),
         );
         worker.run().await;
         assert!(
@@ -768,6 +944,8 @@ mod tests {
             BucketRegistry::default(),
             stub_embedder(),
             trigger_rx,
+            None,
+            fresh_resync_request_tx(),
         );
         let handle = tokio::spawn(worker.run());
 
@@ -839,6 +1017,8 @@ mod tests {
             BucketRegistry::default(),
             stub_embedder(),
             trigger_rx,
+            None,
+            fresh_resync_request_tx(),
         );
         let handle = tokio::spawn(worker.run());
 
@@ -881,6 +1061,8 @@ mod tests {
             BucketRegistry::default(),
             stub_embedder(),
             trigger_rx,
+            None,
+            fresh_resync_request_tx(),
         );
         let handle = tokio::spawn(worker.run());
 

@@ -48,8 +48,14 @@ const TRIGGER_CHANNEL_CAPACITY: usize = 1;
 pub fn spawn_for_registry(
     registry: &BucketRegistry,
     embedding_providers: &HashMap<String, EmbeddingProviderEntry>,
+    resync_request_tx: mpsc::UnboundedSender<String>,
 ) -> HashMap<String, FeedWorkerControl> {
-    spawn_for_registry_with_observer(registry, embedding_providers, Arc::new(NoopObserver))
+    spawn_for_registry_with_observer(
+        registry,
+        embedding_providers,
+        resync_request_tx,
+        Arc::new(NoopObserver),
+    )
 }
 
 /// Variant that lets callers (tests) supply a custom observer for
@@ -58,6 +64,7 @@ pub fn spawn_for_registry(
 pub fn spawn_for_registry_with_observer(
     registry: &BucketRegistry,
     embedding_providers: &HashMap<String, EmbeddingProviderEntry>,
+    resync_request_tx: mpsc::UnboundedSender<String>,
     observer: Arc<dyn WorkerObserver>,
 ) -> HashMap<String, FeedWorkerControl> {
     let mut controls: HashMap<String, FeedWorkerControl> = HashMap::new();
@@ -65,6 +72,7 @@ pub fn spawn_for_registry_with_observer(
         let SourceConfig::Tracked {
             driver: driver_cfg,
             delta_cadence,
+            resync_cadence,
             ..
         } = &entry.config.source
         else {
@@ -84,6 +92,7 @@ pub fn spawn_for_registry_with_observer(
         let (trigger_tx, trigger_rx) = mpsc::channel::<()>(TRIGGER_CHANNEL_CAPACITY);
         let driver = driver_for(driver_cfg);
         let interval = cadence_to_duration(*delta_cadence);
+        let resync_interval = cadence_to_duration(*resync_cadence);
         let driver_name = match driver_cfg {
             TrackedDriver::Wikipedia { language, .. } => format!("wikipedia:{language}"),
         };
@@ -92,6 +101,7 @@ pub fn spawn_for_registry_with_observer(
             driver = %driver_name,
             embedder = %embedder_name,
             interval_secs = interval.map(|d| d.as_secs()).unwrap_or(0),
+            resync_interval_secs = resync_interval.map(|d| d.as_secs()).unwrap_or(0),
             "spawning feed worker for tracked bucket",
         );
         let worker = FeedWorker::new(
@@ -104,6 +114,8 @@ pub fn spawn_for_registry_with_observer(
             registry.clone(),
             provider_entry.provider.clone(),
             trigger_rx,
+            resync_interval,
+            resync_request_tx.clone(),
         );
         tokio::spawn(worker.run());
         controls.insert(
@@ -275,7 +287,8 @@ embedder = "test_embedder"
         .await;
 
         let providers = embedders_with_test_entry("test_embedder");
-        let controls = spawn_for_registry(&registry, &providers);
+        let (resync_tx, _resync_rx) = mpsc::unbounded_channel::<String>();
+        let controls = spawn_for_registry(&registry, &providers, resync_tx);
 
         assert_eq!(controls.len(), 1, "only the tracked bucket gets a worker");
         assert!(controls.contains_key("wiki_simple"));
@@ -307,7 +320,8 @@ embedder = "test_embedder"
         // Empty catalog — bucket's `embedder = "test_embedder"` won't
         // resolve.
         let providers = HashMap::new();
-        let controls = spawn_for_registry(&registry, &providers);
+        let (resync_tx, _resync_rx) = mpsc::unbounded_channel::<String>();
+        let controls = spawn_for_registry(&registry, &providers, resync_tx);
         assert!(
             controls.is_empty(),
             "no workers should spawn when the configured embedder is missing",
@@ -329,7 +343,8 @@ embedder = "test_embedder"
         let recording = Arc::new(Recording::default());
         let observer = Arc::new(ObserverBox(recording.clone()));
         let providers = embedders_with_test_entry("test_embedder");
-        let controls = spawn_for_registry_with_observer(&registry, &providers, observer);
+        let (resync_tx, _resync_rx) = mpsc::unbounded_channel::<String>();
+        let controls = spawn_for_registry_with_observer(&registry, &providers, resync_tx, observer);
         assert_eq!(controls.len(), 1);
 
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;

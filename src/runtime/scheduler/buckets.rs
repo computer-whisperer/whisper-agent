@@ -418,7 +418,7 @@ impl Scheduler {
             id,
             progress,
             task_tx,
-            conn_id,
+            Some(conn_id),
             correlation_id,
             resume_slot_id,
             BuildIntent::Normal,
@@ -457,34 +457,39 @@ impl Scheduler {
     /// `Error` synchronously; acceptance broadcasts `BucketBuildStarted`
     /// the same way an initial build does, so the UI's existing
     /// progress wiring lights up unchanged.
+    ///
+    /// `requester` distinguishes a wire-driven dispatch (from
+    /// `ResyncBucket`) from a scheduler-driven dispatch (from a
+    /// FeedWorker resync-cadence tick). For scheduled triggers,
+    /// rejections log instead of surfacing as `Error` events, and the
+    /// `BucketBuildStarted` ack-to-requester path is skipped — the
+    /// broadcast still goes to all clients.
     pub(super) fn handle_resync_bucket(
         &mut self,
-        conn_id: ConnId,
+        requester: Option<ConnId>,
         correlation_id: Option<String>,
         id: String,
     ) {
+        let refuse = |scheduler: &mut Scheduler, msg: String| match requester {
+            Some(conn) => {
+                scheduler.send_bucket_error(conn, correlation_id.clone(), "resync_bucket", msg);
+            }
+            None => {
+                warn!(bucket_id = %id, error = %msg, "scheduled resync rejected");
+            }
+        };
         if let Err(e) = validate_bucket_id(&id) {
-            self.send_bucket_error(conn_id, correlation_id, "resync_bucket", e);
+            refuse(self, e);
             return;
         }
         if self.active_bucket_builds.contains_key(&id) {
-            self.send_bucket_error(
-                conn_id,
-                correlation_id,
-                "resync_bucket",
-                format!("build already in flight for `{id}`"),
-            );
+            refuse(self, format!("build already in flight for `{id}`"));
             return;
         }
         let entry = match self.bucket_registry.buckets.get(&id) {
             Some(e) => e.clone(),
             None => {
-                self.send_bucket_error(
-                    conn_id,
-                    correlation_id,
-                    "resync_bucket",
-                    format!("unknown bucket id `{id}`"),
-                );
+                refuse(self, format!("unknown bucket id `{id}`"));
                 return;
             }
         };
@@ -496,10 +501,8 @@ impl Scheduler {
             entry.config.source,
             crate::knowledge::SourceConfig::Tracked { .. }
         ) {
-            self.send_bucket_error(
-                conn_id,
-                correlation_id,
-                "resync_bucket",
+            refuse(
+                self,
                 format!(
                     "bucket `{id}` is not tracked (source kind: {}) — resync requires a tracked driver",
                     entry.config.source.kind(),
@@ -513,10 +516,8 @@ impl Scheduler {
         {
             Some(p) => p.provider.clone(),
             None => {
-                self.send_bucket_error(
-                    conn_id,
-                    correlation_id,
-                    "resync_bucket",
+                refuse(
+                    self,
                     format!(
                         "embedder `{}` not configured",
                         entry.config.defaults.embedder
@@ -528,19 +529,14 @@ impl Scheduler {
         let source = match build_source(&entry.config.source) {
             Ok(s) => s,
             Err(e) => {
-                self.send_bucket_error(conn_id, correlation_id, "resync_bucket", e);
+                refuse(self, e);
                 return;
             }
         };
         let bucket = match DiskBucket::open(entry.dir.clone(), BucketId::server(id.clone())) {
             Ok(b) => Arc::new(b),
             Err(e) => {
-                self.send_bucket_error(
-                    conn_id,
-                    correlation_id,
-                    "resync_bucket",
-                    format!("open failed: {e}"),
-                );
+                refuse(self, format!("open failed: {e}"));
                 return;
             }
         };
@@ -559,20 +555,38 @@ impl Scheduler {
         self.active_bucket_progress
             .insert(id.clone(), progress.clone());
 
-        let started = ServerToClient::BucketBuildStarted {
-            correlation_id: None,
-            bucket_id: id.clone(),
-            slot_id: String::new(),
-        };
-        self.router.broadcast_task_list_except(started, conn_id);
-        self.router.send_to_client(
-            conn_id,
-            ServerToClient::BucketBuildStarted {
-                correlation_id: correlation_id.clone(),
-                bucket_id: id.clone(),
-                slot_id: String::new(),
-            },
-        );
+        // Broadcast `BucketBuildStarted` to all subscribers so the UI
+        // lights up regardless of who triggered. For wire-driven
+        // dispatch, also send a correlation-id-bearing ack back to the
+        // requesting client; scheduled dispatch skips that step (no
+        // requester to correlate with).
+        match requester {
+            Some(conn) => {
+                let started = ServerToClient::BucketBuildStarted {
+                    correlation_id: None,
+                    bucket_id: id.clone(),
+                    slot_id: String::new(),
+                };
+                self.router.broadcast_task_list_except(started, conn);
+                self.router.send_to_client(
+                    conn,
+                    ServerToClient::BucketBuildStarted {
+                        correlation_id: correlation_id.clone(),
+                        bucket_id: id.clone(),
+                        slot_id: String::new(),
+                    },
+                );
+            }
+            None => {
+                let started = ServerToClient::BucketBuildStarted {
+                    correlation_id: None,
+                    bucket_id: id.clone(),
+                    slot_id: String::new(),
+                };
+                broadcast_all(&self.router, started);
+                tracing::info!(bucket_id = %id, "scheduled resync started");
+            }
+        }
 
         let task_tx = self.bucket_task_sender();
         let chunker_config = entry.config.chunker.clone();
@@ -587,7 +601,7 @@ impl Scheduler {
             id,
             progress,
             task_tx,
-            conn_id,
+            requester,
             correlation_id,
             None, // never resume — see comment above
             BuildIntent::Resync,
@@ -801,7 +815,7 @@ async fn run_build(
     bucket_id: String,
     progress: Arc<ProgressShared>,
     task_tx: mpsc::UnboundedSender<BucketTaskUpdate>,
-    requester_conn: ConnId,
+    requester_conn: Option<ConnId>,
     correlation_id: Option<String>,
     resume_slot_id: Option<String>,
     intent: BuildIntent,
@@ -889,7 +903,7 @@ async fn run_build(
                         bucket_id,
                         slot_id: String::new(),
                         outcome: BucketBuildOutcome::Success,
-                        requester_conn: Some(requester_conn),
+                        requester_conn,
                         correlation_id,
                     });
                     return;
@@ -911,7 +925,7 @@ async fn run_build(
                         bucket_id,
                         slot_id: String::new(),
                         outcome,
-                        requester_conn: Some(requester_conn),
+                        requester_conn,
                         correlation_id,
                     });
                     return;
@@ -935,7 +949,7 @@ async fn run_build(
                         }
                     ),
                 },
-                requester_conn: Some(requester_conn),
+                requester_conn,
                 correlation_id,
             });
             return;
@@ -956,7 +970,7 @@ async fn run_build(
                         bucket_id,
                         slot_id: String::new(),
                         outcome,
-                        requester_conn: Some(requester_conn),
+                        requester_conn,
                         correlation_id,
                     });
                     return;
@@ -1048,11 +1062,17 @@ async fn run_build(
             outcome = BucketBuildOutcome::Error {
                 message: format!("resync built new slot but cursor reset failed: {e}"),
             };
+        } else if let Err(e) = stamp_last_resync_at(&bucket_dir, chrono::Utc::now()) {
+            outcome = BucketBuildOutcome::Error {
+                message: format!(
+                    "resync built new slot and reset cursor but timestamp write failed: {e}"
+                ),
+            };
         } else {
             tracing::info!(
                 bucket_id = %bucket_id,
                 snapshot_id = %new_id,
-                "resync complete: new slot active, delta cursor reset",
+                "resync complete: new slot active, delta cursor reset, last_resync_at stamped",
             );
         }
     }
@@ -1061,7 +1081,7 @@ async fn run_build(
         bucket_id,
         slot_id,
         outcome,
-        requester_conn: Some(requester_conn),
+        requester_conn,
         correlation_id,
     });
 }
@@ -1476,6 +1496,22 @@ fn reset_delta_cursor_to(
     let mut state = FeedState::load(bucket_dir)
         .map_err(|e| BucketError::Other(format!("feed-state load: {e}")))?;
     state.set_last_applied_delta(DeltaId::new(new_snapshot_id.as_str()));
+    state
+        .save_atomic(bucket_dir)
+        .map_err(|e| BucketError::Other(format!("feed-state save: {e}")))?;
+    Ok(())
+}
+
+/// Stamp `feed-state.toml`'s `last_resync_at` so the FeedWorker's
+/// resync-cadence scheduling survives server restarts. Called only
+/// after a successful Resync slot rebuild + delta-cursor reset.
+fn stamp_last_resync_at(
+    bucket_dir: &Path,
+    at: chrono::DateTime<chrono::Utc>,
+) -> Result<(), BucketError> {
+    let mut state = FeedState::load(bucket_dir)
+        .map_err(|e| BucketError::Other(format!("feed-state load: {e}")))?;
+    state.set_last_resync_at(at);
     state
         .save_atomic(bucket_dir)
         .map_err(|e| BucketError::Other(format!("feed-state save: {e}")))?;

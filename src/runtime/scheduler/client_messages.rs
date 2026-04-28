@@ -362,7 +362,7 @@ impl Scheduler {
                 self.handle_poll_feed_now(conn_id, correlation_id, id);
             }
             ClientToServer::ResyncBucket { correlation_id, id } => {
-                self.handle_resync_bucket(conn_id, correlation_id, id);
+                self.handle_resync_bucket(Some(conn_id), correlation_id, id);
             }
             ClientToServer::AddHostEnvProvider {
                 correlation_id,

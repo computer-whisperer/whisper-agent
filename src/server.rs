@@ -230,7 +230,7 @@ pub async fn serve(listen: SocketAddr, config: ServerConfig) -> anyhow::Result<(
         None => crate::knowledge::BucketRegistry::default(),
     };
 
-    let (mut scheduler, stream_rx, bucket_task_rx) = Scheduler::new(
+    let (mut scheduler, stream_rx, bucket_task_rx, resync_request_rx) = Scheduler::new(
         default_pod,
         config.host_id,
         config.backends,
@@ -282,6 +282,7 @@ pub async fn serve(listen: SocketAddr, config: ServerConfig) -> anyhow::Result<(
         inbox_rx,
         stream_rx,
         bucket_task_rx,
+        resync_request_rx,
     ));
 
     let auth_state = Arc::new(AuthState::new(

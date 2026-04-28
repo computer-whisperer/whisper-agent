@@ -83,6 +83,21 @@ pub struct FeedState {
     /// the application slice lands.
     #[serde(default)]
     pub last_applied_delta_id: Option<String>,
+
+    /// Wall-clock timestamp of the last successful resync — i.e. the
+    /// last time the bucket's active slot was rebuilt off the driver's
+    /// `latest_base()`. Used by the per-bucket FeedWorker to compute
+    /// the next scheduled resync fire-time on spawn (so a server
+    /// restart doesn't reset the resync clock; with monthly cadence
+    /// and a k8s `Recreate` deploy strategy, that would otherwise
+    /// mean resync never fires in practice).
+    ///
+    /// `None` means "never resynced" — the worker treats this as
+    /// "infinitely overdue" and fires on the first cadence tick after
+    /// spawn. Initial-build does *not* set this field; only an
+    /// explicit Resync run does.
+    #[serde(default)]
+    pub last_resync_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 impl FeedState {
@@ -153,6 +168,13 @@ impl FeedState {
     /// Typed setter for the last-applied delta cursor.
     pub fn set_last_applied_delta(&mut self, id: DeltaId) {
         self.last_applied_delta_id = Some(id.0);
+    }
+
+    /// Setter for the last-resync timestamp. Callers should use
+    /// `chrono::Utc::now()` at the moment a successful Resync slot
+    /// rebuild publishes its new active slot.
+    pub fn set_last_resync_at(&mut self, at: chrono::DateTime<chrono::Utc>) {
+        self.last_resync_at = Some(at);
     }
 }
 
