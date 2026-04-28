@@ -60,7 +60,7 @@ const MAGIC: &[u8; 4] = b"VECT";
 const FORMAT_VERSION: u8 = 1;
 
 /// Total header size in bytes. Vectors start at this offset.
-const HEADER_SIZE: u64 = 16;
+pub(super) const HEADER_SIZE: u64 = 16;
 
 /// Quantization variant tag stored in the `vectors.bin` header.
 ///
@@ -540,28 +540,7 @@ impl VectorStoreReader {
         }
         let slice = &bytes[byte_offset..byte_end];
 
-        let mut out = Vec::with_capacity(dim);
-        match self.quant {
-            VectorQuant::F32 => {
-                for chunk in slice.chunks_exact(4) {
-                    out.push(f32::from_le_bytes(chunk.try_into().unwrap()));
-                }
-            }
-            VectorQuant::F16 => {
-                for chunk in slice.chunks_exact(2) {
-                    let h = half::f16::from_le_bytes(chunk.try_into().unwrap());
-                    out.push(h.to_f32());
-                }
-            }
-            VectorQuant::Int8 => {
-                let scale = f32::from_le_bytes(slice[0..4].try_into().unwrap());
-                for &b in &slice[4..] {
-                    let q = b as i8;
-                    out.push(q as f32 * scale);
-                }
-            }
-        }
-        Ok(out)
+        Ok(dequantize_record(slice, self.quant, dim))
     }
 
     /// Iterate `(chunk_id, position)` pairs in unspecified order. Used
@@ -570,6 +549,40 @@ impl VectorStoreReader {
     pub fn iter_chunk_positions(&self) -> impl Iterator<Item = (ChunkId, u64)> + '_ {
         self.index.iter().map(|(id, &pos)| (*id, pos))
     }
+}
+
+/// Decode one `vectors.bin` record from raw bytes back to f32. The
+/// `slice` must be exactly [`VectorQuant::record_stride`] bytes; `dim`
+/// is the embedder dimension. Inverse of the corresponding encoding
+/// branch in [`VectorStoreWriter::append`].
+///
+/// Pulled out so the resume-from-vectors.bin rebuild path in
+/// `disk_bucket.rs` can read records without going through
+/// `VectorStoreReader` (which requires `vectors.idx` — the resume
+/// path may run before idx is finalized).
+pub(super) fn dequantize_record(slice: &[u8], quant: VectorQuant, dim: usize) -> Vec<f32> {
+    let mut out = Vec::with_capacity(dim);
+    match quant {
+        VectorQuant::F32 => {
+            for chunk in slice.chunks_exact(4) {
+                out.push(f32::from_le_bytes(chunk.try_into().unwrap()));
+            }
+        }
+        VectorQuant::F16 => {
+            for chunk in slice.chunks_exact(2) {
+                let h = half::f16::from_le_bytes(chunk.try_into().unwrap());
+                out.push(h.to_f32());
+            }
+        }
+        VectorQuant::Int8 => {
+            let scale = f32::from_le_bytes(slice[0..4].try_into().unwrap());
+            for &b in &slice[4..] {
+                let q = b as i8;
+                out.push(q as f32 * scale);
+            }
+        }
+    }
+    out
 }
 
 fn read_header_bytes(bytes: &[u8]) -> io::Result<(u32, VectorQuant)> {

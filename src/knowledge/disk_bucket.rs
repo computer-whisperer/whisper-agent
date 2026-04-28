@@ -943,9 +943,16 @@ impl DiskBucket {
                 );
                 let by_position = resumed_chunk_ids.clone();
                 let slot_path_for_thread = slot_path.clone();
+                let resume_dense_quant = super::dense::DenseQuant::from_vector_quant(
+                    self.config.defaults.quantization.into(),
+                );
                 let dense =
                     tokio::task::spawn_blocking(move || -> Result<DenseIndex, BucketError> {
-                        DenseIndex::load_from_with_positions(&slot_path_for_thread, by_position)
+                        DenseIndex::load_from_with_positions(
+                            &slot_path_for_thread,
+                            by_position,
+                            resume_dense_quant,
+                        )
                     })
                     .await
                     .map_err(|e| BucketError::Other(format!("spawn_blocking dense load: {e}")))??;
@@ -962,12 +969,19 @@ impl DiskBucket {
                     dump_snapshot = ?dump_snapshot,
                     "resume_slot: dense.snapshot lags BatchEmbedded checkpoint; rebuilding HNSW from vectors.bin",
                 );
+                let resume_dense_quant = super::dense::DenseQuant::from_vector_quant(
+                    self.config.defaults.quantization.into(),
+                );
                 let dense = DenseIndex::empty(
+                    resume_dense_quant,
                     HnswParams::default(),
                     (planned.len().saturating_mul(8)).max(1024),
                 );
                 let bin_path_for_thread = vectors_bin.clone();
-                let dim = embedder_snapshot.dimension;
+                let dim = embedder_snapshot.dimension as usize;
+                let vec_quant: super::vectors::VectorQuant =
+                    self.config.defaults.quantization.into();
+                let stride = vec_quant.record_stride(dim);
                 let chunk_ids = resumed_chunk_ids.clone();
                 let slot_id_for_thread = slot_id.to_string();
                 let log_step = chunk_ids.len().max(20).div_ceil(20);
@@ -978,15 +992,13 @@ impl DiskBucket {
                             std::fs::File::open(&bin_path_for_thread).map_err(BucketError::Io)?;
                         use std::io::{Read, Seek, SeekFrom};
                         for (position, chunk_id) in chunk_ids.iter().enumerate() {
-                            let byte_offset = 16u64 + position as u64 * dim as u64 * 4;
+                            let byte_offset =
+                                super::vectors::HEADER_SIZE + position as u64 * stride as u64;
                             bin.seek(SeekFrom::Start(byte_offset))
                                 .map_err(BucketError::Io)?;
-                            let mut bytes = vec![0u8; dim as usize * 4];
+                            let mut bytes = vec![0u8; stride];
                             bin.read_exact(&mut bytes).map_err(BucketError::Io)?;
-                            let mut v = Vec::with_capacity(dim as usize);
-                            for chunk in bytes.chunks_exact(4) {
-                                v.push(f32::from_le_bytes(chunk.try_into().unwrap()));
-                            }
+                            let v = super::vectors::dequantize_record(&bytes, vec_quant, dim);
                             dense.insert(*chunk_id, position as u64, &v);
                             if (position + 1).is_multiple_of(log_step) {
                                 tracing::info!(
@@ -1126,10 +1138,21 @@ impl DiskBucket {
         // chunker runs (one record can produce many chunks),
         // so we estimate from `source_records` with headroom.
         // Hnsw::new treats this as an allocation hint, not a cap.
+        //
+        // Dense backend follows the bucket's vectors.bin quantization
+        // (f32 → f32, f16/int8 → f16). Resume reuses the backend the
+        // prior partial build chose — `resume.dense` already has it
+        // baked in via the load_from_with_positions call upstream.
         let dense_size_hint = source_records.saturating_mul(8).max(1024) as usize;
+        let dense_quant: super::vectors::VectorQuant = self.config.defaults.quantization.into();
+        let dense_quant = super::dense::DenseQuant::from_vector_quant(dense_quant);
         let dense = match resume.dense {
             Some(d) => d,
-            None => Arc::new(DenseIndex::empty(HnswParams::default(), dense_size_hint)),
+            None => Arc::new(DenseIndex::empty(
+                dense_quant,
+                HnswParams::default(),
+                dense_size_hint,
+            )),
         };
 
         // Mid-build active install: if the bucket has no active slot
@@ -2460,9 +2483,12 @@ fn compact_into_new_slot(
         None
     };
     // Generous size hint: surviving count is bounded above by base +
-    // delta. Over-estimate is cheap.
+    // delta. Over-estimate is cheap. Dense backend follows the
+    // bucket's vectors.bin quantization (f32 → f32, f16/int8 → f16).
     let dense_hint = old.dense.len();
-    let dense = DenseIndex::empty(HnswParams::default(), dense_hint);
+    let dense_quant =
+        super::dense::DenseQuant::from_vector_quant(old.manifest.serving.quantization.into());
+    let dense = DenseIndex::empty(dense_quant, HnswParams::default(), dense_hint);
 
     let base_vectors = old
         .vectors
