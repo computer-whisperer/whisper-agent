@@ -1938,31 +1938,46 @@ impl Bucket for DiskBucket {
                 .map(|c| c.source_ref.source_id.clone())
                 .collect();
 
-            // 2. Embed (network IO).
-            let texts: Vec<String> = new_chunks.iter().map(|c| c.text.clone()).collect();
-            let req = EmbedRequest {
-                model: "",
-                inputs: &texts,
-            };
-            let resp = embedder
-                .embed(&req, cancel)
-                .await
-                .map_err(|e| BucketError::Provider(e.to_string()))?;
-            if resp.embeddings.len() != new_chunks.len() {
+            // 2. Embed (network IO). Split into `EMBED_BATCH_SIZE`
+            //    sub-batches so a single API call never exceeds the
+            //    provider's `max_client_batch_size` — apply_delta can
+            //    submit hundreds of chunks at once when many wiki
+            //    pages change in one daily delta.
+            let dim = active.manifest.embedder.dimension;
+            let mut all_embeddings: Vec<Vec<f32>> = Vec::with_capacity(new_chunks.len());
+            for window in new_chunks.chunks(EMBED_BATCH_SIZE) {
+                let texts: Vec<String> = window.iter().map(|c| c.text.clone()).collect();
+                let req = EmbedRequest {
+                    model: "",
+                    inputs: &texts,
+                };
+                let resp = embedder
+                    .embed(&req, cancel)
+                    .await
+                    .map_err(|e| BucketError::Provider(e.to_string()))?;
+                if resp.embeddings.len() != window.len() {
+                    return Err(BucketError::Provider(format!(
+                        "embedder returned {} vectors for {} inputs",
+                        resp.embeddings.len(),
+                        window.len(),
+                    )));
+                }
+                for v in &resp.embeddings {
+                    if v.len() as u32 != dim {
+                        return Err(BucketError::DimensionMismatch {
+                            query: v.len() as u32,
+                            slot: dim,
+                        });
+                    }
+                }
+                all_embeddings.extend(resp.embeddings);
+            }
+            if all_embeddings.len() != new_chunks.len() {
                 return Err(BucketError::Provider(format!(
-                    "embedder returned {} vectors for {} inputs",
-                    resp.embeddings.len(),
+                    "embedder returned {} vectors total for {} inputs across sub-batches",
+                    all_embeddings.len(),
                     new_chunks.len(),
                 )));
-            }
-            let dim = active.manifest.embedder.dimension;
-            for v in &resp.embeddings {
-                if v.len() as u32 != dim {
-                    return Err(BucketError::DimensionMismatch {
-                        query: v.len() as u32,
-                        slot: dim,
-                    });
-                }
             }
 
             // 3. File IO + HNSW insert + tantivy on a blocking thread.
@@ -1972,7 +1987,7 @@ impl Bucket for DiskBucket {
             let load_mode = serving_mode_to_load_mode(active.manifest.serving.mode);
             let sparse_enabled = active.sparse.is_some();
             let dense = active.dense.clone();
-            let embeddings = resp.embeddings;
+            let embeddings = all_embeddings;
             let chunk_ids_clone = chunk_ids.clone();
             let new_delta_reader = tokio::task::spawn_blocking(
                 move || -> Result<Arc<ChunkStoreReader>, BucketError> {
@@ -5735,5 +5750,59 @@ embedder = "tei_test"
             .await
             .unwrap();
         assert_eq!(hits.len(), 1);
+    }
+
+    /// A delta that produces more than `EMBED_BATCH_SIZE` chunks must
+    /// still respect the per-API-call cap inside `Bucket::insert`.
+    /// Regression for the TEI 422 error observed when applying a
+    /// daily wiki delta that touched 430+ pages in one shot.
+    #[tokio::test]
+    async fn apply_delta_caps_embed_calls_at_batch_size() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("notes");
+        fs::create_dir_all(&source).unwrap();
+        write_md(&source, "seed.md", "seed body");
+
+        let bucket_root = tmp.path().join("bucket");
+        let bucket = open_test_bucket(&bucket_root, &source);
+        let adapter = MarkdownDir::new(&source);
+        let (chunker, chunker_snapshot) = TokenBasedChunker::from_config(&bucket.config().chunker);
+        let mock = Arc::new(MockEmbedder::new(8));
+        let cancel = CancellationToken::new();
+        bucket
+            .build_slot(
+                &adapter,
+                &chunker,
+                chunker_snapshot,
+                mock.clone(),
+                None,
+                &cancel,
+            )
+            .await
+            .unwrap();
+        bucket.set_embedder(mock.clone(), "mock-embedder").unwrap();
+
+        // Reset the high-water mark so the build phase doesn't pollute it.
+        mock.max_inputs_in_call.store(0, Ordering::SeqCst);
+
+        // One short record per page → one chunk per page. Pick a
+        // count well above EMBED_BATCH_SIZE so a naive single-shot
+        // embed would exceed the cap.
+        let target_records = super::EMBED_BATCH_SIZE * 3 + 17;
+        let records: Vec<SourceRecord> = (0..target_records)
+            .map(|i| delta_record(&format!("page-{i}.md"), &format!("body-{i}-uniqtoken")))
+            .collect();
+        let delta = CannedDeltaAdapter { records };
+
+        let stats = bucket.apply_delta(&delta, &cancel).await.unwrap();
+        assert_eq!(stats.pages_applied as usize, target_records);
+        assert!(stats.chunks_inserted >= target_records as u64);
+
+        let max_seen = mock.max_inputs_in_call.load(Ordering::SeqCst);
+        assert!(
+            max_seen <= super::EMBED_BATCH_SIZE,
+            "insert exceeded EMBED_BATCH_SIZE ({}): max seen {max_seen}",
+            super::EMBED_BATCH_SIZE,
+        );
     }
 }
