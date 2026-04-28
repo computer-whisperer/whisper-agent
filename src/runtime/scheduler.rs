@@ -1231,6 +1231,12 @@ impl Scheduler {
                     .map(|t| (t.name.clone(), t.annotations.clone()))
                     .collect();
                 self.resources.populate_mcp_tools(&id, tools, annotations);
+                // Broadcast a `ResourceUpdated` so every connected
+                // client's `resources` map picks up the new entry —
+                // the pod editor reads from there to render the
+                // shared-MCP-host checkbox list, so without this it'd
+                // stay stale until the next `ListResources` round-trip.
+                self.emit_mcp_host_updated(&id);
                 let host = self.shared_mcp_host_info(&name).expect("just applied");
                 let reply = if is_add {
                     ServerToClient::SharedMcpHostAdded {
@@ -1289,6 +1295,15 @@ impl Scheduler {
         }
         self.shared_mcp_catalog.remove(name)?;
         self.resources.mcp_hosts.remove(&id);
+        // Symmetric with the GC removal path: tell every connected
+        // client the registry entry is gone so their `resources` map
+        // stays in sync. Without this the pod editor would still
+        // render a checkbox for the removed host until a reload.
+        self.router
+            .broadcast_resource(ServerToClient::ResourceDestroyed {
+                id: id.0,
+                kind: ResourceKind::McpHost,
+            });
         Ok(())
     }
 
@@ -1547,6 +1562,11 @@ impl Scheduler {
                     .map(|t| (t.name.clone(), t.annotations.clone()))
                     .collect();
                 self.resources.populate_mcp_tools(&id, tools, annotations);
+                // Same rationale as the non-OAuth Add path: broadcast
+                // a `ResourceUpdated` so the pod editor's source of
+                // truth (`resources`) reflects the new host without
+                // a reload.
+                self.emit_mcp_host_updated(&id);
                 let host = self.shared_mcp_host_info(&name).expect("just inserted");
                 self.router.send_to_client(
                     conn_id,
