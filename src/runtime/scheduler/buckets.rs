@@ -32,7 +32,7 @@ use whisper_agent_protocol::{
 use super::{ConnId, Scheduler};
 use crate::knowledge::{BucketError, BucketId};
 use crate::knowledge::{
-    BuildObserver, BuildPhase, Chunker, DiskBucket, FeedDriver, FeedState, MarkdownDir,
+    BuildObserver, BuildPhase, Chunker, DeltaId, DiskBucket, FeedDriver, FeedState, MarkdownDir,
     MediaWikiXml, SnapshotId, SourceAdapter, base_cache_dir, registry::entry_to_summary,
     resolve_chunker, source::feed::driver_for,
 };
@@ -1098,12 +1098,130 @@ fn build_source(source: &crate::knowledge::SourceConfig) -> Result<BuildSource, 
     }
 }
 
+/// Outcome of resolving a tracked bucket's source for a *resync* — i.e.
+/// when the caller wants to advance to the latest base regardless of
+/// what's recorded in `feed-state.toml`.
+///
+/// `AlreadyAtLatest` is returned when the driver's `latest_base()`
+/// matches the recorded `current_base_snapshot_id`; the caller can
+/// skip the rebuild without touching disk. `Build` carries a fresh
+/// adapter pointing at the just-downloaded base file plus the new
+/// snapshot id (so the caller can advance the delta cursor on success).
+#[allow(dead_code)] // `Build.adapter` consumed in slice 2b.
+enum ResyncResolution {
+    AlreadyAtLatest {
+        snapshot_id: SnapshotId,
+    },
+    Build {
+        adapter: Box<dyn SourceAdapter + Send + Sync>,
+        new_snapshot_id: SnapshotId,
+    },
+}
+
+/// Async preamble to a *resync* build pipeline. Counterpart to
+/// [`resolve_source`] for the case where the caller wants to advance
+/// to the driver's current `latest_base()` regardless of any snapshot
+/// id already recorded in `feed-state.toml`.
+///
+/// Returns [`ResyncResolution::AlreadyAtLatest`] when there's nothing
+/// to do — the recorded `current_base_snapshot_id` matches the driver's
+/// latest. Otherwise downloads the new base into
+/// `source-cache/base/<new_id>/`, persists the new snapshot id, and
+/// returns a [`SourceAdapter`] pointing at the freshly-cached file
+/// alongside the new id (so the caller can reset the delta cursor on
+/// successful slot rebuild via [`reset_delta_cursor_to`]).
+///
+/// Phase=Downloading is published via the observer for the duration of
+/// the fetch — same UI affordance as the initial-build path.
+#[allow(dead_code)] // Wired in slice 2b.
+async fn resolve_resync_source(
+    driver: Box<dyn FeedDriver>,
+    bucket_dir: &Path,
+    observer: &dyn BuildObserver,
+    cancel: &CancellationToken,
+) -> Result<ResyncResolution, BucketError> {
+    let latest = driver
+        .latest_base(cancel)
+        .await
+        .map_err(|e| BucketError::Other(format!("feed driver latest_base: {e}")))?;
+
+    let mut state = FeedState::load(bucket_dir)
+        .map_err(|e| BucketError::Other(format!("feed-state load: {e}")))?;
+
+    if state.current_base().as_ref() == Some(&latest) {
+        return Ok(ResyncResolution::AlreadyAtLatest {
+            snapshot_id: latest,
+        });
+    }
+
+    observer.on_phase(BuildPhase::Downloading);
+
+    let dest_dir = base_cache_dir(bucket_dir, &latest);
+    let dest = dest_dir.join(driver.base_filename(&latest));
+    driver
+        .fetch_base(&latest, &dest, cancel)
+        .await
+        .map_err(|e| match e {
+            crate::knowledge::FeedError::Cancelled => BucketError::Cancelled,
+            other => BucketError::Other(format!("feed driver fetch_base: {other}")),
+        })?;
+
+    // Persist the new snapshot id only after the file is in place — a
+    // partial write should never produce a state file claiming a base
+    // we don't actually have. Mirrors `resolve_source`.
+    state.set_current_base(latest.clone());
+    state
+        .save_atomic(bucket_dir)
+        .map_err(|e| BucketError::Other(format!("feed-state save: {e}")))?;
+
+    let adapter: Box<dyn SourceAdapter + Send + Sync> = match driver.parse_adapter() {
+        "mediawiki_xml" => Box::new(MediaWikiXml::new(&dest)),
+        other => {
+            return Err(BucketError::Other(format!(
+                "tracked driver `{}` reports parse_adapter `{other}`, \
+                 which has no matching SourceAdapter binding",
+                driver.parse_adapter(),
+            )));
+        }
+    };
+
+    Ok(ResyncResolution::Build {
+        adapter,
+        new_snapshot_id: latest,
+    })
+}
+
+/// After a successful resync slot rebuild against `new_snapshot_id`,
+/// reset `feed-state.toml`'s `last_applied_delta_id` so the next
+/// FeedWorker tick lists deltas strictly after the new base. Both ids
+/// share the same `YYYYMMDD` lexicographic order that
+/// `WikipediaDriver::list_deltas_since` uses, so reusing the snapshot
+/// id as a delta cursor is exact, not an approximation.
+///
+/// This is the correctness reset for the rare case where deltas dated
+/// after the old base were applied to the old slot during the resync
+/// build: re-applying them to the new slot is idempotent (apply_delta's
+/// "first chunk_id already live" check), and skipping ones already
+/// folded into the new base is a no-op.
+#[allow(dead_code)] // Wired in slice 2b.
+fn reset_delta_cursor_to(
+    bucket_dir: &Path,
+    new_snapshot_id: &SnapshotId,
+) -> Result<(), BucketError> {
+    let mut state = FeedState::load(bucket_dir)
+        .map_err(|e| BucketError::Other(format!("feed-state load: {e}")))?;
+    state.set_last_applied_delta(DeltaId::new(new_snapshot_id.as_str()));
+    state
+        .save_atomic(bucket_dir)
+        .map_err(|e| BucketError::Other(format!("feed-state save: {e}")))?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::Mutex;
 
-    use crate::knowledge::DeltaId;
     use crate::knowledge::source::feed::BoxFuture;
 
     /// Shared call log so a test holding an `Arc` can inspect calls
@@ -1308,5 +1426,136 @@ mod tests {
         // State unchanged — still pointing at the recorded snapshot.
         let after = FeedState::load(tmp.path()).unwrap();
         assert_eq!(after.current_base(), Some(SnapshotId::new("20260301")));
+    }
+
+    #[tokio::test]
+    async fn resolve_resync_source_returns_already_at_latest_when_current_matches() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut state = FeedState::default();
+        state.set_current_base(SnapshotId::new("20260401"));
+        state.save_atomic(tmp.path()).unwrap();
+
+        let (driver, log) = FakeDriver::new("20260401", b"unused");
+        let driver: Box<dyn FeedDriver> = Box::new(driver);
+        let observer = PhaseRecorder::default();
+        let cancel = CancellationToken::new();
+
+        let res = resolve_resync_source(driver, tmp.path(), &observer, &cancel)
+            .await
+            .unwrap();
+
+        match res {
+            ResyncResolution::AlreadyAtLatest { snapshot_id } => {
+                assert_eq!(snapshot_id, SnapshotId::new("20260401"));
+            }
+            ResyncResolution::Build { .. } => panic!("expected AlreadyAtLatest"),
+        }
+
+        let calls = log.lock().unwrap().clone();
+        assert_eq!(calls.first().map(|s| s.as_str()), Some("latest_base"));
+        assert!(
+            !calls.iter().any(|c| c.starts_with("fetch_base")),
+            "fetch_base must not run when already at latest; got {calls:?}"
+        );
+        assert!(
+            observer.phases.lock().unwrap().is_empty(),
+            "no Downloading phase should fire on the no-op path"
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_resync_source_fetches_new_base_when_latest_differs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut state = FeedState::default();
+        state.set_current_base(SnapshotId::new("20260301"));
+        state.set_last_applied_delta(DeltaId::new("20260315"));
+        state.save_atomic(tmp.path()).unwrap();
+
+        let payload = b"<?xml version=\"1.0\"?><mediawiki></mediawiki>";
+        let (driver, log) = FakeDriver::new("20260401", payload);
+        let driver: Box<dyn FeedDriver> = Box::new(driver);
+        let observer = PhaseRecorder::default();
+        let cancel = CancellationToken::new();
+
+        let res = resolve_resync_source(driver, tmp.path(), &observer, &cancel)
+            .await
+            .unwrap();
+
+        let new_id = match res {
+            ResyncResolution::Build {
+                new_snapshot_id, ..
+            } => new_snapshot_id,
+            ResyncResolution::AlreadyAtLatest { .. } => panic!("expected Build"),
+        };
+        assert_eq!(new_id, SnapshotId::new("20260401"));
+
+        // Phase=Downloading was emitted exactly once.
+        assert_eq!(
+            observer.phases.lock().unwrap().as_slice(),
+            &[BuildPhase::Downloading]
+        );
+
+        let calls = log.lock().unwrap().clone();
+        assert_eq!(calls.first().map(|s| s.as_str()), Some("latest_base"));
+        assert!(calls.iter().any(|c| c.starts_with("fetch_base(20260401")));
+
+        // current_base advanced to the new id.
+        let after = FeedState::load(tmp.path()).unwrap();
+        assert_eq!(after.current_base(), Some(SnapshotId::new("20260401")));
+        // last_applied_delta_id is *unchanged* by resolve — the cursor
+        // reset is a separate step (`reset_delta_cursor_to`) that the
+        // orchestrator runs only after a successful rebuild.
+        assert_eq!(
+            after.last_applied_delta(),
+            Some(DeltaId::new("20260315")),
+            "resolve_resync_source must not touch the delta cursor",
+        );
+
+        // The base file landed.
+        let expected_path = tmp
+            .path()
+            .join("source-cache/base/20260401/fake-20260401.xml.bz2");
+        assert!(expected_path.exists());
+    }
+
+    #[tokio::test]
+    async fn resolve_resync_source_handles_unset_current_base() {
+        // Edge case: a tracked bucket whose feed-state was never
+        // written (e.g. resync triggered before the initial build
+        // somehow). `latest_base()` still applies; we just have
+        // nothing to compare against, so the resync proceeds.
+        let tmp = tempfile::tempdir().unwrap();
+
+        let (driver, _log) = FakeDriver::new("20260401", b"payload");
+        let driver: Box<dyn FeedDriver> = Box::new(driver);
+        let observer = PhaseRecorder::default();
+        let cancel = CancellationToken::new();
+
+        let res = resolve_resync_source(driver, tmp.path(), &observer, &cancel)
+            .await
+            .unwrap();
+        assert!(matches!(res, ResyncResolution::Build { .. }));
+
+        let after = FeedState::load(tmp.path()).unwrap();
+        assert_eq!(after.current_base(), Some(SnapshotId::new("20260401")));
+    }
+
+    #[test]
+    fn reset_delta_cursor_to_overwrites_last_applied_delta() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut state = FeedState::default();
+        state.set_current_base(SnapshotId::new("20260401"));
+        state.set_last_applied_delta(DeltaId::new("20260415"));
+        state.save_atomic(tmp.path()).unwrap();
+
+        reset_delta_cursor_to(tmp.path(), &SnapshotId::new("20260501")).unwrap();
+
+        let after = FeedState::load(tmp.path()).unwrap();
+        // current_base is left alone — that's resolve_resync_source's job.
+        assert_eq!(after.current_base(), Some(SnapshotId::new("20260401")));
+        // The cursor is now the new snapshot id verbatim, so the next
+        // list_deltas_since(Some("20260501")) returns deltas strictly
+        // after that date.
+        assert_eq!(after.last_applied_delta(), Some(DeltaId::new("20260501")),);
     }
 }
