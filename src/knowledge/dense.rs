@@ -372,7 +372,9 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let bin = tmp.path().join("vectors.bin");
         let idx = tmp.path().join("vectors.idx");
-        let mut w = VectorStoreWriter::create(&bin, &idx, dim).unwrap();
+        let mut w =
+            VectorStoreWriter::create(&bin, &idx, dim, crate::knowledge::vectors::VectorQuant::F32)
+                .unwrap();
         for i in 0..n {
             let id = ChunkId::from_source(&[i as u8; 32], i as u64);
             // Distinctive vector: one-hot at position i % dim, scaled by i.

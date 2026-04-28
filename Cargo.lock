@@ -6299,6 +6299,7 @@ dependencies = [
  "clap",
  "cron",
  "futures",
+ "half",
  "hf-hub",
  "hnsw_rs",
  "memmap2",

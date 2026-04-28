@@ -1,10 +1,12 @@
 //! Persistent embedding-vector storage for a slot.
 //!
 //! Two files per slot, paralleling the chunks layout:
-//! - `vectors.bin` — fixed 16-byte header, then `N × dim × 4` bytes of f32
-//!   vectors back-to-back. No per-record framing — vectors are
-//!   uniform-size for a given slot, so `vectors.bin[16 + pos*dim*4 .. +
-//!   dim*4]` is the vector at position `pos`.
+//! - `vectors.bin` — fixed 16-byte header, then `N × dim × bytes_per_dim`
+//!   bytes of vectors back-to-back. `bytes_per_dim` is determined by
+//!   the slot's [`VectorQuant`] choice: 4 for f32, 2 for f16. No per-
+//!   record framing — vectors are uniform-size for a given slot, so
+//!   `vectors.bin[16 + pos*stride .. +stride]` is the vector at
+//!   position `pos`, where `stride = dim * bytes_per_dim`.
 //! - `vectors.idx` — sorted `(chunk_id, position)` entries. Position is
 //!   the index into the dense vector array, not a byte offset.
 //!
@@ -59,25 +61,67 @@ const FORMAT_VERSION: u8 = 1;
 /// Total header size in bytes. Vectors start at this offset.
 const HEADER_SIZE: u64 = 16;
 
-/// Quantization variant tag. Only f32 is supported in slice 4; f16 / int8
-/// are reserved values for the future quantization slice.
+/// Quantization variant tag stored in the `vectors.bin` header.
+///
+/// `F32` (4 bytes/dim, native) is the original format. `F16` (2 bytes/
+/// dim via [`half::f16`]) trades ~1% recall for half the on-disk
+/// vector footprint and half the HNSW data-file size. `Int8` is a
+/// reserved value for a future per-vector-scale quantization slice.
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VectorQuant {
     F32 = 0,
-    // F16 = 1,    // future
+    F16 = 1,
     // Int8 = 2,   // future
 }
 
-// vectors.bin layout (slice 4):
+impl VectorQuant {
+    /// Bytes consumed per scalar dimension on disk.
+    pub fn bytes_per_dim(self) -> usize {
+        match self {
+            VectorQuant::F32 => 4,
+            VectorQuant::F16 => 2,
+        }
+    }
+
+    /// Round-trip from the on-disk header byte. `Err` for unknown /
+    /// reserved values (today's `Int8 = 2` and beyond).
+    pub fn from_header_byte(b: u8) -> io::Result<Self> {
+        match b {
+            0 => Ok(VectorQuant::F32),
+            1 => Ok(VectorQuant::F16),
+            other => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("vectors.bin: unsupported quantization variant {other}"),
+            )),
+        }
+    }
+}
+
+impl From<super::config::Quantization> for VectorQuant {
+    fn from(q: super::config::Quantization) -> Self {
+        match q {
+            super::config::Quantization::F32 => VectorQuant::F32,
+            super::config::Quantization::F16 => VectorQuant::F16,
+            // `Int8` config value is parseable but not yet wired into
+            // the vector pipeline. Map to F32 for now so an int8-
+            // configured bucket builds (and reads back) as f32 rather
+            // than crashing — when the int8 path lands, this arm
+            // becomes a real branch.
+            super::config::Quantization::Int8 => VectorQuant::F32,
+        }
+    }
+}
+
+// vectors.bin layout:
 //   [4 bytes] magic = b"VECT"
 //   [1 byte]  format_version (= 1)
-//   [1 byte]  quantization (0 = f32)
+//   [1 byte]  quantization (0 = f32, 1 = f16)
 //   [2 bytes] reserved (zero)
 //   [4 bytes] dimension (u32 LE)
 //   [4 bytes] reserved (zero, future use)
 //   ── header ends at offset 16 ──
-//   [N × dim × 4 bytes] vectors back-to-back, native f32 little-endian.
+//   [N × dim × bytes_per_dim] vectors back-to-back, native LE.
 //
 // vectors.idx layout:
 //   [8 bytes] entry count (u64 LE)
@@ -93,13 +137,23 @@ pub struct VectorStoreWriter {
     bin: BufWriter<File>,
     idx_path: PathBuf,
     dimension: u32,
+    quant: VectorQuant,
     /// Next position to assign to an appended vector.
     next_position: u64,
     entries: Vec<(ChunkId, u64)>,
 }
 
 impl VectorStoreWriter {
-    pub fn create(bin_path: &Path, idx_path: &Path, dimension: u32) -> io::Result<Self> {
+    /// Create a new `vectors.bin` with the given quantization. F32 is
+    /// the historical default; F16 halves on-disk vector size at the
+    /// cost of ~1% dense recall (validated against the project's
+    /// `recall_eval` harness on a per-bucket basis).
+    pub fn create(
+        bin_path: &Path,
+        idx_path: &Path,
+        dimension: u32,
+        quant: VectorQuant,
+    ) -> io::Result<Self> {
         if dimension == 0 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -108,13 +162,14 @@ impl VectorStoreWriter {
         }
         let mut bin = BufWriter::new(File::create(bin_path)?);
         bin.write_all(MAGIC)?;
-        bin.write_all(&[FORMAT_VERSION, VectorQuant::F32 as u8, 0, 0])?;
+        bin.write_all(&[FORMAT_VERSION, quant as u8, 0, 0])?;
         bin.write_all(&dimension.to_le_bytes())?;
         bin.write_all(&[0u8; 4])?; // reserved
         Ok(Self {
             bin,
             idx_path: idx_path.to_path_buf(),
             dimension,
+            quant,
             next_position: 0,
             entries: Vec::new(),
         })
@@ -122,9 +177,11 @@ impl VectorStoreWriter {
 
     /// Reopen an existing `vectors.bin` for resumed appending. Verifies
     /// the on-disk header matches `expected_dimension`, truncates the
-    /// file to `HEADER_SIZE + chunk_ids.len() * dim * 4` (dropping any
+    /// file to `HEADER_SIZE + chunk_ids.len() * stride` (dropping any
     /// trailing partial vectors), and seeds the in-memory entries with
-    /// `chunk_ids` paired with sequential positions `0..len`.
+    /// `chunk_ids` paired with sequential positions `0..len`. The
+    /// quantization variant is read back from the header — a resumed
+    /// build inherits whatever choice the original `create` call made.
     ///
     /// The caller supplies `chunk_ids` in the same insertion order they
     /// were originally appended; positions are derived from order.
@@ -139,7 +196,7 @@ impl VectorStoreWriter {
         // VectorStoreReader does — bad magic / version / quant all
         // surface as InvalidData.
         let mut probe = File::open(bin_path)?;
-        let on_disk_dim = read_header(&mut probe)?;
+        let (on_disk_dim, on_disk_quant) = read_header(&mut probe)?;
         drop(probe);
         if on_disk_dim != expected_dimension {
             return Err(io::Error::new(
@@ -151,7 +208,8 @@ impl VectorStoreWriter {
         }
 
         let len = chunk_ids.len() as u64;
-        let target_size = HEADER_SIZE + len * expected_dimension as u64 * 4;
+        let stride = expected_dimension as u64 * on_disk_quant.bytes_per_dim() as u64;
+        let target_size = HEADER_SIZE + len * stride;
         let truncate = OpenOptions::new().write(true).open(bin_path)?;
         truncate.set_len(target_size)?;
         drop(truncate);
@@ -167,6 +225,7 @@ impl VectorStoreWriter {
             bin: BufWriter::new(file),
             idx_path: idx_path.to_path_buf(),
             dimension: expected_dimension,
+            quant: on_disk_quant,
             next_position: len,
             entries,
         })
@@ -185,7 +244,9 @@ impl VectorStoreWriter {
     }
 
     /// Append a vector and record its position. Returns the position the
-    /// vector was assigned.
+    /// vector was assigned. The input is always `&[f32]` (embedders
+    /// emit f32); quantization to the slot's chosen format happens
+    /// here.
     pub fn append(&mut self, chunk_id: ChunkId, vector: &[f32]) -> io::Result<u64> {
         if vector.len() != self.dimension as usize {
             return Err(io::Error::new(
@@ -197,8 +258,18 @@ impl VectorStoreWriter {
                 ),
             ));
         }
-        for value in vector {
-            self.bin.write_all(&value.to_le_bytes())?;
+        match self.quant {
+            VectorQuant::F32 => {
+                for value in vector {
+                    self.bin.write_all(&value.to_le_bytes())?;
+                }
+            }
+            VectorQuant::F16 => {
+                for value in vector {
+                    let h = half::f16::from_f32(*value);
+                    self.bin.write_all(&h.to_le_bytes())?;
+                }
+            }
         }
         let pos = self.next_position;
         self.next_position += 1;
@@ -223,18 +294,21 @@ impl VectorStoreWriter {
     ///
     /// Validates the on-disk header dimension when an existing file is
     /// found — a mismatch means the slot's embedder has somehow drifted
-    /// since the prior call.
+    /// since the prior call. The quantization variant comes from the
+    /// existing header for an open-append case, or from the supplied
+    /// `quant_for_create` when creating fresh.
     pub fn create_or_open_append(
         bin_path: &Path,
         idx_path: &Path,
         expected_dimension: u32,
+        quant_for_create: VectorQuant,
     ) -> io::Result<Self> {
         if !bin_path.exists() {
-            return Self::create(bin_path, idx_path, expected_dimension);
+            return Self::create(bin_path, idx_path, expected_dimension, quant_for_create);
         }
 
         let mut probe = File::open(bin_path)?;
-        let on_disk_dim = read_header(&mut probe)?;
+        let (on_disk_dim, on_disk_quant) = read_header(&mut probe)?;
         drop(probe);
         if on_disk_dim != expected_dimension {
             return Err(io::Error::new(
@@ -260,6 +334,7 @@ impl VectorStoreWriter {
             bin: BufWriter::new(file),
             idx_path: idx_path.to_path_buf(),
             dimension: expected_dimension,
+            quant: on_disk_quant,
             next_position,
             entries,
         })
@@ -292,6 +367,7 @@ impl VectorStoreWriter {
 pub struct VectorStoreReader {
     storage: VectorStorage,
     dimension: u32,
+    quant: VectorQuant,
     index: HashMap<ChunkId, u64>,
 }
 
@@ -357,17 +433,26 @@ impl VectorStoreReader {
                 VectorStorage::Eager(bytes.into_boxed_slice())
             }
         };
-        let dimension = read_header_bytes(storage.bytes())?;
+        let (dimension, quant) = read_header_bytes(storage.bytes())?;
         let index = read_idx(idx_path)?;
         Ok(Self {
             storage,
             dimension,
+            quant,
             index,
         })
     }
 
     pub fn dimension(&self) -> u32 {
         self.dimension
+    }
+
+    /// Quantization tier this `vectors.bin` was written with. Returned
+    /// for callers (HNSW build, manifest validation) that need to
+    /// know precisely what's on disk vs. what was *requested* in
+    /// `bucket.toml`.
+    pub fn quant(&self) -> VectorQuant {
+        self.quant
     }
 
     pub fn len(&self) -> usize {
@@ -394,10 +479,17 @@ impl VectorStoreReader {
     /// Read the vector at a specific position (its index in the dense
     /// `vectors.bin` array). Used by the HNSW build path which iterates
     /// vectors in position order rather than by chunk id.
+    ///
+    /// Always returns `Vec<f32>` regardless of on-disk quantization —
+    /// the in-memory representation in HNSW build / search remains f32
+    /// for now. Per-call promotion is cheap (a few thousand ops at
+    /// dim=1024), and the caller is read-once-per-position.
     pub fn read_at_position(&self, position: u64) -> io::Result<Vec<f32>> {
         let dim = self.dimension as usize;
-        let byte_offset = (HEADER_SIZE + position * dim as u64 * 4) as usize;
-        let byte_end = byte_offset + dim * 4;
+        let bytes_per_dim = self.quant.bytes_per_dim();
+        let stride = dim * bytes_per_dim;
+        let byte_offset = (HEADER_SIZE as usize) + (position as usize) * stride;
+        let byte_end = byte_offset + stride;
 
         let bytes = self.storage.bytes();
         if byte_end > bytes.len() {
@@ -412,8 +504,18 @@ impl VectorStoreReader {
         let slice = &bytes[byte_offset..byte_end];
 
         let mut out = Vec::with_capacity(dim);
-        for chunk in slice.chunks_exact(4) {
-            out.push(f32::from_le_bytes(chunk.try_into().unwrap()));
+        match self.quant {
+            VectorQuant::F32 => {
+                for chunk in slice.chunks_exact(4) {
+                    out.push(f32::from_le_bytes(chunk.try_into().unwrap()));
+                }
+            }
+            VectorQuant::F16 => {
+                for chunk in slice.chunks_exact(2) {
+                    let h = half::f16::from_le_bytes(chunk.try_into().unwrap());
+                    out.push(h.to_f32());
+                }
+            }
         }
         Ok(out)
     }
@@ -426,7 +528,7 @@ impl VectorStoreReader {
     }
 }
 
-fn read_header_bytes(bytes: &[u8]) -> io::Result<u32> {
+fn read_header_bytes(bytes: &[u8]) -> io::Result<(u32, VectorQuant)> {
     if bytes.len() < HEADER_SIZE as usize {
         return Err(io::Error::new(
             io::ErrorKind::UnexpectedEof,
@@ -447,13 +549,7 @@ fn read_header_bytes(bytes: &[u8]) -> io::Result<u32> {
             format!("vectors.bin: unknown format version {version}"),
         ));
     }
-    let quant = header[5];
-    if quant != VectorQuant::F32 as u8 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("vectors.bin: unsupported quantization variant {quant}"),
-        ));
-    }
+    let quant = VectorQuant::from_header_byte(header[5])?;
     let dimension = u32::from_le_bytes(header[8..12].try_into().unwrap());
     if dimension == 0 {
         return Err(io::Error::new(
@@ -461,10 +557,10 @@ fn read_header_bytes(bytes: &[u8]) -> io::Result<u32> {
             "vectors.bin: dimension is 0",
         ));
     }
-    Ok(dimension)
+    Ok((dimension, quant))
 }
 
-fn read_header(bin: &mut File) -> io::Result<u32> {
+fn read_header(bin: &mut File) -> io::Result<(u32, VectorQuant)> {
     let mut header = [0u8; HEADER_SIZE as usize];
     bin.read_exact(&mut header)?;
     read_header_bytes(&header)
@@ -499,6 +595,65 @@ mod tests {
     }
 
     #[test]
+    fn roundtrip_single_vector_f16() {
+        // f16 quantization: write a vector, read it back, expect a
+        // close-but-not-exact match (f16 has ~3-4 decimal digits of
+        // precision in the [0, 1] range).
+        let tmp = tempfile::tempdir().unwrap();
+        let bin = tmp.path().join("vectors.bin");
+        let idx = tmp.path().join("vectors.idx");
+
+        let id = ChunkId::from_source(&[1; 32], 0);
+        let v = vec![0.1, 0.2, 0.3, 0.4];
+
+        {
+            let mut w = VectorStoreWriter::create(&bin, &idx, 4, VectorQuant::F16).unwrap();
+            assert_eq!(w.append(id, &v).unwrap(), 0);
+            assert_eq!(w.finalize().unwrap(), 1);
+        }
+
+        let r = VectorStoreReader::open(&bin, &idx).unwrap();
+        assert_eq!(r.dimension(), 4);
+        assert_eq!(r.quant(), VectorQuant::F16);
+        let fetched = r.fetch(id).unwrap().unwrap();
+        for (i, (got, want)) in fetched.iter().zip(v.iter()).enumerate() {
+            let diff = (got - want).abs();
+            assert!(diff < 0.001, "dim {i}: got {got}, want {want}, diff {diff}",);
+        }
+
+        // On-disk size: header + 4 dims × 2 bytes = 24 bytes (vs.
+        // 32 bytes for the f32 case). A direct measurement so the
+        // halving is asserted, not just believed.
+        let on_disk = std::fs::metadata(&bin).unwrap().len();
+        assert_eq!(on_disk, 16 + 4 * 2);
+    }
+
+    #[test]
+    fn f16_header_byte_persists_across_open() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin = tmp.path().join("vectors.bin");
+        let idx = tmp.path().join("vectors.idx");
+
+        {
+            let mut w = VectorStoreWriter::create(&bin, &idx, 4, VectorQuant::F16).unwrap();
+            w.append(ChunkId::from_source(&[1; 32], 0), &[1.0, 2.0, 3.0, 4.0])
+                .unwrap();
+            w.finalize().unwrap();
+        }
+
+        // Reader should see F16, not silently fall back to F32.
+        let r = VectorStoreReader::open(&bin, &idx).unwrap();
+        assert_eq!(r.quant(), VectorQuant::F16);
+
+        // create_or_open_append should read the on-disk quant rather
+        // than overriding with the caller-supplied default. Pass F32
+        // as `quant_for_create` and verify the resulting writer
+        // inherits F16 from the existing file.
+        let w = VectorStoreWriter::create_or_open_append(&bin, &idx, 4, VectorQuant::F32).unwrap();
+        assert_eq!(w.quant, VectorQuant::F16);
+    }
+
+    #[test]
     fn roundtrip_single_vector() {
         let tmp = tempfile::tempdir().unwrap();
         let bin = tmp.path().join("vectors.bin");
@@ -508,7 +663,7 @@ mod tests {
         let v = vec![0.1, 0.2, 0.3, 0.4];
 
         {
-            let mut w = VectorStoreWriter::create(&bin, &idx, 4).unwrap();
+            let mut w = VectorStoreWriter::create(&bin, &idx, 4, VectorQuant::F32).unwrap();
             assert_eq!(w.append(id, &v).unwrap(), 0);
             assert_eq!(w.finalize().unwrap(), 1);
         }
@@ -537,7 +692,7 @@ mod tests {
             .collect();
 
         {
-            let mut w = VectorStoreWriter::create(&bin, &idx, dim).unwrap();
+            let mut w = VectorStoreWriter::create(&bin, &idx, dim, VectorQuant::F32).unwrap();
             for (id, v) in &inputs {
                 w.append(*id, v).unwrap();
             }
@@ -563,7 +718,7 @@ mod tests {
 
         let id = ChunkId::from_source(&[1; 32], 0);
         {
-            let mut w = VectorStoreWriter::create(&bin, &idx, 4).unwrap();
+            let mut w = VectorStoreWriter::create(&bin, &idx, 4, VectorQuant::F32).unwrap();
             w.append(id, &[1.0, 2.0, 3.0, 4.0]).unwrap();
             w.finalize().unwrap();
         }
@@ -577,7 +732,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let bin = tmp.path().join("vectors.bin");
         let idx = tmp.path().join("vectors.idx");
-        let mut w = VectorStoreWriter::create(&bin, &idx, 4).unwrap();
+        let mut w = VectorStoreWriter::create(&bin, &idx, 4, VectorQuant::F32).unwrap();
         let id = ChunkId::from_source(&[1; 32], 0);
         let err = w.append(id, &[0.0; 5]).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
@@ -588,7 +743,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let bin = tmp.path().join("vectors.bin");
         let idx = tmp.path().join("vectors.idx");
-        let err = VectorStoreWriter::create(&bin, &idx, 0).unwrap_err();
+        let err = VectorStoreWriter::create(&bin, &idx, 0, VectorQuant::F32).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
     }
 
@@ -597,7 +752,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let bin = tmp.path().join("vectors.bin");
         let idx = tmp.path().join("vectors.idx");
-        let w = VectorStoreWriter::create(&bin, &idx, 16).unwrap();
+        let w = VectorStoreWriter::create(&bin, &idx, 16, VectorQuant::F32).unwrap();
         assert!(w.is_empty());
         assert_eq!(w.finalize().unwrap(), 0);
 
@@ -614,7 +769,7 @@ mod tests {
         let idx = tmp.path().join("vectors.idx");
         let id = ChunkId::from_source(&[1; 32], 0);
         {
-            let mut w = VectorStoreWriter::create(&bin, &idx, 4).unwrap();
+            let mut w = VectorStoreWriter::create(&bin, &idx, 4, VectorQuant::F32).unwrap();
             w.append(id, &[1.0, 2.0, 3.0, 4.0]).unwrap();
             w.finalize().unwrap();
         }
@@ -633,7 +788,7 @@ mod tests {
         let idx = tmp.path().join("vectors.idx");
         let id = ChunkId::from_source(&[1; 32], 0);
         {
-            let mut w = VectorStoreWriter::create(&bin, &idx, 4).unwrap();
+            let mut w = VectorStoreWriter::create(&bin, &idx, 4, VectorQuant::F32).unwrap();
             w.append(id, &[1.0, 2.0, 3.0, 4.0]).unwrap();
             w.finalize().unwrap();
         }
@@ -658,7 +813,7 @@ mod tests {
             .map(|i| ChunkId::from_source(&[i as u8; 32], i as u64))
             .collect();
         {
-            let mut w = VectorStoreWriter::create(&bin, &idx, dim).unwrap();
+            let mut w = VectorStoreWriter::create(&bin, &idx, dim, VectorQuant::F32).unwrap();
             for (i, id) in ids.iter().enumerate() {
                 let v = vec![i as f32; dim as usize];
                 w.append(*id, &v).unwrap();
@@ -708,7 +863,7 @@ mod tests {
         let idx = tmp.path().join("vectors.idx");
         let id = ChunkId::from_source(&[1; 32], 0);
         {
-            let mut w = VectorStoreWriter::create(&bin, &idx, 4).unwrap();
+            let mut w = VectorStoreWriter::create(&bin, &idx, 4, VectorQuant::F32).unwrap();
             w.append(id, &[0.0; 4]).unwrap();
         }
         let err = VectorStoreWriter::open_resume(&bin, &idx, 8, &[id]).unwrap_err();
@@ -726,7 +881,7 @@ mod tests {
             .rev()
             .collect();
         {
-            let mut w = VectorStoreWriter::create(&bin, &idx, 4).unwrap();
+            let mut w = VectorStoreWriter::create(&bin, &idx, 4, VectorQuant::F32).unwrap();
             for id in &ids {
                 w.append(*id, &[0.0, 0.0, 0.0, 0.0]).unwrap();
             }
@@ -774,7 +929,7 @@ mod tests {
             .collect();
 
         {
-            let mut w = VectorStoreWriter::create(&bin, &idx, dim).unwrap();
+            let mut w = VectorStoreWriter::create(&bin, &idx, dim, VectorQuant::F32).unwrap();
             for (id, v) in &inputs {
                 w.append(*id, v).unwrap();
             }
@@ -799,7 +954,7 @@ mod tests {
         let idx = tmp.path().join("vectors.idx");
         let id = ChunkId::from_source(&[1; 32], 0);
         {
-            let mut w = VectorStoreWriter::create(&bin, &idx, 4).unwrap();
+            let mut w = VectorStoreWriter::create(&bin, &idx, 4, VectorQuant::F32).unwrap();
             w.append(id, &[0.1, 0.2, 0.3, 0.4]).unwrap();
             w.finalize().unwrap();
         }

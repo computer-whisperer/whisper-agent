@@ -882,8 +882,13 @@ impl DiskBucket {
             .map_err(BucketError::Io)?
         };
         let vector_writer = if chunks_done == 0 {
-            VectorStoreWriter::create(&vectors_bin, &vectors_idx, embedder_snapshot.dimension)
-                .map_err(BucketError::Io)?
+            VectorStoreWriter::create(
+                &vectors_bin,
+                &vectors_idx,
+                embedder_snapshot.dimension,
+                manifest.serving.quantization.into(),
+            )
+            .map_err(BucketError::Io)?
         } else {
             VectorStoreWriter::open_resume(
                 &vectors_bin,
@@ -1989,6 +1994,7 @@ impl Bucket for DiskBucket {
             let dense = active.dense.clone();
             let embeddings = all_embeddings;
             let chunk_ids_clone = chunk_ids.clone();
+            let quant: super::vectors::VectorQuant = active.manifest.serving.quantization.into();
             let new_delta_reader = tokio::task::spawn_blocking(
                 move || -> Result<Arc<ChunkStoreReader>, BucketError> {
                     persist_insert_batch(
@@ -2000,6 +2006,7 @@ impl Bucket for DiskBucket {
                         sparse_enabled,
                         load_mode,
                         dim,
+                        quant,
                     )
                 },
             )
@@ -2221,6 +2228,7 @@ fn persist_insert_batch(
     sparse_enabled: bool,
     load_mode: LoadMode,
     dimension: u32,
+    quant: super::vectors::VectorQuant,
 ) -> Result<Arc<ChunkStoreReader>, BucketError> {
     let chunks_bin = slot::delta_chunks_bin_path(slot_path);
     let chunks_idx = slot::delta_chunks_idx_path(slot_path);
@@ -2230,7 +2238,7 @@ fn persist_insert_batch(
     let mut chunk_writer = ChunkStoreWriter::create_or_open_append(&chunks_bin, &chunks_idx)
         .map_err(BucketError::Io)?;
     let mut vector_writer =
-        VectorStoreWriter::create_or_open_append(&vectors_bin, &vectors_idx, dimension)
+        VectorStoreWriter::create_or_open_append(&vectors_bin, &vectors_idx, dimension, quant)
             .map_err(BucketError::Io)?;
 
     // Position scheme matches `load_slot`: HNSW positions are an
@@ -2313,6 +2321,7 @@ fn compact_into_new_slot(
         &slot::vectors_bin_path(new_slot_path),
         &slot::vectors_idx_path(new_slot_path),
         dim,
+        old.manifest.serving.quantization.into(),
     )
     .map_err(BucketError::Io)?;
     let mut sparse_builder = if sparse_enabled {
@@ -2477,8 +2486,13 @@ fn open_fresh_handles(
     let tantivy_dir = slot::tantivy_dir(slot_path);
     let chunk_writer =
         ChunkStoreWriter::create(&chunks_bin, &chunks_idx).map_err(BucketError::Io)?;
-    let vector_writer = VectorStoreWriter::create(&vectors_bin, &vectors_idx, dimension)
-        .map_err(BucketError::Io)?;
+    let vector_writer = VectorStoreWriter::create(
+        &vectors_bin,
+        &vectors_idx,
+        dimension,
+        manifest.serving.quantization.into(),
+    )
+    .map_err(BucketError::Io)?;
     let sparse_builder = if sparse_enabled {
         Some(SparseIndexBuilder::create(&tantivy_dir)?)
     } else {

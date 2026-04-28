@@ -160,6 +160,12 @@ hf-hub = { version = "0.4", default-features = false, features = ["rustls-tls", 
 # slot-open time.
 memmap2 = "0.9"
 
+# `half` for f16 quantization in vectors.bin. Already in the lock file
+# transitively (hnsw_rs / tantivy pull it in); listed explicitly so we
+# can name the type. No `serde` feature needed — vectors.bin uses
+# `to_le_bytes` directly, not a serde encoding.
+half = "2"
+
 [dev-dependencies]
 # Tempdirs for source-adapter / chunker tests. Auto-cleanup via Drop.
 tempfile = "3"
