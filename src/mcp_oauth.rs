@@ -30,7 +30,11 @@ const HTTP_TIMEOUT_SECS: u64 = 10;
 #[derive(Debug, Clone, Deserialize)]
 pub struct ResourceMetadata {
     /// The resource identifier the AS will issue tokens for. For MCP,
-    /// this is the MCP server's canonical URL.
+    /// this is the MCP server's canonical URL. RFC 9728 §3.2 specifies
+    /// a single string here, but real-world implementations (GitLab's
+    /// MCP) ship a single-element array, so we accept either shape and
+    /// take the first element. Empty arrays are still rejected.
+    #[serde(deserialize_with = "deserialize_resource_field")]
     pub resource: String,
     /// Authorization servers that can issue tokens for this resource.
     /// We pick the first; servers listing multiple ASes are a future
@@ -41,6 +45,36 @@ pub struct ResourceMetadata {
     /// overrode it.
     #[serde(default)]
     pub scopes_supported: Vec<String>,
+}
+
+/// Deserialize the `resource` field of RFC 9728 metadata permissively:
+/// accept the spec-correct string form *and* the array form some
+/// implementations (e.g. GitLab) emit. The first element of an array
+/// is taken; an empty array is a hard error so we don't silently
+/// resolve to an empty resource indicator that would confuse the AS
+/// at token-exchange time.
+fn deserialize_resource_field<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::Deserialize;
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum OneOrMany {
+        One(String),
+        Many(Vec<String>),
+    }
+    match OneOrMany::deserialize(deserializer)? {
+        OneOrMany::One(s) => Ok(s),
+        OneOrMany::Many(mut v) => {
+            if v.is_empty() {
+                return Err(serde::de::Error::custom(
+                    "`resource` is an empty array; expected a string or non-empty array",
+                ));
+            }
+            Ok(v.swap_remove(0))
+        }
+    }
 }
 
 /// Response shape of RFC 8414 Authorization Server Metadata. Hosted
@@ -192,25 +226,40 @@ pub async fn discover_resource_metadata_url(
         return Ok(url);
     }
 
-    // Fall back to well-known location on the MCP URL's origin. Use
-    // the URL crate to get a correct origin (scheme + host + port).
+    well_known_resource_metadata_url(mcp_url)
+}
+
+/// Build the RFC 9728 §3.1 well-known resource-metadata URL for a
+/// given resource identifier. The constructed URL inserts
+/// `/.well-known/oauth-protected-resource` *between* the authority and
+/// the resource's path component — so a resource at
+/// `https://example.com/api/v4/mcp` advertises its metadata at
+/// `https://example.com/.well-known/oauth-protected-resource/api/v4/mcp`,
+/// not at the origin root. Empty / `/` paths collapse to just the
+/// well-known root.
+fn well_known_resource_metadata_url(mcp_url: &str) -> Result<String> {
     let parsed =
         reqwest::Url::parse(mcp_url).with_context(|| format!("parse mcp_url {mcp_url}"))?;
-    let origin = format!(
-        "{}://{}",
-        parsed.scheme(),
-        parsed
-            .host_str()
-            .ok_or_else(|| anyhow!("mcp_url has no host: {mcp_url}"))?,
-    );
-    // Include port if present and non-default.
-    let origin_with_port = match parsed.port() {
-        Some(port) => format!("{origin}:{port}"),
-        None => origin,
+    let scheme = parsed.scheme();
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| anyhow!("mcp_url has no host: {mcp_url}"))?;
+    let authority = match parsed.port() {
+        Some(port) => format!("{host}:{port}"),
+        None => host.to_string(),
     };
-    Ok(format!(
-        "{origin_with_port}/.well-known/oauth-protected-resource"
-    ))
+    let path = parsed.path();
+    let well_known = "/.well-known/oauth-protected-resource";
+    if path.is_empty() || path == "/" {
+        Ok(format!("{scheme}://{authority}{well_known}"))
+    } else {
+        // `Url::path()` always returns a leading `/`; the spec wants
+        // the resource path appended after `oauth-protected-resource`
+        // (which carries no trailing slash), so concatenation is
+        // already correct without any joining glue. Trailing slashes
+        // on the resource URL are preserved.
+        Ok(format!("{scheme}://{authority}{well_known}{path}"))
+    }
 }
 
 /// Parse `WWW-Authenticate: Bearer resource_metadata="URL"` and
@@ -236,7 +285,11 @@ fn parse_www_authenticate_resource_metadata(header: Option<&str>) -> Option<Stri
 }
 
 /// Fetch RFC 9728 Protected Resource Metadata from `url`. Errors on
-/// non-2xx or malformed JSON.
+/// non-2xx or malformed JSON. Parse failures attach the response's
+/// content-type and a short body snippet so misconfigured deployments
+/// (e.g. a path-stripped well-known URL that lands on the site's
+/// HTML 404 page) surface as an obvious "we got HTML, not JSON" rather
+/// than a bare serde error.
 pub async fn fetch_resource_metadata(
     http: &reqwest::Client,
     url: &str,
@@ -248,13 +301,44 @@ pub async fn fetch_resource_metadata(
         .await
         .with_context(|| format!("GET {url}"))?;
     let status = resp.status();
+    let content_type = resp
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("(none)")
+        .to_string();
+    let body = resp.text().await.unwrap_or_default();
     if !status.is_success() {
-        let body = resp.text().await.unwrap_or_default();
-        bail!("resource metadata {url} returned {status}: {body}");
+        bail!(
+            "resource metadata {url} returned {status} (content-type: {content_type}): {}",
+            body_snippet(&body)
+        );
     }
-    resp.json::<ResourceMetadata>()
-        .await
-        .with_context(|| format!("parse resource metadata {url}"))
+    serde_json::from_str::<ResourceMetadata>(&body).with_context(|| {
+        format!(
+            "parse resource metadata {url} (status {status}, content-type: {content_type}, body: {})",
+            body_snippet(&body)
+        )
+    })
+}
+
+/// One-line preview of an HTTP response body for inclusion in error
+/// messages. Trims long bodies to keep the chained anyhow output
+/// scannable, and renders newlines / control bytes inline so a
+/// multi-line HTML page reads as a single error line.
+fn body_snippet(body: &str) -> String {
+    const MAX_LEN: usize = 240;
+    let trimmed = body.trim();
+    let collapsed: String = trimmed
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    if collapsed.chars().count() > MAX_LEN {
+        let head: String = collapsed.chars().take(MAX_LEN).collect();
+        format!("{head}…")
+    } else {
+        collapsed
+    }
 }
 
 /// Fetch RFC 8414 Authorization Server Metadata from
@@ -661,6 +745,103 @@ mod tests {
         assert_eq!(q.get("response_type").unwrap(), "code");
         assert_eq!(q.get("scope").unwrap(), "read write");
         assert_eq!(q.get("state").unwrap(), "state-xyz");
+    }
+
+    #[test]
+    fn well_known_url_preserves_resource_path() {
+        // GitLab-style: MCP endpoint sits behind a multi-segment path.
+        // RFC 9728 §3.1: insert /.well-known/oauth-protected-resource
+        // between the authority and the path; preserve the path
+        // verbatim. (Bug fix: we used to drop the path and hit the
+        // origin's /.well-known/oauth-protected-resource, which on a
+        // GitLab instance lands on the homepage HTML and chokes the
+        // JSON parser.)
+        assert_eq!(
+            well_known_resource_metadata_url("https://gitlab.cjbal.com/api/v4/mcp").unwrap(),
+            "https://gitlab.cjbal.com/.well-known/oauth-protected-resource/api/v4/mcp"
+        );
+    }
+
+    #[test]
+    fn well_known_url_preserves_trailing_slash() {
+        assert_eq!(
+            well_known_resource_metadata_url("https://example.com/mcp/").unwrap(),
+            "https://example.com/.well-known/oauth-protected-resource/mcp/"
+        );
+    }
+
+    #[test]
+    fn well_known_url_for_origin_only_resource() {
+        // Empty path / "/" collapses to just the well-known root —
+        // not /.well-known/oauth-protected-resource/ with a dangling
+        // trailing slash that some servers route differently.
+        assert_eq!(
+            well_known_resource_metadata_url("https://example.com").unwrap(),
+            "https://example.com/.well-known/oauth-protected-resource"
+        );
+        assert_eq!(
+            well_known_resource_metadata_url("https://example.com/").unwrap(),
+            "https://example.com/.well-known/oauth-protected-resource"
+        );
+    }
+
+    #[test]
+    fn well_known_url_includes_non_default_port() {
+        assert_eq!(
+            well_known_resource_metadata_url("https://example.com:8443/api/mcp").unwrap(),
+            "https://example.com:8443/.well-known/oauth-protected-resource/api/mcp"
+        );
+    }
+
+    #[test]
+    fn well_known_url_rejects_unparseable_input() {
+        assert!(well_known_resource_metadata_url("not-a-url").is_err());
+    }
+
+    #[test]
+    fn resource_metadata_accepts_string_resource() {
+        // RFC 9728 §3.2 spec-correct shape.
+        let body = r#"{"resource": "https://mcp.example.com/api",
+                       "authorization_servers": ["https://as.example.com"]}"#;
+        let m: ResourceMetadata = serde_json::from_str(body).unwrap();
+        assert_eq!(m.resource, "https://mcp.example.com/api");
+        assert_eq!(m.authorization_servers, vec!["https://as.example.com"]);
+    }
+
+    #[test]
+    fn resource_metadata_accepts_array_resource() {
+        // GitLab's MCP server emits the resource field as a single-
+        // element array. Take the first element; preserve the rest of
+        // the document.
+        let body = r#"{"resource": ["https://gitlab.cjbal.com/api/v4/mcp"],
+                       "authorization_servers": ["https://gitlab.cjbal.com"],
+                       "scopes_supported": ["mcp"]}"#;
+        let m: ResourceMetadata = serde_json::from_str(body).unwrap();
+        assert_eq!(m.resource, "https://gitlab.cjbal.com/api/v4/mcp");
+        assert_eq!(m.authorization_servers, vec!["https://gitlab.cjbal.com"]);
+        assert_eq!(m.scopes_supported, vec!["mcp"]);
+    }
+
+    #[test]
+    fn resource_metadata_rejects_empty_resource_array() {
+        // An empty array would silently resolve to an empty resource
+        // indicator, which would confuse the AS at token-exchange
+        // time. Reject up front with a clear error.
+        let body = r#"{"resource": [], "authorization_servers": ["https://as"]}"#;
+        let err = serde_json::from_str::<ResourceMetadata>(body).unwrap_err();
+        assert!(format!("{err}").contains("empty array"), "got: {err}");
+    }
+
+    #[test]
+    fn body_snippet_collapses_newlines_and_truncates() {
+        let html = "<html>\n<head>\n<title>Sign in · GitLab</title>\n</head>\n<body>\n";
+        let snip = body_snippet(html);
+        assert!(!snip.contains('\n'), "got: {snip}");
+        assert!(snip.contains("Sign in"), "got: {snip}");
+        let long = "x".repeat(1000);
+        let snip = body_snippet(&long);
+        assert!(snip.ends_with('…'));
+        assert!(snip.chars().count() <= 241);
     }
 
     #[test]
