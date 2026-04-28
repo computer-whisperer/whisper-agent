@@ -1694,6 +1694,18 @@ impl DiskBucket {
         let active_tombstones = active.tombstones();
         let source_index = active.source_index();
 
+        // Batch tombstones + inserts across the whole delta into a
+        // single `tombstone()` and `insert()` call. The per-page loop
+        // used to do one of each per changed record, which produced
+        // 2N tantivy commits for an N-page delta — a daily wiki delta
+        // (hundreds of pages) buried tantivy in a multi-hour merge
+        // backlog at 400% CPU while leaving the embedder under-
+        // utilized (per-record embed batches of 3-5 chunks each). One
+        // batch keeps tantivy at 2 commits per delta and lets
+        // `embed_batch` saturate the embedder at `EMBED_BATCH_SIZE`.
+        let mut tombstone_ids: Vec<ChunkId> = Vec::new();
+        let mut all_new_chunks: Vec<NewChunk> = Vec::new();
+
         for record_result in adapter.enumerate() {
             if cancel.is_cancelled() {
                 return Err(BucketError::Cancelled);
@@ -1725,11 +1737,22 @@ impl DiskBucket {
             let old_ids = source_index.get(&record.source_id);
             if !old_ids.is_empty() {
                 stats.chunks_tombstoned += old_ids.len() as u64;
-                self.tombstone(old_ids).await?;
+                tombstone_ids.extend(old_ids);
             }
-            self.insert(new_chunks, cancel).await?;
+            all_new_chunks.extend(new_chunks);
             stats.pages_applied += 1;
             stats.chunks_inserted += chunk_count;
+        }
+
+        // Issue the tombstone first so its tantivy delete-term lands
+        // before the insert's add-document — applying in this order
+        // matches the per-page loop's old semantics (tombstone of any
+        // prior revision precedes insert of the new one).
+        if !tombstone_ids.is_empty() {
+            self.tombstone(tombstone_ids).await?;
+        }
+        if !all_new_chunks.is_empty() {
+            self.insert(all_new_chunks, cancel).await?;
         }
 
         Ok(stats)
@@ -5808,6 +5831,10 @@ embedder = "tei_test"
             .collect();
         let delta = CannedDeltaAdapter { records };
 
+        // Reset the call counter too so the post-build call count
+        // reflects only what `apply_delta` triggered.
+        mock.embed_calls.store(0, Ordering::SeqCst);
+
         let stats = bucket.apply_delta(&delta, &cancel).await.unwrap();
         assert_eq!(stats.pages_applied as usize, target_records);
         assert!(stats.chunks_inserted >= target_records as u64);
@@ -5817,6 +5844,22 @@ embedder = "tei_test"
             max_seen <= super::EMBED_BATCH_SIZE,
             "insert exceeded EMBED_BATCH_SIZE ({}): max seen {max_seen}",
             super::EMBED_BATCH_SIZE,
+        );
+
+        // Regression for the per-page tantivy/embedder bug: applying
+        // a multi-record delta should batch into a single
+        // `Bucket::insert` call (and therefore at most
+        // ⌈chunks / EMBED_BATCH_SIZE⌉ embedder calls), not one per
+        // page. Before the fix this would be ~target_records calls
+        // — orders of magnitude too many.
+        let calls = mock.embed_calls.load(Ordering::SeqCst);
+        let expected_max = stats
+            .chunks_inserted
+            .div_ceil(super::EMBED_BATCH_SIZE as u64) as usize;
+        assert!(
+            calls <= expected_max + 1, // +1 slop for rounding
+            "expected ≤{expected_max} embed calls (one per EMBED_BATCH_SIZE-sized window); \
+             got {calls} for {target_records} pages — apply_delta is calling embedder per-page",
         );
     }
 }
