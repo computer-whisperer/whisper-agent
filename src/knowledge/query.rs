@@ -112,24 +112,48 @@ impl QueryEngine {
 
         let query_vec = self.embed_query(text, cancel).await?;
 
+        // Fan out per-bucket dense + sparse searches concurrently
+        // across all buckets, not just within a single bucket. With
+        // a pod-memory bucket (small, ms-latency) and a wikipedia
+        // bucket (HNSW search over millions of vectors, hundreds of
+        // ms) in scope at once, sequential iteration meant total
+        // latency = sum-of-per-bucket; parallel pulls it down to
+        // max-of-per-bucket. The dimension-mismatch tolerance
+        // (drop dense silently if dimensions disagree, keep sparse)
+        // is preserved per-bucket inside the closure.
+        use futures::future::join_all;
+        let per_bucket: Vec<_> = buckets
+            .iter()
+            .map(|bucket| {
+                let qv = &query_vec;
+                let dense_k = params.top_k_dense_per_bucket;
+                let sparse_k = params.top_k_sparse_per_bucket;
+                async move {
+                    let (dense_res, sparse_res) = tokio::join!(
+                        bucket.dense_search(qv, dense_k, cancel),
+                        bucket.sparse_search(text, sparse_k, cancel),
+                    );
+                    let mut out: Vec<Candidate> = Vec::new();
+                    match dense_res {
+                        Ok(cands) => out.extend(cands),
+                        // Bucket built with a different-dimension
+                        // embedder. Sparse path can still contribute;
+                        // skip dense silently.
+                        Err(BucketError::DimensionMismatch { .. }) => {}
+                        Err(e) => return Err(e),
+                    }
+                    match sparse_res {
+                        Ok(cands) => out.extend(cands),
+                        Err(e) => return Err(e),
+                    }
+                    Ok::<Vec<Candidate>, BucketError>(out)
+                }
+            })
+            .collect();
+        let results = join_all(per_bucket).await;
         let mut all_candidates: Vec<Candidate> = Vec::new();
-        for bucket in buckets {
-            let (dense_res, sparse_res) = tokio::join!(
-                bucket.dense_search(&query_vec, params.top_k_dense_per_bucket, cancel),
-                bucket.sparse_search(text, params.top_k_sparse_per_bucket, cancel),
-            );
-
-            match dense_res {
-                Ok(cands) => all_candidates.extend(cands),
-                // Bucket built with a different-dimension embedder.
-                // Sparse path can still contribute; skip dense silently.
-                Err(BucketError::DimensionMismatch { .. }) => {}
-                Err(e) => return Err(e),
-            }
-            match sparse_res {
-                Ok(cands) => all_candidates.extend(cands),
-                Err(e) => return Err(e),
-            }
+        for r in results {
+            all_candidates.extend(r?);
         }
 
         let deduped = dedupe_candidates(all_candidates);
