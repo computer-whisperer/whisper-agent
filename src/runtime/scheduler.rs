@@ -4428,7 +4428,10 @@ pub async fn run(
                 // resync-cadence arm. Dispatch with no requester —
                 // refusals (in-flight build, missing embedder, etc.)
                 // log instead of surfacing as wire errors.
-                scheduler.handle_resync_bucket(None, None, bucket_id);
+                // Scheduled resync is always server-scope; pod-scope tracked-source
+                // workers (and the channel that would carry their resync triggers)
+                // don't exist yet.
+                scheduler.handle_resync_bucket(None, None, bucket_id, None);
             }
             _ = gc_ticker.tick() => {
                 scheduler.gc_tick();

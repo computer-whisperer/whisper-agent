@@ -370,32 +370,61 @@ impl Scheduler {
             ClientToServer::QueryBuckets {
                 correlation_id,
                 bucket_ids,
+                pod_id,
                 query,
                 top_k,
             } => {
-                self.handle_query_buckets(conn_id, correlation_id, bucket_ids, query, top_k);
+                self.handle_query_buckets(
+                    conn_id,
+                    correlation_id,
+                    bucket_ids,
+                    pod_id,
+                    query,
+                    top_k,
+                );
             }
             ClientToServer::CreateBucket {
                 correlation_id,
                 id,
+                pod_id,
                 config,
             } => {
-                self.handle_create_bucket(conn_id, correlation_id, id, config);
+                self.handle_create_bucket(conn_id, correlation_id, id, pod_id, config);
             }
-            ClientToServer::DeleteBucket { correlation_id, id } => {
-                self.handle_delete_bucket(conn_id, correlation_id, id);
+            ClientToServer::DeleteBucket {
+                correlation_id,
+                id,
+                pod_id,
+            } => {
+                self.handle_delete_bucket(conn_id, correlation_id, id, pod_id);
             }
-            ClientToServer::StartBucketBuild { correlation_id, id } => {
-                self.handle_start_bucket_build(conn_id, correlation_id, id);
+            ClientToServer::StartBucketBuild {
+                correlation_id,
+                id,
+                pod_id,
+            } => {
+                self.handle_start_bucket_build(conn_id, correlation_id, id, pod_id);
             }
-            ClientToServer::CancelBucketBuild { correlation_id, id } => {
-                self.handle_cancel_bucket_build(conn_id, correlation_id, id);
+            ClientToServer::CancelBucketBuild {
+                correlation_id,
+                id,
+                pod_id,
+            } => {
+                self.handle_cancel_bucket_build(conn_id, correlation_id, id, pod_id);
             }
-            ClientToServer::PollFeedNow { correlation_id, id } => {
-                self.handle_poll_feed_now(conn_id, correlation_id, id);
+            ClientToServer::PollFeedNow {
+                correlation_id,
+                id,
+                pod_id,
+            } => {
+                self.handle_poll_feed_now(conn_id, correlation_id, id, pod_id);
             }
-            ClientToServer::ResyncBucket { correlation_id, id } => {
-                self.handle_resync_bucket(Some(conn_id), correlation_id, id);
+            ClientToServer::ResyncBucket {
+                correlation_id,
+                id,
+                pod_id,
+            } => {
+                self.handle_resync_bucket(Some(conn_id), correlation_id, id, pod_id);
             }
             ClientToServer::AddHostEnvProvider {
                 correlation_id,
@@ -1376,6 +1405,7 @@ impl Scheduler {
         conn_id: ConnId,
         correlation_id: Option<String>,
         bucket_ids: Vec<String>,
+        pod_id: Option<String>,
         query: String,
         top_k: u32,
     ) {
@@ -1396,6 +1426,19 @@ impl Scheduler {
                 },
             );
         };
+
+        // Pod-scope wire ops parse and reach here, but handler logic
+        // for them lands in PB3b. Reject with a clear message so the
+        // wire schema is forward-compatible without surprising silent
+        // server-scope fallbacks.
+        if pod_id.is_some() {
+            send_err(
+                "QueryBuckets: `pod_id` is not yet supported through this wire path. \
+                 Server-scope buckets only — pod-scope query lifecycle lands in a follow-up."
+                    .into(),
+            );
+            return;
+        }
 
         // Validation: exactly one bucket id, non-empty query, non-zero
         // top_k. Multi-bucket fan-out comes when the dimension-matching

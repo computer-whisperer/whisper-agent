@@ -85,8 +85,20 @@ impl Scheduler {
         conn_id: ConnId,
         correlation_id: Option<String>,
         id: String,
+        pod_id: Option<String>,
         config: BucketCreateInput,
     ) {
+        if pod_id.is_some() {
+            self.send_bucket_error(
+                conn_id,
+                correlation_id,
+                "create_bucket",
+                "pod-scope CreateBucket is not yet implemented through the wire — \
+                 create buckets manually under `<pods_root>/<pod_id>/buckets/<id>/` for now"
+                    .into(),
+            );
+            return;
+        }
         if let Err(e) = validate_bucket_id(&id) {
             self.send_bucket_error(conn_id, correlation_id, "create_bucket", e);
             return;
@@ -227,7 +239,20 @@ impl Scheduler {
         conn_id: ConnId,
         correlation_id: Option<String>,
         id: String,
+        pod_id: Option<String>,
     ) {
+        if pod_id.is_some() {
+            self.send_bucket_error(
+                conn_id,
+                correlation_id,
+                "delete_bucket",
+                "pod-scope DeleteBucket is not yet implemented through the wire — \
+                 remove the bucket directory under `<pods_root>/<pod_id>/buckets/<id>/` \
+                 manually and restart the server for now"
+                    .into(),
+            );
+            return;
+        }
         if let Err(e) = validate_bucket_id(&id) {
             self.send_bucket_error(conn_id, correlation_id, "delete_bucket", e);
             return;
@@ -279,11 +304,16 @@ impl Scheduler {
         let ev = ServerToClient::BucketDeleted {
             correlation_id: None,
             id: id.clone(),
+            pod_id: None,
         };
         self.router.broadcast_task_list_except(ev, conn_id);
         self.router.send_to_client(
             conn_id,
-            ServerToClient::BucketDeleted { correlation_id, id },
+            ServerToClient::BucketDeleted {
+                correlation_id,
+                id,
+                pod_id: None,
+            },
         );
     }
 
@@ -292,7 +322,17 @@ impl Scheduler {
         conn_id: ConnId,
         correlation_id: Option<String>,
         id: String,
+        pod_id: Option<String>,
     ) {
+        if pod_id.is_some() {
+            self.send_bucket_error(
+                conn_id,
+                correlation_id,
+                "start_bucket_build",
+                "pod-scope StartBucketBuild is not yet implemented through the wire.".into(),
+            );
+            return;
+        }
         if let Err(e) = validate_bucket_id(&id) {
             self.send_bucket_error(conn_id, correlation_id, "start_bucket_build", e);
             return;
@@ -372,6 +412,7 @@ impl Scheduler {
         let started = ServerToClient::BucketBuildStarted {
             correlation_id: None,
             bucket_id: id.clone(),
+            pod_id: None,
             slot_id: String::new(),
             started_at: Some(started_at.clone()),
         };
@@ -381,6 +422,7 @@ impl Scheduler {
             ServerToClient::BucketBuildStarted {
                 correlation_id: correlation_id.clone(),
                 bucket_id: id.clone(),
+                pod_id: None,
                 slot_id: String::new(),
                 started_at: Some(started_at),
             },
@@ -409,7 +451,17 @@ impl Scheduler {
         conn_id: ConnId,
         correlation_id: Option<String>,
         id: String,
+        pod_id: Option<String>,
     ) {
+        if pod_id.is_some() {
+            self.send_bucket_error(
+                conn_id,
+                correlation_id,
+                "cancel_bucket_build",
+                "pod-scope CancelBucketBuild is not yet implemented through the wire.".into(),
+            );
+            return;
+        }
         match self.active_bucket_builds.get(&id) {
             Some(token) => {
                 // Cancellation is observed at the next chunk-batch
@@ -448,6 +500,7 @@ impl Scheduler {
         requester: Option<ConnId>,
         correlation_id: Option<String>,
         id: String,
+        pod_id: Option<String>,
     ) {
         let refuse = |scheduler: &mut Scheduler, msg: String| match requester {
             Some(conn) => {
@@ -457,6 +510,13 @@ impl Scheduler {
                 warn!(bucket_id = %id, error = %msg, "scheduled resync rejected");
             }
         };
+        if pod_id.is_some() {
+            refuse(
+                self,
+                "pod-scope ResyncBucket is not yet implemented through the wire.".to_string(),
+            );
+            return;
+        }
         if let Err(e) = validate_bucket_id(&id) {
             refuse(self, e);
             return;
@@ -538,6 +598,7 @@ impl Scheduler {
                 let started = ServerToClient::BucketBuildStarted {
                     correlation_id: None,
                     bucket_id: id.clone(),
+                    pod_id: None,
                     slot_id: String::new(),
                     started_at: Some(started_at.clone()),
                 };
@@ -547,6 +608,7 @@ impl Scheduler {
                     ServerToClient::BucketBuildStarted {
                         correlation_id: correlation_id.clone(),
                         bucket_id: id.clone(),
+                        pod_id: None,
                         slot_id: String::new(),
                         started_at: Some(started_at),
                     },
@@ -556,6 +618,7 @@ impl Scheduler {
                 let started = ServerToClient::BucketBuildStarted {
                     correlation_id: None,
                     bucket_id: id.clone(),
+                    pod_id: None,
                     slot_id: String::new(),
                     started_at: Some(started_at),
                 };
@@ -587,7 +650,17 @@ impl Scheduler {
         conn_id: ConnId,
         correlation_id: Option<String>,
         id: String,
+        pod_id: Option<String>,
     ) {
+        if pod_id.is_some() {
+            self.send_bucket_error(
+                conn_id,
+                correlation_id,
+                "poll_feed_now",
+                "pod-scope PollFeedNow is not yet implemented through the wire.".into(),
+            );
+            return;
+        }
         let Some(control) = self.active_feed_workers.get(&id) else {
             // No feed worker — either an unknown bucket id or the
             // bucket isn't tracked. Same error surface in either
@@ -629,6 +702,7 @@ impl Scheduler {
             ServerToClient::FeedPollAccepted {
                 correlation_id,
                 bucket_id: id,
+                pod_id: None,
             },
         );
     }
@@ -648,6 +722,7 @@ impl Scheduler {
                 ServerToClient::BucketBuildStarted {
                     correlation_id: None,
                     bucket_id: bucket_id.clone(),
+                    pod_id: None,
                     slot_id: String::new(),
                     started_at: Some(started_at.clone()),
                 },
@@ -657,6 +732,7 @@ impl Scheduler {
                 conn_id,
                 ServerToClient::BucketBuildProgress {
                     bucket_id: bucket_id.clone(),
+                    pod_id: None,
                     slot_id: String::new(),
                     phase: snap.phase,
                     source_records: snap.source_records,
@@ -677,6 +753,7 @@ impl Scheduler {
             } => {
                 let event = ServerToClient::BucketBuildProgress {
                     bucket_id,
+                    pod_id: None,
                     slot_id: String::new(), // slot_id surfaces on Ended; stays empty here
                     phase: snapshot.phase,
                     source_records: snapshot.source_records,
@@ -717,6 +794,7 @@ impl Scheduler {
                 let ended = ServerToClient::BucketBuildEnded {
                     correlation_id: None,
                     bucket_id: bucket_id.clone(),
+                    pod_id: None,
                     slot_id: slot_id.clone(),
                     outcome: outcome.clone(),
                     summary: summary.clone(),
@@ -729,6 +807,7 @@ impl Scheduler {
                         ServerToClient::BucketBuildEnded {
                             correlation_id,
                             bucket_id,
+                            pod_id: None,
                             slot_id,
                             outcome,
                             summary,

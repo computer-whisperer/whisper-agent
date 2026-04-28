@@ -3466,6 +3466,11 @@ impl eframe::App for ChatApp {
                     self.send(ClientToServer::QueryBuckets {
                         correlation_id: Some(correlation),
                         bucket_ids: vec![bucket_id],
+                        // WebUI today drives only server-scope buckets
+                        // through the lifecycle ops; pod-scope ops are
+                        // accepted by the wire but rejected by the
+                        // server until PB3b lands.
+                        pod_id: None,
                         query,
                         top_k,
                     });
@@ -3480,6 +3485,7 @@ impl eframe::App for ChatApp {
                     self.send(ClientToServer::CreateBucket {
                         correlation_id: Some(correlation),
                         id,
+                        pod_id: None,
                         config,
                     });
                 }
@@ -3488,6 +3494,7 @@ impl eframe::App for ChatApp {
                     self.send(ClientToServer::DeleteBucket {
                         correlation_id: Some(correlation),
                         id,
+                        pod_id: None,
                     });
                 }
                 BucketsEvent::StartBuild { id } => {
@@ -3501,6 +3508,7 @@ impl eframe::App for ChatApp {
                     self.send(ClientToServer::StartBucketBuild {
                         correlation_id: Some(correlation),
                         id,
+                        pod_id: None,
                     });
                 }
                 BucketsEvent::CancelBuild { id } => {
@@ -3508,6 +3516,7 @@ impl eframe::App for ChatApp {
                     self.send(ClientToServer::CancelBucketBuild {
                         correlation_id: Some(correlation),
                         id,
+                        pod_id: None,
                     });
                 }
                 BucketsEvent::PollFeedNow { id } => {
@@ -3522,6 +3531,7 @@ impl eframe::App for ChatApp {
                     self.send(ClientToServer::PollFeedNow {
                         correlation_id: Some(correlation),
                         id,
+                        pod_id: None,
                     });
                 }
                 BucketsEvent::ResyncBucket { id } => {
@@ -3535,6 +3545,7 @@ impl eframe::App for ChatApp {
                     self.send(ClientToServer::ResyncBucket {
                         correlation_id: Some(correlation),
                         id,
+                        pod_id: None,
                     });
                 }
             }

@@ -1433,6 +1433,12 @@ pub enum ClientToServer {
     /// First query against an unloaded bucket pays the slot-load cost
     /// (HNSW rebuild from `vectors.bin`); subsequent queries hit the
     /// scheduler-side bucket cache and return in milliseconds.
+    ///
+    /// `pod_id` selects the scope of `bucket_ids`: `None` ⇒ server-scope
+    /// (entries under `<buckets_root>/<id>/`); `Some(p)` ⇒ pod-scope
+    /// (entries under `<pods_root>/<p>/buckets/<id>/`). Mixing scopes in
+    /// one query is not supported; a follow-up may graduate the field
+    /// to per-bucket scoping if multi-scope fan-out becomes useful.
     QueryBuckets {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         correlation_id: Option<String>,
@@ -1440,6 +1446,10 @@ pub enum ClientToServer {
         /// multi-bucket fan-out (which already works in `QueryEngine`)
         /// arrives once the dimension-matching UX is figured out.
         bucket_ids: Vec<String>,
+        /// Owning pod when querying pod-scope buckets; `None` for
+        /// server-scope.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pod_id: Option<String>,
         query: String,
         /// Final result count returned to the caller after reranking.
         /// `0` is rejected with `Error` rather than silently returning
@@ -1448,7 +1458,8 @@ pub enum ClientToServer {
     },
     /// Create a new bucket. Server validates `id` (filesystem-safe ASCII)
     /// and the embedder reference, synthesizes `bucket.toml` from
-    /// `config`, writes it under `<buckets_root>/<id>/`, inserts the
+    /// `config`, writes it under `<buckets_root>/<id>/` (server scope) or
+    /// `<pods_root>/<pod_id>/buckets/<id>/` (pod scope), inserts the
     /// entry into the in-memory registry, and broadcasts
     /// `BucketCreated`. The freshly-created bucket has no active slot
     /// yet — `StartBucketBuild` is a separate call.
@@ -1456,6 +1467,12 @@ pub enum ClientToServer {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         correlation_id: Option<String>,
         id: String,
+        /// Owning pod for pod-scope buckets; `None` for server-scope.
+        /// Pod-scope buckets are private to the owning pod — a pod's
+        /// own pod-scope buckets are auto-allowed for its threads
+        /// without needing a `[allow.knowledge_buckets]` grant.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pod_id: Option<String>,
         config: BucketCreateInput,
     },
     /// Remove a bucket from the registry and rmdir its directory. Cancels
@@ -1466,6 +1483,8 @@ pub enum ClientToServer {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         correlation_id: Option<String>,
         id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pod_id: Option<String>,
     },
     /// Kick off a slot build for `id`. The build runs as a detached
     /// background task off the scheduler thread (HNSW build is
@@ -1479,6 +1498,8 @@ pub enum ClientToServer {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         correlation_id: Option<String>,
         id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pod_id: Option<String>,
     },
     /// Cancel an in-flight build for `id`. Fires the build task's
     /// cancellation token; the task observes it at the next chunk-batch
@@ -1490,6 +1511,8 @@ pub enum ClientToServer {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         correlation_id: Option<String>,
         id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pod_id: Option<String>,
     },
     /// Manually trigger a tracked-bucket feed worker to poll its
     /// driver immediately rather than waiting for the next cadence
@@ -1507,6 +1530,8 @@ pub enum ClientToServer {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         correlation_id: Option<String>,
         id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pod_id: Option<String>,
     },
     /// Manually trigger a *resync* for a tracked bucket — rebuild the
     /// active slot off the driver's current `latest_base()`. If the
@@ -1525,6 +1550,8 @@ pub enum ClientToServer {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         correlation_id: Option<String>,
         id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pod_id: Option<String>,
     },
 
     // --- Behavior registry (read-only in phase 1 — see
@@ -2101,10 +2128,15 @@ pub enum ServerToClient {
     },
     /// A bucket was removed (via `DeleteBucket`). Broadcast so peer
     /// clients drop the row + any open progress UI keyed off this id.
+    /// `pod_id` is `Some` for pod-scope buckets; clients that key
+    /// rows by `(pod_id, id)` can drop the right one even when two
+    /// pods share a bucket name.
     BucketDeleted {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         correlation_id: Option<String>,
         id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pod_id: Option<String>,
     },
     /// A `StartBucketBuild` was accepted and the build task started.
     /// Broadcast so every client paints the row as building, not just
@@ -2114,6 +2146,8 @@ pub enum ServerToClient {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         correlation_id: Option<String>,
         bucket_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pod_id: Option<String>,
         slot_id: String,
         /// Wall-clock dispatch time, RFC3339 in UTC (`String` rather
         /// than `chrono::DateTime` so the protocol crate stays
@@ -2130,6 +2164,8 @@ pub enum ServerToClient {
     /// build and reset implicitly when a new build starts.
     BucketBuildProgress {
         bucket_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pod_id: Option<String>,
         slot_id: String,
         phase: BucketBuildPhase,
         source_records: u64,
@@ -2149,6 +2185,8 @@ pub enum ServerToClient {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         correlation_id: Option<String>,
         bucket_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pod_id: Option<String>,
         slot_id: String,
         outcome: BucketBuildOutcome,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2164,6 +2202,8 @@ pub enum ServerToClient {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         correlation_id: Option<String>,
         bucket_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pod_id: Option<String>,
     },
 
     // --- Behavior registry ---
