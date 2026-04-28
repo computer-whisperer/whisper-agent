@@ -598,7 +598,8 @@ impl Scheduler {
         // tick on cadence; their cancellation tokens are stored on
         // the scheduler so `DeleteBucket` can stop them. Skipped for
         // stored / linked / managed buckets.
-        let active_feed_workers = feed_workers::spawn_for_registry(&bucket_registry);
+        let active_feed_workers =
+            feed_workers::spawn_for_registry(&bucket_registry, &embedding_providers);
         Ok((
             Self {
                 default_pod_id,

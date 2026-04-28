@@ -6,23 +6,25 @@
 //! resulting [`CancellationToken`]s on the scheduler so a
 //! `DeleteBucket` can cleanly stop the worker.
 //!
-//! Today's worker is scaffolding-only — it ticks on cadence, logs,
-//! and stops on cancellation. The actual delta-polling and delta-
-//! application slices plug into the loop's NoOp branch in
-//! `crate::knowledge::feed_worker` without changing the spawn-side
-//! shape here.
+//! Each worker grabs the configured embedding provider for its bucket
+//! at spawn time — the same provider the build pipeline used. If the
+//! provider isn't in the scheduler's catalog, the worker is skipped
+//! (logged) rather than spawned in a doomed state. Reconfiguring a
+//! bucket's embedder rebuilds the worker; per-tick re-lookup isn't
+//! plumbed through.
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
 use tokio_util::sync::CancellationToken;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::knowledge::config::{SourceConfig, TrackedDriver};
 use crate::knowledge::source::feed::driver_for;
 use crate::knowledge::{
     BucketRegistry, FeedWorker, NoopObserver, WorkerObserver, cadence_to_duration,
 };
+use crate::runtime::scheduler::EmbeddingProviderEntry;
 
 /// Walk the registry, spawn one [`FeedWorker`] per tracked bucket,
 /// and return their cancellation tokens keyed by bucket id. The
@@ -30,9 +32,15 @@ use crate::knowledge::{
 /// `DeleteBucket` to stop the corresponding worker.
 ///
 /// Stored / linked / managed buckets are skipped — only `tracked`
-/// buckets get a worker.
-pub fn spawn_for_registry(registry: &BucketRegistry) -> HashMap<String, CancellationToken> {
-    spawn_for_registry_with_observer(registry, Arc::new(NoopObserver))
+/// buckets get a worker. Tracked buckets whose configured embedder
+/// isn't present in `embedding_providers` are also skipped (logged):
+/// the worker would error every tick on `set_embedder`, so it's
+/// cleaner to not spawn it at all.
+pub fn spawn_for_registry(
+    registry: &BucketRegistry,
+    embedding_providers: &HashMap<String, EmbeddingProviderEntry>,
+) -> HashMap<String, CancellationToken> {
+    spawn_for_registry_with_observer(registry, embedding_providers, Arc::new(NoopObserver))
 }
 
 /// Variant that lets callers (tests) supply a custom observer for
@@ -40,6 +48,7 @@ pub fn spawn_for_registry(registry: &BucketRegistry) -> HashMap<String, Cancella
 /// [`spawn_for_registry`].
 pub fn spawn_for_registry_with_observer(
     registry: &BucketRegistry,
+    embedding_providers: &HashMap<String, EmbeddingProviderEntry>,
     observer: Arc<dyn WorkerObserver>,
 ) -> HashMap<String, CancellationToken> {
     let mut tokens: HashMap<String, CancellationToken> = HashMap::new();
@@ -52,6 +61,16 @@ pub fn spawn_for_registry_with_observer(
         else {
             continue;
         };
+        let embedder_name = &entry.config.defaults.embedder;
+        let Some(provider_entry) = embedding_providers.get(embedder_name) else {
+            warn!(
+                bucket_id = %id,
+                embedder = %embedder_name,
+                "tracked bucket's configured embedder is not in the provider catalog; \
+                 skipping feed worker spawn",
+            );
+            continue;
+        };
         let cancel = CancellationToken::new();
         let driver = driver_for(driver_cfg);
         let interval = cadence_to_duration(*delta_cadence);
@@ -61,6 +80,7 @@ pub fn spawn_for_registry_with_observer(
         info!(
             bucket_id = %id,
             driver = %driver_name,
+            embedder = %embedder_name,
             interval_secs = interval.map(|d| d.as_secs()).unwrap_or(0),
             "spawning feed worker for tracked bucket",
         );
@@ -71,6 +91,8 @@ pub fn spawn_for_registry_with_observer(
             interval,
             cancel.clone(),
             observer.clone(),
+            registry.clone(),
+            provider_entry.provider.clone(),
         );
         tokio::spawn(worker.run());
         tokens.insert(id.clone(), cancel);
@@ -158,6 +180,66 @@ embedder = "test_embedder"
         }
     }
 
+    /// Build a one-entry embedding-providers map keyed by `name` whose
+    /// provider returns deterministic 8-dim vectors. Tests only need
+    /// the embedder Arc to exist — actual `embed` calls happen during
+    /// `apply_delta` which the spawn-side tests don't exercise.
+    fn embedders_with_test_entry(name: &str) -> HashMap<String, EmbeddingProviderEntry> {
+        let provider: Arc<dyn crate::providers::embedding::EmbeddingProvider> =
+            Arc::new(test_embedder::TestEmbedder);
+        let mut map = HashMap::new();
+        map.insert(
+            name.to_string(),
+            EmbeddingProviderEntry {
+                provider,
+                kind: "test".to_string(),
+                auth_mode: None,
+                source: crate::pod::config::EmbeddingProviderConfig::Tei {
+                    endpoint: "http://test.invalid".to_string(),
+                    auth: None,
+                },
+            },
+        );
+        map
+    }
+
+    /// Lightweight `EmbeddingProvider` for spawn-side tests. Never
+    /// actually called — the apply path requires a built bucket which
+    /// these tests don't construct.
+    mod test_embedder {
+        use crate::providers::embedding::{
+            BoxFuture, EmbedRequest, EmbeddingError, EmbeddingModelInfo, EmbeddingProvider,
+            EmbeddingResponse,
+        };
+        use tokio_util::sync::CancellationToken;
+
+        pub struct TestEmbedder;
+        impl EmbeddingProvider for TestEmbedder {
+            fn embed<'a>(
+                &'a self,
+                _req: &'a EmbedRequest<'a>,
+                _cancel: &'a CancellationToken,
+            ) -> BoxFuture<'a, Result<EmbeddingResponse, EmbeddingError>> {
+                Box::pin(async {
+                    Err(EmbeddingError::Transport(
+                        "TestEmbedder is spawn-only; not callable from apply path".into(),
+                    ))
+                })
+            }
+            fn list_models<'a>(
+                &'a self,
+            ) -> BoxFuture<'a, Result<Vec<EmbeddingModelInfo>, EmbeddingError>> {
+                Box::pin(async {
+                    Ok(vec![EmbeddingModelInfo {
+                        id: "test-embedder".to_string(),
+                        dimension: 8,
+                        max_input_tokens: None,
+                    }])
+                })
+            }
+        }
+    }
+
     #[tokio::test]
     async fn skips_non_tracked_buckets() {
         let tmp = tempfile::tempdir().unwrap();
@@ -175,7 +257,8 @@ embedder = "test_embedder"
         )
         .await;
 
-        let tokens = spawn_for_registry(&registry);
+        let providers = embedders_with_test_entry("test_embedder");
+        let tokens = spawn_for_registry(&registry, &providers);
 
         assert_eq!(tokens.len(), 1, "only the tracked bucket gets a worker");
         assert!(tokens.contains_key("wiki_simple"));
@@ -186,6 +269,32 @@ embedder = "test_embedder"
         for token in tokens.values() {
             token.cancel();
         }
+    }
+
+    /// A tracked bucket whose `[defaults] embedder` isn't in the
+    /// catalog gets skipped entirely. The worker would otherwise hit
+    /// every tick with a `set_embedder` failure — cleaner to not
+    /// spawn one at all and surface the misconfiguration via the
+    /// startup log.
+    #[tokio::test]
+    async fn skips_tracked_bucket_when_embedder_not_in_catalog() {
+        let tmp = tempfile::tempdir().unwrap();
+        let registry = make_registry_with_buckets(
+            tmp.path(),
+            &[(
+                "wiki_simple",
+                &tracked_wikipedia_toml("Simple Wiki", "simple", "manual"),
+            )],
+        )
+        .await;
+        // Empty catalog — bucket's `embedder = "test_embedder"` won't
+        // resolve.
+        let providers = HashMap::new();
+        let tokens = spawn_for_registry(&registry, &providers);
+        assert!(
+            tokens.is_empty(),
+            "no workers should spawn when the configured embedder is missing",
+        );
     }
 
     #[tokio::test]
@@ -202,7 +311,8 @@ embedder = "test_embedder"
 
         let recording = Arc::new(Recording::default());
         let observer = Arc::new(ObserverBox(recording.clone()));
-        let tokens = spawn_for_registry_with_observer(&registry, observer);
+        let providers = embedders_with_test_entry("test_embedder");
+        let tokens = spawn_for_registry_with_observer(&registry, &providers, observer);
         assert_eq!(tokens.len(), 1);
 
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;

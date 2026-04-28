@@ -19,12 +19,6 @@
 //!
 //! ## What does NOT live here yet
 //!
-//! - **Page-level mutation.** Today's worker advances the cursor as
-//!   soon as a delta has been *downloaded*; page-level `tombstone`
-//!   and `insert` against the active slot's index land in a follow-up
-//!   slice. Until then the field name `last_applied_delta_id` is
-//!   slightly aspirational — its real semantics in this slice is
-//!   "downloaded; application pending".
 //! - **Manual triggers.** The "Poll now" / "Resync now" wire path
 //!   isn't wired; manual cadence currently emits one Idle tick and
 //!   blocks on cancellation.
@@ -44,18 +38,23 @@
 //!   than a [`TrackedCadence`] so tests can pass intervals as small
 //!   as they need.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
+use crate::providers::embedding::EmbeddingProvider;
+
+use super::DeltaApplyStats;
 use super::config::TrackedCadence;
 use super::feed_state::{FeedState, delta_cache_dir};
+use super::registry::BucketRegistry;
 #[cfg(test)]
 use super::source::DeltaId;
 use super::source::FeedDriver;
+use super::source::MediaWikiXml;
 
 /// Map a configured cadence to a polling-interval duration. `Manual`
 /// returns `None` — the worker still runs but only ticks on explicit
@@ -86,11 +85,21 @@ pub enum TickOutcome {
     /// Cadence is `Manual`; the loop is idle until an external trigger
     /// fires.
     Idle,
-    /// Polled the driver, listed deltas, and downloaded all that were
-    /// new. `listed` is what the driver returned; `fetched` is how
-    /// many actually transferred bytes (the driver's idempotent
-    /// `fetch_delta` short-circuits when a file is already cached).
-    Polled { listed: usize, fetched: usize },
+    /// Polled the driver, listed deltas, downloaded the new ones, and
+    /// applied them against the active slot. Counters carry through
+    /// from each step:
+    /// - `listed` — what the driver returned;
+    /// - `fetched` — how many actually transferred bytes (the
+    ///   driver's idempotent `fetch_delta` short-circuits when a
+    ///   file is already cached);
+    /// - `applied` — sum of [`DeltaApplyStats`] across the deltas
+    ///   processed in this tick (pages applied / unchanged / chunks
+    ///   tombstoned + inserted).
+    Polled {
+        listed: usize,
+        fetched: usize,
+        applied: DeltaApplyStats,
+    },
     /// The bucket has no `current_base_snapshot_id` recorded yet — the
     /// initial-build path hasn't run. The worker skips polling
     /// because there's no anchor to apply deltas against.
@@ -136,9 +145,24 @@ pub struct FeedWorker {
     interval: Option<Duration>,
     cancel: CancellationToken,
     observer: Arc<dyn WorkerObserver>,
+    /// Registry handle for resolving the bucket on first apply. The
+    /// worker doesn't pre-load — first-tick HNSW open at boot would
+    /// be expensive at enwiki scale — so we lean on the registry's
+    /// lazy `loaded_bucket`. The clone shares the registry's
+    /// internal `Arc<Mutex>` cache, so one bucket is opened once
+    /// across the worker, scheduler queries, and any other consumer.
+    registry: BucketRegistry,
+    /// Embedder snapshot for this bucket, captured at spawn time.
+    /// Reconfiguring the bucket's `[embedding_providers.<name>]`
+    /// rebuilds the worker; per-tick re-lookup isn't required for v1.
+    /// The slot's manifest carries the canonical `model_id`, so we
+    /// don't store one here — `apply_one_delta` reads it from the
+    /// loaded bucket when calling `set_embedder`.
+    embedder: Arc<dyn EmbeddingProvider>,
 }
 
 impl FeedWorker {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         bucket_id: impl Into<String>,
         bucket_dir: PathBuf,
@@ -146,6 +170,8 @@ impl FeedWorker {
         interval: Option<Duration>,
         cancel: CancellationToken,
         observer: Arc<dyn WorkerObserver>,
+        registry: BucketRegistry,
+        embedder: Arc<dyn EmbeddingProvider>,
     ) -> Self {
         Self {
             bucket_id: bucket_id.into(),
@@ -154,6 +180,8 @@ impl FeedWorker {
             interval,
             cancel,
             observer,
+            registry,
+            embedder,
         }
     }
 
@@ -209,16 +237,17 @@ impl FeedWorker {
         info!(bucket_id = %self.bucket_id, "feed worker stopped");
     }
 
-    /// One round of "list deltas since last cursor + download each new
-    /// one." Pulled out of `run` so the future "Poll now" trigger can
-    /// drive the same code path on demand.
+    /// One round of "list deltas since last cursor; for each new
+    /// delta, download then apply against the active slot, then
+    /// advance the cursor." Pulled out of `run` so the future "Poll
+    /// now" trigger can drive the same code path on demand.
     ///
-    /// Today the cursor advances as soon as a delta is downloaded
-    /// (`last_applied_delta_id` doubles as the
-    /// most-recently-downloaded id during this slice). The cursor
-    /// keeps the driver's directory listing bounded; the actual
-    /// page-level tombstone+insert against the active slot lands in
-    /// the next slice.
+    /// Cursor semantics: `last_applied_delta_id` advances after the
+    /// delta has been *applied* to the bucket index — not just
+    /// downloaded. Since `apply_delta` is idempotent (re-running
+    /// against the same delta is a clean no-op) and `fetch_delta` is
+    /// idempotent (skips already-cached files), retry on next tick
+    /// is safe at any failure point.
     async fn poll_once(&self) -> TickOutcome {
         // Read the on-disk cursor. On any IO/parse error, surface as a
         // tick error so the worker can retry on its next cadence.
@@ -245,10 +274,12 @@ impl FeedWorker {
             return TickOutcome::Polled {
                 listed: 0,
                 fetched: 0,
+                applied: DeltaApplyStats::default(),
             };
         }
 
         let mut fetched = 0usize;
+        let mut applied_total = DeltaApplyStats::default();
         for delta_id in &listing {
             if self.cancel.is_cancelled() {
                 return TickOutcome::Error("cancelled".to_string());
@@ -257,10 +288,9 @@ impl FeedWorker {
             let dest_dir = delta_cache_dir(&self.bucket_dir, delta_id);
             let dest = dest_dir.join(self.driver.delta_filename(delta_id));
 
-            // The driver's `fetch_delta` is idempotent — if the file
-            // already exists with non-zero size it returns Ok without
-            // transferring bytes. Whether or not we fetched, we
-            // advance the cursor so the next listing skips this id.
+            // Step 1: download (idempotent — skips already-cached
+            // files at the driver's discretion). On failure leave the
+            // cursor where it is so the next tick re-tries.
             let pre_existed = std::fs::metadata(&dest)
                 .map(|m| m.is_file() && m.len() > 0)
                 .unwrap_or(false);
@@ -281,9 +311,36 @@ impl FeedWorker {
                 }
             }
 
-            // Persist the cursor after each successful fetch so a
-            // crash partway through a long catch-up batch doesn't
-            // re-download what we already have.
+            // Step 2: apply against the active slot. Bucket lookup
+            // goes through the registry's lazy `loaded_bucket` so the
+            // HNSW reload cost lands on first-apply, not on server
+            // boot. After first call the registry caches the Arc.
+            let apply_result = self.apply_one_delta(&dest).await;
+            match apply_result {
+                Ok(stats) => {
+                    debug!(
+                        bucket_id = %self.bucket_id,
+                        delta = %delta_id,
+                        ?stats,
+                        "delta applied",
+                    );
+                    applied_total = sum_stats(applied_total, stats);
+                }
+                Err(e) => {
+                    warn!(
+                        bucket_id = %self.bucket_id,
+                        delta = %delta_id,
+                        error = %e,
+                        "apply_delta failed; will retry on next tick",
+                    );
+                    return TickOutcome::Error(format!("apply_delta {delta_id}: {e}"));
+                }
+            }
+
+            // Step 3: advance cursor only after both download and
+            // apply succeeded. Persist immediately so a crash here
+            // doesn't reapply the same delta on the next tick (idempotent
+            // anyway, but cheaper to skip the re-application).
             state.set_last_applied_delta(delta_id.clone());
             if let Err(e) = state.save_atomic(&self.bucket_dir) {
                 return TickOutcome::Error(format!("feed-state save: {e}"));
@@ -293,7 +350,55 @@ impl FeedWorker {
         TickOutcome::Polled {
             listed: listing.len(),
             fetched,
+            applied: applied_total,
         }
+    }
+
+    /// Resolve the bucket through the registry, ensure its embedder
+    /// is wired (idempotent — `set_embedder` short-circuits when the
+    /// model_id matches), construct the right
+    /// [`SourceAdapter`](super::source::SourceAdapter) for the
+    /// driver's archive format, and call
+    /// [`DiskBucket::apply_delta`](super::disk_bucket::DiskBucket::apply_delta).
+    ///
+    /// Adapter dispatch is by the driver's `parse_adapter()` id —
+    /// `"mediawiki_xml"` is the only valid value today. Future
+    /// drivers (Wikidata, arxiv-feed) plug in here as new arms.
+    async fn apply_one_delta(
+        &self,
+        delta_path: &Path,
+    ) -> Result<DeltaApplyStats, super::types::BucketError> {
+        let bucket = self.registry.loaded_bucket(&self.bucket_id).await?;
+        let model_id = bucket.active_embedder_model_id().ok_or_else(|| {
+            super::types::BucketError::Other(
+                "active slot has no recorded embedder; bucket needs an initial build before \
+                 deltas can be applied"
+                    .to_string(),
+            )
+        })?;
+        bucket.set_embedder(self.embedder.clone(), &model_id)?;
+
+        match self.driver.parse_adapter() {
+            "mediawiki_xml" => {
+                let adapter = MediaWikiXml::new(delta_path);
+                bucket.apply_delta(&adapter, &self.cancel).await
+            }
+            other => Err(super::types::BucketError::Other(format!(
+                "feed driver reported unknown parse_adapter `{other}`",
+            ))),
+        }
+    }
+}
+
+/// Element-wise sum of two [`DeltaApplyStats`]. Used to roll up
+/// per-delta stats into the tick-level total surfaced on `Polled`.
+fn sum_stats(a: DeltaApplyStats, b: DeltaApplyStats) -> DeltaApplyStats {
+    DeltaApplyStats {
+        pages_applied: a.pages_applied + b.pages_applied,
+        pages_unchanged: a.pages_unchanged + b.pages_unchanged,
+        pages_skipped_empty: a.pages_skipped_empty + b.pages_skipped_empty,
+        chunks_tombstoned: a.chunks_tombstoned + b.chunks_tombstoned,
+        chunks_inserted: a.chunks_inserted + b.chunks_inserted,
     }
 }
 
@@ -303,8 +408,49 @@ mod tests {
     use std::path::Path;
     use std::sync::Mutex;
 
+    use crate::providers::embedding::{
+        BoxFuture as ProviderBoxFuture, EmbedRequest, EmbeddingError, EmbeddingModelInfo,
+        EmbeddingResponse,
+    };
+
     use super::super::source::feed::BoxFuture;
     use super::super::source::{FeedError, SnapshotId};
+
+    /// Minimal `EmbeddingProvider` used by the tests in this module —
+    /// the constructor needs *something*, but apply isn't actually
+    /// exercised here (the registry is empty so `loaded_bucket` fails
+    /// before any embed call). For end-to-end download+apply
+    /// coverage, see the live-simplewiki run; bucket-level apply
+    /// behavior is exercised in `disk_bucket::tests::apply_delta_*`.
+    struct StubEmbedder;
+    impl EmbeddingProvider for StubEmbedder {
+        fn embed<'a>(
+            &'a self,
+            _req: &'a EmbedRequest<'a>,
+            _cancel: &'a CancellationToken,
+        ) -> ProviderBoxFuture<'a, Result<EmbeddingResponse, EmbeddingError>> {
+            Box::pin(async {
+                Err(EmbeddingError::Transport(
+                    "StubEmbedder not callable in feed_worker unit tests".into(),
+                ))
+            })
+        }
+        fn list_models<'a>(
+            &'a self,
+        ) -> ProviderBoxFuture<'a, Result<Vec<EmbeddingModelInfo>, EmbeddingError>> {
+            Box::pin(async {
+                Ok(vec![EmbeddingModelInfo {
+                    id: "stub".to_string(),
+                    dimension: 8,
+                    max_input_tokens: None,
+                }])
+            })
+        }
+    }
+
+    fn stub_embedder() -> Arc<dyn EmbeddingProvider> {
+        Arc::new(StubEmbedder)
+    }
 
     #[derive(Default)]
     struct RecordingObserver {
@@ -452,6 +598,8 @@ mod tests {
             Some(Duration::from_millis(25)),
             cancel.clone(),
             observer.clone(),
+            BucketRegistry::default(),
+            stub_embedder(),
         );
         let handle = tokio::spawn(worker.run());
 
@@ -470,10 +618,11 @@ mod tests {
                     outcome,
                     TickOutcome::Polled {
                         listed: 0,
-                        fetched: 0
+                        fetched: 0,
+                        ..
                     }
                 ),
-                "every tick should be Polled{{0,0}} on an empty listing; got {outcome:?}"
+                "every tick should be Polled{{0,0,..}} on an empty listing; got {outcome:?}"
             );
         }
     }
@@ -491,6 +640,8 @@ mod tests {
             None,
             cancel.clone(),
             observer.clone(),
+            BucketRegistry::default(),
+            stub_embedder(),
         );
         let handle = tokio::spawn(worker.run());
 
@@ -517,6 +668,8 @@ mod tests {
             Some(Duration::from_secs(86_400)),
             cancel,
             observer.clone(),
+            BucketRegistry::default(),
+            stub_embedder(),
         );
         worker.run().await;
         assert!(
@@ -525,8 +678,24 @@ mod tests {
         );
     }
 
+    /// Verify that the worker's download stage drives the driver
+    /// correctly — the listing is consulted, deltas land in the
+    /// per-bucket cache, and the cursor *only* advances if apply
+    /// also succeeds. With an empty registry (no bucket entry),
+    /// `apply_one_delta` errors before any fetch happens — see
+    /// `loaded_bucket` returning `BucketError::Other("unknown bucket id")`
+    /// — so the first download lands but apply blows up, the tick is
+    /// `TickOutcome::Error`, and the cursor stays at None. The next
+    /// tick re-lists, re-downloads (idempotent — files already on
+    /// disk), errors again. This shape matches what we want for the
+    /// "feed-state has a base but the bucket initial-build hasn't
+    /// finished yet" edge case in production.
+    ///
+    /// End-to-end download+apply with a real bucket is verified by
+    /// the live simplewiki run; bucket-level apply behavior is
+    /// covered by `disk_bucket::tests::apply_delta_*`.
     #[tokio::test]
-    async fn poll_downloads_new_deltas_and_advances_cursor() {
+    async fn poll_downloads_then_errors_when_bucket_not_in_registry() {
         let tmp = tempfile::tempdir().unwrap();
         write_feed_state_with_base(tmp.path(), "20260401");
 
@@ -548,6 +717,8 @@ mod tests {
             Some(Duration::from_millis(50)),
             cancel.clone(),
             observer.clone(),
+            BucketRegistry::default(),
+            stub_embedder(),
         );
         let handle = tokio::spawn(worker.run());
 
@@ -556,29 +727,35 @@ mod tests {
         handle.await.unwrap();
 
         let ticks = observer.ticks.lock().unwrap().clone();
-        let first = ticks.first().expect("at least one tick");
-        assert_eq!(
-            first.1,
-            TickOutcome::Polled {
-                listed: 3,
-                fetched: 3
-            },
-            "first tick should download all 3 deltas, got {first:?}"
+        // Every tick errors out at apply time; the first delta
+        // gets downloaded before apply fails, but the cursor stays
+        // at None so subsequent ticks see the same listing.
+        assert!(
+            ticks
+                .iter()
+                .all(|(_, o)| matches!(o, TickOutcome::Error(_))),
+            "every tick should be Error (apply fails on missing bucket): {ticks:?}",
         );
 
-        for date in ["20260420", "20260421", "20260422"] {
-            let dest = tmp
-                .path()
-                .join(format!("source-cache/deltas/{date}/delta-{date}.bin"));
-            assert!(dest.exists(), "expected delta file at {}", dest.display());
-            assert_eq!(std::fs::read(&dest).unwrap(), payload);
-        }
+        // First delta landed on disk before apply errored. The
+        // worker bails out of the per-tick loop after the apply
+        // failure, so deltas 2 and 3 don't get downloaded *this
+        // tick* — they will on subsequent ticks (still failing at
+        // apply, but the file exists after fetch). Verify at least
+        // one of them landed.
+        let landed_first = tmp
+            .path()
+            .join("source-cache/deltas/20260420/delta-20260420.bin");
+        assert!(
+            landed_first.exists(),
+            "expected first delta at {}",
+            landed_first.display()
+        );
+        assert_eq!(std::fs::read(&landed_first).unwrap(), payload);
 
+        // Cursor must NOT have advanced — apply never succeeded.
         let state = FeedState::load(tmp.path()).unwrap();
-        assert_eq!(
-            state.last_applied_delta(),
-            Some(DeltaId::new("20260422".to_string())),
-        );
+        assert_eq!(state.last_applied_delta(), None);
 
         let calls = log.lock().unwrap().clone();
         assert_eq!(
@@ -589,13 +766,9 @@ mod tests {
             ticks.len(),
             "one list_deltas_since per tick",
         );
-        assert_eq!(
-            calls
-                .iter()
-                .filter(|c| c.starts_with("fetch_delta"))
-                .count(),
-            3,
-            "exactly 3 fetch_delta calls (cursor advances after first tick): {calls:?}",
+        assert!(
+            calls.iter().any(|c| c.starts_with("fetch_delta(20260420")),
+            "first delta should have been fetched at least once: {calls:?}",
         );
     }
 
@@ -613,6 +786,8 @@ mod tests {
             Some(Duration::from_millis(25)),
             cancel.clone(),
             observer.clone(),
+            BucketRegistry::default(),
+            stub_embedder(),
         );
         let handle = tokio::spawn(worker.run());
 

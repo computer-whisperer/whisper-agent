@@ -1575,6 +1575,18 @@ impl DiskBucket {
             .map(|s| s.manifest.embedder.dimension)
     }
 
+    /// Model id recorded on the active slot's manifest. Used by the
+    /// [`FeedWorker`](super::feed_worker::FeedWorker) to validate
+    /// that the runtime embedder it's about to install via
+    /// `set_embedder` matches what the slot was built against —
+    /// `set_embedder` does the same check internally; this accessor
+    /// just lets the caller surface a clearer error before paying
+    /// the embedder install.
+    pub fn active_embedder_model_id(&self) -> Option<String> {
+        self.active_snapshot()
+            .map(|s| s.manifest.embedder.model_id.clone())
+    }
+
     /// Test/inspection accessor. Fetches a vector by chunk id from the
     /// active slot. Returns `None` when no slot is active or while a
     /// build is in progress (the vectors reader needs `vectors.idx`,
