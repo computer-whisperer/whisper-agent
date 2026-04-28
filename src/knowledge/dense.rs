@@ -14,15 +14,17 @@
 //! vectors.
 //!
 //! Quantization: the in-memory HNSW data type tracks the bucket's
-//! [`crate::knowledge::vectors::VectorQuant`] choice. F32 buckets
-//! keep `Hnsw<f32, DistL2>`; F16 and Int8 buckets use
-//! `Hnsw<f16, DistF16L2>` (Int8 falls back to f16 because per-vector
-//! scale prefixes don't fit hnsw_rs's typed `T` slot — switching to
-//! f16 still halves `dense.hnsw.data` vs the old f32-only behavior).
-//! The choice is recorded inside the hnsw_rs dump itself (its
-//! deserialization is type-parameterized), so [`DenseIndex::load_from`]
-//! re-derives the correct backend from the bucket's `VectorQuant`
-//! and asks hnsw_rs for that specific instantiation.
+//! [`crate::knowledge::vectors::VectorQuant`] choice. F32 →
+//! `Hnsw<f32, DistL2>`, F16 → `Hnsw<f16, DistF16L2>`, Int8 →
+//! `Hnsw<i8, DistInt8L2>`. The int8 backend uses a single
+//! dataset-wide scale (calibrated from the first batch of vectors
+//! during build, persisted in the `dense.int8_scale` sidecar); for
+//! L2 *ordering* the scale's `s²` constant factor cancels, so
+//! `DistInt8L2` is just `(a − b)²` over i8 values with i32 arithmetic
+//! to avoid underflow on `i8::MIN`. The hnsw_rs dump is type-
+//! parameterized, so [`DenseIndex::load_from`] re-derives the correct
+//! backend from the bucket's `VectorQuant` and asks hnsw_rs for that
+//! specific instantiation.
 //!
 //! HNSW data ids are vector positions (the index into `vectors.bin`).
 //! The position→chunk_id mapping is rebuilt at load time from
@@ -123,28 +125,63 @@ impl Distance<f16> for DistF16L2 {
     }
 }
 
+/// L2 distance over signed-byte (`i8`) vectors. The vectors are
+/// already-quantized i8 representations of unit-norm-ish embeddings;
+/// the f32→i8 scale is implicit and identical for both inputs, so
+/// L2 *ordering* over the i8 representation is preserved (constant
+/// `scale²` factor falls out of `(s·a − s·b)² = s²·(a−b)²`). The
+/// returned value is in i8-units, not real-world units — fine for
+/// ranking / chunk-id-set comparison; downstream rerank uses its
+/// own scoring.
+///
+/// i8 difference computed in i32 to avoid the `-128 - 1` underflow
+/// edge case. Squared diff fits in 17 bits, sum across 1024 dims
+/// fits comfortably in i64.
+#[derive(Default, Copy, Clone)]
+pub struct DistInt8L2;
+
+impl Distance<i8> for DistInt8L2 {
+    fn eval(&self, va: &[i8], vb: &[i8]) -> f32 {
+        debug_assert_eq!(va.len(), vb.len());
+        let norm: i64 = va
+            .iter()
+            .zip(vb.iter())
+            .map(|(a, b)| {
+                let d = *a as i32 - *b as i32;
+                (d * d) as i64
+            })
+            .sum();
+        (norm as f32).sqrt()
+    }
+}
+
 /// HNSW backend type for a slot. Tracks the in-memory vector
-/// representation that hnsw_rs holds — `f32` for plain buckets, `f16`
-/// for any quantized bucket. Int8 vectors.bin storage uses per-vector
-/// scale prefixes that don't fit hnsw_rs's typed `T`, so int8 buckets
-/// fall back to f16 in HNSW (still halves `dense.hnsw.data` vs the
-/// old f32-only path).
+/// representation that hnsw_rs holds. Mirrors the bucket's
+/// `serving.quantization` choice: F32 → `Hnsw<f32, DistL2>`,
+/// F16 → `Hnsw<f16, DistF16L2>`, Int8 → `Hnsw<i8, DistInt8L2>`.
+///
+/// The int8 backend uses a single dataset-wide scale (calibrated
+/// from the first batch of vectors during build, persisted in the
+/// `dense.int8_scale` sidecar). It assumes inputs are roughly
+/// unit-norm — true for typical text embedders like
+/// Qwen3-Embedding-0.6B; non-normalized inputs would saturate at
+/// ±127 and lose recall.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DenseQuant {
     F32,
     F16,
+    Int8,
 }
 
 impl DenseQuant {
     /// Map the bucket's vectors.bin quantization to the HNSW backend
-    /// it should use. F32 → f32 HNSW (no quantization noise on the
-    /// search side). F16 → f16 HNSW (the natural pairing). Int8 →
-    /// f16 HNSW (per-vector-scale int8 doesn't fit a typed `T`; the
-    /// f16 fallback still halves the dump file).
+    /// it should use. F32 → f32 HNSW (no quantization noise). F16 →
+    /// f16 HNSW. Int8 → int8 HNSW (quarters `dense.hnsw.data` vs f32).
     pub fn from_vector_quant(q: VectorQuant) -> Self {
         match q {
             VectorQuant::F32 => DenseQuant::F32,
-            VectorQuant::F16 | VectorQuant::Int8 => DenseQuant::F16,
+            VectorQuant::F16 => DenseQuant::F16,
+            VectorQuant::Int8 => DenseQuant::Int8,
         }
     }
 }
@@ -171,7 +208,7 @@ pub struct DenseIndex {
 /// `'static` because Hnsw owns its inserted data via internal
 /// reference-counting; we don't keep external references alive.
 ///
-/// Branch on the on-disk vector type. Both arms keep the same
+/// Branch on the on-disk vector type. All arms keep the same
 /// `by_position` translation table — its shape is independent of
 /// the dense vector representation, so callers don't have to care
 /// which arm is active.
@@ -189,24 +226,70 @@ enum DenseInner {
         hnsw: Hnsw<'static, f16, DistF16L2>,
         by_position: Vec<ChunkId>,
     },
+    Int8 {
+        hnsw: Hnsw<'static, i8, DistInt8L2>,
+        by_position: Vec<ChunkId>,
+        /// f32-to-i8 scale: `i8 = clamp(round(f32 / scale), -127, 127)`.
+        /// `None` until calibrated from the first batch of vectors via
+        /// [`DenseIndex::set_int8_scale`]; after that the value is
+        /// fixed for the lifetime of this index. Persisted in the
+        /// `dense.int8_scale` sidecar so a reload reuses the same scale
+        /// and quantizes queries identically.
+        scale: Option<f32>,
+    },
 }
 
 impl DenseInner {
     fn by_position(&self) -> &[ChunkId] {
         match self {
-            DenseInner::F32 { by_position, .. } | DenseInner::F16 { by_position, .. } => {
-                by_position
-            }
+            DenseInner::F32 { by_position, .. }
+            | DenseInner::F16 { by_position, .. }
+            | DenseInner::Int8 { by_position, .. } => by_position,
         }
     }
 
     fn by_position_mut(&mut self) -> &mut Vec<ChunkId> {
         match self {
-            DenseInner::F32 { by_position, .. } | DenseInner::F16 { by_position, .. } => {
-                by_position
-            }
+            DenseInner::F32 { by_position, .. }
+            | DenseInner::F16 { by_position, .. }
+            | DenseInner::Int8 { by_position, .. } => by_position,
         }
     }
+}
+
+/// File name for the int8 backend's f32→i8 scale sidecar. Single
+/// LE f32 (4 bytes). Written by [`DenseIndex::dump_to`] right next to
+/// `dense.hnsw.{graph,data}`; read by [`DenseIndex::load_from`] when
+/// the bucket's `VectorQuant::Int8` directs us to the int8 backend.
+///
+/// Absent on F32 / F16 buckets — its presence implicitly marks an
+/// int8 dump.
+const DENSE_INT8_SCALE_NAME: &str = "dense.int8_scale";
+
+/// Quantize one f32 vector into i8 using `scale`. Standard symmetric
+/// rounding-then-clamp; matches `vectors.rs`'s int8 encoding shape but
+/// uses the dataset-wide scale (vectors.bin uses per-vector scale).
+fn quantize_f32_to_i8(vector: &[f32], scale: f32) -> Vec<i8> {
+    debug_assert!(scale > 0.0, "int8 scale must be positive, got {scale}");
+    let inv = 1.0 / scale;
+    vector
+        .iter()
+        .map(|v| (v * inv).round().clamp(-127.0, 127.0) as i8)
+        .collect()
+}
+
+/// Compute the int8 calibration scale for a sample of f32 vectors.
+/// Returns `max_abs * 1.1 / 127` — 10% headroom keeps later batches
+/// (whose max-abs may slightly exceed the calibration sample) from
+/// saturating at ±127. The `1.0e-6` floor guards against the all-
+/// zero edge case (avoids dividing by zero at quantize time).
+pub(super) fn calibrate_int8_scale(samples: &[Vec<f32>]) -> f32 {
+    let max_abs: f32 = samples
+        .iter()
+        .flat_map(|v| v.iter())
+        .map(|v| v.abs())
+        .fold(0.0f32, f32::max);
+    (max_abs * 1.1 / 127.0).max(1.0e-6)
 }
 
 impl std::fmt::Debug for DenseIndex {
@@ -215,6 +298,7 @@ impl std::fmt::Debug for DenseIndex {
         let (len, quant) = match inner.as_deref() {
             Ok(DenseInner::F32 { by_position, .. }) => (by_position.len(), DenseQuant::F32),
             Ok(DenseInner::F16 { by_position, .. }) => (by_position.len(), DenseQuant::F16),
+            Ok(DenseInner::Int8 { by_position, .. }) => (by_position.len(), DenseQuant::Int8),
             Err(_) => (0, DenseQuant::F32),
         };
         f.debug_struct("DenseIndex")
@@ -231,6 +315,14 @@ impl DenseIndex {
     /// it as a sizing suggestion, not a hard cap — but undersizing
     /// forces reallocation. Tune to the expected chunk count when
     /// known; over-estimate is cheap.
+    ///
+    /// For [`DenseQuant::Int8`] backends, the f32→i8 scale starts
+    /// uncalibrated; the caller must invoke [`Self::set_int8_scale`]
+    /// (typically with [`calibrate_int8_scale`] applied to the first
+    /// batch of vectors) before any inserts. Calling `insert` /
+    /// `search` against an uncalibrated int8 index panics in debug
+    /// and returns wrong results in release — the contract is "set
+    /// the scale once, then proceed."
     pub fn empty(quant: DenseQuant, params: HnswParams, max_elements_hint: usize) -> Self {
         let inner = match quant {
             DenseQuant::F32 => {
@@ -259,9 +351,64 @@ impl DenseIndex {
                     by_position: Vec::new(),
                 }
             }
+            DenseQuant::Int8 => {
+                let hnsw: Hnsw<'static, i8, DistInt8L2> = Hnsw::new(
+                    params.max_nb_connection,
+                    max_elements_hint.max(1),
+                    params.max_layer,
+                    params.ef_construction,
+                    DistInt8L2,
+                );
+                DenseInner::Int8 {
+                    hnsw,
+                    by_position: Vec::new(),
+                    scale: None,
+                }
+            }
         };
         Self {
             inner: RwLock::new(inner),
+        }
+    }
+
+    /// Set the f32→i8 scale on an int8 backend. Must be called exactly
+    /// once before the first insert / search. Idempotent at the same
+    /// scale value is fine; setting a different scale after the fact
+    /// would corrupt the index (already-inserted vectors were quantized
+    /// at the old scale), so we reject it.
+    ///
+    /// Panics if called on a non-int8 backend — the call shouldn't
+    /// happen and a panic surfaces the wiring bug rather than silently
+    /// proceeding with a wrong scale.
+    pub fn set_int8_scale(&self, new_scale: f32) -> Result<(), BucketError> {
+        debug_assert!(
+            new_scale > 0.0,
+            "int8 scale must be positive, got {new_scale}"
+        );
+        let mut inner = self.inner.write().expect("DenseIndex lock poisoned");
+        match &mut *inner {
+            DenseInner::Int8 { scale, .. } => match *scale {
+                None => {
+                    *scale = Some(new_scale);
+                    Ok(())
+                }
+                Some(existing) if (existing - new_scale).abs() < f32::EPSILON => Ok(()),
+                Some(existing) => Err(BucketError::Other(format!(
+                    "int8 scale already set to {existing}; cannot reset to {new_scale}",
+                ))),
+            },
+            _ => panic!("set_int8_scale called on non-int8 DenseIndex backend"),
+        }
+    }
+
+    /// Read the int8 scale, if set. Useful for tests and for callers
+    /// that need to persist the scale alongside other slot metadata.
+    /// Returns `None` for non-int8 backends and for uncalibrated int8
+    /// backends.
+    pub fn int8_scale(&self) -> Option<f32> {
+        match &*self.inner.read().expect("DenseIndex lock poisoned") {
+            DenseInner::Int8 { scale, .. } => *scale,
+            _ => None,
         }
     }
 
@@ -270,6 +417,7 @@ impl DenseIndex {
         match &*self.inner.read().expect("DenseIndex lock poisoned") {
             DenseInner::F32 { .. } => DenseQuant::F32,
             DenseInner::F16 { .. } => DenseQuant::F16,
+            DenseInner::Int8 { .. } => DenseQuant::Int8,
         }
     }
 
@@ -279,9 +427,11 @@ impl DenseIndex {
     /// increasing positions starting from 0; gaps are tolerated but the
     /// rest of the codebase doesn't currently produce them.
     ///
-    /// Vectors come in as f32 regardless of the backend; the f16 path
-    /// converts before insert. Per-call conversion cost is small at
-    /// realistic dims (1024 f32→f16 promotions ≈ a few µs).
+    /// Vectors come in as f32 regardless of the backend; f16 / int8
+    /// paths convert before insert. Per-call conversion cost is small
+    /// at realistic dims (1024 f32→f16/i8 conversions ≈ a few µs).
+    /// For int8, [`Self::set_int8_scale`] must have been called first
+    /// — debug-panics otherwise.
     pub fn insert(&self, chunk_id: ChunkId, position: u64, vector: &[f32]) {
         let mut inner = self.inner.write().expect("DenseIndex lock poisoned");
         match &mut *inner {
@@ -291,6 +441,11 @@ impl DenseIndex {
             DenseInner::F16 { hnsw, .. } => {
                 let v16: Vec<f16> = vector.iter().map(|&x| f16::from_f32(x)).collect();
                 hnsw.insert((&v16, position as usize));
+            }
+            DenseInner::Int8 { hnsw, scale, .. } => {
+                let s = scale.expect("int8 DenseIndex insert called before set_int8_scale");
+                let vi8 = quantize_f32_to_i8(vector, s);
+                hnsw.insert((&vi8, position as usize));
             }
         }
         let by_position = inner.by_position_mut();
@@ -310,7 +465,12 @@ impl DenseIndex {
     /// on slot reload when a dump is missing/stale.
     ///
     /// The HNSW backend is selected from the vectors.bin quantization
-    /// — see [`DenseQuant::from_vector_quant`] for the mapping.
+    /// — see [`DenseQuant::from_vector_quant`] for the mapping. For
+    /// the int8 backend, this method does a calibration first-pass
+    /// over a prefix of vectors (up to 256, or the whole store if
+    /// smaller) to find max-abs and set the scale. The first-pass is
+    /// independent of the second insert-pass — it doesn't materialize
+    /// vectors twice; it just samples enough to fix the scale.
     pub fn build(vectors: &VectorStoreReader, params: HnswParams) -> Result<Self, BucketError> {
         let count = vectors.len();
         let quant = DenseQuant::from_vector_quant(vectors.quant());
@@ -322,6 +482,23 @@ impl DenseIndex {
         pairs.sort_by_key(|(pos, _)| *pos);
 
         let index = Self::empty(quant, params, count);
+
+        // Int8 calibration: sample up to the first 256 vectors to
+        // compute the dataset-wide scale before inserting any. 256 is
+        // generous for unit-norm embeddings; max-abs converges quickly.
+        if quant == DenseQuant::Int8 {
+            let sample_n = pairs.len().min(256);
+            let mut samples: Vec<Vec<f32>> = Vec::with_capacity(sample_n);
+            for (position, _) in pairs.iter().take(sample_n).copied() {
+                let v = vectors
+                    .read_at_position(position)
+                    .map_err(BucketError::Io)?;
+                samples.push(v);
+            }
+            let scale = calibrate_int8_scale(&samples);
+            index.set_int8_scale(scale)?;
+        }
+
         for (position, chunk_id) in pairs.iter().copied() {
             let vector = vectors
                 .read_at_position(position)
@@ -351,9 +528,9 @@ impl DenseIndex {
     /// `max(top_k * 2, 64)` — generous enough to keep recall high at
     /// workspace scales without paying much for the over-fetch.
     ///
-    /// Query is always f32; the f16 backend promotes it once before
-    /// dispatch. The conversion is hot-path-cheap (one pass over the
-    /// query vector, no allocation per HNSW edge probe).
+    /// Query is always f32; non-f32 backends promote/quantize it once
+    /// before dispatch. The conversion is hot-path-cheap (one pass over
+    /// the query vector, no allocation per HNSW edge probe).
     pub fn search(&self, query: &[f32], top_k: usize) -> Vec<(ChunkId, f32)> {
         let inner = self.inner.read().expect("DenseIndex lock poisoned");
         if inner.by_position().is_empty() || top_k == 0 {
@@ -376,6 +553,19 @@ impl DenseIndex {
                     .filter_map(|n| by_position.get(n.d_id).map(|&id| (id, n.distance)))
                     .collect()
             }
+            DenseInner::Int8 {
+                hnsw,
+                by_position,
+                scale,
+            } => {
+                let s = scale.expect("int8 DenseIndex search called before set_int8_scale");
+                let qi8 = quantize_f32_to_i8(query, s);
+                let neighbours = hnsw.search(&qi8, top_k, ef);
+                neighbours
+                    .into_iter()
+                    .filter_map(|n| by_position.get(n.d_id).map(|&id| (id, n.distance)))
+                    .collect()
+            }
         }
     }
 
@@ -393,8 +583,12 @@ impl DenseIndex {
     /// hnsw files reflect the recorded chunk count.
     pub fn dump_to(&self, slot_dir: &Path) -> Result<(), BucketError> {
         let snapshot_path = slot_dir.join(DENSE_SNAPSHOT_NAME);
+        let int8_scale_path = slot_dir.join(DENSE_INT8_SCALE_NAME);
         if snapshot_path.exists() {
             std::fs::remove_file(&snapshot_path).map_err(BucketError::Io)?;
+        }
+        if int8_scale_path.exists() {
+            std::fs::remove_file(&int8_scale_path).map_err(BucketError::Io)?;
         }
         for ext in [".hnsw.graph", ".hnsw.data"] {
             let p = slot_dir.join(format!("{DENSE_BASENAME}{ext}"));
@@ -405,21 +599,40 @@ impl DenseIndex {
         // Hold the read lock while dumping so concurrent inserts don't
         // grow the HNSW between file_dump and reading get_nb_point —
         // sidecar must reflect exactly what's in the dump files.
-        let snapshot_count = {
+        let (snapshot_count, int8_scale) = {
             let inner = self.inner.read().expect("DenseIndex lock poisoned");
             match &*inner {
                 DenseInner::F32 { hnsw, .. } => {
                     hnsw.file_dump(slot_dir, DENSE_BASENAME)
                         .map_err(|e| BucketError::Other(format!("hnsw file_dump: {e}")))?;
-                    hnsw.get_nb_point() as u64
+                    (hnsw.get_nb_point() as u64, None)
                 }
                 DenseInner::F16 { hnsw, .. } => {
                     hnsw.file_dump(slot_dir, DENSE_BASENAME)
                         .map_err(|e| BucketError::Other(format!("hnsw file_dump: {e}")))?;
-                    hnsw.get_nb_point() as u64
+                    (hnsw.get_nb_point() as u64, None)
+                }
+                DenseInner::Int8 { hnsw, scale, .. } => {
+                    let s = scale.ok_or_else(|| {
+                        BucketError::Other(
+                            "dump_to: int8 DenseIndex has no calibrated scale".to_string(),
+                        )
+                    })?;
+                    hnsw.file_dump(slot_dir, DENSE_BASENAME)
+                        .map_err(|e| BucketError::Other(format!("hnsw file_dump: {e}")))?;
+                    (hnsw.get_nb_point() as u64, Some(s))
                 }
             }
         };
+        // Sidecar order: hnsw files first (above), then int8_scale (if
+        // applicable), then dense.snapshot last. Loaders use the
+        // presence of dense.snapshot as the "dump is complete" signal,
+        // so the int8_scale must be flushed before that signal is
+        // visible — otherwise a crash between snapshot and scale could
+        // leave a snapshot pointing at a missing scale.
+        if let Some(s) = int8_scale {
+            std::fs::write(&int8_scale_path, s.to_le_bytes()).map_err(BucketError::Io)?;
+        }
         std::fs::write(&snapshot_path, snapshot_count.to_le_bytes()).map_err(BucketError::Io)?;
         Ok(())
     }
@@ -526,10 +739,60 @@ fn load_with_quant_and_positions(
             }
             DenseInner::F16 { hnsw, by_position }
         }
+        DenseQuant::Int8 => {
+            // Read the f32→i8 calibration scale from the sidecar
+            // before touching the hnsw files. Absent / wrong-sized
+            // sidecar means the dump is from a pre-int8-HNSW run or
+            // partially written — caller (registry slot-open) falls
+            // back to the rebuild-from-vectors path.
+            let scale_path = slot_dir.join(DENSE_INT8_SCALE_NAME);
+            let scale = read_int8_scale_sidecar(&scale_path)?;
+            let hnsw: Hnsw<'static, i8, DistInt8L2> = io
+                .load_hnsw()
+                .map_err(|e| BucketError::Other(format!("hnsw load: {e}")))?;
+            let hnsw_count = hnsw.get_nb_point();
+            if hnsw_count != by_position.len() {
+                return Err(BucketError::Other(format!(
+                    "hnsw dump count {hnsw_count} does not match expected count {}",
+                    by_position.len(),
+                )));
+            }
+            DenseInner::Int8 {
+                hnsw,
+                by_position,
+                scale: Some(scale),
+            }
+        }
     };
     Ok(DenseIndex {
         inner: RwLock::new(inner),
     })
+}
+
+/// Read the `dense.int8_scale` sidecar (4-byte LE f32). Errors when
+/// the file is missing, the wrong size, or holds a non-positive value
+/// — all of which mean the int8 dump can't be trusted.
+fn read_int8_scale_sidecar(path: &Path) -> Result<f32, BucketError> {
+    let bytes = std::fs::read(path).map_err(|e| {
+        BucketError::Other(format!(
+            "int8 scale sidecar missing or unreadable at {}: {e}",
+            path.display(),
+        ))
+    })?;
+    if bytes.len() != 4 {
+        return Err(BucketError::Other(format!(
+            "int8 scale sidecar at {} has {} bytes, expected 4",
+            path.display(),
+            bytes.len(),
+        )));
+    }
+    let scale = f32::from_le_bytes(bytes.try_into().unwrap());
+    if !(scale > 0.0 && scale.is_finite()) {
+        return Err(BucketError::Other(format!(
+            "int8 scale sidecar holds non-positive / non-finite value: {scale}",
+        )));
+    }
+    Ok(scale)
 }
 
 /// Read the sidecar `dense.snapshot` file written by [`DenseIndex::dump_to`].
@@ -818,12 +1081,11 @@ mod tests {
     }
 
     #[test]
-    fn dense_quant_from_vector_quant_maps_int8_to_f16() {
+    fn dense_quant_from_vector_quant_one_to_one() {
         use crate::knowledge::vectors::VectorQuant;
-        // F32 stays F32 (no quantization noise on the search side);
-        // F16 and Int8 both land on f16 HNSW (per-vector-scale Int8
-        // doesn't fit hnsw_rs's typed T, so the f16 fallback is the
-        // best available).
+        // Each vectors.bin quant maps to its own HNSW backend:
+        // F32 → f32, F16 → f16, Int8 → int8 (with calibrated
+        // dataset-wide scale).
         assert_eq!(
             DenseQuant::from_vector_quant(VectorQuant::F32),
             DenseQuant::F32
@@ -834,7 +1096,7 @@ mod tests {
         );
         assert_eq!(
             DenseQuant::from_vector_quant(VectorQuant::Int8),
-            DenseQuant::F16
+            DenseQuant::Int8
         );
     }
 
@@ -864,16 +1126,21 @@ mod tests {
     }
 
     #[test]
-    fn build_from_int8_vectors_uses_f16_backend() {
-        // Int8 vectors.bin → f16 HNSW. The vectors.bin int8 path
-        // already loses some precision at the per-vector-scale step,
+    fn build_from_int8_vectors_uses_int8_backend() {
+        // Int8 vectors.bin → int8 HNSW with a calibrated dataset-wide
+        // scale. Both the per-vector-scale (vectors.bin storage) and
+        // the dataset-wide-scale (HNSW) introduce some precision loss,
         // so we only check that the top-1 nearest neighbour is the
-        // exact match (its quantized vector is also one-hot).
+        // exact match.
         let tmp = build_test_vectors_quant(8, 50, crate::knowledge::vectors::VectorQuant::Int8);
         let vectors = open_reader(&tmp);
         let index = DenseIndex::build(&vectors, HnswParams::default()).unwrap();
         assert_eq!(index.len(), 50);
-        assert_eq!(index.quant(), DenseQuant::F16);
+        assert_eq!(index.quant(), DenseQuant::Int8);
+        assert!(
+            index.int8_scale().is_some(),
+            "build() must calibrate the int8 scale before returning",
+        );
 
         let mut query = vec![0.0f32; 8];
         query[5] = 6.0;
@@ -967,5 +1234,197 @@ mod tests {
         let from_built = built.search(&q, 1);
         let from_loaded = loaded.search(&q, 1);
         assert_eq!(from_built[0].0, from_loaded[0].0);
+    }
+
+    #[test]
+    fn dist_int8_l2_matches_f32_ordering() {
+        // Sanity check on `DistInt8L2`: a query that's a closer match
+        // to one of two i8 candidates must rank that candidate first.
+        let dist = DistInt8L2;
+        let q: Vec<i8> = vec![10, 20, 30, 40];
+        let near: Vec<i8> = vec![11, 19, 31, 39]; // small per-component diff
+        let far: Vec<i8> = vec![50, 50, 50, 50]; // big per-component diff
+        let d_near = dist.eval(&q, &near);
+        let d_far = dist.eval(&q, &far);
+        assert!(
+            d_near < d_far,
+            "near ({d_near}) should rank closer than far ({d_far})",
+        );
+        // sqrt(0) = 0 — identity vectors have zero distance.
+        assert_eq!(dist.eval(&q, &q), 0.0);
+    }
+
+    #[test]
+    fn dist_int8_l2_handles_full_range_without_overflow() {
+        // i8 range is [-128, 127]. (-128 - 127) = -255 squared = 65025.
+        // Sum across 1024 dims fits in i64. Verify no overflow / panic.
+        let dist = DistInt8L2;
+        let a: Vec<i8> = vec![-128i8; 1024];
+        let b: Vec<i8> = vec![127i8; 1024];
+        let d = dist.eval(&a, &b);
+        // Expected: sqrt(1024 * 255^2) = 255 * sqrt(1024) = 255 * 32 = 8160
+        assert!((d - 8160.0).abs() < 1.0, "got d={d}, expected ~8160");
+    }
+
+    #[test]
+    fn calibrate_int8_scale_uses_max_abs_with_headroom() {
+        // max-abs across the sample is 0.5; expected scale = 0.5 *
+        // 1.1 / 127 ≈ 0.004331.
+        let samples = vec![vec![0.1f32, -0.5, 0.3], vec![0.4, -0.2, 0.0]];
+        let s = calibrate_int8_scale(&samples);
+        let expected = 0.5 * 1.1 / 127.0;
+        assert!(
+            (s - expected).abs() < 1.0e-7,
+            "scale {s} should be {expected}",
+        );
+    }
+
+    #[test]
+    fn calibrate_int8_scale_floor_for_all_zero_input() {
+        // All-zero samples → max_abs = 0 → would divide by zero at
+        // quantize time without the floor. The floor must produce a
+        // strictly positive scale.
+        let samples = vec![vec![0.0f32, 0.0, 0.0]; 5];
+        let s = calibrate_int8_scale(&samples);
+        assert!(s > 0.0, "scale {s} must be strictly positive");
+        assert!(s.is_finite(), "scale {s} must be finite");
+    }
+
+    #[test]
+    fn set_int8_scale_rejects_conflicting_reset() {
+        let index = DenseIndex::empty(DenseQuant::Int8, HnswParams::default(), 16);
+        index.set_int8_scale(0.001).unwrap();
+        // Same scale: idempotent.
+        assert!(index.set_int8_scale(0.001).is_ok());
+        // Different scale: error (would invalidate already-inserted
+        // quantized vectors).
+        let err = index.set_int8_scale(0.002).unwrap_err();
+        assert!(
+            err.to_string().contains("already set"),
+            "unexpected error: {err}",
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "non-int8 DenseIndex backend")]
+    fn set_int8_scale_panics_on_f32_backend() {
+        // Calling set_int8_scale on the wrong backend is a wiring bug;
+        // panic is the right surface.
+        let index = DenseIndex::empty(DenseQuant::F32, HnswParams::default(), 16);
+        let _ = index.set_int8_scale(0.001);
+    }
+
+    #[test]
+    fn dump_and_load_roundtrip_int8() {
+        let tmp = build_test_vectors_quant(8, 50, crate::knowledge::vectors::VectorQuant::Int8);
+        let vectors = open_reader(&tmp);
+        let built = DenseIndex::build(&vectors, HnswParams::default()).unwrap();
+        assert_eq!(built.quant(), DenseQuant::Int8);
+        let scale_before = built.int8_scale().expect("calibrated by build()");
+        built.dump_to(tmp.path()).unwrap();
+
+        // The int8_scale sidecar must exist after dump_to.
+        let scale_path = tmp.path().join("dense.int8_scale");
+        assert!(scale_path.exists(), "dense.int8_scale sidecar missing");
+        assert_eq!(
+            std::fs::metadata(&scale_path).unwrap().len(),
+            4,
+            "sidecar must be exactly 4 bytes (one LE f32)",
+        );
+
+        let loaded = DenseIndex::load_from(tmp.path(), &vectors).unwrap();
+        assert_eq!(loaded.quant(), DenseQuant::Int8);
+        assert_eq!(loaded.int8_scale(), Some(scale_before));
+        assert_eq!(loaded.len(), built.len());
+
+        let mut query = vec![0.0f32; 8];
+        query[5] = 6.0;
+        let from_built = built.search(&query, 1);
+        let from_loaded = loaded.search(&query, 1);
+        assert_eq!(from_built[0].0, from_loaded[0].0);
+    }
+
+    #[test]
+    fn int8_dump_is_smaller_than_f16_dump() {
+        // The whole point of int8-in-HNSW: 1 byte/dim vs f16's 2
+        // bytes/dim. dense.hnsw.data should be roughly half of f16
+        // for the same vector count. Generous bound (< 70% of f16,
+        // matching the f16-vs-f32 test's framing).
+        let dim: u32 = 64;
+        let n = 200;
+
+        let f16_tmp = build_test_vectors_quant(dim, n, crate::knowledge::vectors::VectorQuant::F16);
+        let f16_vec = open_reader(&f16_tmp);
+        DenseIndex::build(&f16_vec, HnswParams::default())
+            .unwrap()
+            .dump_to(f16_tmp.path())
+            .unwrap();
+        let f16_data = std::fs::metadata(f16_tmp.path().join("dense.hnsw.data"))
+            .unwrap()
+            .len();
+
+        let int8_tmp =
+            build_test_vectors_quant(dim, n, crate::knowledge::vectors::VectorQuant::Int8);
+        let int8_vec = open_reader(&int8_tmp);
+        DenseIndex::build(&int8_vec, HnswParams::default())
+            .unwrap()
+            .dump_to(int8_tmp.path())
+            .unwrap();
+        let int8_data = std::fs::metadata(int8_tmp.path().join("dense.hnsw.data"))
+            .unwrap()
+            .len();
+
+        let ratio = int8_data as f64 / f16_data as f64;
+        assert!(
+            ratio < 0.7,
+            "int8 dense.hnsw.data ({int8_data}) should be < 70% of f16 ({f16_data}); got ratio={ratio:.3}",
+        );
+    }
+
+    #[test]
+    fn load_from_with_positions_int8_roundtrips() {
+        // Resume path for int8 backend.
+        let tmp = build_test_vectors_quant(8, 20, crate::knowledge::vectors::VectorQuant::Int8);
+        let vectors = open_reader(&tmp);
+        let built = DenseIndex::build(&vectors, HnswParams::default()).unwrap();
+        built.dump_to(tmp.path()).unwrap();
+
+        let mut pairs: Vec<(u64, ChunkId)> = vectors
+            .iter_chunk_positions()
+            .map(|(id, pos)| (pos, id))
+            .collect();
+        pairs.sort_by_key(|(pos, _)| *pos);
+        let by_position: Vec<ChunkId> = pairs.into_iter().map(|(_, id)| id).collect();
+
+        let loaded =
+            DenseIndex::load_from_with_positions(tmp.path(), by_position, DenseQuant::Int8)
+                .unwrap();
+        assert_eq!(loaded.quant(), DenseQuant::Int8);
+        assert_eq!(loaded.int8_scale(), built.int8_scale());
+
+        let mut q = vec![0.0f32; 8];
+        q[3] = 4.0;
+        let from_built = built.search(&q, 1);
+        let from_loaded = loaded.search(&q, 1);
+        assert_eq!(from_built[0].0, from_loaded[0].0);
+    }
+
+    #[test]
+    fn load_from_int8_missing_sidecar_returns_error() {
+        // Build + dump int8, then delete the sidecar — load_from must
+        // error out so the registry's load-or-rebuild fallback kicks in.
+        let tmp = build_test_vectors_quant(8, 20, crate::knowledge::vectors::VectorQuant::Int8);
+        let vectors = open_reader(&tmp);
+        let built = DenseIndex::build(&vectors, HnswParams::default()).unwrap();
+        built.dump_to(tmp.path()).unwrap();
+
+        std::fs::remove_file(tmp.path().join("dense.int8_scale")).unwrap();
+
+        let err = DenseIndex::load_from(tmp.path(), &vectors).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("int8 scale sidecar"),
+            "unexpected error: {msg}",
+        );
     }
 }

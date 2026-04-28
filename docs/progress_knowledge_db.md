@@ -53,6 +53,7 @@ Last updated: **2026-04-28**.
 | KM  | `knowledge_modify` — LLM-callable insert/tombstone for managed buckets, EmptySource bootstrap, scope-gated | `efeebb7..591ad65` |
 | MQ  | Multi-bucket query fan-out — `join_all` across per-bucket dense+sparse futures; max-of-per-bucket latency | `a5ff7d2` |
 | HQ  | HNSW-side f16 quantization — `DistF16L2`, enum-dispatched `DenseInner::{F32, F16}`, plumbed through `DenseIndex::{empty, build, load_from*}`. Halves `dense.hnsw.data` for any quantized bucket. Drive-by: resume rebuild path stride bug (was hardcoded f32) | `0a29cb8` |
+| HQ8 | HNSW-side int8 quantization — `DistInt8L2` (i32 arithmetic, scale-cancels-out), `DenseInner::Int8` with calibrated dataset-wide scale, `dense.int8_scale` sidecar. Quarters `dense.hnsw.data` for int8 buckets vs f32. First-batch calibration in the streaming build path; first-256-sample calibration in `DenseIndex::build` and the resume rebuild path. | _pending_ |
 
 ## End-to-end validation (Simple English Wikipedia, mock embedder)
 
@@ -217,7 +218,6 @@ chronological — order may shuffle as the dataset reveals what hurts.
 | 10+ | Auto-compaction triggers (delta-ratio / tombstone-ratio thresholds, scheduled) | `Bucket::compact` is callable manually; auto-trigger heuristics still TBD. Real thresholds need observation on actual mutating buckets; should also have time-based triggers (e.g. compact pod memory daily). |
 | 10+ | Live-mode post-turn relevance nudge                            | Per design doc § "Live retrieval mode". Cross-cuts scheduler — not load-bearing for v1. |
 | 10+ | Per-pod buckets (`<pods_root>/<pod>/buckets/`)                 | Server-scope is enough until multi-pod isolation is a felt need. Today's `BucketScope::Pod` enum variant is unwired. |
-| 10+ | int8 in HNSW data (dataset-wide shared scale)                  | f16 in HNSW landed in slice `HQ`; further halving for int8 buckets requires a shared scale (per-vector scale doesn't fit hnsw_rs's typed `T`). Would quarter `dense.hnsw.data` for int8 buckets vs f32. Manifest schema bump + `VectorStoreWriter::create` shared-scale codepath. Open question: does int8-everywhere cost more recall than f16-everywhere? Worth measuring before investing in the shared-scale codepath. |
 
 ## Dangling cleanup (none blocking)
 

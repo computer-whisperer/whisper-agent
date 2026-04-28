@@ -991,6 +991,28 @@ impl DiskBucket {
                         let mut bin =
                             std::fs::File::open(&bin_path_for_thread).map_err(BucketError::Io)?;
                         use std::io::{Read, Seek, SeekFrom};
+
+                        // Int8 backend: first-pass calibration over up
+                        // to 256 sample vectors before inserting any.
+                        // Mirrors `DenseIndex::build`'s sampling logic.
+                        if resume_dense_quant == super::dense::DenseQuant::Int8 {
+                            let sample_n = chunk_ids.len().min(256);
+                            let mut samples: Vec<Vec<f32>> = Vec::with_capacity(sample_n);
+                            for position in 0..sample_n {
+                                let byte_offset =
+                                    super::vectors::HEADER_SIZE + position as u64 * stride as u64;
+                                bin.seek(SeekFrom::Start(byte_offset))
+                                    .map_err(BucketError::Io)?;
+                                let mut bytes = vec![0u8; stride];
+                                bin.read_exact(&mut bytes).map_err(BucketError::Io)?;
+                                samples.push(super::vectors::dequantize_record(
+                                    &bytes, vec_quant, dim,
+                                ));
+                            }
+                            let scale = super::dense::calibrate_int8_scale(&samples);
+                            dense.set_int8_scale(scale)?;
+                        }
+
                         for (position, chunk_id) in chunk_ids.iter().enumerate() {
                             let byte_offset =
                                 super::vectors::HEADER_SIZE + position as u64 * stride as u64;
@@ -1301,6 +1323,21 @@ impl DiskBucket {
         // and exits.
         let writer_fut = async {
             while let Some(batch) = embedded_rx.recv().await {
+                // Int8 calibration: the streaming build only knows
+                // the f32→i8 scale once the first batch of real
+                // vectors lands, so we calibrate from this batch
+                // before the first dense.insert. Resume reuses the
+                // scale that was persisted in the sidecar (already
+                // installed via `load_from_with_positions` upstream).
+                if dense.quant() == super::dense::DenseQuant::Int8 && dense.int8_scale().is_none() {
+                    let scale = super::dense::calibrate_int8_scale(&batch.embeddings);
+                    dense.set_int8_scale(scale)?;
+                    tracing::info!(
+                        slot = %slot_id,
+                        scale,
+                        "int8 dense backend calibrated from first batch",
+                    );
+                }
                 let base_position = chunks_emitted;
                 let meta = apply_embedded_batch(
                     batch,
@@ -2484,11 +2521,20 @@ fn compact_into_new_slot(
     };
     // Generous size hint: surviving count is bounded above by base +
     // delta. Over-estimate is cheap. Dense backend follows the
-    // bucket's vectors.bin quantization (f32 → f32, f16/int8 → f16).
+    // bucket's vectors.bin quantization.
     let dense_hint = old.dense.len();
     let dense_quant =
         super::dense::DenseQuant::from_vector_quant(old.manifest.serving.quantization.into());
     let dense = DenseIndex::empty(dense_quant, HnswParams::default(), dense_hint);
+    // Int8 dense backend: reuse the old slot's calibration scale.
+    // Compact filters by tombstones but doesn't change the underlying
+    // value distribution; the same scale stays correct (and reusing
+    // it is cheaper than re-scanning the surviving set to recalibrate).
+    if dense_quant == super::dense::DenseQuant::Int8
+        && let Some(scale) = old.dense.int8_scale()
+    {
+        dense.set_int8_scale(scale)?;
+    }
 
     let base_vectors = old
         .vectors
