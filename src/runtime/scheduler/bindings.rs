@@ -127,6 +127,44 @@ pub(super) fn resolve_bindings_choice(
     })
 }
 
+/// Narrow already-resolved bindings against a scope filter. Used by
+/// top-level paths that supply a `base_scope_override` (behaviors,
+/// auto-compaction continuations) to enforce the same "bindings ⊆
+/// scope" invariant `resolve_bindings_choice` enforces for dispatched
+/// children via `parent_scope`.
+///
+/// Filter semantics differ from `parent_scope`'s reject semantics:
+/// pod defaults that exceed a behavior's narrower `[scope]` are
+/// quietly dropped (the `[scope]` block is the canonical narrower —
+/// authors shouldn't need to repeat themselves in `[thread.bindings]`).
+/// Backend is the exception: it's singular, so an out-of-scope pick
+/// can't be silently filtered and is returned as `Err`.
+pub(super) fn narrow_resolved_bindings_to_scope(
+    resolved: &mut ResolvedBindings,
+    scope_filter: &Scope,
+) -> Result<(), String> {
+    resolved.host_env.retain(|b| match b {
+        HostEnvBinding::Named { name } => scope_filter.host_envs.admits(name),
+        // Inline bindings have no catalog name to gate on a
+        // `SetOrAll<String>`; `resolve_bindings_choice` only ever
+        // emits `Named` from the top-level path, so this arm is
+        // defensive cover for future changes.
+        HostEnvBinding::Inline { .. } => true,
+    });
+    resolved
+        .shared_host_names
+        .retain(|n| scope_filter.mcp_hosts.admits(n));
+    if !resolved.backend_name.is_empty() && !scope_filter.backends.admits(&resolved.backend_name) {
+        return Err(format!(
+            "backend `{}` not in scope.backends — declare \
+             `[thread.bindings] backend = ...` on the behavior to pick \
+             a backend its scope admits",
+            resolved.backend_name,
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -261,5 +299,66 @@ mod tests {
         let r = resolve_bindings_choice(&pod, Some(req), Some(&parent)).unwrap();
         assert_eq!(r.backend_name, "anthropic");
         assert_eq!(r.shared_host_names, vec!["search".to_string()]);
+    }
+
+    #[test]
+    fn behavior_scope_filter_drops_pod_default_mcp_hosts() {
+        // The original bug: a behavior with `[scope] mcp_hosts = []`
+        // inherits the pod's default shared-MCP list because the
+        // behavior fire path doesn't narrow bindings. The helper
+        // covers that gap by filtering pod-defaults that exceed the
+        // scope.
+        let pod = pod_with_two_backends_and_two_envs();
+        let mut resolved = resolve_bindings_choice(&pod, None, None).unwrap();
+        assert_eq!(resolved.shared_host_names, vec!["fetch".to_string()]);
+        let scope = parent_scope_only(&["anthropic"], &["wide"], &[]);
+        narrow_resolved_bindings_to_scope(&mut resolved, &scope).unwrap();
+        assert!(resolved.shared_host_names.is_empty());
+    }
+
+    #[test]
+    fn behavior_scope_filter_drops_out_of_scope_host_envs() {
+        let pod = pod_with_two_backends_and_two_envs();
+        let mut resolved = resolve_bindings_choice(
+            &pod,
+            Some(ThreadBindingsRequest {
+                backend: None,
+                host_env: Some(vec!["wide".into(), "narrow".into()]),
+                mcp_hosts: None,
+            }),
+            None,
+        )
+        .unwrap();
+        let scope = parent_scope_only(&["anthropic"], &["narrow"], &["fetch"]);
+        narrow_resolved_bindings_to_scope(&mut resolved, &scope).unwrap();
+        assert_eq!(resolved.host_env.len(), 1);
+        assert!(matches!(
+            &resolved.host_env[0],
+            HostEnvBinding::Named { name } if name == "narrow"
+        ));
+    }
+
+    #[test]
+    fn behavior_scope_filter_errors_on_out_of_scope_backend() {
+        // Backend is singular — silent filter would leave the thread
+        // with no backend, which is worse than a clear error pointing
+        // the author at the conflict.
+        let pod = pod_with_two_backends_and_two_envs();
+        let mut resolved = resolve_bindings_choice(&pod, None, None).unwrap();
+        assert_eq!(resolved.backend_name, "anthropic");
+        let scope = parent_scope_only(&["openai"], &["wide"], &["fetch"]);
+        let err = narrow_resolved_bindings_to_scope(&mut resolved, &scope).unwrap_err();
+        assert!(err.contains("scope.backends"), "err was: {err}");
+    }
+
+    #[test]
+    fn behavior_scope_filter_passes_when_bindings_within_scope() {
+        let pod = pod_with_two_backends_and_two_envs();
+        let mut resolved = resolve_bindings_choice(&pod, None, None).unwrap();
+        let scope = parent_scope_only(&["anthropic"], &["wide"], &["fetch"]);
+        narrow_resolved_bindings_to_scope(&mut resolved, &scope).unwrap();
+        assert_eq!(resolved.backend_name, "anthropic");
+        assert_eq!(resolved.host_env.len(), 1);
+        assert_eq!(resolved.shared_host_names, vec!["fetch".to_string()]);
     }
 }

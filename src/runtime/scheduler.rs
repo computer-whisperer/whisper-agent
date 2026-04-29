@@ -34,7 +34,7 @@ mod triggers;
 
 pub use self::thread_config::build_default_pod_config;
 
-use self::bindings::resolve_bindings_choice;
+use self::bindings::{narrow_resolved_bindings_to_scope, resolve_bindings_choice};
 use self::retention::{RetentionAction, archive_thread_json, delete_thread_json};
 use self::thread_config::{apply_config_override, base_thread_config_from_pod};
 
@@ -2119,6 +2119,25 @@ impl Scheduler {
             return out;
         };
         for binding in &task.bindings.host_env {
+            // Defense in depth: skip bound host-envs the thread's
+            // current scope doesn't admit. `create_task` already
+            // narrows bindings against scope at thread-creation time
+            // (and `resolve_bindings_choice` enforces it for
+            // dispatched children), so this is normally a no-op —
+            // it catches paths that bypass the create-time narrowing
+            // (e.g. a future code path that mutates bindings
+            // post-create) without the bound MCP's tools showing up
+            // in the listing or being routable.
+            let admitted = match binding {
+                HostEnvBinding::Named { name } => task.scope.host_envs.admits(name),
+                // Inline bindings have no catalog name to gate on a
+                // `SetOrAll<String>`; rely on the create-time path to
+                // keep them in scope.
+                HostEnvBinding::Inline { .. } => true,
+            };
+            if !admitted {
+                continue;
+            }
             let Some((provider, spec)) = self.resolve_binding(&task.pod_id, binding) else {
                 continue;
             };
@@ -2139,6 +2158,10 @@ impl Scheduler {
             });
         }
         for name in &task.bindings.mcp_hosts {
+            // Same defense-in-depth gate as above for shared MCP hosts.
+            if !task.scope.mcp_hosts.admits(name) {
+                continue;
+            }
             let id = McpHostId::shared(name);
             if let Some(entry) = self.resources.mcp_hosts.get(&id) {
                 // Resolve the effective prefix from the catalog. CLI
@@ -2747,7 +2770,20 @@ impl Scheduler {
             .as_ref()
             .and_then(|(parent_id, _)| self.tasks.get(parent_id))
             .map(|p| p.scope.clone());
-        let resolved = resolve_bindings_choice(pod, bindings_request, parent_scope.as_ref())?;
+        let mut resolved = resolve_bindings_choice(pod, bindings_request, parent_scope.as_ref())?;
+        // Top-level paths that supply a `base_scope_override` (behavior
+        // fires, primarily) need bindings narrowed against the override
+        // for the same "bindings ⊆ scope" invariant
+        // `resolve_bindings_choice` enforces for dispatched children
+        // via `parent_scope`. Without this, a behavior with `[scope]
+        // mcp_hosts = []` still inherits the pod's default shared-MCP
+        // list and the runtime tool listing exposes every tool from
+        // every bound host.
+        if dispatched_by_parent.is_none()
+            && let Some(scope_filter) = base_scope_override.as_ref()
+        {
+            narrow_resolved_bindings_to_scope(&mut resolved, scope_filter)?;
+        }
         // Validate shared MCP host names against the server catalog too —
         // a name allowed by the pod but not actually wired up at the server
         // is a misconfiguration we want to surface at create-time.
