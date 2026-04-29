@@ -130,14 +130,7 @@ pub(super) fn render_item(
                 text,
                 msg_index,
                 attachments,
-            } => {
-                if render_user(ui, cache, text, attachments, *msg_index, hovered_prev_frame) {
-                    event = Some(ChatItemEvent::ForkRequested {
-                        msg_index: *msg_index,
-                        seed_text: text.clone(),
-                    });
-                }
-            }
+            } => render_user(ui, cache, text, attachments, *msg_index),
             DisplayItem::AssistantText { text } => render_assistant_text(ui, cache, text),
             DisplayItem::AssistantImage { source } => render_assistant_image(ui, idx, source),
             DisplayItem::Reasoning { text } => {
@@ -197,12 +190,26 @@ pub(super) fn render_item(
     let gutter_rect = egui::Rect::from_min_max(r.min, egui::pos2(r.min.x + GUTTER_WIDTH, r.max.y));
     ui.painter().rect_filled(gutter_rect, 0.0, gutter_color);
 
-    // AssistantText has no header to hang controls off of, so the
-    // hover-revealed copy button is overlaid at top-right via `ui.put`.
-    // This avoids a layout shift when the button appears (vs. reserving
-    // a header row that's empty when not hovered).
+    // Hover-revealed row controls are overlaid at top-right via
+    // `ui.put` rather than allocated into the row's layout. Reserving
+    // layout space only when hovered shifts everything below by a few
+    // pixels each time the mouse crosses a row, which read as jitter
+    // when scanning down a long conversation. The overlay anchors to
+    // the row's already-allocated rect, so the row's height is
+    // identical hovered or not.
     if hovered_prev_frame && let DisplayItem::AssistantText { text } = item {
         overlay_copy_button(ui, r, text, ("assistant-copy", idx));
+    }
+    if hovered_prev_frame
+        && let DisplayItem::User {
+            text, msg_index, ..
+        } = item
+        && overlay_user_actions(ui, r, text, ("user", *msg_index))
+    {
+        event = Some(ChatItemEvent::ForkRequested {
+            msg_index: *msg_index,
+            seed_text: text.clone(),
+        });
     }
 
     // Persist hover for next frame; repaint on the edge so the
@@ -251,73 +258,80 @@ fn overlay_copy_button(
     }
 }
 
-/// Returns `true` when the user clicked the hover-reveal "fork" button on
-/// this row. `row_hovered` controls whether the button is drawn — when
-/// false we don't reserve space for it, so non-hovered rows stay visually
-/// quiet.
+/// Hover-revealed fork + copy controls for a User row, anchored to
+/// the top-right of `frame_rect`. Returns `true` when the fork button
+/// was clicked this frame; copy is handled internally. Same overlay
+/// approach as [`overlay_copy_button`] — rendered via `ui.put`, so
+/// non-hovered rows don't reserve any layout space for the buttons.
+fn overlay_user_actions(
+    ui: &mut egui::Ui,
+    frame_rect: egui::Rect,
+    text: &str,
+    id_source: (&'static str, usize),
+) -> bool {
+    let clip_right = ui.clip_rect().right();
+    let right = clip_right.min(frame_rect.right()) - 8.0;
+    let top = frame_rect.top() + 4.0;
+    let height = ui.spacing().interact_size.y;
+    let copy_size = egui::vec2(40.0, height);
+    let fork_size = egui::vec2(60.0, height);
+    let gap = 4.0;
+    let copy_rect = egui::Rect::from_min_size(egui::pos2(right - copy_size.x, top), copy_size);
+    let fork_rect = egui::Rect::from_min_size(
+        egui::pos2(copy_rect.left() - gap - fork_size.x, top),
+        fork_size,
+    );
+    let mut fork_clicked = false;
+    let mut copy_clicked = false;
+    ui.push_id(id_source, |ui| {
+        let fork_btn = egui::Button::new(
+            RichText::new("⑂ fork")
+                .color(Color32::from_gray(160))
+                .small(),
+        )
+        .frame(false);
+        if ui
+            .put(fork_rect, fork_btn)
+            .on_hover_text("Fork a new thread starting from this message")
+            .clicked()
+        {
+            fork_clicked = true;
+        }
+        let copy_btn =
+            egui::Button::new(RichText::new("copy").color(Color32::from_gray(160)).small())
+                .frame(false);
+        if ui
+            .put(copy_rect, copy_btn)
+            .on_hover_text("Copy this message's text to clipboard")
+            .clicked()
+        {
+            copy_clicked = true;
+        }
+    });
+    if copy_clicked {
+        ui.ctx().copy_text(text.to_string());
+    }
+    fork_clicked
+}
+
 fn render_user(
     ui: &mut egui::Ui,
     cache: &mut CommonMarkCache,
     text: &str,
     attachments: &[Attachment],
     msg_index: usize,
-    row_hovered: bool,
-) -> bool {
+) {
     // Role label sits above the body rather than inline so a multi-line
     // markdown body (code block, list, blockquote) doesn't wrap awkwardly
     // around the "USER" chip the way horizontal_wrapped would force.
-    let mut fork_clicked = false;
-    ui.horizontal(|ui| {
-        ui.label(RichText::new("USER").color(COLOR_USER).strong().small());
-        if row_hovered {
-            // Anchor the chips to the scroll viewport's right edge, not
-            // the frame's. A non-wrapping markdown child (wide code
-            // block, long URL) pushes the frame wider than the viewport
-            // so a plain right-to-left layout lands the buttons in the
-            // clipped region off-screen.
-            let clip_right = ui.clip_rect().right();
-            let cursor_x = ui.cursor().min.x;
-            let budget = (clip_right - cursor_x).max(0.0);
-            if budget > 0.0 {
-                let height = ui.spacing().interact_size.y;
-                ui.allocate_ui_with_layout(
-                    egui::vec2(budget, height),
-                    egui::Layout::right_to_left(egui::Align::Center),
-                    |ui| {
-                        let fork_btn = egui::Button::new(
-                            RichText::new("⑂ fork")
-                                .color(Color32::from_gray(160))
-                                .small(),
-                        )
-                        .frame(false);
-                        if ui
-                            .add(fork_btn)
-                            .on_hover_text("Fork a new thread starting from this message")
-                            .clicked()
-                        {
-                            fork_clicked = true;
-                        }
-                        let copy_btn = egui::Button::new(
-                            RichText::new("copy").color(Color32::from_gray(160)).small(),
-                        )
-                        .frame(false);
-                        if ui
-                            .add(copy_btn)
-                            .on_hover_text("Copy this message's text to clipboard")
-                            .clicked()
-                        {
-                            ui.ctx().copy_text(text.to_string());
-                        }
-                    },
-                );
-            }
-        }
-    });
+    // Hover-revealed fork/copy controls are not drawn here — they're
+    // overlaid by `render_item` after `frame.show` returns, so the row
+    // height is constant regardless of hover state.
+    ui.label(RichText::new("USER").color(COLOR_USER).strong().small());
     if !text.is_empty() {
         render_markdown(ui, cache, ("user", text), text);
     }
     render_user_attachments(ui, attachments, msg_index);
-    fork_clicked
 }
 
 /// Inline thumbnail strip for the image attachments that travelled
