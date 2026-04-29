@@ -41,6 +41,12 @@ pub struct OpenAiChatClient {
     http: reqwest::Client,
     base_url: String,
     api_key: Option<String>,
+    /// Set on streaming requests to ask the server to inline a
+    /// `prompt_progress` field on chunks during prefill. llama.cpp >= b8914
+    /// honors this; OpenAI proper and other compat servers ignore unknown
+    /// request fields, so leaving it on by default would still be safe —
+    /// but driver-specific opt-in keeps the request body honest.
+    request_prompt_progress: bool,
 }
 
 impl OpenAiChatClient {
@@ -52,7 +58,17 @@ impl OpenAiChatClient {
             http: reqwest::Client::new(),
             base_url,
             api_key,
+            request_prompt_progress: false,
         }
+    }
+
+    /// Enable llama.cpp's `return_progress: true` on streaming requests so
+    /// the SSE chunks carry inline `prompt_progress` and the consume path
+    /// can lift them into [`ModelEvent::PrefillProgress`]. Used by
+    /// [`crate::providers::llamacpp::LlamaCppClient`].
+    pub fn with_prompt_progress(mut self) -> Self {
+        self.request_prompt_progress = true;
+        self
     }
 
     fn apply_auth(&self, builder: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
@@ -90,6 +106,7 @@ impl OpenAiChatClient {
             tools: if tools.is_empty() { None } else { Some(tools) },
             stream: None,
             stream_options: None,
+            return_progress: None,
         };
 
         let url = format!("{}/chat/completions", self.base_url);
@@ -201,6 +218,7 @@ impl OpenAiChatClient {
                 tools: if tools.is_empty() { None } else { Some(tools) },
                 stream: Some(true),
                 stream_options: Some(OaStreamOptions { include_usage: true }),
+                return_progress: if self.request_prompt_progress { Some(true) } else { None },
             };
 
             let url = format!("{}/chat/completions", self.base_url);
@@ -760,6 +778,11 @@ struct OaRequest<'a> {
     /// empty `choices` and a populated `usage` object.
     #[serde(skip_serializing_if = "Option::is_none")]
     stream_options: Option<OaStreamOptions>,
+    /// llama.cpp-specific (b8914+): when streaming, request inline
+    /// `prompt_progress` chunks during prefill. Other compat servers
+    /// silently ignore the field.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    return_progress: Option<bool>,
 }
 
 #[derive(Serialize, Debug)]
@@ -1010,6 +1033,28 @@ struct OaStreamEvent {
     choices: Vec<OaStreamChoice>,
     #[serde(default)]
     usage: Option<OaUsage>,
+    /// llama.cpp prefill heartbeat (b8914+). Present on chunks emitted
+    /// during prompt processing when the request set `return_progress`.
+    /// Other compat servers never emit this; the field stays absent.
+    #[serde(default)]
+    prompt_progress: Option<OaPromptProgress>,
+}
+
+/// Inline prefill progress payload (llama.cpp-specific). The four fields
+/// match `result_prompt_progress::to_json` upstream. We surface only
+/// `processed` and `total` to the rest of the pipeline; `cache` and
+/// `time_ms` are tracked here for future use (a "real progress" bar that
+/// excludes already-cached tokens) but currently unused.
+#[derive(Deserialize, Debug)]
+struct OaPromptProgress {
+    total: u32,
+    #[serde(default)]
+    #[allow(dead_code)]
+    cache: u32,
+    processed: u32,
+    #[serde(default)]
+    #[allow(dead_code)]
+    time_ms: u64,
 }
 
 #[derive(Deserialize, Debug)]
@@ -1096,6 +1141,19 @@ impl ChatStreamState {
         let mut out = Vec::new();
         if let Some(u) = ev.usage {
             self.usage = Some(u);
+        }
+        if let Some(progress) = ev.prompt_progress {
+            // The `processed/total` ratio includes cache hits as
+            // already-done; that matches what users intuit a prefill
+            // progress bar to mean. Suppress nonsensical readings
+            // (zero total, processed > total) so a strange server
+            // response doesn't crash the bar.
+            if progress.total > 0 && progress.processed <= progress.total {
+                out.push(ModelEvent::PrefillProgress {
+                    tokens_processed: progress.processed,
+                    tokens_total: progress.total,
+                });
+            }
         }
         for choice in ev.choices {
             if let Some(delta) = choice.delta {
@@ -1743,6 +1801,68 @@ mod tests {
             }
             _ => panic!("expected Completed, got {last:?}"),
         }
+    }
+
+    #[test]
+    fn streaming_prompt_progress_emits_prefill_events() {
+        // Real chunk shape captured from llama.cpp b8914 with
+        // `return_progress: true` set on the request. The empty-delta
+        // role frame on the first chunk carries the first progress
+        // sample; subsequent chunks carry incrementing `processed`
+        // values up to `total`. Source: tools/server/server-task.cpp
+        // result_prompt_progress::to_json.
+        let frames = [
+            r#"{"choices":[{"delta":{"role":"assistant","content":null}}],"prompt_progress":{"total":1000,"cache":0,"processed":0,"time_ms":3}}"#,
+            r#"{"choices":[{"delta":{"role":"assistant","content":null}}],"prompt_progress":{"total":1000,"cache":0,"processed":512,"time_ms":250}}"#,
+            r#"{"choices":[{"delta":{"role":"assistant","content":null}}],"prompt_progress":{"total":1000,"cache":0,"processed":1000,"time_ms":500}}"#,
+            r#"{"choices":[{"delta":{"content":"Hi"}}]}"#,
+            r#"{"choices":[{"delta":{},"finish_reason":"stop"}]}"#,
+            "[DONE]",
+        ];
+        let events = drive_stream(&frames);
+        let progress: Vec<(u32, u32)> = events
+            .iter()
+            .filter_map(|e| match e {
+                ModelEvent::PrefillProgress {
+                    tokens_processed,
+                    tokens_total,
+                } => Some((*tokens_processed, *tokens_total)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(progress, vec![(0, 1000), (512, 1000), (1000, 1000)]);
+        // Text delta still flows through cleanly after the progress
+        // chunks — i.e. `prompt_progress` doesn't suppress the
+        // accompanying choice delta.
+        let deltas: Vec<&str> = events
+            .iter()
+            .filter_map(|e| match e {
+                ModelEvent::TextDelta { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(deltas, vec!["Hi"]);
+    }
+
+    #[test]
+    fn streaming_prompt_progress_skips_nonsensical_readings() {
+        // A server response with `total: 0` (or `processed > total`)
+        // would produce a divide-by-zero or >100% bar. consume() drops
+        // those silently so the UI doesn't show garbage.
+        let frames = [
+            r#"{"choices":[{"delta":{"role":"assistant"}}],"prompt_progress":{"total":0,"cache":0,"processed":0,"time_ms":0}}"#,
+            r#"{"choices":[{"delta":{"role":"assistant"}}],"prompt_progress":{"total":100,"cache":0,"processed":150,"time_ms":1}}"#,
+            r#"{"choices":[{"delta":{"content":"x"}}]}"#,
+            r#"{"choices":[{"delta":{},"finish_reason":"stop"}]}"#,
+            "[DONE]",
+        ];
+        let events = drive_stream(&frames);
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, ModelEvent::PrefillProgress { .. })),
+            "no PrefillProgress events should fire on bad readings; got {events:?}"
+        );
     }
 
     #[test]
