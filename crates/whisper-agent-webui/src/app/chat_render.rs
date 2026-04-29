@@ -115,6 +115,9 @@ pub(super) fn render_item(
         DisplayItem::AssistantText { .. } => {
             Some(ui.make_persistent_id(("chat-row-hover", "assistant", idx)))
         }
+        DisplayItem::Reasoning { .. } => {
+            Some(ui.make_persistent_id(("chat-row-hover", "reasoning", idx)))
+        }
         _ => None,
     };
     let hovered_prev_frame = row_hover_id
@@ -200,6 +203,9 @@ pub(super) fn render_item(
     if hovered_prev_frame && let DisplayItem::AssistantText { text } = item {
         overlay_copy_button(ui, r, text, ("assistant-copy", idx));
     }
+    if hovered_prev_frame && let DisplayItem::Reasoning { text } = item {
+        overlay_copy_button(ui, r, text, ("reasoning-copy", idx));
+    }
     if hovered_prev_frame
         && let DisplayItem::User {
             text, msg_index, ..
@@ -228,8 +234,19 @@ pub(super) fn render_item(
 /// Draw a small "copy" button anchored to the top-right of `frame_rect`
 /// (clamped to the scroll viewport's clip rect so a too-wide row can't
 /// push it off-screen) that copies `text` to the clipboard on click.
-/// `id_source` scopes the inner widget id so multiple overlay buttons
-/// (one per row) don't collide on a shared call-site id.
+/// `id_source` scopes the Area's id so per-row overlays don't collide.
+///
+/// Rendered as a foreground `egui::Area` rather than `ui.put`. `ui.put`
+/// runs through `Ui::scope_dyn`, which calls `advance_cursor_after_rect`
+/// on the parent — and for top-down layouts that path *unconditionally*
+/// sets `cursor.min.y = widget_rect.max.y + spacing` (egui 0.34
+/// `layout.rs:758`), regressing the parent's cursor when the overlay
+/// rect's bottom is above the parent's current cursor (which is the
+/// case after `frame.show()` returns for any non-trivial chat row).
+/// The next item then renders at the regressed y, overlapping the
+/// previous frame and producing visible jitter as the mouse scans
+/// across rows. `Area` is decoupled from any parent placer, so the
+/// chat ScrollArea's cursor is left untouched.
 fn overlay_copy_button(
     ui: &mut egui::Ui,
     frame_rect: egui::Rect,
@@ -240,20 +257,22 @@ fn overlay_copy_button(
     let right = clip_right.min(frame_rect.right()) - 8.0;
     let top = frame_rect.top() + 4.0;
     let size = egui::vec2(40.0, ui.spacing().interact_size.y);
-    let btn_rect = egui::Rect::from_min_size(egui::pos2(right - size.x, top), size);
-    let btn = egui::Button::new(RichText::new("copy").color(Color32::from_gray(160)).small())
-        .frame(false);
-    let mut clicked = false;
-    ui.push_id(id_source, |ui| {
-        if ui
-            .put(btn_rect, btn)
+    let pos = egui::pos2(right - size.x, top);
+    let area_id = ui.id().with(id_source);
+    let resp = egui::Area::new(area_id)
+        .order(egui::Order::Foreground)
+        .fixed_pos(pos)
+        .interactable(true)
+        .show(ui.ctx(), |ui| {
+            ui.add_sized(
+                size,
+                egui::Button::new(RichText::new("copy").color(Color32::from_gray(160)).small())
+                    .frame(false),
+            )
             .on_hover_text("Copy this turn's text to clipboard")
-            .clicked()
-        {
-            clicked = true;
-        }
-    });
-    if clicked {
+        })
+        .inner;
+    if resp.clicked() {
         ui.ctx().copy_text(text.to_string());
     }
 }
@@ -261,8 +280,8 @@ fn overlay_copy_button(
 /// Hover-revealed fork + copy controls for a User row, anchored to
 /// the top-right of `frame_rect`. Returns `true` when the fork button
 /// was clicked this frame; copy is handled internally. Same overlay
-/// approach as [`overlay_copy_button`] — rendered via `ui.put`, so
-/// non-hovered rows don't reserve any layout space for the buttons.
+/// approach as [`overlay_copy_button`] — see that function's doc for
+/// why we use `Area` rather than `ui.put`.
 fn overlay_user_actions(
     ui: &mut egui::Ui,
     frame_rect: egui::Rect,
@@ -276,38 +295,44 @@ fn overlay_user_actions(
     let copy_size = egui::vec2(40.0, height);
     let fork_size = egui::vec2(60.0, height);
     let gap = 4.0;
-    let copy_rect = egui::Rect::from_min_size(egui::pos2(right - copy_size.x, top), copy_size);
-    let fork_rect = egui::Rect::from_min_size(
-        egui::pos2(copy_rect.left() - gap - fork_size.x, top),
-        fork_size,
-    );
-    let mut fork_clicked = false;
-    let mut copy_clicked = false;
-    ui.push_id(id_source, |ui| {
-        let fork_btn = egui::Button::new(
-            RichText::new("⑂ fork")
-                .color(Color32::from_gray(160))
-                .small(),
-        )
-        .frame(false);
-        if ui
-            .put(fork_rect, fork_btn)
-            .on_hover_text("Fork a new thread starting from this message")
-            .clicked()
-        {
-            fork_clicked = true;
-        }
-        let copy_btn =
-            egui::Button::new(RichText::new("copy").color(Color32::from_gray(160)).small())
-                .frame(false);
-        if ui
-            .put(copy_rect, copy_btn)
-            .on_hover_text("Copy this message's text to clipboard")
-            .clicked()
-        {
-            copy_clicked = true;
-        }
-    });
+    // Position the Area at the fork button's top-left; the inner
+    // horizontal layout then places fork-then-copy left-to-right.
+    let pos = egui::pos2(right - copy_size.x - gap - fork_size.x, top);
+    let area_id = ui.id().with(id_source);
+    let (fork_clicked, copy_clicked) = egui::Area::new(area_id)
+        .order(egui::Order::Foreground)
+        .fixed_pos(pos)
+        .interactable(true)
+        .show(ui.ctx(), |ui| {
+            ui.spacing_mut().item_spacing.x = gap;
+            ui.horizontal(|ui| {
+                let fork_clicked = ui
+                    .add_sized(
+                        fork_size,
+                        egui::Button::new(
+                            RichText::new("⑂ fork")
+                                .color(Color32::from_gray(160))
+                                .small(),
+                        )
+                        .frame(false),
+                    )
+                    .on_hover_text("Fork a new thread starting from this message")
+                    .clicked();
+                let copy_clicked = ui
+                    .add_sized(
+                        copy_size,
+                        egui::Button::new(
+                            RichText::new("copy").color(Color32::from_gray(160)).small(),
+                        )
+                        .frame(false),
+                    )
+                    .on_hover_text("Copy this message's text to clipboard")
+                    .clicked();
+                (fork_clicked, copy_clicked)
+            })
+            .inner
+        })
+        .inner;
     if copy_clicked {
         ui.ctx().copy_text(text.to_string());
     }
@@ -463,6 +488,10 @@ fn render_reasoning(ui: &mut egui::Ui, cache: &mut CommonMarkCache, text: &str, 
     } else {
         preview.to_string()
     };
+    // Copy button is rendered as a hover overlay by `render_item` after
+    // `frame.show()` returns (matches User and AssistantText). The
+    // header here only carries the role badge, streaming spinner, and
+    // one-line preview.
     egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), id, false)
         .show_header(ui, |ui| {
             if streaming {
@@ -481,33 +510,6 @@ fn render_reasoning(ui: &mut egui::Ui, cache: &mut CommonMarkCache, text: &str, 
                     .color(Color32::from_gray(140))
                     .italics(),
             );
-            // Right-aligned copy button. Anchored to the scroll
-            // viewport's right edge for the same reason as the
-            // user-row controls — a wide preview line could otherwise
-            // push the button off-screen.
-            let clip_right = ui.clip_rect().right();
-            let cursor_x = ui.cursor().min.x;
-            let budget = (clip_right - cursor_x).max(0.0);
-            if budget > 0.0 {
-                let height = ui.spacing().interact_size.y;
-                ui.allocate_ui_with_layout(
-                    egui::vec2(budget, height),
-                    egui::Layout::right_to_left(egui::Align::Center),
-                    |ui| {
-                        let copy_btn = egui::Button::new(
-                            RichText::new("copy").color(Color32::from_gray(160)).small(),
-                        )
-                        .frame(false);
-                        if ui
-                            .add(copy_btn)
-                            .on_hover_text("Copy reasoning text to clipboard")
-                            .clicked()
-                        {
-                            ui.ctx().copy_text(text.to_string());
-                        }
-                    },
-                );
-            }
         })
         .body(|ui| {
             render_markdown(ui, cache, ("reasoning", text), text);
@@ -719,10 +721,13 @@ fn render_tool_call(
     // style output scroll without clicking through. Collapses back to
     // default-closed once the final result lands.
     let default_open = result.is_none() && !streaming_output.is_empty();
-    let (chip_text, chip_color) = match result {
-        None => ("running", Color32::from_rgb(200, 180, 60)),
-        Some(FusedToolResult { is_error: true, .. }) => ("error", COLOR_ERROR),
-        Some(_) => ("ok", Color32::from_rgb(140, 200, 140)),
+    // Successful completed calls don't get a chip — the gray result
+    // preview already says "this didn't error". Only show the chip
+    // for the two states that carry signal: in-flight and failure.
+    let chip = match result {
+        None => Some(("running", Color32::from_rgb(200, 180, 60))),
+        Some(FusedToolResult { is_error: true, .. }) => Some(("error", COLOR_ERROR)),
+        Some(_) => None,
     };
     egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), id, default_open)
         .show_header(ui, |ui| {
@@ -757,9 +762,11 @@ fn render_tool_call(
                         );
                     }
                 }
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.label(RichText::new(chip_text).color(chip_color).small().strong());
-                });
+                if let Some((chip_text, chip_color)) = chip {
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.label(RichText::new(chip_text).color(chip_color).small().strong());
+                    });
+                }
             });
         })
         .body(|ui| {
@@ -841,10 +848,13 @@ fn render_tool_result(
     tool_use_id.hash(&mut hasher);
     text.hash(&mut hasher);
     let id = ui.make_persistent_id(("tool_result", hasher.finish()));
-    let (chip_text, chip_color) = if is_error {
-        ("error", COLOR_ERROR)
+    // Same chip rule as `render_tool_call`: only show the chip when
+    // there's signal to convey. A successful result is implicit from
+    // the gray preview color; only the error case earns a chip.
+    let chip = if is_error {
+        Some(("error", COLOR_ERROR))
     } else {
-        ("ok", Color32::from_rgb(140, 200, 140))
+        None
     };
     let label = if name.is_empty() { "tool_result" } else { name };
     egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), id, false)
@@ -866,9 +876,11 @@ fn render_tool_result(
                             .small(),
                     );
                 }
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.label(RichText::new(chip_text).color(chip_color).small().strong());
-                });
+                if let Some((chip_text, chip_color)) = chip {
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.label(RichText::new(chip_text).color(chip_color).small().strong());
+                    });
+                }
             });
         })
         .body(|ui| {
