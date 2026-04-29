@@ -1580,6 +1580,12 @@ struct SharedMcpEditorState {
     /// The auth kind on the entry when the editor opened, so the UI
     /// can describe the "keep existing auth" option meaningfully.
     auth_kind_on_load: SharedMcpAuthPublic,
+    /// Tool-name prefix override the operator is composing. See
+    /// [`SharedMcpPrefixChoice`] for the wire mapping.
+    prefix_choice: SharedMcpPrefixChoice,
+    /// Staged custom-prefix string. Only consulted when
+    /// `prefix_choice` is `Custom`.
+    prefix_custom: String,
     error: Option<String>,
     pending_correlation: Option<String>,
     /// True while an OAuth flow has been started and the authz URL
@@ -1610,6 +1616,22 @@ enum SharedMcpAuthChoice {
     /// selectable on Add (Edit of an existing OAuth entry routes
     /// token refresh through a separate path, not this form).
     Oauth2,
+}
+
+/// Which prefix variant the user is composing in the editor. Maps to
+/// `SharedMcpPrefixInput` on save — the form always has a concrete
+/// choice (seeded from the catalog on Edit, defaulted to `Default` on
+/// Add), so the wire `Unchanged` value is never emitted from here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SharedMcpPrefixChoice {
+    /// Use the catalog `name` as the tool-name prefix (the default
+    /// for new hosts — model sees `{name}_{tool}`).
+    Default,
+    /// Disable prefixing entirely — the model sees the bare server-side
+    /// tool name. Equivalent to legacy unprefixed shared-MCP behaviour.
+    None,
+    /// Operator-supplied custom prefix string.
+    Custom,
 }
 
 /// Sub-form shown over the Settings modal when the user clicks
@@ -3710,7 +3732,12 @@ impl eframe::App for ChatApp {
                         name,
                     });
                 }
-                SettingsEvent::AddSharedMcpHost { name, url, auth } => {
+                SettingsEvent::AddSharedMcpHost {
+                    name,
+                    url,
+                    auth,
+                    prefix,
+                } => {
                     let correlation = self.next_correlation_id();
                     if let Some(modal) = self.settings_modal.as_mut()
                         && let Some(sub) = modal.shared_mcp_editor.as_mut()
@@ -3722,13 +3749,15 @@ impl eframe::App for ChatApp {
                         name,
                         url,
                         auth,
-                        // Editor doesn't expose prefix yet; server
-                        // resolves `Unchanged` to `Default` (use the
-                        // host name as the prefix) on Add.
-                        prefix: whisper_agent_protocol::SharedMcpPrefixInput::Unchanged,
+                        prefix,
                     });
                 }
-                SettingsEvent::UpdateSharedMcpHost { name, url, auth } => {
+                SettingsEvent::UpdateSharedMcpHost {
+                    name,
+                    url,
+                    auth,
+                    prefix,
+                } => {
                     let correlation = self.next_correlation_id();
                     if let Some(modal) = self.settings_modal.as_mut()
                         && let Some(sub) = modal.shared_mcp_editor.as_mut()
@@ -3740,10 +3769,7 @@ impl eframe::App for ChatApp {
                         name,
                         url,
                         auth,
-                        // Editor doesn't expose prefix yet; `Unchanged`
-                        // tells the server to leave the catalog's
-                        // existing prefix override alone.
-                        prefix: whisper_agent_protocol::SharedMcpPrefixInput::Unchanged,
+                        prefix,
                     });
                 }
                 SettingsEvent::OpenAddProvider => {

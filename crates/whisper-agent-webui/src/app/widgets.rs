@@ -117,6 +117,20 @@ pub(super) fn render_shared_mcp_host_row(
                 .small()
                 .color(Color32::from_gray(170)),
         );
+        ui.label(RichText::new("·").small().color(Color32::from_gray(120)));
+        // Prefix is a three-state in storage but the operator only
+        // needs the rendered shape: <prefix>_<tool>, or "(none)" when
+        // the catalog has explicitly disabled prefixing.
+        let prefix_label = match host.prefix.as_deref() {
+            None => format!("prefix: {}_", host.name),
+            Some("") => "prefix: (none)".to_string(),
+            Some(p) => format!("prefix: {p}_"),
+        };
+        ui.label(
+            RichText::new(prefix_label)
+                .small()
+                .color(Color32::from_gray(170)),
+        );
     });
     if !host.last_error.is_empty() {
         ui.label(

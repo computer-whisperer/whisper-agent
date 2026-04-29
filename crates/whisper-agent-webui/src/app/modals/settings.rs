@@ -15,7 +15,8 @@ use std::collections::{HashMap, HashSet};
 
 use egui::{Color32, RichText, ScrollArea, TextEdit};
 use whisper_agent_protocol::{
-    BackendSummary, HostEnvProviderInfo, SharedMcpAuthInput, SharedMcpAuthPublic, SharedMcpHostInfo,
+    BackendSummary, HostEnvProviderInfo, SharedMcpAuthInput, SharedMcpAuthPublic,
+    SharedMcpHostInfo, SharedMcpPrefixInput,
 };
 
 use super::super::widgets::{
@@ -25,6 +26,7 @@ use super::super::widgets::{
 use super::super::{
     CodexRotateState, ProviderRemovePending, ServerConfigEditorState, SettingsModalState,
     SettingsTab, SharedMcpAuthChoice, SharedMcpEditorMode, SharedMcpEditorState,
+    SharedMcpPrefixChoice,
 };
 
 /// Side-channel actions a `render_settings_modal` call can emit.
@@ -57,6 +59,7 @@ pub(crate) enum SettingsEvent {
         name: String,
         url: String,
         auth: SharedMcpAuthInput,
+        prefix: SharedMcpPrefixInput,
     },
     /// Shared-MCP sub-form: Save clicked in Edit mode. Caller mints
     /// the correlation, stamps it on the sub-form, and dispatches
@@ -65,6 +68,7 @@ pub(crate) enum SettingsEvent {
         name: String,
         url: String,
         auth: Option<SharedMcpAuthInput>,
+        prefix: SharedMcpPrefixInput,
     },
 
     /// Host-env-providers tab: + Add provider clicked.
@@ -189,6 +193,8 @@ pub(crate) fn render_settings_modal(
             bearer: String::new(),
             oauth_scope: String::new(),
             auth_kind_on_load: SharedMcpAuthPublic::None,
+            prefix_choice: SharedMcpPrefixChoice::Default,
+            prefix_custom: String::new(),
             error: None,
             pending_correlation: None,
             oauth_in_flight: false,
@@ -206,6 +212,17 @@ pub(crate) fn render_settings_modal(
             SharedMcpAuthPublic::Bearer => SharedMcpAuthChoice::Bearer,
             SharedMcpAuthPublic::Oauth2 { .. } => SharedMcpAuthChoice::Bearer,
         };
+        // Map the catalog's three-state `Option<String>` to the
+        // editor's choice + buffer. `None` (catalog default) and a
+        // `Some(name)` that exactly matches the host name both render
+        // as `Default` so the operator doesn't see a redundant custom
+        // override that's identical to the default.
+        let (prefix_choice, prefix_custom) = match host.prefix.as_deref() {
+            None => (SharedMcpPrefixChoice::Default, String::new()),
+            Some("") => (SharedMcpPrefixChoice::None, String::new()),
+            Some(p) if p == host.name => (SharedMcpPrefixChoice::Default, String::new()),
+            Some(p) => (SharedMcpPrefixChoice::Custom, p.to_string()),
+        };
         modal.shared_mcp_editor = Some(SharedMcpEditorState {
             mode: SharedMcpEditorMode::Edit,
             name: host.name,
@@ -214,6 +231,8 @@ pub(crate) fn render_settings_modal(
             bearer: String::new(),
             oauth_scope: String::new(),
             auth_kind_on_load: host.auth,
+            prefix_choice,
+            prefix_custom,
             error: None,
             pending_correlation: None,
             oauth_in_flight: false,
@@ -741,6 +760,62 @@ fn render_shared_mcp_editor_subform(
                 }
             }
 
+            ui.add_space(8.0);
+            ui.label(
+                RichText::new("Tool-name prefix")
+                    .small()
+                    .color(Color32::from_gray(170)),
+            );
+            ui.horizontal(|ui| {
+                ui.radio_value(
+                    &mut sub.prefix_choice,
+                    SharedMcpPrefixChoice::Default,
+                    "Default (host name)",
+                );
+                ui.radio_value(&mut sub.prefix_choice, SharedMcpPrefixChoice::None, "None");
+                ui.radio_value(
+                    &mut sub.prefix_choice,
+                    SharedMcpPrefixChoice::Custom,
+                    "Custom",
+                );
+            });
+            match sub.prefix_choice {
+                SharedMcpPrefixChoice::Default => {
+                    let example_prefix = if sub.name.trim().is_empty() {
+                        "<host name>"
+                    } else {
+                        sub.name.trim()
+                    };
+                    ui.label(
+                        RichText::new(format!(
+                            "Tools will appear to the model as `{example_prefix}_<tool>`."
+                        ))
+                        .small()
+                        .color(Color32::from_gray(150)),
+                    );
+                }
+                SharedMcpPrefixChoice::None => {
+                    ui.label(
+                        RichText::new(
+                            "Tools will appear to the model with their bare \
+                             server-side names. Risks collisions across hosts.",
+                        )
+                        .small()
+                        .color(Color32::from_rgb(0xd0, 0xa0, 0x70)),
+                    );
+                }
+                SharedMcpPrefixChoice::Custom => {
+                    ui.horizontal(|ui| {
+                        ui.label("prefix");
+                        ui.add(
+                            TextEdit::singleline(&mut sub.prefix_custom)
+                                .hint_text("e.g. 'gh' → gh_<tool>")
+                                .desired_width(f32::INFINITY),
+                        );
+                    });
+                }
+            }
+
             if sub.oauth_in_flight {
                 ui.add_space(6.0);
                 ui.colored_label(
@@ -791,6 +866,27 @@ fn render_shared_mcp_editor_subform(
         sub.error = None;
         let bearer = sub.bearer.trim().to_string();
         let scope = sub.oauth_scope.trim().to_string();
+        // Resolve the editor's prefix choice into a wire-shape
+        // `SharedMcpPrefixInput`. `Custom` with an empty trimmed buffer
+        // is rejected up-front rather than silently collapsed to
+        // `Default`, so the operator can tell the form what they meant.
+        let prefix_input = match &sub.prefix_choice {
+            SharedMcpPrefixChoice::Default => Some(SharedMcpPrefixInput::Default),
+            SharedMcpPrefixChoice::None => Some(SharedMcpPrefixInput::None),
+            SharedMcpPrefixChoice::Custom => {
+                let trimmed = sub.prefix_custom.trim().to_string();
+                if trimmed.is_empty() {
+                    None
+                } else {
+                    Some(SharedMcpPrefixInput::Custom { value: trimmed })
+                }
+            }
+        };
+        let Some(prefix) = prefix_input else {
+            sub.error = Some("Custom prefix can't be empty.".to_string());
+            modal.shared_mcp_editor = Some(sub);
+            return;
+        };
         let event = match (sub.mode, sub.auth_choice) {
             (SharedMcpEditorMode::Add, SharedMcpAuthChoice::Oauth2) => {
                 // Grab the origin the webui is served from so the
@@ -805,6 +901,7 @@ fn render_shared_mcp_editor_subform(
                         scope: (!scope.is_empty()).then_some(scope),
                         redirect_base,
                     },
+                    prefix,
                 }
             }
             (SharedMcpEditorMode::Add, SharedMcpAuthChoice::Bearer) => {
@@ -812,6 +909,7 @@ fn render_shared_mcp_editor_subform(
                     name: sub.name.trim().to_string(),
                     url: sub.url.trim().to_string(),
                     auth: SharedMcpAuthInput::Bearer { token: bearer },
+                    prefix,
                 }
             }
             (SharedMcpEditorMode::Add, SharedMcpAuthChoice::Anonymous) => {
@@ -819,6 +917,7 @@ fn render_shared_mcp_editor_subform(
                     name: sub.name.trim().to_string(),
                     url: sub.url.trim().to_string(),
                     auth: SharedMcpAuthInput::None,
+                    prefix,
                 }
             }
             (SharedMcpEditorMode::Edit, choice) => {
@@ -848,6 +947,7 @@ fn render_shared_mcp_editor_subform(
                     name: sub.name.clone(),
                     url: sub.url.trim().to_string(),
                     auth,
+                    prefix,
                 }
             }
         };
