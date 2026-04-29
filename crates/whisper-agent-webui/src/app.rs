@@ -1357,6 +1357,9 @@ struct CreateBucketForm {
     overlap_tokens: u32,
     dense_enabled: bool,
     sparse_enabled: bool,
+    /// Vectors-bin quantization. f32 default keeps the historical
+    /// behavior; f16/int8 trade recall for disk + RAM footprint.
+    quantization: QuantizationChoice,
     /// `Some` while a `CreateBucket` is in flight; the renderer hides
     /// the Create button + shows a spinner. The empty-string sentinel
     /// is set by the renderer on click; the parent overwrites with
@@ -1386,6 +1389,7 @@ impl Default for CreateBucketForm {
             overlap_tokens: 50,
             dense_enabled: true,
             sparse_enabled: true,
+            quantization: QuantizationChoice::default(),
             pending_correlation: None,
             error: None,
         }
@@ -1436,6 +1440,17 @@ impl TrackedCadenceChoice {
             Self::Manual => "manual",
         }
     }
+}
+
+/// UI mirror of `whisper_agent_protocol::QuantizationInput`. Frozen into
+/// the new slot's manifest at build time, so the choice can't be
+/// changed without rebuilding the bucket.
+#[derive(Copy, Clone, Eq, PartialEq, Default)]
+pub(crate) enum QuantizationChoice {
+    #[default]
+    F32,
+    F16,
+    Int8,
 }
 
 /// Lifecycle of the search form's last-issued query. Renderer reads

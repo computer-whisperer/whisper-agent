@@ -26,8 +26,8 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::warn;
 use whisper_agent_protocol::{
-    BucketBuildOutcome, BucketBuildPhase, BucketCreateInput, BucketSourceInput, ServerToClient,
-    TrackedCadenceInput, TrackedDriverInput,
+    BucketBuildOutcome, BucketBuildPhase, BucketCreateInput, BucketSourceInput, QuantizationInput,
+    ServerToClient, TrackedCadenceInput, TrackedDriverInput,
 };
 
 use super::{ConnId, Scheduler};
@@ -1507,6 +1507,11 @@ fn synthesize_bucket_toml(config: &BucketCreateInput) -> String {
             resync_cadence,
         } => render_tracked_source_block(driver, *delta_cadence, *resync_cadence),
     };
+    let quantization = match config.quantization.unwrap_or_default() {
+        QuantizationInput::F32 => "f32",
+        QuantizationInput::F16 => "f16",
+        QuantizationInput::Int8 => "int8",
+    };
     format!(
         "name = {name}\n{description}created_at = \"{now}\"\n\n\
          {source}\n\
@@ -1522,7 +1527,7 @@ fn synthesize_bucket_toml(config: &BucketCreateInput) -> String {
          [defaults]\n\
          embedder = {embedder}\n\
          serving_mode = \"ram\"\n\
-         quantization = \"f32\"\n",
+         quantization = \"{quantization}\"\n",
         name = toml_quote(&config.name),
         description = description_line,
         source = source_block,
@@ -2186,6 +2191,7 @@ mod tests {
             overlap_tokens: 50,
             dense_enabled: true,
             sparse_enabled: true,
+            quantization: None,
         };
         let toml_text = synthesize_bucket_toml(&cfg);
         let parsed = crate::knowledge::BucketConfig::from_toml_str(&toml_text)
@@ -2227,6 +2233,7 @@ mod tests {
             overlap_tokens: 50,
             dense_enabled: true,
             sparse_enabled: true,
+            quantization: None,
         };
         let toml_text = synthesize_bucket_toml(&cfg);
         assert!(

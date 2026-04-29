@@ -953,11 +953,24 @@ pub enum TrackedCadenceInput {
     Manual,
 }
 
+/// Vector-quantization choice surfaced in the create form. Mirrors
+/// `crate::knowledge::config::Quantization` server-side; we maintain a
+/// wire-side enum to keep the protocol crate independent of server
+/// types. Snake-case names match the TOML literals the server writes.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum QuantizationInput {
+    #[default]
+    F32,
+    F16,
+    Int8,
+}
+
 /// Form payload for `CreateBucket`. The server synthesizes a fresh
 /// `bucket.toml` from this and writes it under
 /// `<buckets_root>/<id>/bucket.toml`. Defaults that aren't user-tunable
-/// at v1 (compaction thresholds, serving mode, quantization) are filled
-/// in server-side rather than asking the WebUI to surface every knob.
+/// at v1 (compaction thresholds, serving mode) are filled in server-
+/// side rather than asking the WebUI to surface every knob.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct BucketCreateInput {
     pub name: String,
@@ -970,6 +983,11 @@ pub struct BucketCreateInput {
     pub overlap_tokens: u32,
     pub dense_enabled: bool,
     pub sparse_enabled: bool,
+    /// Vectors-storage quantization. `None` ⇒ server picks its default
+    /// (currently `f32`). Older clients that don't surface the field
+    /// still produce valid create requests.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quantization: Option<QuantizationInput>,
 }
 
 /// Coarse phase tag emitted by `BucketBuildProgress`. The build pipeline

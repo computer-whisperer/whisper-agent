@@ -8,12 +8,13 @@
 use egui::{Color32, ComboBox, RichText, ScrollArea, TextEdit};
 use whisper_agent_protocol::{
     BucketBuildPhase, BucketCreateInput, BucketSourceInput, BucketSummary, EmbeddingProviderInfo,
-    PodSummary, QueryHit, SlotStateLabel, TrackedCadenceInput, TrackedDriverInput,
+    PodSummary, QuantizationInput, QueryHit, SlotStateLabel, TrackedCadenceInput,
+    TrackedDriverInput,
 };
 
 use super::super::{
-    BucketsModalState, CreateBucketForm, QueryStatus, SourceKindChoice, TrackedCadenceChoice,
-    TrackedDriverChoice,
+    BucketsModalState, CreateBucketForm, QuantizationChoice, QueryStatus, SourceKindChoice,
+    TrackedCadenceChoice, TrackedDriverChoice,
 };
 
 /// Side-channel actions a `render_buckets_modal` call can emit. The
@@ -86,6 +87,30 @@ fn cadence_to_wire(c: TrackedCadenceChoice) -> TrackedCadenceInput {
         TrackedCadenceChoice::Monthly => TrackedCadenceInput::Monthly,
         TrackedCadenceChoice::Quarterly => TrackedCadenceInput::Quarterly,
         TrackedCadenceChoice::Manual => TrackedCadenceInput::Manual,
+    }
+}
+
+/// All quantization variants in dropdown order. F32 first so it stays
+/// the visible default when the user opens the form.
+const QUANTIZATION_CHOICES: [QuantizationChoice; 3] = [
+    QuantizationChoice::F32,
+    QuantizationChoice::F16,
+    QuantizationChoice::Int8,
+];
+
+fn quantization_label(q: QuantizationChoice) -> &'static str {
+    match q {
+        QuantizationChoice::F32 => "f32",
+        QuantizationChoice::F16 => "f16",
+        QuantizationChoice::Int8 => "int8",
+    }
+}
+
+fn quantization_to_wire(q: QuantizationChoice) -> QuantizationInput {
+    match q {
+        QuantizationChoice::F32 => QuantizationInput::F32,
+        QuantizationChoice::F16 => QuantizationInput::F16,
+        QuantizationChoice::Int8 => QuantizationInput::Int8,
     }
 }
 
@@ -472,6 +497,22 @@ fn render_create_section(
                 });
             });
             ui.end_row();
+
+            // Vectors-bin quantization. f32 = full precision (default,
+            // largest disk + RAM), f16 = half precision (2× smaller, ~no
+            // recall loss), int8 = quantized (4× smaller, slight recall
+            // loss). Frozen into the slot at build time.
+            ui.label(RichText::new("quantization").small());
+            ui.add_enabled_ui(!saving, |ui| {
+                ComboBox::from_id_salt("create-bucket-quantization")
+                    .selected_text(quantization_label(form.quantization))
+                    .show_ui(ui, |ui| {
+                        for q in QUANTIZATION_CHOICES {
+                            ui.selectable_value(&mut form.quantization, q, quantization_label(q));
+                        }
+                    });
+            });
+            ui.end_row();
         });
 
     if let Some(err) = form.error.as_deref() {
@@ -591,6 +632,7 @@ fn build_create_input(form: &mut CreateBucketForm) -> Option<BucketCreateInput> 
         overlap_tokens: form.overlap_tokens,
         dense_enabled: form.dense_enabled,
         sparse_enabled: form.sparse_enabled,
+        quantization: Some(quantization_to_wire(form.quantization)),
     })
 }
 
