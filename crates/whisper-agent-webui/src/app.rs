@@ -3352,8 +3352,18 @@ impl eframe::App for ChatApp {
                                 );
                             });
                         } else {
+                            // Items behind a collapsing header (Reasoning,
+                            // running ToolCall) hide their streaming
+                            // deltas past the one-line preview, so the
+                            // renderers want a "this thread is currently
+                            // streaming" signal to draw an inline spinner.
+                            let thread_streaming = view.summary.state == ThreadStateLabel::Working;
+                            let last_idx = view.items.len().saturating_sub(1);
                             for (idx, item) in view.items.iter().enumerate() {
-                                if let Some(event) = render_item(ui, md_cache, idx, item) {
+                                let is_tail = idx == last_idx;
+                                if let Some(event) =
+                                    render_item(ui, md_cache, idx, item, is_tail, thread_streaming)
+                                {
                                     match event {
                                         ChatItemEvent::ForkRequested {
                                             msg_index,

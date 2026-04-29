@@ -91,6 +91,8 @@ pub(super) fn render_item(
     cache: &mut CommonMarkCache,
     idx: usize,
     item: &DisplayItem,
+    is_tail: bool,
+    thread_streaming: bool,
 ) -> Option<ChatItemEvent> {
     let (gutter_color, fill) = item_palette(item);
     let frame = egui::Frame::default()
@@ -138,7 +140,15 @@ pub(super) fn render_item(
             }
             DisplayItem::AssistantText { text } => render_assistant_text(ui, cache, text),
             DisplayItem::AssistantImage { source } => render_assistant_image(ui, idx, source),
-            DisplayItem::Reasoning { text } => render_reasoning(ui, cache, text),
+            DisplayItem::Reasoning { text } => {
+                // Reasoning blocks are default-collapsed, so streaming
+                // deltas are invisible past the one-line preview header
+                // — the spinner is the operator's only signal that the
+                // model is still emitting CoT. Only the tail Reasoning
+                // gets it; an earlier Reasoning the turn moved past
+                // isn't streaming anymore.
+                render_reasoning(ui, cache, text, is_tail && thread_streaming)
+            }
             DisplayItem::ToolCall {
                 tool_use_id,
                 name,
@@ -156,6 +166,10 @@ pub(super) fn render_item(
                 diff.as_ref(),
                 streaming_output,
                 result.as_ref(),
+                // A ToolCall with no fused result while the thread is
+                // Working is still in flight — applies to every running
+                // call in a parallel-tool batch, not just the tail one.
+                result.is_none() && thread_streaming,
             ),
             DisplayItem::ToolCallStreaming {
                 tool_use_id,
@@ -423,7 +437,7 @@ fn bytes_image_uri(data: &[u8]) -> String {
     format!("bytes://image-{:016x}", h.finish())
 }
 
-fn render_reasoning(ui: &mut egui::Ui, cache: &mut CommonMarkCache, text: &str) {
+fn render_reasoning(ui: &mut egui::Ui, cache: &mut CommonMarkCache, text: &str, streaming: bool) {
     let id = ui.make_persistent_id(("reasoning", text.as_ptr() as usize));
     let preview = text.lines().next().unwrap_or("").trim();
     let header = if preview.is_empty() {
@@ -437,6 +451,10 @@ fn render_reasoning(ui: &mut egui::Ui, cache: &mut CommonMarkCache, text: &str) 
     };
     egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), id, false)
         .show_header(ui, |ui| {
+            if streaming {
+                ui.add(egui::Spinner::new().size(12.0));
+                ui.add_space(4.0);
+            }
             ui.label(
                 RichText::new("REASONING")
                     .color(COLOR_REASONING)
@@ -675,6 +693,7 @@ fn render_tool_call(
     diff: Option<&DiffPayload>,
     streaming_output: &str,
     result: Option<&FusedToolResult>,
+    streaming: bool,
 ) {
     let id = ui.make_persistent_id(("tool", tool_use_id));
     // Default-collapsed. Chat stream reads as a sequence of one-line
@@ -694,6 +713,10 @@ fn render_tool_call(
     egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), id, default_open)
         .show_header(ui, |ui| {
             ui.horizontal(|ui| {
+                if streaming {
+                    ui.add(egui::Spinner::new().size(12.0));
+                    ui.add_space(4.0);
+                }
                 ui.label(RichText::new(name).color(COLOR_TOOL).strong().monospace());
                 ui.add_space(6.0);
                 ui.label(
