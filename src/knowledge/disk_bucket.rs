@@ -117,6 +117,26 @@ const DENSE_DUMP_BATCH_INTERVAL: u64 = 32;
 #[cfg(test)]
 const DENSE_DUMP_BATCH_INTERVAL: u64 = 1;
 
+/// Number of embedder batches folded into each durability barrier:
+/// chunks.bin/vectors.bin fsync, tantivy commit (= one new segment),
+/// active-slot reader refresh, and `build.state` fsync. At per-batch
+/// (interval = 1) cadence a full-enwiki run produces hundreds of
+/// thousands of tantivy segments — every commit creates one, and the
+/// background merge thread then fights the embedder for CPU folding
+/// them in (the same dynamic the delta path documented and fixed when
+/// it batched its inserts at line ~1760). Folding 8 batches per
+/// barrier cuts segment count, fsync count, and live-reader reopen
+/// count 8× at the cost of resume losing up to ~(N-1) batches of
+/// post-checkpoint work — a few minutes of embedder time at typical
+/// throughput, which is the right trade for a multi-day wiki build.
+///
+/// Tests pin this at 1 so cancel-after-N-batches resume tests stay
+/// deterministic with the existing per-batch checkpoint cadence.
+#[cfg(not(test))]
+const WRITER_COMMIT_INTERVAL: u64 = 8;
+#[cfg(test)]
+const WRITER_COMMIT_INTERVAL: u64 = 1;
+
 /// Coarse build-stage tag passed to [`BuildObserver::on_phase`]. Mirrors
 /// the wire-side `BucketBuildPhase` so the scheduler can pass these
 /// through unmodified.
@@ -1321,67 +1341,111 @@ impl DiskBucket {
         // what stops new batches from being produced; once the
         // upstream cascade drops `embedded_tx`, this loop sees `None`
         // and exits.
+        //
+        // Per-batch work is in-memory only (apply + observer tick).
+        // The durability barrier (chunk/vector fsync, tantivy commit,
+        // active-slot reader refresh, build_state.sync, optional HNSW
+        // dump) runs only when `batches_since_checkpoint` reaches
+        // `WRITER_COMMIT_INTERVAL` or at EOF with pending work — see
+        // the const docs for the trade-off.
         let writer_fut = async {
-            while let Some(batch) = embedded_rx.recv().await {
-                // Int8 calibration: the streaming build only knows
-                // the f32→i8 scale once the first batch of real
-                // vectors lands, so we calibrate from this batch
-                // before the first dense.insert. Resume reuses the
-                // scale that was persisted in the sidecar (already
-                // installed via `load_from_with_positions` upstream).
-                if dense.quant() == super::dense::DenseQuant::Int8 && dense.int8_scale().is_none() {
-                    let scale = super::dense::calibrate_int8_scale(&batch.embeddings);
-                    dense.set_int8_scale(scale)?;
-                    tracing::info!(
-                        slot = %slot_id,
-                        scale,
-                        "int8 dense backend calibrated from first batch",
-                    );
+            let mut batches_since_checkpoint: u64 = 0;
+            let mut last_batch_index: u64 = 0;
+            loop {
+                let recv = embedded_rx.recv().await;
+                let eof = recv.is_none();
+                if let Some(batch) = recv {
+                    // Int8 calibration: the streaming build only knows
+                    // the f32→i8 scale once the first batch of real
+                    // vectors lands, so we calibrate from this batch
+                    // before the first dense.insert. Resume reuses the
+                    // scale that was persisted in the sidecar (already
+                    // installed via `load_from_with_positions` upstream).
+                    if dense.quant() == super::dense::DenseQuant::Int8
+                        && dense.int8_scale().is_none()
+                    {
+                        let scale = super::dense::calibrate_int8_scale(&batch.embeddings);
+                        dense.set_int8_scale(scale)?;
+                        tracing::info!(
+                            slot = %slot_id,
+                            scale,
+                            "int8 dense backend calibrated from first batch",
+                        );
+                    }
+                    let base_position = chunks_emitted;
+                    let meta = apply_embedded_batch(
+                        batch,
+                        &mut chunk_writer,
+                        &mut vector_writer,
+                        sparse_builder.as_mut(),
+                        dense.as_ref(),
+                        base_position,
+                    )?;
+                    chunks_emitted += meta.chunk_count;
+                    records_completed = meta.records_completed_at_end;
+                    last_batch_index = meta.batch_index;
+                    batches_since_checkpoint += 1;
                 }
-                let base_position = chunks_emitted;
-                let meta = apply_embedded_batch(
-                    batch,
-                    &mut chunk_writer,
-                    &mut vector_writer,
-                    sparse_builder.as_mut(),
-                    dense.as_ref(),
-                    base_position,
-                )?;
-                chunk_writer.flush().map_err(BucketError::Io)?;
-                vector_writer.flush().map_err(BucketError::Io)?;
-                if let Some(builder) = sparse_builder.as_mut() {
-                    builder.commit()?;
+                let processed_batch = !eof;
+
+                // Run the durability barrier on interval, or at EOF
+                // (including cancel) if any post-checkpoint batches
+                // are pending. The trailing-checkpoint case preserves
+                // the "cancel-mid-build leaves a resume checkpoint"
+                // contract the chunker stage relies on.
+                let checkpoint_due = if eof {
+                    batches_since_checkpoint > 0
+                } else {
+                    batches_since_checkpoint >= WRITER_COMMIT_INTERVAL
+                };
+                if checkpoint_due {
+                    chunk_writer.flush().map_err(BucketError::Io)?;
+                    vector_writer.flush().map_err(BucketError::Io)?;
+                    if let Some(builder) = sparse_builder.as_mut() {
+                        builder.commit()?;
+                    }
+                    self.update_active_during_build(
+                        slot_path,
+                        &chunk_writer,
+                        &dense,
+                        &manifest,
+                        install_during_build,
+                        &mut active_during_build,
+                    )?;
+                    build_state
+                        .append(&BuildStateRecord::BatchEmbedded {
+                            batch_index: last_batch_index,
+                            source_records_completed: records_completed,
+                            chunks_completed: chunks_emitted,
+                        })
+                        .map_err(BucketError::Io)?;
+                    // Durability barrier: BatchEmbedded is the resume
+                    // checkpoint. Writers have already flushed +
+                    // committed above; this fsync makes the log entry
+                    // stating "everything up to here is durable" itself
+                    // durable.
+                    build_state.sync().map_err(BucketError::Io)?;
+                    batches_since_dump += batches_since_checkpoint;
+                    batches_since_checkpoint = 0;
+                    if batches_since_dump >= DENSE_DUMP_BATCH_INTERVAL {
+                        periodic_dump(slot_path, slot_id, &dense).await?;
+                        batches_since_dump = 0;
+                    }
                 }
-                chunks_emitted += meta.chunk_count;
-                records_completed = meta.records_completed_at_end;
-                self.update_active_during_build(
-                    slot_path,
-                    &chunk_writer,
-                    &dense,
-                    &manifest,
-                    install_during_build,
-                    &mut active_during_build,
-                )?;
-                build_state
-                    .append(&BuildStateRecord::BatchEmbedded {
-                        batch_index: meta.batch_index,
-                        source_records_completed: records_completed,
-                        chunks_completed: chunks_emitted,
-                    })
-                    .map_err(BucketError::Io)?;
-                // Durability barrier: BatchEmbedded is the resume
-                // checkpoint. Writers have already flushed +
-                // committed above; this fsync makes the log entry
-                // stating "everything up to here is durable" itself
-                // durable.
-                build_state.sync().map_err(BucketError::Io)?;
-                batches_since_dump += 1;
-                if batches_since_dump >= DENSE_DUMP_BATCH_INTERVAL {
-                    periodic_dump(slot_path, slot_id, &dense).await?;
-                    batches_since_dump = 0;
-                }
-                if let Some(obs) = observer {
+
+                // Notify the observer after any checkpoint that fired
+                // this iteration so an `on_progress` arrival is a real
+                // "you can see batch N's state now" signal — the
+                // mid-build query test (and the wire progress consumer)
+                // assume the active slot is installed by the time
+                // `on_progress` fires for the batch that triggered the
+                // first checkpoint.
+                if processed_batch && let Some(obs) = observer {
                     obs.on_progress(records_completed, chunks_emitted);
+                }
+
+                if eof {
+                    break;
                 }
             }
             // Channel closed cleanly. Promote a cancel observed

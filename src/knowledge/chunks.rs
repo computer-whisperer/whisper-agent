@@ -70,14 +70,22 @@ const RECORD_VERSION: u8 = 1;
 /// shared id→offset index, and writes the sorted `chunks.idx` on
 /// [`finalize`](Self::finalize).
 ///
-/// The index ([`SharedChunkIndex`]) is grown in place on `append` and
-/// can be cloned out via [`Self::share_index`] for a live reader
-/// during the build. No per-batch snapshot copy.
+/// Index visibility is gated on [`Self::flush`]: `append` stages new
+/// id→offset entries into a `pending` map and only merges them into
+/// the shared [`SharedChunkIndex`] after the bin is fsynced. This is
+/// what lets the build pipeline batch fsyncs across many `append`s
+/// without ever exposing a live reader to an offset whose bytes
+/// haven't actually landed on disk — a fetch through the live reader
+/// either sees the chunk fully (post-flush) or not at all (still
+/// pending).
 #[derive(Debug)]
 pub struct ChunkStoreWriter {
     bin: BufWriter<File>,
     idx_path: PathBuf,
     index: SharedChunkIndex,
+    /// id→offset entries written since the last flush. Promoted into
+    /// `index` only after `bin.sync_data()` succeeds in [`Self::flush`].
+    pending: HashMap<ChunkId, u64>,
     cursor: u64,
 }
 
@@ -88,6 +96,7 @@ impl ChunkStoreWriter {
             bin: BufWriter::new(file),
             idx_path: idx_path.to_path_buf(),
             index: Arc::new(RwLock::new(HashMap::new())),
+            pending: HashMap::new(),
             cursor: 0,
         })
     }
@@ -144,6 +153,7 @@ impl ChunkStoreWriter {
             bin: BufWriter::new(file),
             idx_path: idx_path.to_path_buf(),
             index: Arc::new(RwLock::new(map)),
+            pending: HashMap::new(),
             cursor,
         })
     }
@@ -171,12 +181,14 @@ impl ChunkStoreWriter {
             bin: BufWriter::new(file),
             idx_path: idx_path.to_path_buf(),
             index: Arc::new(RwLock::new(map)),
+            pending: HashMap::new(),
             cursor,
         })
     }
 
-    /// Append a chunk and record its offset in the shared index.
-    /// Returns the offset where the record was written.
+    /// Append a chunk and stage its offset for the next flush. Returns
+    /// the offset where the record was written. The id is *not* yet
+    /// visible to live readers — see [`Self::flush`].
     pub fn append(
         &mut self,
         chunk_id: ChunkId,
@@ -186,21 +198,28 @@ impl ChunkStoreWriter {
         let offset = self.cursor;
         let written = write_record(&mut self.bin, source_ref, text)?;
         self.cursor += written;
-        self.index
-            .write()
-            .expect("ChunkStoreWriter index lock poisoned")
-            .insert(chunk_id, offset);
+        self.pending.insert(chunk_id, offset);
         Ok(offset)
     }
 
-    /// Flush buffered writes to the underlying file and `sync_data`.
-    /// Live readers opened via [`ChunkStoreReader::open_with_shared_index`]
-    /// only see record bytes that have been flushed; the build path
-    /// calls this at every batch boundary as part of the durability
-    /// barrier.
+    /// Flush buffered writes to the underlying file, `sync_data`, and
+    /// then promote staged `append` entries into the shared index so
+    /// live readers can find them. Holding the bytes-on-disk barrier
+    /// before exposing the offsets is what keeps a `Live` reader from
+    /// ever seeing an index entry whose record bytes are still in the
+    /// `BufWriter` (or the kernel page cache).
     pub fn flush(&mut self) -> io::Result<()> {
         self.bin.flush()?;
         self.bin.get_ref().sync_data()?;
+        if !self.pending.is_empty() {
+            let mut idx = self
+                .index
+                .write()
+                .expect("ChunkStoreWriter index lock poisoned");
+            for (id, off) in self.pending.drain() {
+                idx.insert(id, off);
+            }
+        }
         Ok(())
     }
 
@@ -232,6 +251,19 @@ impl ChunkStoreWriter {
         // Drop the BufWriter so the underlying file is closed before we
         // open the next file — helps on Windows; harmless on Unix.
         drop(self.bin);
+
+        // Promote any append-staged entries into the shared index so
+        // they land in `chunks.idx` even if the caller never invoked
+        // `flush()` between the last append and finalize.
+        if !self.pending.is_empty() {
+            let mut idx = self
+                .index
+                .write()
+                .expect("ChunkStoreWriter index lock poisoned");
+            for (id, off) in self.pending.drain() {
+                idx.insert(id, off);
+            }
+        }
 
         // Collect into a Vec to sort. Live readers may still be holding
         // an Arc clone; we don't mutate the map here, just iterate.
