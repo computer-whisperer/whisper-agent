@@ -641,7 +641,7 @@ fn spec_to_oa_tool(t: &ToolSpec) -> OaTool {
         function: OaFunctionSpec {
             name: t.name.clone(),
             description: t.description.clone(),
-            parameters: t.input_schema.clone(),
+            parameters: t.input_schema_value(),
         },
     }
 }

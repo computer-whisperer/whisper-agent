@@ -250,7 +250,7 @@ fn spec_to_anthropic_tool(t: &ToolSpec) -> AnthropicTool {
     AnthropicTool {
         name: t.name.clone(),
         description: t.description.clone(),
-        input_schema: t.input_schema.clone(),
+        input_schema: t.input_schema_value(),
         cache_control: None,
     }
 }
@@ -1008,12 +1008,12 @@ mod tests {
             ToolSpec {
                 name: "bash".into(),
                 description: "run a shell command".into(),
-                input_schema: json!({"type":"object"}),
+                params: Vec::new(),
             },
             ToolSpec {
                 name: "read_file".into(),
                 description: "read a file".into(),
-                input_schema: json!({"type":"object"}),
+                params: Vec::new(),
             },
         ]
     }

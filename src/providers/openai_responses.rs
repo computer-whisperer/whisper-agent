@@ -732,7 +732,7 @@ fn spec_to_rsp_tool(t: &ToolSpec) -> RspTool {
     RspTool::Function {
         name: t.name.clone(),
         description: t.description.clone(),
-        parameters: t.input_schema.clone(),
+        parameters: t.input_schema_value(),
         strict: false,
     }
 }

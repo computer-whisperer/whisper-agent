@@ -939,7 +939,7 @@ fn spec_to_fn_decl(t: &ToolSpec) -> FunctionDeclaration {
     FunctionDeclaration {
         name: t.name.clone(),
         description: t.description.clone(),
-        parameters: t.input_schema.clone(),
+        parameters: t.input_schema_value(),
     }
 }
 

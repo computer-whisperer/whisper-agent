@@ -18,7 +18,8 @@ use serde_json::Value;
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 use whisper_agent_protocol::{
-    ContentBlock, ContentCapabilities, ImageMime, MediaSupport, Message, Usage,
+    ContentBlock, ContentCapabilities, ImageMime, MediaSupport, Message, ParamSpec, ToolSchema,
+    Usage,
 };
 
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
@@ -60,7 +61,26 @@ pub enum CacheBreakpoint {
 pub struct ToolSpec {
     pub name: String,
     pub description: String,
-    pub input_schema: Value,
+    /// Typed parameter list. Adapters that need the JSON Schema
+    /// envelope on the wire build it via [`Self::input_schema_value`]
+    /// at the boundary — every provider currently consumes
+    /// JSON-Schema-shaped input, so this is a thin wrapper around
+    /// [`ToolSchema::input_schema_value`].
+    pub params: Vec<ParamSpec>,
+}
+
+impl ToolSpec {
+    /// JSON Schema view of `params` — `{type:"object", properties:...,
+    /// required:[...]}` — for provider adapters and any other site
+    /// that still consumes the wire schema directly.
+    pub fn input_schema_value(&self) -> Value {
+        ToolSchema {
+            name: self.name.clone(),
+            description: self.description.clone(),
+            params: self.params.clone(),
+        }
+        .input_schema_value()
+    }
 }
 
 #[derive(Debug)]
