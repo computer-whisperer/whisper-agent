@@ -3011,10 +3011,17 @@ impl Scheduler {
         let tool_blocks: Vec<whisper_agent_protocol::ContentBlock> = self
             .wire_tool_descriptors(thread_id)
             .into_iter()
-            .map(|t| whisper_agent_protocol::ContentBlock::ToolSchema {
-                name: t.name,
-                description: t.description,
-                input_schema: t.input_schema,
+            .map(|t| {
+                let typed = whisper_agent_protocol::ToolSchema::from_mcp(
+                    t.name,
+                    t.description,
+                    &t.input_schema,
+                );
+                whisper_agent_protocol::ContentBlock::ToolSchema {
+                    name: typed.name,
+                    description: typed.description,
+                    params: typed.params,
+                }
             })
             .collect();
         let tools_msg = whisper_agent_protocol::Message::tools_manifest(tool_blocks);

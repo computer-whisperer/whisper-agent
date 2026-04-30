@@ -9,6 +9,8 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::tool_schema::ParamSpec;
+
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum Role {
@@ -487,13 +489,20 @@ pub enum ContentBlock {
     /// One entry in a tool manifest snapshot. Appears only as content
     /// on a `Role::Tools` message; provider adapters lift it into
     /// their native `tools` request field (Anthropic `tools[]`,
-    /// OpenAI `tools[].function`, Gemini `FunctionDeclaration`). The
-    /// fields mirror `ToolSpec` — name, free-form description, JSON
-    /// Schema for the input — so translation is direct.
+    /// OpenAI `tools[].function`, Gemini `FunctionDeclaration`).
+    ///
+    /// `params` is the typed input-schema view (see
+    /// [`crate::tool_schema`]); adapters that need the JSON Schema
+    /// envelope on the wire reconstruct it via
+    /// [`crate::ToolSchema::input_schema_value`]. Persisted threads
+    /// from before the typed swap stored an `input_schema: Value`
+    /// blob instead — the loader migrates those forward (see
+    /// `normalize_legacy_tool_schema_blocks` in `pod::persist`).
     ToolSchema {
         name: String,
         description: String,
-        input_schema: Value,
+        #[serde(default)]
+        params: Vec<ParamSpec>,
     },
 }
 
@@ -660,7 +669,7 @@ impl Conversation {
     /// thread's `Role::Tools` manifest message. Returns an empty iter
     /// if the manifest slot isn't populated — adapters interpret that
     /// as "this thread has no tools available."
-    pub fn tool_schemas(&self) -> impl Iterator<Item = (&str, &str, &Value)> {
+    pub fn tool_schemas(&self) -> impl Iterator<Item = (&str, &str, &[ParamSpec])> {
         let idx = match self.messages.first() {
             Some(m) if m.role == Role::System => 1,
             _ => 0,
@@ -675,8 +684,8 @@ impl Conversation {
             ContentBlock::ToolSchema {
                 name,
                 description,
-                input_schema,
-            } => Some((name.as_str(), description.as_str(), input_schema)),
+                params,
+            } => Some((name.as_str(), description.as_str(), params.as_slice())),
             _ => None,
         })
     }

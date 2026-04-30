@@ -82,13 +82,17 @@ pub(super) fn add_message_items(msg: &Message, msg_index: usize, out: &mut Vec<D
             // Tool manifest: one `ContentBlock::ToolSchema` per tool.
             // The collapsed row shows the count; expanded shows
             // name + description + input-schema for each entry.
+            //
+            // Pre-typed-schema cut: re-emit the JSON Schema envelope
+            // and pretty-print as before. The structured renderer
+            // lands in a follow-up commit and walks `params` directly.
             let mut rendered = String::new();
             let mut count = 0usize;
             for block in &msg.content {
                 if let ContentBlock::ToolSchema {
                     name,
                     description,
-                    input_schema,
+                    params,
                 } = block
                 {
                     if count > 0 {
@@ -100,8 +104,15 @@ pub(super) fn add_message_items(msg: &Message, msg_index: usize, out: &mut Vec<D
                         rendered.push_str(description);
                     }
                     rendered.push('\n');
-                    rendered
-                        .push_str(&serde_json::to_string_pretty(input_schema).unwrap_or_default());
+                    let typed = whisper_agent_protocol::ToolSchema {
+                        name: name.clone(),
+                        description: description.clone(),
+                        params: params.clone(),
+                    };
+                    rendered.push_str(
+                        &serde_json::to_string_pretty(&typed.input_schema_value())
+                            .unwrap_or_default(),
+                    );
                     count += 1;
                 }
             }

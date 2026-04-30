@@ -742,6 +742,7 @@ async fn load_one(path: &Path, pod_id: &str) -> Result<Thread> {
     let mut value: serde_json::Value =
         serde_json::from_slice(&bytes).with_context(|| format!("parse {}", path.display()))?;
     normalize_legacy_host_env_binding(&mut value);
+    normalize_legacy_tool_schema_blocks(&mut value);
     let mut task: Thread =
         serde_json::from_value(value).with_context(|| format!("decode {}", path.display()))?;
     // Stamp pod_id from the directory we found it in. This wins over any
@@ -839,6 +840,71 @@ fn normalize_legacy_host_env_binding(value: &mut serde_json::Value) {
         });
         if !already_clean {
             *arr = rewritten;
+        }
+    }
+}
+
+/// Pre-deserialize migration: pre-typed-schema threads stored each
+/// tool manifest entry as `{"type":"tool_schema","name","description",
+/// "input_schema": <JSON Schema Value>}`. The new shape carries
+/// `params: [ParamSpec]` instead. Walk the conversation tree and
+/// translate any old-form blocks via [`whisper_agent_protocol::ToolSchema::from_mcp`]
+/// so the subsequent `serde_json::from_value` sees only the new shape.
+/// Idempotent — already-migrated blocks (no `input_schema` field, or
+/// already carrying `params`) pass through untouched.
+fn normalize_legacy_tool_schema_blocks(value: &mut serde_json::Value) {
+    let Some(messages) = value
+        .get_mut("conversation")
+        .and_then(|c| c.get_mut("messages"))
+        .and_then(|m| m.as_array_mut())
+    else {
+        return;
+    };
+    for msg in messages {
+        let Some(content) = msg.get_mut("content").and_then(|c| c.as_array_mut()) else {
+            continue;
+        };
+        for block in content {
+            let Some(obj) = block.as_object_mut() else {
+                continue;
+            };
+            let is_tool_schema = obj
+                .get("type")
+                .and_then(|t| t.as_str())
+                .map(|t| t == "tool_schema")
+                .unwrap_or(false);
+            if !is_tool_schema {
+                continue;
+            }
+            // Already migrated: `params` present (with or without a
+            // stray `input_schema` from a partially-rolled-back run —
+            // prefer params and drop the old field).
+            if obj.contains_key("params") {
+                obj.remove("input_schema");
+                continue;
+            }
+            let Some(input_schema) = obj.remove("input_schema") else {
+                continue;
+            };
+            let name = obj
+                .get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let description = obj
+                .get("description")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let typed =
+                whisper_agent_protocol::ToolSchema::from_mcp(name, description, &input_schema);
+            // serde_json::to_value on a typed struct can't fail for our
+            // schema (no IO, no non-string-keyed maps). Defaulting to
+            // an empty array on the impossible error keeps a malformed
+            // single block from killing the whole conversation load.
+            let params_value = serde_json::to_value(&typed.params)
+                .unwrap_or_else(|_| serde_json::Value::Array(Vec::new()));
+            obj.insert("params".to_string(), params_value);
         }
     }
 }
@@ -1300,5 +1366,77 @@ mod tests {
                 .exists()
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn legacy_tool_schema_block_migrates_to_typed_params() {
+        // Pre-typed-schema thread JSON: tool_schema blocks held a raw
+        // JSON Schema in `input_schema`. The migration walks the
+        // conversation and rewrites them in-place to the new
+        // `params: [ParamSpec]` shape so the subsequent
+        // serde_json::from_value sees only the modern wire form.
+        let mut value = serde_json::json!({
+            "conversation": {
+                "messages": [
+                    {
+                        "role": "tools",
+                        "content": [
+                            {
+                                "type": "tool_schema",
+                                "name": "read_file",
+                                "description": "Read a file.",
+                                "input_schema": {
+                                    "type": "object",
+                                    "properties": {
+                                        "path": { "type": "string", "description": "where" }
+                                    },
+                                    "required": ["path"]
+                                }
+                            }
+                        ]
+                    }
+                ]
+            }
+        });
+        normalize_legacy_tool_schema_blocks(&mut value);
+        let block = &value["conversation"]["messages"][0]["content"][0];
+        assert!(block.get("input_schema").is_none(), "legacy field cleared");
+        let params = block["params"].as_array().unwrap();
+        assert_eq!(params.len(), 1);
+        assert_eq!(params[0]["name"], "path");
+        assert_eq!(params[0]["required"], true);
+        assert_eq!(params[0]["ty"]["kind"], "string");
+        assert_eq!(params[0]["description"], "where");
+    }
+
+    #[test]
+    fn already_migrated_tool_schema_block_is_left_alone() {
+        // Idempotency: a thread that's already on the new shape must
+        // not be rewritten. (And if both fields are present from a
+        // botched rollback, prefer params and drop input_schema.)
+        let mut value = serde_json::json!({
+            "conversation": {
+                "messages": [
+                    {
+                        "role": "tools",
+                        "content": [
+                            {
+                                "type": "tool_schema",
+                                "name": "t",
+                                "description": "",
+                                "params": [
+                                    { "name": "p", "ty": { "kind": "string" } }
+                                ],
+                                "input_schema": { "type": "object" }
+                            }
+                        ]
+                    }
+                ]
+            }
+        });
+        normalize_legacy_tool_schema_blocks(&mut value);
+        let block = &value["conversation"]["messages"][0]["content"][0];
+        assert!(block.get("input_schema").is_none());
+        assert_eq!(block["params"][0]["name"], "p");
     }
 }

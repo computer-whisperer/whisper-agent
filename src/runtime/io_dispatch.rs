@@ -1372,10 +1372,20 @@ fn build_model_request(
     let tools: Vec<ToolSpec> = task
         .conversation
         .tool_schemas()
-        .map(|(name, description, input_schema)| ToolSpec {
-            name: name.to_string(),
-            description: description.to_string(),
-            input_schema: input_schema.clone(),
+        .map(|(name, description, params)| {
+            // Re-emit the JSON Schema envelope for providers — they
+            // still take Value-shaped `input_schema` until commit 3.
+            let typed = whisper_agent_protocol::ToolSchema {
+                name: name.to_string(),
+                description: description.to_string(),
+                params: params.to_vec(),
+            };
+            let input_schema = typed.input_schema_value();
+            ToolSpec {
+                name: typed.name,
+                description: typed.description,
+                input_schema,
+            }
         })
         .collect();
     let setup_end = task.conversation.setup_prefix_end();
