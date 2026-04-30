@@ -1701,9 +1701,18 @@ struct BehaviorEditorModalState {
     /// Working prompt text. Empty until snapshot lands or when the
     /// behavior has no prompt.
     working_prompt: String,
+    /// Editor buffer for the system-prompt override file (sibling
+    /// `system_prompt.md`). Mirrors `BehaviorSnapshot.system_prompt`
+    /// — `None` when the file is absent on disk, `Some(content)` when
+    /// present. Independent of `config.thread.system_prompt`: the
+    /// override toggle in the System Prompt tab flips the config field,
+    /// this buffer holds the file content. Both ride together on
+    /// `UpdateBehavior` (no side `WritePodFile` round-trip).
+    working_system_prompt: Option<String>,
     /// Server-known baselines for Revert + dirty detection.
     baseline_config: Option<BehaviorConfig>,
     baseline_prompt: String,
+    baseline_system_prompt: Option<String>,
     /// Raw TOML tab backing buffer. Regenerated from working_config on
     /// tab entry unless raw_dirty says there's an unsaved raw edit.
     raw_buffer: String,
@@ -1720,6 +1729,7 @@ enum BehaviorEditorTab {
     Scope,
     Retention,
     Prompt,
+    SystemPrompt,
     RawToml,
 }
 
@@ -1731,9 +1741,20 @@ impl BehaviorEditorTab {
             BehaviorEditorTab::Scope => "Scope",
             BehaviorEditorTab::Retention => "Retention",
             BehaviorEditorTab::Prompt => "Prompt",
+            BehaviorEditorTab::SystemPrompt => "System Prompt",
             BehaviorEditorTab::RawToml => "Raw TOML",
         }
     }
+}
+
+/// Conventional pod-relative path for the system-prompt override
+/// associated with a behavior. The toggle in the System Prompt tab
+/// flips `config.thread.system_prompt` between `None` and
+/// `Some(File { name = behavior_system_prompt_path(id) })`; the editor
+/// buffer round-trips against this path through `ReadPodFile` /
+/// `WritePodFile`. Mirrors the pod-level `system_prompt.md` convention.
+fn behavior_system_prompt_path(behavior_id: &str) -> String {
+    format!("behaviors/{behavior_id}/system_prompt.md")
 }
 
 impl BehaviorEditorModalState {
@@ -1743,8 +1764,10 @@ impl BehaviorEditorModalState {
             behavior_id,
             working_config: None,
             working_prompt: String::new(),
+            working_system_prompt: None,
             baseline_config: None,
             baseline_prompt: String::new(),
+            baseline_system_prompt: None,
             raw_buffer: String::new(),
             raw_dirty: false,
             tab: BehaviorEditorTab::Trigger,
@@ -1753,8 +1776,12 @@ impl BehaviorEditorModalState {
         }
     }
 
-    /// True when anything — structured config, prompt, or raw buffer —
-    /// has diverged from the server-known baseline.
+    /// True when anything — structured config, prompt, raw buffer, or
+    /// system-prompt file content — has diverged from the
+    /// server-known baseline. The system-prompt buffer only counts
+    /// when the working config has the override active as a `File`
+    /// variant; `Text`-variant changes show up in `config` itself,
+    /// and a toggled-off override moots the buffer entirely.
     fn is_dirty(&self) -> bool {
         let config_dirty = match (&self.working_config, &self.baseline_config) {
             (Some(w), Some(b)) => w != b || self.raw_dirty,
@@ -1762,7 +1789,16 @@ impl BehaviorEditorModalState {
         };
         let prompt_dirty =
             self.baseline_config.is_some() && self.working_prompt != self.baseline_prompt;
-        config_dirty || prompt_dirty
+        let override_is_file = matches!(
+            self.working_config
+                .as_ref()
+                .and_then(|c| c.thread.system_prompt.as_ref()),
+            Some(whisper_agent_protocol::SystemPromptChoice::File { .. })
+        );
+        let system_prompt_dirty = self.baseline_config.is_some()
+            && override_is_file
+            && self.working_system_prompt != self.baseline_system_prompt;
+        config_dirty || prompt_dirty || system_prompt_dirty
     }
 }
 
@@ -3506,6 +3542,7 @@ impl eframe::App for ChatApp {
                         behavior_id,
                         config,
                         prompt: String::new(),
+                        system_prompt: None,
                     });
                 }
             }
@@ -3526,6 +3563,7 @@ impl eframe::App for ChatApp {
                     behavior_id,
                     config,
                     prompt,
+                    system_prompt,
                 } => {
                     let correlation = self.next_correlation_id();
                     if let Some(modal) = self.behavior_editor_modal.as_mut() {
@@ -3537,6 +3575,7 @@ impl eframe::App for ChatApp {
                         behavior_id,
                         config,
                         prompt,
+                        system_prompt,
                     });
                 }
             }

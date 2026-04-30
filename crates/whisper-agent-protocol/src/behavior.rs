@@ -423,6 +423,16 @@ pub struct BehaviorSnapshot {
     pub toml_text: String,
     /// Contents of the sibling `prompt.md`. Empty string when missing.
     pub prompt: String,
+    /// Contents of the sibling `system_prompt.md`, the conventional
+    /// location for a per-behavior system-prompt override. `None` when
+    /// the file is absent. Independent of
+    /// `config.thread.system_prompt`: the file may exist without the
+    /// config referencing it (dormant), or the config may reference a
+    /// non-conventional path or inline `Text` (in which case this
+    /// snapshot field is `None`). Lets a UI editor round-trip the
+    /// content in one save without a side `WritePodFile`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub system_prompt: Option<String>,
     pub state: BehaviorState,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub load_error: Option<String>,

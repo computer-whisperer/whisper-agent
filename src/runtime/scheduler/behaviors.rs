@@ -644,6 +644,7 @@ impl Scheduler {
     /// disk write in the background. Mirrors the `CreatePod` shape: the
     /// in-memory state is immediately queryable; a failing disk write
     /// logs a warn but doesn't roll back the in-memory entry.
+    #[allow(clippy::too_many_arguments)] // mirrors the destructured wire variant
     pub(super) fn handle_create_behavior(
         &mut self,
         conn_id: ConnId,
@@ -652,6 +653,7 @@ impl Scheduler {
         behavior_id: String,
         config: whisper_agent_protocol::BehaviorConfig,
         prompt: String,
+        system_prompt: Option<String>,
     ) {
         if let Err(e) = crate::pod::behaviors::validate_behavior_id(&behavior_id) {
             self.send_behavior_error(conn_id, correlation_id, "create_behavior", e);
@@ -698,6 +700,7 @@ impl Scheduler {
             config: Some(config.clone()),
             raw_toml,
             prompt: prompt.clone(),
+            system_prompt: system_prompt.clone(),
             state: whisper_agent_protocol::BehaviorState::default(),
             load_error: None,
         };
@@ -724,8 +727,14 @@ impl Scheduler {
         if let Some(pod_dir) = pod_dir {
             let bid = behavior_id;
             tokio::spawn(async move {
-                if let Err(e) =
-                    crate::pod::behaviors::create_on_disk(&pod_dir, &bid, &config, &prompt).await
+                if let Err(e) = crate::pod::behaviors::create_on_disk(
+                    &pod_dir,
+                    &bid,
+                    &config,
+                    &prompt,
+                    system_prompt.as_deref(),
+                )
+                .await
                 {
                     warn!(behavior_id = %bid, error = %e, "create_behavior disk write failed");
                 }
@@ -736,6 +745,7 @@ impl Scheduler {
     /// `UpdateBehavior` handler — replace the in-memory entry's config /
     /// prompt / raw_toml (preserving state), broadcast
     /// `BehaviorUpdated`, disk-write in the background.
+    #[allow(clippy::too_many_arguments)] // mirrors the destructured wire variant
     pub(super) fn handle_update_behavior(
         &mut self,
         conn_id: ConnId,
@@ -744,6 +754,7 @@ impl Scheduler {
         behavior_id: String,
         config: whisper_agent_protocol::BehaviorConfig,
         prompt: String,
+        system_prompt: Option<String>,
     ) {
         if let Err(e) = crate::pod::behaviors::validate_behavior_id(&behavior_id) {
             self.send_behavior_error(conn_id, correlation_id, "update_behavior", e);
@@ -782,6 +793,12 @@ impl Scheduler {
         behavior.config = Some(config.clone());
         behavior.raw_toml = raw_toml;
         behavior.prompt = prompt.clone();
+        // Only mutate the cached system_prompt when the caller is
+        // actually overwriting the file; a `None` carries no edit so
+        // the in-memory cache stays aligned with what's still on disk.
+        if let Some(text) = &system_prompt {
+            behavior.system_prompt = Some(text.clone());
+        }
         behavior.load_error = None;
         let snapshot = behavior.snapshot();
         let pod_dir = pod.dir.clone();
@@ -801,8 +818,14 @@ impl Scheduler {
 
         let bid = behavior_id;
         tokio::spawn(async move {
-            if let Err(e) =
-                crate::pod::behaviors::update_on_disk(&pod_dir, &bid, &config, &prompt).await
+            if let Err(e) = crate::pod::behaviors::update_on_disk(
+                &pod_dir,
+                &bid,
+                &config,
+                &prompt,
+                system_prompt.as_deref(),
+            )
+            .await
             {
                 warn!(behavior_id = %bid, error = %e, "update_behavior disk write failed");
             }

@@ -33,6 +33,11 @@ pub const BEHAVIOR_TOML: &str = "behavior.toml";
 pub const BEHAVIOR_PROMPT: &str = "prompt.md";
 /// Filename for the persisted trigger state.
 pub const BEHAVIOR_STATE: &str = "state.json";
+/// Filename for the per-behavior system-prompt override (the
+/// conventional file the override mechanism reads at fire time when
+/// `config.thread.system_prompt = File { name = "behaviors/<id>/system_prompt.md" }`).
+/// Optional — most behaviors inherit the pod default.
+pub const BEHAVIOR_SYSTEM_PROMPT: &str = "system_prompt.md";
 
 pub type BehaviorId = String;
 
@@ -66,6 +71,13 @@ pub struct Behavior {
     pub raw_toml: String,
     /// Contents of the sibling `prompt.md`. Empty when absent.
     pub prompt: String,
+    /// Contents of the sibling `system_prompt.md`. `None` when the
+    /// file is absent — the conventional override file is optional.
+    /// Independent of `config.thread.system_prompt`: the file may
+    /// exist without the config referencing it (dormant), or vice
+    /// versa (config points at a non-conventional path or inline
+    /// `Text` — in which case this field stays `None`).
+    pub system_prompt: Option<String>,
     pub state: BehaviorState,
     /// Parsed cron Schedule + timezone. `Some` only when `config.trigger`
     /// is `Cron` AND both parsed cleanly. Rebuilt by `refresh_cron` on
@@ -104,6 +116,7 @@ impl Behavior {
             config: self.config.clone(),
             toml_text: self.raw_toml.clone(),
             prompt: self.prompt.clone(),
+            system_prompt: self.system_prompt.clone(),
             state: self.state.clone(),
             load_error: self.load_error.clone(),
         }
@@ -242,15 +255,17 @@ pub fn validate_behavior_id(id: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Write a fresh behavior's three files to disk. Creates the
-/// `behaviors/<id>/` directory, fails if it already exists. `state.json`
-/// is seeded with a default `BehaviorState` so subsequent state updates
-/// can write-in-place.
+/// Write a fresh behavior's files to disk. Creates the
+/// `behaviors/<id>/` directory, fails if it already exists.
+/// `state.json` is seeded with a default `BehaviorState` so subsequent
+/// state updates can write-in-place. `system_prompt` is written only
+/// when `Some` (the override file is optional).
 pub async fn create_on_disk(
     pod_dir: &Path,
     behavior_id: &str,
     config: &BehaviorConfig,
     prompt: &str,
+    system_prompt: Option<&str>,
 ) -> anyhow::Result<()> {
     let dir = pod_dir.join(BEHAVIORS_DIR).join(behavior_id);
     if fs::try_exists(&dir).await.unwrap_or(false) {
@@ -263,19 +278,28 @@ pub async fn create_on_disk(
     let toml_text = to_toml(config)?;
     fs::write(dir.join(BEHAVIOR_TOML), toml_text).await?;
     fs::write(dir.join(BEHAVIOR_PROMPT), prompt).await?;
+    if let Some(text) = system_prompt {
+        fs::write(dir.join(BEHAVIOR_SYSTEM_PROMPT), text).await?;
+    }
     let state = BehaviorState::default();
     let state_json = serde_json::to_vec_pretty(&state)?;
     fs::write(dir.join(BEHAVIOR_STATE), state_json).await?;
     Ok(())
 }
 
-/// Overwrite a behavior's `behavior.toml` + `prompt.md`. Does NOT touch
-/// `state.json` — the run history survives config edits.
+/// Overwrite a behavior's `behavior.toml` + `prompt.md`, plus the
+/// sibling `system_prompt.md` when `system_prompt` is `Some`. Does NOT
+/// touch `state.json` — the run history survives config edits — and
+/// does NOT delete `system_prompt.md` when called with `None` (a
+/// config-only edit must not clobber prior override content; removing
+/// the override is done by clearing `config.thread.system_prompt`,
+/// leaving the file dormant on disk).
 pub async fn update_on_disk(
     pod_dir: &Path,
     behavior_id: &str,
     config: &BehaviorConfig,
     prompt: &str,
+    system_prompt: Option<&str>,
 ) -> anyhow::Result<()> {
     let dir = pod_dir.join(BEHAVIORS_DIR).join(behavior_id);
     if !fs::try_exists(&dir).await.unwrap_or(false) {
@@ -287,6 +311,9 @@ pub async fn update_on_disk(
     let toml_text = to_toml(config)?;
     fs::write(dir.join(BEHAVIOR_TOML), toml_text).await?;
     fs::write(dir.join(BEHAVIOR_PROMPT), prompt).await?;
+    if let Some(text) = system_prompt {
+        fs::write(dir.join(BEHAVIOR_SYSTEM_PROMPT), text).await?;
+    }
     Ok(())
 }
 
@@ -386,6 +413,24 @@ async fn load_one(dir: &Path, pod_id: &str, behavior_id: &str) -> Option<Behavio
     let prompt_path = dir.join(BEHAVIOR_PROMPT);
     let prompt = fs::read_to_string(&prompt_path).await.unwrap_or_default();
 
+    // Optional system-prompt override file. Missing → None (file is
+    // optional). Present-but-unreadable → warn + None so a transient
+    // I/O hiccup doesn't crash behavior load; the override config
+    // field's resolver re-reads at fire time and gets its own chance.
+    let system_prompt_path = dir.join(BEHAVIOR_SYSTEM_PROMPT);
+    let system_prompt = match fs::read_to_string(&system_prompt_path).await {
+        Ok(text) => Some(text),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => {
+            warn!(
+                path = %system_prompt_path.display(),
+                error = %e,
+                "read system_prompt.md failed; treating as absent",
+            );
+            None
+        }
+    };
+
     let state_path = dir.join(BEHAVIOR_STATE);
     let state = match fs::read(&state_path).await {
         Ok(bytes) => match serde_json::from_slice::<BehaviorState>(&bytes) {
@@ -413,6 +458,7 @@ async fn load_one(dir: &Path, pod_id: &str, behavior_id: &str) -> Option<Behavio
         config,
         raw_toml,
         prompt,
+        system_prompt,
         state,
         cron,
         load_error,
@@ -824,7 +870,7 @@ kind = "webhook"
             on_completion: RetentionPolicy::default(),
             scope: Default::default(),
         };
-        create_on_disk(&pod_dir, "daily", &cfg, "do the thing")
+        create_on_disk(&pod_dir, "daily", &cfg, "do the thing", None)
             .await
             .unwrap();
         let loaded = load_behaviors_for_pod(&pod_dir, "testpod").await;
@@ -847,8 +893,10 @@ kind = "webhook"
             on_completion: RetentionPolicy::default(),
             scope: Default::default(),
         };
-        create_on_disk(&pod_dir, "x", &cfg, "").await.unwrap();
-        let err = create_on_disk(&pod_dir, "x", &cfg, "").await.unwrap_err();
+        create_on_disk(&pod_dir, "x", &cfg, "", None).await.unwrap();
+        let err = create_on_disk(&pod_dir, "x", &cfg, "", None)
+            .await
+            .unwrap_err();
         assert!(err.to_string().contains("already exists"));
         let _ = std::fs::remove_dir_all(&pod_dir);
     }
@@ -864,7 +912,7 @@ kind = "webhook"
             on_completion: RetentionPolicy::default(),
             scope: Default::default(),
         };
-        create_on_disk(&pod_dir, "b", &cfg, "v1-prompt")
+        create_on_disk(&pod_dir, "b", &cfg, "v1-prompt", None)
             .await
             .unwrap();
         // Simulate some accumulated state.
@@ -883,7 +931,7 @@ kind = "webhook"
             name: "v2".into(),
             ..cfg
         };
-        update_on_disk(&pod_dir, "b", &cfg2, "v2-prompt")
+        update_on_disk(&pod_dir, "b", &cfg2, "v2-prompt", None)
             .await
             .unwrap();
 
@@ -906,7 +954,7 @@ kind = "webhook"
             on_completion: RetentionPolicy::default(),
             scope: Default::default(),
         };
-        let err = update_on_disk(&pod_dir, "ghost", &cfg, "")
+        let err = update_on_disk(&pod_dir, "ghost", &cfg, "", None)
             .await
             .unwrap_err();
         assert!(err.to_string().contains("does not exist"));
@@ -922,6 +970,125 @@ kind = "webhook"
     }
 
     #[tokio::test]
+    async fn loads_system_prompt_md_when_present() {
+        let pod_dir = scratch_dir();
+        let dir = pod_dir.join(BEHAVIORS_DIR).join("with-override");
+        write(&dir.join(BEHAVIOR_TOML), r#"name = "WithOverride""#);
+        write(&dir.join(BEHAVIOR_SYSTEM_PROMPT), "You are a summarizer.");
+        let behaviors = load_behaviors_for_pod(&pod_dir, "testpod").await;
+        assert_eq!(behaviors.len(), 1);
+        assert_eq!(
+            behaviors[0].system_prompt.as_deref(),
+            Some("You are a summarizer.")
+        );
+        // The snapshot exposes the same content to clients.
+        let snap = behaviors[0].snapshot();
+        assert_eq!(snap.system_prompt.as_deref(), Some("You are a summarizer."));
+        let _ = std::fs::remove_dir_all(&pod_dir);
+    }
+
+    #[tokio::test]
+    async fn missing_system_prompt_md_loads_as_none() {
+        let pod_dir = scratch_dir();
+        let dir = pod_dir.join(BEHAVIORS_DIR).join("plain");
+        write(&dir.join(BEHAVIOR_TOML), r#"name = "Plain""#);
+        let behaviors = load_behaviors_for_pod(&pod_dir, "testpod").await;
+        assert_eq!(behaviors.len(), 1);
+        assert!(behaviors[0].system_prompt.is_none());
+        assert!(behaviors[0].snapshot().system_prompt.is_none());
+        let _ = std::fs::remove_dir_all(&pod_dir);
+    }
+
+    #[tokio::test]
+    async fn create_writes_system_prompt_md_when_some() {
+        let pod_dir = scratch_dir();
+        let cfg = BehaviorConfig {
+            name: "with-prompt".into(),
+            description: None,
+            trigger: TriggerSpec::default(),
+            thread: whisper_agent_protocol::BehaviorThreadOverride::default(),
+            on_completion: RetentionPolicy::default(),
+            scope: Default::default(),
+        };
+        create_on_disk(&pod_dir, "with-prompt", &cfg, "do thing", Some("Be terse."))
+            .await
+            .unwrap();
+        let loaded = load_behaviors_for_pod(&pod_dir, "testpod").await;
+        assert_eq!(loaded[0].system_prompt.as_deref(), Some("Be terse."));
+        let _ = std::fs::remove_dir_all(&pod_dir);
+    }
+
+    #[tokio::test]
+    async fn create_skips_system_prompt_md_when_none() {
+        let pod_dir = scratch_dir();
+        let cfg = BehaviorConfig {
+            name: "no-prompt".into(),
+            description: None,
+            trigger: TriggerSpec::default(),
+            thread: whisper_agent_protocol::BehaviorThreadOverride::default(),
+            on_completion: RetentionPolicy::default(),
+            scope: Default::default(),
+        };
+        create_on_disk(&pod_dir, "no-prompt", &cfg, "", None)
+            .await
+            .unwrap();
+        let path = pod_dir
+            .join(BEHAVIORS_DIR)
+            .join("no-prompt")
+            .join(BEHAVIOR_SYSTEM_PROMPT);
+        assert!(!path.exists(), "system_prompt.md must not be created");
+        let _ = std::fs::remove_dir_all(&pod_dir);
+    }
+
+    #[tokio::test]
+    async fn update_overwrites_system_prompt_md_when_some() {
+        let pod_dir = scratch_dir();
+        let cfg = BehaviorConfig {
+            name: "edit".into(),
+            description: None,
+            trigger: TriggerSpec::default(),
+            thread: whisper_agent_protocol::BehaviorThreadOverride::default(),
+            on_completion: RetentionPolicy::default(),
+            scope: Default::default(),
+        };
+        create_on_disk(&pod_dir, "edit", &cfg, "p1", Some("v1"))
+            .await
+            .unwrap();
+        update_on_disk(&pod_dir, "edit", &cfg, "p1", Some("v2"))
+            .await
+            .unwrap();
+        let loaded = load_behaviors_for_pod(&pod_dir, "testpod").await;
+        assert_eq!(loaded[0].system_prompt.as_deref(), Some("v2"));
+        let _ = std::fs::remove_dir_all(&pod_dir);
+    }
+
+    #[tokio::test]
+    async fn update_with_none_leaves_system_prompt_md_alone() {
+        // A config-only edit must not clobber prior override content
+        // — `None` is "untouched", not "delete".
+        let pod_dir = scratch_dir();
+        let cfg = BehaviorConfig {
+            name: "edit".into(),
+            description: None,
+            trigger: TriggerSpec::default(),
+            thread: whisper_agent_protocol::BehaviorThreadOverride::default(),
+            on_completion: RetentionPolicy::default(),
+            scope: Default::default(),
+        };
+        create_on_disk(&pod_dir, "edit", &cfg, "p1", Some("preserved"))
+            .await
+            .unwrap();
+        update_on_disk(&pod_dir, "edit", &cfg, "p2", None)
+            .await
+            .unwrap();
+        let loaded = load_behaviors_for_pod(&pod_dir, "testpod").await;
+        assert_eq!(loaded[0].prompt, "p2");
+        // system_prompt.md content must be intact.
+        assert_eq!(loaded[0].system_prompt.as_deref(), Some("preserved"));
+        let _ = std::fs::remove_dir_all(&pod_dir);
+    }
+
+    #[tokio::test]
     async fn delete_removes_behavior_dir() {
         let pod_dir = scratch_dir();
         let cfg = BehaviorConfig {
@@ -932,7 +1099,9 @@ kind = "webhook"
             on_completion: RetentionPolicy::default(),
             scope: Default::default(),
         };
-        create_on_disk(&pod_dir, "gone", &cfg, "").await.unwrap();
+        create_on_disk(&pod_dir, "gone", &cfg, "", None)
+            .await
+            .unwrap();
         delete_on_disk(&pod_dir, "gone").await.unwrap();
         let loaded = load_behaviors_for_pod(&pod_dir, "testpod").await;
         assert!(loaded.is_empty());

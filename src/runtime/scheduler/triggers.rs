@@ -213,6 +213,7 @@ mod tests {
             config,
             raw_toml: String::new(),
             prompt: String::new(),
+            system_prompt: None,
             state: whisper_agent_protocol::BehaviorState::default(),
             cron: None,
             load_error,

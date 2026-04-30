@@ -117,6 +117,7 @@ impl Scheduler {
                 config: Some(parsed),
                 raw_toml: toml_text,
                 prompt: String::new(),
+                system_prompt: None,
                 state: whisper_agent_protocol::BehaviorState::default(),
                 load_error: None,
             };

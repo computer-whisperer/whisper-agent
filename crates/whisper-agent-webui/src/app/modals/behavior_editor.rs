@@ -1,7 +1,9 @@
 //! Per-behavior editor — structured tabs (Trigger / Thread / Scope /
-//! Retention / Prompt) plus a Raw TOML escape hatch for the config.
-//! Save ships the working `BehaviorConfig` + prompt through
-//! `UpdateBehavior`.
+//! Retention / Prompt / System Prompt) plus a Raw TOML escape hatch
+//! for the config. Save ships the working `BehaviorConfig` together
+//! with `prompt` and an optional `system_prompt` through a single
+//! `UpdateBehavior`; both prompt files round-trip alongside the
+//! config in one wire message.
 
 use std::collections::HashMap;
 
@@ -11,7 +13,8 @@ use whisper_agent_protocol::{BackendSummary, BehaviorConfig, ModelSummary, PodCo
 use super::super::editor_render::{
     render_behavior_editor_prompt_tab, render_behavior_editor_raw_tab,
     render_behavior_editor_retention_tab, render_behavior_editor_scope_tab,
-    render_behavior_editor_thread_tab, render_behavior_editor_trigger_tab,
+    render_behavior_editor_system_prompt_tab, render_behavior_editor_thread_tab,
+    render_behavior_editor_trigger_tab,
 };
 use super::super::{BehaviorEditorModalState, BehaviorEditorTab};
 
@@ -29,11 +32,19 @@ pub(crate) enum BehaviorEditorEvent {
     RequestModels(String),
     /// Save clicked. Caller mints a correlation, stamps it on the
     /// (still-open) modal, and dispatches `UpdateBehavior`.
+    ///
+    /// `system_prompt` is `Some(content)` when the override toggle is
+    /// on AND the buffer diverges from baseline (server overwrites
+    /// `behaviors/<id>/system_prompt.md`). It's `None` when the
+    /// override is off, when the buffer is unchanged, or when the
+    /// override is configured inline as `Text` (the change rides on
+    /// `config` itself; the side file isn't involved).
     SaveRequested {
         pod_id: String,
         behavior_id: String,
         config: BehaviorConfig,
         prompt: String,
+        system_prompt: Option<String>,
     },
 }
 
@@ -129,6 +140,7 @@ pub(crate) fn render_behavior_editor_modal(
                         BehaviorEditorTab::Scope,
                         BehaviorEditorTab::Retention,
                         BehaviorEditorTab::Prompt,
+                        BehaviorEditorTab::SystemPrompt,
                         BehaviorEditorTab::RawToml,
                     ] {
                         let active = modal.tab == tab;
@@ -195,6 +207,16 @@ pub(crate) fn render_behavior_editor_modal(
                         BehaviorEditorTab::Prompt => {
                             render_behavior_editor_prompt_tab(ui, &mut modal.working_prompt);
                         }
+                        BehaviorEditorTab::SystemPrompt => {
+                            if let Some(cfg) = modal.working_config.as_mut() {
+                                render_behavior_editor_system_prompt_tab(
+                                    ui,
+                                    &modal.behavior_id,
+                                    cfg,
+                                    &mut modal.working_system_prompt,
+                                );
+                            }
+                        }
                         BehaviorEditorTab::RawToml => {
                             render_behavior_editor_raw_tab(
                                 ui,
@@ -242,6 +264,26 @@ pub(crate) fn render_behavior_editor_modal(
         } else {
             working.clone()
         };
+        // System-prompt file write: only when the override is on AND
+        // the buffer diverges from the loaded baseline. Inline `Text`
+        // overrides ride on `config` itself (no side file); unset
+        // override means there's nothing to persist.
+        let override_active_as_file = matches!(
+            config.thread.system_prompt,
+            Some(whisper_agent_protocol::SystemPromptChoice::File { .. })
+        );
+        let system_prompt = if override_active_as_file
+            && modal.working_system_prompt != modal.baseline_system_prompt
+        {
+            // `Some(_)` means write the file with this content;
+            // `None` would mean "leave the file alone." On the wire
+            // both are valid, but here we always have a buffer when
+            // the override is on (toggling on seeds an empty string
+            // if no file is loaded yet).
+            Some(modal.working_system_prompt.clone().unwrap_or_default())
+        } else {
+            None
+        };
         modal.error = None;
         let pod_id = modal.pod_id.clone();
         let behavior_id = modal.behavior_id.clone();
@@ -253,6 +295,7 @@ pub(crate) fn render_behavior_editor_modal(
             behavior_id,
             config,
             prompt,
+            system_prompt,
         });
         return events;
     }
@@ -263,6 +306,7 @@ pub(crate) fn render_behavior_editor_modal(
             modal.raw_dirty = false;
         }
         modal.working_prompt = modal.baseline_prompt.clone();
+        modal.working_system_prompt = modal.baseline_system_prompt.clone();
         modal.error = None;
         modal.pending_correlation = None;
         *slot = Some(modal);

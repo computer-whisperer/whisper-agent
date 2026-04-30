@@ -1025,6 +1025,7 @@ impl ChatApp {
                         }
                     }
                     modal.baseline_prompt = snapshot.prompt.clone();
+                    modal.baseline_system_prompt = snapshot.system_prompt.clone();
                     modal.pending_correlation = None;
                     modal.error = None;
                 }

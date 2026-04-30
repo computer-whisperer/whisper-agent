@@ -1108,6 +1108,8 @@ impl ChatApp {
             modal.baseline_config = snapshot.config.clone();
             modal.working_prompt = snapshot.prompt.clone();
             modal.baseline_prompt = snapshot.prompt.clone();
+            modal.working_system_prompt = snapshot.system_prompt.clone();
+            modal.baseline_system_prompt = snapshot.system_prompt.clone();
             modal.raw_buffer = snapshot.toml_text.clone();
             modal.raw_dirty = false;
             modal.error = snapshot.load_error.clone();

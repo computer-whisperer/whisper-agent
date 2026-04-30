@@ -1687,9 +1687,9 @@ pub enum ClientToServer {
         payload: Option<serde_json::Value>,
     },
     /// Create a new behavior under the named pod. Writes
-    /// `<pod>/behaviors/<behavior_id>/{behavior.toml,prompt.md,state.json}`.
-    /// Fails on id collision; to mutate an existing behavior use
-    /// `UpdateBehavior`.
+    /// `<pod>/behaviors/<behavior_id>/{behavior.toml,prompt.md,state.json}`,
+    /// plus `system_prompt.md` when `system_prompt` is `Some`. Fails on
+    /// id collision; to mutate an existing behavior use `UpdateBehavior`.
     CreateBehavior {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         correlation_id: Option<String>,
@@ -1699,6 +1699,15 @@ pub enum ClientToServer {
         /// Contents of the sibling `prompt.md`. May be empty.
         #[serde(default)]
         prompt: String,
+        /// Optional contents of the sibling `system_prompt.md` — the
+        /// conventional location for a per-behavior system-prompt
+        /// override. `Some` writes the file (creating it if absent);
+        /// `None` skips the write entirely. The
+        /// `config.thread.system_prompt` field is the independent
+        /// switch that decides whether the file is consulted at fire
+        /// time.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        system_prompt: Option<String>,
     },
     /// Replace an existing behavior's config + prompt. Does NOT reset
     /// `state.json` — run_count / last_fired_at / etc. are
@@ -1711,6 +1720,14 @@ pub enum ClientToServer {
         config: BehaviorConfig,
         #[serde(default)]
         prompt: String,
+        /// Optional override-file content. `Some` overwrites
+        /// `system_prompt.md`; `None` leaves the file untouched (so a
+        /// no-op edit doesn't churn disk, and a config-only edit
+        /// doesn't accidentally clobber prior content). Removing the
+        /// override is done by clearing `config.thread.system_prompt`
+        /// — the file lingers on disk but is dormant.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        system_prompt: Option<String>,
     },
     /// Remove a behavior. Idempotent-ish — unknown behavior returns an
     /// error, but a repeated call against the same id after deletion is

@@ -1291,6 +1291,7 @@ impl Scheduler {
                 behavior_id,
                 config,
                 prompt,
+                system_prompt,
             } => {
                 self.handle_create_behavior(
                     conn_id,
@@ -1299,6 +1300,7 @@ impl Scheduler {
                     behavior_id,
                     config,
                     prompt,
+                    system_prompt,
                 );
             }
             ClientToServer::UpdateBehavior {
@@ -1307,6 +1309,7 @@ impl Scheduler {
                 behavior_id,
                 config,
                 prompt,
+                system_prompt,
             } => {
                 self.handle_update_behavior(
                     conn_id,
@@ -1315,6 +1318,7 @@ impl Scheduler {
                     behavior_id,
                     config,
                     prompt,
+                    system_prompt,
                 );
             }
             ClientToServer::DeleteBehavior {

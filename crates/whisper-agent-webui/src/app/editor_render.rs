@@ -1762,13 +1762,142 @@ pub(super) fn render_behavior_editor_prompt_tab(ui: &mut egui::Ui, prompt: &mut 
         "prompt.md — delivered as the initial user message when the \
          behavior fires. `{{payload}}` is substituted with the \
          trigger payload (pretty JSON; empty for Null payloads). The \
-         pod's system_prompt_file remains the thread's system prompt.",
+         pod's system_prompt_file remains the thread's system prompt \
+         unless the System Prompt tab overrides it.",
     );
     ui.add_space(4.0);
     ui.add_sized(
         [ui.available_width(), ui.available_height().max(180.0)],
         TextEdit::multiline(prompt).desired_rows(12),
     );
+}
+
+/// System-prompt override tab. Toggles
+/// `config.thread.system_prompt` between `None` and
+/// `Some(File { name = "behaviors/<id>/system_prompt.md" })`. When
+/// the override is on and bound to a `File`, the editor buffer holds
+/// `system_prompt.md`'s content (which round-trips through
+/// `BehaviorSnapshot.system_prompt` and `UpdateBehavior.system_prompt`
+/// alongside the config save). `Text` overrides — set via Raw TOML —
+/// are bound directly to the inline string; the side file is not
+/// involved, and the buffer mirrors the field for revert consistency.
+pub(super) fn render_behavior_editor_system_prompt_tab(
+    ui: &mut egui::Ui,
+    behavior_id: &str,
+    cfg: &mut BehaviorConfig,
+    working_buffer: &mut Option<String>,
+) {
+    use whisper_agent_protocol::SystemPromptChoice;
+
+    ui.add_space(4.0);
+    hint(
+        ui,
+        "Optional system-prompt override for threads this behavior \
+         spawns. Off = inherit the pod's default system prompt. On = \
+         use the text below as the agent-personality preamble for \
+         spawned threads. Stored as a sibling file in the behavior's \
+         directory; the override mechanism reads it at fire time.",
+    );
+    ui.add_space(6.0);
+
+    let conv_path = super::behavior_system_prompt_path(behavior_id);
+    let mut override_on = cfg.thread.system_prompt.is_some();
+    let was_on = override_on;
+    if ui
+        .checkbox(&mut override_on, "Override pod default system prompt")
+        .changed()
+    {
+        match (was_on, override_on) {
+            (false, true) => {
+                // Toggle on — bind to the conventional pod-relative
+                // file path. Preserve any existing buffer so a
+                // toggle-off-then-on round trip doesn't drop the
+                // user's draft; only seed an empty buffer when none
+                // exists yet.
+                cfg.thread.system_prompt = Some(SystemPromptChoice::File {
+                    name: conv_path.clone(),
+                });
+                if working_buffer.is_none() {
+                    *working_buffer = Some(String::new());
+                }
+            }
+            (true, false) => {
+                // Toggle off — drop the config reference. The
+                // sibling file (if any) is left on disk so the user
+                // can re-enable without losing content.
+                cfg.thread.system_prompt = None;
+            }
+            _ => {}
+        }
+    }
+
+    if !override_on {
+        ui.add_space(4.0);
+        ui.label(
+            RichText::new("(inheriting pod default — toggle on to override)")
+                .italics()
+                .color(Color32::from_gray(160)),
+        );
+        return;
+    }
+
+    ui.add_space(6.0);
+    match cfg.thread.system_prompt.as_mut() {
+        Some(SystemPromptChoice::File { name }) => {
+            let path_label = name.clone();
+            let non_conv = path_label != conv_path;
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new("file:")
+                        .small()
+                        .color(Color32::from_gray(160)),
+                );
+                ui.label(
+                    RichText::new(&path_label)
+                        .small()
+                        .monospace()
+                        .color(Color32::from_gray(180)),
+                );
+            });
+            if non_conv {
+                ui.add_space(2.0);
+                hint(
+                    ui,
+                    "Non-conventional path — `UpdateBehavior` only \
+                     writes the conventional `behaviors/<id>/system_prompt.md`, \
+                     so edits to this buffer are saved there. Use Raw \
+                     TOML to retarget the pointer if you really want a \
+                     different path.",
+                );
+            }
+            ui.add_space(4.0);
+            let buffer = working_buffer.get_or_insert_with(String::new);
+            ui.add_sized(
+                [ui.available_width(), ui.available_height().max(180.0)],
+                TextEdit::multiline(buffer).desired_rows(12),
+            );
+        }
+        Some(SystemPromptChoice::Text { text }) => {
+            // Inline text override (typically authored via Raw TOML).
+            // Bind the editor directly to the config field — no side
+            // file involved. Edits flow through `config != baseline`
+            // (handled by `is_dirty` as plain config divergence), so
+            // `working_buffer` is intentionally untouched here:
+            // mirroring the inline text would corrupt the File-variant
+            // baseline relationship `is_dirty` relies on.
+            ui.label(
+                RichText::new("inline text (no side file)")
+                    .small()
+                    .color(Color32::from_gray(160)),
+            );
+            ui.add_space(4.0);
+            ui.add_sized(
+                [ui.available_width(), ui.available_height().max(180.0)],
+                TextEdit::multiline(text).desired_rows(12),
+            );
+        }
+        None => {}
+    }
 }
 
 pub(super) fn render_behavior_editor_raw_tab(
