@@ -598,13 +598,14 @@ enum DisplayItem {
         text: String,
     },
     SetupTools {
-        /// Count of tool schemas in the manifest (for the collapsed header).
-        count: usize,
-        /// Human-readable rendering of the manifest — one entry per
-        /// tool, name + description + input-schema — shown when the
-        /// row is expanded. Precomputed at item-build time so the
-        /// renderer doesn't re-serialize every frame.
-        text: String,
+        /// Typed tool manifest carried verbatim from the conversation's
+        /// `Role::Tools` blocks. The renderer walks this directly —
+        /// per-tool nested collapsibles, per-parameter rows with
+        /// names / types / required markers / descriptions — instead
+        /// of a pre-flattened JSON string. Cloned at item-build time
+        /// so the renderer doesn't re-borrow the conversation each
+        /// frame.
+        entries: Vec<whisper_agent_protocol::ToolSchema>,
     },
     /// Per-LLM-call diagnostic footer, emitted once at the end of
     /// every assistant turn. Sourced live from `ThreadAssistantEnd`

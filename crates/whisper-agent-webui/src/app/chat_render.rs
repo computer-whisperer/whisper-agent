@@ -18,7 +18,7 @@
 
 use egui::{Color32, RichText};
 use egui_commonmark::{CommonMarkCache, CommonMarkViewer};
-use whisper_agent_protocol::{Attachment, ImageSource, Usage};
+use whisper_agent_protocol::{Attachment, ImageSource, ParamSpec, ParamType, ToolSchema, Usage};
 
 use super::{DiffPayload, DisplayItem, FusedToolResult};
 
@@ -181,7 +181,7 @@ pub(super) fn render_item(
             } => render_tool_result(ui, tool_use_id, name, text, *is_error, attachments),
             DisplayItem::SystemNote { text, is_error } => render_system_note(ui, text, *is_error),
             DisplayItem::SetupPrompt { text } => render_setup_prompt(ui, text),
-            DisplayItem::SetupTools { count, text } => render_setup_tools(ui, *count, text),
+            DisplayItem::SetupTools { entries } => render_setup_tools(ui, entries),
             DisplayItem::TurnStats { usage } => render_turn_stats(ui, usage),
         }
     });
@@ -601,11 +601,22 @@ fn render_setup_prompt(ui: &mut egui::Ui, text: &str) {
 }
 
 /// Render the thread-prefix tool-manifest entry. Collapsed header
-/// shows the advertised count; expanded body lists each tool's
-/// name, description, and input schema. Default-collapsed so a
-/// thread with dozens of tools doesn't bury the conversation.
-fn render_setup_tools(ui: &mut egui::Ui, count: usize, text: &str) {
-    let id = ui.make_persistent_id(("setup-tools", text.as_ptr() as usize));
+/// shows the advertised count; expanded body is a list of per-tool
+/// nested collapsibles, each defaulting to closed so a thread with
+/// dozens of tools doesn't bury the conversation. Inside each
+/// per-tool body we walk the typed `params` directly — every field
+/// becomes a row with name / type / required marker / default /
+/// description, and nested objects/arrays indent.
+fn render_setup_tools(ui: &mut egui::Ui, entries: &[ToolSchema]) {
+    let count = entries.len();
+    // Persistence ID needs to be stable across frames but distinct
+    // per manifest instance. Hash the tool names — adequate uniqueness
+    // and survives renders without depending on Vec address (which
+    // moves when the items vector resizes).
+    let id_seed: u64 = entries
+        .iter()
+        .fold(0u64, |acc, e| acc.wrapping_add(hash_str(&e.name)));
+    let id = ui.make_persistent_id(("setup-tools", id_seed));
     egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), id, false)
         .show_header(ui, |ui| {
             ui.label(RichText::new("TOOLS").color(COLOR_SETUP).strong().small());
@@ -617,13 +628,210 @@ fn render_setup_tools(ui: &mut egui::Ui, count: usize, text: &str) {
             );
         })
         .body(|ui| {
+            for entry in entries {
+                render_one_tool(ui, entry);
+            }
+        });
+}
+
+fn render_one_tool(ui: &mut egui::Ui, t: &ToolSchema) {
+    let id = ui.make_persistent_id(("setup-tool", hash_str(&t.name)));
+    egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), id, false)
+        .show_header(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new(&t.name)
+                        .color(COLOR_TOOL)
+                        .strong()
+                        .monospace(),
+                );
+                let preview = first_line_preview(&t.description, 80);
+                if !preview.is_empty() {
+                    ui.add_space(8.0);
+                    ui.label(
+                        RichText::new(preview)
+                            .color(Color32::from_gray(140))
+                            .italics()
+                            .small(),
+                    );
+                }
+            });
+        })
+        .body(|ui| {
+            if !t.description.is_empty() {
+                ui.label(
+                    RichText::new(&t.description)
+                        .color(Color32::from_gray(180))
+                        .small(),
+                );
+                ui.add_space(4.0);
+            }
+            if t.params.is_empty() {
+                ui.label(
+                    RichText::new("(no parameters)")
+                        .color(Color32::from_gray(120))
+                        .italics()
+                        .small(),
+                );
+            } else {
+                for p in &t.params {
+                    render_param(ui, p, 0);
+                }
+            }
+        });
+}
+
+/// Render one parameter row. `indent` is the nesting depth — top
+/// level params start at 0, children of an `Object` field are at 1,
+/// etc. Each level adds a 16px left pad so the nesting is visible
+/// without committing extra collapsibles per parameter (which would
+/// be visual noise for the common shallow case).
+fn render_param(ui: &mut egui::Ui, p: &ParamSpec, indent: u8) {
+    let pad = 16.0 * indent as f32;
+    ui.horizontal(|ui| {
+        if pad > 0.0 {
+            ui.add_space(pad);
+        }
+        ui.label(
+            RichText::new(&p.name)
+                .color(COLOR_TOOL)
+                .strong()
+                .monospace()
+                .small(),
+        );
+        ui.add_space(6.0);
+        ui.label(
+            RichText::new(format_param_type(&p.ty))
+                .color(Color32::from_gray(150))
+                .small(),
+        );
+        if p.required {
+            ui.add_space(6.0);
             ui.label(
-                RichText::new(text)
-                    .color(Color32::from_gray(180))
+                RichText::new("required")
+                    .color(Color32::from_rgb(180, 140, 100))
+                    .small()
+                    .strong(),
+            );
+        }
+        if let Some(d) = &p.default {
+            ui.add_space(6.0);
+            ui.label(
+                RichText::new(format!("= {}", value_short(d)))
+                    .color(Color32::from_gray(120))
                     .monospace()
                     .small(),
             );
+        }
+    });
+    if !p.description.is_empty() {
+        ui.horizontal(|ui| {
+            if pad > 0.0 {
+                ui.add_space(pad);
+            }
+            ui.add_space(16.0);
+            ui.label(
+                RichText::new(&p.description)
+                    .color(Color32::from_gray(170))
+                    .small(),
+            );
         });
+    }
+    match &p.ty {
+        ParamType::Object { fields } => {
+            for f in fields {
+                render_param(ui, f, indent.saturating_add(1));
+            }
+        }
+        ParamType::Array { items } => {
+            // Surface the element shape one level down for arrays of
+            // records. For arrays of scalars the type label already
+            // says everything ("array of string"), so skip the row.
+            if let ParamType::Object { fields } = items.as_ref() {
+                ui.horizontal(|ui| {
+                    let inner_pad = 16.0 * (indent.saturating_add(1)) as f32;
+                    if inner_pad > 0.0 {
+                        ui.add_space(inner_pad);
+                    }
+                    ui.label(
+                        RichText::new("(array element)")
+                            .color(Color32::from_gray(120))
+                            .italics()
+                            .small(),
+                    );
+                });
+                for f in fields {
+                    render_param(ui, f, indent.saturating_add(2));
+                }
+            }
+        }
+        ParamType::Raw { schema } => {
+            // Unmodeled JSON Schema fragment. Pretty-print it as a
+            // monospace block so the param is at least introspectable
+            // — better than swallowing it.
+            ui.horizontal(|ui| {
+                if pad > 0.0 {
+                    ui.add_space(pad);
+                }
+                ui.add_space(16.0);
+                ui.label(
+                    RichText::new(serde_json::to_string_pretty(schema).unwrap_or_default())
+                        .color(Color32::from_gray(140))
+                        .monospace()
+                        .small(),
+                );
+            });
+        }
+        ParamType::String { .. } | ParamType::Integer | ParamType::Number | ParamType::Boolean => {}
+    }
+}
+
+fn format_param_type(t: &ParamType) -> String {
+    match t {
+        ParamType::String { enum_values } if enum_values.is_empty() => "string".into(),
+        ParamType::String { enum_values } => format!("string · one of: {}", enum_values.join(", ")),
+        ParamType::Integer => "integer".into(),
+        ParamType::Number => "number".into(),
+        ParamType::Boolean => "boolean".into(),
+        ParamType::Array { items } => format!("array of {}", scalar_type_label(items)),
+        ParamType::Object { .. } => "object".into(),
+        ParamType::Raw { .. } => "(custom)".into(),
+    }
+}
+
+fn scalar_type_label(t: &ParamType) -> &'static str {
+    match t {
+        ParamType::String { .. } => "string",
+        ParamType::Integer => "integer",
+        ParamType::Number => "number",
+        ParamType::Boolean => "boolean",
+        ParamType::Array { .. } => "array",
+        ParamType::Object { .. } => "object",
+        ParamType::Raw { .. } => "(custom)",
+    }
+}
+
+fn value_short(v: &serde_json::Value) -> String {
+    let s = serde_json::to_string(v).unwrap_or_default();
+    if s.chars().count() > 60 {
+        let mut out: String = s.chars().take(60).collect();
+        out.push('…');
+        out
+    } else {
+        s
+    }
+}
+
+/// FNV-1a hash for stable per-name persistent IDs in the manifest
+/// renderer. Keeps egui's CollapsingState keyed on tool identity, not
+/// vector address.
+fn hash_str(s: &str) -> u64 {
+    let mut h: u64 = 0xcbf29ce484222325;
+    for b in s.bytes() {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    h
 }
 
 /// Per-turn diagnostic footer. Format: `tokens in 12,345 · cached

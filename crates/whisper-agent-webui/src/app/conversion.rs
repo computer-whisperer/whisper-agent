@@ -80,47 +80,27 @@ pub(super) fn add_message_items(msg: &Message, msg_index: usize, out: &mut Vec<D
         }
         Role::Tools => {
             // Tool manifest: one `ContentBlock::ToolSchema` per tool.
-            // The collapsed row shows the count; expanded shows
-            // name + description + input-schema for each entry.
-            //
-            // Pre-typed-schema cut: re-emit the JSON Schema envelope
-            // and pretty-print as before. The structured renderer
-            // lands in a follow-up commit and walks `params` directly.
-            let mut rendered = String::new();
-            let mut count = 0usize;
-            for block in &msg.content {
-                if let ContentBlock::ToolSchema {
-                    name,
-                    description,
-                    params,
-                } = block
-                {
-                    if count > 0 {
-                        rendered.push_str("\n\n");
-                    }
-                    rendered.push_str(name);
-                    if !description.is_empty() {
-                        rendered.push_str(" — ");
-                        rendered.push_str(description);
-                    }
-                    rendered.push('\n');
-                    let typed = whisper_agent_protocol::ToolSchema {
+            // Cloned into a `Vec<ToolSchema>` so the renderer walks
+            // the typed shape directly (params + types + required +
+            // descriptions) — see `render_setup_tools`.
+            let entries: Vec<whisper_agent_protocol::ToolSchema> = msg
+                .content
+                .iter()
+                .filter_map(|b| match b {
+                    ContentBlock::ToolSchema {
+                        name,
+                        description,
+                        params,
+                    } => Some(whisper_agent_protocol::ToolSchema {
                         name: name.clone(),
                         description: description.clone(),
                         params: params.clone(),
-                    };
-                    rendered.push_str(
-                        &serde_json::to_string_pretty(&typed.input_schema_value())
-                            .unwrap_or_default(),
-                    );
-                    count += 1;
-                }
-            }
-            if count > 0 {
-                out.push(DisplayItem::SetupTools {
-                    count,
-                    text: rendered,
-                });
+                    }),
+                    _ => None,
+                })
+                .collect();
+            if !entries.is_empty() {
+                out.push(DisplayItem::SetupTools { entries });
             }
         }
         Role::User => {
