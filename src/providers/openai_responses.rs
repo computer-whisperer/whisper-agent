@@ -94,6 +94,7 @@ impl OpenAiResponsesClient {
     }
 
     fn new(base_url: String, auth: ClientAuth) -> Self {
+        crate::ensure_default_crypto_provider();
         let base_url = base_url.trim_end_matches('/').to_string();
         Self {
             http: reqwest::Client::new(),

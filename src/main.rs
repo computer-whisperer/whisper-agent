@@ -291,13 +291,7 @@ async fn main() -> Result<()> {
         )
         .init();
 
-    // Pin rustls's process-level CryptoProvider before any TLS code
-    // runs. Both `ring` and `aws-lc-rs` arrive transitively, so rustls
-    // refuses to auto-pick. `.ok()` swallows the "already installed"
-    // error if some library beat us to it.
-    rustls::crypto::ring::default_provider()
-        .install_default()
-        .ok();
+    whisper_agent::ensure_default_crypto_provider();
 
     let cli = Cli::parse();
     match cli.command {

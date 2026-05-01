@@ -53,6 +53,7 @@ impl OpenAiChatClient {
     /// `base_url` is the prefix under which `/chat/completions` and `/models` live.
     /// `api_key` is omitted for endpoints that don't require auth (Ollama, LM Studio).
     pub fn new(base_url: String, api_key: Option<String>) -> Self {
+        crate::ensure_default_crypto_provider();
         let base_url = base_url.trim_end_matches('/').to_string();
         Self {
             http: reqwest::Client::new(),

@@ -63,6 +63,7 @@ impl WikipediaDriver {
     /// `<lang>wiki` URL form internally. Pass `mirror = None` to use
     /// [`DEFAULT_MIRROR`].
     pub fn new(language: impl Into<String>, mirror: Option<String>) -> Self {
+        crate::ensure_default_crypto_provider();
         let mirror = mirror
             .unwrap_or_else(|| DEFAULT_MIRROR.to_string())
             .trim_end_matches('/')

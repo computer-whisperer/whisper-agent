@@ -30,7 +30,7 @@ toml = { version = "1", default-features = false, features = ["display", "parse"
 # `similar` powers the unified-diff renderer for edit_file / write_file
 # tool calls. Default features include `bytes` + `text`; we only need
 # the text diff API.
-similar = { version = "2", default-features = false, features = ["text"] }
+similar = { version = "3", default-features = false, features = ["text"] }
 # Markdown viewer for chat log messages. Stripped to the text-parser
 # only: no `load-images` (don't fetch network resources from rendered
 # output) and no syntect-backed `better_syntax_highlighting` (keeps
@@ -52,7 +52,7 @@ image = { version = "0.25", default-features = false, features = ["png", "jpeg",
 # drag-drop plumbing bug; neither works → staging/capabilities bug).
 # `default-features = false` drops the GTK3 native backend in favor
 # of xdg-portal where available, keeping the native binary smaller.
-rfd = { version = "0.15", default-features = false, features = ["xdg-portal", "tokio"] }
+rfd = { version = "0.17", default-features = false, features = ["xdg-portal"] }
 # Cron + tz for the behavior-editor "next N fires" preview. Mirror the
 # server's parsers so what the editor shows matches what the scheduler
 # will fire. chrono's default features include `clock` + `wasmbind`,

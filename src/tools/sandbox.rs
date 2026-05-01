@@ -168,6 +168,7 @@ pub struct DaemonClient {
 
 impl DaemonClient {
     pub fn new(name: String, daemon_url: String, control_token: Option<String>) -> Self {
+        crate::ensure_default_crypto_provider();
         let http = reqwest::Client::builder()
             .connect_timeout(DAEMON_CONNECT_TIMEOUT)
             .timeout(DAEMON_REQUEST_TIMEOUT)

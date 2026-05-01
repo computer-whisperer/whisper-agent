@@ -57,6 +57,13 @@ async fn main() -> anyhow::Result<()> {
 
     let args = Args::parse();
 
+    // reqwest 0.13's `rustls-no-provider` requires the application to
+    // install a CryptoProvider before any Client is built. `.ok()`
+    // swallows "already installed" if some library beat us to it.
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .ok();
+
     let http = reqwest::Client::builder()
         .timeout(Duration::from_secs(args.request_timeout_seconds))
         .user_agent(concat!(

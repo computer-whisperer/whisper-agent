@@ -248,7 +248,7 @@ impl SparseIndex {
             .parse_query(query_text)
             .map_err(|e| BucketError::Other(format!("tantivy parse_query: {e}")))?;
         let top_docs = searcher
-            .search(&query, &TopDocs::with_limit(top_k))
+            .search(&query, &TopDocs::with_limit(top_k).order_by_score())
             .map_err(|e| BucketError::Other(format!("tantivy search: {e}")))?;
 
         let mut out = Vec::with_capacity(top_docs.len());

@@ -36,7 +36,7 @@ anyhow = "1"
 
 # HTTP server / client
 axum = "0.8"
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider"] }
 
 # Time
 chrono-tz = "0.10"
@@ -73,7 +73,7 @@ tokio = { workspace = true, features = ["fs", "io-util", "sync", "net"] }
 tokio-util = "0.7"
 serde = { workspace = true }
 serde_json = { workspace = true }
-reqwest = { workspace = true, features = ["json", "stream"] }
+reqwest = { workspace = true, features = ["json", "stream", "form"] }
 url = { workspace = true }
 futures = "0.3"
 async-stream = "0.3"
@@ -91,12 +91,12 @@ axum = { workspace = true, features = ["ws"] }
 # rustls cert/key file loaders we need for `--tls-cert`/`--tls-key`.
 axum-server = { version = "0.8", features = ["tls-rustls"] }
 # Direct rustls dep to call `crypto::ring::default_provider()`
-# `.install_default()` once at startup. Both `aws-lc-rs` and `ring`
-# arrive transitively (reqwest via hyper-rustls uses ring;
-# axum-server/rustls default to aws-lc-rs), and rustls 0.23 panics on
-# the first TLS use if both are active without an explicit pick.
-# Keep it on `ring` to match reqwest's chain — avoids dragging in the
-# aws-lc-sys NASM build for an otherwise-unused crypto path.
+# `.install_default()` once at startup. reqwest 0.13's
+# `rustls-no-provider` feature deliberately leaves provider selection
+# to the application; axum-server pulls aws-lc-rs in transitively, and
+# rustls 0.23 panics on the first TLS use if both providers are active
+# without an explicit pick. Our `install_default()` settles it on ring
+# at startup — avoids dragging the aws-lc-sys NASM build into our chain.
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
 tower-http = { version = "0.6", features = ["trace"] }
 # `rust-embed` bakes the webui pkg/ + assets/ trees into the release
@@ -114,8 +114,8 @@ subtle = { workspace = true }
 # OAuth 2.1 + PKCE for shared-MCP-host authorization: `rand` mints
 # per-flow state + PKCE verifiers; `sha2` hashes the verifier into
 # the S256 code_challenge presented on the authorization URL.
-rand = "0.9"
-sha2 = "0.10"
+rand = "0.10"
+sha2 = "0.11"
 # blake3 for chunk-id hashing in the knowledge-bucket layer. Multi-GB/s
 # throughput matters because the chunker hashes every source record on a
 # wikipedia-scale build — sha2 would bottleneck the chunking stage.
@@ -128,7 +128,7 @@ hnsw_rs = "0.3"
 # the de-facto Lucene-equivalent in Rust; segment-based, mature, and
 # composes cleanly with our slot directory layout (one tantivy
 # directory per slot).
-tantivy = "0.24"
+tantivy = "0.26"
 # Streaming XML parser for the MediaWiki source adapter — wikipedia
 # dumps are far too large to parse with a DOM-style API. quick-xml
 # exposes pull-style events that let us walk a 22 GB enwiki dump
@@ -139,19 +139,19 @@ quick-xml = "0.39"
 # `Read` impl over the compressed file; we wrap it in `BufReader`
 # before handing to quick-xml so chunked decompression overlaps with
 # parsing.
-bzip2 = "0.5"
+bzip2 = "0.6"
 # Real BPE tokenizer for chunk-boundary stability across embedder
 # rotations. The chunker takes token-level offsets from `Encoding` and
 # slices the source text at exact token-count boundaries — chunk text
 # is always a contiguous substring of the source. `onig` (the default
 # regex backend) pulls in a C dep we don't need; `unstable_wasm` flag
 # disables it.
-tokenizers = { version = "0.21", default-features = false, features = ["onig", "esaxx_fast"] }
+tokenizers = { version = "0.23", default-features = false, features = ["onig", "esaxx_fast"] }
 # HuggingFace Hub client for auto-fetching `tokenizer.json` when the
 # bucket's chunker is set to `tokenizer = "auto"` and resolves to a
 # model id via the embedder. Sync API is fine — resolution happens
 # once at slot-build start, not on the hot path.
-hf-hub = { version = "0.4", default-features = false, features = ["rustls-tls", "ureq"] }
+hf-hub = { version = "0.5", default-features = false, features = ["rustls-tls", "ureq"] }
 # memmap2 for the slot's chunks.bin / vectors.bin readers. Replaces a
 # `Mutex<File>` + seek+read per fetch — concurrent queries no longer
 # serialize on a single file handle, and a slot's working set lives

@@ -48,6 +48,7 @@ pub struct LlamaCppClient {
 
 impl LlamaCppClient {
     pub fn new(base_url: String) -> Self {
+        crate::ensure_default_crypto_provider();
         let origin = base_url.trim_end_matches('/').to_string();
         let openai_base = format!("{origin}/v1");
         Self {

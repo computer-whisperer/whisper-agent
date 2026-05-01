@@ -53,6 +53,7 @@ struct TeiHttp {
 
 impl TeiHttp {
     fn new(endpoint: String, api_key: Option<String>) -> Self {
+        crate::ensure_default_crypto_provider();
         Self {
             origin: endpoint.trim_end_matches('/').to_string(),
             api_key,

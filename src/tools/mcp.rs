@@ -316,6 +316,7 @@ impl McpSession {
     /// `Authorization: Bearer <token>` on every subsequent request —
     /// per-sandbox MCP hosts issue this token at provision time.
     pub async fn connect(url: impl Into<String>, bearer: Option<String>) -> Result<Self, McpError> {
+        crate::ensure_default_crypto_provider();
         let session = Self {
             http: reqwest::Client::new(),
             url: url.into(),

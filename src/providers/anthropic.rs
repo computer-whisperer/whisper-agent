@@ -50,6 +50,7 @@ pub struct AnthropicClient {
 
 impl AnthropicClient {
     pub fn new(api_key: String) -> Self {
+        crate::ensure_default_crypto_provider();
         Self {
             http: reqwest::Client::new(),
             api_key,

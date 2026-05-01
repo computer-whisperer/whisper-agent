@@ -13,6 +13,11 @@ path = "src/main.rs"
 axum = { workspace = true }
 tokio = { workspace = true, features = ["net"] }
 reqwest = { workspace = true }
+# `crypto::ring::default_provider().install_default()` once at startup.
+# reqwest 0.13's `rustls-no-provider` feature deliberately leaves
+# provider selection to the application; without an install Client::new
+# panics with "No provider set" on first TLS use.
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
@@ -21,5 +26,5 @@ clap = { workspace = true }
 thiserror = { workspace = true }
 anyhow = { workspace = true }
 url = { workspace = true }
-html2text = "0.16"
+html2text = "0.17"
 whisper-agent-mcp-proto = { workspace = true }

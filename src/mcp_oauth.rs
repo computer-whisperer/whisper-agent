@@ -14,7 +14,7 @@
 
 use anyhow::{Context, Result, anyhow, bail};
 use base64::Engine;
-use rand::RngCore;
+use rand::Rng;
 use reqwest::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE, WWW_AUTHENTICATE};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -642,6 +642,7 @@ async fn post_token_form(
 /// Kept as a free function rather than a state field on Scheduler so
 /// test paths can build their own.
 pub fn http_client() -> Result<reqwest::Client> {
+    crate::ensure_default_crypto_provider();
     reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(HTTP_TIMEOUT_SECS))
         .build()
