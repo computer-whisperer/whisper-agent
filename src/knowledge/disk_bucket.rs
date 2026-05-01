@@ -101,19 +101,25 @@ const PIPELINE_CHANNEL_CAPACITY: usize = 1;
 /// pick up the dump instead of rebuilding the graph from vectors.bin
 /// (an `O(M N log N)` cost proportional to how far the prior attempt
 /// got). The dump itself blocks new appends for its duration since
-/// hnsw_rs serializes writes against the read lock — at scales where
-/// dumps are expensive, the embedder network roundtrips dominate
-/// anyway. Picked 32 batches (= 4096 chunks at EMBED_BATCH_SIZE=128)
-/// as a balance: small enough that workspace-scale builds get at
-/// least one dump if cancelled past the first few batches, large
-/// enough that wiki-scale builds do ~7k dumps over a multi-day build
-/// rather than hundreds of thousands.
+/// hnsw_rs serializes writes against the read lock — and at
+/// wiki-scale on Ceph that block window is ~14 min for a 1.3M-point
+/// f32 graph (~6 GB rewritten from scratch), which on the first real
+/// enwiki build pinned TEI's GPU duty cycle around 6%. The original
+/// "embedder roundtrips dominate anyway" assumption only holds when
+/// the dump is short relative to the inter-dump embed window.
+///
+/// 256 batches (= 32k chunks at EMBED_BATCH_SIZE=128) makes the embed
+/// window long enough to amortize each dump: ~8 min of embedder work
+/// per ~14 min dump, so duty cycle climbs to ~35–40%. Resume cost
+/// scales with the *post-snapshot* tail (capped at 32k chunks of HNSW
+/// rebuild — ~1 sec at hnsw_rs's insert rate), which is negligible
+/// compared to the rebuild we already accept on a missing-dump fallback.
 ///
 /// Lowered to 1 in tests so the resume tests cover both fast-path
 /// (sidecar load) and fallback (rebuild) without needing to feed
 /// thousands of records through the build to trigger a real dump.
 #[cfg(not(test))]
-const DENSE_DUMP_BATCH_INTERVAL: u64 = 32;
+const DENSE_DUMP_BATCH_INTERVAL: u64 = 256;
 #[cfg(test)]
 const DENSE_DUMP_BATCH_INTERVAL: u64 = 1;
 
