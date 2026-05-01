@@ -97,31 +97,52 @@ const PIPELINE_CHANNEL_CAPACITY: usize = 2;
 #[cfg(test)]
 const PIPELINE_CHANNEL_CAPACITY: usize = 1;
 
-/// Dump the in-progress HNSW + sidecar every N batches so resume can
-/// pick up the dump instead of rebuilding the graph from vectors.bin
-/// (an `O(M N log N)` cost proportional to how far the prior attempt
-/// got). The dump itself blocks new appends for its duration since
-/// hnsw_rs serializes writes against the read lock — and at
-/// wiki-scale on Ceph that block window is ~14 min for a 1.3M-point
-/// f32 graph (~6 GB rewritten from scratch), which on the first real
-/// enwiki build pinned TEI's GPU duty cycle around 6%. The original
-/// "embedder roundtrips dominate anyway" assumption only holds when
-/// the dump is short relative to the inter-dump embed window.
+/// How many BatchEmbedded checkpoints between periodic HNSW dumps.
+/// Returned by [`dense_dump_interval_batches`].
 ///
-/// 256 batches (= 32k chunks at EMBED_BATCH_SIZE=128) makes the embed
-/// window long enough to amortize each dump: ~8 min of embedder work
-/// per ~14 min dump, so duty cycle climbs to ~35–40%. Resume cost
-/// scales with the *post-snapshot* tail (capped at 32k chunks of HNSW
-/// rebuild — ~1 sec at hnsw_rs's insert rate), which is negligible
-/// compared to the rebuild we already accept on a missing-dump fallback.
+/// The dump itself rewrites the entire HNSW graph (`hnsw_rs`'s
+/// `file_dump` is full-rewrite, no incremental support) and serializes
+/// against new inserts via the read lock, so its duration grows linearly
+/// with N. On Ceph at ~3-4 MB/s sustained, dump time runs ~28 min at
+/// 2.5M f32 points and extrapolates to ~150 min at full enwiki (~13M).
+/// A constant interval lets the embedder's duty cycle decay as N grows;
+/// scaling the interval with N is what keeps it bounded.
 ///
-/// Lowered to 1 in tests so the resume tests cover both fast-path
-/// (sidecar load) and fallback (rebuild) without needing to feed
-/// thousands of records through the build to trigger a real dump.
-#[cfg(not(test))]
-const DENSE_DUMP_BATCH_INTERVAL: u64 = 256;
-#[cfg(test)]
-const DENSE_DUMP_BATCH_INTERVAL: u64 = 1;
+/// Strategy: dump every time the index has grown by ~25% — i.e.,
+/// threshold ≈ `chunks_emitted / (4 × EMBED_BATCH_SIZE)`. With both the
+/// dump cost and the embed window proportional to N, the ratio (and
+/// thus duty cycle) is N-invariant. Below the floor we keep the
+/// original 256-batch (~32 k chunk) cadence: workspace-scale dumps are
+/// cheap and resume cost matters more there.
+///
+/// Resume cost: the post-snapshot tail rebuilds at hnsw_rs's insert
+/// rate (~90 inserts/s at wiki scale on this hardware), so a 25%-tail
+/// at 2.5M is ~625k chunks ≈ ~115 min — bounded, and acceptable on a
+/// multi-day build vs. the multi-hour from-scratch rebuild we already
+/// accept on a missing-dump fallback.
+///
+/// Pinned at 1 in tests so resume tests deterministically exercise
+/// both the fast-path (sidecar load) and fallback (rebuild) without
+/// having to feed thousands of records through a build.
+fn dense_dump_interval_batches(chunks_emitted: u64) -> u64 {
+    #[cfg(test)]
+    {
+        let _ = chunks_emitted;
+        1
+    }
+    #[cfg(not(test))]
+    {
+        dense_dump_interval_batches_prod(chunks_emitted)
+    }
+}
+
+/// Production formula extracted so tests can pin the math without
+/// fighting the test-cfg constant-1 override of the wrapper.
+fn dense_dump_interval_batches_prod(chunks_emitted: u64) -> u64 {
+    const FLOOR_BATCHES: u64 = 256;
+    let scaled_batches = chunks_emitted / (4 * EMBED_BATCH_SIZE as u64);
+    scaled_batches.max(FLOOR_BATCHES)
+}
 
 /// Number of embedder batches folded into each durability barrier:
 /// chunks.bin/vectors.bin fsync, tantivy commit (= one new segment),
@@ -925,11 +946,16 @@ impl DiskBucket {
             .map_err(BucketError::Io)?
         };
         let sparse_builder = if sparse_enabled {
-            if tantivy_dir.exists() {
-                Some(SparseIndexBuilder::open_resume(&tantivy_dir)?)
-            } else {
-                Some(SparseIndexBuilder::create(&tantivy_dir)?)
-            }
+            Some(
+                reopen_or_rebuild_sparse(
+                    &tantivy_dir,
+                    &chunks_bin,
+                    &resumed_chunk_ids,
+                    slot_id,
+                    cancel,
+                )
+                .await?,
+            )
         } else {
             None
         };
@@ -1213,7 +1239,7 @@ impl DiskBucket {
         let install_during_build = !self.has_active_slot();
         let mut active_during_build: Option<Arc<LoadedSlot>> = None;
 
-        // Periodic-dump cadence: every DENSE_DUMP_BATCH_INTERVAL
+        // Periodic-dump cadence: every dense_dump_interval_batches()
         // BatchEmbedded records, dump the HNSW + sidecar so resume
         // can skip the M-N-log-N rebuild from vectors.bin.
         let mut batches_since_dump: u64 = 0;
@@ -1433,7 +1459,7 @@ impl DiskBucket {
                     build_state.sync().map_err(BucketError::Io)?;
                     batches_since_dump += batches_since_checkpoint;
                     batches_since_checkpoint = 0;
-                    if batches_since_dump >= DENSE_DUMP_BATCH_INTERVAL {
+                    if batches_since_dump >= dense_dump_interval_batches(chunks_emitted) {
                         periodic_dump(slot_path, slot_id, &dense).await?;
                         batches_since_dump = 0;
                     }
@@ -2782,9 +2808,9 @@ fn open_fresh_handles(
 /// returning an error — a missing dump means resume falls back to a
 /// sequential rebuild from vectors.bin, but doesn't lose any data.
 ///
-/// Used both for periodic mid-build dumps (every
-/// [`DENSE_DUMP_BATCH_INTERVAL`] batches) and the end-of-build dump
-/// in the `BuildingDense` phase.
+/// Used both for periodic mid-build dumps (cadence selected by
+/// [`dense_dump_interval_batches`]) and the end-of-build dump in the
+/// `BuildingDense` phase.
 async fn periodic_dump(
     slot_path: &Path,
     slot_id: &str,
@@ -2953,6 +2979,80 @@ struct EmbeddedBatchMeta {
     batch_index: u64,
     chunk_count: u64,
     records_completed_at_end: u64,
+}
+
+/// Open the resumed slot's tantivy directory for further appending —
+/// or, if it can't be opened (typically a tantivy on-disk-format
+/// version bump), wipe the directory and reseed a fresh BM25 index
+/// from `chunks.bin` so the resume can continue without restarting the
+/// embed pipeline.
+///
+/// `chunks.bin` is the durable source of truth for chunk text
+/// (already truncated to exactly `chunk_ids.len()` records by the
+/// surrounding resume preamble), so a sparse rebuild is a finite
+/// CPU-bound walk: no re-embedding, no source re-fetching. Cost is
+/// roughly tantivy's add_document throughput (~5–20k docs/sec for
+/// this schema) over the resumed chunk count.
+///
+/// Done in `spawn_blocking` because tantivy's writer is sync and can
+/// stall a Tokio worker for tens of minutes at wiki scale.
+async fn reopen_or_rebuild_sparse(
+    tantivy_dir: &Path,
+    chunks_bin: &Path,
+    chunk_ids: &[ChunkId],
+    slot_id: &str,
+    cancel: &CancellationToken,
+) -> Result<SparseIndexBuilder, BucketError> {
+    if !tantivy_dir.exists() {
+        return SparseIndexBuilder::create(tantivy_dir);
+    }
+    match SparseIndexBuilder::open_resume(tantivy_dir) {
+        Ok(builder) => Ok(builder),
+        Err(open_err) => {
+            tracing::warn!(
+                slot = %slot_id,
+                error = %open_err,
+                "resume_slot: tantivy open_resume failed; rebuilding sparse index from chunks.bin",
+            );
+            fs::remove_dir_all(tantivy_dir).map_err(BucketError::Io)?;
+            let tantivy_dir = tantivy_dir.to_path_buf();
+            let chunks_bin = chunks_bin.to_path_buf();
+            let chunk_ids = chunk_ids.to_vec();
+            let slot_id = slot_id.to_string();
+            let cancel = cancel.clone();
+            tokio::task::spawn_blocking(move || -> Result<SparseIndexBuilder, BucketError> {
+                let mut builder = SparseIndexBuilder::create(&tantivy_dir)?;
+                let total = chunk_ids.len();
+                let log_step = total.max(20).div_ceil(20);
+                let iter = super::chunks::iter_records_with_ids(&chunks_bin, &chunk_ids)
+                    .map_err(BucketError::Io)?;
+                for (i, item) in iter.enumerate() {
+                    if cancel.is_cancelled() {
+                        return Err(BucketError::Cancelled);
+                    }
+                    let chunk = item.map_err(BucketError::Io)?;
+                    builder.add(chunk.id, &chunk.text)?;
+                    if (i + 1).is_multiple_of(log_step) {
+                        tracing::info!(
+                            slot = %slot_id,
+                            rebuilt = i + 1,
+                            of = total,
+                            "resume_slot: sparse rebuild progress",
+                        );
+                    }
+                }
+                builder.commit()?;
+                tracing::info!(
+                    slot = %slot_id,
+                    chunks = total,
+                    "resume_slot: sparse rebuild complete",
+                );
+                Ok(builder)
+            })
+            .await
+            .map_err(|e| BucketError::Other(format!("spawn_blocking sparse rebuild: {e}")))?
+        }
+    }
 }
 
 async fn derive_embedder_snapshot(
@@ -3214,6 +3314,43 @@ mod tests {
         BoxFuture as ProviderBoxFuture, EmbedRequest as ProviderEmbedRequest, EmbeddingError,
         EmbeddingModelInfo, EmbeddingResponse,
     };
+
+    #[test]
+    fn dense_dump_interval_floors_at_256_then_scales_with_n() {
+        // Below the floor crossover (~131 k chunks) the formula returns
+        // the 256-batch floor — workspace-scale builds keep the original
+        // cadence, dumps are cheap there.
+        assert_eq!(dense_dump_interval_batches_prod(0), 256);
+        assert_eq!(dense_dump_interval_batches_prod(32_000), 256);
+        assert_eq!(dense_dump_interval_batches_prod(131_071), 256);
+        // At chunks_emitted = 4 × 128 × 256 = 131 072 the scaled value
+        // equals the floor; one chunk past it crosses over.
+        assert_eq!(dense_dump_interval_batches_prod(131_072), 256);
+        assert!(dense_dump_interval_batches_prod(131_584) > 256);
+
+        // Above the floor, the threshold scales linearly: at 2.5 M
+        // chunks (current production state) we dump after ~25 % growth,
+        // i.e. ~625 k chunks ≈ ~4880 batches.
+        let at_2_5m = dense_dump_interval_batches_prod(2_500_000);
+        assert_eq!(at_2_5m, 2_500_000 / (4 * EMBED_BATCH_SIZE as u64));
+        assert!((4500..5500).contains(&(at_2_5m as u32)));
+
+        // At full enwiki (~13 M chunks): ~25k batches between dumps.
+        let at_13m = dense_dump_interval_batches_prod(13_000_000);
+        assert!((24_000..27_000).contains(&(at_13m as u32)));
+
+        // Monotonicity: bigger N can never reduce the threshold.
+        for &(a, b) in &[
+            (0u64, 200_000),
+            (200_000, 1_000_000),
+            (1_000_000, 5_000_000),
+        ] {
+            assert!(
+                dense_dump_interval_batches_prod(b) >= dense_dump_interval_batches_prod(a),
+                "non-monotonic between {a} and {b}",
+            );
+        }
+    }
 
     /// Deterministic mock embedder for tests. Produces a vector derived
     /// from `blake3(text)` so the same input always yields the same
@@ -5209,9 +5346,9 @@ embedder = "tei_test"
         // The fast resume path: if dense.snapshot's chunk count matches
         // the last BatchEmbedded's chunks_completed, resume should load
         // the dump rather than rebuild the HNSW from vectors.bin. With
-        // DENSE_DUMP_BATCH_INTERVAL=1 in tests, every BatchEmbedded
-        // fires a dump, so the sidecar always matches the latest log
-        // entry on a clean cancel.
+        // dense_dump_interval_batches() pinned at 1 in tests, every
+        // BatchEmbedded fires a dump, so the sidecar always matches the
+        // latest log entry on a clean cancel.
         use crate::knowledge::build_state::{self, BuildStateRecord};
         use crate::knowledge::dense::read_dump_snapshot;
 
@@ -5382,6 +5519,132 @@ embedder = "tei_test"
         .unwrap();
         assert_eq!(manifest.state, SlotState::Ready);
         assert_eq!(manifest.stats.chunk_count, total_records as u64);
+    }
+
+    #[tokio::test]
+    async fn resume_rebuilds_sparse_when_tantivy_dir_unloadable() {
+        // Models a tantivy on-disk-format version bump: between
+        // partial-build crash and resume, the existing index.tantivy/
+        // becomes unloadable. The resume preamble must wipe it and
+        // reseed from the durable chunks.bin so that:
+        //   1. resume completes without a full re-embed,
+        //   2. the rebuilt sparse covers chunks added pre-resume,
+        //      not just post-resume,
+        //   3. post-resume incremental adds keep working.
+        use crate::knowledge::build_state::{self, BuildStateRecord};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("notes");
+        fs::create_dir_all(&source).unwrap();
+
+        // Same shape as `resume_completes_a_partially_built_slot`:
+        // enough records that one batch lands and at least one batch
+        // remains for resume to do.
+        let total_records = super::EMBED_BATCH_SIZE * 2 + 30;
+        for i in 0..total_records {
+            write_md(
+                &source,
+                &format!("doc-{i:04}.md"),
+                &format!("doc-{i:04} body content"),
+            );
+        }
+
+        let bucket_root = tmp.path().join("bucket");
+        let bucket = open_test_bucket(&bucket_root, &source);
+        let adapter = MarkdownDir::new(&source);
+        let (chunker, chunker_snapshot) = TokenBasedChunker::from_config(&bucket.config().chunker);
+
+        let cancel = CancellationToken::new();
+        let cancelling = Arc::new(CancellingEmbedder::new(8, 1, cancel.clone()));
+        let _ = bucket
+            .build_slot(
+                &adapter,
+                &chunker,
+                chunker_snapshot.clone(),
+                cancelling,
+                None,
+                &cancel,
+            )
+            .await
+            .unwrap_err();
+
+        let resumable = bucket.find_resumable_slot().unwrap().unwrap();
+        let slot_path = slot::slot_dir(&bucket_root, &resumable);
+
+        // Confirm at least one batch was checkpointed pre-resume so
+        // the rebuilt sparse has prior coverage to reproduce.
+        let log_pre = build_state::read_all(&slot_path.join(slot::BUILD_STATE)).unwrap();
+        let pre_chunks = log_pre
+            .iter()
+            .rev()
+            .find_map(|r| match r {
+                BuildStateRecord::BatchEmbedded {
+                    chunks_completed, ..
+                } => Some(*chunks_completed),
+                _ => None,
+            })
+            .expect("at least one BatchEmbedded must be present");
+        assert!(pre_chunks > 0);
+
+        // Force the fallback by corrupting tantivy's meta.json — the
+        // canonical "different on-disk format" failure mode. Open
+        // would surface a parse error; the resume path treats *any*
+        // open_resume failure as "wipe and rebuild from chunks.bin".
+        let tantivy_dir = slot::tantivy_dir(&slot_path);
+        let meta = tantivy_dir.join("meta.json");
+        assert!(meta.exists(), "test precondition: meta.json should exist");
+        fs::write(&meta, b"not valid tantivy metadata").unwrap();
+
+        let resume_cancel = CancellationToken::new();
+        let plain: Arc<dyn EmbeddingProvider> = Arc::new(MockEmbedder::new(8));
+        let resumed = bucket
+            .resume_slot(
+                &resumable,
+                &adapter,
+                &chunker,
+                chunker_snapshot.clone(),
+                plain,
+                None,
+                &resume_cancel,
+            )
+            .await
+            .unwrap();
+        assert_eq!(resumed, resumable);
+
+        let manifest = SlotManifest::from_toml_str(
+            &fs::read_to_string(slot::manifest_path(&slot_path)).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(manifest.state, SlotState::Ready);
+        assert_eq!(manifest.stats.chunk_count, total_records as u64);
+
+        // Sparse-coverage proof: a doc whose chunks were added in the
+        // first (pre-resume) batch must still be findable. doc-0000
+        // is in the first batch; if the rebuild had been skipped, BM25
+        // would only contain post-resume docs and this query would miss.
+        let cancel_q = CancellationToken::new();
+        let early_hits = bucket
+            .sparse_search("doc-0000", 5, &cancel_q)
+            .await
+            .unwrap();
+        assert!(
+            !early_hits.is_empty(),
+            "first-batch doc must be in rebuilt sparse index",
+        );
+        // And a doc that lands only after resume must also be findable —
+        // the post-resume incremental add path is unaffected.
+        let late_hits = bucket
+            .sparse_search(
+                &format!("doc-{:04}", super::EMBED_BATCH_SIZE * 2 + 10),
+                5,
+                &cancel_q,
+            )
+            .await
+            .unwrap();
+        assert!(
+            !late_hits.is_empty(),
+            "post-resume doc must be in rebuilt sparse index",
+        );
     }
 
     #[tokio::test]

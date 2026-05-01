@@ -567,6 +567,72 @@ pub fn scan_record_offsets(bin_path: &Path) -> io::Result<Vec<u64>> {
     }
 }
 
+/// Walk `chunks.bin` sequentially, pairing each record with the
+/// `chunk_id` at the matching position in `chunk_ids`. Yields full
+/// [`Chunk`]s in insertion order via a streaming iterator (no
+/// materialization of all records up front).
+///
+/// Used by the resume path when an existing tantivy directory must be
+/// rebuilt from durable chunk text — e.g. after a tantivy version bump
+/// invalidates the on-disk format. The chunker re-walk has already
+/// produced `chunk_ids` in their original insertion order, and
+/// `chunks.bin` is already truncated to those records, so a sequential
+/// walk pairs the two without seek overhead.
+///
+/// Caller invariants:
+/// - `chunks.bin` exists and contains exactly `chunk_ids.len()` records
+///   after any trailing-partial truncation has happened (typically via
+///   [`ChunkStoreWriter::open_resume`] / [`scan_record_offsets`]).
+/// - `chunk_ids` is in insertion order.
+///
+/// A short read where a record header is expected is reported as
+/// `io::ErrorKind::UnexpectedEof`; that means `chunks.bin` has fewer
+/// records than `chunk_ids` claims, which a caller should treat as
+/// resume-state corruption.
+pub fn iter_records_with_ids<'a>(
+    bin_path: &Path,
+    chunk_ids: &'a [ChunkId],
+) -> io::Result<RecordIter<'a>> {
+    let file = File::open(bin_path)?;
+    Ok(RecordIter {
+        reader: BufReader::new(file),
+        chunk_ids,
+        cursor: 0,
+    })
+}
+
+/// Iterator returned by [`iter_records_with_ids`]. Reads each record's
+/// 4-byte length prefix, then its body, parses the body via the same
+/// path as [`ChunkStoreReader::fetch`], and yields a full [`Chunk`].
+pub struct RecordIter<'a> {
+    reader: BufReader<File>,
+    chunk_ids: &'a [ChunkId],
+    cursor: usize,
+}
+
+impl Iterator for RecordIter<'_> {
+    type Item = io::Result<Chunk>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.cursor >= self.chunk_ids.len() {
+            return None;
+        }
+        let chunk_id = self.chunk_ids[self.cursor];
+        self.cursor += 1;
+
+        let mut len_bytes = [0u8; 4];
+        if let Err(e) = self.reader.read_exact(&mut len_bytes) {
+            return Some(Err(e));
+        }
+        let body_len = u32::from_le_bytes(len_bytes) as usize;
+        let mut body = vec![0u8; body_len];
+        if let Err(e) = self.reader.read_exact(&mut body) {
+            return Some(Err(e));
+        }
+        Some(parse_record(chunk_id, &body))
+    }
+}
+
 fn read_idx(path: &Path) -> io::Result<HashMap<ChunkId, u64>> {
     let mut idx = BufReader::new(File::open(path)?);
     let mut count_bytes = [0u8; 8];
@@ -996,6 +1062,81 @@ mod tests {
         let r = ChunkStoreReader::open(&bin, &idx).unwrap();
         let err = r.fetch(id).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn iter_records_with_ids_walks_in_insertion_order() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin = tmp.path().join("chunks.bin");
+        let idx = tmp.path().join("chunks.idx");
+
+        let inputs: Vec<(ChunkId, &str, Option<&str>, String)> = (0..12)
+            .map(|i| {
+                (
+                    ChunkId::from_source(&[i as u8; 32], i as u64),
+                    if i % 2 == 0 { "a.md" } else { "b.md" },
+                    if i % 3 == 0 { Some("loc") } else { None },
+                    format!("body text {i}"),
+                )
+            })
+            .collect();
+
+        {
+            let mut w = ChunkStoreWriter::create(&bin, &idx).unwrap();
+            for (id, src, loc, text) in &inputs {
+                w.append(*id, &sref(src, *loc), text).unwrap();
+            }
+            w.finalize().unwrap();
+        }
+
+        let chunk_ids: Vec<ChunkId> = inputs.iter().map(|(id, ..)| *id).collect();
+        let chunks: Vec<Chunk> = iter_records_with_ids(&bin, &chunk_ids)
+            .unwrap()
+            .collect::<io::Result<Vec<_>>>()
+            .unwrap();
+
+        assert_eq!(chunks.len(), inputs.len());
+        for ((id, src, loc, text), chunk) in inputs.iter().zip(chunks.iter()) {
+            assert_eq!(chunk.id, *id);
+            assert_eq!(chunk.text, *text);
+            assert_eq!(chunk.source_ref.source_id, *src);
+            assert_eq!(chunk.source_ref.locator.as_deref(), *loc);
+        }
+    }
+
+    #[test]
+    fn iter_records_with_ids_stops_at_chunk_ids_len() {
+        // Iterator must not over-read chunks.bin past the supplied
+        // chunk_ids slice — even if more records exist on disk. Resume
+        // relies on this when chunks.bin temporarily holds a trailing
+        // partial record that scan_record_offsets/open_resume will
+        // truncate.
+        let tmp = tempfile::tempdir().unwrap();
+        let bin = tmp.path().join("chunks.bin");
+        let idx = tmp.path().join("chunks.idx");
+
+        let ids: Vec<ChunkId> = (0..5)
+            .map(|i| ChunkId::from_source(&[i; 32], i as u64))
+            .collect();
+        {
+            let mut w = ChunkStoreWriter::create(&bin, &idx).unwrap();
+            for (i, id) in ids.iter().enumerate() {
+                w.append(*id, &sref("doc", None), &format!("text-{i}"))
+                    .unwrap();
+            }
+            w.finalize().unwrap();
+        }
+
+        // Iterate only the first 3 ids; iterator should stop after 3
+        // records without touching the 4th and 5th.
+        let chunks: Vec<Chunk> = iter_records_with_ids(&bin, &ids[..3])
+            .unwrap()
+            .collect::<io::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(chunks.len(), 3);
+        for (i, chunk) in chunks.iter().enumerate() {
+            assert_eq!(chunk.text, format!("text-{i}"));
+        }
     }
 
     /// Both `LoadMode::Mmap` and `LoadMode::Eager` must return
