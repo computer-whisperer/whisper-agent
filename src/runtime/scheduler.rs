@@ -1995,10 +1995,12 @@ impl Scheduler {
         // whose daemon is admitted but not currently connected
         // contributes no tools — same effect as v1 when an env hasn't
         // finished provisioning. Bindings that map to v1 providers
-        // were already handled by `bound_mcp_hosts` above; skipping
-        // them here avoids double-counting if a name ever appears in
-        // both registries (validate_host_env_providers already rejects
-        // that, but defense in depth).
+        // were already handled by `bound_mcp_hosts` above; the
+        // `is_v2_daemon_binding(provider)` check below skips them here.
+        // The check is on `provider` (the catalog name in the pod's
+        // allow.host_env entry, which for v2 must match a
+        // `[[auth.daemons]]` name), not on `name` (the local binding
+        // name the model sees as a tool prefix).
         for binding in &task.bindings.host_env {
             let HostEnvBinding::Named { name } = binding else {
                 continue;
@@ -2006,10 +2008,13 @@ impl Scheduler {
             if !task.scope.host_envs.admits(name) {
                 continue;
             }
-            if !self.is_v2_daemon_binding(name) {
+            let Some((provider, _spec)) = self.resolve_binding(&task.pod_id, binding) else {
+                continue;
+            };
+            if !self.is_v2_daemon_binding(&provider) {
                 continue;
             }
-            let Some(handle) = self.v2_daemon_handle(name) else {
+            let Some(handle) = self.v2_daemon_handle(&provider) else {
                 continue;
             };
             for tool in &handle.capabilities().tools {
