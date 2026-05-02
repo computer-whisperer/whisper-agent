@@ -97,17 +97,24 @@ pub struct Config {
 /// presents these to bearer-token comparisons (`Authorization: Bearer <tok>`
 /// for native clients, `wa_session=<tok>` cookie for browser).
 ///
-/// Two token lists: `[[auth.clients]]` for everyday chat access, and
-/// `[[auth.admins]]` for settings mutations (rotate provider
-/// credentials, etc.). An admin token also grants client access —
-/// the handlers check "is admin" as a capability on top of the base
-/// auth match.
+/// Three token lists:
+/// - `[[auth.clients]]` — everyday chat access.
+/// - `[[auth.admins]]` — settings mutations (rotate provider
+///   credentials, etc.). An admin token also grants client access —
+///   the handlers check "is admin" as a capability on top of the
+///   base auth match.
+/// - `[[auth.daemons]]` — host-env daemons admitted to dial in to
+///   `/v1/host_env_link` (v2 host-env protocol; see
+///   `docs/design_host_env_protocol.md`). Daemon tokens are scoped
+///   to that endpoint only — they don't grant chat access.
 #[derive(Deserialize, Debug, Clone, Default, PartialEq, Eq)]
 pub struct AuthConfig {
     #[serde(default)]
     pub clients: Vec<AuthClient>,
     #[serde(default)]
     pub admins: Vec<AuthClient>,
+    #[serde(default)]
+    pub daemons: Vec<AuthDaemon>,
 }
 
 /// One entry from `[[auth.clients]]` or `[[auth.admins]]`. `name` is
@@ -120,19 +127,143 @@ pub struct AuthClient {
     pub token: String,
 }
 
+/// One entry from `[[auth.daemons]]`. `name` cross-references a v2
+/// host-env provider (`[[host_env_providers]] kind = "v2_ws"`); the
+/// daemon presents `token` as `Authorization: Bearer <token>` on the
+/// WebSocket upgrade.
+#[derive(Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct AuthDaemon {
+    pub name: String,
+    pub token: String,
+}
+
 /// One catalog entry from `[[host_env_providers]]`. `name` is what
-/// pod entries reference; `url` is the daemon endpoint; `token_file`
-/// (optional) points at a file whose single-line contents are the
-/// pre-shared bearer the daemon's `--control-token-file` loaded.
+/// pod entries reference. The other fields' validity depends on
+/// `kind`; see [`HostEnvProviderKind`] and [`validate_host_env_providers`].
+///
 /// Future security fields (`tls = { ca = "...", client_cert = "..." }`,
 /// etc.) plug in here without breaking compat — TOML deserialize
 /// ignores unknown keys by default.
 #[derive(Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct HostEnvProviderConfig {
     pub name: String,
-    pub url: String,
+    /// Wire protocol the entry uses. Defaults to [`HostEnvProviderKind::V1Http`]
+    /// so existing configs migrate without edits.
+    #[serde(default)]
+    pub kind: HostEnvProviderKind,
+    /// Daemon endpoint URL. Required for `kind = "v1_http"`; must be
+    /// absent for `kind = "v2_ws"` (v2 daemons dial in, the scheduler
+    /// never dials out).
+    #[serde(default)]
+    pub url: Option<String>,
+    /// File containing the bearer the scheduler presents to a v1
+    /// daemon's control plane. Optional even for v1 (a daemon running
+    /// `--no-auth` accepts anonymous control). Must be absent for
+    /// `kind = "v2_ws"` — v2 admission lives in `[[auth.daemons]]`.
     #[serde(default)]
     pub token_file: Option<std::path::PathBuf>,
+}
+
+/// Wire protocol a `[[host_env_providers]]` entry uses.
+///
+/// - **`V1Http`** (legacy) — scheduler dials the daemon's HTTP control
+///   plane at `url`; daemon spawns an mcp-host child whose URL gets
+///   bounced back to the scheduler.
+/// - **`V2Ws`** (new wire) — daemon dials whisper-agent at
+///   `/v1/host_env_link`, presents an `[[auth.daemons]]` bearer.
+///   Scheduler drives sessions over the resulting WebSocket. See
+///   `docs/design_host_env_protocol.md`.
+#[derive(Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum HostEnvProviderKind {
+    #[default]
+    V1Http,
+    V2Ws,
+}
+
+/// Cross-validate the `[[host_env_providers]]` and `[[auth.daemons]]`
+/// tables. Errors at startup so a misconfigured config fails loudly
+/// instead of silently leaving providers unreachable.
+///
+/// Rules:
+/// - **v1_http** entries require `url`; `token_file` is optional.
+/// - **v2_ws** entries reject `url` and `token_file`; require a
+///   matching `[[auth.daemons]]` entry by `name`.
+/// - **provider names** must be unique across the table.
+/// - **daemon names** must be unique across the table.
+/// - `[[auth.daemons]]` entries with no matching v2_ws provider warn
+///   (the token is admitted but won't be used by anything today;
+///   reserved for future daemon-typed endpoints).
+pub fn validate_host_env_providers(
+    providers: &[HostEnvProviderConfig],
+    daemons: &[AuthDaemon],
+) -> anyhow::Result<()> {
+    use anyhow::{anyhow, bail};
+    use std::collections::HashSet;
+
+    let mut seen_provider_names = HashSet::new();
+    for p in providers {
+        if !seen_provider_names.insert(p.name.as_str()) {
+            bail!("host_env_providers: duplicate provider name `{}`", p.name);
+        }
+        match p.kind {
+            HostEnvProviderKind::V1Http => {
+                if p.url.is_none() {
+                    bail!("host_env_providers: `{}` (v1_http) requires `url`", p.name);
+                }
+            }
+            HostEnvProviderKind::V2Ws => {
+                if p.url.is_some() {
+                    bail!(
+                        "host_env_providers: `{}` (v2_ws) must not set `url` — v2 daemons dial in",
+                        p.name
+                    );
+                }
+                if p.token_file.is_some() {
+                    bail!(
+                        "host_env_providers: `{}` (v2_ws) must not set `token_file` — admission lives in [[auth.daemons]]",
+                        p.name
+                    );
+                }
+            }
+        }
+    }
+
+    let mut seen_daemon_names = HashSet::new();
+    for d in daemons {
+        if !seen_daemon_names.insert(d.name.as_str()) {
+            bail!("auth.daemons: duplicate daemon name `{}`", d.name);
+        }
+        if d.token.trim().is_empty() {
+            bail!("auth.daemons: `{}` token is empty", d.name);
+        }
+    }
+
+    let v2_provider_names: HashSet<&str> = providers
+        .iter()
+        .filter(|p| p.kind == HostEnvProviderKind::V2Ws)
+        .map(|p| p.name.as_str())
+        .collect();
+    for p in providers {
+        if p.kind == HostEnvProviderKind::V2Ws && !seen_daemon_names.contains(p.name.as_str()) {
+            return Err(anyhow!(
+                "host_env_providers: `{}` (v2_ws) has no matching [[auth.daemons]] entry by name",
+                p.name
+            ));
+        }
+    }
+    for d in daemons {
+        if !v2_provider_names.contains(d.name.as_str()) {
+            // Logged at startup by main; not a hard error so future
+            // daemon-typed endpoints can share the table.
+            tracing::warn!(
+                daemon = %d.name,
+                "[[auth.daemons]] entry with no matching v2_ws host_env_provider — token admitted but unused"
+            );
+        }
+    }
+
+    Ok(())
 }
 
 /// Backend auth configuration. Tagged by `mode`; providers pick the variants
@@ -796,5 +927,158 @@ auth = { mode = "api_key", value = "sk-test" }
         cfg.validate().unwrap();
         assert!(cfg.embedding_providers.is_empty());
         assert!(cfg.rerank_providers.is_empty());
+    }
+
+    // ─── host_env_providers + auth.daemons cross-validation ───
+
+    fn v1(name: &str, url: &str) -> HostEnvProviderConfig {
+        HostEnvProviderConfig {
+            name: name.into(),
+            kind: HostEnvProviderKind::V1Http,
+            url: Some(url.into()),
+            token_file: None,
+        }
+    }
+
+    fn v2(name: &str) -> HostEnvProviderConfig {
+        HostEnvProviderConfig {
+            name: name.into(),
+            kind: HostEnvProviderKind::V2Ws,
+            url: None,
+            token_file: None,
+        }
+    }
+
+    fn daemon(name: &str, token: &str) -> AuthDaemon {
+        AuthDaemon {
+            name: name.into(),
+            token: token.into(),
+        }
+    }
+
+    #[test]
+    fn host_env_provider_kind_defaults_to_v1_http() {
+        let text = r#"
+[[host_env_providers]]
+name = "legacy"
+url  = "http://x:9820"
+"#;
+        let cfg: Config = toml::from_str(text).unwrap();
+        assert_eq!(cfg.host_env_providers.len(), 1);
+        let entry = &cfg.host_env_providers[0];
+        assert_eq!(entry.kind, HostEnvProviderKind::V1Http);
+        assert_eq!(entry.url.as_deref(), Some("http://x:9820"));
+        validate_host_env_providers(&cfg.host_env_providers, &[]).unwrap();
+    }
+
+    #[test]
+    fn validate_v2_requires_matching_auth_daemons_entry() {
+        let providers = [v2("beta")];
+        // No matching daemon → reject.
+        let err = validate_host_env_providers(&providers, &[]).unwrap_err();
+        assert!(
+            format!("{err}").contains("no matching [[auth.daemons]]"),
+            "{err}"
+        );
+        // Matching daemon → ok.
+        validate_host_env_providers(&providers, &[daemon("beta", "tok")]).unwrap();
+    }
+
+    #[test]
+    fn validate_v1_requires_url() {
+        let providers = [HostEnvProviderConfig {
+            name: "broken".into(),
+            kind: HostEnvProviderKind::V1Http,
+            url: None,
+            token_file: None,
+        }];
+        let err = validate_host_env_providers(&providers, &[]).unwrap_err();
+        assert!(format!("{err}").contains("requires `url`"), "{err}");
+    }
+
+    #[test]
+    fn validate_v2_rejects_url() {
+        let providers = [HostEnvProviderConfig {
+            name: "beta".into(),
+            kind: HostEnvProviderKind::V2Ws,
+            url: Some("http://nope".into()),
+            token_file: None,
+        }];
+        let err = validate_host_env_providers(&providers, &[daemon("beta", "t")]).unwrap_err();
+        assert!(format!("{err}").contains("must not set `url`"), "{err}");
+    }
+
+    #[test]
+    fn validate_v2_rejects_token_file() {
+        let providers = [HostEnvProviderConfig {
+            name: "beta".into(),
+            kind: HostEnvProviderKind::V2Ws,
+            url: None,
+            token_file: Some("/tmp/x".into()),
+        }];
+        let err = validate_host_env_providers(&providers, &[daemon("beta", "t")]).unwrap_err();
+        assert!(
+            format!("{err}").contains("must not set `token_file`"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_duplicate_provider_names() {
+        let providers = [v1("a", "http://1"), v1("a", "http://2")];
+        let err = validate_host_env_providers(&providers, &[]).unwrap_err();
+        assert!(
+            format!("{err}").contains("duplicate provider name"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_duplicate_daemon_names() {
+        let providers = [v2("beta")];
+        let daemons = [daemon("beta", "t1"), daemon("beta", "t2")];
+        let err = validate_host_env_providers(&providers, &daemons).unwrap_err();
+        assert!(format!("{err}").contains("duplicate daemon name"), "{err}");
+    }
+
+    #[test]
+    fn validate_rejects_empty_daemon_token() {
+        let providers = [v2("beta")];
+        let daemons = [daemon("beta", "   ")];
+        let err = validate_host_env_providers(&providers, &daemons).unwrap_err();
+        assert!(format!("{err}").contains("token is empty"), "{err}");
+    }
+
+    #[test]
+    fn validate_orphan_daemon_is_warning_not_error() {
+        // A daemon admitted without a matching v2_ws provider is a
+        // warning (logged) rather than a hard error — the table is
+        // designed to grow other daemon-typed endpoints later.
+        validate_host_env_providers(&[v1("legacy", "http://x")], &[daemon("orphan", "t")]).unwrap();
+    }
+
+    #[test]
+    fn parses_full_v1_v2_mix_and_auth_daemons_table() {
+        let text = r#"
+[[host_env_providers]]
+name = "legacy"
+kind = "v1_http"
+url  = "http://legacy:9820"
+
+[[host_env_providers]]
+name = "beta"
+kind = "v2_ws"
+
+[[auth.daemons]]
+name  = "beta"
+token = "tok-beta"
+"#;
+        let cfg: Config = toml::from_str(text).unwrap();
+        validate_host_env_providers(&cfg.host_env_providers, &cfg.auth.daemons).unwrap();
+        assert_eq!(cfg.host_env_providers.len(), 2);
+        assert_eq!(cfg.host_env_providers[0].kind, HostEnvProviderKind::V1Http);
+        assert_eq!(cfg.host_env_providers[1].kind, HostEnvProviderKind::V2Ws);
+        assert_eq!(cfg.auth.daemons.len(), 1);
+        assert_eq!(cfg.auth.daemons[0].name, "beta");
     }
 }

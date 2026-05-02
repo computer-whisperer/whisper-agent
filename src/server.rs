@@ -37,7 +37,7 @@ use axum::{
     routing::{get, post},
 };
 
-use crate::pod::config::AuthClient;
+use crate::pod::config::{AuthClient, AuthDaemon};
 use crate::server::auth::AuthState;
 use futures::{SinkExt, StreamExt};
 use rust_embed::RustEmbed;
@@ -156,6 +156,13 @@ pub struct ServerConfig {
     /// (every `matches_client` check is a superset), but additionally
     /// unlock settings-mutation handlers like `UpdateCodexAuth`.
     pub auth_admins: Vec<AuthClient>,
+    /// Configured daemon-auth tokens. Used by the `/v1/host_env_link`
+    /// endpoint (v2 host-env protocol) to admit a daemon dialing in.
+    /// Carried here at the same level as `auth_clients` / `auth_admins`
+    /// to share the same plaintext-bearer-over-loopback-or-TLS gating;
+    /// see `validate_host_env_providers` for the cross-check against
+    /// `[[host_env_providers]] kind = "v2_ws"`.
+    pub auth_daemons: Vec<AuthDaemon>,
     /// Path to the `whisper-agent.toml` the server was loaded from. `None`
     /// when the server was started without `--config` (env-key-only
     /// fallback) — runtime config-edit endpoints reject in that mode

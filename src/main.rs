@@ -9,7 +9,9 @@ use tracing_subscriber::EnvFilter;
 use whisper_agent_protocol::ThreadConfig;
 use whisper_agent_protocol::sandbox::{HostEnvSpec, NetworkPolicy, PathAccess};
 
-use whisper_agent::pod::config::{Auth, BackendConfig, Config};
+use whisper_agent::pod::config::{
+    Auth, BackendConfig, Config, HostEnvProviderKind, validate_host_env_providers,
+};
 use whisper_agent::providers::anthropic::AnthropicClient;
 use whisper_agent::runtime::scheduler::{
     BackendEntry, EmbeddingProviderEntry, RerankProviderEntry, SharedHostOverlay,
@@ -356,6 +358,7 @@ async fn run_serve(args: ServeArgs) -> Result<()> {
         toml_provider_entries,
         auth_clients,
         auth_admins,
+        auth_daemons,
     ) = match &resolved_config {
         Some(path) => {
             info!(config = %path.display(), "loading backend catalog");
@@ -406,6 +409,11 @@ async fn run_serve(args: ServeArgs) -> Result<()> {
                     },
                 );
             }
+            // Cross-validate v1/v2 host_env_providers against
+            // [[auth.daemons]] before any of them get seeded into the
+            // catalog or live registry. Failure here is loud and
+            // immediate; better than a silently-unreachable v2 entry.
+            validate_host_env_providers(&cfg.host_env_providers, &cfg.auth.daemons)?;
             (
                 map,
                 embed_map,
@@ -414,6 +422,7 @@ async fn run_serve(args: ServeArgs) -> Result<()> {
                 cfg.host_env_providers,
                 cfg.auth.clients,
                 cfg.auth.admins,
+                cfg.auth.daemons,
             )
         }
         None => {
@@ -443,6 +452,7 @@ async fn run_serve(args: ServeArgs) -> Result<()> {
                 HashMap::new(),
                 HashMap::new(),
                 HashMap::new(),
+                Vec::new(),
                 Vec::new(),
                 Vec::new(),
                 Vec::new(),
@@ -516,16 +526,25 @@ async fn run_serve(args: ServeArgs) -> Result<()> {
 
     let now = chrono::Utc::now();
     for entry in &toml_provider_entries {
+        // v2_ws entries are config-only (TOML + [[auth.daemons]]); they
+        // do not flow into the runtime-mutable catalog. The catalog
+        // stays v1-only until phase 4 collapses both into a single
+        // registry. validate_host_env_providers already enforced the
+        // shape so the unwrap below is sound for v1 entries.
+        if entry.kind == HostEnvProviderKind::V2Ws {
+            continue;
+        }
+        let url = entry
+            .url
+            .as_ref()
+            .expect("v1_http entry has url after validation")
+            .clone();
         let token = match &entry.token_file {
             Some(path) => Some(sandbox::read_token_file(&entry.name, path)?),
             None => None,
         };
-        let inserted = catalog.insert_if_missing(new_seeded_entry(
-            entry.name.clone(),
-            entry.url.clone(),
-            token,
-            now,
-        ))?;
+        let inserted =
+            catalog.insert_if_missing(new_seeded_entry(entry.name.clone(), url, token, now))?;
         host_env_catalog::log_seed_result(&entry.name, inserted);
     }
 
@@ -600,10 +619,11 @@ async fn run_serve(args: ServeArgs) -> Result<()> {
     // wire in cleartext is a footgun we'd rather hard-fail on than warn
     // about. Wildcard binds (0.0.0.0, ::) are conservatively treated as
     // non-loopback because they accept both.
-    let any_tokens = !auth_clients.is_empty() || !auth_admins.is_empty();
+    let any_tokens =
+        !auth_clients.is_empty() || !auth_admins.is_empty() || !auth_daemons.is_empty();
     if any_tokens && !args.listen.ip().is_loopback() && tls.is_none() {
         return Err(anyhow!(
-            "[[auth.clients]] or [[auth.admins]] is configured and --listen {} is not loopback, but no --tls-cert/--tls-key was provided; \
+            "[[auth.clients]], [[auth.admins]], or [[auth.daemons]] is configured and --listen {} is not loopback, but no --tls-cert/--tls-key was provided; \
              refusing to send tokens over plain HTTP",
             args.listen
         ));
@@ -633,6 +653,7 @@ async fn run_serve(args: ServeArgs) -> Result<()> {
         tls,
         auth_clients,
         auth_admins,
+        auth_daemons,
         server_config_path: resolved_config,
     };
     server::serve(args.listen, server_config).await

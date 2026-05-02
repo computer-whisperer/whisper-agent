@@ -95,21 +95,35 @@ auth          = { mode = "api_key", env = "ANTHROPIC_API_KEY" }
 # Host-env providers — sandbox daemons that provision per-thread MCP hosts.
 # -----------------------------------------------------------------------------
 #
-# Each `[[host_env_providers]]` entry registers a `whisper-agent-sandbox`-shaped
-# daemon. Pods opt threads into one by name in their `[[allow.host_env]]` table.
-# scripts/dev.sh registers `local-landlock` automatically and synthesizes a
-# default pod that uses it; configure here only if you have additional managed
-# hosts (e.g. one per remote machine the AUR package is installed on).
+# Each `[[host_env_providers]]` entry registers a sandbox daemon. Pods opt
+# threads into one by name in their `[[allow.host_env]]` table. scripts/dev.sh
+# registers `local-landlock` automatically and synthesizes a default pod that
+# uses it; configure here only if you have additional managed hosts (e.g. one
+# per remote machine the AUR package is installed on).
 #
-# `token_file` points at a file whose single-line contents match the
-# `--control-token-file` the daemon was started with. The file at
-# /var/lib/whisper-agent/sandbox-control-token (created by the AUR install) is
-# the typical source on managed hosts.
+# Two protocols are supported via `kind` (defaults to `v1_http` for back-compat):
+#
+# - `kind = "v1_http"` — legacy `whisper-agent-sandbox`-shaped daemon. The
+#   scheduler dials the daemon at `url`. `token_file` points at a file whose
+#   single-line contents match the `--control-token-file` the daemon was
+#   started with. The file at /var/lib/whisper-agent/sandbox-control-token
+#   (created by the AUR install) is the typical source on managed hosts.
+#
+# - `kind = "v2_ws"` — new wire (see docs/design_host_env_protocol.md).
+#   The daemon dials whisper-agent at `/v1/host_env_link` over HTTPS,
+#   presenting a bearer admitted by `[[auth.daemons]]` below. `url` and
+#   `token_file` must be unset on a v2 entry — admission lives in
+#   [[auth.daemons]].
 
 # [[host_env_providers]]
 # name       = "host-alpha"
+# kind       = "v1_http"
 # url        = "http://alpha.internal:9820"
 # token_file = "/etc/whisper-agent/host-alpha.token"
+
+# [[host_env_providers]]
+# name = "host-beta"
+# kind = "v2_ws"
 
 
 # -----------------------------------------------------------------------------
@@ -137,9 +151,11 @@ auth          = { mode = "api_key", env = "ANTHROPIC_API_KEY" }
 # non-loopback listen and `[auth]` is empty, all external connections are
 # rejected outright.
 #
-# Two lists. `clients` get chat access; `admins` additionally can rotate
+# Three lists. `clients` get chat access; `admins` additionally can rotate
 # provider credentials and edit the running config from the webui's Settings
-# tab. Generate tokens with e.g. `openssl rand -base64 32`.
+# tab; `daemons` admit a v2 host-env daemon dialing into /v1/host_env_link.
+# Daemon tokens are scoped to that endpoint only (no chat access).
+# Generate tokens with e.g. `openssl rand -base64 32`.
 
 # [[auth.clients]]
 # name  = "my-laptop"
@@ -148,3 +164,7 @@ auth          = { mode = "api_key", env = "ANTHROPIC_API_KEY" }
 # [[auth.admins]]
 # name  = "me"
 # token = "REPLACE_WITH_A_DIFFERENT_LONG_RANDOM_STRING"
+
+# [[auth.daemons]]
+# name  = "host-beta"             # matches a [[host_env_providers]] kind = "v2_ws"
+# token = "REPLACE_WITH_A_LONG_RANDOM_STRING"
