@@ -1,0 +1,19 @@
+[package]
+name = "whisper-agent-worker-proto"
+description = "Wire types for the daemon ↔ worker IPC — host-daemon ↔ host-worker (formerly mcp-host)."
+version = "0.3.13"
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+# `serde_json::Value` carries dynamic tool arguments.
+serde_json = { workspace = true }
+# CBOR is the on-the-wire serialization. ciborium is the workspace
+# pinned encoder/decoder.
+ciborium = { workspace = true }
+# Re-exports of `CallId`, `ToolDescriptor`, `ToolAnnotations`,
+# `ContentBlock`, `EmbeddedResource`, `CallToolResult`. The
+# scheduler ↔ daemon and the daemon ↔ worker wires share these
+# types byte-for-byte; deduplicating avoids translation glue.
+whisper-agent-host-proto = { workspace = true }

@@ -51,6 +51,7 @@ regex = "1"
 whisper-agent-protocol = { path = "crates/whisper-agent-protocol" }
 whisper-agent-mcp-proto = { path = "crates/whisper-agent-mcp-proto" }
 whisper-agent-host-proto = { path = "crates/whisper-agent-host-proto" }
+whisper-agent-worker-proto = { path = "crates/whisper-agent-worker-proto" }
 
 [package]
 name = "whisper-agent"

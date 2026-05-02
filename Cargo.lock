@@ -6657,6 +6657,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "whisper-agent-worker-proto"
+version = "0.3.13"
+dependencies = [
+ "ciborium",
+ "serde",
+ "serde_json",
+ "whisper-agent-host-proto",
+]
+
+[[package]]
 name = "widestring"
 version = "1.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
