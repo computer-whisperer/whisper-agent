@@ -25,11 +25,11 @@ pub mod endpoint;
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use thiserror::Error;
-use tokio::sync::{Mutex, Notify, mpsc, oneshot};
+use tokio::sync::{Notify, mpsc, oneshot};
 use whisper_agent_host_proto::{
     CallId, CallToolResult, DaemonCapabilities, HostEnvSpec, ProvisionPhase, SessionId,
     ThreadContext,
@@ -100,28 +100,41 @@ impl LiveDaemonRegistry {
     /// Seed the admitted set from the configured `[[auth.daemons]]`
     /// names. Idempotent. Called at startup; runtime mutation lands
     /// when v2 catalog edits become a thing.
-    pub async fn admit_names<I: IntoIterator<Item = String>>(&self, names: I) {
-        let mut inner = self.inner.lock().await;
+    pub fn admit_names<I: IntoIterator<Item = String>>(&self, names: I) {
+        let mut inner = self.inner.lock().expect("registry mutex poisoned");
         inner.admitted.extend(names);
     }
 
     /// Return the connection handle for a daemon if currently online.
-    pub async fn handle(&self, name: &str) -> Option<Arc<LiveDaemonHandle>> {
-        self.inner.lock().await.connected.get(name).cloned()
+    pub fn handle(&self, name: &str) -> Option<Arc<LiveDaemonHandle>> {
+        self.inner
+            .lock()
+            .expect("registry mutex poisoned")
+            .connected
+            .get(name)
+            .cloned()
     }
 
-    pub async fn is_admitted(&self, name: &str) -> bool {
-        self.inner.lock().await.admitted.contains(name)
+    pub fn is_admitted(&self, name: &str) -> bool {
+        self.inner
+            .lock()
+            .expect("registry mutex poisoned")
+            .admitted
+            .contains(name)
     }
 
-    pub async fn is_connected(&self, name: &str) -> bool {
-        self.inner.lock().await.connected.contains_key(name)
+    pub fn is_connected(&self, name: &str) -> bool {
+        self.inner
+            .lock()
+            .expect("registry mutex poisoned")
+            .connected
+            .contains_key(name)
     }
 
     /// Snapshot of (admitted, connected) name lists. Sorted output for
     /// deterministic logging / tests.
-    pub async fn snapshot(&self) -> RegistrySnapshot {
-        let inner = self.inner.lock().await;
+    pub fn snapshot(&self) -> RegistrySnapshot {
+        let inner = self.inner.lock().expect("registry mutex poisoned");
         let mut admitted: Vec<String> = inner.admitted.iter().cloned().collect();
         admitted.sort();
         let mut connected: Vec<String> = inner.connected.keys().cloned().collect();
@@ -142,7 +155,7 @@ impl LiveDaemonRegistry {
             // Subscribe before checking state so we can't miss the
             // notify that fires between check and await.
             let notified = self.change.notified();
-            if let Some(h) = self.handle(name).await {
+            if let Some(h) = self.handle(name) {
                 return h;
             }
             notified.await;
@@ -152,8 +165,8 @@ impl LiveDaemonRegistry {
     /// Insert a connected handle. Returns `false` if a handle with
     /// the same name is already registered (caller should send
     /// `Goodbye::NameAlreadyConnected` and close).
-    async fn try_insert_connected(&self, name: String, handle: Arc<LiveDaemonHandle>) -> bool {
-        let mut inner = self.inner.lock().await;
+    fn try_insert_connected(&self, name: String, handle: Arc<LiveDaemonHandle>) -> bool {
+        let mut inner = self.inner.lock().expect("registry mutex poisoned");
         if inner.connected.contains_key(&name) {
             return false;
         }
@@ -163,8 +176,8 @@ impl LiveDaemonRegistry {
     }
 
     /// Remove a connected handle on disconnect. No-op if absent.
-    async fn remove_connected(&self, name: &str) {
-        let mut inner = self.inner.lock().await;
+    fn remove_connected(&self, name: &str) {
+        let mut inner = self.inner.lock().expect("registry mutex poisoned");
         if inner.connected.remove(name).is_some() {
             self.change.notify_waiters();
         }

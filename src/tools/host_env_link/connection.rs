@@ -104,10 +104,7 @@ pub(super) async fn run_connection(
         next_session_seq: AtomicU64::new(1),
     });
 
-    if !registry
-        .try_insert_connected(name.clone(), handle.clone())
-        .await
-    {
+    if !registry.try_insert_connected(name.clone(), handle.clone()) {
         // A daemon with this name is already registered. Reject the
         // newcomer with `Goodbye` so the operator notices and don't
         // touch the existing slot. (The existing-handle eviction
@@ -142,7 +139,7 @@ pub(super) async fn run_connection(
 
     event_loop(&name, &mut sink, &mut stream, cmd_rx).await;
 
-    registry.remove_connected(&name).await;
+    registry.remove_connected(&name);
     info!(daemon = %name, "v2 host-env daemon disconnected");
 }
 

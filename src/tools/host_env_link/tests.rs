@@ -129,7 +129,7 @@ fn ws_request_with_token(addr: SocketAddr, token: &str) -> http::Request<()> {
 async fn round_trip_open_session_invoke_tool() {
     // ─── server side ───
     let registry = Arc::new(LiveDaemonRegistry::new());
-    registry.admit_names(["alpha".to_string()]).await;
+    registry.admit_names(["alpha".to_string()]);
     let auth = Arc::new(DaemonAuthState::new(vec![AuthDaemon {
         name: "alpha".into(),
         token: "tok-alpha".into(),
@@ -326,7 +326,7 @@ async fn rejects_protocol_mismatch() {
         other => panic!("expected Goodbye, got {other:?}"),
     }
     // Daemon should never have appeared in the registry.
-    assert!(!registry.is_connected("alpha").await);
+    assert!(!registry.is_connected("alpha"));
 
     let _ = shutdown.send(());
 }
@@ -334,7 +334,7 @@ async fn rejects_protocol_mismatch() {
 #[tokio::test]
 async fn rejects_duplicate_name() {
     let registry = Arc::new(LiveDaemonRegistry::new());
-    registry.admit_names(["alpha".to_string()]).await;
+    registry.admit_names(["alpha".to_string()]);
     let auth = Arc::new(DaemonAuthState::new(vec![AuthDaemon {
         name: "alpha".into(),
         token: "tok-alpha".into(),
@@ -383,14 +383,14 @@ async fn rejects_duplicate_name() {
         other => panic!("expected Goodbye, got {other:?}"),
     }
     // Original daemon still connected.
-    assert!(registry.is_connected("alpha").await);
+    assert!(registry.is_connected("alpha"));
     let _ = shutdown.send(());
 }
 
 #[tokio::test]
 async fn surfaces_session_failed_to_consumer() {
     let registry = Arc::new(LiveDaemonRegistry::new());
-    registry.admit_names(["alpha".to_string()]).await;
+    registry.admit_names(["alpha".to_string()]);
     let auth = Arc::new(DaemonAuthState::new(vec![AuthDaemon {
         name: "alpha".into(),
         token: "tok-alpha".into(),
@@ -453,13 +453,11 @@ async fn surfaces_session_failed_to_consumer() {
 #[tokio::test]
 async fn registry_admits_offline_names_separately_from_connected() {
     let registry = LiveDaemonRegistry::new();
-    registry
-        .admit_names(["alpha".to_string(), "beta".to_string()])
-        .await;
-    let snap = registry.snapshot().await;
+    registry.admit_names(["alpha".to_string(), "beta".to_string()]);
+    let snap = registry.snapshot();
     assert_eq!(snap.admitted, vec!["alpha".to_string(), "beta".to_string()]);
     assert!(snap.connected.is_empty());
-    assert!(registry.is_admitted("alpha").await);
-    assert!(!registry.is_connected("alpha").await);
-    assert!(!registry.is_admitted("gamma").await);
+    assert!(registry.is_admitted("alpha"));
+    assert!(!registry.is_connected("alpha"));
+    assert!(!registry.is_admitted("gamma"));
 }

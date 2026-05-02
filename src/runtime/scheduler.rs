@@ -409,6 +409,14 @@ pub struct Scheduler {
     /// runtime-overlay providers. Add/update/remove commands write
     /// through here so the catalog survives restart.
     host_env_catalog: crate::tools::host_env_catalog::CatalogStore,
+    /// v2 host-env link registry. Holds the admitted-name set
+    /// (sourced from `[[auth.daemons]]` at startup) plus the live WS
+    /// handle for each currently-connected daemon. The runtime tracks
+    /// it through the Scheduler so binding resolution and tool-catalog
+    /// merging can resolve v2 daemon names alongside the existing v1
+    /// `host_env_registry`. Always present — empty when no
+    /// `[[auth.daemons]]` is configured.
+    v2_daemon_registry: Arc<crate::tools::host_env_link::LiveDaemonRegistry>,
     /// Durable catalog of shared MCP hosts. The scheduler is the
     /// authority; `ResourceRegistry.mcp_hosts` holds the live
     /// `McpSession` per name, which we keep in sync on every
@@ -567,6 +575,7 @@ impl Scheduler {
         host_env_catalog: crate::tools::host_env_catalog::CatalogStore,
         shared_mcp_catalog: crate::tools::shared_mcp_catalog::CatalogStore,
         shared_mcp_overlays: Vec<SharedHostOverlay>,
+        v2_daemon_registry: Arc<crate::tools::host_env_link::LiveDaemonRegistry>,
         server_config_path: Option<PathBuf>,
     ) -> anyhow::Result<(
         Self,
@@ -658,6 +667,7 @@ impl Scheduler {
                 persister: None,
                 host_env_registry,
                 host_env_catalog,
+                v2_daemon_registry,
                 shared_mcp_catalog,
                 shared_mcp_overlay_names: overlay_names,
                 pending_oauth_flows: HashMap::new(),
@@ -786,6 +796,26 @@ impl Scheduler {
     /// Look up a host-env provider in the catalog by name.
     pub(crate) fn host_env_provider(&self, name: &str) -> Option<&Arc<dyn HostEnvProvider>> {
         self.host_env_registry.get(name)
+    }
+
+    /// Whether `name` is a v2 host-env daemon admitted by
+    /// `[[auth.daemons]]`. True regardless of current connection state
+    /// — admitted-but-offline still returns `true`. Used to decide
+    /// whether a binding name should route through the v2 path or
+    /// fall through to the v1 `host_env_registry` lookup.
+    pub(crate) fn is_v2_daemon_binding(&self, name: &str) -> bool {
+        self.v2_daemon_registry.is_admitted(name)
+    }
+
+    /// Live handle for a v2 daemon, if one is currently connected.
+    /// Returns `None` for both "not admitted" and "admitted but
+    /// offline" — the caller distinguishes by also checking
+    /// `is_v2_daemon_binding`. Cheap to call (single mutex lock).
+    pub(crate) fn v2_daemon_handle(
+        &self,
+        name: &str,
+    ) -> Option<Arc<crate::tools::host_env_link::LiveDaemonHandle>> {
+        self.v2_daemon_registry.handle(name)
     }
 
     /// Classify a registered provider's origin for protocol output.
@@ -1952,6 +1982,59 @@ impl Scheduler {
                         input_schema: tool.input_schema.clone(),
                         annotations: tool.annotations.clone(),
                         category,
+                        requires_escalation,
+                    });
+                }
+            }
+        }
+
+        // v2 host-env daemon bindings — same shape as v1 host-env
+        // tools (prefixed by binding name, categorized as HostEnv) but
+        // sourced from the daemon's `Hello.capabilities.tools` rather
+        // than from a provisioned MCP host's `tools/list`. A binding
+        // whose daemon is admitted but not currently connected
+        // contributes no tools — same effect as v1 when an env hasn't
+        // finished provisioning. Bindings that map to v1 providers
+        // were already handled by `bound_mcp_hosts` above; skipping
+        // them here avoids double-counting if a name ever appears in
+        // both registries (validate_host_env_providers already rejects
+        // that, but defense in depth).
+        for binding in &task.bindings.host_env {
+            let HostEnvBinding::Named { name } = binding else {
+                continue;
+            };
+            if !task.scope.host_envs.admits(name) {
+                continue;
+            }
+            if !self.is_v2_daemon_binding(name) {
+                continue;
+            }
+            let Some(handle) = self.v2_daemon_handle(name) else {
+                continue;
+            };
+            for tool in &handle.capabilities().tools {
+                if !model_takes_images && tool.name == "view_image" {
+                    continue;
+                }
+                if !model_takes_documents && tool.name == "view_pdf" {
+                    continue;
+                }
+                let public_name = format!("{name}_{}", tool.name);
+                let admission = classify(&public_name);
+                let requires_escalation = match admission {
+                    ToolAdmission::Admitted => false,
+                    ToolAdmission::Askable => true,
+                    ToolAdmission::OutOfReach => continue,
+                };
+                if seen.insert(public_name.clone()) {
+                    out.push(AdmissibleTool {
+                        name: public_name,
+                        description: tool.description.clone(),
+                        input_schema: tool.input_schema.clone(),
+                        annotations: v2_to_mcp_annotations(&tool.annotations),
+                        category: ToolCategory::HostEnv {
+                            env_name: name.clone(),
+                        },
                         requires_escalation,
                     });
                 }
@@ -4340,6 +4423,22 @@ pub(crate) fn check_behavior_authoring_pure(
 /// escape hatch. A missing or unreadable file falls back to the pod's
 /// cached default with a warn-level log, matching the pod loader's
 /// graceful-degrade policy for `thread_defaults.system_prompt_file`.
+/// Translate `whisper_agent_host_proto::ToolAnnotations` (v2 daemon
+/// wire shape) into the `crate::tools::mcp::ToolAnnotations` shape
+/// the rest of the runtime / wire types use. Same fields, distinct
+/// types — no information loss.
+fn v2_to_mcp_annotations(
+    src: &whisper_agent_host_proto::ToolAnnotations,
+) -> crate::tools::mcp::ToolAnnotations {
+    crate::tools::mcp::ToolAnnotations {
+        title: src.title.clone(),
+        read_only_hint: src.read_only_hint,
+        destructive_hint: src.destructive_hint,
+        idempotent_hint: src.idempotent_hint,
+        open_world_hint: src.open_world_hint,
+    }
+}
+
 fn resolve_system_prompt_file(pod: &crate::pod::Pod, name: &str) -> String {
     // Pod-relative path: accept nested directories (e.g.
     // `behaviors/<id>/system_prompt.md`) but reject traversal, absolute

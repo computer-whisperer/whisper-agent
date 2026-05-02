@@ -238,6 +238,13 @@ pub async fn serve(listen: SocketAddr, config: ServerConfig) -> anyhow::Result<(
         None => crate::knowledge::BucketRegistry::default(),
     };
 
+    // Build the v2 host-env registry up here (rather than at WS-router
+    // mount time) so the same Arc is shared between the scheduler
+    // (binding resolution / tool-catalog merge) and the axum router
+    // (handles incoming daemon WS upgrades).
+    let live_daemon_registry = Arc::new(LiveDaemonRegistry::new());
+    live_daemon_registry.admit_names(config.auth_daemons.iter().map(|d| d.name.clone()));
+
     let (mut scheduler, stream_rx, bucket_task_rx, resync_request_rx) = Scheduler::new(
         default_pod,
         config.host_id,
@@ -250,6 +257,7 @@ pub async fn serve(listen: SocketAddr, config: ServerConfig) -> anyhow::Result<(
         config.host_env_catalog,
         config.shared_mcp_catalog,
         config.shared_mcp_overlays,
+        live_daemon_registry.clone(),
         config.server_config_path,
     )
     .await
@@ -326,17 +334,11 @@ pub async fn serve(listen: SocketAddr, config: ServerConfig) -> anyhow::Result<(
         auth: auth_state.clone(),
     };
 
-    // v2 host-env link infrastructure. The registry is a sibling
-    // of the client `AppState` because daemons authenticate against
-    // a different token list and never touch chat-side concerns.
+    // v2 host-env link infrastructure. The registry was built earlier
+    // so it could be handed to the scheduler; here we attach it to
+    // the WS-link router. Daemons authenticate against a different
+    // token list (`[[auth.daemons]]`) than the chat-side clients.
     let daemon_auth = Arc::new(DaemonAuthState::new(config.auth_daemons.clone()));
-    let live_daemon_registry = Arc::new(LiveDaemonRegistry::new());
-    // Seed admitted names from the configured daemon table so
-    // pods referencing v2_ws providers can validate their bindings
-    // even before any daemon dials in.
-    live_daemon_registry
-        .admit_names(config.auth_daemons.iter().map(|d| d.name.clone()))
-        .await;
     if daemon_auth.is_empty() {
         info!("v2 host-env link disabled (no [[auth.daemons]] in config)");
     } else {
