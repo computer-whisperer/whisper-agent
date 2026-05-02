@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use tokio::sync::{Mutex, mpsc, oneshot};
-use whisper_agent_host_proto::{CallToolResult, DaemonCapabilities};
+use whisper_agent_host_proto::{CallToolResult, DaemonCapabilities, ThreadContext};
 
 use super::LiveDaemonHandle;
 use super::connection::Command;
@@ -30,6 +30,10 @@ pub(crate) struct FakeDaemonState {
     pub invokes: AtomicUsize,
     pub closes: AtomicUsize,
     pub pending_invokes: Mutex<Vec<oneshot::Sender<Result<CallToolResult, String>>>>,
+    /// `ThreadContext` carried by each received `OpenSession`, in
+    /// arrival order. Lets phase 5b+ tests assert that the dispatcher
+    /// is sending the right context per `(thread, binding)` pair.
+    pub opened_contexts: Mutex<Vec<ThreadContext>>,
 }
 
 pub(crate) struct FakeDaemonRig {
@@ -61,8 +65,9 @@ where
     let task = tokio::spawn(async move {
         while let Some(cmd) = cmd_rx.recv().await {
             match cmd {
-                Command::OpenSession { ready, .. } => {
+                Command::OpenSession { ready, context, .. } => {
                     state_for_task.opens.fetch_add(1, Ordering::Relaxed);
+                    state_for_task.opened_contexts.lock().await.push(context);
                     let _ = ready.send(Ok(()));
                 }
                 Command::InvokeTool {

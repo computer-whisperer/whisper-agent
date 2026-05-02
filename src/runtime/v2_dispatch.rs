@@ -18,9 +18,9 @@ use std::sync::Arc;
 
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
-use whisper_agent_host_proto::{ContentBlock, HostEnvSpec, ThreadContext};
+use whisper_agent_host_proto::{ContentBlock, HostEnvSpec};
 
-use crate::runtime::scheduler::V2SessionStore;
+use crate::runtime::scheduler::{V2ContextStore, V2SessionStore};
 use crate::tools::host_env_link::{LinkError, LiveDaemonHandle};
 use crate::tools::mcp::{CallToolResult, McpContentBlock, McpEmbeddedResource};
 
@@ -28,9 +28,10 @@ use crate::tools::mcp::{CallToolResult, McpContentBlock, McpEmbeddedResource};
 ///
 /// Lookup-or-open semantics:
 /// 1. If [`V2SessionStore::get`] returns a handle, use it directly.
-/// 2. Otherwise call [`LiveDaemonHandle::open_session`] (with the
-///    binding's spec + an empty [`ThreadContext`] today; per-thread
-///    context lands in phase 5 alongside `UpdateSession`).
+/// 2. Otherwise read the current `ThreadContext` from
+///    [`V2ContextStore`] (defaulting on miss) and call
+///    [`LiveDaemonHandle::open_session`] with it. The daemon then
+///    enforces context fields (denylist, runas, etc.) per phase 5a.
 /// 3. [`V2SessionStore::insert_or_keep`] races safely with concurrent
 ///    opens for the same key — the loser's handle drops here, fires
 ///    `CloseSession`, and the winner's handle is returned to all
@@ -44,6 +45,7 @@ use crate::tools::mcp::{CallToolResult, McpContentBlock, McpEmbeddedResource};
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn dispatch_v2_tool(
     sessions: V2SessionStore,
+    contexts: V2ContextStore,
     daemon_handle: Arc<LiveDaemonHandle>,
     thread_id: String,
     binding_name: String,
@@ -55,8 +57,9 @@ pub(crate) async fn dispatch_v2_tool(
     let session = match sessions.get(&thread_id, &binding_name) {
         Some(s) => s,
         None => {
+            let context = contexts.get_or_default(&thread_id, &binding_name);
             let opened = daemon_handle
-                .open_session(thread_id.clone(), spec, ThreadContext::default())
+                .open_session(thread_id.clone(), spec, context)
                 .await
                 .map_err(open_session_error_msg)?;
             sessions.insert_or_keep(thread_id.clone(), binding_name.clone(), Arc::new(opened))
@@ -254,6 +257,7 @@ mod tests {
 
         let result = dispatch_v2_tool(
             sessions.clone(),
+            V2ContextStore::default(),
             rig.handle.clone(),
             "thread-1".into(),
             "alpha".into(),
@@ -290,6 +294,7 @@ mod tests {
         for _ in 0..3 {
             dispatch_v2_tool(
                 sessions.clone(),
+                V2ContextStore::default(),
                 rig.handle.clone(),
                 "thread-1".into(),
                 "alpha".into(),
@@ -325,6 +330,7 @@ mod tests {
         for tid in ["thread-1", "thread-2"] {
             dispatch_v2_tool(
                 sessions.clone(),
+                V2ContextStore::default(),
                 rig.handle.clone(),
                 tid.into(),
                 "alpha".into(),
@@ -355,6 +361,7 @@ mod tests {
 
         dispatch_v2_tool(
             sessions.clone(),
+            V2ContextStore::default(),
             rig.handle.clone(),
             "thread-1".into(),
             "alpha".into(),
@@ -384,6 +391,7 @@ mod tests {
         // Next dispatch on the same key opens a fresh session.
         dispatch_v2_tool(
             sessions.clone(),
+            V2ContextStore::default(),
             rig.handle.clone(),
             "thread-1".into(),
             "alpha".into(),
@@ -418,6 +426,7 @@ mod tests {
 
         let err = dispatch_v2_tool(
             sessions.clone(),
+            V2ContextStore::default(),
             rig.handle.clone(),
             "thread-1".into(),
             "alpha".into(),
@@ -437,6 +446,126 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dispatch_sends_configured_context_at_open_session() {
+        use std::collections::BTreeSet;
+        use whisper_agent_host_proto::ThreadContext;
+        let rig = spawn_fake_daemon("alpha".into(), sample_capabilities(), |_tool, _args| {
+            InvokeOutcome::Reply(Ok(whisper_agent_host_proto::CallToolResult {
+                content: vec![],
+                is_error: None,
+            }))
+        });
+        let sessions = V2SessionStore::default();
+        let contexts = V2ContextStore::default();
+        let configured = ThreadContext {
+            runas: Some("worker".into()),
+            tool_denylist: BTreeSet::from(["bash".into()]),
+            ..ThreadContext::default()
+        };
+        contexts.set("thread-1".into(), "alpha".into(), configured.clone());
+
+        dispatch_v2_tool(
+            sessions.clone(),
+            contexts.clone(),
+            rig.handle.clone(),
+            "thread-1".into(),
+            "alpha".into(),
+            sample_spec(),
+            "echo".into(),
+            dispatch_args(),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("dispatch failed");
+
+        let opened = rig.state.opened_contexts.lock().await;
+        assert_eq!(opened.len(), 1);
+        assert_eq!(opened[0], configured);
+
+        // A second dispatch on the same key should reuse the session
+        // — and thus NOT re-open with a context. Verify only one
+        // OpenSession was emitted.
+        drop(opened);
+        dispatch_v2_tool(
+            sessions.clone(),
+            contexts.clone(),
+            rig.handle.clone(),
+            "thread-1".into(),
+            "alpha".into(),
+            sample_spec(),
+            "echo".into(),
+            dispatch_args(),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("dispatch failed");
+        assert_eq!(rig.state.opened_contexts.lock().await.len(), 1);
+
+        shutdown_and_join(rig, sessions, &["thread-1"]).await;
+    }
+
+    #[tokio::test]
+    async fn dispatch_uses_default_context_when_unset() {
+        use whisper_agent_host_proto::ThreadContext;
+        let rig = spawn_fake_daemon("alpha".into(), sample_capabilities(), |_tool, _args| {
+            InvokeOutcome::Reply(Ok(whisper_agent_host_proto::CallToolResult {
+                content: vec![],
+                is_error: None,
+            }))
+        });
+        let sessions = V2SessionStore::default();
+
+        dispatch_v2_tool(
+            sessions.clone(),
+            V2ContextStore::default(),
+            rig.handle.clone(),
+            "thread-1".into(),
+            "alpha".into(),
+            sample_spec(),
+            "echo".into(),
+            dispatch_args(),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("dispatch failed");
+
+        let opened = rig.state.opened_contexts.lock().await;
+        assert_eq!(opened.len(), 1);
+        assert_eq!(opened[0], ThreadContext::default());
+        drop(opened);
+
+        shutdown_and_join(rig, sessions, &["thread-1"]).await;
+    }
+
+    #[tokio::test]
+    async fn context_store_remove_thread_drops_only_that_thread() {
+        use whisper_agent_host_proto::ThreadContext;
+        let store = V2ContextStore::default();
+        let ctx_a = ThreadContext {
+            runas: Some("a".into()),
+            ..ThreadContext::default()
+        };
+        let ctx_b = ThreadContext {
+            runas: Some("b".into()),
+            ..ThreadContext::default()
+        };
+        store.set("thread-1".into(), "alpha".into(), ctx_a.clone());
+        store.set("thread-2".into(), "alpha".into(), ctx_b.clone());
+
+        store.remove_thread("thread-1");
+        assert_eq!(
+            store.get_or_default("thread-1", "alpha"),
+            ThreadContext::default(),
+            "thread-1's entry should be cleared"
+        );
+        assert_eq!(
+            store.get_or_default("thread-2", "alpha"),
+            ctx_b,
+            "thread-2's entry must survive"
+        );
+    }
+
+    #[tokio::test]
     async fn dispatch_propagates_invoke_failure() {
         let rig = spawn_fake_daemon("alpha".into(), sample_capabilities(), |_tool, _args| {
             InvokeOutcome::Reply(Err("backend exploded".into()))
@@ -445,6 +574,7 @@ mod tests {
 
         let err = dispatch_v2_tool(
             sessions.clone(),
+            V2ContextStore::default(),
             rig.handle.clone(),
             "thread-1".into(),
             "alpha".into(),

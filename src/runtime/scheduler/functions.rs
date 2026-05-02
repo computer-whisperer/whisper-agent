@@ -2484,9 +2484,11 @@ impl Scheduler {
                 real_name,
             }) => {
                 let sessions = self.v2_session_store();
+                let contexts = self.v2_context_store();
                 Box::pin(async move {
                     let result = crate::runtime::v2_dispatch::dispatch_v2_tool(
                         sessions,
+                        contexts,
                         daemon_handle,
                         thread_id.clone(),
                         binding_name,

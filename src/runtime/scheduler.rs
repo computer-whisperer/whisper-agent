@@ -444,6 +444,13 @@ pub struct Scheduler {
     /// reference is gone, which is exactly the semantics we want
     /// (don't tear down a session out from under an in-flight call).
     v2_sessions: V2SessionStore,
+    /// Per-thread / per-binding `ThreadContext` snapshots. The
+    /// dispatcher reads from this at `OpenSession` time so the daemon
+    /// receives the current context (denylist / runas / env / etc.).
+    /// Default-on-miss: a thread that never configured a context opens
+    /// sessions with `ThreadContext::default()`, matching pre-5b
+    /// behavior.
+    v2_contexts: V2ContextStore,
     /// Durable catalog of shared MCP hosts. The scheduler is the
     /// authority; `ResourceRegistry.mcp_hosts` holds the live
     /// `McpSession` per name, which we keep in sync on every
@@ -696,6 +703,7 @@ impl Scheduler {
                 host_env_catalog,
                 v2_daemon_registry,
                 v2_sessions: V2SessionStore::new(),
+                v2_contexts: V2ContextStore::new(),
                 shared_mcp_catalog,
                 shared_mcp_overlay_names: overlay_names,
                 pending_oauth_flows: HashMap::new(),
@@ -852,6 +860,15 @@ impl Scheduler {
     /// await. Cheap (`Arc` clone).
     pub(crate) fn v2_session_store(&self) -> V2SessionStore {
         self.v2_sessions.clone()
+    }
+
+    /// Clone of the v2 context store. Same cheap-Arc-clone pattern as
+    /// [`Self::v2_session_store`]. Dispatch futures grab one at route
+    /// time so they can read the current ThreadContext for the
+    /// `(thread, binding)` pair without holding a `&mut Scheduler`
+    /// borrow across the open-session await.
+    pub(crate) fn v2_context_store(&self) -> V2ContextStore {
+        self.v2_contexts.clone()
     }
 
     /// Classify a registered provider's origin for protocol output.
@@ -4285,6 +4302,11 @@ impl Scheduler {
         // dispatch futures hold their own Arc<SessionHandle> clones,
         // so a sweep mid-call doesn't kill the call's session.
         self.v2_sessions.remove_thread(thread_id);
+        // Drop the per-thread ThreadContext snapshots too. A future
+        // re-binding to the same daemon name on a re-created thread
+        // starts from `ThreadContext::default()` rather than inheriting
+        // the prior thread's runas/denylist/etc.
+        self.v2_contexts.remove_thread(thread_id);
         // Provisioning guard is now keyed per HostEnvId, not per thread
         // — shared across all threads that bind to the same deduped
         // host-env. Don't clear on thread removal; other threads may
@@ -4583,6 +4605,71 @@ impl V2SessionStore {
         self.inner
             .lock()
             .expect("v2 session store mutex poisoned")
+            .retain(|(tid, _), _| tid.as_str() != thread_id);
+    }
+}
+
+type V2ContextMap = HashMap<V2SessionKey, whisper_agent_host_proto::ThreadContext>;
+
+/// Per-thread / per-binding [`whisper_agent_host_proto::ThreadContext`]
+/// store. Mirrors [`V2SessionStore`]'s shape so the dispatcher can
+/// look up the context for an upcoming `OpenSession` without holding
+/// a `&mut Scheduler` borrow.
+///
+/// Lookup-without-set returns [`ThreadContext::default()`]: a thread
+/// that's never had its context configured opens sessions with the
+/// daemon's defaults, exactly as before phase 5b. Phase 5c will wire
+/// `set` calls to additionally send `Frame::UpdateSession` to any
+/// already-open sessions.
+#[derive(Clone, Default)]
+pub(crate) struct V2ContextStore {
+    inner: Arc<std::sync::Mutex<V2ContextMap>>,
+}
+
+impl V2ContextStore {
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    /// Snapshot of the current context for a `(thread, binding)` pair.
+    /// Falls back to `ThreadContext::default()` when nothing's set —
+    /// the daemon's session-defaults will then govern.
+    pub(crate) fn get_or_default(
+        &self,
+        thread_id: &str,
+        binding_name: &str,
+    ) -> whisper_agent_host_proto::ThreadContext {
+        self.inner
+            .lock()
+            .expect("v2 context store mutex poisoned")
+            .get(&(thread_id.to_string(), binding_name.to_string()))
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// Replace the context for `(thread, binding)`. Returns the
+    /// previous value if any (caller can diff to build a
+    /// `ThreadContextDelta` for `Frame::UpdateSession` — phase 5c).
+    #[allow(dead_code)] // used by tests today; phase 5c wires the production callers
+    pub(crate) fn set(
+        &self,
+        thread_id: String,
+        binding_name: String,
+        context: whisper_agent_host_proto::ThreadContext,
+    ) -> Option<whisper_agent_host_proto::ThreadContext> {
+        self.inner
+            .lock()
+            .expect("v2 context store mutex poisoned")
+            .insert((thread_id, binding_name), context)
+    }
+
+    /// Drop every context belonging to `thread_id`. Mirrors
+    /// [`V2SessionStore::remove_thread`] — both stores are swept
+    /// together at thread teardown.
+    pub(crate) fn remove_thread(&self, thread_id: &str) {
+        self.inner
+            .lock()
+            .expect("v2 context store mutex poisoned")
             .retain(|(tid, _), _| tid.as_str() != thread_id);
     }
 }
