@@ -39,6 +39,7 @@ use axum::{
 
 use crate::pod::config::{AuthClient, AuthDaemon};
 use crate::server::auth::AuthState;
+use crate::tools::host_env_link::{self, DaemonAuthState, LiveDaemonRegistry};
 use futures::{SinkExt, StreamExt};
 use rust_embed::RustEmbed;
 use tokio::net::TcpListener;
@@ -325,11 +326,46 @@ pub async fn serve(listen: SocketAddr, config: ServerConfig) -> anyhow::Result<(
         auth: auth_state.clone(),
     };
 
+    // v2 host-env link infrastructure. The registry is a sibling
+    // of the client `AppState` because daemons authenticate against
+    // a different token list and never touch chat-side concerns.
+    let daemon_auth = Arc::new(DaemonAuthState::new(config.auth_daemons.clone()));
+    let live_daemon_registry = Arc::new(LiveDaemonRegistry::new());
+    // Seed admitted names from the configured daemon table so
+    // pods referencing v2_ws providers can validate their bindings
+    // even before any daemon dials in.
+    live_daemon_registry
+        .admit_names(config.auth_daemons.iter().map(|d| d.name.clone()))
+        .await;
+    if daemon_auth.is_empty() {
+        info!("v2 host-env link disabled (no [[auth.daemons]] in config)");
+    } else {
+        info!(
+            count = daemon_auth.len(),
+            "v2 host-env link enabled — daemons may dial /v1/host_env_link"
+        );
+    }
+
     // route_layer applies only to routes registered before it. The /ws and
     // /auth/check routes go through the gate; /auth/login (the way you
     // acquire a session) stays open, as do /health (k8s probe), the
     // webhook trigger surface (separate per-trigger-secret story TBD),
     // and the static webui assets.
+    // The v2 host-env link goes on its own sub-router with its own
+    // bearer middleware (daemon tokens are admitted from
+    // [[auth.daemons]], a separate table from the chat-client tokens
+    // [[auth.clients]] / [[auth.admins]] the rest of the router uses).
+    // Daemons present `Authorization: Bearer <token>` on the WS
+    // upgrade; loopback bypass is intentionally absent because the
+    // daemon name is resolved from the token, so we always need it.
+    let host_env_link_router = Router::new()
+        .route("/v1/host_env_link", get(host_env_link::link_handler))
+        .route_layer(middleware::from_fn_with_state(
+            daemon_auth.clone(),
+            host_env_link::auth::require_daemon_auth,
+        ))
+        .with_state(live_daemon_registry.clone());
+
     let app = Router::new()
         .route("/ws", get(ws_handler))
         .route("/auth/check", get(auth::handle_check))
@@ -337,6 +373,7 @@ pub async fn serve(listen: SocketAddr, config: ServerConfig) -> anyhow::Result<(
             auth_state.clone(),
             auth::require_auth,
         ))
+        .merge(host_env_link_router)
         .route("/health", get(|| async { "ok" }))
         .route(
             "/auth/login",

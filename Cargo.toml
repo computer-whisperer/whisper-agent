@@ -107,6 +107,7 @@ tower-http = { version = "0.6", features = ["trace"] }
 rust-embed = "8"
 mime_guess = "2"
 whisper-agent-protocol = { workspace = true }
+whisper-agent-host-proto = { workspace = true }
 toml = "1"
 base64 = "0.22"
 regex = { workspace = true }
@@ -176,3 +177,12 @@ tempfile = "3"
 # `AHashMap` (not `std::HashMap`). Listed explicitly so test code can
 # name the type.
 ahash = "0.8"
+# WebSocket client for the host-env link integration tests. Already
+# transitive via `axum`'s ws feature; pinning explicitly here so the
+# test code can use `connect_async` against an axum-mounted endpoint
+# bound to a real loopback port.
+tokio-tungstenite = "0.28"
+# `http` types — explicit dep so tests can build `http::Request`s with
+# Authorization headers for `connect_async`. Already transitive via
+# axum.
+http = "1"

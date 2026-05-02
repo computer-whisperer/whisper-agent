@@ -12,6 +12,7 @@
 pub mod about_docs;
 pub mod builtin_tools;
 pub mod host_env_catalog;
+pub mod host_env_link;
 pub mod mcp;
 pub mod sandbox;
 pub mod shared_mcp_catalog;
