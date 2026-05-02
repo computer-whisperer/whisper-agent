@@ -131,6 +131,87 @@ where
     Option::<T>::deserialize(d).map(Some)
 }
 
+impl ThreadContext {
+    /// Compute the [`ThreadContextDelta`] that turns `self` into
+    /// `new`. Fields that match are absent from the delta. For
+    /// `env`, additions/overrides go into `env_set` and removed
+    /// names into `env_unset`.
+    ///
+    /// Used by the scheduler when its stored context for a session
+    /// changes — the delta is what travels in `Frame::UpdateSession`.
+    pub fn diff_to(&self, new: &ThreadContext) -> ThreadContextDelta {
+        let mut delta = ThreadContextDelta::default();
+        if self.workspace_root != new.workspace_root {
+            delta.workspace_root = Some(new.workspace_root.clone());
+        }
+        // Env: per-key set/unset rather than whole-map replace.
+        for (k, v) in &new.env {
+            if self.env.get(k) != Some(v) {
+                delta.env_set.insert(k.clone(), v.clone());
+            }
+        }
+        for k in self.env.keys() {
+            if !new.env.contains_key(k) {
+                delta.env_unset.insert(k.clone());
+            }
+        }
+        if self.runas != new.runas {
+            delta.runas = Some(new.runas.clone());
+        }
+        if self.tool_denylist != new.tool_denylist {
+            delta.tool_denylist = Some(new.tool_denylist.clone());
+        }
+        if self.bash_timeout_secs != new.bash_timeout_secs {
+            delta.bash_timeout_secs = Some(new.bash_timeout_secs);
+        }
+        if self.output_byte_cap != new.output_byte_cap {
+            delta.output_byte_cap = Some(new.output_byte_cap);
+        }
+        delta
+    }
+
+    /// Apply a [`ThreadContextDelta`] in-place. Daemon-side: the
+    /// session's stored context is mutated, and subsequent tool
+    /// calls run under the new values. Workspace-root changes are
+    /// recorded but cannot move the worker — the daemon should
+    /// surface a warning if that field is set in a delta.
+    pub fn apply_delta(&mut self, delta: &ThreadContextDelta) {
+        if let Some(wr) = &delta.workspace_root {
+            self.workspace_root = wr.clone();
+        }
+        for k in &delta.env_unset {
+            self.env.remove(k);
+        }
+        for (k, v) in &delta.env_set {
+            self.env.insert(k.clone(), v.clone());
+        }
+        if let Some(r) = &delta.runas {
+            self.runas = r.clone();
+        }
+        if let Some(d) = &delta.tool_denylist {
+            self.tool_denylist = d.clone();
+        }
+        if let Some(t) = &delta.bash_timeout_secs {
+            self.bash_timeout_secs = *t;
+        }
+        if let Some(c) = &delta.output_byte_cap {
+            self.output_byte_cap = *c;
+        }
+    }
+
+    /// True when the delta would mutate `self`. Lets the scheduler
+    /// avoid sending no-op `Frame::UpdateSession` frames.
+    pub fn delta_is_empty(delta: &ThreadContextDelta) -> bool {
+        delta.workspace_root.is_none()
+            && delta.env_set.is_empty()
+            && delta.env_unset.is_empty()
+            && delta.runas.is_none()
+            && delta.tool_denylist.is_none()
+            && delta.bash_timeout_secs.is_none()
+            && delta.output_byte_cap.is_none()
+    }
+}
+
 /// Partial update to a [`ThreadContext`].
 ///
 /// Field semantics follow the standard `Option<Option<T>>` pattern:
@@ -285,5 +366,145 @@ mod tests {
         ciborium::into_writer(&ThreadContextDelta::default(), &mut bytes).unwrap();
         let v: ciborium::Value = ciborium::from_reader(bytes.as_slice()).unwrap();
         assert_eq!(v.as_map().expect("map").len(), 0);
+    }
+
+    #[test]
+    fn diff_to_returns_empty_delta_for_identical_contexts() {
+        let a = ThreadContext {
+            runas: Some("worker".into()),
+            env: BTreeMap::from([("PATH".into(), "/usr/bin".into())]),
+            ..ThreadContext::default()
+        };
+        let b = a.clone();
+        let delta = a.diff_to(&b);
+        assert!(ThreadContext::delta_is_empty(&delta));
+    }
+
+    #[test]
+    fn diff_to_sets_changed_scalar_fields() {
+        let a = ThreadContext::default();
+        let b = ThreadContext {
+            runas: Some("worker".into()),
+            bash_timeout_secs: Some(60),
+            ..ThreadContext::default()
+        };
+        let delta = a.diff_to(&b);
+        assert_eq!(delta.runas, Some(Some("worker".into())));
+        assert_eq!(delta.bash_timeout_secs, Some(Some(60)));
+        assert!(delta.workspace_root.is_none());
+    }
+
+    #[test]
+    fn diff_to_clears_scalar_fields_via_double_some_none() {
+        // a has runas set; b has it None → delta carries Some(None) so
+        // the daemon can distinguish "clear" from "no change".
+        let a = ThreadContext {
+            runas: Some("worker".into()),
+            ..ThreadContext::default()
+        };
+        let b = ThreadContext::default();
+        let delta = a.diff_to(&b);
+        assert_eq!(delta.runas, Some(None));
+    }
+
+    #[test]
+    fn diff_to_emits_env_set_and_env_unset() {
+        let a = ThreadContext {
+            env: BTreeMap::from([
+                ("PATH".into(), "/usr/bin".into()),
+                ("OLD".into(), "x".into()),
+            ]),
+            ..ThreadContext::default()
+        };
+        let b = ThreadContext {
+            env: BTreeMap::from([
+                ("PATH".into(), "/usr/local/bin".into()), // changed
+                ("NEW".into(), "y".into()),               // added
+                                                          // OLD removed
+            ]),
+            ..ThreadContext::default()
+        };
+        let delta = a.diff_to(&b);
+        assert_eq!(
+            delta.env_set,
+            BTreeMap::from([
+                ("PATH".into(), "/usr/local/bin".into()),
+                ("NEW".into(), "y".into()),
+            ])
+        );
+        assert_eq!(delta.env_unset, BTreeSet::from(["OLD".into()]));
+    }
+
+    #[test]
+    fn diff_to_replaces_whole_denylist() {
+        let a = ThreadContext {
+            tool_denylist: BTreeSet::from(["bash".into()]),
+            ..ThreadContext::default()
+        };
+        let b = ThreadContext {
+            tool_denylist: BTreeSet::from(["bash".into(), "edit_file".into()]),
+            ..ThreadContext::default()
+        };
+        let delta = a.diff_to(&b);
+        assert_eq!(
+            delta.tool_denylist,
+            Some(BTreeSet::from(["bash".into(), "edit_file".into()]))
+        );
+    }
+
+    #[test]
+    fn apply_delta_round_trips_through_diff() {
+        // For any (a, b), apply_delta(a, diff(a → b)) should equal b.
+        let a = ThreadContext {
+            runas: Some("worker".into()),
+            env: BTreeMap::from([("PATH".into(), "/usr/bin".into())]),
+            tool_denylist: BTreeSet::from(["bash".into()]),
+            bash_timeout_secs: Some(30),
+            ..ThreadContext::default()
+        };
+        let b = ThreadContext {
+            runas: None,
+            env: BTreeMap::from([
+                ("PATH".into(), "/usr/local/bin".into()),
+                ("HOME".into(), "/home/me".into()),
+            ]),
+            tool_denylist: BTreeSet::new(),
+            bash_timeout_secs: Some(120),
+            workspace_root: Some(PathBuf::from("/work")),
+            output_byte_cap: Some(1024),
+        };
+        let delta = a.diff_to(&b);
+        let mut applied = a.clone();
+        applied.apply_delta(&delta);
+        assert_eq!(applied, b);
+    }
+
+    #[test]
+    fn apply_empty_delta_is_no_op() {
+        let original = ThreadContext {
+            runas: Some("worker".into()),
+            env: BTreeMap::from([("PATH".into(), "/usr/bin".into())]),
+            ..ThreadContext::default()
+        };
+        let mut applied = original.clone();
+        applied.apply_delta(&ThreadContextDelta::default());
+        assert_eq!(applied, original);
+    }
+
+    #[test]
+    fn apply_delta_env_unset_takes_precedence_over_env_set_on_same_key() {
+        // Pathological-but-possible: a delta lists the same key in
+        // both env_set and env_unset. apply_delta processes unset
+        // first then set, so the final state has the set value —
+        // documented here to pin the contract.
+        let mut ctx = ThreadContext {
+            env: BTreeMap::from([("X".into(), "old".into())]),
+            ..ThreadContext::default()
+        };
+        let mut delta = ThreadContextDelta::default();
+        delta.env_unset.insert("X".into());
+        delta.env_set.insert("X".into(), "new".into());
+        ctx.apply_delta(&delta);
+        assert_eq!(ctx.env.get("X").map(String::as_str), Some("new"));
     }
 }

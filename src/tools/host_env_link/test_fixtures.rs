@@ -10,7 +10,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use tokio::sync::{Mutex, mpsc, oneshot};
-use whisper_agent_host_proto::{CallToolResult, DaemonCapabilities, ThreadContext};
+use whisper_agent_host_proto::{
+    CallToolResult, DaemonCapabilities, ThreadContext, ThreadContextDelta,
+};
 
 use super::LiveDaemonHandle;
 use super::connection::Command;
@@ -34,6 +36,10 @@ pub(crate) struct FakeDaemonState {
     /// arrival order. Lets phase 5b+ tests assert that the dispatcher
     /// is sending the right context per `(thread, binding)` pair.
     pub opened_contexts: Mutex<Vec<ThreadContext>>,
+    /// `ThreadContextDelta` carried by each received `UpdateSession`,
+    /// in arrival order. Lets phase 5c tests assert that mid-session
+    /// edits flow through the wire.
+    pub updates: Mutex<Vec<ThreadContextDelta>>,
 }
 
 pub(crate) struct FakeDaemonRig {
@@ -85,6 +91,9 @@ where
                             state_for_task.pending_invokes.lock().await.push(result);
                         }
                     }
+                }
+                Command::UpdateSession { context_delta, .. } => {
+                    state_for_task.updates.lock().await.push(context_delta);
                 }
                 Command::CloseSession { .. } => {
                     state_for_task.closes.fetch_add(1, Ordering::Relaxed);

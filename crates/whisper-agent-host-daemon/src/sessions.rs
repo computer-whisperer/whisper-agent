@@ -14,7 +14,7 @@
 
 use std::collections::HashMap;
 
-use whisper_agent_host_proto::{SessionId, ThreadContext};
+use whisper_agent_host_proto::{SessionId, ThreadContext, ThreadContextDelta};
 
 use crate::worker::Worker;
 
@@ -59,6 +59,19 @@ impl SessionRegistry {
             mcp_token: s.worker.mcp_token.clone(),
             context: s.context.clone(),
         })
+    }
+
+    /// Apply a [`ThreadContextDelta`] to the session's stored context.
+    /// Returns `false` if no session by that id exists (caller decides
+    /// whether that's a warn or a no-op).
+    pub fn apply_context_delta(&mut self, id: &SessionId, delta: &ThreadContextDelta) -> bool {
+        match self.by_id.get_mut(id) {
+            Some(s) => {
+                s.context.apply_delta(delta);
+                true
+            }
+            None => false,
+        }
     }
 
     pub fn len(&self) -> usize {

@@ -538,6 +538,113 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn session_handle_update_context_reaches_daemon() {
+        use std::collections::BTreeSet;
+        use whisper_agent_host_proto::ThreadContext;
+        let rig = spawn_fake_daemon("alpha".into(), sample_capabilities(), |_tool, _args| {
+            InvokeOutcome::Reply(Ok(whisper_agent_host_proto::CallToolResult {
+                content: vec![],
+                is_error: None,
+            }))
+        });
+        let sessions = V2SessionStore::default();
+
+        // Open a session via dispatch_v2_tool so we have a SessionHandle
+        // in the store.
+        dispatch_v2_tool(
+            sessions.clone(),
+            V2ContextStore::default(),
+            rig.handle.clone(),
+            "thread-1".into(),
+            "alpha".into(),
+            sample_spec(),
+            "echo".into(),
+            dispatch_args(),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("dispatch failed");
+
+        // Pull the session handle back out and push an UpdateSession.
+        let session = sessions.get("thread-1", "alpha").expect("session missing");
+        let delta = ThreadContext::default().diff_to(&ThreadContext {
+            tool_denylist: BTreeSet::from(["bash".into()]),
+            ..ThreadContext::default()
+        });
+        session
+            .update_context(delta.clone())
+            .expect("update failed");
+        drop(session);
+
+        // Wire send is fire-and-forget; spin briefly until the fake
+        // daemon records it.
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if !rig.state.updates.lock().await.is_empty() {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("UpdateSession never delivered");
+
+        let updates = rig.state.updates.lock().await;
+        assert_eq!(updates.len(), 1);
+        assert_eq!(updates[0], delta);
+        drop(updates);
+
+        shutdown_and_join(rig, sessions, &["thread-1"]).await;
+    }
+
+    #[tokio::test]
+    async fn session_handle_update_context_after_disconnect_returns_disconnected() {
+        use whisper_agent_host_proto::ThreadContextDelta;
+        let rig = spawn_fake_daemon("alpha".into(), sample_capabilities(), |_tool, _args| {
+            InvokeOutcome::Reply(Ok(whisper_agent_host_proto::CallToolResult {
+                content: vec![],
+                is_error: None,
+            }))
+        });
+        let sessions = V2SessionStore::default();
+
+        dispatch_v2_tool(
+            sessions.clone(),
+            V2ContextStore::default(),
+            rig.handle.clone(),
+            "thread-1".into(),
+            "alpha".into(),
+            sample_spec(),
+            "echo".into(),
+            dispatch_args(),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("dispatch failed");
+
+        let session = sessions.get("thread-1", "alpha").expect("session missing");
+
+        // Tear the daemon side down by aborting the fake-daemon task —
+        // that drops the receiver end of the command channel, which
+        // makes try_send return Err. We can't wait for the task to
+        // exit by dropping all senders, because `session` itself holds
+        // a sender clone (and we still need it to call update_context).
+        rig.task.abort();
+        let _ = rig.task.await; // surfaces JoinError::Cancelled, fine
+
+        let err = session
+            .update_context(ThreadContextDelta::default())
+            .expect_err("expected disconnected");
+        assert!(
+            matches!(err, crate::tools::host_env_link::LinkError::Disconnected(ref n) if n == "alpha"),
+            "unexpected error: {err}",
+        );
+        drop(session);
+        drop(rig.handle);
+        sessions.remove_thread("thread-1");
+    }
+
+    #[tokio::test]
     async fn context_store_remove_thread_drops_only_that_thread() {
         use whisper_agent_host_proto::ThreadContext;
         let store = V2ContextStore::default();

@@ -362,11 +362,26 @@ async fn handle_inbound(
             session_id,
             context_delta,
         } => {
-            // Phase 5 work — accept on the wire so old daemons get a
-            // log line rather than a confusing close. The actual delta
-            // application (env, runas, denylist) lands later.
-            let _ = (session_id, context_delta);
-            warn!("UpdateSession received but not yet implemented");
+            // Apply the delta to the session's stored ThreadContext.
+            // Subsequent tool calls run under the new values
+            // (denylist, runas, env, bash_timeout). workspace_root in
+            // a delta is recorded but cannot move the worker — the
+            // daemon doesn't tear down and reprovision; only the next
+            // OpenSession would re-landlock. We log a warning when
+            // the field shows up so operators see the limitation.
+            if context_delta.workspace_root.is_some() {
+                warn!(
+                    %session_id,
+                    "UpdateSession.workspace_root cannot move a live worker — \
+                     value recorded but ineffective until next OpenSession",
+                );
+            }
+            if !sessions.apply_context_delta(&session_id, &context_delta) {
+                warn!(
+                    %session_id,
+                    "UpdateSession against unknown session — ignoring",
+                );
+            }
             Ok(ControlFlow::Continue)
         }
         Frame::CancelCall {

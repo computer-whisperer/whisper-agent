@@ -56,6 +56,15 @@ pub(super) enum Command {
         arguments: serde_json::Value,
         result: oneshot::Sender<Result<CallToolResult, String>>,
     },
+    /// Apply a [`whisper_agent_host_proto::ThreadContextDelta`] to a
+    /// live session. Fire-and-forget: the daemon doesn't ack — the
+    /// scheduler discovers application failures only at the next tool
+    /// call (which would either succeed under the new context or
+    /// surface the failure via its own ToolFinal).
+    UpdateSession {
+        session_id: SessionId,
+        context_delta: whisper_agent_host_proto::ThreadContextDelta,
+    },
     CloseSession {
         session_id: SessionId,
     },
@@ -326,6 +335,28 @@ async fn handle_command(
                     call_id,
                     tool_name,
                     arguments,
+                },
+            )
+            .await
+        }
+        Command::UpdateSession {
+            session_id,
+            context_delta,
+        } => {
+            // No demux state to update — the scheduler-side store is
+            // the source of truth, and the daemon-side application is
+            // fire-and-forget. We do skip sending if the session isn't
+            // known to this connection (likely already torn down) so a
+            // stale UpdateSession after CloseSession doesn't reach the
+            // daemon.
+            if !sessions.contains_key(&session_id) {
+                return Ok(());
+            }
+            send_frame(
+                sink,
+                Frame::UpdateSession {
+                    session_id,
+                    context_delta,
                 },
             )
             .await

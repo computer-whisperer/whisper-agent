@@ -318,6 +318,30 @@ impl SessionHandle {
     }
 }
 
+impl SessionHandle {
+    /// Push a [`whisper_agent_host_proto::ThreadContextDelta`] to the
+    /// daemon. Fire-and-forget: the daemon doesn't ack, and the
+    /// protocol's failure surface is the next tool call against this
+    /// session (which would either succeed under the new context or
+    /// surface the failure via its own ToolFinal).
+    ///
+    /// Returns [`LinkError::Disconnected`] if the channel to the
+    /// connection task is closed (daemon already torn down) so the
+    /// caller can decide whether to log or retry.
+    pub fn update_context(
+        &self,
+        delta: whisper_agent_host_proto::ThreadContextDelta,
+    ) -> Result<(), LinkError> {
+        let cmd = Command::UpdateSession {
+            session_id: self.session_id.clone(),
+            context_delta: delta,
+        };
+        self.cmd_tx
+            .try_send(cmd)
+            .map_err(|_| LinkError::Disconnected(self.daemon_name.clone()))
+    }
+}
+
 impl Drop for SessionHandle {
     fn drop(&mut self) {
         // Best-effort fire-and-forget: tell the connection task to

@@ -871,6 +871,52 @@ impl Scheduler {
         self.v2_contexts.clone()
     }
 
+    /// Set the v2 ThreadContext for `(thread, binding)` and, if a
+    /// session is already open for the pair, push the resulting
+    /// [`whisper_agent_host_proto::ThreadContextDelta`] through to
+    /// the daemon via [`crate::tools::host_env_link::SessionHandle::update_context`].
+    ///
+    /// Computing the delta against the prior stored value (rather
+    /// than always sending the whole context) avoids wire noise when
+    /// only one field changed and lets the daemon use the standard
+    /// "field absent ⇒ no change" semantics from the protocol.
+    /// No-op deltas are dropped before the wire send.
+    ///
+    /// The send is fire-and-forget per the protocol (see
+    /// `SessionHandle::update_context`); a `Disconnected` error is
+    /// logged but not propagated — the next tool call will surface
+    /// the disconnect via its own ToolFinal.
+    #[allow(dead_code)] // production caller lands with phase 5e UI surface
+    pub(crate) fn set_v2_context(
+        &self,
+        thread_id: &str,
+        binding_name: &str,
+        new_context: whisper_agent_host_proto::ThreadContext,
+    ) {
+        let prior = self
+            .v2_contexts
+            .set(
+                thread_id.to_string(),
+                binding_name.to_string(),
+                new_context.clone(),
+            )
+            .unwrap_or_default();
+        let delta = prior.diff_to(&new_context);
+        if whisper_agent_host_proto::ThreadContext::delta_is_empty(&delta) {
+            return;
+        }
+        if let Some(session) = self.v2_sessions.get(thread_id, binding_name)
+            && let Err(e) = session.update_context(delta)
+        {
+            tracing::warn!(
+                %thread_id,
+                %binding_name,
+                error = %e,
+                "v2 UpdateSession send failed (daemon disconnected)",
+            );
+        }
+    }
+
     /// Classify a registered provider's origin for protocol output.
     /// Anything in the registry but absent from the durable catalog is
     /// a `RuntimeOverlay` (CLI-flag provided); anything in the catalog
