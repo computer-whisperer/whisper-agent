@@ -14,3 +14,4 @@ pub mod memory_snapshot;
 pub mod scheduler;
 pub mod thread;
 pub mod tool_listing;
+pub mod v2_dispatch;

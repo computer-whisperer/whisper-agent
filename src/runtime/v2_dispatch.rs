@@ -122,7 +122,16 @@ fn translate_content_block(src: ContentBlock) -> McpContentBlock {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use whisper_agent_host_proto::EmbeddedResource;
+    use std::sync::atomic::Ordering;
+    use std::time::Duration;
+    use whisper_agent_host_proto::{
+        DaemonCapabilities, EmbeddedResource, HostEnvSpecKind, ToolDescriptor,
+    };
+    use whisper_agent_protocol::sandbox::{NetworkPolicy, PathAccess};
+
+    use crate::tools::host_env_link::test_fixtures::{
+        FakeDaemonRig, InvokeOutcome, spawn_fake_daemon,
+    };
 
     #[test]
     fn translate_text_block() {
@@ -186,5 +195,271 @@ mod tests {
         };
         let r = translate_call_result(src);
         assert!(!r.is_error);
+    }
+
+    fn sample_capabilities() -> DaemonCapabilities {
+        DaemonCapabilities {
+            tools: vec![ToolDescriptor {
+                name: "echo".into(),
+                description: "echo a message".into(),
+                input_schema: serde_json::json!({"type":"object"}),
+                annotations: Default::default(),
+            }],
+            spec_kinds: vec![HostEnvSpecKind::Landlock],
+            max_concurrent_sessions: None,
+            supports_background_tasks: false,
+        }
+    }
+
+    fn sample_spec() -> HostEnvSpec {
+        HostEnvSpec::Landlock {
+            allowed_paths: vec![PathAccess::read_write("/tmp/v2-dispatch-test")],
+            network: NetworkPolicy::Isolated,
+        }
+    }
+
+    fn dispatch_args() -> Value {
+        serde_json::json!({"msg":"hi"})
+    }
+
+    /// Drop the rig's handle and wait for the fake-daemon task to
+    /// exit. Once the last `Arc<LiveDaemonHandle>` is dropped (and any
+    /// derived `SessionHandle`s — they each clone the cmd_tx), the
+    /// command channel closes and the task's `recv` returns `None`.
+    async fn shutdown_and_join(rig: FakeDaemonRig, sessions: V2SessionStore, thread_ids: &[&str]) {
+        for tid in thread_ids {
+            sessions.remove_thread(tid);
+        }
+        drop(sessions);
+        drop(rig.handle);
+        tokio::time::timeout(Duration::from_secs(2), rig.task)
+            .await
+            .expect("fake daemon task hung")
+            .expect("fake daemon task panicked");
+    }
+
+    #[tokio::test]
+    async fn dispatch_opens_session_and_returns_translated_result() {
+        let rig = spawn_fake_daemon("alpha".into(), sample_capabilities(), |tool, args| {
+            assert_eq!(tool, "echo");
+            assert_eq!(args, &dispatch_args());
+            InvokeOutcome::Reply(Ok(whisper_agent_host_proto::CallToolResult {
+                content: vec![ContentBlock::Text {
+                    text: "echoed: hi".into(),
+                }],
+                is_error: None,
+            }))
+        });
+        let sessions = V2SessionStore::default();
+
+        let result = dispatch_v2_tool(
+            sessions.clone(),
+            rig.handle.clone(),
+            "thread-1".into(),
+            "alpha".into(),
+            sample_spec(),
+            "echo".into(),
+            dispatch_args(),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("dispatch failed");
+
+        assert!(!result.is_error);
+        assert_eq!(result.content.len(), 1);
+        let McpContentBlock::Text { text } = &result.content[0] else {
+            panic!("expected text content");
+        };
+        assert_eq!(text, "echoed: hi");
+        assert_eq!(rig.state.opens.load(Ordering::Relaxed), 1);
+        assert_eq!(rig.state.invokes.load(Ordering::Relaxed), 1);
+
+        shutdown_and_join(rig, sessions, &["thread-1"]).await;
+    }
+
+    #[tokio::test]
+    async fn dispatch_reuses_session_within_same_thread_binding() {
+        let rig = spawn_fake_daemon("alpha".into(), sample_capabilities(), |_tool, _args| {
+            InvokeOutcome::Reply(Ok(whisper_agent_host_proto::CallToolResult {
+                content: vec![],
+                is_error: None,
+            }))
+        });
+        let sessions = V2SessionStore::default();
+
+        for _ in 0..3 {
+            dispatch_v2_tool(
+                sessions.clone(),
+                rig.handle.clone(),
+                "thread-1".into(),
+                "alpha".into(),
+                sample_spec(),
+                "echo".into(),
+                dispatch_args(),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("dispatch failed");
+        }
+
+        assert_eq!(
+            rig.state.opens.load(Ordering::Relaxed),
+            1,
+            "session should be opened once and reused"
+        );
+        assert_eq!(rig.state.invokes.load(Ordering::Relaxed), 3);
+
+        shutdown_and_join(rig, sessions, &["thread-1"]).await;
+    }
+
+    #[tokio::test]
+    async fn dispatch_opens_distinct_sessions_for_distinct_threads() {
+        let rig = spawn_fake_daemon("alpha".into(), sample_capabilities(), |_tool, _args| {
+            InvokeOutcome::Reply(Ok(whisper_agent_host_proto::CallToolResult {
+                content: vec![],
+                is_error: None,
+            }))
+        });
+        let sessions = V2SessionStore::default();
+
+        for tid in ["thread-1", "thread-2"] {
+            dispatch_v2_tool(
+                sessions.clone(),
+                rig.handle.clone(),
+                tid.into(),
+                "alpha".into(),
+                sample_spec(),
+                "echo".into(),
+                dispatch_args(),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("dispatch failed");
+        }
+
+        assert_eq!(rig.state.opens.load(Ordering::Relaxed), 2);
+        assert_eq!(rig.state.invokes.load(Ordering::Relaxed), 2);
+
+        shutdown_and_join(rig, sessions, &["thread-1", "thread-2"]).await;
+    }
+
+    #[tokio::test]
+    async fn dispatch_remove_thread_drops_session_and_fires_close() {
+        let rig = spawn_fake_daemon("alpha".into(), sample_capabilities(), |_tool, _args| {
+            InvokeOutcome::Reply(Ok(whisper_agent_host_proto::CallToolResult {
+                content: vec![],
+                is_error: None,
+            }))
+        });
+        let sessions = V2SessionStore::default();
+
+        dispatch_v2_tool(
+            sessions.clone(),
+            rig.handle.clone(),
+            "thread-1".into(),
+            "alpha".into(),
+            sample_spec(),
+            "echo".into(),
+            dispatch_args(),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("dispatch failed");
+        assert_eq!(rig.state.opens.load(Ordering::Relaxed), 1);
+
+        // Sweep the thread; SessionHandle::Drop should fire CloseSession.
+        sessions.remove_thread("thread-1");
+        // CloseSession is fire-and-forget; give the task a beat to receive it.
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if rig.state.closes.load(Ordering::Relaxed) >= 1 {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("CloseSession never delivered");
+
+        // Next dispatch on the same key opens a fresh session.
+        dispatch_v2_tool(
+            sessions.clone(),
+            rig.handle.clone(),
+            "thread-1".into(),
+            "alpha".into(),
+            sample_spec(),
+            "echo".into(),
+            dispatch_args(),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("dispatch failed");
+        assert_eq!(rig.state.opens.load(Ordering::Relaxed), 2);
+
+        shutdown_and_join(rig, sessions, &["thread-1"]).await;
+    }
+
+    #[tokio::test]
+    async fn dispatch_returns_cancelled_when_token_fires_mid_invoke() {
+        let rig = spawn_fake_daemon(
+            "alpha".into(),
+            sample_capabilities(),
+            // Stash the InvokeTool oneshot so the dispatch future stays pending.
+            |_tool, _args| InvokeOutcome::Stash,
+        );
+        let sessions = V2SessionStore::default();
+        let cancel = CancellationToken::new();
+
+        let cancel_for_task = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            cancel_for_task.cancel();
+        });
+
+        let err = dispatch_v2_tool(
+            sessions.clone(),
+            rig.handle.clone(),
+            "thread-1".into(),
+            "alpha".into(),
+            sample_spec(),
+            "echo".into(),
+            dispatch_args(),
+            cancel,
+        )
+        .await
+        .expect_err("expected cancellation error");
+        assert_eq!(err, "cancelled");
+
+        // Drain the stashed senders so the receiver side doesn't keep
+        // them alive past the rig task's lifetime.
+        rig.state.pending_invokes.lock().await.clear();
+        shutdown_and_join(rig, sessions, &["thread-1"]).await;
+    }
+
+    #[tokio::test]
+    async fn dispatch_propagates_invoke_failure() {
+        let rig = spawn_fake_daemon("alpha".into(), sample_capabilities(), |_tool, _args| {
+            InvokeOutcome::Reply(Err("backend exploded".into()))
+        });
+        let sessions = V2SessionStore::default();
+
+        let err = dispatch_v2_tool(
+            sessions.clone(),
+            rig.handle.clone(),
+            "thread-1".into(),
+            "alpha".into(),
+            sample_spec(),
+            "echo".into(),
+            dispatch_args(),
+            CancellationToken::new(),
+        )
+        .await
+        .expect_err("expected invoke error");
+        assert!(
+            err.contains("v2 invoke failed") && err.contains("backend exploded"),
+            "unexpected error message: {err}",
+        );
+
+        shutdown_and_join(rig, sessions, &["thread-1"]).await;
     }
 }
