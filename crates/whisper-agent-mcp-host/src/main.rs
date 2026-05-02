@@ -1,17 +1,28 @@
-use std::net::SocketAddr;
+//! `whisper-agent-mcp-host` worker binary.
+//!
+//! Spawned by `whisper-agent-host-daemon` once per session, inside a
+//! landlock sandbox. Communicates with its parent over a Unix
+//! `socketpair` the daemon dup'd to FD 3 at spawn — see
+//! `whisper-agent-worker-proto` for the wire and `crate::ipc` for
+//! the local end of it.
+//!
+//! No HTTP server, no listening port, no bearer token: the worker is
+//! strictly daemon-private and the OS authenticates the channel
+//! (you have FD 3, you're trusted). The crate name still carries
+//! "mcp-host" for hysterical-raisins reasons; see
+//! `docs/design_host_env_protocol.md` §Phase 7 for the rename plan.
+
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use anyhow::{Context, anyhow};
+use anyhow::Context;
 use clap::Parser;
-use tokio::io::{AsyncBufReadExt, BufReader};
-use tokio::net::TcpListener;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
+mod ipc;
 #[cfg(unix)]
 mod runas;
-mod server;
 mod tools;
 mod workspace;
 
@@ -20,37 +31,13 @@ use crate::workspace::Workspace;
 #[derive(Parser, Debug)]
 #[command(
     version,
-    about = "MCP server exposing read_file, write_file, and bash within a workspace root."
+    about = "Per-session worker for whisper-agent-host-daemon. Speaks worker-proto over FD 3."
 )]
 struct Args {
-    /// HTTP listen address. Defaults to dual-stack (`[::]:8800`) when run
-    /// standalone. Production use is via `whisper-agent-sandbox`, which
-    /// always passes an explicit `--listen 127.0.0.1:<port>` (one mcp-host
-    /// per landlock-isolated thread, loopback-only by design).
-    #[arg(long, default_value = "[::]:8800")]
-    listen: SocketAddr,
-
-    /// Workspace root. All file operations are confined to this directory.
+    /// Workspace root. All file operations are confined to this
+    /// directory. Daemon-supplied per spawn.
     #[arg(long)]
     workspace_root: PathBuf,
-
-    /// Read a bearer token from a single line on stdin at startup; every
-    /// request to `/mcp` must then present it as `Authorization: Bearer
-    /// <token>`. The launching process (typically
-    /// whisper-agent-sandbox) writes the token once and closes stdin.
-    /// Stdin is used so the token never appears in argv or the
-    /// environment, both of which are readable via `/proc/<pid>/...`
-    /// under the same uid.
-    #[arg(long, conflicts_with = "no_auth")]
-    token_stdin: bool,
-
-    /// Run with no authentication — any caller that can reach the
-    /// listen address can invoke tools. Explicit opt-in so a
-    /// misconfiguration cannot silently leave the server unauthenticated.
-    /// Intended only for one-off local dev; real deployments use
-    /// `--token-stdin`.
-    #[arg(long, conflicts_with = "token_stdin")]
-    no_auth: bool,
 }
 
 #[tokio::main]
@@ -59,79 +46,19 @@ async fn main() -> anyhow::Result<()> {
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
         )
+        // Worker logs go to stderr; the daemon captures and tail-buffers
+        // them for failure reporting (see `worker.rs::drain_stderr`).
+        .with_writer(std::io::stderr)
         .init();
 
     let args = Args::parse();
-    if !args.token_stdin && !args.no_auth {
-        return Err(anyhow!(
-            "must pass exactly one of --token-stdin or --no-auth"
-        ));
-    }
-
-    let expected_token = if args.token_stdin {
-        let mut reader = BufReader::new(tokio::io::stdin());
-        let mut line = String::new();
-        let n = reader
-            .read_line(&mut line)
-            .await
-            .context("reading token from stdin")?;
-        if n == 0 {
-            return Err(anyhow!("stdin closed before a token was read"));
-        }
-        let token = line.trim().to_string();
-        if token.is_empty() {
-            return Err(anyhow!("stdin supplied an empty token"));
-        }
-        Some(token)
-    } else {
-        None
-    };
-
     let workspace = Workspace::new(&args.workspace_root)
         .with_context(|| format!("invalid workspace root {:?}", args.workspace_root))?;
+    info!(
+        version = env!("CARGO_PKG_VERSION"),
+        root = %args.workspace_root.display(),
+        "whisper-agent-mcp-host starting"
+    );
 
-    let state = server::AppState {
-        workspace: Arc::new(workspace),
-        expected_token: expected_token.map(Arc::new),
-    };
-    let app = server::router(state);
-
-    let listener = TcpListener::bind(args.listen)
-        .await
-        .with_context(|| format!("failed to bind {}", args.listen))?;
-    // Announce the bound address to our parent on stdout. When called
-    // from whisper-agent-sandbox we're launched with --listen
-    // 127.0.0.1:0 and the sandbox reads this line to learn the
-    // kernel-assigned port. Also useful for standalone operators
-    // running with a fixed port — one canonical source of truth for
-    // "am I actually up?". tracing writes to stderr, so this line
-    // doesn't interleave with log output.
-    let actual_addr = listener
-        .local_addr()
-        .context("query local_addr on bound listener")?;
-    println!("listening {actual_addr}");
-    // Flush explicitly: when stdout is a pipe (sandbox-spawned case),
-    // the default line-buffering may defer the write long enough for
-    // the parent's readline to timeout. Flush guarantees the parent
-    // sees the line synchronously with the bind.
-    use std::io::Write;
-    std::io::stdout()
-        .flush()
-        .context("flush stdout handshake line")?;
-    if args.no_auth {
-        info!(version = env!("CARGO_PKG_VERSION"), addr = %actual_addr, root = %args.workspace_root.display(), "whisper-agent-mcp-host listening (NO AUTH)");
-    } else {
-        info!(version = env!("CARGO_PKG_VERSION"), addr = %actual_addr, root = %args.workspace_root.display(), "whisper-agent-mcp-host listening (bearer auth)");
-    }
-
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
-        .await
-        .context("server failed")?;
-    Ok(())
-}
-
-async fn shutdown_signal() {
-    let _ = tokio::signal::ctrl_c().await;
-    info!("shutdown signal received");
+    ipc::run(Arc::new(workspace)).await
 }

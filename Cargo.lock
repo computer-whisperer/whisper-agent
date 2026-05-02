@@ -6499,8 +6499,8 @@ dependencies = [
  "futures",
  "http",
  "landlock",
+ "libc",
  "rand 0.10.1",
- "reqwest 0.13.3",
  "serde",
  "serde_json",
  "tempfile",
@@ -6512,6 +6512,7 @@ dependencies = [
  "url",
  "whisper-agent-host-proto",
  "whisper-agent-protocol",
+ "whisper-agent-worker-proto",
 ]
 
 [[package]]
@@ -6550,8 +6551,8 @@ version = "0.3.13"
 dependencies = [
  "anyhow",
  "async-stream",
- "axum",
  "base64 0.22.1",
+ "ciborium",
  "clap",
  "futures",
  "globset",
@@ -6562,12 +6563,11 @@ dependencies = [
  "resvg",
  "serde",
  "serde_json",
- "subtle",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
  "tracing-subscriber",
- "whisper-agent-mcp-proto",
+ "whisper-agent-worker-proto",
 ]
 
 [[package]]

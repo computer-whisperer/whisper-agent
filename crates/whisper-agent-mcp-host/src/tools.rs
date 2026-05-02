@@ -19,7 +19,9 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 use tokio::time::{Instant, timeout_at};
 
-use whisper_agent_mcp_proto::{CallToolResult, ContentBlock, Tool, ToolAnnotations};
+use whisper_agent_worker_proto::{
+    CallToolResult, ContentBlock, ToolAnnotations, ToolDescriptor as Tool,
+};
 
 use crate::workspace::Workspace;
 
@@ -119,13 +121,13 @@ fn read_file_descriptor() -> Tool {
             },
             "required": ["path"]
         }),
-        annotations: Some(ToolAnnotations {
+        annotations: ToolAnnotations {
             title: Some("Read file".into()),
             read_only_hint: Some(true),
             destructive_hint: Some(false),
             idempotent_hint: Some(true),
             open_world_hint: Some(false),
-        }),
+        },
     }
 }
 
@@ -296,13 +298,13 @@ fn view_image_descriptor() -> Tool {
             },
             "required": ["path"]
         }),
-        annotations: Some(ToolAnnotations {
+        annotations: ToolAnnotations {
             title: Some("View image".into()),
             read_only_hint: Some(true),
             destructive_hint: Some(false),
             idempotent_hint: Some(true),
             open_world_hint: Some(false),
-        }),
+        },
     }
 }
 
@@ -559,13 +561,13 @@ fn view_pdf_descriptor() -> Tool {
             },
             "required": ["path"]
         }),
-        annotations: Some(ToolAnnotations {
+        annotations: ToolAnnotations {
             title: Some("View PDF".into()),
             read_only_hint: Some(true),
             destructive_hint: Some(false),
             idempotent_hint: Some(true),
             open_world_hint: Some(false),
-        }),
+        },
     }
 }
 
@@ -642,13 +644,13 @@ fn write_file_descriptor() -> Tool {
             },
             "required": ["path", "content"]
         }),
-        annotations: Some(ToolAnnotations {
+        annotations: ToolAnnotations {
             title: Some("Write file".into()),
             read_only_hint: Some(false),
             destructive_hint: Some(true),
             idempotent_hint: Some(true),
             open_world_hint: Some(false),
-        }),
+        },
     }
 }
 
@@ -797,14 +799,14 @@ fn edit_file_descriptor() -> Tool {
             },
             "required": ["path", "old_string", "new_string"]
         }),
-        annotations: Some(ToolAnnotations {
+        annotations: ToolAnnotations {
             title: Some("Edit file".into()),
             read_only_hint: Some(false),
             destructive_hint: Some(true),
             // Not idempotent — rerunning after success would find zero matches and error.
             idempotent_hint: Some(false),
             open_world_hint: Some(false),
-        }),
+        },
     }
 }
 
@@ -1013,13 +1015,13 @@ fn bash_descriptor() -> Tool {
             },
             "required": ["command"]
         }),
-        annotations: Some(ToolAnnotations {
+        annotations: ToolAnnotations {
             title: Some("Run bash command".into()),
             read_only_hint: Some(false),
             destructive_hint: Some(true),
             idempotent_hint: Some(false),
             open_world_hint: Some(true),
-        }),
+        },
     }
 }
 
@@ -1455,13 +1457,13 @@ fn list_dir_descriptor() -> Tool {
                 }
             }
         }),
-        annotations: Some(ToolAnnotations {
+        annotations: ToolAnnotations {
             title: Some("List directory".into()),
             read_only_hint: Some(true),
             destructive_hint: Some(false),
             idempotent_hint: Some(true),
             open_world_hint: Some(false),
-        }),
+        },
     }
 }
 
@@ -1568,13 +1570,13 @@ fn glob_descriptor() -> Tool {
             },
             "required": ["pattern"]
         }),
-        annotations: Some(ToolAnnotations {
+        annotations: ToolAnnotations {
             title: Some("Glob-find files".into()),
             read_only_hint: Some(true),
             destructive_hint: Some(false),
             idempotent_hint: Some(true),
             open_world_hint: Some(false),
-        }),
+        },
     }
 }
 
@@ -1701,13 +1703,13 @@ fn grep_descriptor() -> Tool {
             },
             "required": ["pattern"]
         }),
-        annotations: Some(ToolAnnotations {
+        annotations: ToolAnnotations {
             title: Some("Grep file contents".into()),
             read_only_hint: Some(true),
             destructive_hint: Some(false),
             idempotent_hint: Some(true),
             open_world_hint: Some(false),
-        }),
+        },
     }
 }
 
@@ -1895,13 +1897,13 @@ fn crate_source_descriptor() -> Tool {
             },
             "required": ["crate_name"]
         }),
-        annotations: Some(ToolAnnotations {
+        annotations: ToolAnnotations {
             title: Some("Resolve Rust crate source".into()),
             read_only_hint: Some(true),
             destructive_hint: Some(false),
             idempotent_hint: Some(true),
             open_world_hint: Some(false),
-        }),
+        },
     }
 }
 
@@ -2717,7 +2719,7 @@ fn main() {
 
     /// Pull the single Resource block out of a Final result for
     /// view_pdf assertions. Panics on any other shape.
-    fn final_resource(r: &CallToolResult) -> &whisper_agent_mcp_proto::EmbeddedResource {
+    fn final_resource(r: &CallToolResult) -> &whisper_agent_worker_proto::EmbeddedResource {
         match r.content.first() {
             Some(ContentBlock::Resource { resource }) => resource,
             other => panic!("expected resource result, got {other:?}"),

@@ -10,8 +10,7 @@ name = "whisper-agent-mcp-host"
 path = "src/main.rs"
 
 [dependencies]
-axum = { workspace = true }
-tokio = { workspace = true, features = ["process", "fs", "io-util", "io-std"] }
+tokio = { workspace = true, features = ["process", "fs", "io-util", "net", "sync"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
@@ -19,6 +18,7 @@ tracing-subscriber = { workspace = true }
 clap = { workspace = true }
 thiserror = { workspace = true }
 anyhow = { workspace = true }
+ciborium = { workspace = true }
 ignore = "0.4"
 globset = "0.4"
 regex = "1"
@@ -32,13 +32,12 @@ image = { version = "0.25", default-features = false, features = ["png", "jpeg",
 # image embeds and the default `raster-images` feature stay off so
 # `<image href=...>` can't reach out to disk or network during render.
 resvg = { version = "0.47", default-features = false, features = ["text", "system-fonts"] }
-# Base64 for serializing image bytes back to the model in MCP image
+# Base64 for serializing image bytes back to the model in image
 # content blocks. STANDARD-encoded.
 base64 = "0.22"
-subtle = { workspace = true }
 futures = "0.3"
 async-stream = "0.3"
-whisper-agent-mcp-proto = { workspace = true }
+whisper-agent-worker-proto = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

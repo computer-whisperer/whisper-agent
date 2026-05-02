@@ -5,7 +5,6 @@
 //! tool calls. Reconnect-with-backoff is at this layer; the library
 //! gives us a clean error per dial, we log it, sleep, retry.
 
-use std::net::IpAddr;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -38,15 +37,11 @@ struct Args {
 
     /// Path to the `whisper-agent-mcp-host` binary the daemon spawns
     /// for each session. Resolved against `$PATH` if not absolute.
+    /// The daemon ↔ worker hop is a Unix socketpair (handed to the
+    /// child as FD 3 at spawn) — there is no port allocation, so no
+    /// bind-IP knob.
     #[arg(long, default_value = "whisper-agent-mcp-host")]
     mcp_host_bin: String,
-
-    /// Loopback interface workers bind on. `127.0.0.1` keeps each
-    /// worker isolated to localhost (the production default);
-    /// `[::]` / `0.0.0.0` is for dev environments where the daemon
-    /// itself isn't loopback-only.
-    #[arg(long, default_value = "127.0.0.1")]
-    bind_ip: IpAddr,
 
     /// Optional override for the workspace handed to the startup
     /// probe worker. Defaults to a fresh tempdir under `$TMPDIR` —
@@ -97,7 +92,7 @@ async fn main() -> anyhow::Result<()> {
             path
         }
     };
-    let tools = catalog::probe_tool_catalog(&args.mcp_host_bin, args.bind_ip, &probe_ws_path)
+    let tools = catalog::probe_tool_catalog(&args.mcp_host_bin, &probe_ws_path)
         .await
         .context("probing worker tool catalog")?;
     let capabilities = DaemonCapabilities {
@@ -128,7 +123,6 @@ async fn run_loop(
             daemon_version: env!("CARGO_PKG_VERSION").into(),
             capabilities: capabilities.clone(),
             mcp_host_bin: args.mcp_host_bin.clone(),
-            bind_ip: args.bind_ip,
             tls_connector: None,
         };
         match connection::run_connection(config).await {

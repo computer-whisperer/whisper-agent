@@ -11,7 +11,6 @@
 //! anything terminal so the operator-visible logging happens at one
 //! call site.
 
-use std::net::IpAddr;
 use std::sync::Arc;
 
 use futures::{SinkExt, StreamExt};
@@ -24,13 +23,12 @@ use tokio_tungstenite::{
 };
 use tracing::{debug, info, warn};
 use whisper_agent_host_proto::{
-    CallId, CallToolResult, ContentBlock, DaemonCapabilities, EmbeddedResource, Frame,
-    GoodbyeReason, HostEnvSpec, PROTOCOL_VERSION, ProvisionPhase, SessionEndReason, SessionId,
-    ThreadContext,
+    CallId, CallToolResult, DaemonCapabilities, Frame, GoodbyeReason, HostEnvSpec,
+    PROTOCOL_VERSION, ProvisionPhase, SessionEndReason, SessionId, ThreadContext,
 };
 
 use crate::sessions::{DispatchTarget, Session, SessionRegistry};
-use crate::worker::{self, WorkerError};
+use crate::worker::{self, Worker, WorkerError};
 
 type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
@@ -60,10 +58,6 @@ pub struct ConnectionConfig {
     /// daemon spawns per-session. Resolved against `$PATH` if not
     /// absolute.
     pub mcp_host_bin: String,
-    /// Loopback IP the spawned worker binds. Same convention as
-    /// `whisper-agent-sandbox`: `127.0.0.1` to keep workers
-    /// loopback-only (the common case), `[::]` for dual-stack dev.
-    pub bind_ip: IpAddr,
     /// Optional rustls connector. `None` = use system roots
     /// (tokio-tungstenite's default for `wss://`). Tests pass `Some`
     /// with a self-signed-trust connector when dialing local TLS.
@@ -122,14 +116,12 @@ pub async fn run_connection(config: ConnectionConfig) -> Result<(), ConnectError
 
     let runtime = Arc::new(Runtime {
         mcp_host_bin: config.mcp_host_bin.clone(),
-        bind_ip: config.bind_ip,
     });
     event_loop(socket, runtime).await
 }
 
 struct Runtime {
     mcp_host_bin: String,
-    bind_ip: IpAddr,
 }
 
 /// Inbound work items the event loop processes alongside WS frames.
@@ -490,11 +482,13 @@ fn spawn_open_session(
         let result = worker::spawn(
             &spec,
             &runtime.mcp_host_bin,
-            runtime.bind_ip,
             workspace_root_override.as_deref(),
         )
         .await
-        .map(|w| Session { worker: w, context });
+        .map(|w| Session {
+            worker: Arc::new(w),
+            context,
+        });
         let _ = work_tx
             .send(Work::SpawnDone {
                 session_id,
@@ -548,7 +542,9 @@ fn spawn_invoke_tool(
     work_tx: mpsc::Sender<Work>,
 ) {
     tokio::spawn(async move {
-        let result = invoke_tool(&target, &tool_name, arguments).await;
+        let result = invoke_tool(&target.worker, call_id, tool_name, arguments)
+            .await
+            .map_err(|e| e.to_string());
         let _ = work_tx
             .send(Work::ToolDone {
                 session_id,
@@ -559,123 +555,20 @@ fn spawn_invoke_tool(
     });
 }
 
-/// One MCP `tools/call` against the session's worker. Returns either
-/// the parsed [`CallToolResult`] or a string carrying enough detail
-/// for the scheduler-side error path. Network/HTTP/JSON errors all
-/// fold into the `Err` arm; tool-level errors (file not found, bad
-/// args) come back as an `Ok(CallToolResult)` with `is_error = Some(true)`
-/// — same convention as MCP.
+/// Run one tool call against the session's worker over the daemon ↔
+/// worker IPC. Returns the worker's terminal [`CallToolResult`]
+/// (which itself may carry `is_error = Some(true)` for tool-level
+/// failures), or an [`Err`] for IPC-level failures (worker died,
+/// socket dropped). Errors fold into the scheduler-bound `ToolFinal`
+/// at the call site, so the scheduler always sees a terminal frame
+/// per call_id.
 async fn invoke_tool(
-    target: &DispatchTarget,
-    tool_name: &str,
+    worker: &Worker,
+    call_id: CallId,
+    tool_name: String,
     arguments: serde_json::Value,
-) -> Result<CallToolResult, String> {
-    let body = serde_json::json!({
-        "jsonrpc": "2.0",
-        "id": 1,
-        "method": "tools/call",
-        "params": { "name": tool_name, "arguments": arguments },
-    });
-    let resp = reqwest::Client::new()
-        .post(&target.mcp_url)
-        .bearer_auth(&target.mcp_token)
-        .json(&body)
-        .send()
-        .await
-        .map_err(|e| format!("MCP request failed: {e}"))?;
-    if !resp.status().is_success() {
-        return Err(format!("MCP returned HTTP {}", resp.status()));
-    }
-    let value: serde_json::Value = resp
-        .json()
-        .await
-        .map_err(|e| format!("MCP response decode: {e}"))?;
-    if let Some(err) = value.get("error") {
-        return Err(format!("MCP error: {err}"));
-    }
-    let result = value
-        .get("result")
-        .ok_or_else(|| "MCP response missing `result`".to_string())?;
-    parse_call_result(result).map_err(|e| format!("MCP result parse: {e}"))
-}
-
-/// Translate the MCP `tools/call` result body (camelCase) into a
-/// host-proto [`CallToolResult`] (snake_case).
-fn parse_call_result(value: &serde_json::Value) -> Result<CallToolResult, String> {
-    let content = value
-        .get("content")
-        .and_then(|v| v.as_array())
-        .ok_or("missing `content` array")?;
-    let blocks = content
-        .iter()
-        .map(parse_content_block)
-        .collect::<Result<Vec<_>, _>>()?;
-    let is_error = value.get("isError").and_then(|v| v.as_bool());
-    Ok(CallToolResult {
-        content: blocks,
-        is_error,
-    })
-}
-
-fn parse_content_block(value: &serde_json::Value) -> Result<ContentBlock, String> {
-    let ty = value
-        .get("type")
-        .and_then(|v| v.as_str())
-        .ok_or("content block missing `type`")?;
-    match ty {
-        "text" => {
-            let text = value
-                .get("text")
-                .and_then(|v| v.as_str())
-                .ok_or("text block missing `text`")?
-                .to_string();
-            Ok(ContentBlock::Text { text })
-        }
-        "image" => {
-            let data = value
-                .get("data")
-                .and_then(|v| v.as_str())
-                .ok_or("image block missing `data`")?
-                .to_string();
-            let mime_type = value
-                .get("mimeType")
-                .and_then(|v| v.as_str())
-                .ok_or("image block missing `mimeType`")?
-                .to_string();
-            Ok(ContentBlock::Image { data, mime_type })
-        }
-        "resource" => {
-            let resource = value
-                .get("resource")
-                .ok_or("resource block missing `resource`")?;
-            let uri = resource
-                .get("uri")
-                .and_then(|v| v.as_str())
-                .ok_or("resource missing `uri`")?
-                .to_string();
-            let mime_type = resource
-                .get("mimeType")
-                .and_then(|v| v.as_str())
-                .map(str::to_string);
-            let text = resource
-                .get("text")
-                .and_then(|v| v.as_str())
-                .map(str::to_string);
-            let blob = resource
-                .get("blob")
-                .and_then(|v| v.as_str())
-                .map(str::to_string);
-            Ok(ContentBlock::Resource {
-                resource: EmbeddedResource {
-                    uri,
-                    mime_type,
-                    text,
-                    blob,
-                },
-            })
-        }
-        other => Err(format!("unknown content block type: {other}")),
-    }
+) -> Result<CallToolResult, WorkerError> {
+    worker.invoke(call_id, tool_name, arguments).await
 }
 
 /// Best guess at which [`ProvisionPhase`] a [`WorkerError`] occurred
@@ -687,9 +580,10 @@ fn phase_of(err: &WorkerError) -> ProvisionPhase {
         | WorkerError::WorkspaceRootNotInSpec { .. }
         | WorkerError::Unsupported(_) => ProvisionPhase::PreExec,
         WorkerError::Spawn(_) => ProvisionPhase::WorkerSpawn,
-        WorkerError::ChildExited { .. } | WorkerError::StartupTimeout { .. } => {
-            ProvisionPhase::WorkerHandshake
-        }
+        WorkerError::ChildExited { .. }
+        | WorkerError::StartupTimeout { .. }
+        | WorkerError::ProtocolMismatch { .. }
+        | WorkerError::Disconnected => ProvisionPhase::WorkerHandshake,
     }
 }
 
@@ -756,85 +650,6 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn parse_call_result_text_block() {
-        let v = json!({
-            "content": [{ "type": "text", "text": "hello" }],
-        });
-        let r = parse_call_result(&v).unwrap();
-        assert_eq!(r.content.len(), 1);
-        assert!(matches!(&r.content[0], ContentBlock::Text { text } if text == "hello"));
-        assert_eq!(r.is_error, None);
-    }
-
-    #[test]
-    fn parse_call_result_is_error_propagates() {
-        let v = json!({
-            "content": [{ "type": "text", "text": "boom" }],
-            "isError": true,
-        });
-        let r = parse_call_result(&v).unwrap();
-        assert_eq!(r.is_error, Some(true));
-    }
-
-    #[test]
-    fn parse_call_result_image_block() {
-        let v = json!({
-            "content": [{
-                "type": "image",
-                "data": "AAAA",
-                "mimeType": "image/png",
-            }],
-        });
-        let r = parse_call_result(&v).unwrap();
-        match &r.content[0] {
-            ContentBlock::Image { data, mime_type } => {
-                assert_eq!(data, "AAAA");
-                assert_eq!(mime_type, "image/png");
-            }
-            other => panic!("unexpected block: {other:?}"),
-        }
-    }
-
-    #[test]
-    fn parse_call_result_resource_blob_block() {
-        let v = json!({
-            "content": [{
-                "type": "resource",
-                "resource": {
-                    "uri": "file:///tmp/x.pdf",
-                    "mimeType": "application/pdf",
-                    "blob": "BBBB",
-                }
-            }],
-        });
-        let r = parse_call_result(&v).unwrap();
-        match &r.content[0] {
-            ContentBlock::Resource { resource } => {
-                assert_eq!(resource.uri, "file:///tmp/x.pdf");
-                assert_eq!(resource.mime_type.as_deref(), Some("application/pdf"));
-                assert_eq!(resource.blob.as_deref(), Some("BBBB"));
-                assert_eq!(resource.text, None);
-            }
-            other => panic!("unexpected block: {other:?}"),
-        }
-    }
-
-    #[test]
-    fn parse_call_result_rejects_missing_content() {
-        let v = json!({});
-        assert!(parse_call_result(&v).is_err());
-    }
-
-    #[test]
-    fn parse_call_result_rejects_unknown_type() {
-        let v = json!({
-            "content": [{ "type": "video", "url": "x" }],
-        });
-        let e = parse_call_result(&v).unwrap_err();
-        assert!(e.contains("video"), "got: {e}");
-    }
-
-    #[test]
     fn phase_of_classifies_errors() {
         use ProvisionPhase::*;
         assert_eq!(phase_of(&WorkerError::NoWorkspaceRoot), PreExec);
@@ -863,6 +678,15 @@ mod tests {
             }),
             WorkerHandshake
         );
+        assert_eq!(
+            phase_of(&WorkerError::ProtocolMismatch {
+                worker: 999,
+                daemon: 1,
+                stderr_tail: String::new()
+            }),
+            WorkerHandshake
+        );
+        assert_eq!(phase_of(&WorkerError::Disconnected), WorkerHandshake);
     }
 
     fn ctx_with_runas(name: &str) -> ThreadContext {

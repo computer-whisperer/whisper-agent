@@ -130,6 +130,41 @@ impl CallToolResult {
             is_error: Some(true),
         }
     }
+
+    /// Convenience: a successful single-image result. `data` is
+    /// base64-encoded bytes; `mime_type` is the IANA media type
+    /// (`image/png`, `image/jpeg`, ...).
+    pub fn image(data: impl Into<String>, mime_type: impl Into<String>) -> Self {
+        Self {
+            content: vec![ContentBlock::Image {
+                data: data.into(),
+                mime_type: mime_type.into(),
+            }],
+            is_error: None,
+        }
+    }
+
+    /// Convenience: a successful single embedded-resource result with a
+    /// base64-encoded binary blob (PDFs, etc.). `uri` is a stable
+    /// identifier (typically `file:///<path>`); `mime_type` is the IANA
+    /// media type.
+    pub fn resource_blob(
+        uri: impl Into<String>,
+        mime_type: impl Into<String>,
+        blob: impl Into<String>,
+    ) -> Self {
+        Self {
+            content: vec![ContentBlock::Resource {
+                resource: EmbeddedResource {
+                    uri: uri.into(),
+                    mime_type: Some(mime_type.into()),
+                    text: None,
+                    blob: Some(blob.into()),
+                },
+            }],
+            is_error: None,
+        }
+    }
 }
 
 #[cfg(test)]

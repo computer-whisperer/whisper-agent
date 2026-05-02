@@ -13,17 +13,18 @@
 //! registry to dispatch a tool call is small and cheap to clone.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use whisper_agent_host_proto::{SessionId, ThreadContext, ThreadContextDelta};
 
 use crate::worker::Worker;
 
-/// State the daemon retains per live session: the worker handle, the
-/// session-level [`ThreadContext`] (denylist, runas, env, etc.), and
-/// the dispatch tuple (`url`, `bearer`). Later phases will accrete
-/// background-task state and active call cancellations.
+/// State the daemon retains per live session: the worker handle and
+/// the session-level [`ThreadContext`] (denylist, runas, env, etc.).
+/// Later phases will accrete background-task state and active call
+/// cancellations.
 pub struct Session {
-    pub worker: Worker,
+    pub worker: Arc<Worker>,
     pub context: ThreadContext,
 }
 
@@ -33,14 +34,14 @@ pub struct SessionRegistry {
 }
 
 /// What the dispatcher needs to make one tool call against a session
-/// without holding a registry borrow across the await: the worker URL
-/// + bearer plus a snapshot of the session's [`ThreadContext`] so the
-///   dispatch task can apply denylist / argument-overrides without
-///   re-locking the registry.
-#[derive(Clone, Debug)]
+/// without holding a registry borrow across the await: a clone of the
+/// worker handle (cheap — just an `Arc` + an `mpsc::Sender`) plus a
+/// snapshot of the session's [`ThreadContext`] so the dispatch task
+/// can apply denylist / argument-overrides without re-locking the
+/// registry.
+#[derive(Clone)]
 pub struct DispatchTarget {
-    pub mcp_url: String,
-    pub mcp_token: String,
+    pub worker: Arc<Worker>,
     pub context: ThreadContext,
 }
 
@@ -55,8 +56,7 @@ impl SessionRegistry {
 
     pub fn dispatch_target(&self, id: &SessionId) -> Option<DispatchTarget> {
         self.by_id.get(id).map(|s| DispatchTarget {
-            mcp_url: s.worker.mcp_url.clone(),
-            mcp_token: s.worker.mcp_token.clone(),
+            worker: s.worker.clone(),
             context: s.context.clone(),
         })
     }

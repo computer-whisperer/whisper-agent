@@ -100,7 +100,6 @@ fn config(port: u16) -> connection::ConnectionConfig {
         daemon_version: "test-0".into(),
         capabilities: cap(),
         mcp_host_bin: "whisper-agent-mcp-host".into(),
-        bind_ip: "127.0.0.1".parse().unwrap(),
         tls_connector: None,
     }
 }
