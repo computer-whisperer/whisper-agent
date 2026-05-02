@@ -1,9 +1,7 @@
 //! Durable shared-MCP-host catalog.
 //!
-//! Sibling of the pods directory (`<pods_root>/../shared_mcp_hosts.toml`),
-//! same trust boundary as `host_env_providers.toml`. Unlike host-env
-//! providers — which are our own daemons we provision and own —
-//! shared MCP hosts are endpoints the operator points us at, often
+//! Sibling of the pods directory (`<pods_root>/../shared_mcp_hosts.toml`).
+//! Shared MCP hosts are endpoints the operator points us at, often
 //! third-party MCP servers with their own auth story. Step 1 supports
 //! anonymous + static bearer tokens; Step 2 extends [`SharedMcpAuth`]
 //! with an OAuth 2.1 variant for servers that require a browser-driven
@@ -15,8 +13,7 @@
 //! behaviour. Entries added through the runtime surface (WebUI / RPC)
 //! win on name collision.
 //!
-//! File is written 0600; load refuses broader perms for the same
-//! reason as the host-env catalog — tokens live inline.
+//! File is written 0600; load refuses broader perms — tokens live inline.
 
 use std::fs;
 use std::io::Write;
@@ -28,7 +25,16 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use tracing::info;
 
-use crate::tools::host_env_catalog::CatalogOrigin;
+/// Where a catalog entry came from. `Seeded` entries were imported
+/// from `whisper-agent.toml`; `Manual` entries were added at runtime
+/// via WebUI / RPC. CLI overlays are not persisted (and therefore not
+/// represented here).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CatalogOrigin {
+    Seeded,
+    Manual,
+}
 
 /// Default filename, sibling of the pods directory.
 pub const CATALOG_FILENAME: &str = "shared_mcp_hosts.toml";
@@ -182,9 +188,8 @@ impl CatalogEntry {
     }
 }
 
-/// On-disk wrapper. Uses `[[host]]` rather than `[[provider]]` so the
-/// file reads naturally (`host_env_providers.toml` has providers,
-/// `shared_mcp_hosts.toml` has hosts).
+/// On-disk wrapper. Uses `[[host]]` so the file reads naturally
+/// (`shared_mcp_hosts.toml` has hosts).
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct CatalogFile {
     #[serde(default, rename = "host")]

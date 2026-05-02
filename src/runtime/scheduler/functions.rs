@@ -795,17 +795,6 @@ impl Scheduler {
             );
             return;
         }
-        if name == crate::tools::builtin_tools::LIST_HOST_ENV_PROVIDERS {
-            self.complete_list_host_env_providers_call(
-                thread_id,
-                op_id,
-                tool_use_id,
-                input,
-                disposition,
-                pending_io,
-            );
-            return;
-        }
         if name == crate::tools::builtin_tools::KNOWLEDGE_QUERY {
             self.complete_knowledge_query_call(
                 thread_id,
@@ -1016,7 +1005,6 @@ impl Scheduler {
                         },
                         pod_update: None,
                         scheduler_command: None,
-                        host_env_lost: None,
                     },
                 )
             }));
@@ -1068,7 +1056,6 @@ impl Scheduler {
                         },
                         pod_update: None,
                         scheduler_command: None,
-                        host_env_lost: None,
                     },
                 )
             }));
@@ -1408,7 +1395,6 @@ impl Scheduler {
                     result,
                     pod_update: None,
                     scheduler_command: None,
-                    host_env_lost: None,
                 },
             )
         }));
@@ -2230,7 +2216,6 @@ impl Scheduler {
                     },
                     pod_update: None,
                     scheduler_command: None,
-                    host_env_lost: None,
                 },
             )
         }));
@@ -3367,7 +3352,6 @@ fn immediate_tool_error(
                 },
                 pod_update: None,
                 scheduler_command: None,
-                host_env_lost: None,
             },
         )
     })
@@ -3398,7 +3382,6 @@ fn immediate_tool_success(
                 },
                 pod_update: None,
                 scheduler_command: None,
-                host_env_lost: None,
             },
         )
     })
@@ -3427,7 +3410,6 @@ fn tool_success_completion(
             },
             pod_update: None,
             scheduler_command: None,
-            host_env_lost: None,
         },
     )
 }
@@ -3450,7 +3432,6 @@ fn tool_error_completion(
             },
             pod_update: None,
             scheduler_command: None,
-            host_env_lost: None,
         },
     )
 }
@@ -3562,7 +3543,6 @@ fn make_denial_future(
                 },
                 pod_update: None,
                 scheduler_command: None,
-                host_env_lost: None,
             },
         )
     })

@@ -32,7 +32,6 @@ pub mod find_tool;
 mod grep;
 pub mod knowledge_modify;
 pub mod knowledge_query;
-pub mod list_host_env_providers;
 pub mod list_llm_providers;
 pub mod list_mcp_hosts;
 mod list_threads;
@@ -146,7 +145,6 @@ pub const DESCRIBE_TOOL: &str = "describe_tool";
 pub const FIND_TOOL: &str = "find_tool";
 pub const LIST_LLM_PROVIDERS: &str = "list_llm_providers";
 pub const LIST_MCP_HOSTS: &str = "list_mcp_hosts";
-pub const LIST_HOST_ENV_PROVIDERS: &str = "list_host_env_providers";
 pub const KNOWLEDGE_QUERY: &str = "knowledge_query";
 pub const KNOWLEDGE_MODIFY: &str = "knowledge_modify";
 
@@ -172,7 +170,6 @@ pub fn is_builtin(name: &str) -> bool {
             | FIND_TOOL
             | LIST_LLM_PROVIDERS
             | LIST_MCP_HOSTS
-            | LIST_HOST_ENV_PROVIDERS
             | KNOWLEDGE_QUERY
             | KNOWLEDGE_MODIFY
     )
@@ -205,7 +202,6 @@ pub fn reserved_env_name_prefixes() -> Vec<&'static str> {
         FIND_TOOL,
         LIST_LLM_PROVIDERS,
         LIST_MCP_HOSTS,
-        LIST_HOST_ENV_PROVIDERS,
         KNOWLEDGE_QUERY,
         KNOWLEDGE_MODIFY,
     ];
@@ -239,7 +235,6 @@ pub fn descriptors() -> Vec<McpTool> {
         find_tool::descriptor(),
         list_llm_providers::descriptor(),
         list_mcp_hosts::descriptor(),
-        list_host_env_providers::descriptor(),
         knowledge_query::descriptor(),
         knowledge_modify::descriptor(),
     ]
@@ -444,11 +439,6 @@ pub async fn dispatch(
         LIST_MCP_HOSTS => no_update_error(
             "list_mcp_hosts must be intercepted at the scheduler layer \
              (complete_list_mcp_hosts_call); reaching this arm is a bug"
-                .into(),
-        ),
-        LIST_HOST_ENV_PROVIDERS => no_update_error(
-            "list_host_env_providers must be intercepted at the scheduler layer \
-             (complete_list_host_env_providers_call); reaching this arm is a bug"
                 .into(),
         ),
         KNOWLEDGE_QUERY => no_update_error(

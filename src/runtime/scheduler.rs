@@ -54,22 +54,16 @@ use whisper_agent_protocol::{
 
 use crate::knowledge::BucketRegistry;
 use crate::pod::persist::{LoadedState, Persister};
-use crate::pod::resources::{
-    BackendId, CompleteHostEnvOutcome, HostEnvId, McpHostId, ResourceRegistry,
-};
+use crate::pod::resources::{BackendId, McpHostId, ResourceRegistry};
 use crate::pod::{Pod, PodId};
 use crate::providers::embedding::EmbeddingProvider;
 use crate::providers::model::ModelProvider;
 use crate::providers::rerank::RerankProvider;
 use crate::runtime::audit::AuditLog;
-use crate::runtime::io_dispatch::{
-    self, IoCompletion, ProvisionCompletion, ProvisionPhase, ProvisionResult, SchedulerCompletion,
-    SchedulerFuture,
-};
+use crate::runtime::io_dispatch::{self, IoCompletion, SchedulerCompletion, SchedulerFuture};
 use crate::runtime::thread::{IoResult, OpId, StepOutcome, Thread, derive_title, new_task_id};
 use crate::server::thread_router::ThreadEventRouter;
 use crate::tools::mcp::{McpSession, ToolAnnotations, ToolDescriptor as McpTool};
-use crate::tools::sandbox::HostEnvProvider;
 use whisper_agent_protocol::HostEnvSpec;
 
 pub type ConnId = u64;
@@ -411,24 +405,12 @@ pub struct Scheduler {
     /// Runtime config-edit handlers refuse to write back without it.
     server_config_path: Option<PathBuf>,
     persister: Option<Persister>,
-    /// Live catalog of host-env providers, keyed by name. Empty when
-    /// the server was started without any catalog entries or TOML-seed
-    /// `[[host_env_providers]]` — threads in such a server can still
-    /// run, just without any host-env MCP (so their tool catalog is
-    /// shared-only). Mutated at runtime via `AddHostEnvProvider` /
-    /// `UpdateHostEnvProvider` / `RemoveHostEnvProvider` commands.
-    host_env_registry: crate::tools::sandbox::HostEnvRegistry,
-    /// Durable backing store mirroring the registry minus any CLI-only
-    /// runtime-overlay providers. Add/update/remove commands write
-    /// through here so the catalog survives restart.
-    host_env_catalog: crate::tools::host_env_catalog::CatalogStore,
     /// v2 host-env link registry. Holds the admitted-name set
     /// (sourced from `[[auth.daemons]]` at startup) plus the live WS
     /// handle for each currently-connected daemon. The runtime tracks
     /// it through the Scheduler so binding resolution and tool-catalog
-    /// merging can resolve v2 daemon names alongside the existing v1
-    /// `host_env_registry`. Always present — empty when no
-    /// `[[auth.daemons]]` is configured.
+    /// merging can resolve v2 daemon names. Always present — empty
+    /// when no `[[auth.daemons]]` is configured.
     v2_daemon_registry: Arc<crate::tools::host_env_link::LiveDaemonRegistry>,
     /// Open v2 sessions, keyed by `(thread_id, binding_name)`.
     /// `binding_name` is the pod's local allow.host_env entry name —
@@ -524,13 +506,6 @@ pub struct Scheduler {
     /// than tokio::spawn per update) means two rapid state changes
     /// produce exactly one disk write per iteration.
     dirty_behaviors: HashSet<(String, String)>,
-    /// `HostEnvId`s whose provisioning future is currently in flight.
-    /// Keyed by the deduped host-env id (not thread) so threads that
-    /// share a binding (same provider + spec) ride on a single
-    /// provision attempt. A thread with multiple host-env bindings
-    /// contributes one entry per binding; each entry clears
-    /// independently when its provision completes.
-    provisioning_in_flight: HashSet<HostEnvId>,
     /// Sender half of the stream-update channel; cloned and handed to each
     /// dispatched I/O future that wants to push interim events (streaming
     /// model deltas today, MCP tool-output chunks tomorrow). The receiver
@@ -612,8 +587,6 @@ impl Scheduler {
         rerank_providers: HashMap<String, RerankProviderEntry>,
         bucket_registry: BucketRegistry,
         audit: AuditLog,
-        host_env_registry: crate::tools::sandbox::HostEnvRegistry,
-        host_env_catalog: crate::tools::host_env_catalog::CatalogStore,
         shared_mcp_catalog: crate::tools::shared_mcp_catalog::CatalogStore,
         shared_mcp_overlays: Vec<SharedHostOverlay>,
         v2_daemon_registry: Arc<crate::tools::host_env_link::LiveDaemonRegistry>,
@@ -706,8 +679,6 @@ impl Scheduler {
                 bucket_registry,
                 server_config_path,
                 persister: None,
-                host_env_registry,
-                host_env_catalog,
                 v2_daemon_registry,
                 v2_sessions: V2SessionStore::new(),
                 v2_contexts: V2ContextStore::new(),
@@ -725,7 +696,6 @@ impl Scheduler {
                 next_op_id: 1,
                 dirty: HashSet::new(),
                 dirty_behaviors: HashSet::new(),
-                provisioning_in_flight: HashSet::new(),
                 stream_tx,
                 active_bucket_builds: HashMap::new(),
                 active_bucket_progress: HashMap::new(),
@@ -837,16 +807,9 @@ impl Scheduler {
         self.backends.get(name)
     }
 
-    /// Look up a host-env provider in the catalog by name.
-    pub(crate) fn host_env_provider(&self, name: &str) -> Option<&Arc<dyn HostEnvProvider>> {
-        self.host_env_registry.get(name)
-    }
-
     /// Whether `name` is a v2 host-env daemon admitted by
     /// `[[auth.daemons]]`. True regardless of current connection state
-    /// — admitted-but-offline still returns `true`. Used to decide
-    /// whether a binding name should route through the v2 path or
-    /// fall through to the v1 `host_env_registry` lookup.
+    /// — admitted-but-offline still returns `true`.
     pub(crate) fn is_v2_daemon_binding(&self, name: &str) -> bool {
         self.v2_daemon_registry.is_admitted(name)
     }
@@ -950,257 +913,19 @@ impl Scheduler {
         }
     }
 
-    /// Classify a registered provider's origin for protocol output.
-    /// Anything in the registry but absent from the durable catalog is
-    /// a `RuntimeOverlay` (CLI-flag provided); anything in the catalog
-    /// reports the catalog's stored origin.
-    fn host_env_provider_origin(
-        &self,
-        name: &str,
-    ) -> whisper_agent_protocol::HostEnvProviderOrigin {
-        use crate::tools::host_env_catalog::CatalogOrigin;
-        use whisper_agent_protocol::HostEnvProviderOrigin;
-        match self.host_env_catalog.get(name).map(|e| e.origin) {
-            Some(CatalogOrigin::Seeded) => HostEnvProviderOrigin::Seeded,
-            Some(CatalogOrigin::Manual) => HostEnvProviderOrigin::Manual,
-            None => HostEnvProviderOrigin::RuntimeOverlay,
-        }
-    }
-
-    /// Snapshot the registry for `ListHostEnvProviders`. Entries appear
-    /// in name-sorted order (via `HostEnvRegistry::snapshot`).
-    pub(crate) fn host_env_provider_snapshot(
-        &self,
-    ) -> Vec<whisper_agent_protocol::HostEnvProviderInfo> {
-        self.host_env_registry
-            .snapshot(|name| self.host_env_provider_origin(name))
-    }
-
-    /// Build a single `HostEnvProviderInfo` from the live registry
-    /// state, with its origin classified. Returns `None` when the
-    /// name isn't in the registry. Used by the Add/Update response
-    /// paths so the wire record always reflects what the registry
-    /// actually holds (including reachability, which is live state).
-    pub(crate) fn host_env_provider_info(
-        &self,
-        name: &str,
-    ) -> Option<whisper_agent_protocol::HostEnvProviderInfo> {
-        let entry = self.host_env_registry.entry(name)?;
-        Some(whisper_agent_protocol::HostEnvProviderInfo {
-            name: name.to_string(),
-            url: entry.url.clone(),
-            origin: self.host_env_provider_origin(name),
-            has_token: entry.token.is_some(),
-            reachability: entry.reachability.clone(),
-        })
-    }
-
-    /// Enumerate one reachability-probe future per registered
-    /// provider. Each future resolves to a `SchedulerCompletion::Probe`
-    /// the run loop feeds back into `apply_probe_completion`. Clones
-    /// the `Arc<dyn HostEnvProvider>` so the probe future is
-    /// self-contained — the registry can mutate concurrently without
-    /// invalidating in-flight probes.
-    pub(crate) fn spawn_reachability_probes(
-        &self,
-    ) -> Vec<crate::runtime::io_dispatch::SchedulerFuture> {
-        use crate::runtime::io_dispatch::{ProbeCompletion, SchedulerCompletion};
-        let mut futs: Vec<crate::runtime::io_dispatch::SchedulerFuture> = Vec::new();
-        for name in self.host_env_registry.names() {
-            let Some(entry) = self.host_env_registry.entry(&name) else {
-                continue;
-            };
-            let provider = entry.provider.clone();
-            let name_owned = name.clone();
-            futs.push(Box::pin(async move {
-                let result = provider.probe().await.map_err(|e| e.to_string());
-                SchedulerCompletion::Probe(ProbeCompletion {
-                    name: name_owned,
-                    observed_at: chrono::Utc::now(),
-                    result,
-                })
-            }));
-        }
-        futs
-    }
-
-    /// Update the registry entry's reachability from a probe result
-    /// and emit a `HostEnvProviderUpdated` push if the state actually
-    /// changed. The "changed?" gate matters — a reachable daemon
-    /// would otherwise generate a push every probe tick.
-    pub(crate) fn apply_probe_completion(
-        &mut self,
-        probe: crate::runtime::io_dispatch::ProbeCompletion,
-    ) {
-        let crate::runtime::io_dispatch::ProbeCompletion {
-            name,
-            observed_at,
-            result,
-        } = probe;
-        // Log transitions at WARN / INFO, repeats at DEBUG. With the
-        // 30s probe tick a permanently-down daemon would otherwise
-        // spam WARN every tick forever; operators want the first edge
-        // + the recovery, not a ticker in the journal.
-        let changed = match result {
-            Ok(()) => {
-                let changed = self.host_env_registry.mark_reachable(&name, observed_at);
-                if changed {
-                    info!(provider = %name, "host-env provider probe recovered");
-                } else {
-                    debug!(provider = %name, "host-env provider probe ok");
-                }
-                changed
-            }
-            Err(msg) => {
-                let changed =
-                    self.host_env_registry
-                        .mark_unreachable(&name, observed_at, msg.clone());
-                if changed {
-                    warn!(provider = %name, error = %msg, "host-env provider probe failed");
-                } else {
-                    debug!(provider = %name, error = %msg, "host-env provider probe still failing");
-                }
-                changed
-            }
-        };
-        if changed && let Some(info) = self.host_env_provider_info(&name) {
-            self.router.broadcast_resource(
-                whisper_agent_protocol::ServerToClient::HostEnvProviderUpdated {
-                    correlation_id: None,
-                    provider: info,
-                },
-            );
-        }
-    }
-
-    /// Pod IDs whose `[[allow.host_env]]` references the given
-    /// provider name. Used by the remove path to refuse removal while
-    /// any loaded pod binding would be orphaned. Archived pods aren't
-    /// loaded into `self.pods` and therefore aren't checked — that's
-    /// intentional: archived pods are already unreachable.
-    fn pods_referencing_host_env_provider(&self, name: &str) -> Vec<String> {
-        let mut refs: Vec<String> = self
-            .pods
-            .iter()
-            .filter(|(_, pod)| {
-                pod.config
-                    .allow
-                    .host_env
-                    .iter()
-                    .any(|entry| entry.provider == name)
-            })
-            .map(|(id, _)| id.to_string())
-            .collect();
-        refs.sort();
-        refs
-    }
-
-    /// Add a provider to the durable catalog and the live registry.
-    /// Returns the canonical snapshot on success so the caller can
-    /// echo it back to clients.
-    pub(crate) fn add_host_env_provider(
-        &mut self,
-        name: String,
-        url: String,
-        token: Option<String>,
-    ) -> anyhow::Result<whisper_agent_protocol::HostEnvProviderInfo> {
-        if name.is_empty() {
-            anyhow::bail!("provider name must be non-empty");
-        }
-        if url.is_empty() {
-            anyhow::bail!("provider url must be non-empty");
-        }
-        if self.host_env_registry.contains(&name) {
-            anyhow::bail!(
-                "provider `{name}` already registered (as {})",
-                match self.host_env_provider_origin(&name) {
-                    whisper_agent_protocol::HostEnvProviderOrigin::Seeded => "seeded",
-                    whisper_agent_protocol::HostEnvProviderOrigin::Manual => "manual",
-                    whisper_agent_protocol::HostEnvProviderOrigin::RuntimeOverlay =>
-                        "runtime-overlay (CLI --host-env-provider flag)",
-                }
-            );
-        }
-        let now = chrono::Utc::now();
-        self.host_env_catalog
-            .insert(crate::tools::host_env_catalog::new_manual_entry(
-                name.clone(),
-                url.clone(),
-                token.clone(),
-                now,
-            ))?;
-        self.host_env_registry
-            .insert_or_replace(name.clone(), url, token);
-        Ok(self.host_env_provider_info(&name).expect("just inserted"))
-    }
-
-    /// Replace `url` and `token` on an existing catalog entry. Refuses
-    /// runtime-overlay entries (they're not in the catalog to edit).
-    pub(crate) fn update_host_env_provider(
-        &mut self,
-        name: String,
-        url: String,
-        token: Option<String>,
-    ) -> anyhow::Result<whisper_agent_protocol::HostEnvProviderInfo> {
-        if url.is_empty() {
-            anyhow::bail!("provider url must be non-empty");
-        }
-        if !self.host_env_catalog.contains(&name) {
-            if self.host_env_registry.contains(&name) {
-                anyhow::bail!(
-                    "provider `{name}` is a runtime-overlay from a CLI flag and can't be updated at runtime; remove the --host-env-provider flag and restart to manage it here"
-                );
-            }
-            anyhow::bail!("provider `{name}` not in catalog");
-        }
-        let now = chrono::Utc::now();
-        self.host_env_catalog
-            .update(&name, url.clone(), token.clone(), now)?;
-        self.host_env_registry
-            .insert_or_replace(name.clone(), url, token);
-        Ok(self.host_env_provider_info(&name).expect("just updated"))
-    }
-
-    /// Remove a provider from the catalog and live registry. Refuses
-    /// with a listing of referencing pod IDs if any loaded pod's
-    /// `[[allow.host_env]]` still names this provider. Also refuses
-    /// runtime-overlay entries (not in the catalog). Existing live
-    /// host-env handles already provisioned against the provider keep
-    /// working until GC'd — the handle cached the URL and http client.
-    pub(crate) fn remove_host_env_provider(&mut self, name: &str) -> anyhow::Result<()> {
-        if !self.host_env_catalog.contains(name) {
-            if self.host_env_registry.contains(name) {
-                anyhow::bail!(
-                    "provider `{name}` is a runtime-overlay from a CLI flag; remove the flag and restart to unregister"
-                );
-            }
-            anyhow::bail!("provider `{name}` not in catalog");
-        }
-        let refs = self.pods_referencing_host_env_provider(name);
-        if !refs.is_empty() {
-            anyhow::bail!(
-                "provider `{name}` is referenced by pod `[[allow.host_env]]` in: [{}]. Edit those pods first",
-                refs.join(", ")
-            );
-        }
-        self.host_env_catalog.remove(name)?;
-        self.host_env_registry.remove(name);
-        Ok(())
-    }
-
     // ---------- Shared-MCP-host catalog surface ----------
 
     /// Classify a shared-MCP-host's origin for protocol output.
-    /// Same shape as `host_env_provider_origin`: catalog wins over
-    /// CLI overlay, unknown names report as `RuntimeOverlay` (they
-    /// exist in the registry but nowhere durable).
-    fn shared_mcp_host_origin(&self, name: &str) -> whisper_agent_protocol::HostEnvProviderOrigin {
-        use crate::tools::host_env_catalog::CatalogOrigin;
-        use whisper_agent_protocol::HostEnvProviderOrigin;
+    /// Catalog wins over CLI overlay; unknown names report as
+    /// `RuntimeOverlay` (they exist in the registry but nowhere
+    /// durable).
+    fn shared_mcp_host_origin(&self, name: &str) -> whisper_agent_protocol::CatalogOrigin {
+        use crate::tools::shared_mcp_catalog::CatalogOrigin;
+        use whisper_agent_protocol::CatalogOrigin as ProtoOrigin;
         match self.shared_mcp_catalog.get(name).map(|e| e.origin) {
-            Some(CatalogOrigin::Seeded) => HostEnvProviderOrigin::Seeded,
-            Some(CatalogOrigin::Manual) => HostEnvProviderOrigin::Manual,
-            None => HostEnvProviderOrigin::RuntimeOverlay,
+            Some(CatalogOrigin::Seeded) => ProtoOrigin::Seeded,
+            Some(CatalogOrigin::Manual) => ProtoOrigin::Manual,
+            None => ProtoOrigin::RuntimeOverlay,
         }
     }
 

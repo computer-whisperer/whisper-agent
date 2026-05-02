@@ -6609,25 +6609,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "whisper-agent-sandbox"
-version = "0.3.13"
-dependencies = [
- "anyhow",
- "axum",
- "clap",
- "landlock",
- "rand 0.10.1",
- "serde",
- "serde_json",
- "subtle",
- "thiserror 2.0.18",
- "tokio",
- "tracing",
- "tracing-subscriber",
- "whisper-agent-protocol",
-]
-
-[[package]]
 name = "whisper-agent-webui"
 version = "0.3.13"
 dependencies = [

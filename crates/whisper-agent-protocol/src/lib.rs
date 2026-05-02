@@ -319,61 +319,13 @@ pub struct ThreadBindingsRequest {
     pub mcp_hosts: Option<Vec<String>>,
 }
 
-/// Server-advertised entry from the host-env-provider catalog. Sent in
-/// response to `ListHostEnvProviders` so the webui's pod editor can
-/// populate its provider dropdown. Every entry represents a
-/// daemon-backed provider — there are no built-ins.
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-pub struct HostEnvProviderInfo {
-    /// User-facing catalog name (matches `NamedHostEnv.provider`).
-    pub name: String,
-    /// Daemon URL the scheduler talks to for provision / teardown.
-    /// Included so a WebUI management panel can display it; clients
-    /// that only need the name (pod-editor dropdown) can ignore it.
-    pub url: String,
-    /// How this entry entered the catalog. `Seeded` entries were
-    /// imported from `whisper-agent.toml`'s `[[host_env_providers]]`
-    /// table on startup; `Manual` entries were added at runtime
-    /// (WebUI / RPC). `RuntimeOverlay` entries come from CLI flags
-    /// and are not persisted — they live only for this server run.
-    pub origin: HostEnvProviderOrigin,
-    /// Whether the entry carries a control-plane bearer token.
-    /// The token itself is never sent over the wire; clients get a
-    /// boolean so the UI can show "authenticated" / "anonymous"
-    /// status without exposing the secret.
-    pub has_token: bool,
-    /// Last-known daemon liveness for this provider. Updated from
-    /// both periodic probes (on a background timer) and opportunistic
-    /// signals (provision success / connect-fail). `Unknown` means
-    /// the probe hasn't run yet — fresh registrations start here.
-    #[serde(default)]
-    pub reachability: HostEnvReachability,
-}
-
-/// Daemon-liveness status carried on `HostEnvProviderInfo`. Times are
-/// RFC-3339 strings so the protocol crate can stay chrono-free.
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default)]
-#[serde(tag = "state", rename_all = "snake_case")]
-pub enum HostEnvReachability {
-    /// No probe has completed yet. Also the state on boot before the
-    /// first tick fires.
-    #[default]
-    Unknown,
-    /// Last probe or provision succeeded. `at` is the observation time.
-    Reachable { at: String },
-    /// Last probe failed. `since` is the first failed observation
-    /// after the last `Reachable`, or first failure at all if we've
-    /// never seen it. `last_error` carries the most recent failure
-    /// message for operator display.
-    Unreachable { since: String, last_error: String },
-}
-
-/// Provenance enum for `HostEnvProviderInfo.origin`. Mirrors the
-/// server's internal `CatalogOrigin` plus a `RuntimeOverlay` variant
-/// for CLI-provided entries that never land in the durable catalog.
+/// Provenance enum for catalog entries surfaced over the wire. Mirrors
+/// the server's internal `CatalogOrigin` plus a `RuntimeOverlay`
+/// variant for CLI-provided entries that never land in the durable
+/// catalog.
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-pub enum HostEnvProviderOrigin {
+pub enum CatalogOrigin {
     Seeded,
     Manual,
     RuntimeOverlay,
@@ -396,7 +348,7 @@ pub struct SharedMcpHostInfo {
     /// How this entry entered the catalog. Mirrors the host-env shape
     /// (`Seeded` from `[shared_mcp_hosts]` TOML, `Manual` from WebUI /
     /// RPC, `RuntimeOverlay` from a CLI `--shared-mcp-host` flag).
-    pub origin: HostEnvProviderOrigin,
+    pub origin: CatalogOrigin,
     /// Non-secret auth classification. The secret itself (bearer token,
     /// OAuth tokens) is never sent to the client; the UI gets just
     /// enough to render "anonymous" / "bearer-auth" / etc.
@@ -1272,62 +1224,6 @@ pub enum ClientToServer {
         correlation_id: Option<String>,
     },
 
-    /// Snapshot of the server's host-env-provider catalog. Used by the
-    /// pod editor to populate the per-entry "provider" dropdown.
-    /// Server responds with `HostEnvProvidersList`.
-    ListHostEnvProviders {
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        correlation_id: Option<String>,
-    },
-
-    /// Register a new host-env provider with the durable catalog. The
-    /// server validates the name (non-empty, not already in use) and
-    /// persists the entry to `host_env_providers.toml` before
-    /// responding. Responds with `HostEnvProviderAdded` on success or
-    /// `Error` on validation failure.
-    AddHostEnvProvider {
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        correlation_id: Option<String>,
-        name: String,
-        url: String,
-        /// Control-plane bearer the daemon expects. Omit for dev
-        /// daemons running without `--control-token-file`.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        token: Option<String>,
-    },
-
-    /// Replace url / token on an existing catalog entry. Origin and
-    /// created_at are preserved. Responds with `HostEnvProviderUpdated`
-    /// or `Error` (unknown name, or the entry is a `RuntimeOverlay`
-    /// that can't be persisted).
-    UpdateHostEnvProvider {
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        correlation_id: Option<String>,
-        name: String,
-        url: String,
-        /// When `None`, the existing token is cleared. To keep the
-        /// existing token, clients must read it from — wait, they
-        /// can't; tokens are never sent to the client. So: clients
-        /// that don't intend to change the token must omit the field
-        /// entirely (it'd still be `None` on the wire), which means
-        /// "clear it". The UI should make this distinction obvious;
-        /// a three-way toggle (keep / set / clear) is the natural
-        /// shape, but until we need it we keep the wire simple.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        token: Option<String>,
-    },
-
-    /// Remove a provider from the catalog. Refused if any loaded pod's
-    /// `[[allow.host_env]]` table references the name — the response
-    /// is an `Error` listing the referencing pods so the operator can
-    /// edit them first. Responds with `HostEnvProviderRemoved` on
-    /// success.
-    RemoveHostEnvProvider {
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        correlation_id: Option<String>,
-        name: String,
-    },
-
     /// Enumerate shared-MCP-host catalog entries. Server responds with
     /// `SharedMcpHostsList`.
     ListSharedMcpHosts {
@@ -1453,8 +1349,8 @@ pub enum ClientToServer {
     /// hot-swaps the in-memory backend catalog: any thread bound to a
     /// removed or modified backend is cancelled before the swap so it
     /// can't silently transition to a new provider mid-conversation.
-    /// Other config sections (shared_mcp_hosts, host_env_providers,
-    /// secrets, auth) are persisted to disk but require a server
+    /// Other config sections (shared_mcp_hosts, secrets, auth) are
+    /// persisted to disk but require a server
     /// restart to take effect — the server reports them in the
     /// response's `restart_required_sections` list. Response:
     /// `ServerConfigUpdateResult` on success, `Error` on validation or
@@ -2022,34 +1918,6 @@ pub enum ServerToClient {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         correlation_id: Option<String>,
         resources: Vec<ResourceSnapshot>,
-    },
-    /// Snapshot response to `ListHostEnvProviders`. Entries appear in
-    /// name-sorted order; no built-ins.
-    HostEnvProvidersList {
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        correlation_id: Option<String>,
-        providers: Vec<HostEnvProviderInfo>,
-    },
-    /// Successful response to `AddHostEnvProvider`. Carries the
-    /// canonicalized entry so the client can update its local view
-    /// without re-fetching the whole list.
-    HostEnvProviderAdded {
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        correlation_id: Option<String>,
-        provider: HostEnvProviderInfo,
-    },
-    /// Successful response to `UpdateHostEnvProvider`.
-    HostEnvProviderUpdated {
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        correlation_id: Option<String>,
-        provider: HostEnvProviderInfo,
-    },
-    /// Successful response to `RemoveHostEnvProvider`. The name is
-    /// echoed so clients can identify which local entry to drop.
-    HostEnvProviderRemoved {
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        correlation_id: Option<String>,
-        name: String,
     },
     /// Snapshot response to `ListSharedMcpHosts`. Entries in
     /// name-sorted order.
