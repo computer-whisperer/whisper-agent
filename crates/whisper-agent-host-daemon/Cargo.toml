@@ -1,0 +1,51 @@
+[package]
+name = "whisper-agent-host-daemon"
+description = "Host-side daemon for the v2 host-env protocol — dials whisper-agent over WebSocket and provisions per-session sandboxes for incoming tool calls."
+version = "0.3.13"
+edition.workspace = true
+license.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "whisper-agent-host-daemon"
+path = "src/main.rs"
+
+[dependencies]
+whisper-agent-protocol = { workspace = true }
+whisper-agent-host-proto = { workspace = true }
+tokio = { workspace = true, features = ["process", "fs", "io-util", "io-std", "net", "sync"] }
+tokio-tungstenite = { version = "0.28", features = ["rustls-tls-native-roots"] }
+# `connect_async_tls_with_config` takes a tungstenite-shaped Connector;
+# the rustls feature pulls in the ring-backed default. We don't pin
+# rustls explicitly — the daemon doesn't need axum-server's
+# multi-provider tangle, just one TLS client.
+futures = "0.3"
+axum = { workspace = true, features = ["ws"] }
+http = "1"
+serde = { workspace = true }
+serde_json = { workspace = true }
+ciborium = { workspace = true }
+url = { workspace = true }
+reqwest = { workspace = true, features = ["json"] }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+clap = { workspace = true, features = ["env"] }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+landlock = "0.4"
+rand = "0.10"
+# `tempfile` provides the default workspace handed to the startup probe
+# worker. The probe never reads or writes files there — it only answers
+# tools/list — but landlock requires *some* RW path in its ruleset, so
+# we hand it a fresh tempdir that drops after the probe completes.
+tempfile = "3"
+
+[dev-dependencies]
+# WS server harness for the integration tests — stand up a loopback
+# axum server, mount /v1/host_env_link, dial it from the daemon library.
+# Same versions the in-tree host_env_link server-side tests use, so
+# both sides exercise the same wire types.
+tokio-tungstenite = "0.28"
+http = "1"

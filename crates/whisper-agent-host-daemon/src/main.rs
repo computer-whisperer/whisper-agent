@@ -1,0 +1,165 @@
+//! `whisper-agent-host-daemon` binary.
+//!
+//! Long-lived process that dials whisper-agent over an authenticated
+//! WebSocket and provisions per-session sandboxes for incoming
+//! tool calls. Reconnect-with-backoff is at this layer; the library
+//! gives us a clean error per dial, we log it, sleep, retry.
+
+use std::net::IpAddr;
+use std::path::PathBuf;
+use std::time::Duration;
+
+use anyhow::{Context, anyhow};
+use clap::Parser;
+use rand::RngExt;
+use tracing::{error, info, warn};
+use tracing_subscriber::EnvFilter;
+use whisper_agent_host_daemon::{ConnectError, catalog, connection};
+use whisper_agent_host_proto::{DaemonCapabilities, HostEnvSpecKind};
+
+#[derive(Parser, Debug)]
+#[command(
+    name = "whisper-agent-host-daemon",
+    version,
+    about = "Dial-in host daemon for the v2 host-env protocol"
+)]
+struct Args {
+    /// Full WebSocket URL of the scheduler endpoint, including scheme
+    /// and path. `wss://` for production (TLS via system roots),
+    /// `ws://` for loopback dev.
+    #[arg(long, env = "WHISPER_AGENT_SERVER_URL")]
+    server_url: String,
+
+    /// Path to the bearer-token file the daemon presents at WS
+    /// upgrade. Single line, whitespace-trimmed. Must match a
+    /// `[[auth.daemons]]` entry on the scheduler.
+    #[arg(long, env = "WHISPER_AGENT_TOKEN_FILE")]
+    token_file: PathBuf,
+
+    /// Path to the `whisper-agent-mcp-host` binary the daemon spawns
+    /// for each session. Resolved against `$PATH` if not absolute.
+    #[arg(long, default_value = "whisper-agent-mcp-host")]
+    mcp_host_bin: String,
+
+    /// Loopback interface workers bind on. `127.0.0.1` keeps each
+    /// worker isolated to localhost (the production default);
+    /// `[::]` / `0.0.0.0` is for dev environments where the daemon
+    /// itself isn't loopback-only.
+    #[arg(long, default_value = "127.0.0.1")]
+    bind_ip: IpAddr,
+
+    /// Optional override for the workspace handed to the startup
+    /// probe worker. Defaults to a fresh tempdir under `$TMPDIR` —
+    /// override only when probing in a writable-elsewhere setup.
+    #[arg(long)]
+    probe_workspace: Option<PathBuf>,
+
+    /// Reconnect backoff ceiling. The dial loop uses exponential
+    /// backoff with jitter, capped at this many seconds.
+    #[arg(long, default_value_t = 60)]
+    reconnect_max_secs: u64,
+}
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| EnvFilter::new("whisper_agent_host_daemon=info")),
+        )
+        .init();
+
+    let args = Args::parse();
+
+    let token = tokio::fs::read_to_string(&args.token_file)
+        .await
+        .with_context(|| format!("reading token from {}", args.token_file.display()))?;
+    let token = token.trim().to_string();
+    if token.is_empty() {
+        return Err(anyhow!(
+            "token file {} is empty after trim",
+            args.token_file.display()
+        ));
+    }
+
+    // Probe the worker once to learn what it advertises. Failure here
+    // is fatal — if we can't talk to the worker locally, we have no
+    // business announcing capabilities to the scheduler. The probe
+    // workspace must outlive the probe call; we hold it in this scope
+    // and let it drop after the catalog is built.
+    let _probe_dir_guard;
+    let probe_ws_path: String = match args.probe_workspace.as_ref() {
+        Some(p) => p.to_string_lossy().into_owned(),
+        None => {
+            let dir = tempfile::tempdir().context("creating probe-workspace tempdir")?;
+            let path = dir.path().to_string_lossy().into_owned();
+            _probe_dir_guard = dir;
+            path
+        }
+    };
+    let tools = catalog::probe_tool_catalog(&args.mcp_host_bin, args.bind_ip, &probe_ws_path)
+        .await
+        .context("probing worker tool catalog")?;
+    let capabilities = DaemonCapabilities {
+        tools,
+        spec_kinds: vec![HostEnvSpecKind::Landlock],
+        max_concurrent_sessions: None,
+        supports_background_tasks: false,
+    };
+
+    run_loop(args, token, capabilities).await
+}
+
+async fn run_loop(
+    args: Args,
+    token: String,
+    capabilities: DaemonCapabilities,
+) -> anyhow::Result<()> {
+    let mut backoff_secs = 1u64;
+    info!(
+        url = %args.server_url,
+        tools = capabilities.tools.len(),
+        "host-env daemon starting"
+    );
+    loop {
+        let config = connection::ConnectionConfig {
+            server_url: args.server_url.clone(),
+            token: token.clone(),
+            daemon_version: env!("CARGO_PKG_VERSION").into(),
+            capabilities: capabilities.clone(),
+            mcp_host_bin: args.mcp_host_bin.clone(),
+            bind_ip: args.bind_ip,
+            tls_connector: None,
+        };
+        match connection::run_connection(config).await {
+            Ok(()) => {
+                info!("link closed cleanly, reconnecting after backoff");
+                backoff_secs = 1; // reset on clean close
+            }
+            Err(e) => match &e {
+                ConnectError::ProtocolMismatch { .. } => {
+                    error!(error = %e, "fatal: protocol mismatch — exiting");
+                    return Err(anyhow!(e.to_string()));
+                }
+                ConnectError::Goodbye { reason, .. } => {
+                    use whisper_agent_host_proto::GoodbyeReason::*;
+                    match reason {
+                        ProtocolMismatch | Unauthorized | NameAlreadyConnected => {
+                            error!(error = %e, "fatal: scheduler refused connection — exiting");
+                            return Err(anyhow!(e.to_string()));
+                        }
+                        ServerShutdown | DaemonShutdown | Other => {
+                            warn!(error = %e, "scheduler said goodbye, will reconnect");
+                        }
+                    }
+                }
+                _ => warn!(error = %e, "connection failed, will reconnect"),
+            },
+        }
+        let jitter = rand::rng().random_range(0..1000);
+        let sleep_ms = backoff_secs * 1000 + jitter;
+        info!(sleep_ms, "reconnect backoff");
+        tokio::time::sleep(Duration::from_millis(sleep_ms)).await;
+        backoff_secs = (backoff_secs * 2).min(args.reconnect_max_secs);
+    }
+}
