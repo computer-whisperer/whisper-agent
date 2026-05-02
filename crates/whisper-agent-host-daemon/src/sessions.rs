@@ -14,16 +14,17 @@
 
 use std::collections::HashMap;
 
-use whisper_agent_host_proto::SessionId;
+use whisper_agent_host_proto::{SessionId, ThreadContext};
 
 use crate::worker::Worker;
 
-/// State the daemon retains per live session. Today this is just the
-/// worker handle and the dispatch tuple (`url`, `bearer`); later
-/// phases will accrete `ThreadContext` snapshots, background-task
-/// state, and active call cancellations.
+/// State the daemon retains per live session: the worker handle, the
+/// session-level [`ThreadContext`] (denylist, runas, env, etc.), and
+/// the dispatch tuple (`url`, `bearer`). Later phases will accrete
+/// background-task state and active call cancellations.
 pub struct Session {
     pub worker: Worker,
+    pub context: ThreadContext,
 }
 
 #[derive(Default)]
@@ -32,11 +33,15 @@ pub struct SessionRegistry {
 }
 
 /// What the dispatcher needs to make one tool call against a session
-/// without holding a registry borrow across the await.
+/// without holding a registry borrow across the await: the worker URL
+/// + bearer plus a snapshot of the session's [`ThreadContext`] so the
+///   dispatch task can apply denylist / argument-overrides without
+///   re-locking the registry.
 #[derive(Clone, Debug)]
 pub struct DispatchTarget {
     pub mcp_url: String,
     pub mcp_token: String,
+    pub context: ThreadContext,
 }
 
 impl SessionRegistry {
@@ -52,6 +57,7 @@ impl SessionRegistry {
         self.by_id.get(id).map(|s| DispatchTarget {
             mcp_url: s.worker.mcp_url.clone(),
             mcp_token: s.worker.mcp_token.clone(),
+            context: s.context.clone(),
         })
     }
 

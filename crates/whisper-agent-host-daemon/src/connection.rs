@@ -138,9 +138,13 @@ struct Runtime {
 enum Work {
     /// A worker spawn finished. Either insert the session and emit
     /// [`Frame::SessionReady`], or emit [`Frame::SessionFailed`].
+    /// Boxed because `Session` carries the full `Worker` (with its
+    /// `Child`) and a `ThreadContext`; without the box the enum is
+    /// dominated by this variant and the dispatch path's `ToolDone`
+    /// inflates with it (clippy::large_enum_variant).
     SpawnDone {
         session_id: SessionId,
-        result: Result<Session, WorkerError>,
+        result: Box<Result<Session, WorkerError>>,
     },
     /// A tool call finished. Emit [`Frame::ToolFinal`] back to the
     /// scheduler. `Err` paths fold into a `CallToolResult` with
@@ -279,6 +283,32 @@ async fn handle_inbound(
         } => {
             match sessions.dispatch_target(&session_id) {
                 Some(target) => {
+                    // Defense-in-depth: the scheduler also enforces the
+                    // allowlist before dispatching, but the denylist is
+                    // a per-session veto the scheduler may not know about
+                    // (e.g. the user just edited it). Refusing here costs
+                    // nothing if the scheduler already filtered.
+                    if target.context.tool_denylist.contains(&tool_name) {
+                        warn!(
+                            %session_id,
+                            %call_id,
+                            %tool_name,
+                            "tool denied by session denylist",
+                        );
+                        send_frame(
+                            socket,
+                            Frame::ToolFinal {
+                                session_id,
+                                call_id,
+                                result: CallToolResult::error_text(format!(
+                                    "tool `{tool_name}` denied by session denylist"
+                                )),
+                            },
+                        )
+                        .await?;
+                        return Ok(ControlFlow::Continue);
+                    }
+                    let arguments = apply_context_overrides(&tool_name, arguments, &target.context);
                     spawn_invoke_tool(
                         session_id,
                         call_id,
@@ -393,7 +423,7 @@ async fn handle_work(
     socket: &mut WsStream,
 ) -> Result<(), ConnectError> {
     match work {
-        Work::SpawnDone { session_id, result } => match result {
+        Work::SpawnDone { session_id, result } => match *result {
             Ok(session) => {
                 sessions.insert(session_id.clone(), session);
                 send_frame(socket, Frame::SessionReady { session_id }).await?;
@@ -439,13 +469,59 @@ fn spawn_open_session(
     runtime: Arc<Runtime>,
     work_tx: mpsc::Sender<Work>,
 ) {
-    let _ = (thread_id, context); // applied in phase 5 via UpdateSession
+    let _ = thread_id; // daemon-side logging only; the worker doesn't see it
     tokio::spawn(async move {
-        let result = worker::spawn(&spec, &runtime.mcp_host_bin, runtime.bind_ip)
-            .await
-            .map(|w| Session { worker: w });
-        let _ = work_tx.send(Work::SpawnDone { session_id, result }).await;
+        let workspace_root_override = context.workspace_root.clone();
+        let result = worker::spawn(
+            &spec,
+            &runtime.mcp_host_bin,
+            runtime.bind_ip,
+            workspace_root_override.as_deref(),
+        )
+        .await
+        .map(|w| Session { worker: w, context });
+        let _ = work_tx
+            .send(Work::SpawnDone {
+                session_id,
+                result: Box::new(result),
+            })
+            .await;
     });
+}
+
+/// Inject session-level [`ThreadContext`] knobs into the per-call
+/// `arguments` blob. Today only `bash` has corresponding tool args
+/// (`run_as`, `timeout_seconds`); other tools are passed through
+/// unchanged. The session's value wins over whatever the model put
+/// in the call — that's the point of the daemon-side enforcement.
+///
+/// `env` and `output_byte_cap` need worker-side support and aren't
+/// applied yet; the session record retains them so a later sub-phase
+/// can wire them without another round-trip.
+pub(crate) fn apply_context_overrides(
+    tool_name: &str,
+    mut arguments: serde_json::Value,
+    context: &ThreadContext,
+) -> serde_json::Value {
+    if tool_name != "bash" {
+        return arguments;
+    }
+    let Some(obj) = arguments.as_object_mut() else {
+        return arguments;
+    };
+    if let Some(runas) = &context.runas {
+        obj.insert(
+            "run_as".to_string(),
+            serde_json::Value::String(runas.clone()),
+        );
+    }
+    if let Some(secs) = context.bash_timeout_secs {
+        obj.insert(
+            "timeout_seconds".to_string(),
+            serde_json::Value::Number(serde_json::Number::from(secs)),
+        );
+    }
+    arguments
 }
 
 fn spawn_invoke_tool(
@@ -592,7 +668,9 @@ fn parse_content_block(value: &serde_json::Value) -> Result<ContentBlock, String
 /// operator — there's no "retry on phase X" logic that depends on it.
 fn phase_of(err: &WorkerError) -> ProvisionPhase {
     match err {
-        WorkerError::NoWorkspaceRoot | WorkerError::Unsupported(_) => ProvisionPhase::PreExec,
+        WorkerError::NoWorkspaceRoot
+        | WorkerError::WorkspaceRootNotInSpec { .. }
+        | WorkerError::Unsupported(_) => ProvisionPhase::PreExec,
         WorkerError::Spawn(_) => ProvisionPhase::WorkerSpawn,
         WorkerError::ChildExited { .. } | WorkerError::StartupTimeout { .. } => {
             ProvisionPhase::WorkerHandshake
@@ -746,6 +824,12 @@ mod tests {
         use ProvisionPhase::*;
         assert_eq!(phase_of(&WorkerError::NoWorkspaceRoot), PreExec);
         assert_eq!(
+            phase_of(&WorkerError::WorkspaceRootNotInSpec {
+                override_path: "/nope".into()
+            }),
+            PreExec
+        );
+        assert_eq!(
             phase_of(&WorkerError::Unsupported("container".into())),
             PreExec
         );
@@ -764,5 +848,81 @@ mod tests {
             }),
             WorkerHandshake
         );
+    }
+
+    fn ctx_with_runas(name: &str) -> ThreadContext {
+        ThreadContext {
+            runas: Some(name.to_string()),
+            ..ThreadContext::default()
+        }
+    }
+
+    fn ctx_with_bash_timeout(secs: u32) -> ThreadContext {
+        ThreadContext {
+            bash_timeout_secs: Some(secs),
+            ..ThreadContext::default()
+        }
+    }
+
+    #[test]
+    fn apply_context_overrides_passes_through_non_bash_tools() {
+        let ctx = ctx_with_runas("worker");
+        let args = json!({"path": "/etc/hostname"});
+        let out = apply_context_overrides("read_file", args.clone(), &ctx);
+        assert_eq!(out, args, "non-bash tools must pass through unchanged");
+    }
+
+    #[test]
+    fn apply_context_overrides_injects_runas_into_bash() {
+        let ctx = ctx_with_runas("worker");
+        let args = json!({"command": "id"});
+        let out = apply_context_overrides("bash", args, &ctx);
+        assert_eq!(out["run_as"], json!("worker"));
+        assert_eq!(out["command"], json!("id"));
+    }
+
+    #[test]
+    fn apply_context_overrides_runas_wins_over_model_supplied_value() {
+        // Defense-in-depth: the session's runas overrides whatever the
+        // model put in the call. A compromised model can't escape by
+        // supplying its own run_as.
+        let ctx = ctx_with_runas("worker");
+        let args = json!({"command": "id", "run_as": "root"});
+        let out = apply_context_overrides("bash", args, &ctx);
+        assert_eq!(out["run_as"], json!("worker"));
+    }
+
+    #[test]
+    fn apply_context_overrides_injects_bash_timeout() {
+        let ctx = ctx_with_bash_timeout(30);
+        let args = json!({"command": "sleep 60"});
+        let out = apply_context_overrides("bash", args, &ctx);
+        assert_eq!(out["timeout_seconds"], json!(30));
+    }
+
+    #[test]
+    fn apply_context_overrides_bash_timeout_wins_over_model_value() {
+        let ctx = ctx_with_bash_timeout(30);
+        let args = json!({"command": "sleep 60", "timeout_seconds": 600});
+        let out = apply_context_overrides("bash", args, &ctx);
+        assert_eq!(out["timeout_seconds"], json!(30));
+    }
+
+    #[test]
+    fn apply_context_overrides_default_context_does_not_mutate() {
+        let ctx = ThreadContext::default();
+        let args = json!({"command": "id", "run_as": "root", "timeout_seconds": 60});
+        let out = apply_context_overrides("bash", args.clone(), &ctx);
+        assert_eq!(out, args);
+    }
+
+    #[test]
+    fn apply_context_overrides_handles_non_object_arguments() {
+        // Pathological: scheduler shouldn't send non-object args, but
+        // we shouldn't panic if it does — just pass through.
+        let ctx = ctx_with_runas("worker");
+        let args = json!("not an object");
+        let out = apply_context_overrides("bash", args.clone(), &ctx);
+        assert_eq!(out, args);
     }
 }

@@ -13,6 +13,7 @@
 //! fulfill it.
 
 use std::net::{IpAddr, SocketAddr};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -50,6 +51,10 @@ pub struct Worker {
 pub enum WorkerError {
     #[error("no read-write path in spec — cannot determine workspace root")]
     NoWorkspaceRoot,
+    #[error(
+        "workspace_root override `{override_path}` is not under any read-write path in the spec"
+    )]
+    WorkspaceRootNotInSpec { override_path: String },
     #[error("spawn failed: {0}")]
     Spawn(String),
     #[error(
@@ -79,19 +84,69 @@ fn format_stderr_suffix(tail: &str) -> String {
 
 /// Dispatch on spec kind. Today only [`HostEnvSpec::Landlock`] is
 /// implemented; container support is a future item.
+///
+/// `workspace_root_override` lets the per-session
+/// [`whisper_agent_host_proto::ThreadContext::workspace_root`] pick a
+/// specific writable path from the spec when the spec advertises more
+/// than one. `None` ⇒ fall back to the first read-write path in the
+/// spec, preserving pre-5a behavior.
 pub async fn spawn(
     spec: &HostEnvSpec,
     mcp_host_bin: &str,
     bind_ip: IpAddr,
+    workspace_root_override: Option<&Path>,
 ) -> Result<Worker, WorkerError> {
     match spec {
         HostEnvSpec::Landlock {
             allowed_paths,
             network,
-        } => spawn_landlock(allowed_paths, network, mcp_host_bin, bind_ip).await,
+        } => {
+            spawn_landlock(
+                allowed_paths,
+                network,
+                mcp_host_bin,
+                bind_ip,
+                workspace_root_override,
+            )
+            .await
+        }
         HostEnvSpec::Container { .. } => Err(WorkerError::Unsupported(
             "container provisioning not yet implemented".into(),
         )),
+    }
+}
+
+/// Pick the workspace root for a session. If the caller supplies an
+/// override, it must be one of the spec's read-write paths (or a
+/// descendant of one — landlock allows access below the granted node,
+/// so a sub-path of an RW root is itself RW). Otherwise fall back to
+/// the first RW path in the spec.
+pub(crate) fn resolve_workspace_root(
+    allowed_paths: &[PathAccess],
+    workspace_root_override: Option<&Path>,
+) -> Result<PathBuf, WorkerError> {
+    let rw_roots: Vec<&str> = allowed_paths
+        .iter()
+        .filter(|p| p.mode == AccessMode::ReadWrite)
+        .map(|p| p.path.as_str())
+        .collect();
+    if rw_roots.is_empty() {
+        return Err(WorkerError::NoWorkspaceRoot);
+    }
+    match workspace_root_override {
+        None => Ok(PathBuf::from(rw_roots[0])),
+        Some(override_path) => {
+            let inside_rw = rw_roots
+                .iter()
+                .any(|root| override_path.starts_with(Path::new(root)));
+            if inside_rw {
+                Ok(override_path.to_path_buf())
+            } else {
+                Err(WorkerError::WorkspaceRootNotInSpec {
+                    override_path: override_path.display().to_string(),
+                })
+            }
+        }
     }
 }
 
@@ -132,12 +187,10 @@ async fn spawn_landlock(
     network: &NetworkPolicy,
     mcp_host_bin: &str,
     bind_ip: IpAddr,
+    workspace_root_override: Option<&Path>,
 ) -> Result<Worker, WorkerError> {
-    let workspace_root = allowed_paths
-        .iter()
-        .find(|p| p.mode == AccessMode::ReadWrite)
-        .map(|p| p.path.clone())
-        .ok_or(WorkerError::NoWorkspaceRoot)?;
+    let workspace_root_path = resolve_workspace_root(allowed_paths, workspace_root_override)?;
+    let workspace_root = workspace_root_path.to_string_lossy().into_owned();
 
     let bin_dir = resolve_bin_dir(mcp_host_bin)?;
 
@@ -406,5 +459,64 @@ mod tests {
     fn parse_listening_line_rejects_garbage() {
         assert!(parse_listening_line("listening not-a-socket").is_none());
         assert!(parse_listening_line("listening 127.0.0.1").is_none());
+    }
+
+    #[test]
+    fn resolve_workspace_root_uses_first_rw_when_no_override() {
+        let paths = vec![
+            PathAccess::read_only("/lib"),
+            PathAccess::read_write("/work/a"),
+            PathAccess::read_write("/work/b"),
+        ];
+        assert_eq!(
+            resolve_workspace_root(&paths, None).unwrap(),
+            PathBuf::from("/work/a")
+        );
+    }
+
+    #[test]
+    fn resolve_workspace_root_errors_when_no_rw_path() {
+        let paths = vec![PathAccess::read_only("/lib")];
+        assert!(matches!(
+            resolve_workspace_root(&paths, None),
+            Err(WorkerError::NoWorkspaceRoot)
+        ));
+    }
+
+    #[test]
+    fn resolve_workspace_root_accepts_override_matching_rw_path() {
+        let paths = vec![PathAccess::read_write("/work/a")];
+        let override_path = Path::new("/work/a");
+        assert_eq!(
+            resolve_workspace_root(&paths, Some(override_path)).unwrap(),
+            PathBuf::from("/work/a")
+        );
+    }
+
+    #[test]
+    fn resolve_workspace_root_accepts_override_under_rw_path() {
+        // Landlock grants access below the granted node, so a sub-path
+        // of an RW root is itself writable — accept it as a workspace.
+        let paths = vec![PathAccess::read_write("/work")];
+        let override_path = Path::new("/work/projects/foo");
+        assert_eq!(
+            resolve_workspace_root(&paths, Some(override_path)).unwrap(),
+            PathBuf::from("/work/projects/foo")
+        );
+    }
+
+    #[test]
+    fn resolve_workspace_root_rejects_override_outside_rw_paths() {
+        let paths = vec![
+            PathAccess::read_write("/work"),
+            PathAccess::read_only("/lib"),
+        ];
+        let override_path = Path::new("/lib/somewhere");
+        match resolve_workspace_root(&paths, Some(override_path)) {
+            Err(WorkerError::WorkspaceRootNotInSpec { override_path: p }) => {
+                assert_eq!(p, "/lib/somewhere");
+            }
+            other => panic!("expected WorkspaceRootNotInSpec, got {other:?}"),
+        }
     }
 }

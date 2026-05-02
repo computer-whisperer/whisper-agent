@@ -58,7 +58,7 @@ pub async fn probe_tool_catalog(
         %probe_workspace,
         "spawning probe worker for tool-catalog discovery"
     );
-    let worker = spawn(&spec, mcp_host_bin, bind_ip).await?;
+    let worker = spawn(&spec, mcp_host_bin, bind_ip, None).await?;
     let descriptors = list_tools(&worker).await?;
     info!(count = descriptors.len(), "probed worker tool catalog");
     // `worker` drops here → child gets killed via `kill_on_drop`.
