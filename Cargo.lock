@@ -6451,6 +6451,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "whisper-agent-host-proto"
+version = "0.3.13"
+dependencies = [
+ "ciborium",
+ "serde",
+ "serde_json",
+ "whisper-agent-protocol",
+]
+
+[[package]]
 name = "whisper-agent-mcp-fetch"
 version = "0.3.13"
 dependencies = [

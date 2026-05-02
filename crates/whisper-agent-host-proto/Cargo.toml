@@ -1,0 +1,19 @@
+[package]
+name = "whisper-agent-host-proto"
+description = "Wire types for the host-env protocol — whisper-agent ↔ host-daemon."
+version = "0.3.13"
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+# `serde_json::Value` carries dynamic tool arguments / hook payloads.
+# Concrete tool argument shapes are defined per-tool, so the wire
+# can't pin the schema here.
+serde_json = { workspace = true }
+# CBOR is the on-the-wire serialization. ciborium is the workspace
+# pinned encoder/decoder.
+ciborium = { workspace = true }
+# `HostEnvSpec` and friends — the sandbox-spec types are owned by
+# whisper-agent-protocol, this crate just transports them.
+whisper-agent-protocol = { workspace = true }
