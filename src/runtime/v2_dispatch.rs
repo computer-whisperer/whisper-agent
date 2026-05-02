@@ -20,8 +20,8 @@ use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 use whisper_agent_host_proto::{ContentBlock, HostEnvSpec};
 
-use crate::runtime::scheduler::{V2ContextStore, V2SessionStore};
-use crate::tools::host_env_link::{LinkError, LiveDaemonHandle};
+use crate::runtime::scheduler::{V2ContextStore, V2DisconnectPolicy, V2SessionStore};
+use crate::tools::host_env_link::{LinkError, LiveDaemonHandle, LiveDaemonRegistry};
 use crate::tools::mcp::{CallToolResult, McpContentBlock, McpEmbeddedResource};
 
 /// Invoke a tool against the daemon for `(thread_id, binding_name)`.
@@ -37,16 +37,26 @@ use crate::tools::mcp::{CallToolResult, McpContentBlock, McpEmbeddedResource};
 ///    `CloseSession`, and the winner's handle is returned to all
 ///    callers.
 ///
-/// Cancellation is awaited alongside the dispatch via `select!`. On
-/// cancel the in-flight `invoke_tool` future is dropped (the channel
-/// to the connection task carries no cancellation message yet — the
-/// daemon will eventually emit `ToolFinal` with whatever it has, the
-/// scheduler discards the result for a Cancelled thread anyway).
+/// Disconnect handling is governed by `policy`:
+/// - [`V2DisconnectPolicy::ContinueWithWarning`] returns the
+///   `LinkError::Disconnected` immediately as a tool error.
+/// - [`V2DisconnectPolicy::PauseUntilReconnect`] drops the stale
+///   session, awaits a fresh handle from the registry via
+///   [`LiveDaemonRegistry::wait_for_connection`], then loops to retry
+///   open + invoke transparently. The cancel token is the escape
+///   hatch — drop it (or the thread cancels) to break the wait.
+///
+/// Cancellation is awaited alongside dispatch via `select!`. On cancel
+/// the in-flight future is dropped (the daemon-side call may continue
+/// and emit a ToolFinal for it — the scheduler discards the result
+/// for a Cancelled thread anyway).
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn dispatch_v2_tool(
     sessions: V2SessionStore,
     contexts: V2ContextStore,
-    daemon_handle: Arc<LiveDaemonHandle>,
+    registry: Arc<LiveDaemonRegistry>,
+    initial_handle: Arc<LiveDaemonHandle>,
+    policy: V2DisconnectPolicy,
     thread_id: String,
     binding_name: String,
     spec: HostEnvSpec,
@@ -54,27 +64,82 @@ pub(crate) async fn dispatch_v2_tool(
     arguments: Value,
     cancel: CancellationToken,
 ) -> Result<CallToolResult, String> {
-    let session = match sessions.get(&thread_id, &binding_name) {
-        Some(s) => s,
-        None => {
-            let context = contexts.get_or_default(&thread_id, &binding_name);
-            let opened = daemon_handle
-                .open_session(thread_id.clone(), spec, context)
-                .await
-                .map_err(open_session_error_msg)?;
-            sessions.insert_or_keep(thread_id.clone(), binding_name.clone(), Arc::new(opened))
+    let mut handle = initial_handle;
+    loop {
+        let session = match sessions.get(&thread_id, &binding_name) {
+            Some(s) => s,
+            None => {
+                let context = contexts.get_or_default(&thread_id, &binding_name);
+                let open = handle.open_session(thread_id.clone(), spec.clone(), context);
+                let opened = tokio::select! {
+                    r = open => r,
+                    _ = cancel.cancelled() => return Err("cancelled".to_string()),
+                };
+                match opened {
+                    Ok(o) => sessions.insert_or_keep(
+                        thread_id.clone(),
+                        binding_name.clone(),
+                        Arc::new(o),
+                    ),
+                    Err(LinkError::Disconnected(name))
+                        if policy == V2DisconnectPolicy::PauseUntilReconnect =>
+                    {
+                        match wait_for_reconnect(&registry, &name, &cancel).await {
+                            Some(fresh) => {
+                                handle = fresh;
+                                continue;
+                            }
+                            None => return Err("cancelled".to_string()),
+                        }
+                    }
+                    Err(e) => return Err(open_session_error_msg(e)),
+                }
+            }
+        };
+
+        let invoke = session.invoke_tool(real_name.clone(), arguments.clone());
+        let result = tokio::select! {
+            r = invoke => r,
+            _ = cancel.cancelled() => return Err("cancelled".to_string()),
+        };
+
+        match result {
+            Ok(host_result) => return Ok(translate_call_result(host_result)),
+            Err(LinkError::Disconnected(name))
+                if policy == V2DisconnectPolicy::PauseUntilReconnect =>
+            {
+                // Drop the stale session before swapping in a fresh
+                // handle: its cmd_tx is dead, and leaving it in the
+                // store would let a parallel dispatch race on the
+                // same broken handle.
+                drop(session);
+                sessions.remove_session(&thread_id, &binding_name);
+                match wait_for_reconnect(&registry, &name, &cancel).await {
+                    Some(fresh) => {
+                        handle = fresh;
+                        // Loop iterates: next pass opens a fresh
+                        // session via `handle` and re-invokes.
+                    }
+                    None => return Err("cancelled".to_string()),
+                }
+            }
+            Err(e) => return Err(invoke_error_msg(e)),
         }
-    };
+    }
+}
 
-    let invoke = session.invoke_tool(real_name, arguments);
-    let result = tokio::select! {
-        r = invoke => r,
-        _ = cancel.cancelled() => return Err("cancelled".to_string()),
-    };
-
-    match result {
-        Ok(host_result) => Ok(translate_call_result(host_result)),
-        Err(e) => Err(invoke_error_msg(e)),
+/// Wait for `name` to come back online, escaping on cancel. Returns
+/// `Some(handle)` on reconnect or `None` if cancelled. Pulled out of
+/// the dispatcher so the same select-on-cancel shape covers both the
+/// open-session and invoke disconnect paths.
+async fn wait_for_reconnect(
+    registry: &LiveDaemonRegistry,
+    name: &str,
+    cancel: &CancellationToken,
+) -> Option<Arc<LiveDaemonHandle>> {
+    tokio::select! {
+        h = registry.wait_for_connection(name) => Some(h),
+        _ = cancel.cancelled() => None,
     }
 }
 
@@ -258,7 +323,9 @@ mod tests {
         let result = dispatch_v2_tool(
             sessions.clone(),
             V2ContextStore::default(),
+            Arc::new(LiveDaemonRegistry::new()),
             rig.handle.clone(),
+            V2DisconnectPolicy::ContinueWithWarning,
             "thread-1".into(),
             "alpha".into(),
             sample_spec(),
@@ -295,7 +362,9 @@ mod tests {
             dispatch_v2_tool(
                 sessions.clone(),
                 V2ContextStore::default(),
+                Arc::new(LiveDaemonRegistry::new()),
                 rig.handle.clone(),
+                V2DisconnectPolicy::ContinueWithWarning,
                 "thread-1".into(),
                 "alpha".into(),
                 sample_spec(),
@@ -331,7 +400,9 @@ mod tests {
             dispatch_v2_tool(
                 sessions.clone(),
                 V2ContextStore::default(),
+                Arc::new(LiveDaemonRegistry::new()),
                 rig.handle.clone(),
+                V2DisconnectPolicy::ContinueWithWarning,
                 tid.into(),
                 "alpha".into(),
                 sample_spec(),
@@ -362,7 +433,9 @@ mod tests {
         dispatch_v2_tool(
             sessions.clone(),
             V2ContextStore::default(),
+            Arc::new(LiveDaemonRegistry::new()),
             rig.handle.clone(),
+            V2DisconnectPolicy::ContinueWithWarning,
             "thread-1".into(),
             "alpha".into(),
             sample_spec(),
@@ -392,7 +465,9 @@ mod tests {
         dispatch_v2_tool(
             sessions.clone(),
             V2ContextStore::default(),
+            Arc::new(LiveDaemonRegistry::new()),
             rig.handle.clone(),
+            V2DisconnectPolicy::ContinueWithWarning,
             "thread-1".into(),
             "alpha".into(),
             sample_spec(),
@@ -427,7 +502,9 @@ mod tests {
         let err = dispatch_v2_tool(
             sessions.clone(),
             V2ContextStore::default(),
+            Arc::new(LiveDaemonRegistry::new()),
             rig.handle.clone(),
+            V2DisconnectPolicy::ContinueWithWarning,
             "thread-1".into(),
             "alpha".into(),
             sample_spec(),
@@ -467,7 +544,9 @@ mod tests {
         dispatch_v2_tool(
             sessions.clone(),
             contexts.clone(),
+            Arc::new(LiveDaemonRegistry::new()),
             rig.handle.clone(),
+            V2DisconnectPolicy::ContinueWithWarning,
             "thread-1".into(),
             "alpha".into(),
             sample_spec(),
@@ -489,7 +568,9 @@ mod tests {
         dispatch_v2_tool(
             sessions.clone(),
             contexts.clone(),
+            Arc::new(LiveDaemonRegistry::new()),
             rig.handle.clone(),
+            V2DisconnectPolicy::ContinueWithWarning,
             "thread-1".into(),
             "alpha".into(),
             sample_spec(),
@@ -518,7 +599,9 @@ mod tests {
         dispatch_v2_tool(
             sessions.clone(),
             V2ContextStore::default(),
+            Arc::new(LiveDaemonRegistry::new()),
             rig.handle.clone(),
+            V2DisconnectPolicy::ContinueWithWarning,
             "thread-1".into(),
             "alpha".into(),
             sample_spec(),
@@ -554,7 +637,9 @@ mod tests {
         dispatch_v2_tool(
             sessions.clone(),
             V2ContextStore::default(),
+            Arc::new(LiveDaemonRegistry::new()),
             rig.handle.clone(),
+            V2DisconnectPolicy::ContinueWithWarning,
             "thread-1".into(),
             "alpha".into(),
             sample_spec(),
@@ -611,7 +696,9 @@ mod tests {
         dispatch_v2_tool(
             sessions.clone(),
             V2ContextStore::default(),
+            Arc::new(LiveDaemonRegistry::new()),
             rig.handle.clone(),
+            V2DisconnectPolicy::ContinueWithWarning,
             "thread-1".into(),
             "alpha".into(),
             sample_spec(),
@@ -682,7 +769,9 @@ mod tests {
         let err = dispatch_v2_tool(
             sessions.clone(),
             V2ContextStore::default(),
+            Arc::new(LiveDaemonRegistry::new()),
             rig.handle.clone(),
+            V2DisconnectPolicy::ContinueWithWarning,
             "thread-1".into(),
             "alpha".into(),
             sample_spec(),
@@ -698,5 +787,252 @@ mod tests {
         );
 
         shutdown_and_join(rig, sessions, &["thread-1"]).await;
+    }
+
+    #[tokio::test]
+    async fn pause_until_reconnect_retries_after_daemon_swap() {
+        // Wire path under test: invoke against handle1 fails with
+        // Disconnected → dispatcher waits for "alpha" to reappear
+        // in the registry → handle2 inserted → dispatcher opens a
+        // fresh session against handle2 and the retry succeeds.
+        let registry = Arc::new(LiveDaemonRegistry::new());
+        let rig1 = spawn_fake_daemon(
+            "alpha".into(),
+            sample_capabilities(),
+            // Stash invokes so the call hangs until we abort the rig.
+            |_, _| InvokeOutcome::Stash,
+        );
+        registry.insert_for_test("alpha".into(), rig1.handle.clone());
+        let rig2 = spawn_fake_daemon("alpha".into(), sample_capabilities(), |_, _| {
+            InvokeOutcome::Reply(Ok(whisper_agent_host_proto::CallToolResult {
+                content: vec![ContentBlock::Text {
+                    text: "from-rig2".into(),
+                }],
+                is_error: None,
+            }))
+        });
+
+        let sessions = V2SessionStore::default();
+        let cancel = CancellationToken::new();
+
+        let dispatch = tokio::spawn({
+            let sessions = sessions.clone();
+            let registry = registry.clone();
+            let handle1 = rig1.handle.clone();
+            let cancel = cancel.clone();
+            async move {
+                dispatch_v2_tool(
+                    sessions,
+                    V2ContextStore::default(),
+                    registry,
+                    handle1,
+                    V2DisconnectPolicy::PauseUntilReconnect,
+                    "thread-1".into(),
+                    "alpha".into(),
+                    sample_spec(),
+                    "echo".into(),
+                    dispatch_args(),
+                    cancel,
+                )
+                .await
+            }
+        });
+
+        // Wait until rig1 has stashed the invoke (proves dispatch_v2_tool
+        // got past open_session and is awaiting the result oneshot).
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if rig1.state.invokes.load(Ordering::Relaxed) >= 1 {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("rig1 never received the invoke");
+
+        // Simulate disconnect: abort rig1's task and drain any stashed
+        // result oneshots from FakeDaemonState. The state struct is
+        // Arc'd, so abort alone doesn't drop the pending_invokes Vec
+        // — the test has to drain it explicitly to surface
+        // LinkError::Disconnected to invoke_tool's awaiting result_rx.
+        registry.remove_for_test("alpha");
+        rig1.task.abort();
+        rig1.state.pending_invokes.lock().await.clear();
+
+        // Reconnect: register rig2 under the same name. The
+        // dispatcher's wait_for_reconnect resolves to rig2's handle
+        // and the retry opens a fresh session against it.
+        registry.insert_for_test("alpha".into(), rig2.handle.clone());
+
+        let result = tokio::time::timeout(Duration::from_secs(5), dispatch)
+            .await
+            .expect("dispatch hung after reconnect")
+            .expect("dispatch task panicked")
+            .expect("dispatch returned error");
+        assert_eq!(result.content.len(), 1);
+        let McpContentBlock::Text { text } = &result.content[0] else {
+            panic!("expected text content");
+        };
+        assert_eq!(text, "from-rig2");
+        assert_eq!(rig2.state.opens.load(Ordering::Relaxed), 1);
+        assert_eq!(rig2.state.invokes.load(Ordering::Relaxed), 1);
+
+        cancel.cancel();
+        // Pull the rig2 handle clone the registry is still holding;
+        // otherwise the cmd_tx stays alive and the daemon task can't
+        // exit when shutdown_and_join drops the rig's own handle.
+        registry.remove_for_test("alpha");
+        drop(registry);
+        shutdown_and_join(rig2, sessions, &["thread-1"]).await;
+        // rig1 was aborted; just drop the handle.
+        drop(rig1.handle);
+    }
+
+    #[tokio::test]
+    async fn continue_with_warning_returns_error_immediately_on_disconnect() {
+        let registry = Arc::new(LiveDaemonRegistry::new());
+        let rig = spawn_fake_daemon("alpha".into(), sample_capabilities(), |_, _| {
+            InvokeOutcome::Stash
+        });
+        registry.insert_for_test("alpha".into(), rig.handle.clone());
+
+        let sessions = V2SessionStore::default();
+        let cancel = CancellationToken::new();
+
+        let dispatch = tokio::spawn({
+            let sessions = sessions.clone();
+            let registry = registry.clone();
+            let handle = rig.handle.clone();
+            let cancel = cancel.clone();
+            async move {
+                dispatch_v2_tool(
+                    sessions,
+                    V2ContextStore::default(),
+                    registry,
+                    handle,
+                    V2DisconnectPolicy::ContinueWithWarning,
+                    "thread-1".into(),
+                    "alpha".into(),
+                    sample_spec(),
+                    "echo".into(),
+                    dispatch_args(),
+                    cancel,
+                )
+                .await
+            }
+        });
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if rig.state.invokes.load(Ordering::Relaxed) >= 1 {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("rig never received the invoke");
+
+        rig.task.abort();
+        // Drain stashed oneshots — see pause_until_reconnect test for
+        // the why. Without this the result_rx in invoke_tool stays
+        // awaiting forever even after the task aborts.
+        rig.state.pending_invokes.lock().await.clear();
+        // No new daemon registered — ContinueWithWarning shouldn't
+        // wait for one, it just returns the error.
+
+        let err = tokio::time::timeout(Duration::from_secs(2), dispatch)
+            .await
+            .expect("dispatch hung")
+            .expect("dispatch panicked")
+            .expect_err("expected error");
+        assert!(
+            err.contains("v2 invoke failed") && err.contains("disconnect"),
+            "unexpected error: {err}",
+        );
+
+        cancel.cancel();
+        sessions.remove_thread("thread-1");
+        drop(rig.handle);
+    }
+
+    #[tokio::test]
+    async fn pause_until_reconnect_cancellable_during_wait() {
+        let registry = Arc::new(LiveDaemonRegistry::new());
+        let rig = spawn_fake_daemon("alpha".into(), sample_capabilities(), |_, _| {
+            InvokeOutcome::Stash
+        });
+        registry.insert_for_test("alpha".into(), rig.handle.clone());
+
+        let sessions = V2SessionStore::default();
+        let cancel = CancellationToken::new();
+
+        let dispatch = tokio::spawn({
+            let sessions = sessions.clone();
+            let registry = registry.clone();
+            let handle = rig.handle.clone();
+            let cancel = cancel.clone();
+            async move {
+                dispatch_v2_tool(
+                    sessions,
+                    V2ContextStore::default(),
+                    registry,
+                    handle,
+                    V2DisconnectPolicy::PauseUntilReconnect,
+                    "thread-1".into(),
+                    "alpha".into(),
+                    sample_spec(),
+                    "echo".into(),
+                    dispatch_args(),
+                    cancel,
+                )
+                .await
+            }
+        });
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if rig.state.invokes.load(Ordering::Relaxed) >= 1 {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("rig never received the invoke");
+
+        // Disconnect → dispatcher enters wait_for_reconnect (no daemon
+        // will reappear). Cancel the token to escape.
+        registry.remove_for_test("alpha");
+        rig.task.abort();
+        rig.state.pending_invokes.lock().await.clear();
+        // Give the dispatcher a beat to enter wait_for_reconnect.
+        tokio::task::yield_now().await;
+        cancel.cancel();
+
+        let err = tokio::time::timeout(Duration::from_secs(2), dispatch)
+            .await
+            .expect("dispatch hung after cancel")
+            .expect("dispatch panicked")
+            .expect_err("expected cancelled error");
+        assert_eq!(err, "cancelled");
+
+        sessions.remove_thread("thread-1");
+        drop(rig.handle);
+    }
+
+    #[tokio::test]
+    async fn policy_store_default_on_miss_and_set_get_round_trip() {
+        let store = crate::runtime::scheduler::V2PolicyStore::new();
+        assert_eq!(
+            store.get("never-set"),
+            V2DisconnectPolicy::ContinueWithWarning
+        );
+        let prior = store.set("t1".into(), V2DisconnectPolicy::PauseUntilReconnect);
+        assert!(prior.is_none());
+        assert_eq!(store.get("t1"), V2DisconnectPolicy::PauseUntilReconnect);
+        store.remove_thread("t1");
+        assert_eq!(store.get("t1"), V2DisconnectPolicy::ContinueWithWarning);
     }
 }

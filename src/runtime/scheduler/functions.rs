@@ -2485,11 +2485,15 @@ impl Scheduler {
             }) => {
                 let sessions = self.v2_session_store();
                 let contexts = self.v2_context_store();
+                let registry = self.v2_daemon_registry();
+                let policy = self.v2_policy_store().get(&thread_id);
                 Box::pin(async move {
                     let result = crate::runtime::v2_dispatch::dispatch_v2_tool(
                         sessions,
                         contexts,
+                        registry,
                         daemon_handle,
+                        policy,
                         thread_id.clone(),
                         binding_name,
                         spec,

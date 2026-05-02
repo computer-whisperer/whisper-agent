@@ -182,6 +182,24 @@ impl LiveDaemonRegistry {
             self.change.notify_waiters();
         }
     }
+
+    /// Test-only: insert a handle directly. Production code routes
+    /// through `try_insert_connected` from the connection task. Tests
+    /// for the dispatcher's reconnect retry loop need to swap in fresh
+    /// handles without standing up the full WS handshake.
+    #[cfg(test)]
+    pub(crate) fn insert_for_test(&self, name: String, handle: Arc<LiveDaemonHandle>) {
+        let mut inner = self.inner.lock().expect("registry mutex poisoned");
+        inner.connected.insert(name, handle);
+        self.change.notify_waiters();
+    }
+
+    /// Test-only: drop a handle directly. Pair with `insert_for_test`
+    /// for tests that simulate disconnect.
+    #[cfg(test)]
+    pub(crate) fn remove_for_test(&self, name: &str) {
+        self.remove_connected(name);
+    }
 }
 
 /// Sorted snapshot of registry state for logging / introspection.

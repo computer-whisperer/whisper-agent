@@ -451,6 +451,13 @@ pub struct Scheduler {
     /// sessions with `ThreadContext::default()`, matching pre-5b
     /// behavior.
     v2_contexts: V2ContextStore,
+    /// Per-thread v2 disconnect policy. The dispatcher reads this on
+    /// every `LinkError::Disconnected` from a v2 daemon to decide
+    /// whether to surface the failure to the model
+    /// (`ContinueWithWarning`) or hold the call open until the daemon
+    /// reconnects (`PauseUntilReconnect`). Default-on-miss preserves
+    /// pre-5d behavior.
+    v2_policies: V2PolicyStore,
     /// Durable catalog of shared MCP hosts. The scheduler is the
     /// authority; `ResourceRegistry.mcp_hosts` holds the live
     /// `McpSession` per name, which we keep in sync on every
@@ -704,6 +711,7 @@ impl Scheduler {
                 v2_daemon_registry,
                 v2_sessions: V2SessionStore::new(),
                 v2_contexts: V2ContextStore::new(),
+                v2_policies: V2PolicyStore::new(),
                 shared_mcp_catalog,
                 shared_mcp_overlay_names: overlay_names,
                 pending_oauth_flows: HashMap::new(),
@@ -869,6 +877,31 @@ impl Scheduler {
     /// borrow across the open-session await.
     pub(crate) fn v2_context_store(&self) -> V2ContextStore {
         self.v2_contexts.clone()
+    }
+
+    /// Clone of the v2 disconnect-policy store. Cheap (`Arc` clone).
+    /// Dispatch futures grab one at route time so their reconnect
+    /// retry loop can read the policy without holding a `&mut Scheduler`
+    /// borrow across the await.
+    pub(crate) fn v2_policy_store(&self) -> V2PolicyStore {
+        self.v2_policies.clone()
+    }
+
+    /// Clone of the v2 daemon registry. Dispatch futures grab one at
+    /// route time so the `PauseUntilReconnect` reconnect-wait can
+    /// re-resolve a `LiveDaemonHandle` for the same daemon name after
+    /// a disconnect.
+    pub(crate) fn v2_daemon_registry(
+        &self,
+    ) -> Arc<crate::tools::host_env_link::LiveDaemonRegistry> {
+        self.v2_daemon_registry.clone()
+    }
+
+    /// Set the v2 disconnect policy for a thread. Allow(dead_code)
+    /// until the phase 5e UI surface wires a production caller.
+    #[allow(dead_code)]
+    pub(crate) fn set_v2_disconnect_policy(&self, thread_id: &str, policy: V2DisconnectPolicy) {
+        self.v2_policies.set(thread_id.to_string(), policy);
     }
 
     /// Set the v2 ThreadContext for `(thread, binding)` and, if a
@@ -4353,6 +4386,9 @@ impl Scheduler {
         // starts from `ThreadContext::default()` rather than inheriting
         // the prior thread's runas/denylist/etc.
         self.v2_contexts.remove_thread(thread_id);
+        // Drop the per-thread disconnect policy too — a re-created
+        // thread starts at the default `ContinueWithWarning`.
+        self.v2_policies.remove_thread(thread_id);
         // Provisioning guard is now keyed per HostEnvId, not per thread
         // — shared across all threads that bind to the same deduped
         // host-env. Don't clear on thread removal; other threads may
@@ -4652,6 +4688,85 @@ impl V2SessionStore {
             .lock()
             .expect("v2 session store mutex poisoned")
             .retain(|(tid, _), _| tid.as_str() != thread_id);
+    }
+
+    /// Drop a single `(thread, binding)` session. Used by the
+    /// dispatcher's retry loop after a daemon disconnect: the stale
+    /// SessionHandle's cmd_tx is closed, so the next iteration must
+    /// open a fresh session against the reconnected daemon.
+    pub(crate) fn remove_session(&self, thread_id: &str, binding_name: &str) {
+        self.inner
+            .lock()
+            .expect("v2 session store mutex poisoned")
+            .remove(&(thread_id.to_string(), binding_name.to_string()));
+    }
+}
+
+/// What to do when a v2 daemon disconnects mid-call.
+///
+/// Per-thread, not per-binding: a thread is paused or warned as a
+/// whole even if only one of its bindings dropped its daemon. The
+/// per-binding variant is plausible but the design doc landed on
+/// per-thread for simplicity (one editable field per thread).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum V2DisconnectPolicy {
+    /// Surface the disconnect to the model as a tool-call error.
+    /// The model decides how to respond (often "wait and retry").
+    /// This matches pre-5d behavior for every thread.
+    #[default]
+    ContinueWithWarning,
+    /// Hold the dispatch open until the daemon reconnects (or the
+    /// thread cancel token fires). The model sees a single
+    /// transparently-completed tool call across the gap, no
+    /// disconnect plumbing leaks into its turn.
+    PauseUntilReconnect,
+}
+
+type V2PolicyMap = HashMap<String, V2DisconnectPolicy>;
+
+/// Per-thread [`V2DisconnectPolicy`] store. Default-on-miss returns
+/// [`V2DisconnectPolicy::ContinueWithWarning`] — pre-5d behavior — so
+/// a thread that never explicitly opted into pause-until-reconnect
+/// keeps the old failure surface.
+#[derive(Clone, Default)]
+pub(crate) struct V2PolicyStore {
+    inner: Arc<std::sync::Mutex<V2PolicyMap>>,
+}
+
+impl V2PolicyStore {
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    pub(crate) fn get(&self, thread_id: &str) -> V2DisconnectPolicy {
+        self.inner
+            .lock()
+            .expect("v2 policy store mutex poisoned")
+            .get(thread_id)
+            .copied()
+            .unwrap_or_default()
+    }
+
+    /// Replace the policy for a thread. Returns the previous value
+    /// if any. Allow(dead_code) until the phase 5e UI surface wires
+    /// a production caller.
+    #[allow(dead_code)]
+    pub(crate) fn set(
+        &self,
+        thread_id: String,
+        policy: V2DisconnectPolicy,
+    ) -> Option<V2DisconnectPolicy> {
+        self.inner
+            .lock()
+            .expect("v2 policy store mutex poisoned")
+            .insert(thread_id, policy)
+    }
+
+    pub(crate) fn remove_thread(&self, thread_id: &str) {
+        self.inner
+            .lock()
+            .expect("v2 policy store mutex poisoned")
+            .remove(thread_id);
     }
 }
 
