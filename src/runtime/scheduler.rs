@@ -92,6 +92,19 @@ pub enum ToolRoute {
         host: String,
         real_name: String,
     },
+    /// Forward to a v2 host-env daemon over the WS link. The
+    /// dispatcher (in `io_dispatch`) looks up an existing
+    /// `Arc<SessionHandle>` for `(thread_id, binding_name)` in the
+    /// shared `V2SessionStore` and opens a new one (via
+    /// `daemon_handle.open_session`) if missing. `real_name` is the
+    /// daemon-side tool name (the public name minus the
+    /// `{binding_name}_` prefix the model used).
+    V2HostEnv {
+        daemon_handle: Arc<crate::tools::host_env_link::LiveDaemonHandle>,
+        binding_name: String,
+        spec: HostEnvSpec,
+        real_name: String,
+    },
 }
 
 /// Whether a `BoundMcp` came from a thread's host-env binding or from
@@ -417,6 +430,20 @@ pub struct Scheduler {
     /// `host_env_registry`. Always present — empty when no
     /// `[[auth.daemons]]` is configured.
     v2_daemon_registry: Arc<crate::tools::host_env_link::LiveDaemonRegistry>,
+    /// Open v2 sessions, keyed by `(thread_id, binding_name)`.
+    /// `binding_name` is the pod's local allow.host_env entry name —
+    /// not the daemon name — because two bindings can target the
+    /// same daemon with different specs and need distinct sessions.
+    ///
+    /// Behind an `Arc<Mutex<>>` so dispatch futures can clone the Arc
+    /// at route-time and lookup / insert without holding a `&mut
+    /// Scheduler` across the open-session await. Each value is
+    /// `Arc<SessionHandle>` so a long-running tool call can hold its
+    /// session reference past a concurrent `sweep_thread` clear; the
+    /// underlying `Drop` fires `CloseSession` only when the last
+    /// reference is gone, which is exactly the semantics we want
+    /// (don't tear down a session out from under an in-flight call).
+    v2_sessions: V2SessionStore,
     /// Durable catalog of shared MCP hosts. The scheduler is the
     /// authority; `ResourceRegistry.mcp_hosts` holds the live
     /// `McpSession` per name, which we keep in sync on every
@@ -668,6 +695,7 @@ impl Scheduler {
                 host_env_registry,
                 host_env_catalog,
                 v2_daemon_registry,
+                v2_sessions: V2SessionStore::new(),
                 shared_mcp_catalog,
                 shared_mcp_overlay_names: overlay_names,
                 pending_oauth_flows: HashMap::new(),
@@ -816,6 +844,14 @@ impl Scheduler {
         name: &str,
     ) -> Option<Arc<crate::tools::host_env_link::LiveDaemonHandle>> {
         self.v2_daemon_registry.handle(name)
+    }
+
+    /// Clone of the v2 session store. Dispatch futures grab one of
+    /// these at route time so they can lookup / insert without
+    /// holding a `&mut Scheduler` borrow across the open-session
+    /// await. Cheap (`Arc` clone).
+    pub(crate) fn v2_session_store(&self) -> V2SessionStore {
+        self.v2_sessions.clone()
     }
 
     /// Classify a registered provider's origin for protocol output.
@@ -2148,6 +2184,51 @@ impl Scheduler {
         if crate::tools::builtin_tools::is_builtin(tool_name) {
             let pod_id = self.tasks.get(thread_id)?.pod_id.clone();
             return Some(ToolRoute::Builtin { pod_id });
+        }
+        // v2 host-env daemons first — they're a parallel routing
+        // path that doesn't go through `bound_mcp_hosts` (which is
+        // v1-only). A binding's `provider` matching a v2 daemon name
+        // and the daemon currently connected → match by
+        // `{binding_name}_{tool}` prefix against `capabilities().tools`.
+        // First-match wins, mirroring v1 ordering semantics.
+        if let Some(task) = self.tasks.get(thread_id) {
+            for binding in &task.bindings.host_env {
+                let HostEnvBinding::Named { name } = binding else {
+                    continue;
+                };
+                if !task.scope.host_envs.admits(name) {
+                    continue;
+                }
+                let Some((provider, spec)) = self.resolve_binding(&task.pod_id, binding) else {
+                    continue;
+                };
+                if !self.is_v2_daemon_binding(&provider) {
+                    continue;
+                }
+                let Some(handle) = self.v2_daemon_handle(&provider) else {
+                    // Admitted but offline — no tools to match. v1
+                    // bindings in the same situation (env not yet
+                    // provisioned) also fall through silently.
+                    continue;
+                };
+                let expected = format!("{name}_");
+                let Some(stripped) = tool_name.strip_prefix(&expected) else {
+                    continue;
+                };
+                if handle
+                    .capabilities()
+                    .tools
+                    .iter()
+                    .any(|t| t.name == stripped)
+                {
+                    return Some(ToolRoute::V2HostEnv {
+                        daemon_handle: handle,
+                        binding_name: name.clone(),
+                        spec,
+                        real_name: stripped.to_string(),
+                    });
+                }
+            }
         }
         for bound in self.bound_mcp_hosts(thread_id) {
             let Some(prefix) = bound.prefix else {
@@ -4199,6 +4280,11 @@ impl Scheduler {
         self.tasks.remove(thread_id);
         self.cancel_tokens.remove(thread_id);
         self.dirty.remove(thread_id);
+        // v2 sessions are per-thread (no dedup) so nothing to release-
+        // count — drop fires CloseSession to the daemon. In-flight
+        // dispatch futures hold their own Arc<SessionHandle> clones,
+        // so a sweep mid-call doesn't kill the call's session.
+        self.v2_sessions.remove_thread(thread_id);
         // Provisioning guard is now keyed per HostEnvId, not per thread
         // — shared across all threads that bind to the same deduped
         // host-env. Don't clear on thread removal; other threads may
@@ -4428,6 +4514,79 @@ pub(crate) fn check_behavior_authoring_pure(
 /// escape hatch. A missing or unreadable file falls back to the pod's
 /// cached default with a warn-level log, matching the pod loader's
 /// graceful-degrade policy for `thread_defaults.system_prompt_file`.
+/// `(thread_id, binding_name)` key into the v2 session map.
+type V2SessionKey = (String, String);
+
+type V2SessionMap = HashMap<V2SessionKey, Arc<crate::tools::host_env_link::SessionHandle>>;
+
+/// Per-thread / per-binding v2 session storage. See
+/// [`Scheduler::v2_sessions`] for why this hides behind a clonable
+/// `Arc<Mutex<>>` — short version: dispatch futures need to look up
+/// or open a session without holding a `&mut Scheduler` across the
+/// open-session await.
+///
+/// Methods take/return `Arc<SessionHandle>` so a tool call's
+/// dispatch future can hang on to its session reference past a
+/// concurrent thread-sweep clearing the entry from this map. The
+/// underlying `Drop` impl on `SessionHandle` fires `CloseSession`
+/// when the last `Arc` drops — which is exactly when no in-flight
+/// call needs it any more.
+#[derive(Clone, Default)]
+pub(crate) struct V2SessionStore {
+    inner: Arc<std::sync::Mutex<V2SessionMap>>,
+}
+
+impl V2SessionStore {
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    /// Cheap lookup. Clone of the `Arc` (no I/O, no await). Returns
+    /// `None` when no session has been opened yet for this pair.
+    pub(crate) fn get(
+        &self,
+        thread_id: &str,
+        binding_name: &str,
+    ) -> Option<Arc<crate::tools::host_env_link::SessionHandle>> {
+        self.inner
+            .lock()
+            .expect("v2 session store mutex poisoned")
+            .get(&(thread_id.to_string(), binding_name.to_string()))
+            .cloned()
+    }
+
+    /// Insert a freshly-opened session, returning the value already
+    /// stored if any. The dispatcher uses this to "lose the race"
+    /// gracefully when two concurrent tool calls both opened a
+    /// session for the same key — the loser's `Arc<SessionHandle>`
+    /// drops here, fires `CloseSession`, and the winner's session
+    /// is the one returned.
+    pub(crate) fn insert_or_keep(
+        &self,
+        thread_id: String,
+        binding_name: String,
+        session: Arc<crate::tools::host_env_link::SessionHandle>,
+    ) -> Arc<crate::tools::host_env_link::SessionHandle> {
+        use std::collections::hash_map::Entry;
+        let mut g = self.inner.lock().expect("v2 session store mutex poisoned");
+        match g.entry((thread_id, binding_name)) {
+            Entry::Occupied(o) => o.get().clone(),
+            Entry::Vacant(v) => v.insert(session).clone(),
+        }
+    }
+
+    /// Drop every session belonging to `thread_id`. Each removed
+    /// `Arc<SessionHandle>` drops here, firing `CloseSession` to the
+    /// daemon — except those still held by an in-flight dispatch
+    /// future, which keep the session alive until they complete.
+    pub(crate) fn remove_thread(&self, thread_id: &str) {
+        self.inner
+            .lock()
+            .expect("v2 session store mutex poisoned")
+            .retain(|(tid, _), _| tid.as_str() != thread_id);
+    }
+}
+
 /// Translate `whisper_agent_host_proto::ToolAnnotations` (v2 daemon
 /// wire shape) into the `crate::tools::mcp::ToolAnnotations` shape
 /// the rest of the runtime / wire types use. Same fields, distinct

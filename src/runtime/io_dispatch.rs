@@ -1331,6 +1331,49 @@ fn tool_call(
                 })
             })
         }
+        Some(ToolRoute::V2HostEnv {
+            daemon_handle,
+            binding_name,
+            spec,
+            real_name,
+        }) => {
+            let sessions = scheduler.v2_session_store();
+            Box::pin(async move {
+                let result = crate::runtime::v2_dispatch::dispatch_v2_tool(
+                    sessions,
+                    daemon_handle,
+                    thread_id.clone(),
+                    binding_name,
+                    spec,
+                    real_name,
+                    input,
+                    cancel,
+                )
+                .await;
+                let result = match result {
+                    Ok(r) if r.is_error => {
+                        Err(crate::tools::mcp::mcp_blocks_text_preview(&r.content))
+                    }
+                    Ok(r) => Ok(r),
+                    Err(e) => Err(e),
+                };
+                SchedulerCompletion::Io(IoCompletion {
+                    thread_id,
+                    op_id,
+                    result: IoResult::ToolCall {
+                        tool_use_id,
+                        result,
+                    },
+                    pod_update: None,
+                    scheduler_command: None,
+                    // host_env_lost is a v1 concept (the MCP host went
+                    // away mid-call). v2 disconnects surface as plain
+                    // errors today; phase 5's per-thread disconnect
+                    // policy is where pause-vs-warn lands.
+                    host_env_lost: None,
+                })
+            })
+        }
         None => Box::pin(async move {
             SchedulerCompletion::Io(IoCompletion {
                 thread_id,

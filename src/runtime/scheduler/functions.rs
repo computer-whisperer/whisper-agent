@@ -839,6 +839,19 @@ impl Scheduler {
                 name: name.clone(),
                 args: input.clone(),
             },
+            // v2 host-env routes share the McpToolUse function shape
+            // — both are "tool dispatched to a remote endpoint, await
+            // a single terminal result." The `host` namespace uses a
+            // `v2:` prefix so the function-tracking layer can tell
+            // the two wires apart in logs / debugging without growing
+            // a new variant. The actual dispatch (in io_dispatch)
+            // already routes through `route_tool` again, so the
+            // namespace is purely informational.
+            Some(ToolRoute::V2HostEnv { binding_name, .. }) => Function::McpToolUse {
+                host: format!("v2:{binding_name}"),
+                name: name.clone(),
+                args: input.clone(),
+            },
             None => {
                 // No route — the thread's turn will surface this as a
                 // tool-not-found error when the IO future runs. Let it
@@ -2464,6 +2477,35 @@ impl Scheduler {
                     scheduler_command: None,
                 })
             }),
+            Some(crate::runtime::scheduler::ToolRoute::V2HostEnv {
+                daemon_handle,
+                binding_name,
+                spec,
+                real_name,
+            }) => {
+                let sessions = self.v2_session_store();
+                Box::pin(async move {
+                    let result = crate::runtime::v2_dispatch::dispatch_v2_tool(
+                        sessions,
+                        daemon_handle,
+                        thread_id.clone(),
+                        binding_name,
+                        spec,
+                        real_name,
+                        args,
+                        cancel,
+                    )
+                    .await;
+                    SchedulerCompletion::SudoInner(SudoInnerCompletion {
+                        function_id,
+                        thread_id,
+                        decision,
+                        result,
+                        pod_update: None,
+                        scheduler_command: None,
+                    })
+                })
+            }
             None => Box::pin(async move {
                 SchedulerCompletion::SudoInner(SudoInnerCompletion {
                     function_id,
