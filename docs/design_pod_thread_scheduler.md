@@ -1,5 +1,13 @@
 # Pods, Threads, and Decoupled Resources
 
+> **Host-env note (2026-05).** The host-env-specific portions of this doc —
+> the `[[host_env_providers]]` catalog shape, dedup via
+> `HostEnvId::for_provider_spec`, the auto-provisioning resolver, idle GC,
+> reachability probes, the `CreateHostEnv`/`DestroyHostEnv` wire frames —
+> are superseded by [`design_host_env_protocol.md`](design_host_env_protocol.md).
+> The pod/thread/resource layering described below remains authoritative.
+> Inline pointers below mark each affected section.
+
 This document describes how whisper-agent organizes long-lived agent work. Three layered concepts:
 
 - **Pod** — a *directory on disk* with a `pod.toml` config and per-thread JSON files. Persistent by definition: a pod IS its directory. The TOML defines what threads inside the pod are *allowed* to use (backends, MCP hosts, host-env sandboxes) and the defaults applied to fresh threads.
@@ -214,6 +222,14 @@ Tasks-as-data discipline: thread mutation happens *only* through `thread.step()`
 
 ## Server catalog
 
+> The host-env half of this section (`[[host_env_providers]]`,
+> `host_env_providers.toml`, the `--host-env-provider` CLI overlay, the
+> 30 s `/health` probe) is superseded by
+> [`design_host_env_protocol.md`](design_host_env_protocol.md). v2 admits
+> daemons by name + token in `[[auth.daemons]]` and treats "is the
+> WebSocket up" as the reachability signal. Backends and shared MCP hosts
+> remain as described.
+
 Pod TOMLs reference backends, MCP hosts, and host-env providers *by name*. Backends and shared MCP hosts are declared in the server's top-level TOML (the file the `whisper-agent serve` command points at — typically `whisper-agent.toml`):
 
 ```toml
@@ -248,6 +264,15 @@ A pod that references a catalog entry the server doesn't know warns at load time
 
 ## Resource registries
 
+> The host-env entry shape, refcount/pin model, dedup via
+> `HostEnvId::for_provider_spec`, idle GC of host envs, and the
+> `Errored`/`Lost`/`TornDown` lifecycle for host-env entries are
+> superseded by [`design_host_env_protocol.md`](design_host_env_protocol.md).
+> v2 sessions are per `(thread, binding_name)` with no dedup, and the
+> `McpHostEntry` mirror created via `McpHostId::for_host_env` retires
+> with them. `BackendEntry` and shared `McpHostEntry`s remain as
+> described.
+
 Three flat `HashMap`s in the scheduler's `ResourceRegistry` (`src/pod/resources.rs`): `BackendEntry`, `McpHostEntry`, `HostEnvEntry`. Each carries a `ResourceState` (`Provisioning | Ready | Errored | Lost | TornDown`), a refcount (threads currently bound), and a `pinned` flag. `Errored` means provisioning never succeeded; `Lost` means an entry was Ready but a later transport failure (daemon restarted or powered off) invalidated its session — the cached handle is dropped without a teardown RPC, the current tool call fails cleanly, and the next thread arriving with the same `(provider, spec)` triggers a fresh provision.
 
 Two behaviors at the resolver layer:
@@ -258,6 +283,16 @@ Two behaviors at the resolver layer:
 GC: refcount + idle timeout + pin. Ready resources with zero users for 5 minutes are torn down. Torn-down / errored / lost entries linger for an hour for inspection ("yes, that host-env existed and failed because…") then evict. Backends never GC — they're cheap handles.
 
 ## Auto-provisioning
+
+> The host-env half of this section (the dedup-key lookup,
+> `CreateHostEnv` enqueue, `WaitingOnResources` block-until-provisioned
+> path, and UI-driven `CreateHostEnv` for unscoped sandboxes) is
+> superseded by [`design_host_env_protocol.md`](design_host_env_protocol.md).
+> v2 opens a fresh session per `(thread, binding)` against a live daemon
+> WebSocket; threads bound to an offline daemon block on
+> `WaitingOnResources` until it dials in, then the scheduler issues
+> `OpenSession`. The MCP-host and backend halves below remain as
+> described.
 
 A `ResourceResolver` sits between thread creation and the registries. When a thread wants `bindings.host_env = Named { name: "default" }`:
 
