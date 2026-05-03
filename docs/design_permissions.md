@@ -53,6 +53,14 @@ Pattern 1 is one layer. The others are **sandboxing** and **audit**.
 
 **Sandboxing** is the load-bearing safety boundary for unattended work. A thread binds to one or more `host_env` entries — each a named (provider, spec) pair declared in the pod's `[[allow.host_env]]` table. The provider (today: a daemon admitted via `[[auth.daemons]]`, typically `local-landlock` running `whisper-agent-host-daemon` — see [`design_host_env_protocol.md`](design_host_env_protocol.md)) provisions the host-env for the thread and spawns the MCP host inside it, scoped to the allowed paths and network policy. Tools running inside can't escape the landlock ruleset regardless of what they're asked to do. The pod's `[[allow.host_env]]` entries are the only place allowed_paths can be declared — there is no mechanism for narrowing `allowed_paths` per-dispatch, so a thread runs with the full path set of every named host-env it is bound to. See [sandbox architecture memory](../) for the layering rationale: per-task `SandboxSpec`, `SandboxBackend` trait, provisioned below the MCP layer because MCP's roots (advisory `file://` URIs) don't carry an image, mount mode, or network policy — real isolation has to come from below.
 
+**Implicit grants under landlock.** The `local-landlock` provider applies a fixed set of grants on top of every spec's `allowed_paths`, because the worker (and the subprocesses it execs, like `bash`) needs system libs and tooling to function:
+
+- `/usr`, `/lib`, `/lib64`, `/bin`, `/sbin`, `/etc`, `/proc`, `/dev/{null,urandom,zero}` — read-only.
+- `/tmp` — **read+write** (for build temp files: cargo, rustc, gcc). This means anything under `/tmp` is reachable, not just the workspace if the workspace lives there.
+- The directory containing the `mcp-host` binary — read-only (so exec works).
+
+`allowed_paths` therefore *adds to* this set rather than being the complete set. Operators auditing what a thread can reach should treat the union as the answer. The implicit-grant list lives in `apply_landlock` (`crates/whisper-agent-host-daemon/src/worker.rs`) and is mirrored in the webui's "Allowed paths" hint; if it changes, both surfaces need to update together.
+
 This is why an all-`Allow` default `[allow.tools]` is sensible for autonomous behaviors: the sandbox bounds blast radius regardless of what the model decides to do. For interactive use where the sandbox is relaxed, per-tool `AllowWithPrompt` overrides — typically on the builtin pod-editing tools and any destructive MCP tools — give a second line of defense around privilege-escalation vectors.
 
 **Audit.** Every tool call writes one line to a JSONL audit log (`src/runtime/audit.rs`). Shape:

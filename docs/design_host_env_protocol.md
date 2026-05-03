@@ -353,7 +353,13 @@ What's deliberately **not** in `ThreadContext`:
 - **Landlock paths / network policy.** Those are `HostEnvSpec`. Changing
   them requires re-landlocking the worker, which means tearing down and
   reprovisioning — that's what `OpenSession` already is. `UpdateSession` is
-  for things changeable without re-landlocking.
+  for things changeable without re-landlocking. NB: the daemon adds a
+  fixed set of implicit grants (system libs, `/etc`, `/proc`, `/tmp` RW,
+  etc.) on top of `HostEnvSpec::Landlock.allowed_paths` so the worker
+  and its subprocesses can run; `allowed_paths` *adds to* that set
+  rather than being the complete set. Full list lives in the
+  `apply_landlock` docstring (`crates/whisper-agent-host-daemon/src/worker.rs`)
+  and is mirrored in `docs/design_permissions.md`.
 - **Tool *allowlist*.** The scheduler enforces this before the call ever
   leaves; the daemon never sees disallowed calls and doesn't need a list.
   `tool_denylist` is specifically a daemon-enforced backstop.

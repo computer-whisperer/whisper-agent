@@ -2062,8 +2062,12 @@ fn render_landlock_body(
     section_heading(ui, "Allowed paths");
     hint(
         ui,
-        "Each row grants the listed access to one host path. Paths not listed \
-         are denied entirely.",
+        "Each row grants the listed access to one host path. Listed paths \
+         are *additional* to the daemon's implicit grants every worker \
+         gets: /usr, /lib, /lib64, /bin, /sbin, /etc, /proc, and \
+         /dev/{null,urandom,zero} read-only, and /tmp read+write (for \
+         build temp files — note this means anything under /tmp is \
+         readable and writable). See docs/design_permissions.md.",
     );
     let mut delete: Option<usize> = None;
     Grid::new("landlock_paths")

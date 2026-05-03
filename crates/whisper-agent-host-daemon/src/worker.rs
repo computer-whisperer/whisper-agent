@@ -634,6 +634,30 @@ fn frame_kind(f: &WorkerFrame) -> &'static str {
     }
 }
 
+/// Apply the Landlock ruleset to the current process. Adds the spec's
+/// `allowed_paths` *on top of* a fixed set of implicit grants the
+/// daemon needs every worker to have:
+///
+/// - `/usr`, `/lib`, `/lib64`, `/bin`, `/sbin` read-only — shared libs
+///   and standard binaries the worker (and any subprocesses, e.g. the
+///   `bash` tool's `/bin/sh`) link against and exec.
+/// - `/etc` read-only — libc nss/resolver config (`ld.so.cache`,
+///   `resolv.conf`, `nsswitch.conf`, `passwd` for `getpwuid`).
+/// - `/proc` read-only — many tools (cargo, rustc, ps) require it.
+/// - `/dev/null`, `/dev/urandom`, `/dev/zero` read-only.
+/// - `/tmp` **read+write** — convenience for build temp files (cargo,
+///   rustc, gcc). NB: this means a thread can read/write *any* file
+///   under `/tmp`, not just its own workspace if the workspace happens
+///   to live under `/tmp`.
+/// - `bin_dir` read-only — directory containing the `mcp-host` binary
+///   so exec works.
+///
+/// These grants are not surfaced in `pod.toml` and not visible to the
+/// model. Operators relying on `allowed_paths` as the *complete* set
+/// of accessible filesystem locations should know about them — see
+/// `docs/design_permissions.md` (Sandboxing) and the webui's
+/// "Allowed paths" hint, both of which mirror this list. If you change
+/// the implicit set, update those surfaces too.
 fn apply_landlock(
     allowed_paths: &[PathAccess],
     network: &NetworkPolicy,
@@ -654,6 +678,8 @@ fn apply_landlock(
 
     let mut created = ruleset.create()?;
 
+    // Implicit grants — keep in sync with the docstring above and the
+    // mirrors in design_permissions.md and editor_render.rs.
     created = created.add_rules(path_beneath_rules(
         ["/usr", "/lib", "/lib64", "/etc", "/bin", "/sbin"],
         AccessFs::from_read(abi),
