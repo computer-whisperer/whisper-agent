@@ -46,7 +46,7 @@ use std::time::Duration;
 use futures::StreamExt;
 use futures::stream::FuturesUnordered;
 use tokio::sync::mpsc;
-use tracing::{debug, error, info, warn};
+use tracing::{error, info, warn};
 use whisper_agent_protocol::{
     ClientToServer, HostEnvBinding, ResourceKind, ServerToClient, ThreadBindings,
     ThreadBindingsRequest, ThreadConfigOverride, ThreadStateLabel,
@@ -101,38 +101,19 @@ pub enum ToolRoute {
     },
 }
 
-/// Whether a `BoundMcp` came from a thread's host-env binding or from
-/// its shared-MCP-host binding. Drives `ToolCategory` selection in
-/// `admissible_and_askable_tools`. Decoupled from `prefix` because
-/// shared MCPs can carry a prefix too once a catalog override is set,
-/// and the listing categorization should still reflect the source kind
-/// rather than the prefix presence.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum BoundMcpKind {
-    HostEnv,
-    Shared,
-}
-
 /// An MCP host entry the scheduler is routing a specific thread's tool
 /// call through, paired with the prefix the model sees on every tool
 /// this MCP advertises. `prefix: Some(name)` means the model sees
 /// `{name}_{tool}` and the MCP receives the bare `tool`; `prefix: None`
-/// is pass-through (the reserved Inline host-env path, and shared MCPs
-/// whose catalog entry explicitly disables prefixing via the empty
-/// string).
+/// is pass-through (shared MCPs whose catalog entry explicitly disables
+/// prefixing via the empty string).
 struct BoundMcp<'a> {
     entry: &'a crate::pod::resources::McpHostEntry,
-    /// Prefix applied to tool names. For host-env MCPs this is the env
-    /// binding name; for shared MCPs it's the catalog entry's
-    /// `effective_prefix()` (defaults to the host name unless the
-    /// catalog overrides it). `None` means tools are exposed bare.
+    /// Prefix applied to tool names. For shared MCPs it's the catalog
+    /// entry's `effective_prefix()` (defaults to the host name unless
+    /// the catalog overrides it). `None` means tools are exposed bare.
     prefix: Option<&'a str>,
-    /// Whether this binding is a host-env MCP or a shared MCP. Used
-    /// to categorize the tool in listings and to keep that
-    /// categorization stable when the prefix shape changes.
-    kind: BoundMcpKind,
-    /// Human-meaningful source name — the host-env binding name for
-    /// host-env MCPs, the shared catalog host name for shared MCPs.
+    /// Human-meaningful source name — the shared catalog host name.
     /// Used for listing categorization; distinct from `entry.id` which
     /// is a registry-internal opaque handle.
     source_name: String,
@@ -352,11 +333,6 @@ const CRON_TICK_SECS: u64 = 30;
 /// retention window is swept within 60 min. Missed tick behavior
 /// (Delay) prevents bursts when the process resumes after suspension.
 const RETENTION_TICK_SECS: u64 = 3600;
-/// How often host-env provider reachability is probed. 30 s means a
-/// daemon outage is visible in the WebUI within 30 s of the daemon
-/// going down. Also bounds how stale the reachability indicator can
-/// be when nothing else is exercising the provider.
-const HOST_ENV_PROBE_TICK_SECS: u64 = 30;
 /// How often the OAuth refresh sweep runs. 60s is short enough that
 /// the 5-minute safety margin (`OAUTH_REFRESH_MARGIN_SECS`) covers
 /// ~5 sweep attempts per token lifetime — plenty of headroom for a
@@ -762,12 +738,6 @@ impl Scheduler {
     // event — there are no clients connected yet, and a fresh client gets the
     // full set via `ListResources`.
 
-    fn emit_host_env_updated(&self, id: &HostEnvId) {
-        if let Some(snap) = self.resources.snapshot_host_env(id) {
-            self.router
-                .broadcast_resource(ServerToClient::ResourceUpdated { resource: snap });
-        }
-    }
     fn emit_mcp_host_updated(&self, id: &McpHostId) {
         if let Some(snap) = self.resources.snapshot_mcp_host(id) {
             self.router
@@ -1708,23 +1678,6 @@ impl Scheduler {
         }
     }
 
-    /// Compute the runtime `HostEnvId`s for every binding on the
-    /// thread, in the binding list's declared order. Empty when the
-    /// thread has no host envs; entries whose `resolve_binding` lookup
-    /// fails (named entry removed from pod allow list mid-flight) are
-    /// silently skipped rather than failing the whole list.
-    pub(crate) fn host_env_ids_for_thread(&self, thread_id: &str) -> Vec<HostEnvId> {
-        let Some(task) = self.tasks.get(thread_id) else {
-            return Vec::new();
-        };
-        task.bindings
-            .host_env
-            .iter()
-            .filter_map(|b| self.resolve_binding(&task.pod_id, b))
-            .map(|(provider, spec)| HostEnvId::for_provider_spec(&provider, &spec))
-            .collect()
-    }
-
     /// Enumerate every tool the thread could reach — either admitted
     /// by scope now, or askable via `request_escalation` (in scope's
     /// pod ceiling but denied by current scope).
@@ -1818,13 +1771,8 @@ impl Scheduler {
                     Some(prefix) => format!("{prefix}_{}", tool.name),
                     None => tool.name.clone(),
                 };
-                let category = match bound.kind {
-                    BoundMcpKind::HostEnv => ToolCategory::HostEnv {
-                        env_name: bound.source_name.clone(),
-                    },
-                    BoundMcpKind::Shared => ToolCategory::SharedMcp {
-                        host_name: bound.source_name.clone(),
-                    },
+                let category = ToolCategory::SharedMcp {
+                    host_name: bound.source_name.clone(),
                 };
                 let admission = classify(&public_name);
                 let requires_escalation = match admission {
@@ -2094,59 +2042,14 @@ impl Scheduler {
     }
 
     /// Iterate the thread's bound MCP host entries in precedence
-    /// order: every bound host-env MCP first (in the thread's
-    /// `bindings.host_env` declaration order, each carrying the env's
-    /// name as its tool-prefix), then each shared MCP host in pod-
-    /// declared order (no prefix). Skips ids whose entry isn't yet in
-    /// the registry (host-env MCP is created when provisioning
-    /// dispatches; shared entries exist from startup). `Inline` host-
-    /// env bindings don't carry a stable short name and are
-    /// therefore prefix-less too — in practice they're reserved for a
-    /// future subagent path and don't reach this code today.
+    /// order. v1 host-env MCPs are gone; the v2 path doesn't go
+    /// through the resource registry, so this only walks shared MCP
+    /// hosts in pod-declared order (no prefix on legacy entries).
     fn bound_mcp_hosts(&self, thread_id: &str) -> Vec<BoundMcp<'_>> {
         let mut out = Vec::new();
         let Some(task) = self.tasks.get(thread_id) else {
             return out;
         };
-        for binding in &task.bindings.host_env {
-            // Defense in depth: skip bound host-envs the thread's
-            // current scope doesn't admit. `create_task` already
-            // narrows bindings against scope at thread-creation time
-            // (and `resolve_bindings_choice` enforces it for
-            // dispatched children), so this is normally a no-op —
-            // it catches paths that bypass the create-time narrowing
-            // (e.g. a future code path that mutates bindings
-            // post-create) without the bound MCP's tools showing up
-            // in the listing or being routable.
-            let admitted = match binding {
-                HostEnvBinding::Named { name } => task.scope.host_envs.admits(name),
-                // Inline bindings have no catalog name to gate on a
-                // `SetOrAll<String>`; rely on the create-time path to
-                // keep them in scope.
-                HostEnvBinding::Inline { .. } => true,
-            };
-            if !admitted {
-                continue;
-            }
-            let Some((provider, spec)) = self.resolve_binding(&task.pod_id, binding) else {
-                continue;
-            };
-            let he_id = HostEnvId::for_provider_spec(&provider, &spec);
-            let mcp_id = McpHostId::for_host_env(&he_id);
-            let Some(entry) = self.resources.mcp_hosts.get(&mcp_id) else {
-                continue;
-            };
-            let (prefix, source_name) = match binding {
-                HostEnvBinding::Named { name } => (Some(name.as_str()), name.clone()),
-                HostEnvBinding::Inline { .. } => (None, "<inline>".to_string()),
-            };
-            out.push(BoundMcp {
-                entry,
-                prefix,
-                kind: BoundMcpKind::HostEnv,
-                source_name,
-            });
-        }
         for name in &task.bindings.mcp_hosts {
             // Same defense-in-depth gate as above for shared MCP hosts.
             if !task.scope.mcp_hosts.admits(name) {
@@ -2166,7 +2069,6 @@ impl Scheduler {
                 out.push(BoundMcp {
                     entry,
                     prefix,
-                    kind: BoundMcpKind::Shared,
                     source_name: name.clone(),
                 });
             }
@@ -2174,29 +2076,17 @@ impl Scheduler {
         out
     }
 
-    /// Walk the thread's bindings and return every bound resource id whose
-    /// registry entry isn't yet Ready (or is missing entirely — happens
-    /// post-restart for the host-env MCP). Used by
-    /// `send_user_message` to park the thread in `WaitingOnResources`
-    /// when provisioning is still in flight. Covers every host-env
-    /// binding the thread has (not just the first) — the thread stays
-    /// blocked until all of them finish provisioning.
+    /// Walk the thread's bindings and return every bound resource id
+    /// whose registry entry isn't yet Ready (or is missing entirely).
+    /// Used by `send_user_message` to park the thread in
+    /// `WaitingOnResources` when shared-MCP connect is still in flight.
+    /// v1 host-env provisioning is gone; v2 sessions open lazily on
+    /// first tool call, so they don't park threads at message time.
     fn pending_resources_for(&self, thread_id: &str) -> Vec<String> {
         let Some(task) = self.tasks.get(thread_id) else {
             return Vec::new();
         };
         let mut out = Vec::new();
-        for he_id in self.host_env_ids_for_thread(thread_id) {
-            match self.resources.host_envs.get(&he_id) {
-                Some(e) if e.state.is_ready() => {}
-                _ => out.push(he_id.0.clone()),
-            }
-            let mcp_id = McpHostId::for_host_env(&he_id);
-            match self.resources.mcp_hosts.get(&mcp_id) {
-                Some(e) if e.state.is_ready() => {}
-                _ => out.push(mcp_id.0),
-            }
-        }
         for name in &task.bindings.mcp_hosts {
             let id = McpHostId::shared(name);
             match self.resources.mcp_hosts.get(&id) {
@@ -2205,52 +2095,6 @@ impl Scheduler {
             }
         }
         out
-    }
-
-    /// Ensure a host-env provisioning future is in flight for every
-    /// binding this thread has that isn't yet Ready. No-op when the
-    /// thread has no host-env bindings — in that case the thread's
-    /// tool set is just the shared MCPs it bound to, no provisioning
-    /// needed. Called from `create_task` and `send_user_message`
-    /// (post-restart recovery).
-    ///
-    /// The `provisioning_in_flight` guard is keyed per `HostEnvId`:
-    /// threads that share a binding (deduped to the same id) reuse a
-    /// single in-flight provision instead of each spawning their own.
-    /// A thread with multiple host-envs dispatches one future per id
-    /// (minus any id that already has an in-flight provision from
-    /// another thread or from a prior call).
-    fn ensure_host_env_provisioning(
-        &mut self,
-        thread_id: &str,
-        pending_io: &mut FuturesUnordered<SchedulerFuture>,
-    ) {
-        let host_env_ids = self.host_env_ids_for_thread(thread_id);
-        if host_env_ids.is_empty() {
-            return;
-        }
-        for host_env_id in host_env_ids {
-            if self.provisioning_in_flight.contains(&host_env_id) {
-                continue;
-            }
-            let mcp_id = McpHostId::for_host_env(&host_env_id);
-            let needs_dispatch = match self.resources.mcp_hosts.get(&mcp_id) {
-                Some(entry) => !entry.state.is_ready(),
-                None => true,
-            };
-            if !needs_dispatch {
-                continue;
-            }
-            // Register the MCP entry up front so waiters can observe
-            // Provisioning. Idempotent: re-registering for the same
-            // host_env just touches last_used and adds the thread user.
-            self.resources
-                .pre_register_host_env_mcp(&host_env_id, thread_id);
-            self.emit_mcp_host_updated(&mcp_id);
-            self.provisioning_in_flight.insert(host_env_id.clone());
-            let fut = io_dispatch::provision_host_env_mcp(self, thread_id.to_string(), host_env_id);
-            pending_io.push(fut);
-        }
     }
 
     /// The thread's current `pod_modify` cap, or `None` if the thread is
@@ -2548,12 +2392,6 @@ impl Scheduler {
                 );
                 task.bindings.host_env = defaulted;
                 bindings_dirty = true;
-            }
-            for binding in task.bindings.host_env.clone() {
-                if let Some((provider, spec)) = self.resolve_binding(&task.pod_id, &binding) {
-                    self.resources
-                        .pre_register_host_env(&task.id, provider, spec);
-                }
             }
 
             let backend_id = BackendId::for_name(&task.bindings.backend);
@@ -2928,29 +2766,6 @@ impl Scheduler {
         self.mark_dirty(thread_id);
     }
 
-    /// Are every one of the thread's host-env MCPs ready to advertise
-    /// tools? True when the thread has no host-env bindings, or when
-    /// every bound host-env MCP entry is in `ResourceState::Ready`.
-    /// False means the `Role::Tools` seed must wait for the
-    /// remaining `HostEnvMcpCompleted` hooks — we merge every env's
-    /// tools into a single manifest message, so deferring until the
-    /// slowest env lands keeps the snapshot complete instead of
-    /// freezing a partial tool list.
-    fn host_env_mcp_is_ready(&self, thread_id: &str) -> bool {
-        let host_env_ids = self.host_env_ids_for_thread(thread_id);
-        if host_env_ids.is_empty() {
-            return true; // no host-env bindings — nothing to wait for
-        }
-        host_env_ids.iter().all(|he_id| {
-            let mcp_id = McpHostId::for_host_env(he_id);
-            self.resources
-                .mcp_hosts
-                .get(&mcp_id)
-                .map(|e| e.state.is_ready())
-                .unwrap_or(false)
-        })
-    }
-
     /// Finalize the setup prefix for a freshly-seeded thread: insert
     /// the `Role::Tools` manifest, the initial tool-catalog listing
     /// (a `Role::System` block), and the memory-index snapshot (also
@@ -2983,9 +2798,6 @@ impl Scheduler {
     /// server state. One `ThreadSnapshot` broadcast at the end
     /// rebuilds their view from authoritative state in a single pass.
     fn finalize_setup_prefix(&mut self, thread_id: &str) {
-        if !self.host_env_mcp_is_ready(thread_id) {
-            return;
-        }
         let Some(task) = self.tasks.get(thread_id) else {
             return;
         };
@@ -3056,80 +2868,6 @@ impl Scheduler {
         }
     }
 
-    /// Binding-side prefix a given thread would apply to tool names
-    /// from `target_mcp_id`, if any. `Some(prefix)` for host-env
-    /// bindings (host-env tools are prefixed `{env_name}_{tool}` on
-    /// the wire); `None` for shared MCPs or if the thread isn't
-    /// bound to the target MCP. Used by the mid-conversation
-    /// activation path to render the right public names.
-    fn prefix_for_bound_mcp(&self, thread_id: &str, target_mcp_id: &McpHostId) -> Option<String> {
-        self.bound_mcp_hosts(thread_id)
-            .into_iter()
-            .find(|b| &b.entry.id == target_mcp_id)
-            .and_then(|b| b.prefix.map(|s| s.to_string()))
-    }
-
-    /// Append a tail-end `Role::System` activation message for a set
-    /// of newly-available tool names. Honors the thread's
-    /// `activation_surface`: `Announce` renders names + one-liners,
-    /// `InjectSchema` renders full schemas inline.
-    ///
-    /// Used by the escalation-approve path (for `AddTool` grants) and
-    /// by mid-conversation MCP-attach paths. Append-only by
-    /// construction — never mutates position-1 `Role::Tools`, so the
-    /// static prefix cache stays hot.
-    ///
-    /// Tools passed as `names` that aren't admissible to the thread
-    /// right now (denied, or out of pod ceiling) are silently dropped
-    /// — the caller doesn't need to pre-filter.
-    pub(crate) fn push_tool_activation_message(&mut self, thread_id: &str, names: &[String]) {
-        use whisper_agent_protocol::tool_surface::ActivationSurface;
-        if names.is_empty() {
-            return;
-        }
-        let Some(task) = self.tasks.get(thread_id) else {
-            return;
-        };
-        let surface = task.tool_surface.activation_surface;
-        let all = self.admissible_and_askable_tools(thread_id);
-        let wanted: std::collections::HashSet<&String> = names.iter().collect();
-        let matches: Vec<_> = all
-            .into_iter()
-            .filter(|t| wanted.contains(&t.name) && !t.requires_escalation)
-            .collect();
-        if matches.is_empty() {
-            return;
-        }
-        let text = match surface {
-            ActivationSurface::Announce => {
-                crate::runtime::tool_listing::render_activation_announce(&matches)
-            }
-            ActivationSurface::InjectSchema => {
-                crate::runtime::tool_listing::render_activation_inject(&matches)
-            }
-        };
-        if text.is_empty() {
-            return;
-        }
-        let snapshot = if let Some(task) = self.tasks.get_mut(thread_id) {
-            task.conversation
-                .push(whisper_agent_protocol::Message::system_text(text));
-            Some(task.snapshot())
-        } else {
-            None
-        };
-        self.mark_dirty(thread_id);
-        if let Some(snapshot) = snapshot {
-            self.router.broadcast_to_subscribers(
-                thread_id,
-                ServerToClient::ThreadSnapshot {
-                    thread_id: thread_id.to_string(),
-                    snapshot,
-                },
-            );
-        }
-    }
-
     /// Shared tail for freshly-constructed threads (minted by
     /// `create_task`, `fork_task`, etc). Pre-registers the host env
     /// if `task.bindings.host_env` is set, inserts `task` into the
@@ -3154,23 +2892,6 @@ impl Scheduler {
         let thread_id = task.id.clone();
         let pod_id = task.pod_id.clone();
 
-        // Deterministic `HostEnvId` means a second thread with the
-        // same (provider, spec) joins the existing entry as a user.
-        // Empty binding list → no pre-register; tools come from shared
-        // MCPs alone.
-        let host_env_ids: Vec<HostEnvId> = task
-            .bindings
-            .host_env
-            .iter()
-            .map(|binding| {
-                let (provider, spec) = self
-                    .resolve_binding(&pod_id, binding)
-                    .expect("caller already validated this binding");
-                self.resources
-                    .pre_register_host_env(&thread_id, provider, spec)
-            })
-            .collect();
-
         let backend_name = task.bindings.backend.clone();
         let shared_hosts = task.bindings.mcp_hosts.clone();
         let summary = task.summary();
@@ -3186,15 +2907,12 @@ impl Scheduler {
         let backend_id = BackendId::for_name(&backend_name);
         self.resources.add_backend_user(&backend_id, &thread_id);
         self.emit_backend_updated(&backend_id);
-        for id in &host_env_ids {
-            self.emit_host_env_updated(id);
-        }
         for name in &shared_hosts {
             let host_id = McpHostId::shared(name);
             self.resources.add_mcp_user(&host_id, &thread_id);
             self.emit_mcp_host_updated(&host_id);
         }
-        self.ensure_host_env_provisioning(&thread_id, pending_io);
+        let _ = pending_io;
 
         match (requester, correlation_id) {
             (Some(conn), Some(cid)) => {
@@ -3407,12 +3125,7 @@ impl Scheduler {
         pending_io: &mut FuturesUnordered<SchedulerFuture>,
     ) {
         self.mark_dirty(thread_id);
-        // Post-restart: a loaded thread's host-env MCP entry may not
-        // exist yet (the in-memory registry doesn't survive process
-        // restart). ensure_host_env_provisioning is a no-op when
-        // create_task already dispatched in this cycle or when the
-        // thread has no host_env binding.
-        self.ensure_host_env_provisioning(thread_id, pending_io);
+        let _ = pending_io;
         // If the thread was mid tool-call-cycle (AwaitingTools) when
         // this user message arrived, synthesize error-tagged
         // tool_results for every unresolved tool_use so the
@@ -3505,7 +3218,7 @@ impl Scheduler {
         pending_io: &mut FuturesUnordered<SchedulerFuture>,
     ) {
         self.mark_dirty(thread_id);
-        self.ensure_host_env_provisioning(thread_id, pending_io);
+        let _ = pending_io;
         // Deliberately don't derive a title from this text — a
         // machine-rendered notification isn't a useful thread title.
         let pending_resources = self.pending_resources_for(thread_id);
@@ -3529,8 +3242,7 @@ impl Scheduler {
     }
 
     /// Apply one per-thread I/O completion to its task and dispatch any
-    /// resulting events. Resource-provisioning completions take a
-    /// different path; see [`Self::apply_provision_completion`].
+    /// resulting events.
     fn apply_io_completion(
         &mut self,
         completion: IoCompletion,
@@ -3542,7 +3254,6 @@ impl Scheduler {
             result,
             pod_update,
             scheduler_command,
-            host_env_lost,
         } = completion;
         let mut events = Vec::new();
 
@@ -3556,33 +3267,6 @@ impl Scheduler {
             self.apply_pod_update(&thread_id, update);
         }
 
-        // Handle transport-lost signal from the MCP tool-call path.
-        // Mark both the host env and its MCP entry Lost, broadcast
-        // resource updates, and — since the session won't recover —
-        // don't emit a teardown RPC (mark_host_env_lost drops the
-        // cached handle itself). The thread sees the normal tool
-        // error below and keeps running; the next thread to arrive
-        // with the same (provider, spec) re-provisions via the
-        // existing Errored-reset path in pre_register_host_env.
-        if let Some(signal) = host_env_lost {
-            let message = signal.message;
-            if let Some(host_env_id) = signal.mcp_host_id.host_env_id() {
-                if self
-                    .resources
-                    .mark_host_env_lost(&host_env_id, message.clone())
-                {
-                    self.emit_host_env_updated(&host_env_id);
-                }
-                if self.resources.mark_mcp_lost(&signal.mcp_host_id, message) {
-                    self.emit_mcp_host_updated(&signal.mcp_host_id);
-                }
-                warn!(
-                    %thread_id,
-                    host_env_id = %host_env_id.0,
-                    "host env marked Lost after transport failure"
-                );
-            }
-        }
         if let Some(command) = scheduler_command {
             self.apply_scheduler_command(&thread_id, command, pending_io);
         }
@@ -3632,232 +3316,6 @@ impl Scheduler {
         // this layer — CreateThread Function lands in Phase 5).
         if let Some((tool_use_id, tc_result)) = tool_result_snapshot {
             self.complete_tool_function(&thread_id, &tool_use_id, &tc_result, pending_io);
-        }
-    }
-
-    /// Apply a resource-provisioning completion. Updates the registry
-    /// (sandbox handle + primary MCP session + tool catalog), broadcasts
-    /// resource events, and nudges every thread parked in
-    /// `WaitingOnResources` whose `needed` set contained one of the now-
-    /// Ready ids. Newly-Ready threads get stepped.
-    fn apply_provision_completion(
-        &mut self,
-        completion: ProvisionCompletion,
-        pending_io: &mut FuturesUnordered<SchedulerFuture>,
-    ) {
-        let ProvisionCompletion { thread_id, result } = completion;
-        // Per-id guard: clear using the completion's host_env_id. The
-        // thread_id rides along only so the scheduler can tie errors
-        // back to who originally dispatched this provision; the guard
-        // itself is keyed per deduped id because dedup-joining threads
-        // share one in-flight provision.
-        let completed_id = match &result {
-            ProvisionResult::HostEnvMcpReady { host_env_id, .. } => host_env_id.clone(),
-            ProvisionResult::HostEnvMcpFailed { host_env_id, .. } => host_env_id.clone(),
-        };
-        self.provisioning_in_flight.remove(&completed_id);
-        // Opportunistic reachability: if the provision reached (or
-        // went past) the HostEnv phase, the daemon responded, so the
-        // provider is live; if it failed at the HostEnv phase, the
-        // daemon is unreachable or rejecting control-plane requests.
-        // Later phase failures (McpConnect, ListTools) imply the
-        // daemon *is* reachable — the sandbox came up — so we still
-        // report Reachable. We look up the provider name through the
-        // host_env_id's entry in `resources`.
-        let provider_name = self
-            .resources
-            .host_envs
-            .get(&completed_id)
-            .map(|e| e.provider.clone());
-        if let Some(provider_name) = provider_name {
-            let now = chrono::Utc::now();
-            let changed = match &result {
-                ProvisionResult::HostEnvMcpReady { .. } => {
-                    self.host_env_registry.mark_reachable(&provider_name, now)
-                }
-                ProvisionResult::HostEnvMcpFailed {
-                    phase: ProvisionPhase::HostEnv,
-                    message,
-                    ..
-                } => self
-                    .host_env_registry
-                    .mark_unreachable(&provider_name, now, message.clone()),
-                ProvisionResult::HostEnvMcpFailed { .. } => {
-                    self.host_env_registry.mark_reachable(&provider_name, now)
-                }
-            };
-            if changed && let Some(info) = self.host_env_provider_info(&provider_name) {
-                self.router.broadcast_resource(
-                    whisper_agent_protocol::ServerToClient::HostEnvProviderUpdated {
-                        correlation_id: None,
-                        provider: info,
-                    },
-                );
-            }
-        }
-        match result {
-            ProvisionResult::HostEnvMcpReady {
-                host_env_id,
-                host_env_handle,
-                mcp_url,
-                mcp_token,
-                mcp_session,
-                tools,
-            } => {
-                let mcp_id = McpHostId::for_host_env(&host_env_id);
-                // 1. Host env — attach the handle (or recognize the
-                //    dedup race and tear ours down).
-                let outcome = self.resources.complete_host_env_provisioning(
-                    &host_env_id,
-                    Some(mcp_url.clone()),
-                    mcp_token,
-                    Some(host_env_handle),
-                );
-                match outcome {
-                    CompleteHostEnvOutcome::Completed => {
-                        self.emit_host_env_updated(&host_env_id);
-                    }
-                    CompleteHostEnvOutcome::AlreadyCompleted { unused_handle }
-                    | CompleteHostEnvOutcome::NotPreRegistered { unused_handle } => {
-                        self.emit_host_env_updated(&host_env_id);
-                        if let Some(mut h) = unused_handle {
-                            tokio::spawn(async move {
-                                if let Err(e) = h.teardown().await {
-                                    warn!(error = %e, "teardown of dedup-loser host env failed");
-                                }
-                            });
-                        }
-                    }
-                }
-
-                // 2. Host-env MCP host — attach session + tools.
-                let attached = self
-                    .resources
-                    .complete_host_env_mcp(&mcp_id, mcp_url, mcp_session);
-                if !attached {
-                    warn!(%thread_id, "host-env mcp already attached or missing — completion dropped");
-                }
-                let annotations: HashMap<String, ToolAnnotations> = tools
-                    .iter()
-                    .map(|t| (t.name.clone(), t.annotations.clone()))
-                    .collect();
-                self.resources
-                    .populate_mcp_tools(&mcp_id, tools, annotations);
-                self.emit_mcp_host_updated(&mcp_id);
-
-                // 3. Finalize the setup prefix for every thread bound
-                //    to this MCP *whose remaining host-env MCPs are
-                //    also Ready*. Threads that bind to multiple envs
-                //    merge every env's tools into one manifest;
-                //    pushing partway would freeze a tool list missing
-                //    the slower envs' contributions.
-                //    `finalize_setup_prefix` self-gates on
-                //    `host_env_mcp_is_ready` and is idempotent (keyed
-                //    on `Role::Tools` existence), so it's safe to
-                //    call against every bound thread. Runs BEFORE
-                //    `step_until_blocked` below — so no model call
-                //    has fired yet, and the setup-prefix write is
-                //    still free (nothing has been cached).
-                let bound_to_mcp: Vec<String> = self
-                    .resources
-                    .mcp_hosts
-                    .get(&mcp_id)
-                    .map(|e| e.users.iter().cloned().collect())
-                    .unwrap_or_default();
-                // Snapshot the raw tool names now — the registry was
-                // populated above and we'll need them for the
-                // activation-message branch below (the setup-prefix
-                // path handles already-seeded threads itself; this is
-                // only for threads whose prefix already finalized).
-                let fresh_tool_names: Vec<String> = self
-                    .resources
-                    .mcp_hosts
-                    .get(&mcp_id)
-                    .map(|e| e.tools.iter().map(|t| t.name.clone()).collect())
-                    .unwrap_or_default();
-                for tid in &bound_to_mcp {
-                    let already_seeded = self
-                        .tasks
-                        .get(tid)
-                        .map(|t| {
-                            t.conversation
-                                .messages()
-                                .iter()
-                                .any(|m| m.role == whisper_agent_protocol::Role::Tools)
-                        })
-                        .unwrap_or(false);
-                    if already_seeded {
-                        // Rare case: the thread already crossed its
-                        // setup boundary but this MCP is arriving now
-                        // (e.g. re-provision after a Lost state). The
-                        // static Role::Tools is immutable per cache-
-                        // coherence — emit an append-only activation
-                        // message instead so the model sees the new
-                        // names.
-                        let prefix = self.prefix_for_bound_mcp(tid, &mcp_id);
-                        let prefixed: Vec<String> = fresh_tool_names
-                            .iter()
-                            .map(|n| match &prefix {
-                                Some(p) => format!("{p}_{n}"),
-                                None => n.clone(),
-                            })
-                            .collect();
-                        self.push_tool_activation_message(tid, &prefixed);
-                    } else {
-                        self.finalize_setup_prefix(tid);
-                    }
-                }
-
-                // 4. Nudge any threads that were waiting on these
-                //    resources. Dedup means multiple threads can share
-                //    one host env + MCP pair.
-                let mut newly_ready: Vec<String> = Vec::new();
-                let resource_ids = [host_env_id.0.clone(), mcp_id.0.clone()];
-                for id in &resource_ids {
-                    for task in self.tasks.values_mut() {
-                        if task.clear_waiting_resource(id) {
-                            newly_ready.push(task.id.clone());
-                        }
-                    }
-                }
-                for id in newly_ready {
-                    self.mark_dirty(&id);
-                    self.step_until_blocked(&id, pending_io);
-                }
-            }
-            ProvisionResult::HostEnvMcpFailed {
-                phase,
-                message,
-                host_env_id,
-            } => {
-                warn!(%thread_id, phase = phase.as_str(), error = %message, "host env provisioning failed");
-                let mcp_id = McpHostId::for_host_env(&host_env_id);
-                // Mark both entries Errored so future threads observe
-                // the failure and don't endlessly retry.
-                self.resources.mark_mcp_errored(&mcp_id, message.clone());
-                self.emit_mcp_host_updated(&mcp_id);
-                if matches!(phase, ProvisionPhase::HostEnv) {
-                    self.resources
-                        .mark_host_env_errored(&host_env_id, message.clone());
-                    self.emit_host_env_updated(&host_env_id);
-                }
-                // Fail the requesting thread.
-                if let Some(task) = self.tasks.get_mut(&thread_id) {
-                    task.fail(phase.as_str(), message);
-                    let mut events = Vec::new();
-                    events.push(crate::runtime::thread::ThreadEvent::Error {
-                        message: format!(
-                            "{}: {}",
-                            phase.as_str(),
-                            task.failure_detail().unwrap_or_default()
-                        ),
-                    });
-                    self.mark_dirty(&thread_id);
-                    self.router.dispatch_events(&thread_id, events);
-                    self.teardown_host_env_if_terminal(&thread_id);
-                    self.on_behavior_thread_terminal(&thread_id, pending_io);
-                }
-            }
         }
     }
 
@@ -3988,18 +3446,7 @@ impl Scheduler {
         pod_id: &str,
         bindings: &whisper_agent_protocol::ThreadBindings,
     ) {
-        for binding in &bindings.host_env {
-            if let Some((provider, spec)) = self.resolve_binding(pod_id, binding) {
-                let sid = HostEnvId::for_provider_spec(&provider, &spec);
-                let _ = self.resources.release_host_env_user(&sid, thread_id);
-                self.emit_host_env_updated(&sid);
-                // The host-env MCP is scoped to the same (provider, spec)
-                // dedup, so drop this thread from its user set too.
-                let mcp_id = McpHostId::for_host_env(&sid);
-                self.resources.remove_mcp_user(&mcp_id, thread_id);
-                self.emit_mcp_host_updated(&mcp_id);
-            }
-        }
+        let _ = pod_id;
         let backend_id = BackendId::for_name(&bindings.backend);
         self.resources.remove_backend_user(&backend_id, thread_id);
         for shared in &bindings.mcp_hosts {
@@ -4114,10 +3561,6 @@ impl Scheduler {
         // Drop the per-thread disconnect policy too — a re-created
         // thread starts at the default `ContinueWithWarning`.
         self.v2_policies.remove_thread(thread_id);
-        // Provisioning guard is now keyed per HostEnvId, not per thread
-        // — shared across all threads that bind to the same deduped
-        // host-env. Don't clear on thread removal; other threads may
-        // still be riding the same provision.
         if let Some(pod) = self.pods.get_mut(pod_id) {
             pod.threads.remove(thread_id);
         }
@@ -4147,23 +3590,12 @@ impl Scheduler {
     }
 
     /// One GC sweep over the resource registry. Tears down idle Ready
-    /// resources (sandboxes, per-thread MCP hosts) and removes terminal
-    /// entries that have been retained long enough. Spawns async sandbox
-    /// teardown futures and broadcasts `ResourceUpdated` /
-    /// `ResourceDestroyed` events for every change.
+    /// shared MCP hosts and removes terminal entries retained long
+    /// enough. v2 daemon sessions are not GC'd here — they're
+    /// owned by the daemon and torn down via `CloseSession` when the
+    /// per-thread session handle drops.
     fn gc_tick(&mut self) {
         self.sweep_expired_oauth_flows();
-        // Ground-truth "in use" sets. A thread's `bindings.host_env` +
-        // `bindings.mcp_hosts` pin the corresponding registry entries
-        // against reap for as long as the thread is live — regardless
-        // of whether the registry's `users` refcount has drifted. A
-        // thread parked on a slow model call or a dispatched child
-        // touches nothing in the registry, so refcount-only idle
-        // detection would race live work. Failed / Cancelled threads
-        // don't count — their bindings are already released via
-        // `teardown_host_env_if_terminal` and they're on their way
-        // out anyway.
-        let mut in_use_host_envs: HashSet<HostEnvId> = HashSet::new();
         let mut in_use_mcp_hosts: HashSet<McpHostId> = HashSet::new();
         for task in self.tasks.values() {
             if matches!(
@@ -4171,14 +3603,6 @@ impl Scheduler {
                 ThreadStateLabel::Failed | ThreadStateLabel::Cancelled
             ) {
                 continue;
-            }
-            for binding in &task.bindings.host_env {
-                if let Some((provider, spec)) = self.resolve_binding(&task.pod_id, binding) {
-                    let hid = HostEnvId::for_provider_spec(&provider, &spec);
-                    let mid = McpHostId::for_host_env(&hid);
-                    in_use_host_envs.insert(hid);
-                    in_use_mcp_hosts.insert(mid);
-                }
             }
             for name in &task.bindings.mcp_hosts {
                 in_use_mcp_hosts.insert(McpHostId::shared(name));
@@ -4188,39 +3612,14 @@ impl Scheduler {
             chrono::Utc::now(),
             chrono::Duration::seconds(IDLE_RESOURCE_SECS),
             chrono::Duration::seconds(TERMINAL_RETENTION_SECS),
-            &in_use_host_envs,
             &in_use_mcp_hosts,
         );
-        if plan.torn_down_host_envs.is_empty()
-            && plan.torn_down_mcp_hosts.is_empty()
-            && plan.destroyed_host_envs.is_empty()
-            && plan.destroyed_mcp_hosts.is_empty()
-        {
+        if plan.torn_down_mcp_hosts.is_empty() && plan.destroyed_mcp_hosts.is_empty() {
             return;
-        }
-        for (id, handle) in plan.torn_down_host_envs {
-            info!(sandbox_id = %id.0, "GC: tearing down idle sandbox");
-            self.emit_host_env_updated(&id);
-            if let Some(mut h) = handle {
-                let id_str = id.0.clone();
-                tokio::spawn(async move {
-                    if let Err(e) = h.teardown().await {
-                        warn!(sandbox_id = %id_str, error = %e, "GC sandbox teardown failed");
-                    }
-                });
-            }
         }
         for id in plan.torn_down_mcp_hosts {
             info!(mcp_id = %id.0, "GC: tearing down idle MCP host");
             self.emit_mcp_host_updated(&id);
-        }
-        for id in plan.destroyed_host_envs {
-            info!(sandbox_id = %id.0, "GC: removing stale terminal sandbox entry");
-            self.router
-                .broadcast_resource(ServerToClient::ResourceDestroyed {
-                    id: id.0,
-                    kind: ResourceKind::HostEnv,
-                });
         }
         for id in plan.destroyed_mcp_hosts {
             info!(mcp_id = %id.0, "GC: removing stale terminal MCP host entry");
@@ -4232,54 +3631,10 @@ impl Scheduler {
         }
     }
 
-    fn teardown_host_env_if_terminal(&mut self, thread_id: &str) {
-        // Completed is NOT terminal — the task can receive follow-up messages.
-        // Only tear down on truly irreversible states.
-        let is_terminal = self.tasks.get(thread_id).is_some_and(|t| {
-            matches!(
-                t.public_state(),
-                ThreadStateLabel::Failed | ThreadStateLabel::Cancelled
-            )
-        });
-        if !is_terminal {
-            return;
-        }
-        // Each bound host env (and its MCP) is shared across threads
-        // with matching (provider, spec); drop this thread from every
-        // bound entry's user set and tear down only those whose count
-        // hits zero and aren't pinned. No-op for threads with zero
-        // host_env bindings — nothing was ever provisioned.
-        let host_env_ids = self.host_env_ids_for_thread(thread_id);
-        for sandbox_id in host_env_ids {
-            // Drop the thread's reservation on the host-env MCP too.
-            let mcp_id = McpHostId::for_host_env(&sandbox_id);
-            self.resources.remove_mcp_user(&mcp_id, thread_id);
-            self.emit_mcp_host_updated(&mcp_id);
-            let remaining = self.resources.release_host_env_user(&sandbox_id, thread_id);
-            let pinned = self
-                .resources
-                .host_envs
-                .get(&sandbox_id)
-                .map(|e| e.pinned)
-                .unwrap_or(false);
-            if remaining == 0 && !pinned {
-                let handle = self.resources.take_host_env_handle(&sandbox_id);
-                self.resources.mark_host_env_torn_down(&sandbox_id);
-                self.emit_host_env_updated(&sandbox_id);
-                if let Some(mut handle) = handle {
-                    let tid = thread_id.to_string();
-                    tokio::spawn(async move {
-                        if let Err(e) = handle.teardown().await {
-                            warn!(thread_id = %tid, error = %e, "sandbox teardown failed");
-                        }
-                    });
-                }
-            } else {
-                // Sandbox lives on for the other threads using it; the user
-                // list changed so subscribers want a refresh.
-                self.emit_host_env_updated(&sandbox_id);
-            }
-        }
+    fn teardown_host_env_if_terminal(&mut self, _thread_id: &str) {
+        // v1 host envs are gone; v2 daemon sessions are torn down by
+        // the per-thread `Arc<SessionHandle>` drop in V2SessionStore
+        // via the daemon's `CloseSession` frame. Nothing to do here.
     }
 }
 
@@ -4627,7 +3982,6 @@ pub async fn run(
     let mut gc_ticker = tokio::time::interval(Duration::from_secs(GC_TICK_SECS));
     let mut cron_ticker = tokio::time::interval(Duration::from_secs(CRON_TICK_SECS));
     let mut retention_ticker = tokio::time::interval(Duration::from_secs(RETENTION_TICK_SECS));
-    let mut probe_ticker = tokio::time::interval(Duration::from_secs(HOST_ENV_PROBE_TICK_SECS));
     let mut oauth_refresh_ticker =
         tokio::time::interval(Duration::from_secs(OAUTH_REFRESH_TICK_SECS));
     // Skip the first immediate tick on all — `interval` fires at t=0 by default.
@@ -4637,12 +3991,6 @@ pub async fn run(
     cron_ticker.tick().await;
     retention_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     retention_ticker.tick().await;
-    // Probe ticker differs: we *want* the first tick to fire immediately
-    // so reachability transitions from Unknown to Reachable/Unreachable
-    // as soon as the server is up, instead of staring at Unknown for
-    // 30 s. MissedTickBehavior::Skip prevents thundering-herd bursts
-    // after the process suspends and resumes (laptop lids etc.).
-    probe_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     // Oauth refresh: skip the first tick (no point refreshing at
     // boot — freshly loaded tokens are, by definition, fresh) and
     // drop missed ticks instead of bursting. Suspended laptops can
@@ -4676,12 +4024,6 @@ pub async fn run(
                             let thread_id = io.thread_id.clone();
                             scheduler.apply_io_completion(io, &mut pending_io);
                             scheduler.step_until_blocked(&thread_id, &mut pending_io);
-                        }
-                        SchedulerCompletion::Provision(prov) => {
-                            scheduler.apply_provision_completion(prov, &mut pending_io);
-                        }
-                        SchedulerCompletion::Probe(probe) => {
-                            scheduler.apply_probe_completion(probe);
                         }
                         SchedulerCompletion::SharedMcp(done) => {
                             scheduler.apply_shared_mcp_completion(done);
@@ -4728,9 +4070,6 @@ pub async fn run(
             }
             _ = retention_ticker.tick() => {
                 scheduler.retention_sweep();
-            }
-            _ = probe_ticker.tick() => {
-                pending_io.extend(scheduler.spawn_reachability_probes());
             }
             _ = oauth_refresh_ticker.tick() => {
                 pending_io.extend(scheduler.spawn_oauth_refresh_futures());

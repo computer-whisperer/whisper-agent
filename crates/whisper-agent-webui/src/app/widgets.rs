@@ -12,9 +12,8 @@ use std::collections::HashSet;
 
 use egui::{Color32, Grid, RichText, ScrollArea, TextEdit};
 use whisper_agent_protocol::{
-    BackendSummary, HostEnvBinding, HostEnvProviderInfo, HostEnvProviderOrigin,
-    HostEnvReachability, HostEnvSpec, ResourceSnapshot, ResourceStateLabel, SharedMcpAuthPublic,
-    SharedMcpHostInfo, ThreadStateLabel,
+    BackendSummary, CatalogOrigin, HostEnvBinding, HostEnvSpec, ResourceSnapshot,
+    ResourceStateLabel, SharedMcpAuthPublic, SharedMcpHostInfo, ThreadStateLabel,
 };
 
 use super::editor_render::section_heading;
@@ -97,9 +96,9 @@ pub(super) fn render_shared_mcp_host_row(
         );
         ui.label(RichText::new("·").small().color(Color32::from_gray(120)));
         let origin = match host.origin {
-            HostEnvProviderOrigin::Seeded => "seeded",
-            HostEnvProviderOrigin::Manual => "manual",
-            HostEnvProviderOrigin::RuntimeOverlay => "cli-overlay",
+            CatalogOrigin::Seeded => "seeded",
+            CatalogOrigin::Manual => "manual",
+            CatalogOrigin::RuntimeOverlay => "cli-overlay",
         };
         ui.label(
             RichText::new(format!("origin: {origin}"))
@@ -139,7 +138,7 @@ pub(super) fn render_shared_mcp_host_row(
                 .color(Color32::from_rgb(0xd0, 0x70, 0x70)),
         );
     }
-    let is_overlay = matches!(host.origin, HostEnvProviderOrigin::RuntimeOverlay);
+    let is_overlay = matches!(host.origin, CatalogOrigin::RuntimeOverlay);
     ui.horizontal(|ui| {
         // Edit is disabled on both CLI overlays and OAuth entries:
         // overlays can't mutate at runtime (shadowed by catalog);
@@ -224,43 +223,26 @@ pub(super) const OAUTH_AVAILABLE: bool = true;
 #[cfg(not(target_arch = "wasm32"))]
 pub(super) const OAUTH_AVAILABLE: bool = false;
 
-/// Three-section list of the server's currently-tracked resources
-/// (host envs, MCP hosts, backends). Each section is a collapsible
+/// Two-section list of the server's currently-tracked resources
+/// (MCP hosts, backends). Each section is a collapsible
 /// header that defaults open; entries inside are sorted by id so the
 /// order is stable across snapshots.
 pub(super) fn render_resource_list(
     ui: &mut egui::Ui,
     resources: &HashMap<String, ResourceSnapshot>,
 ) {
-    let mut host_envs: Vec<&ResourceSnapshot> = Vec::new();
     let mut mcp_hosts: Vec<&ResourceSnapshot> = Vec::new();
     let mut backends: Vec<&ResourceSnapshot> = Vec::new();
     for r in resources.values() {
         match r {
-            ResourceSnapshot::HostEnv { .. } => host_envs.push(r),
             ResourceSnapshot::McpHost { .. } => mcp_hosts.push(r),
             ResourceSnapshot::Backend { .. } => backends.push(r),
         }
     }
-    host_envs.sort_by_key(|r| r.id().to_string());
     mcp_hosts.sort_by_key(|r| r.id().to_string());
     backends.sort_by_key(|r| r.id().to_string());
 
     ScrollArea::vertical().show(ui, |ui| {
-        egui::CollapsingHeader::new(format!("Host envs ({})", host_envs.len()))
-            .default_open(true)
-            .show(ui, |ui| {
-                for r in &host_envs {
-                    render_resource_row(ui, r);
-                }
-                if host_envs.is_empty() {
-                    ui.label(
-                        RichText::new("(none)")
-                            .color(Color32::from_gray(140))
-                            .small(),
-                    );
-                }
-            });
         egui::CollapsingHeader::new(format!("MCP Hosts ({})", mcp_hosts.len()))
             .default_open(true)
             .show(ui, |ui| {
@@ -294,17 +276,6 @@ pub(super) fn render_resource_list(
 
 fn render_resource_row(ui: &mut egui::Ui, resource: &ResourceSnapshot) {
     let (label, sub, state, users) = match resource {
-        ResourceSnapshot::HostEnv {
-            id,
-            provider,
-            spec,
-            state,
-            users,
-            ..
-        } => {
-            let sub = format!("{provider} · {}", spec_label(spec));
-            (id.clone(), sub, *state, users.len())
-        }
         ResourceSnapshot::McpHost {
             id,
             label,
@@ -358,32 +329,6 @@ pub(super) fn spec_label(spec: &HostEnvSpec) -> String {
         HostEnvSpec::Landlock { allowed_paths, .. } => {
             format!("landlock · {} paths", allowed_paths.len())
         }
-    }
-}
-
-pub(super) fn provider_origin_chip(origin: HostEnvProviderOrigin) -> (&'static str, Color32) {
-    match origin {
-        HostEnvProviderOrigin::Seeded => ("seeded", Color32::from_rgb(140, 160, 200)),
-        HostEnvProviderOrigin::Manual => ("manual", Color32::from_rgb(140, 200, 160)),
-        HostEnvProviderOrigin::RuntimeOverlay => ("cli-overlay", Color32::from_rgb(200, 180, 120)),
-    }
-}
-
-pub(super) fn provider_reachability_chip(
-    r: &HostEnvReachability,
-) -> (&'static str, Color32, Option<String>) {
-    match r {
-        HostEnvReachability::Unknown => ("probing", Color32::from_gray(150), None),
-        HostEnvReachability::Reachable { at } => (
-            "reachable",
-            Color32::from_rgb(120, 180, 120),
-            Some(format!("last probe OK · {at}")),
-        ),
-        HostEnvReachability::Unreachable { since, last_error } => (
-            "unreachable",
-            Color32::from_rgb(220, 110, 110),
-            Some(format!("since {since} · {last_error}")),
-        ),
     }
 }
 
@@ -788,113 +733,4 @@ pub(super) fn render_failure_banner(ui: &mut egui::Ui, view: &TaskView) {
             });
         });
     ui.add_space(4.0);
-}
-
-/// Side-channel actions a `render_provider_row` call can emit. The
-/// caller pairs each event with the row's `info` (which the renderer
-/// doesn't re-emit) and turns it into modal-state changes / wire
-/// messages. Mirrors the `ChatItemEvent` pattern in `chat_render` so
-/// the row renderer doesn't need `&mut ChatApp`.
-pub(super) enum ProviderRowEvent {
-    /// Edit clicked — caller opens the provider editor preloaded from
-    /// this row's info.
-    EditRequested,
-    /// Remove clicked while the row was not yet armed — caller arms it
-    /// (next click confirms).
-    RemoveArmed,
-    /// Remove clicked while the row was armed — caller dispatches the
-    /// wire RPC and records a `ProviderRemovePending` entry.
-    RemoveConfirmed,
-}
-
-/// One row in the Providers tab. The display state (`armed`,
-/// `removing`, `pending_error`) is computed by the caller from
-/// `ChatApp.provider_remove_armed` / `provider_remove_pending`; the
-/// renderer reads them and emits at most one `ProviderRowEvent` per
-/// frame, which the caller reduces back into mutations.
-pub(super) fn render_provider_row(
-    ui: &mut egui::Ui,
-    info: &HostEnvProviderInfo,
-    armed: bool,
-    removing: bool,
-    pending_error: Option<&str>,
-) -> Option<ProviderRowEvent> {
-    let (origin_chip, origin_color) = provider_origin_chip(info.origin);
-    let (reach_chip, reach_color, reach_detail) = provider_reachability_chip(&info.reachability);
-    ui.horizontal(|ui| {
-        ui.label(RichText::new(&info.name).strong());
-        ui.label(
-            RichText::new(format!("[{origin_chip}]"))
-                .color(origin_color)
-                .small(),
-        );
-        ui.label(
-            RichText::new(format!("[{reach_chip}]"))
-                .color(reach_color)
-                .small(),
-        );
-        if info.has_token {
-            ui.label(RichText::new("auth").color(Color32::from_gray(160)).small());
-        } else {
-            ui.label(
-                RichText::new("no auth")
-                    .color(Color32::from_rgb(180, 140, 90))
-                    .small(),
-            );
-        }
-    });
-    ui.label(
-        RichText::new(&info.url)
-            .color(Color32::from_gray(160))
-            .small()
-            .monospace(),
-    );
-    if let Some(detail) = &reach_detail {
-        ui.label(RichText::new(detail).color(reach_color).small());
-    }
-
-    // Actions. Runtime-overlay entries (CLI flags) can't be edited or
-    // removed via the UI — the corresponding server-side command
-    // refuses them. Show the buttons disabled with a hint so the user
-    // isn't confused.
-    let is_overlay = info.origin == HostEnvProviderOrigin::RuntimeOverlay;
-    let mut event: Option<ProviderRowEvent> = None;
-
-    ui.horizontal(|ui| {
-        let edit_btn = ui.add_enabled(!is_overlay && !removing, egui::Button::new("Edit"));
-        if edit_btn.clicked() {
-            event = Some(ProviderRowEvent::EditRequested);
-        }
-
-        let remove_label = if removing {
-            "Removing…"
-        } else if armed {
-            "Confirm remove"
-        } else {
-            "Remove"
-        };
-        let remove_btn = ui.add_enabled(!is_overlay && !removing, egui::Button::new(remove_label));
-        if remove_btn.clicked() {
-            event = Some(if armed {
-                ProviderRowEvent::RemoveConfirmed
-            } else {
-                ProviderRowEvent::RemoveArmed
-            });
-        }
-        if is_overlay {
-            ui.label(
-                RichText::new("CLI-overlay (drop --host-env-provider flag to manage here)")
-                    .small()
-                    .color(Color32::from_gray(150)),
-            );
-        }
-    });
-    if let Some(err) = pending_error {
-        ui.label(
-            RichText::new(format!("remove failed: {err}"))
-                .small()
-                .color(Color32::from_rgb(220, 80, 80)),
-        );
-    }
-    event
 }

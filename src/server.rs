@@ -127,15 +127,6 @@ pub struct ServerConfig {
     /// `None`, the server boots with an empty bucket registry — chat
     /// threads still work, knowledge-bucket operations don't.
     pub buckets_root: Option<PathBuf>,
-    /// Host-env provider catalog. Empty registry is a valid config —
-    /// threads in such a server just have no host-env MCP connection.
-    pub host_env_registry: crate::tools::sandbox::HostEnvRegistry,
-    /// Durable backing store for `host_env_registry`. The scheduler
-    /// owns it; every runtime add/update/remove command mutates the
-    /// registry and writes the store through. A fresh server with no
-    /// prior state starts with an empty store sitting at
-    /// `<pods_root>/../host_env_providers.toml`.
-    pub host_env_catalog: crate::tools::host_env_catalog::CatalogStore,
     /// Durable catalog of shared MCP hosts. Add/Update/Remove wire
     /// commands mutate this on the scheduler thread.
     pub shared_mcp_catalog: crate::tools::shared_mcp_catalog::CatalogStore,
@@ -158,11 +149,9 @@ pub struct ServerConfig {
     /// unlock settings-mutation handlers like `UpdateCodexAuth`.
     pub auth_admins: Vec<AuthClient>,
     /// Configured daemon-auth tokens. Used by the `/v1/host_env_link`
-    /// endpoint (v2 host-env protocol) to admit a daemon dialing in.
-    /// Carried here at the same level as `auth_clients` / `auth_admins`
-    /// to share the same plaintext-bearer-over-loopback-or-TLS gating;
-    /// see `validate_host_env_providers` for the cross-check against
-    /// `[[host_env_providers]] kind = "v2_ws"`.
+    /// endpoint to admit a host-env daemon dialing in. Carried here at
+    /// the same level as `auth_clients` / `auth_admins` to share the
+    /// same plaintext-bearer-over-loopback-or-TLS gating.
     pub auth_daemons: Vec<AuthDaemon>,
     /// Path to the `whisper-agent.toml` the server was loaded from. `None`
     /// when the server was started without `--config` (env-key-only
@@ -253,8 +242,6 @@ pub async fn serve(listen: SocketAddr, config: ServerConfig) -> anyhow::Result<(
         config.rerank_providers,
         bucket_registry,
         audit,
-        config.host_env_registry,
-        config.host_env_catalog,
         config.shared_mcp_catalog,
         config.shared_mcp_overlays,
         live_daemon_registry.clone(),

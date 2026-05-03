@@ -14,9 +14,9 @@
 //! plain `Error` response and the existing threads keep running.
 //!
 //! Only the `[backends.*]` section hot-swaps. Changes to other
-//! sections (shared_mcp_hosts, host_env_providers, secrets, auth) are
-//! written to disk but require a server restart to take effect; the
-//! response lists which sections are pending so the user knows.
+//! sections (shared_mcp_hosts, secrets, auth) are written to disk but
+//! require a server restart to take effect; the response lists which
+//! sections are pending so the user knows.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
@@ -77,9 +77,6 @@ fn restart_required_sections(old: &Config, new: &Config) -> Vec<String> {
     let mut sections = Vec::new();
     if old.shared_mcp_hosts != new.shared_mcp_hosts {
         sections.push("shared_mcp_hosts".into());
-    }
-    if old.host_env_providers != new.host_env_providers {
-        sections.push("host_env_providers".into());
     }
     if old.secrets != new.secrets {
         sections.push("secrets".into());
@@ -162,10 +159,10 @@ impl Scheduler {
         }
 
         // Re-read the on-disk file rather than synthesizing a `Config`
-        // from in-memory state — runtime catalog edits (Add/RemoveSharedMcpHost,
-        // host-env mutations) have drifted from what's on disk, so the
-        // file is the only honest baseline for "did this submission
-        // actually change a non-backend section".
+        // from in-memory state — runtime catalog edits
+        // (Add/RemoveSharedMcpHost) have drifted from what's on disk,
+        // so the file is the only honest baseline for "did this
+        // submission actually change a non-backend section".
         let old_cfg: Config = match std::fs::read_to_string(&path) {
             Ok(t) => match toml::from_str(&t) {
                 Ok(c) => c,

@@ -459,15 +459,6 @@ impl ChatApp {
                     modal.pending_correlation = None;
                     return;
                 }
-                // Provider editor modal pending add / update.
-                if let Some(modal) = self.provider_editor_modal.as_mut()
-                    && correlation_id.is_some()
-                    && modal.pending_correlation == correlation_id
-                {
-                    modal.error = Some(message);
-                    modal.pending_correlation = None;
-                    return;
-                }
                 // Codex-auth rotation sub-form pending save. Route the
                 // detail into the sub-form's error field so the user
                 // can fix the paste without retyping; the sub-form
@@ -520,21 +511,6 @@ impl ChatApp {
                         return;
                     }
                 }
-                // Provider remove pending on a specific row. Match by
-                // correlation rather than iterating names so a stale
-                // remove that targets a now-gone name still resolves.
-                if let Some(cid) = correlation_id.as_deref()
-                    && let Some((name, _)) = self
-                        .provider_remove_pending
-                        .iter()
-                        .find(|(_, p)| p.correlation == cid)
-                        .map(|(n, p)| (n.clone(), p))
-                {
-                    if let Some(p) = self.provider_remove_pending.get_mut(&name) {
-                        p.error = Some(message);
-                    }
-                    return;
-                }
                 if let Some(tid) = thread_id.as_ref()
                     && let Some(view) = self.tasks.get_mut(tid)
                 {
@@ -582,9 +558,6 @@ impl ChatApp {
             }
             ServerToClient::ResourceDestroyed { id, .. } => {
                 self.resources.remove(&id);
-            }
-            ServerToClient::HostEnvProvidersList { providers, .. } => {
-                self.host_env_providers = providers;
             }
             ServerToClient::BucketsList { buckets, .. } => {
                 self.buckets = buckets;
@@ -1065,51 +1038,6 @@ impl ChatApp {
             }
             ServerToClient::FunctionEnded { function_id, .. } => {
                 self.active_functions.remove(&function_id);
-            }
-            ServerToClient::HostEnvProviderAdded {
-                provider,
-                correlation_id,
-            }
-            | ServerToClient::HostEnvProviderUpdated {
-                provider,
-                correlation_id,
-            } => {
-                if let Some(existing) = self
-                    .host_env_providers
-                    .iter_mut()
-                    .find(|p| p.name == provider.name)
-                {
-                    *existing = provider;
-                } else {
-                    self.host_env_providers.push(provider);
-                    self.host_env_providers.sort_by(|a, b| a.name.cmp(&b.name));
-                }
-                // Close the editor modal if it was waiting on this
-                // correlation. Edits that bypassed the modal (server-
-                // side seed, another client's CRUD) land here with
-                // `None` and leave the modal alone.
-                if correlation_id.is_some()
-                    && let Some(modal) = self.provider_editor_modal.as_ref()
-                    && modal.pending_correlation == correlation_id
-                {
-                    self.provider_editor_modal = None;
-                }
-            }
-            ServerToClient::HostEnvProviderRemoved {
-                name,
-                correlation_id,
-            } => {
-                self.host_env_providers.retain(|p| p.name != name);
-                // Clear any pending-remove state if this was our
-                // request. Another client's remove lands here too
-                // (correlation_id: None); nothing to clean up in that
-                // case beyond the list itself.
-                if let Some(pending) = self.provider_remove_pending.get(&name)
-                    && correlation_id.as_deref() == Some(pending.correlation.as_str())
-                {
-                    self.provider_remove_pending.remove(&name);
-                }
-                self.provider_remove_armed.remove(&name);
             }
             ServerToClient::CodexAuthUpdated {
                 backend,

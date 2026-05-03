@@ -375,16 +375,6 @@ impl Scheduler {
                     },
                 );
             }
-            ClientToServer::ListHostEnvProviders { correlation_id } => {
-                let providers = self.host_env_provider_snapshot();
-                self.router.send_to_client(
-                    conn_id,
-                    ServerToClient::HostEnvProvidersList {
-                        correlation_id,
-                        providers,
-                    },
-                );
-            }
             ClientToServer::ListBuckets { correlation_id } => {
                 let buckets = self.bucket_registry.summaries();
                 self.router.send_to_client(
@@ -454,82 +444,6 @@ impl Scheduler {
             } => {
                 self.handle_resync_bucket(Some(conn_id), correlation_id, id, pod_id);
             }
-            ClientToServer::AddHostEnvProvider {
-                correlation_id,
-                name,
-                url,
-                token,
-            } => match self.add_host_env_provider(name, url, token) {
-                Ok(provider) => {
-                    self.router.send_to_client(
-                        conn_id,
-                        ServerToClient::HostEnvProviderAdded {
-                            correlation_id,
-                            provider,
-                        },
-                    );
-                }
-                Err(e) => {
-                    self.router.send_to_client(
-                        conn_id,
-                        ServerToClient::Error {
-                            correlation_id,
-                            thread_id: None,
-                            message: format!("add_host_env_provider: {e}"),
-                        },
-                    );
-                }
-            },
-            ClientToServer::UpdateHostEnvProvider {
-                correlation_id,
-                name,
-                url,
-                token,
-            } => match self.update_host_env_provider(name, url, token) {
-                Ok(provider) => {
-                    self.router.send_to_client(
-                        conn_id,
-                        ServerToClient::HostEnvProviderUpdated {
-                            correlation_id,
-                            provider,
-                        },
-                    );
-                }
-                Err(e) => {
-                    self.router.send_to_client(
-                        conn_id,
-                        ServerToClient::Error {
-                            correlation_id,
-                            thread_id: None,
-                            message: format!("update_host_env_provider: {e}"),
-                        },
-                    );
-                }
-            },
-            ClientToServer::RemoveHostEnvProvider {
-                correlation_id,
-                name,
-            } => match self.remove_host_env_provider(&name) {
-                Ok(()) => {
-                    self.router.send_to_client(
-                        conn_id,
-                        ServerToClient::HostEnvProviderRemoved {
-                            correlation_id,
-                            name,
-                        },
-                    );
-                }
-                Err(e) => {
-                    self.router.send_to_client(
-                        conn_id,
-                        ServerToClient::Error {
-                            correlation_id,
-                            thread_id: None,
-                            message: format!("remove_host_env_provider: {e}"),
-                        },
-                    );
-                }
-            },
             ClientToServer::ListSharedMcpHosts { correlation_id } => {
                 let hosts = self.shared_mcp_hosts_snapshot();
                 self.router.send_to_client(
@@ -1151,10 +1065,6 @@ impl Scheduler {
                 // `tasks` / `dirty` / `router` subs, and the
                 // resource-registry user sets would carry stale thread_ids
                 // that prevent GC from ever marking those resources idle.
-                // The per-HostEnvId provisioning guard doesn't need
-                // clearing here — it's shared across threads on the same
-                // deduped id and the in-flight future will clear itself on
-                // completion.
                 for thread_id in &pod.threads {
                     let bindings = self.tasks.get(thread_id).map(|t| t.bindings.clone());
                     self.tasks.remove(thread_id);

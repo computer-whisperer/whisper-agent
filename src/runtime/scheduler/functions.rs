@@ -1466,114 +1466,14 @@ impl Scheduler {
                     "disconnected"
                 };
                 let origin = match h.origin {
-                    whisper_agent_protocol::HostEnvProviderOrigin::Seeded => "seeded",
-                    whisper_agent_protocol::HostEnvProviderOrigin::Manual => "manual",
-                    whisper_agent_protocol::HostEnvProviderOrigin::RuntimeOverlay => {
-                        "runtime_overlay"
-                    }
+                    whisper_agent_protocol::CatalogOrigin::Seeded => "seeded",
+                    whisper_agent_protocol::CatalogOrigin::Manual => "manual",
+                    whisper_agent_protocol::CatalogOrigin::RuntimeOverlay => "runtime_overlay",
                 };
                 out.push_str(&format!(
                     "- `{name}` [{scope}] — url={url}, auth={auth}, {connected}, origin={origin}\n",
                     name = h.name,
                     url = h.url,
-                ));
-            }
-        }
-        pending_io.push(immediate_tool_success(
-            thread_id.to_string(),
-            op_id,
-            tool_use_id,
-            out,
-        ));
-    }
-
-    /// `list_host_env_providers`-specific synchronous path. Reads the
-    /// scheduler's host-env catalog snapshot (no control-plane tokens,
-    /// only a `has_token` presence flag) and annotates each entry with
-    /// whether any of the current pod's `[[allow.host_env]]` entries
-    /// reference the provider.
-    fn complete_list_host_env_providers_call(
-        &mut self,
-        thread_id: &str,
-        op_id: crate::runtime::thread::OpId,
-        tool_use_id: String,
-        input: serde_json::Value,
-        disposition: crate::permission::Disposition,
-        pending_io: &mut FuturesUnordered<SchedulerFuture>,
-    ) {
-        if matches!(disposition, crate::permission::Disposition::Deny) {
-            pending_io.push(make_denial_future(
-                thread_id.to_string(),
-                tool_use_id,
-                op_id,
-                crate::tools::builtin_tools::LIST_HOST_ENV_PROVIDERS.to_string(),
-            ));
-            return;
-        }
-        if let Err(e) = crate::tools::builtin_tools::list_host_env_providers::parse_args(input) {
-            pending_io.push(immediate_tool_error(
-                thread_id.to_string(),
-                op_id,
-                tool_use_id,
-                e,
-            ));
-            return;
-        }
-        let in_scope: std::collections::HashSet<String> = self
-            .tasks
-            .get(thread_id)
-            .and_then(|t| self.pods.get(&t.pod_id))
-            .map(|pod| {
-                pod.config
-                    .allow
-                    .host_env
-                    .iter()
-                    .map(|e| e.provider.clone())
-                    .collect()
-            })
-            .unwrap_or_default();
-
-        let providers = self.host_env_provider_snapshot();
-        let mut out = String::new();
-        out.push_str(
-            "Host-env (sandbox) providers (in scope = referenced by at least one \
-             `[[allow.host_env]]` entry in this pod; out-of-scope entries require \
-             pod_modify to add):\n",
-        );
-        if providers.is_empty() {
-            out.push_str("  (no host-env providers registered on this server)\n");
-        } else {
-            for p in providers {
-                let scope = if in_scope.contains(&p.name) {
-                    "in scope"
-                } else {
-                    "not in scope"
-                };
-                let token = if p.has_token {
-                    "authenticated"
-                } else {
-                    "anonymous"
-                };
-                let reach = match &p.reachability {
-                    whisper_agent_protocol::HostEnvReachability::Unknown => "unknown".to_string(),
-                    whisper_agent_protocol::HostEnvReachability::Reachable { .. } => {
-                        "reachable".to_string()
-                    }
-                    whisper_agent_protocol::HostEnvReachability::Unreachable {
-                        last_error, ..
-                    } => format!("unreachable ({last_error})"),
-                };
-                let origin = match p.origin {
-                    whisper_agent_protocol::HostEnvProviderOrigin::Seeded => "seeded",
-                    whisper_agent_protocol::HostEnvProviderOrigin::Manual => "manual",
-                    whisper_agent_protocol::HostEnvProviderOrigin::RuntimeOverlay => {
-                        "runtime_overlay"
-                    }
-                };
-                out.push_str(&format!(
-                    "- `{name}` [{scope}] — url={url}, {token}, {reach}, origin={origin}\n",
-                    name = p.name,
-                    url = p.url,
                 ));
             }
         }

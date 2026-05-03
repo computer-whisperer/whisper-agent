@@ -22,11 +22,10 @@ mod wire_handler;
 use self::chat_render::{ChatItemEvent, render_item};
 use self::modals::{
     BehaviorEditorEvent, BucketsEvent, BuildProgressView, FileViewerEvent, ForkEvent,
-    NewBehaviorEvent, NewPodEvent, PodEditorEvent, ProviderEditorEvent, SettingsEvent,
-    render_behavior_editor_modal, render_buckets_modal, render_file_viewer_modal,
-    render_fork_modal, render_image_lightbox_modal, render_json_viewer_modal,
-    render_new_behavior_modal, render_new_pod_modal, render_pod_editor_modal,
-    render_provider_editor_modal, render_settings_modal,
+    NewBehaviorEvent, NewPodEvent, PodEditorEvent, SettingsEvent, render_behavior_editor_modal,
+    render_buckets_modal, render_file_viewer_modal, render_fork_modal, render_image_lightbox_modal,
+    render_json_viewer_modal, render_new_behavior_modal, render_new_pod_modal,
+    render_pod_editor_modal, render_settings_modal,
 };
 use self::widgets::{
     render_failure_banner, render_prefill_progress, render_resource_list, render_sudo_banners,
@@ -44,8 +43,8 @@ use whisper_agent_protocol::sandbox::NetworkPolicy;
 use whisper_agent_protocol::{
     AllowMap, Attachment, BackendSummary, BehaviorConfig, BehaviorOrigin, BehaviorSummary,
     BucketSummary, ClientToServer, EmbeddingProviderInfo, FsEntry, FunctionKind, FunctionSummary,
-    HostEnvProviderInfo, HostEnvSpec, ImageMime, ImageSource, ModelSummary, NamedHostEnv, PodAllow,
-    PodConfig, PodLimits, PodSummary, ResourceSnapshot, ServerToClient, SharedMcpAuthPublic,
+    HostEnvSpec, ImageMime, ImageSource, ModelSummary, NamedHostEnv, PodAllow, PodConfig,
+    PodLimits, PodSummary, ResourceSnapshot, ServerToClient, SharedMcpAuthPublic,
     SharedMcpHostInfo, ThreadBindings, ThreadBindingsRequest, ThreadConfigOverride, ThreadDefaults,
     ThreadStateLabel, ThreadSummary, Usage,
 };
@@ -884,22 +883,12 @@ pub struct ChatApp {
     /// known pod. Guarded by this set so we don't re-request on
     /// every `PodList` refresh.
     behaviors_requested: HashSet<String>,
-    /// Server's host-env-provider catalog. Populated lazily on first
-    /// ListHostEnvProviders round-trip; used by the pod editor's
-    /// per-entry provider dropdown. Can be empty — a server started
-    /// without any `[[host_env_providers]]` entries is a valid
-    /// configuration; pods in it just can't declare host envs.
-    host_env_providers: Vec<HostEnvProviderInfo>,
-    host_env_providers_requested: bool,
     /// Server's shared-MCP-host catalog. Populated lazily on the first
     /// ListSharedMcpHosts round-trip (triggered when the settings
     /// modal opens the Shared MCP tab). Read-only for non-admin
     /// clients; admins can add/edit/remove from the settings panel.
     shared_mcp_hosts: Vec<SharedMcpHostInfo>,
     shared_mcp_hosts_requested: bool,
-    /// Modal state for the per-provider add/edit form. `None` = closed.
-    /// Opened from the Providers tab (+Add or Edit row button).
-    provider_editor_modal: Option<ProviderEditorModalState>,
     /// Open state for the cog-button "Server settings" modal. `None`
     /// when closed. The inner state holds which settings tab is
     /// currently selected.
@@ -915,16 +904,6 @@ pub struct ChatApp {
     /// `true` once we've sent `ListBuckets` for this connection — keeps
     /// the modal-open path from re-firing the request every frame.
     buckets_requested: bool,
-    /// Provider names whose Remove button has been clicked once and is
-    /// waiting for confirmation. Two-click UX mirrors the pod archive
-    /// and behavior delete flows. Cleared on confirm / outside click /
-    /// successful remove response.
-    provider_remove_armed: HashSet<String>,
-    /// Per-provider in-flight remove correlation + any returned error.
-    /// The row renders "removing..." while a correlation is present;
-    /// on `HostEnvProviderRemoved` the entry is cleared; on `Error` the
-    /// message is stored for display and the correlation is cleared.
-    provider_remove_pending: HashMap<String, ProviderRemovePending>,
     /// Set of pod ids the user has manually collapsed in the left panel.
     /// Default is "all expanded"; toggling a header inverts membership.
     /// Persisted only in memory — re-expands across reloads.
@@ -1240,35 +1219,6 @@ impl NewPodModalState {
     }
 }
 
-/// State for the per-provider add/edit modal. `mode` decides whether
-/// the name field is editable (Add) or read-only (Edit); everything
-/// else is shared. On Save the form dispatches `AddHostEnvProvider` or
-/// `UpdateHostEnvProvider` and stores the correlation_id so the
-/// corresponding response can find and close the modal.
-///
-/// Token is a free-text field; for Edit, the initial value is blank —
-/// the server never sends tokens back — and saving with an empty
-/// token means "clear the token on this entry" (matches the
-/// protocol's UpdateHostEnvProvider `token: None` semantics).
-struct ProviderEditorModalState {
-    mode: ProviderEditorMode,
-    name: String,
-    url: String,
-    token: String,
-    /// Tracks whether the existing entry had a token at modal open —
-    /// used only to render a "currently authenticated" hint next to
-    /// the blank token field in Edit mode.
-    had_token: bool,
-    error: Option<String>,
-    pending_correlation: Option<String>,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum ProviderEditorMode {
-    Add,
-    Edit,
-}
-
 /// State for the knowledge-buckets management modal.
 ///
 /// Slice 9 added the search surface: `selected_bucket` /
@@ -1540,11 +1490,6 @@ struct ServerConfigEditorState {
 enum SettingsTab {
     #[default]
     Backends,
-    /// Host-env provider catalog (sandbox daemons threads provision
-    /// jails against). Used to live in the left sidebar next to
-    /// Threads/Resources; moved here so all server-wide settings are
-    /// in one place and the sidebar can focus on per-thread state.
-    HostEnvProviders,
     SharedMcp,
     /// Raw editor for `whisper-agent.toml`. Admin-only — the server
     /// rejects `FetchServerConfig` / `UpdateServerConfig` from
@@ -1645,41 +1590,6 @@ struct CodexRotateState {
     contents: String,
     error: Option<String>,
     pending_correlation: Option<String>,
-}
-
-impl ProviderEditorModalState {
-    fn new_add() -> Self {
-        Self {
-            mode: ProviderEditorMode::Add,
-            name: String::new(),
-            url: String::new(),
-            token: String::new(),
-            had_token: false,
-            error: None,
-            pending_correlation: None,
-        }
-    }
-
-    fn new_edit(info: &HostEnvProviderInfo) -> Self {
-        Self {
-            mode: ProviderEditorMode::Edit,
-            name: info.name.clone(),
-            url: info.url.clone(),
-            token: String::new(),
-            had_token: info.has_token,
-            error: None,
-            pending_correlation: None,
-        }
-    }
-}
-
-/// Tracks one in-flight `RemoveHostEnvProvider` request. `correlation`
-/// is the id we'll match against `HostEnvProviderRemoved` or `Error`;
-/// `error` carries any server-side refusal message (e.g. "referenced
-/// by pods [...]") so the row can render it inline.
-struct ProviderRemovePending {
-    correlation: String,
-    error: Option<String>,
 }
 
 /// State for the per-behavior editor modal. Edits two things in
@@ -2024,17 +1934,12 @@ impl ChatApp {
             pods: HashMap::new(),
             pods_requested: false,
             behaviors_requested: HashSet::new(),
-            host_env_providers: Vec::new(),
-            host_env_providers_requested: false,
             shared_mcp_hosts: Vec::new(),
             shared_mcp_hosts_requested: false,
-            provider_editor_modal: None,
             settings_modal: None,
             buckets_modal: None,
             buckets: Vec::new(),
             buckets_requested: false,
-            provider_remove_armed: HashSet::new(),
-            provider_remove_pending: HashMap::new(),
             collapsed_pods: HashSet::new(),
             expanded_interactive_pods: HashSet::new(),
             expanded_behavior_threads: HashSet::new(),
@@ -2506,12 +2411,6 @@ impl ChatApp {
                         correlation_id: None,
                     });
                     self.pods_requested = true;
-                }
-                if !self.host_env_providers_requested {
-                    self.send(ClientToServer::ListHostEnvProviders {
-                        correlation_id: None,
-                    });
-                    self.host_env_providers_requested = true;
                 }
                 if !self.shared_mcp_hosts_requested {
                     self.send(ClientToServer::ListSharedMcpHosts {
@@ -3496,7 +3395,6 @@ impl eframe::App for ChatApp {
             &mut self.pod_editor_modal,
             &self.backends,
             &self.resources,
-            &self.host_env_providers,
             &self.models_by_backend,
             &self.buckets,
         ) {
@@ -3602,31 +3500,6 @@ impl eframe::App for ChatApp {
             }
         }
         render_json_viewer_modal(&ctx, &mut self.json_viewer_modal);
-        if let Some(event) = render_provider_editor_modal(&ctx, &mut self.provider_editor_modal) {
-            let correlation = self.next_correlation_id();
-            let wire = match event {
-                ProviderEditorEvent::AddRequested { name, url, token } => {
-                    ClientToServer::AddHostEnvProvider {
-                        correlation_id: Some(correlation.clone()),
-                        name,
-                        url,
-                        token,
-                    }
-                }
-                ProviderEditorEvent::UpdateRequested { name, url, token } => {
-                    ClientToServer::UpdateHostEnvProvider {
-                        correlation_id: Some(correlation.clone()),
-                        name,
-                        url,
-                        token,
-                    }
-                }
-            };
-            if let Some(modal) = self.provider_editor_modal.as_mut() {
-                modal.pending_correlation = Some(correlation);
-            }
-            self.send(wire);
-        }
         // Knowledge-buckets modal — read-only list (slice 8b) plus
         // the search form (slice 9). Renderer emits `RunQuery` when
         // the user submits a search; we mint a correlation, stamp it
@@ -3743,9 +3616,6 @@ impl eframe::App for ChatApp {
             &mut self.settings_modal,
             &self.backends,
             &self.shared_mcp_hosts,
-            &self.host_env_providers,
-            &mut self.provider_remove_armed,
-            &self.provider_remove_pending,
         ) {
             match event {
                 SettingsEvent::CodexRotateSave { backend, contents } => {
@@ -3820,26 +3690,6 @@ impl eframe::App for ChatApp {
                         url,
                         auth,
                         prefix,
-                    });
-                }
-                SettingsEvent::OpenAddProvider => {
-                    self.provider_editor_modal = Some(ProviderEditorModalState::new_add());
-                }
-                SettingsEvent::OpenEditProvider(info) => {
-                    self.provider_editor_modal = Some(ProviderEditorModalState::new_edit(&info));
-                }
-                SettingsEvent::RemoveHostEnvProvider { name } => {
-                    let correlation = self.next_correlation_id();
-                    self.provider_remove_pending.insert(
-                        name.clone(),
-                        ProviderRemovePending {
-                            correlation: correlation.clone(),
-                            error: None,
-                        },
-                    );
-                    self.send(ClientToServer::RemoveHostEnvProvider {
-                        correlation_id: Some(correlation),
-                        name,
                     });
                 }
             }

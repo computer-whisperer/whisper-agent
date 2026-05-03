@@ -7,9 +7,7 @@
 use std::collections::HashMap;
 
 use egui::{Color32, RichText};
-use whisper_agent_protocol::{
-    BackendSummary, HostEnvProviderInfo, ModelSummary, PodConfig, ResourceSnapshot,
-};
+use whisper_agent_protocol::{BackendSummary, ModelSummary, PodConfig, ResourceSnapshot};
 
 use super::super::editor_render::{
     render_pod_editor_allow_tab, render_pod_editor_defaults_tab, render_pod_editor_limits_tab,
@@ -42,7 +40,6 @@ pub(crate) fn render_pod_editor_modal(
     slot: &mut Option<PodEditorModalState>,
     backends: &[BackendSummary],
     resources: &HashMap<String, ResourceSnapshot>,
-    host_env_providers: &[HostEnvProviderInfo],
     models_by_backend: &HashMap<String, Vec<ModelSummary>>,
     buckets: &[whisper_agent_protocol::BucketSummary],
 ) -> Vec<PodEditorEvent> {
@@ -66,7 +63,6 @@ pub(crate) fn render_pod_editor_modal(
             _ => None,
         })
         .collect();
-    let host_env_providers_owned: Vec<HostEnvProviderInfo> = host_env_providers.to_vec();
     let bucket_catalog: Vec<String> = buckets.iter().map(|b| b.id.clone()).collect();
     // Fire ListModels for whichever backend the model combo is about
     // to show against. Dedup-guarded by the caller.
@@ -162,7 +158,6 @@ pub(crate) fn render_pod_editor_modal(
                                     working,
                                     &backend_catalog,
                                     &shared_mcp_catalog,
-                                    &host_env_providers_owned,
                                     &bucket_catalog,
                                     &mut sandbox_entry_open,
                                     &mut sandbox_entry_delete,
@@ -199,14 +194,7 @@ pub(crate) fn render_pod_editor_modal(
         let mut sub_open = true;
         let mut sub_save = false;
         let mut sub_cancel = false;
-        render_sandbox_entry_modal(
-            ctx,
-            &mut sub,
-            &mut sub_open,
-            &mut sub_save,
-            &mut sub_cancel,
-            host_env_providers,
-        );
+        render_sandbox_entry_modal(ctx, &mut sub, &mut sub_open, &mut sub_save, &mut sub_cancel);
         if sub_save {
             if sub.entry.name.trim().is_empty() {
                 sub.error = Some("name is required".into());

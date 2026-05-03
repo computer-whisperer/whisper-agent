@@ -201,10 +201,11 @@ pub struct CompactionConfigOverride {
 }
 
 /// Concrete resource bindings for a thread. Each field names an entry in
-/// the scheduler's resource registry — `backend` by catalog name, `sandbox`
-/// by `HostEnvId` (content-hash of provider+spec), `mcp_hosts` by
-/// `McpHostId` (the ordered list the thread routes tool calls through,
-/// primary first).
+/// the scheduler's resource registry — `backend` by catalog name and
+/// `mcp_hosts` by `McpHostId` (the ordered list the thread routes tool
+/// calls through, primary first). Host-env bindings name a daemon
+/// admitted via `[[auth.daemons]]`; sessions are opened lazily over
+/// `/v1/host_env_link` on first tool call.
 ///
 /// `tool_filter`, when present, narrows the visible tool catalog to a
 /// whitelist of names — used by subagent / fork flows that want to expose
@@ -220,10 +221,9 @@ pub struct ThreadBindings {
     #[serde(default)]
     pub backend: String,
     /// Host envs the thread is bound to, in declared order. Empty vec
-    /// means "no host env" — the thread runs under the always-built-in
-    /// `bare` provider (in-process, no isolation). Each non-empty entry
-    /// resolves to its own runtime `HostEnvId` at registry-touch time;
-    /// the scheduler provisions and tears down envs independently.
+    /// means "no host env" — tools come only from shared MCP hosts
+    /// and built-ins. Each non-empty entry names a daemon admitted via
+    /// `[[auth.daemons]]`; sessions are opened lazily on first tool call.
     ///
     /// Persisted as an array. Legacy thread.json files (pre-multi-env)
     /// stored a single `HostEnvBinding` under `host_env` — the custom
@@ -597,13 +597,12 @@ pub enum ResourceStateLabel {
     TornDown,
 }
 
-/// Discriminator for resource events. The resource id strings are namespaced
-/// by prefix (`he-`, `mcp-primary-`, `mcp-shared-`, `backend-`) but carrying
-/// the kind explicitly lets clients route without prefix-parsing.
+/// Discriminator for resource events. The resource id strings are
+/// namespaced by prefix (`mcp-shared-`, `backend-`) but carrying the
+/// kind explicitly lets clients route without prefix-parsing.
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ResourceKind {
-    HostEnv,
     McpHost,
     Backend,
 }
@@ -615,18 +614,6 @@ pub enum ResourceKind {
 #[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ResourceSnapshot {
-    HostEnv {
-        id: String,
-        /// Provider name from the catalog this host env is bound to.
-        provider: String,
-        spec: HostEnvSpec,
-        state: ResourceStateLabel,
-        /// User ids (task ids today, thread ids after Phase 2). Sorted.
-        users: Vec<String>,
-        pinned: bool,
-        created_at: String,
-        last_used: String,
-    },
     McpHost {
         id: String,
         url: String,
@@ -659,12 +646,11 @@ pub enum ResourceSnapshot {
 impl ResourceSnapshot {
     pub fn id(&self) -> &str {
         match self {
-            Self::HostEnv { id, .. } | Self::McpHost { id, .. } | Self::Backend { id, .. } => id,
+            Self::McpHost { id, .. } | Self::Backend { id, .. } => id,
         }
     }
     pub fn kind(&self) -> ResourceKind {
         match self {
-            Self::HostEnv { .. } => ResourceKind::HostEnv,
             Self::McpHost { .. } => ResourceKind::McpHost,
             Self::Backend { .. } => ResourceKind::Backend,
         }

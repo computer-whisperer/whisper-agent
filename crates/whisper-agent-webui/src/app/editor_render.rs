@@ -22,8 +22,8 @@ use whisper_agent_protocol::tool_surface::{
 };
 use whisper_agent_protocol::{
     BehaviorConfig, BehaviorOpsCap, BehaviorSnapshot as BehaviorSnapshotProto, BehaviorSummary,
-    CatchUp, DispatchCap, Disposition, HostEnvProviderInfo, HostEnvSpec, ModelSummary, Overlap,
-    PodConfig, PodModifyCap, RetentionPolicy, TriggerSpec,
+    CatchUp, DispatchCap, Disposition, HostEnvSpec, ModelSummary, Overlap, PodConfig, PodModifyCap,
+    RetentionPolicy, TriggerSpec,
 };
 
 fn disposition_label(d: Disposition) -> &'static str {
@@ -136,7 +136,6 @@ pub(super) fn render_pod_editor_allow_tab(
     working: &mut PodConfig,
     backend_catalog: &[String],
     shared_mcp_catalog: &[String],
-    host_env_providers: &[HostEnvProviderInfo],
     bucket_catalog: &[String],
     sandbox_open: &mut Option<SandboxEntryEditorState>,
     sandbox_delete: &mut Option<usize>,
@@ -270,9 +269,9 @@ pub(super) fn render_pod_editor_allow_tab(
     hint(
         ui,
         "Each entry is a named (provider, spec) pair threads in this pod can bind \
-         to. Every entry dispatches to one of the server's configured \
-         `[[host_env_providers]]` daemons. A pod with zero entries is valid — its \
-         threads run with shared MCPs only (no bash / file / edit tools).",
+         to. `provider` names a daemon admitted via `[[auth.daemons]]`. A pod with \
+         zero entries is valid — its threads run with shared MCPs only (no bash / \
+         file / edit tools).",
     );
     if working.allow.host_env.is_empty() {
         ui.label(
@@ -321,8 +320,7 @@ pub(super) fn render_pod_editor_allow_tab(
     }
     ui.add_space(4.0);
     if ui.button("+ Add host env").clicked() {
-        let default_provider = host_env_providers.first().map(|p| p.name.as_str());
-        *sandbox_open = Some(SandboxEntryEditorState::new_for_add(default_provider));
+        *sandbox_open = Some(SandboxEntryEditorState::new_for_add(None));
     }
 
     ui.add_space(10.0);
@@ -1922,7 +1920,6 @@ pub(super) fn render_sandbox_entry_modal(
     open: &mut bool,
     save: &mut bool,
     cancel: &mut bool,
-    providers: &[HostEnvProviderInfo],
 ) {
     let title = match sub.index {
         Some(_) => "Edit host env".to_string(),
@@ -1977,32 +1974,11 @@ pub(super) fn render_sandbox_entry_modal(
                                 ui.end_row();
 
                                 ui.label("provider");
-                                ComboBox::from_id_salt("sandbox_entry_provider")
-                                    .selected_text(if sub.entry.provider.is_empty() {
-                                        "(pick one)".into()
-                                    } else {
-                                        sub.entry.provider.clone()
-                                    })
-                                    .show_ui(ui, |ui| {
-                                        if providers.is_empty() {
-                                            ui.label(
-                                                RichText::new(
-                                                    "no providers configured — add \
-                                                     `[[host_env_providers]]` entries to \
-                                                     whisper-agent.toml",
-                                                )
-                                                .italics()
-                                                .color(Color32::from_gray(160)),
-                                            );
-                                        }
-                                        for p in providers {
-                                            ui.selectable_value(
-                                                &mut sub.entry.provider,
-                                                p.name.clone(),
-                                                &p.name,
-                                            );
-                                        }
-                                    });
+                                ui.add(
+                                    TextEdit::singleline(&mut sub.entry.provider)
+                                        .hint_text("daemon name from `[[auth.daemons]]`")
+                                        .desired_width(f32::INFINITY),
+                                );
                                 ui.end_row();
                                 ui.label("type");
                                 let current = spec_type_label(&sub.entry.spec);

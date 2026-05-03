@@ -66,9 +66,8 @@ pub enum LinkError {
 /// Server-side registry of v2 host-env daemons.
 ///
 /// Two membership tiers, distinct by design:
-/// - **`admitted`** — daemon names admitted by `[[auth.daemons]]` /
-///   `[[host_env_providers]] kind = "v2_ws"`. Stable across restarts;
-///   reflects what the operator has configured.
+/// - **`admitted`** — daemon names admitted by `[[auth.daemons]]`.
+///   Stable across restarts; reflects what the operator has configured.
 /// - **`connected`** — daemon names currently holding a live WS to
 ///   this scheduler. Comes and goes as daemons dial in / drop out.
 ///

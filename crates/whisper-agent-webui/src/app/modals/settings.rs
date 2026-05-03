@@ -11,22 +11,20 @@
 //! `SettingsEvent`s for anything that needs `ChatApp` (correlation
 //! ids, wire dispatch, sibling-modal slots).
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 
 use egui::{Color32, RichText, ScrollArea, TextEdit};
 use whisper_agent_protocol::{
-    BackendSummary, HostEnvProviderInfo, SharedMcpAuthInput, SharedMcpAuthPublic,
-    SharedMcpHostInfo, SharedMcpPrefixInput,
+    BackendSummary, SharedMcpAuthInput, SharedMcpAuthPublic, SharedMcpHostInfo,
+    SharedMcpPrefixInput,
 };
 
 use super::super::widgets::{
-    OAUTH_AVAILABLE, ProviderRowEvent, render_backend_settings_row, render_provider_row,
-    render_shared_mcp_host_row, webui_origin,
+    OAUTH_AVAILABLE, render_backend_settings_row, render_shared_mcp_host_row, webui_origin,
 };
 use super::super::{
-    CodexRotateState, ProviderRemovePending, ServerConfigEditorState, SettingsModalState,
-    SettingsTab, SharedMcpAuthChoice, SharedMcpEditorMode, SharedMcpEditorState,
-    SharedMcpPrefixChoice,
+    CodexRotateState, ServerConfigEditorState, SettingsModalState, SettingsTab,
+    SharedMcpAuthChoice, SharedMcpEditorMode, SharedMcpEditorState, SharedMcpPrefixChoice,
 };
 
 /// Side-channel actions a `render_settings_modal` call can emit.
@@ -70,13 +68,6 @@ pub(crate) enum SettingsEvent {
         auth: Option<SharedMcpAuthInput>,
         prefix: SharedMcpPrefixInput,
     },
-
-    /// Host-env-providers tab: + Add provider clicked.
-    OpenAddProvider,
-    /// Host-env-providers tab: row Edit clicked.
-    OpenEditProvider(HostEnvProviderInfo),
-    /// Host-env-providers tab: row Remove confirmed.
-    RemoveHostEnvProvider { name: String },
 }
 
 pub(crate) fn render_settings_modal(
@@ -84,9 +75,6 @@ pub(crate) fn render_settings_modal(
     slot: &mut Option<SettingsModalState>,
     backends: &[BackendSummary],
     shared_mcp_hosts: &[SharedMcpHostInfo],
-    host_env_providers: &[HostEnvProviderInfo],
-    provider_remove_armed: &mut HashSet<String>,
-    provider_remove_pending: &HashMap<String, ProviderRemovePending>,
 ) -> Vec<SettingsEvent> {
     let mut events = Vec::new();
     let Some(mut modal) = slot.take() else {
@@ -116,15 +104,6 @@ pub(crate) fn render_settings_modal(
                 }
                 if ui
                     .selectable_label(
-                        modal.active_tab == SettingsTab::HostEnvProviders,
-                        "Host-env providers",
-                    )
-                    .clicked()
-                {
-                    modal.active_tab = SettingsTab::HostEnvProviders;
-                }
-                if ui
-                    .selectable_label(
                         modal.active_tab == SettingsTab::SharedMcp,
                         "Shared MCP hosts",
                     )
@@ -150,13 +129,6 @@ pub(crate) fn render_settings_modal(
                     backends,
                     &modal.codex_rotate_banner,
                     &mut rotate_request,
-                ),
-                SettingsTab::HostEnvProviders => render_host_env_providers_tab(
-                    ui,
-                    host_env_providers,
-                    provider_remove_armed,
-                    provider_remove_pending,
-                    &mut events,
                 ),
                 SettingsTab::SharedMcp => render_shared_mcp_tab(
                     ui,
@@ -442,8 +414,7 @@ fn render_server_config_tab(
             "Edits the server-level whisper-agent.toml. Backend-catalog \
              changes hot-swap immediately and cancel any thread using a \
              removed or modified backend. Other sections (shared_mcp_hosts, \
-             host_env_providers, secrets, auth) persist to disk but require \
-             a server restart.",
+             secrets, auth) persist to disk but require a server restart.",
         )
         .small()
         .color(Color32::from_gray(170)),
@@ -959,73 +930,6 @@ fn render_shared_mcp_editor_subform(
     } else {
         modal.shared_mcp_editor = Some(sub);
     }
-}
-
-/// Host-env-providers tab. Lists registered providers with origin +
-/// reachability badges. "+ Add provider" opens the provider editor;
-/// per-row Edit / Remove dispatch through the row event reducer.
-fn render_host_env_providers_tab(
-    ui: &mut egui::Ui,
-    host_env_providers: &[HostEnvProviderInfo],
-    provider_remove_armed: &mut HashSet<String>,
-    provider_remove_pending: &HashMap<String, ProviderRemovePending>,
-    events: &mut Vec<SettingsEvent>,
-) {
-    ui.label(
-        RichText::new(
-            "Sandbox daemons threads can provision isolated host envs \
-             against. Each thread that binds a host env gets its own \
-             landlock-isolated MCP host from the daemon named here.",
-        )
-        .small()
-        .color(Color32::from_gray(150)),
-    );
-    ui.add_space(6.0);
-    ui.horizontal(|ui| {
-        if ui.button("+ Add provider").clicked() {
-            events.push(SettingsEvent::OpenAddProvider);
-        }
-    });
-    ui.add_space(4.0);
-
-    if host_env_providers.is_empty() {
-        ui.label(
-            RichText::new(
-                "No providers registered. Add one above or seed via \
-                 [[host_env_providers]] in whisper-agent.toml.",
-            )
-            .small()
-            .color(Color32::from_gray(150)),
-        );
-        return;
-    }
-
-    ScrollArea::vertical().show(ui, |ui| {
-        for provider in host_env_providers {
-            let pending = provider_remove_pending.get(&provider.name);
-            let removing = pending.is_some_and(|p| p.error.is_none());
-            let pending_error = pending.and_then(|p| p.error.as_deref());
-            let armed = provider_remove_armed.contains(&provider.name);
-            if let Some(event) = render_provider_row(ui, provider, armed, removing, pending_error) {
-                match event {
-                    ProviderRowEvent::EditRequested => {
-                        events.push(SettingsEvent::OpenEditProvider(provider.clone()));
-                    }
-                    ProviderRowEvent::RemoveArmed => {
-                        provider_remove_armed.insert(provider.name.clone());
-                    }
-                    ProviderRowEvent::RemoveConfirmed => {
-                        provider_remove_armed.remove(&provider.name);
-                        events.push(SettingsEvent::RemoveHostEnvProvider {
-                            name: provider.name.clone(),
-                        });
-                    }
-                }
-            }
-            ui.add_space(2.0);
-            ui.separator();
-        }
-    });
 }
 
 /// Renderer-local correlation id. The wire response handler matches
