@@ -287,13 +287,68 @@ where
 pub enum HostEnvBinding {
     Named {
         name: String,
+        /// Working directory for tools running in this binding's session.
+        /// Must sit inside one of the named entry's RW `allowed_paths`
+        /// (landlock allows access below the granted node, so a sub-path
+        /// of an RW root is itself RW).
+        ///
+        /// Defaulted at thread compose time to the named entry's first RW
+        /// path, so persisted threads always carry an explicit value —
+        /// the daemon no longer guesses. `None` is reserved for legacy
+        /// thread.json files persisted before this field existed; the
+        /// scheduler fills it in on load.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        workspace_root: Option<std::path::PathBuf>,
     },
     /// Reserved: ad-hoc/subagent path — not constructable from any
     /// current wire request type.
-    Inline {
-        provider: String,
-        spec: HostEnvSpec,
-    },
+    Inline { provider: String, spec: HostEnvSpec },
+}
+
+/// Per-host-env-entry override carried in [`ThreadBindingsRequest`]. A
+/// bare string deserializes to `{ name, workspace_root: None }` — kept
+/// as a back-compat path so older clients (or hand-written
+/// `dispatch_thread` calls) sending `host_env: ["foo", "bar"]` still
+/// resolve cleanly.
+#[derive(Serialize, Debug, Clone, Default, PartialEq, Eq)]
+pub struct HostEnvBindingRequest {
+    /// Name of the `[[allow.host_env]]` entry to bind to.
+    pub name: String,
+    /// Optional explicit working directory. `None` lets the scheduler
+    /// default it to the named entry's first RW path at compose time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_root: Option<std::path::PathBuf>,
+}
+
+impl<'de> Deserialize<'de> for HostEnvBindingRequest {
+    fn deserialize<D>(d: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Shape {
+            Bare(String),
+            Full {
+                name: String,
+                #[serde(default)]
+                workspace_root: Option<std::path::PathBuf>,
+            },
+        }
+        Ok(match Shape::deserialize(d)? {
+            Shape::Bare(name) => HostEnvBindingRequest {
+                name,
+                workspace_root: None,
+            },
+            Shape::Full {
+                name,
+                workspace_root,
+            } => HostEnvBindingRequest {
+                name,
+                workspace_root,
+            },
+        })
+    }
 }
 
 /// Client-side overrides for the bindings the pod's `thread_defaults` would
@@ -305,13 +360,15 @@ pub struct ThreadBindingsRequest {
     /// Backend catalog name. Empty → server default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub backend: Option<String>,
-    /// Names of `[[allow.host_env]]` entries in the target pod. `None`
-    /// inherits the pod's `thread_defaults.host_env`; `Some(vec)`
-    /// replaces exactly (empty vec means "no host envs — bare thread").
-    /// Each name must resolve in the pod's allow list — the server
-    /// rejects unknown names.
+    /// `[[allow.host_env]]` entries in the target pod. `None` inherits the
+    /// pod's `thread_defaults.host_env`; `Some(vec)` replaces exactly
+    /// (empty vec means "no host envs — bare thread"). Each entry can
+    /// be either a bare name string (back-compat shape) or a full
+    /// [`HostEnvBindingRequest`] object that also carries an optional
+    /// `workspace_root`. Names must resolve in the pod's allow list —
+    /// the server rejects unknown names.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub host_env: Option<Vec<String>>,
+    pub host_env: Option<Vec<HostEnvBindingRequest>>,
     /// Catalog names of shared MCP hosts the thread should bind to. `None`
     /// inherits the pod default; `Some(vec)` replaces exactly (empty vec
     /// means "no shared hosts beyond the primary").
@@ -2328,6 +2385,108 @@ pub fn decode_from_server(bytes: &[u8]) -> Result<ServerToClient, CodecError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn host_env_binding_request_accepts_bare_string() {
+        // Back-compat: older clients and hand-written `dispatch_thread`
+        // calls send `host_env: ["foo"]`. The custom deserializer must
+        // wrap each bare name into a `HostEnvBindingRequest` with a
+        // None workspace_root (so the resolver fills it from the spec).
+        let json = r#"{ "host_env": ["foo", "bar"] }"#;
+        let req: ThreadBindingsRequest = serde_json::from_str(json).unwrap();
+        let entries = req.host_env.expect("host_env populated");
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].name, "foo");
+        assert!(entries[0].workspace_root.is_none());
+        assert_eq!(entries[1].name, "bar");
+        assert!(entries[1].workspace_root.is_none());
+    }
+
+    #[test]
+    fn host_env_binding_request_accepts_full_object() {
+        // New shape: object with optional workspace_root.
+        let json = r#"{
+            "host_env": [
+                { "name": "foo", "workspace_root": "/work/foo" },
+                { "name": "bar" }
+            ]
+        }"#;
+        let req: ThreadBindingsRequest = serde_json::from_str(json).unwrap();
+        let entries = req.host_env.expect("host_env populated");
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].name, "foo");
+        assert_eq!(
+            entries[0].workspace_root.as_deref(),
+            Some(std::path::Path::new("/work/foo"))
+        );
+        assert_eq!(entries[1].name, "bar");
+        assert!(entries[1].workspace_root.is_none());
+    }
+
+    #[test]
+    fn host_env_binding_request_mixed_shapes() {
+        // Each entry deserializes independently — bare strings and
+        // full objects can coexist in the same array.
+        let json = r#"{
+            "host_env": [
+                "foo",
+                { "name": "bar", "workspace_root": "/work/bar" }
+            ]
+        }"#;
+        let req: ThreadBindingsRequest = serde_json::from_str(json).unwrap();
+        let entries = req.host_env.expect("host_env populated");
+        assert_eq!(entries.len(), 2);
+        assert!(entries[0].workspace_root.is_none());
+        assert_eq!(
+            entries[1].workspace_root.as_deref(),
+            Some(std::path::Path::new("/work/bar"))
+        );
+    }
+
+    #[test]
+    fn host_env_binding_named_workspace_root_round_trips() {
+        // Persisted thread.json uses the wire HostEnvBinding type;
+        // workspace_root must round-trip and stay omitted when None.
+        let with = HostEnvBinding::Named {
+            name: "default".into(),
+            workspace_root: Some(std::path::PathBuf::from("/work/x")),
+        };
+        let s = serde_json::to_string(&with).unwrap();
+        assert!(s.contains("workspace_root"));
+        assert!(s.contains("/work/x"));
+        let back: HostEnvBinding = serde_json::from_str(&s).unwrap();
+        assert_eq!(back, with);
+
+        let without = HostEnvBinding::Named {
+            name: "default".into(),
+            workspace_root: None,
+        };
+        let s = serde_json::to_string(&without).unwrap();
+        assert!(
+            !s.contains("workspace_root"),
+            "None should serialize as omitted: {s}"
+        );
+        let back: HostEnvBinding = serde_json::from_str(&s).unwrap();
+        assert_eq!(back, without);
+    }
+
+    #[test]
+    fn host_env_binding_named_legacy_thread_json_loads() {
+        // Persisted thread.json files predating the workspace_root
+        // field carry no such key. Deserialize must fill in None.
+        let json = r#"{ "kind": "named", "name": "default" }"#;
+        let b: HostEnvBinding = serde_json::from_str(json).unwrap();
+        match b {
+            HostEnvBinding::Named {
+                name,
+                workspace_root,
+            } => {
+                assert_eq!(name, "default");
+                assert!(workspace_root.is_none());
+            }
+            _ => panic!("expected Named"),
+        }
+    }
 
     #[test]
     fn fork_thread_reset_capabilities_defaults_false() {

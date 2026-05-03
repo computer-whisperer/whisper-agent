@@ -43,10 +43,10 @@ use whisper_agent_protocol::sandbox::NetworkPolicy;
 use whisper_agent_protocol::{
     AllowMap, Attachment, BackendSummary, BehaviorConfig, BehaviorOrigin, BehaviorSummary,
     BucketSummary, ClientToServer, EmbeddingProviderInfo, FsEntry, FunctionKind, FunctionSummary,
-    HostEnvSpec, ImageMime, ImageSource, ModelSummary, NamedHostEnv, PodAllow, PodConfig,
-    PodLimits, PodSummary, ResourceSnapshot, ServerToClient, SharedMcpAuthPublic,
-    SharedMcpHostInfo, ThreadBindings, ThreadBindingsRequest, ThreadConfigOverride, ThreadDefaults,
-    ThreadStateLabel, ThreadSummary, Usage,
+    HostEnvBindingRequest, HostEnvSpec, ImageMime, ImageSource, ModelSummary, NamedHostEnv,
+    PodAllow, PodConfig, PodLimits, PodSummary, ResourceSnapshot, ServerToClient,
+    SharedMcpAuthPublic, SharedMcpHostInfo, ThreadBindings, ThreadBindingsRequest,
+    ThreadConfigOverride, ThreadDefaults, ThreadStateLabel, ThreadSummary, Usage,
 };
 
 /// Brand icon shown in the top-bar header. Embedded at compile time so
@@ -144,6 +144,21 @@ impl StagedAttachment {
 /// MIME set tight — only our `ImageMime` variants are accepted,
 /// anything else becomes `None` and the drop is rejected at the
 /// compose-area boundary with a visible toast.
+/// First read-write path declared in a host-env spec, used as the
+/// compose-time default for `workspace_root`. Mirrors the server's
+/// `default_workspace_root_for` (in `runtime/scheduler/bindings.rs`)
+/// so the UI shows the same value the server would otherwise pick.
+fn default_workspace_root_for_spec(spec: &HostEnvSpec) -> Option<std::path::PathBuf> {
+    use whisper_agent_protocol::sandbox::AccessMode;
+    match spec {
+        HostEnvSpec::Landlock { allowed_paths, .. } => allowed_paths
+            .iter()
+            .find(|p| p.mode == AccessMode::ReadWrite)
+            .map(|p| std::path::PathBuf::from(&p.path)),
+        HostEnvSpec::Container { .. } => None,
+    }
+}
+
 fn sniff_image_mime(bytes: &[u8]) -> Option<ImageMime> {
     if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
         Some(ImageMime::Png)
@@ -853,7 +868,7 @@ pub struct ChatApp {
     /// and the server rejects unknown names. Reset back to `None` after
     /// every submit so the next compose starts from the pod default,
     /// not whatever the previous thread used.
-    compose_host_env: Option<Vec<String>>,
+    compose_host_env: Option<Vec<HostEnvBindingRequest>>,
     /// Compose target pod id we last resolved the picker overrides
     /// against. When this changes (e.g. the user clicks "+ Thread" in
     /// a different pod), we clear `picker_backend`/`picker_model`/
@@ -3003,18 +3018,63 @@ impl eframe::App for ChatApp {
                             if let Some(selected) = self.compose_host_env.as_mut() {
                                 ui.horizontal_wrapped(|ui| {
                                     for nh in &pod_config.allow.host_env {
-                                        let mut on = selected.iter().any(|n| n == &nh.name);
+                                        let mut on = selected.iter().any(|r| r.name == nh.name);
                                         if ui.checkbox(&mut on, &nh.name).changed() {
                                             if on {
-                                                if !selected.iter().any(|n| n == &nh.name) {
-                                                    selected.push(nh.name.clone());
+                                                if !selected.iter().any(|r| r.name == nh.name) {
+                                                    selected.push(HostEnvBindingRequest {
+                                                        name: nh.name.clone(),
+                                                        workspace_root:
+                                                            default_workspace_root_for_spec(
+                                                                &nh.spec,
+                                                            ),
+                                                    });
                                                 }
                                             } else {
-                                                selected.retain(|n| n != &nh.name);
+                                                selected.retain(|r| r.name != nh.name);
                                             }
                                         }
                                     }
                                 });
+                                // Per-selected-entry working-directory
+                                // override. Defaults to the named entry's
+                                // first RW path; user can edit. Empty
+                                // textedit serializes as `None` and the
+                                // server backfills with the same default.
+                                if !selected.is_empty() {
+                                    egui::Grid::new("compose_host_env_workspaces")
+                                        .num_columns(2)
+                                        .spacing([8.0, 2.0])
+                                        .show(ui, |ui| {
+                                            for entry in selected.iter_mut() {
+                                                ui.label(
+                                                    RichText::new(format!("  {} cwd", entry.name))
+                                                        .small()
+                                                        .color(Color32::from_gray(180)),
+                                                );
+                                                let mut text = entry
+                                                    .workspace_root
+                                                    .as_ref()
+                                                    .map(|p| p.display().to_string())
+                                                    .unwrap_or_default();
+                                                if ui
+                                                    .add(
+                                                        egui::TextEdit::singleline(&mut text)
+                                                            .hint_text("/absolute/path")
+                                                            .desired_width(360.0),
+                                                    )
+                                                    .changed()
+                                                {
+                                                    entry.workspace_root = if text.is_empty() {
+                                                        None
+                                                    } else {
+                                                        Some(std::path::PathBuf::from(&text))
+                                                    };
+                                                }
+                                                ui.end_row();
+                                            }
+                                        });
+                                }
                             }
                         }
                     });

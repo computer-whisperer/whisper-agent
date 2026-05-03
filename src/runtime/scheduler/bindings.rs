@@ -5,10 +5,55 @@
 //! scope as well. Pure — no scheduler state — so the cap-enforcement
 //! rules live in one readable place.
 
-use whisper_agent_protocol::{HostEnvBinding, ThreadBindingsRequest};
+use std::path::PathBuf;
+
+use whisper_agent_protocol::sandbox::AccessMode;
+use whisper_agent_protocol::{
+    HostEnvBinding, HostEnvBindingRequest, HostEnvSpec, ThreadBindingsRequest,
+};
 
 use crate::permission::Scope;
 use crate::pod::Pod;
+
+/// First read-write path declared in the named host-env entry's spec,
+/// used as the compose-time default for `workspace_root` so persisted
+/// bindings always carry an explicit working directory. Returns `None`
+/// for container specs (which carry mounts rather than landlock paths)
+/// and for landlock specs declaring no RW entries.
+pub(super) fn default_workspace_root_for(pod: &Pod, name: &str) -> Option<PathBuf> {
+    let entry = pod
+        .config
+        .allow
+        .host_env
+        .iter()
+        .find(|nh| nh.name == name)?;
+    match &entry.spec {
+        HostEnvSpec::Landlock { allowed_paths, .. } => allowed_paths
+            .iter()
+            .find(|p| p.mode == AccessMode::ReadWrite)
+            .map(|p| PathBuf::from(&p.path)),
+        HostEnvSpec::Container { .. } => None,
+    }
+}
+
+/// True iff `candidate` is at or below one of the named entry's RW
+/// paths. Used to validate operator-supplied `workspace_root` overrides.
+pub(super) fn workspace_root_in_allowed_rw(
+    pod: &Pod,
+    name: &str,
+    candidate: &std::path::Path,
+) -> bool {
+    let Some(entry) = pod.config.allow.host_env.iter().find(|nh| nh.name == name) else {
+        return false;
+    };
+    match &entry.spec {
+        HostEnvSpec::Landlock { allowed_paths, .. } => allowed_paths
+            .iter()
+            .filter(|p| p.mode == AccessMode::ReadWrite)
+            .any(|p| candidate.starts_with(&p.path)),
+        HostEnvSpec::Container { .. } => false,
+    }
+}
 
 /// Resolved binding-side choices for a fresh thread. Validated against
 /// the pod's `[allow]` cap (and the parent's scope, for dispatched
@@ -65,14 +110,28 @@ pub(super) fn resolve_bindings_choice(
         ));
     }
 
-    // `None` → inherit the pod default list; `Some(vec)` → replace
-    // exactly (empty vec means "bind to nothing, thread runs bare").
-    let chosen_names: Vec<String> = request
-        .host_env
-        .unwrap_or_else(|| defaults.host_env.clone());
-    let host_env: Vec<HostEnvBinding> = chosen_names
+    // `None` → inherit the pod default list with default workspace_root
+    // per entry; `Some(vec)` → replace exactly (empty vec means "bind to
+    // nothing, thread runs bare"). Per-entry workspace_root: if the
+    // request didn't pin one, default to the named entry's first RW path
+    // so the persisted binding always carries an explicit value.
+    let chosen: Vec<HostEnvBindingRequest> = request.host_env.unwrap_or_else(|| {
+        defaults
+            .host_env
+            .iter()
+            .map(|name| HostEnvBindingRequest {
+                name: name.clone(),
+                workspace_root: None,
+            })
+            .collect()
+    });
+    let host_env: Vec<HostEnvBinding> = chosen
         .into_iter()
-        .map(|name| {
+        .map(|req| {
+            let HostEnvBindingRequest {
+                name,
+                workspace_root,
+            } = req;
             if !allow.host_env.iter().any(|nh| nh.name == name) {
                 return Err(format!(
                     "host env `{name}` not in pod `{}`'s allow.host_env ({})",
@@ -96,7 +155,25 @@ pub(super) fn resolve_bindings_choice(
                     "host env `{name}` not in dispatching parent's scope.host_envs"
                 ));
             }
-            Ok(HostEnvBinding::Named { name })
+            // Validate explicit workspace_root sits inside the named
+            // entry's RW paths; default it from the spec when unset.
+            let workspace_root = match workspace_root {
+                Some(p) => {
+                    if !workspace_root_in_allowed_rw(pod, &name, &p) {
+                        return Err(format!(
+                            "host env `{name}` workspace_root `{}` is not under any \
+                             read-write path in the entry's spec",
+                            p.display()
+                        ));
+                    }
+                    Some(p)
+                }
+                None => default_workspace_root_for(pod, &name),
+            };
+            Ok(HostEnvBinding::Named {
+                name,
+                workspace_root,
+            })
         })
         .collect::<Result<_, _>>()?;
 
@@ -144,7 +221,7 @@ pub(super) fn narrow_resolved_bindings_to_scope(
     scope_filter: &Scope,
 ) -> Result<(), String> {
     resolved.host_env.retain(|b| match b {
-        HostEnvBinding::Named { name } => scope_filter.host_envs.admits(name),
+        HostEnvBinding::Named { name, .. } => scope_filter.host_envs.admits(name),
         // Inline bindings have no catalog name to gate on a
         // `SetOrAll<String>`; `resolve_bindings_choice` only ever
         // emits `Named` from the top-level path, so this arm is
@@ -267,7 +344,10 @@ mod tests {
         let parent = parent_scope_only(&["anthropic"], &["narrow"], &["fetch"]);
         let req = ThreadBindingsRequest {
             backend: None,
-            host_env: Some(vec!["wide".into()]),
+            host_env: Some(vec![HostEnvBindingRequest {
+                name: "wide".into(),
+                workspace_root: None,
+            }]),
             mcp_hosts: None,
         };
         let err = resolve_bindings_choice(&pod, Some(req), Some(&parent)).unwrap_err();
@@ -293,7 +373,10 @@ mod tests {
         let parent = parent_scope_only(&["anthropic"], &["wide", "narrow"], &["fetch", "search"]);
         let req = ThreadBindingsRequest {
             backend: Some("anthropic".into()),
-            host_env: Some(vec!["narrow".into()]),
+            host_env: Some(vec![HostEnvBindingRequest {
+                name: "narrow".into(),
+                workspace_root: None,
+            }]),
             mcp_hosts: Some(vec!["search".into()]),
         };
         let r = resolve_bindings_choice(&pod, Some(req), Some(&parent)).unwrap();
@@ -323,7 +406,16 @@ mod tests {
             &pod,
             Some(ThreadBindingsRequest {
                 backend: None,
-                host_env: Some(vec!["wide".into(), "narrow".into()]),
+                host_env: Some(vec![
+                    HostEnvBindingRequest {
+                        name: "wide".into(),
+                        workspace_root: None,
+                    },
+                    HostEnvBindingRequest {
+                        name: "narrow".into(),
+                        workspace_root: None,
+                    },
+                ]),
                 mcp_hosts: None,
             }),
             None,
@@ -334,7 +426,7 @@ mod tests {
         assert_eq!(resolved.host_env.len(), 1);
         assert!(matches!(
             &resolved.host_env[0],
-            HostEnvBinding::Named { name } if name == "narrow"
+            HostEnvBinding::Named { name, .. } if name == "narrow"
         ));
     }
 

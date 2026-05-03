@@ -86,7 +86,10 @@ pub struct Worker {
 
 #[derive(Debug, thiserror::Error)]
 pub enum WorkerError {
-    #[error("no read-write path in spec — cannot determine workspace root")]
+    #[error(
+        "ThreadContext.workspace_root is required — the scheduler must set it explicitly \
+         (the daemon no longer guesses from the spec's RW paths)"
+    )]
     NoWorkspaceRoot,
     #[error(
         "workspace_root override `{override_path}` is not under any read-write path in the spec"
@@ -216,37 +219,33 @@ pub async fn spawn(
     }
 }
 
-/// Pick the workspace root for a session. If the caller supplies an
-/// override, it must be one of the spec's read-write paths (or a
-/// descendant of one — landlock allows access below the granted node,
-/// so a sub-path of an RW root is itself RW). Otherwise fall back to
-/// the first RW path in the spec.
+/// Pick the workspace root for a session. The caller (scheduler via
+/// `ThreadContext.workspace_root`) **must** supply an override; the
+/// daemon no longer guesses from the spec's RW paths. The override
+/// must be at or below one of the spec's RW paths (landlock allows
+/// access below a granted node, so a sub-path of an RW root is itself
+/// RW). `None` is rejected with [`WorkerError::NoWorkspaceRoot`].
 pub(crate) fn resolve_workspace_root(
     allowed_paths: &[PathAccess],
     workspace_root_override: Option<&Path>,
 ) -> Result<PathBuf, WorkerError> {
+    let Some(override_path) = workspace_root_override else {
+        return Err(WorkerError::NoWorkspaceRoot);
+    };
     let rw_roots: Vec<&str> = allowed_paths
         .iter()
         .filter(|p| p.mode == AccessMode::ReadWrite)
         .map(|p| p.path.as_str())
         .collect();
-    if rw_roots.is_empty() {
-        return Err(WorkerError::NoWorkspaceRoot);
-    }
-    match workspace_root_override {
-        None => Ok(PathBuf::from(rw_roots[0])),
-        Some(override_path) => {
-            let inside_rw = rw_roots
-                .iter()
-                .any(|root| override_path.starts_with(Path::new(root)));
-            if inside_rw {
-                Ok(override_path.to_path_buf())
-            } else {
-                Err(WorkerError::WorkspaceRootNotInSpec {
-                    override_path: override_path.display().to_string(),
-                })
-            }
-        }
+    let inside_rw = rw_roots
+        .iter()
+        .any(|root| override_path.starts_with(Path::new(root)));
+    if inside_rw {
+        Ok(override_path.to_path_buf())
+    } else {
+        Err(WorkerError::WorkspaceRootNotInSpec {
+            override_path: override_path.display().to_string(),
+        })
     }
 }
 
@@ -711,20 +710,21 @@ mod tests {
     use super::*;
 
     #[test]
-    fn resolve_workspace_root_uses_first_rw_when_no_override() {
+    fn resolve_workspace_root_errors_when_override_missing() {
+        // The daemon no longer guesses; the scheduler is responsible
+        // for setting workspace_root explicitly via ThreadContext.
         let paths = vec![
             PathAccess::read_only("/lib"),
             PathAccess::read_write("/work/a"),
-            PathAccess::read_write("/work/b"),
         ];
-        assert_eq!(
-            resolve_workspace_root(&paths, None).unwrap(),
-            PathBuf::from("/work/a")
-        );
+        assert!(matches!(
+            resolve_workspace_root(&paths, None),
+            Err(WorkerError::NoWorkspaceRoot)
+        ));
     }
 
     #[test]
-    fn resolve_workspace_root_errors_when_no_rw_path() {
+    fn resolve_workspace_root_errors_when_override_missing_and_no_rw_path() {
         let paths = vec![PathAccess::read_only("/lib")];
         assert!(matches!(
             resolve_workspace_root(&paths, None),

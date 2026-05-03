@@ -284,14 +284,21 @@ impl Scheduler {
         });
         // Compaction inherits the parent's host-env list verbatim —
         // same pod allows both parent and continuation, so every entry
-        // still resolves. `Inline` variants aren't addressable by name;
-        // drop those and inherit the pod default for that slot (rare:
-        // `Inline` only exists on the reserved subagent path).
-        let inherited_host_env: Vec<String> = old_bindings
+        // still resolves. Workspace_root carries over too. `Inline`
+        // variants aren't addressable by name; drop those and inherit
+        // the pod default for that slot (rare: `Inline` only exists on
+        // the reserved subagent path).
+        let inherited_host_env: Vec<whisper_agent_protocol::HostEnvBindingRequest> = old_bindings
             .host_env
             .iter()
             .filter_map(|b| match b {
-                whisper_agent_protocol::HostEnvBinding::Named { name } => Some(name.clone()),
+                whisper_agent_protocol::HostEnvBinding::Named {
+                    name,
+                    workspace_root,
+                } => Some(whisper_agent_protocol::HostEnvBindingRequest {
+                    name: name.clone(),
+                    workspace_root: workspace_root.clone(),
+                }),
                 whisper_agent_protocol::HostEnvBinding::Inline { .. } => None,
             })
             .collect();

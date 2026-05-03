@@ -470,7 +470,13 @@ pub(super) fn render_thread_context_inspector(ui: &mut egui::Ui, thread_id: &str
                         .host_env
                         .iter()
                         .map(|b| match b {
-                            HostEnvBinding::Named { name } => name.clone(),
+                            HostEnvBinding::Named {
+                                name,
+                                workspace_root,
+                            } => match workspace_root {
+                                Some(p) => format!("{name} (cwd: {})", p.display()),
+                                None => name.clone(),
+                            },
                             HostEnvBinding::Inline { provider, .. } => {
                                 format!("(inline, provider = {provider})")
                             }

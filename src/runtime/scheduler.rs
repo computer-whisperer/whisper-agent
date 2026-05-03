@@ -852,6 +852,37 @@ impl Scheduler {
     /// `SessionHandle::update_context`); a `Disconnected` error is
     /// logged but not propagated — the next tool call will surface
     /// the disconnect via its own ToolFinal.
+    /// Stamp a fresh `ThreadContext` per Named host-env binding into
+    /// `V2ContextStore`, with the binding's persisted `workspace_root`
+    /// (filled in by the scheduler at compose time / load time — never
+    /// `None` for a binding the operator created via the current code
+    /// path). This makes the dispatcher's
+    /// `contexts.get_or_default(&thread, &binding)` return the explicit
+    /// value at every `OpenSession`, removing the daemon's fall-back
+    /// guess at the workspace root.
+    fn seed_v2_contexts_from_bindings(&self, task: &crate::runtime::thread::Thread) {
+        for binding in &task.bindings.host_env {
+            let HostEnvBinding::Named {
+                name,
+                workspace_root,
+            } = binding
+            else {
+                continue;
+            };
+            let Some(workspace_root) = workspace_root.clone() else {
+                continue;
+            };
+            self.v2_contexts.set(
+                task.id.clone(),
+                name.clone(),
+                whisper_agent_host_proto::ThreadContext {
+                    workspace_root: Some(workspace_root),
+                    ..whisper_agent_host_proto::ThreadContext::default()
+                },
+            );
+        }
+    }
+
     #[allow(dead_code)] // production caller lands with phase 5e UI surface
     pub(crate) fn set_v2_context(
         &self,
@@ -1665,7 +1696,7 @@ impl Scheduler {
         binding: &HostEnvBinding,
     ) -> Option<(String, HostEnvSpec)> {
         match binding {
-            HostEnvBinding::Named { name } => {
+            HostEnvBinding::Named { name, .. } => {
                 let pod = self.pods.get(pod_id)?;
                 pod.config
                     .allow
@@ -1807,7 +1838,7 @@ impl Scheduler {
         // `[[auth.daemons]]` name), not on `name` (the local binding
         // name the model sees as a tool prefix).
         for binding in &task.bindings.host_env {
-            let HostEnvBinding::Named { name } = binding else {
+            let HostEnvBinding::Named { name, .. } = binding else {
                 continue;
             };
             if !task.scope.host_envs.admits(name) {
@@ -1962,7 +1993,7 @@ impl Scheduler {
         // First-match wins, mirroring v1 ordering semantics.
         if let Some(task) = self.tasks.get(thread_id) {
             for binding in &task.bindings.host_env {
-                let HostEnvBinding::Named { name } = binding else {
+                let HostEnvBinding::Named { name, .. } = binding else {
                     continue;
                 };
                 if !task.scope.host_envs.admits(name) {
@@ -2331,12 +2362,20 @@ impl Scheduler {
                         });
                         match matching {
                             Some(name) => {
+                                let workspace_root = self.pods.get(&task.pod_id).and_then(|pod| {
+                                    crate::runtime::scheduler::bindings::default_workspace_root_for(
+                                        pod, &name,
+                                    )
+                                });
                                 warn!(
                                     thread_id = %task.id,
                                     rebound_to = %name,
                                     "migrating Inline host_env binding to Named reference",
                                 );
-                                migrated.push(HostEnvBinding::Named { name });
+                                migrated.push(HostEnvBinding::Named {
+                                    name,
+                                    workspace_root,
+                                });
                                 bindings_dirty = true;
                             }
                             None => {
@@ -2348,8 +2387,29 @@ impl Scheduler {
                             }
                         }
                     }
-                    HostEnvBinding::Named { name } => {
-                        migrated.push(HostEnvBinding::Named { name });
+                    HostEnvBinding::Named {
+                        name,
+                        workspace_root,
+                    } => {
+                        // Persisted thread.json files predating the
+                        // workspace_root field deserialize with `None`;
+                        // fill in from the spec so the field is always
+                        // explicit going forward.
+                        let was_none = workspace_root.is_none();
+                        let filled = workspace_root.or_else(|| {
+                            self.pods.get(&task.pod_id).and_then(|pod| {
+                                crate::runtime::scheduler::bindings::default_workspace_root_for(
+                                    pod, &name,
+                                )
+                            })
+                        });
+                        if was_none && filled.is_some() {
+                            bindings_dirty = true;
+                        }
+                        migrated.push(HostEnvBinding::Named {
+                            name,
+                            workspace_root: filled,
+                        });
                     }
                 }
             }
@@ -2383,7 +2443,13 @@ impl Scheduler {
                     .thread_defaults
                     .host_env
                     .iter()
-                    .map(|name| HostEnvBinding::Named { name: name.clone() })
+                    .map(|name| HostEnvBinding::Named {
+                        name: name.clone(),
+                        workspace_root:
+                            crate::runtime::scheduler::bindings::default_workspace_root_for(
+                                pod, name,
+                            ),
+                    })
                     .collect();
                 warn!(
                     thread_id = %task.id,
@@ -2414,6 +2480,7 @@ impl Scheduler {
                 let task_id = task.id.clone();
                 self.cancel_tokens
                     .insert(task_id.clone(), tokio_util::sync::CancellationToken::new());
+                self.seed_v2_contexts_from_bindings(&task);
                 self.tasks.insert(task_id.clone(), task);
                 if bindings_dirty {
                     self.mark_dirty(&task_id);
@@ -2899,6 +2966,7 @@ impl Scheduler {
             thread_id.clone(),
             tokio_util::sync::CancellationToken::new(),
         );
+        self.seed_v2_contexts_from_bindings(&task);
         self.tasks.insert(thread_id.clone(), task);
         if let Some(pod) = self.pods.get_mut(&pod_id) {
             pod.threads.insert(thread_id.clone());

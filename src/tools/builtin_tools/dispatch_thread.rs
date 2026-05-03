@@ -69,7 +69,12 @@ pub(super) fn descriptor() -> McpTool {
                     "type": "object",
                     "description": "Optional ThreadBindingsRequest. Shape: \
                                     {backend?, host_env?, mcp_hosts?}. Omitted \
-                                    fields inherit from pod defaults."
+                                    fields inherit from pod defaults. Each \
+                                    `host_env` entry may be either a bare name \
+                                    string (back-compat) or an object \
+                                    `{name, workspace_root?}` to pin the working \
+                                    directory; omitted workspace_root defaults \
+                                    to the named entry's first RW path."
                 }
             },
             "required": ["prompt", "sync"]

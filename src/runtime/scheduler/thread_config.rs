@@ -159,9 +159,21 @@ pub(super) fn behavior_override_to_requests(
     };
     let b = &ov.bindings;
     let bindings_request = if b.backend.is_some() || b.host_env.is_some() || b.mcp_hosts.is_some() {
+        // BehaviorBindingsOverride still declares host_env as bare
+        // names — behaviors don't get a per-binding workspace_root
+        // knob. resolve_bindings_choice defaults each entry's
+        // workspace_root from the named pod entry's first RW path.
         Some(ThreadBindingsRequest {
             backend: b.backend.clone(),
-            host_env: b.host_env.clone(),
+            host_env: b.host_env.as_ref().map(|names| {
+                names
+                    .iter()
+                    .map(|name| whisper_agent_protocol::HostEnvBindingRequest {
+                        name: name.clone(),
+                        workspace_root: None,
+                    })
+                    .collect()
+            }),
             mcp_hosts: b.mcp_hosts.clone(),
         })
     } else {
@@ -238,7 +250,13 @@ mod tests {
         ));
         let b = bindings.expect("bindings_request populated");
         assert_eq!(b.backend.as_deref(), Some("anthropic"));
-        assert_eq!(b.host_env.as_deref(), Some(&["readonly".to_string()][..]));
+        // BehaviorBindingsOverride still ships bare-name strings; the
+        // converter wraps each into a HostEnvBindingRequest with no
+        // workspace_root pin (the resolver fills it in from the spec).
+        let host_env = b.host_env.as_ref().expect("host_env populated");
+        assert_eq!(host_env.len(), 1);
+        assert_eq!(host_env[0].name, "readonly");
+        assert!(host_env[0].workspace_root.is_none());
         assert_eq!(b.mcp_hosts.as_deref(), Some(&["fetch".to_string()][..]));
     }
 
