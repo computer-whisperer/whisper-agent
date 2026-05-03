@@ -551,9 +551,12 @@ to track, since the host-env tools come through this protocol directly.
 
 ## Migration phasing
 
-The cutover is intentionally staged so existing remote daemons keep working
-through it. Phases 1–3 are landed; the description below also captures what
-the rescope of phases 4–7 looked like once 1–3 were in.
+The cutover was staged so existing remote daemons kept working through it.
+**All phases below have shipped.** The v1 path (HTTP+JSON-RPC, the
+`whisper-agent-sandbox` crate, `[[host_env_providers]]` TOML, the
+dedup machinery) was retired in phase 7b and is no longer in the codebase
+or wire — operators on v1 must move to `[[auth.daemons]]` plus a running
+`whisper-agent-host-daemon`.
 
 1. **Protocol crate** *(landed).* `whisper-agent-host-proto` ships with the
    `Frame` enum, supporting types, CBOR round-trip tests, and a
@@ -580,9 +583,9 @@ the rescope of phases 4–7 looked like once 1–3 were in.
    "daemon-owned Unix socket worker IPC" rewrite the original phase 3
    sketched is invisible at the wire and was deferred.
 
-4. **Wire threads to v2 daemons.** This is the user-visible value: a thread
-   bound to a v2 daemon name actually invokes its tools. Dispatch in four
-   sub-steps:
+4. **Wire threads to v2 daemons** *(landed).* User-visible value: a thread
+   bound to a v2 daemon name actually invokes its tools. Dispatch landed in
+   four sub-steps:
 
    - **4a. Binding resolution + tool catalog merge.** v2 names resolve in
      scheduler binding lookup (currently the seed loop in `main.rs` skips
@@ -611,39 +614,34 @@ the rescope of phases 4–7 looked like once 1–3 were in.
    stays in place for the v1 path until phase 7 deletes it wholesale —
    cleaning v1 internals before deletion is churn for no shipped value.
 
-5. **Per-thread control surface.** `UpdateSession` with denylist / runas /
-   env / output cap. UI surfaces for editing thread context. This is the
-   feature work that motivated the rework. The per-thread disconnect policy
-   (`pause_until_reconnect` vs `continue_with_warning`) lands here as one
-   of the editable fields.
+5. **Per-thread control surface** *(landed).* `UpdateSession` with
+   denylist / runas / env / output cap. UI surfaces for editing thread
+   context. This is the feature work that motivated the rework. The
+   per-thread disconnect policy (`pause_until_reconnect` vs
+   `continue_with_warning`) landed here as one of the editable fields.
 
-6. **Background tasks.** `BackgroundTaskUpdate` / `ListBackgroundTasks`
-   plumbed end-to-end. Daemon-side spawns and tracks long-running
-   processes per session. UI affordances for surfacing them as first-class
-   active state. `bash` grows a `background` argument; `bash_check`,
-   `bash_kill`, `bash_list` land as new tools.
+6. **Background tasks** *(landed at the IPC layer; user-visible tools
+   pending).* Phase 6.0a/b ship `whisper-agent-worker-proto` and the
+   daemon ↔ worker Unix-socketpair IPC that carries `BackgroundTask*`
+   frames end-to-end. The user-facing pieces — a `bash` `background`
+   argument, the `bash_check` / `bash_kill` / `bash_list` tools, and
+   the UI surfacing of active background tasks — are tracked separately
+   from this protocol effort.
 
-7. **Retire the legacy path.** Once all real deployments are on v2,
-   delete:
-   - `[[host_env_providers]]` v1 catalog code, `HostEnvProviderKind` enum
-     (collapse to single shape), `--host-env-provider` CLI overlay
-   - `HostEnvId::for_provider_spec`, `provisioning_in_flight`, the dedup
-     machinery, `McpHostId::for_host_env`
-   - `whisper-agent-sandbox` crate
-   - The v1 dispatch arms in `io_dispatch`
-   - The legacy HTTP-out `DaemonClient`
+7. **Retire the legacy path** *(landed across 7a + 7b).* 7a deleted the
+   `whisper-agent-sandbox` crate. 7b finished the job in the dispatcher:
+   `[[host_env_providers]]` TOML catalog, `HostEnvProviderKind`,
+   `--host-env-provider` / `--host-env-provider-token` CLI overlays,
+   `HostEnvId::for_provider_spec`, `provisioning_in_flight`,
+   `McpHostId::for_host_env`, the v1 `io_dispatch` arms, the HTTP-out
+   `DaemonClient`, and the v1 webui surfaces (provider editor modal,
+   host-env-providers settings tab). `whisper-agent-mcp-host` was kept
+   under its existing name — renaming it to `…-host-worker` was floated
+   but deferred since the binary contract didn't change.
 
-   `whisper-agent-mcp-host` stays — it's the worker the v2 daemon spawns —
-   but may be renamed (e.g. `whisper-agent-host-worker`) to reflect that
-   it's no longer an HTTP-fronted standalone server. This is the breaking
-   phase; `whisper-agent.toml` files using `[[host_env_providers]]` stop
-   parsing and operators must migrate to `[[auth.daemons]]` + a running
-   `whisper-agent-host-daemon`.
-
-Phases 1–4 ship user-visible value (no plaintext bearer at 3, threads
-actually dispatching to v2 daemons at 4) before any user-visible breakage.
-Phase 7 is the only breaking phase and only happens once all real
-deployments have moved.
+The `whisper-agent.toml` migration is hard: configs with
+`[[host_env_providers]]` stop parsing as of 7b, and operators must move
+to `[[auth.daemons]]` plus a running `whisper-agent-host-daemon`.
 
 ## Not in scope for v1
 

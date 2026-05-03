@@ -29,9 +29,9 @@
 #                                   /tlsconfig/tls.key.
 #
 # Extra args passed to this script flow through to `whisper-agent
-# serve`, so the orchestrator can append flags like
-# `--host-env-provider name=url` and `--host-env-provider-token
-# name=path` without overriding the entrypoint.
+# serve`, so the orchestrator can append flags like `--auth-daemon
+# name=path/to/token-file` (admit a host-env daemon dialing into
+# /v1/host_env_link) without overriding the entrypoint.
 #
 # tini is PID 1 (set by the Dockerfile ENTRYPOINT) and reaps zombies;
 # restart of crashed sidecars is the orchestrator's job.

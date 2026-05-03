@@ -2,10 +2,11 @@
 #
 # Dev convenience: build everything and run the whisper-agent stack.
 #
-# The sandbox daemon is the host-env provider — each thread that binds
-# a host_env gets its own landlock-isolated MCP host, provisioned on
-# demand. No "fallback MCP"; threads without a bound host env run with
-# only shared MCP tools (web fetch / search).
+# `whisper-agent-host-daemon` is the host-env provider — each thread that
+# binds a host_env gets its own landlock-isolated MCP host, provisioned
+# on demand by the daemon over a WebSocket dial-in to the scheduler at
+# /v1/host_env_link. No "fallback MCP"; threads without a bound host env
+# run with only shared MCP tools (web fetch / search).
 #
 # All runtime artifacts (workspace root, audit log, persisted pods/threads)
 # land under ./sandbox/ at the repo root. Gitignored; preserved across runs
@@ -14,7 +15,6 @@
 # Env overrides:
 #   SANDBOX           default: $REPO_ROOT/sandbox
 #   LISTEN_SERVER     default: 127.0.0.1:8080
-#   LISTEN_SANDBOX    default: 127.0.0.1:9810  (sandbox daemon)
 #   LISTEN_FETCH      default: 127.0.0.1:9830  (web-fetch MCP daemon)
 #   LISTEN_SEARCH     default: 127.0.0.1:9831  (web-search MCP daemon)
 #
@@ -38,7 +38,6 @@ cd "$REPO_ROOT"
 
 SANDBOX="${SANDBOX:-$REPO_ROOT/sandbox}"
 LISTEN_SERVER="${LISTEN_SERVER:-127.0.0.1:8080}"
-LISTEN_SANDBOX="${LISTEN_SANDBOX:-127.0.0.1:9810}"
 LISTEN_FETCH="${LISTEN_FETCH:-127.0.0.1:9830}"
 LISTEN_SEARCH="${LISTEN_SEARCH:-127.0.0.1:9831}"
 
@@ -60,16 +59,17 @@ done
 
 mkdir -p "$SANDBOX"
 
-# Pre-shared control-plane bearer between whisper-agent and the sandbox daemon.
-# Generated on first run, preserved across restarts so running processes keep
-# authenticating. Rotate by deleting the file and restarting.
-SANDBOX_TOKEN_FILE="$SANDBOX/sandbox-control-token"
-if [[ ! -s "$SANDBOX_TOKEN_FILE" ]]; then
-    echo "==> generating sandbox control token at $SANDBOX_TOKEN_FILE"
+# Pre-shared bearer the host-daemon presents on the WS upgrade. Generated
+# on first run, preserved across restarts so running processes keep
+# authenticating. The same file is referenced by --auth-daemon (server side)
+# and --token-file (daemon side). Rotate by deleting and restarting both.
+DAEMON_TOKEN_FILE="$SANDBOX/host-daemon-token"
+if [[ ! -s "$DAEMON_TOKEN_FILE" ]]; then
+    echo "==> generating host-daemon token at $DAEMON_TOKEN_FILE"
     umask 077
-    head -c 32 /dev/urandom | od -An -vtx1 | tr -d ' \n' > "$SANDBOX_TOKEN_FILE"
-    echo >> "$SANDBOX_TOKEN_FILE"
-    chmod 600 "$SANDBOX_TOKEN_FILE"
+    head -c 32 /dev/urandom | od -An -vtx1 | tr -d ' \n' > "$DAEMON_TOKEN_FILE"
+    echo >> "$DAEMON_TOKEN_FILE"
+    chmod 600 "$DAEMON_TOKEN_FILE"
 fi
 
 # Build the webui wasm bundle BEFORE the main binary. whisper-agent
@@ -103,7 +103,7 @@ if [[ "$USE_SEARCH" -eq 1 && -z "${BRAVE_API_KEY:-}" ]]; then
     USE_SEARCH=0
 fi
 
-PACKAGES="-p whisper-agent-mcp-host -p whisper-agent-sandbox"
+PACKAGES="-p whisper-agent-mcp-host -p whisper-agent-host-daemon"
 if [[ "$USE_FETCH" -eq 1 ]]; then
     PACKAGES="$PACKAGES -p whisper-agent-mcp-fetch"
 fi
@@ -163,27 +163,24 @@ if [[ "$USE_SEARCH" -eq 1 ]]; then
     SHARED_HOST_ARGS+=(--shared-mcp-host "search=http://$LISTEN_SEARCH/mcp")
 fi
 
-echo "==> starting whisper-agent-sandbox on $LISTEN_SANDBOX"
-"$REPO_ROOT/target/release/whisper-agent-sandbox" \
-    --listen "$LISTEN_SANDBOX" \
+echo "==> starting whisper-agent-host-daemon dialing $LISTEN_SERVER"
+# Daemon dials into /v1/host_env_link with exponential-backoff retry,
+# so it's fine to start before the server is up — it'll connect once
+# the server's listener is ready.
+"$REPO_ROOT/target/release/whisper-agent-host-daemon" \
+    --server-url "ws://$LISTEN_SERVER/v1/host_env_link" \
+    --token-file "$DAEMON_TOKEN_FILE" \
     --mcp-host-bin "$REPO_ROOT/target/release/whisper-agent-mcp-host" \
-    --control-token-file "$SANDBOX_TOKEN_FILE" &
+    --probe-workspace "$SANDBOX" &
 CHILD_PIDS+=($!)
-
-for _ in $(seq 1 20); do
-    if curl -sf "http://$LISTEN_SANDBOX/health" > /dev/null 2>&1; then break; fi
-    sleep 0.25
-done
 
 echo "==> starting whisper-agent on $LISTEN_SERVER (host-env workspace=$SANDBOX)"
 echo "    open http://$LISTEN_SERVER/ in a browser"
-# `local-landlock` is the catalog name we register the sandbox daemon
-# under; the synthesized default pod's host env binds to it with this
-# workspace.
+# `local-landlock` is the daemon name we admit via --auth-daemon; the
+# synthesized default pod's host env binds to it with this workspace.
 "$REPO_ROOT/target/release/whisper-agent" serve \
     --listen "$LISTEN_SERVER" \
-    --host-env-provider "local-landlock=http://$LISTEN_SANDBOX" \
-    --host-env-provider-token "local-landlock=$SANDBOX_TOKEN_FILE" \
+    --auth-daemon "local-landlock=$DAEMON_TOKEN_FILE" \
     --default-host-env-provider "local-landlock" \
     --default-host-env-workspace "$SANDBOX" \
     --audit-log "$SANDBOX/audit.jsonl" \

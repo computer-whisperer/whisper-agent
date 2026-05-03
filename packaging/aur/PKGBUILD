@@ -1,9 +1,10 @@
 # Maintainer: Christian Balcom <robot.inventor@gmail.com>
 #
-# Host-side daemons for whisper-agent. Bundles whisper-agent-sandbox
-# (the per-thread landlock provisioner) and whisper-agent-mcp-host
-# (the per-thread MCP server it spawns). Run these on each managed
-# POSIX host the central whisper-agent server reaches into.
+# Host-side daemons for whisper-agent. Bundles whisper-agent-host-daemon
+# (the per-thread landlock provisioner that dials a central whisper-agent
+# server over WebSocket) and whisper-agent-mcp-host (the per-thread MCP
+# server it spawns). Run these on each managed POSIX host the central
+# whisper-agent server should reach into.
 #
 # The server-side image (whisper-agent + shared MCP sidecars) ships as
 # an OCI image built from the repository's top-level Dockerfile and
@@ -19,27 +20,25 @@
 pkgname=whisper-agent-host
 pkgver=0.3.5
 pkgrel=1
-pkgdesc="Host-side sandbox daemon for whisper-agent (landlock-isolated per-thread MCP hosts)"
+pkgdesc="Host-side daemon for whisper-agent (landlock-isolated per-thread MCP hosts; dials a central server)"
 arch=('x86_64' 'aarch64')
 url="https://github.com/computer-whisperer/whisper-agent"
 license=('MIT' 'Apache')
 depends=('glibc' 'gcc-libs' 'systemd')
 makedepends=('rust' 'cargo')
-provides=('whisper-agent-sandbox' 'whisper-agent-mcp-host')
-backup=('etc/whisper-agent/sandbox.env')
+provides=('whisper-agent-host-daemon' 'whisper-agent-mcp-host')
+backup=('etc/whisper-agent/host-daemon.env')
 install="${pkgname}.install"
 source=(
     "${pkgname}-${pkgver}.tar.gz::${url}/archive/v${pkgver}.tar.gz"
-    'sandbox.env'
-    'whisper-agent-sandbox.service'
-    'ensure-control-token.sh'
+    'host-daemon.env'
+    'whisper-agent-host-daemon.service'
 )
 # Refresh the first checksum with `updpkgsums` whenever pkgver bumps.
-# The other three are local files maintained alongside this PKGBUILD;
+# The other two are local files maintained alongside this PKGBUILD;
 # 'SKIP' is fine because they're versioned in the upstream repo.
 sha256sums=(
     '9ce89c72028ae6c57a0317eef7e302e3d7b9b2b62c2ab2fbf95c099bfead8f86'
-    'SKIP'
     'SKIP'
     'SKIP'
 )
@@ -56,7 +55,7 @@ build() {
     # Only the two host-side bins; the rest of the workspace (server,
     # webui, shared MCP daemons) is not packaged here.
     cargo build --release --frozen \
-        -p whisper-agent-sandbox \
+        -p whisper-agent-host-daemon \
         -p whisper-agent-mcp-host
 }
 
@@ -65,26 +64,23 @@ check() {
     export CARGO_TARGET_DIR="${srcdir}/target"
     export RUSTUP_TOOLCHAIN=stable
     cargo test --release --frozen \
-        -p whisper-agent-sandbox \
+        -p whisper-agent-host-daemon \
         -p whisper-agent-mcp-host
 }
 
 package() {
     cd "${srcdir}/whisper-agent-${pkgver}"
 
-    install -Dm755 "${srcdir}/target/release/whisper-agent-sandbox" \
-        "${pkgdir}/usr/bin/whisper-agent-sandbox"
+    install -Dm755 "${srcdir}/target/release/whisper-agent-host-daemon" \
+        "${pkgdir}/usr/bin/whisper-agent-host-daemon"
     install -Dm755 "${srcdir}/target/release/whisper-agent-mcp-host" \
         "${pkgdir}/usr/bin/whisper-agent-mcp-host"
 
-    install -Dm755 "${srcdir}/ensure-control-token.sh" \
-        "${pkgdir}/usr/lib/whisper-agent/ensure-control-token"
+    install -Dm644 "${srcdir}/whisper-agent-host-daemon.service" \
+        "${pkgdir}/usr/lib/systemd/system/whisper-agent-host-daemon.service"
 
-    install -Dm644 "${srcdir}/whisper-agent-sandbox.service" \
-        "${pkgdir}/usr/lib/systemd/system/whisper-agent-sandbox.service"
-
-    install -Dm644 "${srcdir}/sandbox.env" \
-        "${pkgdir}/etc/whisper-agent/sandbox.env"
+    install -Dm644 "${srcdir}/host-daemon.env" \
+        "${pkgdir}/etc/whisper-agent/host-daemon.env"
 
     install -Dm644 LICENSE-MIT \
         "${pkgdir}/usr/share/licenses/${pkgname}/LICENSE-MIT"

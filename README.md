@@ -28,22 +28,22 @@ See [`docs/design_headless_loop.md`](docs/design_headless_loop.md) for the ratio
 │    compatible local)                                        │
 │  • serves the webui (egui+wasm) and a CBOR/WebSocket        │
 │    protocol for clients                                     │
-└──────────────┬──────────────────────────────────────────────┘
-               │ MCP over streamable HTTP
-   ┌───────────┴──────────────────────────┐
-   │                                      │
-┌──┴──────────────────────┐   ┌───────────┴─────────────────┐
-│ shared MCP daemons      │   │ per-host sandbox daemon     │
-│  • whisper-agent-mcp-   │   │  • whisper-agent-sandbox    │
-│    fetch (HTTP fetch)   │   │    (landlock provisioner)   │
-│  • whisper-agent-mcp-   │   │  • spawns whisper-agent-    │
-│    search (Brave API)   │   │    mcp-host per thread      │
-└─────────────────────────┘   └─────────────────────────────┘
+└──────────────┬─────────────────────┬────────────────────────┘
+               │ MCP over            │ host-env protocol
+               │ streamable HTTP     │ (CBOR/WS, daemon dials in)
+   ┌───────────┴──────────┐    ┌─────┴──────────────────────┐
+   │ shared MCP daemons   │    │ per-host daemon            │
+   │  • whisper-agent-    │    │  • whisper-agent-host-     │
+   │    mcp-fetch         │    │    daemon (landlock        │
+   │  • whisper-agent-    │    │    provisioner)            │
+   │    mcp-search        │    │  • spawns whisper-agent-   │
+   │                      │    │    mcp-host per thread     │
+   └──────────────────────┘    └────────────────────────────┘
 ```
 
 **Server-side** (one container in deployment): `whisper-agent`, `whisper-agent-webui` (wasm bundle served by the agent), `whisper-agent-mcp-fetch`, `whisper-agent-mcp-search`.
 
-**Host-side** (installed on each managed POSIX host as a systemd service): `whisper-agent-sandbox` and the `whisper-agent-mcp-host` binary it spawns.
+**Host-side** (installed on each managed POSIX host as a systemd service): `whisper-agent-host-daemon` and the `whisper-agent-mcp-host` binary it spawns. The daemon dials into the central server's `/v1/host_env_link` endpoint and is admitted by token via `[[auth.daemons]]` — see [`docs/design_host_env_protocol.md`](docs/design_host_env_protocol.md).
 
 ## Quick start (5 minutes, local development)
 
@@ -72,7 +72,7 @@ export ANTHROPIC_API_KEY=sk-ant-...
 # 4. Open http://127.0.0.1:8080/ in a browser.
 ```
 
-`dev.sh` builds every crate (release), builds the webui wasm bundle, starts the sandbox daemon and the shared `web_fetch` MCP daemon, then starts `whisper-agent`. Runtime artifacts (workspace, audit log, persisted pods/threads, sandbox control token) land under `./sandbox/`. Pass `--help` for flags (`--skip-wasm`, `--no-fetch`, `--no-search`).
+`dev.sh` builds every crate (release), builds the webui wasm bundle, starts `whisper-agent-host-daemon` (which dials into the server) and the shared `web_fetch` MCP daemon, then starts `whisper-agent`. Runtime artifacts (workspace, audit log, persisted pods/threads, host-daemon token) land under `./sandbox/`. Pass `--help` for flags (`--skip-wasm`, `--no-fetch`, `--no-search`).
 
 To also enable web search, drop a Brave Search API key into `whisper-agent.toml`'s `[secrets]` table as `BRAVE_API_KEY = "BSA..."` and re-run `dev.sh` — the search daemon auto-starts when the key is present.
 
@@ -89,8 +89,8 @@ The conceptual layout is **pods → threads → resources**: pods are persistent
 - `[backends.<name>]` — one table per LLM endpoint. `kind` selects the wire format; `auth` is a tagged union (`api_key` with `value` or `env`, plus subscription auth modes for OpenAI Codex and Gemini-CLI).
 - `[secrets]` — env vars exported to sibling daemons via `whisper-agent config env` (e.g. `BRAVE_API_KEY` for web search).
 - `[shared_mcp_hosts]` — singleton MCP server URLs all threads can dial. `dev.sh` registers the dev-stack ones via CLI flags; populate this for non-dev deployments.
-- `[[host_env_providers]]` — sandbox-daemon URLs (`name`, `url`, optional `token_file`). Imported once into the durable runtime catalog at `<pods_root>/../host_env_providers.toml`; after that, the WebUI's Providers tab is the source of truth for add / update / remove.
 - `[[auth.clients]]` / `[[auth.admins]]` — bearer tokens for non-loopback access. **Loopback always bypasses auth**; configure these only when exposing the server externally.
+- `[[auth.daemons]]` — bearer tokens admitting `whisper-agent-host-daemon` instances dialing into `/v1/host_env_link`. The daemon endpoint always requires a token (loopback included). See [`docs/design_host_env_protocol.md`](docs/design_host_env_protocol.md).
 - `[embedding_providers.<name>]` / `[rerank_providers.<name>]` — for knowledge buckets; see [`docs/design_knowledge_db.md`](docs/design_knowledge_db.md).
 
 Config search precedence: `--config <path>` → `$XDG_CONFIG_HOME/whisper-agent/whisper-agent.toml` → `$HOME/.config/whisper-agent/whisper-agent.toml` → `./whisper-agent.toml`.
@@ -114,13 +114,19 @@ The entrypoint (`packaging/docker/entrypoint.sh`) starts the fetch sidecar uncon
 
 ### Host-side (Arch / AUR)
 
-The `whisper-agent-host` AUR package (PKGBUILD in `packaging/aur/`) installs `whisper-agent-sandbox` as a systemd service on a managed POSIX host. The systemd unit auto-generates a control-token at `/var/lib/whisper-agent/sandbox-control-token` on first start; copy that token to your central `whisper-agent` server (e.g. as a Kubernetes secret mounted as `--host-env-provider-token`) so the server can authenticate and provision per-thread MCP hosts.
+The `whisper-agent-host` AUR package (PKGBUILD in `packaging/aur/`) installs `whisper-agent-host-daemon` as a systemd service on a managed POSIX host. The daemon dials into the central server over WebSocket; the operator provisions a shared bearer token by adding `[[auth.daemons]] name = "<this-host>", token = "<token>"` to the server's `whisper-agent.toml` and saving the same token at `/var/lib/whisper-agent/host-daemon-token` on the host. The server URL is set in `/etc/whisper-agent/host-daemon.env`.
 
 ```sh
 # On each managed host:
 sudo pacman -S whisper-agent-host    # or: makepkg -si in packaging/aur/
-sudo systemctl enable --now whisper-agent-sandbox.service
-sudo cat /var/lib/whisper-agent/sandbox-control-token   # copy to server-side secret
+
+# Generate token, install on host, register on server (see post-install hint).
+TOKEN=$(openssl rand -base64 32)
+sudo install -Dm600 /dev/stdin /var/lib/whisper-agent/host-daemon-token <<<"$TOKEN"
+echo "[[auth.daemons]] name=<this-host> token=$TOKEN  # copy this into server config"
+
+sudo $EDITOR /etc/whisper-agent/host-daemon.env       # set WHISPER_AGENT_SERVER_URL
+sudo systemctl enable --now whisper-agent-host-daemon.service
 ```
 
 ## Crates
@@ -130,8 +136,10 @@ sudo cat /var/lib/whisper-agent/sandbox-control-token   # copy to server-side se
 | `whisper-agent` (root) | The agent loop, HTTP/WS server, webui host. |
 | `whisper-agent-webui` | Browser chat UI (egui + wasm), built with `wasm-pack`. |
 | `whisper-agent-protocol` | CBOR-over-WebSocket protocol shared by server and webui. |
-| `whisper-agent-sandbox` | Per-host daemon that provisions Landlock-isolated MCP host instances per thread. |
-| `whisper-agent-mcp-host` | MCP server exposing a controlled slice of POSIX (read/write_file, bash). One per thread, spawned by the sandbox daemon. |
+| `whisper-agent-host-daemon` | Per-host daemon that dials into the central server and provisions Landlock-isolated MCP host instances per thread. |
+| `whisper-agent-host-proto` | Wire-protocol types for the daemon ↔ server WebSocket link. |
+| `whisper-agent-worker-proto` | Wire-protocol types for the daemon ↔ per-thread worker IPC over Unix socketpair. |
+| `whisper-agent-mcp-host` | MCP server exposing a controlled slice of POSIX (read/write_file, bash). One per thread, spawned by the host daemon. |
 | `whisper-agent-mcp-fetch` | Shared MCP server exposing a guarded `web_fetch` tool. |
 | `whisper-agent-mcp-search` | Shared MCP server exposing `web_search` (Brave Search API). |
 | `whisper-agent-mcp-proto` | MCP / JSON-RPC types shared by the MCP servers. |

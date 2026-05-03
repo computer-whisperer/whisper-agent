@@ -2,9 +2,12 @@ post_install() {
     cat <<MSG
 ==> whisper-agent-host installed.
 
-  This package ships the host-side daemons:
-    /usr/bin/whisper-agent-sandbox    landlock-isolated MCP host provisioner
-    /usr/bin/whisper-agent-mcp-host   the per-thread MCP server (spawned by sandbox)
+  This package ships the host-side binaries:
+    /usr/bin/whisper-agent-host-daemon  WS dial-in to a central whisper-agent
+                                        server; provisions per-thread
+                                        landlock-isolated MCP host children
+    /usr/bin/whisper-agent-mcp-host     the per-thread MCP server
+                                        (spawned by the daemon)
 
   The daemon runs as root. Landlock rules — applied per-child from
   each pod's \`allowed_paths\` — are the filesystem gate. Running as a
@@ -12,52 +15,54 @@ post_install() {
   ever narrowed it, leaving workspaces like /home/<you>/projects
   unreachable regardless of what the pod config requested.
 
-  The control-plane bearer token is auto-generated on first start at:
-    /var/lib/whisper-agent/sandbox-control-token   (mode 0600)
+  Before enabling the unit:
 
-  Edit /etc/whisper-agent/sandbox.env to change the listen address
-  (default: [::]:9820, dual-stack — leaves 9810 free for the in-tree
-  dev harness at scripts/dev.sh).
+    1. Generate a strong bearer token:
+         openssl rand -base64 32
+    2. On the central whisper-agent server, add an entry to
+       whisper-agent.toml so the server admits this host:
+         [[auth.daemons]]
+         name  = "<a-name-for-this-host>"
+         token = "<the-token-from-step-1>"
+    3. Save the same token on this host (mode 0600, root-owned):
+         install -Dm600 /dev/stdin /var/lib/whisper-agent/host-daemon-token
+         <<< "<the-token-from-step-1>"
+    4. Edit /etc/whisper-agent/host-daemon.env and set
+       WHISPER_AGENT_SERVER_URL to your server's
+       /v1/host_env_link endpoint (wss:// for prod).
+    5. Enable and start:
+         systemctl enable --now whisper-agent-host-daemon.service
 
-  Enable and start the sandbox daemon:
-    systemctl enable --now whisper-agent-sandbox.service
-
-  After first start, copy the control token to your whisper-agent
-  server (e.g. into the kubernetes secret it mounts as
-  --host-env-provider-token name=path) so the server can authenticate.
+  The daemon dials home with exponential-backoff retry, so it's safe
+  to bring it up before the server, and it'll auto-reconnect across
+  server restarts and network blips.
 MSG
 }
 
 post_upgrade() {
-    # Pre-0.3.0-2 the daemon ran under a dedicated 'whisper-agent'
-    # system user. That model is gone — landlock alone is the gate
-    # now. Old installs may still have the user + the root-owned
-    # state dir; clean up best-effort so a restart picks up the new
-    # user cleanly. Failure here is non-fatal (the admin may have
-    # repurposed the user).
-    if getent passwd whisper-agent >/dev/null; then
-        echo "==> removing legacy 'whisper-agent' system user (no longer used)"
-        userdel whisper-agent 2>/dev/null || true
-    fi
-    if getent group whisper-agent >/dev/null; then
-        groupdel whisper-agent 2>/dev/null || true
-    fi
-    # Re-chown the state dir so the root-owned daemon can write it.
-    if [[ -d /var/lib/whisper-agent ]]; then
-        chown -R root:root /var/lib/whisper-agent 2>/dev/null || true
+    if systemctl is-active --quiet whisper-agent-host-daemon.service 2>/dev/null; then
+        echo "==> restart whisper-agent-host-daemon.service to pick up new binaries"
     fi
 
-    if systemctl is-active --quiet whisper-agent-sandbox.service 2>/dev/null; then
-        echo "==> restart whisper-agent-sandbox.service to pick up new binaries"
-    fi
+    # Migration from pre-0.4 releases that shipped whisper-agent-sandbox
+    # (a *listening* HTTP daemon, retired with the v2 protocol cutover).
+    # Stop and disable the old unit so it doesn't fight the new one for
+    # the binary that no longer exists. Best-effort: silently no-op if
+    # the unit was never installed on this host.
+    for legacy_unit in whisper-agent-sandbox.service; do
+        if systemctl is-enabled --quiet "$legacy_unit" 2>/dev/null; then
+            echo "==> disabling legacy $legacy_unit (replaced by whisper-agent-host-daemon)"
+            systemctl disable --now "$legacy_unit" 2>/dev/null || true
+        fi
+    done
 }
 
 pre_remove() {
-    if systemctl is-active --quiet whisper-agent-sandbox.service 2>/dev/null; then
-        systemctl stop whisper-agent-sandbox.service
+    if systemctl is-active --quiet whisper-agent-host-daemon.service 2>/dev/null; then
+        systemctl stop whisper-agent-host-daemon.service
     fi
-    if systemctl is-enabled --quiet whisper-agent-sandbox.service 2>/dev/null; then
-        systemctl disable whisper-agent-sandbox.service
+    if systemctl is-enabled --quiet whisper-agent-host-daemon.service 2>/dev/null; then
+        systemctl disable whisper-agent-host-daemon.service
     fi
 }
 
@@ -66,8 +71,8 @@ post_remove() {
 ==> whisper-agent-host removed.
 
   The runtime data directory /var/lib/whisper-agent/ was preserved
-  (sandbox-control-token, pods/, audit.jsonl). Remove it manually
-  if no longer needed:
+  (host-daemon-token, audit.jsonl, ...). Remove it manually if no
+  longer needed:
 
     rm -rf /var/lib/whisper-agent
 MSG

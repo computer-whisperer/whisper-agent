@@ -9,7 +9,7 @@ use tracing_subscriber::EnvFilter;
 use whisper_agent_protocol::ThreadConfig;
 use whisper_agent_protocol::sandbox::{HostEnvSpec, NetworkPolicy, PathAccess};
 
-use whisper_agent::pod::config::{Auth, BackendConfig, Config};
+use whisper_agent::pod::config::{Auth, AuthDaemon, BackendConfig, Config};
 use whisper_agent::providers::anthropic::AnthropicClient;
 use whisper_agent::runtime::scheduler::{
     BackendEntry, EmbeddingProviderEntry, RerankProviderEntry, SharedHostOverlay,
@@ -180,6 +180,15 @@ struct ServeArgs {
     /// Also configurable in TOML: `[shared_mcp_hosts] fetch = "http://..."`.
     #[arg(long = "shared-mcp-host", value_parser = parse_shared_host_arg)]
     shared_mcp_hosts: Vec<(String, String)>,
+
+    /// Admit a host-env daemon by name at startup, reading its bearer
+    /// token from the given file. Format: `name=path/to/token-file`.
+    /// Repeatable. CLI entries layer on top of `[[auth.daemons]]` from
+    /// the TOML config; duplicate names are an error.
+    ///
+    /// Example: `--auth-daemon local-landlock=/run/whisper-agent/dev-token`.
+    #[arg(long = "auth-daemon", value_parser = parse_auth_daemon_arg)]
+    auth_daemons: Vec<(String, PathBuf)>,
 }
 
 /// Resolve which TOML config file to load. Precedence:
@@ -238,6 +247,21 @@ fn parse_shared_host_arg(s: &str) -> Result<(String, String), String> {
         return Err("url must be non-empty".into());
     }
     Ok((name.to_string(), url.to_string()))
+}
+
+/// Parse a `name=path` pair for `--auth-daemon`. Names must be non-empty;
+/// the token is read from the file at server startup.
+fn parse_auth_daemon_arg(s: &str) -> Result<(String, PathBuf), String> {
+    let (name, path) = s
+        .split_once('=')
+        .ok_or_else(|| "expected `name=path/to/token-file`".to_string())?;
+    if name.is_empty() {
+        return Err("name must be non-empty".into());
+    }
+    if path.is_empty() {
+        return Err("token-file path must be non-empty".into());
+    }
+    Ok((name.to_string(), PathBuf::from(path)))
 }
 
 #[tokio::main]
@@ -313,7 +337,7 @@ async fn run_serve(args: ServeArgs) -> Result<()> {
         shared_host_map,
         auth_clients,
         auth_admins,
-        auth_daemons,
+        mut auth_daemons,
     ) = match &resolved_config {
         Some(path) => {
             info!(config = %path.display(), "loading backend catalog");
@@ -463,6 +487,38 @@ async fn run_serve(args: ServeArgs) -> Result<()> {
                 now,
             ))?;
         shared_mcp_catalog::log_seed_result(name, inserted);
+    }
+
+    // CLI `--auth-daemon name=tokenfile` overlays admit additional
+    // daemons on top of the TOML config. Read each token file at
+    // startup; reject empty names, empty tokens, and duplicates against
+    // either TOML or earlier CLI entries. Mirrors the dispatcher-side
+    // validation in `Config::validate`.
+    for (name, token_path) in &args.auth_daemons {
+        let token = tokio::fs::read_to_string(token_path)
+            .await
+            .with_context(|| {
+                format!(
+                    "--auth-daemon `{name}` reading token from {}",
+                    token_path.display()
+                )
+            })?;
+        let token = token.trim().to_string();
+        if token.is_empty() {
+            return Err(anyhow!(
+                "--auth-daemon `{name}` token file {} is empty",
+                token_path.display()
+            ));
+        }
+        if auth_daemons.iter().any(|d| d.name == *name) {
+            return Err(anyhow!(
+                "--auth-daemon `{name}` duplicates an existing daemon admission entry"
+            ));
+        }
+        auth_daemons.push(AuthDaemon {
+            name: name.clone(),
+            token,
+        });
     }
 
     let default_host_env = build_default_host_env(

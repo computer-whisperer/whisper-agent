@@ -1,5 +1,5 @@
 [Unit]
-Description=whisper-agent sandbox daemon (per-thread landlock-isolated MCP hosts)
+Description=whisper-agent host-env daemon (dials a whisper-agent server, provisions per-thread landlock-isolated MCP hosts)
 Documentation=https://github.com/computer-whisperer/whisper-agent
 Wants=network-online.target
 After=network-online.target
@@ -14,28 +14,25 @@ Type=simple
 # of what the pod's `allowed_paths` lists. Landlock is the gate.
 # (System-level hardening below still applies to the daemon process.)
 
-# Tunables (LISTEN address etc.). Optional; the unit ships with a
-# sample at /etc/whisper-agent/sandbox.env populated with the
-# defaults.
-EnvironmentFile=-/etc/whisper-agent/sandbox.env
-Environment=WHISPER_AGENT_SANDBOX_LISTEN=[::]:9820
+# Required tunables — admin must set these in /etc/whisper-agent/host-daemon.env
+# before enabling the unit:
+#   WHISPER_AGENT_SERVER_URL  — wss://your-server.tld/v1/host_env_link
+#   WHISPER_AGENT_TOKEN_FILE  — file containing the bearer token; the
+#                               same value must appear in [[auth.daemons]]
+#                               on the central server.
+EnvironmentFile=/etc/whisper-agent/host-daemon.env
 
-# systemd creates /var/lib/whisper-agent before ExecStartPre fires, so
-# the helper can drop the control token there without a separate
-# tmpfiles.d entry.
+# State directory still useful for caching things the daemon may want
+# across restarts (and as a per-host workspace root for the startup
+# probe). systemd creates /var/lib/whisper-agent before ExecStart fires.
 StateDirectory=whisper-agent
 StateDirectoryMode=0750
 
-# Generate the control-plane bearer token on first start. Idempotent:
-# the helper no-ops when the file is already populated. Rotate by
-# deleting the file and restarting; remote whisper-agent servers
-# holding the old token will then fail auth and need re-provisioning.
-ExecStartPre=/usr/lib/whisper-agent/ensure-control-token /var/lib/whisper-agent/sandbox-control-token
-
-ExecStart=/usr/bin/whisper-agent-sandbox \
-    --listen ${WHISPER_AGENT_SANDBOX_LISTEN} \
+ExecStart=/usr/bin/whisper-agent-host-daemon \
+    --server-url ${WHISPER_AGENT_SERVER_URL} \
+    --token-file ${WHISPER_AGENT_TOKEN_FILE} \
     --mcp-host-bin /usr/bin/whisper-agent-mcp-host \
-    --control-token-file /var/lib/whisper-agent/sandbox-control-token
+    --probe-workspace /var/lib/whisper-agent
 
 Restart=on-failure
 RestartSec=5
