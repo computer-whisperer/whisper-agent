@@ -489,6 +489,34 @@ mod tests {
         assert!(extract_summary(regex_src, "nothing to see").is_none());
     }
 
+    /// Regression: when the model verbatim-quotes a prior tool result
+    /// (e.g., a dispatched-thread notification) that itself contains a
+    /// `<summary>...</summary>` pair, the default extraction regex must
+    /// capture the OUTER block, not stop at the inner closing tag.
+    /// Triggered on a real gpt-5.5 thread on 2026-05-03 (k8s mavis pod):
+    /// a 45kB summary was truncated to ~19kB at the inner `</summary>`.
+    #[test]
+    fn extracts_outer_summary_when_body_contains_nested_tag() {
+        let regex_src = whisper_agent_protocol::CompactionConfig::default().summary_regex;
+        let text = "<summary>\noutside head\n\
+                    <dispatched-thread-notification><summary>nested</summary></dispatched-thread-notification>\n\
+                    outside tail\n</summary>";
+        let got = extract_summary(&regex_src, text).expect("regex should match outer block");
+        assert!(got.contains("outside head"), "got: {got}");
+        assert!(got.contains("outside tail"), "got: {got}");
+        assert!(got.contains("<summary>nested</summary>"), "got: {got}");
+    }
+
+    /// The default regex anchors to end-of-input (`\s*\z`), tolerating
+    /// trailing whitespace but rejecting trailing prose. The compaction
+    /// prompt instructs the model to end after the closing tag.
+    #[test]
+    fn default_regex_tolerates_trailing_whitespace() {
+        let regex_src = whisper_agent_protocol::CompactionConfig::default().summary_regex;
+        let text = "<summary>\nbody\n</summary>\n  \n";
+        assert_eq!(extract_summary(&regex_src, text).as_deref(), Some("body"));
+    }
+
     #[test]
     fn template_substitutes_summary() {
         let out = render_continuation_template("prefix\n{{summary}}\nsuffix", "THE BODY");

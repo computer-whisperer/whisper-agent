@@ -272,7 +272,15 @@ fn compaction_enabled_default() -> bool {
 }
 
 fn default_summary_regex() -> String {
-    r"(?s)<summary>\s*(.*?)\s*</summary>".to_string()
+    // End-of-input anchor (`\s*\z`) forces the close-tag match to land
+    // on the OUTER `</summary>`, even when the body verbatim-quotes a
+    // prior tool result that itself contains a nested `<summary>...
+    // </summary>` pair (e.g., a dispatched-thread notification — the
+    // case that motivated this regex). Capture is non-greedy with a
+    // trailing `\S` so the body trims surrounding whitespace cleanly.
+    // Built-in compaction prompt instructs the model to end after the
+    // closing tag, so the `\s*\z` anchor is safe in practice.
+    r"(?s)<summary>\s*(.*?\S)\s*</summary>\s*\z".to_string()
 }
 
 fn default_continuation_template() -> String {
