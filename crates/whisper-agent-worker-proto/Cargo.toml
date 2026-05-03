@@ -1,7 +1,7 @@
 [package]
 name = "whisper-agent-worker-proto"
 description = "Wire types for the daemon ↔ worker IPC — host-daemon ↔ host-worker (formerly mcp-host)."
-version = "0.3.13"
+version = "0.3.14"
 edition.workspace = true
 license.workspace = true
 
