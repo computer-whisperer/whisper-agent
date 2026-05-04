@@ -18,10 +18,12 @@ whisper-agent-host-proto = { workspace = true }
 whisper-agent-worker-proto = { workspace = true }
 tokio = { workspace = true, features = ["process", "fs", "io-util", "io-std", "net", "sync"] }
 tokio-tungstenite = { version = "0.28", features = ["rustls-tls-native-roots"] }
-# `connect_async_tls_with_config` takes a tungstenite-shaped Connector;
-# the rustls feature pulls in the ring-backed default. We don't pin
-# rustls explicitly — the daemon doesn't need axum-server's
-# multi-provider tangle, just one TLS client.
+# Direct rustls dep so `main` can call `crypto::ring::default_provider()
+# .install_default()` before any TLS work. rustls 0.23 panics on the
+# first TLS use unless one provider is explicitly the process-wide
+# default — `tokio-tungstenite`'s `rustls-tls-*` feature pulls rustls
+# in but doesn't pick a provider for us.
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
 futures = "0.3"
 axum = { workspace = true, features = ["ws"] }
 http = "1"

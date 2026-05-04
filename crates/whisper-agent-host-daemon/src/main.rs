@@ -66,6 +66,14 @@ async fn main() -> anyhow::Result<()> {
 
     let args = Args::parse();
 
+    // rustls 0.23 panics on the first TLS use unless a provider is
+    // installed as the process default. Match the pattern used by the
+    // other binary crates in this workspace. `.ok()` swallows
+    // "already installed" if a future dep beats us to it.
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .ok();
+
     let token = tokio::fs::read_to_string(&args.token_file)
         .await
         .with_context(|| format!("reading token from {}", args.token_file.display()))?;

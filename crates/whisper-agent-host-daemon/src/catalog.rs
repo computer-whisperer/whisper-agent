@@ -15,6 +15,8 @@
 //! not on the hot path; if the worker can't be spawned, daemon
 //! startup fails loudly — which is what we want.
 
+use std::path::Path;
+
 use tracing::{debug, info};
 use whisper_agent_host_proto::ToolDescriptor;
 use whisper_agent_protocol::sandbox::{NetworkPolicy, PathAccess};
@@ -53,7 +55,12 @@ pub async fn probe_tool_catalog(
         %probe_workspace,
         "spawning probe worker for tool-catalog discovery"
     );
-    let worker = spawn(&spec, mcp_host_bin, None).await?;
+    // The probe runs without a `ThreadContext` (no scheduler attached
+    // yet), so it has to supply its own `workspace_root` override —
+    // since 9887b84 retired the daemon's spec-fallback heuristic. The
+    // override has to live under one of the spec's RW paths, which
+    // it does by construction (we grant it RW just above).
+    let worker = spawn(&spec, mcp_host_bin, Some(Path::new(probe_workspace))).await?;
     info!(count = worker.tools.len(), "probed worker tool catalog");
     // `worker` drops at end of scope → child gets killed via
     // `kill_on_drop`. The frame loop task finishes when the socket
