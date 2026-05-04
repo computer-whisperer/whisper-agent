@@ -29,6 +29,11 @@ makedepends=('rust' 'cargo')
 provides=('whisper-agent-host-daemon' 'whisper-agent-mcp-host')
 backup=('etc/whisper-agent/host-daemon.env')
 install="${pkgname}.install"
+# `ring`'s hand-written assembly objects don't survive LTO link
+# (rust-lld emits "undefined symbol: ring_core_*" for the asm-only
+# entry points). Override the system makepkg.conf's `lto` default
+# so cargo's release profile links the asm objects through normally.
+options=('!lto')
 source=(
     "${pkgname}-${pkgver}.tar.gz::${url}/archive/v${pkgver}.tar.gz"
     'host-daemon.env'
