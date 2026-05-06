@@ -19,7 +19,9 @@
 use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
+use std::time::Duration;
 
 use tokio_util::sync::CancellationToken;
 
@@ -265,6 +267,16 @@ pub trait BuildObserver: Send + Sync {
     /// Cumulative counters since build start. Both values monotonically
     /// increase. Called at end of each chunk-batch flush.
     fn on_progress(&self, source_records: u64, chunks: u64);
+    /// Insert progress for a `BuildingDense` HNSW *rebuild* (resume
+    /// path). The fresh-build dense phase doesn't tick this — hnsw_rs
+    /// runs the build in a single parallel call without a per-insert
+    /// hook. The rebuild path inserts vectors one-by-one in a blocking
+    /// loop, so this counter ticks on the wall-clock cadence of that
+    /// loop and lets the UI show that an hours-long rebuild is alive.
+    ///
+    /// Default impl is a no-op so test observers that don't care about
+    /// the resume path can stay terse.
+    fn on_dense_rebuild_progress(&self, _inserted: u64, _total: u64) {}
 }
 
 pub struct DiskBucket {
@@ -1021,6 +1033,15 @@ impl DiskBucket {
                     dump_snapshot = ?dump_snapshot,
                     "resume_slot: dense.snapshot lags BatchEmbedded checkpoint; rebuilding HNSW from vectors.bin",
                 );
+                // Surface the rebuild as BuildingDense so the UI shows
+                // "building HNSW" instead of leaving the phase tag at
+                // Indexing for the duration of the rebuild (often
+                // many hours at wiki scale). Reset back to Indexing
+                // below before run_after_planning takes over.
+                if let Some(obs) = observer {
+                    obs.on_phase(BuildPhase::BuildingDense);
+                    obs.on_dense_rebuild_progress(0, chunks_done);
+                }
                 let resume_dense_quant = super::dense::DenseQuant::from_vector_quant(
                     self.config.defaults.quantization.into(),
                 );
@@ -1037,7 +1058,14 @@ impl DiskBucket {
                 let chunk_ids = resumed_chunk_ids.clone();
                 let slot_id_for_thread = slot_id.to_string();
                 let log_step = chunk_ids.len().max(20).div_ceil(20);
-                let dense =
+                // Shared with the spawn_blocking loop so the async
+                // poller below can read insert progress without
+                // touching the observer from inside the blocking
+                // closure (the observer is `&dyn` and can't be moved
+                // across that boundary).
+                let inserted_atomic = Arc::new(AtomicU64::new(0));
+                let inserted_for_thread = inserted_atomic.clone();
+                let join =
                     tokio::task::spawn_blocking(move || -> Result<DenseIndex, BucketError> {
                         let total = chunk_ids.len();
                         let mut bin =
@@ -1074,6 +1102,7 @@ impl DiskBucket {
                             bin.read_exact(&mut bytes).map_err(BucketError::Io)?;
                             let v = super::vectors::dequantize_record(&bytes, vec_quant, dim);
                             dense.insert(*chunk_id, position as u64, &v);
+                            inserted_for_thread.store((position + 1) as u64, Ordering::Relaxed);
                             if (position + 1).is_multiple_of(log_step) {
                                 tracing::info!(
                                     slot = %slot_id_for_thread,
@@ -1084,16 +1113,39 @@ impl DiskBucket {
                             }
                         }
                         Ok(dense)
-                    })
-                    .await
-                    .map_err(|e| {
-                        BucketError::Other(format!("spawn_blocking dense rebuild: {e}"))
-                    })??;
+                    });
+                tokio::pin!(join);
+                let mut tick = tokio::time::interval(Duration::from_millis(500));
+                tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                // Skip the immediate first tick — we already pushed a
+                // (0, chunks_done) reading above.
+                tick.tick().await;
+                let join_result = loop {
+                    tokio::select! {
+                        biased;
+                        result = &mut join => break result,
+                        _ = tick.tick() => {
+                            if let Some(obs) = observer {
+                                let inserted = inserted_atomic.load(Ordering::Relaxed);
+                                obs.on_dense_rebuild_progress(inserted, chunks_done);
+                            }
+                        }
+                    }
+                };
+                let dense = join_result.map_err(|e| {
+                    BucketError::Other(format!("spawn_blocking dense rebuild: {e}"))
+                })??;
                 tracing::info!(
                     slot = %slot_id,
                     chunks = chunks_done,
                     "resume_slot: HNSW rebuild complete",
                 );
+                // Hand back to Indexing for run_after_planning, and
+                // clear the dense-rebuild gauge so the UI drops it.
+                if let Some(obs) = observer {
+                    obs.on_dense_rebuild_progress(0, 0);
+                    obs.on_phase(BuildPhase::Indexing);
+                }
                 Some(Arc::new(dense))
             }
         };

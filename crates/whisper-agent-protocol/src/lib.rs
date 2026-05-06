@@ -2211,6 +2211,23 @@ pub enum ServerToClient {
         /// progress tick (not just the synthetic Started replay).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         started_at: Option<String>,
+        /// Inserts completed during a `BuildingDense` HNSW rebuild on
+        /// the resume path. `source_records` / `chunks` stay frozen
+        /// across the rebuild (the chunks are already on disk), so the
+        /// UI needs a separate counter to show that the rebuild is
+        /// progressing instead of looking stuck for hours.
+        ///
+        /// `None` outside the resume rebuild — including the fresh-build
+        /// `BuildingDense` phase, where hnsw_rs builds in parallel from
+        /// a single call and exposes no per-insert hook.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        dense_inserted: Option<u64>,
+        /// Total inserts the resume rebuild needs to complete before
+        /// the index is hydrated and indexing can resume. Equals the
+        /// chunks-on-disk count at rebuild start. `None` when
+        /// `dense_inserted` is `None`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        dense_total: Option<u64>,
     },
     /// Terminal event for a build. `summary` carries the bucket's new
     /// snapshot when the build succeeded (so clients can update the row

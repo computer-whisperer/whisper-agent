@@ -630,6 +630,8 @@ impl ChatApp {
                             source_records: 0,
                             chunks: 0,
                             started_at,
+                            dense_inserted: None,
+                            dense_total: None,
                         },
                     );
                 }
@@ -641,6 +643,8 @@ impl ChatApp {
                 source_records,
                 chunks,
                 started_at,
+                dense_inserted,
+                dense_total,
                 ..
             } => {
                 if let Some(modal) = self.buckets_modal.as_mut() {
@@ -660,6 +664,8 @@ impl ChatApp {
                             source_records,
                             chunks,
                             started_at: started_at.or(prior),
+                            dense_inserted,
+                            dense_total,
                         },
                     );
                 }

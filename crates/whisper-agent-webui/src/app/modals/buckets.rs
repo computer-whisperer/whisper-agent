@@ -127,6 +127,11 @@ pub(crate) struct BuildProgressView {
     /// old servers that pre-date the field; UI renders no elapsed
     /// stopwatch when missing.
     pub(crate) started_at: Option<String>,
+    /// Insert progress for a `BuildingDense` HNSW rebuild on the
+    /// resume path. `Some` only while a rebuild is in flight; `None`
+    /// during fresh builds and outside the rebuild window.
+    pub(crate) dense_inserted: Option<u64>,
+    pub(crate) dense_total: Option<u64>,
 }
 
 pub(crate) fn render_buckets_modal(
@@ -1034,17 +1039,24 @@ fn render_build_progress(ui: &mut egui::Ui, p: &BuildProgressView) {
         .as_deref()
         .map(format_build_elapsed)
         .filter(|s| !s.is_empty());
+    // Resume-path rebuild gauge — replaces the (frozen) pages/chunks
+    // counts when an HNSW rebuild is mid-flight, since those numbers
+    // don't move during the rebuild and look stuck.
+    let counts_body = match (p.dense_inserted, p.dense_total) {
+        (Some(inserted), Some(total)) if total > 0 => format!(
+            "{} / {} HNSW inserts",
+            format_count(inserted),
+            format_count(total),
+        ),
+        _ => format!(
+            "{} pages · {} chunks",
+            format_count(p.source_records),
+            format_count(p.chunks),
+        ),
+    };
     let body = match elapsed_str {
-        Some(elapsed) => format!(
-            "{phase} · {} pages · {} chunks · {elapsed}",
-            format_count(p.source_records),
-            format_count(p.chunks),
-        ),
-        None => format!(
-            "{phase} · {} pages · {} chunks",
-            format_count(p.source_records),
-            format_count(p.chunks),
-        ),
+        Some(elapsed) => format!("{phase} · {counts_body} · {elapsed}"),
+        None => format!("{phase} · {counts_body}"),
     };
     ui.horizontal_wrapped(|ui| {
         ui.spinner();

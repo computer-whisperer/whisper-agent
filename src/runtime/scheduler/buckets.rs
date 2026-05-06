@@ -843,6 +843,8 @@ impl Scheduler {
                     source_records: snap.source_records,
                     chunks: snap.chunks,
                     started_at: Some(started_at),
+                    dense_inserted: snap.dense_inserted,
+                    dense_total: snap.dense_total,
                 },
             );
         }
@@ -865,6 +867,8 @@ impl Scheduler {
                     source_records: snapshot.source_records,
                     chunks: snapshot.chunks,
                     started_at: Some(snapshot.started_at.to_rfc3339()),
+                    dense_inserted: snapshot.dense_inserted,
+                    dense_total: snapshot.dense_total,
                 };
                 self.router.broadcast_task_list(event);
             }
@@ -1331,6 +1335,12 @@ async fn run_build(
 pub struct ProgressShared {
     source_records: AtomicU64,
     chunks: AtomicU64,
+    /// Insert progress for a `BuildingDense` HNSW rebuild (resume
+    /// path). Zero outside the rebuild — the snapshot maps zero to
+    /// `None` on the wire so the UI's gauge only appears when the
+    /// rebuild is actually ticking.
+    dense_inserted: AtomicU64,
+    dense_total: AtomicU64,
     /// Phase encoded as a u8 (0=Indexing, 1=BuildingDense, 2=Finalizing)
     /// so the throttled emitter can read without a lock.
     phase: AtomicU8,
@@ -1349,6 +1359,8 @@ impl Default for ProgressShared {
         Self {
             source_records: AtomicU64::new(0),
             chunks: AtomicU64::new(0),
+            dense_inserted: AtomicU64::new(0),
+            dense_total: AtomicU64::new(0),
             phase: AtomicU8::new(0),
             done: AtomicBool::new(false),
             started_at: chrono::Utc::now(),
@@ -1358,11 +1370,22 @@ impl Default for ProgressShared {
 
 impl ProgressShared {
     pub fn snapshot(&self) -> ProgressSnapshot {
+        let dense_total = self.dense_total.load(Ordering::Acquire);
+        let dense_inserted = self.dense_inserted.load(Ordering::Acquire);
+        // total==0 ⇒ no rebuild active; suppress both fields on the
+        // wire so the client's gauge disappears between rebuilds.
+        let (dense_inserted, dense_total) = if dense_total == 0 {
+            (None, None)
+        } else {
+            (Some(dense_inserted), Some(dense_total))
+        };
         ProgressSnapshot {
             source_records: self.source_records.load(Ordering::Acquire),
             chunks: self.chunks.load(Ordering::Acquire),
             phase: phase_from_u8(self.phase.load(Ordering::Acquire)),
             started_at: self.started_at,
+            dense_inserted,
+            dense_total,
         }
     }
 
@@ -1376,6 +1399,8 @@ pub struct ProgressSnapshot {
     pub chunks: u64,
     pub phase: BucketBuildPhase,
     pub started_at: chrono::DateTime<chrono::Utc>,
+    pub dense_inserted: Option<u64>,
+    pub dense_total: Option<u64>,
 }
 
 // Phase ↔ u8 mapping. Planning is encoded as 0 so the AtomicU8's
@@ -1419,6 +1444,17 @@ impl BuildObserver for ProgressObserver {
             .source_records
             .store(source_records, Ordering::Release);
         self.shared.chunks.store(chunks, Ordering::Release);
+    }
+    fn on_dense_rebuild_progress(&self, inserted: u64, total: u64) {
+        // Order matters on the way *up*: writing `total` first means
+        // a snapshot reader that sees a non-zero total will also see
+        // a sensible inserted value (≤ total). On the way *down*
+        // (rebuild-complete clears with (0, 0)) the order is moot —
+        // both go to zero.
+        self.shared.dense_total.store(total, Ordering::Release);
+        self.shared
+            .dense_inserted
+            .store(inserted, Ordering::Release);
     }
 }
 
