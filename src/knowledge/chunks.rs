@@ -567,6 +567,77 @@ pub fn scan_record_offsets(bin_path: &Path) -> io::Result<Vec<u64>> {
     }
 }
 
+/// Stream the `source_id` field of every record in `chunks.bin`, in
+/// insertion order, parsing only the bytes needed to extract it.
+/// `seek_relative` skips the locator + text bytes — `BufReader` makes
+/// that cheap when the rest of the body is already buffered, and the
+/// underlying file seek when it isn't.
+///
+/// Used by the resume path's chunk-count-mismatch diagnostic, where we
+/// need to identify the first record whose on-disk chunk count differs
+/// from a fresh re-walk. Pairing this stream against the chunker
+/// re-walk's per-record counts (grouped by consecutive same source_id)
+/// pinpoints the first divergence without holding the whole on-disk
+/// source-id list in memory.
+pub fn walk_source_ids(bin_path: &Path) -> io::Result<SourceIdWalker> {
+    let file = File::open(bin_path)?;
+    Ok(SourceIdWalker {
+        reader: BufReader::new(file),
+    })
+}
+
+/// Iterator returned by [`walk_source_ids`]. Yields one `source_id`
+/// per chunks.bin record, in file order.
+pub struct SourceIdWalker {
+    reader: BufReader<File>,
+}
+
+impl Iterator for SourceIdWalker {
+    type Item = io::Result<String>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let mut len_bytes = [0u8; 4];
+        match self.reader.read_exact(&mut len_bytes) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return None,
+            Err(e) => return Some(Err(e)),
+        }
+        let body_len = u32::from_le_bytes(len_bytes) as u64;
+
+        // Body header: version (1) + has_locator (1) + source_id_length (4).
+        let mut head = [0u8; 6];
+        if let Err(e) = self.reader.read_exact(&mut head) {
+            return Some(Err(e));
+        }
+        if head[0] != RECORD_VERSION {
+            return Some(Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("unknown chunks.bin record version: {}", head[0]),
+            )));
+        }
+        let source_id_len = u32::from_le_bytes([head[2], head[3], head[4], head[5]]) as u64;
+
+        let mut source_id_bytes = vec![0u8; source_id_len as usize];
+        if let Err(e) = self.reader.read_exact(&mut source_id_bytes) {
+            return Some(Err(e));
+        }
+        let source_id = match String::from_utf8(source_id_bytes) {
+            Ok(s) => s,
+            Err(e) => return Some(Err(io::Error::new(io::ErrorKind::InvalidData, e))),
+        };
+
+        // Skip locator (if any) + text. Body layout guarantees these
+        // are exactly `body_len - 6 - source_id_len` bytes.
+        let consumed = 6u64 + source_id_len;
+        let to_skip = body_len.saturating_sub(consumed);
+        if let Err(e) = self.reader.seek_relative(to_skip as i64) {
+            return Some(Err(e));
+        }
+
+        Some(Ok(source_id))
+    }
+}
+
 /// Walk `chunks.bin` sequentially, pairing each record with the
 /// `chunk_id` at the matching position in `chunk_ids`. Yields full
 /// [`Chunk`]s in insertion order via a streaming iterator (no
@@ -929,6 +1000,54 @@ mod tests {
         // Last offset matches actual file length.
         let file_len = std::fs::metadata(&bin).unwrap().len();
         assert_eq!(*offsets.last().unwrap(), file_len);
+    }
+
+    #[test]
+    fn walk_source_ids_yields_in_insertion_order() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin = tmp.path().join("chunks.bin");
+        let idx = tmp.path().join("chunks.idx");
+
+        // Mix of records with/without locator and with multibyte source_ids,
+        // because the walker has to skip the right number of bytes regardless.
+        let entries: Vec<(ChunkId, &str, Option<&str>, &str)> = vec![
+            (ChunkId::from_source(&[0u8; 32], 0), "alpha", None, "first"),
+            (
+                ChunkId::from_source(&[1u8; 32], 0),
+                "beta",
+                Some("loc-1"),
+                "second",
+            ),
+            (
+                ChunkId::from_source(&[1u8; 32], 1),
+                "beta",
+                Some("loc-2"),
+                "third",
+            ),
+            (
+                ChunkId::from_source(&[2u8; 32], 0),
+                "γαμμα",
+                None,
+                "non-ascii title",
+            ),
+        ];
+        {
+            let mut w = ChunkStoreWriter::create(&bin, &idx).unwrap();
+            for (id, sid, loc, text) in &entries {
+                w.append(*id, &sref(sid, *loc), text).unwrap();
+            }
+            w.finalize().unwrap();
+        }
+
+        let walked: Vec<String> = walk_source_ids(&bin)
+            .unwrap()
+            .collect::<io::Result<Vec<_>>>()
+            .unwrap();
+        let expected: Vec<String> = entries
+            .iter()
+            .map(|(_, sid, _, _)| sid.to_string())
+            .collect();
+        assert_eq!(walked, expected);
     }
 
     #[test]

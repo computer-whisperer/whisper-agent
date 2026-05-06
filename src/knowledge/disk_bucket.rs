@@ -827,6 +827,12 @@ impl DiskBucket {
         // disk, not what was consumed from the source.
         let mut resumed_chunk_ids: Vec<ChunkId> = Vec::with_capacity(chunks_done as usize);
         let records_to_skip = records_done.min(planned.len() as u64);
+        // Per-planned-record chunk count, populated in lockstep with
+        // the loop. Drives the on-mismatch diagnostic at the bottom of
+        // this function — by pairing this with a streaming walk of
+        // chunks.bin's source_ids we can pinpoint the first record
+        // whose on-disk chunk count diverges from the fresh re-walk.
+        let mut per_record_chunks: Vec<u32> = Vec::with_capacity(records_to_skip as usize);
         let mut iter = adapter.enumerate();
         let mut seen_hashes: HashSet<[u8; 32]> = HashSet::new();
         for (i, (expected_source_id, expected_hash)) in
@@ -865,14 +871,17 @@ impl DiskBucket {
                 );
             }
             if !seen_hashes.insert(record.content_hash) {
+                per_record_chunks.push(0);
                 continue;
             }
+            let n_before = resumed_chunk_ids.len();
             for new_chunk in chunker.chunk(&record) {
                 resumed_chunk_ids.push(ChunkId::from_source(
                     &new_chunk.source_record_hash,
                     new_chunk.chunk_offset,
                 ));
             }
+            per_record_chunks.push((resumed_chunk_ids.len() - n_before) as u32);
             // Tick the observer so the UI's source/chunk counters
             // climb during the re-walk instead of staying at 0 for
             // minutes. Cheap per-iteration store; the throttled
@@ -904,8 +913,33 @@ impl DiskBucket {
         // We hand it off to run_after_planning rather than dropping
         // and re-walking.
         if (resumed_chunk_ids.len() as u64) != chunks_done {
+            // Walk chunks.bin source_ids to find the first record whose
+            // on-disk chunk count diverges from this re-walk. Failure
+            // of the diagnostic itself is non-fatal — surface it as
+            // text alongside the (still-fatal) chunk-count mismatch.
+            let diag = match diagnose_resume_chunk_count_mismatch(
+                &chunks_bin,
+                &planned[..records_to_skip as usize],
+                &per_record_chunks,
+            ) {
+                Ok(s) => s,
+                Err(e) => format!("(diagnostic walk failed: {e})"),
+            };
+            let delta = (resumed_chunk_ids.len() as i64) - (chunks_done as i64);
+            tracing::error!(
+                bucket = %self.id,
+                slot = %slot_id,
+                re_walk_chunks = resumed_chunk_ids.len(),
+                checkpoint_chunks = chunks_done,
+                delta,
+                records_walked = records_to_skip,
+                tokenizer = ?manifest.chunker_snapshot.tokenizer,
+                diagnostic = %diag,
+                "resume_slot: chunker re-walk diverged from build.state checkpoint",
+            );
             return Err(BucketError::Other(format!(
-                "resume_slot: re-derived chunk count {} doesn't match build.state checkpoint {}",
+                "resume_slot: re-derived chunk count {} doesn't match build.state checkpoint {} \
+                 (delta {delta}); diagnostic: {diag}",
                 resumed_chunk_ids.len(),
                 chunks_done,
             )));
@@ -3353,6 +3387,135 @@ fn total_dir_size(dir: &Path) -> std::io::Result<u64> {
         }
     }
     Ok(total)
+}
+
+/// Compare the on-disk chunks.bin against the chunker re-walk's
+/// per-record output to identify the first record whose chunk count
+/// diverges. Returns a one-line summary of either the first mismatch
+/// or "no per-group divergence found" (which would mean some other
+/// bookkeeping is off).
+///
+/// `planned[i]` and `per_record_chunks[i]` are paired by planned-record
+/// index; the i'th entry's chunk count is `per_record_chunks[i]` (0
+/// for dedup-skipped or empty records). chunks.bin only stores records
+/// whose chunk count was > 0, so this filters the planned/counts pair
+/// before comparing.
+///
+/// Walks chunks.bin streamingly, grouping consecutive same-source_id
+/// chunks into (source_id, count) groups, and compares each group
+/// against the next non-zero entry from the planned/counts pair.
+/// Stops at the first divergence.
+fn diagnose_resume_chunk_count_mismatch(
+    chunks_bin: &Path,
+    planned: &[(String, [u8; 32])],
+    per_record_chunks: &[u32],
+) -> std::io::Result<String> {
+    use super::chunks::walk_source_ids;
+
+    let mut walker = walk_source_ids(chunks_bin)?;
+    // Iterator over the re-walk's filtered (planned_idx, source_id, content_hash, chunk_count)
+    // entries — only the records that contributed chunks to chunks.bin.
+    let mut expected_iter = planned
+        .iter()
+        .zip(per_record_chunks.iter().copied())
+        .enumerate()
+        .filter(|(_, (_, n))| *n > 0)
+        .map(|(planned_idx, ((sid, hash), n))| (planned_idx, sid.clone(), *hash, n));
+
+    let mut current_source: Option<String> = None;
+    let mut current_count: u32 = 0;
+    let mut group_idx: usize = 0;
+    let mut total_chunks_walked: u64 = 0;
+
+    let mut close_group = |source: String, count: u32, group_idx: usize| -> Option<String> {
+        match expected_iter.next() {
+            Some((planned_idx, exp_source, exp_hash, exp_count)) => {
+                if exp_source != source || exp_count != count {
+                    Some(format!(
+                        "first divergence at on-disk group #{group_idx}: \
+                         on_disk{{source_id={source:?}, count={count}}} vs \
+                         re_walk{{planned_idx={planned_idx}, source_id={exp_source:?}, \
+                         content_hash={}, count={exp_count}}}",
+                        hex8(&exp_hash),
+                    ))
+                } else {
+                    None
+                }
+            }
+            None => Some(format!(
+                "on-disk group #{group_idx} (source_id={source:?}, count={count}) \
+                 has no matching re-walk entry — chunks.bin has more groups than the re-walk \
+                 expected"
+            )),
+        }
+    };
+
+    loop {
+        match walker.next() {
+            Some(Ok(source_id)) => {
+                total_chunks_walked += 1;
+                match &current_source {
+                    Some(s) if *s == source_id => {
+                        current_count += 1;
+                    }
+                    _ => {
+                        if let Some(prev) = current_source.take() {
+                            if let Some(msg) = close_group(prev, current_count, group_idx) {
+                                return Ok(msg);
+                            }
+                            group_idx += 1;
+                        }
+                        current_source = Some(source_id);
+                        current_count = 1;
+                    }
+                }
+            }
+            Some(Err(e)) => return Err(e),
+            None => {
+                if let Some(prev) = current_source.take() {
+                    if let Some(msg) = close_group(prev, current_count, group_idx) {
+                        return Ok(msg);
+                    }
+                    group_idx += 1;
+                }
+                break;
+            }
+        }
+    }
+
+    // Re-walk should also be exhausted; if it has more, log a preview.
+    let leftover: Vec<(usize, String, [u8; 32], u32)> = expected_iter.take(5).collect();
+    if !leftover.is_empty() {
+        let preview: Vec<String> = leftover
+            .iter()
+            .map(|(idx, sid, hash, n)| {
+                format!(
+                    "{{planned_idx={idx}, source_id={sid:?}, content_hash={}, count={n}}}",
+                    hex8(hash)
+                )
+            })
+            .collect();
+        return Ok(format!(
+            "on-disk exhausted at {total_chunks_walked} chunks ({group_idx} groups); \
+             re-walk has more entries — preview: [{}]",
+            preview.join(", ")
+        ));
+    }
+
+    Ok(format!(
+        "no per-group divergence found across {group_idx} groups / \
+         {total_chunks_walked} on-disk chunks — counters disagree but content matches; \
+         likely a bookkeeping bug in the build pipeline rather than the chunker"
+    ))
+}
+
+fn hex8(bytes: &[u8; 32]) -> String {
+    let mut s = String::with_capacity(16);
+    for b in &bytes[..8] {
+        use std::fmt::Write;
+        let _ = write!(&mut s, "{b:02x}");
+    }
+    s
 }
 
 #[cfg(test)]
@@ -6589,6 +6752,121 @@ embedder = "tei_test"
         assert!(
             msg.contains("already exists"),
             "expected duplicate-source error, got {msg}",
+        );
+    }
+
+    #[test]
+    fn diagnose_chunk_count_mismatch_pinpoints_first_divergent_record() {
+        // Build a chunks.bin where record idx=2 has 3 chunks on disk
+        // but the (faked) re-walk thinks it should have 2. Diagnostic
+        // should name that group as the divergence.
+        use super::super::types::SourceRef;
+        let tmp = tempfile::tempdir().unwrap();
+        let bin = tmp.path().join("chunks.bin");
+        let idx = tmp.path().join("chunks.idx");
+
+        // Helper: append `count` chunks with source_id=`sid` to `w`.
+        let append_group = |w: &mut super::super::chunks::ChunkStoreWriter,
+                            sid: &str,
+                            content_hash: &[u8; 32],
+                            count: u32| {
+            for offset in 0..count {
+                w.append(
+                    super::ChunkId::from_source(content_hash, offset as u64),
+                    &SourceRef {
+                        source_id: sid.to_string(),
+                        locator: None,
+                    },
+                    "body",
+                )
+                .unwrap();
+            }
+        };
+
+        let hashes: Vec<[u8; 32]> = (0..4u8).map(|i| [i; 32]).collect();
+        {
+            let mut w = super::super::chunks::ChunkStoreWriter::create(&bin, &idx).unwrap();
+            append_group(&mut w, "doc-a", &hashes[0], 2);
+            append_group(&mut w, "doc-b", &hashes[1], 1);
+            append_group(&mut w, "doc-c", &hashes[2], 3); // disk says 3
+            append_group(&mut w, "doc-d", &hashes[3], 1);
+            w.finalize().unwrap();
+        }
+        let planned: Vec<(String, [u8; 32])> = vec![
+            ("doc-a".to_string(), hashes[0]),
+            ("doc-b".to_string(), hashes[1]),
+            ("doc-c".to_string(), hashes[2]),
+            ("doc-d".to_string(), hashes[3]),
+        ];
+        // Re-walk thinks doc-c has only 2 chunks.
+        let per_record_chunks = vec![2u32, 1, 2, 1];
+
+        let msg = super::diagnose_resume_chunk_count_mismatch(&bin, &planned, &per_record_chunks)
+            .unwrap();
+        assert!(
+            msg.contains("first divergence at on-disk group #2"),
+            "expected divergence at group #2, got: {msg}"
+        );
+        assert!(
+            msg.contains("doc-c"),
+            "expected doc-c in message, got: {msg}"
+        );
+        assert!(
+            msg.contains("count=3") && msg.contains("count=2"),
+            "expected both counts in message, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn diagnose_chunk_count_mismatch_skips_dedup_and_zero_records() {
+        // Re-walk reports 0 chunks for a deduped record; chunks.bin
+        // should have no group for it. Diagnostic must filter it out
+        // and align the remaining groups correctly.
+        use super::super::types::SourceRef;
+        let tmp = tempfile::tempdir().unwrap();
+        let bin = tmp.path().join("chunks.bin");
+        let idx = tmp.path().join("chunks.idx");
+
+        let hashes: Vec<[u8; 32]> = (0..3u8).map(|i| [i; 32]).collect();
+        {
+            let mut w = super::super::chunks::ChunkStoreWriter::create(&bin, &idx).unwrap();
+            // doc-a: 2 chunks; (doc-b dedup'd, no entry); doc-c: 1 chunk.
+            for offset in 0..2 {
+                w.append(
+                    super::ChunkId::from_source(&hashes[0], offset),
+                    &SourceRef {
+                        source_id: "doc-a".to_string(),
+                        locator: None,
+                    },
+                    "body",
+                )
+                .unwrap();
+            }
+            w.append(
+                super::ChunkId::from_source(&hashes[2], 0),
+                &SourceRef {
+                    source_id: "doc-c".to_string(),
+                    locator: None,
+                },
+                "body",
+            )
+            .unwrap();
+            w.finalize().unwrap();
+        }
+        let planned: Vec<(String, [u8; 32])> = vec![
+            ("doc-a".to_string(), hashes[0]),
+            ("doc-b".to_string(), hashes[1]),
+            ("doc-c".to_string(), hashes[2]),
+        ];
+        let per_record_chunks = vec![2u32, 0, 1]; // doc-b counted 0
+
+        let msg = super::diagnose_resume_chunk_count_mismatch(&bin, &planned, &per_record_chunks)
+            .unwrap();
+        // Counts agree per-record; total matches; expect "no per-group
+        // divergence found" terminator.
+        assert!(
+            msg.contains("no per-group divergence found"),
+            "expected no-divergence message, got: {msg}"
         );
     }
 
