@@ -879,6 +879,21 @@ impl Scheduler {
                 let key = BucketKey::from_optional(pod_id.clone(), bucket_id.clone());
                 self.active_bucket_builds.remove(&key);
                 self.active_bucket_progress.remove(&key);
+                // Mirror the wire `BucketBuildEnded` to tracing so a
+                // failed build is visible in pod logs even if no client
+                // is connected to receive the broadcast. Only Error is
+                // load-bearing here — Success/Cancelled have other
+                // paths (refresh log below, audit, UI) and don't
+                // warrant the noise.
+                if let BucketBuildOutcome::Error { message } = &outcome {
+                    tracing::error!(
+                        bucket = %bucket_id,
+                        pod = ?pod_id,
+                        slot = %slot_id,
+                        error = %message,
+                        "bucket build ended with error",
+                    );
+                }
                 let summary = if matches!(outcome, BucketBuildOutcome::Success) {
                     match pod_id.as_deref() {
                         None => match self.bucket_registry.refresh_entry(&bucket_id).await {
