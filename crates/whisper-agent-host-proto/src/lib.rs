@@ -294,6 +294,7 @@ mod tests {
             GoodbyeReason::ProtocolMismatch,
             GoodbyeReason::Unauthorized,
             GoodbyeReason::NameAlreadyConnected,
+            GoodbyeReason::Superseded,
             GoodbyeReason::ServerShutdown,
             GoodbyeReason::DaemonShutdown,
             GoodbyeReason::Other,

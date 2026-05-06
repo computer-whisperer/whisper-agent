@@ -388,6 +388,88 @@ async fn rejects_duplicate_name() {
 }
 
 #[tokio::test]
+async fn evicts_stale_existing_on_collision() {
+    // Connect a first daemon, force its registry handle to look stale
+    // (last_active_at backdated past CONFLICT_STALE_WINDOW), then
+    // connect a second daemon under the same name. The second should
+    // win the slot; the first should receive `Goodbye::Superseded`.
+    let registry = Arc::new(LiveDaemonRegistry::new());
+    registry.admit_names(["alpha".to_string()]);
+    let auth = Arc::new(DaemonAuthState::new(vec![AuthDaemon {
+        name: "alpha".into(),
+        token: "tok-alpha".into(),
+    }]));
+    let (addr, shutdown) = spawn_server(build_app(registry.clone(), auth)).await;
+
+    // First daemon: complete handshake and register.
+    let req1 = ws_request_with_token(addr, "tok-alpha");
+    let (mut ws1, _) = connect_async(req1).await.unwrap();
+    send_frame(
+        &mut ws1,
+        Frame::Hello {
+            daemon_version: "first".into(),
+            protocol_version: PROTOCOL_VERSION,
+            capabilities: sample_capabilities(),
+        },
+    )
+    .await;
+    let _ = recv_frame(&mut ws1).await; // Welcome
+    let first_handle = tokio::time::timeout(
+        Duration::from_secs(2),
+        registry.wait_for_connection("alpha"),
+    )
+    .await
+    .unwrap();
+
+    // Backdate the existing handle's liveness timestamp so the
+    // registry sees it as stale on the next collision.
+    first_handle.__set_last_active_for_test(0);
+
+    // Second daemon: same name. Should be admitted.
+    let req2 = ws_request_with_token(addr, "tok-alpha");
+    let (mut ws2, _) = connect_async(req2).await.unwrap();
+    send_frame(
+        &mut ws2,
+        Frame::Hello {
+            daemon_version: "second".into(),
+            protocol_version: PROTOCOL_VERSION,
+            capabilities: sample_capabilities(),
+        },
+    )
+    .await;
+    match recv_frame(&mut ws2).await {
+        Frame::Welcome { .. } => {}
+        other => panic!("expected Welcome on second connection, got {other:?}"),
+    }
+
+    // First daemon receives `Goodbye::Superseded`.
+    match recv_frame(&mut ws1).await {
+        Frame::Goodbye { reason, .. } => {
+            use whisper_agent_host_proto::GoodbyeReason;
+            assert!(
+                matches!(reason, GoodbyeReason::Superseded),
+                "expected Superseded, got {reason:?}"
+            );
+        }
+        other => panic!("expected Goodbye on first connection, got {other:?}"),
+    }
+
+    // Registry now points at the new handle, not the backdated one.
+    let current = tokio::time::timeout(
+        Duration::from_secs(2),
+        registry.wait_for_connection("alpha"),
+    )
+    .await
+    .unwrap();
+    assert!(
+        !std::sync::Arc::ptr_eq(&current, &first_handle),
+        "registry should hold the replacement handle, not the superseded one",
+    );
+
+    let _ = shutdown.send(());
+}
+
+#[tokio::test]
 async fn surfaces_session_failed_to_consumer() {
     let registry = Arc::new(LiveDaemonRegistry::new());
     registry.admit_names(["alpha".to_string()]);

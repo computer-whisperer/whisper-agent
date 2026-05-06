@@ -7,7 +7,7 @@
 //! let the caller assert how many of each command flowed through.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU64, AtomicUsize, Ordering};
 
 use tokio::sync::{Mutex, mpsc, oneshot};
 use whisper_agent_host_proto::{
@@ -98,6 +98,12 @@ where
                 Command::CloseSession { .. } => {
                     state_for_task.closes.fetch_add(1, Ordering::Relaxed);
                 }
+                Command::Supersede { .. } => {
+                    // Fake daemon mirrors the production task's
+                    // behavior: a Supersede ends the task. No further
+                    // commands will arrive on this channel.
+                    break;
+                }
             }
         }
     });
@@ -124,6 +130,16 @@ impl LiveDaemonHandle {
             capabilities,
             cmd_tx,
             next_session_seq: AtomicU64::new(1),
+            last_active_at_ms: AtomicI64::new(super::unix_millis_now()),
         }
+    }
+
+    /// Test-only: backdate this handle so the registry's freshness
+    /// check treats it as stale. Used to drive the
+    /// "evict-stale-on-collision" path without sleeping for a real
+    /// `CONFLICT_STALE_WINDOW`.
+    #[doc(hidden)]
+    pub(in crate::tools::host_env_link) fn __set_last_active_for_test(&self, ms: i64) {
+        self.last_active_at_ms.store(ms, Ordering::Release);
     }
 }

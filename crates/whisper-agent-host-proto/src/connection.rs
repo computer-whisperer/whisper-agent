@@ -65,6 +65,13 @@ pub enum GoodbyeReason {
     /// daemon should report this loudly to its operator rather than
     /// reconnecting in a tight loop.
     NameAlreadyConnected,
+    /// The daemon's prior connection was deemed dead (no heartbeat
+    /// liveness within `2 * heartbeat_interval`) and a fresh connection
+    /// has taken its slot. Sent by the scheduler to the *evicted*
+    /// connection. Daemons should treat this as "the scheduler's view
+    /// of you is gone" and not retry on the same socket — but the
+    /// daemon process can keep its newer connection.
+    Superseded,
     /// Server is shutting down. Daemons should reconnect with backoff.
     ServerShutdown,
     /// Daemon is shutting down. The scheduler tears down sessions and

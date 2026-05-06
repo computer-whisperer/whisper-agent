@@ -150,7 +150,13 @@ async fn run_loop(
                             error!(error = %e, "fatal: scheduler refused connection — exiting");
                             return Err(anyhow!(e.to_string()));
                         }
-                        ServerShutdown | DaemonShutdown | Other => {
+                        // `Superseded` means the scheduler treated our
+                        // prior connection as dead (heartbeat timeout)
+                        // and admitted a fresh one in its place. From
+                        // this daemon's view, the relevant connection
+                        // just ended — retry with backoff to make sure
+                        // we have a live socket again.
+                        Superseded | ServerShutdown | DaemonShutdown | Other => {
                             warn!(error = %e, "scheduler said goodbye, will reconnect");
                         }
                     }

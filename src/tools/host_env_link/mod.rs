@@ -25,14 +25,15 @@ pub mod endpoint;
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use thiserror::Error;
 use tokio::sync::{Notify, mpsc, oneshot};
 use whisper_agent_host_proto::{
-    CallId, CallToolResult, DaemonCapabilities, HostEnvSpec, ProvisionPhase, SessionId,
-    ThreadContext,
+    CallId, CallToolResult, DaemonCapabilities, GoodbyeReason, HostEnvSpec, ProvisionPhase,
+    SessionId, ThreadContext,
 };
 
 pub use auth::{AdmittedDaemon, DaemonAuthState};
@@ -161,29 +162,87 @@ impl LiveDaemonRegistry {
         }
     }
 
-    /// Insert a connected handle. Returns `false` if a handle with
-    /// the same name is already registered (caller should send
-    /// `Goodbye::NameAlreadyConnected` and close).
-    fn try_insert_connected(&self, name: String, handle: Arc<LiveDaemonHandle>) -> bool {
-        let mut inner = self.inner.lock().expect("registry mutex poisoned");
-        if inner.connected.contains_key(&name) {
-            return false;
+    /// Insert a connected handle, evicting a stale prior connection if
+    /// one is squatting on the name.
+    ///
+    /// Conflict policy (per `docs/design_host_env_protocol.md`
+    /// §"Conflict policy"):
+    /// - Slot empty → insert and return [`InsertOutcome::Inserted`].
+    /// - Slot occupied and the existing handle has shown liveness
+    ///   within `fresh_window` → return [`InsertOutcome::Rejected`].
+    ///   Caller should send `Goodbye::NameAlreadyConnected`.
+    /// - Slot occupied and the existing handle is stale → ask the
+    ///   prior connection to shut down (so it sends `Goodbye::Superseded`
+    ///   and tears down the WS), replace the registry entry with the
+    ///   new handle, and return [`InsertOutcome::Inserted`].
+    ///
+    /// The "stale" path is what un-deadlocks the half-open case: the
+    /// scheduler-side TCP can't tell a network-blip drop from a still-
+    /// alive idle daemon, so we lean on the heartbeat (the connection
+    /// task updates `last_active_at_ms` on every inbound frame and
+    /// pings every `HEARTBEAT_INTERVAL`). Old enough = dead.
+    fn insert_or_supersede(
+        &self,
+        name: String,
+        handle: Arc<LiveDaemonHandle>,
+        fresh_window: Duration,
+    ) -> InsertOutcome {
+        let evicted = {
+            let mut inner = self.inner.lock().expect("registry mutex poisoned");
+            match inner.connected.get(&name) {
+                None => {
+                    inner.connected.insert(name, handle);
+                    self.change.notify_waiters();
+                    return InsertOutcome::Inserted;
+                }
+                Some(existing) => {
+                    let now = unix_millis_now();
+                    let last = existing.last_active_at_ms.load(Ordering::Acquire);
+                    let age_ms = (now - last).max(0) as u128;
+                    if age_ms < fresh_window.as_millis() {
+                        return InsertOutcome::Rejected {
+                            existing_age_ms: age_ms.min(u64::MAX as u128) as u64,
+                        };
+                    }
+                    // Stale. Replace under the same lock so a third
+                    // concurrent connection sees the new entry, not a
+                    // briefly-empty slot.
+                    let evicted = inner.connected.insert(name, handle);
+                    self.change.notify_waiters();
+                    evicted
+                }
+            }
+        };
+        // Best-effort tell the evicted task to send `Goodbye::Superseded`
+        // and exit. If its command channel is closed (already torn down)
+        // or full, we don't care — the new handle is already in the
+        // registry, and the evicted task's eventual `remove_connected_if`
+        // is a no-op against the new Arc.
+        if let Some(old) = evicted {
+            old.try_send_supersede(
+                GoodbyeReason::Superseded,
+                "evicted: prior connection failed liveness check".into(),
+            );
         }
-        inner.connected.insert(name, handle);
-        self.change.notify_waiters();
-        true
+        InsertOutcome::Inserted
     }
 
-    /// Remove a connected handle on disconnect. No-op if absent.
-    fn remove_connected(&self, name: &str) {
+    /// Remove the registered handle for `name` *only if* it points at
+    /// the same Arc as `handle`. Used by a connection task on exit so
+    /// a task that was previously superseded doesn't yank out the new
+    /// handle that took its slot.
+    fn remove_connected_if(&self, name: &str, handle: &Arc<LiveDaemonHandle>) {
         let mut inner = self.inner.lock().expect("registry mutex poisoned");
-        if inner.connected.remove(name).is_some() {
+        if let Some(current) = inner.connected.get(name)
+            && Arc::ptr_eq(current, handle)
+        {
+            inner.connected.remove(name);
             self.change.notify_waiters();
         }
     }
 
     /// Test-only: insert a handle directly. Production code routes
-    /// through `try_insert_connected` from the connection task. Tests
+    /// through `insert_or_supersede` from the connection task. Tests
     /// for the dispatcher's reconnect retry loop need to swap in fresh
     /// handles without standing up the full WS handshake.
     #[cfg(test)]
@@ -197,8 +256,33 @@ impl LiveDaemonRegistry {
     /// for tests that simulate disconnect.
     #[cfg(test)]
     pub(crate) fn remove_for_test(&self, name: &str) {
-        self.remove_connected(name);
+        let mut inner = self.inner.lock().expect("registry mutex poisoned");
+        if inner.connected.remove(name).is_some() {
+            self.change.notify_waiters();
+        }
     }
+}
+
+/// Result of [`LiveDaemonRegistry::insert_or_supersede`].
+#[derive(Debug)]
+pub(super) enum InsertOutcome {
+    /// The new handle is now the registered entry. If a stale prior
+    /// entry was evicted, it's already been told to shut down.
+    Inserted,
+    /// The slot is occupied by a connection that's still showing
+    /// liveness; the caller should send `Goodbye::NameAlreadyConnected`
+    /// to the freshly-arrived connection. `existing_age_ms` is for
+    /// log context — how recently the existing connection last
+    /// reported activity.
+    Rejected { existing_age_ms: u64 },
+}
+
+pub(super) fn unix_millis_now() -> i64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
 }
 
 /// Sorted snapshot of registry state for logging / introspection.
@@ -214,6 +298,11 @@ pub struct LiveDaemonHandle {
     capabilities: DaemonCapabilities,
     cmd_tx: mpsc::Sender<Command>,
     next_session_seq: AtomicU64,
+    /// Millis-since-Unix-epoch of the most recent inbound activity on
+    /// this connection (any frame, including WS-level Pong). Read by
+    /// the registry's conflict-resolution path to decide whether a
+    /// colliding new connection should evict this one.
+    last_active_at_ms: AtomicI64,
 }
 
 impl fmt::Debug for LiveDaemonHandle {
@@ -232,6 +321,24 @@ impl LiveDaemonHandle {
 
     pub fn capabilities(&self) -> &DaemonCapabilities {
         &self.capabilities
+    }
+
+    /// Mark this handle as having seen inbound activity now. Called
+    /// from the connection task on every received frame.
+    pub(super) fn touch_active(&self) {
+        self.last_active_at_ms
+            .store(unix_millis_now(), Ordering::Release);
+    }
+
+    /// Best-effort send of [`Command::Supersede`] so the connection
+    /// task knows to send a `Goodbye::Superseded` and exit. We use
+    /// `try_send` because: (a) we're already holding the registry
+    /// lock when we call this, so we can't `await`; (b) if the channel
+    /// is full or closed the task is either already shutting down or
+    /// can't keep up — either way the new handle is already registered,
+    /// so eventual cleanup is correct without our help.
+    pub(super) fn try_send_supersede(&self, reason: GoodbyeReason, message: String) {
+        let _ = self.cmd_tx.try_send(Command::Supersede { reason, message });
     }
 
     /// Open a new session against this daemon. Returns once the daemon

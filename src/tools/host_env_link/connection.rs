@@ -19,7 +19,8 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicI64, AtomicU64};
+use std::time::Duration;
 
 use anyhow::{Context, anyhow, bail};
 use axum::extract::ws::{Message, WebSocket};
@@ -31,12 +32,34 @@ use whisper_agent_host_proto::{
     PROTOCOL_VERSION, ProvisionPhase, SessionId, ThreadContext,
 };
 
-use super::{LiveDaemonHandle, LiveDaemonRegistry};
+use super::{InsertOutcome, LiveDaemonHandle, LiveDaemonRegistry, unix_millis_now};
 
 /// Bound on the consumer-→-task command channel. Small because
 /// commands are control-plane (open/invoke/close), not bulk data.
 /// A consumer that floods the channel deserves backpressure.
 const COMMAND_CHANNEL_BOUND: usize = 64;
+
+/// How often the scheduler sends a WS-level Ping to a connected
+/// daemon. Per the design doc, "Heartbeats use WS-level Ping/Pong
+/// frames (RFC 6455 §5.5.2/3), not application-layer frames."
+pub(super) const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
+
+/// How long a connection can go without inbound activity before the
+/// scheduler closes it as dead. Design doc spec: `2 * heartbeat_interval`.
+pub(super) const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Liveness window for the conflict-resolution path. When a new
+/// connection arrives for an already-occupied name, the existing
+/// handle's `last_active_at_ms` is checked against this window:
+/// younger than this ⇒ existing is alive ⇒ reject newcomer; older ⇒
+/// existing is dead ⇒ supersede + accept newcomer.
+///
+/// Sized between [`HEARTBEAT_INTERVAL`] and [`HEARTBEAT_TIMEOUT`] so
+/// (a) a healthy daemon (whose Pong replies tick `last_active_at` at
+/// least every 30 s) is never falsely evicted on a colliding
+/// connection, and (b) the conflict path cleans up faster than the
+/// passive heartbeat-timeout would.
+pub(super) const CONFLICT_STALE_WINDOW: Duration = Duration::from_secs(45);
 
 /// Commands the consumer-side handles send to the connection task.
 /// The task is the sole writer to the WebSocket; consumers never
@@ -67,6 +90,14 @@ pub(super) enum Command {
     },
     CloseSession {
         session_id: SessionId,
+    },
+    /// Tear this connection down: send a `Goodbye{reason}` frame, then
+    /// exit the event loop. Used by the registry's conflict-resolution
+    /// path when a stale prior connection is being evicted to make room
+    /// for a fresh one.
+    Supersede {
+        reason: GoodbyeReason,
+        message: String,
     },
 }
 
@@ -111,26 +142,31 @@ pub(super) async fn run_connection(
         capabilities,
         cmd_tx,
         next_session_seq: AtomicU64::new(1),
+        last_active_at_ms: AtomicI64::new(unix_millis_now()),
     });
 
-    if !registry.try_insert_connected(name.clone(), handle.clone()) {
-        // A daemon with this name is already registered. Reject the
-        // newcomer with `Goodbye` so the operator notices and don't
-        // touch the existing slot. (The existing-handle eviction
-        // policy described in the design doc is phase-3 work.)
-        warn!(
-            daemon = %name,
-            "rejecting v2 daemon connection: name already connected"
-        );
-        let _ = send_frame(
-            &mut sink,
-            Frame::Goodbye {
-                reason: GoodbyeReason::NameAlreadyConnected,
-                message: format!("daemon `{name}` already connected"),
-            },
-        )
-        .await;
-        return;
+    match registry.insert_or_supersede(name.clone(), handle.clone(), CONFLICT_STALE_WINDOW) {
+        InsertOutcome::Inserted => {}
+        InsertOutcome::Rejected { existing_age_ms } => {
+            // A live connection (heartbeat-fresh within
+            // `CONFLICT_STALE_WINDOW`) already holds this slot. Tell
+            // the newcomer and close — the existing connection keeps
+            // running.
+            warn!(
+                daemon = %name,
+                existing_age_ms,
+                "rejecting v2 daemon connection: name already connected, existing handle is fresh"
+            );
+            let _ = send_frame(
+                &mut sink,
+                Frame::Goodbye {
+                    reason: GoodbyeReason::NameAlreadyConnected,
+                    message: format!("daemon `{name}` already connected"),
+                },
+            )
+            .await;
+            return;
+        }
     }
 
     info!(
@@ -141,14 +177,15 @@ pub(super) async fn run_connection(
         "v2 host-env daemon connected"
     );
 
-    // Drop our local handle reference so once `event_loop` finishes
-    // and we leave this scope, the registry's clone is the only one
-    // left — letting it drop naturally on `remove_connected` below.
-    drop(handle);
+    event_loop(&handle, &mut sink, &mut stream, cmd_rx).await;
 
-    event_loop(&name, &mut sink, &mut stream, cmd_rx).await;
-
-    registry.remove_connected(&name);
+    // ptr-eq guard: if this task was superseded, the registry slot
+    // already points at the replacement and we leave it alone.
+    registry.remove_connected_if(&name, &handle);
+    // Best-effort close at the WS level so the daemon doesn't block on
+    // its read side waiting for our half. Failures here are fine —
+    // either the socket is already gone or we're tearing down anyway.
+    let _ = sink.send(Message::Close(None)).await;
     info!(daemon = %name, "v2 host-env daemon disconnected");
 }
 
@@ -216,15 +253,26 @@ async fn handshake(
 }
 
 async fn event_loop(
-    name: &str,
+    handle: &Arc<LiveDaemonHandle>,
     sink: &mut SplitSink<WebSocket, Message>,
     stream: &mut SplitStream<WebSocket>,
     mut cmd_rx: mpsc::Receiver<Command>,
 ) {
+    let name = handle.name();
     let mut sessions: HashMap<SessionId, SessionState> = HashMap::new();
+    // Skip the immediate first tick so we don't ping inside the same
+    // millisecond as the handshake completing.
+    let mut heartbeat = tokio::time::interval(HEARTBEAT_INTERVAL);
+    heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    heartbeat.tick().await;
     loop {
         tokio::select! {
             cmd = cmd_rx.recv() => match cmd {
+                Some(Command::Supersede { reason, message }) => {
+                    info!(daemon = %name, ?reason, %message, "v2 host-env daemon superseded");
+                    let _ = send_frame(sink, Frame::Goodbye { reason, message }).await;
+                    return;
+                }
                 Some(c) => {
                     if let Err(e) = handle_command(c, &mut sessions, sink).await {
                         warn!(daemon = %name, error = %e, "send failed; closing connection");
@@ -245,23 +293,28 @@ async fn event_loop(
                 }
             },
             msg = stream.next() => match msg {
-                Some(Ok(Message::Binary(bytes))) => match Frame::decode_cbor(&bytes) {
-                    Ok(frame) => handle_frame(name, frame, &mut sessions),
-                    Err(e) => {
-                        warn!(daemon = %name, error = %e, "frame decode failed; closing");
-                        let _ = send_frame(sink, Frame::Goodbye {
-                            reason: GoodbyeReason::Other,
-                            message: format!("frame decode failed: {e}"),
-                        }).await;
-                        return;
+                Some(Ok(Message::Binary(bytes))) => {
+                    handle.touch_active();
+                    match Frame::decode_cbor(&bytes) {
+                        Ok(frame) => handle_frame(name, frame, &mut sessions),
+                        Err(e) => {
+                            warn!(daemon = %name, error = %e, "frame decode failed; closing");
+                            let _ = send_frame(sink, Frame::Goodbye {
+                                reason: GoodbyeReason::Other,
+                                message: format!("frame decode failed: {e}"),
+                            }).await;
+                            return;
+                        }
                     }
-                },
+                }
                 Some(Ok(Message::Close(_))) => {
                     debug!(daemon = %name, "daemon sent close frame");
                     return;
                 }
                 Some(Ok(Message::Ping(_))) | Some(Ok(Message::Pong(_))) => {
-                    // axum auto-replies pongs; nothing to do.
+                    // axum auto-replies the daemon's pings; we still
+                    // count both ping and pong as liveness signals.
+                    handle.touch_active();
                 }
                 Some(Ok(Message::Text(_))) => {
                     warn!(daemon = %name, "unexpected text frame on host-env link; closing");
@@ -276,6 +329,30 @@ async fn event_loop(
                     return;
                 }
                 None => return,
+            },
+            _ = heartbeat.tick() => {
+                // Liveness check first — if we haven't heard from the
+                // daemon within HEARTBEAT_TIMEOUT we treat the socket
+                // as half-open and tear it down so the registry slot
+                // becomes available for a real reconnect. (No graceful
+                // Goodbye: by hypothesis the daemon's reads aren't
+                // making it to us; sending more bytes won't change
+                // that.)
+                let now = unix_millis_now();
+                let last = handle.last_active_at_ms.load(std::sync::atomic::Ordering::Acquire);
+                let idle = (now - last).max(0) as u128;
+                if idle > HEARTBEAT_TIMEOUT.as_millis() {
+                    warn!(
+                        daemon = %name,
+                        idle_ms = idle.min(u64::MAX as u128) as u64,
+                        "v2 host-env daemon heartbeat timeout; closing connection"
+                    );
+                    return;
+                }
+                if let Err(e) = sink.send(Message::Ping(Vec::new().into())).await {
+                    warn!(daemon = %name, error = %e, "ws ping send failed; closing");
+                    return;
+                }
             }
         }
     }
@@ -373,6 +450,13 @@ async fn handle_command(
                 return Ok(());
             }
             send_frame(sink, Frame::CloseSession { session_id }).await
+        }
+        Command::Supersede { .. } => {
+            // Intercepted by `event_loop`'s select arm before reaching
+            // here. Listed for match exhaustiveness; if it ever lands
+            // here a refactor moved the lifecycle handling and we
+            // should know quietly rather than panic.
+            Ok(())
         }
     }
 }
