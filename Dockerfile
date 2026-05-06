@@ -80,6 +80,13 @@ USER whisper-agent
 WORKDIR /var/lib/whisper-agent
 
 ENV RUST_LOG=info,whisper_agent=info,tower_http=info
+# hf-hub's default cache root is $HOME/.cache/huggingface, but the
+# runtime user has --no-create-home so $HOME points at the (non-
+# existent, root-owned) /home/whisper-agent — fetches fail with
+# EACCES and the chunker silently falls back to the char-window
+# heuristic. Pin the cache to a path that lives on the data volume
+# so it's writable and persists across pod restarts.
+ENV HF_HOME=/var/lib/whisper-agent/hf-cache
 EXPOSE 8080
 
 ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/entrypoint.sh"]
