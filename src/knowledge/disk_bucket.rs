@@ -1540,6 +1540,13 @@ impl DiskBucket {
         let writer_fut = async {
             let mut batches_since_checkpoint: u64 = 0;
             let mut last_batch_index: u64 = 0;
+            // Per-checkpoint throughput bookkeeping for the structured
+            // progress log emitted at each durability barrier. Lets a
+            // multi-day build's logs answer "how fast was it embedding
+            // when it stalled / restarted / hit a checkpoint" without
+            // needing external metrics scraping.
+            let mut prev_checkpoint_at: Option<std::time::Instant> = None;
+            let mut prev_checkpoint_chunks: u64 = chunks_emitted;
             loop {
                 let recv = embedded_rx.recv().await;
                 let eof = recv.is_none();
@@ -1614,6 +1621,35 @@ impl DiskBucket {
                     // stating "everything up to here is durable" itself
                     // durable.
                     build_state.sync().map_err(BucketError::Io)?;
+                    let now = std::time::Instant::now();
+                    let elapsed_ms: u64 = prev_checkpoint_at
+                        .map(|t| now.duration_since(t).as_millis() as u64)
+                        .unwrap_or(0);
+                    let chunks_since = chunks_emitted.saturating_sub(prev_checkpoint_chunks);
+                    let chunks_per_sec: u64 = chunks_since
+                        .saturating_mul(1000)
+                        .checked_div(elapsed_ms)
+                        .unwrap_or(0);
+                    let percent_done: f64 = if source_records > 0 {
+                        100.0 * (records_completed as f64) / (source_records as f64)
+                    } else {
+                        0.0
+                    };
+                    tracing::info!(
+                        slot = %slot_id,
+                        batch_index = last_batch_index,
+                        records_completed,
+                        source_records,
+                        percent_done = format!("{percent_done:.2}"),
+                        chunks_emitted,
+                        chunks_since_last = chunks_since,
+                        elapsed_ms,
+                        chunks_per_sec,
+                        batches_since_dump,
+                        "checkpoint",
+                    );
+                    prev_checkpoint_at = Some(now);
+                    prev_checkpoint_chunks = chunks_emitted;
                     batches_since_dump += batches_since_checkpoint;
                     batches_since_checkpoint = 0;
                     if batches_since_dump >= dense_dump_interval_batches(chunks_emitted) {
@@ -3110,6 +3146,27 @@ fn apply_embedded_batch(
     let chunk_count = batch.chunks.len() as u64;
     for (offset, (chunk, vector)) in batch.chunks.iter().zip(batch.embeddings.iter()).enumerate() {
         let chunk_id = ChunkId::from_source(&chunk.source_record_hash, chunk.chunk_offset);
+        // Integrity guard: a chunk_id reaching the writer twice means
+        // the chunker's source-level content_hash dedup got bypassed
+        // (the prior failure mode was a resume that started chunker_fut
+        // with empty seen_hashes). ChunkStoreWriter.append silently
+        // overwrites the offset on duplicate inserts, but
+        // VectorStoreWriter pushes to a Vec so the duplicate vector
+        // lands on disk and chunk_count != vector_count trips at
+        // finalize — by which point we've potentially wasted hours on
+        // bad work. Catch it at the moment it happens instead.
+        if chunks.contains(chunk_id) {
+            return Err(BucketError::Other(format!(
+                "duplicate chunk_id at batch {} offset {}: source_id={:?} chunk_offset={} \
+                 content_hash={} — source-level dedup was bypassed (chunker stage seen_hashes \
+                 missing prefix state?)",
+                batch.batch_index,
+                offset,
+                chunk.source_ref.source_id,
+                chunk.chunk_offset,
+                hex8(&chunk.source_record_hash),
+            )));
+        }
         chunks
             .append(chunk_id, &chunk.source_ref, &chunk.text)
             .map_err(BucketError::Io)?;

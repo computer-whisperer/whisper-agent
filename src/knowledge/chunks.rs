@@ -186,6 +186,25 @@ impl ChunkStoreWriter {
         })
     }
 
+    /// True if this `chunk_id` has been `append`-ed already, regardless
+    /// of whether it's been promoted into the shared index yet (still
+    /// in `pending`) or flushed (visible to readers). Used by the
+    /// build pipeline's post-dedup integrity guard — if a chunk_id
+    /// reaches the writer twice the source-level content_hash dedup
+    /// has been bypassed somewhere upstream and a duplicate write
+    /// would silently overwrite the bin offset and corrupt
+    /// vector_count vs chunk_count parity at finalize.
+    pub fn contains(&self, chunk_id: ChunkId) -> bool {
+        if self.pending.contains_key(&chunk_id) {
+            return true;
+        }
+        let idx = self
+            .index
+            .read()
+            .expect("ChunkStoreWriter index lock poisoned");
+        idx.contains_key(&chunk_id)
+    }
+
     /// Append a chunk and stage its offset for the next flush. Returns
     /// the offset where the record was written. The id is *not* yet
     /// visible to live readers — see [`Self::flush`].
@@ -1000,6 +1019,35 @@ mod tests {
         // Last offset matches actual file length.
         let file_len = std::fs::metadata(&bin).unwrap().len();
         assert_eq!(*offsets.last().unwrap(), file_len);
+    }
+
+    #[test]
+    fn contains_sees_appended_ids_before_and_after_flush() {
+        // The integrity guard in the build pipeline calls this against
+        // every chunk before append: it has to return true for ids
+        // that are still in `pending` (post-append, pre-flush) as well
+        // as ids that are in the shared index.
+        let tmp = tempfile::tempdir().unwrap();
+        let bin = tmp.path().join("chunks.bin");
+        let idx = tmp.path().join("chunks.idx");
+
+        let id_a = ChunkId::from_source(&[1u8; 32], 0);
+        let id_b = ChunkId::from_source(&[2u8; 32], 0);
+        let id_unseen = ChunkId::from_source(&[3u8; 32], 0);
+
+        let mut w = ChunkStoreWriter::create(&bin, &idx).unwrap();
+        assert!(!w.contains(id_a));
+
+        w.append(id_a, &sref("doc-a", None), "text-a").unwrap();
+        assert!(w.contains(id_a), "appended id must be visible pre-flush");
+        assert!(!w.contains(id_unseen));
+
+        w.flush().unwrap();
+        assert!(w.contains(id_a), "flushed id must remain visible");
+
+        w.append(id_b, &sref("doc-b", None), "text-b").unwrap();
+        assert!(w.contains(id_a) && w.contains(id_b));
+        assert!(!w.contains(id_unseen));
     }
 
     #[test]
