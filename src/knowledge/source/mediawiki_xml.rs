@@ -6,19 +6,22 @@
 //! Why streaming: a current `enwiki-latest-pages-articles.xml.bz2` is
 //! ~22 GB compressed / ~95 GB uncompressed. DOM parsing is not an
 //! option; we walk events with `quick-xml` and hold only one page in
-//! memory at a time. The bz2 path uses `bzip2::read::MultiBzDecoder`
-//! so decompression streams in lockstep with parsing.
+//! memory at a time. The bz2 path uses
+//! [`ParallelMultiBzDecoder`](super::parallel_bz2::ParallelMultiBzDecoder),
+//! a parallel-per-stream replacement for `bzip2::read::MultiBzDecoder`,
+//! so decompression overlaps the chunker_fut tokio task's XML parsing
+//! and chunking work across cores.
 //!
-//! `MultiBzDecoder` (rather than `BzDecoder`) because the canonical
-//! Wikipedia dumps are **multistream** archives — a sequence of
-//! independent bz2 streams concatenated end-to-end (the index file
-//! published alongside lets clients seek to a specific stream for
-//! random-access decompression). The first stream typically contains
-//! just `<siteinfo>` and no pages; subsequent streams hold pages in
-//! batches. A plain `BzDecoder` would stop at the end of the first
-//! stream, yielding zero pages on a real Wikipedia dump. Single-
-//! stream `.xml.bz2` files (hand-converted, or older non-multistream
-//! exports) are a strict subset and decode the same way.
+//! Parallel multistream because the canonical Wikipedia dumps are
+//! **multistream** archives — a sequence of independent bz2 streams
+//! concatenated end-to-end (the index file published alongside lets
+//! clients seek to a specific stream for random-access decompression).
+//! The first stream typically contains just `<siteinfo>` and no pages;
+//! subsequent streams hold pages in batches. A plain `BzDecoder` would
+//! stop at the end of the first stream, yielding zero pages on a real
+//! Wikipedia dump. Single-stream `.xml.bz2` files (hand-converted, or
+//! older non-multistream exports) are a strict subset — `ParallelMulti`
+//! degrades to a single decoding worker on those.
 //!
 //! Filtering rules baked into v1 — all tunable later via config:
 //! - **Namespace 0 only.** Drops `Talk:` / `User:` / `Template:` etc.
@@ -50,6 +53,7 @@ use quick_xml::escape::unescape;
 use quick_xml::events::Event;
 use quick_xml::name::QName;
 
+use super::parallel_bz2::ParallelMultiBzDecoder;
 use super::{SourceAdapter, SourceError, SourceRecord};
 
 /// Main-article namespace per MediaWiki convention.
@@ -84,20 +88,28 @@ impl SourceAdapter for MediaWikiXml {
 /// Returns a single boxed `BufRead` so the iterator type isn't generic
 /// over the compression flavor.
 fn open_reader(path: &Path) -> Result<Box<dyn BufRead + Send>, SourceError> {
-    let file = File::open(path).map_err(|e| match e.kind() {
-        std::io::ErrorKind::NotFound => SourceError::NotFound(path.display().to_string()),
-        _ => SourceError::Io {
-            path: path.display().to_string(),
-            error: e,
-        },
-    })?;
     if is_bz2(path) {
-        // MultiBzDecoder transparently spans the concatenated bz2
-        // streams that make up a Wikipedia "multistream" dump; on a
-        // single-stream file it behaves identically to BzDecoder.
-        let decoder = bzip2::read::MultiBzDecoder::new(BufReader::new(file));
+        // ParallelMultiBzDecoder mmaps `path` itself, scans for stream
+        // starts once, and dispatches per-stream decompression across
+        // worker threads. Falls back to a single-stream decode if no
+        // bz2 magic is found. On a single-stream `.xml.bz2` file the
+        // worker pool degrades to one worker handling the one stream.
+        let decoder = ParallelMultiBzDecoder::open(path).map_err(|e| match e.kind() {
+            std::io::ErrorKind::NotFound => SourceError::NotFound(path.display().to_string()),
+            _ => SourceError::Io {
+                path: path.display().to_string(),
+                error: e,
+            },
+        })?;
         Ok(Box::new(BufReader::new(decoder)))
     } else {
+        let file = File::open(path).map_err(|e| match e.kind() {
+            std::io::ErrorKind::NotFound => SourceError::NotFound(path.display().to_string()),
+            _ => SourceError::Io {
+                path: path.display().to_string(),
+                error: e,
+            },
+        })?;
         Ok(Box::new(BufReader::new(file)))
     }
 }
