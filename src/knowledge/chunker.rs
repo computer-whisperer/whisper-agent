@@ -469,7 +469,17 @@ enum BpeSource {
 }
 
 fn fetch_hf_tokenizer(model_id: &str) -> Result<(Tokenizer, String), String> {
-    let api = hf_hub::api::sync::Api::new().map_err(|e| format!("hf-hub api init: {e}"))?;
+    // `Api::new()` uses `Cache::default()`, which calls `dirs::home_dir()`
+    // and writes under `$HOME/.cache/huggingface`. That blows up on the
+    // server image: the runtime user is created with `--no-create-home`,
+    // so `$HOME` resolves to the non-existent (root-owned)
+    // `/home/whisper-agent` and every cache write hits EACCES. The
+    // chunker then silently falls back to the char-window heuristic.
+    // `Api::from_env()` honors `HF_HOME` (set in the Dockerfile to a
+    // writable path on the data volume).
+    let api = hf_hub::api::sync::ApiBuilder::from_env()
+        .build()
+        .map_err(|e| format!("hf-hub api init: {e}"))?;
     let repo = api.model(model_id.to_string());
     let path = repo
         .get("tokenizer.json")
