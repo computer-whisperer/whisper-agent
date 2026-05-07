@@ -7,9 +7,11 @@
 //! attempt left off.
 //!
 //! Format choice (jsonl over a binary log) is for grep-ability and
-//! schema evolution — the file is small even at full-wikipedia scale
-//! (~600 MB on a 6.8M-article build), and append throughput is
-//! dominated by the embedder, not by jsonl encoding cost.
+//! schema evolution — the high-volume planning records live in the
+//! sibling [`planned.bin`](super::planned_log) sidecar, so this file
+//! stays small (kilobytes for the phase markers + a few tens of MB
+//! for the per-batch checkpoints at full-wiki scale) and remains
+//! human-greppable for "where did we get to?" debugging.
 //!
 //! See `docs/design_knowledge_db.md` § "Build pipeline" for how this
 //! file fits the overall pipeline.
@@ -18,7 +20,7 @@
 //!
 //! ```text
 //! PhaseChanged { phase: planning }
-//! Planned { source_id, content_hash }   ×N
+//! (planned.bin is written in parallel with this phase, ×N records)
 //! PhaseChanged { phase: indexing }
 //! BatchEmbedded { batch_index, source_records_completed, chunks_completed }   ×M
 //! PhaseChanged { phase: building_dense }
@@ -28,8 +30,8 @@
 //!
 //! Cancel / crash leaves the file ending without `BuildCompleted`;
 //! that's the resume signal. Drift detection on resume is via the
-//! `content_hash` carried on each `Planned` record — re-walking the
-//! source produces fresh hashes; matching ones short-circuit, mismatched
+//! `content_hash` recorded in `planned.bin` — re-walking the source
+//! produces fresh hashes; matching ones short-circuit, mismatched
 //! ones force re-emission of the affected record.
 
 use std::fs::{File, OpenOptions};
@@ -49,16 +51,6 @@ pub enum BuildStateRecord {
     /// boundary; the writer that produced records before this entry
     /// was running in the *previous* phase.
     PhaseChanged { phase: BuildPhase },
-
-    /// One source record was discovered during the planning walk.
-    /// Order in the file matches the order the adapter emits records;
-    /// resume code re-walks the source and matches positionally
-    /// (with content_hash drift-check) against this list.
-    Planned {
-        source_id: String,
-        #[serde(with = "hex32")]
-        content_hash: [u8; 32],
-    },
 
     /// Durability barrier. Every chunk emitted by source records
     /// `0..=source_records_completed - 1` has been flushed + fsynced
@@ -84,8 +76,9 @@ pub enum BuildStateRecord {
 /// attempt are preserved. `append` is buffered and cheap — call
 /// [`Self::sync`] at durability boundaries (end of Planning, after
 /// each `BatchEmbedded`, after `BuildCompleted`) so a crash leaves a
-/// resume-correct file. Per-record fsync would be 6.8M syscalls
-/// during planning at full-wikipedia scale, none of them load-bearing.
+/// resume-correct file. Now that the high-volume planning records
+/// live in `planned.bin`, this file is small enough that a periodic
+/// fsync at every BatchEmbedded checkpoint is essentially free.
 pub struct BuildStateWriter {
     file: BufWriter<File>,
 }
@@ -150,55 +143,9 @@ pub fn read_all(path: &Path) -> io::Result<Vec<BuildStateRecord>> {
     Ok(out)
 }
 
-/// serde adapter: serialize `[u8; 32]` as lowercase hex (matches the
-/// blake3 hash representation used elsewhere in the codebase).
-mod hex32 {
-    use serde::{Deserialize, Deserializer, Serializer, de::Error};
-
-    pub fn serialize<S: Serializer>(bytes: &[u8; 32], ser: S) -> Result<S::Ok, S::Error> {
-        let mut s = String::with_capacity(64);
-        for byte in bytes {
-            use std::fmt::Write;
-            let _ = write!(&mut s, "{byte:02x}");
-        }
-        ser.serialize_str(&s)
-    }
-
-    pub fn deserialize<'de, D: Deserializer<'de>>(de: D) -> Result<[u8; 32], D::Error> {
-        let s = String::deserialize(de)?;
-        if s.len() != 64 {
-            return Err(D::Error::custom(format!(
-                "expected 64 hex chars, got {}",
-                s.len()
-            )));
-        }
-        let mut out = [0u8; 32];
-        let raw = s.as_bytes();
-        for (i, byte) in out.iter_mut().enumerate() {
-            let hi = nybble(raw[i * 2]).map_err(D::Error::custom)?;
-            let lo = nybble(raw[i * 2 + 1]).map_err(D::Error::custom)?;
-            *byte = (hi << 4) | lo;
-        }
-        Ok(out)
-    }
-
-    fn nybble(b: u8) -> Result<u8, String> {
-        match b {
-            b'0'..=b'9' => Ok(b - b'0'),
-            b'a'..=b'f' => Ok(b - b'a' + 10),
-            b'A'..=b'F' => Ok(b - b'A' + 10),
-            other => Err(format!("not a hex character: {:?}", other as char)),
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn sample_hash(byte: u8) -> [u8; 32] {
-        [byte; 32]
-    }
 
     #[test]
     fn roundtrip_full_sequence() {
@@ -208,16 +155,6 @@ mod tests {
         let mut w = BuildStateWriter::create_or_open(&path).unwrap();
         w.append(&BuildStateRecord::PhaseChanged {
             phase: BuildPhase::Planning,
-        })
-        .unwrap();
-        w.append(&BuildStateRecord::Planned {
-            source_id: "a.md".into(),
-            content_hash: sample_hash(0xab),
-        })
-        .unwrap();
-        w.append(&BuildStateRecord::Planned {
-            source_id: "b.md".into(),
-            content_hash: sample_hash(0xcd),
         })
         .unwrap();
         w.append(&BuildStateRecord::PhaseChanged {
@@ -234,7 +171,7 @@ mod tests {
         drop(w);
 
         let records = read_all(&path).unwrap();
-        assert_eq!(records.len(), 6);
+        assert_eq!(records.len(), 4);
         assert_eq!(
             records[0],
             BuildStateRecord::PhaseChanged {
@@ -242,13 +179,14 @@ mod tests {
             }
         );
         assert_eq!(
-            records[1],
-            BuildStateRecord::Planned {
-                source_id: "a.md".into(),
-                content_hash: sample_hash(0xab),
+            records[2],
+            BuildStateRecord::BatchEmbedded {
+                batch_index: 0,
+                source_records_completed: 2,
+                chunks_completed: 5,
             }
         );
-        assert_eq!(records[5], BuildStateRecord::BuildCompleted);
+        assert_eq!(records[3], BuildStateRecord::BuildCompleted);
     }
 
     #[test]
@@ -258,18 +196,20 @@ mod tests {
 
         {
             let mut w = BuildStateWriter::create_or_open(&path).unwrap();
-            w.append(&BuildStateRecord::Planned {
-                source_id: "x".into(),
-                content_hash: sample_hash(1),
+            w.append(&BuildStateRecord::BatchEmbedded {
+                batch_index: 0,
+                source_records_completed: 1,
+                chunks_completed: 1,
             })
             .unwrap();
         }
         // Re-open and append more.
         {
             let mut w = BuildStateWriter::create_or_open(&path).unwrap();
-            w.append(&BuildStateRecord::Planned {
-                source_id: "y".into(),
-                content_hash: sample_hash(2),
+            w.append(&BuildStateRecord::BatchEmbedded {
+                batch_index: 1,
+                source_records_completed: 2,
+                chunks_completed: 3,
             })
             .unwrap();
         }
@@ -278,11 +218,11 @@ mod tests {
         assert_eq!(records.len(), 2);
         match (&records[0], &records[1]) {
             (
-                BuildStateRecord::Planned { source_id: a, .. },
-                BuildStateRecord::Planned { source_id: b, .. },
+                BuildStateRecord::BatchEmbedded { batch_index: a, .. },
+                BuildStateRecord::BatchEmbedded { batch_index: b, .. },
             ) => {
-                assert_eq!(a, "x");
-                assert_eq!(b, "y");
+                assert_eq!(*a, 0);
+                assert_eq!(*b, 1);
             }
             other => panic!("unexpected records: {other:?}"),
         }
@@ -326,21 +266,18 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("build.state");
         let mut w = BuildStateWriter::create_or_open(&path).unwrap();
-        w.append(&BuildStateRecord::Planned {
-            source_id: "wiki/Apollo".into(),
-            content_hash: [
-                0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef, 0x01, 0x23, 0x45, 0x67, 0x89, 0xab,
-                0xcd, 0xef, 0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef, 0x01, 0x23, 0x45, 0x67,
-                0x89, 0xab, 0xcd, 0xef,
-            ],
+        w.append(&BuildStateRecord::BatchEmbedded {
+            batch_index: 7,
+            source_records_completed: 1024,
+            chunks_completed: 4096,
         })
         .unwrap();
         drop(w);
         let bytes = std::fs::read_to_string(&path).unwrap();
         assert_eq!(
             bytes,
-            "{\"type\":\"planned\",\"source_id\":\"wiki/Apollo\",\
-             \"content_hash\":\"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\"}\n"
+            "{\"type\":\"batch_embedded\",\"batch_index\":7,\
+             \"source_records_completed\":1024,\"chunks_completed\":4096}\n"
         );
     }
 

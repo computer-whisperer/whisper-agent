@@ -39,6 +39,7 @@ pub mod feed_state;
 pub mod feed_worker;
 pub mod gc;
 pub mod manifest;
+pub mod planned_log;
 pub mod query;
 pub mod registry;
 pub mod slot;

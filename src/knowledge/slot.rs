@@ -37,6 +37,7 @@ pub const DELTA_VECTORS_IDX: &str = "delta_vectors.idx";
 pub const TOMBSTONES_BIN: &str = "tombstones.bin";
 pub const BUILD_STATE: &str = "build.state";
 pub const BUILD_LOG: &str = "build.log";
+pub const PLANNED_BIN: &str = "planned.bin";
 
 pub fn slots_dir(bucket_root: &Path) -> PathBuf {
     bucket_root.join(SLOTS_DIR)
@@ -76,6 +77,10 @@ pub fn tantivy_dir(slot_dir: &Path) -> PathBuf {
 
 pub fn tombstones_path(slot_dir: &Path) -> PathBuf {
     slot_dir.join(TOMBSTONES_BIN)
+}
+
+pub fn planned_bin_path(slot_dir: &Path) -> PathBuf {
+    slot_dir.join(PLANNED_BIN)
 }
 
 pub fn delta_chunks_bin_path(slot_dir: &Path) -> PathBuf {

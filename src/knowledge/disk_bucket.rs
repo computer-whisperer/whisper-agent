@@ -583,13 +583,14 @@ impl DiskBucket {
         .await
     }
 
-    /// Walk the source once, append a `Planned` record per source
-    /// record with its content hash, sync the log, and promote the
-    /// manifest from `Planning` → `Building`. Shared between
-    /// fresh-build and resume-from-Planning code paths.
+    /// Walk the source once, append a record per source entry to the
+    /// binary `planned.bin` sidecar (carrying source_id +
+    /// content_hash), sync the log, and promote the manifest from
+    /// `Planning` → `Building`. Shared between fresh-build and
+    /// resume-from-Planning code paths.
     ///
     /// The single sync at end-of-loop is the resume invariant for
-    /// this phase: after this returns, every `Planned` line is
+    /// this phase: after this returns, every appended record is
     /// durable. Per-record fsync isn't worth the syscall budget
     /// (Planning crashes just replan).
     fn do_planning_phase(
@@ -602,23 +603,30 @@ impl DiskBucket {
         cancel: &CancellationToken,
     ) -> Result<u64, BucketError> {
         publish_phase(BuildPhase::Planning, observer, build_state)?;
+        let planned_path = slot::planned_bin_path(slot_path);
+        // Resume-from-Planning enters here after we've discarded the
+        // prior build.state; the prior planned.bin needs the same
+        // treatment so we don't append onto stale records.
+        if planned_path.exists() {
+            fs::remove_file(&planned_path).map_err(BucketError::Io)?;
+        }
+        let mut planned = super::planned_log::PlannedWriter::create_or_open(&planned_path)
+            .map_err(BucketError::Io)?;
         let mut source_records: u64 = 0;
         for record in adapter.enumerate() {
             if cancel.is_cancelled() {
                 return Err(BucketError::Cancelled);
             }
             let record = record.map_err(|e| BucketError::Other(format!("source error: {e}")))?;
-            build_state
-                .append(&BuildStateRecord::Planned {
-                    source_id: record.source_id.clone(),
-                    content_hash: record.content_hash,
-                })
+            planned
+                .append(&record.source_id, &record.content_hash)
                 .map_err(BucketError::Io)?;
             source_records += 1;
             if let Some(obs) = observer {
                 obs.on_progress(source_records, 0);
             }
         }
+        planned.sync().map_err(BucketError::Io)?;
         build_state.sync().map_err(BucketError::Io)?;
 
         // Promote manifest to Building once planning is done. Writing
@@ -742,6 +750,10 @@ impl DiskBucket {
             if build_state_path.exists() {
                 fs::remove_file(&build_state_path).map_err(BucketError::Io)?;
             }
+            let planned_path = slot::planned_bin_path(&slot_path);
+            if planned_path.exists() {
+                fs::remove_file(&planned_path).map_err(BucketError::Io)?;
+            }
             let mut build_state =
                 BuildStateWriter::create_or_open(&build_state_path).map_err(BucketError::Io)?;
             let source_records = self.do_planning_phase(
@@ -778,18 +790,11 @@ impl DiskBucket {
         }
 
         // Building state ⇒ replay build.state to find the resume point.
+        // The high-volume planning records live in planned.bin; this
+        // call only loads the small phase + per-batch journal.
         let prior_records =
             super::build_state::read_all(&build_state_path).map_err(BucketError::Io)?;
-        let planned: Vec<(String, [u8; 32])> = prior_records
-            .iter()
-            .filter_map(|r| match r {
-                BuildStateRecord::Planned {
-                    source_id,
-                    content_hash,
-                } => Some((source_id.clone(), *content_hash)),
-                _ => None,
-            })
-            .collect();
+        let planned_path = slot::planned_bin_path(&slot_path);
         let last_batch = prior_records.iter().rev().find_map(|r| match r {
             BuildStateRecord::BatchEmbedded {
                 batch_index,
@@ -799,6 +804,13 @@ impl DiskBucket {
             _ => None,
         });
         let (last_batch_index, records_done, chunks_done) = last_batch.unwrap_or((u64::MAX, 0, 0)); // u64::MAX → 0 below
+
+        // Single quick scan to learn the planned-record count. Cheap
+        // even at wiki scale (~450 MB sequential read), and lets us
+        // size the resume bookkeeping + cap records_to_skip without
+        // materializing the planned list in memory.
+        let planned_count = count_planned(&planned_path)?;
+        let records_to_skip = records_done.min(planned_count);
 
         // Surface "we're alive" to the observer immediately. The
         // preamble below (chunker re-walk + HNSW rebuild from
@@ -814,7 +826,7 @@ impl DiskBucket {
         }
         tracing::info!(
             slot = %slot_id,
-            records_to_replay = records_done.min(planned.len() as u64),
+            records_to_replay = records_to_skip,
             chunks_to_rebuild = chunks_done,
             last_batch_index = last_batch_index,
             "resume_slot: starting preamble (chunker re-walk + HNSW rebuild)",
@@ -823,8 +835,6 @@ impl DiskBucket {
         // Reopen build.state in append mode (existing entries stay).
         let build_state =
             BuildStateWriter::create_or_open(&build_state_path).map_err(BucketError::Io)?;
-
-        let records_to_skip = records_done.min(planned.len() as u64);
 
         // Derive resumed_chunk_ids from chunks.bin's existing records
         // rather than re-running the chunker over records 0..records_to_skip.
@@ -845,12 +855,21 @@ impl DiskBucket {
         // and what was planned — surfacing the exact group + planned
         // index where they disagree, which is what the prior chunker
         // re-walk's diagnostic was producing post-hoc.
+        //
+        // Pass 1: stream planned.bin alongside chunks.bin to build
+        // resumed_chunk_ids and the prefix's seen_hashes. Memory cost
+        // is bounded by `resumed_chunk_ids` (which we need anyway) +
+        // a HashSet of the prefix's content_hashes — no materialized
+        // Vec<(String, [u8;32])>.
         let mut resumed_chunk_ids: Vec<ChunkId> = Vec::with_capacity(chunks_done as usize);
         let mut seen_hashes: HashSet<[u8; 32]> = HashSet::with_capacity(records_to_skip as usize);
         {
+            let mut planned_iter = super::planned_log::PlannedReader::open(&planned_path)
+                .map_err(BucketError::Io)?
+                .take(records_to_skip as usize);
             let mut planned_cursor: usize = 0;
-            let mut current_source: Option<String> = None;
             let mut current_hash: [u8; 32] = [0u8; 32];
+            let mut current_source: Option<String> = None;
             let mut chunk_offset: u64 = 0;
             let mut on_disk_groups: u64 = 0;
 
@@ -871,35 +890,35 @@ impl DiskBucket {
                     let source_id = next.map_err(BucketError::Io)?;
                     let same_group = matches!(&current_source, Some(s) if s == &source_id);
                     if !same_group {
-                        // New group: advance planned_cursor to the next
-                        // non-dup entry and verify the source_ids agree.
-                        let mut found: Option<(usize, &(String, [u8; 32]))> = None;
-                        while planned_cursor < records_to_skip as usize {
-                            let p = &planned[planned_cursor];
+                        // New group: advance the planned cursor to the
+                        // next non-dup entry and verify source_ids agree.
+                        let mut found: Option<(usize, String, [u8; 32])> = None;
+                        for next in planned_iter.by_ref() {
+                            let (id, hash) = next.map_err(BucketError::Io)?;
                             let i = planned_cursor;
                             planned_cursor += 1;
-                            if seen_hashes.insert(p.1) {
-                                found = Some((i, p));
+                            if seen_hashes.insert(hash) {
+                                found = Some((i, id, hash));
                                 break;
                             }
                         }
-                        let (planned_idx, expected) = found.ok_or_else(|| {
+                        let (planned_idx, expected_id, expected_hash) = found.ok_or_else(|| {
                             BucketError::Other(format!(
-                                "resume_slot: chunks.bin has more groups than planned non-dup \
-                                 count (next on-disk group source_id={source_id:?})"
+                                "resume_slot: chunks.bin has more groups than planned \
+                                     non-dup count (next on-disk group source_id={source_id:?})"
                             ))
                         })?;
-                        if expected.0 != source_id {
+                        if expected_id != source_id {
                             return Err(BucketError::Other(format!(
                                 "resume_slot: chunks.bin / planned source_id divergence at \
                                  group #{on_disk_groups}: on_disk={source_id:?} vs \
-                                 planned[{planned_idx}].source_id={:?} (content_hash {})",
-                                expected.0,
-                                hex8(&expected.1),
+                                 planned[{planned_idx}].source_id={expected_id:?} \
+                                 (content_hash {})",
+                                hex8(&expected_hash),
                             )));
                         }
                         current_source = Some(source_id);
-                        current_hash = expected.1;
+                        current_hash = expected_hash;
                         chunk_offset = 0;
                         on_disk_groups += 1;
                     } else {
@@ -937,9 +956,18 @@ impl DiskBucket {
             // dedup-skipped (no chunks on disk) — without those, a
             // post-records_completed twin would be re-emitted just
             // like the bug fixed in the previous commit.
-            while planned_cursor < records_to_skip as usize {
-                seen_hashes.insert(planned[planned_cursor].1);
+            for next in planned_iter {
+                let (_id, hash) = next.map_err(BucketError::Io)?;
+                seen_hashes.insert(hash);
                 planned_cursor += 1;
+            }
+            // `take(records_to_skip)` adapter caps us implicitly; the
+            // counter just confirms the stream actually had that much.
+            if (planned_cursor as u64) != records_to_skip {
+                return Err(BucketError::Other(format!(
+                    "resume_slot: planned.bin yielded {planned_cursor} records but \
+                     records_to_skip={records_to_skip} (build.state checkpoint mismatch?)"
+                )));
             }
         }
         tracing::info!(
@@ -949,7 +977,7 @@ impl DiskBucket {
             "resume_slot: chunks.bin walk complete",
         );
 
-        // Advance the source iterator past the prefix so
+        // Pass 2: advance the source iterator past the prefix so
         // run_after_planning's chunker stage continues at the right
         // position. We re-verify each record's content_hash against
         // planned[i] — this is the only place that catches "the source
@@ -958,10 +986,14 @@ impl DiskBucket {
         // would silently mix old prefix chunks with new post-prefix
         // ones.
         let mut iter = adapter.enumerate();
-        for (i, expected) in planned.iter().enumerate().take(records_to_skip as usize) {
+        let planned_iter2 = super::planned_log::PlannedReader::open(&planned_path)
+            .map_err(BucketError::Io)?
+            .take(records_to_skip as usize);
+        for (i, expected) in planned_iter2.enumerate() {
             if cancel.is_cancelled() {
                 return Err(BucketError::Cancelled);
             }
+            let (expected_id, expected_hash) = expected.map_err(BucketError::Io)?;
             let record = match iter.next() {
                 Some(Ok(r)) => r,
                 Some(Err(e)) => return Err(BucketError::Other(format!("source error: {e}"))),
@@ -971,21 +1003,21 @@ impl DiskBucket {
                     )));
                 }
             };
-            if record.content_hash != expected.1 {
+            if record.content_hash != expected_hash {
                 return Err(BucketError::Other(format!(
                     "resume_slot: source drift detected at record `{}` (was `{}` when planned); \
                      delete the bucket and rebuild to ingest the changed source",
-                    record.source_id, expected.0,
+                    record.source_id, expected_id,
                 )));
             }
-            if record.source_id != expected.0 {
+            if record.source_id != expected_id {
                 // Content matches but source_id differs (rename
                 // without content change). chunk_ids derive from
                 // content_hash so resume is still valid; just log it.
                 tracing::info!(
                     bucket = %self.id,
                     slot = %slot_id,
-                    expected = %expected.0,
+                    expected = %expected_id,
                     got = %record.source_id,
                     "resume: source_id changed but content_hash matches; continuing"
                 );
@@ -1139,7 +1171,7 @@ impl DiskBucket {
                 let dense = DenseIndex::empty(
                     resume_dense_quant,
                     HnswParams::default(),
-                    (planned.len().saturating_mul(8)).max(1024),
+                    ((planned_count as usize).saturating_mul(8)).max(1024),
                 );
                 let bin_path_for_thread = vectors_bin.clone();
                 let dim = embedder_snapshot.dimension as usize;
@@ -1256,7 +1288,7 @@ impl DiskBucket {
         // The Planning phase already happened; we don't re-publish
         // it. Republish Indexing so the observer sees we're back in
         // the embedding loop on the resume path.
-        let source_records_total = planned.len() as u64;
+        let source_records_total = planned_count;
         let handles = BuildHandles {
             manifest,
             chunk_writer,
@@ -3526,6 +3558,23 @@ fn hex8(bytes: &[u8; 32]) -> String {
     s
 }
 
+/// Count records in `planned.bin`. Single sequential scan; missing
+/// file ⇒ 0 (treated as "no planning ever happened" which the caller
+/// translates to records_to_skip = 0).
+fn count_planned(path: &Path) -> Result<u64, BucketError> {
+    let reader = match super::planned_log::PlannedReader::open(path) {
+        Ok(r) => r,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(e) => return Err(BucketError::Io(e)),
+    };
+    let mut count: u64 = 0;
+    for next in reader {
+        next.map_err(BucketError::Io)?;
+        count += 1;
+    }
+    Ok(count)
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs;
@@ -5262,13 +5311,15 @@ embedder = "tei_test"
             .await
             .unwrap();
 
-        let path = slot::slot_dir(&bucket_root, &slot_id).join(slot::BUILD_STATE);
+        let slot_path = slot::slot_dir(&bucket_root, &slot_id);
+        let path = slot_path.join(slot::BUILD_STATE);
         let records = build_state::read_all(&path).unwrap();
 
-        // Planning + 2 Planned + Indexing + ≥1 BatchEmbedded + BuildingDense + Finalizing + BuildCompleted.
+        // Planning + Indexing + ≥1 BatchEmbedded + BuildingDense + Finalizing + BuildCompleted.
+        // Bulk planning records live in planned.bin now.
         assert!(
-            records.len() >= 8,
-            "expected at least 8 records, got {}: {records:#?}",
+            records.len() >= 6,
+            "expected at least 6 records, got {}: {records:#?}",
             records.len()
         );
 
@@ -5290,12 +5341,10 @@ embedder = "tei_test"
             ]
         );
 
-        // Two source records → two Planned entries.
-        let planned_count = records
-            .iter()
-            .filter(|r| matches!(r, BuildStateRecord::Planned { .. }))
-            .count();
-        assert_eq!(planned_count, 2);
+        // Two source records → two planned.bin entries.
+        let planned =
+            crate::knowledge::planned_log::read_all(&slot::planned_bin_path(&slot_path)).unwrap();
+        assert_eq!(planned.len(), 2);
 
         // Last record must be BuildCompleted.
         assert!(matches!(
@@ -6041,20 +6090,22 @@ embedder = "tei_test"
             lineage: None,
         };
         write_manifest(&slot_path, &manifest).unwrap();
-        // Half-written build.state with one Planned + no PhaseChanged
-        // (simulates planning interrupted right after one entry).
+        // Half-written journal: a planning-phase marker in build.state
+        // + a single bogus planned.bin record (simulates planning
+        // interrupted right after one entry).
         let bs_path = slot_path.join(slot::BUILD_STATE);
         let mut bs = BuildStateWriter::create_or_open(&bs_path).unwrap();
         bs.append(&BuildStateRecord::PhaseChanged {
             phase: BuildPhase::Planning,
         })
         .unwrap();
-        bs.append(&BuildStateRecord::Planned {
-            source_id: "a.md".into(),
-            content_hash: [0xfe; 32], // deliberately wrong hash
-        })
-        .unwrap();
         drop(bs);
+        let planned_path = slot::planned_bin_path(&slot_path);
+        let mut planned_w =
+            crate::knowledge::planned_log::PlannedWriter::create_or_open(&planned_path).unwrap();
+        planned_w.append("a.md", &[0xfe; 32]).unwrap(); // deliberately wrong hash
+        planned_w.sync().unwrap();
+        drop(planned_w);
 
         let embedder: Arc<dyn EmbeddingProvider> = Arc::new(MockEmbedder::new(4));
         let cancel = CancellationToken::new();
@@ -6072,19 +6123,19 @@ embedder = "tei_test"
             .unwrap();
         assert_eq!(returned, slot_id);
 
-        // Build completed and the bogus Planned hash got replaced.
+        // Build completed; planned.bin was discarded + rewritten with
+        // the real hashes during the Planning-state restart.
         let log = build_state::read_all(&bs_path).unwrap();
         assert!(matches!(
             log.last().unwrap(),
             BuildStateRecord::BuildCompleted
         ));
+        let planned = crate::knowledge::planned_log::read_all(&planned_path).unwrap();
         let bad_hash = [0xfe; 32];
-        let still_has_bad = log.iter().any(|r| {
-            matches!(r, BuildStateRecord::Planned { content_hash, .. } if *content_hash == bad_hash)
-        });
+        let still_has_bad = planned.iter().any(|(_, h)| *h == bad_hash);
         assert!(
             !still_has_bad,
-            "Planning restart must discard the prior bogus Planned entry"
+            "Planning restart must discard the prior bogus planned.bin entry"
         );
     }
 
