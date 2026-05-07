@@ -18,7 +18,7 @@
 #   5. Push to AUR (separate `aur:whisper-agent-host` git remote).
 
 pkgname=whisper-agent-host
-pkgver=0.3.15
+pkgver=0.3.16
 pkgrel=1
 pkgdesc="Host-side daemon for whisper-agent (landlock-isolated per-thread MCP hosts; dials a central server)"
 arch=('x86_64' 'aarch64')
@@ -43,7 +43,7 @@ source=(
 # The other two are local files maintained alongside this PKGBUILD;
 # 'SKIP' is fine because they're versioned in the upstream repo.
 sha256sums=(
-    '30f8be5d8007a80cf140f3390c46aca13173223543098bb69bea5b92d0b5385a'
+    '3ac26b620725be6cdccbe4654b8617aa7aac758bed81fe01b0496191d46a5498'
     'SKIP'
     'SKIP'
 )
