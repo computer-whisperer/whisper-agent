@@ -30,7 +30,11 @@ jobs:
       - name: Install wasm-pack
         uses: jetli/wasm-pack-action@v0.4.0
         with:
-          version: latest
+          # Pin: jetli's `latest` resolution flipped to 0.9.1 (2021)
+          # mid-day on 2026-05-07, breaking workspace inheritance
+          # parsing. v0.13.1 is the upstream stable; bump after
+          # verifying the action no longer regresses.
+          version: 'v0.13.1'
 
       # `src/server.rs` embeds `crates/whisper-agent-webui/pkg/` via
       # `rust-embed`; the macro checks the folder exists at compile time.
