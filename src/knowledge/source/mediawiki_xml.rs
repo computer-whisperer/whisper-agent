@@ -30,12 +30,16 @@
 //! - **Empty pages dropped.** A `<text>` element whose body is empty or
 //!   whitespace-only contributes nothing to retrieval.
 //!
+//! Wikitext → plaintext: page bodies are run through
+//! [`wikitext_plaintext::to_plaintext`](super::wikitext_plaintext::to_plaintext)
+//! before the [`SourceRecord`] is built. Refs / cite templates /
+//! navboxes / categories / files / trailing reference + see-also
+//! sections are dropped; prose, headings, list items, and link anchor
+//! text survive. This is what made full enwiki indexing tractable —
+//! the prior raw-wikitext path produced ~30 % reference-laden noise
+//! chunks at a fixed embedder ceiling.
+//!
 //! What we do *not* do (deliberately, for v1):
-//! - **No wikitext → plaintext.** The chunker and embedder see raw
-//!   wikitext, including `[[link]]` / `{{template}}` / table markup.
-//!   Embeddings tolerate the noise; sparse search still hits keywords.
-//!   Plaintext extraction (likely via `parse_wiki_text`) lands when
-//!   RAG quality matters more than pipeline shape.
 //! - **No configurable namespace whitelist.** Add when the second use
 //!   case appears.
 //!
@@ -54,6 +58,7 @@ use quick_xml::events::Event;
 use quick_xml::name::QName;
 
 use super::parallel_bz2::ParallelMultiBzDecoder;
+use super::wikitext_plaintext;
 use super::{SourceAdapter, SourceError, SourceRecord};
 
 /// Main-article namespace per MediaWiki convention.
@@ -131,7 +136,12 @@ struct PageState {
 
 impl PageState {
     /// Convert a fully-walked page into a `SourceRecord` if it passes
-    /// the v1 filters (ns=0, not a redirect, non-empty text).
+    /// the v1 filters (ns=0, not a redirect, non-empty text). The
+    /// raw wikitext body is run through `wikitext_plaintext` so the
+    /// chunker downstream sees prose only — `content_hash` is over
+    /// the plaintext, so chunk_ids are stable across pure-markup
+    /// edits to an article (a navbox change doesn't invalidate
+    /// chunks).
     fn into_record(self) -> Option<SourceRecord> {
         if self.is_redirect {
             return None;
@@ -140,11 +150,12 @@ impl PageState {
             return None;
         }
         let title = self.title?;
-        let text = self.text?;
-        if text.trim().is_empty() {
+        let raw = self.text?;
+        let plaintext = wikitext_plaintext::to_plaintext(&raw);
+        if plaintext.trim().is_empty() {
             return None;
         }
-        Some(SourceRecord::new(title, text))
+        Some(SourceRecord::new(title, plaintext))
     }
 }
 
@@ -462,10 +473,13 @@ Line three: {{infobox}}</text>
             .iter()
             .find(|r| r.source_id == "Apollo program")
             .unwrap();
-        // `'''bold'''` and `[[link]]` markup must survive — wikitext-
-        // to-plaintext extraction is deferred, the chunker sees raw.
-        assert!(apollo.text.contains("'''Apollo program'''"));
-        assert!(apollo.text.contains("[[NASA]]"));
+        // Wikitext markup is now stripped — `'''bold'''` and `[[link]]`
+        // become plaintext. The body text and link anchor text survive,
+        // but the markup characters do not.
+        assert!(apollo.text.contains("Apollo program"));
+        assert!(apollo.text.contains("NASA"));
+        assert!(!apollo.text.contains("'''"));
+        assert!(!apollo.text.contains("[["));
     }
 
     #[test]
@@ -480,7 +494,10 @@ Line three: {{infobox}}</text>
             .unwrap();
         assert!(unicode.text.contains("Line one."));
         assert!(unicode.text.contains("αβγ"));
-        assert!(unicode.text.contains("{{infobox}}"));
+        // Templates like `{{infobox}}` are dropped by the wikitext
+        // pre-pass; surrounding prose survives.
+        assert!(!unicode.text.contains("{{infobox}}"));
+        assert!(!unicode.text.contains("infobox"));
     }
 
     #[test]

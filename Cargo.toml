@@ -143,6 +143,14 @@ quick-xml = "0.39"
 # before handing to quick-xml so chunked decompression overlaps with
 # parsing.
 bzip2 = "0.6"
+# Wikitext (MediaWiki markup) parser for converting raw `<text>` page
+# bodies to plaintext before chunking. `parse-wiki-text-2` is the
+# actively-maintained fork of portstrom's `parse_wiki_text`; AST-based
+# (typed Node enum), pure Rust, no deps. Lets us drop refs / cite
+# templates / navboxes / categories / files at the AST level instead
+# of regex-stripping wikitext, which both shrinks per-article chunk
+# count substantially and reduces embedder noise.
+parse-wiki-text-2 = "0.2"
 # Real BPE tokenizer for chunk-boundary stability across embedder
 # rotations. The chunker takes token-level offsets from `Encoding` and
 # slices the source text at exact token-count boundaries — chunk text

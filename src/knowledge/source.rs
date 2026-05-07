@@ -17,6 +17,7 @@ pub mod feed;
 pub mod markdown_dir;
 pub mod mediawiki_xml;
 pub mod parallel_bz2;
+pub mod wikitext_plaintext;
 
 pub use feed::{DeltaId, FeedDriver, FeedError, SnapshotId, WikipediaDriver};
 pub use markdown_dir::MarkdownDir;

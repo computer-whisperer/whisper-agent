@@ -3582,6 +3582,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "parse-wiki-text-2"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "31557823a70a42fb9c7a75684bf5a8a5fc05e473b5858dae66e5be4d7f1ced12"
+
+[[package]]
 name = "paste"
 version = "1.0.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6439,6 +6445,7 @@ dependencies = [
  "http",
  "memmap2",
  "mime_guess",
+ "parse-wiki-text-2",
  "quick-xml",
  "rand 0.10.1",
  "regex",
