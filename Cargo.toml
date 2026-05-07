@@ -56,7 +56,7 @@ whisper-agent-worker-proto = { path = "crates/whisper-agent-worker-proto" }
 [package]
 name = "whisper-agent"
 description = "Server-resident agent loop that reaches into managed POSIX hosts via MCP"
-version = "0.3.16"
+version = "0.3.17"
 edition.workspace = true
 license.workspace = true
 

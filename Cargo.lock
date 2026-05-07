@@ -6417,7 +6417,7 @@ dependencies = [
 
 [[package]]
 name = "whisper-agent"
-version = "0.3.16"
+version = "0.3.17"
 dependencies = [
  "ahash",
  "anyhow",
@@ -6467,7 +6467,7 @@ dependencies = [
 
 [[package]]
 name = "whisper-agent-desktop"
-version = "0.3.16"
+version = "0.3.17"
 dependencies = [
  "anyhow",
  "clap",
@@ -6490,7 +6490,7 @@ dependencies = [
 
 [[package]]
 name = "whisper-agent-host-daemon"
-version = "0.3.16"
+version = "0.3.17"
 dependencies = [
  "anyhow",
  "axum",
@@ -6518,7 +6518,7 @@ dependencies = [
 
 [[package]]
 name = "whisper-agent-host-proto"
-version = "0.3.16"
+version = "0.3.17"
 dependencies = [
  "ciborium",
  "serde",
@@ -6528,7 +6528,7 @@ dependencies = [
 
 [[package]]
 name = "whisper-agent-mcp-fetch"
-version = "0.3.16"
+version = "0.3.17"
 dependencies = [
  "anyhow",
  "axum",
@@ -6548,7 +6548,7 @@ dependencies = [
 
 [[package]]
 name = "whisper-agent-mcp-host"
-version = "0.3.16"
+version = "0.3.17"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -6573,7 +6573,7 @@ dependencies = [
 
 [[package]]
 name = "whisper-agent-mcp-proto"
-version = "0.3.16"
+version = "0.3.17"
 dependencies = [
  "serde",
  "serde_json",
@@ -6581,7 +6581,7 @@ dependencies = [
 
 [[package]]
 name = "whisper-agent-mcp-search"
-version = "0.3.16"
+version = "0.3.17"
 dependencies = [
  "anyhow",
  "axum",
@@ -6600,7 +6600,7 @@ dependencies = [
 
 [[package]]
 name = "whisper-agent-protocol"
-version = "0.3.16"
+version = "0.3.17"
 dependencies = [
  "base64 0.22.1",
  "ciborium",
@@ -6611,7 +6611,7 @@ dependencies = [
 
 [[package]]
 name = "whisper-agent-webui"
-version = "0.3.16"
+version = "0.3.17"
 dependencies = [
  "chrono",
  "chrono-tz",
@@ -6640,7 +6640,7 @@ dependencies = [
 
 [[package]]
 name = "whisper-agent-worker-proto"
-version = "0.3.16"
+version = "0.3.17"
 dependencies = [
  "ciborium",
  "serde",
