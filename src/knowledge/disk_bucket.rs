@@ -252,6 +252,16 @@ struct ResumePoint {
     /// `None` for fresh builds; the indexing loop creates an empty
     /// one in that case.
     dense: Option<Arc<DenseIndex>>,
+    /// Content-hash dedup state for the chunker covering records
+    /// 0..records_completed. Empty for a fresh build. On resume, the
+    /// chunker stage continues across the records_completed boundary
+    /// with this set as its starting state — without it, the chunker
+    /// re-emits chunks for any record whose content_hash *first*
+    /// appeared in the prefix (e.g., the second of two stub articles
+    /// with bit-identical text). Those chunks collide on `chunk_id`
+    /// with their prefix counterparts and corrupt the slot
+    /// (chunk_count != vector_count at finalize).
+    seen_hashes: HashSet<[u8; 32]>,
 }
 
 /// Optional progress hook for `DiskBucket::build_slot`. The build calls
@@ -1193,6 +1203,7 @@ impl DiskBucket {
                 last_batch_index + 1
             },
             dense: dense_for_resume,
+            seen_hashes,
         };
 
         // The Planning phase already happened; we don't re-publish
@@ -1292,6 +1303,10 @@ impl DiskBucket {
         let mut records_completed: u64 = resume.records_completed;
         let mut chunks_emitted: u64 = resume.chunks_emitted;
         let starting_batch_index: u64 = resume.next_batch_index;
+        // Captured here so the chunker stage's `async move` block can
+        // own it; passing the full `resume` into the closure would also
+        // move `resume.dense`, which we still need below.
+        let starting_seen_hashes = resume.seen_hashes;
 
         // Empty HNSW + per-batch dense inserts. Sized hint is
         // generous — actual chunk count is unknown until the
@@ -1361,7 +1376,16 @@ impl DiskBucket {
             // the post-build invariant. Dedup at the source level
             // also saves chunker work and one embedder request per
             // duplicate batch.
-            let mut seen_hashes: HashSet<[u8; 32]> = HashSet::new();
+            //
+            // On resume, this set is pre-populated by the caller from
+            // the prefix's planned content_hashes (records
+            // 0..records_completed) — without that, every resume would
+            // re-emit a chunk for the first dup-hash record it
+            // encounters past records_completed (because the prefix's
+            // first occurrence is invisible to a fresh empty set), and
+            // those rogue chunks accumulate corrupted state on disk
+            // every time the build crashes-and-resumes.
+            let mut seen_hashes: HashSet<[u8; 32]> = starting_seen_hashes;
             for record in iter {
                 if cancel.is_cancelled() {
                     cancelled = true;
@@ -5554,6 +5578,130 @@ embedder = "tei_test"
             !sparse_hits.is_empty(),
             "resumed slot must be queryable on sparse"
         );
+    }
+
+    #[tokio::test]
+    async fn resume_dedups_twin_record_past_records_completed() {
+        // Regression for the resume-time chunker_fut `seen_hashes` bug:
+        // before the fix, the chunker stage on resume started with an
+        // empty dedup set, so a record whose content_hash *first*
+        // appeared in the prefix (records 0..records_completed) but
+        // whose twin sits past records_completed got chunked again on
+        // resume. Same content_hash → same chunk_id → silently
+        // overwrites the in-memory index, but vectors.bin gets a
+        // duplicate vector and the post-build invariant
+        // (`chunk_count != vector_count`) trips at finalize.
+        //
+        // Layout: 400 single-chunk records.
+        //   doc-0000           = "stub"     (h_stub at iter pos 0)
+        //   doc-0001..doc-0299 = unique
+        //   doc-0300           = "stub"     (h_stub TWIN, deliberately
+        //                                    past where records_completed
+        //                                    can land for cancel-after-1
+        //                                    given EMBED_PARALLELISM=1
+        //                                    + channel_capacity=1: the
+        //                                    chunker can fill at most one
+        //                                    batch ahead, so checkpoint
+        //                                    ≤ 2 × EMBED_BATCH_SIZE)
+        //   doc-0301..doc-0399 = unique
+        //
+        // Without the fix, chunker_fut on resume starts with empty
+        // seen_hashes and re-emits doc-0300's chunk; same chunk_id as
+        // doc-0000's chunk → silent overwrite in the chunks index but
+        // vectors.bin gets a duplicate → chunk_count != vector_count
+        // at finalize → resume errors.
+        use crate::knowledge::build_state::{self, BuildStateRecord};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("notes");
+        fs::create_dir_all(&source).unwrap();
+
+        let total_records = 400;
+        let twin_idx = 300;
+        for i in 0..total_records {
+            let body = if i == 0 || i == twin_idx {
+                "stub".to_string()
+            } else {
+                format!("doc-{i:04} body content")
+            };
+            write_md(&source, &format!("doc-{i:04}.md"), &body);
+        }
+
+        let bucket_root = tmp.path().join("bucket");
+        let bucket = open_test_bucket(&bucket_root, &source);
+        let adapter = MarkdownDir::new(&source);
+        let (chunker, chunker_snapshot) = TokenBasedChunker::from_config(&bucket.config().chunker);
+
+        // Cancel after batch 1: records_completed=128, chunks_completed=128.
+        let cancel = CancellationToken::new();
+        let cancelling = Arc::new(CancellingEmbedder::new(8, 1, cancel.clone()));
+        let _ = bucket
+            .build_slot(
+                &adapter,
+                &chunker,
+                chunker_snapshot.clone(),
+                cancelling.clone(),
+                None,
+                &cancel,
+            )
+            .await
+            .unwrap_err();
+
+        let resumable = bucket
+            .find_resumable_slot()
+            .unwrap()
+            .expect("partial slot must be resumable");
+        let slot_path = slot::slot_dir(&bucket_root, &resumable);
+
+        // Sanity-check the checkpoint landed before the twin's iter
+        // position so the bug actually has somewhere to manifest. If a
+        // future test-config change pushes records_completed past
+        // twin_idx the bug-coverage evaporates silently — fail loud
+        // rather than pass-without-testing.
+        let pre_log = build_state::read_all(&slot_path.join(slot::BUILD_STATE)).unwrap();
+        let last_batch = pre_log.iter().rev().find_map(|r| match r {
+            BuildStateRecord::BatchEmbedded {
+                source_records_completed,
+                chunks_completed,
+                ..
+            } => Some((*source_records_completed, *chunks_completed)),
+            _ => None,
+        });
+        let (records_completed, _) = last_batch.expect("at least one batch must checkpoint");
+        assert!(
+            records_completed > 0 && (records_completed as usize) < twin_idx,
+            "checkpoint records_completed={records_completed} must be in (0, {twin_idx}) so the \
+             twin sits past the prefix"
+        );
+
+        // Resume. With the fix this completes; without it,
+        // run_after_planning errors with "chunk/vector count mismatch"
+        // at finalize because doc-0128's chunk got double-emitted.
+        let resume_cancel = CancellationToken::new();
+        let plain: Arc<dyn EmbeddingProvider> = Arc::new(MockEmbedder::new(8));
+        bucket
+            .resume_slot(
+                &resumable,
+                &adapter,
+                &chunker,
+                chunker_snapshot.clone(),
+                plain,
+                None,
+                &resume_cancel,
+            )
+            .await
+            .expect("resume must dedup the stub-twin past records_completed");
+
+        let manifest = SlotManifest::from_toml_str(
+            &fs::read_to_string(slot::manifest_path(&slot_path)).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(manifest.state, SlotState::Ready);
+        // 286 source records, 285 unique content_hashes (doc-0128 is a
+        // dup of doc-0000), so chunk_count == vector_count == 285.
+        assert_eq!(manifest.stats.source_records, total_records as u64);
+        assert_eq!(manifest.stats.chunk_count, (total_records - 1) as u64);
+        assert_eq!(manifest.stats.vector_count, (total_records - 1) as u64);
     }
 
     #[tokio::test]
