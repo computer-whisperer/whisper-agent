@@ -97,7 +97,7 @@ pub(crate) async fn dispatch_v2_tool(
             }
         };
 
-        let invoke = session.invoke_tool(real_name.clone(), arguments.clone());
+        let invoke = session.invoke_tool(real_name.clone(), arguments.clone(), vec![]);
         let result = tokio::select! {
             r = invoke => r,
             _ = cancel.cancelled() => return Err("cancelled".to_string()),

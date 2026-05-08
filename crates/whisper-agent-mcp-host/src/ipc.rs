@@ -36,7 +36,7 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 use whisper_agent_worker_proto::{
-    CallId, CallToolResult, PROTOCOL_VERSION, ToolDescriptor, WorkerFrame,
+    CallId, CallToolResult, ContentBlock, PROTOCOL_VERSION, ToolDescriptor, WorkerFrame,
 };
 
 use crate::tools::{self, ToolStreamItem};
@@ -134,11 +134,13 @@ async fn reader_loop(
                 call_id,
                 tool_name,
                 arguments,
+                attachments,
             })) => {
                 let handle = spawn_invoke(
                     call_id,
                     tool_name,
                     arguments,
+                    attachments,
                     workspace.clone(),
                     out_tx.clone(),
                 );
@@ -187,11 +189,12 @@ fn spawn_invoke(
     call_id: CallId,
     tool_name: String,
     arguments: serde_json::Value,
+    attachments: Vec<ContentBlock>,
     workspace: Arc<Workspace>,
     out_tx: mpsc::Sender<WorkerFrame>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
-        let mut stream = match tools::call_stream(&workspace, &tool_name, arguments) {
+        let mut stream = match tools::call_stream(&workspace, &tool_name, arguments, attachments) {
             Ok(s) => s,
             Err(tools::ToolDispatchError::UnknownTool(name)) => {
                 let _ = out_tx

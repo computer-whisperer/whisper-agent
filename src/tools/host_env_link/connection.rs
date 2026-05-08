@@ -28,7 +28,7 @@ use futures::{SinkExt, StreamExt, stream::SplitSink, stream::SplitStream};
 use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, info, warn};
 use whisper_agent_host_proto::{
-    CallId, CallToolResult, DaemonCapabilities, Frame, GoodbyeReason, HostEnvSpec,
+    CallId, CallToolResult, ContentBlock, DaemonCapabilities, Frame, GoodbyeReason, HostEnvSpec,
     PROTOCOL_VERSION, ProvisionPhase, SessionId, ThreadContext,
 };
 
@@ -77,6 +77,7 @@ pub(super) enum Command {
         call_id: CallId,
         tool_name: String,
         arguments: serde_json::Value,
+        attachments: Vec<ContentBlock>,
         result: oneshot::Sender<Result<CallToolResult, String>>,
     },
     /// Apply a [`whisper_agent_host_proto::ThreadContextDelta`] to a
@@ -394,6 +395,7 @@ async fn handle_command(
             call_id,
             tool_name,
             arguments,
+            attachments,
             result,
         } => {
             match sessions.get_mut(&session_id) {
@@ -412,6 +414,7 @@ async fn handle_command(
                     call_id,
                     tool_name,
                     arguments,
+                    attachments,
                 },
             )
             .await

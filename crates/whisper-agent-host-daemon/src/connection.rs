@@ -23,7 +23,7 @@ use tokio_tungstenite::{
 };
 use tracing::{debug, info, warn};
 use whisper_agent_host_proto::{
-    CallId, CallToolResult, DaemonCapabilities, Frame, GoodbyeReason, HostEnvSpec,
+    CallId, CallToolResult, ContentBlock, DaemonCapabilities, Frame, GoodbyeReason, HostEnvSpec,
     PROTOCOL_VERSION, ProvisionPhase, SessionEndReason, SessionId, ThreadContext,
 };
 
@@ -272,6 +272,7 @@ async fn handle_inbound(
             call_id,
             tool_name,
             arguments,
+            attachments,
         } => {
             match sessions.dispatch_target(&session_id) {
                 Some(target) => {
@@ -306,6 +307,7 @@ async fn handle_inbound(
                         call_id,
                         tool_name,
                         arguments,
+                        attachments,
                         target,
                         work_tx.clone(),
                     );
@@ -538,11 +540,12 @@ fn spawn_invoke_tool(
     call_id: CallId,
     tool_name: String,
     arguments: serde_json::Value,
+    attachments: Vec<ContentBlock>,
     target: DispatchTarget,
     work_tx: mpsc::Sender<Work>,
 ) {
     tokio::spawn(async move {
-        let result = invoke_tool(&target.worker, call_id, tool_name, arguments)
+        let result = invoke_tool(&target.worker, call_id, tool_name, arguments, attachments)
             .await
             .map_err(|e| e.to_string());
         let _ = work_tx
@@ -567,8 +570,11 @@ async fn invoke_tool(
     call_id: CallId,
     tool_name: String,
     arguments: serde_json::Value,
+    attachments: Vec<ContentBlock>,
 ) -> Result<CallToolResult, WorkerError> {
-    worker.invoke(call_id, tool_name, arguments).await
+    worker
+        .invoke(call_id, tool_name, arguments, attachments)
+        .await
 }
 
 /// Best guess at which [`ProvisionPhase`] a [`WorkerError`] occurred

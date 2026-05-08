@@ -205,6 +205,7 @@ async fn round_trip_open_session_invoke_tool() {
                 call_id,
                 tool_name,
                 arguments,
+                ..
             } => {
                 assert_eq!(sid, session_id);
                 assert_eq!(tool_name, "echo");
@@ -251,7 +252,7 @@ async fn round_trip_open_session_invoke_tool() {
 
     // Invoke the tool.
     let result = session
-        .invoke_tool("echo", serde_json::json!({"msg":"hi"}))
+        .invoke_tool("echo", serde_json::json!({"msg":"hi"}), vec![])
         .await
         .expect("invoke_tool failed");
     assert_eq!(result.is_error, None);

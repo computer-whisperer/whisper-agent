@@ -136,11 +136,21 @@ pub enum Frame {
 
     // ─── Per-call ─────────────────────────────────────────────
     /// **S→D**. Invoke a tool inside a live session.
+    ///
+    /// `attachments` is a sidecar slot for content blocks the
+    /// scheduler resolved from conversation state before dispatch
+    /// (today: images referenced by index via the
+    /// `x-content-ref: image` schema marker, used by `save_image`).
+    /// Empty for tools that don't declare a content-ref input —
+    /// `#[serde(default)]` keeps the wire elidible so existing tools
+    /// see no encoded change.
     InvokeTool {
         session_id: SessionId,
         call_id: CallId,
         tool_name: String,
         arguments: serde_json::Value,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        attachments: Vec<ContentBlock>,
     },
     /// **S→D**. Cancel an in-flight call. Daemon may take a moment to
     /// produce the terminal [`Frame::ToolFinal`] — the scheduler treats
@@ -407,7 +417,45 @@ mod tests {
             call_id: CallId(42),
             tool_name: "read_file".into(),
             arguments: serde_json::json!({ "path": "/tmp/x", "max_lines": 50 }),
+            attachments: vec![],
         });
+    }
+
+    #[test]
+    fn invoke_tool_with_attachments_round_trips() {
+        assert_round_trip(Frame::InvokeTool {
+            session_id: sample_session_id(),
+            call_id: CallId(42),
+            tool_name: "save_image".into(),
+            arguments: serde_json::json!({ "path": "out.png", "index": 0 }),
+            attachments: vec![ContentBlock::Image {
+                data: "AAAA".into(),
+                mime_type: "image/png".into(),
+            }],
+        });
+    }
+
+    /// Empty `attachments` must be elided from the wire so existing
+    /// tools see no encoded change. The `#[serde(default,
+    /// skip_serializing_if = "Vec::is_empty")]` attributes guarantee
+    /// this — pin it with a test so a future rename of either flag
+    /// can't silently break the protocol-version no-bump promise.
+    #[test]
+    fn invoke_tool_empty_attachments_elided_on_wire() {
+        let frame = Frame::InvokeTool {
+            session_id: sample_session_id(),
+            call_id: CallId(42),
+            tool_name: "read_file".into(),
+            arguments: serde_json::json!({ "path": "/tmp/x" }),
+            attachments: vec![],
+        };
+        let bytes = frame.encode_cbor().expect("encode");
+        let v: ciborium::Value = ciborium::from_reader(bytes.as_slice()).expect("decode");
+        let map = v.as_map().expect("map");
+        assert!(
+            !map.iter().any(|(k, _)| k.as_text() == Some("attachments")),
+            "empty attachments must be elided from CBOR"
+        );
     }
 
     #[test]

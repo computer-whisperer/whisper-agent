@@ -258,6 +258,7 @@ async fn invoke_tool_for_unknown_session_returns_error_final() {
                     call_id: CallId(1),
                     tool_name: "read_file".into(),
                     arguments: serde_json::json!({"path": "/etc/hostname"}),
+                    attachments: vec![],
                 },
             )
             .await;

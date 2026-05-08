@@ -37,8 +37,8 @@ use tokio::sync::{Mutex, mpsc, oneshot};
 use tracing::{info, warn};
 use whisper_agent_protocol::sandbox::{AccessMode, HostEnvSpec, NetworkPolicy, PathAccess};
 use whisper_agent_worker_proto::{
-    CallId, CallToolResult, PROTOCOL_VERSION as WORKER_PROTOCOL_VERSION, ToolDescriptor,
-    WorkerFrame,
+    CallId, CallToolResult, ContentBlock, PROTOCOL_VERSION as WORKER_PROTOCOL_VERSION,
+    ToolDescriptor, WorkerFrame,
 };
 
 /// Last N stderr bytes we retain for failure reporting. 4 KiB catches
@@ -142,6 +142,7 @@ enum WorkerCommand {
         call_id: CallId,
         tool_name: String,
         arguments: Value,
+        attachments: Vec<ContentBlock>,
         result_tx: oneshot::Sender<Result<CallToolResult, WorkerError>>,
     },
     Cancel {
@@ -160,6 +161,7 @@ impl Worker {
         call_id: CallId,
         tool_name: String,
         arguments: Value,
+        attachments: Vec<ContentBlock>,
     ) -> Result<CallToolResult, WorkerError> {
         let (result_tx, result_rx) = oneshot::channel();
         if self
@@ -168,6 +170,7 @@ impl Worker {
                 call_id,
                 tool_name,
                 arguments,
+                attachments,
                 result_tx,
             })
             .await
@@ -459,8 +462,8 @@ async fn frame_loop(
     loop {
         tokio::select! {
             cmd = cmd_rx.recv() => match cmd {
-                Some(WorkerCommand::Invoke { call_id, tool_name, arguments, result_tx }) => {
-                    let frame = WorkerFrame::InvokeTool { call_id, tool_name, arguments };
+                Some(WorkerCommand::Invoke { call_id, tool_name, arguments, attachments, result_tx }) => {
+                    let frame = WorkerFrame::InvokeTool { call_id, tool_name, arguments, attachments };
                     if write_frame(&mut writer, &frame).await.is_err() {
                         let _ = result_tx.send(Err(WorkerError::Disconnected));
                         break;
@@ -790,6 +793,7 @@ mod tests {
                 call_id: CallId(7),
                 tool_name: "read_file".into(),
                 arguments: serde_json::json!({"path": "/tmp/x"}),
+                attachments: vec![],
                 result_tx,
             })
             .await
@@ -847,6 +851,7 @@ mod tests {
                 call_id: CallId(1),
                 tool_name: "x".into(),
                 arguments: serde_json::Value::Null,
+                attachments: vec![],
                 result_tx,
             })
             .await

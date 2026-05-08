@@ -32,8 +32,8 @@ use std::time::Duration;
 use thiserror::Error;
 use tokio::sync::{Notify, mpsc, oneshot};
 use whisper_agent_host_proto::{
-    CallId, CallToolResult, DaemonCapabilities, GoodbyeReason, HostEnvSpec, ProvisionPhase,
-    SessionId, ThreadContext,
+    CallId, CallToolResult, ContentBlock, DaemonCapabilities, GoodbyeReason, HostEnvSpec,
+    ProvisionPhase, SessionId, ThreadContext,
 };
 
 pub use auth::{AdmittedDaemon, DaemonAuthState};
@@ -417,10 +417,16 @@ impl SessionHandle {
     /// Invoke a tool on this session. Returns the terminal
     /// [`CallToolResult`] when the daemon emits `ToolFinal`.
     /// Streaming chunks are silently discarded in phase 2b.
+    ///
+    /// `attachments` is a sidecar of content blocks the scheduler
+    /// resolved upstream from conversation state — populated only
+    /// for tools whose input schema declares an `x-content-ref`
+    /// parameter. Pass `vec![]` for tools that don't opt in.
     pub async fn invoke_tool(
         &self,
         tool_name: impl Into<String>,
         arguments: serde_json::Value,
+        attachments: Vec<ContentBlock>,
     ) -> Result<CallToolResult, LinkError> {
         let call_id = CallId(self.next_call_seq.fetch_add(1, Ordering::Relaxed));
         let (result_tx, result_rx) = oneshot::channel();
@@ -429,6 +435,7 @@ impl SessionHandle {
             call_id,
             tool_name: tool_name.into(),
             arguments,
+            attachments,
             result: result_tx,
         };
         if self.cmd_tx.send(cmd).await.is_err() {

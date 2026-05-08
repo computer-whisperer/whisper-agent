@@ -55,10 +55,17 @@ pub fn descriptors() -> Vec<Tool> {
 /// terminate with exactly one `Final`. Streaming tools (bash) yield
 /// `Chunk`s before the `Final`; non-streaming tools yield only the
 /// `Final`.
+///
+/// `attachments` is a sidecar of content blocks the scheduler
+/// resolved upstream — populated only for tools whose input schema
+/// declares a `x-content-ref` parameter. Existing tools ignore it;
+/// future content-consuming tools (e.g. `save_image`) read indexed
+/// entries.
 pub fn call_stream(
     workspace: &Arc<Workspace>,
     name: &str,
     args: Value,
+    _attachments: Vec<ContentBlock>,
 ) -> Result<Pin<Box<dyn Stream<Item = ToolStreamItem> + Send>>, ToolDispatchError> {
     let ws = workspace.clone();
     match name {

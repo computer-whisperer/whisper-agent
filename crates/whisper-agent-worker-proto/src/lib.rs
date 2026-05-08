@@ -83,10 +83,19 @@ pub enum WorkerFrame {
     /// **D→W**. Run a tool. The worker responds with zero or more
     /// [`Self::ToolChunk`] frames (only for streaming tools) followed
     /// by exactly one [`Self::ToolFinal`] for this `call_id`.
+    ///
+    /// `attachments` is a sidecar carrying content blocks the
+    /// scheduler resolved upstream (e.g. images referenced by index
+    /// via the `x-content-ref: image` schema marker on a tool's
+    /// input schema). Empty for tools that don't opt in —
+    /// `#[serde(default)]` keeps it off the wire so existing tools
+    /// see no encoded change.
     InvokeTool {
         call_id: CallId,
         tool_name: String,
         arguments: Value,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        attachments: Vec<ContentBlock>,
     },
 
     /// **D→W**. Cancel an in-flight call. The worker may take a
@@ -195,6 +204,7 @@ mod tests {
             call_id: CallId(42),
             tool_name: "read_file".into(),
             arguments: serde_json::json!({ "path": "/tmp/x" }),
+            attachments: vec![],
         });
     }
 
@@ -207,7 +217,41 @@ mod tests {
             call_id: CallId(1),
             tool_name: "list_dir".into(),
             arguments: serde_json::Value::Null,
+            attachments: vec![],
         });
+    }
+
+    #[test]
+    fn invoke_tool_with_attachments_round_trips() {
+        assert_round_trip(WorkerFrame::InvokeTool {
+            call_id: CallId(42),
+            tool_name: "save_image".into(),
+            arguments: serde_json::json!({ "path": "out.png", "index": 0 }),
+            attachments: vec![ContentBlock::Image {
+                data: "AAAA".into(),
+                mime_type: "image/png".into(),
+            }],
+        });
+    }
+
+    /// Empty `attachments` must be elided on the wire so existing
+    /// tools see no encoded change. Matches the same elision in
+    /// host-proto — the daemon forwards through verbatim.
+    #[test]
+    fn invoke_tool_empty_attachments_elided_on_wire() {
+        let frame = WorkerFrame::InvokeTool {
+            call_id: CallId(42),
+            tool_name: "read_file".into(),
+            arguments: serde_json::json!({ "path": "/tmp/x" }),
+            attachments: vec![],
+        };
+        let bytes = frame.encode_cbor().expect("encode");
+        let v: ciborium::Value = ciborium::from_reader(bytes.as_slice()).expect("decode");
+        let map = v.as_map().expect("map");
+        assert!(
+            !map.iter().any(|(k, _)| k.as_text() == Some("attachments")),
+            "empty attachments must be elided from CBOR"
+        );
     }
 
     #[test]
@@ -319,6 +363,7 @@ mod tests {
                     call_id: CallId(1),
                     tool_name: "x".into(),
                     arguments: Value::Null,
+                    attachments: vec![],
                 },
                 "invoke_tool",
             ),
