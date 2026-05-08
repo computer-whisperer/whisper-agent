@@ -1084,6 +1084,35 @@ impl RspStreamState {
                         input,
                     });
                 }
+                // image_generation_call items also need a live event —
+                // without one the webui never receives ThreadAssistantImage
+                // and the image only appears after the next snapshot
+                // refresh. Decode the base64 result here and emit an
+                // ImageBlock so the picture lights up immediately on
+                // turn completion. The persisted ContentBlock::Image
+                // (with ProviderReplay metadata for round-trip) still
+                // rides on the final Completed event via finalize_response.
+                if let RspOutputItem::ImageGenerationCall {
+                    result: Some(b64), ..
+                } = &item
+                {
+                    use base64::Engine;
+                    match base64::engine::general_purpose::STANDARD.decode(b64.as_bytes()) {
+                        Ok(bytes) => {
+                            out.push(ModelEvent::ImageBlock {
+                                source: whisper_agent_protocol::ImageSource::Bytes {
+                                    media_type: whisper_agent_protocol::ImageMime::Png,
+                                    data: bytes,
+                                },
+                            });
+                        }
+                        Err(e) => {
+                            return Err(ModelError::Transport(format!(
+                                "image_generation_call result not valid base64: {e}"
+                            )));
+                        }
+                    }
+                }
                 self.items.push(item);
             }
             RspStreamEvent::ResponseCompleted { response } => {
@@ -2157,6 +2186,41 @@ data: {"type":"response.failed","response":{"status":"failed"},"error":{"message
             out.extend(state.consume(ev).unwrap());
         }
         (out, state)
+    }
+
+    #[test]
+    fn image_generation_call_done_emits_imageblock_for_live_streaming() {
+        // Without a live ImageBlock event, the webui only sees the
+        // image after the next snapshot refresh — the user reported a
+        // chat row with no picture even though the persisted thread
+        // had the bytes. Locking in the live-event emission so the
+        // image appears as soon as the model finishes generating it.
+        let events = [
+            r#"{"type":"response.output_item.done","item":{
+                "type":"image_generation_call","id":"ig_1",
+                "status":"completed","result":"3q2+7w=="
+            }}"#,
+            r#"{"type":"response.completed","response":{
+                "status":"completed","output":[],
+                "usage":{"input_tokens":3,"output_tokens":1}
+            }}"#,
+        ];
+        let (evs, _) = feed_events(&events);
+        let images: Vec<&whisper_agent_protocol::ImageSource> = evs
+            .iter()
+            .filter_map(|e| match e {
+                ModelEvent::ImageBlock { source } => Some(source),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(images.len(), 1, "exactly one ImageBlock per generation");
+        match images[0] {
+            whisper_agent_protocol::ImageSource::Bytes { media_type, data } => {
+                assert_eq!(*media_type, whisper_agent_protocol::ImageMime::Png);
+                assert_eq!(data, &vec![0xDE, 0xAD, 0xBE, 0xEF]);
+            }
+            other => panic!("expected Bytes source, got {other:?}"),
+        }
     }
 
     #[test]
