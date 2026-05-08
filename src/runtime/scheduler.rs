@@ -2953,13 +2953,40 @@ impl Scheduler {
 
         let listing_text = self.render_initial_listing(thread_id);
 
-        let pod_dir = self
-            .tasks
-            .get(thread_id)
-            .and_then(|t| self.pods.get(&t.pod_id))
-            .map(|p| p.dir.clone());
-        let memory_msg = pod_dir
-            .map(|dir| crate::runtime::memory_snapshot::build_block(&dir, chrono::Utc::now()));
+        let memory_msg = self.tasks.get(thread_id).and_then(|task| {
+            let pod_dir = self.pods.get(&task.pod_id).map(|p| p.dir.clone())?;
+            // Pull session context off the task — model id, backend
+            // name, and the host-env binding map. Borrowed straight
+            // out of `task`; `build_block` doesn't retain references
+            // past the call.
+            let host_env_infos: Vec<crate::runtime::memory_snapshot::HostEnvInfo<'_>> = task
+                .bindings
+                .host_env
+                .iter()
+                .filter_map(|b| match b {
+                    whisper_agent_protocol::HostEnvBinding::Named {
+                        name,
+                        workspace_root,
+                    } => Some(crate::runtime::memory_snapshot::HostEnvInfo {
+                        name: name.as_str(),
+                        workspace_root: workspace_root.as_deref(),
+                    }),
+                    // Inline bindings are reserved / not constructable
+                    // from current wire types — skip from the surface.
+                    whisper_agent_protocol::HostEnvBinding::Inline { .. } => None,
+                })
+                .collect();
+            let session = crate::runtime::memory_snapshot::SessionContext {
+                model: task.config.model.as_str(),
+                backend: task.bindings.backend.as_str(),
+                host_envs: &host_env_infos,
+            };
+            Some(crate::runtime::memory_snapshot::build_block(
+                &pod_dir,
+                chrono::Utc::now(),
+                &session,
+            ))
+        });
 
         let snapshot = if let Some(task) = self.tasks.get_mut(thread_id) {
             let mut at = task.conversation.setup_prefix_end();
