@@ -249,6 +249,7 @@ impl ThreadEventRouter {
                     tool_use_id,
                     result_preview,
                     is_error,
+                    attachments,
                 } => {
                     self.broadcast_to_subscribers(
                         thread_id,
@@ -257,6 +258,7 @@ impl ThreadEventRouter {
                             tool_use_id,
                             result_preview,
                             is_error,
+                            attachments,
                         },
                     );
                 }

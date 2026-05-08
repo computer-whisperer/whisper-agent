@@ -22,9 +22,9 @@ use std::collections::HashMap;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use whisper_agent_protocol::{
-    BehaviorOrigin, ContentBlock, Conversation, Message, Role, ThreadBindings, ThreadConfig,
-    ThreadSnapshot, ThreadStateLabel, ThreadSummary, ToolResultContent, ToolSurface, TurnEntry,
-    TurnLog, Usage,
+    BehaviorOrigin, ContentBlock, Conversation, ImageSource, Message, Role, ThreadBindings,
+    ThreadConfig, ThreadSnapshot, ThreadStateLabel, ThreadSummary, ToolResultContent, ToolSurface,
+    TurnEntry, TurnLog, Usage,
 };
 
 use crate::functions::InFlightOps;
@@ -53,6 +53,7 @@ fn synth_interrupted_tool_result(
         tool_use_id: tool_use_id.to_string(),
         result_preview: synth_text.to_string(),
         is_error: true,
+        attachments: Vec::new(),
     });
     ContentBlock::ToolResult {
         tool_use_id: tool_use_id.to_string(),
@@ -267,6 +268,15 @@ pub enum ThreadEvent {
         tool_use_id: String,
         result_preview: String,
         is_error: bool,
+        /// Image attachments lifted from the tool result's content
+        /// blocks. Carried alongside `result_preview` so the live
+        /// streaming path delivers the same images the snapshot
+        /// path would — without this, MCP tools that return image
+        /// content (mcp-imagegen, recall_image, …) wouldn't render
+        /// in the webui until a refresh forced a snapshot resync.
+        /// URL-source images stay too — the renderer picks how to
+        /// display each.
+        attachments: Vec<ImageSource>,
     },
     AssistantEnd {
         stop_reason: Option<String>,
@@ -605,6 +615,7 @@ impl Thread {
                 tool_use_id: req.tool_use_id.clone(),
                 result_preview: synth_text.clone(),
                 is_error: true,
+                attachments: Vec::new(),
             });
             completed.push(ContentBlock::ToolResult {
                 tool_use_id: req.tool_use_id.clone(),
@@ -618,6 +629,7 @@ impl Thread {
                 tool_use_id: tool_use_id.clone(),
                 result_preview: synth_text.clone(),
                 is_error: true,
+                attachments: Vec::new(),
             });
             completed.push(ContentBlock::ToolResult {
                 tool_use_id: tool_use_id.clone(),
@@ -1046,10 +1058,19 @@ impl Thread {
             }
         };
 
+        // Lift any image attachments out of the tool result so the
+        // live streaming path delivers them to webui subscribers.
+        // Without this, MCP tools that return image content (e.g.
+        // mcp-imagegen, recall_image) wouldn't render until a
+        // refresh forced a snapshot resync — the image bytes are
+        // already in `content` but the wire-level ToolCallEnd only
+        // ships `result_preview`.
+        let attachments: Vec<ImageSource> = content.image_sources().into_iter().cloned().collect();
         events.push(ThreadEvent::ToolCallEnd {
             tool_use_id: tool_use_id.clone(),
             result_preview: truncate(preview, 200),
             is_error,
+            attachments,
         });
         events.push(ThreadEvent::AuditToolCall {
             tool_name,

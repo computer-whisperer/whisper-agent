@@ -372,18 +372,15 @@ impl ChatApp {
                 tool_use_id,
                 result_preview,
                 is_error,
+                attachments,
             } => {
                 if let Some(view) = self.tasks.get_mut(&thread_id) {
-                    // Live streaming path carries only a short preview
-                    // string — full image attachments arrive on the
-                    // conversation replay, so pass empty attachments
-                    // here and let the ThreadSnapshot re-populate them.
                     push_tool_result(
                         &mut view.items,
                         tool_use_id,
                         result_preview,
                         is_error,
-                        Vec::new(),
+                        attachments,
                     );
                 }
             }

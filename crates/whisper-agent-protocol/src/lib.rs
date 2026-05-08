@@ -1924,6 +1924,15 @@ pub enum ServerToClient {
         tool_use_id: String,
         result_preview: String,
         is_error: bool,
+        /// Image attachments lifted from the tool result's content
+        /// blocks. Empty for tools that return only text. Carried
+        /// alongside `result_preview` so the live streaming path
+        /// delivers the same images the snapshot path would —
+        /// without this, MCP tools that return image content
+        /// (mcp-imagegen, recall_image, …) wouldn't render in the
+        /// webui until a refresh forced a snapshot resync.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        attachments: Vec<ImageSource>,
     },
     ThreadAssistantEnd {
         thread_id: String,

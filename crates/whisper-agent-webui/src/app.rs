@@ -3902,6 +3902,7 @@ mod tests {
             tool_use_id: "tu-1".into(),
             result_preview: String::new(),
             is_error: false,
+            attachments: Vec::new(),
         };
         let assistant_end = ServerToClient::ThreadAssistantEnd {
             thread_id: "t".into(),
