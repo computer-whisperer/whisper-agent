@@ -37,6 +37,7 @@ pub mod list_llm_providers;
 pub mod list_mcp_hosts;
 mod list_threads;
 mod pod_show_thread;
+pub mod recall_image;
 pub mod sudo;
 
 use std::collections::HashMap;
@@ -149,6 +150,7 @@ pub const LIST_MCP_HOSTS: &str = "list_mcp_hosts";
 pub const KNOWLEDGE_QUERY: &str = "knowledge_query";
 pub const KNOWLEDGE_MODIFY: &str = "knowledge_modify";
 pub const LIST_IMAGES: &str = "list_images";
+pub const RECALL_IMAGE: &str = "recall_image";
 
 /// True if `name` is a builtin pod tool. Used by the scheduler's router
 /// to branch the tool-call dispatch path.
@@ -175,6 +177,7 @@ pub fn is_builtin(name: &str) -> bool {
             | KNOWLEDGE_QUERY
             | KNOWLEDGE_MODIFY
             | LIST_IMAGES
+            | RECALL_IMAGE
     )
 }
 
@@ -208,6 +211,7 @@ pub fn reserved_env_name_prefixes() -> Vec<&'static str> {
         KNOWLEDGE_QUERY,
         KNOWLEDGE_MODIFY,
         LIST_IMAGES,
+        RECALL_IMAGE,
     ];
     let mut out: Vec<&'static str> = BUILTINS
         .iter()
@@ -242,6 +246,7 @@ pub fn descriptors() -> Vec<McpTool> {
         knowledge_query::descriptor(),
         knowledge_modify::descriptor(),
         list_images::descriptor(),
+        recall_image::descriptor(),
     ]
 }
 
@@ -434,6 +439,11 @@ pub async fn dispatch(
         LIST_IMAGES => no_update_error(
             "list_images must be intercepted at the scheduler layer \
              (complete_list_images_call); reaching this arm is a bug"
+                .into(),
+        ),
+        RECALL_IMAGE => no_update_error(
+            "recall_image must be intercepted at the scheduler layer \
+             (complete_recall_image_call); reaching this arm is a bug"
                 .into(),
         ),
         FIND_TOOL => no_update_error(

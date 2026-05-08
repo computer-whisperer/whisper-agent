@@ -828,6 +828,17 @@ impl Scheduler {
             );
             return;
         }
+        if name == crate::tools::builtin_tools::RECALL_IMAGE {
+            self.complete_recall_image_call(
+                thread_id,
+                op_id,
+                tool_use_id,
+                input,
+                disposition,
+                pending_io,
+            );
+            return;
+        }
 
         let spec = match self.route_tool(thread_id, &name) {
             Some(ToolRoute::Builtin { .. }) => Function::BuiltinToolCall {
@@ -1285,6 +1296,84 @@ impl Scheduler {
             op_id,
             tool_use_id,
             body,
+        ));
+    }
+
+    /// `recall_image`-specific synchronous path. Resolves the
+    /// caller's `handle` against the live conversation, returns a
+    /// two-block tool result: text header (handle + mime + how-far-
+    /// back) followed by the image content block. Returning the
+    /// image as a content block is what re-introduces it into the
+    /// model's view on the next turn.
+    fn complete_recall_image_call(
+        &mut self,
+        thread_id: &str,
+        op_id: crate::runtime::thread::OpId,
+        tool_use_id: String,
+        input: serde_json::Value,
+        disposition: crate::permission::Disposition,
+        pending_io: &mut FuturesUnordered<SchedulerFuture>,
+    ) {
+        if matches!(disposition, crate::permission::Disposition::Deny) {
+            pending_io.push(make_denial_future(
+                thread_id.to_string(),
+                tool_use_id,
+                op_id,
+                crate::tools::builtin_tools::RECALL_IMAGE.to_string(),
+            ));
+            return;
+        }
+        let args = match crate::tools::builtin_tools::recall_image::parse_args(input) {
+            Ok(a) => a,
+            Err(e) => {
+                pending_io.push(immediate_tool_error(
+                    thread_id.to_string(),
+                    op_id,
+                    tool_use_id,
+                    e,
+                ));
+                return;
+            }
+        };
+        let Some(task) = self.task(thread_id) else {
+            pending_io.push(immediate_tool_error(
+                thread_id.to_string(),
+                op_id,
+                tool_use_id,
+                format!("no such thread `{thread_id}`"),
+            ));
+            return;
+        };
+        let Some(image) = crate::tools::builtin_tools::recall_image::find_by_handle(
+            &task.conversation,
+            &args.handle,
+        ) else {
+            pending_io.push(immediate_tool_error(
+                thread_id.to_string(),
+                op_id,
+                tool_use_id,
+                format!(
+                    "no image with handle `{}` in current context (use `list_images` to see available handles)",
+                    args.handle
+                ),
+            ));
+            return;
+        };
+        let header = crate::tools::builtin_tools::recall_image::render_header(&args.handle, &image);
+        use base64::Engine;
+        let encoded = base64::engine::general_purpose::STANDARD.encode(&image.bytes);
+        let blocks = vec![
+            crate::tools::mcp::McpContentBlock::Text { text: header },
+            crate::tools::mcp::McpContentBlock::Image {
+                data: encoded,
+                mime_type: image.mime.as_mime_str().to_string(),
+            },
+        ];
+        pending_io.push(immediate_tool_success_blocks(
+            thread_id.to_string(),
+            op_id,
+            tool_use_id,
+            blocks,
         ));
     }
 
@@ -3372,6 +3461,36 @@ fn immediate_tool_success(
                     tool_use_id,
                     result: Ok(crate::tools::mcp::CallToolResult {
                         content: vec![crate::tools::mcp::McpContentBlock::Text { text }],
+                        is_error: false,
+                    }),
+                },
+                pod_update: None,
+                scheduler_command: None,
+            },
+        )
+    })
+}
+
+/// Like [`immediate_tool_success`] but lets the caller pass an
+/// arbitrary `Vec<McpContentBlock>` body — used by `recall_image`
+/// to return text + image content together. The image content is
+/// what re-introduces the recalled image into the model's view on
+/// the next turn.
+fn immediate_tool_success_blocks(
+    parent_thread_id: String,
+    op_id: crate::runtime::thread::OpId,
+    tool_use_id: String,
+    content: Vec<crate::tools::mcp::McpContentBlock>,
+) -> SchedulerFuture {
+    Box::pin(async move {
+        crate::runtime::io_dispatch::SchedulerCompletion::Io(
+            crate::runtime::io_dispatch::IoCompletion {
+                thread_id: parent_thread_id,
+                op_id,
+                result: crate::runtime::thread::IoResult::ToolCall {
+                    tool_use_id,
+                    result: Ok(crate::tools::mcp::CallToolResult {
+                        content,
                         is_error: false,
                     }),
                 },
