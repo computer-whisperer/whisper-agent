@@ -637,11 +637,28 @@ fn convert_assistant_message(blocks: &[ContentBlock], out: &mut Vec<RspItem>) {
             ContentBlock::ToolResult { .. } | ContentBlock::ToolSchema { .. } => {
                 // Neither belongs on an assistant message.
             }
-            ContentBlock::Image { .. } | ContentBlock::Document { .. } => {
-                // Model-emitted images come from the `image_generation` built-in
-                // tool (not yet wired up on our side) — nothing reaches here
-                // from a persisted assistant turn today. Documents are never
-                // model-emitted. Drop silently in both cases.
+            ContentBlock::Image { source, replay } => {
+                // Built-in image_generation echo: if the block was
+                // minted by *this* backend, re-emit as an
+                // image_generation_call input item so the server sees
+                // the prior image and can edit it on follow-up turns.
+                // Blocks tagged for a different provider (or untagged
+                // user uploads) don't belong on an assistant turn —
+                // drop. Mirrors the Thinking-replay treatment above.
+                if let Some(item) = image_to_image_generation_call_item(source, replay.as_ref()) {
+                    if !text_accum.is_empty() {
+                        out.push(RspItem::Message {
+                            role: "assistant",
+                            content: vec![RspInputMessagePart::OutputText {
+                                text: std::mem::take(&mut text_accum),
+                            }],
+                        });
+                    }
+                    out.push(item);
+                }
+            }
+            ContentBlock::Document { .. } => {
+                // Documents are never model-emitted. Drop silently.
             }
         }
     }
@@ -684,6 +701,42 @@ fn thinking_to_reasoning_item(replay: Option<&ProviderReplay>) -> Option<RspItem
     })
 }
 
+/// Build an outbound `image_generation_call` input item from a stored
+/// assistant `ContentBlock::Image`. Returns `None` if the replay blob was
+/// minted by a different provider (we can't echo someone else's id) or
+/// if the source isn't inline bytes (URL-source images don't carry the
+/// base64 the API expects on the input side).
+///
+/// Output-only fields (`action`, `background`, `output_format`,
+/// `quality`, `size`, `revised_prompt`) are deliberately omitted — the
+/// API 400s with `Unknown parameter: input[N].<field>` if they're
+/// present. Empirical reference: `scripts/probe_responses_api.sh`.
+fn image_to_image_generation_call_item(
+    source: &whisper_agent_protocol::ImageSource,
+    replay: Option<&ProviderReplay>,
+) -> Option<RspItem> {
+    let r = replay?;
+    if r.provider != PROVIDER_TAG {
+        return None;
+    }
+    let bytes = match source {
+        whisper_agent_protocol::ImageSource::Bytes { data, .. } => data,
+        whisper_agent_protocol::ImageSource::Url { .. } => return None,
+    };
+    use base64::Engine;
+    let result = base64::engine::general_purpose::STANDARD.encode(bytes);
+    let obj = r.data.as_object();
+    let id = obj
+        .and_then(|o| o.get("id"))
+        .and_then(|v| v.as_str())
+        .map(String::from);
+    let status = obj
+        .and_then(|o| o.get("status"))
+        .and_then(|v| v.as_str())
+        .map(String::from);
+    Some(RspItem::ImageGenerationCall { id, status, result })
+}
+
 fn tool_result_as_text(content: &ToolResultContent, is_error: bool) -> String {
     let base = match content {
         ToolResultContent::Text(s) => s.clone(),
@@ -708,6 +761,17 @@ fn tool_result_as_text(content: &ToolResultContent, is_error: bool) -> String {
 }
 
 fn spec_to_rsp_tool(t: &ToolSpec) -> RspTool {
+    if let whisper_agent_protocol::ToolKind::ProviderBuiltin = t.kind {
+        // Today the only ProviderBuiltin we wire is `image_generation`.
+        // Other built-ins (web_search, file_search, code_interpreter, …)
+        // would either match on name here or carry a richer kind enum.
+        if t.name == "image_generation" {
+            return RspTool::ImageGeneration {
+                size: "auto",
+                quality: "auto",
+            };
+        }
+    }
     RspTool::Function {
         name: t.name.clone(),
         description: t.description.clone(),
@@ -1133,6 +1197,53 @@ fn finalize_response(
                     }
                 }
             }
+            RspOutputItem::ImageGenerationCall {
+                id,
+                status,
+                result,
+                revised_prompt,
+            } => {
+                let Some(b64) = result else {
+                    // Some intermediate variants of this item arrive
+                    // mid-stream with status="generating" and no result;
+                    // the terminal item carries the bytes. Defensive:
+                    // skip a result-less item rather than fail the turn.
+                    continue;
+                };
+                use base64::Engine;
+                let bytes = match base64::engine::general_purpose::STANDARD.decode(b64.as_bytes()) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        return Err(ModelError::Transport(format!(
+                            "image_generation_call result not valid base64: {e}"
+                        )));
+                    }
+                };
+                let mut replay_data = serde_json::Map::new();
+                if let Some(id) = &id {
+                    replay_data.insert("id".into(), Value::String(id.clone()));
+                }
+                if let Some(s) = &status {
+                    replay_data.insert("status".into(), Value::String(s.clone()));
+                }
+                if let Some(rp) = &revised_prompt {
+                    // Display-only; never sent back. Preserved on the
+                    // replay blob so the UI can surface "what the model
+                    // decided to draw" without us re-deriving it.
+                    replay_data.insert("revised_prompt".into(), Value::String(rp.clone()));
+                }
+                let replay = (!replay_data.is_empty()).then(|| ProviderReplay {
+                    provider: PROVIDER_TAG.into(),
+                    data: Value::Object(replay_data),
+                });
+                content.push(ContentBlock::Image {
+                    source: whisper_agent_protocol::ImageSource::Bytes {
+                        media_type: whisper_agent_protocol::ImageMime::Png,
+                        data: bytes,
+                    },
+                    replay,
+                });
+            }
             RspOutputItem::FunctionCall {
                 call_id,
                 name,
@@ -1240,6 +1351,19 @@ enum RspItem {
         encrypted_content: Option<String>,
         summary: Vec<RspReasoningPart>,
     },
+    /// Replay item for a previously-generated image, echoed into `input`
+    /// so the model sees the prior bytes and can edit them on a follow-up
+    /// turn. Output-only fields (action / background / output_format /
+    /// quality / size / revised_prompt) are stripped — the API rejects
+    /// them on input (`Unknown parameter: input[N].action`). Empirical
+    /// reference: `scripts/probe_responses_api.sh`.
+    ImageGenerationCall {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        status: Option<String>,
+        result: String,
+    },
 }
 
 #[derive(Serialize, Debug)]
@@ -1283,6 +1407,15 @@ enum RspTool {
         description: String,
         parameters: Value,
         strict: bool,
+    },
+    /// Provider-side built-in: model invokes it inside `/responses` and
+    /// the result rides back as an output item, no separate tool_use →
+    /// tool_result roundtrip. v1 keeps the size/quality knobs at their
+    /// `auto` defaults so the API picks per-prompt; future iterations
+    /// could plumb operator-set defaults.
+    ImageGeneration {
+        size: &'static str,
+        quality: &'static str,
     },
 }
 
@@ -1370,6 +1503,23 @@ enum RspOutputItem {
         /// surface text here instead of `summary`; both can be present.
         #[serde(default)]
         content: Vec<RspReasoningPart>,
+    },
+    /// Result of an `image_generation` built-in tool invocation. The
+    /// model decided to invoke the tool and the server ran it inline;
+    /// `result` is base64-encoded PNG bytes. Other fields (action,
+    /// background, output_format, quality, size, revised_prompt) are
+    /// output-only metadata — see the probe findings under
+    /// `scripts/probe_responses_api.sh` for the input-shape constraints
+    /// when echoing this back next turn.
+    ImageGenerationCall {
+        #[serde(default)]
+        id: Option<String>,
+        #[serde(default)]
+        status: Option<String>,
+        #[serde(default)]
+        result: Option<String>,
+        #[serde(default)]
+        revised_prompt: Option<String>,
     },
     #[serde(other)]
     Other,
@@ -1783,6 +1933,150 @@ data: {"type":"response.failed","response":{"status":"failed"},"error":{"message
         assert_eq!(v["id"], "rs_1");
         assert_eq!(v["encrypted_content"], "ec-blob");
         assert_eq!(v["summary"][0]["type"], "summary_text");
+    }
+
+    #[test]
+    fn image_generation_call_outbound_shape_matches_api_constraints() {
+        // The Codex subscription API rejects output-only fields
+        // (`action`, `background`, `output_format`, `quality`, `size`,
+        // `revised_prompt`) when items are echoed back as input. The
+        // empirical reference is `scripts/probe_responses_api.sh`. Lock
+        // the wire shape so nobody adds these fields without remembering
+        // why they're absent.
+        let native = ProviderReplay {
+            provider: "openai_responses".into(),
+            data: serde_json::json!({
+                "id": "ig_1",
+                "status": "completed",
+                "revised_prompt": "Edit the existing image…",
+            }),
+        };
+        let source = whisper_agent_protocol::ImageSource::Bytes {
+            media_type: whisper_agent_protocol::ImageMime::Png,
+            data: vec![0xDE, 0xAD, 0xBE, 0xEF],
+        };
+        let item =
+            image_to_image_generation_call_item(&source, Some(&native)).expect("should echo");
+        let v = serde_json::to_value(&item).unwrap();
+        assert_eq!(v["type"], "image_generation_call");
+        assert_eq!(v["id"], "ig_1");
+        assert_eq!(v["status"], "completed");
+        assert_eq!(
+            v["result"], "3q2+7w==",
+            "base64(0xDEADBEEF) lands in `result`"
+        );
+        // Everything output-only must be absent.
+        for forbidden in [
+            "action",
+            "background",
+            "output_format",
+            "quality",
+            "size",
+            "revised_prompt",
+        ] {
+            assert!(
+                v.get(forbidden).is_none(),
+                "field `{forbidden}` must be stripped — API rejects it on input"
+            );
+        }
+    }
+
+    #[test]
+    fn image_generation_call_outbound_drops_foreign_provider_replay() {
+        let foreign = ProviderReplay {
+            provider: "anthropic".into(),
+            data: serde_json::json!({"id": "x"}),
+        };
+        let source = whisper_agent_protocol::ImageSource::Bytes {
+            media_type: whisper_agent_protocol::ImageMime::Png,
+            data: vec![1, 2, 3],
+        };
+        assert!(image_to_image_generation_call_item(&source, Some(&foreign)).is_none());
+    }
+
+    #[test]
+    fn image_generation_call_outbound_skips_url_sources() {
+        // URL-source images don't carry the bytes the API needs to put
+        // in `result`; nothing useful to echo back.
+        let native = ProviderReplay {
+            provider: "openai_responses".into(),
+            data: serde_json::json!({"id": "ig_x"}),
+        };
+        let source = whisper_agent_protocol::ImageSource::Url {
+            url: "https://example.com/x.png".into(),
+        };
+        assert!(image_to_image_generation_call_item(&source, Some(&native)).is_none());
+    }
+
+    #[test]
+    fn image_generation_call_inbound_decodes_base64_into_bytes() {
+        // The full incoming-item path: SSE → finalize_response →
+        // ContentBlock::Image with bytes + replay metadata.
+        let raw = r#"{
+            "type": "image_generation_call",
+            "id": "ig_1",
+            "status": "completed",
+            "result": "3q2+7w==",
+            "revised_prompt": "a cat"
+        }"#;
+        let item: RspOutputItem = serde_json::from_str(raw).expect("parse output item");
+        let (content, _stop, _usage) =
+            finalize_response(vec![item], Some("completed".into()), None, None).expect("finalize");
+        assert_eq!(content.len(), 1);
+        let ContentBlock::Image { source, replay } = &content[0] else {
+            panic!("expected ContentBlock::Image, got {:?}", content[0]);
+        };
+        match source {
+            whisper_agent_protocol::ImageSource::Bytes { media_type, data } => {
+                assert_eq!(*media_type, whisper_agent_protocol::ImageMime::Png);
+                assert_eq!(data, &vec![0xDE, 0xAD, 0xBE, 0xEF]);
+            }
+            other => panic!("expected Bytes source, got {other:?}"),
+        }
+        let replay = replay.as_ref().expect("replay should be present");
+        assert_eq!(replay.provider, "openai_responses");
+        let obj = replay.data.as_object().unwrap();
+        assert_eq!(obj.get("id").unwrap(), "ig_1");
+        assert_eq!(obj.get("status").unwrap(), "completed");
+        assert_eq!(obj.get("revised_prompt").unwrap(), "a cat");
+    }
+
+    #[test]
+    fn image_generation_call_inbound_skips_partial_items_without_result() {
+        // Mid-stream partials arrive with status="generating" and no
+        // result yet; finalize_response must skip them rather than
+        // failing the turn.
+        let raw = r#"{
+            "type": "image_generation_call",
+            "id": "ig_1",
+            "status": "generating"
+        }"#;
+        let item: RspOutputItem = serde_json::from_str(raw).expect("parse output item");
+        let (content, _stop, _usage) =
+            finalize_response(vec![item], Some("completed".into()), None, None).expect("finalize");
+        assert!(content.is_empty(), "partial item must produce no block");
+    }
+
+    #[test]
+    fn image_generation_tool_renders_to_correct_wire_shape() {
+        let spec = ToolSpec {
+            name: "image_generation".into(),
+            description: "(unused on the wire for built-ins)".into(),
+            params: Vec::new(),
+            kind: whisper_agent_protocol::ToolKind::ProviderBuiltin,
+        };
+        let rendered = spec_to_rsp_tool(&spec);
+        let v = serde_json::to_value(&rendered).unwrap();
+        assert_eq!(v["type"], "image_generation");
+        assert_eq!(v["size"], "auto");
+        assert_eq!(v["quality"], "auto");
+        // No function-call fields (the API rejects them on built-in tools).
+        for forbidden in ["name", "description", "parameters", "strict"] {
+            assert!(
+                v.get(forbidden).is_none(),
+                "built-in tool wire shape must not carry `{forbidden}`"
+            );
+        }
     }
 
     #[test]

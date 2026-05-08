@@ -2864,6 +2864,40 @@ impl Scheduler {
     /// later messages, so streaming subscribers would drift from
     /// server state. One `ThreadSnapshot` broadcast at the end
     /// rebuilds their view from authoritative state in a single pass.
+    /// Provider-side built-in tool schemas the thread's bound backend
+    /// supports. Today the only one is OpenAI's `image_generation`,
+    /// which lights up when the backend's kind is `openai_responses`.
+    /// Other built-ins (web_search, file_search, code_interpreter)
+    /// would slot in here when their wire shapes are wired up.
+    fn synthesize_provider_builtin_tools(
+        &self,
+        thread_id: &str,
+    ) -> Vec<whisper_agent_protocol::ContentBlock> {
+        let Some(task) = self.tasks.get(thread_id) else {
+            return Vec::new();
+        };
+        let Some(entry) = self.backends.get(&task.bindings.backend) else {
+            return Vec::new();
+        };
+        if entry.kind != "openai_responses" {
+            return Vec::new();
+        }
+        vec![whisper_agent_protocol::ContentBlock::ToolSchema {
+            name: "image_generation".into(),
+            description:
+                "Generate an image from the conversation context. Invoke this when the user asks \
+                 for a picture, diagram, illustration, mockup, or other visual output. The tool \
+                 runs server-side inside the model's response — no arguments to construct, just \
+                 invoke it. The model passes the relevant conversation context (uploaded images, \
+                 prior turns, the user's request) directly to the image model. Subsequent \
+                 invocations after a prior image_generation in the same conversation edit the \
+                 previous image rather than starting from scratch."
+                    .into(),
+            params: Vec::new(),
+            kind: whisper_agent_protocol::ToolKind::ProviderBuiltin,
+        }]
+    }
+
     fn finalize_setup_prefix(&mut self, thread_id: &str) {
         let Some(task) = self.tasks.get(thread_id) else {
             return;
@@ -2877,7 +2911,7 @@ impl Scheduler {
             return;
         }
 
-        let tool_blocks: Vec<whisper_agent_protocol::ContentBlock> = self
+        let mut tool_blocks: Vec<whisper_agent_protocol::ContentBlock> = self
             .wire_tool_descriptors(thread_id)
             .into_iter()
             .map(|t| {
@@ -2890,9 +2924,17 @@ impl Scheduler {
                     name: typed.name,
                     description: typed.description,
                     params: typed.params,
+                    kind: typed.kind,
                 }
             })
             .collect();
+        // Append provider-side built-in tools the bound backend supports.
+        // These don't go through the MCP / host-env catalogs (they're
+        // executed inside the provider's API request), so the wire
+        // descriptors above don't surface them — we synthesize here.
+        for block in self.synthesize_provider_builtin_tools(thread_id) {
+            tool_blocks.push(block);
+        }
         let tools_msg = whisper_agent_protocol::Message::tools_manifest(tool_blocks);
 
         let listing_text = self.render_initial_listing(thread_id);
