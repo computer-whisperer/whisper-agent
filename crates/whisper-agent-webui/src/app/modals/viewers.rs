@@ -12,22 +12,28 @@
 //!   correlation id and dispatch the `WritePodFile` wire message; the
 //!   renderer never touches `ChatApp`.
 
-use egui::{Color32, RichText, TextEdit};
+use std::sync::Arc;
 
-use super::super::chat_render;
+use egui::{Color32, RichText, TextEdit};
+use whisper_agent_protocol::ImageMime;
+
+use super::super::chat_render::{self, EnlargedImage};
 use super::super::{FileViewerModalState, JsonViewerModalState, render_json_node};
 
 /// Centered, click-to-dismiss preview of a tool-result attachment.
+/// Includes a Save button that hands the raw bytes to a native save
+/// dialog (or browser download on wasm) via `rfd::AsyncFileDialog`.
 pub(crate) fn render_image_lightbox_modal(ctx: &egui::Context) {
     let key = egui::Id::new(chat_render::ENLARGED_IMAGE_KEY);
-    let uri: Option<String> = ctx.memory(|mem| mem.data.get_temp::<String>(key));
-    let Some(uri) = uri else { return };
+    let payload: Option<EnlargedImage> = ctx.memory(|mem| mem.data.get_temp::<EnlargedImage>(key));
+    let Some(payload) = payload else { return };
 
     let screen = ctx.content_rect();
     let max_h = (screen.height() - 80.0).max(240.0);
     let max_w = (screen.width() - 80.0).max(320.0);
     let mut open = true;
     let mut dismiss = ctx.input(|i| i.key_pressed(egui::Key::Escape));
+    let mut save_clicked = false;
 
     egui::Window::new("attachment")
         .collapsible(false)
@@ -48,18 +54,115 @@ pub(crate) fn render_image_lightbox_modal(ctx: &egui::Context) {
                         {
                             dismiss = true;
                         }
+                        if ui
+                            .button("Save…")
+                            .on_hover_text("Save image to a file")
+                            .clicked()
+                        {
+                            save_clicked = true;
+                        }
                     });
                 });
                 ui.add(
-                    egui::Image::new(&uri)
+                    egui::Image::new(&payload.uri)
                         .max_size(egui::vec2(max_w - 24.0, max_h - 60.0))
                         .fit_to_exact_size(egui::vec2(max_w - 24.0, max_h - 60.0)),
                 );
             });
         });
 
+    if save_clicked {
+        spawn_image_save(payload.bytes.clone(), payload.mime);
+    }
+
     if dismiss || !open {
-        ctx.memory_mut(|mem| mem.data.remove::<String>(key));
+        ctx.memory_mut(|mem| mem.data.remove::<EnlargedImage>(key));
+    }
+}
+
+/// Default extension for an `ImageMime`. `as_mime_str` already maps
+/// each variant to `image/<ext>` (with `image/jpeg` for `Jpeg`); we
+/// take the trailing token and special-case `jpeg → jpg` because the
+/// canonical filename extension is the shorter form.
+fn extension_for_mime(mime: ImageMime) -> &'static str {
+    match mime {
+        ImageMime::Jpeg => "jpg",
+        ImageMime::Png => "png",
+        ImageMime::Gif => "gif",
+        ImageMime::Webp => "webp",
+        ImageMime::Heic => "heic",
+        ImageMime::Heif => "heif",
+    }
+}
+
+/// Build a `whisper-image-{hash}.{ext}` filename. The hash is a short
+/// prefix of a SipHash over the bytes — same family used by
+/// `bytes_image_uri` — so distinct images get distinct default
+/// names without the user having to invent one.
+fn default_save_name(bytes: &[u8], mime: ImageMime) -> String {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut h = DefaultHasher::new();
+    bytes.hash(&mut h);
+    format!(
+        "whisper-image-{:08x}.{}",
+        h.finish() as u32,
+        extension_for_mime(mime)
+    )
+}
+
+/// Spawn a native (rfd + tokio current-thread) or browser
+/// (wasm_bindgen_futures) save dialog. Mirrors the
+/// `spawn_file_picker` pattern in `app.rs`. Errors are logged but
+/// not surfaced — cancel is the dominant non-success path and
+/// already silent.
+fn spawn_image_save(bytes: Arc<[u8]>, mime: ImageMime) {
+    let suggested = default_save_name(&bytes, mime);
+    let mime_str = mime.as_mime_str();
+    let ext = extension_for_mime(mime);
+
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        std::thread::spawn(move || {
+            let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            else {
+                log::error!("failed to build tokio runtime for image save dialog");
+                return;
+            };
+            rt.block_on(async move {
+                let Some(handle) = rfd::AsyncFileDialog::new()
+                    .set_title("Save image")
+                    .set_file_name(&suggested)
+                    .add_filter(mime_str, &[ext])
+                    .save_file()
+                    .await
+                else {
+                    return;
+                };
+                if let Err(err) = handle.write(&bytes).await {
+                    log::error!("failed to write saved image: {err}");
+                }
+            });
+        });
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        wasm_bindgen_futures::spawn_local(async move {
+            let Some(handle) = rfd::AsyncFileDialog::new()
+                .set_title("Save image")
+                .set_file_name(&suggested)
+                .add_filter(mime_str, &[ext])
+                .save_file()
+                .await
+            else {
+                return;
+            };
+            if let Err(err) = handle.write(&bytes).await {
+                log::error!("failed to write saved image: {err}");
+            }
+        });
     }
 }
 

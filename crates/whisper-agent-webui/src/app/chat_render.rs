@@ -16,9 +16,13 @@
 //! row instead, so chronology stays intact. Both kinds default to
 //! collapsed.
 
+use std::sync::Arc;
+
 use egui::{Color32, RichText};
 use egui_commonmark::{CommonMarkCache, CommonMarkViewer};
-use whisper_agent_protocol::{Attachment, ImageSource, ParamSpec, ParamType, ToolSchema, Usage};
+use whisper_agent_protocol::{
+    Attachment, ImageMime, ImageSource, ParamSpec, ParamType, ToolSchema, Usage,
+};
 
 use super::{DiffPayload, DisplayItem, FusedToolResult};
 
@@ -404,7 +408,7 @@ fn render_image_strip(ui: &mut egui::Ui, sources: &[&ImageSource], _uri_prefix: 
     ui.horizontal_wrapped(|ui| {
         for src in sources.iter() {
             match src {
-                ImageSource::Bytes { data, .. } => {
+                ImageSource::Bytes { data, media_type } => {
                     let uri = bytes_image_uri(data);
                     ui.ctx().include_bytes(uri.clone(), data.clone());
                     let resp = ui.add(
@@ -417,9 +421,14 @@ fn render_image_strip(ui: &mut egui::Ui, sources: &[&ImageSource], _uri_prefix: 
                         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
                     }
                     if resp.clicked() {
+                        let payload = EnlargedImage {
+                            uri: uri.clone(),
+                            bytes: Arc::<[u8]>::from(data.as_slice()),
+                            mime: *media_type,
+                        };
                         ui.ctx().memory_mut(|mem| {
                             mem.data
-                                .insert_temp(egui::Id::new(ENLARGED_IMAGE_KEY), uri.clone());
+                                .insert_temp(egui::Id::new(ENLARGED_IMAGE_KEY), payload);
                         });
                     }
                 }
@@ -438,12 +447,26 @@ fn render_image_strip(ui: &mut egui::Ui, sources: &[&ImageSource], _uri_prefix: 
     });
 }
 
-/// Memory key under which the chat-thumbnail strip stashes the URI of
-/// the image the user just clicked. Read at the top of `ChatApp::ui`
-/// to drive the lightbox modal. Lives in `egui::Memory::data` as a
-/// temp value (cleared on app close) — the modal only needs it for
-/// the duration of the dismiss.
+/// Memory key under which the chat-thumbnail strip stashes the
+/// payload of the image the user just clicked. Read at the top of
+/// `ChatApp::ui` to drive the lightbox modal. Lives in
+/// `egui::Memory::data` as a temp value (cleared on app close) — the
+/// modal only needs it for the duration of the dismiss.
 pub(crate) const ENLARGED_IMAGE_KEY: &str = "whisper.enlarged_image_uri";
+
+/// What the lightbox needs to display and (optionally) save an image.
+/// `uri` is the `bytes://image-{hash}` key registered with egui's
+/// bytes loader so `egui::Image::new(&uri)` can render. `bytes` keeps
+/// the raw payload alive separately because the bytes loader doesn't
+/// expose retrieval — the Save action needs the original data to
+/// hand to `rfd`. `mime` drives the default file extension in the
+/// save dialog.
+#[derive(Clone)]
+pub(crate) struct EnlargedImage {
+    pub uri: String,
+    pub bytes: Arc<[u8]>,
+    pub mime: ImageMime,
+}
 
 fn render_assistant_text(ui: &mut egui::Ui, cache: &mut CommonMarkCache, text: &str) {
     // No role label — the gutter color carries it. This is the bulk
