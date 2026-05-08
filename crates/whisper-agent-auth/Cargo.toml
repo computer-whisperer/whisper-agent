@@ -1,0 +1,18 @@
+[package]
+name = "whisper-agent-auth"
+description = "Shared auth primitives for whisper-agent: ApiKey + ChatGPT-subscription (Codex OAuth) used by the main daemon and sibling MCP daemons that hit OpenAI."
+version = "0.3.18"
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+reqwest = { workspace = true, features = ["json"] }
+tokio = { workspace = true, features = ["sync"] }
+# `default-features = false` matches main crate to avoid pulling
+# wasm-only features that conflict in workspace resolution.
+chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
+base64 = "0.22"

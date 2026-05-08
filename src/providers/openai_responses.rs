@@ -34,11 +34,11 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
+use whisper_agent_auth::{ClientAuth, CodexAuth};
 use whisper_agent_protocol::{
     ContentBlock, Message, ProviderReplay, Role, ToolResultContent, Usage,
 };
 
-use crate::providers::codex_auth::CodexAuth;
 use crate::providers::model::{
     BoxFuture, BoxStream, ModelError, ModelEvent, ModelInfo, ModelProvider, ModelRequest,
     ModelResponse, ToolSpec, UpdateAuthError,
@@ -61,17 +61,6 @@ pub const CHATGPT_CODEX_BASE: &str = "https://chatgpt.com/backend-api/codex";
 /// same wire contract, and anything below the highest observed gate hides
 /// frontier models from the picker.
 const CODEX_CLIENT_VERSION: &str = "99.0.0";
-
-/// Runtime auth material for a Responses-API client. The client itself is
-/// cheap and shared; [`ClientAuth`] is what differs between an API-key session
-/// and a ChatGPT-subscription session.
-pub enum ClientAuth {
-    ApiKey(String),
-    /// ChatGPT OAuth tokens, typically loaded from `~/.codex/auth.json`.
-    /// Wrapped in a mutex because refresh mutates the tokens, and the client
-    /// may be called from multiple scheduler tasks concurrently.
-    Codex(Arc<Mutex<CodexAuth>>),
-}
 
 pub struct OpenAiResponsesClient {
     http: reqwest::Client,
@@ -107,21 +96,10 @@ impl OpenAiResponsesClient {
     /// the current auth mode requires. For Codex auth, refreshes the token
     /// if it's near expiry before returning.
     async fn prepare_headers(&self) -> Result<(String, Vec<(&'static str, String)>), ModelError> {
-        match &self.auth {
-            ClientAuth::ApiKey(key) => Ok((key.clone(), Vec::new())),
-            ClientAuth::Codex(m) => {
-                let mut guard = m.lock().await;
-                guard
-                    .ensure_fresh(&self.http)
-                    .await
-                    .map_err(|e| ModelError::Transport(format!("codex auth refresh: {e}")))?;
-                let mut extras = Vec::new();
-                if let Some(acc) = guard.chatgpt_account_id() {
-                    extras.push(("chatgpt-account-id", acc.to_string()));
-                }
-                Ok((guard.access_token().to_string(), extras))
-            }
-        }
+        self.auth
+            .prepare_headers(&self.http)
+            .await
+            .map_err(|e| ModelError::Transport(e.to_string()))
     }
 
     /// Build + send the Responses request, returning the live HTTP response

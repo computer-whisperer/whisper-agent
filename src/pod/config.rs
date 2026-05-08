@@ -35,10 +35,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result, anyhow};
 use serde::Deserialize;
 
-use std::path::PathBuf;
-
 use crate::providers::anthropic::AnthropicClient;
-use crate::providers::codex_auth::CodexAuth;
 use crate::providers::embedding::EmbeddingProvider;
 use crate::providers::gemini::{GEMINI_API_BASE, GEMINI_CODE_ASSIST_BASE, GeminiClient};
 use crate::providers::gemini_auth::GeminiAuth;
@@ -130,91 +127,11 @@ pub struct AuthDaemon {
     pub token: String,
 }
 
-/// Backend auth configuration. Tagged by `mode`; providers pick the variants
-/// they accept and error at build time on incompatible combinations (e.g.
-/// Anthropic rejects `chatgpt_subscription`).
-///
-/// Examples:
-/// ```toml
-/// auth = { mode = "api_key", value = "sk-..." }
-/// auth = { mode = "api_key", env  = "ANTHROPIC_API_KEY" }
-/// auth = { mode = "chatgpt_subscription", source = "codex" }
-/// auth = { mode = "chatgpt_subscription", source = "codex", path = "/custom/auth.json" }
-/// ```
-#[derive(Deserialize, Debug, Clone, PartialEq, Eq)]
-#[serde(tag = "mode", rename_all = "snake_case")]
-pub enum Auth {
-    ApiKey {
-        #[serde(default)]
-        value: Option<String>,
-        #[serde(default)]
-        env: Option<String>,
-    },
-    /// Use a ChatGPT subscription's OAuth tokens instead of an API key. Today
-    /// the only `source` is `codex` — we read the credentials file that the
-    /// Codex CLI maintains at `~/.codex/auth.json`.
-    ChatgptSubscription {
-        source: ChatgptSubscriptionSource,
-        /// Override the default file location for the chosen `source`.
-        #[serde(default)]
-        path: Option<PathBuf>,
-    },
-    /// Use Google OAuth tokens minted by a companion tool. Today the only
-    /// `source` is `gemini_cli` — we read `~/.gemini/oauth_creds.json`.
-    GoogleOauth {
-        source: GoogleOauthSource,
-        #[serde(default)]
-        path: Option<PathBuf>,
-    },
-}
-
-#[derive(Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum ChatgptSubscriptionSource {
-    /// `~/.codex/auth.json`, maintained by `codex login`.
-    Codex,
-}
-
-#[derive(Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum GoogleOauthSource {
-    /// `~/.gemini/oauth_creds.json`, maintained by `gemini` interactive login.
-    GeminiCli,
-}
-
-impl Auth {
-    /// Stable tag matching the serde `mode` string. Used by the settings
-    /// panel to display which credential slot a backend uses without
-    /// touching the credential itself.
-    pub fn mode_name(&self) -> &'static str {
-        match self {
-            Auth::ApiKey { .. } => "api_key",
-            Auth::ChatgptSubscription { .. } => "chatgpt_subscription",
-            Auth::GoogleOauth { .. } => "google_oauth",
-        }
-    }
-
-    /// Resolve to the raw API key string, reading env vars as needed. Errors if the
-    /// auth entry is malformed (neither or both of `value`/`env` set, env var unset),
-    /// or if the auth mode isn't `api_key`.
-    pub fn resolve_api_key(&self) -> Result<String> {
-        match self {
-            Auth::ApiKey { value, env } => match (value.as_deref(), env.as_deref()) {
-                (Some(v), None) => Ok(v.to_string()),
-                (None, Some(var)) => {
-                    std::env::var(var).with_context(|| format!("env var `{var}` not set"))
-                }
-                (Some(_), Some(_)) => {
-                    Err(anyhow!("auth.api_key: set exactly one of `value` or `env`"))
-                }
-                (None, None) => Err(anyhow!("auth.api_key: missing `value` or `env`")),
-            },
-            Auth::ChatgptSubscription { .. } | Auth::GoogleOauth { .. } => {
-                Err(anyhow!("this backend requires `auth.mode = \"api_key\"`"))
-            }
-        }
-    }
-}
+/// Backend auth configuration. Defined in `whisper-agent-auth` so sibling
+/// MCP daemons can deserialize the same TOML shape without depending on
+/// the main crate. Re-exported here for back-compat with the many
+/// `crate::pod::config::Auth` import sites.
+pub use whisper_agent_auth::{Auth, ChatgptSubscriptionSource, CodexAuth, GoogleOauthSource};
 
 #[derive(Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case")]

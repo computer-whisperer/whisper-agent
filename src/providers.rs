@@ -10,12 +10,13 @@
 //! the same pattern for retrieval-side workloads. Today only [`tei`]
 //! implements them; OpenAI / Cohere / Voyage hookups plug in alongside.
 //!
-//! `codex_auth` and `gemini_auth` are readers for the OAuth token stores
-//! those CLIs drop on disk, so we can piggyback on an already-authenticated
-//! user session without running our own OAuth flow.
+//! `gemini_auth` is a reader for the OAuth token store the Gemini CLI drops
+//! on disk, so we can piggyback on an already-authenticated user session
+//! without running our own OAuth flow. The corresponding Codex (ChatGPT
+//! subscription) reader lives in the shared `whisper-agent-auth` crate so
+//! sibling MCP daemons can use it too.
 
 pub mod anthropic;
-pub mod codex_auth;
 pub mod embedding;
 pub mod gemini;
 pub mod gemini_auth;
