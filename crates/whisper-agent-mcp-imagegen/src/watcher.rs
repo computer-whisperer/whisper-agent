@@ -104,7 +104,8 @@ pub async fn watch(
                 info!(
                     auth_mode,
                     api_base = %new.api_base,
-                    default_model = %new.default_model,
+                    image_model = %new.image_model,
+                    chat_model = %new.chat_model,
                     "config reloaded"
                 );
                 resolved.store(Arc::new(new));

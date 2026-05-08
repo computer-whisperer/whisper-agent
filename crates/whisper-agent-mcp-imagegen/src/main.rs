@@ -20,6 +20,7 @@ use tokio::net::TcpListener;
 use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
 
+mod codex;
 mod config;
 mod server;
 mod tools;
@@ -103,7 +104,8 @@ async fn main() -> Result<()> {
         backend = %args.backend,
         auth_mode,
         api_base = %initial.api_base,
-        default_model = %initial.default_model,
+        image_model = %initial.image_model,
+        chat_model = %initial.chat_model,
         "resolved initial config"
     );
 

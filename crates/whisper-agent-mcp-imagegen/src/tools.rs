@@ -8,9 +8,11 @@ use reqwest::Client;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tracing::warn;
+use whisper_agent_auth::ClientAuth;
 
 use whisper_agent_mcp_proto::{CallToolResult, ContentBlock, Tool, ToolAnnotations};
 
+use crate::codex;
 use crate::config::Resolved;
 
 #[derive(Debug, thiserror::Error)]
@@ -86,11 +88,6 @@ fn image_generate_descriptor() -> Tool {
                     "enum": ["low", "medium", "high", "auto"],
                     "description": "Generation quality. Higher quality costs more and takes \
                                     longer. Defaults to the daemon's configured default."
-                },
-                "model": {
-                    "type": "string",
-                    "description": "Override the default model (e.g. `gpt-image-2`, \
-                                    `gpt-image-1`). Most callers should leave this unset."
                 }
             },
             "required": ["prompt"]
@@ -115,8 +112,6 @@ struct ImageGenerateArgs {
     size: Option<String>,
     #[serde(default)]
     quality: Option<String>,
-    #[serde(default)]
-    model: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -147,35 +142,96 @@ async fn image_generate(cfg: &Arc<ImageGenConfig>, args: Value) -> CallToolResul
 
     let n = parsed.n.unwrap_or(1).clamp(1, MAX_N);
     // Snapshot the live config under arc-swap so an in-flight reload can't
-    // pull the rug out from under us mid-request. Subsequent `prepare_headers`
-    // and HTTP send all see the same auth + base + model.
+    // pull the rug out from under us mid-request. Subsequent auth + URL
+    // accesses all see the same point-in-time config.
     let resolved = cfg.resolved.load_full();
-    let model = parsed.model.as_deref().unwrap_or(&resolved.default_model);
     let size = parsed.size.as_deref().unwrap_or(&cfg.default_size);
     let quality = parsed.quality.as_deref().unwrap_or(&cfg.default_quality);
 
+    // The standalone `/v1/images/generations` endpoint is api-key only —
+    // chatgpt.com/backend-api/codex doesn't serve it. Branch on auth so
+    // subscription users get a working path via the Responses API's
+    // built-in `image_generation` tool.
+    let images: Vec<String> = match &resolved.auth {
+        ClientAuth::ApiKey(_) => {
+            match generate_via_images_api(&cfg.http, &resolved, &parsed.prompt, n, size, quality)
+                .await
+            {
+                Ok(v) => v,
+                Err(e) => return CallToolResult::error_text(e),
+            }
+        }
+        ClientAuth::Codex(_) => {
+            match codex::generate_via_responses(codex::Request {
+                http: &cfg.http,
+                auth: &resolved.auth,
+                api_base: &resolved.api_base,
+                chat_model: &resolved.chat_model,
+                prompt: &parsed.prompt,
+                size,
+                quality,
+                n,
+            })
+            .await
+            {
+                Ok(v) => v,
+                Err(e) => return CallToolResult::error_text(format!("image_generate: {e}")),
+            }
+        }
+    };
+
+    if images.is_empty() {
+        return CallToolResult::error_text("image_generate: no images returned");
+    }
+
+    let content: Vec<ContentBlock> = images
+        .into_iter()
+        .map(|b64| ContentBlock::Image {
+            data: b64,
+            mime_type: "image/png".into(),
+        })
+        .collect();
+
+    CallToolResult {
+        content,
+        is_error: None,
+    }
+}
+
+/// Hit `/v1/images/generations` directly. Returns each image as a base64
+/// string; errors with a human-readable string suitable for surfacing in the
+/// MCP tool result.
+async fn generate_via_images_api(
+    http: &Client,
+    resolved: &Resolved,
+    prompt: &str,
+    n: u32,
+    size: &str,
+    quality: &str,
+) -> Result<Vec<String>, String> {
     let body = json!({
-        "model": model,
-        "prompt": parsed.prompt,
+        "model": resolved.image_model,
+        "prompt": prompt,
         "n": n,
         "size": size,
         "quality": quality,
     });
 
-    let (bearer, extra_headers) = match resolved.auth.prepare_headers(&cfg.http).await {
-        Ok(v) => v,
-        Err(e) => return CallToolResult::error_text(format!("image_generate auth: {e}")),
-    };
+    let (bearer, extra_headers) = resolved
+        .auth
+        .prepare_headers(http)
+        .await
+        .map_err(|e| format!("image_generate auth: {e}"))?;
 
     let url = format!("{}/images/generations", resolved.api_base);
-    let mut req = cfg.http.post(&url).bearer_auth(&bearer).json(&body);
+    let mut req = http.post(&url).bearer_auth(&bearer).json(&body);
     for (k, v) in &extra_headers {
         req = req.header(*k, v);
     }
-    let resp = match req.send().await {
-        Ok(r) => r,
-        Err(e) => return CallToolResult::error_text(format!("image_generate request: {e}")),
-    };
+    let resp = req
+        .send()
+        .await
+        .map_err(|e| format!("image_generate request: {e}"))?;
 
     let status = resp.status();
     if !status.is_success() {
@@ -184,48 +240,40 @@ async fn image_generate(cfg: &Arc<ImageGenConfig>, args: Value) -> CallToolResul
             .await
             .unwrap_or_else(|e| format!("(failed to read body: {e})"));
         warn!(%status, body = %body_text, "openai images api error");
-        return CallToolResult::error_text(format!(
+        return Err(format!(
             "image_generate failed: HTTP {} — {}",
             status.as_u16(),
             truncate_for_display(&body_text, 1024)
         ));
     }
 
-    let parsed_body: OpenAiImagesResponse = match resp.json().await {
-        Ok(v) => v,
-        Err(e) => {
-            return CallToolResult::error_text(format!("image_generate decode response: {e}"));
-        }
-    };
+    let parsed_body: OpenAiImagesResponse = resp
+        .json()
+        .await
+        .map_err(|e| format!("image_generate decode response: {e}"))?;
 
     if parsed_body.data.is_empty() {
-        return CallToolResult::error_text("image_generate: response contained no images");
+        return Err("image_generate: response contained no images".into());
     }
 
-    let mut content: Vec<ContentBlock> = Vec::with_capacity(parsed_body.data.len());
+    let mut images: Vec<String> = Vec::with_capacity(parsed_body.data.len());
     for (idx, datum) in parsed_body.data.into_iter().enumerate() {
         let Some(b64) = datum.b64_json else {
-            return CallToolResult::error_text(format!(
+            return Err(format!(
                 "image_generate: image {idx} had no `b64_json` field — \
                  this MCP server only supports models that return inline base64 \
-                 (gpt-image-* family); got model `{model}`"
+                 (gpt-image-* family); got model `{}`",
+                resolved.image_model
             ));
         };
-        content.push(ContentBlock::Image {
-            data: b64,
-            mime_type: "image/png".into(),
-        });
+        images.push(b64);
     }
-
-    CallToolResult {
-        content,
-        is_error: None,
-    }
+    Ok(images)
 }
 
 /// Truncate a UTF-8 string to at most `max_bytes` for use in error messages.
 /// Walks back to a char boundary; appends an ellipsis if anything was dropped.
-fn truncate_for_display(s: &str, max_bytes: usize) -> String {
+pub(crate) fn truncate_for_display(s: &str, max_bytes: usize) -> String {
     if s.len() <= max_bytes {
         return s.to_string();
     }

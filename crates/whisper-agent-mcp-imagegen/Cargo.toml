@@ -12,7 +12,8 @@ path = "src/main.rs"
 [dependencies]
 axum = { workspace = true }
 tokio = { workspace = true, features = ["net", "sync", "fs"] }
-reqwest = { workspace = true, features = ["json"] }
+reqwest = { workspace = true, features = ["json", "stream"] }
+futures = "0.3"
 # `crypto::ring::default_provider().install_default()` once at startup.
 # reqwest 0.13's `rustls-no-provider` feature deliberately leaves
 # provider selection to the application; without an install Client::new

@@ -6678,6 +6678,7 @@ dependencies = [
  "arc-swap",
  "axum",
  "clap",
+ "futures",
  "notify",
  "reqwest 0.13.3",
  "rustls",

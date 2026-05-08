@@ -43,7 +43,16 @@ struct BackendView {
 pub struct Resolved {
     pub auth: ClientAuth,
     pub api_base: String,
-    pub default_model: String,
+    /// Image model name passed to the api_key path's
+    /// `/v1/images/generations` request body. Hardcoded default since
+    /// the backend's `default_model` is the chat model for ChatGPT
+    /// flows, not an image model.
+    pub image_model: String,
+    /// Chat model used to drive the Codex path's `/responses` request
+    /// when the model invokes the `image_generation` built-in tool.
+    /// Sourced from the backend's `default_model`, with a fallback for
+    /// older configs that don't set one.
+    pub chat_model: String,
 }
 
 /// Default base URL when the backend doesn't override `base_url` and
@@ -55,8 +64,15 @@ const OPENAI_API_BASE: &str = "https://api.openai.com/v1";
 /// behavior — the ChatGPT route serves its own host.
 const CHATGPT_CODEX_BASE: &str = "https://chatgpt.com/backend-api/codex";
 
-/// Fallback default model when the backend's `default_model` field is unset.
-const FALLBACK_DEFAULT_MODEL: &str = "gpt-image-2";
+/// Image model used by the api_key path's `/v1/images/generations` request
+/// when the tool call doesn't override it. `gpt-image-2` is OpenAI's latest
+/// as of April 2026.
+const DEFAULT_IMAGE_MODEL: &str = "gpt-image-2";
+
+/// Chat model used by the Codex path's `/responses` request when the
+/// backend's `default_model` is unset. Picked to be a current model that
+/// supports the `image_generation` built-in tool.
+const FALLBACK_CHAT_MODEL: &str = "gpt-5";
 
 /// Read the config file from disk and resolve the named backend into
 /// runtime auth material. Errors if the file is missing/unparseable, the
@@ -99,14 +115,15 @@ pub fn resolve(config_path: &Path, backend_name: &str) -> Result<Resolved> {
         })
         .trim_end_matches('/')
         .to_string();
-    let default_model = backend
+    let chat_model = backend
         .default_model
         .clone()
-        .unwrap_or_else(|| FALLBACK_DEFAULT_MODEL.to_string());
+        .unwrap_or_else(|| FALLBACK_CHAT_MODEL.to_string());
     Ok(Resolved {
         auth: client_auth,
         api_base,
-        default_model,
+        image_model: DEFAULT_IMAGE_MODEL.to_string(),
+        chat_model,
     })
 }
 
