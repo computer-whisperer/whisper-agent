@@ -1,0 +1,32 @@
+[package]
+name = "whisper-agent-mcp-imagegen"
+description = "MCP server exposing an image_generate tool backed by the OpenAI Images API. Reads its OpenAI auth from the shared whisper-agent.toml so a single config file drives both the main daemon and image-gen sibling."
+version = "0.3.18"
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "whisper-agent-mcp-imagegen"
+path = "src/main.rs"
+
+[dependencies]
+axum = { workspace = true }
+tokio = { workspace = true, features = ["net", "sync", "fs"] }
+reqwest = { workspace = true, features = ["json"] }
+# `crypto::ring::default_provider().install_default()` once at startup.
+# reqwest 0.13's `rustls-no-provider` feature deliberately leaves
+# provider selection to the application; without an install Client::new
+# panics with "No provider set" on first TLS use.
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+clap = { workspace = true, features = ["env"] }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+toml = "1"
+notify = "8"
+arc-swap = "1"
+whisper-agent-mcp-proto = { workspace = true }
+whisper-agent-auth = { workspace = true }

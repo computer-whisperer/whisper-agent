@@ -13,10 +13,15 @@
 # so persistence survives a restart.
 #
 # Env overrides:
-#   SANDBOX           default: $REPO_ROOT/sandbox
-#   LISTEN_SERVER     default: 127.0.0.1:8080
-#   LISTEN_FETCH      default: 127.0.0.1:9830  (web-fetch MCP daemon)
-#   LISTEN_SEARCH     default: 127.0.0.1:9831  (web-search MCP daemon)
+#   SANDBOX            default: $REPO_ROOT/sandbox
+#   LISTEN_SERVER      default: 127.0.0.1:8080
+#   LISTEN_FETCH       default: 127.0.0.1:9830  (web-fetch MCP daemon)
+#   LISTEN_SEARCH      default: 127.0.0.1:9831  (web-search MCP daemon)
+#   LISTEN_IMAGEGEN    default: 127.0.0.1:9832  (image-gen MCP daemon)
+#   IMAGEGEN_BACKEND   default: openai          (name of the [backends.X] entry
+#                                               in whisper-agent.toml whose auth
+#                                               drives image generation. Must be
+#                                               kind = "openai_responses".)
 #
 # Flags:
 #   --skip-wasm       skip the wasm-pack build (use when only Rust code changed)
@@ -24,6 +29,10 @@
 #   --no-search       skip starting the web-search daemon (no `web_search` tool).
 #                     Auto-set when BRAVE_API_KEY is absent from whisper-agent.toml's
 #                     [secrets] table.
+#   --no-imagegen     skip starting the image-gen daemon (no `image_generate` tool).
+#                     Auto-set when the daemon fails to come up (missing backend,
+#                     wrong kind, missing API key, etc.) — we try-and-skip rather
+#                     than duplicating config validation here in shell.
 #
 # Config discovery: the whisper-agent binary searches (in order)
 # $XDG_CONFIG_HOME/whisper-agent/whisper-agent.toml,
@@ -40,15 +49,19 @@ SANDBOX="${SANDBOX:-$REPO_ROOT/sandbox}"
 LISTEN_SERVER="${LISTEN_SERVER:-127.0.0.1:8080}"
 LISTEN_FETCH="${LISTEN_FETCH:-127.0.0.1:9830}"
 LISTEN_SEARCH="${LISTEN_SEARCH:-127.0.0.1:9831}"
+LISTEN_IMAGEGEN="${LISTEN_IMAGEGEN:-127.0.0.1:9832}"
+IMAGEGEN_BACKEND="${IMAGEGEN_BACKEND:-openai}"
 
 SKIP_WASM=0
 USE_FETCH=1
 USE_SEARCH=1
+USE_IMAGEGEN=1
 for arg in "$@"; do
     case "$arg" in
         --skip-wasm)    SKIP_WASM=1 ;;
         --no-fetch)     USE_FETCH=0 ;;
         --no-search)    USE_SEARCH=0 ;;
+        --no-imagegen)  USE_IMAGEGEN=0 ;;
         -h|--help)
             sed -n '2,/^$/p' "$0" | sed 's/^# \{0,1\}//'
             exit 0
@@ -110,6 +123,9 @@ fi
 if [[ "$USE_SEARCH" -eq 1 ]]; then
     PACKAGES="$PACKAGES -p whisper-agent-mcp-search"
 fi
+if [[ "$USE_IMAGEGEN" -eq 1 ]]; then
+    PACKAGES="$PACKAGES -p whisper-agent-mcp-imagegen"
+fi
 
 echo "==> building ($PACKAGES) (release)"
 # shellcheck disable=SC2086
@@ -161,6 +177,43 @@ if [[ "$USE_SEARCH" -eq 1 ]]; then
     done
 
     SHARED_HOST_ARGS+=(--shared-mcp-host "search=http://$LISTEN_SEARCH/mcp")
+fi
+
+# image-gen daemon: reads OpenAI auth from whisper-agent.toml's
+# [backends.$IMAGEGEN_BACKEND] entry. If the backend is missing, the wrong
+# kind, or its credentials don't resolve, the daemon exits during startup
+# rather than half-running. We detect that here by polling /mcp for a few
+# seconds; if it never answers, drop the wiring and continue without
+# `image_generate`.
+if [[ "$USE_IMAGEGEN" -eq 1 ]]; then
+    echo "==> starting whisper-agent-mcp-imagegen on $LISTEN_IMAGEGEN (backend=$IMAGEGEN_BACKEND)"
+    "$REPO_ROOT/target/release/whisper-agent-mcp-imagegen" \
+        --listen "$LISTEN_IMAGEGEN" \
+        --backend "$IMAGEGEN_BACKEND" &
+    IMAGEGEN_PID=$!
+    CHILD_PIDS+=($IMAGEGEN_PID)
+
+    IMAGEGEN_READY=0
+    for _ in $(seq 1 20); do
+        if ! kill -0 "$IMAGEGEN_PID" 2>/dev/null; then
+            break # daemon exited (missing backend, bad auth, etc.)
+        fi
+        if curl -sf -X POST "http://$LISTEN_IMAGEGEN/mcp" \
+            -H 'content-type: application/json' \
+            -d '{"jsonrpc":"2.0","id":1,"method":"ping"}' > /dev/null 2>&1
+        then
+            IMAGEGEN_READY=1
+            break
+        fi
+        sleep 0.25
+    done
+
+    if [[ "$IMAGEGEN_READY" -eq 1 ]]; then
+        SHARED_HOST_ARGS+=(--shared-mcp-host "imagegen=http://$LISTEN_IMAGEGEN/mcp")
+    else
+        echo "==> imagegen daemon failed to come up — continuing without image_generate" \
+             "(set IMAGEGEN_BACKEND or pass --no-imagegen to silence)"
+    fi
 fi
 
 echo "==> starting whisper-agent-host-daemon dialing $LISTEN_SERVER"
