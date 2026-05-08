@@ -16,9 +16,14 @@
 
 use std::sync::Arc;
 
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 use whisper_agent_host_proto::{ContentBlock, HostEnvSpec};
+use whisper_agent_protocol::{
+    ContentBlock as ProtoContentBlock, Conversation, ImageSource, ToolResultContent,
+};
 
 use crate::runtime::scheduler::{V2ContextStore, V2DisconnectPolicy, V2SessionStore};
 use crate::tools::host_env_link::{LinkError, LiveDaemonHandle, LiveDaemonRegistry};
@@ -62,6 +67,7 @@ pub(crate) async fn dispatch_v2_tool(
     spec: HostEnvSpec,
     real_name: String,
     arguments: Value,
+    attachments: Vec<ContentBlock>,
     cancel: CancellationToken,
 ) -> Result<CallToolResult, String> {
     let mut handle = initial_handle;
@@ -97,7 +103,7 @@ pub(crate) async fn dispatch_v2_tool(
             }
         };
 
-        let invoke = session.invoke_tool(real_name.clone(), arguments.clone(), vec![]);
+        let invoke = session.invoke_tool(real_name.clone(), arguments.clone(), attachments.clone());
         let result = tokio::select! {
             r = invoke => r,
             _ = cancel.cancelled() => return Err("cancelled".to_string()),
@@ -187,6 +193,116 @@ fn translate_content_block(src: ContentBlock) -> McpContentBlock {
     }
 }
 
+/// Schema-marker keyword that opts a parameter into upstream content-
+/// resolution. The dispatcher treats a property whose schema carries
+/// `"x-content-ref": "image"` as an index into the conversation's
+/// recent-image history; the model passes an integer, the dispatcher
+/// resolves it to a [`ContentBlock::Image`] in the
+/// [`whisper_agent_host_proto::Frame::InvokeTool`] sidecar before the
+/// daemon ever sees the call. Today only `"image"` is recognized.
+const CONTENT_REF_KEY: &str = "x-content-ref";
+
+/// Walk a tool's input schema for [`CONTENT_REF_KEY`]-marked properties
+/// and resolve each into an attachment from `conversation`.
+///
+/// Resolution rules:
+/// - The marker value must be `"image"` (the only kind today). Other
+///   values produce an error so a future kind can't silently fall
+///   through to the wrong code path.
+/// - The argument bound to the marked property must be a non-negative
+///   integer; out-of-range values (no Nth-most-recent image in
+///   history) error before dispatch — the daemon never sees a
+///   half-resolved call.
+/// - Url-source images are skipped during the conversation walk
+///   because the wire ContentBlock requires inline base64 bytes.
+///
+/// Attachment ordering follows JSON-property iteration order
+/// (alphabetical under `serde_json::Map`'s default backend) so
+/// multi-ref tools have a predictable layout. Today only `save_image`
+/// declares a single ref param; if multi-ref tools appear, pin a
+/// stable ordering convention then.
+pub(crate) fn resolve_content_refs(
+    input_schema: &Value,
+    arguments: &Value,
+    conversation: &Conversation,
+) -> Result<Vec<ContentBlock>, String> {
+    let Some(properties) = input_schema.get("properties").and_then(|v| v.as_object()) else {
+        return Ok(Vec::new());
+    };
+    let mut images: Option<Vec<(Vec<u8>, &'static str)>> = None;
+    let mut out = Vec::new();
+    for (name, prop) in properties {
+        let Some(kind) = prop.get(CONTENT_REF_KEY).and_then(|v| v.as_str()) else {
+            continue;
+        };
+        if kind != "image" {
+            return Err(format!(
+                "tool input_schema declares unknown {CONTENT_REF_KEY}: `{kind}` on `{name}`"
+            ));
+        }
+        let index = arguments
+            .get(name)
+            .and_then(|v| v.as_u64())
+            .ok_or_else(|| {
+                format!("expected non-negative integer at argument `{name}` (image index)")
+            })?;
+        let images = images.get_or_insert_with(|| recent_image_bytes(conversation));
+        let (data, mime) = images.get(index as usize).ok_or_else(|| {
+            format!(
+                "image index {index} is out of range (only {} image(s) in current context)",
+                images.len()
+            )
+        })?;
+        out.push(ContentBlock::Image {
+            data: BASE64_STANDARD.encode(data),
+            mime_type: (*mime).to_string(),
+        });
+    }
+    Ok(out)
+}
+
+/// Borrow image-bytes pairs from the conversation in
+/// most-recent-first order. Walks both standalone
+/// [`ProtoContentBlock::Image`] blocks and image blocks embedded in
+/// `ToolResult::Blocks`. Only inline-bytes sources land in the
+/// output; URL sources are skipped because the wire ContentBlock
+/// requires inline base64.
+///
+/// Cloned into owned `Vec<u8>` so the result outlives the
+/// `Conversation` borrow — call sites pre-collect once per dispatch
+/// and index into the snapshot.
+fn recent_image_bytes(conversation: &Conversation) -> Vec<(Vec<u8>, &'static str)> {
+    let mut out = Vec::new();
+    for msg in conversation.messages().iter().rev() {
+        for block in msg.content.iter().rev() {
+            match block {
+                ProtoContentBlock::Image {
+                    source: ImageSource::Bytes { data, media_type },
+                    ..
+                } => {
+                    out.push((data.clone(), media_type.as_mime_str()));
+                }
+                ProtoContentBlock::ToolResult {
+                    content: ToolResultContent::Blocks(blocks),
+                    ..
+                } => {
+                    for inner in blocks.iter().rev() {
+                        if let ProtoContentBlock::Image {
+                            source: ImageSource::Bytes { data, media_type },
+                            ..
+                        } = inner
+                        {
+                            out.push((data.clone(), media_type.as_mime_str()));
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -196,10 +312,174 @@ mod tests {
         DaemonCapabilities, EmbeddedResource, HostEnvSpecKind, ToolDescriptor,
     };
     use whisper_agent_protocol::sandbox::{NetworkPolicy, PathAccess};
+    use whisper_agent_protocol::{ImageMime, Message, Role};
 
     use crate::tools::host_env_link::test_fixtures::{
         FakeDaemonRig, InvokeOutcome, spawn_fake_daemon,
     };
+
+    /// One-image conversation helper for resolver tests. Each call
+    /// pushes a fresh user message with a single inline-bytes image
+    /// block so order-of-insertion = order-from-oldest.
+    fn convo_with_images(images: &[(&[u8], ImageMime)]) -> Conversation {
+        let mut c = Conversation::new();
+        for (data, mime) in images {
+            c.push(Message {
+                role: Role::User,
+                content: vec![ProtoContentBlock::Image {
+                    source: ImageSource::Bytes {
+                        data: data.to_vec(),
+                        media_type: *mime,
+                    },
+                    replay: None,
+                }],
+            });
+        }
+        c
+    }
+
+    #[test]
+    fn resolve_no_ref_params_returns_empty() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "path": { "type": "string" }
+            }
+        });
+        let args = serde_json::json!({ "path": "out.png" });
+        let conv = convo_with_images(&[(&[1, 2, 3], ImageMime::Png)]);
+        let attach = resolve_content_refs(&schema, &args, &conv).expect("resolve");
+        assert!(attach.is_empty());
+    }
+
+    #[test]
+    fn resolve_index_zero_returns_most_recent() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "path": { "type": "string" },
+                "index": { "type": "integer", CONTENT_REF_KEY: "image" }
+            }
+        });
+        let args = serde_json::json!({ "path": "out.png", "index": 0 });
+        let conv =
+            convo_with_images(&[(&[1, 1, 1], ImageMime::Jpeg), (&[2, 2, 2], ImageMime::Png)]);
+        let attach = resolve_content_refs(&schema, &args, &conv).expect("resolve");
+        assert_eq!(attach.len(), 1);
+        let ContentBlock::Image { data, mime_type } = &attach[0] else {
+            panic!("expected image block, got {:?}", attach[0]);
+        };
+        assert_eq!(*mime_type, "image/png");
+        assert_eq!(BASE64_STANDARD.decode(data).unwrap(), vec![2, 2, 2]);
+    }
+
+    #[test]
+    fn resolve_index_n_walks_back() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "index": { "type": "integer", CONTENT_REF_KEY: "image" }
+            }
+        });
+        let args = serde_json::json!({ "index": 1 });
+        let conv = convo_with_images(&[(&[7, 7], ImageMime::Jpeg), (&[8, 8], ImageMime::Png)]);
+        let attach = resolve_content_refs(&schema, &args, &conv).expect("resolve");
+        let ContentBlock::Image { data, mime_type } = &attach[0] else {
+            panic!("expected image block");
+        };
+        assert_eq!(*mime_type, "image/jpeg");
+        assert_eq!(BASE64_STANDARD.decode(data).unwrap(), vec![7, 7]);
+    }
+
+    #[test]
+    fn resolve_index_out_of_range_errors() {
+        let schema = serde_json::json!({
+            "properties": {
+                "index": { "type": "integer", CONTENT_REF_KEY: "image" }
+            }
+        });
+        let args = serde_json::json!({ "index": 5 });
+        let conv = convo_with_images(&[(&[1], ImageMime::Png)]);
+        let err = resolve_content_refs(&schema, &args, &conv).expect_err("should error");
+        assert!(err.contains("out of range"), "got: {err}");
+    }
+
+    #[test]
+    fn resolve_missing_index_arg_errors() {
+        let schema = serde_json::json!({
+            "properties": {
+                "index": { "type": "integer", CONTENT_REF_KEY: "image" }
+            }
+        });
+        let args = serde_json::json!({});
+        let conv = convo_with_images(&[(&[1], ImageMime::Png)]);
+        let err = resolve_content_refs(&schema, &args, &conv).expect_err("should error");
+        assert!(err.contains("non-negative integer"), "got: {err}");
+    }
+
+    #[test]
+    fn resolve_unknown_ref_kind_errors() {
+        let schema = serde_json::json!({
+            "properties": {
+                "x": { "type": "integer", CONTENT_REF_KEY: "audio" }
+            }
+        });
+        let args = serde_json::json!({ "x": 0 });
+        let conv = convo_with_images(&[(&[1], ImageMime::Png)]);
+        let err = resolve_content_refs(&schema, &args, &conv).expect_err("should error");
+        assert!(err.contains("audio"), "got: {err}");
+    }
+
+    /// URL-source images can't ride as inline-bytes attachments, so
+    /// they're invisible to the index. A conversation with only a
+    /// URL image looks empty to the resolver.
+    #[test]
+    fn recent_image_bytes_skips_url_sources() {
+        let mut conv = Conversation::new();
+        conv.push(Message {
+            role: Role::User,
+            content: vec![ProtoContentBlock::Image {
+                source: ImageSource::Url {
+                    url: "https://example/cat.png".into(),
+                },
+                replay: None,
+            }],
+        });
+        assert!(recent_image_bytes(&conv).is_empty());
+    }
+
+    /// Image blocks embedded in tool-result content count toward
+    /// the clipboard, not just standalone Image blocks. Future tools
+    /// like screenshot capture will return their image inside a
+    /// ToolResult — those need to be reachable by `save_image`.
+    #[test]
+    fn recent_image_bytes_walks_into_tool_results() {
+        use whisper_agent_protocol::ToolResultContent;
+        let mut conv = Conversation::new();
+        conv.push(Message {
+            role: Role::Assistant,
+            content: vec![ProtoContentBlock::ToolResult {
+                tool_use_id: "tu_1".into(),
+                content: ToolResultContent::Blocks(vec![
+                    ProtoContentBlock::Text {
+                        text: "screenshot:".into(),
+                    },
+                    ProtoContentBlock::Image {
+                        source: ImageSource::Bytes {
+                            data: vec![9, 9],
+                            media_type: ImageMime::Webp,
+                        },
+                        replay: None,
+                    },
+                ]),
+                is_error: false,
+            }],
+        });
+        let images = recent_image_bytes(&conv);
+        assert_eq!(images.len(), 1);
+        assert_eq!(images[0].0, vec![9, 9]);
+        assert_eq!(images[0].1, "image/webp");
+    }
 
     #[test]
     fn translate_text_block() {
@@ -331,6 +611,7 @@ mod tests {
             sample_spec(),
             "echo".into(),
             dispatch_args(),
+            vec![],
             CancellationToken::new(),
         )
         .await
@@ -370,6 +651,7 @@ mod tests {
                 sample_spec(),
                 "echo".into(),
                 dispatch_args(),
+                vec![],
                 CancellationToken::new(),
             )
             .await
@@ -408,6 +690,7 @@ mod tests {
                 sample_spec(),
                 "echo".into(),
                 dispatch_args(),
+                vec![],
                 CancellationToken::new(),
             )
             .await
@@ -441,6 +724,7 @@ mod tests {
             sample_spec(),
             "echo".into(),
             dispatch_args(),
+            vec![],
             CancellationToken::new(),
         )
         .await
@@ -473,6 +757,7 @@ mod tests {
             sample_spec(),
             "echo".into(),
             dispatch_args(),
+            vec![],
             CancellationToken::new(),
         )
         .await
@@ -510,6 +795,7 @@ mod tests {
             sample_spec(),
             "echo".into(),
             dispatch_args(),
+            vec![],
             cancel,
         )
         .await
@@ -552,6 +838,7 @@ mod tests {
             sample_spec(),
             "echo".into(),
             dispatch_args(),
+            vec![],
             CancellationToken::new(),
         )
         .await
@@ -576,6 +863,7 @@ mod tests {
             sample_spec(),
             "echo".into(),
             dispatch_args(),
+            vec![],
             CancellationToken::new(),
         )
         .await
@@ -607,6 +895,7 @@ mod tests {
             sample_spec(),
             "echo".into(),
             dispatch_args(),
+            vec![],
             CancellationToken::new(),
         )
         .await
@@ -645,6 +934,7 @@ mod tests {
             sample_spec(),
             "echo".into(),
             dispatch_args(),
+            vec![],
             CancellationToken::new(),
         )
         .await
@@ -704,6 +994,7 @@ mod tests {
             sample_spec(),
             "echo".into(),
             dispatch_args(),
+            vec![],
             CancellationToken::new(),
         )
         .await
@@ -777,6 +1068,7 @@ mod tests {
             sample_spec(),
             "echo".into(),
             dispatch_args(),
+            vec![],
             CancellationToken::new(),
         )
         .await
@@ -832,6 +1124,7 @@ mod tests {
                     sample_spec(),
                     "echo".into(),
                     dispatch_args(),
+                    vec![],
                     cancel,
                 )
                 .await
@@ -917,6 +1210,7 @@ mod tests {
                     sample_spec(),
                     "echo".into(),
                     dispatch_args(),
+                    vec![],
                     cancel,
                 )
                 .await
@@ -985,6 +1279,7 @@ mod tests {
                     sample_spec(),
                     "echo".into(),
                     dispatch_args(),
+                    vec![],
                     cancel,
                 )
                 .await

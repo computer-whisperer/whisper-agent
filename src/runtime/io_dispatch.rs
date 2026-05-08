@@ -1008,6 +1008,46 @@ fn tool_call(
             let contexts = scheduler.v2_context_store();
             let registry = scheduler.v2_daemon_registry();
             let policy = scheduler.v2_policy_store().get(&thread_id);
+            // Resolve x-content-ref params from conversation state
+            // before dispatch — bytes ride to the daemon as an
+            // attachments sidecar so the tool's input_schema can
+            // declare an honest `index: integer` parameter while the
+            // worker actually receives the resolved bytes. Resolution
+            // failures (out-of-range index, malformed args) short-
+            // circuit to a tool-call error without ever opening a
+            // worker session.
+            let attachments = match daemon_handle
+                .capabilities()
+                .tools
+                .iter()
+                .find(|t| t.name == real_name)
+            {
+                Some(tool) => match crate::runtime::v2_dispatch::resolve_content_refs(
+                    &tool.input_schema,
+                    &input,
+                    &scheduler
+                        .task(&thread_id)
+                        .expect("task exists")
+                        .conversation,
+                ) {
+                    Ok(a) => a,
+                    Err(e) => {
+                        return Box::pin(async move {
+                            SchedulerCompletion::Io(IoCompletion {
+                                thread_id,
+                                op_id,
+                                result: IoResult::ToolCall {
+                                    tool_use_id,
+                                    result: Err(e),
+                                },
+                                pod_update: None,
+                                scheduler_command: None,
+                            })
+                        });
+                    }
+                },
+                None => Vec::new(),
+            };
             Box::pin(async move {
                 let result = crate::runtime::v2_dispatch::dispatch_v2_tool(
                     sessions,
@@ -1020,6 +1060,7 @@ fn tool_call(
                     spec,
                     real_name,
                     input,
+                    attachments,
                     cancel,
                 )
                 .await;

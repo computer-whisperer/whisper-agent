@@ -2372,6 +2372,37 @@ impl Scheduler {
                 let contexts = self.v2_context_store();
                 let registry = self.v2_daemon_registry();
                 let policy = self.v2_policy_store().get(&thread_id);
+                // Same content-ref resolution as the io_dispatch
+                // path: see [`crate::runtime::v2_dispatch::resolve_content_refs`].
+                // Resolution failures short-circuit to a SudoInner
+                // error completion before any worker session opens.
+                let attachments = match daemon_handle
+                    .capabilities()
+                    .tools
+                    .iter()
+                    .find(|t| t.name == real_name)
+                {
+                    Some(tool) => match crate::runtime::v2_dispatch::resolve_content_refs(
+                        &tool.input_schema,
+                        &args,
+                        &self.task(&thread_id).expect("task exists").conversation,
+                    ) {
+                        Ok(a) => a,
+                        Err(e) => {
+                            return Box::pin(async move {
+                                SchedulerCompletion::SudoInner(SudoInnerCompletion {
+                                    function_id,
+                                    thread_id,
+                                    decision,
+                                    result: Err(e),
+                                    pod_update: None,
+                                    scheduler_command: None,
+                                })
+                            });
+                        }
+                    },
+                    None => Vec::new(),
+                };
                 Box::pin(async move {
                     let result = crate::runtime::v2_dispatch::dispatch_v2_tool(
                         sessions,
@@ -2384,6 +2415,7 @@ impl Scheduler {
                         spec,
                         real_name,
                         args,
+                        attachments,
                         cancel,
                     )
                     .await;
