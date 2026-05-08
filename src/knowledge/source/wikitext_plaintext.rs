@@ -482,8 +482,7 @@ mod tests {
         // Synthetic ~3 KB article — about the median wikipedia size.
         // Ensures parse + walk completes in a sane time on the
         // chunker stage (~6.8 M articles × this ⇒ wall-clock budget).
-        let para =
-            "The '''[[Apollo program]]''' was a series of missions {{cite book|title=NASA}} \
+        let para = "The '''[[Apollo program]]''' was a series of missions {{cite book|title=NASA}} \
              carried out by [[NASA]] between 1961 and 1972.<ref>NHistory.</ref> The program \
              aimed to land humans on the [[Moon]].<ref name=\"k\"/> Five further successful \
              landings occurred through 1972, ending with [[Apollo 17]]. ";
