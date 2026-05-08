@@ -4,7 +4,7 @@
 //! are returned as `is_error: true` results — not JSON-RPC errors. JSON-RPC errors are reserved
 //! for protocol-level problems (unknown tool, bad arguments).
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::process::Stdio;
 use std::sync::{Arc, LazyLock};
@@ -1670,20 +1670,56 @@ async fn list_dir(workspace: &Arc<Workspace>, args: Value) -> CallToolResult {
 
 // ---------- glob ----------
 
+/// Extract the longest path prefix of `pattern` that contains no glob
+/// metacharacters — used to pick the directory the walker starts from
+/// when the user supplies an absolute pattern. For `/home/me/**/*.rs`
+/// this returns `/home/me`; for `/etc/passwd` (no wildcards) it
+/// returns `/etc/passwd` itself, and `ignore::WalkBuilder::new` on a
+/// regular file iterates just that one file.
+fn literal_path_prefix(pattern: &str) -> PathBuf {
+    fn has_glob_meta(s: &str) -> bool {
+        s.contains(['*', '?', '[', '{'])
+    }
+    let mut prefix = PathBuf::new();
+    for component in Path::new(pattern).components() {
+        match component {
+            std::path::Component::RootDir => prefix.push(component.as_os_str()),
+            std::path::Component::Normal(s) => {
+                let s = s.to_string_lossy();
+                if has_glob_meta(&s) {
+                    break;
+                }
+                prefix.push(s.as_ref());
+            }
+            // Other components (Prefix on Windows, CurDir, ParentDir)
+            // — pass through; the walker resolves them.
+            other => prefix.push(other.as_os_str()),
+        }
+    }
+    prefix
+}
+
 fn glob_descriptor() -> Tool {
     Tool {
         name: "glob".into(),
-        description: "Find files in the workspace whose paths match a glob pattern. Respects \
-                      `.gitignore`, `.git/info/exclude`, and hidden files (opt-in). Use standard \
-                      glob syntax: `**/*.rs`, `src/**/test_*.py`, `docs/*.md`. Returns one path \
-                      per line, relative to the workspace root."
+        description: "Find files whose paths match a glob pattern. Two modes:\n\
+                      \n\
+                      - **Relative pattern** (e.g. `**/*.rs`, `docs/*.md`) — walks the \
+                      workspace root, returns paths relative to it.\n\
+                      - **Absolute pattern** (e.g. `/home/me/projects/**/*.svg`) — walks \
+                      from the pattern's literal prefix (everything before the first wildcard) \
+                      and returns absolute paths. Subject to sandbox path access; paths \
+                      outside your allowed roots silently won't show up.\n\
+                      \n\
+                      Respects `.gitignore`, `.git/info/exclude`, and hidden files (opt-in). \
+                      Standard glob syntax: `*`, `?`, `**`, `[...]`, `{a,b}`."
             .into(),
         input_schema: json!({
             "type": "object",
             "properties": {
                 "pattern": {
                     "type": "string",
-                    "description": "Glob pattern matched against paths relative to the workspace root."
+                    "description": "Glob pattern. Relative patterns match paths under the workspace root; absolute patterns (starting with `/`) match absolute filesystem paths."
                 },
                 "include_hidden": {
                     "type": "boolean",
@@ -1731,14 +1767,34 @@ async fn glob(workspace: &Arc<Workspace>, args: Value) -> CallToolResult {
         Err(e) => return CallToolResult::error_text(format!("invalid glob pattern: {e}")),
     };
     let max = parsed.max_results.unwrap_or(1000).max(1) as usize;
-    let root = workspace.root().to_path_buf();
     let include_hidden = parsed.include_hidden;
     let include_ignored = parsed.include_ignored;
+
+    // Two modes: relative patterns walk from the workspace root and
+    // match against paths relative to it; absolute patterns walk from
+    // the literal prefix of the pattern and match against absolute
+    // paths. Sandbox (Landlock) is the authority on what's actually
+    // readable — we don't second-guess it here, we just make sure
+    // the matcher can succeed.
+    let absolute = parsed.pattern.starts_with('/');
+    let walk_root: PathBuf = if absolute {
+        let prefix = literal_path_prefix(&parsed.pattern);
+        if prefix.as_os_str().is_empty() || prefix == Path::new("/") {
+            return CallToolResult::error_text(
+                "absolute glob pattern must include at least one literal path segment \
+                 before the first wildcard (e.g. `/home/me/**/*.rs`, not `/**/*.rs`)"
+                    .to_string(),
+            );
+        }
+        prefix
+    } else {
+        workspace.root().to_path_buf()
+    };
 
     // Walk on a blocking thread — ignore::Walk is synchronous and can touch thousands of
     // dirs; don't tie up the async runtime.
     let result = tokio::task::spawn_blocking(move || {
-        let mut walker = ignore::WalkBuilder::new(&root);
+        let mut walker = ignore::WalkBuilder::new(&walk_root);
         walker
             .hidden(!include_hidden)
             .git_ignore(!include_ignored)
@@ -1756,15 +1812,21 @@ async fn glob(workspace: &Arc<Workspace>, args: Value) -> CallToolResult {
             if !entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
                 continue;
             }
-            let Ok(rel) = entry.path().strip_prefix(&root) else {
-                continue;
+            let path = entry.path();
+            let candidate: &Path = if absolute {
+                path
+            } else {
+                match path.strip_prefix(&walk_root) {
+                    Ok(rel) => rel,
+                    Err(_) => continue,
+                }
             };
-            if matcher.is_match(rel) {
+            if matcher.is_match(candidate) {
                 if hits.len() >= max {
                     truncated = true;
                     break;
                 }
-                hits.push(rel.to_string_lossy().into_owned());
+                hits.push(candidate.to_string_lossy().into_owned());
             }
         }
         hits.sort();
@@ -2987,6 +3049,119 @@ fn main() {
             other => panic!("expected text error result, got {other:?}"),
         };
         assert!(body.contains("not look like a PDF"));
+    }
+
+    // ---------- glob ----------
+
+    fn final_text(result: &CallToolResult) -> &str {
+        match result.content.first() {
+            Some(ContentBlock::Text { text }) => text.as_str(),
+            other => panic!("expected text result, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn literal_path_prefix_extracts_non_wildcard_root() {
+        assert_eq!(
+            literal_path_prefix("/home/me/**/*.rs"),
+            std::path::PathBuf::from("/home/me"),
+        );
+        assert_eq!(
+            literal_path_prefix("/home/me/projects/foo/*.svg"),
+            std::path::PathBuf::from("/home/me/projects/foo"),
+        );
+        assert_eq!(
+            literal_path_prefix("/etc/passwd"),
+            std::path::PathBuf::from("/etc/passwd"),
+        );
+        // Wildcard right after `/` — prefix stays at `/`. Caller is
+        // expected to reject this; we still want the helper to return
+        // a stable value.
+        assert_eq!(literal_path_prefix("/*.rs"), std::path::PathBuf::from("/"),);
+    }
+
+    #[tokio::test]
+    async fn glob_relative_pattern_walks_workspace_root() {
+        let ws = test_workspace();
+        std::fs::write(ws.root().join("alpha.rs"), b"").unwrap();
+        std::fs::write(ws.root().join("beta.txt"), b"").unwrap();
+        std::fs::create_dir(ws.root().join("sub")).unwrap();
+        std::fs::write(ws.root().join("sub/gamma.rs"), b"").unwrap();
+
+        let result = glob(&ws, json!({ "pattern": "**/*.rs" })).await;
+        let body = final_text(&result);
+        assert!(body.contains("alpha.rs"), "missing alpha.rs in {body}");
+        assert!(
+            body.contains("sub/gamma.rs"),
+            "missing sub/gamma.rs in {body}"
+        );
+        assert!(!body.contains("beta.txt"));
+    }
+
+    #[tokio::test]
+    async fn glob_absolute_pattern_walks_literal_prefix() {
+        // The workspace root is a temp dir; we use it as the literal
+        // prefix of an absolute pattern that points at exactly those
+        // files. This is the case the model's call defeated before
+        // — `glob` was matching against relative paths so an absolute
+        // pattern returned no hits.
+        let ws = test_workspace();
+        std::fs::write(ws.root().join("icon.svg"), b"").unwrap();
+        std::fs::write(ws.root().join("README.md"), b"").unwrap();
+
+        let pattern = format!("{}/*.svg", ws.root().display());
+        let result = glob(&ws, json!({ "pattern": pattern })).await;
+        let body = final_text(&result);
+        let expected = ws.root().join("icon.svg").display().to_string();
+        assert!(
+            body.contains(&expected),
+            "absolute pattern should return absolute path; got {body}"
+        );
+        assert!(!body.contains("README.md"));
+    }
+
+    #[tokio::test]
+    async fn glob_absolute_pattern_outside_workspace() {
+        // The point of the absolute-pattern path: the walker is no
+        // longer rooted at the workspace, so we can find files in
+        // sibling temp directories the sandbox grants. Simulate a
+        // sibling directory and verify the model's `/...` pattern
+        // hits it.
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static N: AtomicU64 = AtomicU64::new(0);
+        let n = N.fetch_add(1, Ordering::Relaxed);
+
+        let ws = test_workspace();
+        let sibling =
+            std::env::temp_dir().join(format!("wamh-glob-sibling-{}-{n}", std::process::id()));
+        std::fs::create_dir_all(&sibling).unwrap();
+        std::fs::write(sibling.join("target.svg"), b"").unwrap();
+
+        let pattern = format!("{}/*.svg", sibling.display());
+        let result = glob(&ws, json!({ "pattern": pattern })).await;
+        let body = final_text(&result);
+        let expected = sibling.join("target.svg").display().to_string();
+        assert!(
+            body.contains(&expected),
+            "expected sibling absolute hit, got {body}"
+        );
+
+        std::fs::remove_dir_all(&sibling).ok();
+    }
+
+    #[tokio::test]
+    async fn glob_absolute_pattern_with_no_literal_prefix_is_rejected() {
+        // `/*.rs` would walk the whole filesystem from `/`. Reject
+        // upfront with an actionable message rather than letting the
+        // walker burn cycles.
+        let ws = test_workspace();
+        let result = glob(&ws, json!({ "pattern": "/*.rs" })).await;
+        assert_eq!(result.is_error, Some(true));
+        let body = final_text(&result);
+        assert!(
+            body.contains("literal path segment"),
+            "error should explain the requirement, got {body}"
+        );
     }
 
     #[tokio::test]
