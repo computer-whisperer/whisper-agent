@@ -10,6 +10,10 @@
 //! Notify fires multiple events per save (e.g. CREATE + MODIFY + CHMOD).
 //! We debounce 300ms before reloading so a burst settles into one reload.
 //! Reload errors are logged and the previous resolved config stays live.
+//!
+//! IN_ACCESS events are filtered out: our own re-read of the config inside
+//! the reload path triggers them on real filesystems, which would close a
+//! self-feedback loop (read → access event → debounce → read → …).
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -17,7 +21,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use arc_swap::ArcSwap;
-use notify::{Event, RecursiveMode, Watcher, recommended_watcher};
+use notify::{Event, EventKind, RecursiveMode, Watcher, recommended_watcher};
 use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 
@@ -47,6 +51,13 @@ pub async fn watch(
     let target_basename_cb = target_basename.clone();
     let mut watcher = recommended_watcher(move |res: notify::Result<Event>| match res {
         Ok(event) => {
+            // Skip pure-read events. Without this, our own re-read of the
+            // config inside the reload path fires inotify IN_ACCESS, which
+            // closes a feedback loop with the debounce timer firing every
+            // ~300ms forever.
+            if matches!(event.kind, EventKind::Access(_)) {
+                return;
+            }
             let touched = event
                 .paths
                 .iter()
