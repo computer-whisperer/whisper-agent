@@ -32,6 +32,7 @@ pub mod find_tool;
 mod grep;
 pub mod knowledge_modify;
 pub mod knowledge_query;
+pub mod list_images;
 pub mod list_llm_providers;
 pub mod list_mcp_hosts;
 mod list_threads;
@@ -147,6 +148,7 @@ pub const LIST_LLM_PROVIDERS: &str = "list_llm_providers";
 pub const LIST_MCP_HOSTS: &str = "list_mcp_hosts";
 pub const KNOWLEDGE_QUERY: &str = "knowledge_query";
 pub const KNOWLEDGE_MODIFY: &str = "knowledge_modify";
+pub const LIST_IMAGES: &str = "list_images";
 
 /// True if `name` is a builtin pod tool. Used by the scheduler's router
 /// to branch the tool-call dispatch path.
@@ -172,6 +174,7 @@ pub fn is_builtin(name: &str) -> bool {
             | LIST_MCP_HOSTS
             | KNOWLEDGE_QUERY
             | KNOWLEDGE_MODIFY
+            | LIST_IMAGES
     )
 }
 
@@ -204,6 +207,7 @@ pub fn reserved_env_name_prefixes() -> Vec<&'static str> {
         LIST_MCP_HOSTS,
         KNOWLEDGE_QUERY,
         KNOWLEDGE_MODIFY,
+        LIST_IMAGES,
     ];
     let mut out: Vec<&'static str> = BUILTINS
         .iter()
@@ -237,6 +241,7 @@ pub fn descriptors() -> Vec<McpTool> {
         list_mcp_hosts::descriptor(),
         knowledge_query::descriptor(),
         knowledge_modify::descriptor(),
+        list_images::descriptor(),
     ]
 }
 
@@ -424,6 +429,11 @@ pub async fn dispatch(
         DESCRIBE_TOOL => no_update_error(
             "describe_tool must be intercepted at the scheduler layer \
              (complete_describe_tool_call); reaching this arm is a bug"
+                .into(),
+        ),
+        LIST_IMAGES => no_update_error(
+            "list_images must be intercepted at the scheduler layer \
+             (complete_list_images_call); reaching this arm is a bug"
                 .into(),
         ),
         FIND_TOOL => no_update_error(

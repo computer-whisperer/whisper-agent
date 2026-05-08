@@ -817,6 +817,17 @@ impl Scheduler {
             );
             return;
         }
+        if name == crate::tools::builtin_tools::LIST_IMAGES {
+            self.complete_list_images_call(
+                thread_id,
+                op_id,
+                tool_use_id,
+                input,
+                disposition,
+                pending_io,
+            );
+            return;
+        }
 
         let spec = match self.route_tool(thread_id, &name) {
             Some(ToolRoute::Builtin { .. }) => Function::BuiltinToolCall {
@@ -1222,6 +1233,58 @@ impl Scheduler {
             op_id,
             tool_use_id,
             out,
+        ));
+    }
+
+    /// `list_images`-specific synchronous path. Walks the calling
+    /// thread's conversation, collects every inline-bytes image
+    /// (standalone or embedded in a tool result), and renders a
+    /// most-recent-first catalog with content-addressed handles.
+    /// Pure read against scheduler state — no I/O — so the result
+    /// fires immediately.
+    fn complete_list_images_call(
+        &mut self,
+        thread_id: &str,
+        op_id: crate::runtime::thread::OpId,
+        tool_use_id: String,
+        input: serde_json::Value,
+        disposition: crate::permission::Disposition,
+        pending_io: &mut FuturesUnordered<SchedulerFuture>,
+    ) {
+        if matches!(disposition, crate::permission::Disposition::Deny) {
+            pending_io.push(make_denial_future(
+                thread_id.to_string(),
+                tool_use_id,
+                op_id,
+                crate::tools::builtin_tools::LIST_IMAGES.to_string(),
+            ));
+            return;
+        }
+        if let Err(e) = crate::tools::builtin_tools::list_images::parse_args(input) {
+            pending_io.push(immediate_tool_error(
+                thread_id.to_string(),
+                op_id,
+                tool_use_id,
+                e,
+            ));
+            return;
+        }
+        let Some(task) = self.task(thread_id) else {
+            pending_io.push(immediate_tool_error(
+                thread_id.to_string(),
+                op_id,
+                tool_use_id,
+                format!("no such thread `{thread_id}`"),
+            ));
+            return;
+        };
+        let entries = crate::tools::builtin_tools::list_images::collect_entries(&task.conversation);
+        let body = crate::tools::builtin_tools::list_images::render(&entries);
+        pending_io.push(immediate_tool_success(
+            thread_id.to_string(),
+            op_id,
+            tool_use_id,
+            body,
         ));
     }
 
