@@ -762,14 +762,19 @@ fn tool_result_as_text(content: &ToolResultContent, is_error: bool) -> String {
 
 fn spec_to_rsp_tool(t: &ToolSpec) -> RspTool {
     if let whisper_agent_protocol::ToolKind::ProviderBuiltin = t.kind {
-        // Today the only ProviderBuiltin we wire is `image_generation`.
-        // Other built-ins (web_search, file_search, code_interpreter, …)
-        // would either match on name here or carry a richer kind enum.
-        if t.name == "image_generation" {
-            return RspTool::ImageGeneration {
-                size: "auto",
-                quality: "auto",
-            };
+        // Provider-built-in tools dispatch by reserved name; the
+        // synthesizer in scheduler.rs and this match must agree.
+        // Future built-ins (file_search, code_interpreter, …) slot in
+        // alongside.
+        match t.name.as_str() {
+            "image_generation" => {
+                return RspTool::ImageGeneration {
+                    size: "auto",
+                    quality: "auto",
+                };
+            }
+            "web_search" => return RspTool::WebSearch,
+            _ => {}
         }
     }
     RspTool::Function {
@@ -1296,6 +1301,11 @@ fn finalize_response(
                     replay: None,
                 });
             }
+            RspOutputItem::WebSearchCall => {
+                // Intentional drop — see the doc comment on the variant.
+                // The model's text reply (next item) carries the search
+                // results inline with citations.
+            }
             RspOutputItem::Other => {}
         }
     }
@@ -1446,6 +1456,12 @@ enum RspTool {
         size: &'static str,
         quality: &'static str,
     },
+    /// Provider-side web search. Output items (`web_search_call`) are
+    /// metadata about the search the model ran; the actual results
+    /// flow into the model's text reply as inline markdown citations,
+    /// which already round-trip through the normal assistant-message
+    /// path. We don't echo `web_search_call` items back next turn.
+    WebSearch,
 }
 
 /// SSE frames we care about on the streaming `/responses` route.
@@ -1550,6 +1566,17 @@ enum RspOutputItem {
         #[serde(default)]
         revised_prompt: Option<String>,
     },
+    /// Result of a `web_search` built-in invocation. The user-visible
+    /// search results flow through as inline markdown citations on the
+    /// subsequent `Message` item — this item just captures metadata
+    /// (id + the queries the model issued). We accept it explicitly
+    /// so unknown shapes still loud-fail via `Other`, but we don't
+    /// surface it to the conversation log: the Message already has
+    /// everything the user needs, and there's no round-trip benefit
+    /// (the model's text reply already carries the search context
+    /// forward). Fields are deliberately omitted — none are read
+    /// today; serde silently accepts the rest of the wire payload.
+    WebSearchCall,
     #[serde(other)]
     Other,
 }
@@ -2084,6 +2111,44 @@ data: {"type":"response.failed","response":{"status":"failed"},"error":{"message
         let (content, _stop, _usage) =
             finalize_response(vec![item], Some("completed".into()), None, None).expect("finalize");
         assert!(content.is_empty(), "partial item must produce no block");
+    }
+
+    #[test]
+    fn web_search_tool_renders_to_correct_wire_shape() {
+        // Codex specifically rejects `web_search_preview` ("Unsupported
+        // tool type"). Empirical reference: probe_responses_api.sh.
+        let spec = ToolSpec {
+            name: "web_search".into(),
+            description: "(unused on the wire for built-ins)".into(),
+            params: Vec::new(),
+            kind: whisper_agent_protocol::ToolKind::ProviderBuiltin,
+        };
+        let v = serde_json::to_value(spec_to_rsp_tool(&spec)).unwrap();
+        assert_eq!(v["type"], "web_search");
+        for forbidden in ["name", "description", "parameters", "strict"] {
+            assert!(
+                v.get(forbidden).is_none(),
+                "built-in tool wire shape must not carry `{forbidden}`"
+            );
+        }
+    }
+
+    #[test]
+    fn web_search_call_is_dropped_from_conversation() {
+        // The user-visible search results flow as citations in the
+        // subsequent Message item; the call item itself adds nothing.
+        // Make sure we don't accidentally surface it as a content
+        // block (which would clutter the chat log).
+        let raw = r#"{
+            "type": "web_search_call",
+            "id": "ws_1",
+            "status": "completed",
+            "action": {"type": "search", "queries": ["weather today"]}
+        }"#;
+        let item: RspOutputItem = serde_json::from_str(raw).expect("parse output item");
+        let (content, _stop, _usage) =
+            finalize_response(vec![item], Some("completed".into()), None, None).expect("finalize");
+        assert!(content.is_empty(), "web_search_call must produce no block");
     }
 
     #[test]

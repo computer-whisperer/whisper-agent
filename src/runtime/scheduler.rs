@@ -2882,20 +2882,34 @@ impl Scheduler {
         if entry.kind != "openai_responses" {
             return Vec::new();
         }
-        vec![whisper_agent_protocol::ContentBlock::ToolSchema {
-            name: "image_generation".into(),
-            description:
-                "Generate an image from the conversation context. Invoke this when the user asks \
-                 for a picture, diagram, illustration, mockup, or other visual output. The tool \
-                 runs server-side inside the model's response — no arguments to construct, just \
-                 invoke it. The model passes the relevant conversation context (uploaded images, \
-                 prior turns, the user's request) directly to the image model. Subsequent \
-                 invocations after a prior image_generation in the same conversation edit the \
-                 previous image rather than starting from scratch."
-                    .into(),
-            params: Vec::new(),
-            kind: whisper_agent_protocol::ToolKind::ProviderBuiltin,
-        }]
+        vec![
+            whisper_agent_protocol::ContentBlock::ToolSchema {
+                name: "image_generation".into(),
+                description:
+                    "Generate an image from the conversation context. Invoke this when the user \
+                     asks for a picture, diagram, illustration, mockup, or other visual output. \
+                     The tool runs server-side inside the model's response — no arguments to \
+                     construct, just invoke it. The model passes the relevant conversation \
+                     context (uploaded images, prior turns, the user's request) directly to the \
+                     image model. Subsequent invocations after a prior image_generation in the \
+                     same conversation edit the previous image rather than starting from scratch."
+                        .into(),
+                params: Vec::new(),
+                kind: whisper_agent_protocol::ToolKind::ProviderBuiltin,
+            },
+            whisper_agent_protocol::ContentBlock::ToolSchema {
+                name: "web_search".into(),
+                description:
+                    "Search the web from inside the response. Invoke this when the user asks \
+                     about recent events, current facts, prices, news, or anything that may have \
+                     changed since the model's training cutoff. The tool runs server-side; the \
+                     model formulates the search query itself and the results flow into its \
+                     answer with inline source citations."
+                        .into(),
+                params: Vec::new(),
+                kind: whisper_agent_protocol::ToolKind::ProviderBuiltin,
+            },
+        ]
     }
 
     fn finalize_setup_prefix(&mut self, thread_id: &str) {
