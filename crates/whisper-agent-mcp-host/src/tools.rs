@@ -43,6 +43,7 @@ pub fn descriptors() -> Vec<Tool> {
         view_pdf_descriptor(),
         write_file_descriptor(),
         edit_file_descriptor(),
+        save_image_descriptor(),
         bash_descriptor(),
         list_dir_descriptor(),
         glob_descriptor(),
@@ -65,7 +66,7 @@ pub fn call_stream(
     workspace: &Arc<Workspace>,
     name: &str,
     args: Value,
-    _attachments: Vec<ContentBlock>,
+    attachments: Vec<ContentBlock>,
 ) -> Result<Pin<Box<dyn Stream<Item = ToolStreamItem> + Send>>, ToolDispatchError> {
     let ws = workspace.clone();
     match name {
@@ -75,6 +76,9 @@ pub fn call_stream(
         "view_pdf" => Ok(single(async move { view_pdf(&ws, args).await })),
         "write_file" => Ok(single(async move { write_file(&ws, args).await })),
         "edit_file" => Ok(single(async move { edit_file(&ws, args).await })),
+        "save_image" => Ok(single(
+            async move { save_image(&ws, args, attachments).await },
+        )),
         "list_dir" => Ok(single(async move { list_dir(&ws, args).await })),
         "glob" => Ok(single(async move { glob(&ws, args).await })),
         "grep" => Ok(single(async move { grep(&ws, args).await })),
@@ -996,6 +1000,130 @@ fn multi_match_hint(content: &str, old_string: &str) -> String {
         ));
     }
     out
+}
+
+// ---------- save_image ----------
+
+/// Save a recently-seen image to a file in the workspace. The
+/// `index` parameter is a clipboard-style addressing scheme into
+/// the conversation's image history, resolved upstream by the
+/// scheduler before this tool ever runs — see
+/// `crate::tools::host_env_link` and
+/// `whisper_agent::runtime::v2_dispatch::resolve_content_refs`.
+/// At dispatch the resolved image rides as `attachments[0]`; this
+/// tool just decodes the base64 payload and writes the bytes.
+fn save_image_descriptor() -> Tool {
+    Tool {
+        name: "save_image".into(),
+        description: "Write an image from the recent-image history of this conversation to \
+                      a file in the workspace. The most-recent image is `index = 0`; older \
+                      images are at higher indices (`1` is the second-most-recent, and so on). \
+                      Image history includes user-uploaded images, model-generated images, \
+                      and image content from any tool result — anything currently in the \
+                      conversation. URL-source images aren't reachable; only inline-bytes \
+                      images can be saved. By default, refuses to overwrite an existing file; \
+                      pass `overwrite: true` to replace."
+            .into(),
+        input_schema: json!({
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "Destination path — absolute, or relative to the workspace root."
+                },
+                "index": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "description": "Position into the conversation's recent-image history (0 = most recent).",
+                    // Custom marker the scheduler walks before dispatch:
+                    // resolves this integer into a ContentBlock and
+                    // attaches it to the tool call's sidecar. The
+                    // worker-side handler reads the bytes from
+                    // `attachments[0]` rather than re-resolving here.
+                    "x-content-ref": "image"
+                },
+                "overwrite": {
+                    "type": "boolean",
+                    "description": "If true, replace an existing file at `path`. Default false."
+                }
+            },
+            "required": ["path", "index"]
+        }),
+        annotations: ToolAnnotations {
+            title: Some("Save image".into()),
+            read_only_hint: Some(false),
+            destructive_hint: Some(true),
+            idempotent_hint: Some(true),
+            open_world_hint: Some(false),
+        },
+    }
+}
+
+#[derive(Deserialize)]
+struct SaveImageArgs {
+    path: PathBuf,
+    // `index` is consumed by the scheduler-side resolver before the
+    // call reaches the worker; the byte payload arrives in
+    // `attachments[0]`. We still parse it for validation symmetry —
+    // a missing or non-integer `index` here means the resolver was
+    // bypassed, which is a contract violation worth surfacing.
+    #[allow(dead_code)]
+    index: u64,
+    #[serde(default)]
+    overwrite: bool,
+}
+
+async fn save_image(
+    workspace: &Arc<Workspace>,
+    args: Value,
+    attachments: Vec<ContentBlock>,
+) -> CallToolResult {
+    let parsed: SaveImageArgs = match serde_json::from_value(args) {
+        Ok(v) => v,
+        Err(e) => return CallToolResult::error_text(format!("invalid arguments: {e}")),
+    };
+    // The scheduler-side resolver fills attachments[0] with the
+    // resolved image. Defensive: if the resolver was skipped
+    // (e.g. tool list didn't carry the schema marker), fail
+    // explicitly rather than silently writing nothing.
+    let Some(ContentBlock::Image { data, mime_type }) = attachments.first() else {
+        return CallToolResult::error_text(
+            "save_image was invoked without a resolved image attachment — \
+             the scheduler-side x-content-ref resolver may not be wired"
+                .to_string(),
+        );
+    };
+    use base64::Engine;
+    let bytes = match base64::engine::general_purpose::STANDARD.decode(data) {
+        Ok(b) => b,
+        Err(e) => {
+            return CallToolResult::error_text(format!("attachment base64 decode failed: {e}"));
+        }
+    };
+    let path = match workspace.resolve(&parsed.path) {
+        Ok(p) => p,
+        Err(e) => return CallToolResult::error_text(e.to_string()),
+    };
+    if !parsed.overwrite && path.exists() {
+        return CallToolResult::error_text(format!(
+            "{} already exists — pass `overwrite: true` to replace",
+            parsed.path.display()
+        ));
+    }
+    if let Some(parent) = path.parent()
+        && let Err(e) = tokio::fs::create_dir_all(parent).await
+    {
+        return CallToolResult::error_text(format!("create_dir_all({}): {e}", parent.display()));
+    }
+    match tokio::fs::write(&path, &bytes).await {
+        Ok(()) => CallToolResult::text(format!(
+            "wrote {} bytes ({}) to {}",
+            bytes.len(),
+            mime_type,
+            parsed.path.display()
+        )),
+        Err(e) => CallToolResult::error_text(format!("save_image({}): {e}", parsed.path.display())),
+    }
 }
 
 // ---------- bash ----------
@@ -2379,6 +2507,95 @@ fn main() {
         root.push(format!("wamh-bash-test-{}-{n}", std::process::id()));
         std::fs::create_dir_all(&root).unwrap();
         Arc::new(Workspace::new(&root).unwrap())
+    }
+
+    // ---------- save_image ----------
+
+    fn fake_attachment(bytes: &[u8], mime: &str) -> ContentBlock {
+        use base64::Engine;
+        ContentBlock::Image {
+            data: base64::engine::general_purpose::STANDARD.encode(bytes),
+            mime_type: mime.into(),
+        }
+    }
+
+    /// `save_image_descriptor`'s schema must mark `index` with the
+    /// `x-content-ref: image` keyword. The dispatcher relies on
+    /// scanning this marker to decide whether to resolve content
+    /// before forwarding — if the keyword goes missing, the resolver
+    /// silently passes the call through and `save_image` errors at
+    /// runtime with "no resolved image attachment." Pin it here so a
+    /// future schema edit can't break the contract without flagging.
+    #[test]
+    fn save_image_schema_declares_content_ref_marker() {
+        let d = save_image_descriptor();
+        let marker = d
+            .input_schema
+            .get("properties")
+            .and_then(|p| p.get("index"))
+            .and_then(|i| i.get("x-content-ref"));
+        assert_eq!(marker, Some(&json!("image")));
+    }
+
+    #[tokio::test]
+    async fn save_image_writes_attachment_bytes_to_workspace() {
+        let ws = test_workspace();
+        let bytes: &[u8] = b"\x89PNG\r\n\x1a\nfake-png-bytes";
+        let result = save_image(
+            &ws,
+            json!({"path": "out.png", "index": 0}),
+            vec![fake_attachment(bytes, "image/png")],
+        )
+        .await;
+        assert!(!matches!(result.is_error, Some(true)), "{result:?}");
+        let written = tokio::fs::read(ws.root().join("out.png"))
+            .await
+            .expect("read back");
+        assert_eq!(written, bytes);
+    }
+
+    /// Refuses to clobber unless `overwrite: true`. Mirror's the
+    /// "fail loudly" failure-mode the design called out — the model
+    /// should learn from the tool result, not silently overwrite.
+    #[tokio::test]
+    async fn save_image_refuses_to_overwrite_by_default() {
+        let ws = test_workspace();
+        let path = ws.root().join("out.png");
+        tokio::fs::write(&path, b"old").await.unwrap();
+        let result = save_image(
+            &ws,
+            json!({"path": "out.png", "index": 0}),
+            vec![fake_attachment(b"new", "image/png")],
+        )
+        .await;
+        assert_eq!(result.is_error, Some(true));
+        // Existing file must be untouched.
+        assert_eq!(tokio::fs::read(&path).await.unwrap(), b"old");
+    }
+
+    #[tokio::test]
+    async fn save_image_overwrites_when_explicitly_opted_in() {
+        let ws = test_workspace();
+        let path = ws.root().join("out.png");
+        tokio::fs::write(&path, b"old").await.unwrap();
+        let result = save_image(
+            &ws,
+            json!({"path": "out.png", "index": 0, "overwrite": true}),
+            vec![fake_attachment(b"new", "image/png")],
+        )
+        .await;
+        assert!(!matches!(result.is_error, Some(true)), "{result:?}");
+        assert_eq!(tokio::fs::read(&path).await.unwrap(), b"new");
+    }
+
+    /// Defensive: if the scheduler-side resolver was bypassed
+    /// (attachments empty), the worker tool errors out clearly
+    /// rather than writing zero bytes.
+    #[tokio::test]
+    async fn save_image_errors_when_attachment_missing() {
+        let ws = test_workspace();
+        let result = save_image(&ws, json!({"path": "out.png", "index": 0}), vec![]).await;
+        assert_eq!(result.is_error, Some(true));
     }
 
     async fn run_bash_to_final(ws: Arc<Workspace>, args: Value) -> (Vec<String>, CallToolResult) {
