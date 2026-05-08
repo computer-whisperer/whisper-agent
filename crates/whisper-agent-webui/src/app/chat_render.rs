@@ -988,12 +988,7 @@ fn render_tool_call(
                         .small(),
                 );
             }
-            if let Some(FusedToolResult {
-                text,
-                is_error,
-                attachments,
-            }) = result
-            {
+            if let Some(FusedToolResult { text, is_error, .. }) = result {
                 ui.add_space(6.0);
                 ui.label(
                     RichText::new("result")
@@ -1008,11 +1003,6 @@ fn render_tool_call(
                 };
                 if !text.is_empty() {
                     ui.label(RichText::new(text).color(color).monospace().small());
-                }
-                if !attachments.is_empty() {
-                    ui.add_space(4.0);
-                    let refs: Vec<&ImageSource> = attachments.iter().collect();
-                    render_image_strip(ui, &refs, &format!("toolcall-{tool_use_id}"));
                 }
             } else if !streaming_output.is_empty() {
                 ui.add_space(6.0);
@@ -1030,13 +1020,23 @@ fn render_tool_call(
                 );
             }
         });
+    // Image attachments render outside the collapsing body so a
+    // default-collapsed row still surfaces images. Text result content
+    // stays inside the header (preview + expandable body); pictures get
+    // first-class chat-row treatment alongside the call.
+    if let Some(FusedToolResult { attachments, .. }) = result
+        && !attachments.is_empty()
+    {
+        ui.add_space(4.0);
+        let refs: Vec<&ImageSource> = attachments.iter().collect();
+        render_image_strip(ui, &refs, &format!("toolcall-{tool_use_id}"));
+    }
 }
 
 /// Render a tool-result row. Always default-collapsed — the row
 /// renders as a one-line `name preview [status]` header; clicking
-/// expands to show the full result text and any image attachments.
-/// Matches the treatment of tool calls and reasoning rows so the
-/// chat stream stays quiet by default.
+/// expands to show the full result text. Image attachments render
+/// outside the collapsing body so they're visible without a click.
 fn render_tool_result(
     ui: &mut egui::Ui,
     tool_use_id: &str,
@@ -1100,12 +1100,13 @@ fn render_tool_result(
             if !text.is_empty() {
                 ui.label(RichText::new(text).color(color).monospace().small());
             }
-            if !attachments.is_empty() {
-                ui.add_space(4.0);
-                let refs: Vec<&ImageSource> = attachments.iter().collect();
-                render_image_strip(ui, &refs, &format!("toolresult-{tool_use_id}"));
-            }
         });
+    // Outside the collapsing body — see render_tool_call for rationale.
+    if !attachments.is_empty() {
+        ui.add_space(4.0);
+        let refs: Vec<&ImageSource> = attachments.iter().collect();
+        render_image_strip(ui, &refs, &format!("toolresult-{tool_use_id}"));
+    }
 }
 
 /// Pull a short preview of a tool-call result for the collapsed
