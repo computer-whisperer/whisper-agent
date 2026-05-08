@@ -646,7 +646,12 @@ fn frame_kind(f: &WorkerFrame) -> &'static str {
 /// - `/etc` read-only — libc nss/resolver config (`ld.so.cache`,
 ///   `resolv.conf`, `nsswitch.conf`, `passwd` for `getpwuid`).
 /// - `/proc` read-only — many tools (cargo, rustc, ps) require it.
-/// - `/dev/null`, `/dev/urandom`, `/dev/zero` read-only.
+/// - `/dev/null`, `/dev/zero` **read+write** — character devices with
+///   silent writes; granting write so shell idioms (`cmd 2>/dev/null`,
+///   `cmd >/dev/null`) and `open(O_RDWR)` for mmap-based zero-init
+///   work. Bytes go nowhere.
+/// - `/dev/urandom` read-only — read for entropy; writes (which would
+///   add entropy and require CAP_SYS_ADMIN anyway) stay denied.
 /// - `/tmp` **read+write** — convenience for build temp files (cargo,
 ///   rustc, gcc). NB: this means a thread can read/write *any* file
 ///   under `/tmp`, not just its own workspace if the workspace happens
@@ -687,8 +692,16 @@ fn apply_landlock(
         AccessFs::from_read(abi),
     ))?;
 
+    // /dev/null + /dev/zero need write access — shell `2>/dev/null`
+    // redirects open the file with O_WRONLY, and mmap-based zero-init
+    // opens /dev/zero O_RDWR. Read-only blocks both. /dev/urandom stays
+    // read-only (writes add entropy via a privileged ioctl anyway).
     created = created.add_rules(path_beneath_rules(
-        ["/dev/null", "/dev/urandom", "/dev/zero"],
+        ["/dev/null", "/dev/zero"],
+        AccessFs::from_all(abi),
+    ))?;
+    created = created.add_rules(path_beneath_rules(
+        ["/dev/urandom"],
         AccessFs::from_read(abi),
     ))?;
 

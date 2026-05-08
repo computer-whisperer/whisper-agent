@@ -55,7 +55,8 @@ Pattern 1 is one layer. The others are **sandboxing** and **audit**.
 
 **Implicit grants under landlock.** The `local-landlock` provider applies a fixed set of grants on top of every spec's `allowed_paths`, because the worker (and the subprocesses it execs, like `bash`) needs system libs and tooling to function:
 
-- `/usr`, `/lib`, `/lib64`, `/bin`, `/sbin`, `/etc`, `/proc`, `/dev/{null,urandom,zero}` — read-only.
+- `/usr`, `/lib`, `/lib64`, `/bin`, `/sbin`, `/etc`, `/proc`, `/dev/urandom` — read-only.
+- `/dev/null`, `/dev/zero` — read+write (writes are silently dropped by the kernel; we grant write so shell `2>/dev/null` redirects and `open(O_RDWR)` for zero-init mmaps don't trip the sandbox).
 - `/tmp` — **read+write** (for build temp files: cargo, rustc, gcc). This means anything under `/tmp` is reachable, not just the workspace if the workspace lives there.
 - The directory containing the `mcp-host` binary — read-only (so exec works).
 
