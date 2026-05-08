@@ -194,13 +194,30 @@ fn translate_content_block(src: ContentBlock) -> McpContentBlock {
 }
 
 /// Schema-marker keyword that opts a parameter into upstream content-
-/// resolution. The dispatcher treats a property whose schema carries
-/// `"x-content-ref": "image"` as an index into the conversation's
-/// recent-image history; the model passes an integer, the dispatcher
-/// resolves it to a [`ContentBlock::Image`] in the
+/// resolution. A property whose schema carries
+/// `"x-content-ref": "image"` is treated as an image *handle* — a
+/// short hex string from [`image_handle`] — that the dispatcher
+/// matches against the conversation's recent-image history and
+/// resolves into a [`ContentBlock::Image`] on the
 /// [`whisper_agent_host_proto::Frame::InvokeTool`] sidecar before the
 /// daemon ever sees the call. Today only `"image"` is recognized.
+///
+/// Handles, not indices: indices are unstable under recall (recalling
+/// an image into context shifts every later index), handles are
+/// content-addressed and stable across the conversation lifetime.
 const CONTENT_REF_KEY: &str = "x-content-ref";
+
+/// Stable, short, content-addressed handle for an image. First 4
+/// bytes of a blake3 hash, formatted as 8 lowercase hex chars. 32
+/// bits is plenty for an in-conversation set — collision probability
+/// is microscopic at the scale a single conversation reaches —
+/// and short enough that the model can faithfully echo it back in
+/// tool arguments without typos.
+pub(crate) fn image_handle(bytes: &[u8]) -> String {
+    let h = blake3::hash(bytes);
+    let prefix = u32::from_be_bytes(h.as_bytes()[..4].try_into().expect("blake3 output ≥ 4B"));
+    format!("{prefix:08x}")
+}
 
 /// Walk a tool's input schema for [`CONTENT_REF_KEY`]-marked properties
 /// and resolve each into an attachment from `conversation`.
@@ -209,10 +226,12 @@ const CONTENT_REF_KEY: &str = "x-content-ref";
 /// - The marker value must be `"image"` (the only kind today). Other
 ///   values produce an error so a future kind can't silently fall
 ///   through to the wrong code path.
-/// - The argument bound to the marked property must be a non-negative
-///   integer; out-of-range values (no Nth-most-recent image in
-///   history) error before dispatch — the daemon never sees a
-///   half-resolved call.
+/// - The argument bound to the marked property must be a string
+///   matching the [`image_handle`] of an image present in the live
+///   conversation. Unknown handles error before dispatch — the
+///   daemon never sees a half-resolved call.
+/// - Handles are matched case-insensitively (callers may have
+///   uppercased mid-conversation); the stored form is lowercase.
 /// - Url-source images are skipped during the conversation walk
 ///   because the wire ContentBlock requires inline base64 bytes.
 ///
@@ -240,17 +259,19 @@ pub(crate) fn resolve_content_refs(
                 "tool input_schema declares unknown {CONTENT_REF_KEY}: `{kind}` on `{name}`"
             ));
         }
-        let index = arguments
+        let handle_arg = arguments
             .get(name)
-            .and_then(|v| v.as_u64())
+            .and_then(|v| v.as_str())
             .ok_or_else(|| {
-                format!("expected non-negative integer at argument `{name}` (image index)")
+                format!("expected string image handle at argument `{name}` (8-hex-char id)")
             })?;
+        let target = handle_arg.trim().to_ascii_lowercase();
         let images = images.get_or_insert_with(|| recent_image_bytes(conversation));
-        let (data, mime) = images.get(index as usize).ok_or_else(|| {
+        let found = images.iter().find(|(data, _)| image_handle(data) == target);
+        let (data, mime) = found.ok_or_else(|| {
             format!(
-                "image index {index} is out of range (only {} image(s) in current context)",
-                images.len()
+                "no image with handle `{target}` in current context \
+                 (use `list_images` to see available handles)"
             )
         })?;
         out.push(ContentBlock::Image {
@@ -271,7 +292,7 @@ pub(crate) fn resolve_content_refs(
 /// Cloned into owned `Vec<u8>` so the result outlives the
 /// `Conversation` borrow — call sites pre-collect once per dispatch
 /// and index into the snapshot.
-fn recent_image_bytes(conversation: &Conversation) -> Vec<(Vec<u8>, &'static str)> {
+pub(crate) fn recent_image_bytes(conversation: &Conversation) -> Vec<(Vec<u8>, &'static str)> {
     let mut out = Vec::new();
     for msg in conversation.messages().iter().rev() {
         for block in msg.content.iter().rev() {
@@ -352,16 +373,35 @@ mod tests {
         assert!(attach.is_empty());
     }
 
+    /// Handle is the 8-hex prefix of blake3. Stable across calls,
+    /// case-insensitive on the input side. This pins the format so
+    /// tools that surface handles to the model (e.g. `list_images`)
+    /// stay aligned with the resolver.
     #[test]
-    fn resolve_index_zero_returns_most_recent() {
+    fn image_handle_is_eight_lowercase_hex() {
+        let h = image_handle(&[1, 2, 3, 4]);
+        assert_eq!(h.len(), 8);
+        assert!(
+            h.chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
+        );
+        // Determinism: same bytes → same handle.
+        assert_eq!(h, image_handle(&[1, 2, 3, 4]));
+        // Different bytes → different handle (with overwhelming probability).
+        assert_ne!(h, image_handle(&[1, 2, 3, 5]));
+    }
+
+    #[test]
+    fn resolve_handle_returns_matching_image() {
         let schema = serde_json::json!({
             "type": "object",
             "properties": {
                 "path": { "type": "string" },
-                "index": { "type": "integer", CONTENT_REF_KEY: "image" }
+                "handle": { "type": "string", CONTENT_REF_KEY: "image" }
             }
         });
-        let args = serde_json::json!({ "path": "out.png", "index": 0 });
+        let target = image_handle(&[2, 2, 2]);
+        let args = serde_json::json!({ "path": "out.png", "handle": target });
         let conv =
             convo_with_images(&[(&[1, 1, 1], ImageMime::Jpeg), (&[2, 2, 2], ImageMime::Png)]);
         let attach = resolve_content_refs(&schema, &args, &conv).expect("resolve");
@@ -373,16 +413,23 @@ mod tests {
         assert_eq!(BASE64_STANDARD.decode(data).unwrap(), vec![2, 2, 2]);
     }
 
+    /// Handle stays valid no matter how many later images push it
+    /// off the front of the clipboard — that's the whole point of
+    /// content-addressing. Index would have shifted; handle does not.
     #[test]
-    fn resolve_index_n_walks_back() {
+    fn resolve_handle_stable_under_later_pushes() {
         let schema = serde_json::json!({
-            "type": "object",
             "properties": {
-                "index": { "type": "integer", CONTENT_REF_KEY: "image" }
+                "handle": { "type": "string", CONTENT_REF_KEY: "image" }
             }
         });
-        let args = serde_json::json!({ "index": 1 });
-        let conv = convo_with_images(&[(&[7, 7], ImageMime::Jpeg), (&[8, 8], ImageMime::Png)]);
+        let target = image_handle(&[7, 7]);
+        let conv = convo_with_images(&[
+            (&[7, 7], ImageMime::Jpeg),
+            (&[8, 8], ImageMime::Png),
+            (&[9, 9], ImageMime::Webp),
+        ]);
+        let args = serde_json::json!({ "handle": target });
         let attach = resolve_content_refs(&schema, &args, &conv).expect("resolve");
         let ContentBlock::Image { data, mime_type } = &attach[0] else {
             panic!("expected image block");
@@ -392,39 +439,52 @@ mod tests {
     }
 
     #[test]
-    fn resolve_index_out_of_range_errors() {
+    fn resolve_uppercase_handle_matches() {
         let schema = serde_json::json!({
             "properties": {
-                "index": { "type": "integer", CONTENT_REF_KEY: "image" }
+                "handle": { "type": "string", CONTENT_REF_KEY: "image" }
             }
         });
-        let args = serde_json::json!({ "index": 5 });
-        let conv = convo_with_images(&[(&[1], ImageMime::Png)]);
-        let err = resolve_content_refs(&schema, &args, &conv).expect_err("should error");
-        assert!(err.contains("out of range"), "got: {err}");
+        let target = image_handle(&[1, 2, 3]).to_ascii_uppercase();
+        let conv = convo_with_images(&[(&[1, 2, 3], ImageMime::Png)]);
+        let args = serde_json::json!({ "handle": target });
+        resolve_content_refs(&schema, &args, &conv).expect("uppercase handle should match");
     }
 
     #[test]
-    fn resolve_missing_index_arg_errors() {
+    fn resolve_unknown_handle_errors() {
         let schema = serde_json::json!({
             "properties": {
-                "index": { "type": "integer", CONTENT_REF_KEY: "image" }
+                "handle": { "type": "string", CONTENT_REF_KEY: "image" }
+            }
+        });
+        let args = serde_json::json!({ "handle": "00000000" });
+        let conv = convo_with_images(&[(&[1], ImageMime::Png)]);
+        let err = resolve_content_refs(&schema, &args, &conv).expect_err("should error");
+        assert!(err.contains("no image with handle"), "got: {err}");
+    }
+
+    #[test]
+    fn resolve_missing_handle_arg_errors() {
+        let schema = serde_json::json!({
+            "properties": {
+                "handle": { "type": "string", CONTENT_REF_KEY: "image" }
             }
         });
         let args = serde_json::json!({});
         let conv = convo_with_images(&[(&[1], ImageMime::Png)]);
         let err = resolve_content_refs(&schema, &args, &conv).expect_err("should error");
-        assert!(err.contains("non-negative integer"), "got: {err}");
+        assert!(err.contains("string image handle"), "got: {err}");
     }
 
     #[test]
     fn resolve_unknown_ref_kind_errors() {
         let schema = serde_json::json!({
             "properties": {
-                "x": { "type": "integer", CONTENT_REF_KEY: "audio" }
+                "x": { "type": "string", CONTENT_REF_KEY: "audio" }
             }
         });
-        let args = serde_json::json!({ "x": 0 });
+        let args = serde_json::json!({ "x": "deadbeef" });
         let conv = convo_with_images(&[(&[1], ImageMime::Png)]);
         let err = resolve_content_refs(&schema, &args, &conv).expect_err("should error");
         assert!(err.contains("audio"), "got: {err}");

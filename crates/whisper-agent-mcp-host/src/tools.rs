@@ -1005,24 +1005,20 @@ fn multi_match_hint(content: &str, old_string: &str) -> String {
 // ---------- save_image ----------
 
 /// Save a recently-seen image to a file in the workspace. The
-/// `index` parameter is a clipboard-style addressing scheme into
-/// the conversation's image history, resolved upstream by the
-/// scheduler before this tool ever runs — see
-/// `crate::tools::host_env_link` and
-/// `whisper_agent::runtime::v2_dispatch::resolve_content_refs`.
-/// At dispatch the resolved image rides as `attachments[0]`; this
-/// tool just decodes the base64 payload and writes the bytes.
+/// `handle` parameter is a content-addressed image handle (see
+/// `list_images` to discover them); the scheduler resolves it
+/// upstream and rides the bytes to this tool in `attachments[0]`.
+/// The worker just decodes the base64 payload and writes.
 fn save_image_descriptor() -> Tool {
     Tool {
         name: "save_image".into(),
-        description: "Write an image from the recent-image history of this conversation to \
-                      a file in the workspace. The most-recent image is `index = 0`; older \
-                      images are at higher indices (`1` is the second-most-recent, and so on). \
+        description: "Write an image from this conversation's image history to a file in the \
+                      workspace. `handle` is a content-addressed image handle from \
+                      `list_images` — call that first if you don't already have a handle. \
                       Image history includes user-uploaded images, model-generated images, \
-                      and image content from any tool result — anything currently in the \
-                      conversation. URL-source images aren't reachable; only inline-bytes \
-                      images can be saved. By default, refuses to overwrite an existing file; \
-                      pass `overwrite: true` to replace."
+                      and image content from any tool result; URL-source images aren't \
+                      reachable. By default, refuses to overwrite an existing file; pass \
+                      `overwrite: true` to replace."
             .into(),
         input_schema: json!({
             "type": "object",
@@ -1031,12 +1027,11 @@ fn save_image_descriptor() -> Tool {
                     "type": "string",
                     "description": "Destination path — absolute, or relative to the workspace root."
                 },
-                "index": {
-                    "type": "integer",
-                    "minimum": 0,
-                    "description": "Position into the conversation's recent-image history (0 = most recent).",
+                "handle": {
+                    "type": "string",
+                    "description": "Content-addressed image handle (8 hex chars) from `list_images`.",
                     // Custom marker the scheduler walks before dispatch:
-                    // resolves this integer into a ContentBlock and
+                    // resolves this handle into a ContentBlock and
                     // attaches it to the tool call's sidecar. The
                     // worker-side handler reads the bytes from
                     // `attachments[0]` rather than re-resolving here.
@@ -1047,7 +1042,7 @@ fn save_image_descriptor() -> Tool {
                     "description": "If true, replace an existing file at `path`. Default false."
                 }
             },
-            "required": ["path", "index"]
+            "required": ["path", "handle"]
         }),
         annotations: ToolAnnotations {
             title: Some("Save image".into()),
@@ -1062,13 +1057,13 @@ fn save_image_descriptor() -> Tool {
 #[derive(Deserialize)]
 struct SaveImageArgs {
     path: PathBuf,
-    // `index` is consumed by the scheduler-side resolver before the
+    // `handle` is consumed by the scheduler-side resolver before the
     // call reaches the worker; the byte payload arrives in
-    // `attachments[0]`. We still parse it for validation symmetry —
-    // a missing or non-integer `index` here means the resolver was
+    // `attachments[0]`. Still parsed for validation symmetry —
+    // a missing or non-string `handle` here means the resolver was
     // bypassed, which is a contract violation worth surfacing.
     #[allow(dead_code)]
-    index: u64,
+    handle: String,
     #[serde(default)]
     overwrite: bool,
 }
@@ -2519,31 +2514,36 @@ fn main() {
         }
     }
 
-    /// `save_image_descriptor`'s schema must mark `index` with the
-    /// `x-content-ref: image` keyword. The dispatcher relies on
-    /// scanning this marker to decide whether to resolve content
-    /// before forwarding — if the keyword goes missing, the resolver
+    /// `save_image_descriptor`'s schema must mark `handle` with the
+    /// `x-content-ref: image` keyword. The dispatcher scans this
+    /// marker to decide whether to resolve content before
+    /// forwarding — if the keyword goes missing, the resolver
     /// silently passes the call through and `save_image` errors at
-    /// runtime with "no resolved image attachment." Pin it here so a
-    /// future schema edit can't break the contract without flagging.
+    /// runtime with "no resolved image attachment." Pin it here so
+    /// a future schema edit can't break the contract without
+    /// flagging.
     #[test]
     fn save_image_schema_declares_content_ref_marker() {
         let d = save_image_descriptor();
         let marker = d
             .input_schema
             .get("properties")
-            .and_then(|p| p.get("index"))
+            .and_then(|p| p.get("handle"))
             .and_then(|i| i.get("x-content-ref"));
         assert_eq!(marker, Some(&json!("image")));
     }
 
+    /// `handle` is consumed by the scheduler-side resolver, but the
+    /// worker still parses it for symmetry. Pass any non-empty
+    /// string through here — the actual resolution is tested
+    /// upstream in `runtime::v2_dispatch::tests::resolve_*`.
     #[tokio::test]
     async fn save_image_writes_attachment_bytes_to_workspace() {
         let ws = test_workspace();
         let bytes: &[u8] = b"\x89PNG\r\n\x1a\nfake-png-bytes";
         let result = save_image(
             &ws,
-            json!({"path": "out.png", "index": 0}),
+            json!({"path": "out.png", "handle": "deadbeef"}),
             vec![fake_attachment(bytes, "image/png")],
         )
         .await;
@@ -2564,7 +2564,7 @@ fn main() {
         tokio::fs::write(&path, b"old").await.unwrap();
         let result = save_image(
             &ws,
-            json!({"path": "out.png", "index": 0}),
+            json!({"path": "out.png", "handle": "deadbeef"}),
             vec![fake_attachment(b"new", "image/png")],
         )
         .await;
@@ -2580,7 +2580,7 @@ fn main() {
         tokio::fs::write(&path, b"old").await.unwrap();
         let result = save_image(
             &ws,
-            json!({"path": "out.png", "index": 0, "overwrite": true}),
+            json!({"path": "out.png", "handle": "deadbeef", "overwrite": true}),
             vec![fake_attachment(b"new", "image/png")],
         )
         .await;
@@ -2594,7 +2594,12 @@ fn main() {
     #[tokio::test]
     async fn save_image_errors_when_attachment_missing() {
         let ws = test_workspace();
-        let result = save_image(&ws, json!({"path": "out.png", "index": 0}), vec![]).await;
+        let result = save_image(
+            &ws,
+            json!({"path": "out.png", "handle": "deadbeef"}),
+            vec![],
+        )
+        .await;
         assert_eq!(result.is_error, Some(true));
     }
 
