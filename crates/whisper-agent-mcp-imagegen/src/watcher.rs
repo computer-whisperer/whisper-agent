@@ -22,6 +22,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use arc_swap::ArcSwap;
 use notify::{Event, EventKind, RecursiveMode, Watcher, recommended_watcher};
+use reqwest::Client;
 use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 
@@ -36,6 +37,7 @@ pub async fn watch(
     config_path: PathBuf,
     backend_name: String,
     resolved: Arc<ArcSwap<Resolved>>,
+    http: Client,
 ) -> Result<()> {
     let parent = config_path
         .parent()
@@ -96,7 +98,8 @@ pub async fn watch(
             }
         }
         match config::resolve(&config_path, &backend_name) {
-            Ok(new) => {
+            Ok(mut new) => {
+                config::refresh_chat_model(&http, &mut new).await;
                 let auth_mode = match &new.auth {
                     whisper_agent_auth::ClientAuth::ApiKey(_) => "api_key",
                     whisper_agent_auth::ClientAuth::Codex(_) => "chatgpt_subscription",

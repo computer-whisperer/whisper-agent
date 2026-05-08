@@ -11,8 +11,12 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow};
+use reqwest::Client;
 use serde::Deserialize;
+use tracing::warn;
 use whisper_agent_auth::{Auth, ClientAuth};
+
+use crate::codex;
 
 /// Top-level subset of `whisper-agent.toml`.
 #[derive(Deserialize, Debug)]
@@ -125,6 +129,30 @@ pub fn resolve(config_path: &Path, backend_name: &str) -> Result<Resolved> {
         image_model: DEFAULT_IMAGE_MODEL.to_string(),
         chat_model,
     })
+}
+
+/// On the Codex auth path, replace `resolved.chat_model` with whatever the
+/// upstream `/models` endpoint considers current — `gpt-5` (and friends)
+/// rotate quickly, and a stale default is the most common cause of HTTP
+/// 400 from the subscription host. Discovery failures are logged and the
+/// resolve-time value is left in place so the daemon stays up.
+pub async fn refresh_chat_model(http: &Client, resolved: &mut Resolved) {
+    if !matches!(resolved.auth, ClientAuth::Codex(_)) {
+        return;
+    }
+    match codex::discover_chat_model(http, &resolved.auth, &resolved.api_base).await {
+        Ok(slug) => {
+            tracing::info!(model = %slug, "discovered chat model from /models endpoint");
+            resolved.chat_model = slug;
+        }
+        Err(e) => {
+            warn!(
+                error = %e,
+                fallback = %resolved.chat_model,
+                "model discovery failed; using fallback"
+            );
+        }
+    }
 }
 
 /// Discover the config path the same way the main `whisper-agent` daemon

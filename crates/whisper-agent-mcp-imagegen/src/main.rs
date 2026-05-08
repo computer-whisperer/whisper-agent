@@ -93,8 +93,9 @@ async fn main() -> Result<()> {
         .context("build reqwest client")?;
 
     let config_path = config::discover_config_path(args.config)?;
-    let initial = config::resolve(&config_path, &args.backend)
+    let mut initial = config::resolve(&config_path, &args.backend)
         .with_context(|| format!("initial resolve from {}", config_path.display()))?;
+    config::refresh_chat_model(&http, &mut initial).await;
     let auth_mode = match &initial.auth {
         whisper_agent_auth::ClientAuth::ApiKey(_) => "api_key",
         whisper_agent_auth::ClientAuth::Codex(_) => "chatgpt_subscription",
@@ -112,7 +113,7 @@ async fn main() -> Result<()> {
     let resolved = Arc::new(ArcSwap::from_pointee(initial));
 
     let cfg = Arc::new(tools::ImageGenConfig {
-        http,
+        http: http.clone(),
         resolved: Arc::clone(&resolved),
         default_size: args.default_size,
         default_quality: args.default_quality,
@@ -123,8 +124,16 @@ async fn main() -> Result<()> {
     let watcher_path = config_path.clone();
     let watcher_backend = args.backend.clone();
     let watcher_resolved = Arc::clone(&resolved);
+    let watcher_http = http.clone();
     tokio::spawn(async move {
-        if let Err(e) = watcher::watch(watcher_path, watcher_backend, watcher_resolved).await {
+        if let Err(e) = watcher::watch(
+            watcher_path,
+            watcher_backend,
+            watcher_resolved,
+            watcher_http,
+        )
+        .await
+        {
             error!(error = %e, "config watcher exited");
         }
     });

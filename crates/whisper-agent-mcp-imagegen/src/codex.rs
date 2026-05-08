@@ -33,6 +33,65 @@ use whisper_agent_auth::ClientAuth;
 /// can split into multiple tool calls if they need variations.
 pub const MAX_N_VIA_RESPONSES: u32 = 1;
 
+/// Sent to the Codex `/models` endpoint as `?client_version=…`. The backend
+/// gates models on this; setting it high (matching the main daemon) lets us
+/// see whatever the upstream considers current. Mirrors
+/// `CODEX_CLIENT_VERSION` in the main crate's openai_responses module.
+const CODEX_CLIENT_VERSION: &str = "99.0.0";
+
+/// Query the Codex `/models` endpoint and return the first model the
+/// backend marks as `supported_in_api && visibility == "list"`. Caller
+/// should use this in preference to a hardcoded model name — the Codex
+/// roster moves (`gpt-5` was retired in favor of `gpt-5.x`/`gpt-5.x-codex`),
+/// and a stale default is the most common cause of HTTP 400 from the
+/// subscription host.
+pub async fn discover_chat_model(
+    http: &Client,
+    auth: &ClientAuth,
+    api_base: &str,
+) -> Result<String> {
+    #[derive(Deserialize)]
+    struct CodexModelsResponse {
+        #[serde(default)]
+        models: Vec<CodexModel>,
+    }
+    #[derive(Deserialize)]
+    struct CodexModel {
+        slug: String,
+        #[serde(default)]
+        visibility: Option<String>,
+        #[serde(default)]
+        supported_in_api: bool,
+    }
+
+    let url = format!("{api_base}/models?client_version={CODEX_CLIENT_VERSION}");
+    let (bearer, extras) = auth
+        .prepare_headers(http)
+        .await
+        .map_err(|e| anyhow!("auth: {e}"))?;
+    let mut req = http.get(&url).bearer_auth(&bearer);
+    for (k, v) in &extras {
+        req = req.header(*k, v);
+    }
+    let resp = req.send().await.map_err(|e| anyhow!("send: {e}"))?;
+    let status = resp.status();
+    if !status.is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        return Err(anyhow!(
+            "/models HTTP {}: {}",
+            status.as_u16(),
+            crate::tools::truncate_for_display(&body, 512)
+        ));
+    }
+    let parsed: CodexModelsResponse = resp.json().await.map_err(|e| anyhow!("decode: {e}"))?;
+    parsed
+        .models
+        .into_iter()
+        .find(|m| m.supported_in_api && m.visibility.as_deref() == Some("list"))
+        .map(|m| m.slug)
+        .ok_or_else(|| anyhow!("/models returned no `supported_in_api && visibility=list` entries"))
+}
+
 pub struct Request<'a> {
     pub http: &'a Client,
     pub auth: &'a ClientAuth,
