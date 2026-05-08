@@ -1010,11 +1010,13 @@ mod tests {
                 name: "bash".into(),
                 description: "run a shell command".into(),
                 params: Vec::new(),
+                kind: whisper_agent_protocol::ToolKind::Function,
             },
             ToolSpec {
                 name: "read_file".into(),
                 description: "read a file".into(),
                 params: Vec::new(),
+                kind: whisper_agent_protocol::ToolKind::Function,
             },
         ]
     }

@@ -1082,10 +1082,11 @@ fn build_model_request(
     let tools: Vec<ToolSpec> = task
         .conversation
         .tool_schemas()
-        .map(|(name, description, params)| ToolSpec {
-            name: name.to_string(),
-            description: description.to_string(),
-            params: params.to_vec(),
+        .map(|t| ToolSpec {
+            name: t.name.to_string(),
+            description: t.description.to_string(),
+            params: t.params.to_vec(),
+            kind: t.kind,
         })
         .collect();
     let setup_end = task.conversation.setup_prefix_end();

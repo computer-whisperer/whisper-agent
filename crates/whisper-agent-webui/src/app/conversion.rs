@@ -91,10 +91,12 @@ pub(super) fn add_message_items(msg: &Message, msg_index: usize, out: &mut Vec<D
                         name,
                         description,
                         params,
+                        kind,
                     } => Some(whisper_agent_protocol::ToolSchema {
                         name: name.clone(),
                         description: description.clone(),
                         params: params.clone(),
+                        kind: *kind,
                     }),
                     _ => None,
                 })

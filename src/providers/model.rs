@@ -18,8 +18,8 @@ use serde_json::Value;
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 use whisper_agent_protocol::{
-    ContentBlock, ContentCapabilities, ImageMime, MediaSupport, Message, ParamSpec, ToolSchema,
-    Usage,
+    ContentBlock, ContentCapabilities, ImageMime, MediaSupport, Message, ParamSpec, ToolKind,
+    ToolSchema, Usage,
 };
 
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
@@ -67,6 +67,12 @@ pub struct ToolSpec {
     /// JSON-Schema-shaped input, so this is a thin wrapper around
     /// [`ToolSchema::input_schema_value`].
     pub params: Vec<ParamSpec>,
+    /// Function-call (default, agent-side dispatch) vs ProviderBuiltin
+    /// (provider runs the tool inline; no tool_use → tool_result
+    /// roundtrip). Adapters branch on this in their `tools` wire
+    /// shaping (e.g. OpenAI's `image_generation` is `{type: "image_generation"}`,
+    /// not `{type: "function", function: {...}}`).
+    pub kind: ToolKind,
 }
 
 impl ToolSpec {
@@ -78,6 +84,7 @@ impl ToolSpec {
             name: self.name.clone(),
             description: self.description.clone(),
             params: self.params.clone(),
+            kind: self.kind,
         }
         .input_schema_value()
     }

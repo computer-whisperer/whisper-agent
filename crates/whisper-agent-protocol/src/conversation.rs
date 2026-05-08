@@ -9,7 +9,15 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::tool_schema::ParamSpec;
+use crate::tool_schema::{ParamSpec, ToolKind};
+
+#[derive(Clone, Copy, Debug)]
+pub struct ToolSchemaRef<'a> {
+    pub name: &'a str,
+    pub description: &'a str,
+    pub params: &'a [ParamSpec],
+    pub kind: ToolKind,
+}
 
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -503,6 +511,11 @@ pub enum ContentBlock {
         description: String,
         #[serde(default)]
         params: Vec<ParamSpec>,
+        /// Function-call tool (default) vs provider-side built-in.
+        /// Skipped on serialization when `Function` so existing thread
+        /// JSONs don't grow a noisy field on every tool entry.
+        #[serde(default, skip_serializing_if = "ToolKind::is_function")]
+        kind: ToolKind,
     },
 }
 
@@ -665,11 +678,14 @@ impl Conversation {
         }
     }
 
+    /// Borrowed view of one tool schema entry in a thread's manifest.
+    /// Yielded by [`Self::tool_schemas`].
+    ///
     /// Iterator over the `Role::ToolSchema` entries stored in the
     /// thread's `Role::Tools` manifest message. Returns an empty iter
     /// if the manifest slot isn't populated — adapters interpret that
     /// as "this thread has no tools available."
-    pub fn tool_schemas(&self) -> impl Iterator<Item = (&str, &str, &[ParamSpec])> {
+    pub fn tool_schemas(&self) -> impl Iterator<Item = ToolSchemaRef<'_>> {
         let idx = match self.messages.first() {
             Some(m) if m.role == Role::System => 1,
             _ => 0,
@@ -685,7 +701,13 @@ impl Conversation {
                 name,
                 description,
                 params,
-            } => Some((name.as_str(), description.as_str(), params.as_slice())),
+                kind,
+            } => Some(ToolSchemaRef {
+                name: name.as_str(),
+                description: description.as_str(),
+                params: params.as_slice(),
+                kind: *kind,
+            }),
             _ => None,
         })
     }

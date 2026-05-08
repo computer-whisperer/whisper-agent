@@ -32,7 +32,7 @@ pub use pod::{
     CompactionConfig, FsEntry, NamedHostEnv, PodAllow, PodAllowCaps, PodConfig, PodLimits,
     PodSnapshot, PodState, PodSummary, ThreadDefaultCaps, ThreadDefaults,
 };
-pub use tool_schema::{ParamSpec, ParamType, ToolSchema};
+pub use tool_schema::{ParamSpec, ParamType, ToolKind, ToolSchema};
 pub use tool_surface::{ActivationSurface, CoreTools, InitialListing, ToolSurface};
 // `SystemPromptChoice` is defined below; re-export here so other
 // crates can refer to it as `whisper_agent_protocol::SystemPromptChoice`.

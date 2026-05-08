@@ -34,6 +34,36 @@ pub struct ToolSchema {
     pub description: String,
     #[serde(default)]
     pub params: Vec<ParamSpec>,
+    /// Whether this tool runs agent-side (function-call protocol) or
+    /// provider-side (built-in tool the model invokes inside the same
+    /// request, with the result returned inline). Defaults to
+    /// [`ToolKind::Function`] for back-compat with persisted threads
+    /// and any third-party caller producing schemas without this field.
+    #[serde(default, skip_serializing_if = "ToolKind::is_function")]
+    pub kind: ToolKind,
+}
+
+/// How a tool is executed. Function tools are dispatched by the agent
+/// (built-in handlers, MCP servers, host-env daemons); ProviderBuiltin
+/// tools are run inside the provider's API request itself, with the
+/// result returned as part of the assistant message — there's no
+/// separate `tool_use` → `tool_result` round-trip.
+///
+/// Today the only ProviderBuiltin we wire up is OpenAI's
+/// `image_generation`; the same plumbing extends to `web_search`,
+/// `file_search`, `code_interpreter`, etc. when we add them.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolKind {
+    #[default]
+    Function,
+    ProviderBuiltin,
+}
+
+impl ToolKind {
+    pub fn is_function(&self) -> bool {
+        matches!(self, ToolKind::Function)
+    }
 }
 
 /// One named parameter on a tool. `required` is denormalized off the
@@ -106,6 +136,7 @@ impl ToolSchema {
             name: name.into(),
             description: description.into(),
             params: parse_root_params(input_schema),
+            kind: ToolKind::Function,
         }
     }
 
