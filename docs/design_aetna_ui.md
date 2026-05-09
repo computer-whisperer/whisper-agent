@@ -555,7 +555,7 @@ lines:
 - knowledge buckets
 - ✅ behavior editor (v1: name / description / trigger kind /
   cron schedule / prompt — sheet, not dialog)
-- pod editor (raw TOML)
+- ✅ pod editor (raw TOML — sheet, not dialog)
 - ✅ new pod
 - ✅ new behavior
 - fork thread
@@ -647,6 +647,33 @@ Deferred to follow-up sheet slices:
   side `WritePodFile`, mirroring egui).
 - **Raw TOML tab** — the escape hatch for malformed configs;
   needs a `toml::to_string_pretty` round-trip for sync.
+
+**Pod editor sheet (landed):** mirrors the behavior editor's
+sheet shape but the body is much simpler — a single
+monospace `text_area` over the pod's raw `pod.toml`. The wire
+surface (`UpdatePodConfig { toml_text: String }`) takes the
+text directly; the server parses + validates and replies with
+`Error` on parse failure (surfaced inline) or
+`PodConfigUpdated` on success (closes the sheet on correlation
+match). The text_area's default Hug height combined with the
+outer `scroll` lets long pod.tomls scroll the whole sheet body
+rather than clipping internally.
+
+Entry point: a `settings`-icon button in the sidebar header,
+rendered only when some pod tab is active. Single key
+(`sidebar:pod-settings`) — at any moment exactly one pod is
+active, so the click target is implicitly scoped to whatever's
+selected.
+
+Save short-circuits the no-op case (`working_toml ==
+baseline_toml`) so a re-save without edits surfaces "no
+changes to save" rather than a wire round-trip. v1 explicitly
+does not surface a structured form (allow lists, host_envs,
+MCP hosts, sandbox, thread_defaults) — those land in
+follow-up slices that mirror the egui pod editor's
+multi-tabbed shape, but the raw-only path covers the 80%
+case (and remains the escape hatch for any malformed config
+the structured form can't represent).
 
 ### ✅ Stage 9 — Login form
 

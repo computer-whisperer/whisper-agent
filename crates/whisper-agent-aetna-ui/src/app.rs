@@ -534,6 +534,14 @@ pub struct ChatApp {
     /// `BehaviorSnapshot` lands and populates `working_config` /
     /// `working_prompt`.
     behavior_editor: Option<BehaviorEditorSheetState>,
+    /// Pod editor sheet state. `Some` while the right-hand raw-TOML
+    /// editor is open for a pod; `None` when closed. Hydrates from
+    /// a `GetPod` round-trip — the snapshot's `toml_text` becomes the
+    /// edit buffer. v1 ships exactly the raw-TOML escape hatch; the
+    /// structured tabs (allow lists, host_envs, MCP hosts, sandbox)
+    /// land in follow-up slices once `sheet`-shaped form composition
+    /// has more surface to share with the behavior editor.
+    pod_editor: Option<PodEditorSheetState>,
     /// Monotonic counter for outgoing `correlation_id` strings.
     /// Each modal that sends a request claims an id and waits for
     /// the matching reply (success or `Error`) before closing or
@@ -765,6 +773,55 @@ impl BehaviorEditorSheetState {
     }
 }
 
+/// Form state for the pod editor sheet. v1 surface is a single
+/// `text_area` over the pod's raw `pod.toml`. Server validates the
+/// parse on `UpdatePodConfig` and replies with `Error` on failure or
+/// `PodConfigUpdated` on success. A failed parse leaves the working
+/// buffer alone so the user can fix and retry without losing edits.
+/// Structured tabs (allow lists, host_envs, MCP hosts, sandbox) land
+/// in a follow-up slice — the egui sibling exposes them as additional
+/// tabs alongside the raw editor; aetna v1 takes the raw-only path
+/// for parity with the protocol's `toml_text`-shaped wire surface.
+pub(crate) struct PodEditorSheetState {
+    pub(crate) pod_id: String,
+    /// Edit buffer. Empty until the snapshot lands.
+    pub(crate) working_toml: String,
+    /// Server-known baseline. Save reads it to short-circuit no-op
+    /// saves; future Revert reads it to restore the original. Tracked
+    /// even though v1 doesn't surface Revert because the cost is one
+    /// String clone per snapshot.
+    pub(crate) baseline_toml: String,
+    /// Validation message: server `Error` echo (parse failure) or
+    /// the editor's own diagnostics. Cleared on the next text edit.
+    pub(crate) error: Option<String>,
+    /// Correlation id of the in-flight `GetPod` request, if any.
+    pub(crate) pending_get: Option<String>,
+    /// Correlation id of the in-flight `UpdatePodConfig` request,
+    /// if any. Cleared on `PodConfigUpdated` (close) or `Error`
+    /// (re-enable + surface message).
+    pub(crate) pending_save: Option<String>,
+}
+
+impl PodEditorSheetState {
+    fn new(pod_id: String, pending_get: String) -> Self {
+        Self {
+            pod_id,
+            working_toml: String::new(),
+            baseline_toml: String::new(),
+            error: None,
+            pending_get: Some(pending_get),
+            pending_save: None,
+        }
+    }
+
+    fn hydrate(&mut self, snapshot: whisper_agent_protocol::PodSnapshot) {
+        self.pending_get = None;
+        self.error = None;
+        self.working_toml = snapshot.toml_text.clone();
+        self.baseline_toml = snapshot.toml_text;
+    }
+}
+
 impl ChatApp {
     pub fn new(inbound: Inbound, send_fn: SendFn) -> Self {
         Self {
@@ -802,6 +859,7 @@ impl ChatApp {
             new_pod_modal: None,
             new_behavior_modal: None,
             behavior_editor: None,
+            pod_editor: None,
             correlation_counter: 0,
         }
     }
@@ -903,6 +961,45 @@ impl ChatApp {
                 let pod_ids: Vec<String> = self.pods.keys().cloned().collect();
                 for pod_id in pod_ids {
                     self.ensure_behaviors_requested(&pod_id);
+                }
+            }
+            ServerToClient::PodSnapshot {
+                snapshot,
+                correlation_id,
+            } => {
+                // The pod editor sheet is the only sender of
+                // `GetPod` today. Match by correlation; an unrelated
+                // snapshot (none expected, but defensively) drops on
+                // the floor. The pod_id check guards against the
+                // user closing-then-reopening the editor for a
+                // different pod within the round-trip window.
+                if let Some(editor) = self.pod_editor.as_mut()
+                    && editor.pending_get.as_ref() == correlation_id.as_ref()
+                    && editor.pod_id == snapshot.pod_id
+                {
+                    editor.hydrate(snapshot);
+                }
+            }
+            ServerToClient::PodConfigUpdated {
+                pod_id: _,
+                toml_text: _,
+                parsed: _,
+                correlation_id,
+            } => {
+                // Close the pod editor sheet when its in-flight
+                // `UpdatePodConfig` lands. Match by correlation so an
+                // update from another client doesn't close a sheet
+                // the user is still editing in. We don't refresh any
+                // local state from `parsed` here — `pods` is a list
+                // of summaries (`PodSummary`, not `PodConfig`), so
+                // nothing in the sidebar projection changed; if any
+                // visible field did change (e.g. pod display name)
+                // a follow-up `PodList` broadcast would carry it.
+                if let Some(editor) = self.pod_editor.as_ref()
+                    && let Some(pending) = editor.pending_save.as_ref()
+                    && correlation_id.as_ref() == Some(pending)
+                {
+                    self.pod_editor = None;
                 }
             }
             ServerToClient::PodCreated {
@@ -1420,6 +1517,24 @@ impl ChatApp {
                             consumed = true;
                         }
                     }
+                    // Pod editor — same two-slot pattern as the
+                    // behavior editor (pending_get / pending_save).
+                    // A save failure here is the common case (e.g.
+                    // the server rejected the new TOML's parse or
+                    // failed validation); the inline alert tells the
+                    // user what went wrong without having to switch
+                    // contexts.
+                    if !consumed && let Some(editor) = self.pod_editor.as_mut() {
+                        if editor.pending_save.as_ref() == Some(corr) {
+                            editor.error = Some(message.clone());
+                            editor.pending_save = None;
+                            consumed = true;
+                        } else if editor.pending_get.as_ref() == Some(corr) {
+                            editor.error = Some(message.clone());
+                            editor.pending_get = None;
+                            consumed = true;
+                        }
+                    }
                 }
                 // Thread-scoped errors land on the view's failure
                 // slot so the pane's destructive banner has
@@ -1527,6 +1642,12 @@ impl App for ChatApp {
         // Idempotent — clicking twice while open just resets the
         // form, which matches what the user means by "I want to
         // start over".
+        if event.is_click_or_activate(SIDEBAR_POD_SETTINGS_KEY) {
+            if let Some(pod) = self.pod_tab.clone() {
+                self.open_pod_editor(pod);
+            }
+            return;
+        }
         if event.is_click_or_activate(SIDEBAR_NEW_POD_KEY) {
             self.new_pod_modal = Some(NewPodModalState::default());
             return;
@@ -1563,6 +1684,11 @@ impl App for ChatApp {
         // description / prompt / cron schedule), the trigger-kind
         // picker, primary Save, secondary Cancel, scrim Dismiss.
         if self.handle_behavior_editor_event(&event) {
+            return;
+        }
+        // Pod editor sheet routing — single text_area + Save /
+        // Cancel / Dismiss.
+        if self.handle_pod_editor_event(&event) {
             return;
         }
 
@@ -1857,6 +1983,22 @@ const BEHAVIOR_DELETE_PREFIX: &str = "behavior-delete:";
 /// Click opens the [`BEHAVIOR_EDITOR_KEY`] sheet and fires
 /// `GetBehavior` to hydrate the form.
 const BEHAVIOR_EDIT_PREFIX: &str = "behavior-edit:";
+
+/// Routed key for the active-pod settings gear in the sidebar header
+/// — opens the pod editor sheet for `pod_tab` (rendered only when
+/// some pod is active). Single key, not pod-id-suffixed, because at
+/// any moment exactly one pod is active and the click target is
+/// scoped to whatever's selected.
+const SIDEBAR_POD_SETTINGS_KEY: &str = "sidebar:pod-settings";
+
+/// Routed-key prefix the pod editor sheet uses. Extended keys:
+/// `{prefix}:dismiss` (scrim), `{prefix}:toml` (text_area body),
+/// `{prefix}:save` (primary), `{prefix}:cancel` (secondary).
+const POD_EDITOR_KEY: &str = "pod-editor";
+const POD_EDITOR_TOML_KEY: &str = "pod-editor:toml";
+const POD_EDITOR_SAVE_KEY: &str = "pod-editor:save";
+const POD_EDITOR_CANCEL_KEY: &str = "pod-editor:cancel";
+const POD_EDITOR_DISMISS_KEY: &str = "pod-editor:dismiss";
 
 /// Routed-key prefix the per-behavior editor sheet uses. Extended
 /// keys: `{prefix}:dismiss` (scrim, emitted by `sheet`),
@@ -2164,7 +2306,13 @@ impl ChatApp {
         // pod-tab-agnostic (the threads-section "+" is per-pod), so
         // putting it in the sidebar header keeps the two scopes
         // visually distinct.
-        let mut entries: Vec<El> = vec![sidebar_header([row([
+        // Header chrome on the right: "+ new pod" first, then the
+        // active-pod settings gear (only when a pod is selected — a
+        // gear without a target would be confusing), then the
+        // connection badge. Settings sits adjacent to the pod tab
+        // strip below it, so visually scoped to "this pod" even
+        // though the click is on the header row.
+        let mut header_row: Vec<El> = vec![
             // Title eats the slack and ellipses if the right-hand
             // chrome grows past the remaining width (e.g. the wider
             // "connecting…" badge during early connect). The app
@@ -2177,11 +2325,20 @@ impl ChatApp {
                 .key(SIDEBAR_NEW_POD_KEY)
                 .ghost()
                 .icon_size(tokens::ICON_XS),
-            self.connection_badge(),
-        ])
-        .align(Align::Center)
-        .gap(tokens::SPACE_2)
-        .width(Size::Fill(1.0))])];
+        ];
+        if self.pod_tab.is_some() {
+            header_row.push(
+                icon_button("settings")
+                    .key(SIDEBAR_POD_SETTINGS_KEY)
+                    .ghost()
+                    .icon_size(tokens::ICON_XS),
+            );
+        }
+        header_row.push(self.connection_badge());
+        let mut entries: Vec<El> = vec![sidebar_header([row(header_row)
+            .align(Align::Center)
+            .gap(tokens::SPACE_2)
+            .width(Size::Fill(1.0))])];
 
         if self.pods.is_empty() {
             entries.push(text("no pods yet").muted().small());
@@ -3001,6 +3158,9 @@ impl ChatApp {
                 out.push(Some(self.behavior_editor_trigger_kind_menu()));
             }
         }
+        if let Some(sheet_el) = self.render_pod_editor_sheet() {
+            out.push(Some(sheet_el));
+        }
         out
     }
 
@@ -3787,6 +3947,174 @@ impl ChatApp {
         .map(|k| (k.wire_value().to_string(), k.display_label().to_string()))
         .collect();
         select_menu(BEHAVIOR_EDITOR_TRIGGER_KIND_KEY, options)
+    }
+
+    /// Open (or re-target) the pod editor sheet for `pod_id`. Mints
+    /// a correlation, fires `GetPod`, hangs the sheet on
+    /// `pod_editor`. No-op if the sheet is already open for the same
+    /// pod (avoids re-firing the round-trip and trampling pending
+    /// edits). A different pod takes over wholesale; any in-flight
+    /// snapshot for the previous pod will arrive with a stale
+    /// correlation and be dropped on the floor.
+    fn open_pod_editor(&mut self, pod_id: String) {
+        if let Some(existing) = self.pod_editor.as_ref()
+            && existing.pod_id == pod_id
+        {
+            return;
+        }
+        let correlation_id = self.next_correlation_id();
+        self.pod_editor = Some(PodEditorSheetState::new(
+            pod_id.clone(),
+            correlation_id.clone(),
+        ));
+        self.send(ClientToServer::GetPod {
+            correlation_id: Some(correlation_id),
+            pod_id,
+        });
+    }
+
+    /// Routing for the pod editor sheet. Mirrors the behavior editor
+    /// shape: text_area edits, primary Save, secondary Cancel, scrim
+    /// Dismiss. Returns `true` when consumed.
+    fn handle_pod_editor_event(&mut self, event: &UiEvent) -> bool {
+        if self.pod_editor.is_none() {
+            return false;
+        }
+
+        if event.target_key() == Some(POD_EDITOR_TOML_KEY) {
+            if let Some(editor) = self.pod_editor.as_mut() {
+                text_area::apply_event(
+                    &mut editor.working_toml,
+                    &mut self.selection,
+                    POD_EDITOR_TOML_KEY,
+                    event,
+                );
+                editor.error = None;
+            }
+            return true;
+        }
+
+        if event.is_click_or_activate(POD_EDITOR_CANCEL_KEY)
+            || event.is_click_or_activate(POD_EDITOR_DISMISS_KEY)
+        {
+            self.pod_editor = None;
+            return true;
+        }
+
+        if event.is_click_or_activate(POD_EDITOR_SAVE_KEY) {
+            self.submit_pod_editor();
+            return true;
+        }
+
+        false
+    }
+
+    /// Validate + dispatch the pod editor's Save. Server does the
+    /// heavy lifting (parse + validate); the client only short-
+    /// circuits the no-op case where the buffer matches the
+    /// baseline. Mints a correlation, stashes it in `pending_save`,
+    /// ships `UpdatePodConfig`. Wire echo (`PodConfigUpdated` or
+    /// `Error`) closes or re-enables the sheet via the inbound arm.
+    fn submit_pod_editor(&mut self) {
+        let Some(editor) = self.pod_editor.as_ref() else {
+            return;
+        };
+        if editor.pending_save.is_some() {
+            return;
+        }
+        if editor.pending_get.is_some() {
+            // Snapshot still in flight — saving an empty buffer
+            // would clobber the on-disk pod with whitespace. Refuse
+            // until hydration completes.
+            return;
+        }
+        if editor.working_toml == editor.baseline_toml {
+            self.set_pod_editor_error("no changes to save".into());
+            return;
+        }
+        let pod_id = editor.pod_id.clone();
+        let toml_text = editor.working_toml.clone();
+        let correlation_id = self.next_correlation_id();
+        if let Some(editor) = self.pod_editor.as_mut() {
+            editor.pending_save = Some(correlation_id.clone());
+            editor.error = None;
+        }
+        self.send(ClientToServer::UpdatePodConfig {
+            correlation_id: Some(correlation_id),
+            pod_id,
+            toml_text,
+        });
+    }
+
+    fn set_pod_editor_error(&mut self, msg: String) {
+        if let Some(editor) = self.pod_editor.as_mut() {
+            editor.error = Some(msg);
+        }
+    }
+
+    /// Render the pod editor sheet if open. Same `sheet` + `scroll`
+    /// shape as the behavior editor; the only meaningful difference
+    /// is the body — one big monospace `text_area` over the raw TOML
+    /// instead of a structured form. The text_area takes a fixed
+    /// height (480 px) so it dominates the sheet's visual real
+    /// estate; scroll wraps it so smaller viewports still see the
+    /// footer.
+    fn render_pod_editor_sheet(&self) -> Option<El> {
+        let editor = self.pod_editor.as_ref()?;
+
+        let pod_label = self
+            .pods
+            .get(&editor.pod_id)
+            .map(|p| p.name.clone())
+            .unwrap_or_else(|| editor.pod_id.clone());
+        let header = sheet_header([
+            sheet_title(format!("Pod settings — {pod_label}")),
+            sheet_description(
+                "Edit the pod's `pod.toml` directly. The server parses + \
+                 validates on save; a parse failure surfaces inline and \
+                 the on-disk file is left untouched.",
+            ),
+        ]);
+
+        let body: El = if editor.pending_get.is_some() {
+            paragraph("loading pod…").muted()
+        } else {
+            // Monospace text_area for raw TOML. Default sizing is
+            // Fill width / Hug height — the field grows to fit its
+            // content. Vertical overflow is handled by the enclosing
+            // `scroll` (the body wrapper below), so a 200-line
+            // pod.toml scrolls the whole sheet body rather than
+            // clipping inside the text_area.
+            text_area(&editor.working_toml, &self.selection, POD_EDITOR_TOML_KEY).mono()
+        };
+
+        let pending_save = editor.pending_save.is_some();
+        let dirty = editor.working_toml != editor.baseline_toml;
+        let mut save = button(if pending_save { "Saving…" } else { "Save" })
+            .key(POD_EDITOR_SAVE_KEY)
+            .primary();
+        if editor.pending_get.is_some() || pending_save || !dirty {
+            save = save.disabled();
+        }
+        let cancel = button("Cancel").key(POD_EDITOR_CANCEL_KEY);
+
+        let mut body_children: Vec<El> = vec![body];
+        if let Some(err) = editor.error.as_deref() {
+            body_children.push(
+                alert([
+                    alert_title("couldn't save pod"),
+                    alert_description(err.to_string()),
+                ])
+                .destructive(),
+            );
+        }
+        let scroll_body = scroll(body_children)
+            .key("pod-editor:scroll")
+            .gap(tokens::SPACE_4);
+
+        let children: Vec<El> = vec![header, scroll_body, sheet_footer([cancel, save])];
+
+        Some(sheet(POD_EDITOR_KEY, SheetSide::Right, children))
     }
 
     fn backend_menu(&self) -> El {

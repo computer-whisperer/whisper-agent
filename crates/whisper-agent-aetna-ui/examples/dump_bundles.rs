@@ -240,10 +240,17 @@ enum Scene {
     /// Verifies the menu paints over the sheet panel via
     /// `popover_layers` ordering.
     BehaviorEditorTriggerKindOpen,
+    /// Pod editor sheet, hydrated against the active pod's
+    /// `pod.toml`. Click sequence: gear icon in the sidebar header
+    /// (only rendered when `pod_tab.is_some()`). The per-scene
+    /// SendFn synthesizes a `PodSnapshot` reply when the matching
+    /// `GetPod` lands, then the dump loop's second `before_build`
+    /// drain hydrates the editor before render.
+    PodEditorHydrated,
 }
 
 impl Scene {
-    const ALL: [Scene; 32] = [
+    const ALL: [Scene; 33] = [
         Scene::Connecting,
         Scene::Connected,
         Scene::Closed,
@@ -276,6 +283,7 @@ impl Scene {
         Scene::NewBehaviorModalEmpty,
         Scene::BehaviorEditorHydrated,
         Scene::BehaviorEditorTriggerKindOpen,
+        Scene::PodEditorHydrated,
     ];
 
     fn slug(self) -> &'static str {
@@ -312,6 +320,7 @@ impl Scene {
             Scene::NewBehaviorModalEmpty => "new_behavior_modal_empty",
             Scene::BehaviorEditorHydrated => "behavior_editor_hydrated",
             Scene::BehaviorEditorTriggerKindOpen => "behavior_editor_trigger_kind_open",
+            Scene::PodEditorHydrated => "pod_editor_hydrated",
         }
     }
 
@@ -376,6 +385,10 @@ impl Scene {
                 "behavior-edit:default:architect",
                 "behavior-editor:trigger-kind",
             ],
+            // Click the gear icon — sidebar header's pod-settings
+            // affordance. Renders only when `pod_tab.is_some()`,
+            // which it is here (PodList seeded a default).
+            Scene::PodEditorHydrated => vec!["sidebar:pod-settings"],
             // Pick a backend (which fires a no-op `ListModels`),
             // then a model id from the pre-seeded `ModelsList`,
             // then a pod. Each `option:` click goes through
@@ -427,6 +440,24 @@ fn build_app(scene: Scene) -> Box<dyn App> {
                             snapshot: mock_architect_snapshot(),
                         },
                     ));
+                }
+            })
+        }
+        Scene::PodEditorHydrated => {
+            let queue = inbound.clone();
+            Box::new(move |msg| {
+                if let ClientToServer::GetPod {
+                    correlation_id,
+                    pod_id,
+                } = msg
+                    && pod_id == "default"
+                {
+                    queue
+                        .borrow_mut()
+                        .push_back(InboundEvent::Wire(ServerToClient::PodSnapshot {
+                            correlation_id,
+                            snapshot: mock_default_pod_snapshot(),
+                        }));
                 }
             })
         }
@@ -692,6 +723,28 @@ fn build_app(scene: Scene) -> Box<dyn App> {
                 correlation_id: None,
                 pod_id: "default".into(),
                 behaviors: mock_mavis_behaviors(),
+            }));
+        }
+        Scene::PodEditorHydrated => {
+            // Connection + pod list (so the active-pod gear renders),
+            // plus an empty thread list so the right pane is the
+            // no-selection compose form (visible behind the right-
+            // attached sheet). Pod settings click then fires GetPod;
+            // the per-scene SendFn injects the matching PodSnapshot
+            // reply, drained by the dump loop's second before_build.
+            q.push_back(InboundEvent::ConnectionOpened);
+            q.push_back(InboundEvent::Wire(ServerToClient::PodList {
+                correlation_id: None,
+                pods: mock_pods(),
+                default_pod_id: "default".into(),
+            }));
+            q.push_back(InboundEvent::Wire(ServerToClient::ThreadList {
+                correlation_id: None,
+                tasks: Vec::new(),
+            }));
+            q.push_back(InboundEvent::Wire(ServerToClient::BackendsList {
+                correlation_id: None,
+                backends: mock_backends(),
             }));
         }
         Scene::SidebarBehaviorsEmpty => {
@@ -1140,6 +1193,80 @@ fn mock_architect_snapshot() -> whisper_agent_protocol::BehaviorSnapshot {
             queued_payload: None,
         },
         load_error: None,
+    }
+}
+
+/// Hydrated `PodSnapshot` for the `default` pod that the pod-editor
+/// scene opens. Mirrors what `GetPod` returns from a running server:
+/// a parsed `PodConfig` plus the raw `pod.toml` text the sheet's
+/// `text_area` renders. The sheet only reads `toml_text`, so the
+/// `config` stub stays minimal — the on-wire surface is what the
+/// scene exercises visually.
+fn mock_default_pod_snapshot() -> whisper_agent_protocol::PodSnapshot {
+    use whisper_agent_protocol::{
+        AllowMap, CompactionConfig, NamedHostEnv, PodAllow, PodConfig, PodLimits, PodSnapshot,
+        ThreadDefaults,
+    };
+    let toml_text = r#"name = "default"
+description = "the synthesized server-default pod"
+created_at = "2026-05-01T00:00:00Z"
+
+[allow]
+backends = ["anthropic-prod", "openai-team"]
+mcp_hosts = ["filesystem", "git"]
+knowledge_buckets = ["wiki"]
+
+[[allow.host_env]]
+name = "main"
+provider = "shell"
+host = "127.0.0.1"
+
+[allow.tools]
+default = "allow"
+
+[thread_defaults]
+backend = "anthropic-prod"
+model = "claude-opus-4-7"
+system_prompt_file = "system_prompt.md"
+max_tokens = 16384
+max_turns = 30
+host_env = ["main"]
+mcp_hosts = ["filesystem", "git"]
+"#
+    .to_string();
+    let config = PodConfig {
+        name: "default".into(),
+        description: Some("the synthesized server-default pod".into()),
+        created_at: "2026-05-01T00:00:00Z".into(),
+        allow: PodAllow {
+            backends: vec!["anthropic-prod".into(), "openai-team".into()],
+            mcp_hosts: vec!["filesystem".into(), "git".into()],
+            host_env: Vec::<NamedHostEnv>::new(),
+            knowledge_buckets: vec!["wiki".into()],
+            tools: AllowMap::allow_all(),
+            caps: Default::default(),
+        },
+        thread_defaults: ThreadDefaults {
+            backend: "anthropic-prod".into(),
+            model: "claude-opus-4-7".into(),
+            system_prompt_file: "system_prompt.md".into(),
+            max_tokens: 16384,
+            max_turns: 30,
+            host_env: vec!["main".into()],
+            mcp_hosts: vec!["filesystem".into(), "git".into()],
+            compaction: CompactionConfig::default(),
+            caps: Default::default(),
+            tool_surface: Default::default(),
+        },
+        limits: PodLimits::default(),
+    };
+    PodSnapshot {
+        pod_id: "default".into(),
+        config,
+        toml_text,
+        threads: Vec::new(),
+        archived: false,
+        behaviors: Vec::new(),
     }
 }
 
