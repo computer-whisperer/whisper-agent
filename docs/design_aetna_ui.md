@@ -261,7 +261,7 @@ tab strip rather than ported piecemeal. Multi-slice rollout:
   relative-activity in the muted second line. Dispatch children
   left-padded by `SPACE_3 * depth`. "Show N more" pagination at
   `SIDEBAR_THREAD_PREVIEW = 10` rows. No new wire calls.
-- **🌗 Slice β — behaviors first-class.** Per-pod `Behaviors (N)`
+- **✅ Slice β — behaviors first-class.** Per-pod `Behaviors (N)`
   subsection *below* the threads section, populated via
   `ListBehaviors` (deduped per pod per connection) and kept fresh
   by `BehaviorList` / `BehaviorCreated` / `BehaviorUpdated` /
@@ -278,10 +278,19 @@ tab strip rather than ported piecemeal. Multi-slice rollout:
   filters its rows to interactive (no origin) plus orphan-origin
   (origin set but behavior not in registry) — orphans get a
   `· via {behavior}` description suffix so deleted-behavior
-  provenance stays visible. Per-row actions (Run, Pause, Edit,
-  Delete) still pending — slice β.2 / γ. Cron schedule
-  humanization deferred since `BehaviorSummary` doesn't carry the
-  schedule string; lands in γ alongside `GetBehavior`.
+  provenance stays visible.
+
+  **β.2** added inline action toolbars in the expanded body: a
+  Run-now button (`RunBehavior`, disabled on errored rows since
+  the scheduler would just bounce) and a Pause/Resume toggle
+  (`SetBehaviorEnabled`). Wire echoes (`ThreadCreated` for runs,
+  `BehaviorStateChanged` for the toggle) update the local view
+  on the next tick — no optimistic mutation, so the UI never
+  diverges from server state.
+
+  Edit / Delete still pending γ (need modals + arm-confirm). Cron
+  schedule humanization also γ since `BehaviorSummary` doesn't
+  carry the schedule string and needs a `GetBehavior` round-trip.
 - **⏳ Slice γ — danger affordances.** Inline arm-confirm pattern
   (probably a small `danger_button` helper that animates "Click again
   to confirm") for archive-pod / delete-behavior. Hooks into the

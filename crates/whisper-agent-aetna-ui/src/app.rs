@@ -929,6 +929,50 @@ impl App for ChatApp {
             return;
         }
 
+        // Behavior Run-now button: fire `RunBehavior` for the
+        // `{pod_id}:{behavior_id}` pair. Server replies with
+        // `ThreadCreated` carrying the spawned thread; the
+        // sidebar's behavior-section then nests it under the row
+        // automatically (no special routing needed here).
+        if let Some(key) = event.route()
+            && let Some(rest) = key.strip_prefix(BEHAVIOR_RUN_PREFIX)
+            && matches!(event.kind, UiEventKind::Click | UiEventKind::Activate)
+            && let Some((pod, beh)) = rest.split_once(':')
+        {
+            self.send(ClientToServer::RunBehavior {
+                correlation_id: None,
+                pod_id: pod.to_string(),
+                behavior_id: beh.to_string(),
+                payload: None,
+            });
+            return;
+        }
+
+        // Behavior Pause/Resume toggle: send `SetBehaviorEnabled`
+        // with the inverse of whatever we currently believe. Don't
+        // optimistically mutate local state — the server's
+        // `BehaviorStateChanged` echo is sub-millisecond on
+        // loopback and the canonical source.
+        if let Some(key) = event.route()
+            && let Some(rest) = key.strip_prefix(BEHAVIOR_TOGGLE_PREFIX)
+            && matches!(event.kind, UiEventKind::Click | UiEventKind::Activate)
+            && let Some((pod, beh)) = rest.split_once(':')
+        {
+            let next_enabled = self
+                .behaviors_by_pod
+                .get(pod)
+                .and_then(|list| list.iter().find(|b| b.behavior_id == beh))
+                .map(|b| !b.enabled)
+                .unwrap_or(true);
+            self.send(ClientToServer::SetBehaviorEnabled {
+                correlation_id: None,
+                pod_id: pod.to_string(),
+                behavior_id: beh.to_string(),
+                enabled: next_enabled,
+            });
+            return;
+        }
+
         // Compose `text_area` edits: when the routed target is the
         // compose box, fold the event through aetna's controlled-
         // widget helper. The buffer is per-thread when a thread is
@@ -1053,9 +1097,24 @@ const SIDEBAR_THREAD_PREVIEW: usize = 10;
 /// prefix carry `{pod_id}:{behavior_id}`. Distinct from the
 /// `thread:` prefix so the two click-target families don't collide.
 const BEHAVIOR_ROW_PREFIX: &str = "behavior-row:";
+/// Manual-fire button inside an expanded behavior body. Sends
+/// `RunBehavior` for the matching `{pod_id}:{behavior_id}` pair.
+const BEHAVIOR_RUN_PREFIX: &str = "behavior-run:";
+/// Pause/resume toggle inside an expanded behavior body. Sends
+/// `SetBehaviorEnabled` with the inverse of the row's current
+/// `enabled` flag for the matching `{pod_id}:{behavior_id}` pair.
+const BEHAVIOR_TOGGLE_PREFIX: &str = "behavior-toggle:";
 
 fn behavior_row_key(pod_id: &str, behavior_id: &str) -> String {
     format!("{BEHAVIOR_ROW_PREFIX}{pod_id}:{behavior_id}")
+}
+
+fn behavior_run_key(pod_id: &str, behavior_id: &str) -> String {
+    format!("{BEHAVIOR_RUN_PREFIX}{pod_id}:{behavior_id}")
+}
+
+fn behavior_toggle_key(pod_id: &str, behavior_id: &str) -> String {
+    format!("{BEHAVIOR_TOGGLE_PREFIX}{pod_id}:{behavior_id}")
 }
 
 /// Composite expansion-state key for `expanded_behaviors`. Mirrors
@@ -1386,6 +1445,7 @@ impl ChatApp {
             let expanded = self.expanded_behaviors.contains(&expand_key);
             rows.push(self.behavior_item_row(pod_id, b, runs.len(), expanded));
             if expanded {
+                rows.push(self.behavior_actions_row(pod_id, b));
                 if runs.is_empty() {
                     rows.push(text("no runs yet").muted().small().padding(Sides {
                         left: tokens::SPACE_3 + tokens::SPACE_3,
@@ -1483,6 +1543,38 @@ impl ChatApp {
 
         let key = behavior_row_key(pod_id, &b.behavior_id);
         item([content, actions]).key(key)
+    }
+
+    /// Inline action toolbar shown inside an expanded behavior body.
+    /// Two compact buttons: Run-now (always enabled when the
+    /// behavior loaded — manual `RunBehavior` works regardless of
+    /// the `enabled` flag), and a Pause/Resume toggle reflecting
+    /// the current `enabled` state. Errored behaviors get the Run
+    /// button disabled — their config didn't load, so firing would
+    /// just bounce off the scheduler. Edit / Delete still pending
+    /// (slice γ; need modals).
+    fn behavior_actions_row(&self, pod_id: &str, b: &BehaviorSummary) -> El {
+        let mut run = button("Run now")
+            .key(behavior_run_key(pod_id, &b.behavior_id))
+            .ghost();
+        if b.load_error.is_some() {
+            run = run.disabled();
+        }
+        let toggle_label = if b.enabled { "Pause" } else { "Resume" };
+        let toggle = button(toggle_label)
+            .key(behavior_toggle_key(pod_id, &b.behavior_id))
+            .ghost();
+        // Indent matches the nested-thread depth=1 left-pad so the
+        // toolbar visually belongs to the expanded body.
+        row([run, toggle])
+            .gap(tokens::SPACE_2)
+            .padding(Sides {
+                left: tokens::SPACE_3 + tokens::SPACE_3,
+                right: tokens::SPACE_3,
+                top: tokens::SPACE_1,
+                bottom: tokens::SPACE_1,
+            })
+            .width(Size::Fill(1.0))
     }
 
     /// Build the pod selector row. Single-active selection keyed
