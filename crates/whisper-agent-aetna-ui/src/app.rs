@@ -215,6 +215,22 @@ pub struct ChatApp {
     // ----- catalog (server-broadcast tier) -----
     pods: HashMap<String, PodSummary>,
     threads: HashMap<String, ThreadSummary>,
+    /// Server's "route `CreateThread { pod_id: None }` here" pod —
+    /// echoed on every `PodList`. Used as the auto-select default
+    /// for the sidebar's pod tabs on first connect, and as the
+    /// "Default pod" sentinel resolution target.
+    default_pod_id: Option<String>,
+
+    // ----- sidebar nav -----
+    /// Pod whose threads the sidebar is currently showing. Single
+    /// active pod at a time (tabs idiom) so the sidebar has space
+    /// to surface threads + behaviors + dispatch nesting per pod
+    /// without competing for vertical real estate.
+    pod_tab: Option<String>,
+    /// Per-pod sidebar paginations: pods whose thread list is
+    /// fully expanded (otherwise capped at [`SIDEBAR_THREAD_PREVIEW`]
+    /// rows and a "Show N more" toggle).
+    expanded_pod_threads: HashSet<String>,
 
     // ----- model catalog (request/response tier) -----
     /// Backends advertised by the server. Populated from
@@ -304,6 +320,9 @@ impl ChatApp {
             list_requested: false,
             pods: HashMap::new(),
             threads: HashMap::new(),
+            default_pod_id: None,
+            pod_tab: None,
+            expanded_pod_threads: HashSet::new(),
             backends: Vec::new(),
             models_by_backend: HashMap::new(),
             requested_models_for: HashSet::new(),
@@ -379,11 +398,34 @@ impl ChatApp {
 
     fn dispatch_wire(&mut self, msg: ServerToClient) {
         match msg {
-            ServerToClient::PodList { pods, .. } => {
+            ServerToClient::PodList {
+                pods,
+                default_pod_id,
+                ..
+            } => {
                 self.pods = pods.into_iter().map(|p| (p.pod_id.clone(), p)).collect();
+                if !default_pod_id.is_empty() {
+                    self.default_pod_id = Some(default_pod_id);
+                }
+                // Seed the sidebar's active pod tab on first PodList
+                // (or after a reconnect that cleared it). Prefer the
+                // server-declared default; fall back to whichever
+                // non-archived pod sorts first by name. If the
+                // currently-tabbed pod no longer exists in the list,
+                // re-pick.
+                let valid = self
+                    .pod_tab
+                    .as_ref()
+                    .is_some_and(|p| self.pods.contains_key(p));
+                if !valid {
+                    self.pod_tab = self.pick_default_pod_tab();
+                }
             }
             ServerToClient::PodCreated { pod, .. } => {
                 self.pods.insert(pod.pod_id.clone(), pod);
+                if self.pod_tab.is_none() {
+                    self.pod_tab = self.pick_default_pod_tab();
+                }
             }
             ServerToClient::ThreadList { tasks, .. } => {
                 // Replace wholesale: server's list is authoritative.
@@ -713,6 +755,40 @@ impl App for ChatApp {
             return;
         }
 
+        // Sidebar pod-tab strip. `tabs::apply_event` parses the
+        // `pod-tabs:tab:{id}` routed key back to an id; the parse
+        // closure rejects ids we no longer know about (defensive
+        // against a stale event arriving after a `PodList` shrunk
+        // the set).
+        let pod_tab_changed = aetna_core::widgets::tabs::apply_event(
+            &mut self.pod_tab,
+            &event,
+            POD_TABS_KEY,
+            |raw| {
+                if self.pods.contains_key(raw) {
+                    Some(Some(raw.to_string()))
+                } else {
+                    None
+                }
+            },
+        );
+        if pod_tab_changed {
+            return;
+        }
+
+        // "Show N more" / "Show less" toggle on the active pod's
+        // thread list. One toggle per pod (the active one), so we
+        // key membership in `expanded_pod_threads` by the active
+        // pod_id.
+        if event.is_click_or_activate(SIDEBAR_SHOWMORE_KEY) {
+            if let Some(pod) = self.pod_tab.clone()
+                && !self.expanded_pod_threads.remove(&pod)
+            {
+                self.expanded_pod_threads.insert(pod);
+            }
+            return;
+        }
+
         // Compose `text_area` edits: when the routed target is the
         // compose box, fold the event through aetna's controlled-
         // widget helper. The buffer is per-thread when a thread is
@@ -816,6 +892,21 @@ impl App for ChatApp {
 
 const COMPOSE_KEY: &str = "compose";
 const SEND_KEY: &str = "send";
+
+/// Routed key for the sidebar's pod-tab strip. Per-tab option keys
+/// are auto-derived as `pod-tabs:tab:{pod_id}` by `tabs_list`.
+const POD_TABS_KEY: &str = "pod-tabs";
+
+/// Routed key for the "Show N more" / "Show less" toggle that
+/// expands the active pod's thread list past
+/// [`SIDEBAR_THREAD_PREVIEW`]. One toggle per pod (the active one)
+/// so a single shared key is fine.
+const SIDEBAR_SHOWMORE_KEY: &str = "sidebar:showmore";
+
+/// Default-collapsed cap on per-pod thread rows in the sidebar.
+/// Mirrors `whisper-agent-webui::THREAD_ROW_PREVIEW_COUNT`. The
+/// "Show N more" toggle reveals the full list per pod.
+const SIDEBAR_THREAD_PREVIEW: usize = 10;
 
 // Routed keys for the new-thread compose form's three `select_trigger`
 // pickers. Each `select_menu` in the build pass shares its trigger key
@@ -1041,10 +1132,11 @@ impl ChatApp {
     }
 
     fn sidebar(&self) -> El {
-        // `sidebar([...])` bundles the canonical Panel-surface
-        // recipe: width = `tokens::SIDEBAR_WIDTH`, fill/stroke from
-        // theme tokens, default padding + gap. We compose its
-        // children from `sidebar_header` + per-pod `sidebar_group`.
+        // The redesign: pod tabs at the top, single active pod whose
+        // threads (and eventually behaviors) fill the rest. The
+        // egui sibling's pod-as-collapsible-section idiom doesn't
+        // scale when one pod dominates and the others are empty —
+        // tabs put the focus on the workspace the user is in.
         let mut entries: Vec<El> = vec![sidebar_header([row([
             text("whisper-agent").title().width(Size::Fill(1.0)),
             self.connection_badge(),
@@ -1053,44 +1145,131 @@ impl ChatApp {
         .gap(tokens::SPACE_2)
         .width(Size::Fill(1.0))])];
 
-        // Pods sorted: non-archived first, then by pod_id for stability.
-        // Within each pod, threads sorted by last_active descending so
-        // the most recently touched thread floats to the top.
-        let mut pods: Vec<&PodSummary> = self.pods.values().collect();
-        pods.sort_by(|a, b| {
-            a.archived
-                .cmp(&b.archived)
-                .then_with(|| a.pod_id.cmp(&b.pod_id))
-        });
-
-        if pods.is_empty() {
+        if self.pods.is_empty() {
             entries.push(text("no pods yet").muted().small());
+            return sidebar(entries);
         }
 
-        for pod in pods {
-            let mut group_children: Vec<El> = vec![sidebar_group_label(pod_label(pod))];
+        entries.push(self.pod_tabs());
 
-            let mut pod_threads: Vec<&ThreadSummary> = self
-                .threads
-                .values()
-                .filter(|t| t.pod_id == pod.pod_id)
-                .collect();
-            pod_threads.sort_by(|a, b| b.last_active.cmp(&a.last_active));
-
-            if pod_threads.is_empty() {
-                group_children.push(text("no threads").muted().xsmall());
-            } else {
-                let menu_items: Vec<El> = pod_threads
-                    .iter()
-                    .map(|t| sidebar_menu_item(self.thread_row(t)))
-                    .collect();
-                group_children.push(sidebar_menu(menu_items));
-            }
-
-            entries.push(sidebar_group(group_children));
+        if let Some(active) = self.pod_tab.as_deref() {
+            entries.push(self.threads_section(active));
         }
 
         sidebar(entries)
+    }
+
+    /// Build the pod selector row. Single-active selection keyed
+    /// `POD_TABS_KEY`; per-tab option keys auto-derived as
+    /// `pod-tabs:tab:{pod_id}` by `tabs_list`.
+    fn pod_tabs(&self) -> El {
+        let pods = self.sorted_pods();
+        // Tabs default to the empty string when nothing is active —
+        // `tabs_list` reads the `current` value to mark the
+        // selected trigger and wouldn't match any real pod_id.
+        let current = self.pod_tab.clone().unwrap_or_default();
+        let options: Vec<(String, String)> = pods
+            .iter()
+            .map(|p| (p.pod_id.clone(), pod_tab_label(p)))
+            .collect();
+        tabs_list(POD_TABS_KEY, &current, options)
+    }
+
+    /// Threads section for the active pod: header + paginated list
+    /// of `item` rows. The `+` action (new thread in this pod) and
+    /// behaviors subsection are out of scope for slice α.
+    fn threads_section(&self, pod_id: &str) -> El {
+        let mut threads: Vec<&ThreadSummary> = self
+            .threads
+            .values()
+            .filter(|t| t.pod_id == pod_id)
+            .collect();
+        // Newest activity floats to the top; ties broken by created_at
+        // (stable across rebuilds since both fields are server-side
+        // monotonic).
+        threads.sort_by(|a, b| b.last_active.cmp(&a.last_active));
+
+        let total = threads.len();
+        let header_label = format!("Threads ({total})");
+        let header = row([sidebar_group_label(header_label).width(Size::Fill(1.0))])
+            .padding(Sides::xy(tokens::SPACE_2, tokens::SPACE_1))
+            .width(Size::Fill(1.0));
+
+        let mut group_children: Vec<El> = vec![header];
+
+        if threads.is_empty() {
+            group_children.push(
+                text("no threads in this pod yet")
+                    .muted()
+                    .small()
+                    .padding(Sides::xy(tokens::SPACE_2, tokens::SPACE_1)),
+            );
+            return sidebar_group(group_children);
+        }
+
+        let ordered = order_threads_by_dispatch(&threads);
+        let expanded = self.expanded_pod_threads.contains(pod_id);
+        let shown = if expanded {
+            ordered.len()
+        } else {
+            ordered.len().min(SIDEBAR_THREAD_PREVIEW)
+        };
+
+        let rows: Vec<El> = ordered[..shown]
+            .iter()
+            .map(|(t, depth)| self.thread_item_row(t, *depth))
+            .collect();
+        group_children.push(item_group(rows));
+
+        let hidden = ordered.len().saturating_sub(shown);
+        if hidden > 0 {
+            group_children.push(
+                button(format!("Show {hidden} more"))
+                    .ghost()
+                    .key(SIDEBAR_SHOWMORE_KEY)
+                    .width(Size::Fill(1.0)),
+            );
+        } else if expanded && ordered.len() > SIDEBAR_THREAD_PREVIEW {
+            group_children.push(
+                button("Show less")
+                    .ghost()
+                    .key(SIDEBAR_SHOWMORE_KEY)
+                    .width(Size::Fill(1.0)),
+            );
+        }
+
+        sidebar_group(group_children)
+    }
+
+    /// One thread row in the sidebar. Uses aetna's `item` widget
+    /// (the canonical "object/action list row" affordance), keyed
+    /// by `thread:{id}` so the existing on_event routing stays
+    /// intact. Title sits above a muted second line of
+    /// `state · relative_time`. Dispatch children are
+    /// left-padded by `depth * SPACE_3` so chains read top-down
+    /// without needing inline marker glyphs on every row.
+    fn thread_item_row(&self, t: &ThreadSummary, depth: usize) -> El {
+        let key = format!("thread:{}", t.thread_id);
+        let is_current = self.selected.as_deref() == Some(t.thread_id.as_str());
+
+        let title = t.title.as_deref().unwrap_or(&t.thread_id).to_string();
+        let secondary = format!(
+            "{} · {}",
+            state_label(t.state),
+            format_relative(&t.last_active),
+        );
+
+        let content = item_content([item_title(title), item_description(secondary)]);
+        let mut row_el = item([content]).key(key);
+        if is_current {
+            row_el = row_el.current();
+        }
+        if depth > 0 {
+            // Item's default left padding is SPACE_3. Add an extra
+            // SPACE_3 per dispatch level to surface parentage.
+            row_el = row_el.pl(tokens::SPACE_3 + tokens::SPACE_3 * depth as f32);
+        }
+        row_el
     }
 
     fn connection_badge(&self) -> El {
@@ -1104,15 +1283,35 @@ impl ChatApp {
         }
     }
 
-    fn thread_row(&self, t: &ThreadSummary) -> El {
-        let key = format!("thread:{}", t.thread_id);
-        let current = self.selected.as_deref() == Some(t.thread_id.as_str());
-        // `sidebar_menu_button` handles the `current` styling itself
-        // (Surface/Current vs Ghost). We tack the routing key on
-        // after construction. The displayed label is trimmed to keep
-        // the fixed sidebar width — `ellipsis()` would also work but
-        // a hard char cut keeps the dump deterministic.
-        sidebar_menu_button(thread_label(t), current).key(key)
+    /// Pods sorted for display: non-archived first, then by name
+    /// (display) for stability. Returns slice borrows into
+    /// [`Self::pods`] so the caller can read fields without
+    /// cloning.
+    fn sorted_pods(&self) -> Vec<&PodSummary> {
+        let mut pods: Vec<&PodSummary> = self.pods.values().collect();
+        pods.sort_by(|a, b| {
+            a.archived
+                .cmp(&b.archived)
+                .then_with(|| a.name.cmp(&b.name))
+                .then_with(|| a.pod_id.cmp(&b.pod_id))
+        });
+        pods
+    }
+
+    /// Pick a sensible default pod for the sidebar's active tab.
+    /// Prefers the server-declared `default_pod_id`; falls back to
+    /// the first non-archived pod by display name. Returns `None`
+    /// only when there are no pods yet (sidebar shows "no pods").
+    fn pick_default_pod_tab(&self) -> Option<String> {
+        if let Some(id) = &self.default_pod_id
+            && self.pods.contains_key(id)
+        {
+            return Some(id.clone());
+        }
+        self.sorted_pods()
+            .into_iter()
+            .find(|p| !p.archived)
+            .map(|p| p.pod_id.clone())
     }
 
     fn content(&self) -> El {
@@ -1480,12 +1679,13 @@ fn empty_state(label: &str) -> El {
         .height(Size::Fill(1.0))
 }
 
-fn pod_label(pod: &PodSummary) -> String {
-    if pod.archived {
-        format!("{} (archived)", pod.name)
-    } else {
-        pod.name.clone()
-    }
+/// Compact label for the sidebar's pod tab pill. Shows the pod name
+/// with a thread-count suffix so an empty pod is visible at a glance;
+/// archived pods get a trailing marker so the tab still reads sensibly
+/// when the user has un-hidden them.
+fn pod_tab_label(pod: &PodSummary) -> String {
+    let suffix = if pod.archived { " (archived)" } else { "" };
+    format!("{}{suffix}", pod.name)
 }
 
 /// Map a `ThreadStateLabel` to a styled badge. Color mirrors the
@@ -1514,19 +1714,99 @@ fn state_label(state: whisper_agent_protocol::ThreadStateLabel) -> &'static str 
     }
 }
 
-fn thread_label(t: &ThreadSummary) -> String {
-    let title = t.title.as_deref().unwrap_or("untitled");
-    // Sidebar width is fixed; trim long titles so they don't push
-    // the row wider and force the button to ellipsize awkwardly.
-    let trimmed = take_chars(title, 32);
-    if trimmed.len() < title.len() {
-        format!("{trimmed}…")
-    } else {
-        trimmed
+/// Format an RFC3339 timestamp as a compact relative duration:
+/// `"12m"`, `"3h"`, `"1d"`, `"2w"`, `"5mo"`, `"2y"`. Mirrors the
+/// egui sibling's `format_relative_time`. Returns `"just now"` for
+/// sub-minute deltas and `""` for parse failures (callers can drop
+/// the row's secondary line entirely if they care).
+fn format_relative(rfc3339: &str) -> String {
+    let Ok(parsed) = chrono::DateTime::parse_from_rfc3339(rfc3339) else {
+        return String::new();
+    };
+    let now = chrono::Utc::now();
+    let delta = now.signed_duration_since(parsed.with_timezone(&chrono::Utc));
+    let secs = delta.num_seconds();
+    if secs < 60 {
+        return "just now".to_string();
     }
+    let mins = secs / 60;
+    if mins < 60 {
+        return format!("{mins}m");
+    }
+    let hours = mins / 60;
+    if hours < 24 {
+        return format!("{hours}h");
+    }
+    let days = hours / 24;
+    if days < 14 {
+        return format!("{days}d");
+    }
+    let weeks = days / 7;
+    if weeks < 8 {
+        return format!("{weeks}w");
+    }
+    let months = days / 30;
+    if months < 24 {
+        return format!("{months}mo");
+    }
+    let years = days / 365;
+    format!("{years}y")
+}
+
+/// Reorder a flat list of threads into DFS-by-dispatch order. Each
+/// root is followed by its dispatched children (transitively); rare
+/// in production, but when a thread fans out to N subthreads the
+/// indent makes the parentage scan-able. Children whose parent isn't
+/// in the input list are promoted to roots so nothing is lost; cycles
+/// are broken by a visited set (the scheduler enforces a depth cap,
+/// but defensive code is cheap).
+fn order_threads_by_dispatch<'a>(flat: &[&'a ThreadSummary]) -> Vec<(&'a ThreadSummary, usize)> {
+    let in_set: HashSet<&str> = flat.iter().map(|t| t.thread_id.as_str()).collect();
+    let by_id: HashMap<&str, &ThreadSummary> =
+        flat.iter().map(|t| (t.thread_id.as_str(), *t)).collect();
+
+    // Sibling order: walk `flat` in input order so the newest-first
+    // sort is preserved within each bucket.
+    let mut children_of: HashMap<&str, Vec<&ThreadSummary>> = HashMap::new();
+    let mut roots: Vec<&ThreadSummary> = Vec::new();
+    for t in flat {
+        match t.dispatched_by.as_deref() {
+            Some(parent) if in_set.contains(parent) => {
+                children_of.entry(parent).or_default().push(t);
+            }
+            _ => roots.push(t),
+        }
+    }
+
+    let mut visited: HashSet<&str> = HashSet::new();
+    let mut out: Vec<(&ThreadSummary, usize)> = Vec::new();
+    let mut stack: Vec<(&ThreadSummary, usize)> =
+        roots.into_iter().rev().map(|t| (t, 0_usize)).collect();
+    while let Some((t, depth)) = stack.pop() {
+        if !visited.insert(t.thread_id.as_str()) {
+            continue;
+        }
+        out.push((t, depth));
+        if let Some(kids) = children_of.get(t.thread_id.as_str()) {
+            // Reverse-push so the original order is preserved on pop.
+            for kid in kids.iter().rev() {
+                stack.push((kid, depth + 1));
+            }
+        }
+    }
+    // Promote any unreached children (ones whose parent landed in
+    // `flat` but the BFS missed — defensive against cycles).
+    for t in flat {
+        if visited.insert(t.thread_id.as_str()) {
+            out.push((t, 0));
+        }
+    }
+    let _ = by_id; // reserved for parent lookup if we add hover tooltips later
+    out
 }
 
 /// Take up to `n` chars from a string, respecting char boundaries.
+#[allow(dead_code)]
 fn take_chars(s: &str, n: usize) -> String {
     s.chars().take(n).collect()
 }

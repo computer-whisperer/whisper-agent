@@ -190,10 +190,18 @@ Successive refactors moved the UI off hand-rolled chrome onto aetna's
 purpose-built widgets. The rules of thumb:
 
 - **Sidebar.** `sidebar([...])` for the surface, `sidebar_header([...])`
-  for the title row, per-pod `sidebar_group([sidebar_group_label("name"),
-  sidebar_menu([sidebar_menu_item(button), ...])])`. Selected nav is the
-  `current` treatment (`SurfaceRole::Current`, ACCENT fill — quieter than
-  `primary`), produced by `sidebar_menu_button(label, current)`.
+  for the title row. The active *workspace* is selected via a `tabs_list`
+  pod-tab strip at the top — single active pod at a time, so the rest of
+  the sidebar can spend its vertical real estate on that pod's threads
+  (and eventually behaviors, dispatch nesting, filters) instead of
+  competing collapsible sections. Threads render as
+  `item_group([item([item_content([item_title, item_description])])])`
+  rows — aetna's "object/action list row" widget gets us the right
+  hover/press/focus rail + cursor + keying for free. Title sits above a
+  muted second line of `state · relative_time`. Dispatch children are
+  left-padded by `SPACE_3 * depth` so chains read top-down without
+  inline marker glyphs on every row. Selected row uses `.current()`
+  (ACCENT fill — quieter than `.primary()`).
 - **Toolbar headers, not card headers, for thread identity.**
   `toolbar([toolbar_title, spacer, state_badge])` is the thread-pane
   header recipe. Cards isolate objects; the chat content frame is one
@@ -238,6 +246,35 @@ correct without forcing data into the helper mold. Per aetna's
 Each stage is a self-contained slice with its own commit. The progression is
 roughly the inverse of dependency depth: read-only shell first, then
 write paths, then composition, then cross-cutting features.
+
+### Sidebar redesign (in flight)
+
+The egui sidebar's pod-as-collapsible-section idiom doesn't scale when
+one pod dominates and others are sparse — a real-world snapshot of the
+production server has 2 pods (4 threads vs. 29 threads + 4 cron
+behaviors). The aetna sidebar is being redesigned around an active-pod
+tab strip rather than ported piecemeal. Multi-slice rollout:
+
+- **✅ Slice α — pod tabs + item-row threads.** `tabs_list` selector at
+  the top of the sidebar; `item_group` of `item([item_content([title,
+  description])])` rows for the active pod's threads. State and
+  relative-activity in the muted second line. Dispatch children
+  left-padded by `SPACE_3 * depth`. "Show N more" pagination at
+  `SIDEBAR_THREAD_PREVIEW = 10` rows. No new wire calls.
+- **⏳ Slice β — behaviors first-class.** Behaviors subsection above
+  threads, with humanized cron schedule labels (`"hourly · :50"` vs
+  `"0 * * * *"`), description as muted second line, accordion
+  expansion for per-row controls + recent threads. New wire:
+  `ListBehaviors` + the `Behavior*` broadcast events. Pod overflow
+  menu (⋯ → archive / pause / edit / files) lands here too via a
+  `popover_panel` of `menu_items`.
+- **⏳ Slice γ — danger affordances.** Inline arm-confirm pattern
+  (probably a small `danger_button` helper that animates "Click again
+  to confirm") for archive-pod / delete-behavior. Hooks into the
+  ⋯ menu and the per-behavior toolbar.
+- **⏳ Slice δ — entry points.** "+ New pod" in the pod-tab overflow,
+  per-pod ➕ "new thread", ➕ "new behavior". Several stub out until
+  Stage 8's modals exist.
 
 ### ✅ Stage 1 — Scaffold (commit `a46b421`)
 

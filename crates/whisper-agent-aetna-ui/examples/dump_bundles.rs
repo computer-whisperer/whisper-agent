@@ -133,10 +133,19 @@ enum Scene {
     /// after a failed `derive_ws_url`. Verifies the destructive
     /// alert renders below the form.
     LoginFormWithError,
+    /// Sidebar with a dispatch chain: one parent thread fans out to
+    /// three children. Verifies the depth-indent path in
+    /// `order_threads_by_dispatch` renders the children below the
+    /// parent.
+    SidebarDispatchChain,
+    /// Sidebar with more threads than `SIDEBAR_THREAD_PREVIEW`.
+    /// Verifies the "Show N more" toggle button appears at the
+    /// bottom of the truncated list.
+    SidebarManyThreads,
 }
 
 impl Scene {
-    const ALL: [Scene; 17] = [
+    const ALL: [Scene; 19] = [
         Scene::Connecting,
         Scene::Connected,
         Scene::Closed,
@@ -154,6 +163,8 @@ impl Scene {
         Scene::LoginFormEmpty,
         Scene::LoginFormPrefilled,
         Scene::LoginFormWithError,
+        Scene::SidebarDispatchChain,
+        Scene::SidebarManyThreads,
     ];
 
     fn slug(self) -> &'static str {
@@ -175,6 +186,8 @@ impl Scene {
             Scene::LoginFormEmpty => "login_form_empty",
             Scene::LoginFormPrefilled => "login_form_prefilled",
             Scene::LoginFormWithError => "login_form_with_error",
+            Scene::SidebarDispatchChain => "sidebar_dispatch_chain",
+            Scene::SidebarManyThreads => "sidebar_many_threads",
         }
     }
 
@@ -238,6 +251,30 @@ fn build_app(scene: Scene) -> Box<dyn App> {
             q.push_back(InboundEvent::ConnectionError {
                 detail: "DNS resolution failed".into(),
             });
+        }
+        Scene::SidebarDispatchChain => {
+            q.push_back(InboundEvent::ConnectionOpened);
+            q.push_back(InboundEvent::Wire(ServerToClient::PodList {
+                correlation_id: None,
+                pods: mock_pods(),
+                default_pod_id: "default".into(),
+            }));
+            q.push_back(InboundEvent::Wire(ServerToClient::ThreadList {
+                correlation_id: None,
+                tasks: mock_dispatch_chain_threads(),
+            }));
+        }
+        Scene::SidebarManyThreads => {
+            q.push_back(InboundEvent::ConnectionOpened);
+            q.push_back(InboundEvent::Wire(ServerToClient::PodList {
+                correlation_id: None,
+                pods: mock_pods(),
+                default_pod_id: "default".into(),
+            }));
+            q.push_back(InboundEvent::Wire(ServerToClient::ThreadList {
+                correlation_id: None,
+                tasks: mock_many_threads(15),
+            }));
         }
         Scene::PopulatedNoSelection
         | Scene::LoadingThread
@@ -471,6 +508,96 @@ fn mock_threads() -> Vec<ThreadSummary> {
             dispatched_by: None,
         },
     ]
+}
+
+/// One parent thread plus three dispatched children, all in the
+/// `default` pod. Mirrors the production `mavis` instance's
+/// dispatch fan-out (`task-18abcff7ad2a29b9` → 3 children) so the
+/// sidebar's depth-indent rendering exercises a realistic shape.
+fn mock_dispatch_chain_threads() -> Vec<ThreadSummary> {
+    let parent_id = "task-parent".to_string();
+    vec![
+        ThreadSummary {
+            thread_id: parent_id.clone(),
+            pod_id: "default".into(),
+            title: Some("Investigation: behavior compaction".into()),
+            state: ThreadStateLabel::Completed,
+            created_at: "2026-05-08T08:00:00Z".into(),
+            last_active: "2026-05-08T08:30:00Z".into(),
+            origin: None,
+            continued_from: None,
+            dispatched_by: None,
+        },
+        ThreadSummary {
+            thread_id: "task-child-a".into(),
+            pod_id: "default".into(),
+            title: Some("subthread A — survey current pipeline".into()),
+            state: ThreadStateLabel::Completed,
+            created_at: "2026-05-08T08:10:00Z".into(),
+            last_active: "2026-05-08T08:20:00Z".into(),
+            origin: None,
+            continued_from: None,
+            dispatched_by: Some(parent_id.clone()),
+        },
+        ThreadSummary {
+            thread_id: "task-child-b".into(),
+            pod_id: "default".into(),
+            title: Some("subthread B — measure compaction overhead".into()),
+            state: ThreadStateLabel::Completed,
+            created_at: "2026-05-08T08:11:00Z".into(),
+            last_active: "2026-05-08T08:22:00Z".into(),
+            origin: None,
+            continued_from: None,
+            dispatched_by: Some(parent_id.clone()),
+        },
+        ThreadSummary {
+            thread_id: "task-child-c".into(),
+            pod_id: "default".into(),
+            title: Some("subthread C — identify failure modes".into()),
+            state: ThreadStateLabel::Failed,
+            created_at: "2026-05-08T08:12:00Z".into(),
+            last_active: "2026-05-08T08:24:00Z".into(),
+            origin: None,
+            continued_from: None,
+            dispatched_by: Some(parent_id),
+        },
+    ]
+}
+
+/// `n` synthetic threads in the default pod, for the
+/// `SidebarManyThreads` scene that exercises the "Show N more"
+/// pagination toggle once the total exceeds
+/// `SIDEBAR_THREAD_PREVIEW`. Titles are deterministic so the dump
+/// is stable across regenerations.
+fn mock_many_threads(n: usize) -> Vec<ThreadSummary> {
+    (0..n)
+        .map(|i| {
+            // Vary the state across rows so the second-line caption
+            // exercises every label the sidebar renders.
+            let state = match i % 4 {
+                0 => ThreadStateLabel::Idle,
+                1 => ThreadStateLabel::Working,
+                2 => ThreadStateLabel::Completed,
+                _ => ThreadStateLabel::Failed,
+            };
+            // Walk `last_active` backward in 47-minute steps so the
+            // relative-time captions span minutes/hours/days.
+            let minutes_ago = i as i64 * 47;
+            let last = chrono::DateTime::parse_from_rfc3339("2026-05-09T08:00:00Z").unwrap()
+                - chrono::Duration::minutes(minutes_ago);
+            ThreadSummary {
+                thread_id: format!("task-many-{i:02}"),
+                pod_id: "default".into(),
+                title: Some(format!("synthetic thread #{i}")),
+                state,
+                created_at: last.to_rfc3339(),
+                last_active: last.to_rfc3339(),
+                origin: None,
+                continued_from: None,
+                dispatched_by: None,
+            }
+        })
+        .collect()
 }
 
 /// A few-message snapshot for the `ThreadWithMessages` scene. Touches
