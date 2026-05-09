@@ -251,6 +251,12 @@ pub struct ChatApp {
     /// (rather than per-pod) so a tab switch preserves the user's
     /// expand state across pods.
     expanded_behaviors: HashSet<String>,
+    /// `(pod_id, behavior_id)` of a Delete button that's been
+    /// armed (clicked once). The next click on the same button
+    /// fires `DeleteBehavior`; any other click disarms. At most
+    /// one armed delete at a time so the UI never has two
+    /// "confirm" buttons live simultaneously.
+    delete_armed_behavior: Option<(String, String)>,
 
     // ----- model catalog (request/response tier) -----
     /// Backends advertised by the server. Populated from
@@ -412,6 +418,7 @@ impl ChatApp {
             behaviors_by_pod: HashMap::new(),
             requested_behaviors_for: HashSet::new(),
             expanded_behaviors: HashSet::new(),
+            delete_armed_behavior: None,
             backends: Vec::new(),
             models_by_backend: HashMap::new(),
             requested_models_for: HashSet::new(),
@@ -1001,6 +1008,24 @@ impl App for ChatApp {
     }
 
     fn on_event(&mut self, event: UiEvent) {
+        // Auto-disarm a pending behavior delete unless this click is
+        // its matching second arm. The sidebar rebuilds every event,
+        // so any other click — selecting a thread, opening a modal,
+        // toggling a pod tab — is the user's "I changed my mind"
+        // gesture. Runs before any handler that would `return`, so
+        // every routed click flows through this gate. Bare-text
+        // events (focus, hover, key presses without a route) leave
+        // the arm intact.
+        if matches!(event.kind, UiEventKind::Click | UiEventKind::Activate)
+            && self.delete_armed_behavior.is_some()
+        {
+            let armed = self.delete_armed_behavior.as_ref().unwrap();
+            let armed_key = behavior_delete_key(&armed.0, &armed.1);
+            if event.route() != Some(armed_key.as_str()) {
+                self.delete_armed_behavior = None;
+            }
+        }
+
         // Sidebar thread selection: any click on a `thread:{id}` key
         // activates that thread.
         if let Some(key) = event.route()
@@ -1154,6 +1179,30 @@ impl App for ChatApp {
                 behavior_id: beh.to_string(),
                 enabled: next_enabled,
             });
+            return;
+        }
+
+        // Behavior Delete: two-click arm-confirm. The pre-handler at
+        // the top of `on_event` already cleared `delete_armed_behavior`
+        // if this click isn't for the armed pair, so by this point
+        // either this is the armed key (fire) or no arm is held
+        // (set the arm). One key, two outcomes.
+        if let Some(key) = event.route()
+            && let Some(rest) = key.strip_prefix(BEHAVIOR_DELETE_PREFIX)
+            && matches!(event.kind, UiEventKind::Click | UiEventKind::Activate)
+            && let Some((pod, beh)) = rest.split_once(':')
+        {
+            let pair = (pod.to_string(), beh.to_string());
+            if self.delete_armed_behavior.as_ref() == Some(&pair) {
+                self.delete_armed_behavior = None;
+                self.send(ClientToServer::DeleteBehavior {
+                    correlation_id: None,
+                    pod_id: pod.to_string(),
+                    behavior_id: beh.to_string(),
+                });
+            } else {
+                self.delete_armed_behavior = Some(pair);
+            }
             return;
         }
 
@@ -1319,6 +1368,13 @@ const BEHAVIOR_RUN_PREFIX: &str = "behavior-run:";
 /// `enabled` flag for the matching `{pod_id}:{behavior_id}` pair.
 const BEHAVIOR_TOGGLE_PREFIX: &str = "behavior-toggle:";
 
+/// Routed-key prefix for the per-behavior Delete button. Suffix
+/// is `{pod_id}:{behavior_id}` (split on the first `:`). Two-click
+/// arm-confirm: first click sets `delete_armed_behavior`, second
+/// click on the same key fires `DeleteBehavior`. Any unrelated
+/// click disarms.
+const BEHAVIOR_DELETE_PREFIX: &str = "behavior-delete:";
+
 fn behavior_row_key(pod_id: &str, behavior_id: &str) -> String {
     format!("{BEHAVIOR_ROW_PREFIX}{pod_id}:{behavior_id}")
 }
@@ -1329,6 +1385,10 @@ fn behavior_run_key(pod_id: &str, behavior_id: &str) -> String {
 
 fn behavior_toggle_key(pod_id: &str, behavior_id: &str) -> String {
     format!("{BEHAVIOR_TOGGLE_PREFIX}{pod_id}:{behavior_id}")
+}
+
+fn behavior_delete_key(pod_id: &str, behavior_id: &str) -> String {
+    format!("{BEHAVIOR_DELETE_PREFIX}{pod_id}:{behavior_id}")
 }
 
 /// Composite expansion-state key for `expanded_behaviors`. Mirrors
@@ -1807,13 +1867,17 @@ impl ChatApp {
     }
 
     /// Inline action toolbar shown inside an expanded behavior body.
-    /// Two compact buttons: Run-now (always enabled when the
-    /// behavior loaded — manual `RunBehavior` works regardless of
-    /// the `enabled` flag), and a Pause/Resume toggle reflecting
-    /// the current `enabled` state. Errored behaviors get the Run
-    /// button disabled — their config didn't load, so firing would
-    /// just bounce off the scheduler. Edit / Delete still pending
-    /// (slice γ; need modals).
+    /// Two-row layout: the top row carries the everyday Run-now and
+    /// Pause/Resume buttons; the bottom row carries a destructive
+    /// Delete with two-click arm-confirm. First click flips the
+    /// label to "Confirm delete?" and the styling to destructive;
+    /// second click on the same button fires `DeleteBehavior`. Any
+    /// unrelated click disarms (handled at the top of `on_event`).
+    /// Two rows because the sidebar's 224 px isn't wide enough to
+    /// hold all three buttons side-by-side once the armed Delete
+    /// label expands. The visual split also signals "this is the
+    /// danger zone" without needing an extra divider. Edit still
+    /// pending (needs the full behavior editor).
     fn behavior_actions_row(&self, pod_id: &str, b: &BehaviorSummary) -> El {
         let mut run = button("Run now")
             .key(behavior_run_key(pod_id, &b.behavior_id))
@@ -1825,17 +1889,56 @@ impl ChatApp {
         let toggle = button(toggle_label)
             .key(behavior_toggle_key(pod_id, &b.behavior_id))
             .ghost();
+
+        let armed = self
+            .delete_armed_behavior
+            .as_ref()
+            .map(|(p, bb)| p == pod_id && bb == &b.behavior_id)
+            .unwrap_or(false);
+        // The color shift is the load-bearing arm signal: idle is a
+        // muted ghost button that visually matches Run / Pause, so
+        // the user doesn't accidentally hit a loud "Delete" when
+        // they meant to scroll. Click once → solid destructive
+        // fill plus the wider "Confirm delete?" label, which makes
+        // the second click an obvious deliberate gesture.
+        // (`.ghost().destructive()` doesn't compose the way it
+        // looks — `destructive()` runs `tint()` which writes back
+        // to `fill` regardless of ghost, so the idle styling has
+        // to be plain ghost.)
+        let delete = if armed {
+            button("Confirm delete?")
+                .key(behavior_delete_key(pod_id, &b.behavior_id))
+                .destructive()
+        } else {
+            button("Delete")
+                .key(behavior_delete_key(pod_id, &b.behavior_id))
+                .ghost()
+        };
+
         // Indent matches the nested-thread depth=1 left-pad so the
-        // toolbar visually belongs to the expanded body.
-        row([run, toggle])
-            .gap(tokens::SPACE_2)
-            .padding(Sides {
-                left: tokens::SPACE_3 + tokens::SPACE_3,
-                right: tokens::SPACE_3,
-                top: tokens::SPACE_1,
-                bottom: tokens::SPACE_1,
-            })
-            .width(Size::Fill(1.0))
+        // toolbar visually belongs to the expanded body. Two rows:
+        // actions left-aligned on top, destructive right-aligned
+        // below. Tight `gap(0)` between the sub-rows so the toolbar
+        // doesn't eat extra vertical space — the row backgrounds
+        // are transparent, the visual separation is the spacer +
+        // right-aligned destructive cluster.
+        let pad = Sides {
+            left: tokens::SPACE_3 + tokens::SPACE_3,
+            right: tokens::SPACE_3,
+            top: 0.0,
+            bottom: tokens::SPACE_1,
+        };
+        column([
+            row([run, toggle])
+                .gap(tokens::SPACE_2)
+                .width(Size::Fill(1.0)),
+            row([spacer(), delete])
+                .align(Align::Center)
+                .width(Size::Fill(1.0)),
+        ])
+        .gap(0.0)
+        .padding(pad)
+        .width(Size::Fill(1.0))
     }
 
     /// Build the pod selector row. Single-active selection keyed

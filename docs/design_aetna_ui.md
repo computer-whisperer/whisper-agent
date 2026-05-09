@@ -291,10 +291,29 @@ tab strip rather than ported piecemeal. Multi-slice rollout:
   Edit / Delete still pending γ (need modals + arm-confirm). Cron
   schedule humanization also γ since `BehaviorSummary` doesn't
   carry the schedule string and needs a `GetBehavior` round-trip.
-- **⏳ Slice γ — danger affordances.** Inline arm-confirm pattern
-  (probably a small `danger_button` helper that animates "Click again
-  to confirm") for archive-pod / delete-behavior. Hooks into the
-  ⋯ menu and the per-behavior toolbar.
+- **🌗 Slice γ — danger affordances.** Two-click arm-confirm
+  landed for Delete Behavior. State is a single
+  `delete_armed_behavior: Option<(pod, behavior)>` slot — only one
+  arm at a time so the UI never has two "confirm" buttons live.
+  Pre-handler at the top of `on_event` auto-disarms when the next
+  click lands anywhere other than the matching `behavior-delete:`
+  key, so opening a modal / switching tabs / picking a thread all
+  cancel a pending arm.
+
+  Visual contract: idle Delete is a plain ghost button (matches
+  Run / Pause weight, won't catch a misclicked scroll); armed
+  flips to solid destructive fill with the wider "Confirm delete?"
+  label. The color change is the load-bearing arm signal — the
+  label change alone wouldn't be enough on a fast double-click.
+  Layout: two-row toolbar inside the expanded behavior body,
+  since 224 px isn't wide enough to hold Run + Pause + the armed
+  Delete on one row.
+
+  Edit still pending — needs the behavior editor (cron schedule,
+  prompt body, thread overrides — bigger surface than what
+  `dialog` accommodates well; `sheet` is the fit). Archive-pod
+  and other danger ops will reuse the same arm-confirm shape
+  when they land.
 - **✅ Slice δ — entry points.** Three "+" affordances landed,
   each scoped to where it appears:
     - **Per-pod "new thread"** — `icon_button("plus")` keyed

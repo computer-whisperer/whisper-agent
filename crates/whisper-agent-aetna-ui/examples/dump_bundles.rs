@@ -155,6 +155,12 @@ enum Scene {
     /// targets `behavior-row:default:architect` to toggle the
     /// architect row open.
     SidebarBehaviorsExpanded,
+    /// Same as `SidebarBehaviorsExpanded` but with the Delete
+    /// button armed (clicked once). Verifies the label flip
+    /// ("Delete" → "Confirm delete?") and the destructive solid
+    /// fill that's only meant to land on the second click. Same
+    /// arm pattern slice γ uses for any future danger affordances.
+    SidebarBehaviorsDeleteArmed,
     /// "+ New pod" modal opened straight from the sidebar header
     /// with no fields filled. Verifies the dialog scaffolding —
     /// scrim + content panel + form + cancel/create footer — paints
@@ -184,7 +190,7 @@ enum Scene {
 }
 
 impl Scene {
-    const ALL: [Scene; 25] = [
+    const ALL: [Scene; 26] = [
         Scene::Connecting,
         Scene::Connected,
         Scene::Closed,
@@ -206,6 +212,7 @@ impl Scene {
         Scene::SidebarManyThreads,
         Scene::SidebarBehaviors,
         Scene::SidebarBehaviorsExpanded,
+        Scene::SidebarBehaviorsDeleteArmed,
         Scene::SidebarBehaviorsEmpty,
         Scene::NewPodModalEmpty,
         Scene::NewPodModalNoBackends,
@@ -235,6 +242,7 @@ impl Scene {
             Scene::SidebarManyThreads => "sidebar_many_threads",
             Scene::SidebarBehaviors => "sidebar_behaviors",
             Scene::SidebarBehaviorsExpanded => "sidebar_behaviors_expanded",
+            Scene::SidebarBehaviorsDeleteArmed => "sidebar_behaviors_delete_armed",
             Scene::SidebarBehaviorsEmpty => "sidebar_behaviors_empty",
             Scene::NewPodModalEmpty => "new_pod_modal_empty",
             Scene::NewPodModalNoBackends => "new_pod_modal_no_backends",
@@ -256,6 +264,14 @@ impl Scene {
             // Toggle the architect behavior row open so the nested
             // spawned-thread row renders inside `behaviors_section`.
             Scene::SidebarBehaviorsExpanded => vec!["behavior-row:default:architect"],
+            // Open the architect row, then click its Delete button
+            // once to arm. Auto-disarm pre-handler at the top of
+            // `on_event` will leave the arm intact since this click
+            // is on the matching `behavior-delete:` key.
+            Scene::SidebarBehaviorsDeleteArmed => vec![
+                "behavior-row:default:architect",
+                "behavior-delete:default:architect",
+            ],
             // One toggle click on the backend trigger leaves the menu
             // open — render captures the popover.
             Scene::NewThreadFormBackendOpen => vec!["picker:backend"],
@@ -338,7 +354,9 @@ fn build_app(scene: Scene) -> Box<dyn App> {
                 tasks: mock_many_threads(15),
             }));
         }
-        Scene::SidebarBehaviors | Scene::SidebarBehaviorsExpanded => {
+        Scene::SidebarBehaviors
+        | Scene::SidebarBehaviorsExpanded
+        | Scene::SidebarBehaviorsDeleteArmed => {
             q.push_back(InboundEvent::ConnectionOpened);
             q.push_back(InboundEvent::Wire(ServerToClient::PodList {
                 correlation_id: None,
