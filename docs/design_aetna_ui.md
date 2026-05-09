@@ -468,9 +468,17 @@ Header polish (commits `55269bb` / `39617e3`):
   collapse back when `End` lands and the buffer clears (commit
   `8a3db38`)
 
+Diff rendering landed: `edit_file` (`old_string` / `new_string`)
+and `write_file` (`content`, treated as a creation) tool calls now
+resolve a `DiffPayload` at conversion time and render through
+`diff_body` instead of dumping raw JSON args. Lines come through
+`similar::TextDiff::from_lines` and paint as monospace rows with
+`+` / `-` / ` ` prefixes, colored via two registered theme tokens
+(`diff-add-foreground`, `diff-del-foreground`) — the destructive /
+success tokens read poorly on the muted body fill, so we declare
+GitHub-shaped hues that the bundle linter accepts.
+
 Still deferred:
-- inline unified-diff rendering for `edit_file` / `write_file`
-  (currently shown as raw JSON args)
 - async `dispatch_thread` callbacks routing into the originating
   call's result slot — currently they fall through to a standalone
   `ToolResult` row when the call has scrolled out of fusion range

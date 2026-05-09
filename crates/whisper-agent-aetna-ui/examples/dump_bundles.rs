@@ -115,6 +115,13 @@ enum Scene {
     /// in their default-collapsed shape — head of chat reads as two
     /// muted one-line headers rather than dumping the full prompt.
     ThreadWithSetup,
+    /// Subscribed thread with an `edit_file` tool call (in-place
+    /// substitution) and a `write_file` tool call (creation) so the
+    /// inline diff renderer is exercised — `+`/`-` colored line
+    /// rows, file-path header, `(new) {path}` for the creation
+    /// case. Both calls are pre-expanded so the diff bodies render
+    /// without a synthetic click.
+    ThreadWithDiff,
     /// Subscribed thread mid-prefill — `ThreadPrefillProgress` has
     /// arrived but no text/reasoning delta has yet. Verifies the
     /// thin progress bar + token-count caption above the chat log.
@@ -198,7 +205,7 @@ enum Scene {
 }
 
 impl Scene {
-    const ALL: [Scene; 27] = [
+    const ALL: [Scene; 28] = [
         Scene::Connecting,
         Scene::Connected,
         Scene::Closed,
@@ -214,6 +221,7 @@ impl Scene {
         Scene::ThreadWithDraft,
         Scene::ThreadWithImages,
         Scene::ThreadWithSetup,
+        Scene::ThreadWithDiff,
         Scene::LoginFormEmpty,
         Scene::LoginFormPrefilled,
         Scene::LoginFormWithError,
@@ -245,6 +253,7 @@ impl Scene {
             Scene::ThreadWithDraft => "thread_with_draft",
             Scene::ThreadWithImages => "thread_with_images",
             Scene::ThreadWithSetup => "thread_with_setup",
+            Scene::ThreadWithDiff => "thread_with_diff",
             Scene::LoginFormEmpty => "login_form_empty",
             Scene::LoginFormPrefilled => "login_form_prefilled",
             Scene::LoginFormWithError => "login_form_with_error",
@@ -272,6 +281,12 @@ impl Scene {
             | Scene::ThreadWithDraft
             | Scene::ThreadWithImages
             | Scene::ThreadWithSetup => vec!["thread:t-1"],
+            // Open the thread, then click each diff tool's
+            // accordion so the bodies render expanded. Indices
+            // come from the conversation's display-item order:
+            // user (0), assistant text (1), edit_file (2),
+            // write_file (3).
+            Scene::ThreadWithDiff => vec!["thread:t-1", "tool:accordion:2", "tool:accordion:3"],
             // Toggle the architect behavior row open so the nested
             // spawned-thread row renders inside `behaviors_section`.
             Scene::SidebarBehaviorsExpanded => vec!["behavior-row:default:architect"],
@@ -391,7 +406,8 @@ fn build_app(scene: Scene) -> Box<dyn App> {
         | Scene::ThreadPrefilling
         | Scene::ThreadWithDraft
         | Scene::ThreadWithImages
-        | Scene::ThreadWithSetup => {
+        | Scene::ThreadWithSetup
+        | Scene::ThreadWithDiff => {
             q.push_back(InboundEvent::ConnectionOpened);
             q.push_back(InboundEvent::Wire(ServerToClient::PodList {
                 correlation_id: None,
@@ -448,6 +464,12 @@ fn build_app(scene: Scene) -> Box<dyn App> {
                 q.push_back(InboundEvent::Wire(ServerToClient::ThreadSnapshot {
                     thread_id: "t-1".into(),
                     snapshot: mock_setup_snapshot(),
+                }));
+            }
+            if matches!(scene, Scene::ThreadWithDiff) {
+                q.push_back(InboundEvent::Wire(ServerToClient::ThreadSnapshot {
+                    thread_id: "t-1".into(),
+                    snapshot: mock_diff_snapshot(),
                 }));
             }
         }
@@ -1226,6 +1248,82 @@ fn mock_setup_snapshot() -> ThreadSnapshot {
         }],
     };
     snapshot
+}
+
+/// Snapshot for the `ThreadWithDiff` scene — one `edit_file`
+/// call (in-place substitution) and one `write_file` call
+/// (creation). Both fused with their tool results so the call
+/// rows render with the diff body in their accordion. Synthetic
+/// clicks open both accordions so the rendered scene shows the
+/// `+`/`-` rows directly.
+fn mock_diff_snapshot() -> ThreadSnapshot {
+    let mut conv = Conversation::new();
+    conv.push(Message::system_text(""));
+    conv.push(Message::user_text(
+        "Add a `total_count()` helper to the cache module, then create \
+         a tiny module-level docs file alongside it.",
+    ));
+    conv.push(Message {
+        role: Role::Assistant,
+        content: vec![
+            ContentBlock::Text {
+                text: "Sure — substituting the helper in first, then creating the docs file."
+                    .into(),
+            },
+            ContentBlock::ToolUse {
+                id: "tool-edit-001".into(),
+                name: "edit_file".into(),
+                input: serde_json::json!({
+                    "path": "src/cache.rs",
+                    "old_string":
+                        "pub struct Cache {\n    inner: HashMap<String, Entry>,\n}\n\
+                         \n\
+                         impl Cache {\n    pub fn new() -> Self {\n        \
+                             Self { inner: HashMap::new() }\n    }\n}\n",
+                    "new_string":
+                        "pub struct Cache {\n    inner: HashMap<String, Entry>,\n}\n\
+                         \n\
+                         impl Cache {\n    pub fn new() -> Self {\n        \
+                             Self { inner: HashMap::new() }\n    }\n\n    \
+                             /// Total number of entries currently held.\n    \
+                             pub fn total_count(&self) -> usize {\n        \
+                                 self.inner.len()\n    }\n}\n",
+                }),
+                replay: None,
+            },
+        ],
+    });
+    conv.push(Message {
+        role: Role::ToolResult,
+        content: vec![ContentBlock::ToolResult {
+            tool_use_id: "tool-edit-001".into(),
+            content: ToolResultContent::Text("edited src/cache.rs (1 substitution applied)".into()),
+            is_error: false,
+        }],
+    });
+    conv.push(Message {
+        role: Role::Assistant,
+        content: vec![ContentBlock::ToolUse {
+            id: "tool-write-001".into(),
+            name: "write_file".into(),
+            input: serde_json::json!({
+                "path": "src/cache.md",
+                "content":
+                    "# Cache\n\nIn-memory key/value store; entries expire when the\n\
+                     pod's `cache_ttl` setting elapses.\n",
+            }),
+            replay: None,
+        }],
+    });
+    conv.push(Message {
+        role: Role::ToolResult,
+        content: vec![ContentBlock::ToolResult {
+            tool_use_id: "tool-write-001".into(),
+            content: ToolResultContent::Text("wrote src/cache.md (4 lines)".into()),
+            is_error: false,
+        }],
+    });
+    base_snapshot(conv, ThreadStateLabel::Idle, String::new())
 }
 
 /// Encode a small RGB checker pattern as PNG bytes. Used by

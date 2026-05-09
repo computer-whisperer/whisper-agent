@@ -32,6 +32,10 @@ cron = { workspace = true }
 # server adapters accept (HEIC/HEIF land as a placeholder for now —
 # the `image` crate doesn't decode them without an extra C library).
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "gif"] }
+# Line-granularity diff used to render `edit_file` / `write_file`
+# tool calls as +/- colored bodies. Same crate the egui sibling
+# uses; default features off since we only need the text path.
+similar = { version = "3", default-features = false, features = ["text"] }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 wasm-bindgen = "0.2"

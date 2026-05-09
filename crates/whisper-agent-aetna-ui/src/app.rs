@@ -128,6 +128,12 @@ enum DisplayItem {
         /// header then falls back to just the tool name. Mirrors
         /// the egui sibling's `tool_summary`.
         summary: Option<String>,
+        /// Resolved diff for `edit_file` / `write_file` tool calls.
+        /// `Some` when the args carry the expected shape (path +
+        /// old_string + new_string for edit_file; path + content
+        /// for write_file). When set, the body renders the diff
+        /// instead of the raw `args_pretty` JSON.
+        diff: Option<DiffPayload>,
         /// Pretty-printed JSON args. `None` when the snapshot path
         /// produced a tool call without typed args (legacy threads).
         args_pretty: Option<String>,
@@ -214,6 +220,32 @@ fn tool_summary_from_args(name: &str, args: Option<&serde_json::Value>) -> Optio
     }
 }
 
+/// Resolve a [`DiffPayload`] from a tool call's args when the tool
+/// is one we know how to render as a diff. `edit_file` carries
+/// `path` + `old_string` + `new_string` for an in-place
+/// substitution; `write_file` carries `path` + `content` and is
+/// treated as creating a fresh file (old_text empty,
+/// `is_creation = true`). Anything else returns `None`.
+fn extract_diff(name: &str, args: Option<&serde_json::Value>) -> Option<DiffPayload> {
+    let v = args?;
+    let s = |key: &str| v.get(key).and_then(|x| x.as_str()).map(str::to_owned);
+    match name {
+        "edit_file" => Some(DiffPayload {
+            path: s("path")?,
+            old_text: s("old_string")?,
+            new_text: s("new_string")?,
+            is_creation: false,
+        }),
+        "write_file" => Some(DiffPayload {
+            path: s("path")?,
+            old_text: String::new(),
+            new_text: s("content")?,
+            is_creation: true,
+        }),
+        _ => None,
+    }
+}
+
 /// Format a `Usage` block into the muted one-line summary the
 /// `TurnStats` row renders. Mirrors the egui sibling's layout —
 /// `in 1,234 · cached 800 · created 200 · out 567`. Cache columns
@@ -252,6 +284,24 @@ fn fmt_count(n: u32) -> String {
         out.push(*b as char);
     }
     out
+}
+
+/// File-edit tool call's args resolved into a unified-diff shape.
+/// Produced by [`extract_diff`] for `edit_file` (old_string →
+/// new_string substitution) and `write_file` (full-content
+/// creation, treated as old_text="" + new_text=content). Routes
+/// through the diff renderer in [`tool_call_body`] instead of the
+/// generic JSON args block.
+///
+/// `is_creation` flips the body's header from the bare `{path}` to
+/// `(new) {path}` so the user can tell at a glance whether they're
+/// looking at an in-place edit or a fresh file write.
+#[derive(Clone)]
+struct DiffPayload {
+    path: String,
+    old_text: String,
+    new_text: String,
+    is_creation: bool,
 }
 
 /// Compact subset of [`whisper_agent_protocol::ToolSchema`] —
@@ -963,10 +1013,12 @@ impl ChatApp {
                         _ => false,
                     });
                     let summary = tool_summary_from_args(&name, args.as_ref());
+                    let diff = extract_diff(&name, args.as_ref());
                     let entry = DisplayItem::ToolCall {
                         tool_use_id,
                         name,
                         summary,
+                        diff,
                         args_pretty,
                         streaming_output: String::new(),
                         result: None,
@@ -1058,8 +1110,9 @@ impl ChatApp {
                             // No args yet — they're still streaming.
                             // `Begin` resolves the typed args and
                             // replaces this entry with a summary-
-                            // bearing one matched by id.
+                            // and-diff-bearing one matched by id.
                             summary: None,
+                            diff: None,
                             args_pretty: None,
                             streaming_output: String::new(),
                             result: None,
@@ -3356,6 +3409,7 @@ impl ChatApp {
                 tool_use_id,
                 name,
                 summary,
+                diff,
                 args_pretty,
                 streaming_output,
                 result,
@@ -3373,8 +3427,12 @@ impl ChatApp {
                 let streaming = result.is_none() && !streaming_output.is_empty();
                 let open = streaming || self.open_accordions.contains(&routed);
                 let header = tool_call_header(name, summary.as_deref(), result.as_ref());
-                let body_blocks =
-                    tool_call_body(args_pretty.as_deref(), streaming_output, result.as_ref());
+                let body_blocks = tool_call_body(
+                    diff.as_ref(),
+                    args_pretty.as_deref(),
+                    streaming_output,
+                    result.as_ref(),
+                );
                 let item_el = accordion_item(key, value, header, open, body_blocks);
                 let gutter = match result {
                     Some(r) if r.is_error => tokens::DESTRUCTIVE,
@@ -3537,19 +3595,34 @@ fn tool_call_header(name: &str, summary: Option<&str>, result: Option<&FusedTool
     out
 }
 
-/// Expanded-body content for a tool-call accordion. Args render in a
-/// `code_block` (mono, scrollable horizontally), then the streaming
-/// stdout/stderr buffer if any chunks have arrived, then the
-/// integrated result body once `End` has landed. Sections are
+/// Expanded-body content for a tool-call accordion. When a `diff`
+/// is present (`edit_file` / `write_file` paths the renderer
+/// recognizes), the body shows a unified-diff view rooted at the
+/// path; otherwise args render in a generic `code_block`. Then the
+/// streaming stdout/stderr buffer if any chunks have arrived, then
+/// the integrated result body once `End` has landed. Sections are
 /// separated by small muted captions so the structure reads at a
 /// glance.
 fn tool_call_body(
+    diff: Option<&DiffPayload>,
     args_pretty: Option<&str>,
     streaming_output: &str,
     result: Option<&FusedToolResult>,
 ) -> Vec<El> {
     let mut blocks: Vec<El> = Vec::new();
-    if let Some(args) = args_pretty
+    if let Some(d) = diff {
+        // The diff replaces the args block — `path` + the
+        // unified-diff body already say everything the raw JSON
+        // would, plus the visual signal (red/green) of what's
+        // actually changing.
+        let header_text = if d.is_creation {
+            format!("(new) {}", d.path)
+        } else {
+            d.path.clone()
+        };
+        blocks.push(text(header_text).caption().muted().bold());
+        blocks.push(diff_body(&d.old_text, &d.new_text));
+    } else if let Some(args) = args_pretty
         && !args.trim().is_empty()
     {
         blocks.push(text("args").caption().muted());
@@ -3568,6 +3641,49 @@ fn tool_call_body(
         blocks.push(text("(no detail)").muted());
     }
     blocks
+}
+
+/// Mid-saturation diff-line text colors. The destructive /
+/// success tokens read poorly on the dark `MUTED` body fill —
+/// `DESTRUCTIVE` is dark maroon (intended as a *background* color
+/// behind white text), and `SUCCESS` runs hot enough that long
+/// stretches of `+` lines visually vibrate. These hues sit closer
+/// to GitHub's diff palette: rosy for deletes, mint for adds.
+/// Declared as named tokens (rather than raw `Color::rgb`) so the
+/// bundle linter accepts them as theme-registered.
+const DIFF_DEL_FG: Color = Color::token("diff-del-foreground", 230, 130, 130, 255);
+const DIFF_ADD_FG: Color = Color::token("diff-add-foreground", 150, 220, 170, 255);
+
+/// Render a unified line-granularity diff body. Each `similar`
+/// change becomes one mono row prefixed with `+` / `-` / ` ` and
+/// colored to match the change kind. Equal lines stay muted so
+/// the eye lands on the additions / deletions.
+fn diff_body(old_text: &str, new_text: &str) -> El {
+    use similar::{ChangeTag, TextDiff};
+
+    let text_diff = TextDiff::from_lines(old_text, new_text);
+    let mut rows: Vec<El> = Vec::new();
+    for change in text_diff.iter_all_changes() {
+        let (prefix, color) = match change.tag() {
+            ChangeTag::Equal => (' ', tokens::MUTED_FOREGROUND),
+            ChangeTag::Delete => ('-', DIFF_DEL_FG),
+            ChangeTag::Insert => ('+', DIFF_ADD_FG),
+        };
+        let raw = change.value();
+        let trimmed = raw.strip_suffix('\n').unwrap_or(raw);
+        rows.push(
+            mono(format!("{prefix}{trimmed}"))
+                .small()
+                .text_color(color)
+                .width(Size::Fill(1.0)),
+        );
+    }
+    column(rows)
+        .gap(0.0)
+        .padding(Sides::xy(tokens::SPACE_3, tokens::SPACE_2))
+        .fill(tokens::MUTED)
+        .radius(tokens::RADIUS_MD)
+        .width(Size::Fill(1.0))
 }
 
 /// Event-log row — narrow role-colored gutter + content with
@@ -3738,10 +3854,12 @@ fn push_block(block: &ContentBlock, user_role: bool, out: &mut Vec<DisplayItem>)
         } => {
             let args_pretty = serde_json::to_string_pretty(input).ok();
             let summary = tool_summary_from_args(name, Some(input));
+            let diff = extract_diff(name, Some(input));
             out.push(DisplayItem::ToolCall {
                 tool_use_id: id.clone(),
                 name: name.clone(),
                 summary,
+                diff,
                 args_pretty,
                 streaming_output: String::new(),
                 result: None,
