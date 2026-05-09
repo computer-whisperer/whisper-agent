@@ -373,6 +373,13 @@ struct ThreadView {
     /// summary when the snapshot hasn't arrived yet, and so a
     /// resubscribe replaces the live items cleanly.
     title: Option<String>,
+    /// `ThreadSnapshot::failure` mirrored locally. `Some` when the
+    /// thread is in a failed state (server set the field at the
+    /// time of the integration error). The pane renders a
+    /// destructive banner above the chat log when this is set
+    /// *and* the summary's state is `Failed` — the conjunction
+    /// avoids surfacing stale failure text after a recovery.
+    failure: Option<String>,
 }
 
 pub struct ChatApp {
@@ -915,6 +922,7 @@ impl ChatApp {
                 let view = ThreadView {
                     items,
                     title: snapshot.title,
+                    failure: snapshot.failure,
                 };
                 // Hydrate the local draft from the snapshot — the
                 // server's stored draft is authoritative on initial
@@ -1153,26 +1161,42 @@ impl ChatApp {
             | ServerToClient::ThreadCompacted { .. } => {}
             ServerToClient::Error {
                 correlation_id,
+                thread_id,
                 message,
-                ..
             } => {
-                // Route the error to whichever modal claimed the
-                // matching correlation. Each modal owns its own
-                // `pending_correlation` slot; whoever it matches
+                // Modals first: each modal owns its own
+                // `pending_correlation` slot; whichever matches
                 // surfaces the message and clears the pending so
-                // the form re-enables for retry.
+                // the form re-enables for retry. `consumed`
+                // gates the thread-scoped fallback so a single
+                // Error can't double-fire onto both layers.
+                let mut consumed = false;
                 if let Some(corr) = correlation_id.as_ref() {
                     if let Some(modal) = self.new_pod_modal.as_mut()
                         && modal.pending_correlation.as_ref() == Some(corr)
                     {
-                        modal.error = Some(message);
+                        modal.error = Some(message.clone());
                         modal.pending_correlation = None;
+                        consumed = true;
                     } else if let Some(modal) = self.new_behavior_modal.as_mut()
                         && modal.pending_correlation.as_ref() == Some(corr)
                     {
-                        modal.error = Some(message);
+                        modal.error = Some(message.clone());
                         modal.pending_correlation = None;
+                        consumed = true;
                     }
+                }
+                // Thread-scoped errors land on the view's failure
+                // slot so the pane's destructive banner has
+                // something to show even before the next
+                // snapshot. State flips to `Failed` via a
+                // separate `ThreadStateChanged` echo (the
+                // banner gate uses the conjunction).
+                if !consumed
+                    && let Some(tid) = thread_id.as_ref()
+                    && let Some(view) = self.views.get_mut(tid)
+                {
+                    view.failure = Some(message);
                 }
             }
             // Catalog tiers we don't yet surface. Quietly accepted so
@@ -2481,10 +2505,42 @@ impl ChatApp {
             }
         };
 
-        column([header, body, self.compose_box()])
+        // Destructive banner above the chat log when this thread
+        // is in `Failed` state and the view carries a failure
+        // detail. The conjunction matches egui — we don't surface
+        // a stale failure message on a thread that's recovered
+        // (its `state` will have flipped back) even if `failure`
+        // hasn't been cleared yet by a fresh snapshot.
+        let mut layers: Vec<El> = vec![header];
+        if let Some(banner) = self.thread_failure_banner(thread_id) {
+            layers.push(banner);
+        }
+        layers.push(body);
+        layers.push(self.compose_box());
+        column(layers)
             .gap(0.0)
             .width(Size::Fill(1.0))
             .height(Size::Fill(1.0))
+    }
+
+    /// Return a destructive `alert` describing the thread's
+    /// recorded failure, when the thread is currently in
+    /// `Failed` state and the view has a failure detail. `None`
+    /// when either guard fails.
+    fn thread_failure_banner(&self, thread_id: &str) -> Option<El> {
+        let summary = self.threads.get(thread_id)?;
+        if summary.state != whisper_agent_protocol::ThreadStateLabel::Failed {
+            return None;
+        }
+        let view = self.views.get(thread_id)?;
+        let detail = view.failure.as_deref()?;
+        Some(
+            alert([
+                alert_title("thread failed"),
+                alert_description(detail.to_string()),
+            ])
+            .destructive(),
+        )
     }
 
     /// New-thread compose form. Rendered in the content pane when no

@@ -131,6 +131,12 @@ enum Scene {
     /// typically don't co-occur — but this is the visual
     /// regression scene.
     ThreadWithProvenance,
+    /// Subscribed thread in `Failed` state with a failure detail
+    /// on the snapshot. Verifies the destructive banner renders
+    /// between the header and the chat log, and that the gate
+    /// (state == Failed AND view.failure.is_some()) behaves
+    /// correctly.
+    ThreadWithFailure,
     /// Subscribed thread mid-prefill — `ThreadPrefillProgress` has
     /// arrived but no text/reasoning delta has yet. Verifies the
     /// thin progress bar + token-count caption above the chat log.
@@ -214,7 +220,7 @@ enum Scene {
 }
 
 impl Scene {
-    const ALL: [Scene; 29] = [
+    const ALL: [Scene; 30] = [
         Scene::Connecting,
         Scene::Connected,
         Scene::Closed,
@@ -232,6 +238,7 @@ impl Scene {
         Scene::ThreadWithSetup,
         Scene::ThreadWithDiff,
         Scene::ThreadWithProvenance,
+        Scene::ThreadWithFailure,
         Scene::LoginFormEmpty,
         Scene::LoginFormPrefilled,
         Scene::LoginFormWithError,
@@ -265,6 +272,7 @@ impl Scene {
             Scene::ThreadWithSetup => "thread_with_setup",
             Scene::ThreadWithDiff => "thread_with_diff",
             Scene::ThreadWithProvenance => "thread_with_provenance",
+            Scene::ThreadWithFailure => "thread_with_failure",
             Scene::LoginFormEmpty => "login_form_empty",
             Scene::LoginFormPrefilled => "login_form_prefilled",
             Scene::LoginFormWithError => "login_form_with_error",
@@ -292,7 +300,8 @@ impl Scene {
             | Scene::ThreadWithDraft
             | Scene::ThreadWithImages
             | Scene::ThreadWithSetup
-            | Scene::ThreadWithProvenance => vec!["thread:t-1"],
+            | Scene::ThreadWithProvenance
+            | Scene::ThreadWithFailure => vec!["thread:t-1"],
             // Open the thread, then click each diff tool's
             // accordion so the bodies render expanded. Indices
             // come from the conversation's display-item order:
@@ -420,20 +429,23 @@ fn build_app(scene: Scene) -> Box<dyn App> {
         | Scene::ThreadWithImages
         | Scene::ThreadWithSetup
         | Scene::ThreadWithDiff
-        | Scene::ThreadWithProvenance => {
+        | Scene::ThreadWithProvenance
+        | Scene::ThreadWithFailure => {
             q.push_back(InboundEvent::ConnectionOpened);
             q.push_back(InboundEvent::Wire(ServerToClient::PodList {
                 correlation_id: None,
                 pods: mock_pods(),
                 default_pod_id: "default".into(),
             }));
-            // Provenance scene swaps in a thread list whose t-1
-            // carries origin / continued_from / dispatched_by so
-            // the pane header's chip cluster has all three to
-            // render. Other scenes keep `mock_threads()` for
-            // visual stability.
+            // Provenance / failure scenes swap in tweaked thread
+            // lists so the relevant summary fields drive the pane
+            // header (provenance chips) and the failure banner's
+            // state gate (`state == Failed`). Other scenes keep
+            // `mock_threads()` for visual stability.
             let threads = if matches!(scene, Scene::ThreadWithProvenance) {
                 mock_provenance_threads()
+            } else if matches!(scene, Scene::ThreadWithFailure) {
+                mock_failure_threads()
             } else {
                 mock_threads()
             };
@@ -493,6 +505,12 @@ fn build_app(scene: Scene) -> Box<dyn App> {
                 q.push_back(InboundEvent::Wire(ServerToClient::ThreadSnapshot {
                     thread_id: "t-1".into(),
                     snapshot: mock_diff_snapshot(),
+                }));
+            }
+            if matches!(scene, Scene::ThreadWithFailure) {
+                q.push_back(InboundEvent::Wire(ServerToClient::ThreadSnapshot {
+                    thread_id: "t-1".into(),
+                    snapshot: mock_failure_snapshot(),
                 }));
             }
         }
@@ -754,6 +772,16 @@ fn mock_provenance_threads() -> Vec<ThreadSummary> {
     });
     t[0].continued_from = Some("task-7c9c8d6a4f0b1234".into());
     t[0].dispatched_by = Some("task-18abcff7ad2a29b9".into());
+    t
+}
+
+/// Mark t-1 as failed so the pane's failure-banner gate
+/// (`state == Failed && view.failure.is_some()`) trips. Body
+/// arrives via [`mock_failure_snapshot`] which carries the
+/// `snapshot.failure` text the banner shows.
+fn mock_failure_threads() -> Vec<ThreadSummary> {
+    let mut t = mock_threads();
+    t[0].state = ThreadStateLabel::Failed;
     t
 }
 
@@ -1364,6 +1392,34 @@ fn mock_diff_snapshot() -> ThreadSnapshot {
         }],
     });
     base_snapshot(conv, ThreadStateLabel::Idle, String::new())
+}
+
+/// Snapshot for the `ThreadWithFailure` scene — one user turn,
+/// the assistant's first response triggered a tool-validation
+/// error mid-loop, and the integrator marked the thread as
+/// `Failed` with the same message echoed onto `snapshot.failure`.
+/// Mirrors the wire shape the server emits when a thread enters
+/// the failed state.
+fn mock_failure_snapshot() -> ThreadSnapshot {
+    let mut conv = Conversation::new();
+    conv.push(Message::system_text(""));
+    conv.push(Message::user_text(
+        "Run `validate_release` against the candidate tag and report the diff.",
+    ));
+    conv.push(Message {
+        role: Role::Assistant,
+        content: vec![ContentBlock::Text {
+            text: "Pulling the candidate tag and validating now.".into(),
+        }],
+    });
+    let mut snapshot = base_snapshot(conv, ThreadStateLabel::Failed, String::new());
+    snapshot.failure = Some(
+        "tool `validate_release` not in this pod's allow-list \
+         (allow.tools.deny set to {validate_release}); \
+         scheduler aborted the turn"
+            .into(),
+    );
+    snapshot
 }
 
 /// Encode a small RGB checker pattern as PNG bytes. Used by

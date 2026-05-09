@@ -371,6 +371,13 @@ Chat-log polish (commits `fb6d675` / `55269bb`):
   the trigger context without opening the (eventual) thread
   inspector. `short_id` truncates to 12 chars + `…` so chips
   stay compact
+- destructive failure banner above the chat log when the thread
+  is `state == Failed && view.failure.is_some()`. `view.failure`
+  is mirrored from `snapshot.failure` on subscribe; the wire-side
+  `Error { thread_id, message, .. }` arm also writes it so a
+  fresh failure surfaces before the next snapshot lands. The
+  conjunction (state AND failure) avoids stale banners on
+  recovered threads
 
 ### ✅ Stage 3 — Compose + send (commit `66d7c3e`)
 
