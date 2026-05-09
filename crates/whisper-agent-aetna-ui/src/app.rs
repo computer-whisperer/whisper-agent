@@ -897,6 +897,17 @@ impl App for ChatApp {
             return;
         }
 
+        // "+ New thread" entry point: clear the selection and
+        // pre-bind the active pod in the new-thread compose form's
+        // pod picker so the compose pane opens scoped to where the
+        // user clicked. No wire round-trip — the actual `CreateThread`
+        // fires when the user hits Start in the compose card.
+        if event.is_click_or_activate(SIDEBAR_NEW_THREAD_KEY) {
+            self.selected = None;
+            self.picker_pod = self.pod_tab.clone();
+            return;
+        }
+
         // "Show N more" / "Show less" toggle on the active pod's
         // thread list. One toggle per pod (the active one), so we
         // key membership in `expanded_pod_threads` by the active
@@ -1091,6 +1102,13 @@ const SIDEBAR_SHOWMORE_KEY: &str = "sidebar:showmore";
 /// Mirrors `whisper-agent-webui::THREAD_ROW_PREVIEW_COUNT`. The
 /// "Show N more" toggle reveals the full list per pod.
 const SIDEBAR_THREAD_PREVIEW: usize = 10;
+
+/// Routed key for the "+" icon-button next to the Threads section
+/// header — the primary entry point for starting a new thread in the
+/// active pod. Click clears the selection and pre-selects the active
+/// pod in the new-thread compose form's pod picker so the user lands
+/// on a compose pane already scoped to where they're working.
+const SIDEBAR_NEW_THREAD_KEY: &str = "sidebar:new-thread";
 
 /// Routed-key prefix for behavior rows in the sidebar (the
 /// expandable "show this behavior's runs" toggle). Children of this
@@ -1622,9 +1640,23 @@ impl ChatApp {
 
         let total = threads.len();
         let header_label = format!("Threads ({total})");
-        let header = row([sidebar_group_label(header_label).width(Size::Fill(1.0))])
-            .padding(Sides::xy(tokens::SPACE_2, tokens::SPACE_1))
-            .width(Size::Fill(1.0));
+        // The "+" entry point lives in the section header so it's
+        // the first thing the eye lands on when scanning the
+        // sidebar. Sticking it in the right slot of the header row
+        // keeps it adjacent to the label that scopes its meaning
+        // ("new thread *here*"). Render it `ghost` so it visually
+        // belongs to the chrome rather than competing with row
+        // content.
+        let header = row([
+            sidebar_group_label(header_label).width(Size::Fill(1.0)),
+            icon_button("plus")
+                .key(SIDEBAR_NEW_THREAD_KEY)
+                .ghost()
+                .icon_size(tokens::ICON_XS),
+        ])
+        .align(Align::Center)
+        .padding(Sides::xy(tokens::SPACE_2, tokens::SPACE_1))
+        .width(Size::Fill(1.0));
 
         let mut group_children: Vec<El> = vec![header];
 

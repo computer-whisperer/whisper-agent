@@ -295,9 +295,16 @@ tab strip rather than ported piecemeal. Multi-slice rollout:
   (probably a small `danger_button` helper that animates "Click again
   to confirm") for archive-pod / delete-behavior. Hooks into the
   ⋯ menu and the per-behavior toolbar.
-- **⏳ Slice δ — entry points.** "+ New pod" in the pod-tab overflow,
-  per-pod ➕ "new thread", ➕ "new behavior". Several stub out until
-  Stage 8's modals exist.
+- **🌗 Slice δ — entry points.** Per-pod ➕ "new thread" landed: an
+  `icon_button("plus")` keyed `sidebar:new-thread` lives in the
+  Threads section header. Click clears `selected` and pre-binds the
+  active pod into `picker_pod` so the new-thread compose pane opens
+  scoped to where the user clicked — no wire round-trip until Start.
+
+  "+ New pod" and "+ New behavior" stay deferred — both want
+  modals (id + display name fields at minimum), so they ride on
+  Stage 8's `dialog` widget landing rather than punching out
+  partial inline forms now.
 
 ### ✅ Stage 1 — Scaffold (commit `a46b421`)
 
