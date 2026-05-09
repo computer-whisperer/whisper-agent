@@ -247,10 +247,19 @@ enum Scene {
     /// `GetPod` lands, then the dump loop's second `before_build`
     /// drain hydrates the editor before render.
     PodEditorHydrated,
+    /// Fork-from-message dialog with a User row pre-selected. The
+    /// dialog opens via a synthetic click on the per-row fork
+    /// affordance (`chat:user-fork:{msg_index}`) — routing is
+    /// key-based, not hit-test-based, so this works even though the
+    /// dump's `BuildCx` doesn't carry a `UiState` to drive
+    /// `is_hovering_within`. (The hover-revealed affordance itself
+    /// is verified live in the dev binary; the dump captures the
+    /// post-click modal layout.)
+    ForkModalOpen,
 }
 
 impl Scene {
-    const ALL: [Scene; 33] = [
+    const ALL: [Scene; 34] = [
         Scene::Connecting,
         Scene::Connected,
         Scene::Closed,
@@ -284,6 +293,7 @@ impl Scene {
         Scene::BehaviorEditorHydrated,
         Scene::BehaviorEditorTriggerKindOpen,
         Scene::PodEditorHydrated,
+        Scene::ForkModalOpen,
     ];
 
     fn slug(self) -> &'static str {
@@ -321,6 +331,7 @@ impl Scene {
             Scene::BehaviorEditorHydrated => "behavior_editor_hydrated",
             Scene::BehaviorEditorTriggerKindOpen => "behavior_editor_trigger_kind_open",
             Scene::PodEditorHydrated => "pod_editor_hydrated",
+            Scene::ForkModalOpen => "fork_modal_open",
         }
     }
 
@@ -389,6 +400,14 @@ impl Scene {
             // affordance. Renders only when `pod_tab.is_some()`,
             // which it is here (PodList seeded a default).
             Scene::PodEditorHydrated => vec!["sidebar:pod-settings"],
+            // Select the thread, then click the per-row fork
+            // affordance for the first User message. `mock_snapshot`
+            // pushes an empty system_text at msg_index=0 first, so
+            // the first user message lands at msg_index=1. Synthetic
+            // clicks route by key alone — they don't go through
+            // hit-test, so the hover-conditional render of the
+            // affordance doesn't matter for the on_event dispatch.
+            Scene::ForkModalOpen => vec!["thread:t-1", "chat:user-fork:1"],
             // Pick a backend (which fires a no-op `ListModels`),
             // then a model id from the pre-seeded `ModelsList`,
             // then a pod. Each `option:` click goes through
@@ -745,6 +764,27 @@ fn build_app(scene: Scene) -> Box<dyn App> {
             q.push_back(InboundEvent::Wire(ServerToClient::BackendsList {
                 correlation_id: None,
                 backends: mock_backends(),
+            }));
+        }
+        Scene::ForkModalOpen => {
+            // Same baseline as `ThreadWithMessages` — pods + thread
+            // list + a snapshot for t-1 with a single User
+            // message at msg_index=0. The fork-affordance click
+            // pulls the seed text out of that message; the dialog
+            // opens in the post-click frame.
+            q.push_back(InboundEvent::ConnectionOpened);
+            q.push_back(InboundEvent::Wire(ServerToClient::PodList {
+                correlation_id: None,
+                pods: mock_pods(),
+                default_pod_id: "default".into(),
+            }));
+            q.push_back(InboundEvent::Wire(ServerToClient::ThreadList {
+                correlation_id: None,
+                tasks: mock_threads(),
+            }));
+            q.push_back(InboundEvent::Wire(ServerToClient::ThreadSnapshot {
+                thread_id: "t-1".into(),
+                snapshot: mock_snapshot(),
             }));
         }
         Scene::SidebarBehaviorsEmpty => {

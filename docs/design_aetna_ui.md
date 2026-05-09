@@ -558,7 +558,7 @@ lines:
 - ✅ pod editor (raw TOML — sheet, not dialog)
 - ✅ new pod
 - ✅ new behavior
-- fork thread
+- ✅ fork thread (paired with per-User-row hover affordance)
 - file / JSON / image viewers
 
 **Pattern landed with the `+ New pod` modal:**
@@ -658,6 +658,44 @@ text directly; the server parses + validates and replies with
 match). The text_area's default Hug height combined with the
 outer `scroll` lets long pod.tomls scroll the whole sheet body
 rather than clipping internally.
+
+**Fork-thread dialog + per-row hover affordance (landed):**
+the first slice that uses aetna's new `BuildCx::is_hovering_within(key)`
++ subtree-interaction-envelope cascade (upstream gh#9 / gh#10).
+Each User row in the chat log gets a keyed wrapper
+(`chat:user-row:{idx}`) and `event_log_row` reads
+`is_hovering_within(row_key)` during build to decide whether to
+render a `git-branch` icon-button next to the user text. Click
+on the affordance routes through `chat:user-fork:{msg_index}`,
+which opens the fork dialog pre-populated with the clicked
+message's `from_message_index` + seed text.
+
+The fork dialog itself is a regular `dialog`-shaped modal: an
+explainer paragraph + two `switch`-shaped form items (Archive
+original — default on; Reset capabilities — default off). Confirm
+mints a correlation, ships `ClientToServer::ForkThread`, and
+stashes `(correlation, seed_text)` in `pending_fork_seed`. The
+matching `ThreadCreated` echo (correlation-matched) seeds the new
+thread's `drafts[new_id]` slot with the captured prompt and auto-
+selects the new thread — so the user lands on a compose box that's
+ready for "edit slightly and resend." Mirrors the egui sibling's
+`pending_fork_seed` flow.
+
+`DisplayItem::User` grew a `msg_index: usize` field for this. The
+snapshot path computes it from the message's position in
+`Conversation.messages()`. Streaming `ThreadUserMessage` reads it
+from a new `ThreadView::next_msg_index` counter that hydrates
+from the snapshot's message count and bumps on commit-shaped wire
+arms (`ThreadUserMessage`, `ThreadAssistantEnd`,
+`ThreadToolResultMessage`).
+
+**Hover note:** the affordance is hover-conditional in the live
+binary but always rendered in the bundle dump's `ForkModalOpen`
+scene — synthetic clicks route by key alone, so the click
+through to the modal doesn't depend on the affordance being
+visually rendered. Bundle-side hover simulation needs a
+`UiState`-injecting `BuildCx` and isn't worth the surface area
+for one scene.
 
 Entry point: a `settings`-icon button in the sidebar header,
 rendered only when some pod tab is active. Single key

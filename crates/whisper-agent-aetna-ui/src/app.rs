@@ -85,6 +85,14 @@ impl ConnectionStatus {
 enum DisplayItem {
     User {
         text: String,
+        /// Index in the conversation's `Message` vector this user
+        /// turn occupies. Surfaced to the per-row fork affordance so
+        /// `ClientToServer::ForkThread { from_message_index }` knows
+        /// where to fork from. Mirrors the egui sibling's per-row
+        /// msg_index. Live-streamed `ThreadUserMessage` rows take the
+        /// next index past the current `view.items`' last seen User
+        /// — see `view_user_msg_index_for_streaming`.
+        msg_index: usize,
     },
     Assistant {
         text: String,
@@ -380,6 +388,14 @@ struct ThreadView {
     /// *and* the summary's state is `Failed` — the conjunction
     /// avoids surfacing stale failure text after a recovery.
     failure: Option<String>,
+    /// Index a freshly-arriving `ThreadUserMessage` lands at in the
+    /// underlying [`whisper_agent_protocol::Conversation`]. Hydrated
+    /// from `conv.messages().count()` on snapshot, then incremented
+    /// per server-broadcast message arm so per-row fork affordances
+    /// can stamp the matching `from_message_index`. Tool-result and
+    /// assistant streaming arms also bump this so the count tracks
+    /// the conversation, not just user turns.
+    next_msg_index: usize,
 }
 
 pub struct ChatApp {
@@ -542,6 +558,16 @@ pub struct ChatApp {
     /// land in follow-up slices once `sheet`-shaped form composition
     /// has more surface to share with the behavior editor.
     pod_editor: Option<PodEditorSheetState>,
+    /// Fork-thread confirm dialog state. `Some` while the dialog is
+    /// open; `None` when closed.
+    fork_modal: Option<ForkModalState>,
+    /// `(correlation_id, seed_text)` for an outstanding `ForkThread`.
+    /// On the matching `ThreadCreated` echo the new thread's draft
+    /// gets seeded with the original prompt — the user's typical
+    /// next-step is "edit slightly and resend," and the draft slot
+    /// is exactly where the new thread's compose box reads from.
+    /// Mirrors the egui sibling's same-named field.
+    pending_fork_seed: Option<(String, String)>,
     /// Monotonic counter for outgoing `correlation_id` strings.
     /// Each modal that sends a request claims an id and waits for
     /// the matching reply (success or `Error`) before closing or
@@ -773,6 +799,36 @@ impl BehaviorEditorSheetState {
     }
 }
 
+/// State for the "fork from this message" confirm dialog. Opened
+/// from a per-User-row fork icon; closes (without sending anything)
+/// on cancel or scrim dismiss, or fires `ForkThread` on confirm and
+/// closes immediately. We don't track a `pending_correlation` here
+/// because the server doesn't echo a `ForkThread`-specific reply —
+/// the matching `ThreadCreated` lands through the normal arm and
+/// (when correlation matches `pending_fork_seed`'s id) seeds the
+/// new thread's draft with the captured prompt text.
+pub(crate) struct ForkModalState {
+    /// The thread we're forking off of. Captured at click time so
+    /// the dialog still routes correctly even if the user re-selects
+    /// before clicking Fork.
+    pub(crate) thread_id: String,
+    /// Wire's `from_message_index` — the conversation index this
+    /// fork replays up to (but not including).
+    pub(crate) from_message_index: usize,
+    /// User-message text the user clicked fork on. Used as the draft
+    /// seed for the new thread once `ThreadCreated` lands.
+    pub(crate) seed_text: String,
+    /// Archive the source thread on confirm. Default `true` —
+    /// fork is almost always "I want to try something different
+    /// from here," and the original typically becomes noise.
+    pub(crate) archive_original: bool,
+    /// Re-derive scope / bindings / config from the pod's current
+    /// `thread_defaults` instead of inheriting from the source
+    /// thread. Default `false` (inherit) — most forks are "continue
+    /// where I left off" with the source's settings.
+    pub(crate) reset_capabilities: bool,
+}
+
 /// Form state for the pod editor sheet. v1 surface is a single
 /// `text_area` over the pod's raw `pod.toml`. Server validates the
 /// parse on `UpdatePodConfig` and replies with `Error` on failure or
@@ -860,6 +916,8 @@ impl ChatApp {
             new_behavior_modal: None,
             behavior_editor: None,
             pod_editor: None,
+            fork_modal: None,
+            pending_fork_seed: None,
             correlation_counter: 0,
         }
     }
@@ -1177,16 +1235,34 @@ impl ChatApp {
                     self.selected = None;
                 }
             }
-            ServerToClient::ThreadCreated { summary, .. } => {
+            ServerToClient::ThreadCreated {
+                summary,
+                correlation_id,
+                ..
+            } => {
                 let new_id = summary.thread_id.clone();
                 self.threads.insert(new_id.clone(), summary);
+                // Was this `ThreadCreated` the echo for an outstanding
+                // `ForkThread`? If so, capture the seed text into the
+                // new thread's draft and auto-select it. Match by
+                // correlation so an unrelated `ThreadCreated` (e.g.
+                // a behavior fire) doesn't accidentally consume the
+                // seed.
+                let fork_match = matches!(
+                    (&self.pending_fork_seed, correlation_id.as_ref()),
+                    (Some((corr, _)), Some(echoed)) if corr == echoed
+                );
+                if fork_match && let Some((_, seed)) = self.pending_fork_seed.take() {
+                    self.drafts.insert(new_id.clone(), seed);
+                    self.select_thread(new_id.clone());
+                }
                 // If the user just submitted the new-thread form (no
                 // selection currently), auto-select the freshly
                 // created thread so the post-create transition lands
                 // them in the live conversation. Skipped when another
                 // thread is already selected so a background create
                 // (e.g. dispatch_thread) doesn't yank focus away.
-                if self.selected.is_none() {
+                if !fork_match && self.selected.is_none() {
                     self.select_thread(new_id);
                     // Pickers and compose buffer were consumed by the
                     // CreateThread send; reset them so the next
@@ -1233,10 +1309,12 @@ impl ChatApp {
             } => {
                 let items =
                     conversation_to_display_items(&snapshot.conversation, &snapshot.turn_log);
+                let next_msg_index = snapshot.conversation.messages().len();
                 let view = ThreadView {
                     items,
                     title: snapshot.title,
                     failure: snapshot.failure,
+                    next_msg_index,
                 };
                 // Hydrate the local draft from the snapshot — the
                 // server's stored draft is authoritative on initial
@@ -1276,10 +1354,18 @@ impl ChatApp {
             ServerToClient::ThreadUserMessage {
                 thread_id, text, ..
             } => {
-                if let Some(view) = self.views.get_mut(&thread_id)
-                    && !text.is_empty()
-                {
-                    view.items.push(DisplayItem::User { text });
+                if let Some(view) = self.views.get_mut(&thread_id) {
+                    if !text.is_empty() {
+                        view.items.push(DisplayItem::User {
+                            text,
+                            msg_index: view.next_msg_index,
+                        });
+                    }
+                    // Bump regardless of empty-text guard — the
+                    // server still records an empty user message in
+                    // the conversation, so the next message lands at
+                    // the index past this one.
+                    view.next_msg_index += 1;
                 }
             }
             ServerToClient::ThreadAssistantTextDelta { thread_id, delta } => {
@@ -1466,11 +1552,25 @@ impl ChatApp {
             } => {
                 if let Some(view) = self.views.get_mut(&thread_id) {
                     view.items.push(DisplayItem::TurnStats { usage });
+                    // Assistant turn just committed → conversation
+                    // grew by one Message. Keeping `next_msg_index`
+                    // honest is what makes per-row fork from a
+                    // streamed-in user msg target the right index.
+                    view.next_msg_index += 1;
+                }
+            }
+            ServerToClient::ThreadToolResultMessage { thread_id, .. } => {
+                // Tool-result message landed on the conversation
+                // (separate from the optimistic fusion we already
+                // do in the ToolResult arm). We don't surface the
+                // arm's own content yet, but the count bump still
+                // matters for `next_msg_index`.
+                if let Some(view) = self.views.get_mut(&thread_id) {
+                    view.next_msg_index += 1;
                 }
             }
             // Per-turn append events not yet surfaced.
-            ServerToClient::ThreadToolResultMessage { .. }
-            | ServerToClient::ThreadAssistantBegin { .. }
+            ServerToClient::ThreadAssistantBegin { .. }
             | ServerToClient::ThreadLoopComplete { .. }
             | ServerToClient::ThreadCompacted { .. } => {}
             ServerToClient::Error {
@@ -1561,14 +1661,19 @@ impl App for ChatApp {
         self.drain_inbound();
     }
 
-    fn build(&self, _cx: &BuildCx) -> El {
+    fn build(&self, cx: &BuildCx) -> El {
         // Root is an overlay stack: the main row carries the chrome,
         // any open `select_menu` rides above it as a popover layer.
         // Per `widgets::select` doc, the menu must sit at the El
         // tree root so it paints over content and intercepts the
         // dismiss scrim's click — we collect them here.
+        //
+        // `cx` threads down through `content` → `event_log_row` so
+        // the chat log can read `is_hovering_within(row_key)` to
+        // surface per-row affordances (e.g. the user-row fork
+        // button) without mirroring hover state through `on_event`.
         overlays(
-            row([self.sidebar(), self.content()])
+            row([self.sidebar(), self.content(cx)])
                 .width(Size::Fill(1.0))
                 .height(Size::Fill(1.0))
                 .gap(0.0),
@@ -1689,6 +1794,21 @@ impl App for ChatApp {
         // Pod editor sheet routing — single text_area + Save /
         // Cancel / Dismiss.
         if self.handle_pod_editor_event(&event) {
+            return;
+        }
+        // Fork dialog routing — switch toggles, primary / cancel /
+        // dismiss.
+        if self.handle_fork_modal_event(&event) {
+            return;
+        }
+        // Per-User-row fork affordance — opens the fork dialog
+        // pre-populated with the clicked message's index + text.
+        if let Some(key) = event.route()
+            && let Some(suffix) = key.strip_prefix(CHAT_USER_FORK_PREFIX)
+            && matches!(event.kind, UiEventKind::Click | UiEventKind::Activate)
+            && let Ok(msg_index) = suffix.parse::<usize>()
+        {
+            self.open_fork_modal(msg_index);
             return;
         }
 
@@ -1983,6 +2103,36 @@ const BEHAVIOR_DELETE_PREFIX: &str = "behavior-delete:";
 /// Click opens the [`BEHAVIOR_EDITOR_KEY`] sheet and fires
 /// `GetBehavior` to hydrate the form.
 const BEHAVIOR_EDIT_PREFIX: &str = "behavior-edit:";
+
+/// Routed-key prefix for the per-User-row fork affordance. Suffix is
+/// `{msg_index}` (parsed back to a `usize` in `on_event`). Click
+/// opens the fork dialog pre-populated with the clicked message's
+/// index + seed text.
+const CHAT_USER_FORK_PREFIX: &str = "chat:user-fork:";
+
+/// Key for a User row's hover-detection wrapper. `idx` is the
+/// display-item index (stable per build), distinct from `msg_index`
+/// (the wire's conversation message index): we use display-item
+/// position for keying so streaming-time index drift doesn't move
+/// the hover key out from under the cursor.
+fn chat_user_row_key(idx: usize) -> String {
+    format!("chat:user-row:{idx}")
+}
+
+fn chat_user_fork_key(msg_index: usize) -> String {
+    format!("{CHAT_USER_FORK_PREFIX}{msg_index}")
+}
+
+/// Routed-key prefix the fork dialog uses. Extended keys:
+/// `{prefix}:dismiss`, `{prefix}:archive` (Switch toggle),
+/// `{prefix}:reset-caps` (Switch toggle), `{prefix}:confirm`
+/// (primary), `{prefix}:cancel` (secondary).
+const FORK_MODAL_KEY: &str = "fork";
+const FORK_MODAL_ARCHIVE_KEY: &str = "fork:archive";
+const FORK_MODAL_RESET_CAPS_KEY: &str = "fork:reset-caps";
+const FORK_MODAL_CONFIRM_KEY: &str = "fork:confirm";
+const FORK_MODAL_CANCEL_KEY: &str = "fork:cancel";
+const FORK_MODAL_DISMISS_KEY: &str = "fork:dismiss";
 
 /// Routed key for the active-pod settings gear in the sidebar header
 /// — opens the pod editor sheet for `pod_tab` (rendered only when
@@ -2809,10 +2959,10 @@ impl ChatApp {
             .map(|p| p.pod_id.clone())
     }
 
-    fn content(&self) -> El {
+    fn content(&self, cx: &BuildCx) -> El {
         let inner = match self.selected.as_ref() {
             None => self.new_thread_pane(),
-            Some(thread_id) => self.thread_pane(thread_id),
+            Some(thread_id) => self.thread_pane(thread_id, cx),
         };
         // Connection alerts surface above the per-thread pane so
         // they're visible regardless of which thread (if any) is
@@ -2876,7 +3026,7 @@ impl ChatApp {
         )
     }
 
-    fn thread_pane(&self, thread_id: &str) -> El {
+    fn thread_pane(&self, thread_id: &str, cx: &BuildCx) -> El {
         let summary = self.threads.get(thread_id);
         let view = self.views.get(thread_id);
 
@@ -2942,7 +3092,7 @@ impl ChatApp {
                     .items
                     .iter()
                     .enumerate()
-                    .map(|(idx, item)| self.event_log_row(idx, item))
+                    .map(|(idx, item)| self.event_log_row(idx, item, cx))
                     .collect();
                 // Inter-row breathing room. Upstream's README example
                 // has no explicit gap; with the row content sitting
@@ -3160,6 +3310,9 @@ impl ChatApp {
         }
         if let Some(sheet_el) = self.render_pod_editor_sheet() {
             out.push(Some(sheet_el));
+        }
+        if let Some(modal_el) = self.render_fork_modal() {
+            out.push(Some(modal_el));
         }
         out
     }
@@ -4117,6 +4270,169 @@ impl ChatApp {
         Some(sheet(POD_EDITOR_KEY, SheetSide::Right, children))
     }
 
+    /// Open the fork-thread dialog for the current thread's
+    /// `msg_index`-th message. Pulls the seed text out of the
+    /// matching User display item — the dialog uses it to label the
+    /// confirm and the wire round-trip uses it to seed the new
+    /// thread's draft. No-op if no thread is selected (the fork
+    /// affordance is only rendered on a selected thread's User
+    /// rows, but defend against the race anyway) or if the
+    /// `msg_index` doesn't resolve to a User item in the live view
+    /// (e.g. the snapshot rolled while the click was in flight).
+    fn open_fork_modal(&mut self, msg_index: usize) {
+        let Some(thread_id) = self.selected.clone() else {
+            return;
+        };
+        let Some(view) = self.views.get(&thread_id) else {
+            return;
+        };
+        let Some(seed_text) = view.items.iter().find_map(|it| match it {
+            DisplayItem::User { text, msg_index: m } if *m == msg_index => Some(text.clone()),
+            _ => None,
+        }) else {
+            return;
+        };
+        // Archive-by-default per the egui sibling: a fork is almost
+        // always "I want to try something different from here," so
+        // the default leaves the original off the sidebar list.
+        self.fork_modal = Some(ForkModalState {
+            thread_id,
+            from_message_index: msg_index,
+            seed_text,
+            archive_original: true,
+            reset_capabilities: false,
+        });
+    }
+
+    /// Routing for the fork dialog. Switch toggles flip in place
+    /// (no wire round-trip until confirm); cancel / dismiss close;
+    /// confirm fires `ClientToServer::ForkThread` and stamps
+    /// `pending_fork_seed` so the resulting `ThreadCreated` echo
+    /// can seed the new thread's draft. Returns `true` when
+    /// consumed.
+    fn handle_fork_modal_event(&mut self, event: &UiEvent) -> bool {
+        if self.fork_modal.is_none() {
+            return false;
+        }
+
+        // Switches use `widgets::switch` — its `apply_event` flips
+        // the bool when the routed click lands on the switch's key.
+        if let Some(modal) = self.fork_modal.as_mut() {
+            switch::apply_event(&mut modal.archive_original, event, FORK_MODAL_ARCHIVE_KEY);
+            switch::apply_event(
+                &mut modal.reset_capabilities,
+                event,
+                FORK_MODAL_RESET_CAPS_KEY,
+            );
+        }
+
+        if event.is_click_or_activate(FORK_MODAL_CANCEL_KEY)
+            || event.is_click_or_activate(FORK_MODAL_DISMISS_KEY)
+        {
+            self.fork_modal = None;
+            return true;
+        }
+
+        if event.is_click_or_activate(FORK_MODAL_CONFIRM_KEY) {
+            self.confirm_fork_modal();
+            return true;
+        }
+
+        // Switch clicks land on their own keys; consume those so we
+        // don't fall through to other handlers.
+        if event.target_key() == Some(FORK_MODAL_ARCHIVE_KEY)
+            || event.target_key() == Some(FORK_MODAL_RESET_CAPS_KEY)
+        {
+            return true;
+        }
+
+        false
+    }
+
+    /// Fire `ForkThread` and stash the correlation + seed text so
+    /// the matching `ThreadCreated` arm can seed the new thread's
+    /// draft. Closes the modal immediately (server-side fork is
+    /// quick on loopback; if it fails the `Error` arm surfaces a
+    /// thread-scoped error rather than a modal-side one — the modal
+    /// state is gone by then).
+    fn confirm_fork_modal(&mut self) {
+        let Some(modal) = self.fork_modal.take() else {
+            return;
+        };
+        let correlation_id = self.next_correlation_id();
+        self.pending_fork_seed = Some((correlation_id.clone(), modal.seed_text));
+        self.send(ClientToServer::ForkThread {
+            correlation_id: Some(correlation_id),
+            thread_id: modal.thread_id,
+            from_message_index: modal.from_message_index,
+            archive_original: modal.archive_original,
+            reset_capabilities: modal.reset_capabilities,
+        });
+    }
+
+    /// Render the fork dialog if open. Same shadcn-shaped scaffold
+    /// the create modals use: `dialog([dialog_header, body,
+    /// dialog_footer])`. Body composes the explainer text + two
+    /// `switch`-shaped form items (Archive original, Reset
+    /// capabilities) with form_descriptions clarifying the
+    /// non-obvious choice.
+    fn render_fork_modal(&self) -> Option<El> {
+        let modal = self.fork_modal.as_ref()?;
+
+        let archive_switch = switch(modal.archive_original).key(FORK_MODAL_ARCHIVE_KEY);
+        let reset_switch = switch(modal.reset_capabilities).key(FORK_MODAL_RESET_CAPS_KEY);
+
+        let confirm = button("Fork").key(FORK_MODAL_CONFIRM_KEY).primary();
+        let cancel = button("Cancel").key(FORK_MODAL_CANCEL_KEY);
+
+        let body = column([
+            paragraph(
+                "Forks this thread at the selected user message. The new \
+                 thread shares the pod, bindings, config, and tool allowlist, \
+                 and starts with the conversation up to (but not including) \
+                 that message — ready for you to retype the prompt.",
+            )
+            .muted(),
+            form([
+                form_item([
+                    form_label("Archive original"),
+                    form_control(archive_switch),
+                    form_description(
+                        "Archived threads drop off the sidebar list but stay \
+                         on disk; still readable from the server's pod \
+                         directory.",
+                    ),
+                ]),
+                form_item([
+                    form_label("Reset capabilities"),
+                    form_control(reset_switch),
+                    form_description(
+                        "Off (default): inherit the source thread's live \
+                         bindings, scope, and config. On: re-derive from the \
+                         pod's current defaults — pick this up to use newly-\
+                         added MCP hosts, sandbox bindings, or cap changes \
+                         since the source was created.",
+                    ),
+                ]),
+            ]),
+        ])
+        .gap(tokens::SPACE_3)
+        .width(Size::Fill(1.0));
+
+        let children: Vec<El> = vec![
+            dialog_header([
+                dialog_title("Fork from this message"),
+                dialog_description(format!(
+                    "Forking at message #{} of the current thread.",
+                    modal.from_message_index
+                )),
+            ]),
+            body,
+            dialog_footer([cancel, confirm]),
+        ];
+        Some(dialog(FORK_MODAL_KEY, children))
+    }
+
     fn backend_menu(&self) -> El {
         let mut options: Vec<(String, String)> = vec![(
             PICKER_INHERIT.to_string(),
@@ -4450,17 +4766,53 @@ impl ChatApp {
     /// Reasoning + tool rows nest an `accordion_item` so their
     /// bodies collapse — typical thread reads are noisy with these
     /// otherwise.
-    fn event_log_row(&self, idx: usize, item: &DisplayItem) -> El {
+    fn event_log_row(&self, idx: usize, item: &DisplayItem, cx: &BuildCx) -> El {
         match item {
-            DisplayItem::User { text: t } => {
-                let body = paragraph(t.clone());
+            DisplayItem::User { text: t, msg_index } => {
+                // Wrap the body in a keyed container so
+                // `is_hovering_within` can answer "is the cursor on
+                // this row?" — the fork affordance fades in based on
+                // the predicate. The key uses `idx` (display-item
+                // position, stable per build pass) rather than
+                // msg_index so that two User items at the same
+                // msg_index — possible during streaming if anything
+                // weird happens — don't collide. Behavior is purely
+                // visual; routing for the fork click goes through
+                // `fork:{msg_index}` (msg_index is what the wire
+                // needs).
+                let row_key = chat_user_row_key(idx);
+                let hovered = cx.is_hovering_within(&row_key);
+                // Plain paragraph for the unhovered case keeps the
+                // wrap calculation identical to the pre-fork-
+                // affordance render — wrapping a paragraph in a
+                // multi-child row caused Y-overflow because the
+                // row's cross-axis sizing didn't propagate the
+                // wrap-width hint correctly. Only diverge into a
+                // row layout when the affordance is actually
+                // present.
+                let inner = if hovered {
+                    // `git-branch` ships in aetna's built-in icon
+                    // registry — close enough to a "fork" semantic
+                    // for v1 without bundling a `git-fork` SVG.
+                    let fork = icon_button("git-branch")
+                        .key(chat_user_fork_key(*msg_index))
+                        .ghost()
+                        .icon_size(tokens::ICON_XS);
+                    row([paragraph(t.clone()).width(Size::Fill(1.0)), fork])
+                        .gap(tokens::SPACE_2)
+                        .align(Align::Start)
+                        .width(Size::Fill(1.0))
+                        .key(row_key)
+                } else {
+                    paragraph(t.clone()).width(Size::Fill(1.0)).key(row_key)
+                };
                 // Upstream README's worked example uses
                 // `with_alpha(18)` (~7%) for the user fill — too low
                 // to be visible against the dark zinc-950 background.
                 // Bump to ~25% so user turns actually break up a long
                 // assistant stream. Subtle enough to still read as
                 // "log entry, not card".
-                log_row(tokens::INFO, Some(tokens::INFO.with_alpha(64)), body)
+                log_row(tokens::INFO, Some(tokens::INFO.with_alpha(64)), inner)
             }
             DisplayItem::Assistant { text: t } => {
                 // Markdown rendering for assistant content. The egui
@@ -4866,7 +5218,7 @@ fn conversation_to_display_items(
 ) -> Vec<DisplayItem> {
     let mut out: Vec<DisplayItem> = Vec::new();
     let mut entry_iter = turn_log.entries.iter();
-    for msg in conv.messages() {
+    for (msg_index, msg) in conv.messages().iter().enumerate() {
         match msg.role {
             Role::System => {
                 // System prompt at the head of the conversation —
@@ -4906,12 +5258,12 @@ fn conversation_to_display_items(
             }
             Role::User => {
                 for block in &msg.content {
-                    push_block(block, true, &mut out);
+                    push_block(block, true, msg_index, &mut out);
                 }
             }
             Role::Assistant => {
                 for block in &msg.content {
-                    push_block(block, false, &mut out);
+                    push_block(block, false, msg_index, &mut out);
                 }
                 // Pull the next turn-log entry — one per assistant
                 // response — and append the usage row so it lands
@@ -4946,12 +5298,15 @@ fn conversation_to_display_items(
     out
 }
 
-fn push_block(block: &ContentBlock, user_role: bool, out: &mut Vec<DisplayItem>) {
+fn push_block(block: &ContentBlock, user_role: bool, msg_index: usize, out: &mut Vec<DisplayItem>) {
     match block {
         ContentBlock::Text { text } => {
             if !text.is_empty() {
                 if user_role {
-                    out.push(DisplayItem::User { text: text.clone() });
+                    out.push(DisplayItem::User {
+                        text: text.clone(),
+                        msg_index,
+                    });
                 } else {
                     out.push(DisplayItem::Assistant { text: text.clone() });
                 }
