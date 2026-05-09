@@ -300,21 +300,24 @@ tab strip rather than ported piecemeal. Multi-slice rollout:
   key, so opening a modal / switching tabs / picking a thread all
   cancel a pending arm.
 
-  Visual contract: idle Delete is a trash `icon_button().ghost()`
-  (matches Run / Pause weight, won't catch a misclicked scroll);
-  armed flips to a wider text `button("Confirm delete?")
-  .destructive()`. The combined icon→text + ghost→destructive
-  shift is the load-bearing arm signal — either alone would be
-  too easy to misclick past on a fast double-tap. Layout: two-
-  row toolbar inside the expanded behavior body — Run + Pause on
-  top, Edit (left) + Delete (right) on the bottom. The bottom
-  row pairs "modify-this-record" (Edit) with destructive (Delete)
-  so the row composition itself signals "danger zone."
+  Visual contract: idle Delete is a trash `icon_button().ghost()`;
+  armed is the same trash icon under `.destructive()` (solid red
+  fill — `.ghost().destructive()` doesn't compose, since
+  `destructive()` writes back to `fill` regardless of ghost).
+  The ghost→destructive color flip is the arm signal: a quiet
+  gray icon goes loud red on the user's first click, with time
+  to render before the second click of a normal-tempo double-tap
+  lands. Pre-handler at the top of `on_event` clears the arm if
+  any other click happens first. Layout: single row of four
+  icon-buttons (Run / Pause·Resume / Edit / Delete) clustered
+  side-by-side. With every action shrunk to 32 px the strip is
+  ~152 px wide, well under the sidebar's 224 px, so the two-row
+  split the text-labelled version needed is gone.
 
   Chrome leans on icons over text per `feedback_aetna_chrome_icons`
   — Run is `zap` (lightning, distinct from Pause's `play`-on-
-  resume), Pause is `pause`/`play`, Edit is `square-pen`, idle
-  Delete is `trash`. None of these ship in aetna's built-in
+  resume), Pause is `pause`/`play`, Edit is `square-pen`, Delete
+  is `trash`. None of these ship in aetna's built-in
   [`IconName`] registry yet; the lucide-shaped SVGs are bundled
   in `crates/whisper-agent-aetna-ui/src/icons.rs` and constructed
   via `SvgIcon::parse_current_color`. When a future aetna

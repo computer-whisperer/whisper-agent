@@ -2382,24 +2382,27 @@ impl ChatApp {
     }
 
     /// Inline action toolbar shown inside an expanded behavior body.
-    /// Icon-shaped chrome (lucide `zap` / `pause` or `play` / square-
-    /// pen / trash) — keeps the toolbar dense in a 224 px sidebar
-    /// column where text labels read crowded. Two-row layout: the top
-    /// row carries Run-now and Pause(Resume); the bottom row pairs
-    /// Edit (left) with Delete (right, two-click arm-confirm).
+    /// Single row of four icon-buttons (lucide `zap` / `pause` or
+    /// `play` / `square-pen` / `trash`) clustered side-by-side. With
+    /// every action shrunk to a 32 px icon the whole strip is ~152 px
+    /// wide — well under the sidebar's 224 px — so the two-row split
+    /// the text-labelled version needed is gone.
     ///
     /// Run-now uses `zap` (lightning = "fire now") rather than `play`
     /// so it doesn't visually collide with the Resume `play` icon
-    /// when the behavior is paused. The armed Delete keeps a text
-    /// label ("Confirm delete?") because a label change is the only
-    /// reliable signal for an arm-confirm gesture — switching from
-    /// trash-icon to text on arm makes the second-click intent
-    /// unmistakable.
+    /// when the behavior is paused. Pause and Resume share the
+    /// `behavior-toggle:` route key — same button, different icon
+    /// based on `enabled`.
     ///
-    /// Two rows because the sidebar's 224 px isn't wide enough to hold
-    /// every button next to the (sometimes-armed) Delete; the visual
-    /// split also separates "everyday" (Run / Pause) from "modify-
-    /// this-record" + destructive (Edit / Delete).
+    /// Delete is two-click arm-confirm: idle is `trash.ghost()`,
+    /// armed is the same `trash` icon under `.destructive()` (solid
+    /// red fill, since `.ghost().destructive()` doesn't compose —
+    /// `destructive()` writes back to `fill` regardless of ghost).
+    /// The color flip is the arm signal: a quiet gray icon goes loud
+    /// red on the user's first click, and on a normal-tempo
+    /// double-click the red has time to render before the second
+    /// click lands. Pre-handler at the top of `on_event` clears the
+    /// arm if any other click happens first.
     ///
     /// Edit opens the [`BEHAVIOR_EDITOR_KEY`] sheet (right-attached
     /// `SheetSide::Right`); load-errored rows can still open it so the
@@ -2429,18 +2432,8 @@ impl ChatApp {
             .as_ref()
             .map(|(p, bb)| p == pod_id && bb == &b.behavior_id)
             .unwrap_or(false);
-        // Two affordance shifts on arm: the idle trash icon flips
-        // to a text "Confirm delete?" label, AND the styling flips
-        // to solid destructive fill. The icon→text shift is what
-        // keeps the second-click gesture unmistakable — a fast
-        // double-click on a trash icon is plausibly accidental, but
-        // a click on a wide red text button isn't. (`.ghost().
-        // destructive()` doesn't compose the way it looks —
-        // `destructive()` runs `tint()` which writes back to `fill`
-        // regardless of ghost, so the idle styling has to be plain
-        // ghost.)
         let delete = if armed {
-            button("Confirm delete?")
+            icon_button(crate::icons::ICON_TRASH.clone())
                 .key(behavior_delete_key(pod_id, &b.behavior_id))
                 .destructive()
         } else {
@@ -2450,29 +2443,17 @@ impl ChatApp {
         };
 
         // Indent matches the nested-thread depth=1 left-pad so the
-        // toolbar visually belongs to the expanded body. Two rows:
-        // actions left-aligned on top, destructive right-aligned
-        // below. Tight `gap(0)` between the sub-rows so the toolbar
-        // doesn't eat extra vertical space — the row backgrounds
-        // are transparent, the visual separation is the spacer +
-        // right-aligned destructive cluster.
+        // toolbar visually belongs to the expanded body.
         let pad = Sides {
             left: tokens::SPACE_3 + tokens::SPACE_3,
             right: tokens::SPACE_3,
             top: 0.0,
             bottom: tokens::SPACE_1,
         };
-        column([
-            row([run, toggle])
-                .gap(tokens::SPACE_2)
-                .width(Size::Fill(1.0)),
-            row([edit, spacer(), delete])
-                .align(Align::Center)
-                .width(Size::Fill(1.0)),
-        ])
-        .gap(0.0)
-        .padding(pad)
-        .width(Size::Fill(1.0))
+        row([run, toggle, edit, delete])
+            .gap(tokens::SPACE_2)
+            .padding(pad)
+            .width(Size::Fill(1.0))
     }
 
     /// Build the pod selector row. Single-active selection keyed
