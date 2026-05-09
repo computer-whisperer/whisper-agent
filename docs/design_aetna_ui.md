@@ -262,17 +262,24 @@ tab strip rather than ported piecemeal. Multi-slice rollout:
   left-padded by `SPACE_3 * depth`. "Show N more" pagination at
   `SIDEBAR_THREAD_PREVIEW = 10` rows. No new wire calls.
 - **🌗 Slice β — behaviors first-class.** Per-pod `Behaviors (N)`
-  subsection above threads, populated via `ListBehaviors` (deduped
-  per pod per connection) and kept fresh by `BehaviorList` /
-  `BehaviorCreated` / `BehaviorUpdated` / `BehaviorDeleted` /
-  `BehaviorStateChanged`. Each row is an `item_group([item([
-  item_content([title, description])])])` — title is the display
-  name (`⚠`-prefixed when load_error), description is
-  `"{kind} · {status}"` for healthy rows (`status` =
-  `paused` / `last fired Nh` / `no runs yet`) or
-  `"errored: {reason}"` for malformed configs. Per-row actions
-  (Run, Pause, Edit, Delete) and accordion expansion to a
-  recent-threads list still pending — slice β.2 / γ. Cron schedule
+  subsection *below* the threads section, populated via
+  `ListBehaviors` (deduped per pod per connection) and kept fresh
+  by `BehaviorList` / `BehaviorCreated` / `BehaviorUpdated` /
+  `BehaviorDeleted` / `BehaviorStateChanged`. Each row is an
+  item-shaped expandable container: title is the display name
+  (`⚠`-prefixed when load_error), description is `"{kind} ·
+  {status}"` for healthy rows (`status` = `paused` /
+  `last fired Nh` / `no runs yet`) or `"errored: {reason}"` for
+  malformed configs, plus a `"{N} runs"` caption when the row has
+  spawned threads in view, plus a chevron in the actions slot.
+  Click toggles `expanded_behaviors` membership; when expanded,
+  the behavior's spawned threads (`origin.behavior_id == this`)
+  render nested below with `depth=1` indent. The threads section
+  filters its rows to interactive (no origin) plus orphan-origin
+  (origin set but behavior not in registry) — orphans get a
+  `· via {behavior}` description suffix so deleted-behavior
+  provenance stays visible. Per-row actions (Run, Pause, Edit,
+  Delete) still pending — slice β.2 / γ. Cron schedule
   humanization deferred since `BehaviorSummary` doesn't carry the
   schedule string; lands in γ alongside `GetBehavior`.
 - **⏳ Slice γ — danger affordances.** Inline arm-confirm pattern

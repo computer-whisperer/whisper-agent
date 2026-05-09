@@ -29,10 +29,10 @@ use whisper_agent_aetna_ui::{
     ChatApp, Inbound, InboundEvent, LoginApp, LoginInput, SendFn, SubmitFn,
 };
 use whisper_agent_protocol::{
-    BackendSummary, BehaviorSummary, CompactionConfig, ContentBlock, ContentCapabilities,
-    Conversation, ImageMime, ImageSource, Message, ModelSummary, PodSummary, Role, ServerToClient,
-    ThreadBindings, ThreadConfig, ThreadSnapshot, ThreadStateLabel, ThreadSummary,
-    ToolResultContent, TurnLog, Usage, permission::Scope,
+    BackendSummary, BehaviorOrigin, BehaviorSummary, CompactionConfig, ContentBlock,
+    ContentCapabilities, Conversation, ImageMime, ImageSource, Message, ModelSummary, PodSummary,
+    Role, ServerToClient, ThreadBindings, ThreadConfig, ThreadSnapshot, ThreadStateLabel,
+    ThreadSummary, ToolResultContent, TurnLog, Usage, permission::Scope,
 };
 
 fn main() -> std::io::Result<()> {
@@ -143,15 +143,22 @@ enum Scene {
     /// bottom of the truncated list.
     SidebarManyThreads,
     /// Sidebar with a behaviors-rich pod (mirrors the production
-    /// `mavis` shape: 4 cron behaviors, one paused, one errored).
-    /// Exercises the per-pod `BehaviorList` ingest path and the
-    /// `behaviors_section` rendering — including the muted second
-    /// line's status priority (errored > paused > last-fired-time).
+    /// `mavis` shape: 4 cron behaviors, one paused, one errored)
+    /// plus interactive threads above and behavior-spawned runs
+    /// nested under their parent behavior. Exercises the per-pod
+    /// `BehaviorList` ingest path and the `behaviors_section`
+    /// rendering — including the muted second line's status
+    /// priority (errored > paused > last-fired-time).
     SidebarBehaviors,
+    /// Same as `SidebarBehaviors` but with one behavior expanded so
+    /// the nested-thread render path is exercised. Click sequence
+    /// targets `behavior-row:default:architect` to toggle the
+    /// architect row open.
+    SidebarBehaviorsExpanded,
 }
 
 impl Scene {
-    const ALL: [Scene; 20] = [
+    const ALL: [Scene; 21] = [
         Scene::Connecting,
         Scene::Connected,
         Scene::Closed,
@@ -172,6 +179,7 @@ impl Scene {
         Scene::SidebarDispatchChain,
         Scene::SidebarManyThreads,
         Scene::SidebarBehaviors,
+        Scene::SidebarBehaviorsExpanded,
     ];
 
     fn slug(self) -> &'static str {
@@ -196,6 +204,7 @@ impl Scene {
             Scene::SidebarDispatchChain => "sidebar_dispatch_chain",
             Scene::SidebarManyThreads => "sidebar_many_threads",
             Scene::SidebarBehaviors => "sidebar_behaviors",
+            Scene::SidebarBehaviorsExpanded => "sidebar_behaviors_expanded",
         }
     }
 
@@ -210,6 +219,9 @@ impl Scene {
             | Scene::ThreadPrefilling
             | Scene::ThreadWithDraft
             | Scene::ThreadWithImages => vec!["thread:t-1"],
+            // Toggle the architect behavior row open so the nested
+            // spawned-thread row renders inside `behaviors_section`.
+            Scene::SidebarBehaviorsExpanded => vec!["behavior-row:default:architect"],
             // One toggle click on the backend trigger leaves the menu
             // open — render captures the popover.
             Scene::NewThreadFormBackendOpen => vec!["picker:backend"],
@@ -284,7 +296,7 @@ fn build_app(scene: Scene) -> Box<dyn App> {
                 tasks: mock_many_threads(15),
             }));
         }
-        Scene::SidebarBehaviors => {
+        Scene::SidebarBehaviors | Scene::SidebarBehaviorsExpanded => {
             q.push_back(InboundEvent::ConnectionOpened);
             q.push_back(InboundEvent::Wire(ServerToClient::PodList {
                 correlation_id: None,
@@ -293,7 +305,7 @@ fn build_app(scene: Scene) -> Box<dyn App> {
             }));
             q.push_back(InboundEvent::Wire(ServerToClient::ThreadList {
                 correlation_id: None,
-                tasks: Vec::new(),
+                tasks: mock_mavis_threads(),
             }));
             q.push_back(InboundEvent::Wire(ServerToClient::BehaviorList {
                 correlation_id: None,
@@ -585,6 +597,104 @@ fn mock_dispatch_chain_threads() -> Vec<ThreadSummary> {
             origin: None,
             continued_from: None,
             dispatched_by: Some(parent_id),
+        },
+    ]
+}
+
+/// Threads mirroring the production `mavis` pod's mix: interactive
+/// user-initiated conversations + a few behavior-spawned runs. The
+/// behavior-spawned threads carry a populated `origin` so they're
+/// filtered out of the interactive list and nest under their
+/// behavior in `behaviors_section`.
+fn mock_mavis_threads() -> Vec<ThreadSummary> {
+    let mk_origin = |behavior: &str, fired: &str| BehaviorOrigin {
+        behavior_id: behavior.into(),
+        fired_at: fired.into(),
+        trigger_payload: serde_json::Value::Null,
+    };
+    vec![
+        // --- interactive threads ---
+        ThreadSummary {
+            thread_id: "task-int-001".into(),
+            pod_id: "default".into(),
+            title: Some("Mavis svg redesign".into()),
+            state: ThreadStateLabel::Idle,
+            created_at: "2026-05-09T07:00:00Z".into(),
+            last_active: "2026-05-09T07:30:00Z".into(),
+            origin: None,
+            continued_from: None,
+            dispatched_by: None,
+        },
+        ThreadSummary {
+            thread_id: "task-int-002".into(),
+            pod_id: "default".into(),
+            title: Some("Description blurbs for github profile".into()),
+            state: ThreadStateLabel::Completed,
+            created_at: "2026-05-08T22:00:00Z".into(),
+            last_active: "2026-05-08T22:45:00Z".into(),
+            origin: None,
+            continued_from: None,
+            dispatched_by: None,
+        },
+        ThreadSummary {
+            thread_id: "task-int-003".into(),
+            pod_id: "default".into(),
+            title: Some("testing tool surface".into()),
+            state: ThreadStateLabel::Failed,
+            created_at: "2026-05-08T18:00:00Z".into(),
+            last_active: "2026-05-08T18:10:00Z".into(),
+            origin: None,
+            continued_from: None,
+            dispatched_by: None,
+        },
+        // --- behavior-spawned (architect) ---
+        ThreadSummary {
+            thread_id: "task-architect-001".into(),
+            pod_id: "default".into(),
+            title: Some("Analyze recent agent threads. Identify failure pat…".into()),
+            state: ThreadStateLabel::Completed,
+            created_at: "2026-05-09T02:00:00Z".into(),
+            last_active: "2026-05-09T02:18:00Z".into(),
+            origin: Some(mk_origin("architect", "2026-05-09T02:00:00Z")),
+            continued_from: None,
+            dispatched_by: None,
+        },
+        // --- behavior-spawned (researcher, two recent fires) ---
+        ThreadSummary {
+            thread_id: "task-researcher-001".into(),
+            pod_id: "default".into(),
+            title: Some("Periodic wiki sweep — root /home/christian".into()),
+            state: ThreadStateLabel::Completed,
+            created_at: "2026-05-09T07:50:00Z".into(),
+            last_active: "2026-05-09T07:55:00Z".into(),
+            origin: Some(mk_origin("researcher", "2026-05-09T07:50:00Z")),
+            continued_from: None,
+            dispatched_by: None,
+        },
+        ThreadSummary {
+            thread_id: "task-researcher-002".into(),
+            pod_id: "default".into(),
+            title: Some("Periodic wiki sweep — root /home/christian".into()),
+            state: ThreadStateLabel::Completed,
+            created_at: "2026-05-09T06:50:00Z".into(),
+            last_active: "2026-05-09T06:54:00Z".into(),
+            origin: Some(mk_origin("researcher", "2026-05-09T06:50:00Z")),
+            continued_from: None,
+            dispatched_by: None,
+        },
+        // --- orphan-origin (behavior 'old-greeter' was deleted but
+        //     this thread survived; it should fall through to the
+        //     interactive list with the 'via old-greeter' marker).
+        ThreadSummary {
+            thread_id: "task-orphan-001".into(),
+            pod_id: "default".into(),
+            title: Some("welcome scan — pre-rename".into()),
+            state: ThreadStateLabel::Completed,
+            created_at: "2026-05-01T10:00:00Z".into(),
+            last_active: "2026-05-01T10:05:00Z".into(),
+            origin: Some(mk_origin("old-greeter", "2026-05-01T10:00:00Z")),
+            continued_from: None,
+            dispatched_by: None,
         },
     ]
 }

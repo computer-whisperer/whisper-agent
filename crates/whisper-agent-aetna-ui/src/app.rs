@@ -243,6 +243,12 @@ pub struct ChatApp {
     /// connection. Cleared on reconnect so a fresh `ConnectionOpened`
     /// re-fetches whatever pods come back in `PodList`.
     requested_behaviors_for: HashSet<String>,
+    /// Expanded behavior rows in the sidebar: `"{pod_id}::{behavior_id}"`
+    /// composite keys whose membership controls whether the behavior's
+    /// spawned threads render nested below the row. Single global set
+    /// (rather than per-pod) so a tab switch preserves the user's
+    /// expand state across pods.
+    expanded_behaviors: HashSet<String>,
 
     // ----- model catalog (request/response tier) -----
     /// Backends advertised by the server. Populated from
@@ -337,6 +343,7 @@ impl ChatApp {
             expanded_pod_threads: HashSet::new(),
             behaviors_by_pod: HashMap::new(),
             requested_behaviors_for: HashSet::new(),
+            expanded_behaviors: HashSet::new(),
             backends: Vec::new(),
             models_by_backend: HashMap::new(),
             requested_models_for: HashSet::new(),
@@ -903,6 +910,25 @@ impl App for ChatApp {
             return;
         }
 
+        // Behavior row toggle: routed key is `behavior-row:{pod}:{id}`.
+        // Toggle membership of the same `(pod, behavior)` pair in
+        // `expanded_behaviors`. Click alone activates — drag /
+        // hover / pointer-down don't.
+        if let Some(key) = event.route()
+            && let Some(rest) = key.strip_prefix(BEHAVIOR_ROW_PREFIX)
+            && matches!(event.kind, UiEventKind::Click | UiEventKind::Activate)
+        {
+            // `{pod_id}:{behavior_id}` — split on the first `:` so a
+            // behavior_id containing a colon doesn't break the parse.
+            if let Some((pod, beh)) = rest.split_once(':') {
+                let composite = behavior_expand_key(pod, beh);
+                if !self.expanded_behaviors.remove(&composite) {
+                    self.expanded_behaviors.insert(composite);
+                }
+            }
+            return;
+        }
+
         // Compose `text_area` edits: when the routed target is the
         // compose box, fold the event through aetna's controlled-
         // widget helper. The buffer is per-thread when a thread is
@@ -1021,6 +1047,23 @@ const SIDEBAR_SHOWMORE_KEY: &str = "sidebar:showmore";
 /// Mirrors `whisper-agent-webui::THREAD_ROW_PREVIEW_COUNT`. The
 /// "Show N more" toggle reveals the full list per pod.
 const SIDEBAR_THREAD_PREVIEW: usize = 10;
+
+/// Routed-key prefix for behavior rows in the sidebar (the
+/// expandable "show this behavior's runs" toggle). Children of this
+/// prefix carry `{pod_id}:{behavior_id}`. Distinct from the
+/// `thread:` prefix so the two click-target families don't collide.
+const BEHAVIOR_ROW_PREFIX: &str = "behavior-row:";
+
+fn behavior_row_key(pod_id: &str, behavior_id: &str) -> String {
+    format!("{BEHAVIOR_ROW_PREFIX}{pod_id}:{behavior_id}")
+}
+
+/// Composite expansion-state key for `expanded_behaviors`. Mirrors
+/// the route key but without the prefix — the set is internal,
+/// so the leading `behavior-row:` isn't load-bearing.
+fn behavior_expand_key(pod_id: &str, behavior_id: &str) -> String {
+    format!("{pod_id}::{behavior_id}")
+}
 
 // Routed keys for the new-thread compose form's three `select_trigger`
 // pickers. Each `select_menu` in the build pass shares its trigger key
@@ -1282,11 +1325,15 @@ impl ChatApp {
         entries.push(self.pod_tabs());
 
         if let Some(active) = self.pod_tab.as_deref() {
-            // Behaviors section sits above threads when the active
-            // pod has any registered. Empty pod → skip the section
-            // entirely (no point showing a "Behaviors (0)" header
-            // when no behaviors exist; the threads section's
-            // empty-state copy is already enough chrome).
+            // Threads (interactive — `origin == None`) come first;
+            // they're the day-to-day reading order. Behavior-spawned
+            // threads (`origin == Some(behavior_id)`) nest under
+            // their parent behavior in the section below, since
+            // grouping per-behavior runs is more useful than mixing
+            // them into the interactive list. Mirrors the egui
+            // sibling's partition.
+            entries.push(self.threads_section(active));
+
             let behaviors = self
                 .behaviors_by_pod
                 .get(active)
@@ -1295,16 +1342,17 @@ impl ChatApp {
             if !behaviors.is_empty() {
                 entries.push(self.behaviors_section(active, behaviors));
             }
-            entries.push(self.threads_section(active));
         }
 
         sidebar(entries)
     }
 
     /// Behaviors subsection for the active pod: header + per-behavior
-    /// `item` rows. Slice β surfaces the registry visually; per-row
-    /// actions (Run, Pause, Edit, Delete) and accordion expansion
-    /// land in slices β.2 / γ.
+    /// expandable `item`-shaped rows. Each behavior's spawned threads
+    /// (those whose `origin.behavior_id` matches) nest below the row
+    /// when expanded — mirrors the egui sibling's grouping so per-run
+    /// history reads as the behavior's own log instead of polluting
+    /// the interactive thread list.
     fn behaviors_section(&self, pod_id: &str, behaviors: &[BehaviorSummary]) -> El {
         let total = behaviors.len();
         let header_label = format!("Behaviors ({total})");
@@ -1312,26 +1360,68 @@ impl ChatApp {
             .padding(Sides::xy(tokens::SPACE_2, tokens::SPACE_1))
             .width(Size::Fill(1.0));
 
-        let mut group_children: Vec<El> = vec![header];
-        let rows: Vec<El> = behaviors
-            .iter()
-            .map(|b| self.behavior_item_row(b))
-            .collect();
-        group_children.push(item_group(rows));
+        // Pre-bucket the active pod's behavior-origin threads by
+        // behavior_id so each row can reach in for its own runs
+        // without a per-row scan of the threads map.
+        let mut threads_by_behavior: HashMap<&str, Vec<&ThreadSummary>> = HashMap::new();
+        for t in self.threads.values().filter(|t| t.pod_id == pod_id) {
+            if let Some(origin) = &t.origin {
+                threads_by_behavior
+                    .entry(origin.behavior_id.as_str())
+                    .or_default()
+                    .push(t);
+            }
+        }
+        for runs in threads_by_behavior.values_mut() {
+            runs.sort_by(|a, b| b.last_active.cmp(&a.last_active));
+        }
 
-        // Pod-id rides as a `let _ = ...` for now — slice β.2 will
-        // route per-row actions back through `pod_id` so we keep
-        // the parameter on the public surface.
-        let _ = pod_id;
-        sidebar_group(group_children)
+        let mut rows: Vec<El> = Vec::new();
+        for b in behaviors {
+            let runs = threads_by_behavior
+                .get(b.behavior_id.as_str())
+                .cloned()
+                .unwrap_or_default();
+            let expand_key = behavior_expand_key(pod_id, &b.behavior_id);
+            let expanded = self.expanded_behaviors.contains(&expand_key);
+            rows.push(self.behavior_item_row(pod_id, b, runs.len(), expanded));
+            if expanded {
+                if runs.is_empty() {
+                    rows.push(text("no runs yet").muted().small().padding(Sides {
+                        left: tokens::SPACE_3 + tokens::SPACE_3,
+                        right: tokens::SPACE_3,
+                        top: tokens::SPACE_1,
+                        bottom: tokens::SPACE_1,
+                    }));
+                } else {
+                    for run in runs {
+                        // Nested under its behavior — the parent
+                        // row already names the origin, so suppress
+                        // the per-row "via" marker.
+                        rows.push(self.thread_item_row(run, 1, false));
+                    }
+                }
+            }
+        }
+
+        sidebar_group(vec![header, item_group(rows)])
     }
 
-    /// One behavior row in the sidebar. Title is the display name;
-    /// description is `"{kind} · {status}"` where status reflects
-    /// `paused` / `errored` / last-fired-relative / `no runs yet`,
-    /// in roughly that priority order. Errored behaviors get a
-    /// trailing destructive marker prefix on the title.
-    fn behavior_item_row(&self, b: &BehaviorSummary) -> El {
+    /// One behavior row in the sidebar — visually item-shaped with a
+    /// chevron indicator in the actions slot. Click anywhere on the
+    /// row toggles `expanded_behaviors` membership, which controls
+    /// whether the behavior's spawned threads render nested below
+    /// in [`behaviors_section`]. Title is the display name; description
+    /// is `"{kind} · {status}"` (or `"errored: {reason}"` for
+    /// load-error rows). Run-count suffixed when nonzero so the user
+    /// sees the run history without expanding.
+    fn behavior_item_row(
+        &self,
+        pod_id: &str,
+        b: &BehaviorSummary,
+        run_count_in_view: usize,
+        expanded: bool,
+    ) -> El {
         let title = if b.load_error.is_some() {
             format!("⚠ {}", b.name)
         } else {
@@ -1363,12 +1453,36 @@ impl ChatApp {
             format!("{kind} · {status}")
         };
 
-        let content = item_content([item_title(title), item_description(secondary)]);
-        // Slice β: rows are not yet keyed for click-through. Per-row
-        // actions arrive in β.2 (Run, Pause); expansion to a
-        // recent-threads list lands in γ alongside the danger
-        // affordance pattern.
-        item([content])
+        let mut content_blocks: Vec<El> = vec![item_title(title), item_description(secondary)];
+        // Show a small run-count badge on the row when there are
+        // spawned threads in view — same affordance the user
+        // expands into. Skipped at zero so quiet behaviors stay
+        // visually quiet.
+        if run_count_in_view > 0 {
+            content_blocks.push(
+                text(format!(
+                    "{run_count_in_view} run{}",
+                    if run_count_in_view == 1 { "" } else { "s" }
+                ))
+                .caption()
+                .muted(),
+            );
+        }
+        let content = item_content(content_blocks);
+
+        // Chevron in the actions slot tracks expansion. Click on
+        // the row routes via `behavior:{pod}:{id}`.
+        let chevron_name = if expanded {
+            "chevron-down"
+        } else {
+            "chevron-right"
+        };
+        let actions = item_actions([icon(chevron_name)
+            .icon_size(tokens::ICON_SM)
+            .text_color(tokens::MUTED_FOREGROUND)]);
+
+        let key = behavior_row_key(pod_id, &b.behavior_id);
+        item([content, actions]).key(key)
     }
 
     /// Build the pod selector row. Single-active selection keyed
@@ -1388,13 +1502,26 @@ impl ChatApp {
     }
 
     /// Threads section for the active pod: header + paginated list
-    /// of `item` rows. The `+` action (new thread in this pod) and
-    /// behaviors subsection are out of scope for slice α.
+    /// of `item` rows. Interactive threads only (origin == None);
+    /// behavior-spawned threads nest under their behavior in
+    /// [`behaviors_section`]. Orphan-origin threads (their behavior
+    /// is no longer in the registry — likely deleted while spawned
+    /// threads survived) fall through here so they don't disappear
+    /// silently, with a `via {behavior_id}` description marker.
     fn threads_section(&self, pod_id: &str) -> El {
+        let known_behavior_ids: HashSet<&str> = self
+            .behaviors_by_pod
+            .get(pod_id)
+            .map(|v| v.iter().map(|b| b.behavior_id.as_str()).collect())
+            .unwrap_or_default();
         let mut threads: Vec<&ThreadSummary> = self
             .threads
             .values()
             .filter(|t| t.pod_id == pod_id)
+            .filter(|t| match &t.origin {
+                None => true,
+                Some(origin) => !known_behavior_ids.contains(origin.behavior_id.as_str()),
+            })
             .collect();
         // Newest activity floats to the top; ties broken by created_at
         // (stable across rebuilds since both fields are server-side
@@ -1429,7 +1556,10 @@ impl ChatApp {
 
         let rows: Vec<El> = ordered[..shown]
             .iter()
-            .map(|(t, depth)| self.thread_item_row(t, *depth))
+            // Threads list is the place where orphan-origin rows
+            // surface — show the via-marker so their provenance is
+            // visible.
+            .map(|(t, depth)| self.thread_item_row(t, *depth, true))
             .collect();
         group_children.push(item_group(rows));
 
@@ -1457,19 +1587,30 @@ impl ChatApp {
     /// (the canonical "object/action list row" affordance), keyed
     /// by `thread:{id}` so the existing on_event routing stays
     /// intact. Title sits above a muted second line of
-    /// `state · relative_time`. Dispatch children are
+    /// `state · relative_time`. Dispatch / behavior children are
     /// left-padded by `depth * SPACE_3` so chains read top-down
     /// without needing inline marker glyphs on every row.
-    fn thread_item_row(&self, t: &ThreadSummary, depth: usize) -> El {
+    ///
+    /// `show_via_origin` controls the orphan-origin marker. The
+    /// caller passes `true` only when the row is rendered
+    /// standalone in the threads list because its behavior was
+    /// deleted — then the suffix `· via {behavior}` keeps the
+    /// provenance visible. Rows nested under their behavior in
+    /// [`behaviors_section`] pass `false` since the parent row
+    /// already supplies that context.
+    fn thread_item_row(&self, t: &ThreadSummary, depth: usize, show_via_origin: bool) -> El {
         let key = format!("thread:{}", t.thread_id);
         let is_current = self.selected.as_deref() == Some(t.thread_id.as_str());
 
         let title = t.title.as_deref().unwrap_or(&t.thread_id).to_string();
-        let secondary = format!(
+        let mut secondary = format!(
             "{} · {}",
             state_label(t.state),
             format_relative(&t.last_active),
         );
+        if show_via_origin && let Some(origin) = &t.origin {
+            secondary.push_str(&format!(" · via {}", origin.behavior_id));
+        }
 
         let content = item_content([item_title(title), item_description(secondary)]);
         let mut row_el = item([content]).key(key);
