@@ -17,6 +17,7 @@ crate-type = ["cdylib", "rlib"]
 # spec keeps us in lockstep with whatever is checked out at HEAD without
 # round-tripping through crates.io.
 aetna-core = { path = "../../../../aetna/aetna.main/crates/aetna-core" }
+aetna-markdown = { path = "../../../../aetna/aetna.main/crates/aetna-markdown" }
 
 whisper-agent-protocol = { workspace = true }
 serde = { workspace = true }

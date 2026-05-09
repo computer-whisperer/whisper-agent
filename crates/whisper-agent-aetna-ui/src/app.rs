@@ -2,17 +2,21 @@
 //! whisper-agent chat client.
 //!
 //! Surface so far: connection-status banner, sidebar with pods +
-//! threads, snapshot + delta-streamed chat log, compose box that
-//! sends follow-up turns to the selected thread.
+//! threads, snapshot + delta-streamed chat log rendered as event-log
+//! rows (3px role-colored gutter + content), assistant turns through
+//! `aetna_markdown::md`, reasoning + tool rows in collapsible
+//! `accordion_item`s, compose box that sends follow-up turns to the
+//! selected thread.
 //! Build/on_event split is the load-bearing test of the pivot — every
 //! interactive element routes through [`ChatApp::on_event`] via a
 //! key, every visual is a function of state read in
 //! [`ChatApp::build`].
 //!
 //! Things deliberately deferred:
-//! - markdown / code blocks (pending an upstream aetna parser)
-//! - reasoning-block collapsing
-//! - tool calls + tool results (rendered as a generic placeholder for now)
+//! - tool calls + tool results — currently a single accordion row
+//!   per non-text block (placeholder text); stage 6 breaks them
+//!   into purpose-built rows with diff rendering, streaming output,
+//!   etc.
 //! - tool-streaming, prefill progress, image output streaming
 //! - "compose into a fresh thread" (needs the model picker / pod
 //!   target / bindings surface)
@@ -143,6 +147,15 @@ pub struct ChatApp {
     /// only has the compose `text_area`, but the same cursor will
     /// own selection in the chat log when `.selectable()` lands.
     selection: Selection,
+
+    // ----- accordion state -----
+    /// Open accordion items, keyed by the routed key string the
+    /// accordion runtime emits (`{group}:accordion:{value}` —
+    /// produced by [`aetna_core::widgets::accordion::accordion_item_key`]).
+    /// Reasoning and tool rows go through this; the egui sibling's
+    /// per-row `Option<bool>` shape doesn't generalize when we have
+    /// many independent rows in a single thread.
+    open_accordions: HashSet<String>,
 }
 
 impl ChatApp {
@@ -160,6 +173,7 @@ impl ChatApp {
             subscribed: HashSet::new(),
             compose_input: String::new(),
             selection: Selection::default(),
+            open_accordions: HashSet::new(),
         }
     }
 
@@ -374,6 +388,20 @@ impl App for ChatApp {
             return;
         }
 
+        // Accordion toggles (reasoning + tool rows). The accordion
+        // runtime emits routed keys shaped `{group}:accordion:{value}`;
+        // we just toggle membership of the routed key in our open set
+        // — independent toggles per row, no single-active enforcement.
+        if matches!(event.kind, UiEventKind::Click | UiEventKind::Activate)
+            && let Some(key) = event.route()
+            && key.contains(":accordion:")
+        {
+            if !self.open_accordions.remove(key) {
+                self.open_accordions.insert(key.to_string());
+            }
+            return;
+        }
+
         // Global selection plumbing — when the runtime synthesizes a
         // SelectionChanged event from pointer drags, mirror it onto
         // our owned `Selection`. Required for the in-text caret
@@ -564,26 +592,20 @@ impl ChatApp {
             .unwrap_or("untitled")
             .to_string();
 
-        let mut title_row: Vec<El> = vec![card_title(title).width(Size::Fill(1.0))];
+        // `toolbar([title, spacer, badge])` is the canonical thread
+        // header recipe — compact, center-aligned, single line. The
+        // thread id rides as a muted second line so the toolbar stays
+        // tight; an inspector affordance can pin it back into a popover
+        // later when modals land.
+        let mut toolbar_children: Vec<El> = vec![toolbar_title(title), spacer()];
         if let Some(s) = summary {
-            title_row.push(state_badge(s.state));
+            toolbar_children.push(state_badge(s.state));
         }
-        let header_children: Vec<El> = vec![
-            row(title_row)
-                .align(Align::Center)
-                .gap(tokens::SPACE_2)
-                .width(Size::Fill(1.0)),
-            card_description(thread_id.to_string()),
-        ];
-        // The card_header surface gives the title bar a subtle muted
-        // strip; we drop the surrounding card chrome (no shadow, no
-        // radius) since this header sits flush at the top of the
-        // pane and would otherwise float visibly inside the wider
-        // content rect.
-        let header = card_header(header_children)
-            .fill(tokens::MUTED)
-            .stroke(tokens::BORDER)
-            .width(Size::Fill(1.0));
+        let header = column([toolbar(toolbar_children), text(thread_id).muted().xsmall()])
+            .gap(tokens::SPACE_1)
+            .padding(tokens::SPACE_4)
+            .width(Size::Fill(1.0))
+            .stroke(tokens::BORDER);
 
         // Scroll key derived from the thread id so the offset
         // persists across rebuilds *for this thread*; switching
@@ -594,11 +616,19 @@ impl ChatApp {
             None => empty_state("loading…"),
             Some(v) if v.items.is_empty() => empty_state("no messages yet"),
             Some(v) => {
-                let rows: Vec<El> = v.items.iter().map(display_item_row).collect();
+                // Thread the row index in as the accordion `value` so
+                // each reasoning / tool row has an independent open
+                // state stable across rebuilds.
+                let rows: Vec<El> = v
+                    .items
+                    .iter()
+                    .enumerate()
+                    .map(|(idx, item)| self.event_log_row(idx, item))
+                    .collect();
                 scroll(rows)
                     .key(scroll_key)
-                    .gap(tokens::SPACE_3)
-                    .padding(tokens::SPACE_4)
+                    .gap(0.0)
+                    .padding(tokens::SPACE_2)
                     .width(Size::Fill(1.0))
                     .height(Size::Fill(1.0))
             }
@@ -697,40 +727,102 @@ fn take_chars(s: &str, n: usize) -> String {
     s.chars().take(n).collect()
 }
 
-fn display_item_row(item: &DisplayItem) -> El {
-    match item {
-        DisplayItem::User { text: t } => chat_row("user", t, RoleVariant::User),
-        DisplayItem::Assistant { text: t } => chat_row("assistant", t, RoleVariant::Assistant),
-        DisplayItem::Reasoning { text: t } => chat_row("reasoning", t, RoleVariant::Reasoning),
-        DisplayItem::SystemNote { text: t } => chat_row("system", t, RoleVariant::System),
-        DisplayItem::ToolCallPlaceholder { label } => chat_row("tool", label, RoleVariant::Tool),
+impl ChatApp {
+    /// One row in the chat log. Per upstream guidance
+    /// (`aetna-core/README.md` "Conversation / event-log row"), we
+    /// don't render every message as a `card` — cards isolate
+    /// objects, but a transcript should scan as one continuous
+    /// record with small role markers. Each row is a 3px role-colored
+    /// gutter beside the message content; user rows get a faint
+    /// info-tinted fill so user turns stand out from a long
+    /// assistant stream.
+    ///
+    /// Reasoning + tool rows nest an `accordion_item` so their
+    /// bodies collapse — typical thread reads are noisy with these
+    /// otherwise.
+    fn event_log_row(&self, idx: usize, item: &DisplayItem) -> El {
+        match item {
+            DisplayItem::User { text: t } => {
+                let body = paragraph(t.clone());
+                log_row(tokens::INFO, Some(tokens::INFO.with_alpha(18)), body)
+            }
+            DisplayItem::Assistant { text: t } => {
+                // Markdown rendering for assistant content. The egui
+                // sibling renders user input verbatim and assistant
+                // output as markdown — same pattern here.
+                let body = aetna_markdown::md(t);
+                log_row(tokens::SUCCESS, None, body)
+            }
+            DisplayItem::Reasoning { text: t } => {
+                let preview = first_line_preview(t, 80);
+                let key = "reasoning";
+                let value = format!("{idx}");
+                let routed = accordion_item_key(key, &value);
+                let open = self.open_accordions.contains(&routed);
+                let item_el = accordion_item(key, value, preview, open, [paragraph(t.clone())]);
+                log_row(tokens::MUTED_FOREGROUND, None, item_el)
+            }
+            DisplayItem::SystemNote { text: t } => {
+                let body = paragraph(t.clone());
+                log_row(tokens::WARNING, None, body)
+            }
+            DisplayItem::ToolCallPlaceholder { label } => {
+                let key = "tool";
+                let value = format!("{idx}");
+                let routed = accordion_item_key(key, &value);
+                let open = self.open_accordions.contains(&routed);
+                let item_el =
+                    accordion_item(key, value, label.clone(), open, [paragraph(label.clone())]);
+                log_row(tokens::WARNING, None, item_el)
+            }
+        }
     }
 }
 
-#[derive(Clone, Copy)]
-enum RoleVariant {
-    User,
-    Assistant,
-    Reasoning,
-    System,
-    Tool,
+/// Event-log row — narrow role-colored gutter + content with
+/// internal padding. Optional `faint_fill` tints the row's
+/// background for emphasis (we use it for user turns so they're
+/// distinguishable in a long assistant stream).
+fn log_row(role_color: Color, faint_fill: Option<Color>, content: El) -> El {
+    let gutter = El::new(Kind::Custom("log_gutter"))
+        .fill(role_color)
+        .width(Size::Fixed(3.0))
+        .height(Size::Fill(1.0));
+    let padded_content = content
+        .padding(Sides {
+            left: tokens::SPACE_3,
+            right: tokens::SPACE_2,
+            top: tokens::SPACE_2,
+            bottom: tokens::SPACE_2,
+        })
+        .width(Size::Fill(1.0));
+    let row_el = row([gutter, padded_content])
+        .gap(0.0)
+        .width(Size::Fill(1.0));
+    if let Some(fill) = faint_fill {
+        row_el.fill(fill)
+    } else {
+        row_el
+    }
 }
 
-/// One chat row: a card with a role badge in the header and the
-/// message body in the content slot. Reasoning / system / tool
-/// variants tint the badge so a long log scans at a glance.
-fn chat_row(role_label: &str, body: &str, variant: RoleVariant) -> El {
-    let role_chip = match variant {
-        RoleVariant::User => badge(role_label).info(),
-        RoleVariant::Assistant => badge(role_label).success(),
-        RoleVariant::Reasoning => badge(role_label).muted(),
-        RoleVariant::System => badge(role_label).warning(),
-        RoleVariant::Tool => badge(role_label).muted(),
-    };
-    card([
-        card_header([role_chip]),
-        card_content([paragraph(body.to_string())]),
-    ])
+/// First non-empty line of `s`, truncated to `max_chars` chars
+/// (char-boundary aware). Used as the collapsed accordion label for
+/// reasoning rows so the log header gives a hint of what's inside
+/// without unfolding the body.
+fn first_line_preview(s: &str, max_chars: usize) -> String {
+    let line = s
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .unwrap_or("");
+    let chars: Vec<char> = line.chars().collect();
+    if chars.len() <= max_chars {
+        line.to_string()
+    } else {
+        let head: String = chars.iter().take(max_chars).collect();
+        format!("{head}…")
+    }
 }
 
 /// Walk a [`Conversation`] into the lightweight stage-2 [`DisplayItem`]

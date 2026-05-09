@@ -184,17 +184,36 @@ behavior editor active, …).
 
 ## Visual idioms — "tailwind/shadcn for free"
 
-The polish refactor (commit `3db5938`) moved the UI off hand-rolled
-chrome onto aetna's purpose-built widgets. The rules of thumb:
+Successive refactors moved the UI off hand-rolled chrome onto aetna's
+purpose-built widgets. The rules of thumb:
 
 - **Sidebar.** `sidebar([...])` for the surface, `sidebar_header([...])`
   for the title row, per-pod `sidebar_group([sidebar_group_label("name"),
   sidebar_menu([sidebar_menu_item(button), ...])])`. Selected nav is the
   `current` treatment (`SurfaceRole::Current`, ACCENT fill — quieter than
   `primary`), produced by `sidebar_menu_button(label, current)`.
-- **Cards.** Each chat row is `card([card_header([role badge]),
-  card_content([paragraph(body)])])`. Surface role + shadow + radius come
-  from the theme; we don't restate them.
+- **Toolbar headers, not card headers, for thread identity.**
+  `toolbar([toolbar_title, spacer, state_badge])` is the thread-pane
+  header recipe. Cards isolate objects; the chat content frame is one
+  continuous record with a header bar above it.
+- **Event-log rows for the chat log, not cards per message.** Per
+  upstream aetna guidance (`aetna-core/README.md` "Conversation /
+  event-log row"), each message renders as a 3px role-colored gutter
+  beside the message content — `row([gutter, content])`. User rows
+  optionally take a faint info-tinted fill so they pop out of a long
+  assistant stream. Local helper `log_row(role_color, faint_fill,
+  content)` in `app.rs`.
+- **Markdown for assistant text.** Assistant content goes through
+  `aetna_markdown::md(text)`, which walks pulldown-cmark's event API
+  into `paragraph` / `bullet_list` / `code_block` / `inlines` /
+  `text(...).code()` etc. — same surface a hand-authored aetna tree
+  would use. User text stays as `paragraph(text)` (we don't render
+  user-typed markdown).
+- **Accordion for noisy rows.** Reasoning and tool-call rows nest
+  `accordion_item(group, value, label, open, [body])`. Open state
+  lives on `ChatApp.open_accordions: HashSet<String>` keyed by
+  `accordion_item_key(group, value)`, toggled in `on_event` by
+  matching `:accordion:` in the routed key.
 - **Alerts.** Connection failures surface as `alert([alert_title,
   alert_description]).warning() / .destructive()` at the top of the
   content pane. Status-tier UX, separate from the per-thread chrome.
@@ -255,15 +274,17 @@ model. Needs:
 - `CreateThread { pod_id, config_override, bindings_request, ... }` send
 - echo handling (`ThreadCreated`)
 
-### ⏳ Stage 5 — Drafts, prefill progress, reasoning collapse
+### ⏳ Stage 5 — Drafts, prefill progress
 
 Quality-of-life on the existing surface:
 - `SetThreadDraft` debounce + `ThreadDraftUpdated` echo handling so
   in-progress text persists across thread switches and clients
-- `ThreadPrefillProgress` rendered as a transient progress bar inside
-  the assistant card while a turn is mid-prefill
-- Reasoning blocks default-collapsed (using `accordion`)
+- `ThreadPrefillProgress` rendered as a transient progress indicator
+  while a turn is mid-prefill
 - Per-message hover affordances (copy, fork-from-here)
+
+Reasoning collapse moved into the event-log refactor (`accordion_item`
+per row, open state in `ChatApp.open_accordions`).
 
 ### ⏳ Stage 6 — Tool calls and tool results
 
@@ -305,11 +326,17 @@ Currently the desktop binary requires `--server` + `--token` /
 that writes to `~/.config/whisper-agent/desktop.toml`. Trivial port once
 `text_input` is exercised live (it's already in stage 3).
 
-### ⏳ Stage 10 — Markdown rendering
+### ✅ Stage 10 — Markdown rendering
 
-Pending an upstream aetna parser. The user is implementing this in
-aetna itself, so this stage becomes a one-line swap from
-`paragraph(text)` to whatever the new constructor is.
+`aetna-markdown` landed upstream and we now route assistant text
+through `aetna_markdown::md(text)`. Pulldown-cmark walks the source
+into headings, paragraphs, lists, code blocks, inline runs, and
+emphasis — identical to a hand-authored aetna tree. Got picked up as
+part of the event-log refactor since both touched the same code.
+
+Future polish: GFM tables landed in `aetna-markdown 0.3.0` already;
+math + footnotes + task lists + raw HTML are still upstream
+deferreds.
 
 ### ⏳ Stage 11 — wasm browser entry + server bundle switch
 

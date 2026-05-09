@@ -26,7 +26,11 @@ use std::rc::Rc;
 use aetna_core::prelude::{Rect, render_bundle_themed, write_bundle};
 use aetna_core::{App, BuildCx, UiEvent};
 use whisper_agent_aetna_ui::{ChatApp, Inbound, InboundEvent, SendFn};
-use whisper_agent_protocol::{PodSummary, ServerToClient, ThreadStateLabel, ThreadSummary};
+use whisper_agent_protocol::{
+    CompactionConfig, ContentBlock, Conversation, Message, PodSummary, Role, ServerToClient,
+    ThreadBindings, ThreadConfig, ThreadSnapshot, ThreadStateLabel, ThreadSummary, TurnLog, Usage,
+    permission::Scope,
+};
 
 fn main() -> std::io::Result<()> {
     // Native window viewport — the bug, if any, shouldn't depend on
@@ -79,16 +83,21 @@ enum Scene {
     /// Same as `PopulatedNoSelection`, but with a thread clicked —
     /// snapshot hasn't arrived, so the right pane shows "loading…".
     LoadingThread,
+    /// Thread clicked + snapshot pushed. Exercises the event-log row
+    /// shape (gutter + content) plus the markdown-rendered assistant
+    /// turn and the reasoning accordion (collapsed by default).
+    ThreadWithMessages,
 }
 
 impl Scene {
-    const ALL: [Scene; 6] = [
+    const ALL: [Scene; 7] = [
         Scene::Connecting,
         Scene::Connected,
         Scene::Closed,
         Scene::Error,
         Scene::PopulatedNoSelection,
         Scene::LoadingThread,
+        Scene::ThreadWithMessages,
     ];
 
     fn slug(self) -> &'static str {
@@ -99,6 +108,7 @@ impl Scene {
             Scene::Error => "error",
             Scene::PopulatedNoSelection => "populated_no_selection",
             Scene::LoadingThread => "loading_thread",
+            Scene::ThreadWithMessages => "thread_with_messages",
         }
     }
 
@@ -107,7 +117,7 @@ impl Scene {
     /// live UI does.
     fn clicks(self) -> Vec<&'static str> {
         match self {
-            Scene::LoadingThread => vec!["thread:t-1"],
+            Scene::LoadingThread | Scene::ThreadWithMessages => vec!["thread:t-1"],
             _ => Vec::new(),
         }
     }
@@ -137,7 +147,7 @@ fn build_app(scene: Scene) -> ChatApp {
                 detail: "DNS resolution failed".into(),
             });
         }
-        Scene::PopulatedNoSelection | Scene::LoadingThread => {
+        Scene::PopulatedNoSelection | Scene::LoadingThread | Scene::ThreadWithMessages => {
             q.push_back(InboundEvent::ConnectionOpened);
             q.push_back(InboundEvent::Wire(ServerToClient::PodList {
                 correlation_id: None,
@@ -148,6 +158,12 @@ fn build_app(scene: Scene) -> ChatApp {
                 correlation_id: None,
                 tasks: mock_threads(),
             }));
+            if matches!(scene, Scene::ThreadWithMessages) {
+                q.push_back(InboundEvent::Wire(ServerToClient::ThreadSnapshot {
+                    thread_id: "t-1".into(),
+                    snapshot: mock_snapshot(),
+                }));
+            }
         }
     }
     drop(q);
@@ -213,4 +229,66 @@ fn mock_threads() -> Vec<ThreadSummary> {
             dispatched_by: None,
         },
     ]
+}
+
+/// A few-message snapshot for the `ThreadWithMessages` scene. Touches
+/// every DisplayItem variant we render today so the bundle dump
+/// regression-tests the event-log row + accordion + markdown paths in
+/// one go.
+fn mock_snapshot() -> ThreadSnapshot {
+    let mut conv = Conversation::new();
+    conv.push(Message::system_text(""));
+    conv.push(Message::user_text(
+        "Can you summarize the design of the knowledge-bucket layer?",
+    ));
+    conv.push(Message {
+        role: Role::Assistant,
+        content: vec![
+            ContentBlock::Thinking {
+                thinking: "User wants a high-level summary. The design doc is at \
+                    `docs/design_knowledge_db.md`. Hit the entry-point types and \
+                    the slot directory layout."
+                    .into(),
+                replay: None,
+            },
+            ContentBlock::Text {
+                text: "The knowledge-bucket layer adds **dense + sparse retrieval** to \
+                    whisper-agent. Each bucket is a directory under `<buckets_root>/`:\n\
+                    \n\
+                    - `bucket.toml` — config (embedder, chunker, source).\n\
+                    - `slots/` — one segment per build, append-only.\n\
+                    - `source-cache/` — raw artifacts the chunker reads.\n\
+                    \n\
+                    See [`docs/design_knowledge_db.md`](docs/design_knowledge_db.md) \
+                    for the full design."
+                    .into(),
+            },
+        ],
+    });
+    conv.push(Message::user_text("Thanks!"));
+
+    ThreadSnapshot {
+        thread_id: "t-1".into(),
+        pod_id: "default".into(),
+        title: Some("first conversation".into()),
+        config: ThreadConfig {
+            model: "claude-opus-4-7".into(),
+            max_tokens: 4096,
+            max_turns: 8,
+            compaction: CompactionConfig::default(),
+        },
+        bindings: ThreadBindings::default(),
+        state: ThreadStateLabel::Idle,
+        conversation: conv,
+        total_usage: Usage::default(),
+        turn_log: TurnLog::default(),
+        draft: String::new(),
+        created_at: "2026-05-08T10:00:00Z".into(),
+        last_active: "2026-05-08T11:00:00Z".into(),
+        failure: None,
+        origin: None,
+        continued_from: None,
+        dispatched_by: None,
+        scope: Scope::default(),
+    }
 }
