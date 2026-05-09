@@ -29,10 +29,10 @@ use whisper_agent_aetna_ui::{
     ChatApp, Inbound, InboundEvent, LoginApp, LoginInput, SendFn, SubmitFn,
 };
 use whisper_agent_protocol::{
-    BackendSummary, CompactionConfig, ContentBlock, ContentCapabilities, Conversation, ImageMime,
-    ImageSource, Message, ModelSummary, PodSummary, Role, ServerToClient, ThreadBindings,
-    ThreadConfig, ThreadSnapshot, ThreadStateLabel, ThreadSummary, ToolResultContent, TurnLog,
-    Usage, permission::Scope,
+    BackendSummary, BehaviorSummary, CompactionConfig, ContentBlock, ContentCapabilities,
+    Conversation, ImageMime, ImageSource, Message, ModelSummary, PodSummary, Role, ServerToClient,
+    ThreadBindings, ThreadConfig, ThreadSnapshot, ThreadStateLabel, ThreadSummary,
+    ToolResultContent, TurnLog, Usage, permission::Scope,
 };
 
 fn main() -> std::io::Result<()> {
@@ -142,10 +142,16 @@ enum Scene {
     /// Verifies the "Show N more" toggle button appears at the
     /// bottom of the truncated list.
     SidebarManyThreads,
+    /// Sidebar with a behaviors-rich pod (mirrors the production
+    /// `mavis` shape: 4 cron behaviors, one paused, one errored).
+    /// Exercises the per-pod `BehaviorList` ingest path and the
+    /// `behaviors_section` rendering — including the muted second
+    /// line's status priority (errored > paused > last-fired-time).
+    SidebarBehaviors,
 }
 
 impl Scene {
-    const ALL: [Scene; 19] = [
+    const ALL: [Scene; 20] = [
         Scene::Connecting,
         Scene::Connected,
         Scene::Closed,
@@ -165,6 +171,7 @@ impl Scene {
         Scene::LoginFormWithError,
         Scene::SidebarDispatchChain,
         Scene::SidebarManyThreads,
+        Scene::SidebarBehaviors,
     ];
 
     fn slug(self) -> &'static str {
@@ -188,6 +195,7 @@ impl Scene {
             Scene::LoginFormWithError => "login_form_with_error",
             Scene::SidebarDispatchChain => "sidebar_dispatch_chain",
             Scene::SidebarManyThreads => "sidebar_many_threads",
+            Scene::SidebarBehaviors => "sidebar_behaviors",
         }
     }
 
@@ -274,6 +282,23 @@ fn build_app(scene: Scene) -> Box<dyn App> {
             q.push_back(InboundEvent::Wire(ServerToClient::ThreadList {
                 correlation_id: None,
                 tasks: mock_many_threads(15),
+            }));
+        }
+        Scene::SidebarBehaviors => {
+            q.push_back(InboundEvent::ConnectionOpened);
+            q.push_back(InboundEvent::Wire(ServerToClient::PodList {
+                correlation_id: None,
+                pods: mock_pods(),
+                default_pod_id: "default".into(),
+            }));
+            q.push_back(InboundEvent::Wire(ServerToClient::ThreadList {
+                correlation_id: None,
+                tasks: Vec::new(),
+            }));
+            q.push_back(InboundEvent::Wire(ServerToClient::BehaviorList {
+                correlation_id: None,
+                pod_id: "default".into(),
+                behaviors: mock_mavis_behaviors(),
             }));
         }
         Scene::PopulatedNoSelection
@@ -560,6 +585,63 @@ fn mock_dispatch_chain_threads() -> Vec<ThreadSummary> {
             origin: None,
             continued_from: None,
             dispatched_by: Some(parent_id),
+        },
+    ]
+}
+
+/// Behaviors mirroring the production `mavis` pod (4 cron agents),
+/// with two enabled-and-recently-fired entries, one paused, and one
+/// errored. Exercises the four status branches in
+/// `behavior_item_row`'s description line.
+fn mock_mavis_behaviors() -> Vec<BehaviorSummary> {
+    vec![
+        BehaviorSummary {
+            behavior_id: "architect".into(),
+            pod_id: "default".into(),
+            name: "architect".into(),
+            description: Some(
+                "Meta-agent. Observes agent performance and modifies behaviors \
+                 to optimize the system loop."
+                    .into(),
+            ),
+            trigger_kind: Some("cron".into()),
+            enabled: true,
+            run_count: 12,
+            last_fired_at: Some("2026-05-09T02:00:00Z".into()),
+            load_error: None,
+        },
+        BehaviorSummary {
+            behavior_id: "researcher".into(),
+            pod_id: "default".into(),
+            name: "researcher".into(),
+            description: Some("Periodic knowledge-gathering agent.".into()),
+            trigger_kind: Some("cron".into()),
+            enabled: true,
+            run_count: 312,
+            last_fired_at: Some("2026-05-09T07:50:00Z".into()),
+            load_error: None,
+        },
+        BehaviorSummary {
+            behavior_id: "reviewer".into(),
+            pod_id: "default".into(),
+            name: "reviewer".into(),
+            description: Some("Cartographer agent.".into()),
+            trigger_kind: Some("cron".into()),
+            enabled: false,
+            run_count: 48,
+            last_fired_at: Some("2026-05-08T22:20:00Z".into()),
+            load_error: None,
+        },
+        BehaviorSummary {
+            behavior_id: "synthesizer".into(),
+            pod_id: "default".into(),
+            name: "synthesizer".into(),
+            description: Some("Janitorial agent.".into()),
+            trigger_kind: None,
+            enabled: true,
+            run_count: 0,
+            last_fired_at: None,
+            load_error: Some("behavior.toml: invalid cron `30 * * *` (expected 5 fields)".into()),
         },
     ]
 }

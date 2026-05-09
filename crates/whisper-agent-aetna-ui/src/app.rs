@@ -39,8 +39,8 @@ use std::rc::Rc;
 use aetna_core::prelude::*;
 use aetna_core::widgets::select::{SelectAction, classify_event as classify_select_event};
 use whisper_agent_protocol::{
-    BackendSummary, ClientToServer, ContentBlock, ImageSource, ModelSummary, PodSummary, Role,
-    ServerToClient, ThreadConfigOverride, ThreadSummary,
+    BackendSummary, BehaviorSummary, ClientToServer, ContentBlock, ImageSource, ModelSummary,
+    PodSummary, Role, ServerToClient, ThreadConfigOverride, ThreadSummary,
 };
 
 /// Inbound event variants the host shell pushes into the [`Inbound`]
@@ -232,6 +232,18 @@ pub struct ChatApp {
     /// rows and a "Show N more" toggle).
     expanded_pod_threads: HashSet<String>,
 
+    // ----- behaviors (per-pod registry) -----
+    /// Behaviors per pod, keyed by `BehaviorSummary.pod_id`. Populated
+    /// from `BehaviorList` responses (one per pod) and kept in sync by
+    /// `BehaviorCreated` / `BehaviorUpdated` / `BehaviorDeleted` /
+    /// `BehaviorStateChanged` broadcasts. Order within a pod is the
+    /// server's (sorted by behavior_id today).
+    behaviors_by_pod: HashMap<String, Vec<BehaviorSummary>>,
+    /// Pods we've already issued a `ListBehaviors` for on this
+    /// connection. Cleared on reconnect so a fresh `ConnectionOpened`
+    /// re-fetches whatever pods come back in `PodList`.
+    requested_behaviors_for: HashSet<String>,
+
     // ----- model catalog (request/response tier) -----
     /// Backends advertised by the server. Populated from
     /// `BackendsList`; drives the new-thread `Backend` picker. Entries
@@ -323,6 +335,8 @@ impl ChatApp {
             default_pod_id: None,
             pod_tab: None,
             expanded_pod_threads: HashSet::new(),
+            behaviors_by_pod: HashMap::new(),
+            requested_behaviors_for: HashSet::new(),
             backends: Vec::new(),
             models_by_backend: HashMap::new(),
             requested_models_for: HashSet::new(),
@@ -371,6 +385,9 @@ impl ChatApp {
                 // a fresh socket means we have to re-fetch whatever
                 // the user picks.
                 self.requested_models_for.clear();
+                // Per-pod `ListBehaviors` dedup also reset; the next
+                // `PodList` will re-fan-out one request per pod.
+                self.requested_behaviors_for.clear();
                 if !self.list_requested {
                     self.send(ClientToServer::ListPods {
                         correlation_id: None,
@@ -420,11 +437,108 @@ impl ChatApp {
                 if !valid {
                     self.pod_tab = self.pick_default_pod_tab();
                 }
+                // Drop any cached behavior lists for pods that are no
+                // longer in the registry, then fan out `ListBehaviors`
+                // for the remaining pods (deduped against any earlier
+                // request that already covered them).
+                let live: HashSet<String> = self.pods.keys().cloned().collect();
+                self.behaviors_by_pod.retain(|p, _| live.contains(p));
+                let pod_ids: Vec<String> = self.pods.keys().cloned().collect();
+                for pod_id in pod_ids {
+                    self.ensure_behaviors_requested(&pod_id);
+                }
             }
             ServerToClient::PodCreated { pod, .. } => {
-                self.pods.insert(pod.pod_id.clone(), pod);
+                let new_pod_id = pod.pod_id.clone();
+                self.pods.insert(new_pod_id.clone(), pod);
                 if self.pod_tab.is_none() {
                     self.pod_tab = self.pick_default_pod_tab();
+                }
+                self.ensure_behaviors_requested(&new_pod_id);
+            }
+            ServerToClient::BehaviorList {
+                pod_id, behaviors, ..
+            } => {
+                self.behaviors_by_pod.insert(pod_id, behaviors);
+            }
+            ServerToClient::BehaviorCreated { summary, .. } => {
+                let entries = self
+                    .behaviors_by_pod
+                    .entry(summary.pod_id.clone())
+                    .or_default();
+                // Replace any existing entry with the same id (a
+                // create after a delete-then-create round trip), else
+                // append. Keep the server's lexicographic-by-id order
+                // by re-sorting after the insert.
+                if let Some(existing) = entries
+                    .iter_mut()
+                    .find(|e| e.behavior_id == summary.behavior_id)
+                {
+                    *existing = summary;
+                } else {
+                    entries.push(summary);
+                }
+                entries.sort_by(|a, b| a.behavior_id.cmp(&b.behavior_id));
+            }
+            ServerToClient::BehaviorUpdated { snapshot, .. } => {
+                // Project the snapshot back onto the summary shape we
+                // hold for the list view. Keep `last_fired_at` /
+                // `run_count` / `enabled` from the snapshot's `state`
+                // (the canonical source) since UpdateBehavior doesn't
+                // mutate those — but `BehaviorStateChanged` events
+                // run alongside, so we use whichever lands last.
+                let pod_entries = self
+                    .behaviors_by_pod
+                    .entry(snapshot.pod_id.clone())
+                    .or_default();
+                let new_summary = BehaviorSummary {
+                    behavior_id: snapshot.behavior_id.clone(),
+                    pod_id: snapshot.pod_id.clone(),
+                    name: snapshot
+                        .config
+                        .as_ref()
+                        .map(|c| c.name.clone())
+                        .unwrap_or_else(|| snapshot.behavior_id.clone()),
+                    description: snapshot.config.as_ref().and_then(|c| c.description.clone()),
+                    trigger_kind: snapshot
+                        .config
+                        .as_ref()
+                        .map(|c| trigger_kind_label(&c.trigger).to_string()),
+                    enabled: snapshot.state.enabled,
+                    run_count: snapshot.state.run_count,
+                    last_fired_at: snapshot.state.last_fired_at.clone(),
+                    load_error: snapshot.load_error.clone(),
+                };
+                if let Some(slot) = pod_entries
+                    .iter_mut()
+                    .find(|e| e.behavior_id == new_summary.behavior_id)
+                {
+                    *slot = new_summary;
+                } else {
+                    pod_entries.push(new_summary);
+                    pod_entries.sort_by(|a, b| a.behavior_id.cmp(&b.behavior_id));
+                }
+            }
+            ServerToClient::BehaviorDeleted {
+                pod_id,
+                behavior_id,
+                ..
+            } => {
+                if let Some(entries) = self.behaviors_by_pod.get_mut(&pod_id) {
+                    entries.retain(|e| e.behavior_id != behavior_id);
+                }
+            }
+            ServerToClient::BehaviorStateChanged {
+                pod_id,
+                behavior_id,
+                state,
+            } => {
+                if let Some(entries) = self.behaviors_by_pod.get_mut(&pod_id)
+                    && let Some(slot) = entries.iter_mut().find(|e| e.behavior_id == behavior_id)
+                {
+                    slot.enabled = state.enabled;
+                    slot.run_count = state.run_count;
+                    slot.last_fired_at = state.last_fired_at;
                 }
             }
             ServerToClient::ThreadList { tasks, .. } => {
@@ -1109,6 +1223,21 @@ impl ChatApp {
         self.requested_models_for.insert(backend.to_string());
     }
 
+    /// Fire a `ListBehaviors { pod_id }` if we haven't already on
+    /// this connection. Subsequent `Behavior*` broadcasts keep the
+    /// cache fresh; the dedup means repeated `PodList` echoes don't
+    /// cause N×M traffic.
+    fn ensure_behaviors_requested(&mut self, pod_id: &str) {
+        if self.requested_behaviors_for.contains(pod_id) {
+            return;
+        }
+        self.send(ClientToServer::ListBehaviors {
+            correlation_id: None,
+            pod_id: pod_id.to_string(),
+        });
+        self.requested_behaviors_for.insert(pod_id.to_string());
+    }
+
     fn select_thread(&mut self, thread_id: String) {
         // No-op when re-selecting the already-selected thread —
         // avoids resetting the selection cursor when the user
@@ -1153,10 +1282,93 @@ impl ChatApp {
         entries.push(self.pod_tabs());
 
         if let Some(active) = self.pod_tab.as_deref() {
+            // Behaviors section sits above threads when the active
+            // pod has any registered. Empty pod → skip the section
+            // entirely (no point showing a "Behaviors (0)" header
+            // when no behaviors exist; the threads section's
+            // empty-state copy is already enough chrome).
+            let behaviors = self
+                .behaviors_by_pod
+                .get(active)
+                .map(|v| v.as_slice())
+                .unwrap_or(&[]);
+            if !behaviors.is_empty() {
+                entries.push(self.behaviors_section(active, behaviors));
+            }
             entries.push(self.threads_section(active));
         }
 
         sidebar(entries)
+    }
+
+    /// Behaviors subsection for the active pod: header + per-behavior
+    /// `item` rows. Slice β surfaces the registry visually; per-row
+    /// actions (Run, Pause, Edit, Delete) and accordion expansion
+    /// land in slices β.2 / γ.
+    fn behaviors_section(&self, pod_id: &str, behaviors: &[BehaviorSummary]) -> El {
+        let total = behaviors.len();
+        let header_label = format!("Behaviors ({total})");
+        let header = row([sidebar_group_label(header_label).width(Size::Fill(1.0))])
+            .padding(Sides::xy(tokens::SPACE_2, tokens::SPACE_1))
+            .width(Size::Fill(1.0));
+
+        let mut group_children: Vec<El> = vec![header];
+        let rows: Vec<El> = behaviors
+            .iter()
+            .map(|b| self.behavior_item_row(b))
+            .collect();
+        group_children.push(item_group(rows));
+
+        // Pod-id rides as a `let _ = ...` for now — slice β.2 will
+        // route per-row actions back through `pod_id` so we keep
+        // the parameter on the public surface.
+        let _ = pod_id;
+        sidebar_group(group_children)
+    }
+
+    /// One behavior row in the sidebar. Title is the display name;
+    /// description is `"{kind} · {status}"` where status reflects
+    /// `paused` / `errored` / last-fired-relative / `no runs yet`,
+    /// in roughly that priority order. Errored behaviors get a
+    /// trailing destructive marker prefix on the title.
+    fn behavior_item_row(&self, b: &BehaviorSummary) -> El {
+        let title = if b.load_error.is_some() {
+            format!("⚠ {}", b.name)
+        } else {
+            b.name.clone()
+        };
+        // Errored behaviors surface the parse / validation reason
+        // directly — there's no useful trigger_kind to compose with
+        // and the message is the actionable detail. Healthy rows
+        // compose `{kind} · {status}` so the kind tag is always the
+        // first thing the eye lands on.
+        let secondary = if let Some(err) = b.load_error.as_deref() {
+            // Truncate aggressively — the sidebar is narrow and the
+            // full message belongs in the (eventual) editor modal.
+            let preview: String = err.chars().take(60).collect();
+            if preview.len() < err.len() {
+                format!("errored: {preview}…")
+            } else {
+                format!("errored: {preview}")
+            }
+        } else {
+            let kind = b.trigger_kind.as_deref().unwrap_or("manual");
+            let status = if !b.enabled {
+                "paused".to_string()
+            } else if let Some(last) = b.last_fired_at.as_deref() {
+                format!("last fired {}", format_relative(last))
+            } else {
+                "no runs yet".to_string()
+            };
+            format!("{kind} · {status}")
+        };
+
+        let content = item_content([item_title(title), item_description(secondary)]);
+        // Slice β: rows are not yet keyed for click-through. Per-row
+        // actions arrive in β.2 (Run, Pause); expansion to a
+        // recent-threads list lands in γ alongside the danger
+        // affordance pattern.
+        item([content])
     }
 
     /// Build the pod selector row. Single-active selection keyed
@@ -1677,6 +1889,20 @@ fn empty_state(label: &str) -> El {
         .align(Align::Center)
         .width(Size::Fill(1.0))
         .height(Size::Fill(1.0))
+}
+
+/// Map a `TriggerSpec` to the same short discriminator the server
+/// puts in `BehaviorSummary.trigger_kind` (`"manual" | "cron" |
+/// "webhook"`). Keeps both populated paths consistent — `BehaviorList`
+/// rides `trigger_kind` directly; `BehaviorUpdated` carries a full
+/// `BehaviorSnapshot` and we have to re-derive it.
+fn trigger_kind_label(spec: &whisper_agent_protocol::TriggerSpec) -> &'static str {
+    use whisper_agent_protocol::TriggerSpec as T;
+    match spec {
+        T::Manual => "manual",
+        T::Cron { .. } => "cron",
+        T::Webhook { .. } => "webhook",
+    }
 }
 
 /// Compact label for the sidebar's pod tab pill. Shows the pod name

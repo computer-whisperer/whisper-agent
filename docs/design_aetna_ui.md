@@ -261,13 +261,20 @@ tab strip rather than ported piecemeal. Multi-slice rollout:
   relative-activity in the muted second line. Dispatch children
   left-padded by `SPACE_3 * depth`. "Show N more" pagination at
   `SIDEBAR_THREAD_PREVIEW = 10` rows. No new wire calls.
-- **⏳ Slice β — behaviors first-class.** Behaviors subsection above
-  threads, with humanized cron schedule labels (`"hourly · :50"` vs
-  `"0 * * * *"`), description as muted second line, accordion
-  expansion for per-row controls + recent threads. New wire:
-  `ListBehaviors` + the `Behavior*` broadcast events. Pod overflow
-  menu (⋯ → archive / pause / edit / files) lands here too via a
-  `popover_panel` of `menu_items`.
+- **🌗 Slice β — behaviors first-class.** Per-pod `Behaviors (N)`
+  subsection above threads, populated via `ListBehaviors` (deduped
+  per pod per connection) and kept fresh by `BehaviorList` /
+  `BehaviorCreated` / `BehaviorUpdated` / `BehaviorDeleted` /
+  `BehaviorStateChanged`. Each row is an `item_group([item([
+  item_content([title, description])])])` — title is the display
+  name (`⚠`-prefixed when load_error), description is
+  `"{kind} · {status}"` for healthy rows (`status` =
+  `paused` / `last fired Nh` / `no runs yet`) or
+  `"errored: {reason}"` for malformed configs. Per-row actions
+  (Run, Pause, Edit, Delete) and accordion expansion to a
+  recent-threads list still pending — slice β.2 / γ. Cron schedule
+  humanization deferred since `BehaviorSummary` doesn't carry the
+  schedule string; lands in γ alongside `GetBehavior`.
 - **⏳ Slice γ — danger affordances.** Inline arm-confirm pattern
   (probably a small `danger_button` helper that animates "Click again
   to confirm") for archive-pod / delete-behavior. Hooks into the
