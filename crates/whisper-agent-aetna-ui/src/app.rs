@@ -92,8 +92,23 @@ enum DisplayItem {
     Reasoning {
         text: String,
     },
-    SystemNote {
+    /// Thread-prefix system prompt — the `Role::System` message at
+    /// the head of the conversation. Default-collapsed so a long
+    /// prompt doesn't dominate the chat log; expanded body shows
+    /// the full text in a code-styled block. Mirrors the egui
+    /// sibling's `DisplayItem::SetupPrompt`.
+    SetupPrompt {
         text: String,
+    },
+    /// Thread-prefix tool manifest — the `Role::Tools` message
+    /// carrying one `ContentBlock::ToolSchema` per advertised
+    /// tool. Default-collapsed; collapsed header shows
+    /// `{N} tools`, expanded body shows the per-tool list. We
+    /// keep just the schemas the renderer actually needs (name +
+    /// description) — the wire shape stays in the snapshot if
+    /// future expansion wants typed parameter walking too.
+    SetupTools {
+        entries: Vec<ToolSchemaSummary>,
     },
     /// A model-emitted tool call. Fuses with its result when the
     /// matching `ContentBlock::ToolResult` (or `ThreadToolCallEnd`)
@@ -140,6 +155,17 @@ enum DisplayItem {
     GenericPlaceholder {
         label: String,
     },
+}
+
+/// Compact subset of [`whisper_agent_protocol::ToolSchema`] —
+/// just the fields the [`DisplayItem::SetupTools`] body shows.
+/// Cloned at conversion time so the renderer doesn't carry the
+/// full typed-params shape across rebuilds (params don't render
+/// today; reserved for the future structured-params expansion).
+#[derive(Clone)]
+struct ToolSchemaSummary {
+    name: String,
+    description: String,
 }
 
 /// Tool-result body fused onto its originating [`DisplayItem::ToolCall`].
@@ -3168,9 +3194,47 @@ impl ChatApp {
                 let item_el = accordion_item(key, value, preview, open, [paragraph(t.clone())]);
                 log_row(tokens::MUTED_FOREGROUND, None, item_el)
             }
-            DisplayItem::SystemNote { text: t } => {
-                let body = paragraph(t.clone());
-                log_row(tokens::WARNING, None, body)
+            DisplayItem::SetupPrompt { text: t } => {
+                // Default-collapsed accordion: header is "SYSTEM"
+                // tag + a one-line preview of the prompt; body
+                // is the full text in a code-styled block. The
+                // muted gutter reads as "thread metadata" rather
+                // than a participant turn.
+                let preview = first_line_preview(t, 80);
+                let key = "setup-prompt";
+                let value = format!("{idx}");
+                let routed = accordion_item_key(key, &value);
+                let open = self.open_accordions.contains(&routed);
+                let header = format!("SYSTEM · {preview}");
+                let item_el = accordion_item(key, value, header, open, [code_block(t.clone())]);
+                log_row(tokens::MUTED_FOREGROUND, None, item_el)
+            }
+            DisplayItem::SetupTools { entries } => {
+                // Default-collapsed accordion: header is the count
+                // ("TOOLS · 23 tools"); body lists per-tool
+                // name + description as muted text. Future work:
+                // walk the typed params for each tool inline (the
+                // egui sibling does this; we kept the wire shape
+                // off the `DisplayItem` for now).
+                let count = entries.len();
+                let key = "setup-tools";
+                let value = format!("{idx}");
+                let routed = accordion_item_key(key, &value);
+                let open = self.open_accordions.contains(&routed);
+                let header = format!("TOOLS · {count} tool{}", if count == 1 { "" } else { "s" });
+                let body_blocks: Vec<El> = entries
+                    .iter()
+                    .map(|t| {
+                        column([
+                            text(t.name.clone()).label().bold(),
+                            text(t.description.clone()).muted().small().wrap_text(),
+                        ])
+                        .gap(tokens::SPACE_1)
+                        .width(Size::Fill(1.0))
+                    })
+                    .collect();
+                let item_el = accordion_item(key, value, header, open, body_blocks);
+                log_row(tokens::MUTED_FOREGROUND, None, item_el)
             }
             DisplayItem::ToolCall {
                 tool_use_id,
@@ -3407,25 +3471,39 @@ fn conversation_to_display_items(conv: &whisper_agent_protocol::Conversation) ->
     for msg in conv.messages() {
         match msg.role {
             Role::System => {
+                // System prompt at the head of the conversation —
+                // render as a default-collapsed `SetupPrompt`
+                // accordion. Empty prompts produce no row so the
+                // log doesn't start with a meaningless "(empty)"
+                // entry. Mirrors the egui sibling.
                 if let Some(t) = first_text(&msg.content)
                     && !t.is_empty()
                 {
-                    out.push(DisplayItem::SystemNote { text: t });
+                    out.push(DisplayItem::SetupPrompt { text: t });
                 }
             }
             Role::Tools => {
-                let names: Vec<String> = msg
+                // Tool manifest — fold every advertised
+                // `ContentBlock::ToolSchema` into a single
+                // default-collapsed `SetupTools` row whose header
+                // counts entries and whose body lists per-tool
+                // name + description. Empty manifests skipped for
+                // the same reason as empty system prompts.
+                let entries: Vec<ToolSchemaSummary> = msg
                     .content
                     .iter()
                     .filter_map(|b| match b {
-                        ContentBlock::ToolSchema { name, .. } => Some(name.clone()),
+                        ContentBlock::ToolSchema {
+                            name, description, ..
+                        } => Some(ToolSchemaSummary {
+                            name: name.clone(),
+                            description: description.clone(),
+                        }),
                         _ => None,
                     })
                     .collect();
-                if !names.is_empty() {
-                    out.push(DisplayItem::SystemNote {
-                        text: format!("tools available: {}", names.join(", ")),
-                    });
+                if !entries.is_empty() {
+                    out.push(DisplayItem::SetupTools { entries });
                 }
             }
             Role::User => {

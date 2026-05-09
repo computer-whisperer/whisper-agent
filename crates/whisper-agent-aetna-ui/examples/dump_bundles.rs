@@ -32,7 +32,7 @@ use whisper_agent_protocol::{
     BackendSummary, BehaviorOrigin, BehaviorSummary, CompactionConfig, ContentBlock,
     ContentCapabilities, Conversation, ImageMime, ImageSource, Message, ModelSummary, PodSummary,
     Role, ServerToClient, ThreadBindings, ThreadConfig, ThreadSnapshot, ThreadStateLabel,
-    ThreadSummary, ToolResultContent, TurnLog, Usage, permission::Scope,
+    ThreadSummary, ToolKind, ToolResultContent, TurnLog, Usage, permission::Scope,
 };
 
 fn main() -> std::io::Result<()> {
@@ -107,6 +107,14 @@ enum Scene {
     /// picked. Validates the trigger label fallbacks and that
     /// picking a backend triggers a model-list fetch.
     NewThreadFormFilled,
+    /// Subscribed thread whose conversation includes a real system
+    /// prompt (`Role::System` with non-empty text) and a tools
+    /// manifest (`Role::Tools` with several `ToolSchema` blocks)
+    /// at the head, plus one user/assistant exchange. Verifies that
+    /// the new `SetupPrompt` and `SetupTools` accordion rows render
+    /// in their default-collapsed shape — head of chat reads as two
+    /// muted one-line headers rather than dumping the full prompt.
+    ThreadWithSetup,
     /// Subscribed thread mid-prefill — `ThreadPrefillProgress` has
     /// arrived but no text/reasoning delta has yet. Verifies the
     /// thin progress bar + token-count caption above the chat log.
@@ -190,7 +198,7 @@ enum Scene {
 }
 
 impl Scene {
-    const ALL: [Scene; 26] = [
+    const ALL: [Scene; 27] = [
         Scene::Connecting,
         Scene::Connected,
         Scene::Closed,
@@ -205,6 +213,7 @@ impl Scene {
         Scene::ThreadPrefilling,
         Scene::ThreadWithDraft,
         Scene::ThreadWithImages,
+        Scene::ThreadWithSetup,
         Scene::LoginFormEmpty,
         Scene::LoginFormPrefilled,
         Scene::LoginFormWithError,
@@ -235,6 +244,7 @@ impl Scene {
             Scene::ThreadPrefilling => "thread_prefilling",
             Scene::ThreadWithDraft => "thread_with_draft",
             Scene::ThreadWithImages => "thread_with_images",
+            Scene::ThreadWithSetup => "thread_with_setup",
             Scene::LoginFormEmpty => "login_form_empty",
             Scene::LoginFormPrefilled => "login_form_prefilled",
             Scene::LoginFormWithError => "login_form_with_error",
@@ -260,7 +270,8 @@ impl Scene {
             | Scene::ThreadWithToolCall
             | Scene::ThreadPrefilling
             | Scene::ThreadWithDraft
-            | Scene::ThreadWithImages => vec!["thread:t-1"],
+            | Scene::ThreadWithImages
+            | Scene::ThreadWithSetup => vec!["thread:t-1"],
             // Toggle the architect behavior row open so the nested
             // spawned-thread row renders inside `behaviors_section`.
             Scene::SidebarBehaviorsExpanded => vec!["behavior-row:default:architect"],
@@ -379,7 +390,8 @@ fn build_app(scene: Scene) -> Box<dyn App> {
         | Scene::ThreadWithToolCall
         | Scene::ThreadPrefilling
         | Scene::ThreadWithDraft
-        | Scene::ThreadWithImages => {
+        | Scene::ThreadWithImages
+        | Scene::ThreadWithSetup => {
             q.push_back(InboundEvent::ConnectionOpened);
             q.push_back(InboundEvent::Wire(ServerToClient::PodList {
                 correlation_id: None,
@@ -430,6 +442,12 @@ fn build_app(scene: Scene) -> Box<dyn App> {
                 q.push_back(InboundEvent::Wire(ServerToClient::ThreadSnapshot {
                     thread_id: "t-1".into(),
                     snapshot: mock_image_snapshot(),
+                }));
+            }
+            if matches!(scene, Scene::ThreadWithSetup) {
+                q.push_back(InboundEvent::Wire(ServerToClient::ThreadSnapshot {
+                    thread_id: "t-1".into(),
+                    snapshot: mock_setup_snapshot(),
                 }));
             }
         }
@@ -1123,6 +1141,76 @@ fn mock_image_snapshot() -> ThreadSnapshot {
                 replay: None,
             },
         ],
+    });
+    base_snapshot(conv, ThreadStateLabel::Idle, String::new())
+}
+
+/// Snapshot for the `ThreadWithSetup` scene — a real `Role::System`
+/// system prompt and a `Role::Tools` manifest carrying a handful of
+/// `ContentBlock::ToolSchema` entries, plus one user/assistant
+/// exchange afterwards. Exercises the default-collapsed
+/// `SetupPrompt` and `SetupTools` accordion rows at the head of
+/// the chat — the noisy "rah-rah here is your full system prompt"
+/// wall is replaced by a one-line preview the user can expand.
+fn mock_setup_snapshot() -> ThreadSnapshot {
+    let mut conv = Conversation::new();
+    conv.push(Message::system_text(
+        "You are Mavis, a coding agent embedded inside whisper-agent.\n\
+         \n\
+         Behaviors:\n\
+         - Read the user's request literally, then verify against actual code\n\
+         - Prefer minimal diffs — match existing style and conventions\n\
+         - When you are uncertain, ask before guessing\n\
+         - Never silently expand scope past the request\n\
+         \n\
+         When you finish a task, summarize the changes and the next step in\n\
+         no more than two sentences.",
+    ));
+    conv.push(Message {
+        role: Role::Tools,
+        content: vec![
+            ContentBlock::ToolSchema {
+                name: "list_files".into(),
+                description: "List the files at a directory path. Honors the pod's allow-list.".into(),
+                params: Vec::new(),
+                kind: ToolKind::default(),
+            },
+            ContentBlock::ToolSchema {
+                name: "read_file".into(),
+                description: "Read a file's contents as UTF-8 text.".into(),
+                params: Vec::new(),
+                kind: ToolKind::default(),
+            },
+            ContentBlock::ToolSchema {
+                name: "write_file".into(),
+                description: "Replace a file's contents. Returns a unified diff against the previous content.".into(),
+                params: Vec::new(),
+                kind: ToolKind::default(),
+            },
+            ContentBlock::ToolSchema {
+                name: "grep".into(),
+                description: "Search a path tree for a regex pattern. Returns up to 200 hits.".into(),
+                params: Vec::new(),
+                kind: ToolKind::default(),
+            },
+            ContentBlock::ToolSchema {
+                name: "run_bash".into(),
+                description: "Run a bash command in the pod's sandbox. Captures stdout / stderr / exit code.".into(),
+                params: Vec::new(),
+                kind: ToolKind::default(),
+            },
+        ],
+    });
+    conv.push(Message::user_text(
+        "Quick sanity check — do you see the system prompt I just loaded?",
+    ));
+    conv.push(Message {
+        role: Role::Assistant,
+        content: vec![ContentBlock::Text {
+            text: "Yes — it's the Mavis prompt that scopes responses to literal reads of code,\
+                   minimal-diff edits, and asking-before-guessing on uncertainty. Ready when you are."
+                .into(),
+        }],
     });
     base_snapshot(conv, ThreadStateLabel::Idle, String::new())
 }
