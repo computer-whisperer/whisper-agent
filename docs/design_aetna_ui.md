@@ -353,6 +353,18 @@ Validates the build/on_event split end-to-end.
 Polish refactor swapped hand-rolled column/row chrome for `sidebar` /
 `card` / `alert` / `badge` primitives.
 
+Chat-log polish (commits `fb6d675` / `55269bb`):
+- thread-prefix `Role::System` and `Role::Tools` messages render as
+  default-collapsed `SetupPrompt` / `SetupTools` accordion rows
+  (`SYSTEM · {first-line preview}` and `TOOLS · {N} tools`) instead
+  of dumping the full prompt as a noisy warning-gutter row. The user
+  expands when they want detail
+- `TurnStats` row (no gutter, no fill, right-aligned muted caption
+  `in 1,284 · cached 980 · out 86`) interleaved after each
+  Assistant message. `conversation_to_display_items` walks
+  `snapshot.turn_log` in lockstep with assistant turns; live
+  streaming appends from `ThreadAssistantEnd { usage }`
+
 ### ✅ Stage 3 — Compose + send (commit `66d7c3e`)
 
 Compose `text_area` + Send button at the bottom of the selected thread's
@@ -441,12 +453,31 @@ events `ThreadToolCallBegin`, `ThreadToolCallContent`,
 `ThreadToolCallEnd`, and `ThreadToolCallStreaming` (args-being-typed
 placeholder) all land into the same row shape.
 
+Header polish (commits `55269bb` / `39617e3`):
+- collapsed row appends the first-line result preview after the
+  glyph + name so a closed row reads `✓ list_files · drwxr-xr-x
+  rust-stdlib/` rather than just `✓ list_files`
+- relevant arg surfaces in `[brackets]` between name and preview
+  (`✓ read_file [src/lib.rs] · pub mod foo;`), pulled by
+  `tool_summary_from_args` from the tool's well-known field
+  (`path`, `command`, `pattern`, …). Same heuristic as egui's
+  `tool_summary`, plus aliases for whisper-agent's own tool
+  catalog (`run_bash`, `list_files`)
+- streaming tool calls (`result.is_none() && !streaming_output.is_empty()`)
+  auto-expand so the user sees output scroll without clicking;
+  collapse back when `End` lands and the buffer clears (commit
+  `8a3db38`)
+
 Still deferred:
 - inline unified-diff rendering for `edit_file` / `write_file`
   (currently shown as raw JSON args)
 - async `dispatch_thread` callbacks routing into the originating
   call's result slot — currently they fall through to a standalone
   `ToolResult` row when the call has scrolled out of fusion range
+- streaming-args placeholder text (`writing args · {N} chars`) —
+  egui shows progress while args JSON is being typed; aetna pushes
+  a name-only `ToolCall` placeholder which works but doesn't
+  signal "still arriving"
 
 ### 🌗 Stage 7 — Images / attachments (rendering side done)
 
