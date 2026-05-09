@@ -29,10 +29,11 @@ use whisper_agent_aetna_ui::{
     ChatApp, Inbound, InboundEvent, LoginApp, LoginInput, SendFn, SubmitFn,
 };
 use whisper_agent_protocol::{
-    BackendSummary, BehaviorOrigin, BehaviorSummary, CompactionConfig, ContentBlock,
-    ContentCapabilities, Conversation, ImageMime, ImageSource, Message, ModelSummary, PodSummary,
-    Role, ServerToClient, ThreadBindings, ThreadConfig, ThreadSnapshot, ThreadStateLabel,
-    ThreadSummary, ToolKind, ToolResultContent, TurnEntry, TurnLog, Usage, permission::Scope,
+    BackendSummary, BehaviorOrigin, BehaviorSummary, ClientToServer, CompactionConfig,
+    ContentBlock, ContentCapabilities, Conversation, ImageMime, ImageSource, Message, ModelSummary,
+    PodSummary, Role, ServerToClient, ThreadBindings, ThreadConfig, ThreadSnapshot,
+    ThreadStateLabel, ThreadSummary, ToolKind, ToolResultContent, TurnEntry, TurnLog, Usage,
+    permission::Scope,
 };
 
 fn main() -> std::io::Result<()> {
@@ -48,10 +49,18 @@ fn main() -> std::io::Result<()> {
         // (e.g. a future modal-host App) can be added without
         // teaching the renderer about it.
         let mut app: Box<dyn App> = build_app(scene);
+        // Drain the wire seed once (mirrors a real frame start).
         app.before_build();
         for click in scene.clicks() {
             app.on_event(UiEvent::synthetic_click(click));
         }
+        // Second drain: scenes that depend on a wire response to a
+        // request the click loop just fired (e.g. behavior-editor
+        // scenes that pre-queue the matching `BehaviorSnapshot` for
+        // the click-side `GetBehavior`) need this to land their
+        // response into a UI state that already opened. A no-op for
+        // scenes whose queue is empty by now.
+        app.before_build();
         let theme = app.theme();
         let cx = BuildCx::new(&theme);
         let mut tree = app.build(&cx);
@@ -217,10 +226,24 @@ enum Scene {
     /// the user *needs* "+ New behavior" the most). No modal is
     /// opened; this just exercises the section's empty branch.
     SidebarBehaviorsEmpty,
+    /// Per-behavior editor sheet, hydrated against the architect
+    /// behavior's snapshot. Click sequence: expand the behavior
+    /// row, click Edit. The seed pre-pushes a `BehaviorSnapshot`
+    /// reply with a deterministic correlation id (`aui-1`, the first
+    /// id the editor mints — see `next_correlation_id`); the click
+    /// fires the matching `GetBehavior` from `open_behavior_editor`
+    /// and the inbound queue's BehaviorSnapshot then hydrates the
+    /// form so the dump captures the populated body, not "loading…".
+    BehaviorEditorHydrated,
+    /// Same baseline as [`BehaviorEditorHydrated`] but with the
+    /// trigger-kind `select_menu` toggled open via a third click.
+    /// Verifies the menu paints over the sheet panel via
+    /// `popover_layers` ordering.
+    BehaviorEditorTriggerKindOpen,
 }
 
 impl Scene {
-    const ALL: [Scene; 30] = [
+    const ALL: [Scene; 32] = [
         Scene::Connecting,
         Scene::Connected,
         Scene::Closed,
@@ -251,6 +274,8 @@ impl Scene {
         Scene::NewPodModalEmpty,
         Scene::NewPodModalNoBackends,
         Scene::NewBehaviorModalEmpty,
+        Scene::BehaviorEditorHydrated,
+        Scene::BehaviorEditorTriggerKindOpen,
     ];
 
     fn slug(self) -> &'static str {
@@ -285,6 +310,8 @@ impl Scene {
             Scene::NewPodModalEmpty => "new_pod_modal_empty",
             Scene::NewPodModalNoBackends => "new_pod_modal_no_backends",
             Scene::NewBehaviorModalEmpty => "new_behavior_modal_empty",
+            Scene::BehaviorEditorHydrated => "behavior_editor_hydrated",
+            Scene::BehaviorEditorTriggerKindOpen => "behavior_editor_trigger_kind_open",
         }
     }
 
@@ -330,6 +357,25 @@ impl Scene {
             // active `default` pod. Click route carries the pod
             // id as suffix.
             Scene::NewBehaviorModalEmpty => vec!["sidebar:new-behavior:default"],
+            // Expand the architect behavior row, then click Edit
+            // to open the editor sheet. The pre-seeded
+            // `BehaviorSnapshot` correlation matches the first
+            // outgoing `GetBehavior` correlation (`aui-1`), so the
+            // form hydrates inside this same render frame rather
+            // than rendering the loading placeholder.
+            Scene::BehaviorEditorHydrated => vec![
+                "behavior-row:default:architect",
+                "behavior-edit:default:architect",
+            ],
+            // Same as above plus a click on the trigger-kind
+            // `select_trigger`, which classify_select_event maps
+            // to `Toggle` and our handler flips
+            // `editor.trigger_kind_open`.
+            Scene::BehaviorEditorTriggerKindOpen => vec![
+                "behavior-row:default:architect",
+                "behavior-edit:default:architect",
+                "behavior-editor:trigger-kind",
+            ],
             // Pick a backend (which fires a no-op `ListModels`),
             // then a model id from the pre-seeded `ModelsList`,
             // then a pod. Each `option:` click goes through
@@ -355,10 +401,37 @@ fn build_app(scene: Scene) -> Box<dyn App> {
     }
 
     let inbound: Inbound = Rc::new(std::cell::RefCell::new(VecDeque::new()));
-    // No-op outbound: bundle dumping never sends to a server. Kept on
-    // the same `SendFn` shape so [`ChatApp::new`] is the same call
-    // shape the live binary uses.
-    let send_fn: SendFn = Box::new(|_msg| {});
+    // Outbound: most scenes don't observe the wire side and use a
+    // pure no-op SendFn. Wire-response-driven scenes — currently
+    // just the behavior-editor pair — capture the inbound queue and
+    // synthesize a server reply for the request the click loop
+    // emits, so the second `before_build` drain in the dump loop
+    // sees the matching response. Captures here are per-scene
+    // because the response's correlation has to match the request's
+    // correlation, and that pairing is scene-specific.
+    let send_fn: SendFn = match scene {
+        Scene::BehaviorEditorHydrated | Scene::BehaviorEditorTriggerKindOpen => {
+            let queue = inbound.clone();
+            Box::new(move |msg| {
+                if let ClientToServer::GetBehavior {
+                    correlation_id,
+                    pod_id,
+                    behavior_id,
+                } = msg
+                    && pod_id == "default"
+                    && behavior_id == "architect"
+                {
+                    queue.borrow_mut().push_back(InboundEvent::Wire(
+                        ServerToClient::BehaviorSnapshot {
+                            correlation_id,
+                            snapshot: mock_architect_snapshot(),
+                        },
+                    ));
+                }
+            })
+        }
+        _ => Box::new(|_msg| {}),
+    };
     let app = ChatApp::new(inbound.clone(), send_fn);
 
     let mut q = inbound.borrow_mut();
@@ -577,6 +650,34 @@ fn build_app(scene: Scene) -> Box<dyn App> {
             // Same baseline as `SidebarBehaviors` — the dialog
             // overlays a real behaviors registry so the scrim
             // layering shows over a populated section header.
+            q.push_back(InboundEvent::ConnectionOpened);
+            q.push_back(InboundEvent::Wire(ServerToClient::PodList {
+                correlation_id: None,
+                pods: mock_pods(),
+                default_pod_id: "default".into(),
+            }));
+            q.push_back(InboundEvent::Wire(ServerToClient::ThreadList {
+                correlation_id: None,
+                tasks: mock_mavis_threads(),
+            }));
+            q.push_back(InboundEvent::Wire(ServerToClient::BehaviorList {
+                correlation_id: None,
+                pod_id: "default".into(),
+                behaviors: mock_mavis_behaviors(),
+            }));
+        }
+        Scene::BehaviorEditorHydrated | Scene::BehaviorEditorTriggerKindOpen => {
+            // Same baseline as `SidebarBehaviorsExpanded` — pods +
+            // threads + behaviors registry — so the click loop can
+            // expand the architect row and click Edit. The
+            // matching `BehaviorSnapshot` reply is synthesized by
+            // the per-scene SendFn (see `build_app`'s match) when
+            // the click loop fires `GetBehavior`; the second
+            // `before_build` drain after clicks then hydrates the
+            // editor. Order matters: we don't pre-queue the
+            // snapshot here because the editor doesn't exist at
+            // first-drain time, and the correlation id wouldn't be
+            // known yet anyway.
             q.push_back(InboundEvent::ConnectionOpened);
             q.push_back(InboundEvent::Wire(ServerToClient::PodList {
                 correlation_id: None,
@@ -992,6 +1093,54 @@ fn mock_mavis_behaviors() -> Vec<BehaviorSummary> {
             load_error: Some("behavior.toml: invalid cron `30 * * *` (expected 5 fields)".into()),
         },
     ]
+}
+
+/// Hydrated `BehaviorSnapshot` for the architect cron behavior the
+/// editor scenes open. Mirrors what `GetBehavior` returns from a
+/// running server: a parsed `BehaviorConfig` with a cron trigger,
+/// a non-empty `prompt.md` body, and a normal `BehaviorState`. No
+/// `system_prompt.md` (override is dormant), no `load_error`.
+fn mock_architect_snapshot() -> whisper_agent_protocol::BehaviorSnapshot {
+    use whisper_agent_protocol::{
+        BehaviorConfig, BehaviorScope, BehaviorSnapshot, BehaviorState, BehaviorThreadOverride,
+        CatchUp, Overlap, RetentionPolicy, TriggerSpec,
+    };
+    BehaviorSnapshot {
+        behavior_id: "architect".into(),
+        pod_id: "default".into(),
+        config: Some(BehaviorConfig {
+            name: "architect".into(),
+            description: Some(
+                "Meta-agent. Observes agent performance and modifies behaviors \
+                 to optimize the system loop."
+                    .into(),
+            ),
+            trigger: TriggerSpec::Cron {
+                schedule: "0 2 * * *".into(),
+                timezone: "UTC".into(),
+                overlap: Overlap::Skip,
+                catch_up: CatchUp::One,
+            },
+            thread: BehaviorThreadOverride::default(),
+            on_completion: RetentionPolicy::default(),
+            scope: BehaviorScope::default(),
+        }),
+        toml_text: String::new(),
+        prompt: "Review the last 24 hours of agent threads. Look for \
+                 repeated failure patterns, then propose targeted edits \
+                 to the affected behaviors.\n\npayload: {{payload}}\n"
+            .into(),
+        system_prompt: None,
+        state: BehaviorState {
+            enabled: true,
+            run_count: 12,
+            last_fired_at: Some("2026-05-09T02:00:00Z".into()),
+            last_thread_id: Some("task-architect-001".into()),
+            last_outcome: None,
+            queued_payload: None,
+        },
+        load_error: None,
+    }
 }
 
 /// `n` synthetic threads in the default pod, for the

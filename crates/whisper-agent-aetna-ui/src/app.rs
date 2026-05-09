@@ -527,6 +527,13 @@ pub struct ChatApp {
     /// right pod and `submit` knows where to send `CreateBehavior`.
     /// `None` when closed.
     new_behavior_modal: Option<NewBehaviorModalState>,
+    /// Behavior editor sheet state. `Some` while the right-hand sheet
+    /// is open for a particular `(pod_id, behavior_id)` pair; `None`
+    /// when closed. The form hydrates from a `GetBehavior` round-trip
+    /// — the sheet renders a "loading…" placeholder until
+    /// `BehaviorSnapshot` lands and populates `working_config` /
+    /// `working_prompt`.
+    behavior_editor: Option<BehaviorEditorSheetState>,
     /// Monotonic counter for outgoing `correlation_id` strings.
     /// Each modal that sends a request claims an id and waits for
     /// the matching reply (success or `Error`) before closing or
@@ -582,6 +589,182 @@ impl NewBehaviorModalState {
     }
 }
 
+/// Form state for the per-behavior editor sheet. Held inside an
+/// `Option` on [`ChatApp`] — `Some` while the sheet is open. Hydrates
+/// asynchronously: opening fires a `GetBehavior` and stashes the
+/// correlation in `pending_get`; the matching `BehaviorSnapshot` reply
+/// fills `working_config` / `working_prompt` (and the trigger-derived
+/// editor fields). Until then the sheet renders a "loading…" body.
+///
+/// v1 surface mirrors the doc's call-out: name, description, prompt,
+/// trigger kind, cron schedule. Thread overrides, scope narrowing,
+/// retention policy, system-prompt override, and the raw-TOML escape
+/// hatch are deferred — fields not exposed by the form ride through
+/// `working_config` unchanged on save, so a v1 edit can't accidentally
+/// strip them.
+pub(crate) struct BehaviorEditorSheetState {
+    pub(crate) pod_id: String,
+    pub(crate) behavior_id: String,
+    /// Working copy of the parsed config. `None` until the snapshot
+    /// lands (or stays `None` permanently if the on-disk TOML failed
+    /// to parse — `error` carries the reason and Save is disabled).
+    pub(crate) working_config: Option<BehaviorConfig>,
+    /// Buffer for the sibling `prompt.md`. Empty until the snapshot
+    /// lands or when the behavior has no prompt.
+    pub(crate) working_prompt: String,
+    /// Selected trigger kind — tracked separately because
+    /// [`TriggerSpec`] is a tagged enum, so name+description edits on
+    /// `working_config` can't happen alongside a borrowed schedule
+    /// string. Save rebuilds the `TriggerSpec` variant from this label
+    /// plus [`Self::schedule_buffer`], preserving the existing
+    /// variant's non-exposed fields (timezone, overlap, catch_up)
+    /// when possible.
+    pub(crate) working_kind: TriggerKindLabel,
+    /// Cron schedule edit buffer. Meaningful only when `working_kind
+    /// == Cron`; preserved across kind switches so toggling away and
+    /// back doesn't lose the user's typed schedule.
+    pub(crate) schedule_buffer: String,
+    /// Whether the trigger-kind `select_menu` popover is open. One
+    /// menu at a time across the whole app — opening this menu closes
+    /// the new-thread compose pickers via `close_other_pickers`.
+    pub(crate) trigger_kind_open: bool,
+    /// Validation message: load error from the snapshot, client-side
+    /// validation failure, or server-side `Error` echo.
+    pub(crate) error: Option<String>,
+    /// Correlation id of the in-flight `GetBehavior` request, if any.
+    /// `Some` until the matching `BehaviorSnapshot` arrives.
+    pub(crate) pending_get: Option<String>,
+    /// Correlation id of the in-flight `UpdateBehavior` request, if
+    /// any. `Some` ⇒ the Save button is disabled. Cleared on
+    /// `BehaviorUpdated` (close) or `Error` (re-enable + surface
+    /// message).
+    pub(crate) pending_save: Option<String>,
+}
+
+/// Discriminator used by the editor's trigger-kind picker. Mirrors
+/// the on-wire `TriggerSpec` tag values (`"manual" | "cron" |
+/// "webhook"`) so persisting and reading round-trips through the
+/// label string the picker carries.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TriggerKindLabel {
+    Manual,
+    Cron,
+    Webhook,
+}
+
+impl TriggerKindLabel {
+    fn wire_value(self) -> &'static str {
+        match self {
+            Self::Manual => "manual",
+            Self::Cron => "cron",
+            Self::Webhook => "webhook",
+        }
+    }
+
+    fn display_label(self) -> &'static str {
+        match self {
+            Self::Manual => "Manual",
+            Self::Cron => "Cron",
+            Self::Webhook => "Webhook",
+        }
+    }
+
+    fn from_wire(value: &str) -> Option<Self> {
+        match value {
+            "manual" => Some(Self::Manual),
+            "cron" => Some(Self::Cron),
+            "webhook" => Some(Self::Webhook),
+            _ => None,
+        }
+    }
+
+    fn from_trigger(spec: &TriggerSpec) -> Self {
+        match spec {
+            TriggerSpec::Manual => Self::Manual,
+            TriggerSpec::Cron { .. } => Self::Cron,
+            TriggerSpec::Webhook { .. } => Self::Webhook,
+        }
+    }
+}
+
+impl BehaviorEditorSheetState {
+    fn new(pod_id: String, behavior_id: String, pending_get: String) -> Self {
+        Self {
+            pod_id,
+            behavior_id,
+            working_config: None,
+            working_prompt: String::new(),
+            working_kind: TriggerKindLabel::Manual,
+            schedule_buffer: String::new(),
+            trigger_kind_open: false,
+            error: None,
+            pending_get: Some(pending_get),
+            pending_save: None,
+        }
+    }
+
+    /// Hydrate the working state from a [`BehaviorSnapshot`]. Called
+    /// once when the matching `GetBehavior` round-trip completes. Sets
+    /// `working_kind` + `schedule_buffer` from the trigger variant so
+    /// the form widgets render against the snapshot's values. A
+    /// `load_error` from disk lands in `error` (and `working_config`
+    /// stays `None`) so the user sees the parse failure rather than
+    /// editing against a phantom default.
+    fn hydrate(&mut self, snapshot: whisper_agent_protocol::BehaviorSnapshot) {
+        self.pending_get = None;
+        self.error = snapshot.load_error.clone();
+        if let Some(cfg) = snapshot.config.as_ref() {
+            self.working_kind = TriggerKindLabel::from_trigger(&cfg.trigger);
+            self.schedule_buffer = match &cfg.trigger {
+                TriggerSpec::Cron { schedule, .. } => schedule.clone(),
+                _ => String::new(),
+            };
+        }
+        self.working_config = snapshot.config;
+        self.working_prompt = snapshot.prompt;
+    }
+
+    /// Resolve the form state into a `TriggerSpec` for `UpdateBehavior`.
+    /// Preserves variant-internal fields (timezone, overlap, catch_up
+    /// for cron; overlap for webhook) from the loaded config when the
+    /// kind didn't change; defaults them when transitioning between
+    /// kinds. The schedule string for cron is taken from
+    /// `schedule_buffer` — the variant-internal value is the source of
+    /// truth on disk, but the buffer is the source of truth while the
+    /// editor is open.
+    fn resolved_trigger(&self) -> TriggerSpec {
+        use whisper_agent_protocol::{CatchUp, Overlap};
+        let baseline = self.working_config.as_ref().map(|c| c.trigger.clone());
+        match self.working_kind {
+            TriggerKindLabel::Manual => TriggerSpec::Manual,
+            TriggerKindLabel::Cron => {
+                let (timezone, overlap, catch_up) = match baseline.as_ref() {
+                    Some(TriggerSpec::Cron {
+                        timezone,
+                        overlap,
+                        catch_up,
+                        ..
+                    }) => (timezone.clone(), *overlap, *catch_up),
+                    _ => ("UTC".to_string(), Overlap::default(), CatchUp::default()),
+                };
+                TriggerSpec::Cron {
+                    schedule: self.schedule_buffer.trim().to_string(),
+                    timezone,
+                    overlap,
+                    catch_up,
+                }
+            }
+            TriggerKindLabel::Webhook => {
+                let overlap = match baseline.as_ref() {
+                    Some(TriggerSpec::Webhook { overlap }) => *overlap,
+                    _ => Overlap::default(),
+                };
+                TriggerSpec::Webhook { overlap }
+            }
+        }
+    }
+}
+
 impl ChatApp {
     pub fn new(inbound: Inbound, send_fn: SendFn) -> Self {
         Self {
@@ -618,6 +801,7 @@ impl ChatApp {
             picker_pod_open: false,
             new_pod_modal: None,
             new_behavior_modal: None,
+            behavior_editor: None,
             correlation_counter: 0,
         }
     }
@@ -786,7 +970,40 @@ impl ChatApp {
                 }
                 entries.sort_by(|a, b| a.behavior_id.cmp(&b.behavior_id));
             }
-            ServerToClient::BehaviorUpdated { snapshot, .. } => {
+            ServerToClient::BehaviorSnapshot {
+                snapshot,
+                correlation_id,
+            } => {
+                // The editor sheet is the only sender of `GetBehavior`
+                // today. Match by the editor's `pending_get` slot —
+                // an unrelated snapshot (none expected, but be safe)
+                // drops on the floor. The behavior_id check guards
+                // against the user closing-then-reopening the editor
+                // for a different behavior in the round-trip window.
+                if let Some(editor) = self.behavior_editor.as_mut()
+                    && editor.pending_get.as_ref() == correlation_id.as_ref()
+                    && editor.pod_id == snapshot.pod_id
+                    && editor.behavior_id == snapshot.behavior_id
+                {
+                    editor.hydrate(snapshot);
+                }
+            }
+            ServerToClient::BehaviorUpdated {
+                snapshot,
+                correlation_id,
+            } => {
+                // Close the editor sheet if its `UpdateBehavior` round-
+                // trip just landed. Match by correlation so an update
+                // from another client doesn't accidentally close a
+                // sheet the user is still working in. The summary
+                // refresh below runs regardless of who initiated the
+                // update.
+                if let Some(editor) = self.behavior_editor.as_ref()
+                    && let Some(pending) = editor.pending_save.as_ref()
+                    && correlation_id.as_ref() == Some(pending)
+                {
+                    self.behavior_editor = None;
+                }
                 // Project the snapshot back onto the summary shape we
                 // hold for the list view. Keep `last_fired_at` /
                 // `run_count` / `enabled` from the snapshot's `state`
@@ -1184,6 +1401,24 @@ impl ChatApp {
                         modal.error = Some(message.clone());
                         modal.pending_correlation = None;
                         consumed = true;
+                    } else if let Some(editor) = self.behavior_editor.as_mut() {
+                        // Two correlation slots in flight at any given
+                        // time: `pending_get` (the initial snapshot
+                        // round-trip) and `pending_save` (an in-flight
+                        // UpdateBehavior). Either can fail; either
+                        // surfaces the message into the same `error`
+                        // slot. Save re-enables on save failure; a get
+                        // failure leaves the form in its loading shape
+                        // with the error in place.
+                        if editor.pending_save.as_ref() == Some(corr) {
+                            editor.error = Some(message.clone());
+                            editor.pending_save = None;
+                            consumed = true;
+                        } else if editor.pending_get.as_ref() == Some(corr) {
+                            editor.error = Some(message.clone());
+                            editor.pending_get = None;
+                            consumed = true;
+                        }
                     }
                 }
                 // Thread-scoped errors land on the view's failure
@@ -1324,6 +1559,12 @@ impl App for ChatApp {
         if self.handle_new_behavior_modal_event(&event) {
             return;
         }
+        // Behavior editor sheet routing — text inputs (name /
+        // description / prompt / cron schedule), the trigger-kind
+        // picker, primary Save, secondary Cancel, scrim Dismiss.
+        if self.handle_behavior_editor_event(&event) {
+            return;
+        }
 
         // "Show N more" / "Show less" toggle on the active pod's
         // thread list. One toggle per pod (the active one), so we
@@ -1422,6 +1663,23 @@ impl App for ChatApp {
             } else {
                 self.delete_armed_behavior = Some(pair);
             }
+            return;
+        }
+
+        // Behavior Edit: open the editor sheet for the matching
+        // `{pod}:{beh}` pair and fire `GetBehavior` to hydrate the
+        // form. If the editor is already open for the same pair, this
+        // click is a no-op (avoids re-firing the round-trip and
+        // discarding partial edits). If it's open for a different
+        // behavior, the new pair takes over — the prior pending
+        // snapshot will arrive with a stale correlation and be
+        // dropped on the floor.
+        if let Some(key) = event.route()
+            && let Some(rest) = key.strip_prefix(BEHAVIOR_EDIT_PREFIX)
+            && matches!(event.kind, UiEventKind::Click | UiEventKind::Activate)
+            && let Some((pod, beh)) = rest.split_once(':')
+        {
+            self.open_behavior_editor(pod.to_string(), beh.to_string());
             return;
         }
 
@@ -1594,6 +1852,31 @@ const BEHAVIOR_TOGGLE_PREFIX: &str = "behavior-toggle:";
 /// click disarms.
 const BEHAVIOR_DELETE_PREFIX: &str = "behavior-delete:";
 
+/// Routed-key prefix for the per-behavior Edit button on the
+/// expanded behavior toolbar. Suffix carries `{pod_id}:{behavior_id}`.
+/// Click opens the [`BEHAVIOR_EDITOR_KEY`] sheet and fires
+/// `GetBehavior` to hydrate the form.
+const BEHAVIOR_EDIT_PREFIX: &str = "behavior-edit:";
+
+/// Routed-key prefix the per-behavior editor sheet uses. Extended
+/// keys: `{prefix}:dismiss` (scrim, emitted by `sheet`),
+/// `{prefix}:name` / `{prefix}:description` / `{prefix}:schedule`
+/// (text_input fields), `{prefix}:prompt` (text_area),
+/// `{prefix}:trigger-kind` (select_trigger + select_menu pair),
+/// `{prefix}:save` (primary button), `{prefix}:cancel` (secondary).
+const BEHAVIOR_EDITOR_KEY: &str = "behavior-editor";
+const BEHAVIOR_EDITOR_NAME_KEY: &str = "behavior-editor:name";
+const BEHAVIOR_EDITOR_DESCRIPTION_KEY: &str = "behavior-editor:description";
+const BEHAVIOR_EDITOR_SCHEDULE_KEY: &str = "behavior-editor:schedule";
+const BEHAVIOR_EDITOR_PROMPT_KEY: &str = "behavior-editor:prompt";
+/// `select_trigger` key for the trigger-kind picker; also the prefix
+/// `widgets::select` derives the per-option key from
+/// (`behavior-editor:trigger-kind:option:{value}`).
+const BEHAVIOR_EDITOR_TRIGGER_KIND_KEY: &str = "behavior-editor:trigger-kind";
+const BEHAVIOR_EDITOR_SAVE_KEY: &str = "behavior-editor:save";
+const BEHAVIOR_EDITOR_CANCEL_KEY: &str = "behavior-editor:cancel";
+const BEHAVIOR_EDITOR_DISMISS_KEY: &str = "behavior-editor:dismiss";
+
 fn behavior_row_key(pod_id: &str, behavior_id: &str) -> String {
     format!("{BEHAVIOR_ROW_PREFIX}{pod_id}:{behavior_id}")
 }
@@ -1608,6 +1891,10 @@ fn behavior_toggle_key(pod_id: &str, behavior_id: &str) -> String {
 
 fn behavior_delete_key(pod_id: &str, behavior_id: &str) -> String {
     format!("{BEHAVIOR_DELETE_PREFIX}{pod_id}:{behavior_id}")
+}
+
+fn behavior_edit_key(pod_id: &str, behavior_id: &str) -> String {
+    format!("{BEHAVIOR_EDIT_PREFIX}{pod_id}:{behavior_id}")
 }
 
 /// Composite expansion-state key for `expanded_behaviors`. Mirrors
@@ -1801,6 +2088,15 @@ impl ChatApp {
         }
         if keep_open != PICKER_POD {
             self.picker_pod_open = false;
+        }
+        // The behavior editor's trigger-kind picker shares the same
+        // single-open-at-a-time discipline. Its key isn't one of the
+        // new-thread pickers, so it always closes when something else
+        // toggles.
+        if keep_open != BEHAVIOR_EDITOR_TRIGGER_KIND_KEY
+            && let Some(editor) = self.behavior_editor.as_mut()
+        {
+            editor.trigger_kind_open = false;
         }
     }
 
@@ -2086,17 +2382,19 @@ impl ChatApp {
     }
 
     /// Inline action toolbar shown inside an expanded behavior body.
-    /// Two-row layout: the top row carries the everyday Run-now and
-    /// Pause/Resume buttons; the bottom row carries a destructive
-    /// Delete with two-click arm-confirm. First click flips the
-    /// label to "Confirm delete?" and the styling to destructive;
+    /// Two-row layout: the top row carries Run-now and Pause(Resume);
+    /// the bottom row pairs Edit (left) with destructive Delete
+    /// (right, two-click arm-confirm). First click on Delete flips
+    /// the label to "Confirm delete?" and the styling to destructive;
     /// second click on the same button fires `DeleteBehavior`. Any
     /// unrelated click disarms (handled at the top of `on_event`).
-    /// Two rows because the sidebar's 224 px isn't wide enough to
-    /// hold all three buttons side-by-side once the armed Delete
-    /// label expands. The visual split also signals "this is the
-    /// danger zone" without needing an extra divider. Edit still
-    /// pending (needs the full behavior editor).
+    ///
+    /// Two rows because the sidebar's 224 px isn't wide enough to hold
+    /// three buttons on one row plus the (sometimes-armed) Delete on
+    /// another. Edit opens the [`BEHAVIOR_EDITOR_KEY`] sheet (right-
+    /// attached `SheetSide::Right`); load-errored rows can still open
+    /// it so the user can fix the broken `behavior.toml` from the form
+    /// (or fall back to the eventual raw-TOML tab).
     fn behavior_actions_row(&self, pod_id: &str, b: &BehaviorSummary) -> El {
         let mut run = button("Run now")
             .key(behavior_run_key(pod_id, &b.behavior_id))
@@ -2107,6 +2405,9 @@ impl ChatApp {
         let toggle_label = if b.enabled { "Pause" } else { "Resume" };
         let toggle = button(toggle_label)
             .key(behavior_toggle_key(pod_id, &b.behavior_id))
+            .ghost();
+        let edit = button("Edit")
+            .key(behavior_edit_key(pod_id, &b.behavior_id))
             .ghost();
 
         let armed = self
@@ -2151,7 +2452,7 @@ impl ChatApp {
             row([run, toggle])
                 .gap(tokens::SPACE_2)
                 .width(Size::Fill(1.0)),
-            row([spacer(), delete])
+            row([edit, spacer(), delete])
                 .align(Align::Center)
                 .width(Size::Fill(1.0)),
         ])
@@ -2694,6 +2995,17 @@ impl ChatApp {
         if let Some(modal_el) = self.render_new_behavior_modal() {
             out.push(Some(modal_el));
         }
+        if let Some(sheet_el) = self.render_behavior_editor_sheet() {
+            out.push(Some(sheet_el));
+            // Trigger-kind menu rides above the sheet itself —
+            // `select_menu` paints as its own layer; ordering it last
+            // makes it the topmost so it floats above the sheet panel.
+            if let Some(editor) = self.behavior_editor.as_ref()
+                && editor.trigger_kind_open
+            {
+                out.push(Some(self.behavior_editor_trigger_kind_menu()));
+            }
+        }
         out
     }
 
@@ -2924,6 +3236,223 @@ impl ChatApp {
         }
     }
 
+    /// Open (or re-target) the behavior editor sheet for the given
+    /// `(pod, behavior)` pair. No-op if the sheet is already open for
+    /// the same pair (avoids re-firing `GetBehavior` and trampling the
+    /// user's pending edits). Mints a correlation id and stashes it
+    /// in `pending_get` so the matching `BehaviorSnapshot` reply
+    /// hydrates the form.
+    fn open_behavior_editor(&mut self, pod_id: String, behavior_id: String) {
+        if let Some(existing) = self.behavior_editor.as_ref()
+            && existing.pod_id == pod_id
+            && existing.behavior_id == behavior_id
+        {
+            return;
+        }
+        let correlation_id = self.next_correlation_id();
+        self.behavior_editor = Some(BehaviorEditorSheetState::new(
+            pod_id.clone(),
+            behavior_id.clone(),
+            correlation_id.clone(),
+        ));
+        self.send(ClientToServer::GetBehavior {
+            correlation_id: Some(correlation_id),
+            pod_id,
+            behavior_id,
+        });
+    }
+
+    /// Routing for the per-behavior editor sheet. Same shape as
+    /// [`Self::handle_new_behavior_modal_event`] — bail when closed,
+    /// route text inputs, route the trigger-kind picker, route
+    /// primary / cancel / dismiss. Returns `true` when the event was
+    /// consumed so the outer `on_event` can short-circuit. Per-field
+    /// edits clear the `error` slot so a stale validation message
+    /// doesn't linger after the user starts fixing it.
+    fn handle_behavior_editor_event(&mut self, event: &UiEvent) -> bool {
+        if self.behavior_editor.is_none() {
+            return false;
+        }
+
+        // Trigger-kind picker: classified through `widgets::select` so
+        // toggle / dismiss / pick map to the same shape the new-thread
+        // pickers use. Routed first because its sub-keys
+        // (`...:trigger-kind:option:{value}`) overlap with a
+        // `target_key`-based prefix check.
+        if let Some(action) = classify_select_event(event, BEHAVIOR_EDITOR_TRIGGER_KIND_KEY) {
+            self.handle_behavior_editor_trigger_kind_pick(action);
+            return true;
+        }
+
+        if event.target_key() == Some(BEHAVIOR_EDITOR_NAME_KEY) {
+            if let Some(editor) = self.behavior_editor.as_mut()
+                && let Some(cfg) = editor.working_config.as_mut()
+            {
+                text_input::apply_event(
+                    &mut cfg.name,
+                    &mut self.selection,
+                    BEHAVIOR_EDITOR_NAME_KEY,
+                    event,
+                );
+                editor.error = None;
+            }
+            return true;
+        }
+        if event.target_key() == Some(BEHAVIOR_EDITOR_DESCRIPTION_KEY) {
+            if let Some(editor) = self.behavior_editor.as_mut()
+                && let Some(cfg) = editor.working_config.as_mut()
+            {
+                // `description` is `Option<String>` on the wire — keep
+                // a String buffer for the multi-line text_area and
+                // project back to `None` when the user empties it
+                // (matches the serde `skip_serializing_if =
+                // "Option::is_none"` round-trip on disk).
+                let mut buf = cfg.description.clone().unwrap_or_default();
+                text_area::apply_event(
+                    &mut buf,
+                    &mut self.selection,
+                    BEHAVIOR_EDITOR_DESCRIPTION_KEY,
+                    event,
+                );
+                cfg.description = if buf.trim().is_empty() {
+                    None
+                } else {
+                    Some(buf)
+                };
+                editor.error = None;
+            }
+            return true;
+        }
+        if event.target_key() == Some(BEHAVIOR_EDITOR_SCHEDULE_KEY) {
+            if let Some(editor) = self.behavior_editor.as_mut() {
+                text_input::apply_event(
+                    &mut editor.schedule_buffer,
+                    &mut self.selection,
+                    BEHAVIOR_EDITOR_SCHEDULE_KEY,
+                    event,
+                );
+                editor.error = None;
+            }
+            return true;
+        }
+        if event.target_key() == Some(BEHAVIOR_EDITOR_PROMPT_KEY) {
+            if let Some(editor) = self.behavior_editor.as_mut() {
+                text_area::apply_event(
+                    &mut editor.working_prompt,
+                    &mut self.selection,
+                    BEHAVIOR_EDITOR_PROMPT_KEY,
+                    event,
+                );
+                editor.error = None;
+            }
+            return true;
+        }
+
+        if event.is_click_or_activate(BEHAVIOR_EDITOR_CANCEL_KEY)
+            || event.is_click_or_activate(BEHAVIOR_EDITOR_DISMISS_KEY)
+        {
+            self.behavior_editor = None;
+            return true;
+        }
+
+        if event.is_click_or_activate(BEHAVIOR_EDITOR_SAVE_KEY) {
+            self.submit_behavior_editor();
+            return true;
+        }
+
+        false
+    }
+
+    /// Pick handler for the behavior editor's trigger-kind menu.
+    /// Mirrors the new-thread pickers' classify-then-mutate shape.
+    fn handle_behavior_editor_trigger_kind_pick(&mut self, action: SelectAction) {
+        match action {
+            SelectAction::Toggle => {
+                self.close_other_pickers(BEHAVIOR_EDITOR_TRIGGER_KIND_KEY);
+                if let Some(editor) = self.behavior_editor.as_mut() {
+                    editor.trigger_kind_open = !editor.trigger_kind_open;
+                }
+            }
+            SelectAction::Dismiss => {
+                if let Some(editor) = self.behavior_editor.as_mut() {
+                    editor.trigger_kind_open = false;
+                }
+            }
+            SelectAction::Pick(value) => {
+                if let Some(editor) = self.behavior_editor.as_mut() {
+                    if let Some(kind) = TriggerKindLabel::from_wire(&value) {
+                        editor.working_kind = kind;
+                        editor.error = None;
+                    }
+                    editor.trigger_kind_open = false;
+                }
+            }
+            // `SelectAction` is `#[non_exhaustive]`.
+            _ => {}
+        }
+    }
+
+    /// Validate + dispatch the behavior editor's Save. Same
+    /// correlation-stamping pattern as the create modals: mint an id,
+    /// stash it in `pending_save`, fire `UpdateBehavior`. The wire
+    /// echo (`BehaviorUpdated` or `Error`) closes or re-enables the
+    /// sheet from the inbound handler.
+    fn submit_behavior_editor(&mut self) {
+        let Some(editor) = self.behavior_editor.as_ref() else {
+            return;
+        };
+        if editor.pending_save.is_some() {
+            return;
+        }
+        let Some(working) = editor.working_config.as_ref() else {
+            // Snapshot hasn't landed yet (or load_error). Save isn't
+            // meaningful until we have a config to mutate.
+            return;
+        };
+        if working.name.trim().is_empty() {
+            self.set_behavior_editor_error("name is empty".into());
+            return;
+        }
+        if matches!(editor.working_kind, TriggerKindLabel::Cron)
+            && editor.schedule_buffer.trim().is_empty()
+        {
+            self.set_behavior_editor_error("cron schedule is empty".into());
+            return;
+        }
+
+        let mut config = working.clone();
+        config.trigger = editor.resolved_trigger();
+
+        let pod_id = editor.pod_id.clone();
+        let behavior_id = editor.behavior_id.clone();
+        let prompt = editor.working_prompt.clone();
+        let correlation_id = self.next_correlation_id();
+        if let Some(editor) = self.behavior_editor.as_mut() {
+            editor.pending_save = Some(correlation_id.clone());
+            editor.error = None;
+        }
+        // `system_prompt = None` ⇒ leave the side `system_prompt.md`
+        // file alone. v1 doesn't expose the override editor, so a
+        // save mustn't accidentally clobber a hand-edited file. The
+        // System Prompt tab in the egui sibling is the conventional
+        // way to round-trip the file's contents; that lands in a
+        // follow-up slice.
+        self.send(ClientToServer::UpdateBehavior {
+            correlation_id: Some(correlation_id),
+            pod_id,
+            behavior_id,
+            config,
+            prompt,
+            system_prompt: None,
+        });
+    }
+
+    fn set_behavior_editor_error(&mut self, msg: String) {
+        if let Some(editor) = self.behavior_editor.as_mut() {
+            editor.error = Some(msg);
+        }
+    }
+
     /// Render the "+ New behavior" dialog if open. Same shadcn
     /// scaffolding as the new-pod dialog; the only difference is
     /// the field labels and the description text (manual-trigger
@@ -3088,6 +3617,181 @@ impl ChatApp {
         children.push(dialog_footer([cancel, create]));
 
         Some(dialog(NEW_POD_MODAL_KEY, children))
+    }
+
+    /// Render the per-behavior editor sheet if its state slot is
+    /// open. Right-attached `SheetSide::Right` because the sheet is
+    /// document-shaped (multi-line prompt, multi-field config) — too
+    /// much surface for a centered dialog. The body composes
+    /// shadcn-shaped form items: the same `form_item` (label /
+    /// control / optional description) the create modals use, just
+    /// inside a sheet shell.
+    ///
+    /// Body shape:
+    /// - sheet_header: title (`Edit behavior — {pod}/{id}`) + a one-
+    ///   liner reminding the user that the v1 form covers a subset
+    ///   of the on-disk config (everything else rides through
+    ///   unchanged on save).
+    /// - loading placeholder while `pending_get` is in flight and no
+    ///   `working_config` has landed yet — prevents accidentally
+    ///   serializing a default `BehaviorConfig` and overwriting the
+    ///   on-disk one.
+    /// - form: name / description / trigger-kind / [cron schedule] /
+    ///   prompt. Cron schedule slot only appears when
+    ///   `working_kind == Cron`.
+    /// - alert: load error or save failure. Destructive when present.
+    /// - sheet_footer: Cancel + Save (Save disabled until snapshot
+    ///   lands and during a pending save).
+    fn render_behavior_editor_sheet(&self) -> Option<El> {
+        let editor = self.behavior_editor.as_ref()?;
+
+        let pod_label = self
+            .pods
+            .get(&editor.pod_id)
+            .map(|p| p.name.clone())
+            .unwrap_or_else(|| editor.pod_id.clone());
+        let title = format!("Edit behavior — {pod_label}/{}", editor.behavior_id);
+        let header = sheet_header([
+            sheet_title(title),
+            sheet_description(
+                "Adjust the everyday fields here; thread overrides, scope \
+                 narrowing, retention, and the system-prompt override file \
+                 ride through unchanged on save until their tabs land in a \
+                 follow-up slice.",
+            ),
+        ]);
+
+        let body: El = match editor.working_config.as_ref() {
+            None => {
+                // Either the snapshot hasn't landed yet (pending_get
+                // active) or it landed with a load_error and no
+                // parsed config to render against. The error path
+                // surfaces the message via the alert below; the
+                // pending path just reads "loading…".
+                let label = if editor.pending_get.is_some() {
+                    "loading behavior…"
+                } else {
+                    "no parsed config — fix the on-disk TOML to edit here"
+                };
+                paragraph(label).muted()
+            }
+            Some(cfg) => {
+                let name_input = text_input(&cfg.name, &self.selection, BEHAVIOR_EDITOR_NAME_KEY);
+                // Description is `Option<String>` on disk; the form
+                // stores it as a wrapping multi-line buffer so a
+                // production-shaped 90-100 char description doesn't
+                // overflow the sheet horizontally. `text_input` is
+                // single-line + nowrap and would clip.
+                let description_input = text_area(
+                    cfg.description.as_deref().unwrap_or(""),
+                    &self.selection,
+                    BEHAVIOR_EDITOR_DESCRIPTION_KEY,
+                )
+                .height(Size::Fixed(80.0));
+                let kind_trigger = select_trigger(
+                    BEHAVIOR_EDITOR_TRIGGER_KIND_KEY,
+                    editor.working_kind.display_label(),
+                );
+                let prompt_input = text_area(
+                    &editor.working_prompt,
+                    &self.selection,
+                    BEHAVIOR_EDITOR_PROMPT_KEY,
+                )
+                .height(Size::Fixed(160.0));
+
+                let mut items: Vec<El> = vec![
+                    form_item([
+                        form_label("name"),
+                        form_control(name_input),
+                        form_description("Display name; freely editable."),
+                    ]),
+                    form_item([
+                        form_label("description"),
+                        form_control(description_input),
+                        form_description(
+                            "Short summary surfaced in the sidebar's behavior \
+                             rows. Empty clears the field on save.",
+                        ),
+                    ]),
+                    form_item([form_label("trigger"), form_control(kind_trigger)]),
+                ];
+                if matches!(editor.working_kind, TriggerKindLabel::Cron) {
+                    let schedule_input = text_input(
+                        &editor.schedule_buffer,
+                        &self.selection,
+                        BEHAVIOR_EDITOR_SCHEDULE_KEY,
+                    );
+                    items.push(form_item([
+                        form_label("cron schedule"),
+                        form_control(schedule_input),
+                        form_description(
+                            "Five-field cron expression (minute hour day-of-month \
+                             month day-of-week). Timezone, overlap, and catch-up \
+                             policy keep their on-disk values.",
+                        ),
+                    ]));
+                }
+                items.push(form_item([
+                    form_label("prompt"),
+                    form_control(prompt_input),
+                    form_description(
+                        "The behavior's `prompt.md` body. `{{payload}}` is \
+                         substituted with the trigger's payload at fire time.",
+                    ),
+                ]));
+                form(items)
+            }
+        };
+
+        let pending_save = editor.pending_save.is_some();
+        let mut save = button(if pending_save { "Saving…" } else { "Save" })
+            .key(BEHAVIOR_EDITOR_SAVE_KEY)
+            .primary();
+        if editor.working_config.is_none() || pending_save {
+            save = save.disabled();
+        }
+        let cancel = button("Cancel").key(BEHAVIOR_EDITOR_CANCEL_KEY);
+
+        // Body + optional error alert ride inside a `scroll` so the
+        // sheet panel never overflows vertically — the prompt
+        // text_area alone is 160 px and the form has ~6 form_items, so
+        // the natural height regularly exceeds an 800 px viewport.
+        // Header and footer stay fixed; the scroll grabs the leftover
+        // height. `.key` so the scroll offset survives rebuilds across
+        // edit clicks.
+        let mut body_children: Vec<El> = vec![body];
+        if let Some(err) = editor.error.as_deref() {
+            body_children.push(
+                alert([
+                    alert_title("couldn't save behavior"),
+                    alert_description(err.to_string()),
+                ])
+                .destructive(),
+            );
+        }
+        let scroll_body = scroll(body_children)
+            .key("behavior-editor:scroll")
+            .gap(tokens::SPACE_4);
+
+        let children: Vec<El> = vec![header, scroll_body, sheet_footer([cancel, save])];
+
+        Some(sheet(BEHAVIOR_EDITOR_KEY, SheetSide::Right, children))
+    }
+
+    /// `select_menu` for the behavior editor's trigger-kind picker.
+    /// Three fixed options matching the wire's `TriggerSpec` tag
+    /// values; rendered as a popover layer when
+    /// `editor.trigger_kind_open` is set.
+    fn behavior_editor_trigger_kind_menu(&self) -> El {
+        let options: Vec<(String, String)> = [
+            TriggerKindLabel::Manual,
+            TriggerKindLabel::Cron,
+            TriggerKindLabel::Webhook,
+        ]
+        .into_iter()
+        .map(|k| (k.wire_value().to_string(), k.display_label().to_string()))
+        .collect();
+        select_menu(BEHAVIOR_EDITOR_TRIGGER_KIND_KEY, options)
     }
 
     fn backend_menu(&self) -> El {

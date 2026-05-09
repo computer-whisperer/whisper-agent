@@ -291,7 +291,7 @@ tab strip rather than ported piecemeal. Multi-slice rollout:
   Edit / Delete still pending γ (need modals + arm-confirm). Cron
   schedule humanization also γ since `BehaviorSummary` doesn't
   carry the schedule string and needs a `GetBehavior` round-trip.
-- **🌗 Slice γ — danger affordances.** Two-click arm-confirm
+- **✅ Slice γ — danger affordances.** Two-click arm-confirm
   landed for Delete Behavior. State is a single
   `delete_armed_behavior: Option<(pod, behavior)>` slot — only one
   arm at a time so the UI never has two "confirm" buttons live.
@@ -305,15 +305,20 @@ tab strip rather than ported piecemeal. Multi-slice rollout:
   flips to solid destructive fill with the wider "Confirm delete?"
   label. The color change is the load-bearing arm signal — the
   label change alone wouldn't be enough on a fast double-click.
-  Layout: two-row toolbar inside the expanded behavior body,
-  since 224 px isn't wide enough to hold Run + Pause + the armed
-  Delete on one row.
+  Layout: two-row toolbar inside the expanded behavior body —
+  Run + Pause on top, Edit (left) + Delete (right) on the bottom.
+  Three buttons can't fit on either row alone once the armed
+  Delete label expands; pairing Edit with Delete on the bottom
+  also visually separates "everyday" from "modify-this-record"
+  intent.
 
-  Edit still pending — needs the behavior editor (cron schedule,
-  prompt body, thread overrides — bigger surface than what
-  `dialog` accommodates well; `sheet` is the fit). Archive-pod
-  and other danger ops will reuse the same arm-confirm shape
-  when they land.
+  Edit landed via the per-behavior editor sheet (see Stage 8).
+  Archive-pod and other danger ops will reuse the same
+  arm-confirm shape when they land. **Cron schedule humanization
+  in the sidebar description still pending** — needs a server-
+  side `BehaviorSummary` field (the schedule string isn't
+  carried today, only the trigger kind), so it's a wire-protocol
+  change, not aetna-side work.
 - **✅ Slice δ — entry points.** Three "+" affordances landed,
   each scoped to where it appears:
     - **Per-pod "new thread"** — `icon_button("plus")` keyed
@@ -530,12 +535,14 @@ Also still deferred:
 
 ### 🌗 Stage 8 — Modals (in flight)
 
-`dialog` is the widget. The egui sibling has 8 modals, each a few
-hundred lines:
+`dialog` is the widget for centered form modals; `sheet` is the
+fit for document-shaped surfaces (anything multi-column or
+multi-tab). The egui sibling has 8 modals, each a few hundred
+lines:
 - settings (server config, shared MCP hosts, embedding providers)
 - knowledge buckets
-- behavior editor (with cron preview)
-- new behavior
+- ✅ behavior editor (v1: name / description / trigger kind /
+  cron schedule / prompt — sheet, not dialog)
 - pod editor (raw TOML)
 - ✅ new pod
 - ✅ new behavior
@@ -575,14 +582,59 @@ about `backends`, not the default-pod TOML template — so it
 lands a working pod the user can edit afterwards. A
 `GetPod`-based default-template clone is a follow-up.
 
-The remaining 7 modals slot into this scaffolding pattern. Two
-in particular extend it meaningfully:
-- The behavior editor adds non-trivial form state (cron
-  schedule, prompt) and likely benefits from a separate
-  `text_area` for the prompt body.
-- The pod editor / file viewer want a sheet rather than a
-  centered dialog (they're document-shaped, not form-shaped) —
-  `sheet` widget is in the prelude already.
+The remaining modals slot into this scaffolding pattern.
+
+**Behavior editor sheet (landed):** the first modal that uses
+`sheet` (right-attached `SheetSide::Right`) instead of a
+centered `dialog`. The on-disk surface is too wide for a
+form-shaped dialog — full egui parity has 7 tabs (Trigger,
+Thread, Scope, Retention, Prompt, System Prompt, Raw TOML).
+The aetna v1 ships the 80% case as a single scrollable form:
+name, description (multi-line `text_area` so production-shaped
+~100-char descriptions wrap), trigger kind picker (manual /
+cron / webhook), cron schedule (visible only when kind ==
+Cron), and prompt `text_area`. Fields not exposed by the form
+ride through `working_config` unchanged on save — the editor
+holds a clone of the loaded `BehaviorConfig` and only mutates
+the surfaced fields, so a v1 edit can never strip thread
+overrides, scope, retention, or the system-prompt override
+config.
+
+Lifecycle:
+1. Edit click on the per-behavior toolbar opens the sheet,
+   mints `pending_get` correlation, fires `GetBehavior`.
+2. Sheet renders a "loading…" placeholder until the matching
+   `BehaviorSnapshot` arrives. Hydrate populates
+   `working_config` + `working_prompt`; trigger kind +
+   schedule are derived from the variant tag (preserving
+   timezone / overlap / catch_up for cron in baseline so a
+   no-op save never rewrites them).
+3. Save mints `pending_save`, ships `UpdateBehavior` with
+   `system_prompt: None` (v1 must not clobber the override
+   file the form doesn't expose). `BehaviorUpdated` echo
+   closes the sheet on correlation match; an `Error` surfaces
+   into the same destructive `alert` slot client-side
+   validation uses.
+
+The body is wrapped in a `scroll(...)` between header and
+footer so the prompt's 160 px text_area + form items + alert
+never overflow vertically inside the sheet's `Size::Fill`
+panel. Trigger-kind picker rides on `popover_layers()` above
+the sheet — same pattern the new-thread compose pickers use,
+extended in `close_other_pickers` to include this menu so the
+single-active-menu invariant holds.
+
+Deferred to follow-up sheet slices:
+- **Thread bindings tab** — backend / model / host_env /
+  mcp_host overrides on `BehaviorThreadOverride`.
+- **Scope tab** — per-behavior allow narrowing.
+- **Retention tab** — `RetentionPolicy::ArchiveAfterDays /
+  DeleteAfterDays` controls.
+- **System Prompt tab** — toggle plus the override-file editor
+  (rides as `Some(content)` on `UpdateBehavior` rather than
+  side `WritePodFile`, mirroring egui).
+- **Raw TOML tab** — the escape hatch for malformed configs;
+  needs a `toml::to_string_pretty` round-trip for sync.
 
 ### ✅ Stage 9 — Login form
 
