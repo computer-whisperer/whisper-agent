@@ -3363,7 +3363,15 @@ impl ChatApp {
                 let key = "tool";
                 let value = format!("{idx}");
                 let routed = accordion_item_key(key, &value);
-                let open = self.open_accordions.contains(&routed);
+                // Auto-expand while content is streaming so the
+                // user sees bash-style output scroll without
+                // clicking each running call. Collapses back to
+                // default-closed once `End` lands and the
+                // streaming buffer clears. The user's explicit
+                // `open_accordions` membership keeps a finished
+                // call open if they manually expanded it.
+                let streaming = result.is_none() && !streaming_output.is_empty();
+                let open = streaming || self.open_accordions.contains(&routed);
                 let header = tool_call_header(name, summary.as_deref(), result.as_ref());
                 let body_blocks =
                     tool_call_body(args_pretty.as_deref(), streaming_output, result.as_ref());
