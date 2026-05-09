@@ -32,7 +32,7 @@ use whisper_agent_protocol::{
     BackendSummary, BehaviorOrigin, BehaviorSummary, CompactionConfig, ContentBlock,
     ContentCapabilities, Conversation, ImageMime, ImageSource, Message, ModelSummary, PodSummary,
     Role, ServerToClient, ThreadBindings, ThreadConfig, ThreadSnapshot, ThreadStateLabel,
-    ThreadSummary, ToolKind, ToolResultContent, TurnLog, Usage, permission::Scope,
+    ThreadSummary, ToolKind, ToolResultContent, TurnEntry, TurnLog, Usage, permission::Scope,
 };
 
 fn main() -> std::io::Result<()> {
@@ -1212,7 +1212,20 @@ fn mock_setup_snapshot() -> ThreadSnapshot {
                 .into(),
         }],
     });
-    base_snapshot(conv, ThreadStateLabel::Idle, String::new())
+    let mut snapshot = base_snapshot(conv, ThreadStateLabel::Idle, String::new());
+    // One assistant turn → one TurnEntry. Stats line lands under
+    // the assistant message in the rendered scene.
+    snapshot.turn_log = TurnLog {
+        entries: vec![TurnEntry {
+            usage: Usage {
+                input_tokens: 1284,
+                output_tokens: 86,
+                cache_read_input_tokens: 980,
+                cache_creation_input_tokens: 0,
+            },
+        }],
+    };
+    snapshot
 }
 
 /// Encode a small RGB checker pattern as PNG bytes. Used by

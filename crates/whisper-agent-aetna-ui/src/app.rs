@@ -155,6 +155,54 @@ enum DisplayItem {
     GenericPlaceholder {
         label: String,
     },
+    /// Per-assistant-turn token usage summary. Pulled from
+    /// `ThreadSnapshot::turn_log` and interleaved after each
+    /// `Assistant` message in conversation order. No gutter, no
+    /// fill — auxiliary, not conversation. Mirrors the egui
+    /// sibling's `DisplayItem::TurnStats`.
+    TurnStats {
+        usage: whisper_agent_protocol::Usage,
+    },
+}
+
+/// Format a `Usage` block into the muted one-line summary the
+/// `TurnStats` row renders. Mirrors the egui sibling's layout —
+/// `in 1,234 · cached 800 · created 200 · out 567`. Cache columns
+/// drop out when zero so an uncached call doesn't carry visually
+/// empty fields.
+fn turn_stats_text(usage: &whisper_agent_protocol::Usage) -> String {
+    let mut parts: Vec<String> = Vec::with_capacity(4);
+    parts.push(format!("in {}", fmt_count(usage.input_tokens)));
+    if usage.cache_read_input_tokens > 0 {
+        parts.push(format!(
+            "cached {}",
+            fmt_count(usage.cache_read_input_tokens)
+        ));
+    }
+    if usage.cache_creation_input_tokens > 0 {
+        parts.push(format!(
+            "created {}",
+            fmt_count(usage.cache_creation_input_tokens)
+        ));
+    }
+    parts.push(format!("out {}", fmt_count(usage.output_tokens)));
+    parts.join(" · ")
+}
+
+/// `12345` → `12,345`. Cheap enough per-rebuild that a dedicated
+/// helper is fine; keeps the format consistent across all four
+/// turn-stats columns.
+fn fmt_count(n: u32) -> String {
+    let s = n.to_string();
+    let mut out = String::with_capacity(s.len() + s.len() / 3);
+    let bytes = s.as_bytes();
+    for (i, b) in bytes.iter().enumerate() {
+        if i > 0 && (bytes.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(*b as char);
+    }
+    out
 }
 
 /// Compact subset of [`whisper_agent_protocol::ToolSchema`] —
@@ -763,7 +811,8 @@ impl ChatApp {
                 thread_id,
                 snapshot,
             } => {
-                let items = conversation_to_display_items(&snapshot.conversation);
+                let items =
+                    conversation_to_display_items(&snapshot.conversation, &snapshot.turn_log);
                 let view = ThreadView {
                     items,
                     title: snapshot.title,
@@ -976,10 +1025,21 @@ impl ChatApp {
                     });
                 }
             }
+            // Append a `TurnStats` row when the assistant finishes
+            // a turn — `ThreadAssistantEnd` carries the per-turn
+            // `Usage`. Keeps the streaming chat log in sync with
+            // what `conversation_to_display_items` would produce
+            // from a fresh snapshot.
+            ServerToClient::ThreadAssistantEnd {
+                thread_id, usage, ..
+            } => {
+                if let Some(view) = self.views.get_mut(&thread_id) {
+                    view.items.push(DisplayItem::TurnStats { usage });
+                }
+            }
             // Per-turn append events not yet surfaced.
             ServerToClient::ThreadToolResultMessage { .. }
             | ServerToClient::ThreadAssistantBegin { .. }
-            | ServerToClient::ThreadAssistantEnd { .. }
             | ServerToClient::ThreadLoopComplete { .. }
             | ServerToClient::ThreadCompacted { .. } => {}
             ServerToClient::Error {
@@ -3290,6 +3350,17 @@ impl ChatApp {
                     accordion_item(key, value, label.clone(), open, [paragraph(label.clone())]);
                 log_row(tokens::MUTED_FOREGROUND, None, item_el)
             }
+            DisplayItem::TurnStats { usage } => {
+                // No gutter, no fill — auxiliary metadata, not
+                // conversation. A right-aligned single-line caption
+                // sits where the assistant's gutter ends so it
+                // visually attaches to the turn it summarizes
+                // without dominating the chat.
+                row([spacer(), text(turn_stats_text(usage)).caption().muted()])
+                    .align(Align::Center)
+                    .padding(Sides::xy(tokens::SPACE_3, 0.0))
+                    .width(Size::Fill(1.0))
+            }
             DisplayItem::Image { is_user, state } => {
                 let gutter = if *is_user {
                     tokens::INFO
@@ -3371,14 +3442,24 @@ fn display_dims(src_w: u32, src_h: u32, max_h: f32) -> (f32, f32) {
     (src_w * scale, max_h)
 }
 
-/// Collapsed-header label for a tool call. When the result has
-/// arrived we show a compact status hint so a closed row
-/// communicates pass / fail at a glance.
+/// Collapsed-header label for a tool call. Status glyph + name
+/// always render; once the result has arrived we suffix a one-line
+/// preview so a closed row communicates pass / fail *and* the
+/// outcome at a glance — `✓ read_file · "fn main() {…"`. Empty
+/// previews drop to just the glyph + name (some tools return
+/// silent success).
 fn tool_call_header(name: &str, result: Option<&FusedToolResult>) -> String {
     match result {
         None => format!("⏳ {name}"),
-        Some(r) if r.is_error => format!("✗ {name}"),
-        Some(_) => format!("✓ {name}"),
+        Some(r) => {
+            let glyph = if r.is_error { "✗" } else { "✓" };
+            let preview = first_line_preview(&r.text, 80);
+            if preview.is_empty() {
+                format!("{glyph} {name}")
+            } else {
+                format!("{glyph} {name} · {preview}")
+            }
+        }
     }
 }
 
@@ -3466,8 +3547,20 @@ fn first_line_preview(s: &str, max_chars: usize) -> String {
 /// `ContentBlock::ToolUse` when the result is "near" the call (no
 /// intervening user / assistant text turn). Mirrors how the egui
 /// sibling reads its conversation, just with our smaller item set.
-fn conversation_to_display_items(conv: &whisper_agent_protocol::Conversation) -> Vec<DisplayItem> {
+///
+/// `turn_log` is interleaved by walking its entries in temporal
+/// order alongside the conversation's `Assistant`-role messages —
+/// the runtime pushes exactly one entry per
+/// `integrate_model_response`, so entry N corresponds to the Nth
+/// assistant turn. Older threads (pre-turn-log) load with empty
+/// entries; trailing turns past the entries vec just don't get a
+/// stats row, which is the right fallback.
+fn conversation_to_display_items(
+    conv: &whisper_agent_protocol::Conversation,
+    turn_log: &whisper_agent_protocol::TurnLog,
+) -> Vec<DisplayItem> {
     let mut out: Vec<DisplayItem> = Vec::new();
+    let mut entry_iter = turn_log.entries.iter();
     for msg in conv.messages() {
         match msg.role {
             Role::System => {
@@ -3514,6 +3607,14 @@ fn conversation_to_display_items(conv: &whisper_agent_protocol::Conversation) ->
             Role::Assistant => {
                 for block in &msg.content {
                     push_block(block, false, &mut out);
+                }
+                // Pull the next turn-log entry — one per assistant
+                // response — and append the usage row so it lands
+                // directly under the turn's content. A short log
+                // (older threads, mid-migration) leaves trailing
+                // turns without a stats row rather than crashing.
+                if let Some(entry) = entry_iter.next() {
+                    out.push(DisplayItem::TurnStats { usage: entry.usage });
                 }
             }
             Role::ToolResult => {
