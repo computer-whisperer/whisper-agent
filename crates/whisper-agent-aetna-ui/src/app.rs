@@ -13,11 +13,9 @@
 //! [`ChatApp::build`].
 //!
 //! Things deliberately deferred:
-//! - tool calls + tool results — currently a single accordion row
-//!   per non-text block (placeholder text); stage 6 breaks them
-//!   into purpose-built rows with diff rendering, streaming output,
-//!   etc.
-//! - tool-streaming, prefill progress, image output streaming
+//! - inline diff rendering for `edit_file` / `write_file` tool calls
+//!   (currently shown as raw JSON args)
+//! - prefill progress + image output streaming
 //! - "compose into a fresh thread" (needs the model picker / pod
 //!   target / bindings surface)
 //! - attachment staging + drag/drop/paste/filepicker
@@ -73,10 +71,7 @@ impl ConnectionStatus {
     }
 }
 
-/// One row in the chat log. Stage 2 only fills the text variants;
-/// `ToolCallPlaceholder` is the catch-all that collapses every
-/// non-text content block down to a single annotated row so a thread
-/// with tool calls still renders as something instead of as a hole.
+/// One row in the chat log.
 enum DisplayItem {
     User {
         text: String,
@@ -90,12 +85,47 @@ enum DisplayItem {
     SystemNote {
         text: String,
     },
-    /// Any non-text block (ToolUse, ToolResult, Image, Document,
-    /// ToolSchema, …) collapsed to a single annotated row. Stage 3+
-    /// breaks these out into purpose-built variants.
-    ToolCallPlaceholder {
+    /// A model-emitted tool call. Fuses with its result when the
+    /// matching `ContentBlock::ToolResult` (or `ThreadToolCallEnd`)
+    /// arrives without an intervening user / assistant turn — the
+    /// common case for sync calls. `streaming_output` accumulates
+    /// `ThreadToolCallContent` text fragments while the call is in
+    /// flight; `result` holds the integrated final text once `End`
+    /// lands.
+    ToolCall {
+        tool_use_id: String,
+        name: String,
+        /// Pretty-printed JSON args. `None` when the snapshot path
+        /// produced a tool call without typed args (legacy threads).
+        args_pretty: Option<String>,
+        /// Live `ThreadToolCallContent` chunks accumulated since the
+        /// matching `ThreadToolCallBegin`. Empty until the first
+        /// chunk lands; cleared once the integrated `result` arrives.
+        streaming_output: String,
+        result: Option<FusedToolResult>,
+    },
+    /// Standalone tool result — rendered when the matching tool call
+    /// isn't in this thread's view (e.g. an async `dispatch_thread`
+    /// callback landing after the conversation has moved on, or a
+    /// `Role::ToolResult` message snapshot-walked without a sibling
+    /// `ToolUse` in scope).
+    ToolResult {
+        tool_use_id: String,
+        text: String,
+        is_error: bool,
+    },
+    /// Anything else we don't yet render purpose-built (images,
+    /// documents, tool-schema entries) — collapsed into a single
+    /// annotated row. Future stages break these out.
+    GenericPlaceholder {
         label: String,
     },
+}
+
+/// Tool-result body fused onto its originating [`DisplayItem::ToolCall`].
+struct FusedToolResult {
+    text: String,
+    is_error: bool,
 }
 
 /// Per-thread display state. Held only for threads we've subscribed
@@ -317,17 +347,134 @@ impl ChatApp {
                     }
                 }
             }
-            // Tool-call streaming, prefill progress, image output, and
-            // the begin/end bookends remain stage-4 concerns. They
-            // arrive but don't surface yet.
+            ServerToClient::ThreadToolCallBegin {
+                thread_id,
+                tool_use_id,
+                name,
+                args,
+                ..
+            } => {
+                if let Some(view) = self.views.get_mut(&thread_id) {
+                    let args_pretty = args
+                        .as_ref()
+                        .and_then(|v| serde_json::to_string_pretty(v).ok());
+                    // Replace any stage-streaming placeholder for this
+                    // call (`ThreadToolCallStreaming` upserts one
+                    // ahead of Begin) before appending; otherwise just
+                    // push the new call.
+                    let existing = view.items.iter().rposition(|it| match it {
+                        DisplayItem::ToolCall {
+                            tool_use_id: id,
+                            result: None,
+                            args_pretty: None,
+                            streaming_output,
+                            ..
+                        } => id == &tool_use_id && streaming_output.is_empty(),
+                        _ => false,
+                    });
+                    let entry = DisplayItem::ToolCall {
+                        tool_use_id,
+                        name,
+                        args_pretty,
+                        streaming_output: String::new(),
+                        result: None,
+                    };
+                    match existing {
+                        Some(i) => view.items[i] = entry,
+                        None => view.items.push(entry),
+                    }
+                }
+            }
+            ServerToClient::ThreadToolCallContent {
+                thread_id,
+                tool_use_id,
+                block,
+            } => {
+                if let Some(view) = self.views.get_mut(&thread_id) {
+                    let chunk_text = match &block {
+                        ContentBlock::Text { text } => text.clone(),
+                        // Non-text streaming chunks (images, etc.) get
+                        // a placeholder line — the integrated result
+                        // arriving via `End` is the source of truth.
+                        _ => String::new(),
+                    };
+                    if !chunk_text.is_empty()
+                        && let Some(DisplayItem::ToolCall {
+                            tool_use_id: id,
+                            streaming_output,
+                            ..
+                        }) = view.items.iter_mut().rev().find(|it| {
+                            matches!(it, DisplayItem::ToolCall { tool_use_id: id, .. } if id == &tool_use_id)
+                        })
+                    {
+                        let _ = id;
+                        streaming_output.push_str(&chunk_text);
+                    }
+                }
+            }
+            ServerToClient::ThreadToolCallEnd {
+                thread_id,
+                tool_use_id,
+                result_preview,
+                is_error,
+                ..
+            } => {
+                if let Some(view) = self.views.get_mut(&thread_id) {
+                    if let Some(DisplayItem::ToolCall {
+                        result,
+                        streaming_output,
+                        ..
+                    }) = view.items.iter_mut().rev().find(|it| {
+                        matches!(it, DisplayItem::ToolCall { tool_use_id: id, .. } if id == &tool_use_id)
+                    }) {
+                        // The integrated result is authoritative; drop
+                        // the streaming buffer once End lands.
+                        streaming_output.clear();
+                        *result = Some(FusedToolResult {
+                            text: result_preview,
+                            is_error,
+                        });
+                    } else {
+                        // Orphan result — push as standalone row.
+                        view.items.push(DisplayItem::ToolResult {
+                            tool_use_id,
+                            text: result_preview,
+                            is_error,
+                        });
+                    }
+                }
+            }
+            ServerToClient::ThreadToolCallStreaming {
+                thread_id,
+                tool_use_id,
+                name,
+                ..
+            } => {
+                // Args-still-streaming placeholder. Upserts a ToolCall
+                // with no args / result so the row exists in the log
+                // before `Begin` resolves the typed args. `Begin`
+                // replaces this entry (matched by empty args + empty
+                // streaming_output above).
+                if let Some(view) = self.views.get_mut(&thread_id) {
+                    let already = view.items.iter().any(|it| {
+                        matches!(it, DisplayItem::ToolCall { tool_use_id: id, .. } if id == &tool_use_id)
+                    });
+                    if !already {
+                        view.items.push(DisplayItem::ToolCall {
+                            tool_use_id,
+                            name,
+                            args_pretty: None,
+                            streaming_output: String::new(),
+                            result: None,
+                        });
+                    }
+                }
+            }
+            // Per-turn append events not yet surfaced.
             ServerToClient::ThreadToolResultMessage { .. }
             | ServerToClient::ThreadAssistantBegin { .. }
             | ServerToClient::ThreadAssistantImage { .. }
             | ServerToClient::ThreadAssistantEnd { .. }
-            | ServerToClient::ThreadToolCallStreaming { .. }
-            | ServerToClient::ThreadToolCallBegin { .. }
-            | ServerToClient::ThreadToolCallContent { .. }
-            | ServerToClient::ThreadToolCallEnd { .. }
             | ServerToClient::ThreadLoopComplete { .. }
             | ServerToClient::ThreadDraftUpdated { .. }
             | ServerToClient::ThreadCompacted { .. }
@@ -777,17 +924,106 @@ impl ChatApp {
                 let body = paragraph(t.clone());
                 log_row(tokens::WARNING, None, body)
             }
-            DisplayItem::ToolCallPlaceholder { label } => {
+            DisplayItem::ToolCall {
+                tool_use_id,
+                name,
+                args_pretty,
+                streaming_output,
+                result,
+            } => {
                 let key = "tool";
+                let value = format!("{idx}");
+                let routed = accordion_item_key(key, &value);
+                let open = self.open_accordions.contains(&routed);
+                let header = tool_call_header(name, result.as_ref());
+                let body_blocks =
+                    tool_call_body(args_pretty.as_deref(), streaming_output, result.as_ref());
+                let item_el = accordion_item(key, value, header, open, body_blocks);
+                let gutter = match result {
+                    Some(r) if r.is_error => tokens::DESTRUCTIVE,
+                    _ => tokens::WARNING,
+                };
+                let _ = tool_use_id; // reserved for future fork / re-run affordances
+                log_row(gutter, None, item_el)
+            }
+            DisplayItem::ToolResult {
+                tool_use_id,
+                text: t,
+                is_error,
+            } => {
+                let key = "tool-result";
+                let value = format!("{idx}");
+                let routed = accordion_item_key(key, &value);
+                let open = self.open_accordions.contains(&routed);
+                let header = if *is_error {
+                    "tool result (error)".to_string()
+                } else {
+                    "tool result".to_string()
+                };
+                let item_el = accordion_item(key, value, header, open, [code_block(t.clone())]);
+                let _ = tool_use_id;
+                let gutter = if *is_error {
+                    tokens::DESTRUCTIVE
+                } else {
+                    tokens::WARNING
+                };
+                log_row(gutter, None, item_el)
+            }
+            DisplayItem::GenericPlaceholder { label } => {
+                let key = "generic";
                 let value = format!("{idx}");
                 let routed = accordion_item_key(key, &value);
                 let open = self.open_accordions.contains(&routed);
                 let item_el =
                     accordion_item(key, value, label.clone(), open, [paragraph(label.clone())]);
-                log_row(tokens::WARNING, None, item_el)
+                log_row(tokens::MUTED_FOREGROUND, None, item_el)
             }
         }
     }
+}
+
+/// Collapsed-header label for a tool call. When the result has
+/// arrived we show a compact status hint so a closed row
+/// communicates pass / fail at a glance.
+fn tool_call_header(name: &str, result: Option<&FusedToolResult>) -> String {
+    match result {
+        None => format!("⏳ {name}"),
+        Some(r) if r.is_error => format!("✗ {name}"),
+        Some(_) => format!("✓ {name}"),
+    }
+}
+
+/// Expanded-body content for a tool-call accordion. Args render in a
+/// `code_block` (mono, scrollable horizontally), then the streaming
+/// stdout/stderr buffer if any chunks have arrived, then the
+/// integrated result body once `End` has landed. Sections are
+/// separated by small muted captions so the structure reads at a
+/// glance.
+fn tool_call_body(
+    args_pretty: Option<&str>,
+    streaming_output: &str,
+    result: Option<&FusedToolResult>,
+) -> Vec<El> {
+    let mut blocks: Vec<El> = Vec::new();
+    if let Some(args) = args_pretty
+        && !args.trim().is_empty()
+    {
+        blocks.push(text("args").caption().muted());
+        blocks.push(code_block(args.to_string()));
+    }
+    if !streaming_output.trim().is_empty() {
+        blocks.push(text("output").caption().muted());
+        blocks.push(code_block(streaming_output.to_string()));
+    }
+    if let Some(r) = result {
+        let label = if r.is_error { "error" } else { "result" };
+        blocks.push(text(label).caption().muted());
+        blocks.push(code_block(r.text.clone()));
+    }
+    if blocks.is_empty() {
+        blocks.push(text("(no detail)").muted());
+    }
+    blocks
 }
 
 /// Event-log row — narrow role-colored gutter + content with
@@ -836,9 +1072,11 @@ fn first_line_preview(s: &str, max_chars: usize) -> String {
     }
 }
 
-/// Walk a [`Conversation`] into the lightweight stage-2 [`DisplayItem`]
-/// shape. One item per content block (matching the egui sibling); we
-/// don't yet fuse tool calls with their results.
+/// Walk a [`Conversation`] into the [`DisplayItem`] shape, fusing
+/// `ContentBlock::ToolResult` blocks onto their originating
+/// `ContentBlock::ToolUse` when the result is "near" the call (no
+/// intervening user / assistant text turn). Mirrors how the egui
+/// sibling reads its conversation, just with our smaller item set.
 fn conversation_to_display_items(conv: &whisper_agent_protocol::Conversation) -> Vec<DisplayItem> {
     let mut out: Vec<DisplayItem> = Vec::new();
     for msg in conv.messages() {
@@ -876,14 +1114,19 @@ fn conversation_to_display_items(conv: &whisper_agent_protocol::Conversation) ->
                 }
             }
             Role::ToolResult => {
-                // Surface tool-result text under a generic "tool"
-                // label until stage 3's tool-call fusion lands.
                 for block in &msg.content {
-                    if let ContentBlock::ToolResult { content, .. } = block {
+                    if let ContentBlock::ToolResult {
+                        tool_use_id,
+                        content,
+                        is_error,
+                    } = block
+                    {
                         let text = tool_result_text_summary(content);
-                        if !text.is_empty() {
-                            out.push(DisplayItem::ToolCallPlaceholder {
-                                label: format!("tool result: {text}"),
+                        if !try_fuse_tool_result(&mut out, tool_use_id, &text, *is_error) {
+                            out.push(DisplayItem::ToolResult {
+                                tool_use_id: tool_use_id.clone(),
+                                text,
+                                is_error: *is_error,
                             });
                         }
                     }
@@ -912,35 +1155,85 @@ fn push_block(block: &ContentBlock, user_role: bool, out: &mut Vec<DisplayItem>)
                 });
             }
         }
-        ContentBlock::ToolUse { name, .. } => {
-            out.push(DisplayItem::ToolCallPlaceholder {
-                label: format!("tool call: {name}"),
+        ContentBlock::ToolUse {
+            id, name, input, ..
+        } => {
+            let args_pretty = serde_json::to_string_pretty(input).ok();
+            out.push(DisplayItem::ToolCall {
+                tool_use_id: id.clone(),
+                name: name.clone(),
+                args_pretty,
+                streaming_output: String::new(),
+                result: None,
             });
         }
-        ContentBlock::ToolResult { .. } => {
-            // ToolResult inside an Assistant message is unusual but
-            // surface it generically; the Role::ToolResult path
-            // covers the common case.
-            out.push(DisplayItem::ToolCallPlaceholder {
-                label: "tool result".into(),
-            });
+        ContentBlock::ToolResult {
+            tool_use_id,
+            content,
+            is_error,
+        } => {
+            let text = tool_result_text_summary(content);
+            if !try_fuse_tool_result(out, tool_use_id, &text, *is_error) {
+                out.push(DisplayItem::ToolResult {
+                    tool_use_id: tool_use_id.clone(),
+                    text,
+                    is_error: *is_error,
+                });
+            }
         }
         ContentBlock::Image { .. } => {
-            out.push(DisplayItem::ToolCallPlaceholder {
+            out.push(DisplayItem::GenericPlaceholder {
                 label: "[image]".into(),
             });
         }
         ContentBlock::Document { .. } => {
-            out.push(DisplayItem::ToolCallPlaceholder {
+            out.push(DisplayItem::GenericPlaceholder {
                 label: "[document]".into(),
             });
         }
         ContentBlock::ToolSchema { name, .. } => {
-            out.push(DisplayItem::ToolCallPlaceholder {
+            out.push(DisplayItem::GenericPlaceholder {
                 label: format!("tool schema: {name}"),
             });
         }
     }
+}
+
+/// Try to attach a tool result to its originating call, walking
+/// backward from the end of `out`. Returns `true` if the result was
+/// fused (caller should not push a standalone `ToolResult`); `false`
+/// if no matching open call was found and the caller should fall
+/// through to a standalone row.
+///
+/// "Backward" rather than "any" because ordering matches the
+/// conversation log: the most recent unresolved call is the right
+/// match. We stop at user / assistant text rows to keep an async
+/// dispatch_thread callback that arrives across a turn boundary
+/// from being incorrectly fused with an ancient call.
+fn try_fuse_tool_result(
+    out: &mut [DisplayItem],
+    tool_use_id: &str,
+    text: &str,
+    is_error: bool,
+) -> bool {
+    for item in out.iter_mut().rev() {
+        match item {
+            DisplayItem::ToolCall {
+                tool_use_id: id,
+                result,
+                ..
+            } if id == tool_use_id && result.is_none() => {
+                *result = Some(FusedToolResult {
+                    text: text.to_string(),
+                    is_error,
+                });
+                return true;
+            }
+            DisplayItem::User { .. } | DisplayItem::Assistant { .. } => break,
+            _ => {}
+        }
+    }
+    false
 }
 
 fn first_text(blocks: &[ContentBlock]) -> Option<String> {

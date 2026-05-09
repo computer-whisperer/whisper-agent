@@ -28,8 +28,8 @@ use aetna_core::{App, BuildCx, UiEvent};
 use whisper_agent_aetna_ui::{ChatApp, Inbound, InboundEvent, SendFn};
 use whisper_agent_protocol::{
     CompactionConfig, ContentBlock, Conversation, Message, PodSummary, Role, ServerToClient,
-    ThreadBindings, ThreadConfig, ThreadSnapshot, ThreadStateLabel, ThreadSummary, TurnLog, Usage,
-    permission::Scope,
+    ThreadBindings, ThreadConfig, ThreadSnapshot, ThreadStateLabel, ThreadSummary,
+    ToolResultContent, TurnLog, Usage, permission::Scope,
 };
 
 fn main() -> std::io::Result<()> {
@@ -87,10 +87,15 @@ enum Scene {
     /// shape (gutter + content) plus the markdown-rendered assistant
     /// turn and the reasoning accordion (collapsed by default).
     ThreadWithMessages,
+    /// A thread whose conversation includes a tool call fused with
+    /// its result, plus a one-error tool call. Verifies the
+    /// args-block + result-block layout in the tool-call accordion
+    /// and the destructive gutter on errored calls.
+    ThreadWithToolCall,
 }
 
 impl Scene {
-    const ALL: [Scene; 7] = [
+    const ALL: [Scene; 8] = [
         Scene::Connecting,
         Scene::Connected,
         Scene::Closed,
@@ -98,6 +103,7 @@ impl Scene {
         Scene::PopulatedNoSelection,
         Scene::LoadingThread,
         Scene::ThreadWithMessages,
+        Scene::ThreadWithToolCall,
     ];
 
     fn slug(self) -> &'static str {
@@ -109,6 +115,7 @@ impl Scene {
             Scene::PopulatedNoSelection => "populated_no_selection",
             Scene::LoadingThread => "loading_thread",
             Scene::ThreadWithMessages => "thread_with_messages",
+            Scene::ThreadWithToolCall => "thread_with_tool_call",
         }
     }
 
@@ -117,7 +124,9 @@ impl Scene {
     /// live UI does.
     fn clicks(self) -> Vec<&'static str> {
         match self {
-            Scene::LoadingThread | Scene::ThreadWithMessages => vec!["thread:t-1"],
+            Scene::LoadingThread | Scene::ThreadWithMessages | Scene::ThreadWithToolCall => {
+                vec!["thread:t-1"]
+            }
             _ => Vec::new(),
         }
     }
@@ -147,7 +156,10 @@ fn build_app(scene: Scene) -> ChatApp {
                 detail: "DNS resolution failed".into(),
             });
         }
-        Scene::PopulatedNoSelection | Scene::LoadingThread | Scene::ThreadWithMessages => {
+        Scene::PopulatedNoSelection
+        | Scene::LoadingThread
+        | Scene::ThreadWithMessages
+        | Scene::ThreadWithToolCall => {
             q.push_back(InboundEvent::ConnectionOpened);
             q.push_back(InboundEvent::Wire(ServerToClient::PodList {
                 correlation_id: None,
@@ -162,6 +174,12 @@ fn build_app(scene: Scene) -> ChatApp {
                 q.push_back(InboundEvent::Wire(ServerToClient::ThreadSnapshot {
                     thread_id: "t-1".into(),
                     snapshot: mock_snapshot(),
+                }));
+            }
+            if matches!(scene, Scene::ThreadWithToolCall) {
+                q.push_back(InboundEvent::Wire(ServerToClient::ThreadSnapshot {
+                    thread_id: "t-1".into(),
+                    snapshot: mock_tool_snapshot(),
                 }));
             }
         }
@@ -287,6 +305,92 @@ fn mock_snapshot() -> ThreadSnapshot {
         ],
     });
     conv.push(Message::user_text("Thanks — that's exactly what I needed."));
+
+    ThreadSnapshot {
+        thread_id: "t-1".into(),
+        pod_id: "default".into(),
+        title: Some("first conversation".into()),
+        config: ThreadConfig {
+            model: "claude-opus-4-7".into(),
+            max_tokens: 4096,
+            max_turns: 8,
+            compaction: CompactionConfig::default(),
+        },
+        bindings: ThreadBindings::default(),
+        state: ThreadStateLabel::Idle,
+        conversation: conv,
+        total_usage: Usage::default(),
+        turn_log: TurnLog::default(),
+        draft: String::new(),
+        created_at: "2026-05-08T10:00:00Z".into(),
+        last_active: "2026-05-08T11:00:00Z".into(),
+        failure: None,
+        origin: None,
+        continued_from: None,
+        dispatched_by: None,
+        scope: Scope::default(),
+    }
+}
+
+/// Snapshot exercising the tool-call accordion path. One assistant
+/// turn issues a tool call, a tool-result message fuses with it on
+/// snapshot walk; a second tool call ends in an error so the
+/// destructive gutter + "✗" header treatment shows.
+fn mock_tool_snapshot() -> ThreadSnapshot {
+    let mut conv = Conversation::new();
+    conv.push(Message::system_text(""));
+    conv.push(Message::user_text(
+        "List the files in /sandbox/buckets and grep them for 'TODO'.",
+    ));
+    conv.push(Message {
+        role: Role::Assistant,
+        content: vec![
+            ContentBlock::Text {
+                text: "I'll list the bucket dir first, then grep each file.".into(),
+            },
+            ContentBlock::ToolUse {
+                id: "tool-call-001".into(),
+                name: "list_files".into(),
+                input: serde_json::json!({
+                    "path": "/sandbox/buckets",
+                    "include_hidden": false
+                }),
+                replay: None,
+            },
+        ],
+    });
+    conv.push(Message {
+        role: Role::ToolResult,
+        content: vec![ContentBlock::ToolResult {
+            tool_use_id: "tool-call-001".into(),
+            content: ToolResultContent::Text(
+                "drwxr-xr-x rust-stdlib/\ndrwxr-xr-x cargo-docs/\n-rw-r--r-- README.md".into(),
+            ),
+            is_error: false,
+        }],
+    });
+    conv.push(Message {
+        role: Role::Assistant,
+        content: vec![ContentBlock::ToolUse {
+            id: "tool-call-002".into(),
+            name: "grep".into(),
+            input: serde_json::json!({
+                "pattern": "TODO",
+                "path": "/sandbox/buckets/missing-file"
+            }),
+            replay: None,
+        }],
+    });
+    conv.push(Message {
+        role: Role::ToolResult,
+        content: vec![ContentBlock::ToolResult {
+            tool_use_id: "tool-call-002".into(),
+            content: ToolResultContent::Text(
+                "grep: /sandbox/buckets/missing-file: No such file or directory".into(),
+            ),
+            is_error: true,
+        }],
+    });
 
     ThreadSnapshot {
         thread_id: "t-1".into(),

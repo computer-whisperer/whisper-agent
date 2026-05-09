@@ -286,17 +286,28 @@ Quality-of-life on the existing surface:
 Reasoning collapse moved into the event-log refactor (`accordion_item`
 per row, open state in `ChatApp.open_accordions`).
 
-### ⏳ Stage 6 — Tool calls and tool results
+### ✅ Stage 6 — Tool calls and tool results
 
-The big one. The egui sibling has ~1000 LoC of tool-row rendering. Aetna
-shape:
-- `ToolCall` becomes a `card` with a header showing tool name + args
-  summary, expandable to the JSON args + streaming output + final
-  result via `accordion`
-- `edit_file` / `write_file` get inline unified-diff rendering
-- Async `dispatch_thread` results route into the originating tool's
-  result slot
-- `ToolCallStreaming` placeholder rows reflect args-being-typed
+Tool rows are now real `accordion_item`s with role-coded gutters
+(WARNING for in-flight / success, DESTRUCTIVE for errors) and a
+`code_block` body that shows args, streaming output (when in
+flight), and integrated result. The header carries a status glyph
+(⏳ / ✓ / ✗) plus the tool name so a closed row communicates pass /
+fail at a glance.
+
+Snapshot walk fuses `ContentBlock::ToolUse` + `ContentBlock::ToolResult`
+into a single row when they're adjacent (no intervening user /
+assistant text turn) — same fusion the egui sibling does. Streaming
+events `ThreadToolCallBegin`, `ThreadToolCallContent`,
+`ThreadToolCallEnd`, and `ThreadToolCallStreaming` (args-being-typed
+placeholder) all land into the same row shape.
+
+Still deferred:
+- inline unified-diff rendering for `edit_file` / `write_file`
+  (currently shown as raw JSON args)
+- async `dispatch_thread` callbacks routing into the originating
+  call's result slot — currently they fall through to a standalone
+  `ToolResult` row when the call has scrolled out of fusion range
 
 ### ⏳ Stage 7 — Images / attachments
 
