@@ -115,9 +115,11 @@ Two-tier scheme:
   `key.strip_prefix("thread:")` and friends.
 
 Compose-target keys (`compose`, `send`) are deliberately short — there's
-exactly one compose box at a time. Once stage 4 lands "compose into a
-fresh thread" (the egui sibling's `composing_new` mode), they may grow a
-disambiguator suffix.
+exactly one compose box at a time. The new-thread form (Stage 4) reuses
+both keys; the same `send_compose` routes between `SendUserMessage` and
+`CreateThread` based on `selected.is_some()`. The picker triggers use
+`picker:{backend|model|pod}` with `select_menu` option keys carrying the
+canonical `:option:{value}` suffix.
 
 ### Transport bridge
 
@@ -262,29 +264,66 @@ pane, controlled via `text_area::apply_event` and `App::selection`.
 generations paint live. Deltas coalesce onto the trailing item of their
 own kind (one growing card, not one card per delta).
 
-### ⏳ Stage 4 — Compose into a fresh thread
+### ✅ Stage 4 — Compose into a fresh thread
 
-Currently the compose box only sends follow-up turns to the selected
-thread. The egui webui's `composing_new` mode lets the user start a new
-conversation from the compose box, picking a target pod + backend +
-model. Needs:
-- model picker (`ListBackends` / `ListModels`)
-- pod target chooser
-- bindings (host_env, mcp_hosts) override surface
-- `CreateThread { pod_id, config_override, bindings_request, ... }` send
-- echo handling (`ThreadCreated`)
+The no-selection content pane is now a centered card with a
+`form([...])` of three `select_trigger` pickers (Backend / Model /
+Pod), a `text_area` compose, and a primary `Start` button. Pickers
+go through `widgets::select` (`select_trigger` + conditional
+`select_menu` riding the overlay layer); event routing uses
+`select::classify_event` so picking a backend can side-effect into
+clearing the model selection and firing a `ListModels` for the new
+backend.
 
-### ⏳ Stage 5 — Drafts, prefill progress
+Still deferred:
+- bindings surface (knowledge-db / behavior / shared MCP hosts) — the
+  egui sibling exposes these as a collapsible "advanced" panel; we'll
+  port it once Stage 8's modals exist as a precedent for the picker
+  shape
+- composing-new alongside an existing selection (the egui sibling's
+  toggle between "send to selected thread" and "compose new"). Today
+  the form is reachable only when no thread is selected.
 
-Quality-of-life on the existing surface:
-- `SetThreadDraft` debounce + `ThreadDraftUpdated` echo handling so
-  in-progress text persists across thread switches and clients
-- `ThreadPrefillProgress` rendered as a transient progress indicator
-  while a turn is mid-prefill
-- Per-message hover affordances (copy, fork-from-here)
+Wire flow: `ConnectionOpened` fires `ListBackends` alongside
+`ListPods` / `ListThreads`. Picking a backend triggers
+`ListModels { backend }` once per connection (deduped by
+`requested_models_for`). On send, `build_creation_request` resolves
+`(config_override, pod_id)` from the picker state — including
+falling through to the picked backend's `default_model` or first
+fetched model so the server doesn't accidentally use the wrong
+backend's default. `ThreadCreated` auto-selects the new thread when
+no current selection (so the post-create transition lands the user
+in the live conversation).
 
-Reasoning collapse moved into the event-log refactor (`accordion_item`
-per row, open state in `ChatApp.open_accordions`).
+### ✅ Stage 5 — Drafts, prefill progress
+
+Per-thread compose drafts: `ChatApp.drafts: HashMap<String, String>`
+holds one buffer per thread the user has touched. The compose
+`text_area` binds to `drafts[selected]` when a thread is selected
+and to `compose_input` for the new-thread form (the latter remains
+the only buffer for the no-selection case).
+
+`SetThreadDraft` fires on every text-changing edit — bandwidth is
+trivial vs. the value of always-persistent drafts, and a per-frame
+clock-debounce doesn't ride the build/on_event split cleanly.
+`ThreadDraftUpdated` broadcasts (other clients editing the same
+thread) overwrite the local buffer wholesale; the server only
+fans out to non-senders so we never receive our own echo.
+Snapshot `draft` field hydrates `drafts[id]` on subscribe.
+Selection cursor resets on thread switch (offsets index a
+different string).
+
+`ThreadPrefillProgress` renders as a thin `progress(...)` bar plus
+a muted token-count caption between the toolbar and the
+chat-log scroll. Cleared on first text/reasoning delta — the
+protocol guarantees prefill events stop once the model starts
+emitting output.
+
+Deferred to a later slice:
+- per-keystroke fanout debounce (chrono-backed wall clock or a
+  frame-counter) — currently every keystroke hits the wire
+- per-message hover affordances (copy, fork-from-here) — wants
+  precedent from Stage 8's modals (fork dialog) first
 
 ### ✅ Stage 6 — Tool calls and tool results
 

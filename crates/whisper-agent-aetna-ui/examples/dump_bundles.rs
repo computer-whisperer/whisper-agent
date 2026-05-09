@@ -27,9 +27,9 @@ use aetna_core::prelude::{Rect, render_bundle_themed, write_bundle};
 use aetna_core::{App, BuildCx, UiEvent};
 use whisper_agent_aetna_ui::{ChatApp, Inbound, InboundEvent, SendFn};
 use whisper_agent_protocol::{
-    CompactionConfig, ContentBlock, Conversation, Message, PodSummary, Role, ServerToClient,
-    ThreadBindings, ThreadConfig, ThreadSnapshot, ThreadStateLabel, ThreadSummary,
-    ToolResultContent, TurnLog, Usage, permission::Scope,
+    BackendSummary, CompactionConfig, ContentBlock, ContentCapabilities, Conversation, Message,
+    ModelSummary, PodSummary, Role, ServerToClient, ThreadBindings, ThreadConfig, ThreadSnapshot,
+    ThreadStateLabel, ThreadSummary, ToolResultContent, TurnLog, Usage, permission::Scope,
 };
 
 fn main() -> std::io::Result<()> {
@@ -92,10 +92,30 @@ enum Scene {
     /// args-block + result-block layout in the tool-call accordion
     /// and the destructive gutter on errored calls.
     ThreadWithToolCall,
+    /// New-thread compose form, backends + pods seeded but no
+    /// pickers touched yet. Verifies the card / form / select_trigger
+    /// composition in its idle state.
+    NewThreadFormReady,
+    /// New-thread compose form, backend dropdown open. Verifies the
+    /// `select_menu` popover anchors below the trigger and shows the
+    /// inherit row + per-backend rows.
+    NewThreadFormBackendOpen,
+    /// New-thread compose form with backend, model, and pod all
+    /// picked. Validates the trigger label fallbacks and that
+    /// picking a backend triggers a model-list fetch.
+    NewThreadFormFilled,
+    /// Subscribed thread mid-prefill — `ThreadPrefillProgress` has
+    /// arrived but no text/reasoning delta has yet. Verifies the
+    /// thin progress bar + token-count caption above the chat log.
+    ThreadPrefilling,
+    /// Subscribed thread with a hydrated draft. Verifies the
+    /// per-thread `text_area` binding picks the draft buffer up
+    /// from the snapshot's `draft` field.
+    ThreadWithDraft,
 }
 
 impl Scene {
-    const ALL: [Scene; 8] = [
+    const ALL: [Scene; 13] = [
         Scene::Connecting,
         Scene::Connected,
         Scene::Closed,
@@ -104,6 +124,11 @@ impl Scene {
         Scene::LoadingThread,
         Scene::ThreadWithMessages,
         Scene::ThreadWithToolCall,
+        Scene::NewThreadFormReady,
+        Scene::NewThreadFormBackendOpen,
+        Scene::NewThreadFormFilled,
+        Scene::ThreadPrefilling,
+        Scene::ThreadWithDraft,
     ];
 
     fn slug(self) -> &'static str {
@@ -116,6 +141,11 @@ impl Scene {
             Scene::LoadingThread => "loading_thread",
             Scene::ThreadWithMessages => "thread_with_messages",
             Scene::ThreadWithToolCall => "thread_with_tool_call",
+            Scene::NewThreadFormReady => "new_thread_form_ready",
+            Scene::NewThreadFormBackendOpen => "new_thread_form_backend_open",
+            Scene::NewThreadFormFilled => "new_thread_form_filled",
+            Scene::ThreadPrefilling => "thread_prefilling",
+            Scene::ThreadWithDraft => "thread_with_draft",
         }
     }
 
@@ -124,9 +154,26 @@ impl Scene {
     /// live UI does.
     fn clicks(self) -> Vec<&'static str> {
         match self {
-            Scene::LoadingThread | Scene::ThreadWithMessages | Scene::ThreadWithToolCall => {
-                vec!["thread:t-1"]
-            }
+            Scene::LoadingThread
+            | Scene::ThreadWithMessages
+            | Scene::ThreadWithToolCall
+            | Scene::ThreadPrefilling
+            | Scene::ThreadWithDraft => vec!["thread:t-1"],
+            // One toggle click on the backend trigger leaves the menu
+            // open — render captures the popover.
+            Scene::NewThreadFormBackendOpen => vec!["picker:backend"],
+            // Pick a backend (which fires a no-op `ListModels`),
+            // then a model id from the pre-seeded `ModelsList`,
+            // then a pod. Each `option:` click goes through
+            // `select::classify_event` -> `SelectAction::Pick`.
+            Scene::NewThreadFormFilled => vec![
+                "picker:backend",
+                "picker:backend:option:anthropic-prod",
+                "picker:model",
+                "picker:model:option:claude-opus-4-7",
+                "picker:pod",
+                "picker:pod:option:scratch",
+            ],
             _ => Vec::new(),
         }
     }
@@ -159,7 +206,9 @@ fn build_app(scene: Scene) -> ChatApp {
         Scene::PopulatedNoSelection
         | Scene::LoadingThread
         | Scene::ThreadWithMessages
-        | Scene::ThreadWithToolCall => {
+        | Scene::ThreadWithToolCall
+        | Scene::ThreadPrefilling
+        | Scene::ThreadWithDraft => {
             q.push_back(InboundEvent::ConnectionOpened);
             q.push_back(InboundEvent::Wire(ServerToClient::PodList {
                 correlation_id: None,
@@ -182,10 +231,113 @@ fn build_app(scene: Scene) -> ChatApp {
                     snapshot: mock_tool_snapshot(),
                 }));
             }
+            if matches!(scene, Scene::ThreadPrefilling) {
+                // Fresh snapshot (no assistant content yet) plus an
+                // active prefill event — the indicator should render
+                // until a delta arrives, which it won't here.
+                q.push_back(InboundEvent::Wire(ServerToClient::ThreadSnapshot {
+                    thread_id: "t-1".into(),
+                    snapshot: mock_prefill_snapshot(),
+                }));
+                q.push_back(InboundEvent::Wire(ServerToClient::ThreadPrefillProgress {
+                    thread_id: "t-1".into(),
+                    tokens_processed: 4231,
+                    tokens_total: 8192,
+                }));
+            }
+            if matches!(scene, Scene::ThreadWithDraft) {
+                // Snapshot carries `draft` text — the per-thread
+                // `text_area` should pick it up via the snapshot
+                // hydration path (no separate ThreadDraftUpdated
+                // needed).
+                q.push_back(InboundEvent::Wire(ServerToClient::ThreadSnapshot {
+                    thread_id: "t-1".into(),
+                    snapshot: mock_draft_snapshot(),
+                }));
+            }
+        }
+        Scene::NewThreadFormReady
+        | Scene::NewThreadFormBackendOpen
+        | Scene::NewThreadFormFilled => {
+            // Same baseline as `PopulatedNoSelection` — connection,
+            // pods, and an empty thread list — plus a `BackendsList`
+            // so the backend picker has options. The `Filled` scene
+            // also pre-seeds a `ModelsList` for the backend the
+            // synthetic clicks pick.
+            q.push_back(InboundEvent::ConnectionOpened);
+            q.push_back(InboundEvent::Wire(ServerToClient::PodList {
+                correlation_id: None,
+                pods: mock_pods(),
+                default_pod_id: "default".into(),
+            }));
+            q.push_back(InboundEvent::Wire(ServerToClient::ThreadList {
+                correlation_id: None,
+                tasks: Vec::new(),
+            }));
+            q.push_back(InboundEvent::Wire(ServerToClient::BackendsList {
+                correlation_id: None,
+                backends: mock_backends(),
+            }));
+            if matches!(scene, Scene::NewThreadFormFilled) {
+                q.push_back(InboundEvent::Wire(ServerToClient::ModelsList {
+                    correlation_id: None,
+                    backend: "anthropic-prod".into(),
+                    models: mock_models(),
+                }));
+            }
         }
     }
     drop(q);
     app
+}
+
+fn mock_backends() -> Vec<BackendSummary> {
+    vec![
+        BackendSummary {
+            name: "anthropic-prod".into(),
+            kind: "anthropic".into(),
+            default_model: Some("claude-opus-4-7".into()),
+            auth_mode: Some("api_key".into()),
+        },
+        BackendSummary {
+            name: "openai-team".into(),
+            kind: "openai_chat".into(),
+            default_model: Some("gpt-5".into()),
+            auth_mode: Some("api_key".into()),
+        },
+        BackendSummary {
+            name: "local-llama".into(),
+            kind: "openai_chat".into(),
+            default_model: None,
+            auth_mode: None,
+        },
+    ]
+}
+
+fn mock_models() -> Vec<ModelSummary> {
+    vec![
+        ModelSummary {
+            id: "claude-opus-4-7".into(),
+            display_name: Some("Claude Opus 4.7".into()),
+            context_window: Some(1_000_000),
+            max_output_tokens: Some(8192),
+            capabilities: ContentCapabilities::default(),
+        },
+        ModelSummary {
+            id: "claude-sonnet-4-6".into(),
+            display_name: Some("Claude Sonnet 4.6".into()),
+            context_window: Some(200_000),
+            max_output_tokens: Some(8192),
+            capabilities: ContentCapabilities::default(),
+        },
+        ModelSummary {
+            id: "claude-haiku-4-5".into(),
+            display_name: Some("Claude Haiku 4.5".into()),
+            context_window: Some(200_000),
+            max_output_tokens: Some(8192),
+            capabilities: ContentCapabilities::default(),
+        },
+    ]
 }
 
 fn mock_pods() -> Vec<PodSummary> {
@@ -322,6 +474,73 @@ fn mock_snapshot() -> ThreadSnapshot {
         total_usage: Usage::default(),
         turn_log: TurnLog::default(),
         draft: String::new(),
+        created_at: "2026-05-08T10:00:00Z".into(),
+        last_active: "2026-05-08T11:00:00Z".into(),
+        failure: None,
+        origin: None,
+        continued_from: None,
+        dispatched_by: None,
+        scope: Scope::default(),
+    }
+}
+
+/// Snapshot for the `ThreadPrefilling` scene — one user turn, no
+/// assistant content yet, and the thread state is Working so the
+/// pane reflects the in-flight turn. Pairs with a follow-on
+/// `ThreadPrefillProgress` event seeded by the scene builder.
+fn mock_prefill_snapshot() -> ThreadSnapshot {
+    let mut conv = Conversation::new();
+    conv.push(Message::system_text(""));
+    conv.push(Message::user_text(
+        "Summarize the entire knowledge-db design doc, then highlight the parts \
+         most relevant to a fresh embedder rotation. Lots of context to chew on.",
+    ));
+    base_snapshot(conv, ThreadStateLabel::Working, String::new())
+}
+
+/// Snapshot for the `ThreadWithDraft` scene — exercises the
+/// snapshot's `draft` hydration path. The chat log itself is the
+/// same single user turn as the prefill mock; the only thing
+/// distinguishing the bundle is the populated `text_area` body.
+fn mock_draft_snapshot() -> ThreadSnapshot {
+    let mut conv = Conversation::new();
+    conv.push(Message::system_text(""));
+    conv.push(Message::user_text(
+        "Sketch the Stage 7 plan for image attachments before I start coding.",
+    ));
+    base_snapshot(
+        conv,
+        ThreadStateLabel::Idle,
+        "I should also clarify whether the staging pipeline decodes \
+         server-side or client-side before I send the request."
+            .into(),
+    )
+}
+
+/// Build a `ThreadSnapshot` from a conversation, state, and draft
+/// — matches the shape of `mock_snapshot` / `mock_tool_snapshot`
+/// without duplicating the boilerplate.
+fn base_snapshot(
+    conversation: Conversation,
+    state: ThreadStateLabel,
+    draft: String,
+) -> ThreadSnapshot {
+    ThreadSnapshot {
+        thread_id: "t-1".into(),
+        pod_id: "default".into(),
+        title: Some("first conversation".into()),
+        config: ThreadConfig {
+            model: "claude-opus-4-7".into(),
+            max_tokens: 4096,
+            max_turns: 8,
+            compaction: CompactionConfig::default(),
+        },
+        bindings: ThreadBindings::default(),
+        state,
+        conversation,
+        total_usage: Usage::default(),
+        turn_log: TurnLog::default(),
+        draft,
         created_at: "2026-05-08T10:00:00Z".into(),
         last_active: "2026-05-08T11:00:00Z".into(),
         failure: None,

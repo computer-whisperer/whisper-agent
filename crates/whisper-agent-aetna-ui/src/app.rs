@@ -6,7 +6,9 @@
 //! rows (3px role-colored gutter + content), assistant turns through
 //! `aetna_markdown::md`, reasoning + tool rows in collapsible
 //! `accordion_item`s, compose box that sends follow-up turns to the
-//! selected thread.
+//! selected thread, and a new-thread compose form (card + form +
+//! `select_trigger` pickers for backend / model / pod) reachable
+//! when no thread is selected.
 //! Build/on_event split is the load-bearing test of the pivot — every
 //! interactive element routes through [`ChatApp::on_event`] via a
 //! key, every visual is a function of state read in
@@ -16,8 +18,8 @@
 //! - inline diff rendering for `edit_file` / `write_file` tool calls
 //!   (currently shown as raw JSON args)
 //! - prefill progress + image output streaming
-//! - "compose into a fresh thread" (needs the model picker / pod
-//!   target / bindings surface)
+//! - bindings surface (knowledge-db / behavior / shared MCP hosts) on
+//!   the new-thread form
 //! - attachment staging + drag/drop/paste/filepicker
 //! - per-thread draft persistence (`SetThreadDraft` debounce)
 //! - all settings / behavior / pod / bucket / fork modals
@@ -31,8 +33,10 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::rc::Rc;
 
 use aetna_core::prelude::*;
+use aetna_core::widgets::select::{SelectAction, classify_event as classify_select_event};
 use whisper_agent_protocol::{
-    ClientToServer, ContentBlock, PodSummary, Role, ServerToClient, ThreadSummary,
+    BackendSummary, ClientToServer, ContentBlock, ModelSummary, PodSummary, Role, ServerToClient,
+    ThreadConfigOverride, ThreadSummary,
 };
 
 /// Inbound event variants the host shell pushes into the [`Inbound`]
@@ -154,6 +158,21 @@ pub struct ChatApp {
     pods: HashMap<String, PodSummary>,
     threads: HashMap<String, ThreadSummary>,
 
+    // ----- model catalog (request/response tier) -----
+    /// Backends advertised by the server. Populated from
+    /// `BackendsList`; drives the new-thread `Backend` picker. Entries
+    /// arrive in the server's configured order.
+    backends: Vec<BackendSummary>,
+    /// Models per backend, keyed by `BackendSummary.name`. Populated
+    /// lazily — we only fire `ListModels` for a backend when the user
+    /// has actually picked it on the new-thread form, and we dedup
+    /// repeat picks via [`requested_models_for`].
+    models_by_backend: HashMap<String, Vec<ModelSummary>>,
+    /// Backends we've already issued a `ListModels` for on this
+    /// connection. Cleared on reconnect alongside [`subscribed`] so a
+    /// fresh `ConnectionOpened` re-fetches whatever the user picks.
+    requested_models_for: HashSet<String>,
+
     // ----- selection + per-thread state -----
     selected: Option<String>,
     /// Per-thread chat-log state. Populated on `ThreadSnapshot`; we
@@ -166,16 +185,28 @@ pub struct ChatApp {
     subscribed: HashSet<String>,
 
     // ----- compose -----
-    /// In-progress text in the compose box. Cleared on send. Stage 3
-    /// keeps a single buffer rather than per-thread drafts; the egui
-    /// sibling persists drafts via `SetThreadDraft` debounce — that's
-    /// a stage-4 concern once we've validated the basic send path.
+    /// In-progress text for the *new-thread* compose form (no thread
+    /// selected). Per-thread follow-up drafts live in [`drafts`].
     compose_input: String,
+    /// Per-thread draft text, keyed by `thread_id`. Hydrated from
+    /// [`ThreadSnapshot::draft`] on subscribe and from
+    /// `ThreadDraftUpdated` broadcasts (other clients editing).
+    /// Source of truth for the compose `text_area` whenever a thread
+    /// is selected. Server-side persistence is via `SetThreadDraft`,
+    /// which we fire on every text-changing edit — bandwidth is
+    /// trivial vs. user perception of typing lag.
+    drafts: HashMap<String, String>,
+    /// Active prefill progress per thread, keyed by `thread_id`.
+    /// `(processed, total)` from [`ServerToClient::ThreadPrefillProgress`].
+    /// Cleared on first text/reasoning delta — the protocol says the
+    /// indicator is ephemeral and disappears once the model starts
+    /// emitting output.
+    prefill: HashMap<String, (u32, u32)>,
     /// Global text-selection cursor for `text_area` / `text_input`
     /// widgets. Aetna's controlled widgets read it through
-    /// `App::selection` and write back via `apply_event`. Stage 3
-    /// only has the compose `text_area`, but the same cursor will
-    /// own selection in the chat log when `.selectable()` lands.
+    /// `App::selection` and write back via `apply_event`. Reset
+    /// on thread switch so the cursor lands at offset 0 of the
+    /// newly-bound draft buffer (offsets index a different string).
     selection: Selection,
 
     // ----- accordion state -----
@@ -186,6 +217,23 @@ pub struct ChatApp {
     /// per-row `Option<bool>` shape doesn't generalize when we have
     /// many independent rows in a single thread.
     open_accordions: HashSet<String>,
+
+    // ----- new-thread compose pickers -----
+    /// Backend picked for the next `CreateThread`. `None` means
+    /// inherit the pod's `thread_defaults.backend`. The picker
+    /// re-uses the empty string as the inherit sentinel on the wire
+    /// — see [`PickerInherit`].
+    picker_backend: Option<String>,
+    picker_backend_open: bool,
+    /// Model id picked for the next `CreateThread`. `None` falls
+    /// through to the backend's `default_model` (or the first model
+    /// the backend's `/models` returns).
+    picker_model: Option<String>,
+    picker_model_open: bool,
+    /// Pod id the new thread should land in. `None` routes to the
+    /// server's `compose_pod_id` default.
+    picker_pod: Option<String>,
+    picker_pod_open: bool,
 }
 
 impl ChatApp {
@@ -198,12 +246,23 @@ impl ChatApp {
             list_requested: false,
             pods: HashMap::new(),
             threads: HashMap::new(),
+            backends: Vec::new(),
+            models_by_backend: HashMap::new(),
+            requested_models_for: HashSet::new(),
             selected: None,
             views: HashMap::new(),
             subscribed: HashSet::new(),
             compose_input: String::new(),
+            drafts: HashMap::new(),
+            prefill: HashMap::new(),
             selection: Selection::default(),
             open_accordions: HashSet::new(),
+            picker_backend: None,
+            picker_backend_open: false,
+            picker_model: None,
+            picker_model_open: false,
+            picker_pod: None,
+            picker_pod_open: false,
         }
     }
 
@@ -231,11 +290,18 @@ impl ChatApp {
                 // the local mirror so re-selecting a thread re-asks
                 // for its snapshot.
                 self.subscribed.clear();
+                // Same story for the per-backend `ListModels` dedup —
+                // a fresh socket means we have to re-fetch whatever
+                // the user picks.
+                self.requested_models_for.clear();
                 if !self.list_requested {
                     self.send(ClientToServer::ListPods {
                         correlation_id: None,
                     });
                     self.send(ClientToServer::ListThreads {
+                        correlation_id: None,
+                    });
+                    self.send(ClientToServer::ListBackends {
                         correlation_id: None,
                     });
                     self.list_requested = true;
@@ -278,7 +344,33 @@ impl ChatApp {
                 }
             }
             ServerToClient::ThreadCreated { summary, .. } => {
-                self.threads.insert(summary.thread_id.clone(), summary);
+                let new_id = summary.thread_id.clone();
+                self.threads.insert(new_id.clone(), summary);
+                // If the user just submitted the new-thread form (no
+                // selection currently), auto-select the freshly
+                // created thread so the post-create transition lands
+                // them in the live conversation. Skipped when another
+                // thread is already selected so a background create
+                // (e.g. dispatch_thread) doesn't yank focus away.
+                if self.selected.is_none() {
+                    self.select_thread(new_id);
+                    // Pickers and compose buffer were consumed by the
+                    // CreateThread send; reset them so the next
+                    // "back to no selection" lands on a fresh form
+                    // rather than the stale picker state.
+                    self.picker_backend = None;
+                    self.picker_model = None;
+                    self.picker_pod = None;
+                    self.compose_input.clear();
+                }
+            }
+            ServerToClient::BackendsList { backends, .. } => {
+                self.backends = backends;
+            }
+            ServerToClient::ModelsList {
+                backend, models, ..
+            } => {
+                self.models_by_backend.insert(backend, models);
             }
             ServerToClient::ThreadArchived { thread_id } => {
                 self.threads.remove(&thread_id);
@@ -310,7 +402,36 @@ impl ChatApp {
                     items,
                     title: snapshot.title,
                 };
+                // Hydrate the local draft from the snapshot — the
+                // server's stored draft is authoritative on initial
+                // subscribe. Skip empty strings to avoid littering
+                // the map.
+                if !snapshot.draft.is_empty() {
+                    self.drafts.insert(thread_id.clone(), snapshot.draft);
+                } else {
+                    self.drafts.remove(&thread_id);
+                }
                 self.views.insert(thread_id, view);
+            }
+            ServerToClient::ThreadDraftUpdated { thread_id, text } => {
+                // Broadcast from another client editing the same
+                // thread's draft. The server fans out to every
+                // subscriber except the sender, so we never receive
+                // our own echo here. Replace wholesale; the egui
+                // sibling does the same.
+                if text.is_empty() {
+                    self.drafts.remove(&thread_id);
+                } else {
+                    self.drafts.insert(thread_id, text);
+                }
+            }
+            ServerToClient::ThreadPrefillProgress {
+                thread_id,
+                tokens_processed,
+                tokens_total,
+            } => {
+                self.prefill
+                    .insert(thread_id, (tokens_processed, tokens_total));
             }
             // Per-turn streaming append: a user message just landed on
             // the conversation. Server is the source of truth (the
@@ -326,6 +447,10 @@ impl ChatApp {
                 }
             }
             ServerToClient::ThreadAssistantTextDelta { thread_id, delta } => {
+                // First delta clears the prefill indicator — the
+                // protocol guarantees prefill events stop once the
+                // assistant starts emitting output.
+                self.prefill.remove(&thread_id);
                 if let Some(view) = self.views.get_mut(&thread_id) {
                     // Coalesce onto the trailing AssistantText if
                     // there is one — same shape as the egui sibling
@@ -339,6 +464,7 @@ impl ChatApp {
                 }
             }
             ServerToClient::ThreadAssistantReasoningDelta { thread_id, delta } => {
+                self.prefill.remove(&thread_id);
                 if let Some(view) = self.views.get_mut(&thread_id) {
                     if let Some(DisplayItem::Reasoning { text }) = view.items.last_mut() {
                         text.push_str(&delta);
@@ -476,9 +602,7 @@ impl ChatApp {
             | ServerToClient::ThreadAssistantImage { .. }
             | ServerToClient::ThreadAssistantEnd { .. }
             | ServerToClient::ThreadLoopComplete { .. }
-            | ServerToClient::ThreadDraftUpdated { .. }
-            | ServerToClient::ThreadCompacted { .. }
-            | ServerToClient::ThreadPrefillProgress { .. } => {}
+            | ServerToClient::ThreadCompacted { .. } => {}
             // Catalog tiers we don't yet surface. Quietly accepted so
             // the server's normal broadcast batch doesn't error here.
             _ => {}
@@ -492,15 +616,17 @@ impl App for ChatApp {
     }
 
     fn build(&self, _cx: &BuildCx) -> El {
-        // Root is an overlay stack so future stages can append
-        // toast / tooltip / popover layers without revisiting the
-        // root shape.
+        // Root is an overlay stack: the main row carries the chrome,
+        // any open `select_menu` rides above it as a popover layer.
+        // Per `widgets::select` doc, the menu must sit at the El
+        // tree root so it paints over content and intercepts the
+        // dismiss scrim's click — we collect them here.
         overlays(
             row([self.sidebar(), self.content()])
                 .width(Size::Fill(1.0))
                 .height(Size::Fill(1.0))
                 .gap(0.0),
-            std::iter::empty::<Option<El>>(),
+            self.popover_layers(),
         )
     }
 
@@ -518,20 +644,70 @@ impl App for ChatApp {
 
         // Compose `text_area` edits: when the routed target is the
         // compose box, fold the event through aetna's controlled-
-        // widget helper, which handles caret/selection/clipboard.
+        // widget helper. The buffer is per-thread when a thread is
+        // selected (so drafts persist across switches and survive
+        // reload via `SetThreadDraft`), or `compose_input` for the
+        // new-thread form.
         if event.target_key() == Some(COMPOSE_KEY) {
-            text_area::apply_event(
-                &mut self.compose_input,
-                &mut self.selection,
-                COMPOSE_KEY,
-                &event,
-            );
+            let selected = self.selected.clone();
+            // Field-level borrow split: `self.drafts` /
+            // `self.compose_input` and `self.selection` are
+            // independent fields, so the borrow checker accepts
+            // simultaneous `&mut` access through direct field
+            // expressions. Capture `before`/`after` to detect a
+            // text-changing edit and skip the SetThreadDraft fanout
+            // on cursor-only events.
+            let (changed, new_text) = if let Some(tid) = selected.as_ref() {
+                let buf = self.drafts.entry(tid.clone()).or_default();
+                let before = buf.clone();
+                text_area::apply_event(buf, &mut self.selection, COMPOSE_KEY, &event);
+                (*buf != before, buf.clone())
+            } else {
+                let before = self.compose_input.clone();
+                text_area::apply_event(
+                    &mut self.compose_input,
+                    &mut self.selection,
+                    COMPOSE_KEY,
+                    &event,
+                );
+                (self.compose_input != before, self.compose_input.clone())
+            };
+            // Persist server-side. Fire on every text-changing edit
+            // — the egui sibling debounces, but bandwidth here is
+            // tiny and per-keystroke avoids needing a wall-clock
+            // timer, which doesn't ride the build/on_event split
+            // cleanly.
+            if changed && let Some(tid) = selected {
+                self.send(ClientToServer::SetThreadDraft {
+                    thread_id: tid,
+                    text: new_text,
+                });
+            }
             return;
         }
 
         // Send button.
         if event.is_click_or_activate(SEND_KEY) {
             self.send_compose();
+            return;
+        }
+
+        // New-thread form pickers (backend / model / pod). Each one is
+        // a `select_trigger` + conditionally-rendered `select_menu`
+        // pair routed at `picker:{kind}`. We use `classify_event`
+        // explicitly (rather than the bundled `apply_event`) because
+        // picking a backend has a side-effect — clearing the model
+        // selection and firing a `ListModels` for the new backend.
+        if let Some(action) = classify_select_event(&event, PICKER_BACKEND) {
+            self.handle_backend_pick(action);
+            return;
+        }
+        if let Some(action) = classify_select_event(&event, PICKER_MODEL) {
+            self.handle_model_pick(action);
+            return;
+        }
+        if let Some(action) = classify_select_event(&event, PICKER_POD) {
+            self.handle_pod_pick(action);
             return;
         }
 
@@ -570,32 +746,218 @@ impl App for ChatApp {
 const COMPOSE_KEY: &str = "compose";
 const SEND_KEY: &str = "send";
 
+// Routed keys for the new-thread compose form's three `select_trigger`
+// pickers. Each `select_menu` in the build pass shares its trigger key
+// so the popover anchors below the trigger; the same key is what we
+// classify on in `on_event`.
+const PICKER_BACKEND: &str = "picker:backend";
+const PICKER_MODEL: &str = "picker:model";
+const PICKER_POD: &str = "picker:pod";
+
+/// Sentinel option value emitted by the "inherit / auto / default"
+/// menu row each picker prepends. Empty string can't collide with a
+/// real backend / model id / pod id. Picker pick handlers map this
+/// back to `None` on the corresponding picker field.
+const PICKER_INHERIT: &str = "";
+
 impl ChatApp {
     fn send_compose(&mut self) {
-        // Stage 3 only supports follow-up turns on an already-existing
-        // thread. Creating a fresh thread from the compose box (the
-        // egui sibling's `composing_new` mode) is a stage-4 concern
-        // since it needs the model picker / pod target / bindings
-        // surface. For now: no thread selected = nothing to send.
-        let Some(thread_id) = self.selected.clone() else {
-            return;
-        };
-        let text = std::mem::take(&mut self.compose_input).trim().to_string();
+        let text = self.active_compose_text().trim().to_string();
         if text.is_empty() {
             return;
         }
-        self.send(ClientToServer::SendUserMessage {
-            thread_id,
-            text,
-            attachments: Vec::new(),
-        });
+        if let Some(thread_id) = self.selected.clone() {
+            // Clear the per-thread draft both locally and on the
+            // server. `SetThreadDraft { text: "" }` doubles as the
+            // "we're submitting this draft" signal so other
+            // subscribers stop seeing the in-progress text.
+            self.drafts.remove(&thread_id);
+            self.send(ClientToServer::SetThreadDraft {
+                thread_id: thread_id.clone(),
+                text: String::new(),
+            });
+            self.send(ClientToServer::SendUserMessage {
+                thread_id,
+                text,
+                attachments: Vec::new(),
+            });
+        } else {
+            // No selection -> the compose form is in new-thread
+            // mode. Materialize the picker state into a
+            // `CreateThread` request. `ThreadCreated` will land in
+            // `dispatch_wire` and auto-select the result.
+            let (config_override, pod_id) = self.build_creation_request();
+            self.compose_input.clear();
+            self.send(ClientToServer::CreateThread {
+                correlation_id: None,
+                pod_id,
+                initial_message: text,
+                initial_attachments: Vec::new(),
+                config_override,
+                bindings_request: None,
+            });
+        }
         // Reset selection inside the now-empty compose box so the
         // caret lands at offset 0 on the next frame.
         self.selection = Selection::default();
     }
 
+    /// Active compose buffer for the current selection state. When a
+    /// thread is selected this is the per-thread draft; otherwise
+    /// it's the new-thread form's `compose_input`. Used by both the
+    /// `compose_box` and `new_thread_pane` `text_area` builders.
+    fn active_compose_text(&self) -> &str {
+        match self.selected.as_ref() {
+            Some(tid) => self.drafts.get(tid).map(String::as_str).unwrap_or(""),
+            None => self.compose_input.as_str(),
+        }
+    }
+
+    /// Pick the best (`config_override`, `pod_id`) pair for the next
+    /// `CreateThread` from the compose-form picker state. Mirrors the
+    /// egui sibling's `build_creation_override` shape so server-side
+    /// behavior stays identical between the two clients.
+    fn build_creation_request(&self) -> (Option<ThreadConfigOverride>, Option<String>) {
+        // If the user picked a backend but didn't touch the model
+        // dropdown, pin down the model explicitly so the server
+        // doesn't fall back to the *default backend's* default_model
+        // (which would be wrong for the picked backend). Prefer the
+        // picked backend's `default_model`; else the first model the
+        // backend's `/models` returned; else `None`.
+        let model = self.picker_model.clone().or_else(|| {
+            let b = self.picker_backend.as_ref()?;
+            self.backends
+                .iter()
+                .find(|bs| &bs.name == b)
+                .and_then(|bs| bs.default_model.clone())
+                .or_else(|| {
+                    self.models_by_backend
+                        .get(b)
+                        .and_then(|list| list.first())
+                        .map(|m| m.id.clone())
+                })
+        });
+        let config_override = if model.is_some() {
+            Some(ThreadConfigOverride {
+                model,
+                ..Default::default()
+            })
+        } else {
+            None
+        };
+        (config_override, self.picker_pod.clone())
+    }
+
+    fn handle_backend_pick(&mut self, action: SelectAction) {
+        match action {
+            SelectAction::Toggle => {
+                self.close_other_pickers(PICKER_BACKEND);
+                self.picker_backend_open = !self.picker_backend_open;
+            }
+            SelectAction::Dismiss => self.picker_backend_open = false,
+            SelectAction::Pick(value) => {
+                let new_value = if value == PICKER_INHERIT {
+                    None
+                } else {
+                    Some(value)
+                };
+                if self.picker_backend != new_value {
+                    // Picking a new backend invalidates the model
+                    // selection — model ids are backend-scoped.
+                    self.picker_model = None;
+                    if let Some(b) = new_value.as_ref() {
+                        self.ensure_models_requested(b);
+                    }
+                    self.picker_backend = new_value;
+                }
+                self.picker_backend_open = false;
+            }
+            // `SelectAction` is `#[non_exhaustive]` — future variants
+            // (e.g. keyboard navigation) drop on the floor here until
+            // the picker grows a corresponding handler.
+            _ => {}
+        }
+    }
+
+    fn handle_model_pick(&mut self, action: SelectAction) {
+        match action {
+            SelectAction::Toggle => {
+                self.close_other_pickers(PICKER_MODEL);
+                self.picker_model_open = !self.picker_model_open;
+            }
+            SelectAction::Dismiss => self.picker_model_open = false,
+            SelectAction::Pick(value) => {
+                self.picker_model = if value == PICKER_INHERIT {
+                    None
+                } else {
+                    Some(value)
+                };
+                self.picker_model_open = false;
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_pod_pick(&mut self, action: SelectAction) {
+        match action {
+            SelectAction::Toggle => {
+                self.close_other_pickers(PICKER_POD);
+                self.picker_pod_open = !self.picker_pod_open;
+            }
+            SelectAction::Dismiss => self.picker_pod_open = false,
+            SelectAction::Pick(value) => {
+                self.picker_pod = if value == PICKER_INHERIT {
+                    None
+                } else {
+                    Some(value)
+                };
+                self.picker_pod_open = false;
+            }
+            _ => {}
+        }
+    }
+
+    /// Close every picker except the one identified by `keep_open`.
+    /// Two open menus at once would visually overlap and confuse the
+    /// click-outside dismiss behavior; aetna's popover scrim is per
+    /// menu, so we enforce single-open-at-a-time at the app layer.
+    fn close_other_pickers(&mut self, keep_open: &str) {
+        if keep_open != PICKER_BACKEND {
+            self.picker_backend_open = false;
+        }
+        if keep_open != PICKER_MODEL {
+            self.picker_model_open = false;
+        }
+        if keep_open != PICKER_POD {
+            self.picker_pod_open = false;
+        }
+    }
+
+    /// Fire a `ListModels { backend }` if we haven't already on this
+    /// connection. Idempotent — repeated picks of the same backend
+    /// hit the local `models_by_backend` cache.
+    fn ensure_models_requested(&mut self, backend: &str) {
+        if self.requested_models_for.contains(backend) {
+            return;
+        }
+        self.send(ClientToServer::ListModels {
+            correlation_id: None,
+            backend: backend.to_string(),
+        });
+        self.requested_models_for.insert(backend.to_string());
+    }
+
     fn select_thread(&mut self, thread_id: String) {
+        // No-op when re-selecting the already-selected thread —
+        // avoids resetting the selection cursor when the user
+        // re-clicks the row.
+        if self.selected.as_deref() == Some(thread_id.as_str()) {
+            return;
+        }
         self.selected = Some(thread_id.clone());
+        // Selection offsets indexed into the previous buffer; reset
+        // so the cursor lands at offset 0 of the newly-bound draft.
+        self.selection = Selection::default();
         // Subscribe lazily — once per thread per connection. The
         // server replies with a `ThreadSnapshot` we render in
         // `dispatch_wire`.
@@ -684,13 +1046,7 @@ impl ChatApp {
 
     fn content(&self) -> El {
         let inner = match self.selected.as_ref() {
-            None => column([
-                h2("no thread selected"),
-                text("pick a thread from the sidebar to view its log").muted(),
-            ])
-            .gap(tokens::SPACE_3)
-            .padding(tokens::SPACE_6)
-            .align(Align::Start),
+            None => self.new_thread_pane(),
             Some(thread_id) => self.thread_pane(thread_id),
         };
         // Connection alerts surface above the per-thread pane so
@@ -729,6 +1085,32 @@ impl ChatApp {
         }
     }
 
+    /// Build the prefill-progress row for the given thread, if a
+    /// `ThreadPrefillProgress` event is currently active for it. The
+    /// row is a thin `progress(...)` bar above a small muted token
+    /// count; the egui sibling renders the same shape.
+    ///
+    /// Returns `None` when no prefill is active or the total is zero
+    /// (defensive — a zero total would NaN out the fraction).
+    fn prefill_indicator(&self, thread_id: &str) -> Option<El> {
+        let &(processed, total) = self.prefill.get(thread_id)?;
+        if total == 0 {
+            return None;
+        }
+        let frac = (processed as f32 / total as f32).clamp(0.0, 1.0);
+        let bar = progress(frac, tokens::INFO)
+            .width(Size::Fill(1.0))
+            .height(Size::Fixed(4.0));
+        let label = text(format!("prefilling {processed} / {total} tokens"))
+            .caption()
+            .muted();
+        Some(
+            column([bar, label])
+                .gap(tokens::SPACE_1)
+                .width(Size::Fill(1.0)),
+        )
+    }
+
     fn thread_pane(&self, thread_id: &str) -> El {
         let summary = self.threads.get(thread_id);
         let view = self.views.get(thread_id);
@@ -748,7 +1130,16 @@ impl ChatApp {
         if let Some(s) = summary {
             toolbar_children.push(state_badge(s.state));
         }
-        let header = column([toolbar(toolbar_children), text(thread_id).muted().xsmall()])
+        let mut header_rows: Vec<El> =
+            vec![toolbar(toolbar_children), text(thread_id).muted().xsmall()];
+        // Prefill progress: a thin progress bar plus a muted token
+        // count, rendered while the model is ingesting the prompt.
+        // Cleared automatically once the first text/reasoning delta
+        // arrives (see the `dispatch_wire` arms for those events).
+        if let Some(prefill_row) = self.prefill_indicator(thread_id) {
+            header_rows.push(prefill_row);
+        }
+        let header = column(header_rows)
             .gap(tokens::SPACE_1)
             .padding(tokens::SPACE_4)
             .width(Size::Fill(1.0))
@@ -792,18 +1183,208 @@ impl ChatApp {
             .height(Size::Fill(1.0))
     }
 
+    /// New-thread compose form. Rendered in the content pane when no
+    /// thread is selected — the equivalent of the egui sibling's
+    /// `composing_new` mode. Three `select_trigger` pickers
+    /// (backend / model / pod) sit above a `text_area` and a "Start"
+    /// button. Open menus are emitted as overlay layers from
+    /// [`popover_layers`] so they paint above the rest of the UI.
+    fn new_thread_pane(&self) -> El {
+        let backend_trigger = select_trigger(PICKER_BACKEND, self.backend_label());
+        let model_trigger = select_trigger(PICKER_MODEL, self.model_label());
+        let pod_trigger = select_trigger(PICKER_POD, self.pod_label_for_picker());
+
+        let buf = self.active_compose_text();
+        let editor = text_area(buf, &self.selection, COMPOSE_KEY).height(Size::Fixed(140.0));
+
+        let can_send = !buf.trim().is_empty();
+        let mut send = button("Start").key(SEND_KEY).primary();
+        if !can_send {
+            send = send.disabled();
+        }
+
+        // Right-aligned action row inside `card_footer`.
+        let footer = row([spacer(), send])
+            .width(Size::Fill(1.0))
+            .align(Align::Center);
+
+        let body = card([
+            card_header([
+                card_title("Start a new conversation"),
+                card_description(
+                    "Pick a backend and pod, then type a message to begin. \
+                     Leaving a picker on its inherit row falls through to the \
+                     pod's defaults.",
+                ),
+            ]),
+            card_content([form([
+                form_item([
+                    form_label("Backend"),
+                    form_control(backend_trigger),
+                    form_description(self.backend_hint()),
+                ]),
+                form_item([
+                    form_label("Model"),
+                    form_control(model_trigger),
+                    form_description(self.model_hint()),
+                ]),
+                form_item([form_label("Pod"), form_control(pod_trigger)]),
+                form_item([form_label("Message"), form_control(editor)]),
+            ])]),
+            card_footer([footer]),
+        ])
+        .width(Size::Fixed(640.0));
+
+        // Center the card in the pane; padding keeps it off the
+        // pane edges on small windows.
+        column([body])
+            .padding(tokens::SPACE_6)
+            .align(Align::Center)
+            .width(Size::Fill(1.0))
+            .height(Size::Fill(1.0))
+    }
+
+    fn backend_label(&self) -> String {
+        self.picker_backend
+            .clone()
+            .unwrap_or_else(|| "inherit pod default".to_string())
+    }
+
+    fn backend_hint(&self) -> String {
+        match self.backends.len() {
+            0 => "loading backends…".to_string(),
+            n => format!("{n} backend{} configured", if n == 1 { "" } else { "s" }),
+        }
+    }
+
+    fn model_label(&self) -> String {
+        if let Some(m) = self.picker_model.as_deref() {
+            return m.to_string();
+        }
+        // Mirror `build_creation_request` so the trigger reflects
+        // exactly what the server would resolve if the user hit
+        // Start now — no surprises after submit.
+        if let Some(b) = self.picker_backend.as_ref() {
+            if let Some(default) = self
+                .backends
+                .iter()
+                .find(|bs| &bs.name == b)
+                .and_then(|bs| bs.default_model.clone())
+            {
+                return format!("{default}  (backend default)");
+            }
+            if let Some(first) = self
+                .models_by_backend
+                .get(b)
+                .and_then(|list| list.first())
+                .map(|m| m.id.clone())
+            {
+                return format!("{first}  (first available)");
+            }
+        }
+        "auto (backend default)".to_string()
+    }
+
+    fn model_hint(&self) -> String {
+        let Some(b) = self.picker_backend.as_ref() else {
+            return "pick a backend first to load its models".to_string();
+        };
+        match self.models_by_backend.get(b) {
+            None => "loading models…".to_string(),
+            Some(list) => format!(
+                "{} model{} available",
+                list.len(),
+                if list.len() == 1 { "" } else { "s" }
+            ),
+        }
+    }
+
+    fn pod_label_for_picker(&self) -> String {
+        match self.picker_pod.as_deref() {
+            None => "default pod".to_string(),
+            Some(id) => self
+                .pods
+                .get(id)
+                .map(|p| p.name.clone())
+                .unwrap_or_else(|| id.to_string()),
+        }
+    }
+
+    /// Build the popover layer list for [`overlays`]. Exactly one
+    /// menu can be open at a time (enforced by `close_other_pickers`),
+    /// but the iterator shape lets us extend this to e.g. a settings
+    /// modal or fork dialog without reshaping `build`.
+    fn popover_layers(&self) -> Vec<Option<El>> {
+        let mut out: Vec<Option<El>> = Vec::new();
+        if self.picker_backend_open {
+            out.push(Some(self.backend_menu()));
+        }
+        if self.picker_model_open {
+            out.push(Some(self.model_menu()));
+        }
+        if self.picker_pod_open {
+            out.push(Some(self.pod_menu()));
+        }
+        out
+    }
+
+    fn backend_menu(&self) -> El {
+        let mut options: Vec<(String, String)> = vec![(
+            PICKER_INHERIT.to_string(),
+            "Inherit pod default".to_string(),
+        )];
+        for b in &self.backends {
+            // `kind` (e.g. "anthropic" / "openai_chat") is useful
+            // context — surface it after the alias so the option
+            // reads as `prod-anthropic — anthropic`.
+            options.push((b.name.clone(), format!("{} — {}", b.name, b.kind)));
+        }
+        select_menu(PICKER_BACKEND, options)
+    }
+
+    fn model_menu(&self) -> El {
+        let mut options: Vec<(String, String)> = vec![(
+            PICKER_INHERIT.to_string(),
+            "Auto (backend default)".to_string(),
+        )];
+        if let Some(b) = self.picker_backend.as_ref()
+            && let Some(list) = self.models_by_backend.get(b)
+        {
+            for m in list {
+                let label = m
+                    .display_name
+                    .clone()
+                    .map(|d| format!("{d}  ({})", m.id))
+                    .unwrap_or_else(|| m.id.clone());
+                options.push((m.id.clone(), label));
+            }
+        }
+        select_menu(PICKER_MODEL, options)
+    }
+
+    fn pod_menu(&self) -> El {
+        let mut options: Vec<(String, String)> =
+            vec![(PICKER_INHERIT.to_string(), "Default pod".to_string())];
+        let mut pods: Vec<&PodSummary> = self.pods.values().filter(|p| !p.archived).collect();
+        pods.sort_by(|a, b| a.name.cmp(&b.name));
+        for p in pods {
+            options.push((p.pod_id.clone(), p.name.clone()));
+        }
+        select_menu(PICKER_POD, options)
+    }
+
     fn compose_box(&self) -> El {
         // Disable the send button while the input is whitespace-only —
         // sending an empty message wastes an LLM turn.
-        let can_send = !self.compose_input.trim().is_empty();
+        let buf = self.active_compose_text();
+        let can_send = !buf.trim().is_empty();
         let mut send = button("Send").key(SEND_KEY).primary();
         if !can_send {
             // Aetna's button widget honors `.disabled()` to gray out
             // the surface and skip routing.
             send = send.disabled();
         }
-        let editor =
-            text_area(&self.compose_input, &self.selection, COMPOSE_KEY).height(Size::Fixed(120.0));
+        let editor = text_area(buf, &self.selection, COMPOSE_KEY).height(Size::Fixed(120.0));
 
         // The compose row sits at the bottom of the pane: text_area
         // takes the leftover width, the send button hugs to the
