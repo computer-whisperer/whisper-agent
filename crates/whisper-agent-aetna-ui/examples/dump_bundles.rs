@@ -251,6 +251,12 @@ enum Scene {
     /// on the `pod-editor:tabs:tab:defaults` trigger flips the
     /// active tab without exercising any picker popovers.
     PodEditorDefaultsTab,
+    /// Behavior editor sheet, opened and switched to the Thread tab.
+    /// The architect mock uses `BehaviorThreadOverride::default()`,
+    /// so every override row renders in the "(inherit pod default)"
+    /// shape — a useful baseline for the structured layout, even if
+    /// it doesn't exercise the override-on numeric inputs.
+    BehaviorEditorThreadTab,
     /// Pod editor sheet, opened and switched to the Limits tab.
     /// Same hydration shape as `PodEditorHydrated`; an extra click
     /// on the `pod-editor:tabs:tab:limits` trigger flips the
@@ -269,7 +275,7 @@ enum Scene {
 }
 
 impl Scene {
-    const ALL: [Scene; 36] = [
+    const ALL: [Scene; 37] = [
         Scene::Connecting,
         Scene::Connected,
         Scene::Closed,
@@ -305,6 +311,7 @@ impl Scene {
         Scene::PodEditorHydrated,
         Scene::PodEditorDefaultsTab,
         Scene::PodEditorLimitsTab,
+        Scene::BehaviorEditorThreadTab,
         Scene::ForkModalOpen,
     ];
 
@@ -345,6 +352,7 @@ impl Scene {
             Scene::PodEditorHydrated => "pod_editor_hydrated",
             Scene::PodEditorDefaultsTab => "pod_editor_defaults_tab",
             Scene::PodEditorLimitsTab => "pod_editor_limits_tab",
+            Scene::BehaviorEditorThreadTab => "behavior_editor_thread_tab",
             Scene::ForkModalOpen => "fork_modal_open",
         }
     }
@@ -410,6 +418,14 @@ impl Scene {
                 "behavior-edit:default:architect",
                 "behavior-editor:trigger-kind",
             ],
+            // Open the editor, then click the Thread tab trigger.
+            // The architect mock has a defaulted BehaviorThreadOverride
+            // so every override row renders in the inherit-only state.
+            Scene::BehaviorEditorThreadTab => vec![
+                "behavior-row:default:architect",
+                "behavior-edit:default:architect",
+                "behavior-editor:tabs:tab:thread",
+            ],
             // Click the gear icon — sidebar header's pod-settings
             // affordance. Renders only when `pod_tab.is_some()`,
             // which it is here (PodList seeded a default).
@@ -467,7 +483,9 @@ fn build_app(scene: Scene) -> Box<dyn App> {
     // because the response's correlation has to match the request's
     // correlation, and that pairing is scene-specific.
     let send_fn: SendFn = match scene {
-        Scene::BehaviorEditorHydrated | Scene::BehaviorEditorTriggerKindOpen => {
+        Scene::BehaviorEditorHydrated
+        | Scene::BehaviorEditorTriggerKindOpen
+        | Scene::BehaviorEditorThreadTab => {
             let queue = inbound.clone();
             Box::new(move |msg| {
                 if let ClientToServer::GetBehavior {
@@ -741,7 +759,9 @@ fn build_app(scene: Scene) -> Box<dyn App> {
                 behaviors: mock_mavis_behaviors(),
             }));
         }
-        Scene::BehaviorEditorHydrated | Scene::BehaviorEditorTriggerKindOpen => {
+        Scene::BehaviorEditorHydrated
+        | Scene::BehaviorEditorTriggerKindOpen
+        | Scene::BehaviorEditorThreadTab => {
             // Same baseline as `SidebarBehaviorsExpanded` — pods +
             // threads + behaviors registry — so the click loop can
             // expand the architect row and click Edit. The

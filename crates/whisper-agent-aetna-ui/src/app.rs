@@ -689,6 +689,13 @@ pub(crate) struct BehaviorEditorSheetState {
     /// editor. Single-active-at-a-time discipline shared with the
     /// pod editor's pickers via `close_other_pickers`.
     pub(crate) open_picker: Option<BehaviorEditorPicker>,
+    /// Thread-tab `max_tokens` override numeric buffer. Empty when
+    /// the override is `None`. Same parse-on-edit-and-write-back
+    /// pattern as the pod editor's `max_tokens_buf`.
+    pub(crate) thread_max_tokens_buf: String,
+    /// Thread-tab `max_turns` override numeric buffer. Same shape
+    /// as [`Self::thread_max_tokens_buf`].
+    pub(crate) thread_max_turns_buf: String,
     /// Validation message: load error from the snapshot, client-side
     /// validation failure, or server-side `Error` echo.
     pub(crate) error: Option<String>,
@@ -818,6 +825,9 @@ pub(crate) enum BehaviorEditorPicker {
     Overlap,
     /// Cron `catch_up` policy picker.
     CatchUp,
+    /// Thread-tab `thread.model` override picker. Options are the
+    /// pod's effective backend's model catalog.
+    ThreadModel,
 }
 
 impl BehaviorEditorPicker {
@@ -825,6 +835,7 @@ impl BehaviorEditorPicker {
         match self {
             Self::Overlap => BEHAVIOR_EDITOR_OVERLAP_KEY,
             Self::CatchUp => BEHAVIOR_EDITOR_CATCH_UP_KEY,
+            Self::ThreadModel => BEHAVIOR_EDITOR_THREAD_MODEL_KEY,
         }
     }
 }
@@ -844,6 +855,8 @@ impl BehaviorEditorSheetState {
             tab: BehaviorEditorTab::Trigger,
             trigger_kind_open: false,
             open_picker: None,
+            thread_max_tokens_buf: String::new(),
+            thread_max_turns_buf: String::new(),
             error: None,
             pending_get: Some(pending_get),
             pending_save: None,
@@ -890,6 +903,27 @@ impl BehaviorEditorSheetState {
         }
         self.working_config = snapshot.config;
         self.working_prompt = snapshot.prompt;
+        self.sync_thread_buffers_from_config();
+    }
+
+    /// Pull the Thread-tab numeric override buffers (`max_tokens` /
+    /// `max_turns`) out of `working_config.thread`. Called on hydrate
+    /// only — buffer mutations happen inline in the on_event handler
+    /// (parse-on-edit-and-write-back), so subsequent calls to this
+    /// helper would clobber the user's typing.
+    fn sync_thread_buffers_from_config(&mut self) {
+        if let Some(cfg) = self.working_config.as_ref() {
+            self.thread_max_tokens_buf = cfg
+                .thread
+                .max_tokens
+                .map(|n| n.to_string())
+                .unwrap_or_default();
+            self.thread_max_turns_buf = cfg
+                .thread
+                .max_turns
+                .map(|n| n.to_string())
+                .unwrap_or_default();
+        }
     }
 
     /// Resolve the form state into a `TriggerSpec` for `UpdateBehavior`.
@@ -2555,6 +2589,19 @@ const BEHAVIOR_EDITOR_DISMISS_KEY: &str = "behavior-editor:dismiss";
 const BEHAVIOR_EDITOR_CRON_PRESET_PREFIX: &str = "behavior-editor:cron-preset:";
 /// Same shape, for [`crate::cron_preview::COMMON_TIMEZONES`].
 const BEHAVIOR_EDITOR_TZ_PRESET_PREFIX: &str = "behavior-editor:tz-preset:";
+/// Thread-tab routed keys. Each scalar `BehaviorThreadOverride`
+/// field uses an `_OVERRIDE_KEY` checkbox to toggle Some/None and a
+/// `_VALUE_KEY` for the actual control. Inherit-only rows render
+/// the value control as a muted "(inherit pod default)" paragraph
+/// instead.
+const BEHAVIOR_EDITOR_THREAD_MODEL_OVERRIDE_KEY: &str = "behavior-editor:thread:model:override";
+const BEHAVIOR_EDITOR_THREAD_MODEL_KEY: &str = "behavior-editor:thread:model";
+const BEHAVIOR_EDITOR_THREAD_MAX_TOKENS_OVERRIDE_KEY: &str =
+    "behavior-editor:thread:max-tokens:override";
+const BEHAVIOR_EDITOR_THREAD_MAX_TOKENS_KEY: &str = "behavior-editor:thread:max-tokens";
+const BEHAVIOR_EDITOR_THREAD_MAX_TURNS_OVERRIDE_KEY: &str =
+    "behavior-editor:thread:max-turns:override";
+const BEHAVIOR_EDITOR_THREAD_MAX_TURNS_KEY: &str = "behavior-editor:thread:max-turns";
 
 fn behavior_row_key(pod_id: &str, behavior_id: &str) -> String {
     format!("{BEHAVIOR_ROW_PREFIX}{pod_id}:{behavior_id}")
@@ -4201,7 +4248,11 @@ impl ChatApp {
         }
 
         // Overlap / catch_up pickers — Cron and Webhook share Overlap.
-        for which in [BehaviorEditorPicker::Overlap, BehaviorEditorPicker::CatchUp] {
+        for which in [
+            BehaviorEditorPicker::Overlap,
+            BehaviorEditorPicker::CatchUp,
+            BehaviorEditorPicker::ThreadModel,
+        ] {
             if let Some(action) = classify_select_event(event, which.key()) {
                 self.handle_behavior_editor_picker(which, action);
                 return true;
@@ -4282,6 +4333,95 @@ impl ChatApp {
                 editor.error = None;
             }
             return true;
+        }
+
+        // Thread-tab override-checkbox toggles. Each click flips the
+        // matching `Option<...>` field on `cfg.thread`. Defaults
+        // when transitioning to `Some` mirror the egui sibling's
+        // pre-fill values (16384 tokens, 30 turns).
+        if event.is_click_or_activate(BEHAVIOR_EDITOR_THREAD_MODEL_OVERRIDE_KEY) {
+            if let Some(editor) = self.behavior_editor.as_mut()
+                && let Some(cfg) = editor.working_config.as_mut()
+            {
+                cfg.thread.model = if cfg.thread.model.is_some() {
+                    None
+                } else {
+                    Some(String::new())
+                };
+                editor.error = None;
+            }
+            return true;
+        }
+        if event.is_click_or_activate(BEHAVIOR_EDITOR_THREAD_MAX_TOKENS_OVERRIDE_KEY) {
+            if let Some(editor) = self.behavior_editor.as_mut()
+                && let Some(cfg) = editor.working_config.as_mut()
+            {
+                if cfg.thread.max_tokens.is_some() {
+                    cfg.thread.max_tokens = None;
+                    editor.thread_max_tokens_buf.clear();
+                } else {
+                    cfg.thread.max_tokens = Some(16384);
+                    editor.thread_max_tokens_buf = "16384".to_string();
+                }
+                editor.error = None;
+            }
+            return true;
+        }
+        if event.is_click_or_activate(BEHAVIOR_EDITOR_THREAD_MAX_TURNS_OVERRIDE_KEY) {
+            if let Some(editor) = self.behavior_editor.as_mut()
+                && let Some(cfg) = editor.working_config.as_mut()
+            {
+                if cfg.thread.max_turns.is_some() {
+                    cfg.thread.max_turns = None;
+                    editor.thread_max_turns_buf.clear();
+                } else {
+                    cfg.thread.max_turns = Some(30);
+                    editor.thread_max_turns_buf = "30".to_string();
+                }
+                editor.error = None;
+            }
+            return true;
+        }
+
+        // Thread-tab numeric inputs (max_tokens / max_turns). Same
+        // buffer-then-parse-back pattern as the pod editor's
+        // Defaults numeric inputs.
+        if let Some(editor) = self.behavior_editor.as_mut() {
+            let max_tokens_opts = NumericInputOpts::default()
+                .min(1.0)
+                .max(200_000.0)
+                .step(50.0);
+            if numeric_input::apply_event(
+                &mut editor.thread_max_tokens_buf,
+                &mut self.selection,
+                BEHAVIOR_EDITOR_THREAD_MAX_TOKENS_KEY,
+                &max_tokens_opts,
+                event,
+            ) {
+                if let Ok(v) = editor.thread_max_tokens_buf.parse::<u32>()
+                    && let Some(cfg) = editor.working_config.as_mut()
+                {
+                    cfg.thread.max_tokens = Some(v.clamp(1, 200_000));
+                }
+                editor.error = None;
+                return true;
+            }
+            let max_turns_opts = NumericInputOpts::default().min(1.0).max(10_000.0).step(1.0);
+            if numeric_input::apply_event(
+                &mut editor.thread_max_turns_buf,
+                &mut self.selection,
+                BEHAVIOR_EDITOR_THREAD_MAX_TURNS_KEY,
+                &max_turns_opts,
+                event,
+            ) {
+                if let Ok(v) = editor.thread_max_turns_buf.parse::<u32>()
+                    && let Some(cfg) = editor.working_config.as_mut()
+                {
+                    cfg.thread.max_turns = Some(v.clamp(1, 10_000));
+                }
+                editor.error = None;
+                return true;
+            }
         }
 
         // Cron / timezone preset chips. The route's suffix is the
@@ -4366,6 +4506,11 @@ impl ChatApp {
                                 editor.catch_up_buffer = v;
                             }
                         }
+                        BehaviorEditorPicker::ThreadModel => {
+                            if let Some(cfg) = editor.working_config.as_mut() {
+                                cfg.thread.model = Some(value);
+                            }
+                        }
                     }
                     editor.open_picker = None;
                     editor.error = None;
@@ -4399,6 +4544,33 @@ impl ChatApp {
                         (lbl.to_string(), lbl.to_string())
                     })
                     .collect();
+                select_menu(which.key(), options)
+            }
+            BehaviorEditorPicker::ThreadModel => {
+                // Model menu options come from
+                // `models_by_backend[bindings.backend]` when the
+                // override is set. Empty fallback ⇒ a single
+                // "(no models)" sentinel so the popover isn't blank.
+                let mut options: Vec<(String, String)> = Vec::new();
+                if let Some(editor) = self.behavior_editor.as_ref()
+                    && let Some(cfg) = editor.working_config.as_ref()
+                {
+                    let backend = cfg
+                        .thread
+                        .bindings
+                        .backend
+                        .as_deref()
+                        .filter(|s| !s.is_empty())
+                        .unwrap_or("");
+                    if let Some(models) = self.models_by_backend.get(backend) {
+                        for m in models {
+                            options.push((m.id.clone(), m.id.clone()));
+                        }
+                    }
+                }
+                if options.is_empty() {
+                    options.push((String::new(), "(no models)".to_string()));
+                }
                 select_menu(which.key(), options)
             }
         }
@@ -4755,11 +4927,7 @@ impl ChatApp {
             Some(cfg) => match editor.tab {
                 BehaviorEditorTab::Trigger => self.render_behavior_editor_trigger_tab(editor, cfg),
                 BehaviorEditorTab::Prompt => self.render_behavior_editor_prompt_tab(editor),
-                BehaviorEditorTab::Thread => paragraph(
-                    "Thread tab — coming soon. Edit thread overrides via the \
-                     Raw TOML once that tab lands.",
-                )
-                .muted(),
+                BehaviorEditorTab::Thread => self.render_behavior_editor_thread_tab(editor, cfg),
                 BehaviorEditorTab::Scope => paragraph(
                     "Scope tab — coming soon. Cap and tool-gate narrowing \
                      ride through unchanged on save.",
@@ -5086,6 +5254,146 @@ impl ChatApp {
                  substituted with the trigger's payload at fire time.",
             ),
         ])])
+    }
+
+    /// Thread tab body. Scalar-override knobs on
+    /// `BehaviorThreadOverride`: `model`, `max_tokens`, `max_turns`.
+    /// Each row is a `[checkbox, control-or-inherit-hint]` pair —
+    /// checking the override flips `Some(default) ↔ None`. The
+    /// bindings sub-struct (backend / host_env / mcp_hosts) is
+    /// deferred to a follow-up sub-slice so this commit stays focused
+    /// on scalars.
+    fn render_behavior_editor_thread_tab(
+        &self,
+        editor: &BehaviorEditorSheetState,
+        cfg: &BehaviorConfig,
+    ) -> El {
+        // Effective backend for the model picker. The pod's effective
+        // backend (its `thread_defaults.backend`) lives in the pod's
+        // full config, not the summary — the bindings sub-slice that
+        // wires `bindings.backend` will also wire that lookup. For
+        // now: prefer the binding override when set; otherwise leave
+        // empty and let the model menu render "(no models)".
+        let effective_backend = cfg
+            .thread
+            .bindings
+            .backend
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .unwrap_or("");
+
+        // Model row.
+        let model_override = cfg.thread.model.is_some();
+        let model_value: El = if let Some(model) = cfg.thread.model.as_ref() {
+            let label = if model.is_empty() {
+                "(none)".to_string()
+            } else {
+                model.clone()
+            };
+            select_trigger(BEHAVIOR_EDITOR_THREAD_MODEL_KEY, label)
+        } else {
+            paragraph("(inherit pod default)").muted().small()
+        };
+        let model_row = row([
+            checkbox(model_override).key(BEHAVIOR_EDITOR_THREAD_MODEL_OVERRIDE_KEY),
+            text("override").muted().small(),
+            model_value,
+        ])
+        .gap(tokens::SPACE_2)
+        .align(Align::Center)
+        .width(Size::Fill(1.0));
+
+        // Numeric override row helper inlined twice — splitting it
+        // out into a method would carry a bag of arguments (label,
+        // override_key, value_key, buf, opts) and only buy a small
+        // dedup, so keep it inline here.
+        let max_tokens_override = cfg.thread.max_tokens.is_some();
+        let max_tokens_value: El = if max_tokens_override {
+            numeric_input(
+                &editor.thread_max_tokens_buf,
+                &self.selection,
+                BEHAVIOR_EDITOR_THREAD_MAX_TOKENS_KEY,
+                NumericInputOpts::default()
+                    .min(1.0)
+                    .max(200_000.0)
+                    .step(50.0),
+            )
+        } else {
+            paragraph("(inherit pod default)").muted().small()
+        };
+        let max_tokens_row = row([
+            checkbox(max_tokens_override).key(BEHAVIOR_EDITOR_THREAD_MAX_TOKENS_OVERRIDE_KEY),
+            text("override").muted().small(),
+            max_tokens_value,
+        ])
+        .gap(tokens::SPACE_2)
+        .align(Align::Center)
+        .width(Size::Fill(1.0));
+
+        let max_turns_override = cfg.thread.max_turns.is_some();
+        let max_turns_value: El = if max_turns_override {
+            numeric_input(
+                &editor.thread_max_turns_buf,
+                &self.selection,
+                BEHAVIOR_EDITOR_THREAD_MAX_TURNS_KEY,
+                NumericInputOpts::default().min(1.0).max(10_000.0).step(1.0),
+            )
+        } else {
+            paragraph("(inherit pod default)").muted().small()
+        };
+        let max_turns_row = row([
+            checkbox(max_turns_override).key(BEHAVIOR_EDITOR_THREAD_MAX_TURNS_OVERRIDE_KEY),
+            text("override").muted().small(),
+            max_turns_value,
+        ])
+        .gap(tokens::SPACE_2)
+        .align(Align::Center)
+        .width(Size::Fill(1.0));
+
+        let backend_hint = format!(
+            "Effective backend for the model picker: `{}`. Override via the \
+             bindings sub-slice (coming next).",
+            if effective_backend.is_empty() {
+                "(none — pick a backend on the bindings sub-slice once it lands)"
+            } else {
+                effective_backend
+            }
+        );
+
+        form([
+            form_item([
+                form_label("model"),
+                form_control(model_row),
+                form_description(backend_hint),
+            ]),
+            form_item([
+                form_label("max tokens"),
+                form_control(max_tokens_row),
+                form_description(
+                    "Per-response output cap for the spawned thread. Inherits \
+                     `thread_defaults.max_tokens` when off.",
+                ),
+            ]),
+            form_item([
+                form_label("max turns"),
+                form_control(max_turns_row),
+                form_description(
+                    "Per-cycle assistant-turn cap for the spawned thread. \
+                     Inherits `thread_defaults.max_turns` when off.",
+                ),
+            ]),
+            form_item([
+                form_label("bindings"),
+                form_control(
+                    paragraph(
+                        "backend / host_env / mcp_host overrides land in the \
+                         next sub-slice.",
+                    )
+                    .muted()
+                    .small(),
+                ),
+            ]),
+        ])
     }
 
     /// `select_menu` for the behavior editor's trigger-kind picker.

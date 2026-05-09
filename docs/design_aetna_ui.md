@@ -690,9 +690,34 @@ the preview wall-clock-dependent — fine for rendering, makes
 bundle outputs non-deterministic across runs (they're not
 committed, so no churn).
 
+**Behavior editor — Thread tab scalar overrides (landed):**
+ports the egui sibling's `render_behavior_editor_thread_tab`'s
+"Thread overrides" section. Each scalar field on
+`BehaviorThreadOverride` (`model`, `max_tokens`, `max_turns`)
+becomes a `[checkbox, override-label, control]` row — the
+checkbox flips `Some/None`, the control is a `select_trigger`
+or `numeric_input` when on, a muted `(inherit pod default)`
+paragraph when off. Default-on values match the egui pre-fill
+(empty model string, 16384 tokens, 30 turns).
+
+`BehaviorEditorSheetState` grew `thread_max_tokens_buf` /
+`thread_max_turns_buf` (same buffer-then-parse-back pattern as
+the pod editor's Defaults numeric inputs);
+`sync_thread_buffers_from_config` seeds them at hydrate.
+`BehaviorEditorPicker::ThreadModel` joins the picker family;
+its menu reads from
+`models_by_backend[bindings.backend.unwrap_or("")]` (the
+binding sub-slice will fix the backend lookup against the
+pod's effective default).
+
+The bindings sub-struct (`backend` / `host_env` / `mcp_hosts`)
+is deferred to its own sub-slice — they share the
+override-checkbox shape but each carries its own catalog
+lookup, and folding them into this commit doubled its size.
+
 Deferred to follow-up sheet slices:
-- **Thread bindings tab** — backend / model / host_env /
-  mcp_host overrides on `BehaviorThreadOverride`.
+- **Thread bindings sub-slice** — backend / host_env /
+  mcp_host overrides on `BehaviorThreadOverride.bindings`.
 - **Scope tab** — per-behavior allow narrowing.
 - **Retention tab** — `RetentionPolicy::ArchiveAfterDays /
   DeleteAfterDays` controls.
