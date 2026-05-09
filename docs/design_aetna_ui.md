@@ -442,7 +442,7 @@ Also still deferred:
 - inline images in `ContentBlock::ToolResult` bodies (today
   collapsed via `tool_result_text_summary`'s text-only extractor)
 
-### ⏳ Stage 8 — Modals
+### 🌗 Stage 8 — Modals (in flight)
 
 `dialog` is the widget. The egui sibling has 8 modals, each a few
 hundred lines:
@@ -451,9 +451,51 @@ hundred lines:
 - behavior editor (with cron preview)
 - new behavior
 - pod editor (raw TOML)
-- new pod
+- ✅ new pod
 - fork thread
 - file / JSON / image viewers
+
+**Pattern landed with the `+ New pod` modal:**
+
+- Per-modal state struct (`NewPodModalState`) wrapped in
+  `Option<…>` on `ChatApp` — `Some` while open, `None` while
+  closed; opening twice resets the form (matches the user's
+  intent of "start over").
+- Routed-key prefix (`new-pod:…`) covering scrim dismiss, the
+  text inputs, and the primary / cancel buttons. The dialog's
+  scrim auto-emits `{prefix}:dismiss` so we don't have to wire
+  it explicitly.
+- `correlation_id`-based wire round-trip: the modal stamps a
+  monotonic id on `CreatePod` and stays open with a disabled
+  primary button until either `PodCreated` (close + switch tab
+  to the new pod) or `Error { correlation_id }` (re-enable +
+  surface `message`). Match by id, not pod_id, so an unrelated
+  echo from another client can't accidentally close the modal.
+- Dialog body composes shadcn-shaped primitives: `dialog_header`
+  (title + description) → `form` (two `form_item`s, each
+  label / control / description) → optional `alert` blocks
+  (server warning, validation error) → `dialog_footer`
+  (cancel + create).
+- Renderer hangs off `popover_layers()` so it overlays whatever
+  surface was underneath without restructuring the chat content.
+
+Validation lives client-side (`validate_pod_id_client`,
+empty-fields and duplicate-id checks); the server runs the same
+checks plus a few more during `CreatePod` and any rejection
+echoes back through the `Error` path. `fresh_pod_config` is
+deliberately the lighter of the two egui paths — it only knows
+about `backends`, not the default-pod TOML template — so it
+lands a working pod the user can edit afterwards. A
+`GetPod`-based default-template clone is a follow-up.
+
+The remaining 7 modals slot into this scaffolding pattern. Two
+in particular extend it meaningfully:
+- The behavior editor adds non-trivial form state (cron
+  schedule, prompt) and likely benefits from a separate
+  `text_area` for the prompt body.
+- The pod editor / file viewer want a sheet rather than a
+  centered dialog (they're document-shaped, not form-shaped) —
+  `sheet` widget is in the prelude already.
 
 ### ✅ Stage 9 — Login form
 

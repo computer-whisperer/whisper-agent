@@ -39,8 +39,9 @@ use std::rc::Rc;
 use aetna_core::prelude::*;
 use aetna_core::widgets::select::{SelectAction, classify_event as classify_select_event};
 use whisper_agent_protocol::{
-    BackendSummary, BehaviorSummary, ClientToServer, ContentBlock, ImageSource, ModelSummary,
-    PodSummary, Role, ServerToClient, ThreadConfigOverride, ThreadSummary,
+    AllowMap, BackendSummary, BehaviorSummary, ClientToServer, ContentBlock, ImageSource,
+    ModelSummary, NamedHostEnv, PodAllow, PodConfig, PodLimits, PodSummary, Role, ServerToClient,
+    ThreadConfigOverride, ThreadDefaults, ThreadSummary,
 };
 
 /// Inbound event variants the host shell pushes into the [`Inbound`]
@@ -326,6 +327,40 @@ pub struct ChatApp {
     /// server's `compose_pod_id` default.
     picker_pod: Option<String>,
     picker_pod_open: bool,
+
+    // ----- modals -----
+    /// "+ New pod" dialog state. `Some` while the modal is open;
+    /// `None` when no creation is in flight or no modal is rendered.
+    /// Shape mirrors the egui sibling's `NewPodModalState` — id +
+    /// display name, plus a client-side error slot for fast-fail
+    /// validation feedback.
+    new_pod_modal: Option<NewPodModalState>,
+    /// Monotonic counter for outgoing `correlation_id` strings.
+    /// Each modal that sends a request claims an id and waits for
+    /// the matching reply (success or `Error`) before closing or
+    /// surfacing an error. Counter-based (not UUID) since the wire
+    /// only needs uniqueness within this client session.
+    correlation_counter: u64,
+}
+
+/// Form state for the "+ New pod" modal. Held inside an `Option` on
+/// [`ChatApp`] — `Some` while the dialog is open. Reuses the egui
+/// sibling's two-field shape (directory id + display name) plus a
+/// `pending_correlation` slot so the close happens on the matching
+/// `PodCreated` echo (rather than optimistically on click) and a
+/// server-side `Error` reply lands in the same `error` field a
+/// client-side validation failure does.
+#[derive(Default)]
+pub(crate) struct NewPodModalState {
+    pub(crate) pod_id: String,
+    pub(crate) name: String,
+    /// Client- or server-side validation message. `None` while the
+    /// form is unvalidated or has been edited since the last failure.
+    pub(crate) error: Option<String>,
+    /// Correlation id of the outstanding `CreatePod` request, if any.
+    /// `Some` ⇒ the Create button is disabled (request in flight).
+    /// Cleared on `PodCreated` (close) or `Error` (re-enable + error).
+    pub(crate) pending_correlation: Option<String>,
 }
 
 impl ChatApp {
@@ -361,7 +396,17 @@ impl ChatApp {
             picker_model_open: false,
             picker_pod: None,
             picker_pod_open: false,
+            new_pod_modal: None,
+            correlation_counter: 0,
         }
+    }
+
+    /// Allocate the next correlation id. Counter-based string suffices
+    /// for matching modal pendings — only this session's client
+    /// generates these, and a u64 won't wrap in any realistic session.
+    fn next_correlation_id(&mut self) -> String {
+        self.correlation_counter += 1;
+        format!("aui-{}", self.correlation_counter)
     }
 
     fn send(&self, msg: ClientToServer) {
@@ -455,13 +500,33 @@ impl ChatApp {
                     self.ensure_behaviors_requested(&pod_id);
                 }
             }
-            ServerToClient::PodCreated { pod, .. } => {
+            ServerToClient::PodCreated {
+                pod,
+                correlation_id,
+            } => {
                 let new_pod_id = pod.pod_id.clone();
                 self.pods.insert(new_pod_id.clone(), pod);
                 if self.pod_tab.is_none() {
                     self.pod_tab = self.pick_default_pod_tab();
                 }
                 self.ensure_behaviors_requested(&new_pod_id);
+
+                // Close the new-pod modal if its outstanding request
+                // just got echoed back. Match by correlation rather
+                // than by pod_id so an unrelated `PodCreated` (from
+                // another client, or a webhook) can't accidentally
+                // close a modal the user is still working in.
+                if let Some(modal) = self.new_pod_modal.as_ref()
+                    && let Some(pending) = modal.pending_correlation.as_ref()
+                    && correlation_id.as_ref() == Some(pending)
+                {
+                    self.new_pod_modal = None;
+                    // Switch the active tab to the freshly-created
+                    // pod — the user just made it, that's almost
+                    // certainly where they want to land. Mirrors the
+                    // egui sibling's behavior.
+                    self.pod_tab = Some(new_pod_id);
+                }
             }
             ServerToClient::BehaviorList {
                 pod_id, behaviors, ..
@@ -837,6 +902,23 @@ impl ChatApp {
             | ServerToClient::ThreadAssistantEnd { .. }
             | ServerToClient::ThreadLoopComplete { .. }
             | ServerToClient::ThreadCompacted { .. } => {}
+            ServerToClient::Error {
+                correlation_id,
+                message,
+                ..
+            } => {
+                // Route the error to whichever modal claimed the
+                // matching correlation. Today only the "+ New pod"
+                // modal is a candidate; future modals will extend
+                // this dispatch the same way.
+                if let Some(corr) = correlation_id.as_ref()
+                    && let Some(modal) = self.new_pod_modal.as_mut()
+                    && modal.pending_correlation.as_ref() == Some(corr)
+                {
+                    modal.error = Some(message);
+                    modal.pending_correlation = None;
+                }
+            }
             // Catalog tiers we don't yet surface. Quietly accepted so
             // the server's normal broadcast batch doesn't error here.
             _ => {}
@@ -905,6 +987,23 @@ impl App for ChatApp {
         if event.is_click_or_activate(SIDEBAR_NEW_THREAD_KEY) {
             self.selected = None;
             self.picker_pod = self.pod_tab.clone();
+            return;
+        }
+
+        // "+ New pod" entry point: open the modal with empty fields.
+        // Idempotent — clicking twice while open just resets the
+        // form, which matches what the user means by "I want to
+        // start over".
+        if event.is_click_or_activate(SIDEBAR_NEW_POD_KEY) {
+            self.new_pod_modal = Some(NewPodModalState::default());
+            return;
+        }
+
+        // "+ New pod" modal routing — text inputs, primary / cancel
+        // buttons, and the scrim's auto-emitted dismiss key. Walking
+        // the routes top-down (cheapest checks first) before falling
+        // through to the rest of the on_event body.
+        if self.handle_new_pod_modal_event(&event) {
             return;
         }
 
@@ -1109,6 +1208,17 @@ const SIDEBAR_THREAD_PREVIEW: usize = 10;
 /// pod in the new-thread compose form's pod picker so the user lands
 /// on a compose pane already scoped to where they're working.
 const SIDEBAR_NEW_THREAD_KEY: &str = "sidebar:new-thread";
+
+/// Routed key for the sidebar's "+ New pod" entry point, sitting in
+/// the sidebar header next to the connection badge. Click opens the
+/// `NEW_POD_MODAL_KEY`-keyed dialog.
+const SIDEBAR_NEW_POD_KEY: &str = "sidebar:new-pod";
+
+/// Routed-key prefix the "+ New pod" dialog uses. Extended forms:
+/// `{prefix}:dismiss` (scrim, emitted by `dialog`),
+/// `{prefix}:pod-id` (text_input), `{prefix}:name` (text_input),
+/// `{prefix}:create` (primary submit), `{prefix}:cancel` (secondary).
+const NEW_POD_MODAL_KEY: &str = "new-pod";
 
 /// Routed-key prefix for behavior rows in the sidebar (the
 /// expandable "show this behavior's runs" toggle). Children of this
@@ -1386,8 +1496,26 @@ impl ChatApp {
         // egui sibling's pod-as-collapsible-section idiom doesn't
         // scale when one pod dominates and the others are empty —
         // tabs put the focus on the workspace the user is in.
+        // Sidebar header: title fills available width, "+" entry
+        // point for new pods sits inline before the connection
+        // badge so both pieces of chrome cluster on the right edge.
+        // The "+" is the global pod-creation affordance — it's
+        // pod-tab-agnostic (the threads-section "+" is per-pod), so
+        // putting it in the sidebar header keeps the two scopes
+        // visually distinct.
         let mut entries: Vec<El> = vec![sidebar_header([row([
-            text("whisper-agent").title().width(Size::Fill(1.0)),
+            // Title eats the slack and ellipses if the right-hand
+            // chrome grows past the remaining width (e.g. the wider
+            // "connecting…" badge during early connect). The app
+            // name is fixed and contextual; clipping it is fine.
+            text("whisper-agent")
+                .title()
+                .ellipsis()
+                .width(Size::Fill(1.0)),
+            icon_button("plus")
+                .key(SIDEBAR_NEW_POD_KEY)
+                .ghost()
+                .icon_size(tokens::ICON_XS),
             self.connection_badge(),
         ])
         .align(Align::Center)
@@ -2072,7 +2200,211 @@ impl ChatApp {
         if self.picker_pod_open {
             out.push(Some(self.pod_menu()));
         }
+        // Modals layer last so they paint above the picker
+        // popovers — though in practice the two are mutually
+        // exclusive on screen, the layering choice is harmless.
+        if let Some(modal_el) = self.render_new_pod_modal() {
+            out.push(Some(modal_el));
+        }
         out
+    }
+
+    /// Routing for the "+ New pod" modal. Returns `true` when the
+    /// event was consumed so the outer `on_event` can `return` and
+    /// avoid double-handling. All routes live under the
+    /// [`NEW_POD_MODAL_KEY`] prefix — bail early if the modal is
+    /// closed (its routed events are nonsensical without state).
+    fn handle_new_pod_modal_event(&mut self, event: &UiEvent) -> bool {
+        if self.new_pod_modal.is_none() {
+            return false;
+        }
+        let pod_id_key = format!("{NEW_POD_MODAL_KEY}:pod-id");
+        let name_key = format!("{NEW_POD_MODAL_KEY}:name");
+        let create_key = format!("{NEW_POD_MODAL_KEY}:create");
+        let cancel_key = format!("{NEW_POD_MODAL_KEY}:cancel");
+        let dismiss_key = format!("{NEW_POD_MODAL_KEY}:dismiss");
+
+        // Text inputs go through `text_input::apply_event` so cursor
+        // updates / IME / paste behavior matches every other text
+        // input in the app.
+        if event.target_key() == Some(pod_id_key.as_str()) {
+            if let Some(modal) = self.new_pod_modal.as_mut() {
+                text_input::apply_event(&mut modal.pod_id, &mut self.selection, &pod_id_key, event);
+                // Edits clear stale errors so the form doesn't keep
+                // showing a previous validation message after the
+                // user starts fixing it.
+                modal.error = None;
+            }
+            return true;
+        }
+        if event.target_key() == Some(name_key.as_str()) {
+            if let Some(modal) = self.new_pod_modal.as_mut() {
+                text_input::apply_event(&mut modal.name, &mut self.selection, &name_key, event);
+                modal.error = None;
+            }
+            return true;
+        }
+
+        // Cancel + scrim-dismiss: drop the modal entirely. State is
+        // ephemeral — the next open starts fresh.
+        if event.is_click_or_activate(&cancel_key) || event.is_click_or_activate(&dismiss_key) {
+            self.new_pod_modal = None;
+            return true;
+        }
+
+        // Create: client-validate, then send `CreatePod` with a
+        // correlation id so we can match the server's reply. We do
+        // not optimistically close — the modal stays up with a
+        // disabled button until `PodCreated` (close) or `Error`
+        // (re-enable + error message) lands.
+        if event.is_click_or_activate(&create_key) {
+            self.submit_new_pod_modal();
+            return true;
+        }
+
+        false
+    }
+
+    /// Validate + dispatch the "+ New pod" form. Bails early on
+    /// client-side failures (empty fields, illegal id chars,
+    /// duplicate id, no backends) by setting `modal.error`. On
+    /// success, allocates a correlation id, stamps it onto the
+    /// modal, and sends `CreatePod` — keeping the modal open and
+    /// disabled until the wire round-trip finishes.
+    fn submit_new_pod_modal(&mut self) {
+        let Some(modal) = self.new_pod_modal.as_ref() else {
+            return;
+        };
+        // Already in flight — guard against a stray double-click
+        // racing past the `disabled()` styling.
+        if modal.pending_correlation.is_some() {
+            return;
+        }
+        let pod_id = modal.pod_id.trim().to_string();
+        let name = modal.name.trim().to_string();
+        if let Err(msg) = validate_pod_id_client(&pod_id) {
+            self.set_new_pod_error(msg.to_string());
+            return;
+        }
+        if self.pods.contains_key(&pod_id) {
+            self.set_new_pod_error(format!("pod `{pod_id}` already exists"));
+            return;
+        }
+        if self.backends.is_empty() {
+            self.set_new_pod_error("no backends configured on the server".into());
+            return;
+        }
+
+        let backend_names: Vec<String> = self.backends.iter().map(|b| b.name.clone()).collect();
+        let config = fresh_pod_config(name, backend_names);
+        let correlation_id = self.next_correlation_id();
+        if let Some(modal) = self.new_pod_modal.as_mut() {
+            modal.pending_correlation = Some(correlation_id.clone());
+            modal.error = None;
+        }
+        self.send(ClientToServer::CreatePod {
+            correlation_id: Some(correlation_id),
+            pod_id,
+            config,
+        });
+    }
+
+    /// Helper: surface a client-side validation message without
+    /// touching `pending_correlation` (these failures don't go to
+    /// the wire so there's no in-flight request to track).
+    fn set_new_pod_error(&mut self, msg: String) {
+        if let Some(modal) = self.new_pod_modal.as_mut() {
+            modal.error = Some(msg);
+        }
+    }
+
+    /// Render the "+ New pod" dialog if its modal state is open.
+    /// Children pass through `dialog` directly as siblings — the
+    /// shadcn-shaped `dialog_header` / `dialog_footer` are just
+    /// styled column / row wrappers, the body items in between
+    /// (form, alerts) inherit `dialog_content`'s default gap.
+    fn render_new_pod_modal(&self) -> Option<El> {
+        let modal = self.new_pod_modal.as_ref()?;
+
+        let pod_id_key = format!("{NEW_POD_MODAL_KEY}:pod-id");
+        let name_key = format!("{NEW_POD_MODAL_KEY}:name");
+        let create_key = format!("{NEW_POD_MODAL_KEY}:create");
+        let cancel_key = format!("{NEW_POD_MODAL_KEY}:cancel");
+
+        let pod_id_input = text_input(&modal.pod_id, &self.selection, &pod_id_key);
+        let name_input = text_input(&modal.name, &self.selection, &name_key);
+
+        let backends_empty = self.backends.is_empty();
+        let pending = modal.pending_correlation.is_some();
+        // Mirror the egui sibling's enable rule: both fields trimmed
+        // non-empty, at least one backend known (so `fresh_pod_config`
+        // produces a usable thread_defaults.backend), and no request
+        // already in flight.
+        let create_enabled = !modal.pod_id.trim().is_empty()
+            && !modal.name.trim().is_empty()
+            && !backends_empty
+            && !pending;
+
+        let mut create = button(if pending { "Creating…" } else { "Create" })
+            .key(&create_key)
+            .primary();
+        if !create_enabled {
+            create = create.disabled();
+        }
+        let cancel = button("Cancel").key(&cancel_key);
+
+        let mut children: Vec<El> = vec![
+            dialog_header([
+                dialog_title("New pod"),
+                dialog_description(
+                    "The new pod starts with the configured backends, an \
+                     empty MCP allow-list, and the default tool surface. \
+                     Use the (eventual) pod editor to add MCPs / host \
+                     envs / tool overrides afterwards.",
+                ),
+            ]),
+            form([
+                form_item([
+                    form_label("pod_id"),
+                    form_control(pod_id_input),
+                    form_description(
+                        "Becomes the pod's directory name on disk; immutable \
+                         after creation. Letters, numbers, dashes, underscores.",
+                    ),
+                ]),
+                form_item([
+                    form_label("name"),
+                    form_control(name_input),
+                    form_description("Display name (free text)."),
+                ]),
+            ]),
+        ];
+
+        if backends_empty {
+            children.push(
+                alert([
+                    alert_title("no backends configured"),
+                    alert_description(
+                        "Add at least one backend on the server before creating a pod — \
+                         the new pod's `thread_defaults.backend` would be empty otherwise.",
+                    ),
+                ])
+                .warning(),
+            );
+        }
+        if let Some(err) = modal.error.as_deref() {
+            children.push(
+                alert([
+                    alert_title("couldn't create pod"),
+                    alert_description(err.to_string()),
+                ])
+                .destructive(),
+            );
+        }
+
+        children.push(dialog_footer([cancel, create]));
+
+        Some(dialog(NEW_POD_MODAL_KEY, children))
     }
 
     fn backend_menu(&self) -> El {
@@ -2207,6 +2539,66 @@ fn state_label(state: whisper_agent_protocol::ThreadStateLabel) -> &'static str 
 
 /// Format an RFC3339 timestamp as a compact relative duration:
 /// `"12m"`, `"3h"`, `"1d"`, `"2w"`, `"5mo"`, `"2y"`. Mirrors the
+/// Client-side pre-flight check on a pod_id about to be sent to
+/// `CreatePod`. The server runs the same checks (and a few more)
+/// before writing to disk, but rejecting locally lets us surface a
+/// hint inline without a wire round-trip. Mirrors the egui sibling's
+/// `validate_pod_id_client`.
+fn validate_pod_id_client(id: &str) -> Result<(), &'static str> {
+    if id.is_empty() {
+        return Err("pod_id is empty");
+    }
+    if id.starts_with('.') {
+        return Err("pod_id may not start with '.'");
+    }
+    if id.contains('/') || id.contains('\\') || id.contains('\0') || id == ".." {
+        return Err("pod_id contains illegal characters");
+    }
+    Ok(())
+}
+
+/// Build a minimal `PodConfig` from the user's display name plus the
+/// known backends. Lighter than the egui sibling's
+/// `fresh_pod_config` — that path also clones the server-default
+/// pod's template (system prompt, allowed MCPs, host envs) which we
+/// haven't wired the `GetPod` round-trip for yet. The user can
+/// edit any of these afterwards via the (eventual) pod editor; for
+/// now this is enough to land a working pod the server will accept.
+///
+/// `backend_names` should be the full list of configured backends —
+/// the new pod is allowed to use any of them. The first by sort
+/// order becomes the `thread_defaults.backend`.
+fn fresh_pod_config(name: String, mut backend_names: Vec<String>) -> PodConfig {
+    backend_names.sort();
+    let default_backend = backend_names.first().cloned().unwrap_or_default();
+    PodConfig {
+        name,
+        description: None,
+        created_at: String::new(),
+        allow: PodAllow {
+            backends: backend_names,
+            mcp_hosts: Vec::new(),
+            host_env: Vec::<NamedHostEnv>::new(),
+            knowledge_buckets: Vec::new(),
+            tools: AllowMap::allow_all(),
+            caps: Default::default(),
+        },
+        thread_defaults: ThreadDefaults {
+            backend: default_backend,
+            model: String::new(),
+            system_prompt_file: "system_prompt.md".into(),
+            max_tokens: 16384,
+            max_turns: 30,
+            host_env: Vec::new(),
+            mcp_hosts: Vec::new(),
+            compaction: Default::default(),
+            caps: Default::default(),
+            tool_surface: Default::default(),
+        },
+        limits: PodLimits::default(),
+    }
+}
+
 /// egui sibling's `format_relative_time`. Returns `"just now"` for
 /// sub-minute deltas and `""` for parse failures (callers can drop
 /// the row's secondary line entirely if they care).

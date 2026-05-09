@@ -155,10 +155,23 @@ enum Scene {
     /// targets `behavior-row:default:architect` to toggle the
     /// architect row open.
     SidebarBehaviorsExpanded,
+    /// "+ New pod" modal opened straight from the sidebar header
+    /// with no fields filled. Verifies the dialog scaffolding —
+    /// scrim + content panel + form + cancel/create footer — paints
+    /// over the populated chat surface and that Create renders
+    /// disabled with empty inputs.
+    NewPodModalEmpty,
+    /// Same modal, but with `BackendsList { backends: [] }` seeded
+    /// so the "no backends configured" warning alert renders
+    /// inside the dialog body. Create stays disabled. (Filled-form
+    /// state isn't dumped — synthesizing `UiEventKind::TextInput`
+    /// requires fabricating the `#[non_exhaustive]` `UiTarget`,
+    /// which isn't worth a public test seam.)
+    NewPodModalNoBackends,
 }
 
 impl Scene {
-    const ALL: [Scene; 21] = [
+    const ALL: [Scene; 23] = [
         Scene::Connecting,
         Scene::Connected,
         Scene::Closed,
@@ -180,6 +193,8 @@ impl Scene {
         Scene::SidebarManyThreads,
         Scene::SidebarBehaviors,
         Scene::SidebarBehaviorsExpanded,
+        Scene::NewPodModalEmpty,
+        Scene::NewPodModalNoBackends,
     ];
 
     fn slug(self) -> &'static str {
@@ -205,6 +220,8 @@ impl Scene {
             Scene::SidebarManyThreads => "sidebar_many_threads",
             Scene::SidebarBehaviors => "sidebar_behaviors",
             Scene::SidebarBehaviorsExpanded => "sidebar_behaviors_expanded",
+            Scene::NewPodModalEmpty => "new_pod_modal_empty",
+            Scene::NewPodModalNoBackends => "new_pod_modal_no_backends",
         }
     }
 
@@ -225,6 +242,10 @@ impl Scene {
             // One toggle click on the backend trigger leaves the menu
             // open — render captures the popover.
             Scene::NewThreadFormBackendOpen => vec!["picker:backend"],
+            // Open the "+ New pod" dialog by clicking the sidebar
+            // header's plus button. Same click path the live UI
+            // takes — the modal then renders as an overlay layer.
+            Scene::NewPodModalEmpty | Scene::NewPodModalNoBackends => vec!["sidebar:new-pod"],
             // Pick a backend (which fires a no-op `ListModels`),
             // then a model id from the pre-seeded `ModelsList`,
             // then a pod. Each `option:` click goes through
@@ -402,6 +423,35 @@ fn build_app(scene: Scene) -> Box<dyn App> {
                     models: mock_models(),
                 }));
             }
+        }
+        Scene::NewPodModalEmpty | Scene::NewPodModalNoBackends => {
+            // Populated baseline so the dialog overlays a non-empty
+            // surface (catches any clipping / blend issues that an
+            // empty viewport would hide). The synthetic click on
+            // `sidebar:new-pod` (in `clicks()`) opens the modal.
+            q.push_back(InboundEvent::ConnectionOpened);
+            q.push_back(InboundEvent::Wire(ServerToClient::PodList {
+                correlation_id: None,
+                pods: mock_pods(),
+                default_pod_id: "default".into(),
+            }));
+            q.push_back(InboundEvent::Wire(ServerToClient::ThreadList {
+                correlation_id: None,
+                tasks: mock_threads(),
+            }));
+            // Empty backends list → the dialog renders the warning
+            // alert; otherwise seed a real list so Create can flip
+            // to enabled in normal use (still disabled here only
+            // because the inputs are blank).
+            let backends = if matches!(scene, Scene::NewPodModalNoBackends) {
+                Vec::new()
+            } else {
+                mock_backends()
+            };
+            q.push_back(InboundEvent::Wire(ServerToClient::BackendsList {
+                correlation_id: None,
+                backends,
+            }));
         }
         // Login scenes route through `build_login_app` above and
         // never reach here.
