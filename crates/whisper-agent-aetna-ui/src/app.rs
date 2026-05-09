@@ -120,6 +120,14 @@ enum DisplayItem {
     ToolCall {
         tool_use_id: String,
         name: String,
+        /// One-line summary of the call, derived from a relevant
+        /// argument. `read_file` / `edit_file` / `write_file` ⇒ the
+        /// `path`; `bash` ⇒ the (truncated) `command`; `grep` /
+        /// `glob` ⇒ the `pattern`; `list_dir` ⇒ the `path`. `None`
+        /// when the args don't carry a recognized field — the
+        /// header then falls back to just the tool name. Mirrors
+        /// the egui sibling's `tool_summary`.
+        summary: Option<String>,
         /// Pretty-printed JSON args. `None` when the snapshot path
         /// produced a tool call without typed args (legacy threads).
         args_pretty: Option<String>,
@@ -163,6 +171,47 @@ enum DisplayItem {
     TurnStats {
         usage: whisper_agent_protocol::Usage,
     },
+}
+
+/// Pull a one-line summary out of a tool call's args based on the
+/// tool's name. The well-known set covers the ~5 tools the user
+/// sees most often in a working session — file reads/edits, shell
+/// commands, search. Anything else returns `None` and the header
+/// falls back to just the tool name.
+///
+/// Mirrors the egui sibling's `tool_summary`. Hard-coding the
+/// argument-name knowledge here is the right scope: every tool
+/// declares its own parameter names, so a generic "first-string-
+/// arg" heuristic would routinely surface noise (e.g. an
+/// `encoding` field instead of `path`).
+fn tool_summary_from_args(name: &str, args: Option<&serde_json::Value>) -> Option<String> {
+    let v = args?;
+    let pick = |key: &str| {
+        v.get(key)
+            .and_then(|s| s.as_str())
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+    };
+    match name {
+        "edit_file" | "write_file" | "read_file" => pick("path"),
+        "bash" | "run_bash" => pick("command").map(|c| {
+            // Truncate long shell commands so the header line
+            // doesn't run off the right edge of the chat pane —
+            // the full command is still in the expanded body.
+            let mut s = c;
+            if s.chars().count() > 120 {
+                s = s.chars().take(120).collect::<String>();
+                s.push('…');
+            }
+            s
+        }),
+        "grep" | "glob" => pick("pattern"),
+        // `list_dir` is the egui sibling's name; `list_files` is
+        // what whisper-agent's own tool catalog uses today. Both
+        // map to the same `path` argument shape.
+        "list_dir" | "list_files" => pick("path").or_else(|| Some(".".to_string())),
+        _ => None,
+    }
 }
 
 /// Format a `Usage` block into the muted one-line summary the
@@ -913,9 +962,11 @@ impl ChatApp {
                         } => id == &tool_use_id && streaming_output.is_empty(),
                         _ => false,
                     });
+                    let summary = tool_summary_from_args(&name, args.as_ref());
                     let entry = DisplayItem::ToolCall {
                         tool_use_id,
                         name,
+                        summary,
                         args_pretty,
                         streaming_output: String::new(),
                         result: None,
@@ -1004,6 +1055,11 @@ impl ChatApp {
                         view.items.push(DisplayItem::ToolCall {
                             tool_use_id,
                             name,
+                            // No args yet — they're still streaming.
+                            // `Begin` resolves the typed args and
+                            // replaces this entry with a summary-
+                            // bearing one matched by id.
+                            summary: None,
                             args_pretty: None,
                             streaming_output: String::new(),
                             result: None,
@@ -3299,6 +3355,7 @@ impl ChatApp {
             DisplayItem::ToolCall {
                 tool_use_id,
                 name,
+                summary,
                 args_pretty,
                 streaming_output,
                 result,
@@ -3307,7 +3364,7 @@ impl ChatApp {
                 let value = format!("{idx}");
                 let routed = accordion_item_key(key, &value);
                 let open = self.open_accordions.contains(&routed);
-                let header = tool_call_header(name, result.as_ref());
+                let header = tool_call_header(name, summary.as_deref(), result.as_ref());
                 let body_blocks =
                     tool_call_body(args_pretty.as_deref(), streaming_output, result.as_ref());
                 let item_el = accordion_item(key, value, header, open, body_blocks);
@@ -3442,25 +3499,34 @@ fn display_dims(src_w: u32, src_h: u32, max_h: f32) -> (f32, f32) {
     (src_w * scale, max_h)
 }
 
-/// Collapsed-header label for a tool call. Status glyph + name
-/// always render; once the result has arrived we suffix a one-line
-/// preview so a closed row communicates pass / fail *and* the
-/// outcome at a glance — `✓ read_file · "fn main() {…"`. Empty
-/// previews drop to just the glyph + name (some tools return
-/// silent success).
-fn tool_call_header(name: &str, result: Option<&FusedToolResult>) -> String {
-    match result {
-        None => format!("⏳ {name}"),
-        Some(r) => {
-            let glyph = if r.is_error { "✗" } else { "✓" };
-            let preview = first_line_preview(&r.text, 80);
-            if preview.is_empty() {
-                format!("{glyph} {name}")
-            } else {
-                format!("{glyph} {name} · {preview}")
-            }
+/// Collapsed-header label for a tool call. Three pieces compose
+/// into a single line: status glyph + name + optional argument
+/// summary + optional result preview. The summary lands in
+/// `[brackets]` so it reads as a parameter even when an in-flight
+/// row has no result yet (`⏳ read_file [/path/to/file.rs]`).
+/// Once a result arrives, the preview suffix lets a closed row
+/// communicate pass / fail *and* the outcome at a glance —
+/// `✓ read_file [src/lib.rs] · pub mod foo;`.
+fn tool_call_header(name: &str, summary: Option<&str>, result: Option<&FusedToolResult>) -> String {
+    let glyph = match result {
+        None => "⏳",
+        Some(r) if r.is_error => "✗",
+        Some(_) => "✓",
+    };
+    let mut out = format!("{glyph} {name}");
+    if let Some(s) = summary {
+        out.push_str(" [");
+        out.push_str(s);
+        out.push(']');
+    }
+    if let Some(r) = result {
+        let preview = first_line_preview(&r.text, 80);
+        if !preview.is_empty() {
+            out.push_str(" · ");
+            out.push_str(&preview);
         }
     }
+    out
 }
 
 /// Expanded-body content for a tool-call accordion. Args render in a
@@ -3663,9 +3729,11 @@ fn push_block(block: &ContentBlock, user_role: bool, out: &mut Vec<DisplayItem>)
             id, name, input, ..
         } => {
             let args_pretty = serde_json::to_string_pretty(input).ok();
+            let summary = tool_summary_from_args(name, Some(input));
             out.push(DisplayItem::ToolCall {
                 tool_use_id: id.clone(),
                 name: name.clone(),
+                summary,
                 args_pretty,
                 streaming_output: String::new(),
                 result: None,
