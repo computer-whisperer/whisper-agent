@@ -665,11 +665,32 @@ The Prompt tab body is the existing `prompt.md` text_area
 relocated under its own tab (was the trailing form item in
 the previous single-form layout).
 
+**Cron preview + presets (landed):** new `cron_preview`
+sub-module mirrors webui's verbatim — `parse_schedule` (5-field
+with `"0 "` seconds prefix matching the server's scheduler),
+`parse_tz` (chrono_tz IANA names), `CRON_PRESETS` /
+`COMMON_TIMEZONES` static tables, plus `next_firings` and
+`format_relative` for the preview body. Six unit tests
+cover the parsers and `format_relative`'s output shapes.
+
+In the editor, the Cron arm of the Trigger tab grew preset
+chip rows (CRON_PRESETS as 4-then-3, COMMON_TIMEZONES as 3×3)
+plus a preview form item. Aetna doesn't flex-wrap rows, so
+chip rows are split into multiple `row(...)`s under one
+`column(...)`. Click routing on a chip rewrites the
+schedule/timezone buffer by index — keys carry the array
+position, not the literal expression, to avoid escaping
+`* / -` inside routed key strings.
+
+The preview body parses the live schedule + timezone buffers
+each frame, renders a destructive paragraph on parse failure,
+or a `next 5 firings ({tz})` header followed by a column of
+`[mono(timestamp), muted(relative)]` rows. `Utc::now()` makes
+the preview wall-clock-dependent — fine for rendering, makes
+bundle outputs non-deterministic across runs (they're not
+committed, so no churn).
+
 Deferred to follow-up sheet slices:
-- **Cron preview + presets** — port webui's `cron_preview`
-  module: parse_schedule (5-field with `"0 "` seconds prefix),
-  parse_tz, CRON_PRESETS / COMMON_TIMEZONES rows, and the
-  next-5-firings table.
 - **Thread bindings tab** — backend / model / host_env /
   mcp_host overrides on `BehaviorThreadOverride`.
 - **Scope tab** — per-behavior allow narrowing.

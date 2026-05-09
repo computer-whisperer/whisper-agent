@@ -9,6 +9,7 @@
 //! phase-switching wrapper of their choosing.
 
 mod app;
+mod cron_preview;
 mod icons;
 mod login;
 

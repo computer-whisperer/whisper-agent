@@ -36,6 +36,8 @@ use std::cell::RefCell;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::rc::Rc;
 
+use crate::cron_preview;
+
 use aetna_core::prelude::*;
 use aetna_core::widgets::select::{SelectAction, classify_event as classify_select_event};
 use whisper_agent_protocol::{
@@ -2545,6 +2547,14 @@ const BEHAVIOR_EDITOR_TRIGGER_KIND_KEY: &str = "behavior-editor:trigger-kind";
 const BEHAVIOR_EDITOR_SAVE_KEY: &str = "behavior-editor:save";
 const BEHAVIOR_EDITOR_CANCEL_KEY: &str = "behavior-editor:cancel";
 const BEHAVIOR_EDITOR_DISMISS_KEY: &str = "behavior-editor:dismiss";
+/// Routed-key prefix the Trigger-tab cron preset chips use. Suffix
+/// is the preset's array index (`0`..`CRON_PRESETS.len()-1`); the
+/// click handler reads the preset's expression out of
+/// [`crate::cron_preview::CRON_PRESETS`] by index. Indexing rather
+/// than name-suffixing avoids escaping `* / -` inside routed keys.
+const BEHAVIOR_EDITOR_CRON_PRESET_PREFIX: &str = "behavior-editor:cron-preset:";
+/// Same shape, for [`crate::cron_preview::COMMON_TIMEZONES`].
+const BEHAVIOR_EDITOR_TZ_PRESET_PREFIX: &str = "behavior-editor:tz-preset:";
 
 fn behavior_row_key(pod_id: &str, behavior_id: &str) -> String {
     format!("{BEHAVIOR_ROW_PREFIX}{pod_id}:{behavior_id}")
@@ -4274,6 +4284,38 @@ impl ChatApp {
             return true;
         }
 
+        // Cron / timezone preset chips. The route's suffix is the
+        // preset's array index; we look the expression up directly so
+        // routed keys never carry `* / -` characters.
+        if matches!(event.kind, UiEventKind::Click | UiEventKind::Activate)
+            && let Some(route) = event.route()
+        {
+            if let Some(idx_str) = route.strip_prefix(BEHAVIOR_EDITOR_CRON_PRESET_PREFIX)
+                && let Ok(idx) = idx_str.parse::<usize>()
+                && let Some((_, expr)) = cron_preview::CRON_PRESETS.get(idx)
+                && let Some(editor) = self.behavior_editor.as_mut()
+            {
+                editor.schedule_buffer = (*expr).to_string();
+                self.selection = Selection::default();
+                if let Some(e) = self.behavior_editor.as_mut() {
+                    e.error = None;
+                }
+                return true;
+            }
+            if let Some(idx_str) = route.strip_prefix(BEHAVIOR_EDITOR_TZ_PRESET_PREFIX)
+                && let Ok(idx) = idx_str.parse::<usize>()
+                && let Some(name) = cron_preview::COMMON_TIMEZONES.get(idx)
+                && let Some(editor) = self.behavior_editor.as_mut()
+            {
+                editor.timezone_buffer = (*name).to_string();
+                self.selection = Selection::default();
+                if let Some(e) = self.behavior_editor.as_mut() {
+                    e.error = None;
+                }
+                return true;
+            }
+        }
+
         if event.is_click_or_activate(BEHAVIOR_EDITOR_CANCEL_KEY)
             || event.is_click_or_activate(BEHAVIOR_EDITOR_DISMISS_KEY)
         {
@@ -4864,6 +4906,24 @@ impl ChatApp {
                     BEHAVIOR_EDITOR_CATCH_UP_KEY,
                     catch_up_label(editor.catch_up_buffer),
                 );
+
+                let cron_chips = self.render_preset_chips(
+                    BEHAVIOR_EDITOR_CRON_PRESET_PREFIX,
+                    cron_preview::CRON_PRESETS
+                        .iter()
+                        .enumerate()
+                        .map(|(idx, (label, _))| (idx, (*label).to_string())),
+                    4,
+                );
+                let tz_chips = self.render_preset_chips(
+                    BEHAVIOR_EDITOR_TZ_PRESET_PREFIX,
+                    cron_preview::COMMON_TIMEZONES
+                        .iter()
+                        .enumerate()
+                        .map(|(idx, name)| (idx, (*name).to_string())),
+                    3,
+                );
+
                 items.push(form_item([
                     form_label("schedule"),
                     form_control(schedule_input),
@@ -4874,9 +4934,17 @@ impl ChatApp {
                     ),
                 ]));
                 items.push(form_item([
+                    form_label("schedule presets"),
+                    form_control(cron_chips),
+                ]));
+                items.push(form_item([
                     form_label("timezone"),
                     form_control(timezone_input),
                     form_description("IANA name, e.g. `America/Los_Angeles`."),
+                ]));
+                items.push(form_item([
+                    form_label("timezone presets"),
+                    form_control(tz_chips),
                 ]));
                 items.push(form_item([
                     form_label("overlap"),
@@ -4892,6 +4960,12 @@ impl ChatApp {
                     form_description(
                         "What to do about cron fires missed while the server \
                          was down.",
+                    ),
+                ]));
+                items.push(form_item([
+                    form_label("preview"),
+                    form_control(
+                        self.render_cron_preview(&editor.schedule_buffer, &editor.timezone_buffer),
                     ),
                 ]));
             }
@@ -4924,6 +4998,74 @@ impl ChatApp {
             }
         }
         form(items)
+    }
+
+    /// Build a wrapping-style row of preset chips. Aetna's `row`
+    /// doesn't flex-wrap, so we approximate by splitting the input
+    /// list into multiple `row(...)`s under one `column`. `chunk` is
+    /// the per-row count — picked by the caller to fit the sheet's
+    /// content width.
+    fn render_preset_chips<I>(&self, key_prefix: &str, presets: I, chunk: usize) -> El
+    where
+        I: IntoIterator<Item = (usize, String)>,
+    {
+        let presets: Vec<(usize, String)> = presets.into_iter().collect();
+        let rows: Vec<El> = presets
+            .chunks(chunk)
+            .map(|group| {
+                let buttons: Vec<El> = group
+                    .iter()
+                    .map(|(idx, label)| {
+                        button(label.clone())
+                            .key(format!("{key_prefix}{idx}"))
+                            .ghost()
+                    })
+                    .collect();
+                row(buttons).gap(tokens::SPACE_2)
+            })
+            .collect();
+        column(rows).gap(tokens::SPACE_1)
+    }
+
+    /// Cron-preview body: validate the schedule + timezone, then
+    /// either show a destructive alert with the parse error or a
+    /// small column of next-firing rows. Uses the same parsers the
+    /// server's scheduler uses, so the preview's "next 5 fires"
+    /// agrees with what the cron job will actually fire on.
+    fn render_cron_preview(&self, schedule_str: &str, tz_str: &str) -> El {
+        use chrono::Utc;
+        match (
+            cron_preview::parse_schedule(schedule_str),
+            cron_preview::parse_tz(tz_str),
+        ) {
+            (Err(e), _) => paragraph(format!("schedule: {e}")).destructive().small(),
+            (_, Err(e)) => paragraph(e).destructive().small(),
+            (Ok(schedule), Ok(tz)) => {
+                let upcoming = cron_preview::next_firings(&schedule, tz);
+                if upcoming.is_empty() {
+                    return paragraph("schedule has no upcoming fires")
+                        .destructive()
+                        .small();
+                }
+                let now_utc = Utc::now();
+                let header = paragraph(format!("next {} firings ({})", upcoming.len(), tz.name()))
+                    .muted()
+                    .small();
+                let rows: Vec<El> = upcoming
+                    .iter()
+                    .map(|fire| {
+                        let when = fire.format("%Y-%m-%d %H:%M %Z").to_string();
+                        let rel = cron_preview::format_relative(now_utc, fire.with_timezone(&Utc));
+                        row([
+                            mono(when).text_color(tokens::FOREGROUND),
+                            text(rel).muted().small(),
+                        ])
+                        .gap(tokens::SPACE_4)
+                    })
+                    .collect();
+                column([header].into_iter().chain(rows).collect::<Vec<_>>()).gap(tokens::SPACE_1)
+            }
+        }
     }
 
     /// Prompt tab body. The behavior's `prompt.md` text — the user
