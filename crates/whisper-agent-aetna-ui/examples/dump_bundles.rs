@@ -751,6 +751,10 @@ fn build_app(scene: Scene) -> Box<dyn App> {
             // attached sheet). Pod settings click then fires GetPod;
             // the per-scene SendFn injects the matching PodSnapshot
             // reply, drained by the dump loop's second before_build.
+            //
+            // Seed BackendsList + SharedMcpHostsList + BucketsList so
+            // the structured Allow tab's multi-checks have actual
+            // catalog rows to render.
             q.push_back(InboundEvent::ConnectionOpened);
             q.push_back(InboundEvent::Wire(ServerToClient::PodList {
                 correlation_id: None,
@@ -764,6 +768,14 @@ fn build_app(scene: Scene) -> Box<dyn App> {
             q.push_back(InboundEvent::Wire(ServerToClient::BackendsList {
                 correlation_id: None,
                 backends: mock_backends(),
+            }));
+            q.push_back(InboundEvent::Wire(ServerToClient::SharedMcpHostsList {
+                correlation_id: None,
+                hosts: mock_shared_mcp_hosts(),
+            }));
+            q.push_back(InboundEvent::Wire(ServerToClient::BucketsList {
+                correlation_id: None,
+                buckets: mock_buckets(),
             }));
         }
         Scene::ForkModalOpen => {
@@ -1308,6 +1320,69 @@ mcp_hosts = ["filesystem", "git"]
         archived: false,
         behaviors: Vec::new(),
     }
+}
+
+/// Server-known shared MCP hosts for the pod-editor Allow tab dump.
+/// Two entries (one connected, one with a stale auth) — enough to
+/// render two adjacent toggle items and exercise the multi-check
+/// layout.
+fn mock_shared_mcp_hosts() -> Vec<whisper_agent_protocol::SharedMcpHostInfo> {
+    use whisper_agent_protocol::{CatalogOrigin, SharedMcpAuthPublic, SharedMcpHostInfo};
+    vec![
+        SharedMcpHostInfo {
+            name: "filesystem".into(),
+            url: "http://127.0.0.1:7401/mcp".into(),
+            origin: CatalogOrigin::Seeded,
+            auth: SharedMcpAuthPublic::None,
+            prefix: None,
+            connected: true,
+            last_error: String::new(),
+        },
+        SharedMcpHostInfo {
+            name: "git".into(),
+            url: "http://127.0.0.1:7402/mcp".into(),
+            origin: CatalogOrigin::Seeded,
+            auth: SharedMcpAuthPublic::None,
+            prefix: None,
+            connected: true,
+            last_error: String::new(),
+        },
+    ]
+}
+
+/// Server-known knowledge buckets for the pod-editor Allow tab.
+fn mock_buckets() -> Vec<whisper_agent_protocol::BucketSummary> {
+    use whisper_agent_protocol::BucketSummary;
+    vec![
+        BucketSummary {
+            id: "wiki".into(),
+            scope: "server".into(),
+            pod_id: None,
+            name: "wiki".into(),
+            description: Some("English Wikipedia (2025-04 dump).".into()),
+            source_kind: "stored".into(),
+            source_detail: None,
+            embedder_provider: "qwen3-embedding-0.6b".into(),
+            dense_enabled: true,
+            sparse_enabled: true,
+            created_at: "2026-04-12T00:00:00Z".into(),
+            active_slot: None,
+        },
+        BucketSummary {
+            id: "rust-stdlib".into(),
+            scope: "server".into(),
+            pod_id: None,
+            name: "rust-stdlib".into(),
+            description: Some("Rust standard library docs.".into()),
+            source_kind: "stored".into(),
+            source_detail: None,
+            embedder_provider: "qwen3-embedding-0.6b".into(),
+            dense_enabled: true,
+            sparse_enabled: false,
+            created_at: "2026-04-20T00:00:00Z".into(),
+            active_slot: None,
+        },
+    ]
 }
 
 /// `n` synthetic threads in the default pod, for the

@@ -27,6 +27,11 @@ log = "0.4"
 chrono = "0.4"
 chrono-tz = { workspace = true }
 cron = { workspace = true }
+# Round-trip the structured pod editor's `working_config` through
+# the raw-TOML tab. `default-features = false` mirrors the
+# whisper-agent-webui sibling — we only need the display/parse/serde
+# integration paths.
+toml = { version = "1", default-features = false, features = ["display", "parse", "serde"] }
 # Decode inbound `ContentBlock::Image { source: Bytes }` at render
 # time. Format set mirrors the protocol's `ImageMime` variants the
 # server adapters accept (HEIC/HEIF land as a placeholder for now —

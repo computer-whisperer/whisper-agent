@@ -713,6 +713,48 @@ multi-tabbed shape, but the raw-only path covers the 80%
 case (and remains the escape hatch for any malformed config
 the structured form can't represent).
 
+**Pod editor — Allow tab + tabs strip (landed):** first
+structured slice on top of the raw-TOML escape hatch. The
+sheet body now starts with a 4-button tabs strip
+(Allow / Defaults / Limits / Raw) that switches between
+structured tabs and the legacy text_area. State grows a
+`working_config: Option<PodConfig>` (the structured side's
+truth) plus `working_toml`/`raw_dirty` (the raw side's
+escape hatch). `switch_tab()` enforces the sync invariant:
+leaving Raw with `raw_dirty == true` reparses the toml back
+into `working_config` (or surfaces the parse error and bounces
+the user back to Raw); entering Raw re-serializes the structured
+state so the user sees a fresh round-trip. `resolved_save_toml()`
+returns whichever side is authoritative for the active tab —
+raw text when Raw is current and dirty, otherwise
+`toml::to_string_pretty(working_config)`.
+
+The Allow tab itself ports the egui sibling's
+`render_allow_tab`: identity (id is read-only / created_by is
+read-only / display_name + description text fields), allowed
+backends (multi-check across `state.backends`), allowed shared
+MCP hosts (multi-check across `state.shared_mcp_hosts`),
+allowed knowledge buckets (multi-check across `state.buckets`),
+plus the three pod-modify / dispatch / behaviors caps as
+`select_triggers` driven by the new `PodEditorPicker` enum.
+Catalog wiring: app state grew `shared_mcp_hosts:
+Vec<SharedMcpHostInfo>` and `buckets: Vec<BucketSummary>`, both
+hydrated from `ClientToServer::List{SharedMcpHosts,Buckets}` at
+boot (mirrors the existing `ListPods` / `ListBackends` arms).
+
+Multi-checks use a custom `checkbox_column` helper rather than
+aetna's `toggle_group_multi`, since the latter doesn't wrap and
+the 360px sheet width truncates 4+ items. The helper renders a
+column of `[checkbox, label]` rows that all share a single key
+prefix; click routing collects the picked id via
+`apply_checkbox_list_to_vec()` (push if missing, remove if
+present) into the corresponding `Vec<String>` on `working_config`.
+
+`PodEditorPicker` carries `#[allow(clippy::enum_variant_names)]`
+to keep the `AllowCaps*` prefix grouping; future tabs will add
+their own variants (`DefaultsBackend`, `DefaultsModel`, …) that
+break the shared prefix and let the lint go quiet on its own.
+
 ### ✅ Stage 9 — Login form
 
 `whisper_agent_aetna_ui::LoginApp` is a separate aetna [`App`] —

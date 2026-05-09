@@ -459,6 +459,14 @@ pub struct ChatApp {
     /// `BackendsList`; drives the new-thread `Backend` picker. Entries
     /// arrive in the server's configured order.
     backends: Vec<BackendSummary>,
+    /// Shared-MCP-host catalog. Populated from
+    /// `SharedMcpHostsList`. Read by the structured pod editor's
+    /// Allow tab (multi-check over names) and the behavior editor's
+    /// scope tab (resource list narrowing).
+    shared_mcp_hosts: Vec<whisper_agent_protocol::SharedMcpHostInfo>,
+    /// Knowledge-bucket catalog. Populated from `BucketsList`. Read
+    /// by the pod editor's Allow tab (multi-check over names).
+    buckets: Vec<whisper_agent_protocol::BucketSummary>,
     /// Models per backend, keyed by `BackendSummary.name`. Populated
     /// lazily — we only fire `ListModels` for a backend when the user
     /// has actually picked it on the new-thread form, and we dedup
@@ -829,26 +837,43 @@ pub(crate) struct ForkModalState {
     pub(crate) reset_capabilities: bool,
 }
 
-/// Form state for the pod editor sheet. v1 surface is a single
-/// `text_area` over the pod's raw `pod.toml`. Server validates the
-/// parse on `UpdatePodConfig` and replies with `Error` on failure or
-/// `PodConfigUpdated` on success. A failed parse leaves the working
-/// buffer alone so the user can fix and retry without losing edits.
-/// Structured tabs (allow lists, host_envs, MCP hosts, sandbox) land
-/// in a follow-up slice — the egui sibling exposes them as additional
-/// tabs alongside the raw editor; aetna v1 takes the raw-only path
-/// for parity with the protocol's `toml_text`-shaped wire surface.
+/// Form state for the pod editor sheet. Multi-tab surface mirroring
+/// the egui sibling: `Allow` (identity + allowed resources + caps),
+/// `Defaults` (thread-defaults pre-fill), `Limits` (pod-level caps),
+/// `RawToml` (always-available escape hatch). On hydrate the
+/// snapshot's `config` lands as the structured `working_config` and
+/// its `toml_text` becomes the raw buffer; the two are kept in sync
+/// across tab switches by re-serializing or re-parsing as the user
+/// crosses the structured/raw boundary. Save ships the raw buffer
+/// when the user last edited the raw tab, otherwise re-serializes
+/// `working_config` — same `UpdatePodConfig { toml_text }` wire shape.
 pub(crate) struct PodEditorSheetState {
     pub(crate) pod_id: String,
-    /// Edit buffer. Empty until the snapshot lands.
+    /// Parsed working copy. `None` only when the snapshot's `config`
+    /// failed to parse server-side (rare — the config is loaded from
+    /// disk and validated). Mutated by the structured tabs; the raw
+    /// tab snapshots from this on entry and projects back on exit.
+    pub(crate) working_config: Option<PodConfig>,
+    /// Raw `pod.toml` buffer for the RawToml tab. Re-serialized from
+    /// `working_config` on tab-enter; re-parsed on tab-leave when
+    /// [`Self::raw_dirty`] says the user has typed.
     pub(crate) working_toml: String,
-    /// Server-known baseline. Save reads it to short-circuit no-op
-    /// saves; future Revert reads it to restore the original. Tracked
-    /// even though v1 doesn't surface Revert because the cost is one
-    /// String clone per snapshot.
+    /// Server-known baseline. Save short-circuits when nothing has
+    /// changed (raw text matches AND working_config matches).
     pub(crate) baseline_toml: String,
-    /// Validation message: server `Error` echo (parse failure) or
-    /// the editor's own diagnostics. Cleared on the next text edit.
+    /// Snapshot of the original parsed config. Mirrors `baseline_toml`
+    /// on the structured side so a future Revert button has both.
+    pub(crate) baseline_config: Option<PodConfig>,
+    /// Active tab. Tab-switch logic triggers structured/raw sync.
+    pub(crate) tab: PodEditorTab,
+    /// Set when the raw buffer has diverged from the last
+    /// re-serialization. Drives "leave raw → reparse" logic + the
+    /// Save path's choice between raw text and re-serialized config.
+    pub(crate) raw_dirty: bool,
+    /// Validation message: server `Error` echo (parse failure or
+    /// validation reject) or the editor's own diagnostics
+    /// (raw-tab parse failure on tab-switch). Cleared on the next
+    /// edit.
     pub(crate) error: Option<String>,
     /// Correlation id of the in-flight `GetPod` request, if any.
     pub(crate) pending_get: Option<String>,
@@ -856,17 +881,76 @@ pub(crate) struct PodEditorSheetState {
     /// if any. Cleared on `PodConfigUpdated` (close) or `Error`
     /// (re-enable + surface message).
     pub(crate) pending_save: Option<String>,
+    /// Which `select_menu` (if any) is currently open inside the
+    /// editor. Single-active-at-a-time — the new-thread compose
+    /// pickers and the behavior editor's trigger-kind picker
+    /// coordinate through `close_other_pickers`.
+    pub(crate) open_picker: Option<PodEditorPicker>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[allow(clippy::enum_variant_names)]
+pub(crate) enum PodEditorPicker {
+    /// `allow.caps.pod_modify_thread_pods` cap selector.
+    AllowCapsPodModify,
+    /// `allow.caps.dispatch_threads_in_pods` cap selector.
+    AllowCapsDispatch,
+    /// `allow.caps.use_behaviors_in_pods` cap selector.
+    AllowCapsBehaviors,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PodEditorTab {
+    Allow,
+    Defaults,
+    Limits,
+    RawToml,
+}
+
+impl PodEditorTab {
+    fn label(self) -> &'static str {
+        match self {
+            PodEditorTab::Allow => "Allow",
+            PodEditorTab::Defaults => "Defaults",
+            PodEditorTab::Limits => "Limits",
+            PodEditorTab::RawToml => "Raw",
+        }
+    }
+
+    fn wire_value(self) -> &'static str {
+        match self {
+            PodEditorTab::Allow => "allow",
+            PodEditorTab::Defaults => "defaults",
+            PodEditorTab::Limits => "limits",
+            PodEditorTab::RawToml => "raw",
+        }
+    }
+
+    fn from_wire(value: &str) -> Option<Self> {
+        match value {
+            "allow" => Some(PodEditorTab::Allow),
+            "defaults" => Some(PodEditorTab::Defaults),
+            "limits" => Some(PodEditorTab::Limits),
+            "raw" => Some(PodEditorTab::RawToml),
+            _ => None,
+        }
+    }
 }
 
 impl PodEditorSheetState {
     fn new(pod_id: String, pending_get: String) -> Self {
         Self {
             pod_id,
+            working_config: None,
             working_toml: String::new(),
             baseline_toml: String::new(),
+            baseline_config: None,
+            tab: PodEditorTab::Allow,
+            raw_dirty: false,
             error: None,
             pending_get: Some(pending_get),
             pending_save: None,
+            open_picker: None,
         }
     }
 
@@ -875,6 +959,75 @@ impl PodEditorSheetState {
         self.error = None;
         self.working_toml = snapshot.toml_text.clone();
         self.baseline_toml = snapshot.toml_text;
+        self.working_config = Some(snapshot.config.clone());
+        self.baseline_config = Some(snapshot.config);
+        self.raw_dirty = false;
+    }
+
+    /// Has anything diverged from the server-known baseline? Save
+    /// uses this to gate the "no changes to save" short-circuit.
+    fn dirty(&self) -> bool {
+        if self.raw_dirty && self.working_toml != self.baseline_toml {
+            return true;
+        }
+        match (&self.working_config, &self.baseline_config) {
+            (Some(w), Some(b)) => w != b,
+            _ => false,
+        }
+    }
+
+    /// Switch tabs with the egui-style sync invariant:
+    /// - leaving Raw with `raw_dirty` ⇒ reparse the buffer back into
+    ///   `working_config`. Parse failures keep the user on Raw with
+    ///   the error in `error` (don't drop edits).
+    /// - entering Raw ⇒ re-serialize `working_config` so the buffer
+    ///   reflects the structured edits. Reset `raw_dirty`.
+    fn switch_tab(&mut self, target: PodEditorTab) {
+        if self.tab == target {
+            return;
+        }
+        let leaving_raw = self.tab == PodEditorTab::RawToml;
+        let entering_raw = target == PodEditorTab::RawToml;
+        if leaving_raw && self.raw_dirty {
+            match toml::from_str::<PodConfig>(&self.working_toml) {
+                Ok(parsed) => {
+                    self.working_config = Some(parsed);
+                    self.raw_dirty = false;
+                    self.error = None;
+                }
+                Err(e) => {
+                    self.error = Some(format!("raw TOML doesn't parse: {e}"));
+                    return; // stay on Raw
+                }
+            }
+        }
+        if entering_raw && let Some(cfg) = self.working_config.as_ref() {
+            // Re-serialize from working_config so the raw buffer
+            // reflects every structured edit since last enter. Falls
+            // back to leaving the buffer alone on serialize error
+            // (shouldn't happen — PodConfig round-trips cleanly).
+            if let Ok(text) = toml::to_string_pretty(cfg) {
+                self.working_toml = text;
+            }
+            self.raw_dirty = false;
+        }
+        self.tab = target;
+    }
+
+    /// The TOML text Save should ship. If the user last edited the
+    /// raw tab and didn't switch back, ship the raw buffer (preserves
+    /// any TOML-level shape they typed — comments, key order, etc.).
+    /// Otherwise re-serialize the structured config.
+    fn resolved_save_toml(&self) -> Result<String, String> {
+        if self.tab == PodEditorTab::RawToml && self.raw_dirty {
+            return Ok(self.working_toml.clone());
+        }
+        let Some(cfg) = self.working_config.as_ref() else {
+            return Err(
+                "no parsed config to save — fix the on-disk pod.toml from the Raw tab".into(),
+            );
+        };
+        toml::to_string_pretty(cfg).map_err(|e| format!("couldn't serialize config: {e}"))
     }
 }
 
@@ -896,6 +1049,8 @@ impl ChatApp {
             expanded_behaviors: HashSet::new(),
             delete_armed_behavior: None,
             backends: Vec::new(),
+            shared_mcp_hosts: Vec::new(),
+            buckets: Vec::new(),
             models_by_backend: HashMap::new(),
             requested_models_for: HashSet::new(),
             selected: None,
@@ -969,6 +1124,16 @@ impl ChatApp {
                         correlation_id: None,
                     });
                     self.send(ClientToServer::ListBackends {
+                        correlation_id: None,
+                    });
+                    // Catalog tier consumed by the structured pod
+                    // editor (Allow tab) + behavior editor scope
+                    // tabs. Cheap on the server side; both replies
+                    // are pure registry reads with no I/O.
+                    self.send(ClientToServer::ListSharedMcpHosts {
+                        correlation_id: None,
+                    });
+                    self.send(ClientToServer::ListBuckets {
                         correlation_id: None,
                     });
                     self.list_requested = true;
@@ -1276,6 +1441,17 @@ impl ChatApp {
             }
             ServerToClient::BackendsList { backends, .. } => {
                 self.backends = backends;
+            }
+            ServerToClient::SharedMcpHostsList { hosts, .. } => {
+                // Server is authoritative — replace wholesale on
+                // every snapshot. Per-host add/remove broadcasts
+                // (`SharedMcpHostAdded` / `Removed`) aren't surfaced
+                // here yet; the next reconnect or full-list re-fetch
+                // catches up.
+                self.shared_mcp_hosts = hosts;
+            }
+            ServerToClient::BucketsList { buckets, .. } => {
+                self.buckets = buckets;
             }
             ServerToClient::ModelsList {
                 backend, models, ..
@@ -2142,10 +2318,24 @@ const FORK_MODAL_DISMISS_KEY: &str = "fork:dismiss";
 const SIDEBAR_POD_SETTINGS_KEY: &str = "sidebar:pod-settings";
 
 /// Routed-key prefix the pod editor sheet uses. Extended keys:
-/// `{prefix}:dismiss` (scrim), `{prefix}:toml` (text_area body),
-/// `{prefix}:save` (primary), `{prefix}:cancel` (secondary).
+/// `{prefix}:dismiss` (scrim), `{prefix}:tabs` (tabs_list — auto-
+/// derives `pod-editor:tabs:tab:{value}` per trigger),
+/// `{prefix}:save` (primary), `{prefix}:cancel` (secondary). The
+/// per-tab field keys live under `{prefix}:{tab}:{field}` (see the
+/// individual constants below).
 const POD_EDITOR_KEY: &str = "pod-editor";
-const POD_EDITOR_TOML_KEY: &str = "pod-editor:toml";
+const POD_EDITOR_TABS_KEY: &str = "pod-editor:tabs";
+/// Allow-tab field keys.
+const POD_EDITOR_ALLOW_NAME_KEY: &str = "pod-editor:allow:name";
+const POD_EDITOR_ALLOW_DESCRIPTION_KEY: &str = "pod-editor:allow:description";
+const POD_EDITOR_ALLOW_BACKENDS_KEY: &str = "pod-editor:allow:backends";
+const POD_EDITOR_ALLOW_MCP_HOSTS_KEY: &str = "pod-editor:allow:mcp-hosts";
+const POD_EDITOR_ALLOW_BUCKETS_KEY: &str = "pod-editor:allow:buckets";
+const POD_EDITOR_ALLOW_CAPS_POD_MODIFY_KEY: &str = "pod-editor:allow:caps:pod-modify";
+const POD_EDITOR_ALLOW_CAPS_DISPATCH_KEY: &str = "pod-editor:allow:caps:dispatch";
+const POD_EDITOR_ALLOW_CAPS_BEHAVIORS_KEY: &str = "pod-editor:allow:caps:behaviors";
+/// Raw-tab field key (the only knob in that tab).
+const POD_EDITOR_TOML_KEY: &str = "pod-editor:raw:toml";
 const POD_EDITOR_SAVE_KEY: &str = "pod-editor:save";
 const POD_EDITOR_CANCEL_KEY: &str = "pod-editor:cancel";
 const POD_EDITOR_DISMISS_KEY: &str = "pod-editor:dismiss";
@@ -2194,6 +2384,124 @@ fn behavior_edit_key(pod_id: &str, behavior_id: &str) -> String {
 /// so the leading `behavior-row:` isn't load-bearing.
 fn behavior_expand_key(pod_id: &str, behavior_id: &str) -> String {
     format!("{pod_id}::{behavior_id}")
+}
+
+/// Per-item route key inside a checkbox-list (multi-check rendered
+/// as a column of `[checkbox, label]` rows). Suffix carries the
+/// item's wire value.
+fn checkbox_list_item_key(prefix: &str, value: &str) -> String {
+    format!("{prefix}:item:{value}")
+}
+
+/// Apply a click on a checkbox-list item to a `Vec<String>` of
+/// selected values. Clicks land on `{prefix}:item:{value}`; the
+/// helper toggles the value's membership and keeps the Vec sorted
+/// for a stable on-disk layout. Returns whether the set changed.
+///
+/// Custom rather than reusing `toggle::apply_event_multi` because
+/// aetna's `toggle_group_multi` is a non-wrapping row and the pod
+/// editor's narrow sheet (360 px) overflows once a few labels add
+/// up. Column-of-checkboxes is the wrapping-friendly fallback.
+fn apply_checkbox_list_to_vec(vec: &mut Vec<String>, event: &UiEvent, prefix: &str) -> bool {
+    let Some(target) = event.route() else {
+        return false;
+    };
+    let item_prefix = format!("{prefix}:item:");
+    let Some(value) = target.strip_prefix(&item_prefix) else {
+        return false;
+    };
+    if !matches!(event.kind, UiEventKind::Click | UiEventKind::Activate) {
+        return false;
+    }
+    if let Some(idx) = vec.iter().position(|v| v == value) {
+        vec.remove(idx);
+    } else {
+        vec.push(value.to_string());
+        vec.sort();
+    }
+    true
+}
+
+/// Column-of-checkboxes layout for a multi-check resource list.
+/// Each option becomes a `[checkbox, text(label)]` row keyed
+/// `{group_prefix}:item:{value}`. Use this in narrow surfaces (the
+/// pod editor sheet is 360 px) where aetna's non-wrapping
+/// `toggle_group_multi` would overflow horizontally.
+fn checkbox_column(group_prefix: &str, selected: &[String], options: Vec<(String, String)>) -> El {
+    let rows: Vec<El> = options
+        .into_iter()
+        .map(|(value, label)| {
+            let on = selected.iter().any(|s| s == &value);
+            let key = checkbox_list_item_key(group_prefix, &value);
+            row([
+                checkbox(on).key(&key),
+                text(label).text_color(tokens::FOREGROUND),
+            ])
+            .gap(tokens::SPACE_2)
+            .align(Align::Center)
+            .width(Size::Fill(1.0))
+        })
+        .collect();
+    column(rows).gap(tokens::SPACE_1).width(Size::Fill(1.0))
+}
+
+fn pod_modify_cap_label(cap: whisper_agent_protocol::PodModifyCap) -> &'static str {
+    use whisper_agent_protocol::PodModifyCap as C;
+    match cap {
+        C::None => "none",
+        C::Memories => "memories",
+        C::Content => "content",
+        C::ModifyAllow => "modify_allow",
+    }
+}
+
+fn pod_modify_cap_from_wire(s: &str) -> Option<whisper_agent_protocol::PodModifyCap> {
+    use whisper_agent_protocol::PodModifyCap as C;
+    match s {
+        "none" => Some(C::None),
+        "memories" => Some(C::Memories),
+        "content" => Some(C::Content),
+        "modify_allow" => Some(C::ModifyAllow),
+        _ => None,
+    }
+}
+
+fn dispatch_cap_label(cap: whisper_agent_protocol::DispatchCap) -> &'static str {
+    use whisper_agent_protocol::DispatchCap as C;
+    match cap {
+        C::None => "none",
+        C::WithinScope => "within_scope",
+    }
+}
+
+fn dispatch_cap_from_wire(s: &str) -> Option<whisper_agent_protocol::DispatchCap> {
+    use whisper_agent_protocol::DispatchCap as C;
+    match s {
+        "none" => Some(C::None),
+        "within_scope" => Some(C::WithinScope),
+        _ => None,
+    }
+}
+
+fn behaviors_cap_label(cap: whisper_agent_protocol::BehaviorOpsCap) -> &'static str {
+    use whisper_agent_protocol::BehaviorOpsCap as C;
+    match cap {
+        C::None => "none",
+        C::Read => "read",
+        C::AuthorNarrower => "author_narrower",
+        C::AuthorAny => "author_any",
+    }
+}
+
+fn behaviors_cap_from_wire(s: &str) -> Option<whisper_agent_protocol::BehaviorOpsCap> {
+    use whisper_agent_protocol::BehaviorOpsCap as C;
+    match s {
+        "none" => Some(C::None),
+        "read" => Some(C::Read),
+        "author_narrower" => Some(C::AuthorNarrower),
+        "author_any" => Some(C::AuthorAny),
+        _ => None,
+    }
 }
 
 // Routed keys for the new-thread compose form's three `select_trigger`
@@ -2389,6 +2697,21 @@ impl ChatApp {
             && let Some(editor) = self.behavior_editor.as_mut()
         {
             editor.trigger_kind_open = false;
+        }
+        // Pod editor cap pickers — three select_trigger keys map to
+        // the three `PodEditorPicker` variants. If the open picker's
+        // key isn't `keep_open`, close it.
+        if let Some(editor) = self.pod_editor.as_mut()
+            && let Some(open) = editor.open_picker
+        {
+            let open_key = match open {
+                PodEditorPicker::AllowCapsPodModify => POD_EDITOR_ALLOW_CAPS_POD_MODIFY_KEY,
+                PodEditorPicker::AllowCapsDispatch => POD_EDITOR_ALLOW_CAPS_DISPATCH_KEY,
+                PodEditorPicker::AllowCapsBehaviors => POD_EDITOR_ALLOW_CAPS_BEHAVIORS_KEY,
+            };
+            if keep_open != open_key {
+                editor.open_picker = None;
+            }
         }
     }
 
@@ -3310,6 +3633,15 @@ impl ChatApp {
         }
         if let Some(sheet_el) = self.render_pod_editor_sheet() {
             out.push(Some(sheet_el));
+            // Pod editor cap pickers ride above the sheet — same
+            // single-active discipline as the behavior editor's
+            // trigger-kind picker. Topmost so it floats above the
+            // sheet panel.
+            if let Some(editor) = self.pod_editor.as_ref()
+                && let Some(open) = editor.open_picker
+            {
+                out.push(Some(self.pod_editor_cap_menu(open)));
+            }
         }
         if let Some(modal_el) = self.render_fork_modal() {
             out.push(Some(modal_el));
@@ -4134,14 +4466,125 @@ impl ChatApp {
             return false;
         }
 
+        // Tab strip: route through `tabs::apply_event`, then call
+        // `switch_tab` so the structured/raw sync invariants run.
+        // The widget mutates a String via the closure; we map it back
+        // to a `PodEditorTab`.
+        let mut next_tab: Option<String> = None;
+        let _ = aetna_core::widgets::tabs::apply_event(
+            &mut next_tab,
+            event,
+            POD_EDITOR_TABS_KEY,
+            |raw| Some(Some(raw.to_string())),
+        );
+        if let Some(value) = next_tab
+            && let Some(target) = PodEditorTab::from_wire(&value)
+            && let Some(editor) = self.pod_editor.as_mut()
+        {
+            editor.switch_tab(target);
+            return true;
+        }
+
+        // Cap pickers — three select_trigger / select_menu pairs
+        // routed by their full keys. Match each before falling
+        // through to text-input handlers (whose target_key checks
+        // would shadow the picker option-keys otherwise).
+        if let Some(action) = classify_select_event(event, POD_EDITOR_ALLOW_CAPS_POD_MODIFY_KEY) {
+            self.handle_pod_editor_cap_pick(PodEditorPicker::AllowCapsPodModify, action);
+            return true;
+        }
+        if let Some(action) = classify_select_event(event, POD_EDITOR_ALLOW_CAPS_DISPATCH_KEY) {
+            self.handle_pod_editor_cap_pick(PodEditorPicker::AllowCapsDispatch, action);
+            return true;
+        }
+        if let Some(action) = classify_select_event(event, POD_EDITOR_ALLOW_CAPS_BEHAVIORS_KEY) {
+            self.handle_pod_editor_cap_pick(PodEditorPicker::AllowCapsBehaviors, action);
+            return true;
+        }
+
+        // Allow tab text fields.
+        if event.target_key() == Some(POD_EDITOR_ALLOW_NAME_KEY) {
+            if let Some(editor) = self.pod_editor.as_mut()
+                && let Some(cfg) = editor.working_config.as_mut()
+            {
+                text_input::apply_event(
+                    &mut cfg.name,
+                    &mut self.selection,
+                    POD_EDITOR_ALLOW_NAME_KEY,
+                    event,
+                );
+                editor.error = None;
+            }
+            return true;
+        }
+        if event.target_key() == Some(POD_EDITOR_ALLOW_DESCRIPTION_KEY) {
+            if let Some(editor) = self.pod_editor.as_mut()
+                && let Some(cfg) = editor.working_config.as_mut()
+            {
+                let mut buf = cfg.description.clone().unwrap_or_default();
+                text_area::apply_event(
+                    &mut buf,
+                    &mut self.selection,
+                    POD_EDITOR_ALLOW_DESCRIPTION_KEY,
+                    event,
+                );
+                cfg.description = if buf.trim().is_empty() {
+                    None
+                } else {
+                    Some(buf)
+                };
+                editor.error = None;
+            }
+            return true;
+        }
+
+        // Allow tab multi-checks (backends / mcp_hosts / buckets).
+        // Each item is a `[checkbox, label]` row keyed
+        // `{group_prefix}:item:{value}` — column layout instead of
+        // a non-wrapping toggle_group so narrow sheet widths don't
+        // overflow.
+        if let Some(editor) = self.pod_editor.as_mut()
+            && let Some(cfg) = editor.working_config.as_mut()
+        {
+            if apply_checkbox_list_to_vec(
+                &mut cfg.allow.backends,
+                event,
+                POD_EDITOR_ALLOW_BACKENDS_KEY,
+            ) {
+                editor.error = None;
+                return true;
+            }
+            if apply_checkbox_list_to_vec(
+                &mut cfg.allow.mcp_hosts,
+                event,
+                POD_EDITOR_ALLOW_MCP_HOSTS_KEY,
+            ) {
+                editor.error = None;
+                return true;
+            }
+            if apply_checkbox_list_to_vec(
+                &mut cfg.allow.knowledge_buckets,
+                event,
+                POD_EDITOR_ALLOW_BUCKETS_KEY,
+            ) {
+                editor.error = None;
+                return true;
+            }
+        }
+
+        // Raw tab text_area.
         if event.target_key() == Some(POD_EDITOR_TOML_KEY) {
             if let Some(editor) = self.pod_editor.as_mut() {
+                let before = editor.working_toml.clone();
                 text_area::apply_event(
                     &mut editor.working_toml,
                     &mut self.selection,
                     POD_EDITOR_TOML_KEY,
                     event,
                 );
+                if editor.working_toml != before {
+                    editor.raw_dirty = true;
+                }
                 editor.error = None;
             }
             return true;
@@ -4160,6 +4603,62 @@ impl ChatApp {
         }
 
         false
+    }
+
+    /// Pick handler for the pod editor's three cap select_triggers.
+    /// `which` identifies which slot we're driving; the value parses
+    /// into the appropriate cap enum (PodModifyCap / DispatchCap /
+    /// BehaviorOpsCap). Toggle opens/closes the menu after closing
+    /// any other open picker (single-active invariant).
+    fn handle_pod_editor_cap_pick(&mut self, which: PodEditorPicker, action: SelectAction) {
+        let key_for = |which| match which {
+            PodEditorPicker::AllowCapsPodModify => POD_EDITOR_ALLOW_CAPS_POD_MODIFY_KEY,
+            PodEditorPicker::AllowCapsDispatch => POD_EDITOR_ALLOW_CAPS_DISPATCH_KEY,
+            PodEditorPicker::AllowCapsBehaviors => POD_EDITOR_ALLOW_CAPS_BEHAVIORS_KEY,
+        };
+        match action {
+            SelectAction::Toggle => {
+                self.close_other_pickers(key_for(which));
+                if let Some(editor) = self.pod_editor.as_mut() {
+                    editor.open_picker = if editor.open_picker == Some(which) {
+                        None
+                    } else {
+                        Some(which)
+                    };
+                }
+            }
+            SelectAction::Dismiss => {
+                if let Some(editor) = self.pod_editor.as_mut() {
+                    editor.open_picker = None;
+                }
+            }
+            SelectAction::Pick(value) => {
+                if let Some(editor) = self.pod_editor.as_mut()
+                    && let Some(cfg) = editor.working_config.as_mut()
+                {
+                    match which {
+                        PodEditorPicker::AllowCapsPodModify => {
+                            if let Some(v) = pod_modify_cap_from_wire(&value) {
+                                cfg.allow.caps.pod_modify = v;
+                            }
+                        }
+                        PodEditorPicker::AllowCapsDispatch => {
+                            if let Some(v) = dispatch_cap_from_wire(&value) {
+                                cfg.allow.caps.dispatch = v;
+                            }
+                        }
+                        PodEditorPicker::AllowCapsBehaviors => {
+                            if let Some(v) = behaviors_cap_from_wire(&value) {
+                                cfg.allow.caps.behaviors = v;
+                            }
+                        }
+                    }
+                    editor.open_picker = None;
+                    editor.error = None;
+                }
+            }
+            _ => {}
+        }
     }
 
     /// Validate + dispatch the pod editor's Save. Server does the
@@ -4181,12 +4680,18 @@ impl ChatApp {
             // until hydration completes.
             return;
         }
-        if editor.working_toml == editor.baseline_toml {
+        if !editor.dirty() {
             self.set_pod_editor_error("no changes to save".into());
             return;
         }
         let pod_id = editor.pod_id.clone();
-        let toml_text = editor.working_toml.clone();
+        let toml_text = match editor.resolved_save_toml() {
+            Ok(text) => text,
+            Err(msg) => {
+                self.set_pod_editor_error(msg);
+                return;
+            }
+        };
         let correlation_id = self.next_correlation_id();
         if let Some(editor) = self.pod_editor.as_mut() {
             editor.pending_save = Some(correlation_id.clone());
@@ -4208,10 +4713,9 @@ impl ChatApp {
     /// Render the pod editor sheet if open. Same `sheet` + `scroll`
     /// shape as the behavior editor; the only meaningful difference
     /// is the body — one big monospace `text_area` over the raw TOML
-    /// instead of a structured form. The text_area takes a fixed
-    /// height (480 px) so it dominates the sheet's visual real
-    /// estate; scroll wraps it so smaller viewports still see the
-    /// footer.
+    /// instead of a structured form. The Allow tab is structured;
+    /// Defaults / Limits land in follow-up slices. RawToml is the
+    /// always-available escape hatch with the full text_area.
     fn render_pod_editor_sheet(&self) -> Option<El> {
         let editor = self.pod_editor.as_ref()?;
 
@@ -4223,26 +4727,60 @@ impl ChatApp {
         let header = sheet_header([
             sheet_title(format!("Pod settings — {pod_label}")),
             sheet_description(
-                "Edit the pod's `pod.toml` directly. The server parses + \
-                 validates on save; a parse failure surfaces inline and \
-                 the on-disk file is left untouched.",
+                "Edit the pod's allow lists, thread defaults, and limits. \
+                 The Raw TOML tab is always available; the structured \
+                 tabs round-trip through it on save.",
             ),
         ]);
+
+        // Tab strip. Width-fill so the strip spans the sheet.
+        let tab_value = editor.tab.wire_value().to_string();
+        let tabs_strip = tabs_list(
+            POD_EDITOR_TABS_KEY,
+            &tab_value,
+            [
+                (
+                    PodEditorTab::Allow.wire_value(),
+                    PodEditorTab::Allow.label(),
+                ),
+                (
+                    PodEditorTab::Defaults.wire_value(),
+                    PodEditorTab::Defaults.label(),
+                ),
+                (
+                    PodEditorTab::Limits.wire_value(),
+                    PodEditorTab::Limits.label(),
+                ),
+                (
+                    PodEditorTab::RawToml.wire_value(),
+                    PodEditorTab::RawToml.label(),
+                ),
+            ],
+        );
 
         let body: El = if editor.pending_get.is_some() {
             paragraph("loading pod…").muted()
         } else {
-            // Monospace text_area for raw TOML. Default sizing is
-            // Fill width / Hug height — the field grows to fit its
-            // content. Vertical overflow is handled by the enclosing
-            // `scroll` (the body wrapper below), so a 200-line
-            // pod.toml scrolls the whole sheet body rather than
-            // clipping inside the text_area.
-            text_area(&editor.working_toml, &self.selection, POD_EDITOR_TOML_KEY).mono()
+            match editor.tab {
+                PodEditorTab::Allow => self.render_pod_editor_allow_tab(editor),
+                PodEditorTab::Defaults => paragraph(
+                    "Defaults tab — coming soon. Edit thread defaults via the \
+                     Raw TOML tab in the meantime.",
+                )
+                .muted(),
+                PodEditorTab::Limits => paragraph(
+                    "Limits tab — coming soon. Edit pod limits via the Raw \
+                     TOML tab in the meantime.",
+                )
+                .muted(),
+                PodEditorTab::RawToml => {
+                    text_area(&editor.working_toml, &self.selection, POD_EDITOR_TOML_KEY).mono()
+                }
+            }
         };
 
         let pending_save = editor.pending_save.is_some();
-        let dirty = editor.working_toml != editor.baseline_toml;
+        let dirty = editor.dirty();
         let mut save = button(if pending_save { "Saving…" } else { "Save" })
             .key(POD_EDITOR_SAVE_KEY)
             .primary();
@@ -4251,7 +4789,7 @@ impl ChatApp {
         }
         let cancel = button("Cancel").key(POD_EDITOR_CANCEL_KEY);
 
-        let mut body_children: Vec<El> = vec![body];
+        let mut body_children: Vec<El> = vec![tabs_strip, body];
         if let Some(err) = editor.error.as_deref() {
             body_children.push(
                 alert([
@@ -4268,6 +4806,197 @@ impl ChatApp {
         let children: Vec<El> = vec![header, scroll_body, sheet_footer([cancel, save])];
 
         Some(sheet(POD_EDITOR_KEY, SheetSide::Right, children))
+    }
+
+    /// Allow tab body. Identity (name + description) + multi-checks
+    /// for the three resource lists (backends / shared MCP hosts /
+    /// knowledge buckets) over the server-known catalogs + cap
+    /// ceilings (3 select_triggers). Host-envs editor is deferred —
+    /// it needs a sandbox-entry sub-modal that's a separate slice.
+    /// Per-tool overrides defer to the Raw TOML tab (the egui
+    /// sibling does the same).
+    fn render_pod_editor_allow_tab(&self, editor: &PodEditorSheetState) -> El {
+        let Some(cfg) = editor.working_config.as_ref() else {
+            return paragraph("no parsed config — fix the on-disk pod.toml from the Raw tab")
+                .muted();
+        };
+
+        let name_input = text_input(&cfg.name, &self.selection, POD_EDITOR_ALLOW_NAME_KEY);
+        let description_input = text_area(
+            cfg.description.as_deref().unwrap_or(""),
+            &self.selection,
+            POD_EDITOR_ALLOW_DESCRIPTION_KEY,
+        )
+        .height(Size::Fixed(64.0));
+
+        // Multi-check rows over server-known catalogs.
+        let backends_widget = self.render_pod_editor_backends_check(cfg);
+        let mcp_hosts_widget = self.render_pod_editor_mcp_hosts_check(cfg);
+        let buckets_widget = self.render_pod_editor_buckets_check(cfg);
+
+        // Cap select_triggers — the trigger label always shows the
+        // current value; the menu rides on `popover_layers()` when
+        // `editor.open_picker` matches.
+        let pod_modify_trigger = select_trigger(
+            POD_EDITOR_ALLOW_CAPS_POD_MODIFY_KEY,
+            pod_modify_cap_label(cfg.allow.caps.pod_modify),
+        );
+        let dispatch_trigger = select_trigger(
+            POD_EDITOR_ALLOW_CAPS_DISPATCH_KEY,
+            dispatch_cap_label(cfg.allow.caps.dispatch),
+        );
+        let behaviors_trigger = select_trigger(
+            POD_EDITOR_ALLOW_CAPS_BEHAVIORS_KEY,
+            behaviors_cap_label(cfg.allow.caps.behaviors),
+        );
+
+        form([
+            form_item([
+                form_label("name"),
+                form_control(name_input),
+                form_description("Display name for the pod."),
+            ]),
+            form_item([
+                form_label("description"),
+                form_control(description_input),
+                form_description("Optional — surfaced in the pod list."),
+            ]),
+            form_item([
+                form_label("Allowed backends"),
+                form_control(backends_widget),
+                form_description(
+                    "Threads in this pod may bind to any backend listed here. \
+                     `thread_defaults.backend` must be one of these.",
+                ),
+            ]),
+            form_item([
+                form_label("Allowed shared MCP hosts"),
+                form_control(mcp_hosts_widget),
+                form_description(
+                    "Singleton MCP hosts the pod can use. `thread_defaults.mcp_hosts` \
+                     must reference these by name.",
+                ),
+            ]),
+            form_item([
+                form_label("Allowed knowledge buckets"),
+                form_control(buckets_widget),
+                form_description(
+                    "Bucket ids that threads in this pod may query through the \
+                     `knowledge_query` tool. Empty list = no buckets reachable.",
+                ),
+            ]),
+            form_item([
+                form_label("pod_modify ceiling"),
+                form_control(pod_modify_trigger),
+            ]),
+            form_item([
+                form_label("dispatch ceiling"),
+                form_control(dispatch_trigger),
+            ]),
+            form_item([
+                form_label("behaviors ceiling"),
+                form_control(behaviors_trigger),
+            ]),
+        ])
+    }
+
+    fn render_pod_editor_backends_check(&self, cfg: &PodConfig) -> El {
+        if self.backends.is_empty() {
+            return paragraph("(no backends — server hasn't reported any yet)")
+                .muted()
+                .small();
+        }
+        let options: Vec<(String, String)> = self
+            .backends
+            .iter()
+            .map(|b| (b.name.clone(), b.name.clone()))
+            .collect();
+        checkbox_column(POD_EDITOR_ALLOW_BACKENDS_KEY, &cfg.allow.backends, options)
+    }
+
+    fn render_pod_editor_mcp_hosts_check(&self, cfg: &PodConfig) -> El {
+        if self.shared_mcp_hosts.is_empty() {
+            return paragraph("(no shared MCP hosts configured server-side)")
+                .muted()
+                .small();
+        }
+        let options: Vec<(String, String)> = self
+            .shared_mcp_hosts
+            .iter()
+            .map(|h| (h.name.clone(), h.name.clone()))
+            .collect();
+        checkbox_column(
+            POD_EDITOR_ALLOW_MCP_HOSTS_KEY,
+            &cfg.allow.mcp_hosts,
+            options,
+        )
+    }
+
+    fn render_pod_editor_buckets_check(&self, cfg: &PodConfig) -> El {
+        if self.buckets.is_empty() {
+            return paragraph("(no buckets exist on this server yet)")
+                .muted()
+                .small();
+        }
+        let options: Vec<(String, String)> = self
+            .buckets
+            .iter()
+            .map(|b| (b.id.clone(), b.id.clone()))
+            .collect();
+        checkbox_column(
+            POD_EDITOR_ALLOW_BUCKETS_KEY,
+            &cfg.allow.knowledge_buckets,
+            options,
+        )
+    }
+
+    /// Build the select_menu for whichever pod-editor cap picker is
+    /// open. Single-active — at most one picker open at a time. Each
+    /// menu's options match the matching cap enum's variants.
+    fn pod_editor_cap_menu(&self, which: PodEditorPicker) -> El {
+        use whisper_agent_protocol::{BehaviorOpsCap, DispatchCap, PodModifyCap};
+        match which {
+            PodEditorPicker::AllowCapsPodModify => {
+                let options: Vec<(String, String)> = [
+                    PodModifyCap::None,
+                    PodModifyCap::Memories,
+                    PodModifyCap::Content,
+                    PodModifyCap::ModifyAllow,
+                ]
+                .into_iter()
+                .map(|c| {
+                    let lbl = pod_modify_cap_label(c);
+                    (lbl.to_string(), lbl.to_string())
+                })
+                .collect();
+                select_menu(POD_EDITOR_ALLOW_CAPS_POD_MODIFY_KEY, options)
+            }
+            PodEditorPicker::AllowCapsDispatch => {
+                let options: Vec<(String, String)> = [DispatchCap::None, DispatchCap::WithinScope]
+                    .into_iter()
+                    .map(|c| {
+                        let lbl = dispatch_cap_label(c);
+                        (lbl.to_string(), lbl.to_string())
+                    })
+                    .collect();
+                select_menu(POD_EDITOR_ALLOW_CAPS_DISPATCH_KEY, options)
+            }
+            PodEditorPicker::AllowCapsBehaviors => {
+                let options: Vec<(String, String)> = [
+                    BehaviorOpsCap::None,
+                    BehaviorOpsCap::Read,
+                    BehaviorOpsCap::AuthorNarrower,
+                    BehaviorOpsCap::AuthorAny,
+                ]
+                .into_iter()
+                .map(|c| {
+                    let lbl = behaviors_cap_label(c);
+                    (lbl.to_string(), lbl.to_string())
+                })
+                .collect();
+                select_menu(POD_EDITOR_ALLOW_CAPS_BEHAVIORS_KEY, options)
+            }
+        }
     }
 
     /// Open the fork-thread dialog for the current thread's

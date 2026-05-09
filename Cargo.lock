@@ -7319,6 +7319,7 @@ dependencies = [
  "serde",
  "serde_json",
  "similar",
+ "toml",
  "wasm-bindgen",
  "wasm-bindgen-futures",
  "web-sys",
