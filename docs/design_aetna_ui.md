@@ -681,6 +681,35 @@ Picked in this codebase, not enforced by aetna:
   when a new version's `lint` flags something we hadn't seen, that's
   the cue to reread the upstream changelog.
 
+## Upstream gaps
+
+Items the aetna sibling needs from upstream before we can close
+the gap with the egui webui:
+
+- **`scroll` widget stick-to-bottom mode.** The egui sibling
+  uses `egui::ScrollArea::stick_to_bottom(true)` so the chat log
+  hugs the most recent turn during streaming. Aetna's `scroll`
+  widget exposes only an offset; the App trait can read /
+  `set_scroll_offset` on `UiState`, but the App can only see
+  `BuildCx { theme }` — the scroll-state setter is host-private,
+  so even a "watch the offset and clamp it on each rebuild"
+  workaround isn't available from this side. File against
+  aetna; once a `pinned_to_end` (or `auto_follow_tail`)
+  flag lands, the aetna chat-log scroll picks it up in one
+  line.
+- **`winit` drag/drop + clipboard-image events on
+  `aetna-winit-wgpu`.** Stage 7's input side (image attachment
+  via paste / drop / file picker) is gated on this. egui has
+  it natively; aetna needs the host to surface
+  `WindowEvent::DroppedFile` / clipboard-image readers via a
+  `UiEvent::FileDropped` style variant before this side becomes
+  a thin port.
+- **Markdown viewer scroll-from-source.** The aetna-markdown
+  body re-builds when the source string grows past a threshold;
+  a streaming assistant turn occasionally scrolls flat to the
+  top of the body. Probably tied to the stick-to-bottom gap
+  above; revisit after that lands.
+
 ## Files of interest
 
 - `crates/whisper-agent-aetna-ui/src/app.rs` — the App impl + wire
