@@ -27,6 +27,11 @@ log = "0.4"
 chrono = "0.4"
 chrono-tz = { workspace = true }
 cron = { workspace = true }
+# Decode inbound `ContentBlock::Image { source: Bytes }` at render
+# time. Format set mirrors the protocol's `ImageMime` variants the
+# server adapters accept (HEIC/HEIF land as a placeholder for now —
+# the `image` crate doesn't decode them without an extra C library).
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "gif"] }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 wasm-bindgen = "0.2"

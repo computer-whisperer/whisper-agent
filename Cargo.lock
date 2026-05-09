@@ -7256,6 +7256,7 @@ dependencies = [
  "console_error_panic_hook",
  "cron",
  "getrandom 0.4.2",
+ "image",
  "js-sys",
  "log",
  "serde",

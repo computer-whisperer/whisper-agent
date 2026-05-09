@@ -5,10 +5,13 @@
 //! threads, snapshot + delta-streamed chat log rendered as event-log
 //! rows (3px role-colored gutter + content), assistant turns through
 //! `aetna_markdown::md`, reasoning + tool rows in collapsible
-//! `accordion_item`s, compose box that sends follow-up turns to the
-//! selected thread, and a new-thread compose form (card + form +
-//! `select_trigger` pickers for backend / model / pod) reachable
-//! when no thread is selected.
+//! `accordion_item`s, decoded inline images (PNG/JPEG/WebP/GIF)
+//! rendered through aetna's `image()` widget, compose box that
+//! sends follow-up turns to the selected thread, per-thread compose
+//! drafts persisted via `SetThreadDraft`, prefill-progress indicator,
+//! and a new-thread compose form (card + form + `select_trigger`
+//! pickers for backend / model / pod) reachable when no thread is
+//! selected.
 //! Build/on_event split is the load-bearing test of the pivot — every
 //! interactive element routes through [`ChatApp::on_event`] via a
 //! key, every visual is a function of state read in
@@ -17,11 +20,12 @@
 //! Things deliberately deferred:
 //! - inline diff rendering for `edit_file` / `write_file` tool calls
 //!   (currently shown as raw JSON args)
-//! - prefill progress + image output streaming
 //! - bindings surface (knowledge-db / behavior / shared MCP hosts) on
 //!   the new-thread form
-//! - attachment staging + drag/drop/paste/filepicker
-//! - per-thread draft persistence (`SetThreadDraft` debounce)
+//! - attachment staging input side (drag/drop/paste/filepicker) —
+//!   blocked on aetna-winit-wgpu exposing winit drop / clipboard
+//!   image events; rendering inbound images already works
+//! - URL-source image fetching (currently a muted placeholder)
 //! - all settings / behavior / pod / bucket / fork modals
 //!
 //! Dispatch model: a single `dispatch_wire` walks `ServerToClient`
@@ -35,8 +39,8 @@ use std::rc::Rc;
 use aetna_core::prelude::*;
 use aetna_core::widgets::select::{SelectAction, classify_event as classify_select_event};
 use whisper_agent_protocol::{
-    BackendSummary, ClientToServer, ContentBlock, ModelSummary, PodSummary, Role, ServerToClient,
-    ThreadConfigOverride, ThreadSummary,
+    BackendSummary, ClientToServer, ContentBlock, ImageSource, ModelSummary, PodSummary, Role,
+    ServerToClient, ThreadConfigOverride, ThreadSummary,
 };
 
 /// Inbound event variants the host shell pushes into the [`Inbound`]
@@ -118,6 +122,16 @@ enum DisplayItem {
         text: String,
         is_error: bool,
     },
+    /// Inline image — user-supplied (drag/paste/file picker on the
+    /// egui sibling, eventually here) or model-generated (Gemini
+    /// native image output, OpenAI Responses `image_generation`).
+    /// Decoded once at push time and cached as an `aetna_core::Image`
+    /// so rebuilds don't re-decode the bytes. The `is_user` flag
+    /// drives the role gutter color in `event_log_row`.
+    Image {
+        is_user: bool,
+        state: ImageRenderState,
+    },
     /// Anything else we don't yet render purpose-built (images,
     /// documents, tool-schema entries) — collapsed into a single
     /// annotated row. Future stages break these out.
@@ -130,6 +144,50 @@ enum DisplayItem {
 struct FusedToolResult {
     text: String,
     is_error: bool,
+}
+
+/// Three terminal states for an inline image: successfully decoded
+/// (we hold the `aetna_core::Image` and the original dimensions),
+/// remote URL (deferred — Stage 7 doesn't fetch yet), or a decode
+/// failure (we kept the reason for surfacing in the UI).
+enum ImageRenderState {
+    Decoded {
+        image: aetna_core::image::Image,
+        width: u32,
+        height: u32,
+    },
+    Url {
+        url: String,
+    },
+    Failed {
+        reason: String,
+    },
+}
+
+/// Decode an [`ImageSource::Bytes`] payload into an `aetna_core::Image`,
+/// returning the source-as-display-state so the call site can `match`
+/// without owning the decoder. URL sources route to `Url`; bytes
+/// failures land in `Failed { reason }` so the row still has a
+/// placeholder rather than disappearing silently.
+fn decode_image_source(source: &ImageSource) -> ImageRenderState {
+    match source {
+        ImageSource::Url { url } => ImageRenderState::Url { url: url.clone() },
+        ImageSource::Bytes { data, .. } => match image::load_from_memory(data) {
+            Ok(decoded) => {
+                let rgba = decoded.to_rgba8();
+                let (w, h) = rgba.dimensions();
+                let pixels = rgba.into_raw();
+                ImageRenderState::Decoded {
+                    image: aetna_core::image::Image::from_rgba8(w, h, pixels),
+                    width: w,
+                    height: h,
+                }
+            }
+            Err(err) => ImageRenderState::Failed {
+                reason: err.to_string(),
+            },
+        },
+    }
 }
 
 /// Per-thread display state. Held only for threads we've subscribed
@@ -596,10 +654,23 @@ impl ChatApp {
                     }
                 }
             }
+            ServerToClient::ThreadAssistantImage { thread_id, source } => {
+                // Native image output (Gemini today, OpenAI image_generation
+                // soon). Decoded once at receive time and pushed as its
+                // own row — coalescing onto the trailing AssistantText
+                // would mix the visual layout (markdown body + raster
+                // image side by side reads worse than two adjacent
+                // log rows).
+                if let Some(view) = self.views.get_mut(&thread_id) {
+                    view.items.push(DisplayItem::Image {
+                        is_user: false,
+                        state: decode_image_source(&source),
+                    });
+                }
+            }
             // Per-turn append events not yet surfaced.
             ServerToClient::ThreadToolResultMessage { .. }
             | ServerToClient::ThreadAssistantBegin { .. }
-            | ServerToClient::ThreadAssistantImage { .. }
             | ServerToClient::ThreadAssistantEnd { .. }
             | ServerToClient::ThreadLoopComplete { .. }
             | ServerToClient::ThreadCompacted { .. } => {}
@@ -1559,8 +1630,85 @@ impl ChatApp {
                     accordion_item(key, value, label.clone(), open, [paragraph(label.clone())]);
                 log_row(tokens::MUTED_FOREGROUND, None, item_el)
             }
+            DisplayItem::Image { is_user, state } => {
+                let gutter = if *is_user {
+                    tokens::INFO
+                } else {
+                    tokens::SUCCESS
+                };
+                let body = image_body(state);
+                if *is_user {
+                    log_row(gutter, Some(tokens::INFO.with_alpha(64)), body)
+                } else {
+                    log_row(gutter, None, body)
+                }
+            }
         }
     }
+}
+
+/// Render the body of a [`DisplayItem::Image`]. Decoded images go
+/// through aetna's [`image()`] widget at a capped display height
+/// (so a 4K screenshot doesn't dominate the chat log); URL sources
+/// and decode failures fall through to small annotated placeholders.
+fn image_body(state: &ImageRenderState) -> El {
+    /// Cap on the displayed height of a single image row. Width is
+    /// chosen by `ImageFit::Contain` to preserve aspect — a wide
+    /// screenshot stays full-width but shrinks vertically; a tall
+    /// portrait shrinks to the cap and lets width auto-fit.
+    const MAX_DISPLAY_HEIGHT: f32 = 320.0;
+
+    match state {
+        ImageRenderState::Decoded {
+            image: img,
+            width,
+            height,
+        } => {
+            // Choose displayed dimensions: never up-scale, never
+            // exceed the cap. Width is derived from the aspect ratio
+            // of the source so long-aspect images keep their shape.
+            let (w, h) = display_dims(*width, *height, MAX_DISPLAY_HEIGHT);
+            let caption = text(format!("{width}×{height}")).caption().muted();
+            column([
+                image(img.clone())
+                    .image_fit(ImageFit::Contain)
+                    .width(Size::Fixed(w))
+                    .height(Size::Fixed(h))
+                    .radius(tokens::RADIUS_SM),
+                caption,
+            ])
+            .gap(tokens::SPACE_1)
+        }
+        ImageRenderState::Url { url } => {
+            // No fetch yet — surface the URL so the user can at least
+            // know what was meant to render. Stage 7 follow-up: fetch
+            // + cache via the host shell.
+            column([
+                text("[image at remote URL — fetch deferred]").muted(),
+                text(url.clone()).caption().muted(),
+            ])
+            .gap(tokens::SPACE_1)
+        }
+        ImageRenderState::Failed { reason } => column([
+            text("[image decode failed]").destructive(),
+            text(reason.clone()).caption().muted(),
+        ])
+        .gap(tokens::SPACE_1),
+    }
+}
+
+/// Compute display `(width, height)` for an inline image given the
+/// source dims and a max display height. Never scales up; preserves
+/// aspect ratio. Used by `image_body` so a tall portrait shrinks to
+/// the cap and a tiny avatar stays at native size.
+fn display_dims(src_w: u32, src_h: u32, max_h: f32) -> (f32, f32) {
+    let src_w = src_w.max(1) as f32;
+    let src_h = src_h.max(1) as f32;
+    if src_h <= max_h {
+        return (src_w, src_h);
+    }
+    let scale = max_h / src_h;
+    (src_w * scale, max_h)
 }
 
 /// Collapsed-header label for a tool call. When the result has
@@ -1762,9 +1910,10 @@ fn push_block(block: &ContentBlock, user_role: bool, out: &mut Vec<DisplayItem>)
                 });
             }
         }
-        ContentBlock::Image { .. } => {
-            out.push(DisplayItem::GenericPlaceholder {
-                label: "[image]".into(),
+        ContentBlock::Image { source, .. } => {
+            out.push(DisplayItem::Image {
+                is_user: user_role,
+                state: decode_image_source(source),
             });
         }
         ContentBlock::Document { .. } => {

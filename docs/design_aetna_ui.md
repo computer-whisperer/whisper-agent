@@ -348,13 +348,32 @@ Still deferred:
   call's result slot — currently they fall through to a standalone
   `ToolResult` row when the call has scrolled out of fusion range
 
-### ⏳ Stage 7 — Images / attachments
+### 🌗 Stage 7 — Images / attachments (rendering side done)
 
-Decode PNG/JPEG/WebP/GIF to RGBA at staging time (the `image` crate is
-already in the tree) and hand pixels to aetna's `image()` widget.
-Drag/drop/paste/filepicker reused as-is from the egui sibling — they're
-host-level concerns. The compose-stage attachment strip becomes a row
-of `image()` thumbnails with remove buttons.
+Inbound rendering: `ContentBlock::Image { source: Bytes, .. }` and
+`ServerToClient::ThreadAssistantImage { source }` decode through the
+`image` crate at push time (PNG / JPEG / WebP / GIF — HEIC/HEIF land
+as a `Failed` placeholder until a HEIC dep is on the table). The
+decoded pixels become an `aetna_core::image::Image` cached inside
+`DisplayItem::Image` so rebuilds don't redecode. `event_log_row` then
+renders the image through aetna's `image()` widget at a capped
+display height (320px max — preserves aspect, never up-scales) with
+a small dimensions caption. URL sources fall through to a muted
+placeholder + the URL caption (no fetch yet); decode errors surface
+as a destructive-text + reason caption row.
+
+Input/staging side deferred: `aetna-winit-wgpu` doesn't yet expose
+winit's `WindowEvent::DroppedFile`/`HoveredFile` or platform
+clipboard-image readers, so drag/drop/paste/filepicker need an
+upstream feature first. Track in a follow-up issue against aetna —
+the egui sibling's compose attachment strip becomes a thin port once
+those events ride into `UiEvent`.
+
+Also still deferred:
+- URL fetching via the host shell (caching + a placeholder while
+  in-flight)
+- inline images in `ContentBlock::ToolResult` bodies (today
+  collapsed via `tool_result_text_summary`'s text-only extractor)
 
 ### ⏳ Stage 8 — Modals
 

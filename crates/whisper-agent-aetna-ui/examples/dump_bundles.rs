@@ -27,9 +27,10 @@ use aetna_core::prelude::{Rect, render_bundle_themed, write_bundle};
 use aetna_core::{App, BuildCx, UiEvent};
 use whisper_agent_aetna_ui::{ChatApp, Inbound, InboundEvent, SendFn};
 use whisper_agent_protocol::{
-    BackendSummary, CompactionConfig, ContentBlock, ContentCapabilities, Conversation, Message,
-    ModelSummary, PodSummary, Role, ServerToClient, ThreadBindings, ThreadConfig, ThreadSnapshot,
-    ThreadStateLabel, ThreadSummary, ToolResultContent, TurnLog, Usage, permission::Scope,
+    BackendSummary, CompactionConfig, ContentBlock, ContentCapabilities, Conversation, ImageMime,
+    ImageSource, Message, ModelSummary, PodSummary, Role, ServerToClient, ThreadBindings,
+    ThreadConfig, ThreadSnapshot, ThreadStateLabel, ThreadSummary, ToolResultContent, TurnLog,
+    Usage, permission::Scope,
 };
 
 fn main() -> std::io::Result<()> {
@@ -112,10 +113,16 @@ enum Scene {
     /// per-thread `text_area` binding picks the draft buffer up
     /// from the snapshot's `draft` field.
     ThreadWithDraft,
+    /// Subscribed thread whose snapshot includes a user-attached
+    /// PNG image plus an assistant image-output turn. Exercises the
+    /// decode path (PNG bytes → `aetna_core::Image`), the height
+    /// cap, and both gutters (info for user-supplied, success for
+    /// assistant-emitted).
+    ThreadWithImages,
 }
 
 impl Scene {
-    const ALL: [Scene; 13] = [
+    const ALL: [Scene; 14] = [
         Scene::Connecting,
         Scene::Connected,
         Scene::Closed,
@@ -129,6 +136,7 @@ impl Scene {
         Scene::NewThreadFormFilled,
         Scene::ThreadPrefilling,
         Scene::ThreadWithDraft,
+        Scene::ThreadWithImages,
     ];
 
     fn slug(self) -> &'static str {
@@ -146,6 +154,7 @@ impl Scene {
             Scene::NewThreadFormFilled => "new_thread_form_filled",
             Scene::ThreadPrefilling => "thread_prefilling",
             Scene::ThreadWithDraft => "thread_with_draft",
+            Scene::ThreadWithImages => "thread_with_images",
         }
     }
 
@@ -158,7 +167,8 @@ impl Scene {
             | Scene::ThreadWithMessages
             | Scene::ThreadWithToolCall
             | Scene::ThreadPrefilling
-            | Scene::ThreadWithDraft => vec!["thread:t-1"],
+            | Scene::ThreadWithDraft
+            | Scene::ThreadWithImages => vec!["thread:t-1"],
             // One toggle click on the backend trigger leaves the menu
             // open — render captures the popover.
             Scene::NewThreadFormBackendOpen => vec!["picker:backend"],
@@ -208,7 +218,8 @@ fn build_app(scene: Scene) -> ChatApp {
         | Scene::ThreadWithMessages
         | Scene::ThreadWithToolCall
         | Scene::ThreadPrefilling
-        | Scene::ThreadWithDraft => {
+        | Scene::ThreadWithDraft
+        | Scene::ThreadWithImages => {
             q.push_back(InboundEvent::ConnectionOpened);
             q.push_back(InboundEvent::Wire(ServerToClient::PodList {
                 correlation_id: None,
@@ -253,6 +264,12 @@ fn build_app(scene: Scene) -> ChatApp {
                 q.push_back(InboundEvent::Wire(ServerToClient::ThreadSnapshot {
                     thread_id: "t-1".into(),
                     snapshot: mock_draft_snapshot(),
+                }));
+            }
+            if matches!(scene, Scene::ThreadWithImages) {
+                q.push_back(InboundEvent::Wire(ServerToClient::ThreadSnapshot {
+                    thread_id: "t-1".into(),
+                    snapshot: mock_image_snapshot(),
                 }));
             }
         }
@@ -549,6 +566,82 @@ fn base_snapshot(
         dispatched_by: None,
         scope: Scope::default(),
     }
+}
+
+/// Snapshot for the `ThreadWithImages` scene. Two image rows: a
+/// user-supplied screenshot (encoded as PNG bytes by
+/// [`encode_checker_png`]) and a small URL-only image so the
+/// fallback rendering path is exercised in the same dump. The
+/// assistant turn then emits text + a model-generated image so
+/// the "is_user=false" gutter case is also covered.
+fn mock_image_snapshot() -> ThreadSnapshot {
+    let mut conv = Conversation::new();
+    conv.push(Message::system_text(""));
+    conv.push(Message {
+        role: Role::User,
+        content: vec![
+            ContentBlock::Text {
+                text: "Here's a screenshot of the bug — also, here's a URL of the original \
+                       on the wiki for reference:"
+                    .into(),
+            },
+            ContentBlock::Image {
+                source: ImageSource::Bytes {
+                    media_type: ImageMime::Png,
+                    data: encode_checker_png(160, 100),
+                },
+                replay: None,
+            },
+            ContentBlock::Image {
+                source: ImageSource::Url {
+                    url: "https://example.com/wiki/screenshots/bug-1234.png".into(),
+                },
+                replay: None,
+            },
+        ],
+    });
+    conv.push(Message {
+        role: Role::Assistant,
+        content: vec![
+            ContentBlock::Text {
+                text: "I see the issue — the second column overflows. \
+                       Generated a fix preview:"
+                    .into(),
+            },
+            ContentBlock::Image {
+                source: ImageSource::Bytes {
+                    media_type: ImageMime::Png,
+                    // Different dims than the user's image so the cap
+                    // logic and per-row aspect handling are exercised
+                    // independently.
+                    data: encode_checker_png(240, 80),
+                },
+                replay: None,
+            },
+        ],
+    });
+    base_snapshot(conv, ThreadStateLabel::Idle, String::new())
+}
+
+/// Encode a small RGB checker pattern as PNG bytes. Used by
+/// [`mock_image_snapshot`] to produce a real PNG payload that the
+/// app's `image::load_from_memory` decoder can chew on, without
+/// shipping a binary fixture. 8-pixel tile so the pattern is
+/// visible at the cap'd display height.
+fn encode_checker_png(width: u32, height: u32) -> Vec<u8> {
+    use image::{ImageBuffer, ImageFormat, Rgba};
+    let img: ImageBuffer<Rgba<u8>, _> = ImageBuffer::from_fn(width, height, |x, y| {
+        let cell = ((x / 8) + (y / 8)) % 2;
+        if cell == 0 {
+            Rgba([0xff, 0x00, 0xaa, 0xff])
+        } else {
+            Rgba([0x00, 0xaa, 0xff, 0xff])
+        }
+    });
+    let mut buf = std::io::Cursor::new(Vec::new());
+    img.write_to(&mut buf, ImageFormat::Png)
+        .expect("encode checker PNG");
+    buf.into_inner()
 }
 
 /// Snapshot exercising the tool-call accordion path. One assistant
