@@ -625,9 +625,14 @@ impl ChatApp {
                     .enumerate()
                     .map(|(idx, item)| self.event_log_row(idx, item))
                     .collect();
+                // Inter-row breathing room. Upstream's README example
+                // has no explicit gap; with the row content sitting
+                // flush, adjacent unfilled rows visually blur into one
+                // text flow. SPACE_2 (8px) reads as a log-style line
+                // gap rather than card-isolation.
                 scroll(rows)
                     .key(scroll_key)
-                    .gap(0.0)
+                    .gap(tokens::SPACE_2)
                     .padding(tokens::SPACE_2)
                     .width(Size::Fill(1.0))
                     .height(Size::Fill(1.0))
@@ -744,7 +749,13 @@ impl ChatApp {
         match item {
             DisplayItem::User { text: t } => {
                 let body = paragraph(t.clone());
-                log_row(tokens::INFO, Some(tokens::INFO.with_alpha(18)), body)
+                // Upstream README's worked example uses
+                // `with_alpha(18)` (~7%) for the user fill — too low
+                // to be visible against the dark zinc-950 background.
+                // Bump to ~25% so user turns actually break up a long
+                // assistant stream. Subtle enough to still read as
+                // "log entry, not card".
+                log_row(tokens::INFO, Some(tokens::INFO.with_alpha(64)), body)
             }
             DisplayItem::Assistant { text: t } => {
                 // Markdown rendering for assistant content. The egui
