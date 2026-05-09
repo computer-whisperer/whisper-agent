@@ -94,5 +94,11 @@ if [[ "$READY" -ne 1 ]]; then
 fi
 
 echo "==> launching whisper-agent-desktop-aetna against http://$LISTEN_SERVER"
+# Pass an explicit empty token so the binary's login-form auto-skip
+# matches: it requires both `--server` and a token source to skip the
+# form. Loopback servers ignore the (empty) Authorization header
+# anyway. Drop this flag once we want the script to exercise the
+# login flow itself.
 "$REPO_ROOT/target/release/whisper-agent-desktop-aetna" \
-    --server "http://$LISTEN_SERVER"
+    --server "http://$LISTEN_SERVER" \
+    --token ""

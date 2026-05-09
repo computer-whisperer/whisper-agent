@@ -388,12 +388,35 @@ hundred lines:
 - fork thread
 - file / JSON / image viewers
 
-### ⏳ Stage 9 — Login form
+### ✅ Stage 9 — Login form
 
-Currently the desktop binary requires `--server` + `--token` /
-`WA_TOKEN` / `--token-file`. The egui sibling has an in-app login screen
-that writes to `~/.config/whisper-agent/desktop.toml`. Trivial port once
-`text_input` is exercised live (it's already in stage 3).
+`whisper_agent_aetna_ui::LoginApp` is a separate aetna [`App`] —
+centered card with a server URL field, a password-masked token
+field (`text_input_with(...).password()`), a "Remember on this
+device" checkbox, and a primary Connect button. Submission rides a
+host-supplied `SubmitFn` callback so the lib stays platform-agnostic
+(both the wasm browser entry and the desktop binary will reuse it).
+
+Desktop binary owns a `RootApp` that wraps either a `LoginApp` or
+the existing `DesktopApp(ChatApp)` in a `Phase` enum. Startup
+loads `$XDG_CONFIG_HOME/whisper-agent/desktop.toml` (same shape as
+the egui sibling — both clients can share the file) and
+auto-connects when both server URL and token are known. CLI flags
+override saved config; `--login` forces the form even when both
+are present.
+
+Submission flow: `LoginApp::submit` writes to an
+`Arc<Mutex<Option<LoginInput>>>` "phase signal" the host shell
+reads in `before_build`. On a pending submission, the host
+persists creds (gating token write on the "Remember" checkbox),
+spawns the WS task, and swaps `Phase` to `Connected`. Failed
+`derive_ws_url` calls bounce back to a fresh `LoginApp` with
+`set_error(...)` carrying the parse error.
+
+Bundle scenes: `LoginFormEmpty`, `LoginFormPrefilled`,
+`LoginFormWithError`. The dump loop is now generic over
+`Box<dyn App>` so future App variants (e.g. modal hosts) can join
+without reshaping the loop.
 
 ### ✅ Stage 10 — Markdown rendering
 

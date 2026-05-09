@@ -25,7 +25,9 @@ use std::rc::Rc;
 
 use aetna_core::prelude::{Rect, render_bundle_themed, write_bundle};
 use aetna_core::{App, BuildCx, UiEvent};
-use whisper_agent_aetna_ui::{ChatApp, Inbound, InboundEvent, SendFn};
+use whisper_agent_aetna_ui::{
+    ChatApp, Inbound, InboundEvent, LoginApp, LoginInput, SendFn, SubmitFn,
+};
 use whisper_agent_protocol::{
     BackendSummary, CompactionConfig, ContentBlock, ContentCapabilities, Conversation, ImageMime,
     ImageSource, Message, ModelSummary, PodSummary, Role, ServerToClient, ThreadBindings,
@@ -41,11 +43,11 @@ fn main() -> std::io::Result<()> {
     let out_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("out");
 
     for scene in Scene::ALL {
-        let mut app = build_app(scene);
-        // before_build drains seeded wire frames into the App's
-        // state machine — same path the live host calls. Done before
-        // any synthetic clicks so a click that depends on the wire
-        // state (selecting a known thread) sees that state.
+        // Both `ChatApp` and `LoginApp` implement `App`. The dump
+        // loop is generic over `Box<dyn App>` so a new App variant
+        // (e.g. a future modal-host App) can be added without
+        // teaching the renderer about it.
+        let mut app: Box<dyn App> = build_app(scene);
         app.before_build();
         for click in scene.clicks() {
             app.on_event(UiEvent::synthetic_click(click));
@@ -119,10 +121,22 @@ enum Scene {
     /// cap, and both gutters (info for user-supplied, success for
     /// assistant-emitted).
     ThreadWithImages,
+    /// Empty login form — `LoginApp` straight out of `new(None,
+    /// None, ...)`. Verifies the card / form / text_input
+    /// composition before any user input.
+    LoginFormEmpty,
+    /// Login form pre-filled with a server URL + token (the path
+    /// the desktop binary takes when CLI args or saved config
+    /// supplied creds but `--login` was passed).
+    LoginFormPrefilled,
+    /// Login form with a connection error — `set_error` was called
+    /// after a failed `derive_ws_url`. Verifies the destructive
+    /// alert renders below the form.
+    LoginFormWithError,
 }
 
 impl Scene {
-    const ALL: [Scene; 14] = [
+    const ALL: [Scene; 17] = [
         Scene::Connecting,
         Scene::Connected,
         Scene::Closed,
@@ -137,6 +151,9 @@ impl Scene {
         Scene::ThreadPrefilling,
         Scene::ThreadWithDraft,
         Scene::ThreadWithImages,
+        Scene::LoginFormEmpty,
+        Scene::LoginFormPrefilled,
+        Scene::LoginFormWithError,
     ];
 
     fn slug(self) -> &'static str {
@@ -155,6 +172,9 @@ impl Scene {
             Scene::ThreadPrefilling => "thread_prefilling",
             Scene::ThreadWithDraft => "thread_with_draft",
             Scene::ThreadWithImages => "thread_with_images",
+            Scene::LoginFormEmpty => "login_form_empty",
+            Scene::LoginFormPrefilled => "login_form_prefilled",
+            Scene::LoginFormWithError => "login_form_with_error",
         }
     }
 
@@ -189,7 +209,13 @@ impl Scene {
     }
 }
 
-fn build_app(scene: Scene) -> ChatApp {
+fn build_app(scene: Scene) -> Box<dyn App> {
+    // Login scenes don't need an Inbound queue; build a fresh
+    // `LoginApp` straight from the `LoginInput` signature.
+    if let Some(login_app) = build_login_app(scene) {
+        return Box::new(login_app);
+    }
+
     let inbound: Inbound = Rc::new(std::cell::RefCell::new(VecDeque::new()));
     // No-op outbound: bundle dumping never sends to a server. Kept on
     // the same `SendFn` shape so [`ChatApp::new`] is the same call
@@ -303,9 +329,38 @@ fn build_app(scene: Scene) -> ChatApp {
                 }));
             }
         }
+        // Login scenes route through `build_login_app` above and
+        // never reach here.
+        Scene::LoginFormEmpty | Scene::LoginFormPrefilled | Scene::LoginFormWithError => {
+            unreachable!("login scenes handled by build_login_app");
+        }
     }
     drop(q);
-    app
+    Box::new(app)
+}
+
+/// Construct a `LoginApp` for the login-form scenes. Returns
+/// `None` for non-login scenes so `build_app` can fall through to
+/// the `ChatApp` builder.
+fn build_login_app(scene: Scene) -> Option<LoginApp> {
+    let submit: SubmitFn = Box::new(|_input: LoginInput| {
+        // Bundle dumping never actually submits — the form just
+        // needs a valid callback to live in its struct.
+    });
+    match scene {
+        Scene::LoginFormEmpty => Some(LoginApp::new(None, None, submit)),
+        Scene::LoginFormPrefilled => Some(LoginApp::new(
+            Some("https://chat.example.internal:8443".into()),
+            Some("ya29.example-token-redacted".into()),
+            submit,
+        )),
+        Scene::LoginFormWithError => {
+            let mut app = LoginApp::new(Some("not-a-url".into()), None, submit);
+            app.set_error("invalid server URL: relative URL without a base");
+            Some(app)
+        }
+        _ => None,
+    }
 }
 
 fn mock_backends() -> Vec<BackendSummary> {
