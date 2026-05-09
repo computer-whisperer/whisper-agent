@@ -300,17 +300,26 @@ tab strip rather than ported piecemeal. Multi-slice rollout:
   key, so opening a modal / switching tabs / picking a thread all
   cancel a pending arm.
 
-  Visual contract: idle Delete is a plain ghost button (matches
-  Run / Pause weight, won't catch a misclicked scroll); armed
-  flips to solid destructive fill with the wider "Confirm delete?"
-  label. The color change is the load-bearing arm signal — the
-  label change alone wouldn't be enough on a fast double-click.
-  Layout: two-row toolbar inside the expanded behavior body —
-  Run + Pause on top, Edit (left) + Delete (right) on the bottom.
-  Three buttons can't fit on either row alone once the armed
-  Delete label expands; pairing Edit with Delete on the bottom
-  also visually separates "everyday" from "modify-this-record"
-  intent.
+  Visual contract: idle Delete is a trash `icon_button().ghost()`
+  (matches Run / Pause weight, won't catch a misclicked scroll);
+  armed flips to a wider text `button("Confirm delete?")
+  .destructive()`. The combined icon→text + ghost→destructive
+  shift is the load-bearing arm signal — either alone would be
+  too easy to misclick past on a fast double-tap. Layout: two-
+  row toolbar inside the expanded behavior body — Run + Pause on
+  top, Edit (left) + Delete (right) on the bottom. The bottom
+  row pairs "modify-this-record" (Edit) with destructive (Delete)
+  so the row composition itself signals "danger zone."
+
+  Chrome leans on icons over text per `feedback_aetna_chrome_icons`
+  — Run is `zap` (lightning, distinct from Pause's `play`-on-
+  resume), Pause is `pause`/`play`, Edit is `square-pen`, idle
+  Delete is `trash`. None of these ship in aetna's built-in
+  [`IconName`] registry yet; the lucide-shaped SVGs are bundled
+  in `crates/whisper-agent-aetna-ui/src/icons.rs` and constructed
+  via `SvgIcon::parse_current_color`. When a future aetna
+  upstream registers them, the bundled `LazyLock<SvgIcon>` slots
+  collapse to plain `"name"` strings.
 
   Edit landed via the per-behavior editor sheet (see Stage 8).
   Archive-pod and other danger ops will reuse the same

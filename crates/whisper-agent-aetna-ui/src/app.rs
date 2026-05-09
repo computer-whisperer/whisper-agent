@@ -2382,31 +2382,45 @@ impl ChatApp {
     }
 
     /// Inline action toolbar shown inside an expanded behavior body.
-    /// Two-row layout: the top row carries Run-now and Pause(Resume);
-    /// the bottom row pairs Edit (left) with destructive Delete
-    /// (right, two-click arm-confirm). First click on Delete flips
-    /// the label to "Confirm delete?" and the styling to destructive;
-    /// second click on the same button fires `DeleteBehavior`. Any
-    /// unrelated click disarms (handled at the top of `on_event`).
+    /// Icon-shaped chrome (lucide `zap` / `pause` or `play` / square-
+    /// pen / trash) — keeps the toolbar dense in a 224 px sidebar
+    /// column where text labels read crowded. Two-row layout: the top
+    /// row carries Run-now and Pause(Resume); the bottom row pairs
+    /// Edit (left) with Delete (right, two-click arm-confirm).
+    ///
+    /// Run-now uses `zap` (lightning = "fire now") rather than `play`
+    /// so it doesn't visually collide with the Resume `play` icon
+    /// when the behavior is paused. The armed Delete keeps a text
+    /// label ("Confirm delete?") because a label change is the only
+    /// reliable signal for an arm-confirm gesture — switching from
+    /// trash-icon to text on arm makes the second-click intent
+    /// unmistakable.
     ///
     /// Two rows because the sidebar's 224 px isn't wide enough to hold
-    /// three buttons on one row plus the (sometimes-armed) Delete on
-    /// another. Edit opens the [`BEHAVIOR_EDITOR_KEY`] sheet (right-
-    /// attached `SheetSide::Right`); load-errored rows can still open
-    /// it so the user can fix the broken `behavior.toml` from the form
-    /// (or fall back to the eventual raw-TOML tab).
+    /// every button next to the (sometimes-armed) Delete; the visual
+    /// split also separates "everyday" (Run / Pause) from "modify-
+    /// this-record" + destructive (Edit / Delete).
+    ///
+    /// Edit opens the [`BEHAVIOR_EDITOR_KEY`] sheet (right-attached
+    /// `SheetSide::Right`); load-errored rows can still open it so the
+    /// user can fix the broken `behavior.toml` from the form (or fall
+    /// back to the eventual raw-TOML tab).
     fn behavior_actions_row(&self, pod_id: &str, b: &BehaviorSummary) -> El {
-        let mut run = button("Run now")
+        let mut run = icon_button(crate::icons::ICON_ZAP.clone())
             .key(behavior_run_key(pod_id, &b.behavior_id))
             .ghost();
         if b.load_error.is_some() {
             run = run.disabled();
         }
-        let toggle_label = if b.enabled { "Pause" } else { "Resume" };
-        let toggle = button(toggle_label)
+        let toggle_icon = if b.enabled {
+            crate::icons::ICON_PAUSE.clone()
+        } else {
+            crate::icons::ICON_PLAY.clone()
+        };
+        let toggle = icon_button(toggle_icon)
             .key(behavior_toggle_key(pod_id, &b.behavior_id))
             .ghost();
-        let edit = button("Edit")
+        let edit = icon_button(crate::icons::ICON_SQUARE_PEN.clone())
             .key(behavior_edit_key(pod_id, &b.behavior_id))
             .ghost();
 
@@ -2415,22 +2429,22 @@ impl ChatApp {
             .as_ref()
             .map(|(p, bb)| p == pod_id && bb == &b.behavior_id)
             .unwrap_or(false);
-        // The color shift is the load-bearing arm signal: idle is a
-        // muted ghost button that visually matches Run / Pause, so
-        // the user doesn't accidentally hit a loud "Delete" when
-        // they meant to scroll. Click once → solid destructive
-        // fill plus the wider "Confirm delete?" label, which makes
-        // the second click an obvious deliberate gesture.
-        // (`.ghost().destructive()` doesn't compose the way it
-        // looks — `destructive()` runs `tint()` which writes back
-        // to `fill` regardless of ghost, so the idle styling has
-        // to be plain ghost.)
+        // Two affordance shifts on arm: the idle trash icon flips
+        // to a text "Confirm delete?" label, AND the styling flips
+        // to solid destructive fill. The icon→text shift is what
+        // keeps the second-click gesture unmistakable — a fast
+        // double-click on a trash icon is plausibly accidental, but
+        // a click on a wide red text button isn't. (`.ghost().
+        // destructive()` doesn't compose the way it looks —
+        // `destructive()` runs `tint()` which writes back to `fill`
+        // regardless of ghost, so the idle styling has to be plain
+        // ghost.)
         let delete = if armed {
             button("Confirm delete?")
                 .key(behavior_delete_key(pod_id, &b.behavior_id))
                 .destructive()
         } else {
-            button("Delete")
+            icon_button(crate::icons::ICON_TRASH.clone())
                 .key(behavior_delete_key(pod_id, &b.behavior_id))
                 .ghost()
         };

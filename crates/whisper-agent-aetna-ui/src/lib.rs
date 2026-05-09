@@ -9,6 +9,7 @@
 //! phase-switching wrapper of their choosing.
 
 mod app;
+mod icons;
 mod login;
 
 pub use app::{ChatApp, Inbound, InboundEvent, SendFn};
