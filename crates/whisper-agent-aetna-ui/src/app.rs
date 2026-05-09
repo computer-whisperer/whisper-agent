@@ -39,10 +39,10 @@ use std::rc::Rc;
 use aetna_core::prelude::*;
 use aetna_core::widgets::select::{SelectAction, classify_event as classify_select_event};
 use whisper_agent_protocol::{
-    AllowMap, BackendSummary, BehaviorConfig, BehaviorSummary, BehaviorThreadOverride,
-    ClientToServer, ContentBlock, Disposition, ImageSource, ModelSummary, NamedHostEnv, PodAllow,
-    PodConfig, PodLimits, PodSummary, RetentionPolicy, Role, ServerToClient, ThreadConfigOverride,
-    ThreadDefaults, ThreadSummary, TriggerSpec,
+    AllowMap, BackendSummary, BehaviorConfig, BehaviorSummary, BehaviorThreadOverride, CatchUp,
+    ClientToServer, ContentBlock, Disposition, ImageSource, ModelSummary, NamedHostEnv, Overlap,
+    PodAllow, PodConfig, PodLimits, PodSummary, RetentionPolicy, Role, ServerToClient,
+    ThreadConfigOverride, ThreadDefaults, ThreadSummary, TriggerSpec,
 };
 
 /// Inbound event variants the host shell pushes into the [`Inbound`]
@@ -666,10 +666,27 @@ pub(crate) struct BehaviorEditorSheetState {
     /// == Cron`; preserved across kind switches so toggling away and
     /// back doesn't lose the user's typed schedule.
     pub(crate) schedule_buffer: String,
+    /// Cron timezone edit buffer. Meaningful only when `working_kind
+    /// == Cron`; same preservation discipline as
+    /// [`Self::schedule_buffer`].
+    pub(crate) timezone_buffer: String,
+    /// Cron `overlap` policy buffer. Reused under Webhook for the
+    /// same field, so kind-switching between Cron and Webhook
+    /// preserves the choice.
+    pub(crate) overlap_buffer: Overlap,
+    /// Cron `catch_up` policy buffer.
+    pub(crate) catch_up_buffer: CatchUp,
+    /// Active editor tab. Sub-tabs are placeholders for now;
+    /// follow-up slices fill them in.
+    pub(crate) tab: BehaviorEditorTab,
     /// Whether the trigger-kind `select_menu` popover is open. One
     /// menu at a time across the whole app — opening this menu closes
     /// the new-thread compose pickers via `close_other_pickers`.
     pub(crate) trigger_kind_open: bool,
+    /// Which `select_menu` (if any) is currently open inside the
+    /// editor. Single-active-at-a-time discipline shared with the
+    /// pod editor's pickers via `close_other_pickers`.
+    pub(crate) open_picker: Option<BehaviorEditorPicker>,
     /// Validation message: load error from the snapshot, client-side
     /// validation failure, or server-side `Error` echo.
     pub(crate) error: Option<String>,
@@ -729,6 +746,87 @@ impl TriggerKindLabel {
     }
 }
 
+/// Editor tab discriminator for the behavior editor sheet's
+/// multi-tab body. Mirrors the egui sibling's `BehaviorEditorTab`
+/// (Trigger / Thread / Scope / Retention / Prompt / SystemPrompt /
+/// RawToml). Most non-Trigger tabs render placeholder paragraphs
+/// in the first slice; follow-up slices fill them in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum BehaviorEditorTab {
+    Trigger,
+    Thread,
+    Scope,
+    Retention,
+    Prompt,
+    SystemPrompt,
+    RawToml,
+}
+
+impl BehaviorEditorTab {
+    fn label(self) -> &'static str {
+        // "Retain" rather than "Retention" so all 7 labels fit the
+        // 600 px sheet's 7-tab strip without TextOverflow lint
+        // findings — at the strip's per-tab width budget,
+        // "Retention" overflows by ~7 px and ellipsizes ugly.
+        match self {
+            Self::Trigger => "Trigger",
+            Self::Thread => "Thread",
+            Self::Scope => "Scope",
+            Self::Retention => "Retain",
+            Self::Prompt => "Prompt",
+            Self::SystemPrompt => "System",
+            Self::RawToml => "Raw",
+        }
+    }
+
+    fn wire_value(self) -> &'static str {
+        match self {
+            Self::Trigger => "trigger",
+            Self::Thread => "thread",
+            Self::Scope => "scope",
+            Self::Retention => "retention",
+            Self::Prompt => "prompt",
+            Self::SystemPrompt => "system_prompt",
+            Self::RawToml => "raw",
+        }
+    }
+
+    fn from_wire(value: &str) -> Option<Self> {
+        match value {
+            "trigger" => Some(Self::Trigger),
+            "thread" => Some(Self::Thread),
+            "scope" => Some(Self::Scope),
+            "retention" => Some(Self::Retention),
+            "prompt" => Some(Self::Prompt),
+            "system_prompt" => Some(Self::SystemPrompt),
+            "raw" => Some(Self::RawToml),
+            _ => None,
+        }
+    }
+}
+
+/// Picker discriminator for the behavior editor's `select_trigger`
+/// family. Single-active across the whole sheet via
+/// `close_other_pickers`. The trigger-kind picker stays on the
+/// dedicated `trigger_kind_open: bool` boolean (it pre-dates this
+/// enum) — adding it here would require a larger flow rework.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum BehaviorEditorPicker {
+    /// Cron `overlap` policy picker.
+    Overlap,
+    /// Cron `catch_up` policy picker.
+    CatchUp,
+}
+
+impl BehaviorEditorPicker {
+    fn key(self) -> &'static str {
+        match self {
+            Self::Overlap => BEHAVIOR_EDITOR_OVERLAP_KEY,
+            Self::CatchUp => BEHAVIOR_EDITOR_CATCH_UP_KEY,
+        }
+    }
+}
+
 impl BehaviorEditorSheetState {
     fn new(pod_id: String, behavior_id: String, pending_get: String) -> Self {
         Self {
@@ -738,7 +836,12 @@ impl BehaviorEditorSheetState {
             working_prompt: String::new(),
             working_kind: TriggerKindLabel::Manual,
             schedule_buffer: String::new(),
+            timezone_buffer: "UTC".into(),
+            overlap_buffer: Overlap::default(),
+            catch_up_buffer: CatchUp::default(),
+            tab: BehaviorEditorTab::Trigger,
             trigger_kind_open: false,
+            open_picker: None,
             error: None,
             pending_get: Some(pending_get),
             pending_save: None,
@@ -747,7 +850,7 @@ impl BehaviorEditorSheetState {
 
     /// Hydrate the working state from a [`BehaviorSnapshot`]. Called
     /// once when the matching `GetBehavior` round-trip completes. Sets
-    /// `working_kind` + `schedule_buffer` from the trigger variant so
+    /// `working_kind` + the cron buffers from the trigger variant so
     /// the form widgets render against the snapshot's values. A
     /// `load_error` from disk lands in `error` (and `working_config`
     /// stays `None`) so the user sees the parse failure rather than
@@ -757,52 +860,52 @@ impl BehaviorEditorSheetState {
         self.error = snapshot.load_error.clone();
         if let Some(cfg) = snapshot.config.as_ref() {
             self.working_kind = TriggerKindLabel::from_trigger(&cfg.trigger);
-            self.schedule_buffer = match &cfg.trigger {
-                TriggerSpec::Cron { schedule, .. } => schedule.clone(),
-                _ => String::new(),
-            };
+            match &cfg.trigger {
+                TriggerSpec::Cron {
+                    schedule,
+                    timezone,
+                    overlap,
+                    catch_up,
+                } => {
+                    self.schedule_buffer = schedule.clone();
+                    self.timezone_buffer = timezone.clone();
+                    self.overlap_buffer = *overlap;
+                    self.catch_up_buffer = *catch_up;
+                }
+                TriggerSpec::Webhook { overlap } => {
+                    // Webhook reuses the overlap buffer; leave the
+                    // schedule/timezone/catch_up at their previous
+                    // values so kind-switching back to Cron preserves
+                    // the user's typing.
+                    self.overlap_buffer = *overlap;
+                }
+                TriggerSpec::Manual => {
+                    // Manual carries no scheduling fields. Leave the
+                    // buffers untouched for the same kind-switching
+                    // continuity reason.
+                }
+            }
         }
         self.working_config = snapshot.config;
         self.working_prompt = snapshot.prompt;
     }
 
     /// Resolve the form state into a `TriggerSpec` for `UpdateBehavior`.
-    /// Preserves variant-internal fields (timezone, overlap, catch_up
-    /// for cron; overlap for webhook) from the loaded config when the
-    /// kind didn't change; defaults them when transitioning between
-    /// kinds. The schedule string for cron is taken from
-    /// `schedule_buffer` — the variant-internal value is the source of
-    /// truth on disk, but the buffer is the source of truth while the
-    /// editor is open.
+    /// Each variant pulls from the live editor buffers — for kinds the
+    /// user hasn't touched, the buffers were seeded from the snapshot
+    /// at hydrate time, so the round-trip preserves on-disk values.
     fn resolved_trigger(&self) -> TriggerSpec {
-        use whisper_agent_protocol::{CatchUp, Overlap};
-        let baseline = self.working_config.as_ref().map(|c| c.trigger.clone());
         match self.working_kind {
             TriggerKindLabel::Manual => TriggerSpec::Manual,
-            TriggerKindLabel::Cron => {
-                let (timezone, overlap, catch_up) = match baseline.as_ref() {
-                    Some(TriggerSpec::Cron {
-                        timezone,
-                        overlap,
-                        catch_up,
-                        ..
-                    }) => (timezone.clone(), *overlap, *catch_up),
-                    _ => ("UTC".to_string(), Overlap::default(), CatchUp::default()),
-                };
-                TriggerSpec::Cron {
-                    schedule: self.schedule_buffer.trim().to_string(),
-                    timezone,
-                    overlap,
-                    catch_up,
-                }
-            }
-            TriggerKindLabel::Webhook => {
-                let overlap = match baseline.as_ref() {
-                    Some(TriggerSpec::Webhook { overlap }) => *overlap,
-                    _ => Overlap::default(),
-                };
-                TriggerSpec::Webhook { overlap }
-            }
+            TriggerKindLabel::Cron => TriggerSpec::Cron {
+                schedule: self.schedule_buffer.trim().to_string(),
+                timezone: self.timezone_buffer.trim().to_string(),
+                overlap: self.overlap_buffer,
+                catch_up: self.catch_up_buffer,
+            },
+            TriggerKindLabel::Webhook => TriggerSpec::Webhook {
+                overlap: self.overlap_buffer,
+            },
         }
     }
 }
@@ -2427,9 +2530,13 @@ const POD_EDITOR_DISMISS_KEY: &str = "pod-editor:dismiss";
 /// `{prefix}:trigger-kind` (select_trigger + select_menu pair),
 /// `{prefix}:save` (primary button), `{prefix}:cancel` (secondary).
 const BEHAVIOR_EDITOR_KEY: &str = "behavior-editor";
+const BEHAVIOR_EDITOR_TABS_KEY: &str = "behavior-editor:tabs";
 const BEHAVIOR_EDITOR_NAME_KEY: &str = "behavior-editor:name";
 const BEHAVIOR_EDITOR_DESCRIPTION_KEY: &str = "behavior-editor:description";
 const BEHAVIOR_EDITOR_SCHEDULE_KEY: &str = "behavior-editor:schedule";
+const BEHAVIOR_EDITOR_TIMEZONE_KEY: &str = "behavior-editor:timezone";
+const BEHAVIOR_EDITOR_OVERLAP_KEY: &str = "behavior-editor:overlap";
+const BEHAVIOR_EDITOR_CATCH_UP_KEY: &str = "behavior-editor:catch-up";
 const BEHAVIOR_EDITOR_PROMPT_KEY: &str = "behavior-editor:prompt";
 /// `select_trigger` key for the trigger-kind picker; also the prefix
 /// `widgets::select` derives the per-option key from
@@ -2595,6 +2702,40 @@ fn tool_gate_from_wire(s: &str) -> Option<Disposition> {
     match s {
         "allow_all" => Some(Disposition::Allow),
         "deny_all" => Some(Disposition::Deny),
+        _ => None,
+    }
+}
+
+fn overlap_label(o: Overlap) -> &'static str {
+    match o {
+        Overlap::Skip => "skip",
+        Overlap::QueueOne => "queue_one",
+        Overlap::Allow => "allow",
+    }
+}
+
+fn overlap_from_wire(s: &str) -> Option<Overlap> {
+    match s {
+        "skip" => Some(Overlap::Skip),
+        "queue_one" => Some(Overlap::QueueOne),
+        "allow" => Some(Overlap::Allow),
+        _ => None,
+    }
+}
+
+fn catch_up_label(c: CatchUp) -> &'static str {
+    match c {
+        CatchUp::None => "none",
+        CatchUp::One => "one",
+        CatchUp::All => "all",
+    }
+}
+
+fn catch_up_from_wire(s: &str) -> Option<CatchUp> {
+    match s {
+        "none" => Some(CatchUp::None),
+        "one" => Some(CatchUp::One),
+        "all" => Some(CatchUp::All),
         _ => None,
     }
 }
@@ -2797,6 +2938,16 @@ impl ChatApp {
         // `select_trigger` key via `PodEditorPicker::key`. If the
         // open picker's key isn't `keep_open`, close it.
         if let Some(editor) = self.pod_editor.as_mut()
+            && let Some(open) = editor.open_picker
+            && keep_open != open.key()
+        {
+            editor.open_picker = None;
+        }
+        // Behavior editor's overlap / catch_up pickers — same
+        // single-active discipline. The trigger-kind picker is
+        // closed via the dedicated `trigger_kind_open` boolean
+        // above; everything else lives under `open_picker`.
+        if let Some(editor) = self.behavior_editor.as_mut()
             && let Some(open) = editor.open_picker
             && keep_open != open.key()
         {
@@ -3719,6 +3870,14 @@ impl ChatApp {
             {
                 out.push(Some(self.behavior_editor_trigger_kind_menu()));
             }
+            // Overlap / catch_up pickers — single-active per
+            // `editor.open_picker`. Same topmost-layer discipline as
+            // the trigger-kind menu above.
+            if let Some(editor) = self.behavior_editor.as_ref()
+                && let Some(open) = editor.open_picker
+            {
+                out.push(Some(self.behavior_editor_picker_menu(open)));
+            }
         }
         if let Some(sheet_el) = self.render_pod_editor_sheet() {
             out.push(Some(sheet_el));
@@ -4003,6 +4162,24 @@ impl ChatApp {
             return false;
         }
 
+        // Tabs strip — reuses aetna's `widgets::tabs` event apply
+        // through a String → enum bridge. Identical to the pod
+        // editor's tab-switch wiring.
+        let mut next_tab: Option<String> = None;
+        let _ = aetna_core::widgets::tabs::apply_event(
+            &mut next_tab,
+            event,
+            BEHAVIOR_EDITOR_TABS_KEY,
+            |raw| Some(Some(raw.to_string())),
+        );
+        if let Some(value) = next_tab
+            && let Some(target) = BehaviorEditorTab::from_wire(&value)
+            && let Some(editor) = self.behavior_editor.as_mut()
+        {
+            editor.tab = target;
+            return true;
+        }
+
         // Trigger-kind picker: classified through `widgets::select` so
         // toggle / dismiss / pick map to the same shape the new-thread
         // pickers use. Routed first because its sub-keys
@@ -4011,6 +4188,14 @@ impl ChatApp {
         if let Some(action) = classify_select_event(event, BEHAVIOR_EDITOR_TRIGGER_KIND_KEY) {
             self.handle_behavior_editor_trigger_kind_pick(action);
             return true;
+        }
+
+        // Overlap / catch_up pickers — Cron and Webhook share Overlap.
+        for which in [BehaviorEditorPicker::Overlap, BehaviorEditorPicker::CatchUp] {
+            if let Some(action) = classify_select_event(event, which.key()) {
+                self.handle_behavior_editor_picker(which, action);
+                return true;
+            }
         }
 
         if event.target_key() == Some(BEHAVIOR_EDITOR_NAME_KEY) {
@@ -4064,6 +4249,18 @@ impl ChatApp {
             }
             return true;
         }
+        if event.target_key() == Some(BEHAVIOR_EDITOR_TIMEZONE_KEY) {
+            if let Some(editor) = self.behavior_editor.as_mut() {
+                text_input::apply_event(
+                    &mut editor.timezone_buffer,
+                    &mut self.selection,
+                    BEHAVIOR_EDITOR_TIMEZONE_KEY,
+                    event,
+                );
+                editor.error = None;
+            }
+            return true;
+        }
         if event.target_key() == Some(BEHAVIOR_EDITOR_PROMPT_KEY) {
             if let Some(editor) = self.behavior_editor.as_mut() {
                 text_area::apply_event(
@@ -4090,6 +4287,79 @@ impl ChatApp {
         }
 
         false
+    }
+
+    /// Pick handler for the behavior editor's overlap / catch_up
+    /// `select_trigger`s. Same Toggle / Dismiss / Pick flow as the
+    /// pod editor's picker handler — `which` identifies which slot
+    /// to write back; the parsed wire value lands in the matching
+    /// editor buffer.
+    fn handle_behavior_editor_picker(&mut self, which: BehaviorEditorPicker, action: SelectAction) {
+        match action {
+            SelectAction::Toggle => {
+                self.close_other_pickers(which.key());
+                if let Some(editor) = self.behavior_editor.as_mut() {
+                    editor.open_picker = if editor.open_picker == Some(which) {
+                        None
+                    } else {
+                        Some(which)
+                    };
+                }
+            }
+            SelectAction::Dismiss => {
+                if let Some(editor) = self.behavior_editor.as_mut() {
+                    editor.open_picker = None;
+                }
+            }
+            SelectAction::Pick(value) => {
+                if let Some(editor) = self.behavior_editor.as_mut() {
+                    match which {
+                        BehaviorEditorPicker::Overlap => {
+                            if let Some(v) = overlap_from_wire(&value) {
+                                editor.overlap_buffer = v;
+                            }
+                        }
+                        BehaviorEditorPicker::CatchUp => {
+                            if let Some(v) = catch_up_from_wire(&value) {
+                                editor.catch_up_buffer = v;
+                            }
+                        }
+                    }
+                    editor.open_picker = None;
+                    editor.error = None;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Build the select_menu for whichever overlap / catch_up picker
+    /// is open. Single-active across the editor; rendered as the
+    /// topmost popover layer when `editor.open_picker` matches.
+    fn behavior_editor_picker_menu(&self, which: BehaviorEditorPicker) -> El {
+        match which {
+            BehaviorEditorPicker::Overlap => {
+                let options: Vec<(String, String)> =
+                    [Overlap::Skip, Overlap::QueueOne, Overlap::Allow]
+                        .into_iter()
+                        .map(|o| {
+                            let lbl = overlap_label(o);
+                            (lbl.to_string(), lbl.to_string())
+                        })
+                        .collect();
+                select_menu(which.key(), options)
+            }
+            BehaviorEditorPicker::CatchUp => {
+                let options: Vec<(String, String)> = [CatchUp::None, CatchUp::One, CatchUp::All]
+                    .into_iter()
+                    .map(|c| {
+                        let lbl = catch_up_label(c);
+                        (lbl.to_string(), lbl.to_string())
+                    })
+                    .collect();
+                select_menu(which.key(), options)
+            }
+        }
     }
 
     /// Pick handler for the behavior editor's trigger-kind menu.
@@ -4383,12 +4653,48 @@ impl ChatApp {
         let header = sheet_header([
             sheet_title(title),
             sheet_description(
-                "Adjust the everyday fields here; thread overrides, scope \
-                 narrowing, retention, and the system-prompt override file \
-                 ride through unchanged on save until their tabs land in a \
-                 follow-up slice.",
+                "Trigger / Thread / Scope / Retention / Prompt / System / Raw \
+                 tabs split the per-behavior surface up. Trigger and Prompt \
+                 are wired in this slice; the other tabs land in follow-up \
+                 commits.",
             ),
         ]);
+
+        let tab_value = editor.tab.wire_value().to_string();
+        let tabs_strip = tabs_list(
+            BEHAVIOR_EDITOR_TABS_KEY,
+            &tab_value,
+            [
+                (
+                    BehaviorEditorTab::Trigger.wire_value(),
+                    BehaviorEditorTab::Trigger.label(),
+                ),
+                (
+                    BehaviorEditorTab::Thread.wire_value(),
+                    BehaviorEditorTab::Thread.label(),
+                ),
+                (
+                    BehaviorEditorTab::Scope.wire_value(),
+                    BehaviorEditorTab::Scope.label(),
+                ),
+                (
+                    BehaviorEditorTab::Retention.wire_value(),
+                    BehaviorEditorTab::Retention.label(),
+                ),
+                (
+                    BehaviorEditorTab::Prompt.wire_value(),
+                    BehaviorEditorTab::Prompt.label(),
+                ),
+                (
+                    BehaviorEditorTab::SystemPrompt.wire_value(),
+                    BehaviorEditorTab::SystemPrompt.label(),
+                ),
+                (
+                    BehaviorEditorTab::RawToml.wire_value(),
+                    BehaviorEditorTab::RawToml.label(),
+                ),
+            ],
+        );
 
         let body: El = match editor.working_config.as_ref() {
             None => {
@@ -4404,72 +4710,35 @@ impl ChatApp {
                 };
                 paragraph(label).muted()
             }
-            Some(cfg) => {
-                let name_input = text_input(&cfg.name, &self.selection, BEHAVIOR_EDITOR_NAME_KEY);
-                // Description is `Option<String>` on disk; the form
-                // stores it as a wrapping multi-line buffer so a
-                // production-shaped 90-100 char description doesn't
-                // overflow the sheet horizontally. `text_input` is
-                // single-line + nowrap and would clip.
-                let description_input = text_area(
-                    cfg.description.as_deref().unwrap_or(""),
-                    &self.selection,
-                    BEHAVIOR_EDITOR_DESCRIPTION_KEY,
+            Some(cfg) => match editor.tab {
+                BehaviorEditorTab::Trigger => self.render_behavior_editor_trigger_tab(editor, cfg),
+                BehaviorEditorTab::Prompt => self.render_behavior_editor_prompt_tab(editor),
+                BehaviorEditorTab::Thread => paragraph(
+                    "Thread tab — coming soon. Edit thread overrides via the \
+                     Raw TOML once that tab lands.",
                 )
-                .height(Size::Fixed(80.0));
-                let kind_trigger = select_trigger(
-                    BEHAVIOR_EDITOR_TRIGGER_KIND_KEY,
-                    editor.working_kind.display_label(),
-                );
-                let prompt_input = text_area(
-                    &editor.working_prompt,
-                    &self.selection,
-                    BEHAVIOR_EDITOR_PROMPT_KEY,
+                .muted(),
+                BehaviorEditorTab::Scope => paragraph(
+                    "Scope tab — coming soon. Cap and tool-gate narrowing \
+                     ride through unchanged on save.",
                 )
-                .height(Size::Fixed(160.0));
-
-                let mut items: Vec<El> = vec![
-                    form_item([
-                        form_label("name"),
-                        form_control(name_input),
-                        form_description("Display name; freely editable."),
-                    ]),
-                    form_item([
-                        form_label("description"),
-                        form_control(description_input),
-                        form_description(
-                            "Short summary surfaced in the sidebar's behavior \
-                             rows. Empty clears the field on save.",
-                        ),
-                    ]),
-                    form_item([form_label("trigger"), form_control(kind_trigger)]),
-                ];
-                if matches!(editor.working_kind, TriggerKindLabel::Cron) {
-                    let schedule_input = text_input(
-                        &editor.schedule_buffer,
-                        &self.selection,
-                        BEHAVIOR_EDITOR_SCHEDULE_KEY,
-                    );
-                    items.push(form_item([
-                        form_label("cron schedule"),
-                        form_control(schedule_input),
-                        form_description(
-                            "Five-field cron expression (minute hour day-of-month \
-                             month day-of-week). Timezone, overlap, and catch-up \
-                             policy keep their on-disk values.",
-                        ),
-                    ]));
-                }
-                items.push(form_item([
-                    form_label("prompt"),
-                    form_control(prompt_input),
-                    form_description(
-                        "The behavior's `prompt.md` body. `{{payload}}` is \
-                         substituted with the trigger's payload at fire time.",
-                    ),
-                ]));
-                form(items)
-            }
+                .muted(),
+                BehaviorEditorTab::Retention => paragraph(
+                    "Retention tab — coming soon. Retention policy rides \
+                     through unchanged on save.",
+                )
+                .muted(),
+                BehaviorEditorTab::SystemPrompt => paragraph(
+                    "System prompt tab — coming soon. The system_prompt \
+                     override field rides through unchanged on save.",
+                )
+                .muted(),
+                BehaviorEditorTab::RawToml => paragraph(
+                    "Raw TOML tab — coming soon. Use the structured tabs \
+                     for now.",
+                )
+                .muted(),
+            },
         };
 
         let pending_save = editor.pending_save.is_some();
@@ -4488,7 +4757,7 @@ impl ChatApp {
         // Header and footer stay fixed; the scroll grabs the leftover
         // height. `.key` so the scroll offset survives rebuilds across
         // edit clicks.
-        let mut body_children: Vec<El> = vec![body];
+        let mut body_children: Vec<El> = vec![tabs_strip, body];
         if let Some(err) = editor.error.as_deref() {
             body_children.push(
                 alert([
@@ -4504,7 +4773,177 @@ impl ChatApp {
 
         let children: Vec<El> = vec![header, scroll_body, sheet_footer([cancel, save])];
 
-        Some(sheet(BEHAVIOR_EDITOR_KEY, SheetSide::Right, children))
+        // Inline `sheet()` so we can widen the panel: the stock 360 px
+        // is too narrow for a 7-tab strip (every label overflows). 600 px
+        // fits the labels with padding to spare and stays under half
+        // the desktop's 1280 px viewport.
+        let panel = sheet_content(SheetSide::Right, children)
+            .block_pointer()
+            .width(Size::Fixed(600.0));
+        let layer = overlay([scrim(format!("{BEHAVIOR_EDITOR_KEY}:dismiss")), panel])
+            .align(Align::End)
+            .justify(Justify::Center);
+        Some(layer)
+    }
+
+    /// Trigger tab body. Identity (name + description) + trigger kind
+    /// picker + the cron / webhook / manual sub-form. Cron preview
+    /// (next-firings render) is deferred to a follow-up slice.
+    fn render_behavior_editor_trigger_tab(
+        &self,
+        editor: &BehaviorEditorSheetState,
+        cfg: &BehaviorConfig,
+    ) -> El {
+        let name_input = text_input(&cfg.name, &self.selection, BEHAVIOR_EDITOR_NAME_KEY);
+        let description_input = text_area(
+            cfg.description.as_deref().unwrap_or(""),
+            &self.selection,
+            BEHAVIOR_EDITOR_DESCRIPTION_KEY,
+        )
+        .height(Size::Fixed(80.0));
+        let kind_trigger = select_trigger(
+            BEHAVIOR_EDITOR_TRIGGER_KIND_KEY,
+            editor.working_kind.display_label(),
+        );
+
+        let mut items: Vec<El> = vec![
+            form_item([
+                form_label("name"),
+                form_control(name_input),
+                form_description("Display name; freely editable."),
+            ]),
+            form_item([
+                form_label("description"),
+                form_control(description_input),
+                form_description(
+                    "Short summary surfaced in the sidebar's behavior rows. \
+                     Empty clears the field on save.",
+                ),
+            ]),
+            form_item([
+                form_label("trigger kind"),
+                form_control(kind_trigger),
+                form_description(
+                    "Manual = fires only on RunBehavior. Cron = scheduled. \
+                     Webhook = HTTP POST to the endpoint shown.",
+                ),
+            ]),
+        ];
+
+        match editor.working_kind {
+            TriggerKindLabel::Manual => {
+                items.push(form_item([
+                    form_label("manual"),
+                    form_control(
+                        paragraph(
+                            "No further configuration. Use the Run icon in \
+                             the sidebar (or RunBehavior on the wire) to \
+                             fire.",
+                        )
+                        .muted()
+                        .small(),
+                    ),
+                ]));
+            }
+            TriggerKindLabel::Cron => {
+                let schedule_input = text_input(
+                    &editor.schedule_buffer,
+                    &self.selection,
+                    BEHAVIOR_EDITOR_SCHEDULE_KEY,
+                );
+                let timezone_input = text_input(
+                    &editor.timezone_buffer,
+                    &self.selection,
+                    BEHAVIOR_EDITOR_TIMEZONE_KEY,
+                );
+                let overlap_trigger = select_trigger(
+                    BEHAVIOR_EDITOR_OVERLAP_KEY,
+                    overlap_label(editor.overlap_buffer),
+                );
+                let catch_up_trigger = select_trigger(
+                    BEHAVIOR_EDITOR_CATCH_UP_KEY,
+                    catch_up_label(editor.catch_up_buffer),
+                );
+                items.push(form_item([
+                    form_label("schedule"),
+                    form_control(schedule_input),
+                    form_description(
+                        "Five-field cron expression (minute hour day-of-month \
+                         month day-of-week). Example: `0 9 * * *` for daily \
+                         9am.",
+                    ),
+                ]));
+                items.push(form_item([
+                    form_label("timezone"),
+                    form_control(timezone_input),
+                    form_description("IANA name, e.g. `America/Los_Angeles`."),
+                ]));
+                items.push(form_item([
+                    form_label("overlap"),
+                    form_control(overlap_trigger),
+                    form_description(
+                        "What happens if a fire arrives while the previous \
+                         run is still in flight.",
+                    ),
+                ]));
+                items.push(form_item([
+                    form_label("catch_up"),
+                    form_control(catch_up_trigger),
+                    form_description(
+                        "What to do about cron fires missed while the server \
+                         was down.",
+                    ),
+                ]));
+            }
+            TriggerKindLabel::Webhook => {
+                let overlap_trigger = select_trigger(
+                    BEHAVIOR_EDITOR_OVERLAP_KEY,
+                    overlap_label(editor.overlap_buffer),
+                );
+                items.push(form_item([
+                    form_label("overlap"),
+                    form_control(overlap_trigger),
+                    form_description(
+                        "Same semantics as Cron: Skip drops, QueueOne parks \
+                         one, Allow spawns concurrent runs.",
+                    ),
+                ]));
+                items.push(form_item([
+                    form_label("endpoint"),
+                    form_control(
+                        paragraph(format!(
+                            "POST /triggers/{}/{} (relative to server). \
+                             Empty body → null payload; non-empty bodies \
+                             must be valid JSON.",
+                            editor.pod_id, editor.behavior_id
+                        ))
+                        .muted()
+                        .small(),
+                    ),
+                ]));
+            }
+        }
+        form(items)
+    }
+
+    /// Prompt tab body. The behavior's `prompt.md` text — the user
+    /// turn the spawned thread sees first. `{{payload}}` is the only
+    /// templated substitution.
+    fn render_behavior_editor_prompt_tab(&self, editor: &BehaviorEditorSheetState) -> El {
+        let prompt_input = text_area(
+            &editor.working_prompt,
+            &self.selection,
+            BEHAVIOR_EDITOR_PROMPT_KEY,
+        )
+        .height(Size::Fixed(360.0));
+        form([form_item([
+            form_label("prompt"),
+            form_control(prompt_input),
+            form_description(
+                "The behavior's `prompt.md` body. `{{payload}}` is \
+                 substituted with the trigger's payload at fire time.",
+            ),
+        ])])
     }
 
     /// `select_menu` for the behavior editor's trigger-kind picker.

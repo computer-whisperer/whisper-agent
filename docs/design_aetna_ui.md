@@ -636,7 +636,40 @@ the sheet — same pattern the new-thread compose pickers use,
 extended in `close_other_pickers` to include this menu so the
 single-active-menu invariant holds.
 
+**Behavior editor — tabs strip + structured Trigger tab
+(landed):** rewrites the editor body around a 7-tab strip
+(Trigger / Thread / Scope / Retain / Prompt / System / Raw)
+matching the egui sibling. Sheet width bumped to 600 px from
+the stock 360 px — 7 labels at the narrow width all overflow.
+"Retention" is shortened to "Retain" so the strip lints clean.
+
+The Trigger tab body has identity (name + description), the
+trigger-kind picker, and a kind-conditional sub-form:
+- **Manual** — a hint paragraph; no further config.
+- **Cron** — schedule + timezone text inputs, plus
+  `overlap` / `catch_up` `select_trigger`s driven by a new
+  `BehaviorEditorPicker` enum (single-active-at-a-time via
+  `close_other_pickers`).
+- **Webhook** — `overlap` picker + an endpoint hint
+  showing `POST /triggers/{pod}/{behavior}`.
+
+`BehaviorEditorSheetState` grew `timezone_buffer`,
+`overlap_buffer`, `catch_up_buffer` (preserved across kind
+switches so toggling Cron→Webhook→Cron doesn't lose typed
+values), `tab: BehaviorEditorTab`, and `open_picker:
+Option<BehaviorEditorPicker>`. Hydrate seeds all the buffers
+from the snapshot's `TriggerSpec` variant; `resolved_trigger`
+rebuilds the variant from the live buffers on save.
+
+The Prompt tab body is the existing `prompt.md` text_area
+relocated under its own tab (was the trailing form item in
+the previous single-form layout).
+
 Deferred to follow-up sheet slices:
+- **Cron preview + presets** — port webui's `cron_preview`
+  module: parse_schedule (5-field with `"0 "` seconds prefix),
+  parse_tz, CRON_PRESETS / COMMON_TIMEZONES rows, and the
+  next-5-firings table.
 - **Thread bindings tab** — backend / model / host_env /
   mcp_host overrides on `BehaviorThreadOverride`.
 - **Scope tab** — per-behavior allow narrowing.
