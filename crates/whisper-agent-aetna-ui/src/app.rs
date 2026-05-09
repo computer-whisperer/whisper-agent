@@ -39,9 +39,10 @@ use std::rc::Rc;
 use aetna_core::prelude::*;
 use aetna_core::widgets::select::{SelectAction, classify_event as classify_select_event};
 use whisper_agent_protocol::{
-    AllowMap, BackendSummary, BehaviorSummary, ClientToServer, ContentBlock, ImageSource,
-    ModelSummary, NamedHostEnv, PodAllow, PodConfig, PodLimits, PodSummary, Role, ServerToClient,
-    ThreadConfigOverride, ThreadDefaults, ThreadSummary,
+    AllowMap, BackendSummary, BehaviorConfig, BehaviorSummary, BehaviorThreadOverride,
+    ClientToServer, ContentBlock, ImageSource, ModelSummary, NamedHostEnv, PodAllow, PodConfig,
+    PodLimits, PodSummary, RetentionPolicy, Role, ServerToClient, ThreadConfigOverride,
+    ThreadDefaults, ThreadSummary, TriggerSpec,
 };
 
 /// Inbound event variants the host shell pushes into the [`Inbound`]
@@ -335,6 +336,11 @@ pub struct ChatApp {
     /// display name, plus a client-side error slot for fast-fail
     /// validation feedback.
     new_pod_modal: Option<NewPodModalState>,
+    /// "+ New behavior" dialog state. Opening seeds `pod_id` with
+    /// the active sidebar tab so the dialog title can scope to the
+    /// right pod and `submit` knows where to send `CreateBehavior`.
+    /// `None` when closed.
+    new_behavior_modal: Option<NewBehaviorModalState>,
     /// Monotonic counter for outgoing `correlation_id` strings.
     /// Each modal that sends a request claims an id and waits for
     /// the matching reply (success or `Error`) before closing or
@@ -361,6 +367,33 @@ pub(crate) struct NewPodModalState {
     /// `Some` ⇒ the Create button is disabled (request in flight).
     /// Cleared on `PodCreated` (close) or `Error` (re-enable + error).
     pub(crate) pending_correlation: Option<String>,
+}
+
+/// Form state for the "+ New behavior" modal. Same shape as
+/// [`NewPodModalState`] (id + display name + error +
+/// pending_correlation) plus the `pod_id` the new behavior lands
+/// under — mirrors the egui sibling. The new behavior starts as a
+/// Manual-trigger stub with an empty prompt; the user fills the
+/// rest in the (eventual) editor on the `BehaviorCreated`
+/// round-trip.
+pub(crate) struct NewBehaviorModalState {
+    pub(crate) pod_id: String,
+    pub(crate) behavior_id: String,
+    pub(crate) name: String,
+    pub(crate) error: Option<String>,
+    pub(crate) pending_correlation: Option<String>,
+}
+
+impl NewBehaviorModalState {
+    fn new(pod_id: String) -> Self {
+        Self {
+            pod_id,
+            behavior_id: String::new(),
+            name: String::new(),
+            error: None,
+            pending_correlation: None,
+        }
+    }
 }
 
 impl ChatApp {
@@ -397,6 +430,7 @@ impl ChatApp {
             picker_pod: None,
             picker_pod_open: false,
             new_pod_modal: None,
+            new_behavior_modal: None,
             correlation_counter: 0,
         }
     }
@@ -533,7 +567,20 @@ impl ChatApp {
             } => {
                 self.behaviors_by_pod.insert(pod_id, behaviors);
             }
-            ServerToClient::BehaviorCreated { summary, .. } => {
+            ServerToClient::BehaviorCreated {
+                summary,
+                correlation_id,
+            } => {
+                // Close the new-behavior modal if its outstanding
+                // request just got echoed. Match by id, not pod —
+                // an unrelated `BehaviorCreated` shouldn't close a
+                // modal the user is still working in.
+                if let Some(modal) = self.new_behavior_modal.as_ref()
+                    && let Some(pending) = modal.pending_correlation.as_ref()
+                    && correlation_id.as_ref() == Some(pending)
+                {
+                    self.new_behavior_modal = None;
+                }
                 let entries = self
                     .behaviors_by_pod
                     .entry(summary.pod_id.clone())
@@ -908,15 +955,22 @@ impl ChatApp {
                 ..
             } => {
                 // Route the error to whichever modal claimed the
-                // matching correlation. Today only the "+ New pod"
-                // modal is a candidate; future modals will extend
-                // this dispatch the same way.
-                if let Some(corr) = correlation_id.as_ref()
-                    && let Some(modal) = self.new_pod_modal.as_mut()
-                    && modal.pending_correlation.as_ref() == Some(corr)
-                {
-                    modal.error = Some(message);
-                    modal.pending_correlation = None;
+                // matching correlation. Each modal owns its own
+                // `pending_correlation` slot; whoever it matches
+                // surfaces the message and clears the pending so
+                // the form re-enables for retry.
+                if let Some(corr) = correlation_id.as_ref() {
+                    if let Some(modal) = self.new_pod_modal.as_mut()
+                        && modal.pending_correlation.as_ref() == Some(corr)
+                    {
+                        modal.error = Some(message);
+                        modal.pending_correlation = None;
+                    } else if let Some(modal) = self.new_behavior_modal.as_mut()
+                        && modal.pending_correlation.as_ref() == Some(corr)
+                    {
+                        modal.error = Some(message);
+                        modal.pending_correlation = None;
+                    }
                 }
             }
             // Catalog tiers we don't yet surface. Quietly accepted so
@@ -999,11 +1053,31 @@ impl App for ChatApp {
             return;
         }
 
+        // "+ New behavior" entry point: routed key carries the pod
+        // id (`sidebar:new-behavior:{pod}`) so the modal scopes to
+        // where the user clicked, not just whatever's in the active
+        // tab. Defensive against a stale event arriving for a pod
+        // that was deleted in flight — drop the event then.
+        if let Some(key) = event.route()
+            && let Some(pod_id) = key.strip_prefix(SIDEBAR_NEW_BEHAVIOR_PREFIX)
+            && matches!(event.kind, UiEventKind::Click | UiEventKind::Activate)
+        {
+            if self.pods.contains_key(pod_id) {
+                self.new_behavior_modal = Some(NewBehaviorModalState::new(pod_id.to_string()));
+            }
+            return;
+        }
+
         // "+ New pod" modal routing — text inputs, primary / cancel
         // buttons, and the scrim's auto-emitted dismiss key. Walking
         // the routes top-down (cheapest checks first) before falling
         // through to the rest of the on_event body.
         if self.handle_new_pod_modal_event(&event) {
+            return;
+        }
+        // "+ New behavior" modal routing — same shape as new-pod
+        // (text inputs + primary / cancel + scrim dismiss).
+        if self.handle_new_behavior_modal_event(&event) {
             return;
         }
 
@@ -1219,6 +1293,18 @@ const SIDEBAR_NEW_POD_KEY: &str = "sidebar:new-pod";
 /// `{prefix}:pod-id` (text_input), `{prefix}:name` (text_input),
 /// `{prefix}:create` (primary submit), `{prefix}:cancel` (secondary).
 const NEW_POD_MODAL_KEY: &str = "new-pod";
+
+/// Routed-key prefix for the per-pod "+" icon-button in the
+/// behaviors-section header. Suffix is the pod_id so the dialog
+/// can scope to where the user clicked. Mirrors the
+/// `behavior-row:` family in pod-keying style.
+const SIDEBAR_NEW_BEHAVIOR_PREFIX: &str = "sidebar:new-behavior:";
+
+/// Routed-key prefix the "+ New behavior" dialog uses. Same
+/// extended-key family as [`NEW_POD_MODAL_KEY`]:
+/// `{prefix}:dismiss`, `{prefix}:behavior-id`, `{prefix}:name`,
+/// `{prefix}:create`, `{prefix}:cancel`.
+const NEW_BEHAVIOR_MODAL_KEY: &str = "new-behavior";
 
 /// Routed-key prefix for behavior rows in the sidebar (the
 /// expandable "show this behavior's runs" toggle). Children of this
@@ -1539,12 +1625,14 @@ impl ChatApp {
             // sibling's partition.
             entries.push(self.threads_section(active));
 
-            let behaviors = self
-                .behaviors_by_pod
-                .get(active)
-                .map(|v| v.as_slice())
-                .unwrap_or(&[]);
-            if !behaviors.is_empty() {
+            // Render the section once the per-pod `BehaviorList`
+            // round-trip has landed — even if the list is empty,
+            // since the header carries the "+ New behavior"
+            // affordance the user still needs. Skip entirely
+            // before the round-trip arrives so a "just connected"
+            // sidebar doesn't flash an empty section that
+            // immediately repopulates a frame later.
+            if let Some(behaviors) = self.behaviors_by_pod.get(active) {
                 entries.push(self.behaviors_section(active, behaviors));
             }
         }
@@ -1561,9 +1649,23 @@ impl ChatApp {
     fn behaviors_section(&self, pod_id: &str, behaviors: &[BehaviorSummary]) -> El {
         let total = behaviors.len();
         let header_label = format!("Behaviors ({total})");
-        let header = row([sidebar_group_label(header_label).width(Size::Fill(1.0))])
-            .padding(Sides::xy(tokens::SPACE_2, tokens::SPACE_1))
-            .width(Size::Fill(1.0));
+        // Mirrors the threads-section "+" pattern (slice δ): per-pod
+        // entry point for `CreateBehavior`. The pod id rides on the
+        // routed-key suffix so opening the modal can scope to the
+        // right pod without inferring it from the active tab —
+        // future drag-and-drop could fire this against a non-active
+        // pod and the routing would still be correct.
+        let new_key = format!("{SIDEBAR_NEW_BEHAVIOR_PREFIX}{pod_id}");
+        let header = row([
+            sidebar_group_label(header_label).width(Size::Fill(1.0)),
+            icon_button("plus")
+                .key(new_key)
+                .ghost()
+                .icon_size(tokens::ICON_XS),
+        ])
+        .align(Align::Center)
+        .padding(Sides::xy(tokens::SPACE_2, tokens::SPACE_1))
+        .width(Size::Fill(1.0));
 
         // Pre-bucket the active pod's behavior-origin threads by
         // behavior_id so each row can reach in for its own runs
@@ -1579,6 +1681,19 @@ impl ChatApp {
         }
         for runs in threads_by_behavior.values_mut() {
             runs.sort_by(|a, b| b.last_active.cmp(&a.last_active));
+        }
+
+        // Empty pod: section header (with the "+") still renders so
+        // the affordance is always reachable. Mirrors the
+        // threads-section "no threads in this pod yet" empty state.
+        if behaviors.is_empty() {
+            return sidebar_group(vec![
+                header,
+                text("no behaviors in this pod yet")
+                    .muted()
+                    .small()
+                    .padding(Sides::xy(tokens::SPACE_2, tokens::SPACE_1)),
+            ]);
         }
 
         let mut rows: Vec<El> = Vec::new();
@@ -2206,6 +2321,9 @@ impl ChatApp {
         if let Some(modal_el) = self.render_new_pod_modal() {
             out.push(Some(modal_el));
         }
+        if let Some(modal_el) = self.render_new_behavior_modal() {
+            out.push(Some(modal_el));
+        }
         out
     }
 
@@ -2316,6 +2434,201 @@ impl ChatApp {
         if let Some(modal) = self.new_pod_modal.as_mut() {
             modal.error = Some(msg);
         }
+    }
+
+    /// Routing for the "+ New behavior" modal. Mirrors
+    /// [`Self::handle_new_pod_modal_event`] — bail when closed,
+    /// route text inputs, route cancel / dismiss, route create.
+    fn handle_new_behavior_modal_event(&mut self, event: &UiEvent) -> bool {
+        if self.new_behavior_modal.is_none() {
+            return false;
+        }
+        let behavior_id_key = format!("{NEW_BEHAVIOR_MODAL_KEY}:behavior-id");
+        let name_key = format!("{NEW_BEHAVIOR_MODAL_KEY}:name");
+        let create_key = format!("{NEW_BEHAVIOR_MODAL_KEY}:create");
+        let cancel_key = format!("{NEW_BEHAVIOR_MODAL_KEY}:cancel");
+        let dismiss_key = format!("{NEW_BEHAVIOR_MODAL_KEY}:dismiss");
+
+        if event.target_key() == Some(behavior_id_key.as_str()) {
+            if let Some(modal) = self.new_behavior_modal.as_mut() {
+                text_input::apply_event(
+                    &mut modal.behavior_id,
+                    &mut self.selection,
+                    &behavior_id_key,
+                    event,
+                );
+                modal.error = None;
+            }
+            return true;
+        }
+        if event.target_key() == Some(name_key.as_str()) {
+            if let Some(modal) = self.new_behavior_modal.as_mut() {
+                text_input::apply_event(&mut modal.name, &mut self.selection, &name_key, event);
+                modal.error = None;
+            }
+            return true;
+        }
+
+        if event.is_click_or_activate(&cancel_key) || event.is_click_or_activate(&dismiss_key) {
+            self.new_behavior_modal = None;
+            return true;
+        }
+
+        if event.is_click_or_activate(&create_key) {
+            self.submit_new_behavior_modal();
+            return true;
+        }
+
+        false
+    }
+
+    /// Validate + dispatch the "+ New behavior" form. Same control
+    /// flow as [`Self::submit_new_pod_modal`] — client-side checks
+    /// first, then mint a correlation id and fire `CreateBehavior`
+    /// while keeping the modal open and disabled. The wire
+    /// round-trip closes the modal (`BehaviorCreated`) or surfaces
+    /// the rejection message (`Error`).
+    fn submit_new_behavior_modal(&mut self) {
+        let Some(modal) = self.new_behavior_modal.as_ref() else {
+            return;
+        };
+        if modal.pending_correlation.is_some() {
+            return;
+        }
+        let pod_id = modal.pod_id.clone();
+        let behavior_id = modal.behavior_id.trim().to_string();
+        let name = modal.name.trim().to_string();
+        if let Err(msg) = validate_behavior_id_client(&behavior_id) {
+            self.set_new_behavior_error(msg.to_string());
+            return;
+        }
+        // Defensive: the modal could have been opened against a
+        // pod that was since deleted (rare but cheap to check).
+        if !self.pods.contains_key(&pod_id) {
+            self.set_new_behavior_error(format!("pod `{pod_id}` no longer exists"));
+            return;
+        }
+        let exists = self
+            .behaviors_by_pod
+            .get(&pod_id)
+            .map(|list| list.iter().any(|b| b.behavior_id == behavior_id))
+            .unwrap_or(false);
+        if exists {
+            self.set_new_behavior_error(format!("behavior `{behavior_id}` already exists"));
+            return;
+        }
+        if name.is_empty() {
+            self.set_new_behavior_error("name is empty".into());
+            return;
+        }
+
+        // Manual-trigger stub with empty prompt — the user fills
+        // the rest in the (eventual) editor on the
+        // `BehaviorCreated` round-trip. Mirrors the egui sibling.
+        let config = BehaviorConfig {
+            name,
+            description: None,
+            trigger: TriggerSpec::Manual,
+            thread: BehaviorThreadOverride::default(),
+            on_completion: RetentionPolicy::default(),
+            scope: Default::default(),
+        };
+        let correlation_id = self.next_correlation_id();
+        if let Some(modal) = self.new_behavior_modal.as_mut() {
+            modal.pending_correlation = Some(correlation_id.clone());
+            modal.error = None;
+        }
+        self.send(ClientToServer::CreateBehavior {
+            correlation_id: Some(correlation_id),
+            pod_id,
+            behavior_id,
+            config,
+            prompt: String::new(),
+            system_prompt: None,
+        });
+    }
+
+    fn set_new_behavior_error(&mut self, msg: String) {
+        if let Some(modal) = self.new_behavior_modal.as_mut() {
+            modal.error = Some(msg);
+        }
+    }
+
+    /// Render the "+ New behavior" dialog if open. Same shadcn
+    /// scaffolding as the new-pod dialog; the only difference is
+    /// the field labels and the description text (manual-trigger
+    /// stub vs pod template).
+    fn render_new_behavior_modal(&self) -> Option<El> {
+        let modal = self.new_behavior_modal.as_ref()?;
+
+        let behavior_id_key = format!("{NEW_BEHAVIOR_MODAL_KEY}:behavior-id");
+        let name_key = format!("{NEW_BEHAVIOR_MODAL_KEY}:name");
+        let create_key = format!("{NEW_BEHAVIOR_MODAL_KEY}:create");
+        let cancel_key = format!("{NEW_BEHAVIOR_MODAL_KEY}:cancel");
+
+        let behavior_id_input = text_input(&modal.behavior_id, &self.selection, &behavior_id_key);
+        let name_input = text_input(&modal.name, &self.selection, &name_key);
+
+        let pending = modal.pending_correlation.is_some();
+        let create_enabled =
+            !modal.behavior_id.trim().is_empty() && !modal.name.trim().is_empty() && !pending;
+
+        let mut create = button(if pending { "Creating…" } else { "Create" })
+            .key(&create_key)
+            .primary();
+        if !create_enabled {
+            create = create.disabled();
+        }
+        let cancel = button("Cancel").key(&cancel_key);
+
+        // Compose the title with the pod scope so the user knows
+        // which pod the new behavior lands in (a power user can
+        // have several open at once via the per-pod sidebar
+        // entry-point fanout).
+        let pod_label = self
+            .pods
+            .get(&modal.pod_id)
+            .map(|p| p.name.clone())
+            .unwrap_or_else(|| modal.pod_id.clone());
+        let title = format!("New behavior — {pod_label}");
+
+        let mut children: Vec<El> = vec![
+            dialog_header([
+                dialog_title(title),
+                dialog_description(
+                    "Starts as a manually-triggered behavior with an empty \
+                     prompt. Edit in the (eventual) full editor to add a \
+                     trigger, override thread settings, or write the prompt.",
+                ),
+            ]),
+            form([
+                form_item([
+                    form_label("behavior_id"),
+                    form_control(behavior_id_input),
+                    form_description(
+                        "Becomes the behavior's directory name under the pod; \
+                         immutable after creation.",
+                    ),
+                ]),
+                form_item([
+                    form_label("name"),
+                    form_control(name_input),
+                    form_description("Display name (free text)."),
+                ]),
+            ]),
+        ];
+        if let Some(err) = modal.error.as_deref() {
+            children.push(
+                alert([
+                    alert_title("couldn't create behavior"),
+                    alert_description(err.to_string()),
+                ])
+                .destructive(),
+            );
+        }
+        children.push(dialog_footer([cancel, create]));
+
+        Some(dialog(NEW_BEHAVIOR_MODAL_KEY, children))
     }
 
     /// Render the "+ New pod" dialog if its modal state is open.
@@ -2553,6 +2866,23 @@ fn validate_pod_id_client(id: &str) -> Result<(), &'static str> {
     }
     if id.contains('/') || id.contains('\\') || id.contains('\0') || id == ".." {
         return Err("pod_id contains illegal characters");
+    }
+    Ok(())
+}
+
+/// Same rules as [`validate_pod_id_client`] — behavior ids become
+/// directory names under `<pod>/behaviors/`, so the constraint set
+/// is identical. Kept as a separate function so error messages can
+/// say "behavior_id" instead of "pod_id".
+fn validate_behavior_id_client(id: &str) -> Result<(), &'static str> {
+    if id.is_empty() {
+        return Err("behavior_id is empty");
+    }
+    if id.starts_with('.') {
+        return Err("behavior_id may not start with '.'");
+    }
+    if id.contains('/') || id.contains('\\') || id.contains('\0') || id == ".." {
+        return Err("behavior_id contains illegal characters");
     }
     Ok(())
 }

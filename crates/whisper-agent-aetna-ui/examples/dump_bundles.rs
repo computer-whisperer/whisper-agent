@@ -168,10 +168,23 @@ enum Scene {
     /// requires fabricating the `#[non_exhaustive]` `UiTarget`,
     /// which isn't worth a public test seam.)
     NewPodModalNoBackends,
+    /// "+ New behavior" modal opened from the per-pod sidebar
+    /// `behaviors_section` header. Click sequence routes
+    /// `sidebar:new-behavior:default` (the active tab) to scope
+    /// the dialog title. Behaviors registry seeded with the
+    /// production-shaped `mavis` set so the dialog overlays a real
+    /// list, not an empty section.
+    NewBehaviorModalEmpty,
+    /// Sidebar with a pod that has zero behaviors yet — verifies
+    /// the empty-state copy renders and the "+" affordance still
+    /// sits in the section header (an empty pod is precisely where
+    /// the user *needs* "+ New behavior" the most). No modal is
+    /// opened; this just exercises the section's empty branch.
+    SidebarBehaviorsEmpty,
 }
 
 impl Scene {
-    const ALL: [Scene; 23] = [
+    const ALL: [Scene; 25] = [
         Scene::Connecting,
         Scene::Connected,
         Scene::Closed,
@@ -193,8 +206,10 @@ impl Scene {
         Scene::SidebarManyThreads,
         Scene::SidebarBehaviors,
         Scene::SidebarBehaviorsExpanded,
+        Scene::SidebarBehaviorsEmpty,
         Scene::NewPodModalEmpty,
         Scene::NewPodModalNoBackends,
+        Scene::NewBehaviorModalEmpty,
     ];
 
     fn slug(self) -> &'static str {
@@ -220,8 +235,10 @@ impl Scene {
             Scene::SidebarManyThreads => "sidebar_many_threads",
             Scene::SidebarBehaviors => "sidebar_behaviors",
             Scene::SidebarBehaviorsExpanded => "sidebar_behaviors_expanded",
+            Scene::SidebarBehaviorsEmpty => "sidebar_behaviors_empty",
             Scene::NewPodModalEmpty => "new_pod_modal_empty",
             Scene::NewPodModalNoBackends => "new_pod_modal_no_backends",
+            Scene::NewBehaviorModalEmpty => "new_behavior_modal_empty",
         }
     }
 
@@ -246,6 +263,10 @@ impl Scene {
             // header's plus button. Same click path the live UI
             // takes — the modal then renders as an overlay layer.
             Scene::NewPodModalEmpty | Scene::NewPodModalNoBackends => vec!["sidebar:new-pod"],
+            // Open the "+ New behavior" dialog scoped to the
+            // active `default` pod. Click route carries the pod
+            // id as suffix.
+            Scene::NewBehaviorModalEmpty => vec!["sidebar:new-behavior:default"],
             // Pick a backend (which fires a no-op `ListModels`),
             // then a model id from the pre-seeded `ModelsList`,
             // then a pod. Each `option:` click goes through
@@ -451,6 +472,47 @@ fn build_app(scene: Scene) -> Box<dyn App> {
             q.push_back(InboundEvent::Wire(ServerToClient::BackendsList {
                 correlation_id: None,
                 backends,
+            }));
+        }
+        Scene::NewBehaviorModalEmpty => {
+            // Same baseline as `SidebarBehaviors` — the dialog
+            // overlays a real behaviors registry so the scrim
+            // layering shows over a populated section header.
+            q.push_back(InboundEvent::ConnectionOpened);
+            q.push_back(InboundEvent::Wire(ServerToClient::PodList {
+                correlation_id: None,
+                pods: mock_pods(),
+                default_pod_id: "default".into(),
+            }));
+            q.push_back(InboundEvent::Wire(ServerToClient::ThreadList {
+                correlation_id: None,
+                tasks: mock_mavis_threads(),
+            }));
+            q.push_back(InboundEvent::Wire(ServerToClient::BehaviorList {
+                correlation_id: None,
+                pod_id: "default".into(),
+                behaviors: mock_mavis_behaviors(),
+            }));
+        }
+        Scene::SidebarBehaviorsEmpty => {
+            // Pod-but-no-behaviors scene: the empty state copy
+            // ("no behaviors in this pod yet") + the "+" affordance
+            // in the section header are the focus. No `BehaviorList`
+            // wire event so the section sees an empty list.
+            q.push_back(InboundEvent::ConnectionOpened);
+            q.push_back(InboundEvent::Wire(ServerToClient::PodList {
+                correlation_id: None,
+                pods: mock_pods(),
+                default_pod_id: "default".into(),
+            }));
+            q.push_back(InboundEvent::Wire(ServerToClient::ThreadList {
+                correlation_id: None,
+                tasks: mock_threads(),
+            }));
+            q.push_back(InboundEvent::Wire(ServerToClient::BehaviorList {
+                correlation_id: None,
+                pod_id: "default".into(),
+                behaviors: Vec::new(),
             }));
         }
         // Login scenes route through `build_login_app` above and

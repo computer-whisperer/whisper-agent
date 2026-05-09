@@ -295,16 +295,30 @@ tab strip rather than ported piecemeal. Multi-slice rollout:
   (probably a small `danger_button` helper that animates "Click again
   to confirm") for archive-pod / delete-behavior. Hooks into the
   ⋯ menu and the per-behavior toolbar.
-- **🌗 Slice δ — entry points.** Per-pod ➕ "new thread" landed: an
-  `icon_button("plus")` keyed `sidebar:new-thread` lives in the
-  Threads section header. Click clears `selected` and pre-binds the
-  active pod into `picker_pod` so the new-thread compose pane opens
-  scoped to where the user clicked — no wire round-trip until Start.
+- **✅ Slice δ — entry points.** Three "+" affordances landed,
+  each scoped to where it appears:
+    - **Per-pod "new thread"** — `icon_button("plus")` keyed
+      `sidebar:new-thread` in the Threads section header. Click
+      clears `selected` and pre-binds the active pod into
+      `picker_pod` so the new-thread compose pane opens scoped
+      to where the user clicked. No wire round-trip until Start.
+    - **Global "new pod"** — `icon_button("plus")` keyed
+      `sidebar:new-pod` in the sidebar header next to the
+      connection badge. Opens the `+ New pod` dialog (Stage 8
+      modal scaffold). The title `.ellipsis()`s when the badge
+      grows ("connecting…") so the chrome stays one row.
+    - **Per-pod "new behavior"** — `icon_button("plus")` keyed
+      `sidebar:new-behavior:{pod}` in the Behaviors section
+      header (suffix carries the pod id so the dialog scopes
+      correctly even if the active tab changes between click
+      and modal mount). Opens the `+ New behavior` dialog.
 
-  "+ New pod" and "+ New behavior" stay deferred — both want
-  modals (id + display name fields at minimum), so they ride on
-  Stage 8's `dialog` widget landing rather than punching out
-  partial inline forms now.
+  The Behaviors section now renders an empty-state message
+  ("no behaviors in this pod yet") + the "+" affordance once
+  the per-pod `BehaviorList` round-trip lands — the affordance
+  is most needed precisely when the pod is empty. Pre-list
+  pods skip the section entirely so a "just connected"
+  sidebar doesn't flash an empty section.
 
 ### ✅ Stage 1 — Scaffold (commit `a46b421`)
 
@@ -452,6 +466,7 @@ hundred lines:
 - new behavior
 - pod editor (raw TOML)
 - ✅ new pod
+- ✅ new behavior
 - fork thread
 - file / JSON / image viewers
 
