@@ -1,27 +1,28 @@
 //! [`ChatApp`] — the platform-agnostic aetna [`App`] for the
 //! whisper-agent chat client.
 //!
-//! Stage 2 surface: connection-status banner, sidebar with pods +
-//! threads, snapshot rendering of the selected thread's
-//! conversation as user/assistant text rows. Build/on_event split is
-//! the load-bearing test of the pivot — every interactive element
-//! routes through [`ChatApp::on_event`] via a key, every visual is a
-//! function of state read in [`ChatApp::build`].
+//! Surface so far: connection-status banner, sidebar with pods +
+//! threads, snapshot + delta-streamed chat log, compose box that
+//! sends follow-up turns to the selected thread.
+//! Build/on_event split is the load-bearing test of the pivot — every
+//! interactive element routes through [`ChatApp::on_event`] via a
+//! key, every visual is a function of state read in
+//! [`ChatApp::build`].
 //!
-//! Things stage 2 deliberately defers (planned for later stages):
+//! Things deliberately deferred:
 //! - markdown / code blocks (pending an upstream aetna parser)
 //! - reasoning-block collapsing
 //! - tool calls + tool results (rendered as a generic placeholder for now)
-//! - streaming (text-delta / reasoning-delta / tool-streaming) — only
-//!   the snapshot path is implemented; live deltas are queued but
-//!   ignored
-//! - compose box, attachments, model picker, modals
-//! - per-frame draft persistence (`SetThreadDraft` debounce)
+//! - tool-streaming, prefill progress, image output streaming
+//! - "compose into a fresh thread" (needs the model picker / pod
+//!   target / bindings surface)
+//! - attachment staging + drag/drop/paste/filepicker
+//! - per-thread draft persistence (`SetThreadDraft` debounce)
+//! - all settings / behavior / pod / bucket / fork modals
 //!
 //! Dispatch model: a single `dispatch_wire` walks `ServerToClient`
-//! variants — only the few stage-2 cares about have arms; the rest
-//! drop on the floor with a debug log so we can see what we're
-//! ignoring without spamming the user.
+//! variants — only the ones the current stage cares about have arms;
+//! the rest drop on the floor.
 
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -129,6 +130,19 @@ pub struct ChatApp {
     /// connection. Cleared on reconnect (a fresh `ConnectionOpened`
     /// implies the server lost our subscriptions).
     subscribed: HashSet<String>,
+
+    // ----- compose -----
+    /// In-progress text in the compose box. Cleared on send. Stage 3
+    /// keeps a single buffer rather than per-thread drafts; the egui
+    /// sibling persists drafts via `SetThreadDraft` debounce — that's
+    /// a stage-4 concern once we've validated the basic send path.
+    compose_input: String,
+    /// Global text-selection cursor for `text_area` / `text_input`
+    /// widgets. Aetna's controlled widgets read it through
+    /// `App::selection` and write back via `apply_event`. Stage 3
+    /// only has the compose `text_area`, but the same cursor will
+    /// own selection in the chat log when `.selectable()` lands.
+    selection: Selection,
 }
 
 impl ChatApp {
@@ -144,6 +158,8 @@ impl ChatApp {
             selected: None,
             views: HashMap::new(),
             subscribed: HashSet::new(),
+            compose_input: String::new(),
+            selection: Selection::default(),
         }
     }
 
@@ -252,15 +268,46 @@ impl ChatApp {
                 };
                 self.views.insert(thread_id, view);
             }
-            // Streaming + per-turn append events: stage 2 only renders
-            // snapshots, so we drop these. Resubscribing forces a fresh
-            // snapshot if the user wants to see what arrived. Stage 3
-            // wires these into incremental DisplayItem appends.
-            ServerToClient::ThreadUserMessage { .. }
-            | ServerToClient::ThreadToolResultMessage { .. }
+            // Per-turn streaming append: a user message just landed on
+            // the conversation. Server is the source of truth (the
+            // egui sibling deliberately doesn't optimistically append
+            // its own send), so we wait for this echo.
+            ServerToClient::ThreadUserMessage {
+                thread_id, text, ..
+            } => {
+                if let Some(view) = self.views.get_mut(&thread_id)
+                    && !text.is_empty()
+                {
+                    view.items.push(DisplayItem::User { text });
+                }
+            }
+            ServerToClient::ThreadAssistantTextDelta { thread_id, delta } => {
+                if let Some(view) = self.views.get_mut(&thread_id) {
+                    // Coalesce onto the trailing AssistantText if
+                    // there is one — same shape as the egui sibling
+                    // so a long generation doesn't fan out into one
+                    // card per delta.
+                    if let Some(DisplayItem::Assistant { text }) = view.items.last_mut() {
+                        text.push_str(&delta);
+                    } else {
+                        view.items.push(DisplayItem::Assistant { text: delta });
+                    }
+                }
+            }
+            ServerToClient::ThreadAssistantReasoningDelta { thread_id, delta } => {
+                if let Some(view) = self.views.get_mut(&thread_id) {
+                    if let Some(DisplayItem::Reasoning { text }) = view.items.last_mut() {
+                        text.push_str(&delta);
+                    } else {
+                        view.items.push(DisplayItem::Reasoning { text: delta });
+                    }
+                }
+            }
+            // Tool-call streaming, prefill progress, image output, and
+            // the begin/end bookends remain stage-4 concerns. They
+            // arrive but don't surface yet.
+            ServerToClient::ThreadToolResultMessage { .. }
             | ServerToClient::ThreadAssistantBegin { .. }
-            | ServerToClient::ThreadAssistantTextDelta { .. }
-            | ServerToClient::ThreadAssistantReasoningDelta { .. }
             | ServerToClient::ThreadAssistantImage { .. }
             | ServerToClient::ThreadAssistantEnd { .. }
             | ServerToClient::ThreadToolCallStreaming { .. }
@@ -305,7 +352,39 @@ impl App for ChatApp {
         {
             let thread_id = thread_id.to_string();
             self.select_thread(thread_id);
+            return;
         }
+
+        // Compose `text_area` edits: when the routed target is the
+        // compose box, fold the event through aetna's controlled-
+        // widget helper, which handles caret/selection/clipboard.
+        if event.target_key() == Some(COMPOSE_KEY) {
+            text_area::apply_event(
+                &mut self.compose_input,
+                &mut self.selection,
+                COMPOSE_KEY,
+                &event,
+            );
+            return;
+        }
+
+        // Send button.
+        if event.is_click_or_activate(SEND_KEY) {
+            self.send_compose();
+            return;
+        }
+
+        // Global selection plumbing — when the runtime synthesizes a
+        // SelectionChanged event from pointer drags, mirror it onto
+        // our owned `Selection`. Required for the in-text caret
+        // movement in the compose box to feel right.
+        if let Some(sel) = event.selection.clone() {
+            self.selection = sel;
+        }
+    }
+
+    fn selection(&self) -> Selection {
+        self.selection.clone()
     }
 
     fn theme(&self) -> Theme {
@@ -313,7 +392,33 @@ impl App for ChatApp {
     }
 }
 
+const COMPOSE_KEY: &str = "compose";
+const SEND_KEY: &str = "send";
+
 impl ChatApp {
+    fn send_compose(&mut self) {
+        // Stage 3 only supports follow-up turns on an already-existing
+        // thread. Creating a fresh thread from the compose box (the
+        // egui sibling's `composing_new` mode) is a stage-4 concern
+        // since it needs the model picker / pod target / bindings
+        // surface. For now: no thread selected = nothing to send.
+        let Some(thread_id) = self.selected.clone() else {
+            return;
+        };
+        let text = std::mem::take(&mut self.compose_input).trim().to_string();
+        if text.is_empty() {
+            return;
+        }
+        self.send(ClientToServer::SendUserMessage {
+            thread_id,
+            text,
+            attachments: Vec::new(),
+        });
+        // Reset selection inside the now-empty compose box so the
+        // caret lands at offset 0 on the next frame.
+        self.selection = Selection::default();
+    }
+
     fn select_thread(&mut self, thread_id: String) {
         self.selected = Some(thread_id.clone());
         // Subscribe lazily — once per thread per connection. The
@@ -499,10 +604,37 @@ impl ChatApp {
             }
         };
 
-        column([header, body])
+        column([header, body, self.compose_box()])
             .gap(0.0)
             .width(Size::Fill(1.0))
             .height(Size::Fill(1.0))
+    }
+
+    fn compose_box(&self) -> El {
+        // Disable the send button while the input is whitespace-only —
+        // sending an empty message wastes an LLM turn.
+        let can_send = !self.compose_input.trim().is_empty();
+        let mut send = button("Send").key(SEND_KEY).primary();
+        if !can_send {
+            // Aetna's button widget honors `.disabled()` to gray out
+            // the surface and skip routing.
+            send = send.disabled();
+        }
+        let editor =
+            text_area(&self.compose_input, &self.selection, COMPOSE_KEY).height(Size::Fixed(120.0));
+
+        // The compose row sits at the bottom of the pane: text_area
+        // takes the leftover width, the send button hugs to the
+        // right. `card([...])` would over-style this — it's part of
+        // the same content surface — so we use a thin top stroke as
+        // the visual divider from the chat log.
+        row([editor, send])
+            .gap(tokens::SPACE_3)
+            .padding(tokens::SPACE_3)
+            .align(Align::End)
+            .width(Size::Fill(1.0))
+            .stroke(tokens::BORDER)
+            .fill(tokens::BACKGROUND)
     }
 }
 
