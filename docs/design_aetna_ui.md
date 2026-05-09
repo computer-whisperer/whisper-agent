@@ -364,6 +364,13 @@ Chat-log polish (commits `fb6d675` / `55269bb`):
   Assistant message. `conversation_to_display_items` walks
   `snapshot.turn_log` in lockstep with assistant turns; live
   streaming appends from `ThreadAssistantEnd { usage }`
+- pane-header provenance chips: `via {behavior_id}` for behavior-
+  spawned threads, `forked from {short_id}` for continued threads,
+  `dispatched from {short_id}` for dispatched children. Muted
+  badges between the title and state badge so the user can see
+  the trigger context without opening the (eventual) thread
+  inspector. `short_id` truncates to 12 chars + `…` so chips
+  stay compact
 
 ### ✅ Stage 3 — Compose + send (commit `66d7c3e`)
 

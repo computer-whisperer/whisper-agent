@@ -122,6 +122,15 @@ enum Scene {
     /// case. Both calls are pre-expanded so the diff bodies render
     /// without a synthetic click.
     ThreadWithDiff,
+    /// Subscribed thread whose summary carries every provenance
+    /// field (origin = behavior, continued_from = a previous
+    /// thread, dispatched_by = a parent thread). Verifies the
+    /// pane header's three chip slots (`via`, `forked from`,
+    /// `dispatched from`) all render. A real thread won't usually
+    /// carry all three at once — origin and dispatched_by
+    /// typically don't co-occur — but this is the visual
+    /// regression scene.
+    ThreadWithProvenance,
     /// Subscribed thread mid-prefill — `ThreadPrefillProgress` has
     /// arrived but no text/reasoning delta has yet. Verifies the
     /// thin progress bar + token-count caption above the chat log.
@@ -205,7 +214,7 @@ enum Scene {
 }
 
 impl Scene {
-    const ALL: [Scene; 28] = [
+    const ALL: [Scene; 29] = [
         Scene::Connecting,
         Scene::Connected,
         Scene::Closed,
@@ -222,6 +231,7 @@ impl Scene {
         Scene::ThreadWithImages,
         Scene::ThreadWithSetup,
         Scene::ThreadWithDiff,
+        Scene::ThreadWithProvenance,
         Scene::LoginFormEmpty,
         Scene::LoginFormPrefilled,
         Scene::LoginFormWithError,
@@ -254,6 +264,7 @@ impl Scene {
             Scene::ThreadWithImages => "thread_with_images",
             Scene::ThreadWithSetup => "thread_with_setup",
             Scene::ThreadWithDiff => "thread_with_diff",
+            Scene::ThreadWithProvenance => "thread_with_provenance",
             Scene::LoginFormEmpty => "login_form_empty",
             Scene::LoginFormPrefilled => "login_form_prefilled",
             Scene::LoginFormWithError => "login_form_with_error",
@@ -280,7 +291,8 @@ impl Scene {
             | Scene::ThreadPrefilling
             | Scene::ThreadWithDraft
             | Scene::ThreadWithImages
-            | Scene::ThreadWithSetup => vec!["thread:t-1"],
+            | Scene::ThreadWithSetup
+            | Scene::ThreadWithProvenance => vec!["thread:t-1"],
             // Open the thread, then click each diff tool's
             // accordion so the bodies render expanded. Indices
             // come from the conversation's display-item order:
@@ -407,16 +419,27 @@ fn build_app(scene: Scene) -> Box<dyn App> {
         | Scene::ThreadWithDraft
         | Scene::ThreadWithImages
         | Scene::ThreadWithSetup
-        | Scene::ThreadWithDiff => {
+        | Scene::ThreadWithDiff
+        | Scene::ThreadWithProvenance => {
             q.push_back(InboundEvent::ConnectionOpened);
             q.push_back(InboundEvent::Wire(ServerToClient::PodList {
                 correlation_id: None,
                 pods: mock_pods(),
                 default_pod_id: "default".into(),
             }));
+            // Provenance scene swaps in a thread list whose t-1
+            // carries origin / continued_from / dispatched_by so
+            // the pane header's chip cluster has all three to
+            // render. Other scenes keep `mock_threads()` for
+            // visual stability.
+            let threads = if matches!(scene, Scene::ThreadWithProvenance) {
+                mock_provenance_threads()
+            } else {
+                mock_threads()
+            };
             q.push_back(InboundEvent::Wire(ServerToClient::ThreadList {
                 correlation_id: None,
-                tasks: mock_threads(),
+                tasks: threads,
             }));
             if matches!(scene, Scene::ThreadWithMessages) {
                 q.push_back(InboundEvent::Wire(ServerToClient::ThreadSnapshot {
@@ -715,6 +738,23 @@ fn mock_threads() -> Vec<ThreadSummary> {
             dispatched_by: None,
         },
     ]
+}
+
+/// Same shape as [`mock_threads`] but t-1 carries every
+/// provenance field — origin (behavior-spawned), continued_from
+/// (forked), dispatched_by (parent thread). Used by the
+/// `ThreadWithProvenance` scene to validate the pane header's
+/// three chip slots.
+fn mock_provenance_threads() -> Vec<ThreadSummary> {
+    let mut t = mock_threads();
+    t[0].origin = Some(BehaviorOrigin {
+        behavior_id: "architect".into(),
+        fired_at: "2026-05-08T10:30:00Z".into(),
+        trigger_payload: serde_json::Value::Null,
+    });
+    t[0].continued_from = Some("task-7c9c8d6a4f0b1234".into());
+    t[0].dispatched_by = Some("task-18abcff7ad2a29b9".into());
+    t
 }
 
 /// One parent thread plus three dispatched children, all in the

@@ -2415,7 +2415,23 @@ impl ChatApp {
         // tight; an inspector affordance can pin it back into a popover
         // later when modals land.
         let mut toolbar_children: Vec<El> = vec![toolbar_title(title), spacer()];
+        // Provenance chips between title and state badge: behavior
+        // origin first (most load-bearing — tells the user this
+        // thread fires on a schedule / webhook), then continuation
+        // (forked from another thread), then dispatch parent
+        // (spawned by `dispatch_thread` from another thread).
+        // Muted styling so they read as metadata, not chrome.
         if let Some(s) = summary {
+            if let Some(origin) = &s.origin {
+                toolbar_children.push(badge(format!("via {}", origin.behavior_id)).muted());
+            }
+            if let Some(prev) = &s.continued_from {
+                toolbar_children.push(badge(format!("forked from {}", short_id(prev))).muted());
+            }
+            if let Some(parent) = &s.dispatched_by {
+                toolbar_children
+                    .push(badge(format!("dispatched from {}", short_id(parent))).muted());
+            }
             toolbar_children.push(state_badge(s.state));
         }
         let mut header_rows: Vec<El> =
@@ -3225,6 +3241,22 @@ fn fresh_pod_config(name: String, mut backend_names: Vec<String>) -> PodConfig {
         },
         limits: PodLimits::default(),
     }
+}
+
+/// Truncate a thread id for inline use in chips ("forked from {id}",
+/// "dispatched from {id}"). Thread ids are typically `t-{ulid}`
+/// shaped — long enough to make a chip noisy if rendered in full.
+/// First 12 chars + `…` is enough to recognize the thread when
+/// hovering matches against the sidebar.
+fn short_id(id: &str) -> String {
+    const HEAD: usize = 12;
+    let chars = id.chars().count();
+    if chars <= HEAD {
+        return id.to_string();
+    }
+    let mut head: String = id.chars().take(HEAD).collect();
+    head.push('…');
+    head
 }
 
 /// egui sibling's `format_relative_time`. Returns `"just now"` for
