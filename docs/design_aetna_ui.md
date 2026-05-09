@@ -791,6 +791,15 @@ backend); the model menu options come from
 `models_by_backend[thread_defaults.backend]`, so changing
 backends routes the user to a fresh pick on the next click.
 
+**Pod editor — Limits tab (landed):** trivial slice — the
+protocol's [`PodLimits`] struct only carries
+`max_concurrent_threads` today, so the form is one
+`numeric_input` (1–1000, step 1). Same buffer pattern as the
+Defaults numeric inputs (`max_concurrent_threads_buf` lives on
+`PodEditorSheetState`, parsed back to `working_config.limits`
+on every event). New form items drop in alongside as the
+schema grows.
+
 ### ✅ Stage 9 — Login form
 
 `whisper_agent_aetna_ui::LoginApp` is a separate aetna [`App`] —

@@ -251,6 +251,12 @@ enum Scene {
     /// on the `pod-editor:tabs:tab:defaults` trigger flips the
     /// active tab without exercising any picker popovers.
     PodEditorDefaultsTab,
+    /// Pod editor sheet, opened and switched to the Limits tab.
+    /// Same hydration shape as `PodEditorHydrated`; an extra click
+    /// on the `pod-editor:tabs:tab:limits` trigger flips the
+    /// active tab. Renders a single numeric_input
+    /// (`max_concurrent_threads`).
+    PodEditorLimitsTab,
     /// Fork-from-message dialog with a User row pre-selected. The
     /// dialog opens via a synthetic click on the per-row fork
     /// affordance (`chat:user-fork:{msg_index}`) — routing is
@@ -263,7 +269,7 @@ enum Scene {
 }
 
 impl Scene {
-    const ALL: [Scene; 35] = [
+    const ALL: [Scene; 36] = [
         Scene::Connecting,
         Scene::Connected,
         Scene::Closed,
@@ -298,6 +304,7 @@ impl Scene {
         Scene::BehaviorEditorTriggerKindOpen,
         Scene::PodEditorHydrated,
         Scene::PodEditorDefaultsTab,
+        Scene::PodEditorLimitsTab,
         Scene::ForkModalOpen,
     ];
 
@@ -337,6 +344,7 @@ impl Scene {
             Scene::BehaviorEditorTriggerKindOpen => "behavior_editor_trigger_kind_open",
             Scene::PodEditorHydrated => "pod_editor_hydrated",
             Scene::PodEditorDefaultsTab => "pod_editor_defaults_tab",
+            Scene::PodEditorLimitsTab => "pod_editor_limits_tab",
             Scene::ForkModalOpen => "fork_modal_open",
         }
     }
@@ -414,6 +422,9 @@ impl Scene {
             Scene::PodEditorDefaultsTab => {
                 vec!["sidebar:pod-settings", "pod-editor:tabs:tab:defaults"]
             }
+            Scene::PodEditorLimitsTab => {
+                vec!["sidebar:pod-settings", "pod-editor:tabs:tab:limits"]
+            }
             // Select the thread, then click the per-row fork
             // affordance for the first User message. `mock_snapshot`
             // pushes an empty system_text at msg_index=0 first, so
@@ -476,7 +487,7 @@ fn build_app(scene: Scene) -> Box<dyn App> {
                 }
             })
         }
-        Scene::PodEditorHydrated | Scene::PodEditorDefaultsTab => {
+        Scene::PodEditorHydrated | Scene::PodEditorDefaultsTab | Scene::PodEditorLimitsTab => {
             let queue = inbound.clone();
             Box::new(move |msg| {
                 if let ClientToServer::GetPod {
@@ -758,7 +769,7 @@ fn build_app(scene: Scene) -> Box<dyn App> {
                 behaviors: mock_mavis_behaviors(),
             }));
         }
-        Scene::PodEditorHydrated | Scene::PodEditorDefaultsTab => {
+        Scene::PodEditorHydrated | Scene::PodEditorDefaultsTab | Scene::PodEditorLimitsTab => {
             // Connection + pod list (so the active-pod gear renders),
             // plus an empty thread list so the right pane is the
             // no-selection compose form (visible behind the right-

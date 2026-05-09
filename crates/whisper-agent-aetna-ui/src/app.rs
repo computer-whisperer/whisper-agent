@@ -897,6 +897,9 @@ pub(crate) struct PodEditorSheetState {
     /// Same shape as [`Self::max_tokens_buf`], for
     /// `thread_defaults.max_turns`.
     pub(crate) max_turns_buf: String,
+    /// Same shape as [`Self::max_tokens_buf`], for
+    /// `limits.max_concurrent_threads`.
+    pub(crate) max_concurrent_threads_buf: String,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -994,6 +997,7 @@ impl PodEditorSheetState {
             open_picker: None,
             max_tokens_buf: String::new(),
             max_turns_buf: String::new(),
+            max_concurrent_threads_buf: String::new(),
         }
     }
 
@@ -1017,6 +1021,7 @@ impl PodEditorSheetState {
         if let Some(cfg) = self.working_config.as_ref() {
             self.max_tokens_buf = cfg.thread_defaults.max_tokens.to_string();
             self.max_turns_buf = cfg.thread_defaults.max_turns.to_string();
+            self.max_concurrent_threads_buf = cfg.limits.max_concurrent_threads.to_string();
         }
     }
 
@@ -2406,6 +2411,9 @@ const POD_EDITOR_DEFAULTS_CAPS_POD_MODIFY_KEY: &str = "pod-editor:defaults:caps:
 const POD_EDITOR_DEFAULTS_CAPS_DISPATCH_KEY: &str = "pod-editor:defaults:caps:dispatch";
 const POD_EDITOR_DEFAULTS_CAPS_BEHAVIORS_KEY: &str = "pod-editor:defaults:caps:behaviors";
 const POD_EDITOR_DEFAULTS_MCP_HOSTS_KEY: &str = "pod-editor:defaults:mcp-hosts";
+/// Limits-tab field keys.
+const POD_EDITOR_LIMITS_MAX_CONCURRENT_THREADS_KEY: &str =
+    "pod-editor:limits:max-concurrent-threads";
 /// Raw-tab field key (the only knob in that tab).
 const POD_EDITOR_TOML_KEY: &str = "pod-editor:raw:toml";
 const POD_EDITOR_SAVE_KEY: &str = "pod-editor:save";
@@ -4738,6 +4746,28 @@ impl ChatApp {
             }
         }
 
+        // Limits tab numeric input — `limits.max_concurrent_threads`.
+        // Same buffer-then-parse-back pattern as the Defaults numeric
+        // inputs above; see the comment there.
+        if let Some(editor) = self.pod_editor.as_mut() {
+            let opts = NumericInputOpts::default().min(1.0).max(1000.0).step(1.0);
+            if numeric_input::apply_event(
+                &mut editor.max_concurrent_threads_buf,
+                &mut self.selection,
+                POD_EDITOR_LIMITS_MAX_CONCURRENT_THREADS_KEY,
+                &opts,
+                event,
+            ) {
+                if let Ok(v) = editor.max_concurrent_threads_buf.parse::<u32>()
+                    && let Some(cfg) = editor.working_config.as_mut()
+                {
+                    cfg.limits.max_concurrent_threads = v.clamp(1, 1000);
+                }
+                editor.error = None;
+                return true;
+            }
+        }
+
         // Raw tab text_area.
         if event.target_key() == Some(POD_EDITOR_TOML_KEY) {
             if let Some(editor) = self.pod_editor.as_mut() {
@@ -4958,11 +4988,7 @@ impl ChatApp {
             match editor.tab {
                 PodEditorTab::Allow => self.render_pod_editor_allow_tab(editor),
                 PodEditorTab::Defaults => self.render_pod_editor_defaults_tab(editor),
-                PodEditorTab::Limits => paragraph(
-                    "Limits tab — coming soon. Edit pod limits via the Raw \
-                     TOML tab in the meantime.",
-                )
-                .muted(),
+                PodEditorTab::Limits => self.render_pod_editor_limits_tab(editor),
                 PodEditorTab::RawToml => {
                     text_area(&editor.working_toml, &self.selection, POD_EDITOR_TOML_KEY).mono()
                 }
@@ -5342,6 +5368,34 @@ impl ChatApp {
             &cfg.thread_defaults.mcp_hosts,
             options,
         )
+    }
+
+    /// Limits tab body. Pod-level resource ceilings — currently a
+    /// single `max_concurrent_threads` knob, since the protocol's
+    /// [`PodLimits`] struct only carries that one field. As the
+    /// schema grows (rate caps, spend ceilings, …) new form items
+    /// drop in alongside.
+    fn render_pod_editor_limits_tab(&self, editor: &PodEditorSheetState) -> El {
+        let Some(_cfg) = editor.working_config.as_ref() else {
+            return paragraph("no parsed config — fix the on-disk pod.toml from the Raw tab")
+                .muted();
+        };
+
+        let max_concurrent_widget = numeric_input(
+            &editor.max_concurrent_threads_buf,
+            &self.selection,
+            POD_EDITOR_LIMITS_MAX_CONCURRENT_THREADS_KEY,
+            NumericInputOpts::default().min(1.0).max(1000.0).step(1.0),
+        );
+
+        form([form_item([
+            form_label("max concurrent threads"),
+            form_control(max_concurrent_widget),
+            form_description(
+                "Ceiling on simultaneously-running threads in this pod. New threads \
+                 above the cap queue rather than dispatch.",
+            ),
+        ])])
     }
 
     /// Build the select_menu for whichever pod-editor picker is open.
