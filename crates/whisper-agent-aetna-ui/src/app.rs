@@ -40,8 +40,8 @@ use aetna_core::prelude::*;
 use aetna_core::widgets::select::{SelectAction, classify_event as classify_select_event};
 use whisper_agent_protocol::{
     AllowMap, BackendSummary, BehaviorConfig, BehaviorSummary, BehaviorThreadOverride,
-    ClientToServer, ContentBlock, ImageSource, ModelSummary, NamedHostEnv, PodAllow, PodConfig,
-    PodLimits, PodSummary, RetentionPolicy, Role, ServerToClient, ThreadConfigOverride,
+    ClientToServer, ContentBlock, Disposition, ImageSource, ModelSummary, NamedHostEnv, PodAllow,
+    PodConfig, PodLimits, PodSummary, RetentionPolicy, Role, ServerToClient, ThreadConfigOverride,
     ThreadDefaults, ThreadSummary, TriggerSpec,
 };
 
@@ -886,10 +886,20 @@ pub(crate) struct PodEditorSheetState {
     /// pickers and the behavior editor's trigger-kind picker
     /// coordinate through `close_other_pickers`.
     pub(crate) open_picker: Option<PodEditorPicker>,
+    /// Visible string for the Defaults-tab `max_tokens`
+    /// `numeric_input`. The widget owns its own buffer (lets the user
+    /// type mid-edit states like `"1"` before the trailing digits
+    /// arrive); we parse and write back to
+    /// `working_config.thread_defaults.max_tokens` on every parseable
+    /// edit. Hydrated from the snapshot's parsed config; re-synced
+    /// when leaving Raw with `raw_dirty` reparses.
+    pub(crate) max_tokens_buf: String,
+    /// Same shape as [`Self::max_tokens_buf`], for
+    /// `thread_defaults.max_turns`.
+    pub(crate) max_turns_buf: String,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[allow(clippy::enum_variant_names)]
 pub(crate) enum PodEditorPicker {
     /// `allow.caps.pod_modify_thread_pods` cap selector.
     AllowCapsPodModify,
@@ -897,6 +907,37 @@ pub(crate) enum PodEditorPicker {
     AllowCapsDispatch,
     /// `allow.caps.use_behaviors_in_pods` cap selector.
     AllowCapsBehaviors,
+    /// `thread_defaults.backend` picker (Defaults tab).
+    DefaultsBackend,
+    /// `thread_defaults.model` picker (Defaults tab).
+    DefaultsModel,
+    /// `allow.tools.default` (Allow / Deny) picker (Defaults tab —
+    /// the gate lives under `[allow]` but its default is a
+    /// thread-default knob in spirit, so the egui sibling parks
+    /// it here).
+    DefaultsToolGate,
+    /// `thread_defaults.caps.pod_modify` selector.
+    DefaultsCapsPodModify,
+    /// `thread_defaults.caps.dispatch` selector.
+    DefaultsCapsDispatch,
+    /// `thread_defaults.caps.behaviors` selector.
+    DefaultsCapsBehaviors,
+}
+
+impl PodEditorPicker {
+    fn key(self) -> &'static str {
+        match self {
+            Self::AllowCapsPodModify => POD_EDITOR_ALLOW_CAPS_POD_MODIFY_KEY,
+            Self::AllowCapsDispatch => POD_EDITOR_ALLOW_CAPS_DISPATCH_KEY,
+            Self::AllowCapsBehaviors => POD_EDITOR_ALLOW_CAPS_BEHAVIORS_KEY,
+            Self::DefaultsBackend => POD_EDITOR_DEFAULTS_BACKEND_KEY,
+            Self::DefaultsModel => POD_EDITOR_DEFAULTS_MODEL_KEY,
+            Self::DefaultsToolGate => POD_EDITOR_DEFAULTS_TOOL_GATE_KEY,
+            Self::DefaultsCapsPodModify => POD_EDITOR_DEFAULTS_CAPS_POD_MODIFY_KEY,
+            Self::DefaultsCapsDispatch => POD_EDITOR_DEFAULTS_CAPS_DISPATCH_KEY,
+            Self::DefaultsCapsBehaviors => POD_EDITOR_DEFAULTS_CAPS_BEHAVIORS_KEY,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -951,6 +992,8 @@ impl PodEditorSheetState {
             pending_get: Some(pending_get),
             pending_save: None,
             open_picker: None,
+            max_tokens_buf: String::new(),
+            max_turns_buf: String::new(),
         }
     }
 
@@ -962,6 +1005,19 @@ impl PodEditorSheetState {
         self.working_config = Some(snapshot.config.clone());
         self.baseline_config = Some(snapshot.config);
         self.raw_dirty = false;
+        self.sync_buffers_from_config();
+    }
+
+    /// Pull the Defaults-tab numeric buffers (`max_tokens` /
+    /// `max_turns`) out of the structured `working_config`. Called on
+    /// hydrate and after Raw → structured reparses so the
+    /// `numeric_input` widgets always start aligned with the
+    /// underlying u32s.
+    fn sync_buffers_from_config(&mut self) {
+        if let Some(cfg) = self.working_config.as_ref() {
+            self.max_tokens_buf = cfg.thread_defaults.max_tokens.to_string();
+            self.max_turns_buf = cfg.thread_defaults.max_turns.to_string();
+        }
     }
 
     /// Has anything diverged from the server-known baseline? Save
@@ -994,6 +1050,10 @@ impl PodEditorSheetState {
                     self.working_config = Some(parsed);
                     self.raw_dirty = false;
                     self.error = None;
+                    // Re-sync numeric buffers so the Defaults tab's
+                    // max_tokens / max_turns widgets reflect whatever
+                    // the user typed into the raw TOML.
+                    self.sync_buffers_from_config();
                 }
                 Err(e) => {
                     self.error = Some(format!("raw TOML doesn't parse: {e}"));
@@ -2334,6 +2394,18 @@ const POD_EDITOR_ALLOW_BUCKETS_KEY: &str = "pod-editor:allow:buckets";
 const POD_EDITOR_ALLOW_CAPS_POD_MODIFY_KEY: &str = "pod-editor:allow:caps:pod-modify";
 const POD_EDITOR_ALLOW_CAPS_DISPATCH_KEY: &str = "pod-editor:allow:caps:dispatch";
 const POD_EDITOR_ALLOW_CAPS_BEHAVIORS_KEY: &str = "pod-editor:allow:caps:behaviors";
+/// Defaults-tab field keys.
+const POD_EDITOR_DEFAULTS_BACKEND_KEY: &str = "pod-editor:defaults:backend";
+const POD_EDITOR_DEFAULTS_MODEL_KEY: &str = "pod-editor:defaults:model";
+const POD_EDITOR_DEFAULTS_SYSTEM_PROMPT_FILE_KEY: &str = "pod-editor:defaults:system-prompt-file";
+const POD_EDITOR_DEFAULTS_MAX_TOKENS_KEY: &str = "pod-editor:defaults:max-tokens";
+const POD_EDITOR_DEFAULTS_MAX_TURNS_KEY: &str = "pod-editor:defaults:max-turns";
+const POD_EDITOR_DEFAULTS_TOOL_GATE_KEY: &str = "pod-editor:defaults:tool-gate";
+const POD_EDITOR_DEFAULTS_HOST_ENV_KEY: &str = "pod-editor:defaults:host-env";
+const POD_EDITOR_DEFAULTS_CAPS_POD_MODIFY_KEY: &str = "pod-editor:defaults:caps:pod-modify";
+const POD_EDITOR_DEFAULTS_CAPS_DISPATCH_KEY: &str = "pod-editor:defaults:caps:dispatch";
+const POD_EDITOR_DEFAULTS_CAPS_BEHAVIORS_KEY: &str = "pod-editor:defaults:caps:behaviors";
+const POD_EDITOR_DEFAULTS_MCP_HOSTS_KEY: &str = "pod-editor:defaults:mcp-hosts";
 /// Raw-tab field key (the only knob in that tab).
 const POD_EDITOR_TOML_KEY: &str = "pod-editor:raw:toml";
 const POD_EDITOR_SAVE_KEY: &str = "pod-editor:save";
@@ -2500,6 +2572,21 @@ fn behaviors_cap_from_wire(s: &str) -> Option<whisper_agent_protocol::BehaviorOp
         "read" => Some(C::Read),
         "author_narrower" => Some(C::AuthorNarrower),
         "author_any" => Some(C::AuthorAny),
+        _ => None,
+    }
+}
+
+fn tool_gate_label(d: Disposition) -> &'static str {
+    match d {
+        Disposition::Allow => "allow_all",
+        Disposition::Deny => "deny_all",
+    }
+}
+
+fn tool_gate_from_wire(s: &str) -> Option<Disposition> {
+    match s {
+        "allow_all" => Some(Disposition::Allow),
+        "deny_all" => Some(Disposition::Deny),
         _ => None,
     }
 }
@@ -2698,20 +2785,14 @@ impl ChatApp {
         {
             editor.trigger_kind_open = false;
         }
-        // Pod editor cap pickers — three select_trigger keys map to
-        // the three `PodEditorPicker` variants. If the open picker's
-        // key isn't `keep_open`, close it.
+        // Pod editor pickers — every variant maps 1:1 to a routed
+        // `select_trigger` key via `PodEditorPicker::key`. If the
+        // open picker's key isn't `keep_open`, close it.
         if let Some(editor) = self.pod_editor.as_mut()
             && let Some(open) = editor.open_picker
+            && keep_open != open.key()
         {
-            let open_key = match open {
-                PodEditorPicker::AllowCapsPodModify => POD_EDITOR_ALLOW_CAPS_POD_MODIFY_KEY,
-                PodEditorPicker::AllowCapsDispatch => POD_EDITOR_ALLOW_CAPS_DISPATCH_KEY,
-                PodEditorPicker::AllowCapsBehaviors => POD_EDITOR_ALLOW_CAPS_BEHAVIORS_KEY,
-            };
-            if keep_open != open_key {
-                editor.open_picker = None;
-            }
+            editor.open_picker = None;
         }
     }
 
@@ -3633,14 +3714,14 @@ impl ChatApp {
         }
         if let Some(sheet_el) = self.render_pod_editor_sheet() {
             out.push(Some(sheet_el));
-            // Pod editor cap pickers ride above the sheet — same
-            // single-active discipline as the behavior editor's
-            // trigger-kind picker. Topmost so it floats above the
-            // sheet panel.
+            // Pod editor pickers (caps + Defaults backend/model/tool
+            // gate) ride above the sheet — same single-active
+            // discipline as the behavior editor's trigger-kind
+            // picker. Topmost so it floats above the sheet panel.
             if let Some(editor) = self.pod_editor.as_ref()
                 && let Some(open) = editor.open_picker
             {
-                out.push(Some(self.pod_editor_cap_menu(open)));
+                out.push(Some(self.pod_editor_picker_menu(open)));
             }
         }
         if let Some(modal_el) = self.render_fork_modal() {
@@ -4485,21 +4566,25 @@ impl ChatApp {
             return true;
         }
 
-        // Cap pickers — three select_trigger / select_menu pairs
-        // routed by their full keys. Match each before falling
-        // through to text-input handlers (whose target_key checks
-        // would shadow the picker option-keys otherwise).
-        if let Some(action) = classify_select_event(event, POD_EDITOR_ALLOW_CAPS_POD_MODIFY_KEY) {
-            self.handle_pod_editor_cap_pick(PodEditorPicker::AllowCapsPodModify, action);
-            return true;
-        }
-        if let Some(action) = classify_select_event(event, POD_EDITOR_ALLOW_CAPS_DISPATCH_KEY) {
-            self.handle_pod_editor_cap_pick(PodEditorPicker::AllowCapsDispatch, action);
-            return true;
-        }
-        if let Some(action) = classify_select_event(event, POD_EDITOR_ALLOW_CAPS_BEHAVIORS_KEY) {
-            self.handle_pod_editor_cap_pick(PodEditorPicker::AllowCapsBehaviors, action);
-            return true;
+        // Picker triggers / menus — every editor `select_trigger` is
+        // routed by its variant's [`PodEditorPicker::key`]. Match each
+        // before the text-input handlers below (whose target_key
+        // checks would otherwise shadow the picker option keys).
+        for which in [
+            PodEditorPicker::AllowCapsPodModify,
+            PodEditorPicker::AllowCapsDispatch,
+            PodEditorPicker::AllowCapsBehaviors,
+            PodEditorPicker::DefaultsBackend,
+            PodEditorPicker::DefaultsModel,
+            PodEditorPicker::DefaultsToolGate,
+            PodEditorPicker::DefaultsCapsPodModify,
+            PodEditorPicker::DefaultsCapsDispatch,
+            PodEditorPicker::DefaultsCapsBehaviors,
+        ] {
+            if let Some(action) = classify_select_event(event, which.key()) {
+                self.handle_pod_editor_picker(which, action);
+                return true;
+            }
         }
 
         // Allow tab text fields.
@@ -4572,6 +4657,87 @@ impl ChatApp {
             }
         }
 
+        // Defaults tab text fields.
+        if event.target_key() == Some(POD_EDITOR_DEFAULTS_SYSTEM_PROMPT_FILE_KEY) {
+            if let Some(editor) = self.pod_editor.as_mut()
+                && let Some(cfg) = editor.working_config.as_mut()
+            {
+                text_input::apply_event(
+                    &mut cfg.thread_defaults.system_prompt_file,
+                    &mut self.selection,
+                    POD_EDITOR_DEFAULTS_SYSTEM_PROMPT_FILE_KEY,
+                    event,
+                );
+                editor.error = None;
+            }
+            return true;
+        }
+
+        // Defaults tab numeric inputs (max_tokens / max_turns). The
+        // widget owns a String buffer so mid-edit states like `"1"`
+        // survive between keystrokes; we mirror parseable u32 values
+        // back into `working_config` so `dirty()` and the save round
+        // trip stay accurate.
+        if let Some(editor) = self.pod_editor.as_mut() {
+            let max_tokens_opts = NumericInputOpts::default()
+                .min(1.0)
+                .max(200_000.0)
+                .step(50.0);
+            if numeric_input::apply_event(
+                &mut editor.max_tokens_buf,
+                &mut self.selection,
+                POD_EDITOR_DEFAULTS_MAX_TOKENS_KEY,
+                &max_tokens_opts,
+                event,
+            ) {
+                if let Ok(v) = editor.max_tokens_buf.parse::<u32>()
+                    && let Some(cfg) = editor.working_config.as_mut()
+                {
+                    cfg.thread_defaults.max_tokens = v.clamp(1, 200_000);
+                }
+                editor.error = None;
+                return true;
+            }
+            let max_turns_opts = NumericInputOpts::default().min(1.0).max(10_000.0).step(1.0);
+            if numeric_input::apply_event(
+                &mut editor.max_turns_buf,
+                &mut self.selection,
+                POD_EDITOR_DEFAULTS_MAX_TURNS_KEY,
+                &max_turns_opts,
+                event,
+            ) {
+                if let Ok(v) = editor.max_turns_buf.parse::<u32>()
+                    && let Some(cfg) = editor.working_config.as_mut()
+                {
+                    cfg.thread_defaults.max_turns = v.clamp(1, 10_000);
+                }
+                editor.error = None;
+                return true;
+            }
+        }
+
+        // Defaults tab multi-checks (host_env / default mcp_hosts).
+        if let Some(editor) = self.pod_editor.as_mut()
+            && let Some(cfg) = editor.working_config.as_mut()
+        {
+            if apply_checkbox_list_to_vec(
+                &mut cfg.thread_defaults.host_env,
+                event,
+                POD_EDITOR_DEFAULTS_HOST_ENV_KEY,
+            ) {
+                editor.error = None;
+                return true;
+            }
+            if apply_checkbox_list_to_vec(
+                &mut cfg.thread_defaults.mcp_hosts,
+                event,
+                POD_EDITOR_DEFAULTS_MCP_HOSTS_KEY,
+            ) {
+                editor.error = None;
+                return true;
+            }
+        }
+
         // Raw tab text_area.
         if event.target_key() == Some(POD_EDITOR_TOML_KEY) {
             if let Some(editor) = self.pod_editor.as_mut() {
@@ -4605,20 +4771,16 @@ impl ChatApp {
         false
     }
 
-    /// Pick handler for the pod editor's three cap select_triggers.
-    /// `which` identifies which slot we're driving; the value parses
-    /// into the appropriate cap enum (PodModifyCap / DispatchCap /
-    /// BehaviorOpsCap). Toggle opens/closes the menu after closing
-    /// any other open picker (single-active invariant).
-    fn handle_pod_editor_cap_pick(&mut self, which: PodEditorPicker, action: SelectAction) {
-        let key_for = |which| match which {
-            PodEditorPicker::AllowCapsPodModify => POD_EDITOR_ALLOW_CAPS_POD_MODIFY_KEY,
-            PodEditorPicker::AllowCapsDispatch => POD_EDITOR_ALLOW_CAPS_DISPATCH_KEY,
-            PodEditorPicker::AllowCapsBehaviors => POD_EDITOR_ALLOW_CAPS_BEHAVIORS_KEY,
-        };
+    /// Pick handler for the pod editor's `select_trigger` family.
+    /// `which` identifies the slot driving the action; on `Pick`, the
+    /// value is parsed into whichever cap / disposition / catalog
+    /// name the slot edits and written back into `working_config`.
+    /// Toggle opens or closes the menu after closing any other open
+    /// picker (single-active invariant).
+    fn handle_pod_editor_picker(&mut self, which: PodEditorPicker, action: SelectAction) {
         match action {
             SelectAction::Toggle => {
-                self.close_other_pickers(key_for(which));
+                self.close_other_pickers(which.key());
                 if let Some(editor) = self.pod_editor.as_mut() {
                     editor.open_picker = if editor.open_picker == Some(which) {
                         None
@@ -4650,6 +4812,38 @@ impl ChatApp {
                         PodEditorPicker::AllowCapsBehaviors => {
                             if let Some(v) = behaviors_cap_from_wire(&value) {
                                 cfg.allow.caps.behaviors = v;
+                            }
+                        }
+                        PodEditorPicker::DefaultsBackend => {
+                            cfg.thread_defaults.backend = value;
+                            // Backend changed — clear the model since the
+                            // pre-existing string almost certainly isn't
+                            // valid for the new backend. The user picks
+                            // a model next; the menu only shows valid
+                            // options.
+                            cfg.thread_defaults.model = String::new();
+                        }
+                        PodEditorPicker::DefaultsModel => {
+                            cfg.thread_defaults.model = value;
+                        }
+                        PodEditorPicker::DefaultsToolGate => {
+                            if let Some(v) = tool_gate_from_wire(&value) {
+                                cfg.allow.tools.default = v;
+                            }
+                        }
+                        PodEditorPicker::DefaultsCapsPodModify => {
+                            if let Some(v) = pod_modify_cap_from_wire(&value) {
+                                cfg.thread_defaults.caps.pod_modify = v;
+                            }
+                        }
+                        PodEditorPicker::DefaultsCapsDispatch => {
+                            if let Some(v) = dispatch_cap_from_wire(&value) {
+                                cfg.thread_defaults.caps.dispatch = v;
+                            }
+                        }
+                        PodEditorPicker::DefaultsCapsBehaviors => {
+                            if let Some(v) = behaviors_cap_from_wire(&value) {
+                                cfg.thread_defaults.caps.behaviors = v;
                             }
                         }
                     }
@@ -4763,11 +4957,7 @@ impl ChatApp {
         } else {
             match editor.tab {
                 PodEditorTab::Allow => self.render_pod_editor_allow_tab(editor),
-                PodEditorTab::Defaults => paragraph(
-                    "Defaults tab — coming soon. Edit thread defaults via the \
-                     Raw TOML tab in the meantime.",
-                )
-                .muted(),
+                PodEditorTab::Defaults => self.render_pod_editor_defaults_tab(editor),
                 PodEditorTab::Limits => paragraph(
                     "Limits tab — coming soon. Edit pod limits via the Raw \
                      TOML tab in the meantime.",
@@ -4950,13 +5140,220 @@ impl ChatApp {
         )
     }
 
-    /// Build the select_menu for whichever pod-editor cap picker is
-    /// open. Single-active — at most one picker open at a time. Each
-    /// menu's options match the matching cap enum's variants.
-    fn pod_editor_cap_menu(&self, which: PodEditorPicker) -> El {
+    /// Defaults tab body. Mirrors the egui sibling's
+    /// `render_pod_editor_defaults_tab`: backend / model select_triggers
+    /// (catalog-driven), system-prompt path text input, max_tokens /
+    /// max_turns numeric inputs, tool-gate default + per-cap defaults
+    /// pickers, and host_env / mcp_hosts multi-checks scoped to the
+    /// pod's `allow` lists. Per-tool overrides defer to the Raw tab
+    /// (egui sibling does the same — they're an unbounded
+    /// String → Disposition map; a structured editor would balloon
+    /// the sheet).
+    fn render_pod_editor_defaults_tab(&self, editor: &PodEditorSheetState) -> El {
+        let Some(cfg) = editor.working_config.as_ref() else {
+            return paragraph("no parsed config — fix the on-disk pod.toml from the Raw tab")
+                .muted();
+        };
+
+        let backend_label = if cfg.thread_defaults.backend.is_empty() {
+            "(none)".to_string()
+        } else {
+            cfg.thread_defaults.backend.clone()
+        };
+        let backend_trigger = select_trigger(POD_EDITOR_DEFAULTS_BACKEND_KEY, backend_label);
+
+        let model_label = if cfg.thread_defaults.model.is_empty() {
+            "(none)".to_string()
+        } else {
+            cfg.thread_defaults.model.clone()
+        };
+        let model_trigger = select_trigger(POD_EDITOR_DEFAULTS_MODEL_KEY, model_label);
+
+        let system_prompt_input = text_input(
+            &cfg.thread_defaults.system_prompt_file,
+            &self.selection,
+            POD_EDITOR_DEFAULTS_SYSTEM_PROMPT_FILE_KEY,
+        );
+
+        let max_tokens_widget = numeric_input(
+            &editor.max_tokens_buf,
+            &self.selection,
+            POD_EDITOR_DEFAULTS_MAX_TOKENS_KEY,
+            NumericInputOpts::default()
+                .min(1.0)
+                .max(200_000.0)
+                .step(50.0),
+        );
+        let max_turns_widget = numeric_input(
+            &editor.max_turns_buf,
+            &self.selection,
+            POD_EDITOR_DEFAULTS_MAX_TURNS_KEY,
+            NumericInputOpts::default().min(1.0).max(10_000.0).step(1.0),
+        );
+
+        let tool_gate_trigger = select_trigger(
+            POD_EDITOR_DEFAULTS_TOOL_GATE_KEY,
+            tool_gate_label(cfg.allow.tools.default),
+        );
+        let override_count = cfg.allow.tools.overrides.len();
+        let overrides_label: El = if override_count == 0 {
+            paragraph("(none — edit per-tool overrides via the Raw tab)")
+                .muted()
+                .small()
+        } else {
+            paragraph(format!(
+                "{override_count} override(s) — edit via the Raw tab"
+            ))
+            .muted()
+            .small()
+        };
+
+        let host_env_widget = self.render_pod_editor_defaults_host_env_check(cfg);
+        let mcp_hosts_widget = self.render_pod_editor_defaults_mcp_hosts_check(cfg);
+
+        let pod_modify_trigger = select_trigger(
+            POD_EDITOR_DEFAULTS_CAPS_POD_MODIFY_KEY,
+            pod_modify_cap_label(cfg.thread_defaults.caps.pod_modify),
+        );
+        let dispatch_trigger = select_trigger(
+            POD_EDITOR_DEFAULTS_CAPS_DISPATCH_KEY,
+            dispatch_cap_label(cfg.thread_defaults.caps.dispatch),
+        );
+        let behaviors_trigger = select_trigger(
+            POD_EDITOR_DEFAULTS_CAPS_BEHAVIORS_KEY,
+            behaviors_cap_label(cfg.thread_defaults.caps.behaviors),
+        );
+
+        form([
+            form_item([
+                form_label("backend"),
+                form_control(backend_trigger),
+                form_description(
+                    "Default model backend for new threads. Must be in `allow.backends`.",
+                ),
+            ]),
+            form_item([
+                form_label("model"),
+                form_control(model_trigger),
+                form_description(
+                    "Default model id for new threads. The list filters to the picked \
+                     backend's catalog.",
+                ),
+            ]),
+            form_item([
+                form_label("system prompt file"),
+                form_control(system_prompt_input),
+                form_description(
+                    "Path relative to the pod directory. Empty = no pod-level system \
+                     prompt.",
+                ),
+            ]),
+            form_item([
+                form_label("max tokens"),
+                form_control(max_tokens_widget),
+                form_description(
+                    "Per-response output cap. Threads inherit this and can override \
+                     at create-time.",
+                ),
+            ]),
+            form_item([
+                form_label("max turns"),
+                form_control(max_turns_widget),
+                form_description(
+                    "Per-cycle assistant-turn cap. The thread halts the loop once \
+                     reached.",
+                ),
+            ]),
+            form_item([
+                form_label("tool gate default"),
+                form_control(tool_gate_trigger),
+                form_description(
+                    "Disposition for tools not listed in `allow.tools.overrides`. \
+                     `allow_all` matches the legacy AutoApproveAll preset.",
+                ),
+            ]),
+            form_item([form_label("tool overrides"), form_control(overrides_label)]),
+            form_item([
+                form_label("default host envs"),
+                form_control(host_env_widget),
+                form_description(
+                    "Names from `allow.host_env` that new threads bind to by default. \
+                     Empty = threads run with no host-env MCPs (shared MCPs only).",
+                ),
+            ]),
+            form_item([
+                form_label("default caps — pod_modify"),
+                form_control(pod_modify_trigger),
+                form_description("Starting `pod_modify` cap on a new thread. Must be ≤ allow."),
+            ]),
+            form_item([
+                form_label("default caps — dispatch"),
+                form_control(dispatch_trigger),
+                form_description("Starting `dispatch` cap on a new thread. Must be ≤ allow."),
+            ]),
+            form_item([
+                form_label("default caps — behaviors"),
+                form_control(behaviors_trigger),
+                form_description("Starting `behaviors` cap on a new thread. Must be ≤ allow."),
+            ]),
+            form_item([
+                form_label("default mcp hosts"),
+                form_control(mcp_hosts_widget),
+                form_description(
+                    "Subset of `allow.mcp_hosts` new threads subscribe to by default.",
+                ),
+            ]),
+        ])
+    }
+
+    fn render_pod_editor_defaults_host_env_check(&self, cfg: &PodConfig) -> El {
+        if cfg.allow.host_env.is_empty() {
+            return paragraph("(no host envs in [allow] — threads here run with shared MCPs only)")
+                .muted()
+                .small();
+        }
+        let options: Vec<(String, String)> = cfg
+            .allow
+            .host_env
+            .iter()
+            .map(|e| (e.name.clone(), e.name.clone()))
+            .collect();
+        checkbox_column(
+            POD_EDITOR_DEFAULTS_HOST_ENV_KEY,
+            &cfg.thread_defaults.host_env,
+            options,
+        )
+    }
+
+    fn render_pod_editor_defaults_mcp_hosts_check(&self, cfg: &PodConfig) -> El {
+        if cfg.allow.mcp_hosts.is_empty() {
+            return paragraph("(no shared MCP hosts in [allow])")
+                .muted()
+                .small();
+        }
+        let options: Vec<(String, String)> = cfg
+            .allow
+            .mcp_hosts
+            .iter()
+            .map(|n| (n.clone(), n.clone()))
+            .collect();
+        checkbox_column(
+            POD_EDITOR_DEFAULTS_MCP_HOSTS_KEY,
+            &cfg.thread_defaults.mcp_hosts,
+            options,
+        )
+    }
+
+    /// Build the select_menu for whichever pod-editor picker is open.
+    /// Single-active — at most one picker open at a time. The menu
+    /// options match the underlying cap / disposition enum, except
+    /// for backend / model which list the hydrated catalogs.
+    fn pod_editor_picker_menu(&self, which: PodEditorPicker) -> El {
         use whisper_agent_protocol::{BehaviorOpsCap, DispatchCap, PodModifyCap};
+        let editor = self.pod_editor.as_ref();
+        let cfg = editor.and_then(|e| e.working_config.as_ref());
         match which {
-            PodEditorPicker::AllowCapsPodModify => {
+            PodEditorPicker::AllowCapsPodModify | PodEditorPicker::DefaultsCapsPodModify => {
                 let options: Vec<(String, String)> = [
                     PodModifyCap::None,
                     PodModifyCap::Memories,
@@ -4969,9 +5366,9 @@ impl ChatApp {
                     (lbl.to_string(), lbl.to_string())
                 })
                 .collect();
-                select_menu(POD_EDITOR_ALLOW_CAPS_POD_MODIFY_KEY, options)
+                select_menu(which.key(), options)
             }
-            PodEditorPicker::AllowCapsDispatch => {
+            PodEditorPicker::AllowCapsDispatch | PodEditorPicker::DefaultsCapsDispatch => {
                 let options: Vec<(String, String)> = [DispatchCap::None, DispatchCap::WithinScope]
                     .into_iter()
                     .map(|c| {
@@ -4979,9 +5376,9 @@ impl ChatApp {
                         (lbl.to_string(), lbl.to_string())
                     })
                     .collect();
-                select_menu(POD_EDITOR_ALLOW_CAPS_DISPATCH_KEY, options)
+                select_menu(which.key(), options)
             }
-            PodEditorPicker::AllowCapsBehaviors => {
+            PodEditorPicker::AllowCapsBehaviors | PodEditorPicker::DefaultsCapsBehaviors => {
                 let options: Vec<(String, String)> = [
                     BehaviorOpsCap::None,
                     BehaviorOpsCap::Read,
@@ -4994,7 +5391,62 @@ impl ChatApp {
                     (lbl.to_string(), lbl.to_string())
                 })
                 .collect();
-                select_menu(POD_EDITOR_ALLOW_CAPS_BEHAVIORS_KEY, options)
+                select_menu(which.key(), options)
+            }
+            PodEditorPicker::DefaultsBackend => {
+                // Mirror the egui sibling: the menu offers every
+                // entry in `allow.backends` first, then the rest of
+                // the server-known catalog as "not-in-allow" picks
+                // (so a user can preview names server-side without
+                // needing to leave the editor). The catalog branch's
+                // labels carry no special styling here — aetna's
+                // current select_menu is text-only — but the option
+                // value still round-trips through the same wire.
+                let mut options: Vec<(String, String)> = Vec::new();
+                if let Some(cfg) = cfg {
+                    for name in &cfg.allow.backends {
+                        options.push((name.clone(), name.clone()));
+                    }
+                    for b in &self.backends {
+                        if !cfg.allow.backends.iter().any(|x| x == &b.name) {
+                            options.push((b.name.clone(), format!("{} (not in allow)", b.name)));
+                        }
+                    }
+                } else {
+                    for b in &self.backends {
+                        options.push((b.name.clone(), b.name.clone()));
+                    }
+                }
+                select_menu(which.key(), options)
+            }
+            PodEditorPicker::DefaultsModel => {
+                // Models are scoped by the currently-picked backend.
+                // Empty list → render a single sentinel option so the
+                // popover isn't blank. The menu is hover-coalesced via
+                // its key so it pops up anchored under the trigger.
+                let mut options: Vec<(String, String)> = Vec::new();
+                if let Some(cfg) = cfg {
+                    let backend = &cfg.thread_defaults.backend;
+                    if let Some(models) = self.models_by_backend.get(backend) {
+                        for m in models {
+                            options.push((m.id.clone(), m.id.clone()));
+                        }
+                    }
+                }
+                if options.is_empty() {
+                    options.push((String::new(), "(no models)".to_string()));
+                }
+                select_menu(which.key(), options)
+            }
+            PodEditorPicker::DefaultsToolGate => {
+                let options: Vec<(String, String)> = [Disposition::Allow, Disposition::Deny]
+                    .into_iter()
+                    .map(|d| {
+                        let lbl = tool_gate_label(d);
+                        (lbl.to_string(), lbl.to_string())
+                    })
+                    .collect();
+                select_menu(which.key(), options)
             }
         }
     }

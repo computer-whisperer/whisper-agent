@@ -64,8 +64,7 @@ fn main() -> std::io::Result<()> {
         let theme = app.theme();
         let cx = BuildCx::new(&theme);
         let mut tree = app.build(&cx);
-        let bundle =
-            render_bundle_themed(&mut tree, viewport, Some(env!("CARGO_PKG_NAME")), &theme);
+        let bundle = render_bundle_themed(&mut tree, viewport, &theme);
 
         let name = scene.slug();
         let written = write_bundle(&bundle, &out_dir, name)?;
@@ -247,6 +246,11 @@ enum Scene {
     /// `GetPod` lands, then the dump loop's second `before_build`
     /// drain hydrates the editor before render.
     PodEditorHydrated,
+    /// Pod editor sheet, opened and switched to the Defaults tab.
+    /// Same hydration shape as `PodEditorHydrated`; an extra click
+    /// on the `pod-editor:tabs:tab:defaults` trigger flips the
+    /// active tab without exercising any picker popovers.
+    PodEditorDefaultsTab,
     /// Fork-from-message dialog with a User row pre-selected. The
     /// dialog opens via a synthetic click on the per-row fork
     /// affordance (`chat:user-fork:{msg_index}`) — routing is
@@ -259,7 +263,7 @@ enum Scene {
 }
 
 impl Scene {
-    const ALL: [Scene; 34] = [
+    const ALL: [Scene; 35] = [
         Scene::Connecting,
         Scene::Connected,
         Scene::Closed,
@@ -293,6 +297,7 @@ impl Scene {
         Scene::BehaviorEditorHydrated,
         Scene::BehaviorEditorTriggerKindOpen,
         Scene::PodEditorHydrated,
+        Scene::PodEditorDefaultsTab,
         Scene::ForkModalOpen,
     ];
 
@@ -331,6 +336,7 @@ impl Scene {
             Scene::BehaviorEditorHydrated => "behavior_editor_hydrated",
             Scene::BehaviorEditorTriggerKindOpen => "behavior_editor_trigger_kind_open",
             Scene::PodEditorHydrated => "pod_editor_hydrated",
+            Scene::PodEditorDefaultsTab => "pod_editor_defaults_tab",
             Scene::ForkModalOpen => "fork_modal_open",
         }
     }
@@ -400,6 +406,14 @@ impl Scene {
             // affordance. Renders only when `pod_tab.is_some()`,
             // which it is here (PodList seeded a default).
             Scene::PodEditorHydrated => vec!["sidebar:pod-settings"],
+            // Same as above plus a click on the Defaults tab
+            // trigger. The dump loop drains inbound twice (once
+            // before clicks, once after) so the `PodSnapshot` reply
+            // synthesized by this scene's SendFn lands before we
+            // touch the tab.
+            Scene::PodEditorDefaultsTab => {
+                vec!["sidebar:pod-settings", "pod-editor:tabs:tab:defaults"]
+            }
             // Select the thread, then click the per-row fork
             // affordance for the first User message. `mock_snapshot`
             // pushes an empty system_text at msg_index=0 first, so
@@ -462,7 +476,7 @@ fn build_app(scene: Scene) -> Box<dyn App> {
                 }
             })
         }
-        Scene::PodEditorHydrated => {
+        Scene::PodEditorHydrated | Scene::PodEditorDefaultsTab => {
             let queue = inbound.clone();
             Box::new(move |msg| {
                 if let ClientToServer::GetPod {
@@ -744,7 +758,7 @@ fn build_app(scene: Scene) -> Box<dyn App> {
                 behaviors: mock_mavis_behaviors(),
             }));
         }
-        Scene::PodEditorHydrated => {
+        Scene::PodEditorHydrated | Scene::PodEditorDefaultsTab => {
             // Connection + pod list (so the active-pod gear renders),
             // plus an empty thread list so the right pane is the
             // no-selection compose form (visible behind the right-
@@ -754,7 +768,10 @@ fn build_app(scene: Scene) -> Box<dyn App> {
             //
             // Seed BackendsList + SharedMcpHostsList + BucketsList so
             // the structured Allow tab's multi-checks have actual
-            // catalog rows to render.
+            // catalog rows to render. The Defaults-tab scene also
+            // benefits from BackendsList for the backend trigger's
+            // post-click menu (though this scene doesn't open the
+            // menu).
             q.push_back(InboundEvent::ConnectionOpened);
             q.push_back(InboundEvent::Wire(ServerToClient::PodList {
                 correlation_id: None,

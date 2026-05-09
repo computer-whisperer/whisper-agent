@@ -750,10 +750,46 @@ prefix; click routing collects the picked id via
 `apply_checkbox_list_to_vec()` (push if missing, remove if
 present) into the corresponding `Vec<String>` on `working_config`.
 
-`PodEditorPicker` carries `#[allow(clippy::enum_variant_names)]`
-to keep the `AllowCaps*` prefix grouping; future tabs will add
-their own variants (`DefaultsBackend`, `DefaultsModel`, …) that
-break the shared prefix and let the lint go quiet on its own.
+`PodEditorPicker` originally carried
+`#[allow(clippy::enum_variant_names)]` to keep the `AllowCaps*`
+prefix grouping; the Defaults-tab slice added
+`DefaultsBackend` / `DefaultsModel` / `DefaultsToolGate` /
+`DefaultsCaps*` variants which broke the shared prefix, so the
+attribute is gone and the lint stays quiet on its own. The
+enum gained a `key()` method that maps each variant to its
+routed `select_trigger` key so `close_other_pickers`,
+`handle_pod_editor_picker`, and `pod_editor_picker_menu` no
+longer carry separate per-variant key tables.
+
+**Pod editor — Defaults tab (landed):** structured port of the
+egui sibling's `render_pod_editor_defaults_tab`. Form items:
+backend / model `select_trigger`s (catalog-driven; backend
+options carry `(not in allow)` suffix labels for catalog rows
+that aren't in `allow.backends`, matching the egui sibling's
+"would error on save" warning shape), `system_prompt_file`
+text input, `max_tokens` / `max_turns` aetna `numeric_input`s,
+tool-gate default + per-cap defaults `select_trigger`s, and
+host_env / mcp_hosts multi-checks scoped to the pod's
+`allow.host_env` / `allow.mcp_hosts` lists. Per-tool overrides
+defer to the Raw tab (the egui sibling does the same — they're
+an unbounded `String → Disposition` map; a structured editor
+would balloon the sheet).
+
+`max_tokens_buf` / `max_turns_buf` live on `PodEditorSheetState`
+because aetna's `numeric_input` owns its visible text as an
+external `String` (so mid-edit states like `"1"` survive
+between keystrokes). The handler parses each parseable buffer
+back into the `working_config.thread_defaults.{max_tokens,
+max_turns}` u32 on every event so `dirty()` and the save
+round-trip stay accurate. Buffers re-sync from
+`working_config` on hydrate and after Raw → structured
+reparses, via a new `sync_buffers_from_config()` helper.
+
+The Defaults backend pick clears `thread_defaults.model` (the
+prior model id is almost certainly invalid for the new
+backend); the model menu options come from
+`models_by_backend[thread_defaults.backend]`, so changing
+backends routes the user to a fresh pick on the next click.
 
 ### ✅ Stage 9 — Login form
 
