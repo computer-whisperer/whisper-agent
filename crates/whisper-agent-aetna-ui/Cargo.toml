@@ -1,0 +1,49 @@
+[package]
+name = "whisper-agent-aetna-ui"
+description = "Browser + native chat UI for whisper-agent (aetna)"
+version = "0.3.18"
+edition.workspace = true
+license.workspace = true
+
+[lib]
+# Mirrors `whisper-agent-webui`: `cdylib` is the wasm-pack bundle that
+# the server ships to the browser, `rlib` is what the native desktop
+# crate consumes. Browser entry will land alongside this; for the
+# initial scaffold the rlib path is the only consumer.
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+# Aetna lives in a sibling worktree under active development; the path
+# spec keeps us in lockstep with whatever is checked out at HEAD without
+# round-tripping through crates.io.
+aetna-core = { path = "../../../../aetna/aetna.main/crates/aetna-core" }
+
+whisper-agent-protocol = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+ciborium = { workspace = true }
+log = "0.4"
+chrono = "0.4"
+chrono-tz = { workspace = true }
+cron = { workspace = true }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+console_error_panic_hook = "0.1"
+js-sys = "0.3"
+web-sys = { version = "0.3", features = [
+    "WebSocket",
+    "MessageEvent",
+    "CloseEvent",
+    "ErrorEvent",
+    "Event",
+    "Location",
+    "Window",
+    "Document",
+    "HtmlCanvasElement",
+    "HtmlElement",
+    "BinaryType",
+    "Storage",
+] }
+getrandom = { version = "0.4", features = ["wasm_js"] }

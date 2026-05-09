@@ -1,0 +1,39 @@
+[package]
+name = "whisper-agent-desktop-aetna"
+description = "Native desktop client for whisper-agent (aetna + tokio-tungstenite)"
+version = "0.3.18"
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "whisper-agent-desktop-aetna"
+path = "src/main.rs"
+
+[dependencies]
+# Shared platform-agnostic UI lives in this crate.
+whisper-agent-aetna-ui = { path = "../whisper-agent-aetna-ui" }
+whisper-agent-protocol = { workspace = true }
+
+# Aetna's optional native winit + wgpu host. Owns window creation,
+# event loop, surface configuration, and frame submission so this
+# binary only has to plug a `ChatApp` into it.
+aetna-core = { path = "../../../../aetna/aetna.main/crates/aetna-core" }
+aetna-winit-wgpu = { path = "../../../../aetna/aetna.main/crates/aetna-winit-wgpu" }
+
+# Tokio hosts the WS task on a background thread; the UI runs on the
+# main thread inside winit's event loop.
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync"] }
+# Native WebSocket client. Mirrors the egui desktop crate's TLS feature
+# pick so `wss://` works against the same server cert chain.
+tokio-tungstenite = { version = "0.29", default-features = false, features = ["connect", "handshake", "rustls-tls-native-roots"] }
+# rustls 0.23 refuses to auto-pick a crypto provider when both `ring`
+# and `aws-lc-rs` are reachable; the egui sibling pins `ring` and we
+# match it so only one provider is registered process-wide.
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
+futures = "0.3"
+
+clap = { workspace = true, features = ["env"] }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+url = { workspace = true }
