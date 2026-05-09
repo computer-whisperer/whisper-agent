@@ -238,34 +238,55 @@ fn mock_threads() -> Vec<ThreadSummary> {
 fn mock_snapshot() -> ThreadSnapshot {
     let mut conv = Conversation::new();
     conv.push(Message::system_text(""));
+    // Deliberately a long user prompt so a single message exceeds the
+    // pane's width and we can confirm wrap is reaching the body. The
+    // upstream row-intrinsic bug shows up only when content is long
+    // enough that NoWrap measurement disagrees with Wrap measurement.
     conv.push(Message::user_text(
-        "Can you summarize the design of the knowledge-bucket layer?",
+        "Can you summarize the design of the knowledge-bucket layer? I'm interested in \
+         the on-disk shape, the build pipeline, the embedder rotation story, and how \
+         pod-scoped buckets differ from server-scoped ones — keep each piece short \
+         enough that I can scan it.",
     ));
     conv.push(Message {
         role: Role::Assistant,
         content: vec![
             ContentBlock::Thinking {
-                thinking: "User wants a high-level summary. The design doc is at \
-                    `docs/design_knowledge_db.md`. Hit the entry-point types and \
-                    the slot directory layout."
+                thinking: "User wants a high-level summary covering on-disk shape, \
+                    build pipeline, embedder rotation, and pod- vs. server-scope. \
+                    The design doc is at `docs/design_knowledge_db.md`. Hit the \
+                    entry-point types, the slot directory layout, and one sentence \
+                    on each of their other questions."
                     .into(),
                 replay: None,
             },
             ContentBlock::Text {
                 text: "The knowledge-bucket layer adds **dense + sparse retrieval** to \
-                    whisper-agent. Each bucket is a directory under `<buckets_root>/`:\n\
+                    whisper-agent. Each bucket is a directory under `<buckets_root>/` \
+                    (server scope) or `<pods_root>/<pod>/buckets/` (pod scope) — same \
+                    shape on disk, different visibility:\n\
                     \n\
-                    - `bucket.toml` — config (embedder, chunker, source).\n\
-                    - `slots/` — one segment per build, append-only.\n\
-                    - `source-cache/` — raw artifacts the chunker reads.\n\
+                    - `bucket.toml` — config: embedder name, chunker settings, source \
+                      adapter (stored / linked / managed).\n\
+                    - `slots/` — append-only segments. Each build writes a fresh slot \
+                      with its own HNSW + tantivy indexes, so older slots stay \
+                      readable while a new build runs.\n\
+                    - `source-cache/` — raw artifacts the chunker reads. Stored buckets \
+                      copy bytes in here; linked buckets just point at an external path.\n\
+                    \n\
+                    Embedder rotation is driven by the slot model: a new embedder ⇒ \
+                    a new slot, and the old slot stays serving until you delete it. \
+                    Pod-scoped buckets are reachable only from their owning pod's \
+                    threads; server-scoped buckets are visible to every thread.\n\
                     \n\
                     See [`docs/design_knowledge_db.md`](docs/design_knowledge_db.md) \
-                    for the full design."
+                    for the full design — the on-disk format, slot manifest layout, \
+                    and the resolver logic all live there."
                     .into(),
             },
         ],
     });
-    conv.push(Message::user_text("Thanks!"));
+    conv.push(Message::user_text("Thanks — that's exactly what I needed."));
 
     ThreadSnapshot {
         thread_id: "t-1".into(),

@@ -790,30 +790,50 @@ impl ChatApp {
     }
 }
 
+/// Width of the role-colored gutter, in logical pixels.
+const GUTTER_WIDTH: f32 = 3.0;
+
 /// Event-log row — narrow role-colored gutter + content with
 /// internal padding. Optional `faint_fill` tints the row's
 /// background for emphasis (we use it for user turns so they're
 /// distinguishable in a long assistant stream).
+///
+/// Uses an overlay [`stack`] rather than a `row([gutter, content])`
+/// because aetna's row-axis intrinsic measurement
+/// (`layout.rs::intrinsic_constrained`'s `Axis::Row` branch) calls
+/// `intrinsic(ch)` *without* propagating `available_width`. A
+/// wrappable paragraph child then measures as a single unwrapped
+/// line; the row's height is computed off that, and when the
+/// second-pass layout inside the column wraps correctly, the
+/// wrapped content overflows the row's allocated height. The
+/// overlay axis (`Axis::Overlay`) does pass `available_width` to
+/// children, so the markdown body wraps cleanly.
+///
+/// Visually, the gutter is drawn last so it sits on top of the
+/// content's left edge; the content has enough left padding
+/// (`SPACE_3 + GUTTER_WIDTH`) that no body text or chrome falls
+/// under the gutter.
 fn log_row(role_color: Color, faint_fill: Option<Color>, content: El) -> El {
-    let gutter = El::new(Kind::Custom("log_gutter"))
-        .fill(role_color)
-        .width(Size::Fixed(3.0))
-        .height(Size::Fill(1.0));
-    let padded_content = content
+    let body = content
         .padding(Sides {
-            left: tokens::SPACE_3,
+            left: tokens::SPACE_3 + GUTTER_WIDTH,
             right: tokens::SPACE_2,
             top: tokens::SPACE_2,
             bottom: tokens::SPACE_2,
         })
         .width(Size::Fill(1.0));
-    let row_el = row([gutter, padded_content])
-        .gap(0.0)
+    let gutter = El::new(Kind::Custom("log_gutter"))
+        .fill(role_color)
+        .width(Size::Fixed(GUTTER_WIDTH))
+        .height(Size::Fill(1.0));
+    let stacked = stack([body, gutter])
+        .align(Align::Start)
+        .justify(Justify::Start)
         .width(Size::Fill(1.0));
     if let Some(fill) = faint_fill {
-        row_el.fill(fill)
+        stacked.fill(fill)
     } else {
-        row_el
+        stacked
     }
 }
 
