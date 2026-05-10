@@ -1249,9 +1249,23 @@ trivial / small / medium / large.
   hover is deferred until aetna grows a row-level tooltip
   primitive. Entry point is public so the future file-tree slice
   can route `.json` clicks straight here.
-- ⏳ **File browser / editor.** Tree of pod files; click-to-edit in a
-  `text_area` with save. Egui's `render_file_viewer_modal`
-  (modals/viewers.rs:260). *Medium — tree navigation + dirty-tracking.*
+- 🌗 **File browser / editor.** Edit-with-save *modal* landed:
+  `open_file_viewer(pod_id, path)` mints a correlation and fires
+  `ReadPodFile`; `PodFileContent` hydrates `working` + `baseline`
+  + `readonly`; `WritePodFile` ships the buffer on Save, with
+  `PodFileWritten` adopting the working buffer as the new baseline.
+  Renderer is `render_file_viewer_modal` — same `dialog_content`
+  (720 × 560) shape as the JSON viewer, body is one `text_area`
+  (mono) over `working`, footer is Close / Revert / Save (Revert
+  + Save disabled when buffer == baseline; both gone entirely when
+  `readonly`). Dirty + saving state surfaces via `is_dirty()` and
+  `pending_correlation`. Bundle scenes: `FileViewerEditable` and
+  `FileViewerReadOnly`. The *tree* sidebar that opens these is the
+  next sub-slice — caching of `pod_files: HashMap<(pod, path), Vec<FsEntry>>`,
+  `ListPodDir` round-trips, `classify_pod_file_path` dispatching
+  to `open_pod_editor` / `open_behavior_editor` / `open_json_viewer`
+  / `open_file_viewer`. Egui equivalents are `render_file_tree_modal`
+  + `classify_pod_file_path` in `app/sidebar.rs`.
 - ⏳ **Server settings.** Three tabs (LLM backends with Codex auth
   rotate, Shared MCP hosts CRUD with auth config, raw server
   TOML). Egui's `modals/settings.rs`. Reachable via the cog icon

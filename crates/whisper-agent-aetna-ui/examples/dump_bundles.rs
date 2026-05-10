@@ -314,10 +314,22 @@ enum Scene {
     /// nested object) so the recursive renderer + collapsible
     /// trigger rows + child indents all paint in one scene.
     JsonViewerOpen,
+    /// Edit-with-save file viewer modal opened over a mock editable
+    /// pod file. Same wiring as `JsonViewerOpen` — the per-scene
+    /// SendFn synthesizes a `PodFileContent` reply (readonly = false)
+    /// for the `ReadPodFile` that `open_file_viewer` fires. The body
+    /// shows the populated text_area and the footer carries Close /
+    /// Revert (disabled — buffer == baseline) / Save (disabled).
+    FileViewerEditable,
+    /// Read-only variant of the file viewer modal. Same path, but
+    /// the synthesized reply sets `readonly = true`, so the footer
+    /// collapses to a single Close button and the description
+    /// carries the runtime-owned hint.
+    FileViewerReadOnly,
 }
 
 impl Scene {
-    const ALL: [Scene; 44] = [
+    const ALL: [Scene; 46] = [
         Scene::Connecting,
         Scene::Connected,
         Scene::Closed,
@@ -362,6 +374,8 @@ impl Scene {
         Scene::LightboxOpen,
         Scene::SudoPending,
         Scene::JsonViewerOpen,
+        Scene::FileViewerEditable,
+        Scene::FileViewerReadOnly,
     ];
 
     fn slug(self) -> &'static str {
@@ -410,6 +424,8 @@ impl Scene {
             Scene::LightboxOpen => "lightbox_open",
             Scene::SudoPending => "sudo_pending",
             Scene::JsonViewerOpen => "json_viewer_open",
+            Scene::FileViewerEditable => "file_viewer_editable",
+            Scene::FileViewerReadOnly => "file_viewer_readonly",
         }
     }
 
@@ -640,6 +656,39 @@ fn build_app(scene: Scene) -> Box<dyn App> {
                             correlation_id,
                             snapshot: mock_default_pod_snapshot(),
                         }));
+                }
+            })
+        }
+        Scene::FileViewerEditable | Scene::FileViewerReadOnly => {
+            // Synthesize a `PodFileContent` reply for the
+            // `ReadPodFile` that `open_file_viewer` fires below.
+            // The editable variant lets Save / Revert paint as
+            // disabled (no edits yet); the read-only variant
+            // collapses the footer to Close only.
+            let readonly = matches!(scene, Scene::FileViewerReadOnly);
+            let queue = inbound.clone();
+            Box::new(move |msg| {
+                if let ClientToServer::ReadPodFile {
+                    correlation_id,
+                    pod_id,
+                    path,
+                } = msg
+                    && pod_id == "default"
+                    && path == "notes.md"
+                {
+                    let content = "# Notes\n\nA short markdown body so the \
+                                   text_area paints content rather than the \
+                                   placeholder ghost.\n"
+                        .to_string();
+                    queue.borrow_mut().push_back(InboundEvent::Wire(
+                        ServerToClient::PodFileContent {
+                            correlation_id,
+                            pod_id,
+                            path,
+                            content,
+                            readonly,
+                        },
+                    ));
                 }
             })
         }
@@ -1060,15 +1109,13 @@ fn build_app(scene: Scene) -> Box<dyn App> {
                 behaviors: Vec::new(),
             }));
         }
-        Scene::JsonViewerOpen => {
+        Scene::JsonViewerOpen | Scene::FileViewerEditable | Scene::FileViewerReadOnly => {
             // Populated baseline so the dialog overlays a non-empty
             // sidebar / pane (same idea as the modal scenes above).
             // The viewer itself is opened after the queue borrow
-            // ends — `open_json_viewer` fires `ReadPodFile`, which
-            // routes through the per-scene SendFn that synthesizes
-            // the matching `PodFileContent` reply onto this same
-            // queue. The outer drain in `main` then hydrates
-            // `modal.parsed` before the build pass.
+            // ends — the per-scene SendFn synthesizes the matching
+            // `PodFileContent` reply onto this same queue. The outer
+            // drain in `main` then hydrates the modal before build.
             q.push_back(InboundEvent::ConnectionOpened);
             q.push_back(InboundEvent::Wire(ServerToClient::PodList {
                 correlation_id: None,
@@ -1089,6 +1136,9 @@ fn build_app(scene: Scene) -> Box<dyn App> {
     drop(q);
     if matches!(scene, Scene::JsonViewerOpen) {
         app.open_json_viewer("default".into(), "threads/t-mock.json".into());
+    }
+    if matches!(scene, Scene::FileViewerEditable | Scene::FileViewerReadOnly) {
+        app.open_file_viewer("default".into(), "notes.md".into());
     }
     Box::new(app)
 }

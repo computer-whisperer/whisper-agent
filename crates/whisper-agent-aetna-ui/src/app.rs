@@ -36,7 +36,8 @@
 //! Surfaces still to land (full inventory in
 //! `docs/design_aetna_ui.md` § "Migration gaps from egui webui"):
 //! server settings modal, knowledge-buckets modal,
-//! file browser/editor, thread inspector popover.
+//! file-tree sidebar that opens the file viewer, thread inspector
+//! popover.
 //!
 //! Dispatch model: a single `dispatch_wire` walks `ServerToClient`
 //! variants — only the ones the current stage cares about have arms;
@@ -484,6 +485,55 @@ struct LightboxState {
     height: u32,
 }
 
+/// Generic text-editor modal over one pod file. Opened by clicking
+/// a non-specialized file path in the file tree (pod.toml / behavior
+/// configs / behavior prompts / `.json` paths route to their own
+/// editors). Buffer-and-baseline shape lets Save short-circuit on
+/// `working == baseline` and Revert restore without a re-fetch.
+/// Mirrors the egui sibling's `FileViewerModalState`.
+struct FileViewerModalState {
+    pod_id: String,
+    path: String,
+    /// In-memory edit buffer. `None` until `PodFileContent` lands.
+    working: Option<String>,
+    /// Last-known server content. Pairs with `working` for the
+    /// dirty check and Revert.
+    baseline: Option<String>,
+    /// Mirrors `is_readonly_path` on the file. Runtime state
+    /// (thread JSONs, `pod_state.json`, `behaviors/*/state.json`)
+    /// loads with `true` and the Save / Revert buttons disappear.
+    readonly: bool,
+    /// Inline error: most recent read or write failure. Cleared on
+    /// the next successful round-trip or on the user's next edit.
+    error: Option<String>,
+    /// Outstanding correlation. Distinct from a missing-yet-loaded
+    /// modal: `pending_correlation = Some` + `working = None` means
+    /// the initial read is in flight; `pending_correlation = Some`
+    /// + `working = Some` means a save is in flight.
+    pending_correlation: Option<String>,
+}
+
+impl FileViewerModalState {
+    fn new(pod_id: String, path: String) -> Self {
+        Self {
+            pod_id,
+            path,
+            working: None,
+            baseline: None,
+            readonly: false,
+            error: None,
+            pending_correlation: None,
+        }
+    }
+
+    fn is_dirty(&self) -> bool {
+        match (&self.working, &self.baseline) {
+            (Some(w), Some(b)) => w != b,
+            _ => false,
+        }
+    }
+}
+
 /// Read-only JSON tree viewer state. Opened over a pod file path
 /// (typically a thread JSON or server-emitted state blob). Lifecycle:
 /// `open_json_viewer` mints a correlation + fires `ReadPodFile`, the
@@ -645,6 +695,17 @@ pub struct ChatApp {
     /// `aetna_core::Image` is shared with the inline row so we don't
     /// re-decode the bytes when the modal opens.
     lightbox: Option<LightboxState>,
+
+    // ----- modal: file viewer -----
+    /// Generic edit-with-save modal over a pod file (anything not
+    /// claimed by the pod / behavior editors or the JSON viewer).
+    /// `Some` while open. Lifecycle: `open_file_viewer` stamps
+    /// `pending_correlation` and fires `ReadPodFile`; the matching
+    /// `PodFileContent` arm populates `working` + `baseline` +
+    /// `readonly`. A user Save mints a new correlation and fires
+    /// `WritePodFile`; the matching `PodFileWritten` adopts the
+    /// working buffer as the new baseline.
+    file_viewer_modal: Option<FileViewerModalState>,
 
     // ----- modal: JSON viewer -----
     /// Read-only JSON tree viewer over a pod file. `Some` while the
@@ -1717,6 +1778,7 @@ impl ChatApp {
             sidebar_width: tokens::SIDEBAR_WIDTH,
             sidebar_drag: ResizeDrag::default(),
             lightbox: None,
+            file_viewer_modal: None,
             json_viewer_modal: None,
             json_tree_open: HashSet::new(),
             pending_sudos: HashMap::new(),
@@ -2168,10 +2230,20 @@ impl ChatApp {
                 pod_id,
                 path,
                 content,
+                readonly,
                 correlation_id,
-                ..
             } => {
-                if let Some(modal) = self.json_viewer_modal.as_mut()
+                if let Some(modal) = self.file_viewer_modal.as_mut()
+                    && modal.pod_id == pod_id
+                    && modal.path == path
+                    && modal.pending_correlation == correlation_id
+                {
+                    modal.baseline = Some(content.clone());
+                    modal.working = Some(content);
+                    modal.readonly = readonly;
+                    modal.pending_correlation = None;
+                    modal.error = None;
+                } else if let Some(modal) = self.json_viewer_modal.as_mut()
                     && modal.pod_id == pod_id
                     && modal.path == path
                     && modal.pending_correlation == correlation_id
@@ -2187,6 +2259,26 @@ impl ChatApp {
                             modal.error = Some(format!("parse JSON: {e}"));
                         }
                     }
+                }
+            }
+            ServerToClient::PodFileWritten {
+                pod_id,
+                path,
+                correlation_id,
+            } => {
+                if let Some(modal) = self.file_viewer_modal.as_mut()
+                    && modal.pod_id == pod_id
+                    && modal.path == path
+                    && modal.pending_correlation == correlation_id
+                {
+                    // Save succeeded — adopt the working buffer as the
+                    // new baseline so the dirty indicator flips back to
+                    // clean. Mirrors the egui sibling.
+                    if let Some(w) = modal.working.clone() {
+                        modal.baseline = Some(w);
+                    }
+                    modal.pending_correlation = None;
+                    modal.error = None;
                 }
             }
             ServerToClient::ThreadArchived { thread_id } => {
@@ -2801,6 +2893,40 @@ impl App for ChatApp {
             self.json_tree_open.clear();
             return;
         }
+        // File viewer routing — body text_area first (target_key is
+        // the body, not a click route), then save / revert / close /
+        // dismiss. Edits clear the inline error so a stale "couldn't
+        // save" message doesn't linger after the user starts fixing
+        // it.
+        if event.target_key() == Some(FILE_VIEWER_BODY_KEY) {
+            if let Some(modal) = self.file_viewer_modal.as_mut()
+                && let Some(buf) = modal.working.as_mut()
+                && !modal.readonly
+            {
+                text_area::apply_event(buf, &mut self.selection, FILE_VIEWER_BODY_KEY, &event);
+                modal.error = None;
+            }
+            return;
+        }
+        if event.is_click_or_activate(FILE_VIEWER_SAVE_KEY) {
+            self.submit_file_viewer();
+            return;
+        }
+        if event.is_click_or_activate(FILE_VIEWER_REVERT_KEY) {
+            if let Some(modal) = self.file_viewer_modal.as_mut()
+                && let Some(baseline) = modal.baseline.clone()
+            {
+                modal.working = Some(baseline);
+                modal.error = None;
+            }
+            return;
+        }
+        if event.is_click_or_activate(FILE_VIEWER_DISMISS_KEY)
+            || event.is_click_or_activate(FILE_VIEWER_CLOSE_KEY)
+        {
+            self.file_viewer_modal = None;
+            return;
+        }
 
         // Sudo banner: approve / remember / reject buttons + reject-
         // reason text input. All four routes carry the function_id as
@@ -3369,6 +3495,15 @@ const LIGHTBOX_MODAL_CLOSE_KEY: &str = "lightbox:close";
 const JSON_VIEWER_DISMISS_KEY: &str = "json-viewer:dismiss";
 const JSON_VIEWER_CLOSE_KEY: &str = "json-viewer:close";
 const JSON_TREE_ACCORDION_GROUP: &str = "json-tree";
+
+/// Routed-key shapes for the edit-with-save file viewer modal.
+/// `file-viewer:body` is the text_area's `target_key`; the rest are
+/// click-style buttons / scrim.
+const FILE_VIEWER_DISMISS_KEY: &str = "file-viewer:dismiss";
+const FILE_VIEWER_CLOSE_KEY: &str = "file-viewer:close";
+const FILE_VIEWER_BODY_KEY: &str = "file-viewer:body";
+const FILE_VIEWER_SAVE_KEY: &str = "file-viewer:save";
+const FILE_VIEWER_REVERT_KEY: &str = "file-viewer:revert";
 
 /// Routed key for the sidebar resize handle. Drag / arrow / Home /
 /// End events on this key fold through `resize_handle::apply_event_fixed`
@@ -5317,6 +5452,9 @@ impl ChatApp {
             }
         }
         if let Some(modal_el) = self.render_fork_modal() {
+            out.push(Some(modal_el));
+        }
+        if let Some(modal_el) = self.render_file_viewer_modal() {
             out.push(Some(modal_el));
         }
         if let Some(modal_el) = self.render_json_viewer_modal() {
@@ -9324,6 +9462,138 @@ impl ChatApp {
         Some(overlay([
             scrim(LIGHTBOX_MODAL_DISMISS_KEY),
             dialog_content(children).width(Size::Hug).block_pointer(),
+        ]))
+    }
+
+    /// Open the generic text-editor modal on `<pod_id>/<path>`. Mints
+    /// a correlation, stamps the slot, and fires `ReadPodFile`; the
+    /// matching `PodFileContent` arm hydrates the working buffer,
+    /// the saved baseline, and the read-only flag. Mirrors the egui
+    /// sibling's `open_file_viewer`. Public so the future file-tree
+    /// slice can route generic-file clicks here directly.
+    pub fn open_file_viewer(&mut self, pod_id: String, path: String) {
+        let correlation = self.next_correlation_id();
+        let mut state = FileViewerModalState::new(pod_id.clone(), path.clone());
+        state.pending_correlation = Some(correlation.clone());
+        self.file_viewer_modal = Some(state);
+        self.send(ClientToServer::ReadPodFile {
+            correlation_id: Some(correlation),
+            pod_id,
+            path,
+        });
+    }
+
+    /// Save the file viewer's working buffer. Mints a fresh
+    /// correlation, ships `WritePodFile`, and stamps the modal so the
+    /// matching `PodFileWritten` arm clears the pending state. No-ops
+    /// when the buffer hasn't loaded, is unchanged, is read-only, or
+    /// a save is already in flight — the rendered button is disabled
+    /// in those cases but a stray keyboard route still routes here.
+    fn submit_file_viewer(&mut self) {
+        let Some(modal) = self.file_viewer_modal.as_mut() else {
+            return;
+        };
+        if modal.readonly || modal.pending_correlation.is_some() || !modal.is_dirty() {
+            return;
+        }
+        let Some(content) = modal.working.clone() else {
+            return;
+        };
+        let pod_id = modal.pod_id.clone();
+        let path = modal.path.clone();
+        let correlation = self.next_correlation_id();
+        if let Some(modal) = self.file_viewer_modal.as_mut() {
+            modal.pending_correlation = Some(correlation.clone());
+            modal.error = None;
+        }
+        self.send(ClientToServer::WritePodFile {
+            correlation_id: Some(correlation),
+            pod_id,
+            path,
+            content,
+        });
+    }
+
+    /// Edit-with-save modal over one pod file. Same `dialog_content`
+    /// shape as the JSON viewer; differs in the body (a single
+    /// `text_area` over `working`) and the footer (Save / Revert
+    /// when editable, Close-only when read-only). Pending reads
+    /// render "loading…"; an in-flight save renders the same panel
+    /// with a "Saving…" label on the primary button.
+    fn render_file_viewer_modal(&self) -> Option<El> {
+        let modal = self.file_viewer_modal.as_ref()?;
+        const FILE_VIEWER_W: f32 = 720.0;
+        const FILE_VIEWER_H: f32 = 560.0;
+
+        let title = format!("{} — {}", modal.path, modal.pod_id);
+        let has_data = modal.working.is_some();
+        let dirty = modal.is_dirty();
+        let saving = modal.pending_correlation.is_some() && has_data;
+
+        let body: El = if let Some(working) = modal.working.as_ref() {
+            text_area(working, &self.selection, FILE_VIEWER_BODY_KEY)
+                .mono()
+                .width(Size::Fill(1.0))
+                .height(Size::Fill(1.0))
+        } else if let Some(err) = modal.error.as_deref() {
+            paragraph(err)
+                .color(tokens::DESTRUCTIVE)
+                .width(Size::Fill(1.0))
+        } else {
+            paragraph("loading\u{2026}").muted().width(Size::Fill(1.0))
+        };
+
+        let description = if modal.readonly {
+            "Read-only — runtime state owned by the scheduler"
+        } else {
+            "Edits write back through WritePodFile on Save"
+        };
+
+        let mut footer_children: Vec<El> = Vec::new();
+        footer_children.push(button("Close").key(FILE_VIEWER_CLOSE_KEY));
+        if !modal.readonly {
+            let mut revert = button("Revert").key(FILE_VIEWER_REVERT_KEY);
+            if !dirty || saving {
+                revert = revert.disabled();
+            }
+            footer_children.push(revert);
+            let mut save = button(if saving { "Saving\u{2026}" } else { "Save" })
+                .key(FILE_VIEWER_SAVE_KEY)
+                .primary();
+            if !has_data || !dirty || saving {
+                save = save.disabled();
+            }
+            footer_children.push(save);
+        }
+
+        let mut body_children: Vec<El> = vec![body];
+        if let Some(err) = modal.error.as_deref()
+            && has_data
+        {
+            body_children.push(
+                alert([
+                    alert_title("couldn't save file"),
+                    alert_description(err.to_string()),
+                ])
+                .destructive(),
+            );
+        }
+
+        let children: Vec<El> = vec![
+            dialog_header([dialog_title(title), dialog_description(description)]),
+            column(body_children)
+                .gap(tokens::SPACE_2)
+                .width(Size::Fill(1.0))
+                .height(Size::Fill(1.0)),
+            dialog_footer(footer_children),
+        ];
+
+        Some(overlay([
+            scrim(FILE_VIEWER_DISMISS_KEY),
+            dialog_content(children)
+                .width(Size::Fixed(FILE_VIEWER_W))
+                .height(Size::Fixed(FILE_VIEWER_H))
+                .block_pointer(),
         ]))
     }
 
