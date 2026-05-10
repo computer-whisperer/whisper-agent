@@ -3986,11 +3986,11 @@ impl ChatApp {
         if let Some(modal_el) = self.render_new_behavior_modal() {
             out.push(Some(modal_el));
         }
-        if let Some(sheet_el) = self.render_behavior_editor_sheet() {
-            out.push(Some(sheet_el));
-            // Trigger-kind menu rides above the sheet itself —
+        if let Some(modal_el) = self.render_behavior_editor_modal() {
+            out.push(Some(modal_el));
+            // Trigger-kind menu rides above the dialog itself —
             // `select_menu` paints as its own layer; ordering it last
-            // makes it the topmost so it floats above the sheet panel.
+            // makes it the topmost so it floats above the dialog panel.
             if let Some(editor) = self.behavior_editor.as_ref()
                 && editor.trigger_kind_open
             {
@@ -4005,12 +4005,12 @@ impl ChatApp {
                 out.push(Some(self.behavior_editor_picker_menu(open)));
             }
         }
-        if let Some(sheet_el) = self.render_pod_editor_sheet() {
-            out.push(Some(sheet_el));
+        if let Some(modal_el) = self.render_pod_editor_modal() {
+            out.push(Some(modal_el));
             // Pod editor pickers (caps + Defaults backend/model/tool
-            // gate) ride above the sheet — same single-active
+            // gate) ride above the dialog — same single-active
             // discipline as the behavior editor's trigger-kind
-            // picker. Topmost so it floats above the sheet panel.
+            // picker. Topmost so it floats above the dialog panel.
             if let Some(editor) = self.pod_editor.as_ref()
                 && let Some(open) = editor.open_picker
             {
@@ -5059,16 +5059,17 @@ impl ChatApp {
         Some(dialog(NEW_POD_MODAL_KEY, children))
     }
 
-    /// Render the per-behavior editor sheet if its state slot is
-    /// open. Right-attached `SheetSide::Right` because the sheet is
-    /// document-shaped (multi-line prompt, multi-field config) — too
-    /// much surface for a centered dialog. The body composes
-    /// shadcn-shaped form items: the same `form_item` (label /
-    /// control / optional description) the create modals use, just
-    /// inside a sheet shell.
+    /// Render the per-behavior editor modal if its state slot is
+    /// open. Centered modal dialog (mirroring egui's
+    /// `Window::new(...).anchor(CENTER_CENTER)`) because the 7-tab
+    /// strip + the Defaults / Thread / Scope tabs need substantially
+    /// more horizontal room than a right-attached sheet can comfortably
+    /// give. Body composes shadcn-shaped form items: the same
+    /// `form_item` (label / control / optional description) the create
+    /// modals use, just inside a wider dialog shell.
     ///
     /// Body shape:
-    /// - sheet_header: title (`Edit behavior — {pod}/{id}`) + a one-
+    /// - dialog_header: title (`Edit behavior — {pod}/{id}`) + a one-
     ///   liner reminding the user that the v1 form covers a subset
     ///   of the on-disk config (everything else rides through
     ///   unchanged on save).
@@ -5080,9 +5081,9 @@ impl ChatApp {
     ///   prompt. Cron schedule slot only appears when
     ///   `working_kind == Cron`.
     /// - alert: load error or save failure. Destructive when present.
-    /// - sheet_footer: Cancel + Save (Save disabled until snapshot
+    /// - dialog_footer: Cancel + Save (Save disabled until snapshot
     ///   lands and during a pending save).
-    fn render_behavior_editor_sheet(&self) -> Option<El> {
+    fn render_behavior_editor_modal(&self) -> Option<El> {
         let editor = self.behavior_editor.as_ref()?;
 
         let pod_label = self
@@ -5091,9 +5092,9 @@ impl ChatApp {
             .map(|p| p.name.clone())
             .unwrap_or_else(|| editor.pod_id.clone());
         let title = format!("Edit behavior — {pod_label}/{}", editor.behavior_id);
-        let header = sheet_header([
-            sheet_title(title),
-            sheet_description(
+        let header = dialog_header([
+            dialog_title(title),
+            dialog_description(
                 "Trigger / Thread / Scope / Retention / Prompt / System / Raw \
                  tabs split the per-behavior surface up. Trigger and Prompt \
                  are wired in this slice; the other tabs land in follow-up \
@@ -5184,12 +5185,12 @@ impl ChatApp {
         let cancel = button("Cancel").key(BEHAVIOR_EDITOR_CANCEL_KEY);
 
         // Body + optional error alert ride inside a `scroll` so the
-        // sheet panel never overflows vertically — the prompt
+        // dialog panel never overflows vertically — the prompt
         // text_area alone is 160 px and the form has ~6 form_items, so
-        // the natural height regularly exceeds an 800 px viewport.
-        // Header and footer stay fixed; the scroll grabs the leftover
-        // height. `.key` so the scroll offset survives rebuilds across
-        // edit clicks.
+        // the natural height regularly exceeds the dialog's fixed
+        // height. Header and footer stay fixed; the scroll grabs the
+        // leftover height. `.key` so the scroll offset survives
+        // rebuilds across edit clicks.
         let mut body_children: Vec<El> = vec![tabs_strip, body];
         if let Some(err) = editor.error.as_deref() {
             body_children.push(
@@ -5204,17 +5205,22 @@ impl ChatApp {
             .key("behavior-editor:scroll")
             .gap(tokens::SPACE_4);
 
-        let children: Vec<El> = vec![header, scroll_body, sheet_footer([cancel, save])];
+        let children: Vec<El> = vec![header, scroll_body, dialog_footer([cancel, save])];
 
-        // Inline `sheet()` so we can widen the panel: the stock 360 px
-        // is too narrow for a 7-tab strip (every label overflows). 600 px
-        // fits the labels with padding to spare and stays under half
-        // the desktop's 1280 px viewport.
-        let panel = sheet_content(SheetSide::Right, children)
+        // Inline `dialog()` shape so we can override
+        // `dialog_content`'s 420 px stock width: the 7-tab strip and
+        // the Defaults / Thread / Scope rows need substantially more
+        // room. 720 px matches egui's `Window::default_width(720)` and
+        // leaves a comfortable margin on a 1280 px viewport. Height
+        // pinned at 640 px so the inner scroll has a bounded extent;
+        // mirrors egui's `default_height(560)` plus a little headroom
+        // for the larger form_item gaps aetna uses.
+        let panel = dialog_content(children)
             .block_pointer()
-            .width(Size::Fixed(600.0));
+            .width(Size::Fixed(720.0))
+            .height(Size::Fixed(640.0));
         let layer = overlay([scrim(format!("{BEHAVIOR_EDITOR_KEY}:dismiss")), panel])
-            .align(Align::End)
+            .align(Align::Center)
             .justify(Justify::Center);
         Some(layer)
     }
@@ -6234,13 +6240,13 @@ impl ChatApp {
         }
     }
 
-    /// Render the pod editor sheet if open. Same `sheet` + `scroll`
+    /// Render the pod editor modal if open. Same dialog + `scroll`
     /// shape as the behavior editor; the only meaningful difference
     /// is the body — one big monospace `text_area` over the raw TOML
     /// instead of a structured form. The Allow tab is structured;
     /// Defaults / Limits land in follow-up slices. RawToml is the
     /// always-available escape hatch with the full text_area.
-    fn render_pod_editor_sheet(&self) -> Option<El> {
+    fn render_pod_editor_modal(&self) -> Option<El> {
         let editor = self.pod_editor.as_ref()?;
 
         let pod_label = self
@@ -6248,16 +6254,16 @@ impl ChatApp {
             .get(&editor.pod_id)
             .map(|p| p.name.clone())
             .unwrap_or_else(|| editor.pod_id.clone());
-        let header = sheet_header([
-            sheet_title(format!("Pod settings — {pod_label}")),
-            sheet_description(
+        let header = dialog_header([
+            dialog_title(format!("Pod settings — {pod_label}")),
+            dialog_description(
                 "Edit the pod's allow lists, thread defaults, and limits. \
                  The Raw TOML tab is always available; the structured \
                  tabs round-trip through it on save.",
             ),
         ]);
 
-        // Tab strip. Width-fill so the strip spans the sheet.
+        // Tab strip. Width-fill so the strip spans the dialog.
         let tab_value = editor.tab.wire_value().to_string();
         let tabs_strip = tabs_list(
             POD_EDITOR_TABS_KEY,
@@ -6319,9 +6325,21 @@ impl ChatApp {
             .key("pod-editor:scroll")
             .gap(tokens::SPACE_4);
 
-        let children: Vec<El> = vec![header, scroll_body, sheet_footer([cancel, save])];
+        let children: Vec<El> = vec![header, scroll_body, dialog_footer([cancel, save])];
 
-        Some(sheet(POD_EDITOR_KEY, SheetSide::Right, children))
+        // Inline `dialog()` shape so we can override
+        // `dialog_content`'s 420 px stock width: the Allow tab's
+        // multi-checks and the Defaults tab's wide rows need more room.
+        // Sized to match the behavior editor (720 × 640) for a
+        // consistent editor footprint.
+        let panel = dialog_content(children)
+            .block_pointer()
+            .width(Size::Fixed(720.0))
+            .height(Size::Fixed(640.0));
+        let layer = overlay([scrim(format!("{POD_EDITOR_KEY}:dismiss")), panel])
+            .align(Align::Center)
+            .justify(Justify::Center);
+        Some(layer)
     }
 
     /// Allow tab body. Identity (name + description) + multi-checks

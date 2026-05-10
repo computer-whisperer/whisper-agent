@@ -930,6 +930,27 @@ Defaults numeric inputs (`max_concurrent_threads_buf` lives on
 on every event). New form items drop in alongside as the
 schema grows.
 
+**Pod & behavior editors — modal conversion (landed):** the
+right-attached sheets were always a compromise — even at 600 px
+the behavior editor's 7-tab strip and the Defaults / Thread /
+Scope rows felt cramped, and the egui sibling has always used a
+centered `egui::Window::new(...).anchor(CENTER_CENTER)` shape.
+Both editors swapped to `dialog_content` panels (720 × 640,
+matching egui's `default_width(720) / default_height(560)` plus
+headroom for aetna's larger form_item gaps), centered via
+`overlay([scrim, panel]).align(Align::Center).justify(Justify::Center)`.
+Same `dialog_header` / `scroll(body)` / `dialog_footer` anatomy
+as the create modals; only the panel sizing differs. Picker
+menus (`select_menu` overlays) anchor to their `select_trigger`
+keys regardless of where the parent dialog sits, so no rework
+to `behavior_editor_picker_menu` /
+`behavior_editor_trigger_kind_menu` / `pod_editor_picker_menu`
+was needed. State struct names (`PodEditorSheetState` /
+`BehaviorEditorSheetState`) and key prefixes (`pod-editor:` /
+`behavior-editor:`) stay as-is — they're internal and the
+churn isn't worth it. Renderer entry points are now
+`render_{pod,behavior}_editor_modal`.
+
 ### ✅ Stage 9 — Login form
 
 `whisper_agent_aetna_ui::LoginApp` is a separate aetna [`App`] —
