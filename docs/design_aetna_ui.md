@@ -765,16 +765,7 @@ days, so kind switches in the live editor preserve typed
 values.
 
 Deferred to follow-up sheet slices:
-- **Thread bindings host_env / mcp_hosts sub-slice** — needs
-  pod_config plumbing on `BehaviorEditorSheetState`. Once the
-  editor fires `GetPod` alongside `GetBehavior`, the
-  multi-checks read from `pod.allow.{host_env,mcp_hosts}`.
 - **Scope tab** — per-behavior allow narrowing.
-- **Retention tab** — `RetentionPolicy::ArchiveAfterDays /
-  DeleteAfterDays` controls.
-- **System Prompt tab** — toggle plus the override-file editor
-  (rides as `Some(content)` on `UpdateBehavior` rather than
-  side `WritePodFile`, mirroring egui).
 - **Raw TOML tab** — the escape hatch for malformed configs;
   needs a `toml::to_string_pretty` round-trip for sync.
 
@@ -950,6 +941,53 @@ was needed. State struct names (`PodEditorSheetState` /
 `behavior-editor:`) stay as-is — they're internal and the
 churn isn't worth it. Renderer entry points are now
 `render_{pod,behavior}_editor_modal`.
+
+**Behavior editor — pod_config plumbing + Thread bindings
+host_env / mcp_hosts (landed):** the Thread tab's host_env /
+mcp_hosts override rows landed as a placeholder paragraph
+("…land in a follow-up sub-slice once the editor loads the
+pod's allow lists"). This slice hooks them up.
+
+`BehaviorEditorSheetState` grew `pod_config: Option<PodConfig>`
+and `pending_pod_get: Option<String>`. `open_behavior_editor`
+mints a second correlation alongside the existing `GetBehavior`
+correlation and fires `GetPod` in parallel; both round-trips
+race, and whichever lands first hydrates its slice (so the
+prompt / trigger fields show up the instant the behavior
+snapshot lands, even if the pod snapshot is still in flight).
+The `PodSnapshot` inbound arm grew a second match: the existing
+pod-editor branch stays, and a new behavior-editor branch checks
+the open editor's `pending_pod_get` correlation + `pod_id` and
+stashes `snapshot.config` into `pod_config`.
+
+The Thread tab now renders host_env / mcp_hosts override rows
+in the same `[checkbox, override-text, value-or-hint]` shape as
+the existing model / max_tokens / max_turns / backend rows. With
+override OFF (the default), the value cell renders the standard
+"(inherit pod default)" muted hint. With override ON, the cell
+checks `pending_pod_get` first ("(loading pod allow list…)"
+while in flight), then renders a `checkbox_column` over the
+pod's `allow.host_env` / `allow.mcp_hosts` names, identical to
+the pod editor's Defaults tab multi-checks. Empty allow lists
+surface "(no host envs in pod [allow])" / "(no shared MCP hosts
+in pod [allow])" so the user knows they need to widen the pod
+first.
+
+Two new override-checkbox handlers and two new
+`apply_checkbox_list_to_vec` calls cover the new keys
+(`behavior-editor:thread:host-env:override` /
+`behavior-editor:thread:host-env:item:{name}` and the
+mcp-hosts mirror). Same Some/None toggle pattern as the
+backend override: ON seeds `Some(Vec::new())` (empty
+override = "bind to none"), OFF drops to `None` (inherit pod
+default).
+
+Bundle scenes that open the behavior editor now answer both
+`GetBehavior` and `GetPod` (the SendFn match arm grew from
+single-pattern `if let` to a `match` over both wire kinds), so
+the dump's second `before_build` pass sees a populated
+`pod_config` and the host_env / mcp_hosts inherit hints render
+the same way they will in the live binary.
 
 ### ✅ Stage 9 — Login form
 

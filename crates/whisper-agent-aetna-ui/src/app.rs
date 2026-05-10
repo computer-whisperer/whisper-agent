@@ -718,6 +718,16 @@ pub(crate) struct BehaviorEditorSheetState {
     /// `BehaviorUpdated` (close) or `Error` (re-enable + surface
     /// message).
     pub(crate) pending_save: Option<String>,
+    /// Pod's parsed config — provides the `[allow]` lists the
+    /// host_env / mcp_hosts override rows render against. Hydrated
+    /// asynchronously via a parallel `GetPod` round-trip when the
+    /// editor opens; `None` until the snapshot arrives, in which case
+    /// the override rows render a "(loading pod config…)" placeholder.
+    pub(crate) pod_config: Option<PodConfig>,
+    /// Correlation id of the in-flight `GetPod` request that fires
+    /// alongside `GetBehavior` on editor open. `Some` until the
+    /// matching `PodSnapshot` arrives.
+    pub(crate) pending_pod_get: Option<String>,
 }
 
 /// Discriminator used by the editor's trigger-kind picker. Mirrors
@@ -860,7 +870,12 @@ impl BehaviorEditorPicker {
 }
 
 impl BehaviorEditorSheetState {
-    fn new(pod_id: String, behavior_id: String, pending_get: String) -> Self {
+    fn new(
+        pod_id: String,
+        behavior_id: String,
+        pending_get: String,
+        pending_pod_get: String,
+    ) -> Self {
         Self {
             pod_id,
             behavior_id,
@@ -881,6 +896,8 @@ impl BehaviorEditorSheetState {
             error: None,
             pending_get: Some(pending_get),
             pending_save: None,
+            pod_config: None,
+            pending_pod_get: Some(pending_pod_get),
         }
     }
 
@@ -1431,17 +1448,23 @@ impl ChatApp {
                 snapshot,
                 correlation_id,
             } => {
-                // The pod editor sheet is the only sender of
-                // `GetPod` today. Match by correlation; an unrelated
-                // snapshot (none expected, but defensively) drops on
-                // the floor. The pod_id check guards against the
-                // user closing-then-reopening the editor for a
-                // different pod within the round-trip window.
+                // Two senders today: the pod editor (whole-snapshot
+                // hydrate) and the behavior editor (pod_config slot
+                // for the Thread tab's host_env / mcp_hosts override
+                // pickers). Match by correlation; the pod_id check
+                // guards against close-then-reopen for a different
+                // pod within the round-trip window.
                 if let Some(editor) = self.pod_editor.as_mut()
                     && editor.pending_get.as_ref() == correlation_id.as_ref()
                     && editor.pod_id == snapshot.pod_id
                 {
                     editor.hydrate(snapshot);
+                } else if let Some(editor) = self.behavior_editor.as_mut()
+                    && editor.pending_pod_get.as_ref() == correlation_id.as_ref()
+                    && editor.pod_id == snapshot.pod_id
+                {
+                    editor.pending_pod_get = None;
+                    editor.pod_config = Some(snapshot.config);
                 }
             }
             ServerToClient::PodConfigUpdated {
@@ -2641,6 +2664,17 @@ const BEHAVIOR_EDITOR_THREAD_MAX_TURNS_OVERRIDE_KEY: &str =
 const BEHAVIOR_EDITOR_THREAD_MAX_TURNS_KEY: &str = "behavior-editor:thread:max-turns";
 const BEHAVIOR_EDITOR_THREAD_BACKEND_OVERRIDE_KEY: &str = "behavior-editor:thread:backend:override";
 const BEHAVIOR_EDITOR_THREAD_BACKEND_KEY: &str = "behavior-editor:thread:backend";
+/// Thread-tab `bindings.host_env` override checkbox + multi-check
+/// group prefix. Per-item routes land on
+/// `{HOST_ENV_KEY}:item:{name}` via `apply_checkbox_list_to_vec`,
+/// matching the pod editor's host_env multi-check shape.
+const BEHAVIOR_EDITOR_THREAD_HOST_ENV_OVERRIDE_KEY: &str =
+    "behavior-editor:thread:host-env:override";
+const BEHAVIOR_EDITOR_THREAD_HOST_ENV_KEY: &str = "behavior-editor:thread:host-env";
+/// Same shape for `bindings.mcp_hosts`.
+const BEHAVIOR_EDITOR_THREAD_MCP_HOSTS_OVERRIDE_KEY: &str =
+    "behavior-editor:thread:mcp-hosts:override";
+const BEHAVIOR_EDITOR_THREAD_MCP_HOSTS_KEY: &str = "behavior-editor:thread:mcp-hosts";
 /// Retention-tab routed keys.
 const BEHAVIOR_EDITOR_RETENTION_KIND_KEY: &str = "behavior-editor:retention:kind";
 const BEHAVIOR_EDITOR_RETENTION_DAYS_KEY: &str = "behavior-editor:retention:days";
@@ -4263,16 +4297,26 @@ impl ChatApp {
         {
             return;
         }
-        let correlation_id = self.next_correlation_id();
+        let behavior_correlation = self.next_correlation_id();
+        let pod_correlation = self.next_correlation_id();
         self.behavior_editor = Some(BehaviorEditorSheetState::new(
             pod_id.clone(),
             behavior_id.clone(),
-            correlation_id.clone(),
+            behavior_correlation.clone(),
+            pod_correlation.clone(),
         ));
         self.send(ClientToServer::GetBehavior {
-            correlation_id: Some(correlation_id),
-            pod_id,
+            correlation_id: Some(behavior_correlation),
+            pod_id: pod_id.clone(),
             behavior_id,
+        });
+        // Parallel `GetPod` so the Thread tab's host_env / mcp_hosts
+        // override rows know what allow lists the pod declares. Both
+        // round-trips race; whichever lands first hydrates its slice
+        // of editor state and the other lands when ready.
+        self.send(ClientToServer::GetPod {
+            correlation_id: Some(pod_correlation),
+            pod_id,
         });
     }
 
@@ -4464,6 +4508,59 @@ impl ChatApp {
                 };
                 editor.error = None;
             }
+            return true;
+        }
+
+        // host_env / mcp_hosts override checkboxes. Toggling on
+        // seeds an empty `Some(vec![])` (the multi-check column
+        // populates entries as the user clicks); toggling off
+        // drops to `None` (inherit pod default).
+        if event.is_click_or_activate(BEHAVIOR_EDITOR_THREAD_HOST_ENV_OVERRIDE_KEY) {
+            if let Some(editor) = self.behavior_editor.as_mut()
+                && let Some(cfg) = editor.working_config.as_mut()
+            {
+                cfg.thread.bindings.host_env = if cfg.thread.bindings.host_env.is_some() {
+                    None
+                } else {
+                    Some(Vec::new())
+                };
+                editor.error = None;
+            }
+            return true;
+        }
+        if event.is_click_or_activate(BEHAVIOR_EDITOR_THREAD_MCP_HOSTS_OVERRIDE_KEY) {
+            if let Some(editor) = self.behavior_editor.as_mut()
+                && let Some(cfg) = editor.working_config.as_mut()
+            {
+                cfg.thread.bindings.mcp_hosts = if cfg.thread.bindings.mcp_hosts.is_some() {
+                    None
+                } else {
+                    Some(Vec::new())
+                };
+                editor.error = None;
+            }
+            return true;
+        }
+
+        // host_env / mcp_hosts multi-check item clicks. Routes land
+        // on `{group}:item:{name}`; the helper toggles membership
+        // in the override `Vec<String>`. Only meaningful when the
+        // override is on (`Some(vec)`); when `None`, the rendering
+        // skipped the multi-check entirely so no events fire.
+        if let Some(editor) = self.behavior_editor.as_mut()
+            && let Some(cfg) = editor.working_config.as_mut()
+            && let Some(vec) = cfg.thread.bindings.host_env.as_mut()
+            && apply_checkbox_list_to_vec(vec, event, BEHAVIOR_EDITOR_THREAD_HOST_ENV_KEY)
+        {
+            editor.error = None;
+            return true;
+        }
+        if let Some(editor) = self.behavior_editor.as_mut()
+            && let Some(cfg) = editor.working_config.as_mut()
+            && let Some(vec) = cfg.thread.bindings.mcp_hosts.as_mut()
+            && apply_checkbox_list_to_vec(vec, event, BEHAVIOR_EDITOR_THREAD_MCP_HOSTS_KEY)
+        {
+            editor.error = None;
             return true;
         }
 
@@ -5611,6 +5708,50 @@ impl ChatApp {
         .align(Align::Center)
         .width(Size::Fill(1.0));
 
+        // host_env / mcp_hosts override rows. When override is OFF
+        // we render the standard inherit hint; when ON we render a
+        // multi-check column over the pod's allow list. The pod
+        // config may not have landed yet (parallel `GetPod` is in
+        // flight), so an unhydrated state surfaces a "(loading…)"
+        // hint rather than a blank list.
+        let host_env_override = cfg.thread.bindings.host_env.is_some();
+        let host_env_value: El = if !host_env_override {
+            paragraph("(inherit pod default)").muted().small()
+        } else if editor.pending_pod_get.is_some() {
+            paragraph("(loading pod allow list…)").muted().small()
+        } else if let Some(pod_cfg) = editor.pod_config.as_ref() {
+            self.render_behavior_editor_thread_host_env_check(cfg, pod_cfg)
+        } else {
+            paragraph("(pod config unavailable)").muted().small()
+        };
+        let host_env_row = row([
+            checkbox(host_env_override).key(BEHAVIOR_EDITOR_THREAD_HOST_ENV_OVERRIDE_KEY),
+            text("override").muted().small(),
+            host_env_value,
+        ])
+        .gap(tokens::SPACE_2)
+        .align(Align::Start)
+        .width(Size::Fill(1.0));
+
+        let mcp_hosts_override = cfg.thread.bindings.mcp_hosts.is_some();
+        let mcp_hosts_value: El = if !mcp_hosts_override {
+            paragraph("(inherit pod default)").muted().small()
+        } else if editor.pending_pod_get.is_some() {
+            paragraph("(loading pod allow list…)").muted().small()
+        } else if let Some(pod_cfg) = editor.pod_config.as_ref() {
+            self.render_behavior_editor_thread_mcp_hosts_check(cfg, pod_cfg)
+        } else {
+            paragraph("(pod config unavailable)").muted().small()
+        };
+        let mcp_hosts_row = row([
+            checkbox(mcp_hosts_override).key(BEHAVIOR_EDITOR_THREAD_MCP_HOSTS_OVERRIDE_KEY),
+            text("override").muted().small(),
+            mcp_hosts_value,
+        ])
+        .gap(tokens::SPACE_2)
+        .align(Align::Start)
+        .width(Size::Fill(1.0));
+
         form([
             form_item([
                 form_label("model"),
@@ -5642,18 +5783,66 @@ impl ChatApp {
                 ),
             ]),
             form_item([
-                form_label("host_env / mcp_hosts"),
-                form_control(
-                    paragraph(
-                        "host_env and mcp_hosts override pickers land in a \
-                         follow-up sub-slice once the editor loads the pod's \
-                         allow lists.",
-                    )
-                    .muted()
-                    .small(),
+                form_label("host_env binding"),
+                form_control(host_env_row),
+                form_description(
+                    "Replace the pod-default host_env list for this behavior's \
+                     spawned threads. Options come from the pod's \
+                     `[allow.host_env]`.",
+                ),
+            ]),
+            form_item([
+                form_label("mcp_hosts binding"),
+                form_control(mcp_hosts_row),
+                form_description(
+                    "Replace the pod-default mcp_hosts list for this behavior's \
+                     spawned threads. Options come from the pod's \
+                     `[allow.mcp_hosts]`.",
                 ),
             ]),
         ])
+    }
+
+    /// Multi-check column over the pod's `allow.host_env` names.
+    /// Returns a "(no host envs in pod allow list)" hint when the
+    /// pod declares none — distinct from the parent's
+    /// "(loading…)" / "(pod config unavailable)" placeholders.
+    fn render_behavior_editor_thread_host_env_check(
+        &self,
+        cfg: &BehaviorConfig,
+        pod_cfg: &PodConfig,
+    ) -> El {
+        if pod_cfg.allow.host_env.is_empty() {
+            return paragraph("(no host envs in pod [allow])").muted().small();
+        }
+        let options: Vec<(String, String)> = pod_cfg
+            .allow
+            .host_env
+            .iter()
+            .map(|e| (e.name.clone(), e.name.clone()))
+            .collect();
+        let selected = cfg.thread.bindings.host_env.as_deref().unwrap_or(&[]);
+        checkbox_column(BEHAVIOR_EDITOR_THREAD_HOST_ENV_KEY, selected, options)
+    }
+
+    fn render_behavior_editor_thread_mcp_hosts_check(
+        &self,
+        cfg: &BehaviorConfig,
+        pod_cfg: &PodConfig,
+    ) -> El {
+        if pod_cfg.allow.mcp_hosts.is_empty() {
+            return paragraph("(no shared MCP hosts in pod [allow])")
+                .muted()
+                .small();
+        }
+        let options: Vec<(String, String)> = pod_cfg
+            .allow
+            .mcp_hosts
+            .iter()
+            .map(|n| (n.clone(), n.clone()))
+            .collect();
+        let selected = cfg.thread.bindings.mcp_hosts.as_deref().unwrap_or(&[]);
+        checkbox_column(BEHAVIOR_EDITOR_THREAD_MCP_HOSTS_KEY, selected, options)
     }
 
     /// Retention tab body. Mirrors the egui sibling's

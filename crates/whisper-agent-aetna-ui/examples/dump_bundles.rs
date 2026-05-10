@@ -521,15 +521,17 @@ fn build_app(scene: Scene) -> Box<dyn App> {
         | Scene::BehaviorEditorRetentionTab
         | Scene::BehaviorEditorSystemPromptTab => {
             let queue = inbound.clone();
-            Box::new(move |msg| {
-                if let ClientToServer::GetBehavior {
+            Box::new(move |msg| match msg {
+                // The behavior editor opens with a `GetBehavior` /
+                // `GetPod` pair (parallel correlations); the dump
+                // synthesizes both replies so the Thread tab's
+                // host_env / mcp_hosts override pickers see a
+                // populated `pod_config` slot.
+                ClientToServer::GetBehavior {
                     correlation_id,
                     pod_id,
                     behavior_id,
-                } = msg
-                    && pod_id == "default"
-                    && behavior_id == "architect"
-                {
+                } if pod_id == "default" && behavior_id == "architect" => {
                     queue.borrow_mut().push_back(InboundEvent::Wire(
                         ServerToClient::BehaviorSnapshot {
                             correlation_id,
@@ -537,6 +539,18 @@ fn build_app(scene: Scene) -> Box<dyn App> {
                         },
                     ));
                 }
+                ClientToServer::GetPod {
+                    correlation_id,
+                    pod_id,
+                } if pod_id == "default" => {
+                    queue
+                        .borrow_mut()
+                        .push_back(InboundEvent::Wire(ServerToClient::PodSnapshot {
+                            correlation_id,
+                            snapshot: mock_default_pod_snapshot(),
+                        }));
+                }
+                _ => {}
             })
         }
         Scene::PodEditorHydrated | Scene::PodEditorDefaultsTab | Scene::PodEditorLimitsTab => {
