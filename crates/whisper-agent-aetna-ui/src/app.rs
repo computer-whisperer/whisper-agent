@@ -2480,7 +2480,7 @@ impl ChatApp {
             inbound,
             send_fn,
             server_label: None,
-            sidebar_width: tokens::SIDEBAR_WIDTH,
+            sidebar_width: SIDEBAR_DEFAULT_WIDTH,
             sidebar_drag: ResizeDrag::default(),
             lightbox: None,
             inspector_open: None,
@@ -4838,6 +4838,13 @@ const SIDEBAR_SHOWMORE_KEY: &str = "sidebar:showmore";
 /// Default-collapsed cap on per-pod thread rows in the sidebar.
 /// The "Show N more" toggle reveals the full list per pod.
 const SIDEBAR_THREAD_PREVIEW: usize = 10;
+
+/// Starting width of the sidebar. Bumped above
+/// `tokens::SIDEBAR_WIDTH` (256) so the 48px brand chip + title +
+/// trailing icon buttons fit on one row without ellipsising
+/// "whisper-agent". The user can still drag-resize within
+/// `[SIDEBAR_WIDTH_MIN, SIDEBAR_WIDTH_MAX]`.
+const SIDEBAR_DEFAULT_WIDTH: f32 = 320.0;
 
 /// Routed key for the "+" icon-button next to the Threads section
 /// header — the primary entry point for starting a new thread in the
