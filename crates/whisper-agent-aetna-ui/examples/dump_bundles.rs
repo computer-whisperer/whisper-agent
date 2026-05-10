@@ -342,10 +342,16 @@ enum Scene {
     /// paints populated and the Save / Revert affordances render
     /// disabled (buffer == baseline).
     SettingsServerConfig,
+    /// Thread inspector panel expanded over a populated thread.
+    /// Same baseline as `ThreadWithMessages`; the click loop selects
+    /// the thread, then toggles the inspector. The panel paints
+    /// key/value rows for bindings, max-tokens / max-turns,
+    /// cumulative usage, and any trigger origin.
+    ThreadInspectorOpen,
 }
 
 impl Scene {
-    const ALL: [Scene; 49] = [
+    const ALL: [Scene; 50] = [
         Scene::Connecting,
         Scene::Connected,
         Scene::Closed,
@@ -395,6 +401,7 @@ impl Scene {
         Scene::FileTreeOpen,
         Scene::SettingsBackends,
         Scene::SettingsServerConfig,
+        Scene::ThreadInspectorOpen,
     ];
 
     fn slug(self) -> &'static str {
@@ -448,6 +455,7 @@ impl Scene {
             Scene::FileTreeOpen => "file_tree_open",
             Scene::SettingsBackends => "settings_backends",
             Scene::SettingsServerConfig => "settings_server_config",
+            Scene::ThreadInspectorOpen => "thread_inspector_open",
         }
     }
 
@@ -465,6 +473,9 @@ impl Scene {
             | Scene::ThreadWithSetup
             | Scene::ThreadWithProvenance
             | Scene::ThreadWithFailure => vec!["thread:t-1"],
+            // Inspector scene: select the thread, then click the
+            // toolbar info button so the inspector panel paints.
+            Scene::ThreadInspectorOpen => vec!["thread:t-1", "chat:inspector-toggle"],
             // Open the thread, then click each diff tool's
             // accordion so the bodies render expanded. Indices
             // come from the conversation's display-item order:
@@ -959,7 +970,8 @@ fn build_app(scene: Scene) -> Box<dyn App> {
         | Scene::ThreadWithProvenance
         | Scene::ThreadWithFailure
         | Scene::LightboxOpen
-        | Scene::SudoPending => {
+        | Scene::SudoPending
+        | Scene::ThreadInspectorOpen => {
             q.push_back(InboundEvent::ConnectionOpened);
             q.push_back(InboundEvent::Wire(ServerToClient::PodList {
                 correlation_id: None,
@@ -982,7 +994,10 @@ fn build_app(scene: Scene) -> Box<dyn App> {
                 correlation_id: None,
                 tasks: threads,
             }));
-            if matches!(scene, Scene::ThreadWithMessages) {
+            if matches!(
+                scene,
+                Scene::ThreadWithMessages | Scene::ThreadInspectorOpen
+            ) {
                 q.push_back(InboundEvent::Wire(ServerToClient::ThreadSnapshot {
                     thread_id: "t-1".into(),
                     snapshot: mock_snapshot(),

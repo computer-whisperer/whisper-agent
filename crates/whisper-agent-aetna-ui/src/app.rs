@@ -36,8 +36,7 @@
 //! Surfaces still to land (full inventory in
 //! `docs/design_aetna_ui.md` § "Migration gaps from egui webui"):
 //! Codex auth rotate + Shared MCP CRUD sub-slices of the server
-//! settings modal, knowledge-buckets modal, thread inspector
-//! popover.
+//! settings modal, knowledge-buckets modal.
 //!
 //! Dispatch model: a single `dispatch_wire` walks `ServerToClient`
 //! variants — only the ones the current stage cares about have arms;
@@ -773,6 +772,19 @@ struct ThreadView {
     /// assistant streaming arms also bump this so the count tracks
     /// the conversation, not just user turns.
     next_msg_index: usize,
+    /// Inspector-panel projection of snapshot metadata that the
+    /// header chips can't fit. Hydrated once on snapshot arrival
+    /// alongside `backend` / `model`; the inspector renders these
+    /// inline above the chat log when the user toggles it open.
+    host_env_labels: Vec<String>,
+    mcp_hosts: Vec<String>,
+    max_tokens: u32,
+    max_turns: u32,
+    created_at: String,
+    /// `Some(behavior_id)` when this thread was spawned by a behavior
+    /// trigger. `BehaviorSummary`-style display name lookup happens
+    /// at render time.
+    origin_behavior_id: Option<String>,
 }
 
 pub struct ChatApp {
@@ -814,6 +826,13 @@ pub struct ChatApp {
     /// `aetna_core::Image` is shared with the inline row so we don't
     /// re-decode the bytes when the modal opens.
     lightbox: Option<LightboxState>,
+
+    // ----- thread inspector -----
+    /// Thread id whose inspector panel is currently expanded. `Some`
+    /// while open, `None` when collapsed. Single-slot rather than a
+    /// set since only the selected thread renders its inspector;
+    /// switching threads collapses the prior one.
+    inspector_open: Option<String>,
 
     // ----- modal: server settings -----
     /// Server-settings modal state. `Some` while open. Lifecycle:
@@ -1922,6 +1941,7 @@ impl ChatApp {
             sidebar_width: tokens::SIDEBAR_WIDTH,
             sidebar_drag: ResizeDrag::default(),
             lightbox: None,
+            inspector_open: None,
             settings_modal: None,
             file_viewer_modal: None,
             file_tree_modal_pod: None,
@@ -2510,6 +2530,27 @@ impl ChatApp {
                 let items =
                     conversation_to_display_items(&snapshot.conversation, &snapshot.turn_log);
                 let next_msg_index = snapshot.conversation.messages().len();
+                let host_env_labels = snapshot
+                    .bindings
+                    .host_env
+                    .iter()
+                    .map(|b| match b {
+                        whisper_agent_protocol::HostEnvBinding::Named {
+                            name,
+                            workspace_root,
+                        } => match workspace_root {
+                            Some(p) => format!("{name} (cwd: {})", p.display()),
+                            None => name.clone(),
+                        },
+                        whisper_agent_protocol::HostEnvBinding::Inline { provider, .. } => {
+                            format!("(inline, provider = {provider})")
+                        }
+                    })
+                    .collect();
+                let mcp_hosts = snapshot.bindings.mcp_hosts.clone();
+                let max_tokens = snapshot.config.max_tokens;
+                let max_turns = snapshot.config.max_turns;
+                let origin_behavior_id = snapshot.origin.as_ref().map(|o| o.behavior_id.clone());
                 let view = ThreadView {
                     items,
                     title: snapshot.title,
@@ -2518,6 +2559,12 @@ impl ChatApp {
                     model: snapshot.config.model,
                     total_usage: snapshot.total_usage,
                     next_msg_index,
+                    host_env_labels,
+                    mcp_hosts,
+                    max_tokens,
+                    max_turns,
+                    created_at: snapshot.created_at,
+                    origin_behavior_id,
                 };
                 // Hydrate the local draft from the snapshot — the
                 // server's stored draft is authoritative on initial
@@ -3332,6 +3379,19 @@ impl App for ChatApp {
             self.open_settings_modal();
             return;
         }
+        if event.is_click_or_activate(CHAT_INSPECTOR_TOGGLE_KEY) {
+            // Toggle the inspector for the active thread. Clicking
+            // while open on the same thread collapses; clicking
+            // open on a different thread (only possible if the
+            // active selection changed between build and click —
+            // rare but defended) re-targets.
+            let target = self.selected.clone();
+            self.inspector_open = match (&self.inspector_open, &target) {
+                (Some(open), Some(sel)) if open == sel => None,
+                _ => target,
+            };
+            return;
+        }
         if event.is_click_or_activate(SIDEBAR_NEW_POD_KEY) {
             self.new_pod_modal = Some(NewPodModalState::default());
             return;
@@ -3838,6 +3898,12 @@ const SIDEBAR_POD_FILES_KEY: &str = "sidebar:pod-files";
 /// next to the server URL so the icon associates with "where am I
 /// connected" rather than "what am I working on."
 const SIDEBAR_SERVER_SETTINGS_KEY: &str = "sidebar:server-settings";
+
+/// Thread inspector toggle — `info`-icon button on the thread
+/// toolbar. Click flips `inspector_open` between the selected
+/// thread id and `None`; the renderer paints an inline detail
+/// panel between the header and the chat log when set.
+const CHAT_INSPECTOR_TOGGLE_KEY: &str = "chat:inspector-toggle";
 
 /// Routed-key shapes for the server-settings modal. The tab strip
 /// auto-derives `settings:tabs:tab:{value}` per trigger; per-tab
@@ -5464,6 +5530,116 @@ impl ChatApp {
     ///
     /// Returns `None` when no prefill is active or the total is zero
     /// (defensive — a zero total would NaN out the fraction).
+    /// Thread inspector panel — inline key/value grid rendered above
+    /// the chat log when the user toggles the toolbar's info button.
+    /// Mirrors the egui sibling's `render_thread_context_box`. Skips
+    /// fields the user can already see in the header (title, state),
+    /// surfaces the rest:
+    /// - identity: thread_id, pod_id, created_at, last_active
+    /// - resolved bindings: host_env, mcp_hosts
+    /// - thread config: max_tokens, max_turns
+    /// - cumulative usage: total in / out / cache
+    /// - trigger origin: behavior_id (when spawned by a behavior)
+    ///
+    /// Scope rendering, OAuth-aware MCP host details, and the
+    /// trigger payload pretty-print are deferred — they add
+    /// substantial surface for a v1 inspector.
+    fn render_inspector_panel(
+        &self,
+        thread_id: &str,
+        summary: Option<&ThreadSummary>,
+        view: Option<&ThreadView>,
+    ) -> Option<El> {
+        let view = view?;
+        let mut rows: Vec<El> = Vec::new();
+        let mut push = |label: &str, value: String| {
+            rows.push(
+                row([
+                    text(label.to_string())
+                        .caption()
+                        .muted()
+                        .width(Size::Fixed(140.0)),
+                    text(value).caption().width(Size::Fill(1.0)),
+                ])
+                .gap(tokens::SPACE_3)
+                .align(Align::Start)
+                .width(Size::Fill(1.0)),
+            );
+        };
+
+        push("thread_id", thread_id.to_string());
+        if let Some(s) = summary {
+            push("pod_id", s.pod_id.clone());
+            if !s.last_active.is_empty() {
+                push("last_active", s.last_active.clone());
+            }
+        }
+        if !view.created_at.is_empty() {
+            push("created_at", view.created_at.clone());
+        }
+        let backend_val = if view.backend.is_empty() {
+            "(server default)".to_string()
+        } else {
+            view.backend.clone()
+        };
+        let model_val = if view.model.is_empty() {
+            "(backend default)".to_string()
+        } else {
+            view.model.clone()
+        };
+        push("backend", backend_val);
+        push("model", model_val);
+        if view.max_tokens > 0 {
+            push("max_tokens", view.max_tokens.to_string());
+        }
+        if view.max_turns > 0 {
+            push("max_turns", view.max_turns.to_string());
+        }
+        let host_env_val = if view.host_env_labels.is_empty() {
+            "(none \u{2014} shared MCPs only)".to_string()
+        } else {
+            view.host_env_labels.join(", ")
+        };
+        push("host_env", host_env_val);
+        let mcp_val = if view.mcp_hosts.is_empty() {
+            "(none)".to_string()
+        } else {
+            view.mcp_hosts.join(", ")
+        };
+        push("mcp_hosts", mcp_val);
+        push("total_in", view.total_usage.input_tokens.to_string());
+        push("total_out", view.total_usage.output_tokens.to_string());
+        if view.total_usage.cache_read_input_tokens > 0
+            || view.total_usage.cache_creation_input_tokens > 0
+        {
+            push(
+                "cache r/w",
+                format!(
+                    "{}/{}",
+                    view.total_usage.cache_read_input_tokens,
+                    view.total_usage.cache_creation_input_tokens,
+                ),
+            );
+        }
+        if let Some(behavior_id) = view.origin_behavior_id.as_deref() {
+            push("origin behavior", behavior_id.to_string());
+        }
+
+        Some(
+            column(rows)
+                .gap(tokens::SPACE_1)
+                .padding(Sides {
+                    left: tokens::SPACE_2,
+                    right: tokens::SPACE_2,
+                    top: tokens::SPACE_2,
+                    bottom: tokens::SPACE_2,
+                })
+                .width(Size::Fill(1.0))
+                .fill(tokens::MUTED.with_alpha(40))
+                .radius(tokens::RADIUS_SM),
+        )
+    }
+
     fn prefill_indicator(&self, thread_id: &str) -> Option<El> {
         let &(processed, total) = self.prefill.get(thread_id)?;
         if total == 0 {
@@ -5517,6 +5693,15 @@ impl ChatApp {
                     .push(badge(format!("dispatched from {}", short_id(parent))).muted());
             }
             toolbar_children.push(state_badge(s.state));
+            // Inspector toggle — small info icon on the trailing
+            // edge of the toolbar. Always rendered (the inspector
+            // panel itself is conditional on `inspector_open`).
+            toolbar_children.push(
+                icon_button("info")
+                    .key(CHAT_INSPECTOR_TOGGLE_KEY)
+                    .ghost()
+                    .icon_size(tokens::ICON_XS),
+            );
         }
         // Sub-line under the toolbar: thread id (left) and the
         // backend/model + cumulative-usage chrome (right). Both
@@ -5539,6 +5724,16 @@ impl ChatApp {
                 .align(Align::Center)
                 .width(Size::Fill(1.0)),
         ];
+        // Inspector panel — rendered between the toolbar / sub-line
+        // and the prefill indicator when expanded. Stays part of the
+        // header column so it shares the bottom-stroke separator
+        // with the rest of the chrome and scrolls *with* the
+        // header (not the chat log) when the dialog gets tall.
+        if self.inspector_open.as_deref() == Some(thread_id)
+            && let Some(panel) = self.render_inspector_panel(thread_id, summary, view)
+        {
+            header_rows.push(panel);
+        }
         // Prefill progress: a thin progress bar plus a muted token
         // count, rendered while the model is ingesting the prompt.
         // Cleared automatically once the first text/reasoning delta
@@ -5583,10 +5778,25 @@ impl ChatApp {
                 // flush, adjacent unfilled rows visually blur into one
                 // text flow. SPACE_2 (8px) reads as a log-style line
                 // gap rather than card-isolation.
-                scroll(rows)
-                    .key(scroll_key)
+                //
+                // Right padding lives on the *content* column rather
+                // than the scroll itself so the scrollbar thumb sits
+                // in a reserved gutter outside the focusable rows
+                // (lint flags otherwise — `ScrollbarObscuresFocusable`
+                // — once the body overflows, which the inspector
+                // panel can trigger by shrinking available height).
+                let content = column(rows)
                     .gap(tokens::SPACE_2)
-                    .padding(tokens::SPACE_2)
+                    .padding(Sides {
+                        left: tokens::SPACE_2,
+                        right: tokens::SPACE_2 + tokens::SCROLLBAR_THUMB_WIDTH,
+                        top: tokens::SPACE_2,
+                        bottom: tokens::SPACE_2,
+                    })
+                    .width(Size::Fill(1.0))
+                    .height(Size::Hug);
+                scroll([content])
+                    .key(scroll_key)
                     .width(Size::Fill(1.0))
                     .height(Size::Fill(1.0))
             }

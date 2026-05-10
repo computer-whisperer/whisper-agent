@@ -1334,11 +1334,34 @@ trivial / small / medium / large.
   before `ResolveSudo` ships so the banner doesn't flicker through
   the wire round-trip. `SudoResolved` echo cleans up server-side
   resolutions from any client.
-- ⏳ **Thread inspector.** Egui's `ThreadInspector` struct surfaces
-  per-thread metadata the chip can't fit (allowlist breakdown,
-  resolved bindings, host envs in use). A popover on the thread
-  header would be the natural home. *Small to surface; depends
-  on which fields make the cut.*
+- ✅ **Thread inspector.** Inline detail panel above the chat log,
+  toggled by an `info` icon-button on the thread toolbar (next to
+  the state badge). Aetna doesn't yet have an anchored-popover
+  primitive, so v1 ships the surface as an inline collapsible:
+  click toggles `inspector_open: Option<String>` on `ChatApp`
+  (single-slot since only the selected thread renders); the
+  renderer paints a key/value grid between the header chrome and
+  the prefill / chat body. Fields: `thread_id`, `pod_id`,
+  `created_at`, `last_active`, `backend`, `model`, `max_tokens`,
+  `max_turns`, `host_env` (joined names + `cwd:` suffix for
+  `HostEnvBinding::Named`), `mcp_hosts`, cumulative usage
+  (`total_in` / `total_out`, plus cache r/w when nonzero), and
+  `origin behavior` when the thread was spawned by a behavior.
+  Hydration is one-shot on `ThreadSnapshot`. Scope rendering,
+  the OAuth-aware MCP host detail, and the trigger payload
+  pretty-print are deferred — they add substantial surface that
+  the v1 inspector doesn't need.
+
+  Bundle scene: `ThreadInspectorOpen`.
+
+  As a side-effect, the chat-scroll body's horizontal padding
+  moved from the scroll widget itself onto an inner content
+  column with extra right padding (= `tokens::SCROLLBAR_THUMB_WIDTH`),
+  so the thumb sits in a reserved gutter when the inspector
+  shrinks available height and the body overflows. Lint had
+  been flagging this as `ScrollbarObscuresFocusable` once the
+  inspector landed; the new wrapper closes the warning across
+  all chat-pane scenes.
 
 ### Misc
 
