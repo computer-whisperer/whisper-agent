@@ -2700,9 +2700,45 @@ impl App for ChatApp {
             return;
         }
 
-        // Send button.
+        // Send button. While the selected thread is Working the
+        // primary button is rendered as "Stop" — same key, but the
+        // click cancels the thread instead of sending the (empty)
+        // compose buffer.
         if event.is_click_or_activate(SEND_KEY) {
+            if let Some(thread_id) = self.selected.clone()
+                && self.is_selected_working()
+            {
+                self.send(ClientToServer::CancelThread { thread_id });
+                return;
+            }
             self.send_compose();
+            return;
+        }
+
+        // Thread-level action buttons. Each fires its matching wire
+        // command for the currently-selected thread; the server's
+        // broadcast updates `threads` and the next build reflects
+        // the new state. No optimistic mutation — the UI never
+        // diverges from server-confirmed state.
+        if event.is_click_or_activate(THREAD_CANCEL_KEY)
+            && let Some(thread_id) = self.selected.clone()
+        {
+            self.send(ClientToServer::CancelThread { thread_id });
+            return;
+        }
+        if event.is_click_or_activate(THREAD_ARCHIVE_KEY)
+            && let Some(thread_id) = self.selected.clone()
+        {
+            self.send(ClientToServer::ArchiveThread { thread_id });
+            return;
+        }
+        if event.is_click_or_activate(THREAD_COMPACT_KEY)
+            && let Some(thread_id) = self.selected.clone()
+        {
+            self.send(ClientToServer::CompactThread {
+                thread_id,
+                correlation_id: None,
+            });
             return;
         }
 
@@ -2758,6 +2794,16 @@ impl App for ChatApp {
 }
 
 const COMPOSE_KEY: &str = "compose";
+/// Thread-level action affordances rendered in a row above the
+/// compose text_area when a thread is selected. Each fires the
+/// matching `ClientToServer` variant for the active thread; their
+/// visibility / enabled state depends on the thread's state
+/// (Cancel hides while Working — the Send button toggles to Stop
+/// and covers cancellation; Compact disables while Working since
+/// the server rejects mid-turn).
+const THREAD_CANCEL_KEY: &str = "thread-action:cancel";
+const THREAD_ARCHIVE_KEY: &str = "thread-action:archive";
+const THREAD_COMPACT_KEY: &str = "thread-action:compact";
 /// Compose attach affordance — paperclip icon-button next to the
 /// send button. Click spawns the OS file picker; drag-drop on the
 /// window stages files independently of this key.
@@ -8538,15 +8584,23 @@ impl ChatApp {
 
     fn compose_box(&self) -> El {
         // Allow attachments-only sends: the gate matches send_compose's
-        // mirror (text-or-attachments).
+        // mirror (text-or-attachments). While the selected thread is
+        // Working, the primary button toggles to "Stop" (always
+        // enabled) and clicks cancel the thread instead.
         let buf = self.active_compose_text();
+        let working = self.is_selected_working();
         let can_send = !buf.trim().is_empty() || !self.compose_attachments.is_empty();
-        let mut send = button("Send").key(SEND_KEY).primary();
-        if !can_send {
-            // Aetna's button widget honors `.disabled()` to gray out
-            // the surface and skip routing.
-            send = send.disabled();
-        }
+        let send = if working {
+            // Cancel-shaped affordance — destructive styling so the
+            // user reads it as a stop, not a send.
+            button("Stop").key(SEND_KEY).destructive()
+        } else {
+            let mut b = button("Send").key(SEND_KEY).primary();
+            if !can_send {
+                b = b.disabled();
+            }
+            b
+        };
         let attach = icon_button(crate::icons::ICON_PAPERCLIP.clone())
             .key(COMPOSE_ATTACH_KEY)
             .ghost();
@@ -8556,10 +8610,12 @@ impl ChatApp {
         // takes the leftover width, attach + send hug to the right.
         // `card([...])` would over-style this — it's part of the
         // same content surface — so we use a thin top stroke as the
-        // visual divider from the chat log. Thumbnail strip + hint
-        // sit above the row when staged (otherwise they collapse to
-        // zero height).
+        // visual divider from the chat log. Thread-action row +
+        // thumbnail strip + hint sit above when relevant.
         let mut children: Vec<El> = Vec::new();
+        if let Some(actions) = self.thread_actions_row() {
+            children.push(actions);
+        }
         if let Some(strip) = self.render_compose_attachments() {
             children.push(strip);
         }
@@ -8578,6 +8634,46 @@ impl ChatApp {
             .width(Size::Fill(1.0))
             .stroke(tokens::BORDER)
             .fill(tokens::BACKGROUND)
+    }
+
+    /// Whether the currently-selected thread is in `Working` state.
+    /// `false` for the no-selection (compose-new) path. Used by the
+    /// compose box to toggle Send → Stop and by the Compact button
+    /// to gate enabled state.
+    fn is_selected_working(&self) -> bool {
+        self.selected
+            .as_deref()
+            .and_then(|tid| self.threads.get(tid))
+            .map(|s| s.state == whisper_agent_protocol::ThreadStateLabel::Working)
+            .unwrap_or(false)
+    }
+
+    /// Thread-level action row above the compose text_area:
+    /// Cancel / Archive / Compact. `None` when no thread is
+    /// selected (compose-new mode has no thread to act on).
+    /// Cancel hides while Working — the primary Send/Stop button
+    /// already covers cancellation. Compact disables while
+    /// Working since the server rejects mid-turn compaction.
+    fn thread_actions_row(&self) -> Option<El> {
+        let _tid = self.selected.as_ref()?;
+        let working = self.is_selected_working();
+        let mut buttons: Vec<El> = Vec::new();
+        if !working {
+            buttons.push(button("Cancel").key(THREAD_CANCEL_KEY).ghost());
+        }
+        buttons.push(button("Archive").key(THREAD_ARCHIVE_KEY).ghost());
+        let mut compact = button("Compact").key(THREAD_COMPACT_KEY).ghost();
+        if working {
+            compact = compact.disabled();
+        }
+        buttons.push(compact);
+        Some(
+            row(buttons)
+                .gap(tokens::SPACE_2)
+                .align(Align::Center)
+                .justify(Justify::End)
+                .width(Size::Fill(1.0)),
+        )
     }
 
     /// Thumbnail strip above the compose row. Each staged image
