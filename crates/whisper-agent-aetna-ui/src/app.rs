@@ -35,7 +35,7 @@
 //!
 //! Surfaces still to land (full inventory in
 //! `docs/design_aetna_ui.md` § "Migration gaps from egui webui"):
-//! server settings modal, knowledge-buckets modal, JSON tree viewer,
+//! server settings modal, knowledge-buckets modal,
 //! file browser/editor, thread inspector popover.
 //!
 //! Dispatch model: a single `dispatch_wire` walks `ServerToClient`
@@ -484,6 +484,38 @@ struct LightboxState {
     height: u32,
 }
 
+/// Read-only JSON tree viewer state. Opened over a pod file path
+/// (typically a thread JSON or server-emitted state blob). Lifecycle:
+/// `open_json_viewer` mints a correlation + fires `ReadPodFile`, the
+/// `PodFileContent` arm populates `parsed` on success or `error` on
+/// parse failure. Mirrors the egui sibling's `JsonViewerModalState`.
+struct JsonViewerModalState {
+    pod_id: String,
+    path: String,
+    /// Parsed payload. `None` while the read is in flight OR when the
+    /// file failed to parse as JSON — `error` disambiguates.
+    parsed: Option<serde_json::Value>,
+    /// Parse error or read failure surfaced to the user. Mutually
+    /// exclusive with `parsed` in practice — a successful read clears
+    /// any prior error.
+    error: Option<String>,
+    /// Outstanding `ReadPodFile` correlation. `None` once the matching
+    /// `PodFileContent` lands (whether the JSON parsed or not).
+    pending_correlation: Option<String>,
+}
+
+impl JsonViewerModalState {
+    fn new(pod_id: String, path: String) -> Self {
+        Self {
+            pod_id,
+            path,
+            parsed: None,
+            error: None,
+            pending_correlation: None,
+        }
+    }
+}
+
 /// One pending `sudo(...)` approval the model is awaiting a decision
 /// on. The banner above the chat log surfaces these; the user picks
 /// Approve / Remember / Reject and we send `ResolveSudo`. Mirrors
@@ -613,6 +645,21 @@ pub struct ChatApp {
     /// `aetna_core::Image` is shared with the inline row so we don't
     /// re-decode the bytes when the modal opens.
     lightbox: Option<LightboxState>,
+
+    // ----- modal: JSON viewer -----
+    /// Read-only JSON tree viewer over a pod file. `Some` while the
+    /// modal is open. Lifecycle: opened by `open_json_viewer`, which
+    /// stamps `pending_correlation` and fires `ReadPodFile`; the
+    /// matching `PodFileContent` arm populates `parsed` (on parse
+    /// success) or `error` (on parse failure). Mirrors the egui
+    /// sibling's `json_viewer_modal`.
+    json_viewer_modal: Option<JsonViewerModalState>,
+    /// Per-node collapsed/expanded membership for the JSON tree.
+    /// Routed accordion keys (`json-tree:accordion:<path>`) toggle in
+    /// and out of this set, just like the chat-log `open_accordions`
+    /// pattern. Cleared when the modal closes so a re-open starts
+    /// with the egui sibling's defaults (root-open, deeper-closed).
+    json_tree_open: HashSet<String>,
 
     // ----- in-flight sudo approvals -----
     /// Server-emitted `SudoRequested` events the user hasn't resolved
@@ -1670,6 +1717,8 @@ impl ChatApp {
             sidebar_width: tokens::SIDEBAR_WIDTH,
             sidebar_drag: ResizeDrag::default(),
             lightbox: None,
+            json_viewer_modal: None,
+            json_tree_open: HashSet::new(),
             pending_sudos: HashMap::new(),
             sudo_reject_drafts: HashMap::new(),
             conn_status: ConnectionStatus::Connecting,
@@ -2114,6 +2163,31 @@ impl ChatApp {
                 backend, models, ..
             } => {
                 self.models_by_backend.insert(backend, models);
+            }
+            ServerToClient::PodFileContent {
+                pod_id,
+                path,
+                content,
+                correlation_id,
+                ..
+            } => {
+                if let Some(modal) = self.json_viewer_modal.as_mut()
+                    && modal.pod_id == pod_id
+                    && modal.path == path
+                    && modal.pending_correlation == correlation_id
+                {
+                    modal.pending_correlation = None;
+                    match serde_json::from_str::<serde_json::Value>(&content) {
+                        Ok(value) => {
+                            modal.parsed = Some(value);
+                            modal.error = None;
+                        }
+                        Err(e) => {
+                            modal.parsed = None;
+                            modal.error = Some(format!("parse JSON: {e}"));
+                        }
+                    }
+                }
             }
             ServerToClient::ThreadArchived { thread_id } => {
                 self.threads.remove(&thread_id);
@@ -2715,6 +2789,18 @@ impl App for ChatApp {
             self.lightbox = None;
             return;
         }
+        // JSON viewer dismiss / close — same shape as the lightbox.
+        // Clearing the slot is the close; the per-node accordion
+        // open set is dropped alongside so a re-open lands with the
+        // egui sibling's default-collapsed shape rather than the
+        // user's previous expansion.
+        if event.is_click_or_activate(JSON_VIEWER_DISMISS_KEY)
+            || event.is_click_or_activate(JSON_VIEWER_CLOSE_KEY)
+        {
+            self.json_viewer_modal = None;
+            self.json_tree_open.clear();
+            return;
+        }
 
         // Sudo banner: approve / remember / reject buttons + reject-
         // reason text input. All four routes carry the function_id as
@@ -3105,16 +3191,24 @@ impl App for ChatApp {
             return;
         }
 
-        // Accordion toggles (reasoning + tool rows). The accordion
-        // runtime emits routed keys shaped `{group}:accordion:{value}`;
-        // we just toggle membership of the routed key in our open set
-        // — independent toggles per row, no single-active enforcement.
+        // Accordion toggles (reasoning + tool rows + JSON tree
+        // nodes). The accordion runtime emits routed keys shaped
+        // `{group}:accordion:{value}`; we just toggle membership of
+        // the routed key in our open set — independent toggles per
+        // row, no single-active enforcement. The JSON viewer's tree
+        // routes into its own set so closing the modal can drop
+        // the per-node state without disturbing chat-log accordions.
         if matches!(event.kind, UiEventKind::Click | UiEventKind::Activate)
             && let Some(key) = event.route()
             && key.contains(":accordion:")
         {
-            if !self.open_accordions.remove(key) {
-                self.open_accordions.insert(key.to_string());
+            let set = if key.starts_with(JSON_TREE_ACCORDION_GROUP) {
+                &mut self.json_tree_open
+            } else {
+                &mut self.open_accordions
+            };
+            if !set.remove(key) {
+                set.insert(key.to_string());
             }
             return;
         }
@@ -3267,6 +3361,14 @@ fn chat_image_lightbox_key(idx: usize) -> String {
 /// explicit close button uses `lightbox:close`.
 const LIGHTBOX_MODAL_DISMISS_KEY: &str = "lightbox:dismiss";
 const LIGHTBOX_MODAL_CLOSE_KEY: &str = "lightbox:close";
+
+/// Routed-key shapes for the JSON tree viewer modal. The accordion
+/// group key is shared across every collapsible node — the per-node
+/// `value` carries the JSON pointer-shaped path so routes don't
+/// collide between siblings (`json-tree:accordion:$/foo/0`).
+const JSON_VIEWER_DISMISS_KEY: &str = "json-viewer:dismiss";
+const JSON_VIEWER_CLOSE_KEY: &str = "json-viewer:close";
+const JSON_TREE_ACCORDION_GROUP: &str = "json-tree";
 
 /// Routed key for the sidebar resize handle. Drag / arrow / Home /
 /// End events on this key fold through `resize_handle::apply_event_fixed`
@@ -5215,6 +5317,9 @@ impl ChatApp {
             }
         }
         if let Some(modal_el) = self.render_fork_modal() {
+            out.push(Some(modal_el));
+        }
+        if let Some(modal_el) = self.render_json_viewer_modal() {
             out.push(Some(modal_el));
         }
         // Lightbox last so it paints on top of any other layer —
@@ -9222,6 +9327,183 @@ impl ChatApp {
         ]))
     }
 
+    /// Open the read-only JSON tree viewer on `<pod_id>/<path>`. Mints
+    /// a correlation, stamps the slot, and fires `ReadPodFile`; the
+    /// matching `PodFileContent` arm hydrates `parsed` (or `error`).
+    /// Mirrors the egui sibling's `open_json_viewer`. Public so the
+    /// future file-tree slice can route `.json` clicks here without
+    /// reaching across the modal-state boundary.
+    pub fn open_json_viewer(&mut self, pod_id: String, path: String) {
+        let correlation = self.next_correlation_id();
+        let mut state = JsonViewerModalState::new(pod_id.clone(), path.clone());
+        state.pending_correlation = Some(correlation.clone());
+        self.json_tree_open.clear();
+        self.json_viewer_modal = Some(state);
+        self.send(ClientToServer::ReadPodFile {
+            correlation_id: Some(correlation),
+            pod_id,
+            path,
+        });
+    }
+
+    /// Read-only JSON tree viewer. Reaches for `dialog_content`
+    /// directly (same reasoning as the lightbox — the default
+    /// `dialog` width-locks to 420 px, too narrow for a JSON column).
+    /// The body is a scrollable column of recursive nodes; the
+    /// footer is a single Close button. Pending reads render
+    /// "loading…"; parse failures render a destructive paragraph.
+    fn render_json_viewer_modal(&self) -> Option<El> {
+        let modal = self.json_viewer_modal.as_ref()?;
+        const JSON_VIEWER_W: f32 = 720.0;
+        const JSON_VIEWER_H: f32 = 560.0;
+
+        let title = format!("{} — {}", modal.path, modal.pod_id);
+
+        let body: El = if let Some(value) = modal.parsed.as_ref() {
+            let mut rows: Vec<El> = Vec::new();
+            self.render_json_node(&mut rows, "$", "(root)", value, 0);
+            scroll(rows)
+                .gap(tokens::SPACE_1)
+                .width(Size::Fill(1.0))
+                .height(Size::Fill(1.0))
+        } else if let Some(err) = modal.error.as_deref() {
+            paragraph(err)
+                .color(tokens::DESTRUCTIVE)
+                .width(Size::Fill(1.0))
+        } else {
+            paragraph("loading\u{2026}").muted().width(Size::Fill(1.0))
+        };
+
+        let close = button("Close").key(JSON_VIEWER_CLOSE_KEY);
+
+        let children: Vec<El> = vec![
+            dialog_header([
+                dialog_title(title),
+                dialog_description("Read-only JSON viewer"),
+            ]),
+            body,
+            dialog_footer([close]),
+        ];
+
+        Some(overlay([
+            scrim(JSON_VIEWER_DISMISS_KEY),
+            dialog_content(children)
+                .width(Size::Fixed(JSON_VIEWER_W))
+                .height(Size::Fixed(JSON_VIEWER_H))
+                .block_pointer(),
+        ]))
+    }
+
+    /// Recursive emitter for one JSON node into `rows`. Mirrors the
+    /// egui sibling's `render_json_node`: scalars become one-line
+    /// monospace labels; objects and arrays become collapsible rows
+    /// whose body indents children by `depth + 1`. Long strings render
+    /// as `"…"`-suffixed previews so wide payloads don't blow up the
+    /// row height. (The egui sibling exposes the full text on hover —
+    /// a follow-up once aetna grows a row-level tooltip primitive.)
+    ///
+    /// `path` is a JSON-pointer-style string used as the accordion
+    /// value so sibling collapsibles don't share state (per-node
+    /// membership in `json_tree_open` is keyed on the routed form,
+    /// `json-tree:accordion:<path>`).
+    fn render_json_node(
+        &self,
+        rows: &mut Vec<El>,
+        path: &str,
+        label: &str,
+        value: &serde_json::Value,
+        depth: usize,
+    ) {
+        const STRING_PREVIEW_BYTES: usize = 80;
+        let indent = tokens::SPACE_3 * depth as f32;
+        match value {
+            serde_json::Value::Null => {
+                rows.push(
+                    text(format!("{label}: null"))
+                        .code()
+                        .small()
+                        .muted()
+                        .padding(Sides {
+                            left: indent,
+                            ..Sides::default()
+                        }),
+                );
+            }
+            serde_json::Value::Bool(b) => {
+                rows.push(text(format!("{label}: {b}")).code().small().padding(Sides {
+                    left: indent,
+                    ..Sides::default()
+                }));
+            }
+            serde_json::Value::Number(n) => {
+                rows.push(text(format!("{label}: {n}")).code().small().padding(Sides {
+                    left: indent,
+                    ..Sides::default()
+                }));
+            }
+            serde_json::Value::String(s) => {
+                let full = format!("{s:?}");
+                let preview = if full.len() > STRING_PREVIEW_BYTES {
+                    let mut cut = STRING_PREVIEW_BYTES;
+                    while !full.is_char_boundary(cut) && cut > 0 {
+                        cut -= 1;
+                    }
+                    format!("{}\u{2026}", &full[..cut])
+                } else {
+                    full
+                };
+                rows.push(
+                    text(format!("{label}: {preview}"))
+                        .code()
+                        .small()
+                        .padding(Sides {
+                            left: indent,
+                            ..Sides::default()
+                        }),
+                );
+            }
+            serde_json::Value::Array(arr) => {
+                let header = format!(
+                    "{label}: [{} item{}]",
+                    arr.len(),
+                    if arr.len() == 1 { "" } else { "s" }
+                );
+                let routed = accordion_item_key(JSON_TREE_ACCORDION_GROUP, &path);
+                let open = depth == 0 || self.json_tree_open.contains(&routed);
+                rows.push(json_node_trigger(path, &header, open).padding(Sides {
+                    left: indent,
+                    ..Sides::default()
+                }));
+                if open {
+                    for (i, item) in arr.iter().enumerate() {
+                        let child_path = format!("{path}/{i}");
+                        let child_label = format!("[{i}]");
+                        self.render_json_node(rows, &child_path, &child_label, item, depth + 1);
+                    }
+                }
+            }
+            serde_json::Value::Object(obj) => {
+                let header = format!(
+                    "{label}: {{ {} key{} }}",
+                    obj.len(),
+                    if obj.len() == 1 { "" } else { "s" }
+                );
+                let routed = accordion_item_key(JSON_TREE_ACCORDION_GROUP, &path);
+                let open = depth == 0 || self.json_tree_open.contains(&routed);
+                rows.push(json_node_trigger(path, &header, open).padding(Sides {
+                    left: indent,
+                    ..Sides::default()
+                }));
+                if open {
+                    for (k, v) in obj.iter() {
+                        let child_path = format!("{path}/{k}");
+                        self.render_json_node(rows, &child_path, k, v, depth + 1);
+                    }
+                }
+            }
+        }
+    }
+
     fn render_fork_modal(&self) -> Option<El> {
         let modal = self.fork_modal.as_ref()?;
 
@@ -10108,6 +10390,33 @@ fn display_dims(src_w: u32, src_h: u32, max_h: f32) -> (f32, f32) {
     }
     let scale = max_h / src_h;
     (src_w * scale, max_h)
+}
+
+/// Collapsible row for the JSON tree viewer — tighter than
+/// `accordion_trigger` (which bakes a 40 px height + card chrome
+/// suited to a list of full-width items). A deeply-nested tree
+/// needs single-line rows: a chevron, a monospace header label, and
+/// no fill. The row carries the accordion-routed key so the existing
+/// `:accordion:` event handler picks it up.
+#[track_caller]
+fn json_node_trigger(path: &str, header: &str, open: bool) -> El {
+    let chevron = if open {
+        "chevron-down"
+    } else {
+        "chevron-right"
+    };
+    row([
+        icon(chevron)
+            .icon_size(tokens::ICON_XS)
+            .color(tokens::MUTED_FOREGROUND),
+        text(header.to_string()).code().small().semibold(),
+    ])
+    .key(accordion_item_key(JSON_TREE_ACCORDION_GROUP, &path))
+    .cursor(Cursor::Pointer)
+    .gap(tokens::SPACE_1)
+    .align(Align::Center)
+    .width(Size::Fill(1.0))
+    .focusable()
 }
 
 /// Same as [`display_dims`] but with a separate width cap. The

@@ -307,10 +307,17 @@ enum Scene {
     /// snapshot the warning-styled `alert` shape and the three
     /// approve / remember / reject affordances above the chat log.
     SudoPending,
+    /// Read-only JSON tree viewer modal opened over a mock pod file.
+    /// Seeded by calling `ChatApp::open_json_viewer` before the first
+    /// drain; the per-scene SendFn synthesizes a `PodFileContent`
+    /// reply carrying a mixed-shape payload (scalars + arrays +
+    /// nested object) so the recursive renderer + collapsible
+    /// trigger rows + child indents all paint in one scene.
+    JsonViewerOpen,
 }
 
 impl Scene {
-    const ALL: [Scene; 43] = [
+    const ALL: [Scene; 44] = [
         Scene::Connecting,
         Scene::Connected,
         Scene::Closed,
@@ -354,6 +361,7 @@ impl Scene {
         Scene::ForkModalOpen,
         Scene::LightboxOpen,
         Scene::SudoPending,
+        Scene::JsonViewerOpen,
     ];
 
     fn slug(self) -> &'static str {
@@ -401,6 +409,7 @@ impl Scene {
             Scene::ForkModalOpen => "fork_modal_open",
             Scene::LightboxOpen => "lightbox_open",
             Scene::SudoPending => "sudo_pending",
+            Scene::JsonViewerOpen => "json_viewer_open",
         }
     }
 
@@ -634,9 +643,54 @@ fn build_app(scene: Scene) -> Box<dyn App> {
                 }
             })
         }
+        Scene::JsonViewerOpen => {
+            // Synthesize a `PodFileContent` reply for the
+            // `ReadPodFile` that `open_json_viewer` fires below.
+            // The content is mixed-shape mock JSON (scalars,
+            // nested object, array of objects) so every arm of
+            // `render_json_node` paints in this one scene.
+            let queue = inbound.clone();
+            Box::new(move |msg| {
+                if let ClientToServer::ReadPodFile {
+                    correlation_id,
+                    pod_id,
+                    path,
+                } = msg
+                    && pod_id == "default"
+                    && path == "threads/t-mock.json"
+                {
+                    let content = serde_json::json!({
+                        "thread_id": "t-mock",
+                        "title": "Investigate failing test",
+                        "state": "Idle",
+                        "messages": [
+                            { "role": "user", "text": "Why does test_foo fail?" },
+                            { "role": "assistant", "text": "Looking…" },
+                        ],
+                        "bindings": {
+                            "backend": "anthropic-prod",
+                            "model": "claude-opus-4-7",
+                        },
+                        "archived": false,
+                        "draft": null,
+                    });
+                    let content_str =
+                        serde_json::to_string_pretty(&content).expect("serialize mock JSON");
+                    queue.borrow_mut().push_back(InboundEvent::Wire(
+                        ServerToClient::PodFileContent {
+                            correlation_id,
+                            pod_id,
+                            path,
+                            content: content_str,
+                            readonly: true,
+                        },
+                    ));
+                }
+            })
+        }
         _ => Box::new(|_msg| {}),
     };
-    let app = ChatApp::new(inbound.clone(), send_fn);
+    let mut app = ChatApp::new(inbound.clone(), send_fn);
 
     let mut q = inbound.borrow_mut();
     match scene {
@@ -1006,6 +1060,26 @@ fn build_app(scene: Scene) -> Box<dyn App> {
                 behaviors: Vec::new(),
             }));
         }
+        Scene::JsonViewerOpen => {
+            // Populated baseline so the dialog overlays a non-empty
+            // sidebar / pane (same idea as the modal scenes above).
+            // The viewer itself is opened after the queue borrow
+            // ends — `open_json_viewer` fires `ReadPodFile`, which
+            // routes through the per-scene SendFn that synthesizes
+            // the matching `PodFileContent` reply onto this same
+            // queue. The outer drain in `main` then hydrates
+            // `modal.parsed` before the build pass.
+            q.push_back(InboundEvent::ConnectionOpened);
+            q.push_back(InboundEvent::Wire(ServerToClient::PodList {
+                correlation_id: None,
+                pods: mock_pods(),
+                default_pod_id: "default".into(),
+            }));
+            q.push_back(InboundEvent::Wire(ServerToClient::ThreadList {
+                correlation_id: None,
+                tasks: mock_threads(),
+            }));
+        }
         // Login scenes route through `build_login_app` above and
         // never reach here.
         Scene::LoginFormEmpty | Scene::LoginFormPrefilled | Scene::LoginFormWithError => {
@@ -1013,6 +1087,9 @@ fn build_app(scene: Scene) -> Box<dyn App> {
         }
     }
     drop(q);
+    if matches!(scene, Scene::JsonViewerOpen) {
+        app.open_json_viewer("default".into(), "threads/t-mock.json".into());
+    }
     Box::new(app)
 }
 

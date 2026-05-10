@@ -1234,9 +1234,21 @@ trivial / small / medium / large.
   slot and `render_lightbox_modal` paints a fullscreen `dialog` with
   the image at constrained max dims, a dimensions caption, and a
   Close button. Scrim auto-dismisses on outside-click.
-- ⏳ **JSON tree viewer.** Read-only collapsible-tree display for
-  tool-result and server-config JSON payloads. Egui's
-  `render_json_viewer_modal` (modals/viewers.rs:175). *Small.*
+- ✅ **JSON tree viewer.** `open_json_viewer(pod_id, path)` mints a
+  correlation and fires `ReadPodFile`; the `PodFileContent` arm
+  parses content into `serde_json::Value` and hydrates the modal
+  (or surfaces a `parse JSON: …` error). Renderer is
+  `render_json_viewer_modal` — `dialog_content` (720 × 560) with a
+  scrollable body of recursive `render_json_node` rows. Scalars
+  render as monospace one-liners; objects / arrays render via
+  `json_node_trigger` (a tight chevron + monospace header — the
+  built-in `accordion_trigger` was too heavy for a deep tree).
+  Per-node collapse state lives in `json_tree_open` (separate from
+  chat `open_accordions` so modal-close can drop it independently).
+  Strings preview at 80 bytes with a `…` suffix — full text on
+  hover is deferred until aetna grows a row-level tooltip
+  primitive. Entry point is public so the future file-tree slice
+  can route `.json` clicks straight here.
 - ⏳ **File browser / editor.** Tree of pod files; click-to-edit in a
   `text_area` with save. Egui's `render_file_viewer_modal`
   (modals/viewers.rs:260). *Medium — tree navigation + dirty-tracking.*
