@@ -1026,6 +1026,47 @@ every row renders in the inherit-only state — useful for the
 structured layout, even though the override-on multi-checks
 and cap pickers don't show.
 
+**Pod editor — Defaults tool_surface (landed):** the Defaults
+tab placeholder paragraph for `thread_defaults.tool_surface`
+got replaced with the structured editor that mirrors the egui
+sibling's `render_tool_surface_editor`: three sections under a
+single form_item, each headed by a small label.
+- **`Wire tools: core set`** — a 2-option `radio_group`
+  (`all` vs `named`); when `named` is selected, a multi-line
+  monospace `text_area` (96 px, one tool per line) takes over.
+  The named buffer lives on `PodEditorSheetState` so mid-edit
+  states like a trailing newline survive between keystrokes.
+- **`System-prompt listing`** — a 3-option `radio_group`
+  (`none` / `all_names` / `core_only`).
+- **`Mid-conversation activation`** — a 2-option `radio_group`
+  (`announce` / `inject_schema`).
+
+The radio routes use `aetna_core::widgets::radio::apply_event`
+with the tab's matching `_from_wire` parser (e.g.
+`initial_listing_from_wire`); the textarea routes through
+`text_area::apply_event` and parses-and-writes-back to
+`CoreTools::Named(parse_core_tools_named(buf))` on every
+keystroke. New helpers: `default_core_tools_text` (seed for
+the `All → Named` toggle), `parse_core_tools_named`, and the
+three `_label` / `_from_wire` pairs for `InitialListing` and
+`ActivationSurface`.
+
+The named buffer hydrates from
+`sync_buffers_from_config`: `CoreTools::Named` joins the list
+back to a newline-separated string; `CoreTools::All` falls
+back to `default_core_tools_text()` so toggling `All → Named`
+lands the conventional default text without a separate
+keystroke. The matching textarea-driven write-back also
+parses on every edit, so a stray empty line trims out before
+landing in `CoreTools::Named`.
+
+The existing `pod_editor_defaults_tab` bundle scene picks up
+the new editor without changes — `mock_default_pod_snapshot`
+ships `tool_surface: Default::default()` (which is
+`CoreTools::Named` of the conventional three names), so the
+scene shows the named buffer populated and the radio at
+`named`.
+
 ### ✅ Stage 9 — Login form
 
 `whisper_agent_aetna_ui::LoginApp` is a separate aetna [`App`] —

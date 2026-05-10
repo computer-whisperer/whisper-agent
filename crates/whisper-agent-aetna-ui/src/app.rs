@@ -41,10 +41,11 @@ use crate::cron_preview;
 use aetna_core::prelude::*;
 use aetna_core::widgets::select::{SelectAction, classify_event as classify_select_event};
 use whisper_agent_protocol::{
-    AllowMap, BackendSummary, BehaviorConfig, BehaviorSummary, BehaviorThreadOverride, CatchUp,
-    ClientToServer, ContentBlock, Disposition, ImageSource, ModelSummary, NamedHostEnv, Overlap,
-    PodAllow, PodConfig, PodLimits, PodSummary, RetentionPolicy, Role, ServerToClient,
-    SystemPromptChoice, ThreadConfigOverride, ThreadDefaults, ThreadSummary, TriggerSpec,
+    ActivationSurface, AllowMap, BackendSummary, BehaviorConfig, BehaviorSummary,
+    BehaviorThreadOverride, CatchUp, ClientToServer, ContentBlock, CoreTools, Disposition,
+    ImageSource, InitialListing, ModelSummary, NamedHostEnv, Overlap, PodAllow, PodConfig,
+    PodLimits, PodSummary, RetentionPolicy, Role, ServerToClient, SystemPromptChoice,
+    ThreadConfigOverride, ThreadDefaults, ThreadSummary, TriggerSpec,
 };
 
 /// Inbound event variants the host shell pushes into the [`Inbound`]
@@ -1106,6 +1107,15 @@ pub(crate) struct PodEditorSheetState {
     /// Same shape as [`Self::max_tokens_buf`], for
     /// `limits.max_concurrent_threads`.
     pub(crate) max_concurrent_threads_buf: String,
+    /// Visible string for the Defaults-tab tool-surface
+    /// `core_tools` named-list `text_area`. Holds the multiline
+    /// edit buffer (one tool name per line) while the user types;
+    /// every keystroke parses + writes back to
+    /// `working_config.thread_defaults.tool_surface.core_tools` as
+    /// `CoreTools::Named(parsed)`. Only meaningful when
+    /// `core_tools` is `Named`; toggling to `All` leaves the buffer
+    /// alone so a user's draft survives the round-trip.
+    pub(crate) tool_surface_named_buf: String,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1204,6 +1214,7 @@ impl PodEditorSheetState {
             max_tokens_buf: String::new(),
             max_turns_buf: String::new(),
             max_concurrent_threads_buf: String::new(),
+            tool_surface_named_buf: String::new(),
         }
     }
 
@@ -1228,6 +1239,15 @@ impl PodEditorSheetState {
             self.max_tokens_buf = cfg.thread_defaults.max_tokens.to_string();
             self.max_turns_buf = cfg.thread_defaults.max_turns.to_string();
             self.max_concurrent_threads_buf = cfg.limits.max_concurrent_threads.to_string();
+            // Seed the tool_surface named buffer from the parsed
+            // CoreTools. `All` leaves the buffer at the conventional
+            // default (describe_tool / find_tool / request_escalation)
+            // so the textarea isn't blank when the user toggles
+            // `All` → `Named`.
+            self.tool_surface_named_buf = match &cfg.thread_defaults.tool_surface.core_tools {
+                CoreTools::All => default_core_tools_text(),
+                CoreTools::Named(list) => list.join("\n"),
+            };
         }
     }
 
@@ -2619,6 +2639,18 @@ const POD_EDITOR_DEFAULTS_MAX_TOKENS_KEY: &str = "pod-editor:defaults:max-tokens
 const POD_EDITOR_DEFAULTS_MAX_TURNS_KEY: &str = "pod-editor:defaults:max-turns";
 const POD_EDITOR_DEFAULTS_TOOL_GATE_KEY: &str = "pod-editor:defaults:tool-gate";
 const POD_EDITOR_DEFAULTS_HOST_ENV_KEY: &str = "pod-editor:defaults:host-env";
+/// Defaults-tab tool-surface routed keys. The structured editor for
+/// `thread_defaults.tool_surface` rides directly under the Defaults
+/// form (the field is always present on `ToolSurface`, not Option-
+/// shaped — there's no override checkbox here).
+const POD_EDITOR_DEFAULTS_TOOL_SURFACE_CORE_TOOLS_KEY: &str =
+    "pod-editor:defaults:tool-surface:core-tools";
+const POD_EDITOR_DEFAULTS_TOOL_SURFACE_CORE_TOOLS_NAMED_KEY: &str =
+    "pod-editor:defaults:tool-surface:core-tools:named";
+const POD_EDITOR_DEFAULTS_TOOL_SURFACE_INITIAL_LISTING_KEY: &str =
+    "pod-editor:defaults:tool-surface:initial-listing";
+const POD_EDITOR_DEFAULTS_TOOL_SURFACE_ACTIVATION_SURFACE_KEY: &str =
+    "pod-editor:defaults:tool-surface:activation-surface";
 const POD_EDITOR_DEFAULTS_CAPS_POD_MODIFY_KEY: &str = "pod-editor:defaults:caps:pod-modify";
 const POD_EDITOR_DEFAULTS_CAPS_DISPATCH_KEY: &str = "pod-editor:defaults:caps:dispatch";
 const POD_EDITOR_DEFAULTS_CAPS_BEHAVIORS_KEY: &str = "pod-editor:defaults:caps:behaviors";
@@ -2913,6 +2945,57 @@ fn disposition_from_wire(s: &str) -> Option<Disposition> {
     match s {
         "allow" => Some(Disposition::Allow),
         "deny" => Some(Disposition::Deny),
+        _ => None,
+    }
+}
+
+/// Default seed text for the tool-surface `core_tools` named buffer
+/// when toggling `All` → `Named`. Mirrors the egui sibling's
+/// `default_core_tools_text`. The actual `CoreTools::Named(default)`
+/// at protocol level is the same three names.
+fn default_core_tools_text() -> String {
+    "describe_tool\nfind_tool\nrequest_escalation".to_string()
+}
+
+/// Parse the multi-line named-tools buffer back into a sorted-by-
+/// user-order `Vec<String>`. Empty lines / whitespace-only lines
+/// drop. Mirrors the egui sibling's parse loop.
+fn parse_core_tools_named(buf: &str) -> Vec<String> {
+    buf.lines()
+        .map(|l| l.trim())
+        .filter(|l| !l.is_empty())
+        .map(|l| l.to_string())
+        .collect()
+}
+
+fn initial_listing_label(l: InitialListing) -> &'static str {
+    match l {
+        InitialListing::None => "none",
+        InitialListing::AllNames => "all_names",
+        InitialListing::CoreOnly => "core_only",
+    }
+}
+
+fn initial_listing_from_wire(s: &str) -> Option<InitialListing> {
+    match s {
+        "none" => Some(InitialListing::None),
+        "all_names" => Some(InitialListing::AllNames),
+        "core_only" => Some(InitialListing::CoreOnly),
+        _ => None,
+    }
+}
+
+fn activation_surface_label(a: ActivationSurface) -> &'static str {
+    match a {
+        ActivationSurface::Announce => "announce",
+        ActivationSurface::InjectSchema => "inject_schema",
+    }
+}
+
+fn activation_surface_from_wire(s: &str) -> Option<ActivationSurface> {
+    match s {
+        "announce" => Some(ActivationSurface::Announce),
+        "inject_schema" => Some(ActivationSurface::InjectSchema),
         _ => None,
     }
 }
@@ -6781,6 +6864,76 @@ impl ChatApp {
             }
         }
 
+        // Defaults tab tool_surface — three radio groups + one
+        // text_area for the named-tools buffer when core_tools is
+        // Named. The radio click for core_tools rebuilds the
+        // CoreTools variant from the live buffer (so an All → Named
+        // toggle commits the conventional default text without a
+        // separate keystroke); the text_area's `apply_event` parses
+        // and writes back on every keystroke so `dirty()` stays
+        // accurate mid-edit.
+        if let Some(editor) = self.pod_editor.as_mut() {
+            let mut core_tools_pick: Option<String> = None;
+            if radio::apply_event(
+                &mut core_tools_pick,
+                event,
+                POD_EDITOR_DEFAULTS_TOOL_SURFACE_CORE_TOOLS_KEY,
+                |raw| Some(Some(raw.to_string())),
+            ) {
+                if let Some(pick) = core_tools_pick.as_deref()
+                    && let Some(cfg) = editor.working_config.as_mut()
+                {
+                    cfg.thread_defaults.tool_surface.core_tools = match pick {
+                        "all" => CoreTools::All,
+                        "named" => {
+                            CoreTools::Named(parse_core_tools_named(&editor.tool_surface_named_buf))
+                        }
+                        _ => return true,
+                    };
+                }
+                editor.error = None;
+                return true;
+            }
+        }
+        if let Some(editor) = self.pod_editor.as_mut()
+            && event.target_key() == Some(POD_EDITOR_DEFAULTS_TOOL_SURFACE_CORE_TOOLS_NAMED_KEY)
+        {
+            text_area::apply_event(
+                &mut editor.tool_surface_named_buf,
+                &mut self.selection,
+                POD_EDITOR_DEFAULTS_TOOL_SURFACE_CORE_TOOLS_NAMED_KEY,
+                event,
+            );
+            if let Some(cfg) = editor.working_config.as_mut() {
+                cfg.thread_defaults.tool_surface.core_tools =
+                    CoreTools::Named(parse_core_tools_named(&editor.tool_surface_named_buf));
+            }
+            editor.error = None;
+            return true;
+        }
+        if let Some(editor) = self.pod_editor.as_mut()
+            && let Some(cfg) = editor.working_config.as_mut()
+        {
+            if radio::apply_event(
+                &mut cfg.thread_defaults.tool_surface.initial_listing,
+                event,
+                POD_EDITOR_DEFAULTS_TOOL_SURFACE_INITIAL_LISTING_KEY,
+                initial_listing_from_wire,
+            ) {
+                editor.error = None;
+                return true;
+            }
+            if radio::apply_event(
+                &mut cfg.thread_defaults.tool_surface.activation_surface,
+                event,
+                POD_EDITOR_DEFAULTS_TOOL_SURFACE_ACTIVATION_SURFACE_KEY,
+                activation_surface_from_wire,
+            ) {
+                editor.error = None;
+                return true;
+            }
+        }
+
         // Limits tab numeric input — `limits.max_concurrent_threads`.
         // Same buffer-then-parse-back pattern as the Defaults numeric
         // inputs above; see the comment there.
@@ -7347,6 +7500,15 @@ impl ChatApp {
             ]),
             form_item([form_label("tool overrides"), form_control(overrides_label)]),
             form_item([
+                form_label("tool surface"),
+                form_control(self.render_pod_editor_defaults_tool_surface(editor)),
+                form_description(
+                    "Pod baseline for the wire `tools:` payload + system-prompt \
+                     listing + mid-conversation activation. Behaviors can wholesale-\
+                     replace this via `[scope.tool_surface]`.",
+                ),
+            ]),
+            form_item([
                 form_label("default host envs"),
                 form_control(host_env_widget),
                 form_description(
@@ -7415,6 +7577,131 @@ impl ChatApp {
             &cfg.thread_defaults.mcp_hosts,
             options,
         )
+    }
+
+    /// Structured editor for `thread_defaults.tool_surface`. Three
+    /// sections (matching the egui sibling's
+    /// `render_tool_surface_editor`):
+    /// - core_tools: 2-option `radio_group` (All / Named) + a
+    ///   conditional `text_area` when Named is selected.
+    /// - initial_listing: 3-option `radio_group`.
+    /// - activation_surface: 2-option `radio_group`.
+    ///
+    /// Each section's hint paragraph below the controls echoes the
+    /// egui sibling's prose verbatim — it's load-bearing UX, not
+    /// decoration. The named buffer lives on `PodEditorSheetState`
+    /// (mid-edit states like a trailing newline must survive between
+    /// keystrokes).
+    fn render_pod_editor_defaults_tool_surface(&self, editor: &PodEditorSheetState) -> El {
+        let Some(cfg) = editor.working_config.as_ref() else {
+            return paragraph("(unavailable — config not parsed)")
+                .muted()
+                .small();
+        };
+        let surface = &cfg.thread_defaults.tool_surface;
+
+        // core_tools radio + conditional textarea.
+        let is_all = matches!(surface.core_tools, CoreTools::All);
+        let core_tools_radio = radio_group(
+            POD_EDITOR_DEFAULTS_TOOL_SURFACE_CORE_TOOLS_KEY,
+            &if is_all { "all" } else { "named" },
+            [
+                ("all", "All admissible tools (\"all\")"),
+                ("named", "Only these tools"),
+            ],
+        );
+        let core_tools_section: El = if is_all {
+            column([
+                core_tools_radio,
+                paragraph(
+                    "Every admitted tool lands on the wire with full description. \
+                     Pre-rework behavior — useful when the pod has few tools or \
+                     the author wants no summarization.",
+                )
+                .muted()
+                .small(),
+            ])
+            .gap(tokens::SPACE_2)
+            .width(Size::Fill(1.0))
+        } else {
+            let named_input = text_area(
+                &editor.tool_surface_named_buf,
+                &self.selection,
+                POD_EDITOR_DEFAULTS_TOOL_SURFACE_CORE_TOOLS_NAMED_KEY,
+            )
+            .height(Size::Fixed(96.0))
+            .mono();
+            column([
+                core_tools_radio,
+                paragraph(
+                    "One name per line. Listed tools keep full descriptions; \
+                     every other admitted tool carries a first-line-only \
+                     summary. Names not admitted to the thread are silently \
+                     dropped.",
+                )
+                .muted()
+                .small(),
+                named_input,
+            ])
+            .gap(tokens::SPACE_2)
+            .width(Size::Fill(1.0))
+        };
+
+        let initial_listing_radio = radio_group(
+            POD_EDITOR_DEFAULTS_TOOL_SURFACE_INITIAL_LISTING_KEY,
+            &initial_listing_label(surface.initial_listing),
+            [
+                ("none", "None (discovery-first)"),
+                ("all_names", "All names"),
+                ("core_only", "Core only + counts"),
+            ],
+        );
+        let initial_listing_section = column([
+            initial_listing_radio,
+            paragraph(
+                "What gets appended to the system prompt at thread seed. \
+                 `All names` lists every admissible tool (plus a trailing \
+                 escalation-available section). `Core only` shows counts \
+                 per group. `None` requires `find_tool`.",
+            )
+            .muted()
+            .small(),
+        ])
+        .gap(tokens::SPACE_2)
+        .width(Size::Fill(1.0));
+
+        let activation_surface_radio = radio_group(
+            POD_EDITOR_DEFAULTS_TOOL_SURFACE_ACTIVATION_SURFACE_KEY,
+            &activation_surface_label(surface.activation_surface),
+            [
+                ("announce", "Announce names (default)"),
+                ("inject_schema", "Inject schemas"),
+            ],
+        );
+        let activation_surface_section = column([
+            activation_surface_radio,
+            paragraph(
+                "Mid-conversation tool addition (escalation, late MCP \
+                 attach). `Announce` lists names — the model fetches \
+                 schemas via `describe_tool`. `Inject schemas` inlines \
+                 them, trading tokens for zero round-trips.",
+            )
+            .muted()
+            .small(),
+        ])
+        .gap(tokens::SPACE_2)
+        .width(Size::Fill(1.0));
+
+        column([
+            text("Wire `tools:` core set").label(),
+            core_tools_section,
+            text("System-prompt listing").label(),
+            initial_listing_section,
+            text("Mid-conversation activation").label(),
+            activation_surface_section,
+        ])
+        .gap(tokens::SPACE_3)
+        .width(Size::Fill(1.0))
     }
 
     /// Limits tab body. Pod-level resource ceilings — currently a
