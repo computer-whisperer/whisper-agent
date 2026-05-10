@@ -36,8 +36,8 @@
 //! Surfaces still to land (full inventory in
 //! `docs/design_aetna_ui.md` § "Migration gaps from egui webui"):
 //! Codex auth rotate + Shared MCP CRUD sub-slices of the server
-//! settings modal, bucket create form + search-and-query
-//! sub-slices of the knowledge-buckets modal.
+//! settings modal, +New bucket create form sub-slice of the
+//! knowledge-buckets modal.
 //!
 //! Dispatch model: a single `dispatch_wire` walks `ServerToClient`
 //! variants — only the ones the current stage cares about have arms;
@@ -561,12 +561,9 @@ struct BuildProgressView {
     dense_total: Option<u64>,
 }
 
-/// Knowledge-buckets modal state. v1 ships the read-only catalog
-/// surface, the live build-progress display, and the four row
-/// actions (Build / Pause build / Poll now / Resync now) plus
-/// arm-confirm Delete. Create form + search-and-query are deferred
-/// to follow-up sub-slices — `creating`, `query_input`, `top_k`,
-/// `query_status` aren't carried here yet.
+/// Knowledge-buckets modal state. v1 catalog surface + Phase 3
+/// search-and-query. Create form is deferred to a follow-up
+/// sub-slice — `creating` is not carried here yet.
 #[derive(Default)]
 struct BucketsModalState {
     /// Bucket id whose Delete button is "armed" — clicked once,
@@ -580,6 +577,62 @@ struct BucketsModalState {
     /// bucket_id)`. Overwritten by the next attempt; cleared when a
     /// success lands for the same key.
     build_errors: HashMap<BucketRowKey, String>,
+
+    // ----- search-and-query -----
+    /// Bucket the user has currently selected for query. `None` lets
+    /// the renderer auto-pick the first ready bucket on first paint.
+    /// Stored as `(pod, id)` so a pod-scope bucket sharing a name
+    /// with a server-scope one can't alias.
+    selected_bucket: Option<BucketRowKey>,
+    /// Whether the bucket-picker `select_menu` is open.
+    bucket_picker_open: bool,
+    /// Live text in the search input. Held verbatim; the trim
+    /// happens at submit time.
+    query_input: String,
+    /// `numeric_input`-shaped buffer for `top_k`. Parsed back into
+    /// `top_k` on every event the way the pod / behavior editors do.
+    top_k_buf: String,
+    /// Final top_k that ships with the next `QueryBuckets`. Default
+    /// `10` — set in `BucketsModalState::fresh`.
+    top_k: u32,
+    /// Lifecycle of the most-recently-issued query.
+    query_status: QueryStatus,
+    /// Outstanding `QueryBuckets` correlation. The wire arm uses it
+    /// to ignore stale results that arrive after the user has
+    /// fired a follow-up query.
+    pending_query_correlation: Option<String>,
+    /// `chunk_id`s the user has clicked open in the results pane.
+    /// Keyed on the chunk id rather than hit index so the expanded
+    /// set survives sort changes / re-orderings.
+    query_expanded: HashSet<String>,
+}
+
+impl BucketsModalState {
+    fn fresh() -> Self {
+        Self {
+            top_k: 10,
+            top_k_buf: "10".to_string(),
+            ..Default::default()
+        }
+    }
+}
+
+/// Lifecycle of the search form's last-issued query. The renderer
+/// reads this to decide between hint / spinner / results / error.
+#[derive(Default, Clone)]
+enum QueryStatus {
+    #[default]
+    Idle,
+    InFlight {
+        query: String,
+    },
+    Results {
+        query: String,
+        hits: Vec<whisper_agent_protocol::QueryHit>,
+    },
+    Error {
+        message: String,
+    },
 }
 
 /// Server-settings modal state. v1 has two tabs: a read-only LLM
@@ -2559,6 +2612,23 @@ impl ChatApp {
                     *existing = summary;
                 }
             }
+            ServerToClient::QueryResults {
+                correlation_id,
+                query,
+                hits,
+            } => {
+                if let Some(modal) = self.buckets_modal.as_mut()
+                    && modal.pending_query_correlation == correlation_id
+                {
+                    modal.pending_query_correlation = None;
+                    modal.query_status = QueryStatus::Results { query, hits };
+                    // `query_expanded` is cleared at submit time; we
+                    // deliberately leave it alone here so a click
+                    // that lands during the InFlight window (rare in
+                    // the live UI; ordinary in synthetic-click
+                    // bundle scenes) survives the result arrival.
+                }
+            }
             ServerToClient::FeedPollAccepted { .. } => {
                 // No-op v1 — the egui sibling also doesn't surface a
                 // banner for the ack. The user clicks Poll now, the
@@ -3115,6 +3185,18 @@ impl ChatApp {
                             consumed = true;
                         }
                     }
+                    if !consumed
+                        && let Some(modal) = self.buckets_modal.as_mut()
+                        && modal.pending_query_correlation.as_ref() == Some(corr)
+                    {
+                        // Drop the in-flight pin and surface the
+                        // failure into the search-section banner.
+                        modal.pending_query_correlation = None;
+                        modal.query_status = QueryStatus::Error {
+                            message: message.clone(),
+                        };
+                        consumed = true;
+                    }
                 }
                 // Thread-scoped errors land on the view's failure
                 // slot so the pane's destructive banner has
@@ -3561,6 +3643,71 @@ impl App for ChatApp {
         {
             self.buckets_modal = None;
             return;
+        }
+        // Buckets search routing — picker / text input / top_k /
+        // submit / per-hit toggle. All gated on the modal being open.
+        if self.buckets_modal.is_some() {
+            if let Some(action) = classify_select_event(&event, BUCKETS_SEARCH_PICKER_KEY) {
+                self.handle_bucket_picker_event(action);
+                return;
+            }
+            if event.target_key() == Some(BUCKETS_SEARCH_INPUT_KEY) {
+                // Plain Enter (no modifiers) submits — same UX as
+                // the egui sibling. Branch *before* `text_input::apply_event`
+                // so the submit Enter never reaches the buffer.
+                if event.kind == UiEventKind::KeyDown
+                    && let Some(kp) = event.key_press.as_ref()
+                    && matches!(kp.key, UiKey::Enter)
+                    && !kp.modifiers.shift
+                    && !kp.modifiers.ctrl
+                    && !kp.modifiers.alt
+                    && !kp.modifiers.logo
+                {
+                    self.submit_bucket_query();
+                    return;
+                }
+                if let Some(modal) = self.buckets_modal.as_mut() {
+                    text_input::apply_event(
+                        &mut modal.query_input,
+                        &mut self.selection,
+                        BUCKETS_SEARCH_INPUT_KEY,
+                        &event,
+                    );
+                }
+                return;
+            }
+            if event.is_click_or_activate(BUCKETS_SEARCH_SUBMIT_KEY) {
+                self.submit_bucket_query();
+                return;
+            }
+            // top_k numeric_input. Buffer-then-parse-back pattern.
+            if let Some(modal) = self.buckets_modal.as_mut() {
+                let opts = NumericInputOpts::default().min(1.0).max(50.0).step(1.0);
+                if numeric_input::apply_event(
+                    &mut modal.top_k_buf,
+                    &mut self.selection,
+                    BUCKETS_SEARCH_TOP_K_KEY,
+                    &opts,
+                    &event,
+                ) {
+                    if let Ok(v) = modal.top_k_buf.parse::<u32>() {
+                        modal.top_k = v.clamp(1, 50);
+                    }
+                    return;
+                }
+            }
+            // Per-hit expand toggle. Routed key carries the chunk_id;
+            // membership flips in the `query_expanded` set.
+            if let Some(key) = event.route()
+                && let Some(chunk_id) = key.strip_prefix(BUCKETS_SEARCH_HIT_PREFIX)
+                && matches!(event.kind, UiEventKind::Click | UiEventKind::Activate)
+                && let Some(modal) = self.buckets_modal.as_mut()
+            {
+                if !modal.query_expanded.remove(chunk_id) {
+                    modal.query_expanded.insert(chunk_id.to_string());
+                }
+                return;
+            }
         }
         if let Some(key) = event.route()
             && matches!(event.kind, UiEventKind::Click | UiEventKind::Activate)
@@ -4159,6 +4306,30 @@ const BUCKETS_DELETE_CANCEL_PREFIX: &str = "buckets:delete-cancel:";
 /// (kebab-case alphanumeric per the server's validator) can't
 /// collide.
 const BUCKET_SERVER_SCOPE_SENTINEL: &str = "__server__";
+
+/// Routed-key shapes for the buckets-modal search-and-query section.
+/// The bucket picker rides on the standard `select_trigger` /
+/// `select_menu` family — `classify_select_event` parses the
+/// option-pick event's `Pick(value)` payload, which carries the
+/// `{pod}:{id}` token the picker emitted.
+const BUCKETS_SEARCH_PICKER_KEY: &str = "buckets:search:picker";
+const BUCKETS_SEARCH_INPUT_KEY: &str = "buckets:search:input";
+const BUCKETS_SEARCH_SUBMIT_KEY: &str = "buckets:search:submit";
+const BUCKETS_SEARCH_TOP_K_KEY: &str = "buckets:search:top-k";
+const BUCKETS_SEARCH_HIT_PREFIX: &str = "buckets:search:hit:";
+
+/// Compose the picker option value the bucket-picker `select_menu`
+/// emits. Encodes the (pod, id) pair the wire op needs in a single
+/// string so the standard `SelectAction::Pick(String)` payload
+/// shape works without a parallel lookup table.
+fn bucket_picker_value(row: &BucketRowKey) -> String {
+    format!("{}:{}", bucket_scope_token(&row.0), row.1)
+}
+
+fn bucket_picker_value_parse(value: &str) -> Option<BucketRowKey> {
+    let (scope, id) = value.split_once(':')?;
+    Some((bucket_scope_from_token(scope), id.to_string()))
+}
 
 fn bucket_scope_token(pod_id: &Option<String>) -> &str {
     pod_id.as_deref().unwrap_or(BUCKET_SERVER_SCOPE_SENTINEL)
@@ -6313,6 +6484,14 @@ impl ChatApp {
         }
         if let Some(modal_el) = self.render_buckets_modal() {
             out.push(Some(modal_el));
+            // Bucket-picker menu rides above the dialog itself when
+            // open — same topmost-layer pattern the behavior /
+            // pod editor pickers use.
+            if let Some(modal) = self.buckets_modal.as_ref()
+                && modal.bucket_picker_open
+            {
+                out.push(Some(self.bucket_picker_menu()));
+            }
         }
         if let Some(modal_el) = self.render_file_tree_modal() {
             out.push(Some(modal_el));
@@ -10484,7 +10663,30 @@ impl ChatApp {
     /// the only consumer).
     pub fn open_buckets_modal(&mut self) {
         if self.buckets_modal.is_none() {
-            self.buckets_modal = Some(BucketsModalState::default());
+            self.buckets_modal = Some(BucketsModalState::fresh());
+        }
+    }
+
+    /// Test fixture: pre-seed the bucket-modal search state so a
+    /// bundle-dump scene can paint a populated query without needing
+    /// to thread synthetic text-input events. Sets the picker's
+    /// selection + the live input buffer; the caller fires a
+    /// synthetic click on the Submit button to kick off the wire
+    /// round-trip. Public so the `dump_bundles` example can reach
+    /// it; not part of the production-app surface.
+    #[doc(hidden)]
+    pub fn dev_seed_bucket_search(
+        &mut self,
+        pod_id: Option<String>,
+        bucket_id: String,
+        query: String,
+    ) {
+        if self.buckets_modal.is_none() {
+            self.buckets_modal = Some(BucketsModalState::fresh());
+        }
+        if let Some(modal) = self.buckets_modal.as_mut() {
+            modal.selected_bucket = Some((pod_id, bucket_id));
+            modal.query_input = query;
         }
     }
 
@@ -10541,6 +10743,87 @@ impl ChatApp {
             correlation_id: None,
             id,
             pod_id,
+        });
+    }
+
+    /// Bucket-picker `select_menu` action handler. Toggle opens /
+    /// closes the menu; Pick records the (pod, id) selection +
+    /// closes; Dismiss closes without changing the pick.
+    fn handle_bucket_picker_event(&mut self, action: SelectAction) {
+        let Some(modal) = self.buckets_modal.as_mut() else {
+            return;
+        };
+        match action {
+            SelectAction::Toggle => {
+                modal.bucket_picker_open = !modal.bucket_picker_open;
+            }
+            SelectAction::Dismiss => {
+                modal.bucket_picker_open = false;
+            }
+            SelectAction::Pick(value) => {
+                if let Some(row) = bucket_picker_value_parse(&value) {
+                    modal.selected_bucket = Some(row);
+                    // Switching buckets invalidates the prior result
+                    // set — drop it back to Idle so the user sees a
+                    // hint instead of stale hits.
+                    if !matches!(modal.query_status, QueryStatus::InFlight { .. }) {
+                        modal.query_status = QueryStatus::Idle;
+                    }
+                }
+                modal.bucket_picker_open = false;
+            }
+            // `SelectAction` is `#[non_exhaustive]` — future variants
+            // (e.g. keyboard navigation) drop on the floor here.
+            _ => {}
+        }
+    }
+
+    /// Fire `QueryBuckets` against the picker's selected bucket.
+    /// No-ops when no bucket is picked, the input is empty, or a
+    /// query is already in flight (the renderer disables the button
+    /// in those states; the gate defends against keyboard routes
+    /// arriving with stale state).
+    fn submit_bucket_query(&mut self) {
+        // Phase 1: read the snapshot we'd ship + validate gates.
+        let (bucket_row, query, top_k) = match self.buckets_modal.as_ref() {
+            Some(modal) if !matches!(modal.query_status, QueryStatus::InFlight { .. }) => {
+                let q = modal.query_input.trim().to_string();
+                if q.is_empty() {
+                    return;
+                }
+                // Resolve the picker selection (or default to the
+                // first ready bucket) into a (pod, id) pair. Walk
+                // the catalog so a stale `selected_bucket` referring
+                // to a deleted bucket falls back cleanly.
+                let pick = modal
+                    .selected_bucket
+                    .clone()
+                    .or_else(|| first_ready_bucket(&self.buckets));
+                let Some(row) = pick else {
+                    return;
+                };
+                (row, q, modal.top_k.max(1))
+            }
+            _ => return,
+        };
+
+        // Phase 2: mint correlation (re-borrows `self`).
+        let correlation = self.next_correlation_id();
+
+        // Phase 3: stamp the modal + send.
+        if let Some(modal) = self.buckets_modal.as_mut() {
+            modal.pending_query_correlation = Some(correlation.clone());
+            modal.query_status = QueryStatus::InFlight {
+                query: query.clone(),
+            };
+            modal.query_expanded.clear();
+        }
+        self.send(ClientToServer::QueryBuckets {
+            correlation_id: Some(correlation),
+            bucket_ids: vec![bucket_row.1],
+            pod_id: bucket_row.0,
+            query,
+            top_k,
         });
     }
 
@@ -10820,7 +11103,9 @@ impl ChatApp {
         const BUCKETS_W: f32 = 720.0;
         const BUCKETS_H: f32 = 640.0;
 
-        let body: El = if self.buckets.is_empty() {
+        let search_section = self.render_buckets_search_section(modal);
+
+        let catalog_body: El = if self.buckets.is_empty() {
             paragraph(
                 "No buckets yet. Create one via the wire (server-side \
                  catalog config or a future +New bucket affordance \
@@ -10847,11 +11132,13 @@ impl ChatApp {
                     "Catalog of indexed-text buckets the agent can query. \
                      Build / Pause / Delete actions per row. Tracked \
                      buckets (Wikipedia today) carry Poll-now and \
-                     Resync-now affordances. Create form + search land \
-                     in a follow-up.",
+                     Resync-now affordances. The search section above \
+                     queries any ready bucket. Create form lands in a \
+                     follow-up.",
                 ),
             ]),
-            body,
+            search_section,
+            catalog_body,
             dialog_footer([close]),
         ];
 
@@ -10862,6 +11149,246 @@ impl ChatApp {
                 .height(Size::Fixed(BUCKETS_H))
                 .block_pointer(),
         ]))
+    }
+
+    /// Search-and-query section above the catalog. Three-row layout
+    /// — picker + query input + Search button on top, `top_k`
+    /// numeric input below, results pane (idle hint / spinner-text /
+    /// hits / error) at the bottom. The picker auto-defaults to the
+    /// first ready bucket when no pick has been made; an empty
+    /// ready set collapses the section to a muted hint.
+    fn render_buckets_search_section(&self, modal: &BucketsModalState) -> El {
+        let ready: Vec<&BucketSummary> = self
+            .buckets
+            .iter()
+            .filter(|b| {
+                b.active_slot
+                    .as_ref()
+                    .is_some_and(|s| s.state == SlotStateLabel::Ready)
+            })
+            .collect();
+
+        if ready.is_empty() {
+            return column([
+                text("Search").caption().muted(),
+                paragraph("No ready buckets to query \u{2014} build one first.").muted(),
+            ])
+            .gap(tokens::SPACE_1)
+            .width(Size::Fill(1.0));
+        }
+
+        let busy = matches!(modal.query_status, QueryStatus::InFlight { .. });
+
+        // Picker trigger label: the picker's chosen row (if any),
+        // else the first ready bucket as the auto-pick.
+        let picked = modal
+            .selected_bucket
+            .clone()
+            .or_else(|| Some((ready[0].pod_id.clone(), ready[0].id.clone())));
+        let picker_label = picked
+            .as_ref()
+            .map(|(pod, id)| {
+                if let Some(p) = pod {
+                    format!("{p}/{id}")
+                } else {
+                    id.clone()
+                }
+            })
+            .unwrap_or_else(|| "(pick a bucket)".to_string());
+        let picker_trigger =
+            select_trigger(BUCKETS_SEARCH_PICKER_KEY, picker_label).width(Size::Fixed(220.0));
+
+        let query_input = text_input(
+            &modal.query_input,
+            &self.selection,
+            BUCKETS_SEARCH_INPUT_KEY,
+        )
+        .width(Size::Fill(1.0));
+
+        let mut submit = button(if busy { "Searching\u{2026}" } else { "Search" })
+            .key(BUCKETS_SEARCH_SUBMIT_KEY)
+            .primary();
+        if busy || modal.query_input.trim().is_empty() {
+            submit = submit.disabled();
+        }
+
+        let row1 = row([picker_trigger, query_input, submit])
+            .gap(tokens::SPACE_2)
+            .align(Align::Center)
+            .width(Size::Fill(1.0));
+
+        let top_k_widget = numeric_input(
+            &modal.top_k_buf,
+            &self.selection,
+            BUCKETS_SEARCH_TOP_K_KEY,
+            NumericInputOpts::default().min(1.0).max(50.0).step(1.0),
+        )
+        .width(Size::Fixed(120.0));
+        let row2 = row([
+            text("top_k").caption().muted().width(Size::Fixed(60.0)),
+            top_k_widget,
+        ])
+        .gap(tokens::SPACE_2)
+        .align(Align::Center);
+
+        let results_body: El = match &modal.query_status {
+            QueryStatus::Idle => {
+                paragraph("Type a query and hit Search (or Enter) to run.").muted()
+            }
+            QueryStatus::InFlight { query } => {
+                paragraph(format!("running query: {query:?}\u{2026}")).muted()
+            }
+            QueryStatus::Error { message } => {
+                paragraph(format!("query error: {message}")).color(tokens::DESTRUCTIVE)
+            }
+            QueryStatus::Results { query, hits } => {
+                let mut rows: Vec<El> = Vec::new();
+                rows.push(
+                    text(format!(
+                        "results for {query:?} \u{2014} {} hit{}",
+                        hits.len(),
+                        if hits.len() == 1 { "" } else { "s" },
+                    ))
+                    .caption()
+                    .muted(),
+                );
+                for (i, h) in hits.iter().enumerate() {
+                    rows.push(self.render_query_hit(i + 1, h, &modal.query_expanded));
+                }
+                // Right padding on an inner column reserves a
+                // gutter for the scrollbar thumb so the hit-row
+                // focusables don't get clipped (lint rule
+                // `ScrollbarObscuresFocusable`). Same workaround as
+                // the chat-scroll body.
+                let inner = column(rows)
+                    .gap(tokens::SPACE_2)
+                    .padding(Sides {
+                        left: 0.0,
+                        // Active-state thumb width plus a small
+                        // breathing margin — the scroll widget's
+                        // own outer padding consumes a couple of
+                        // pixels of the gutter, so a bare thumb-
+                        // width inset still leaves the focusable
+                        // overlapping by a hair.
+                        right: tokens::SCROLLBAR_THUMB_WIDTH_ACTIVE + tokens::SPACE_1,
+                        top: 0.0,
+                        bottom: 0.0,
+                    })
+                    .width(Size::Fill(1.0))
+                    .height(Size::Hug);
+                scroll([inner])
+                    .width(Size::Fill(1.0))
+                    .height(Size::Fixed(220.0))
+            }
+        };
+
+        column([text("Search").caption().muted(), row1, row2, results_body])
+            .gap(tokens::SPACE_2)
+            .width(Size::Fill(1.0))
+    }
+
+    /// One result row. Header row carries chevron + rank + source
+    /// id (or chunk-id fallback); meta row underneath carries `via`
+    /// chip + scores + source-locator + chunk-id tail. Click on the
+    /// header row routes through `BUCKETS_SEARCH_HIT_PREFIX:{chunk_id}`
+    /// to toggle expansion; the body underneath swaps between a
+    /// 180-char snippet (collapsed) and a code-block of the full
+    /// chunk text (expanded).
+    fn render_query_hit(
+        &self,
+        rank: usize,
+        h: &whisper_agent_protocol::QueryHit,
+        expanded: &HashSet<String>,
+    ) -> El {
+        let is_open = expanded.contains(&h.chunk_id);
+
+        let title_label = if h.source_id.is_empty() {
+            format!(
+                "(no source id) \u{2014} chunk {}",
+                short_chunk_id(&h.chunk_id)
+            )
+        } else {
+            h.source_id.clone()
+        };
+        let chevron = if is_open {
+            "chevron-down"
+        } else {
+            "chevron-right"
+        };
+
+        // Click target — the header row is a single clickable element
+        // routed by chunk-id so the toggle handler can grow / shrink
+        // membership in `query_expanded`.
+        let header = row([
+            icon(chevron)
+                .icon_size(tokens::ICON_XS)
+                .color(tokens::MUTED_FOREGROUND),
+            text(format!("{rank}. {title_label}"))
+                .label()
+                .bold()
+                .ellipsis()
+                .width(Size::Fill(1.0)),
+        ])
+        .key(format!("{BUCKETS_SEARCH_HIT_PREFIX}{}", h.chunk_id))
+        .cursor(Cursor::Pointer)
+        .gap(tokens::SPACE_1)
+        .align(Align::Center)
+        .width(Size::Fill(1.0))
+        .focusable();
+
+        // Meta row: via chip + scores + locator + short chunk id.
+        let mut meta_children: Vec<El> = vec![
+            text(format!("via {}", h.source_path))
+                .caption()
+                .color(via_chip_color(&h.source_path)),
+            text(format!("rerank {:.3}", h.rerank_score))
+                .caption()
+                .color(tokens::SUCCESS),
+            text(format!("src {:.3}", h.source_score)).caption().muted(),
+        ];
+        if let Some(loc) = h.source_locator.as_deref()
+            && !loc.is_empty()
+        {
+            meta_children.push(text(format!("\u{00B7} {loc}")).caption().muted());
+        }
+        meta_children.push(
+            text(format!("\u{00B7} {}", short_chunk_id(&h.chunk_id)))
+                .caption()
+                .code()
+                .muted(),
+        );
+        let meta = row(meta_children)
+            .gap(tokens::SPACE_2)
+            .align(Align::Center)
+            .padding(Sides {
+                left: tokens::SPACE_3,
+                right: 0.0,
+                top: 0.0,
+                bottom: 0.0,
+            })
+            .width(Size::Fill(1.0));
+
+        let body: El = if is_open {
+            // Full chunk text in a wrapped paragraph nested inside
+            // the standard code-block surface chrome (muted fill,
+            // bordered, rounded). `code_block` itself is `nowrap`
+            // by design (matches shadcn's `overflow-x-auto` for
+            // fenced code) — chunk text is prose, so we feed
+            // `code_block_chrome` a wrap-mode paragraph instead.
+            code_block_chrome(paragraph(h.chunk_text.clone()).code())
+        } else {
+            paragraph(snippet_180(&h.chunk_text)).muted()
+        };
+
+        column([header, meta, body])
+            .gap(tokens::SPACE_1)
+            .padding(Sides {
+                left: 0.0,
+                right: 0.0,
+                top: tokens::SPACE_1,
+                bottom: tokens::SPACE_1,
+            })
+            .width(Size::Fill(1.0))
     }
 
     /// One bucket card. Name + id (mono) at the top, optional
@@ -11589,6 +12116,31 @@ impl ChatApp {
             options.push((p.pod_id.clone(), p.name.clone()));
         }
         select_menu(PICKER_POD, options)
+    }
+
+    /// Bucket-picker menu — one option per ready bucket. Value is
+    /// the `{pod_token}:{id}` shape the search-handler parses back
+    /// into a `(pod, id)` row key. Label prefixes pod-scope buckets
+    /// with `<pod>/` so disambiguation is at-a-glance.
+    fn bucket_picker_menu(&self) -> El {
+        let mut options: Vec<(String, String)> = Vec::new();
+        for b in &self.buckets {
+            let ready = b
+                .active_slot
+                .as_ref()
+                .is_some_and(|s| s.state == SlotStateLabel::Ready);
+            if !ready {
+                continue;
+            }
+            let row = (b.pod_id.clone(), b.id.clone());
+            let label = if let Some(p) = b.pod_id.as_deref() {
+                format!("{p}/{}", b.id)
+            } else {
+                b.id.clone()
+            };
+            options.push((bucket_picker_value(&row), label));
+        }
+        select_menu(BUCKETS_SEARCH_PICKER_KEY, options)
     }
 
     fn compose_box(&self) -> El {
@@ -12409,6 +12961,51 @@ fn json_node_trigger(path: &str, header: &str, open: bool) -> El {
 /// screenshot at native dims would punch out of the dialog, and a
 /// tall portrait would push the close button off-screen. Aspect is
 /// preserved by picking the smaller of the two scale factors.
+/// 12-char chunk-id prefix + ellipsis. Chunk ids are 64-char hex
+/// strings — fitting one in a row alongside scores + locator wants
+/// ~12 chars max.
+fn short_chunk_id(s: &str) -> String {
+    if s.len() > 12 {
+        format!("{}\u{2026}", &s[..12])
+    } else {
+        s.to_string()
+    }
+}
+
+/// 180-char snippet of a chunk's text, with newlines flattened to
+/// spaces so the body reads as a single continuous tooltip rather
+/// than wrapping awkwardly across multiple lines.
+fn snippet_180(s: &str) -> String {
+    let one_line: String = s.replace('\n', " ");
+    one_line.chars().take(180).collect()
+}
+
+/// Color the via= chip by source path so dense / sparse contributions
+/// are distinguishable at a glance. Anything outside the known set
+/// falls back to muted-foreground.
+fn via_chip_color(path: &str) -> Color {
+    match path {
+        "dense" => tokens::INFO,
+        "sparse" => tokens::WARNING,
+        _ => tokens::MUTED_FOREGROUND,
+    }
+}
+
+/// First ready bucket in `buckets`, returned as a `(pod, id)` row
+/// key. Used by `submit_bucket_query` as the auto-pick fallback
+/// when the user submits before touching the picker. `None` when
+/// no bucket is ready to serve queries.
+fn first_ready_bucket(buckets: &[BucketSummary]) -> Option<BucketRowKey> {
+    buckets
+        .iter()
+        .find(|b| {
+            b.active_slot
+                .as_ref()
+                .is_some_and(|s| s.state == SlotStateLabel::Ready)
+        })
+        .map(|b| (b.pod_id.clone(), b.id.clone()))
+}
+
 /// Slot-state colored caption — `ready` green, `failed` destructive,
 /// `building` / `planning` warning, `archived` muted. Used in the
 /// bucket-row slot-info line. Mirrors the egui sibling's

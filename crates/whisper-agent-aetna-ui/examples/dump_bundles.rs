@@ -356,10 +356,16 @@ enum Scene {
     /// armed-delete (driven by a synthetic click that lands the
     /// row in `delete_armed`).
     BucketsModalCatalog,
+    /// Buckets modal with search results painted. Same baseline
+    /// catalog as `BucketsModalCatalog`; the click loop fires a
+    /// query against the ready bucket and the per-scene SendFn
+    /// answers with mock hits, so the results pane paints with one
+    /// expanded hit and one collapsed snippet.
+    BucketsModalSearchResults,
 }
 
 impl Scene {
-    const ALL: [Scene; 51] = [
+    const ALL: [Scene; 52] = [
         Scene::Connecting,
         Scene::Connected,
         Scene::Closed,
@@ -411,6 +417,7 @@ impl Scene {
         Scene::SettingsServerConfig,
         Scene::ThreadInspectorOpen,
         Scene::BucketsModalCatalog,
+        Scene::BucketsModalSearchResults,
     ];
 
     fn slug(self) -> &'static str {
@@ -466,6 +473,7 @@ impl Scene {
             Scene::SettingsServerConfig => "settings_server_config",
             Scene::ThreadInspectorOpen => "thread_inspector_open",
             Scene::BucketsModalCatalog => "buckets_modal_catalog",
+            Scene::BucketsModalSearchResults => "buckets_modal_search_results",
         }
     }
 
@@ -639,6 +647,13 @@ impl Scene {
             // pair renders. The pre-seeded BucketBuildProgress
             // already paints the second row's spinner inline.
             Scene::BucketsModalCatalog => vec!["buckets:delete:__server__:wiki-en"],
+            // Buckets-modal search-results scene: the seed already
+            // primed the picker + query buffer; click Submit to
+            // fire the QueryBuckets, then expand the first hit.
+            Scene::BucketsModalSearchResults => vec![
+                "buckets:search:submit",
+                "buckets:search:hit:0a1b2c3d4e5f6789a0b1c2d3e4f56789",
+            ],
             _ => Vec::new(),
         }
     }
@@ -738,6 +753,64 @@ fn build_app(scene: Scene) -> Box<dyn App> {
                         ServerToClient::ServerConfigFetched {
                             toml_text,
                             correlation_id,
+                        },
+                    ));
+                }
+            })
+        }
+        Scene::BucketsModalSearchResults => {
+            // Answer `QueryBuckets` with two mock hits — one with a
+            // proper source_id (rendered with a colored title),
+            // one with an empty source_id (rendered muted with a
+            // chunk-id fallback).
+            let queue = inbound.clone();
+            Box::new(move |msg| {
+                if let ClientToServer::QueryBuckets {
+                    correlation_id,
+                    query,
+                    ..
+                } = msg
+                {
+                    use whisper_agent_protocol::QueryHit;
+                    let hits = vec![
+                        QueryHit {
+                            bucket_id: "wiki-en".into(),
+                            chunk_id: "0a1b2c3d4e5f6789a0b1c2d3e4f56789".into(),
+                            chunk_text: "Knowledge graphs encode entities and \
+                                         relationships as nodes and edges. The \
+                                         original graph database concept dates \
+                                         from work at Bell Labs in the late \
+                                         1980s; the term \"knowledge graph\" was \
+                                         later popularized by Google's 2012 \
+                                         deployment over the Knowledge Vault."
+                                .into(),
+                            source_path: "dense".into(),
+                            source_score: 0.847,
+                            rerank_score: 0.912,
+                            source_id: "Knowledge graph".into(),
+                            source_locator: Some("chars 1024-1820".into()),
+                        },
+                        QueryHit {
+                            bucket_id: "wiki-en".into(),
+                            chunk_id: "ff00aa11bb22cc33dd44ee55ff66aa77".into(),
+                            chunk_text: "Vector embeddings are continuous \
+                                         dense representations of categorical \
+                                         data, typically learned by \
+                                         contrastive objectives over large \
+                                         text corpora."
+                                .into(),
+                            source_path: "sparse".into(),
+                            source_score: 1.42,
+                            rerank_score: 0.687,
+                            source_id: String::new(),
+                            source_locator: None,
+                        },
+                    ];
+                    queue.borrow_mut().push_back(InboundEvent::Wire(
+                        ServerToClient::QueryResults {
+                            correlation_id,
+                            query,
+                            hits,
                         },
                     ));
                 }
@@ -1292,7 +1365,8 @@ fn build_app(scene: Scene) -> Box<dyn App> {
         | Scene::FileTreeOpen
         | Scene::SettingsBackends
         | Scene::SettingsServerConfig
-        | Scene::BucketsModalCatalog => {
+        | Scene::BucketsModalCatalog
+        | Scene::BucketsModalSearchResults => {
             // Populated baseline so the dialog overlays a non-empty
             // sidebar / pane (same idea as the modal scenes above).
             // The viewer itself is opened after the queue borrow
@@ -1319,17 +1393,23 @@ fn build_app(scene: Scene) -> Box<dyn App> {
                     backends: mock_backends(),
                 }));
             }
-            if matches!(scene, Scene::BucketsModalCatalog) {
+            if matches!(
+                scene,
+                Scene::BucketsModalCatalog | Scene::BucketsModalSearchResults
+            ) {
                 // Three buckets covering each row-chrome state:
                 //   - notes — managed, no slot yet (Build disabled).
                 //   - design — linked, in-flight build (counters
                 //     populated by the BucketBuildProgress below).
                 //   - wiki-en — tracked, ready with active slot;
-                //     the click loop arms its Delete.
+                //     the catalog scene arms its Delete; the
+                //     search scene queries against it.
                 q.push_back(InboundEvent::Wire(ServerToClient::BucketsList {
                     correlation_id: None,
                     buckets: mock_buckets_modal_catalog(),
                 }));
+            }
+            if matches!(scene, Scene::BucketsModalCatalog) {
                 // Build start + first progress tick for `design`,
                 // synthesized at known correlation_id::None and
                 // fields the renderer cares about. Fed *into* the
@@ -1376,6 +1456,9 @@ fn build_app(scene: Scene) -> Box<dyn App> {
     }
     if matches!(scene, Scene::BucketsModalCatalog) {
         app.open_buckets_modal();
+    }
+    if matches!(scene, Scene::BucketsModalSearchResults) {
+        app.dev_seed_bucket_search(None, "wiki-en".into(), "knowledge graph history".into());
     }
     Box::new(app)
 }

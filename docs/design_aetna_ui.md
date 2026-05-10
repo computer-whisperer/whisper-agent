@@ -1317,14 +1317,53 @@ trivial / small / medium / large.
   `ServerConfigFetched`). The egui sibling's success / error
   banners + the `ServerConfigUpdateResult` summary alert all
   paint via aetna's `alert` widget; both scenes lint clean.
-- 🌗 **Knowledge buckets.** Phase 1 landed: read-only catalog
-  modal with per-row chrome (name + id, description, scope /
-  source / embedder chips, slot info), live build-progress
-  display, last-failed-build error banner, and per-row actions
-  (Build / Pause build / Poll now / Resync now + arm-confirm
-  Delete). Phase 2 (create form: quantization / driver / cadence
-  pickers, dispatch validation) and Phase 3 (search-and-query
-  with QueryHit rendering) ride on top in follow-up slices.
+- 🌗 **Knowledge buckets.** Phases 1 and 3 landed: read-only catalog
+  modal with per-row chrome, live build-progress display, last-
+  failed-build error banner, per-row actions (Build / Pause build /
+  Poll now / Resync now + arm-confirm Delete), and the
+  search-and-query interface above the catalog. Phase 2 (the +New
+  bucket create form: quantization / driver / cadence pickers,
+  dispatch validation) is the only remaining sub-slice.
+
+  **Phase 3 detail (search-and-query):** the modal grew a search
+  section above the catalog cards. State on `BucketsModalState`:
+  `selected_bucket`, `bucket_picker_open`, `query_input`,
+  `top_k_buf` + `top_k`, `query_status: QueryStatus`,
+  `pending_query_correlation`, `query_expanded: HashSet<chunk_id>`.
+  `QueryStatus` is the four-arm `Idle / InFlight / Results /
+  Error` enum the egui sibling uses.
+
+  The picker is a standard `select_trigger` + `select_menu` pair —
+  `bucket_picker_value` encodes the `(pod, id)` pair as
+  `{pod_token}:{id}` so `SelectAction::Pick(String)` works without
+  a parallel lookup table; `bucket_picker_value_parse` round-trips
+  it back. The picker menu is an overlay layer in
+  `popover_layers()` driven by `bucket_picker_open`. The query
+  text input submits on plain Enter (the same modifier-gated
+  branch the compose box uses) or on the Search button. `top_k`
+  uses the numeric_input buffer-then-parse pattern, clamped
+  `[1, 50]` to match the egui sibling.
+
+  `QueryBuckets` ships with a fresh correlation; `QueryResults`
+  matches `pending_query_correlation` and folds into
+  `QueryStatus::Results`. A correlation-matching `Error` arm
+  surfaces failure into `QueryStatus::Error` rather than the
+  generic per-thread failure banner. Hits render with a chevron-
+  + rank- + source-id row (or chunk-id fallback for hits with
+  empty `source_id`), a meta row of via-chip (`dense` info color,
+  `sparse` warning color), rerank + source scores, optional
+  source locator + short chunk id, then an expandable body that
+  swaps between a 180-char snippet (collapsed) and a wrapped
+  paragraph wrapped in `code_block_chrome` (expanded — chunk
+  text is prose, so we feed the chrome a wrap-mode body rather
+  than `code_block`'s `nowrap` shape).
+
+  Bundle scene: `BucketsModalSearchResults` exercises the open
+  flow end-to-end — pre-seeds the picker + query buffer, fires
+  Submit, the per-scene SendFn synthesizes a `QueryResults`
+  reply with two hits (one with source_id + dense / one without
+  source_id + sparse), and a synthetic click expands the first
+  hit so the body paints. Lint clean.
 
   Entry point: a `database`-icon button in the sidebar footer
   next to the existing settings cog (bundled SVG — aetna's
