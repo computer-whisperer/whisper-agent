@@ -855,6 +855,15 @@ pub(crate) enum BehaviorEditorPicker {
     /// Retention-tab kind picker (Keep / ArchiveAfterDays /
     /// DeleteAfterDays).
     RetentionKind,
+    /// Scope-tab `scope.tools.default` Disposition picker
+    /// (Allow / Deny). Only meaningful when the tools override is on.
+    ScopeToolsDefault,
+    /// Scope-tab cap-narrowing pickers — same option sets as the
+    /// pod editor's `[allow.caps]` triggers, but the field is
+    /// `Option<Cap>` here (None = inherit pod ceiling).
+    ScopeCapsPodModify,
+    ScopeCapsDispatch,
+    ScopeCapsBehaviors,
 }
 
 impl BehaviorEditorPicker {
@@ -865,6 +874,10 @@ impl BehaviorEditorPicker {
             Self::ThreadModel => BEHAVIOR_EDITOR_THREAD_MODEL_KEY,
             Self::ThreadBackend => BEHAVIOR_EDITOR_THREAD_BACKEND_KEY,
             Self::RetentionKind => BEHAVIOR_EDITOR_RETENTION_KIND_KEY,
+            Self::ScopeToolsDefault => BEHAVIOR_EDITOR_SCOPE_TOOLS_DEFAULT_KEY,
+            Self::ScopeCapsPodModify => BEHAVIOR_EDITOR_SCOPE_CAPS_POD_MODIFY_KEY,
+            Self::ScopeCapsDispatch => BEHAVIOR_EDITOR_SCOPE_CAPS_DISPATCH_KEY,
+            Self::ScopeCapsBehaviors => BEHAVIOR_EDITOR_SCOPE_CAPS_BEHAVIORS_KEY,
         }
     }
 }
@@ -2675,6 +2688,31 @@ const BEHAVIOR_EDITOR_THREAD_HOST_ENV_KEY: &str = "behavior-editor:thread:host-e
 const BEHAVIOR_EDITOR_THREAD_MCP_HOSTS_OVERRIDE_KEY: &str =
     "behavior-editor:thread:mcp-hosts:override";
 const BEHAVIOR_EDITOR_THREAD_MCP_HOSTS_KEY: &str = "behavior-editor:thread:mcp-hosts";
+/// Scope-tab routed keys. Each `Option<...>` field on
+/// `BehaviorScope` carries an `_OVERRIDE_KEY` checkbox toggling
+/// Some/None and either a multi-check group prefix (resource
+/// sets) or a `select_trigger` key (tools default + caps).
+const BEHAVIOR_EDITOR_SCOPE_BACKENDS_OVERRIDE_KEY: &str = "behavior-editor:scope:backends:override";
+const BEHAVIOR_EDITOR_SCOPE_BACKENDS_KEY: &str = "behavior-editor:scope:backends";
+const BEHAVIOR_EDITOR_SCOPE_HOST_ENVS_OVERRIDE_KEY: &str =
+    "behavior-editor:scope:host-envs:override";
+const BEHAVIOR_EDITOR_SCOPE_HOST_ENVS_KEY: &str = "behavior-editor:scope:host-envs";
+const BEHAVIOR_EDITOR_SCOPE_MCP_HOSTS_OVERRIDE_KEY: &str =
+    "behavior-editor:scope:mcp-hosts:override";
+const BEHAVIOR_EDITOR_SCOPE_MCP_HOSTS_KEY: &str = "behavior-editor:scope:mcp-hosts";
+const BEHAVIOR_EDITOR_SCOPE_TOOLS_OVERRIDE_KEY: &str = "behavior-editor:scope:tools:override";
+const BEHAVIOR_EDITOR_SCOPE_TOOLS_DEFAULT_KEY: &str = "behavior-editor:scope:tools:default";
+const BEHAVIOR_EDITOR_SCOPE_CAPS_POD_MODIFY_OVERRIDE_KEY: &str =
+    "behavior-editor:scope:caps:pod-modify:override";
+const BEHAVIOR_EDITOR_SCOPE_CAPS_POD_MODIFY_KEY: &str = "behavior-editor:scope:caps:pod-modify";
+const BEHAVIOR_EDITOR_SCOPE_CAPS_DISPATCH_OVERRIDE_KEY: &str =
+    "behavior-editor:scope:caps:dispatch:override";
+const BEHAVIOR_EDITOR_SCOPE_CAPS_DISPATCH_KEY: &str = "behavior-editor:scope:caps:dispatch";
+const BEHAVIOR_EDITOR_SCOPE_CAPS_BEHAVIORS_OVERRIDE_KEY: &str =
+    "behavior-editor:scope:caps:behaviors:override";
+const BEHAVIOR_EDITOR_SCOPE_CAPS_BEHAVIORS_KEY: &str = "behavior-editor:scope:caps:behaviors";
+const BEHAVIOR_EDITOR_SCOPE_TOOL_SURFACE_OVERRIDE_KEY: &str =
+    "behavior-editor:scope:tool-surface:override";
 /// Retention-tab routed keys.
 const BEHAVIOR_EDITOR_RETENTION_KIND_KEY: &str = "behavior-editor:retention:kind";
 const BEHAVIOR_EDITOR_RETENTION_DAYS_KEY: &str = "behavior-editor:retention:days";
@@ -2854,6 +2892,27 @@ fn tool_gate_from_wire(s: &str) -> Option<Disposition> {
     match s {
         "allow_all" => Some(Disposition::Allow),
         "deny_all" => Some(Disposition::Deny),
+        _ => None,
+    }
+}
+
+/// Bare `Disposition` label for the Scope tab's `tools.default`
+/// picker. Different from `tool_gate_label` (which uses the
+/// `_all` suffix for the pod-level "tool gate" framing) because
+/// the Scope tools default isn't a pod-wide gate; it's the
+/// fallback for un-overridden tools in this behavior's narrowed
+/// allow map.
+fn disposition_label(d: Disposition) -> &'static str {
+    match d {
+        Disposition::Allow => "allow",
+        Disposition::Deny => "deny",
+    }
+}
+
+fn disposition_from_wire(s: &str) -> Option<Disposition> {
+    match s {
+        "allow" => Some(Disposition::Allow),
+        "deny" => Some(Disposition::Deny),
         _ => None,
     }
 }
@@ -4367,6 +4426,10 @@ impl ChatApp {
             BehaviorEditorPicker::ThreadModel,
             BehaviorEditorPicker::ThreadBackend,
             BehaviorEditorPicker::RetentionKind,
+            BehaviorEditorPicker::ScopeToolsDefault,
+            BehaviorEditorPicker::ScopeCapsPodModify,
+            BehaviorEditorPicker::ScopeCapsDispatch,
+            BehaviorEditorPicker::ScopeCapsBehaviors,
         ] {
             if let Some(action) = classify_select_event(event, which.key()) {
                 self.handle_behavior_editor_picker(which, action);
@@ -4559,6 +4622,151 @@ impl ChatApp {
             && let Some(cfg) = editor.working_config.as_mut()
             && let Some(vec) = cfg.thread.bindings.mcp_hosts.as_mut()
             && apply_checkbox_list_to_vec(vec, event, BEHAVIOR_EDITOR_THREAD_MCP_HOSTS_KEY)
+        {
+            editor.error = None;
+            return true;
+        }
+
+        // Scope-tab override checkboxes. Resource sets (backends /
+        // host_envs / mcp_hosts) toggle Some(Vec::new()) ↔ None;
+        // tools toggles `AllowMap::allow_all()` ↔ None; caps toggle
+        // a sensible default ↔ None; tool_surface toggles a default
+        // ToolSurface ↔ None.
+        if event.is_click_or_activate(BEHAVIOR_EDITOR_SCOPE_BACKENDS_OVERRIDE_KEY) {
+            if let Some(editor) = self.behavior_editor.as_mut()
+                && let Some(cfg) = editor.working_config.as_mut()
+            {
+                cfg.scope.backends = if cfg.scope.backends.is_some() {
+                    None
+                } else {
+                    Some(Vec::new())
+                };
+                editor.error = None;
+            }
+            return true;
+        }
+        if event.is_click_or_activate(BEHAVIOR_EDITOR_SCOPE_HOST_ENVS_OVERRIDE_KEY) {
+            if let Some(editor) = self.behavior_editor.as_mut()
+                && let Some(cfg) = editor.working_config.as_mut()
+            {
+                cfg.scope.host_envs = if cfg.scope.host_envs.is_some() {
+                    None
+                } else {
+                    Some(Vec::new())
+                };
+                editor.error = None;
+            }
+            return true;
+        }
+        if event.is_click_or_activate(BEHAVIOR_EDITOR_SCOPE_MCP_HOSTS_OVERRIDE_KEY) {
+            if let Some(editor) = self.behavior_editor.as_mut()
+                && let Some(cfg) = editor.working_config.as_mut()
+            {
+                cfg.scope.mcp_hosts = if cfg.scope.mcp_hosts.is_some() {
+                    None
+                } else {
+                    Some(Vec::new())
+                };
+                editor.error = None;
+            }
+            return true;
+        }
+        if event.is_click_or_activate(BEHAVIOR_EDITOR_SCOPE_TOOLS_OVERRIDE_KEY) {
+            if let Some(editor) = self.behavior_editor.as_mut()
+                && let Some(cfg) = editor.working_config.as_mut()
+            {
+                cfg.scope.tools = if cfg.scope.tools.is_some() {
+                    None
+                } else {
+                    // `allow_all` is the most-permissive identity —
+                    // narrowing to `pod.allow.tools.narrow(allow_all)`
+                    // leaves the pod ceiling unchanged. Per-tool
+                    // overrides ride through Raw TOML for v1.
+                    Some(AllowMap::allow_all())
+                };
+                editor.error = None;
+            }
+            return true;
+        }
+        if event.is_click_or_activate(BEHAVIOR_EDITOR_SCOPE_CAPS_POD_MODIFY_OVERRIDE_KEY) {
+            if let Some(editor) = self.behavior_editor.as_mut()
+                && let Some(cfg) = editor.working_config.as_mut()
+            {
+                cfg.scope.caps.pod_modify = if cfg.scope.caps.pod_modify.is_some() {
+                    None
+                } else {
+                    // ModifyAllow is the most-permissive cap; narrowing
+                    // against the pod ceiling collapses to whatever the
+                    // pod allows. Same identity-under-narrow trick.
+                    Some(whisper_agent_protocol::PodModifyCap::ModifyAllow)
+                };
+                editor.error = None;
+            }
+            return true;
+        }
+        if event.is_click_or_activate(BEHAVIOR_EDITOR_SCOPE_CAPS_DISPATCH_OVERRIDE_KEY) {
+            if let Some(editor) = self.behavior_editor.as_mut()
+                && let Some(cfg) = editor.working_config.as_mut()
+            {
+                cfg.scope.caps.dispatch = if cfg.scope.caps.dispatch.is_some() {
+                    None
+                } else {
+                    Some(whisper_agent_protocol::DispatchCap::WithinScope)
+                };
+                editor.error = None;
+            }
+            return true;
+        }
+        if event.is_click_or_activate(BEHAVIOR_EDITOR_SCOPE_CAPS_BEHAVIORS_OVERRIDE_KEY) {
+            if let Some(editor) = self.behavior_editor.as_mut()
+                && let Some(cfg) = editor.working_config.as_mut()
+            {
+                cfg.scope.caps.behaviors = if cfg.scope.caps.behaviors.is_some() {
+                    None
+                } else {
+                    Some(whisper_agent_protocol::BehaviorOpsCap::AuthorAny)
+                };
+                editor.error = None;
+            }
+            return true;
+        }
+        if event.is_click_or_activate(BEHAVIOR_EDITOR_SCOPE_TOOL_SURFACE_OVERRIDE_KEY) {
+            if let Some(editor) = self.behavior_editor.as_mut()
+                && let Some(cfg) = editor.working_config.as_mut()
+            {
+                cfg.scope.tool_surface = if cfg.scope.tool_surface.is_some() {
+                    None
+                } else {
+                    Some(whisper_agent_protocol::ToolSurface::default())
+                };
+                editor.error = None;
+            }
+            return true;
+        }
+
+        // Scope-tab resource-set multi-check item clicks. Same shape
+        // as the Thread-tab bindings handlers — only meaningful when
+        // the override is on (`Some(vec)`).
+        if let Some(editor) = self.behavior_editor.as_mut()
+            && let Some(cfg) = editor.working_config.as_mut()
+            && let Some(vec) = cfg.scope.backends.as_mut()
+            && apply_checkbox_list_to_vec(vec, event, BEHAVIOR_EDITOR_SCOPE_BACKENDS_KEY)
+        {
+            editor.error = None;
+            return true;
+        }
+        if let Some(editor) = self.behavior_editor.as_mut()
+            && let Some(cfg) = editor.working_config.as_mut()
+            && let Some(vec) = cfg.scope.host_envs.as_mut()
+            && apply_checkbox_list_to_vec(vec, event, BEHAVIOR_EDITOR_SCOPE_HOST_ENVS_KEY)
+        {
+            editor.error = None;
+            return true;
+        }
+        if let Some(editor) = self.behavior_editor.as_mut()
+            && let Some(cfg) = editor.working_config.as_mut()
+            && let Some(vec) = cfg.scope.mcp_hosts.as_mut()
+            && apply_checkbox_list_to_vec(vec, event, BEHAVIOR_EDITOR_SCOPE_MCP_HOSTS_KEY)
         {
             editor.error = None;
             return true;
@@ -4808,6 +5016,35 @@ impl ChatApp {
                                 };
                             }
                         }
+                        BehaviorEditorPicker::ScopeToolsDefault => {
+                            if let Some(cfg) = editor.working_config.as_mut()
+                                && let Some(map) = cfg.scope.tools.as_mut()
+                                && let Some(v) = disposition_from_wire(&value)
+                            {
+                                map.default = v;
+                            }
+                        }
+                        BehaviorEditorPicker::ScopeCapsPodModify => {
+                            if let Some(cfg) = editor.working_config.as_mut()
+                                && let Some(v) = pod_modify_cap_from_wire(&value)
+                            {
+                                cfg.scope.caps.pod_modify = Some(v);
+                            }
+                        }
+                        BehaviorEditorPicker::ScopeCapsDispatch => {
+                            if let Some(cfg) = editor.working_config.as_mut()
+                                && let Some(v) = dispatch_cap_from_wire(&value)
+                            {
+                                cfg.scope.caps.dispatch = Some(v);
+                            }
+                        }
+                        BehaviorEditorPicker::ScopeCapsBehaviors => {
+                            if let Some(cfg) = editor.working_config.as_mut()
+                                && let Some(v) = behaviors_cap_from_wire(&value)
+                            {
+                                cfg.scope.caps.behaviors = Some(v);
+                            }
+                        }
                     }
                     editor.open_picker = None;
                     editor.error = None;
@@ -4892,6 +5129,51 @@ impl ChatApp {
                 .into_iter()
                 .map(|(v, l)| (v.to_string(), l.to_string()))
                 .collect();
+                select_menu(which.key(), options)
+            }
+            BehaviorEditorPicker::ScopeToolsDefault => {
+                let options: Vec<(String, String)> = [Disposition::Allow, Disposition::Deny]
+                    .into_iter()
+                    .map(|d| {
+                        let lbl = disposition_label(d);
+                        (lbl.to_string(), lbl.to_string())
+                    })
+                    .collect();
+                select_menu(which.key(), options)
+            }
+            BehaviorEditorPicker::ScopeCapsPodModify => {
+                use whisper_agent_protocol::PodModifyCap as C;
+                let options: Vec<(String, String)> =
+                    [C::None, C::Memories, C::Content, C::ModifyAllow]
+                        .into_iter()
+                        .map(|c| {
+                            let lbl = pod_modify_cap_label(c);
+                            (lbl.to_string(), lbl.to_string())
+                        })
+                        .collect();
+                select_menu(which.key(), options)
+            }
+            BehaviorEditorPicker::ScopeCapsDispatch => {
+                use whisper_agent_protocol::DispatchCap as C;
+                let options: Vec<(String, String)> = [C::None, C::WithinScope]
+                    .into_iter()
+                    .map(|c| {
+                        let lbl = dispatch_cap_label(c);
+                        (lbl.to_string(), lbl.to_string())
+                    })
+                    .collect();
+                select_menu(which.key(), options)
+            }
+            BehaviorEditorPicker::ScopeCapsBehaviors => {
+                use whisper_agent_protocol::BehaviorOpsCap as C;
+                let options: Vec<(String, String)> =
+                    [C::None, C::Read, C::AuthorNarrower, C::AuthorAny]
+                        .into_iter()
+                        .map(|c| {
+                            let lbl = behaviors_cap_label(c);
+                            (lbl.to_string(), lbl.to_string())
+                        })
+                        .collect();
                 select_menu(which.key(), options)
             }
         }
@@ -5253,11 +5535,7 @@ impl ChatApp {
                 BehaviorEditorTab::Trigger => self.render_behavior_editor_trigger_tab(editor, cfg),
                 BehaviorEditorTab::Prompt => self.render_behavior_editor_prompt_tab(editor),
                 BehaviorEditorTab::Thread => self.render_behavior_editor_thread_tab(editor, cfg),
-                BehaviorEditorTab::Scope => paragraph(
-                    "Scope tab — coming soon. Cap and tool-gate narrowing \
-                     ride through unchanged on save.",
-                )
-                .muted(),
+                BehaviorEditorTab::Scope => self.render_behavior_editor_scope_tab(editor, cfg),
                 BehaviorEditorTab::Retention => {
                     self.render_behavior_editor_retention_tab(editor, cfg)
                 }
@@ -5843,6 +6121,268 @@ impl ChatApp {
             .collect();
         let selected = cfg.thread.bindings.mcp_hosts.as_deref().unwrap_or(&[]);
         checkbox_column(BEHAVIOR_EDITOR_THREAD_MCP_HOSTS_KEY, selected, options)
+    }
+
+    /// Scope tab body. Per-behavior allow narrowing — at fire time
+    /// the spawned thread runs with `pod.allow.narrow(scope)`, so
+    /// every field on `BehaviorScope` is `Option`-shaped: `None`
+    /// means inherit the pod ceiling, `Some(...)` narrows further.
+    /// Mirrors the egui sibling's `render_behavior_editor_scope_tab`,
+    /// minus the per-tool overrides (those are an unbounded
+    /// `String → Disposition` map; the egui sibling defers them to
+    /// Raw TOML and we follow suit) and the structured tool-surface
+    /// editor (deferred for the same reason as the pod editor's
+    /// Defaults `tool_surface` sub-slice).
+    fn render_behavior_editor_scope_tab(
+        &self,
+        editor: &BehaviorEditorSheetState,
+        cfg: &BehaviorConfig,
+    ) -> El {
+        // Resource set rows: backends / host_envs / mcp_hosts. Each
+        // row has an override checkbox; when on, a multi-check column
+        // over the corresponding pod allow list. Pod config may not
+        // have landed yet, so render a "(loading…)" hint in flight.
+        let backends_row = self.render_behavior_editor_scope_resource_row(
+            editor,
+            cfg.scope.backends.as_deref(),
+            BEHAVIOR_EDITOR_SCOPE_BACKENDS_OVERRIDE_KEY,
+            BEHAVIOR_EDITOR_SCOPE_BACKENDS_KEY,
+            |pod_cfg| pod_cfg.allow.backends.clone(),
+            "(no backends in pod [allow])",
+        );
+        let host_envs_row = self.render_behavior_editor_scope_resource_row(
+            editor,
+            cfg.scope.host_envs.as_deref(),
+            BEHAVIOR_EDITOR_SCOPE_HOST_ENVS_OVERRIDE_KEY,
+            BEHAVIOR_EDITOR_SCOPE_HOST_ENVS_KEY,
+            |pod_cfg| {
+                pod_cfg
+                    .allow
+                    .host_env
+                    .iter()
+                    .map(|e| e.name.clone())
+                    .collect()
+            },
+            "(no host envs in pod [allow])",
+        );
+        let mcp_hosts_row = self.render_behavior_editor_scope_resource_row(
+            editor,
+            cfg.scope.mcp_hosts.as_deref(),
+            BEHAVIOR_EDITOR_SCOPE_MCP_HOSTS_OVERRIDE_KEY,
+            BEHAVIOR_EDITOR_SCOPE_MCP_HOSTS_KEY,
+            |pod_cfg| pod_cfg.allow.mcp_hosts.clone(),
+            "(no shared MCP hosts in pod [allow])",
+        );
+
+        // Tools row: override on ⇒ Disposition select_trigger +
+        // override-count text; off ⇒ inherit hint. Per-tool
+        // overrides defer to Raw TOML (matches egui).
+        let tools_override = cfg.scope.tools.is_some();
+        let tools_value: El = if let Some(map) = cfg.scope.tools.as_ref() {
+            let trigger = select_trigger(
+                BEHAVIOR_EDITOR_SCOPE_TOOLS_DEFAULT_KEY,
+                disposition_label(map.default),
+            );
+            let override_count = map.overrides.len();
+            let count_label = if override_count == 0 {
+                "(no per-tool overrides)".to_string()
+            } else {
+                format!("{override_count} per-tool override(s) — edit via Raw TOML")
+            };
+            row([trigger, text(count_label).muted().small()])
+                .gap(tokens::SPACE_2)
+                .align(Align::Center)
+                .width(Size::Fill(1.0))
+        } else {
+            paragraph("(inherit pod allow.tools)").muted().small()
+        };
+        let tools_row = row([
+            checkbox(tools_override).key(BEHAVIOR_EDITOR_SCOPE_TOOLS_OVERRIDE_KEY),
+            text("override").muted().small(),
+            tools_value,
+        ])
+        .gap(tokens::SPACE_2)
+        .align(Align::Center)
+        .width(Size::Fill(1.0));
+
+        // Cap rows: each cap is `Option<Cap>`; override on ⇒
+        // select_trigger over the cap's variants; off ⇒ inherit
+        // hint. Mirrors the egui sibling's per-cap helpers.
+        let pod_modify_row = self.render_behavior_editor_scope_cap_row(
+            cfg.scope.caps.pod_modify.map(pod_modify_cap_label),
+            BEHAVIOR_EDITOR_SCOPE_CAPS_POD_MODIFY_OVERRIDE_KEY,
+            BEHAVIOR_EDITOR_SCOPE_CAPS_POD_MODIFY_KEY,
+        );
+        let dispatch_row = self.render_behavior_editor_scope_cap_row(
+            cfg.scope.caps.dispatch.map(dispatch_cap_label),
+            BEHAVIOR_EDITOR_SCOPE_CAPS_DISPATCH_OVERRIDE_KEY,
+            BEHAVIOR_EDITOR_SCOPE_CAPS_DISPATCH_KEY,
+        );
+        let behaviors_row = self.render_behavior_editor_scope_cap_row(
+            cfg.scope.caps.behaviors.map(behaviors_cap_label),
+            BEHAVIOR_EDITOR_SCOPE_CAPS_BEHAVIORS_OVERRIDE_KEY,
+            BEHAVIOR_EDITOR_SCOPE_CAPS_BEHAVIORS_KEY,
+        );
+
+        // Tool-surface row: override checkbox + inherit/edit hint.
+        // Structured editor lands later (same pattern as the pod
+        // editor's Defaults `tool_surface` sub-slice).
+        let tool_surface_override = cfg.scope.tool_surface.is_some();
+        let tool_surface_value: El = if tool_surface_override {
+            paragraph(
+                "(override on — structured editor coming in a follow-up; \
+                 use Raw TOML to edit fields)",
+            )
+            .muted()
+            .small()
+        } else {
+            paragraph("(inherit pod thread_defaults.tool_surface)")
+                .muted()
+                .small()
+        };
+        let tool_surface_row = row([
+            checkbox(tool_surface_override).key(BEHAVIOR_EDITOR_SCOPE_TOOL_SURFACE_OVERRIDE_KEY),
+            text("override").muted().small(),
+            tool_surface_value,
+        ])
+        .gap(tokens::SPACE_2)
+        .align(Align::Center)
+        .width(Size::Fill(1.0));
+
+        form([
+            form_item([
+                form_label("backends"),
+                form_control(backends_row),
+                form_description(
+                    "Restrict the spawned thread to a subset of pod-allowed \
+                     backends. Empty list = none.",
+                ),
+            ]),
+            form_item([
+                form_label("host_envs"),
+                form_control(host_envs_row),
+                form_description(
+                    "Restrict the spawned thread to a subset of pod-allowed \
+                     host envs.",
+                ),
+            ]),
+            form_item([
+                form_label("mcp_hosts"),
+                form_control(mcp_hosts_row),
+                form_description(
+                    "Restrict the spawned thread to a subset of pod-allowed \
+                     shared MCP hosts.",
+                ),
+            ]),
+            form_item([
+                form_label("tools default"),
+                form_control(tools_row),
+                form_description(
+                    "Per-tool default for un-overridden tools. Per-tool \
+                     overrides ride through Raw TOML in v1.",
+                ),
+            ]),
+            form_item([
+                form_label("pod_modify"),
+                form_control(pod_modify_row),
+                form_description(
+                    "Cap on pod-directory writes for the spawned thread. \
+                     Inherits the pod ceiling when off.",
+                ),
+            ]),
+            form_item([
+                form_label("dispatch"),
+                form_control(dispatch_row),
+                form_description(
+                    "Cap on `dispatch_thread` calls. `none` blocks even \
+                     children with strictly narrower scopes.",
+                ),
+            ]),
+            form_item([
+                form_label("behaviors"),
+                form_control(behaviors_row),
+                form_description(
+                    "Cap on the behavior-management tools. `read` lets the \
+                     thread read configs; `author_*` opens write paths.",
+                ),
+            ]),
+            form_item([
+                form_label("tool surface"),
+                form_control(tool_surface_row),
+                form_description(
+                    "Optional override of the pod's `thread_defaults.\
+                     tool_surface`. Replaces wholesale; this is a \
+                     presentation knob, not a permission gate.",
+                ),
+            ]),
+        ])
+    }
+
+    /// Helper for the Scope tab's resource-set rows (backends /
+    /// host_envs / mcp_hosts). All three share the same shape: an
+    /// override checkbox plus a multi-check column over the pod's
+    /// matching allow list when override is on. Pulled out so the
+    /// three call sites stay readable; pod-config-loading and empty
+    /// states route through here too.
+    fn render_behavior_editor_scope_resource_row(
+        &self,
+        editor: &BehaviorEditorSheetState,
+        selected: Option<&[String]>,
+        override_key: &str,
+        group_key: &str,
+        pod_options: impl Fn(&PodConfig) -> Vec<String>,
+        empty_hint: &str,
+    ) -> El {
+        let on = selected.is_some();
+        let value: El = if !on {
+            paragraph("(inherit pod ceiling)").muted().small()
+        } else if editor.pending_pod_get.is_some() {
+            paragraph("(loading pod allow list…)").muted().small()
+        } else if let Some(pod_cfg) = editor.pod_config.as_ref() {
+            let names = pod_options(pod_cfg);
+            if names.is_empty() {
+                paragraph(empty_hint.to_string()).muted().small()
+            } else {
+                let options: Vec<(String, String)> =
+                    names.into_iter().map(|n| (n.clone(), n)).collect();
+                checkbox_column(group_key, selected.unwrap_or(&[]), options)
+            }
+        } else {
+            paragraph("(pod config unavailable)").muted().small()
+        };
+        row([
+            checkbox(on).key(override_key),
+            text("override").muted().small(),
+            value,
+        ])
+        .gap(tokens::SPACE_2)
+        .align(Align::Start)
+        .width(Size::Fill(1.0))
+    }
+
+    /// Helper for the Scope tab's cap rows. Override checkbox + a
+    /// `select_trigger` (when on) showing the current cap label; an
+    /// inherit hint otherwise.
+    fn render_behavior_editor_scope_cap_row(
+        &self,
+        current_label: Option<&'static str>,
+        override_key: &str,
+        trigger_key: &str,
+    ) -> El {
+        let on = current_label.is_some();
+        let value: El = if let Some(lbl) = current_label {
+            select_trigger(trigger_key, lbl)
+        } else {
+            paragraph("(inherit pod ceiling)").muted().small()
+        };
+        row([
+            checkbox(on).key(override_key),
+            text("override").muted().small(),
+            value,
+        ])
+        .gap(tokens::SPACE_2)
+        .align(Align::Center)
+        .width(Size::Fill(1.0))
     }
 
     /// Retention tab body. Mirrors the egui sibling's

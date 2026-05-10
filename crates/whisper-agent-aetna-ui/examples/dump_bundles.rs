@@ -257,6 +257,12 @@ enum Scene {
     /// shape — a useful baseline for the structured layout, even if
     /// it doesn't exercise the override-on numeric inputs.
     BehaviorEditorThreadTab,
+    /// Behavior editor sheet, opened and switched to the Scope
+    /// tab. Architect mock has `BehaviorScope::default()` so every
+    /// row renders in the inherit-only shape — useful for the
+    /// structured layout, even though it doesn't exercise the
+    /// override-on multi-checks / cap pickers.
+    BehaviorEditorScopeTab,
     /// Behavior editor sheet, opened and switched to the Retention
     /// tab. Architect mock has `RetentionPolicy::default()` (Keep),
     /// so the days numeric input doesn't render — the tab shows
@@ -286,7 +292,7 @@ enum Scene {
 }
 
 impl Scene {
-    const ALL: [Scene; 39] = [
+    const ALL: [Scene; 40] = [
         Scene::Connecting,
         Scene::Connected,
         Scene::Closed,
@@ -323,6 +329,7 @@ impl Scene {
         Scene::PodEditorDefaultsTab,
         Scene::PodEditorLimitsTab,
         Scene::BehaviorEditorThreadTab,
+        Scene::BehaviorEditorScopeTab,
         Scene::BehaviorEditorRetentionTab,
         Scene::BehaviorEditorSystemPromptTab,
         Scene::ForkModalOpen,
@@ -366,6 +373,7 @@ impl Scene {
             Scene::PodEditorDefaultsTab => "pod_editor_defaults_tab",
             Scene::PodEditorLimitsTab => "pod_editor_limits_tab",
             Scene::BehaviorEditorThreadTab => "behavior_editor_thread_tab",
+            Scene::BehaviorEditorScopeTab => "behavior_editor_scope_tab",
             Scene::BehaviorEditorRetentionTab => "behavior_editor_retention_tab",
             Scene::BehaviorEditorSystemPromptTab => "behavior_editor_system_prompt_tab",
             Scene::ForkModalOpen => "fork_modal_open",
@@ -440,6 +448,15 @@ impl Scene {
                 "behavior-row:default:architect",
                 "behavior-edit:default:architect",
                 "behavior-editor:tabs:tab:thread",
+            ],
+            // Same as above plus a click on the Scope tab.
+            // Architect mock has BehaviorScope::default() so every
+            // row renders in the inherit-only shape — the multi-
+            // checks / cap pickers don't show.
+            Scene::BehaviorEditorScopeTab => vec![
+                "behavior-row:default:architect",
+                "behavior-edit:default:architect",
+                "behavior-editor:tabs:tab:scope",
             ],
             // Same as above plus a click on the Retention tab.
             // Architect mock has RetentionPolicy::Keep so the days
@@ -518,6 +535,7 @@ fn build_app(scene: Scene) -> Box<dyn App> {
         Scene::BehaviorEditorHydrated
         | Scene::BehaviorEditorTriggerKindOpen
         | Scene::BehaviorEditorThreadTab
+        | Scene::BehaviorEditorScopeTab
         | Scene::BehaviorEditorRetentionTab
         | Scene::BehaviorEditorSystemPromptTab => {
             let queue = inbound.clone();
@@ -810,6 +828,7 @@ fn build_app(scene: Scene) -> Box<dyn App> {
         Scene::BehaviorEditorHydrated
         | Scene::BehaviorEditorTriggerKindOpen
         | Scene::BehaviorEditorThreadTab
+        | Scene::BehaviorEditorScopeTab
         | Scene::BehaviorEditorRetentionTab
         | Scene::BehaviorEditorSystemPromptTab => {
             // Same baseline as `SidebarBehaviorsExpanded` — pods +

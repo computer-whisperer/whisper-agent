@@ -765,7 +765,6 @@ days, so kind switches in the live editor preserve typed
 values.
 
 Deferred to follow-up sheet slices:
-- **Scope tab** — per-behavior allow narrowing.
 - **Raw TOML tab** — the escape hatch for malformed configs;
   needs a `toml::to_string_pretty` round-trip for sync.
 
@@ -988,6 +987,44 @@ single-pattern `if let` to a `match` over both wire kinds), so
 the dump's second `before_build` pass sees a populated
 `pod_config` and the host_env / mcp_hosts inherit hints render
 the same way they will in the live binary.
+
+**Behavior editor — Scope tab (landed):** ports the egui
+sibling's `render_behavior_editor_scope_tab`. Every field on
+[`BehaviorScope`] is `Option`-shaped (`None` = inherit pod
+ceiling), so each row is the same `[checkbox, "override",
+value-or-inherit]` shape the Thread tab settled on. Eight
+form items: three resource-set multi-checks (backends /
+host_envs / mcp_hosts) over the pod's allow lists; the
+`tools.default` Disposition picker (`allow` / `deny`) plus an
+override-count text reading "(N per-tool override(s) — edit
+via Raw TOML)" since per-tool overrides are an unbounded
+`String → Disposition` map; three cap pickers (pod_modify /
+dispatch / behaviors); and a tool-surface row whose ON state
+shows a "(structured editor coming in a follow-up; use Raw
+TOML to edit fields)" hint, deferred for the same reason as
+the pod editor's Defaults `tool_surface` sub-slice.
+
+`BehaviorEditorPicker` grew four variants
+(`ScopeToolsDefault` / `ScopeCapsPodModify` /
+`ScopeCapsDispatch` / `ScopeCapsBehaviors`); the picker-
+iteration list, picker-handler match, and `picker_menu`
+options switch picked up new arms. Override toggles seed
+sensible identity-under-narrow defaults: resource sets
+toggle `Some(Vec::new())` ↔ `None`; tools toggles
+`Some(AllowMap::allow_all())` ↔ `None`; caps toggle a
+ceiling-shaped value (`PodModifyCap::ModifyAllow`,
+`DispatchCap::WithinScope`, `BehaviorOpsCap::AuthorAny`) ↔
+`None`; tool_surface toggles `Some(ToolSurface::default())` ↔
+`None`. New `disposition_label` / `disposition_from_wire`
+helpers cover the bare `allow`/`deny` shape (distinct from
+the pod editor's `tool_gate_label`'s `_all`-suffixed shape —
+the Scope tools default isn't a pod-wide gate).
+
+A new `behavior_editor_scope_tab` bundle scene exercises the
+tab; the architect mock has `BehaviorScope::default()` so
+every row renders in the inherit-only state — useful for the
+structured layout, even though the override-on multi-checks
+and cap pickers don't show.
 
 ### ✅ Stage 9 — Login form
 
