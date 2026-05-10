@@ -729,6 +729,16 @@ pub(crate) struct BehaviorEditorSheetState {
     /// alongside `GetBehavior` on editor open. `Some` until the
     /// matching `PodSnapshot` arrives.
     pub(crate) pending_pod_get: Option<String>,
+    /// Raw TOML buffer for the Raw tab. Mirrors the pod editor's
+    /// `working_toml`: the structured tabs serialize their
+    /// `working_config` here on tab-enter, and Raw → structured
+    /// reparses this back into `working_config`. Empty until the
+    /// snapshot lands (or until the user first visits the Raw tab).
+    pub(crate) working_toml: String,
+    /// Whether the user has typed into the Raw tab since the last
+    /// re-serialize. Save uses this to decide between shipping the
+    /// raw buffer's parse and the structured `working_config`.
+    pub(crate) raw_dirty: bool,
 }
 
 /// Discriminator used by the editor's trigger-kind picker. Mirrors
@@ -912,6 +922,8 @@ impl BehaviorEditorSheetState {
             pending_save: None,
             pod_config: None,
             pending_pod_get: Some(pending_pod_get),
+            working_toml: String::new(),
+            raw_dirty: false,
         }
     }
 
@@ -958,6 +970,81 @@ impl BehaviorEditorSheetState {
         self.working_system_prompt = snapshot.system_prompt;
         self.sync_thread_buffers_from_config();
         self.sync_retention_buffer_from_config();
+        // Seed the Raw tab's buffer from the structured config so a
+        // first-time visit to Raw shows the snapshot's TOML rather
+        // than an empty pane. Failures (shouldn't happen — every
+        // BehaviorConfig round-trips) leave the buffer at "".
+        if let Some(cfg) = self.working_config.as_ref()
+            && let Ok(text) = toml::to_string_pretty(cfg)
+        {
+            self.working_toml = text;
+        }
+        self.raw_dirty = false;
+    }
+
+    /// Tab-switch with the same raw↔structured sync the pod editor
+    /// uses (`PodEditorSheetState::switch_tab`). Leaving Raw with
+    /// `raw_dirty` reparses the buffer back into `working_config` —
+    /// a parse error keeps the user on Raw with the message in
+    /// `error` so the typed text isn't lost. Entering Raw re-
+    /// serializes from `working_config` so the buffer reflects
+    /// whatever structured edits landed since last enter.
+    fn switch_tab(&mut self, target: BehaviorEditorTab) {
+        if self.tab == target {
+            return;
+        }
+        let leaving_raw = self.tab == BehaviorEditorTab::RawToml;
+        let entering_raw = target == BehaviorEditorTab::RawToml;
+        if leaving_raw && self.raw_dirty {
+            match toml::from_str::<BehaviorConfig>(&self.working_toml) {
+                Ok(parsed) => {
+                    self.working_config = Some(parsed);
+                    self.raw_dirty = false;
+                    self.error = None;
+                    // Re-derive structured-tab state from the new
+                    // parsed config: trigger kind / cron buffers, the
+                    // numeric / retention buffers, and the system-
+                    // prompt buffer. Same shape as `hydrate` minus the
+                    // wire-snapshot bits.
+                    if let Some(cfg) = self.working_config.as_ref() {
+                        self.working_kind = TriggerKindLabel::from_trigger(&cfg.trigger);
+                        if let TriggerSpec::Cron {
+                            schedule,
+                            timezone,
+                            overlap,
+                            catch_up,
+                        } = &cfg.trigger
+                        {
+                            self.schedule_buffer = schedule.clone();
+                            self.timezone_buffer = timezone.clone();
+                            self.overlap_buffer = *overlap;
+                            self.catch_up_buffer = *catch_up;
+                        }
+                    }
+                    self.sync_thread_buffers_from_config();
+                    self.sync_retention_buffer_from_config();
+                }
+                Err(e) => {
+                    self.error = Some(format!("raw TOML doesn't parse: {e}"));
+                    return; // stay on Raw
+                }
+            }
+        }
+        if entering_raw && let Some(cfg) = self.working_config.as_ref() {
+            // Re-serialize from working_config so the raw buffer
+            // reflects every structured edit since last enter.
+            // Apply the same trigger-rebuild submit_behavior_editor
+            // does so the round-trip captures pending kind / cron
+            // buffer edits, not just whatever's parked on the
+            // working trigger.
+            let mut snapshot = cfg.clone();
+            snapshot.trigger = self.resolved_trigger();
+            if let Ok(text) = toml::to_string_pretty(&snapshot) {
+                self.working_toml = text;
+            }
+            self.raw_dirty = false;
+        }
+        self.tab = target;
     }
 
     /// Pull the Retention tab's `days` buffer out of
@@ -2756,6 +2843,11 @@ const BEHAVIOR_EDITOR_RETENTION_DAYS_KEY: &str = "behavior-editor:retention:days
 /// as the new content).
 const BEHAVIOR_EDITOR_SYSTEM_PROMPT_OVERRIDE_KEY: &str = "behavior-editor:system-prompt:override";
 const BEHAVIOR_EDITOR_SYSTEM_PROMPT_KEY: &str = "behavior-editor:system-prompt";
+/// Raw-tab routed key for the behavior.toml `text_area`. Edits flip
+/// `editor.raw_dirty` so a Save (or a tab-switch back to a
+/// structured tab) reparses the buffer before shipping the wire
+/// message.
+const BEHAVIOR_EDITOR_RAW_TOML_KEY: &str = "behavior-editor:raw-toml";
 
 /// Conventional pod-relative path for the system-prompt override
 /// associated with a behavior. The toggle in the System Prompt tab
@@ -4488,7 +4580,10 @@ impl ChatApp {
             && let Some(target) = BehaviorEditorTab::from_wire(&value)
             && let Some(editor) = self.behavior_editor.as_mut()
         {
-            editor.tab = target;
+            // `switch_tab` runs the raw↔structured sync; a Raw → struct
+            // hop with an unparseable buffer keeps the user on Raw and
+            // surfaces the parse error in `editor.error`.
+            editor.switch_tab(target);
             return true;
         }
 
@@ -4910,6 +5005,27 @@ impl ChatApp {
             return true;
         }
 
+        // Raw-tab text_area. Each edit flips `raw_dirty` so the
+        // tab-switch reparse / Save round-trip pick up the change;
+        // see `BehaviorEditorSheetState::switch_tab` for the
+        // `working_toml` ↔ `working_config` contract.
+        if event.target_key() == Some(BEHAVIOR_EDITOR_RAW_TOML_KEY) {
+            if let Some(editor) = self.behavior_editor.as_mut() {
+                let before = editor.working_toml.clone();
+                text_area::apply_event(
+                    &mut editor.working_toml,
+                    &mut self.selection,
+                    BEHAVIOR_EDITOR_RAW_TOML_KEY,
+                    event,
+                );
+                if editor.working_toml != before {
+                    editor.raw_dirty = true;
+                }
+                editor.error = None;
+            }
+            return true;
+        }
+
         // Retention-tab `days` numeric input. Only meaningful when
         // `cfg.on_completion` is a timed variant; we still parse and
         // write back when the kind happens to be Keep so the buffer
@@ -5303,24 +5419,41 @@ impl ChatApp {
         if editor.pending_save.is_some() {
             return;
         }
-        let Some(working) = editor.working_config.as_ref() else {
-            // Snapshot hasn't landed yet (or load_error). Save isn't
-            // meaningful until we have a config to mutate.
-            return;
+
+        // Raw-current with edits ⇒ ship the buffer's parse, not the
+        // structured `working_config`. A parse failure surfaces in
+        // `error` and stays on Raw so the typed text isn't lost
+        // (mirrors the pod editor's `resolved_save_toml` path).
+        let raw_save = editor.tab == BehaviorEditorTab::RawToml && editor.raw_dirty;
+        let config = if raw_save {
+            match toml::from_str::<BehaviorConfig>(&editor.working_toml) {
+                Ok(cfg) => cfg,
+                Err(e) => {
+                    self.set_behavior_editor_error(format!("raw TOML doesn't parse: {e}"));
+                    return;
+                }
+            }
+        } else {
+            let Some(working) = editor.working_config.as_ref() else {
+                // Snapshot hasn't landed yet (or load_error). Save isn't
+                // meaningful until we have a config to mutate.
+                return;
+            };
+            let mut snapshot = working.clone();
+            snapshot.trigger = editor.resolved_trigger();
+            snapshot
         };
-        if working.name.trim().is_empty() {
+        if config.name.trim().is_empty() {
             self.set_behavior_editor_error("name is empty".into());
             return;
         }
-        if matches!(editor.working_kind, TriggerKindLabel::Cron)
+        if !raw_save
+            && matches!(editor.working_kind, TriggerKindLabel::Cron)
             && editor.schedule_buffer.trim().is_empty()
         {
             self.set_behavior_editor_error("cron schedule is empty".into());
             return;
         }
-
-        let mut config = working.clone();
-        config.trigger = editor.resolved_trigger();
 
         let pod_id = editor.pod_id.clone();
         let behavior_id = editor.behavior_id.clone();
@@ -5625,11 +5758,7 @@ impl ChatApp {
                 BehaviorEditorTab::SystemPrompt => {
                     self.render_behavior_editor_system_prompt_tab(editor, cfg)
                 }
-                BehaviorEditorTab::RawToml => paragraph(
-                    "Raw TOML tab — coming soon. Use the structured tabs \
-                     for now.",
-                )
-                .muted(),
+                BehaviorEditorTab::RawToml => self.render_behavior_editor_raw_tab(editor),
             },
         };
 
@@ -6623,6 +6752,43 @@ impl ChatApp {
             None => {}
         }
         form(items)
+    }
+
+    /// Raw TOML tab body. A hint paragraph above a monospace
+    /// multi-line `text_area` over `working_toml`. Round-trip with
+    /// the structured tabs is handled in `switch_tab`: leaving Raw
+    /// with `raw_dirty` reparses; entering Raw re-serializes from
+    /// the structured config so structural edits the user made
+    /// since last visit show up here.
+    ///
+    /// The prompt text is edited in the Prompt tab, not here —
+    /// `behavior.toml` doesn't carry the prompt body, only the
+    /// trigger / thread / scope / retention config.
+    fn render_behavior_editor_raw_tab(&self, editor: &BehaviorEditorSheetState) -> El {
+        let hint = paragraph(
+            "Raw `behavior.toml`. Edits here override the structured tabs on save. \
+             Prompt text is edited in the Prompt tab, not here. Switching back \
+             to a structured tab tries to parse this text first; a parse error \
+             keeps you here so the edit isn't lost.",
+        )
+        .muted()
+        .small();
+        // Hug height (no fixed) lets the textarea grow with the
+        // TOML's line count; the editor modal's outer `scroll`
+        // handles overflow. Same shape the pod editor's Raw tab
+        // uses. The column gets `tokens::RING_WIDTH` of horizontal
+        // padding so the textarea's focus ring isn't clipped by
+        // the scroll's scissor (lint catches the bare-edge case).
+        let body = text_area(
+            &editor.working_toml,
+            &self.selection,
+            BEHAVIOR_EDITOR_RAW_TOML_KEY,
+        )
+        .mono();
+        column([hint, body])
+            .gap(tokens::SPACE_2)
+            .padding(Sides::xy(tokens::RING_WIDTH, 0.0))
+            .width(Size::Fill(1.0))
     }
 
     /// `select_menu` for the behavior editor's trigger-kind picker.

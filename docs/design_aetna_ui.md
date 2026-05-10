@@ -764,9 +764,7 @@ Picking a timed variant re-applies the live buffer's parsed
 days, so kind switches in the live editor preserve typed
 values.
 
-Deferred to follow-up sheet slices:
-- **Raw TOML tab** — the escape hatch for malformed configs;
-  needs a `toml::to_string_pretty` round-trip for sync.
+All structured tabs and the Raw TOML escape hatch landed.
 
 **Pod editor sheet (landed):** mirrors the behavior editor's
 sheet shape but the body is much simpler — a single
@@ -1066,6 +1064,41 @@ ships `tool_surface: Default::default()` (which is
 `CoreTools::Named` of the conventional three names), so the
 scene shows the named buffer populated and the radio at
 `named`.
+
+**Behavior editor — Raw TOML tab (landed):**
+`BehaviorEditorSheetState` grew `working_toml: String` and
+`raw_dirty: bool`. Hydrate seeds the buffer from
+`toml::to_string_pretty(snapshot.config)` so a first visit
+to Raw shows the round-tripped TOML rather than a blank
+pane. Tab routing now goes through a new `switch_tab`
+helper modeled on the pod editor's: leaving Raw with
+`raw_dirty` reparses the buffer back into `working_config`
+(re-deriving the trigger-kind / cron / numeric / retention
+buffers in the process so the structured tabs reflect the
+just-typed TOML); a parse error keeps the user on Raw with
+the message in `error`. Entering Raw re-serializes from
+`working_config` after applying `resolved_trigger()` so
+pending kind / cron buffer edits survive the round-trip.
+
+`submit_behavior_editor` grew the same Raw-current branch
+the pod editor's `resolved_save_toml` carries: when the
+user is on Raw with edits, the buffer parses to
+`BehaviorConfig` and ships through `UpdateBehavior`
+verbatim; a parse failure keeps the editor open with the
+error surfaced in the destructive alert slot.
+
+The Raw tab body is a hint paragraph above a `text_area`
+keyed `behavior-editor:raw-toml`. The textarea uses Hug
+height (the editor modal's outer scroll handles overflow,
+matching the pod editor's Raw shape) and the wrapping
+column carries `tokens::RING_WIDTH` of horizontal padding
+so the textarea's focus ring isn't clipped by the scroll's
+scissor (lint catches the bare-edge case).
+
+A new `behavior_editor_raw_tab` bundle scene exercises the
+tab — the architect mock's parsed config gets serialized on
+hydrate, so the textarea shows the round-tripped TOML the
+moment the scene paints.
 
 ### ✅ Stage 9 — Login form
 

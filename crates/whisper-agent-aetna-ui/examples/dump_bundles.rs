@@ -274,6 +274,13 @@ enum Scene {
     /// inherit-only paragraph; the override checkbox + content
     /// text_area only appear after the user toggles override on.
     BehaviorEditorSystemPromptTab,
+    /// Behavior editor sheet, opened and switched to the Raw TOML
+    /// tab. The `working_toml` buffer was seeded from the architect
+    /// snapshot's parsed config in `hydrate`, so the textarea shows
+    /// the round-tripped TOML at first visit. Switching back to a
+    /// structured tab reparses; a parse error keeps the user on
+    /// Raw with the message in the destructive alert.
+    BehaviorEditorRawTab,
     /// Pod editor sheet, opened and switched to the Limits tab.
     /// Same hydration shape as `PodEditorHydrated`; an extra click
     /// on the `pod-editor:tabs:tab:limits` trigger flips the
@@ -292,7 +299,7 @@ enum Scene {
 }
 
 impl Scene {
-    const ALL: [Scene; 40] = [
+    const ALL: [Scene; 41] = [
         Scene::Connecting,
         Scene::Connected,
         Scene::Closed,
@@ -332,6 +339,7 @@ impl Scene {
         Scene::BehaviorEditorScopeTab,
         Scene::BehaviorEditorRetentionTab,
         Scene::BehaviorEditorSystemPromptTab,
+        Scene::BehaviorEditorRawTab,
         Scene::ForkModalOpen,
     ];
 
@@ -376,6 +384,7 @@ impl Scene {
             Scene::BehaviorEditorScopeTab => "behavior_editor_scope_tab",
             Scene::BehaviorEditorRetentionTab => "behavior_editor_retention_tab",
             Scene::BehaviorEditorSystemPromptTab => "behavior_editor_system_prompt_tab",
+            Scene::BehaviorEditorRawTab => "behavior_editor_raw_tab",
             Scene::ForkModalOpen => "fork_modal_open",
         }
     }
@@ -475,6 +484,15 @@ impl Scene {
                 "behavior-edit:default:architect",
                 "behavior-editor:tabs:tab:system_prompt",
             ],
+            // Same as above plus a click on the Raw tab. The
+            // architect mock's parsed config gets serialized into
+            // `working_toml` on hydrate, so the textarea shows the
+            // round-tripped TOML.
+            Scene::BehaviorEditorRawTab => vec![
+                "behavior-row:default:architect",
+                "behavior-edit:default:architect",
+                "behavior-editor:tabs:tab:raw",
+            ],
             // Click the gear icon — sidebar header's pod-settings
             // affordance. Renders only when `pod_tab.is_some()`,
             // which it is here (PodList seeded a default).
@@ -537,7 +555,8 @@ fn build_app(scene: Scene) -> Box<dyn App> {
         | Scene::BehaviorEditorThreadTab
         | Scene::BehaviorEditorScopeTab
         | Scene::BehaviorEditorRetentionTab
-        | Scene::BehaviorEditorSystemPromptTab => {
+        | Scene::BehaviorEditorSystemPromptTab
+        | Scene::BehaviorEditorRawTab => {
             let queue = inbound.clone();
             Box::new(move |msg| match msg {
                 // The behavior editor opens with a `GetBehavior` /
@@ -830,7 +849,8 @@ fn build_app(scene: Scene) -> Box<dyn App> {
         | Scene::BehaviorEditorThreadTab
         | Scene::BehaviorEditorScopeTab
         | Scene::BehaviorEditorRetentionTab
-        | Scene::BehaviorEditorSystemPromptTab => {
+        | Scene::BehaviorEditorSystemPromptTab
+        | Scene::BehaviorEditorRawTab => {
             // Same baseline as `SidebarBehaviorsExpanded` — pods +
             // threads + behaviors registry — so the click loop can
             // expand the architect row and click Edit. The
