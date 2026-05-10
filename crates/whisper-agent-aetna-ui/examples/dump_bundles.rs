@@ -30,8 +30,8 @@ use whisper_agent_aetna_ui::{
 };
 use whisper_agent_protocol::{
     BackendSummary, BehaviorOrigin, BehaviorSummary, ClientToServer, CompactionConfig,
-    ContentBlock, ContentCapabilities, Conversation, ImageMime, ImageSource, Message, ModelSummary,
-    PodSummary, Role, ServerToClient, ThreadBindings, ThreadConfig, ThreadSnapshot,
+    ContentBlock, ContentCapabilities, Conversation, FsEntry, ImageMime, ImageSource, Message,
+    ModelSummary, PodSummary, Role, ServerToClient, ThreadBindings, ThreadConfig, ThreadSnapshot,
     ThreadStateLabel, ThreadSummary, ToolKind, ToolResultContent, TurnEntry, TurnLog, Usage,
     permission::Scope,
 };
@@ -326,10 +326,16 @@ enum Scene {
     /// collapses to a single Close button and the description
     /// carries the runtime-owned hint.
     FileViewerReadOnly,
+    /// File tree modal scoped to a pod, with one subdir expanded.
+    /// Seeded by calling `ChatApp::open_file_tree_modal` (fires
+    /// `ListPodDir` on the root) and a synthetic click that
+    /// expands the `behaviors/` subdir. The per-scene SendFn
+    /// answers both `ListPodDir` requests with mock entries.
+    FileTreeOpen,
 }
 
 impl Scene {
-    const ALL: [Scene; 46] = [
+    const ALL: [Scene; 47] = [
         Scene::Connecting,
         Scene::Connected,
         Scene::Closed,
@@ -376,6 +382,7 @@ impl Scene {
         Scene::JsonViewerOpen,
         Scene::FileViewerEditable,
         Scene::FileViewerReadOnly,
+        Scene::FileTreeOpen,
     ];
 
     fn slug(self) -> &'static str {
@@ -426,6 +433,7 @@ impl Scene {
             Scene::JsonViewerOpen => "json_viewer_open",
             Scene::FileViewerEditable => "file_viewer_editable",
             Scene::FileViewerReadOnly => "file_viewer_readonly",
+            Scene::FileTreeOpen => "file_tree_open",
         }
     }
 
@@ -579,6 +587,13 @@ impl Scene {
                 "picker:pod",
                 "picker:pod:option:scratch",
             ],
+            // Expand the `behaviors/` subdir so the file-tree scene
+            // shows both the root entries and one expanded child
+            // level (where the per-behavior config + prompt sit).
+            // The SendFn answers the resulting `ListPodDir`, and
+            // the second `before_build` drains the response into
+            // `pod_files`.
+            Scene::FileTreeOpen => vec!["file-tree:dir:default:behaviors"],
             _ => Vec::new(),
         }
     }
@@ -656,6 +671,95 @@ fn build_app(scene: Scene) -> Box<dyn App> {
                             correlation_id,
                             snapshot: mock_default_pod_snapshot(),
                         }));
+                }
+            })
+        }
+        Scene::FileTreeOpen => {
+            // Answer `ListPodDir` for the pod root and the expanded
+            // `behaviors/` subdir with mock entries that cover every
+            // dispatch shape: `pod.toml` (PodConfig), `behaviors/`
+            // (dir), `threads/t-mock.json` (JsonViewer), `notes.md`
+            // (TextEditor), and the per-behavior config + prompt
+            // inside `behaviors/architect/`.
+            let queue = inbound.clone();
+            Box::new(move |msg| {
+                if let ClientToServer::ListPodDir {
+                    correlation_id,
+                    pod_id,
+                    path,
+                } = msg
+                    && pod_id == "default"
+                {
+                    let p = path.unwrap_or_default();
+                    let entries: Vec<FsEntry> = match p.as_str() {
+                        "" => vec![
+                            FsEntry {
+                                name: "pod.toml".into(),
+                                is_dir: false,
+                                size: 320,
+                                readonly: false,
+                            },
+                            FsEntry {
+                                name: "behaviors".into(),
+                                is_dir: true,
+                                size: 0,
+                                readonly: false,
+                            },
+                            FsEntry {
+                                name: "threads".into(),
+                                is_dir: true,
+                                size: 0,
+                                readonly: false,
+                            },
+                            FsEntry {
+                                name: "notes.md".into(),
+                                is_dir: false,
+                                size: 240,
+                                readonly: false,
+                            },
+                            FsEntry {
+                                name: "pod_state.json".into(),
+                                is_dir: false,
+                                size: 1024,
+                                readonly: true,
+                            },
+                        ],
+                        "behaviors" => vec![FsEntry {
+                            name: "architect".into(),
+                            is_dir: true,
+                            size: 0,
+                            readonly: false,
+                        }],
+                        "behaviors/architect" => vec![
+                            FsEntry {
+                                name: "behavior.toml".into(),
+                                is_dir: false,
+                                size: 480,
+                                readonly: false,
+                            },
+                            FsEntry {
+                                name: "prompt.md".into(),
+                                is_dir: false,
+                                size: 760,
+                                readonly: false,
+                            },
+                            FsEntry {
+                                name: "state.json".into(),
+                                is_dir: false,
+                                size: 256,
+                                readonly: true,
+                            },
+                        ],
+                        _ => Vec::new(),
+                    };
+                    queue.borrow_mut().push_back(InboundEvent::Wire(
+                        ServerToClient::PodDirListing {
+                            correlation_id,
+                            pod_id,
+                            path: p,
+                            entries,
+                        },
+                    ));
                 }
             })
         }
@@ -1109,7 +1213,10 @@ fn build_app(scene: Scene) -> Box<dyn App> {
                 behaviors: Vec::new(),
             }));
         }
-        Scene::JsonViewerOpen | Scene::FileViewerEditable | Scene::FileViewerReadOnly => {
+        Scene::JsonViewerOpen
+        | Scene::FileViewerEditable
+        | Scene::FileViewerReadOnly
+        | Scene::FileTreeOpen => {
             // Populated baseline so the dialog overlays a non-empty
             // sidebar / pane (same idea as the modal scenes above).
             // The viewer itself is opened after the queue borrow
@@ -1139,6 +1246,9 @@ fn build_app(scene: Scene) -> Box<dyn App> {
     }
     if matches!(scene, Scene::FileViewerEditable | Scene::FileViewerReadOnly) {
         app.open_file_viewer("default".into(), "notes.md".into());
+    }
+    if matches!(scene, Scene::FileTreeOpen) {
+        app.open_file_tree_modal("default".into());
     }
     Box::new(app)
 }

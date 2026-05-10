@@ -35,9 +35,8 @@
 //!
 //! Surfaces still to land (full inventory in
 //! `docs/design_aetna_ui.md` § "Migration gaps from egui webui"):
-//! server settings modal, knowledge-buckets modal,
-//! file-tree sidebar that opens the file viewer, thread inspector
-//! popover.
+//! server settings modal, knowledge-buckets modal, thread
+//! inspector popover.
 //!
 //! Dispatch model: a single `dispatch_wire` walks `ServerToClient`
 //! variants — only the ones the current stage cares about have arms;
@@ -54,7 +53,7 @@ use aetna_core::widgets::resize_handle::{self, ResizeDrag, Side};
 use aetna_core::widgets::select::{SelectAction, classify_event as classify_select_event};
 use whisper_agent_protocol::{
     ActivationSurface, AllowMap, Attachment, BackendSummary, BehaviorConfig, BehaviorSummary,
-    BehaviorThreadOverride, CatchUp, ClientToServer, ContentBlock, CoreTools, Disposition,
+    BehaviorThreadOverride, CatchUp, ClientToServer, ContentBlock, CoreTools, Disposition, FsEntry,
     ImageMime, ImageSource, InitialListing, ModelSummary, NamedHostEnv, Overlap, PodAllow,
     PodConfig, PodLimits, PodSummary, RetentionPolicy, Role, ServerToClient, SystemPromptChoice,
     ThreadBindingsRequest, ThreadConfigOverride, ThreadDefaults, ThreadSummary, TriggerSpec,
@@ -534,6 +533,24 @@ impl FileViewerModalState {
     }
 }
 
+/// Click-dispatch outcome for a path picked out of the file tree.
+/// Each known-shaped file routes to its specialized editor; everything
+/// else falls through to the generic [`FileViewerModalState`]
+/// (which the server-side `is_readonly_path` sniff downgrades to
+/// read-only when the path can't be safely overwritten).
+///
+/// Path strings mirror server-side constants (`pod::POD_TOML`, the
+/// `behaviors/<id>/{behavior.toml,prompt.md}` shape, the `.json`
+/// extension) — kept in sync by hand because this crate deliberately
+/// doesn't depend on the server crate.
+enum PodFileDispatch {
+    PodConfig,
+    BehaviorConfig(String),
+    BehaviorPrompt(String),
+    JsonViewer(String),
+    TextEditor(String),
+}
+
 /// Read-only JSON tree viewer state. Opened over a pod file path
 /// (typically a thread JSON or server-emitted state blob). Lifecycle:
 /// `open_json_viewer` mints a correlation + fires `ReadPodFile`, the
@@ -706,6 +723,24 @@ pub struct ChatApp {
     /// `WritePodFile`; the matching `PodFileWritten` adopts the
     /// working buffer as the new baseline.
     file_viewer_modal: Option<FileViewerModalState>,
+
+    // ----- modal: file tree -----
+    /// Pod the file-tree modal is currently open over. `Some` while
+    /// open; cleared on dismiss / close. Mirrors the egui sibling's
+    /// `file_tree_modal_pod`.
+    file_tree_modal_pod: Option<String>,
+    /// Cache of `ListPodDir` replies. Keyed by `(pod_id, path)`
+    /// where path is pod-relative ("" = root). Children of expanded
+    /// dirs are fetched lazily one round-trip at a time.
+    pod_files: HashMap<(String, String), Vec<FsEntry>>,
+    /// Outstanding `ListPodDir` keys so a re-render doesn't fire a
+    /// second request for the same dir while the first is in flight.
+    /// Drained when the matching `PodDirListing` lands.
+    pod_files_requested: HashSet<(String, String)>,
+    /// Per-directory expanded membership for the file-tree modal.
+    /// Keyed by `(pod_id, path)`. Toggled by clicks on the dir row;
+    /// expanded dirs trigger a lazy `ensure_pod_dir_fetched`.
+    pod_dirs_open: HashSet<(String, String)>,
 
     // ----- modal: JSON viewer -----
     /// Read-only JSON tree viewer over a pod file. `Some` while the
@@ -1779,6 +1814,10 @@ impl ChatApp {
             sidebar_drag: ResizeDrag::default(),
             lightbox: None,
             file_viewer_modal: None,
+            file_tree_modal_pod: None,
+            pod_files: HashMap::new(),
+            pod_files_requested: HashSet::new(),
+            pod_dirs_open: HashSet::new(),
             json_viewer_modal: None,
             json_tree_open: HashSet::new(),
             pending_sudos: HashMap::new(),
@@ -1878,6 +1917,11 @@ impl ChatApp {
                 // Per-pod `ListBehaviors` dedup also reset; the next
                 // `PodList` will re-fan-out one request per pod.
                 self.requested_behaviors_for.clear();
+                // File-tree caches die on reconnect — server may have
+                // restarted with a different on-disk layout, and the
+                // pending-request guard would otherwise wedge.
+                self.pod_files.clear();
+                self.pod_files_requested.clear();
                 if !self.list_requested {
                     self.send(ClientToServer::ListPods {
                         correlation_id: None,
@@ -2225,6 +2269,16 @@ impl ChatApp {
                 backend, models, ..
             } => {
                 self.models_by_backend.insert(backend, models);
+            }
+            ServerToClient::PodDirListing {
+                pod_id,
+                path,
+                entries,
+                ..
+            } => {
+                let key = (pod_id, path);
+                self.pod_files_requested.remove(&key);
+                self.pod_files.insert(key, entries);
             }
             ServerToClient::PodFileContent {
                 pod_id,
@@ -2927,6 +2981,40 @@ impl App for ChatApp {
             self.file_viewer_modal = None;
             return;
         }
+        // File tree modal routing — close / dismiss, plus dir toggle
+        // and file pick. Both row prefixes carry `{pod}:{path}` so
+        // multi-pod state can't alias across opens.
+        if event.is_click_or_activate(FILE_TREE_DISMISS_KEY)
+            || event.is_click_or_activate(FILE_TREE_CLOSE_KEY)
+        {
+            self.file_tree_modal_pod = None;
+            return;
+        }
+        if let Some(key) = event.route()
+            && let Some(rest) = key.strip_prefix(FILE_TREE_DIR_PREFIX)
+            && matches!(event.kind, UiEventKind::Click | UiEventKind::Activate)
+            && let Some((pod, path)) = rest.split_once(':')
+        {
+            let composite = (pod.to_string(), path.to_string());
+            if !self.pod_dirs_open.remove(&composite) {
+                self.pod_dirs_open.insert(composite);
+                // Lazy fetch of the just-expanded dir. Idempotent
+                // when the cache or in-flight request already
+                // covers it.
+                self.ensure_pod_dir_fetched(pod, path);
+            }
+            return;
+        }
+        if let Some(key) = event.route()
+            && let Some(rest) = key.strip_prefix(FILE_TREE_FILE_PREFIX)
+            && matches!(event.kind, UiEventKind::Click | UiEventKind::Activate)
+            && let Some((pod, path)) = rest.split_once(':')
+        {
+            let pod = pod.to_string();
+            let path = path.to_string();
+            self.handle_file_tree_pick(&pod, &path);
+            return;
+        }
 
         // Sudo banner: approve / remember / reject buttons + reject-
         // reason text input. All four routes carry the function_id as
@@ -3017,6 +3105,12 @@ impl App for ChatApp {
         if event.is_click_or_activate(SIDEBAR_POD_SETTINGS_KEY) {
             if let Some(pod) = self.pod_tab.clone() {
                 self.open_pod_editor(pod);
+            }
+            return;
+        }
+        if event.is_click_or_activate(SIDEBAR_POD_FILES_KEY) {
+            if let Some(pod) = self.pod_tab.clone() {
+                self.open_file_tree_modal(pod);
             }
             return;
         }
@@ -3504,6 +3598,30 @@ const FILE_VIEWER_CLOSE_KEY: &str = "file-viewer:close";
 const FILE_VIEWER_BODY_KEY: &str = "file-viewer:body";
 const FILE_VIEWER_SAVE_KEY: &str = "file-viewer:save";
 const FILE_VIEWER_REVERT_KEY: &str = "file-viewer:revert";
+
+/// Routed-key shapes for the file tree modal. The scrim uses
+/// `file-tree:dismiss`; the close button uses `file-tree:close`. Dir
+/// and file rows carry pod-prefixed suffixes so multi-pod state
+/// doesn't alias across opens (`file-tree:dir:{pod}:{path}` /
+/// `file-tree:file:{pod}:{path}`).
+const FILE_TREE_DISMISS_KEY: &str = "file-tree:dismiss";
+const FILE_TREE_CLOSE_KEY: &str = "file-tree:close";
+const FILE_TREE_DIR_PREFIX: &str = "file-tree:dir:";
+const FILE_TREE_FILE_PREFIX: &str = "file-tree:file:";
+
+/// Sidebar header folder icon — opens the file-tree modal scoped to
+/// the active pod. Rendered alongside the existing `settings` gear
+/// only when some pod tab is active. Single key (no pod-id suffix)
+/// since exactly one pod is active at any moment.
+const SIDEBAR_POD_FILES_KEY: &str = "sidebar:pod-files";
+
+fn file_tree_dir_key(pod_id: &str, path: &str) -> String {
+    format!("{FILE_TREE_DIR_PREFIX}{pod_id}:{path}")
+}
+
+fn file_tree_file_key(pod_id: &str, path: &str) -> String {
+    format!("{FILE_TREE_FILE_PREFIX}{pod_id}:{path}")
+}
 
 /// Routed key for the sidebar resize handle. Drag / arrow / Home /
 /// End events on this key fold through `resize_handle::apply_event_fixed`
@@ -4432,6 +4550,12 @@ impl ChatApp {
                 .icon_size(tokens::ICON_XS),
         ];
         if self.pod_tab.is_some() {
+            header_row.push(
+                icon_button("folder")
+                    .key(SIDEBAR_POD_FILES_KEY)
+                    .ghost()
+                    .icon_size(tokens::ICON_XS),
+            );
             header_row.push(
                 icon_button("settings")
                     .key(SIDEBAR_POD_SETTINGS_KEY)
@@ -5452,6 +5576,9 @@ impl ChatApp {
             }
         }
         if let Some(modal_el) = self.render_fork_modal() {
+            out.push(Some(modal_el));
+        }
+        if let Some(modal_el) = self.render_file_tree_modal() {
             out.push(Some(modal_el));
         }
         if let Some(modal_el) = self.render_file_viewer_modal() {
@@ -9595,6 +9722,225 @@ impl ChatApp {
                 .height(Size::Fixed(FILE_VIEWER_H))
                 .block_pointer(),
         ]))
+    }
+
+    /// Classify a pod-relative file path for the file-tree click
+    /// dispatcher. Strings mirror server-side constants (`pod::POD_TOML`,
+    /// the `behaviors/<id>/{behavior.toml,prompt.md}` shape) — kept in
+    /// sync by hand because this crate deliberately doesn't depend on
+    /// the server crate. `.json` paths route to the JSON viewer; all
+    /// other files fall through to the generic text editor, which the
+    /// server-side `is_readonly_path` sniff downgrades to read-only
+    /// when the path can't be safely overwritten.
+    fn classify_pod_file_path(path: &str) -> PodFileDispatch {
+        if path == "pod.toml" {
+            return PodFileDispatch::PodConfig;
+        }
+        if let Some(rest) = path.strip_prefix("behaviors/")
+            && let Some((id, suffix)) = rest.split_once('/')
+            && !id.is_empty()
+            && !suffix.is_empty()
+            && !suffix.contains('/')
+        {
+            match suffix {
+                "behavior.toml" => return PodFileDispatch::BehaviorConfig(id.to_string()),
+                "prompt.md" => return PodFileDispatch::BehaviorPrompt(id.to_string()),
+                _ => {}
+            }
+        }
+        if path.ends_with(".json") {
+            return PodFileDispatch::JsonViewer(path.to_string());
+        }
+        PodFileDispatch::TextEditor(path.to_string())
+    }
+
+    /// Fire a `ListPodDir` for `(pod_id, path)` iff we don't already
+    /// have a cached listing or a request in flight. `path` is the
+    /// pod-relative directory ("" = pod root). Shallow: children of
+    /// expanded subdirectories are fetched one round-trip at a time.
+    fn ensure_pod_dir_fetched(&mut self, pod_id: &str, path: &str) {
+        let key = (pod_id.to_string(), path.to_string());
+        if self.pod_files.contains_key(&key) || self.pod_files_requested.contains(&key) {
+            return;
+        }
+        self.pod_files_requested.insert(key);
+        self.send(ClientToServer::ListPodDir {
+            correlation_id: None,
+            pod_id: pod_id.to_string(),
+            path: if path.is_empty() {
+                None
+            } else {
+                Some(path.to_string())
+            },
+        });
+    }
+
+    /// Open the file-tree modal scoped to `pod_id`. Stamps the slot
+    /// (the renderer reads it next frame) and primes the root-dir
+    /// fetch so the body has entries to paint by the time the dialog
+    /// is on screen.
+    pub fn open_file_tree_modal(&mut self, pod_id: String) {
+        self.ensure_pod_dir_fetched(&pod_id, "");
+        self.file_tree_modal_pod = Some(pod_id);
+    }
+
+    /// Recursive emitter for one pod directory into `rows`. Dirs
+    /// render as a chevron + name row; clicking toggles
+    /// `pod_dirs_open` membership and (on the next frame) the
+    /// `ensure_pod_dir_fetched` call below kicks the fetch. Files
+    /// render as a row keyed by the dispatch shape — clicks land in
+    /// `handle_file_tree_pick` for routing.
+    ///
+    /// The renderer is `&self`; lazy-fetch + expansion writes happen
+    /// downstream in `on_event` (click-driven) and during build via
+    /// the side-effect-free `is_open` check.
+    fn render_pod_dir(&self, rows: &mut Vec<El>, pod_id: &str, path: &str, depth: usize) {
+        let indent = tokens::SPACE_3 * depth as f32;
+        let key = (pod_id.to_string(), path.to_string());
+        let Some(entries) = self.pod_files.get(&key) else {
+            rows.push(text("loading\u{2026}").caption().muted().padding(Sides {
+                left: indent,
+                ..Sides::default()
+            }));
+            return;
+        };
+        if entries.is_empty() {
+            rows.push(text("(empty)").caption().muted().padding(Sides {
+                left: indent,
+                ..Sides::default()
+            }));
+            return;
+        }
+        for entry in entries {
+            let child_path = if path.is_empty() {
+                entry.name.clone()
+            } else {
+                format!("{path}/{}", entry.name)
+            };
+            if entry.is_dir {
+                let dir_open = self
+                    .pod_dirs_open
+                    .contains(&(pod_id.to_string(), child_path.clone()));
+                let chevron = if dir_open {
+                    "chevron-down"
+                } else {
+                    "chevron-right"
+                };
+                rows.push(
+                    row([
+                        icon(chevron)
+                            .icon_size(tokens::ICON_XS)
+                            .color(tokens::MUTED_FOREGROUND),
+                        text(format!("{}/", entry.name)).small().semibold(),
+                    ])
+                    .key(file_tree_dir_key(pod_id, &child_path))
+                    .cursor(Cursor::Pointer)
+                    .gap(tokens::SPACE_1)
+                    .align(Align::Center)
+                    .width(Size::Fill(1.0))
+                    .focusable()
+                    .padding(Sides {
+                        left: indent,
+                        ..Sides::default()
+                    }),
+                );
+                if dir_open {
+                    self.render_pod_dir(rows, pod_id, &child_path, depth + 1);
+                }
+            } else {
+                let mut label = text(&entry.name).small();
+                if entry.readonly {
+                    label = label.muted();
+                }
+                rows.push(
+                    row([label])
+                        .key(file_tree_file_key(pod_id, &child_path))
+                        .cursor(Cursor::Pointer)
+                        .align(Align::Center)
+                        .width(Size::Fill(1.0))
+                        .focusable()
+                        .padding(Sides {
+                            left: indent + tokens::SPACE_3,
+                            ..Sides::default()
+                        }),
+                );
+            }
+        }
+    }
+
+    /// File-tree modal. Centered `dialog_content` (520 × 600) over a
+    /// scrollable column of recursively-rendered entries rooted at
+    /// the pod's directory. Lazy: each expanded dir fires a single
+    /// `ListPodDir`; the renderer reads cached entries when present
+    /// and renders a "loading…" placeholder otherwise. Click on a
+    /// file routes through `classify_pod_file_path` to the right
+    /// editor.
+    fn render_file_tree_modal(&self) -> Option<El> {
+        let pod_id = self.file_tree_modal_pod.as_deref()?;
+        const FILE_TREE_W: f32 = 520.0;
+        const FILE_TREE_H: f32 = 600.0;
+
+        let pod_label = self
+            .pods
+            .get(pod_id)
+            .map(|p| p.name.clone())
+            .unwrap_or_else(|| pod_id.to_string());
+
+        let mut rows: Vec<El> = Vec::new();
+        self.render_pod_dir(&mut rows, pod_id, "", 0);
+        let body = scroll(rows)
+            .gap(tokens::SPACE_1)
+            .width(Size::Fill(1.0))
+            .height(Size::Fill(1.0));
+
+        let close = button("Close").key(FILE_TREE_CLOSE_KEY);
+
+        let children: Vec<El> = vec![
+            dialog_header([
+                dialog_title(format!("Files \u{2014} {pod_label}")),
+                dialog_description(
+                    "Click a file to edit it. Specialized files (pod.toml, \
+                     behavior configs, prompts) open their own editors; \
+                     .json files open the read-only tree viewer.",
+                ),
+            ]),
+            body,
+            dialog_footer([close]),
+        ];
+
+        Some(overlay([
+            scrim(FILE_TREE_DISMISS_KEY),
+            dialog_content(children)
+                .width(Size::Fixed(FILE_TREE_W))
+                .height(Size::Fixed(FILE_TREE_H))
+                .block_pointer(),
+        ]))
+    }
+
+    /// Handle a click on a file row. Looks up the dispatch shape via
+    /// `classify_pod_file_path` and opens the right editor. The file-
+    /// tree modal stays open underneath — multi-file editing sessions
+    /// don't have to bounce through the tree icon between opens.
+    fn handle_file_tree_pick(&mut self, pod_id: &str, path: &str) {
+        match Self::classify_pod_file_path(path) {
+            PodFileDispatch::PodConfig => {
+                self.open_pod_editor(pod_id.to_string());
+            }
+            PodFileDispatch::BehaviorConfig(behavior_id)
+            | PodFileDispatch::BehaviorPrompt(behavior_id) => {
+                // v1 opens the behavior editor on its default tab —
+                // the egui sibling deep-links Prompt clicks to the
+                // Prompt tab, which we'll wire when `open_behavior_editor`
+                // grows a per-tab variant.
+                self.open_behavior_editor(pod_id.to_string(), behavior_id);
+            }
+            PodFileDispatch::JsonViewer(p) => {
+                self.open_json_viewer(pod_id.to_string(), p);
+            }
+            PodFileDispatch::TextEditor(p) => {
+                self.open_file_viewer(pod_id.to_string(), p);
+            }
+        }
     }
 
     /// Open the read-only JSON tree viewer on `<pod_id>/<path>`. Mints

@@ -1249,23 +1249,43 @@ trivial / small / medium / large.
   hover is deferred until aetna grows a row-level tooltip
   primitive. Entry point is public so the future file-tree slice
   can route `.json` clicks straight here.
-- 🌗 **File browser / editor.** Edit-with-save *modal* landed:
-  `open_file_viewer(pod_id, path)` mints a correlation and fires
-  `ReadPodFile`; `PodFileContent` hydrates `working` + `baseline`
-  + `readonly`; `WritePodFile` ships the buffer on Save, with
-  `PodFileWritten` adopting the working buffer as the new baseline.
-  Renderer is `render_file_viewer_modal` — same `dialog_content`
-  (720 × 560) shape as the JSON viewer, body is one `text_area`
-  (mono) over `working`, footer is Close / Revert / Save (Revert
-  + Save disabled when buffer == baseline; both gone entirely when
-  `readonly`). Dirty + saving state surfaces via `is_dirty()` and
-  `pending_correlation`. Bundle scenes: `FileViewerEditable` and
-  `FileViewerReadOnly`. The *tree* sidebar that opens these is the
-  next sub-slice — caching of `pod_files: HashMap<(pod, path), Vec<FsEntry>>`,
-  `ListPodDir` round-trips, `classify_pod_file_path` dispatching
-  to `open_pod_editor` / `open_behavior_editor` / `open_json_viewer`
-  / `open_file_viewer`. Egui equivalents are `render_file_tree_modal`
-  + `classify_pod_file_path` in `app/sidebar.rs`.
+- ✅ **File browser / editor.** Two slices, both landed.
+
+  **Edit-with-save modal:** `open_file_viewer(pod_id, path)` mints
+  a correlation and fires `ReadPodFile`; `PodFileContent` hydrates
+  `working` + `baseline` + `readonly`; `WritePodFile` ships the
+  buffer on Save, with `PodFileWritten` adopting the working
+  buffer as the new baseline. Renderer is `render_file_viewer_modal`
+  — `dialog_content` (720 × 560), single mono `text_area` body,
+  footer Close / Revert / Save (Revert + Save disabled when
+  buffer == baseline; both gone entirely when `readonly`). Bundle
+  scenes: `FileViewerEditable`, `FileViewerReadOnly`.
+
+  **File tree modal:** `open_file_tree_modal(pod_id)` primes a
+  `ListPodDir` on the pod root and stamps `file_tree_modal_pod`.
+  `PodDirListing` fans into `pod_files: HashMap<(pod_id, path),
+  Vec<FsEntry>>`; `pod_files_requested` dedups in-flight asks.
+  `pod_dirs_open` is the per-(pod, path) expansion set —
+  clicks toggle membership and lazy-fetch on expand. Renderer
+  is `render_file_tree_modal` (520 × 600 `dialog_content` over
+  a scrolled column of recursive `render_pod_dir` rows: dirs
+  carry chevron + name, files carry name only with muted color
+  for `readonly`). Entry point is a folder `icon_button` in the
+  sidebar header alongside the settings gear (rendered only when
+  a pod tab is active). File clicks route through
+  `classify_pod_file_path` to one of the four specialized
+  openers: `open_pod_editor` (pod.toml), `open_behavior_editor`
+  (behaviors/&lt;id&gt;/{behavior.toml,prompt.md}),
+  `open_json_viewer` (*.json), or `open_file_viewer` (everything
+  else). Bundle scene: `FileTreeOpen` (root + one expanded
+  subdir, exercising every dispatch shape). The egui sibling's
+  per-tab deep-link (Prompt clicks landing on the Prompt tab)
+  is deferred until `open_behavior_editor` grows a per-tab
+  variant.
+
+  Reconnect drops `pod_files` + `pod_files_requested` so the
+  in-flight guard doesn't wedge if the server restarts with a
+  different on-disk layout.
 - ⏳ **Server settings.** Three tabs (LLM backends with Codex auth
   rotate, Shared MCP hosts CRUD with auth config, raw server
   TOML). Egui's `modals/settings.rs`. Reachable via the cog icon
