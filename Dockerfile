@@ -2,7 +2,7 @@
 #
 # whisper-agent server image.
 #
-# Bundles whisper-agent (with the webui embedded) plus the shared MCP
+# Bundles whisper-agent (with the aetna-ui wasm bundle embedded) plus the shared MCP
 # sidecars (web fetch, web search) into a single debian-slim image.
 # The host-side sandbox stack ships separately as the AUR package
 # whisper-agent-host — this image does NOT contain whisper-agent-sandbox
@@ -46,8 +46,8 @@ COPY . .
 # wasm bundle first — the agent crate embeds it via rust-embed at
 # compile time. RUSTFLAGS picks the wasm-compatible getrandom backend.
 RUN RUSTFLAGS='--cfg getrandom_backend="wasm_js"' \
-    wasm-pack build crates/whisper-agent-webui --target web --release
-# Server binaries (with the freshly-built webui baked in).
+    wasm-pack build crates/whisper-agent-aetna-ui --target web --release
+# Server binaries (with the freshly-built aetna-ui wasm bundle baked in).
 RUN cargo build --release \
     -p whisper-agent \
     -p whisper-agent-mcp-fetch \

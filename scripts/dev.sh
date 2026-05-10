@@ -85,16 +85,16 @@ if [[ ! -s "$DAEMON_TOKEN_FILE" ]]; then
     chmod 600 "$DAEMON_TOKEN_FILE"
 fi
 
-# Build the webui wasm bundle BEFORE the main binary. whisper-agent
-# embeds `crates/whisper-agent-webui/pkg/` at compile time via
-# rust-embed, so building the binary against a stale pkg/ baked in
-# the previous wasm output and the fresh wasm-pack rewrite wouldn't
-# take effect until the NEXT dev.sh run. Putting wasm-pack first
-# keeps wasm changes and the serving binary in lockstep.
+# Build the browser-ui wasm bundle BEFORE the main binary. The
+# server embeds `crates/whisper-agent-aetna-ui/pkg/` at compile time
+# via rust-embed, so building the binary against a stale pkg/ baked
+# in the previous wasm output and the fresh wasm-pack rewrite
+# wouldn't take effect until the NEXT dev.sh run. Putting wasm-pack
+# first keeps wasm changes and the serving binary in lockstep.
 if [[ "$SKIP_WASM" -eq 0 ]]; then
-    echo "==> building whisper-agent-webui (wasm)"
+    echo "==> building whisper-agent-aetna-ui (wasm)"
     RUSTFLAGS='--cfg getrandom_backend="wasm_js"' \
-        wasm-pack build crates/whisper-agent-webui --target web
+        wasm-pack build crates/whisper-agent-aetna-ui --target web
 else
     echo "==> skipping wasm build (--skip-wasm)"
 fi

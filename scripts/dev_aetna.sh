@@ -8,17 +8,17 @@
 # returns control to the shell; the EXIT trap then tears the server
 # stack down.
 #
-# This is the temporary scaffold companion to scripts/dev.sh while
-# the aetna pivot is in flight. dev.sh stays the canonical entry point
-# for the egui browser webui; once the aetna ui is the default we
-# fold this back into dev.sh.
+# Companion to scripts/dev.sh: dev.sh runs the server (and bakes in
+# the browser-ui wasm bundle for users hitting http://$LISTEN_SERVER);
+# this script adds the native desktop client on top.
 #
 # Env overrides:
 #   LISTEN_SERVER  default: 127.0.0.1:8080  (passed through to dev.sh)
 #
 # Flags:
-#   --include-wasm  also build the egui webui wasm bundle (default: skip,
-#                   since the native binary doesn't need it)
+#   --include-wasm  also build the browser-ui wasm bundle (default: skip,
+#                   since the native desktop client doesn't need it — only
+#                   browser users on http://$LISTEN_SERVER do)
 #   any other       passed through to dev.sh (e.g. --no-fetch, --no-search)
 
 set -euo pipefail
@@ -30,8 +30,8 @@ cd "$REPO_ROOT"
 LISTEN_SERVER="${LISTEN_SERVER:-127.0.0.1:8080}"
 
 # Default to skipping the wasm build — the aetna native binary doesn't
-# need the webui pkg/. Pass --include-wasm to opt in (e.g. when also
-# testing the egui browser ui side-by-side).
+# need the browser-ui pkg/. Pass --include-wasm to opt in (e.g. when
+# also testing the browser ui side-by-side).
 DEV_ARGS=(--skip-wasm)
 PASSTHROUGH=()
 for arg in "$@"; do

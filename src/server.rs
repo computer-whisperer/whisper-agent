@@ -58,19 +58,20 @@ use crate::runtime::scheduler::{
     build_default_pod_config,
 };
 
-// Webui assets baked into the release binary by `rust-embed`. In debug
+// UI assets baked into the release binary by `rust-embed`. In debug
 // builds the macro reads from disk on each request (so `cargo run`
 // picks up edits to assets/ and fresh wasm-pack output without a
-// rebuild); in release builds the file bodies are embedded at compile
-// time. The asset folders must exist when cargo compiles this crate —
-// `scripts/dev.sh` and the Dockerfile both run wasm-pack before the
-// release cargo build, populating `crates/whisper-agent-webui/pkg/`.
+// rebuild); in release builds the file bodies are embedded at
+// compile time. The asset folders must exist when cargo compiles
+// this crate — `scripts/dev.sh` and the Dockerfile both run wasm-
+// pack before the release cargo build, populating
+// `crates/whisper-agent-aetna-ui/pkg/`.
 #[derive(RustEmbed)]
-#[folder = "crates/whisper-agent-webui/pkg/"]
+#[folder = "crates/whisper-agent-aetna-ui/pkg/"]
 struct WebuiPkg;
 
 #[derive(RustEmbed)]
-#[folder = "crates/whisper-agent-webui/assets/"]
+#[folder = "crates/whisper-agent-aetna-ui/assets/"]
 struct WebuiAssets;
 
 /// Look up `path` in an embedded asset folder and return it with a
