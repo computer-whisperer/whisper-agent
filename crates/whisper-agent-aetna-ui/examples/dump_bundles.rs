@@ -31,9 +31,10 @@ use whisper_agent_aetna_ui::{
 use whisper_agent_protocol::{
     ActiveSlotSummary, BackendSummary, BehaviorOrigin, BehaviorSummary, BucketBuildPhase,
     BucketSummary, ClientToServer, CompactionConfig, ContentBlock, ContentCapabilities,
-    Conversation, FsEntry, ImageMime, ImageSource, Message, ModelSummary, PodSummary, Role,
-    ServerToClient, SlotStateLabel, ThreadBindings, ThreadConfig, ThreadSnapshot, ThreadStateLabel,
-    ThreadSummary, ToolKind, ToolResultContent, TurnEntry, TurnLog, Usage, permission::Scope,
+    Conversation, EmbeddingProviderInfo, FsEntry, ImageMime, ImageSource, Message, ModelSummary,
+    PodSummary, Role, ServerToClient, SlotStateLabel, ThreadBindings, ThreadConfig, ThreadSnapshot,
+    ThreadStateLabel, ThreadSummary, ToolKind, ToolResultContent, TurnEntry, TurnLog, Usage,
+    permission::Scope,
 };
 
 fn main() -> std::io::Result<()> {
@@ -362,10 +363,20 @@ enum Scene {
     /// answers with mock hits, so the results pane paints with one
     /// expanded hit and one collapsed snippet.
     BucketsModalSearchResults,
+    /// Buckets modal with the +New bucket create form open at its
+    /// default `linked` source kind. The `EmbeddingProvidersList`
+    /// wire seed populates the embedder picker; the form is
+    /// pre-seeded with reasonable typed values so every input
+    /// paints content rather than a placeholder ghost.
+    BucketsModalCreateForm,
+    /// Same shell as `BucketsModalCreateForm`, but with the
+    /// source kind switched to `tracked` so the driver / language /
+    /// mirror / cadence sub-fields render.
+    BucketsModalCreateFormTracked,
 }
 
 impl Scene {
-    const ALL: [Scene; 52] = [
+    const ALL: [Scene; 54] = [
         Scene::Connecting,
         Scene::Connected,
         Scene::Closed,
@@ -418,6 +429,8 @@ impl Scene {
         Scene::ThreadInspectorOpen,
         Scene::BucketsModalCatalog,
         Scene::BucketsModalSearchResults,
+        Scene::BucketsModalCreateForm,
+        Scene::BucketsModalCreateFormTracked,
     ];
 
     fn slug(self) -> &'static str {
@@ -474,6 +487,8 @@ impl Scene {
             Scene::ThreadInspectorOpen => "thread_inspector_open",
             Scene::BucketsModalCatalog => "buckets_modal_catalog",
             Scene::BucketsModalSearchResults => "buckets_modal_search_results",
+            Scene::BucketsModalCreateForm => "buckets_modal_create_form",
+            Scene::BucketsModalCreateFormTracked => "buckets_modal_create_form_tracked",
         }
     }
 
@@ -1366,7 +1381,9 @@ fn build_app(scene: Scene) -> Box<dyn App> {
         | Scene::SettingsBackends
         | Scene::SettingsServerConfig
         | Scene::BucketsModalCatalog
-        | Scene::BucketsModalSearchResults => {
+        | Scene::BucketsModalSearchResults
+        | Scene::BucketsModalCreateForm
+        | Scene::BucketsModalCreateFormTracked => {
             // Populated baseline so the dialog overlays a non-empty
             // sidebar / pane (same idea as the modal scenes above).
             // The viewer itself is opened after the queue borrow
@@ -1407,6 +1424,28 @@ fn build_app(scene: Scene) -> Box<dyn App> {
                 q.push_back(InboundEvent::Wire(ServerToClient::BucketsList {
                     correlation_id: None,
                     buckets: mock_buckets_modal_catalog(),
+                }));
+            }
+            if matches!(
+                scene,
+                Scene::BucketsModalCreateForm | Scene::BucketsModalCreateFormTracked
+            ) {
+                // No catalog needed for the create form scenes —
+                // an empty buckets list collapses the catalog body
+                // to a muted hint without competing for attention
+                // with the form. Keep an empty `BucketsList` so
+                // the `list_requested` flag flips and `ListBuckets`
+                // doesn't fire on connect.
+                q.push_back(InboundEvent::Wire(ServerToClient::BucketsList {
+                    correlation_id: None,
+                    buckets: Vec::new(),
+                }));
+                // Embedder picker — without this seed the form
+                // falls back to the empty-text-input branch and
+                // the picker doesn't paint.
+                q.push_back(InboundEvent::Wire(ServerToClient::EmbeddingProvidersList {
+                    correlation_id: None,
+                    providers: mock_embedding_providers(),
                 }));
             }
             if matches!(scene, Scene::BucketsModalCatalog) {
@@ -1459,6 +1498,12 @@ fn build_app(scene: Scene) -> Box<dyn App> {
     }
     if matches!(scene, Scene::BucketsModalSearchResults) {
         app.dev_seed_bucket_search(None, "wiki-en".into(), "knowledge graph history".into());
+    }
+    if matches!(scene, Scene::BucketsModalCreateForm) {
+        app.dev_seed_bucket_create("linked");
+    }
+    if matches!(scene, Scene::BucketsModalCreateFormTracked) {
+        app.dev_seed_bucket_create("tracked");
     }
     Box::new(app)
 }
@@ -1532,6 +1577,23 @@ fn mock_models() -> Vec<ModelSummary> {
             context_window: Some(200_000),
             max_output_tokens: Some(8192),
             capabilities: ContentCapabilities::default(),
+        },
+    ]
+}
+
+fn mock_embedding_providers() -> Vec<EmbeddingProviderInfo> {
+    vec![
+        EmbeddingProviderInfo {
+            name: "tei-bge-small".into(),
+            kind: "tei".into(),
+            endpoint: "http://localhost:8081".into(),
+            auth_mode: None,
+        },
+        EmbeddingProviderInfo {
+            name: "tei-jina-base".into(),
+            kind: "tei".into(),
+            endpoint: "http://localhost:8082".into(),
+            auth_mode: None,
         },
     ]
 }

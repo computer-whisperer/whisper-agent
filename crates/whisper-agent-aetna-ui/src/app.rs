@@ -54,12 +54,13 @@ use aetna_core::widgets::resize_handle::{self, ResizeDrag, Side};
 use aetna_core::widgets::select::{SelectAction, classify_event as classify_select_event};
 use whisper_agent_protocol::{
     ActivationSurface, AllowMap, Attachment, BackendSummary, BehaviorConfig, BehaviorSummary,
-    BehaviorThreadOverride, BucketBuildOutcome, BucketBuildPhase, BucketSummary, CatchUp,
-    ClientToServer, ContentBlock, CoreTools, Disposition, FsEntry, ImageMime, ImageSource,
-    InitialListing, ModelSummary, NamedHostEnv, Overlap, PodAllow, PodConfig, PodLimits,
-    PodSummary, RetentionPolicy, Role, ServerToClient, SlotStateLabel, SystemPromptChoice,
-    ThreadBindingsRequest, ThreadConfigOverride, ThreadDefaults, ThreadSummary, TriggerSpec,
-    permission::SudoDecision,
+    BehaviorThreadOverride, BucketBuildOutcome, BucketBuildPhase, BucketCreateInput,
+    BucketSourceInput, BucketSummary, CatchUp, ClientToServer, ContentBlock, CoreTools,
+    Disposition, EmbeddingProviderInfo, FsEntry, ImageMime, ImageSource, InitialListing,
+    ModelSummary, NamedHostEnv, Overlap, PodAllow, PodConfig, PodLimits, PodSummary,
+    QuantizationInput, RetentionPolicy, Role, ServerToClient, SlotStateLabel, SystemPromptChoice,
+    ThreadBindingsRequest, ThreadConfigOverride, ThreadDefaults, ThreadSummary,
+    TrackedCadenceInput, TrackedDriverInput, TriggerSpec, permission::SudoDecision,
 };
 
 /// Inbound event variants the host shell pushes into the [`Inbound`]
@@ -561,9 +562,9 @@ struct BuildProgressView {
     dense_total: Option<u64>,
 }
 
-/// Knowledge-buckets modal state. v1 catalog surface + Phase 3
-/// search-and-query. Create form is deferred to a follow-up
-/// sub-slice — `creating` is not carried here yet.
+/// Knowledge-buckets modal state. Catalog surface + Phase 3
+/// search-and-query + Phase 2 +New bucket create form (the form
+/// itself lives behind the optional `creating` slot).
 #[derive(Default)]
 struct BucketsModalState {
     /// Bucket id whose Delete button is "armed" — clicked once,
@@ -605,6 +606,26 @@ struct BucketsModalState {
     /// Keyed on the chunk id rather than hit index so the expanded
     /// set survives sort changes / re-orderings.
     query_expanded: HashSet<String>,
+
+    // ----- create form -----
+    /// `Some` while the +New bucket form is open. Carries every
+    /// field the user has typed so the contents survive re-render
+    /// frames and the create round-trip. `None` collapses the
+    /// section.
+    creating: Option<CreateBucketForm>,
+    /// Whether the create form's scope `select_menu` is open.
+    create_scope_picker_open: bool,
+    /// Whether the create form's embedder `select_menu` is open.
+    /// (Hidden when the catalog is empty — see `embedding_providers`.)
+    create_embedder_picker_open: bool,
+    /// Whether the create form's tracked-driver `select_menu` is open.
+    create_driver_picker_open: bool,
+    /// Whether the create form's delta-cadence `select_menu` is open.
+    create_delta_cadence_picker_open: bool,
+    /// Whether the create form's resync-cadence `select_menu` is open.
+    create_resync_cadence_picker_open: bool,
+    /// Whether the create form's quantization `select_menu` is open.
+    create_quantization_picker_open: bool,
 }
 
 impl BucketsModalState {
@@ -634,6 +655,243 @@ enum QueryStatus {
         message: String,
     },
 }
+
+/// In-progress new-bucket form state. Lives inside
+/// `BucketsModalState::creating` so it survives re-render frames
+/// across the create round-trip.
+#[derive(Clone)]
+struct CreateBucketForm {
+    /// Filesystem-safe id (becomes the bucket directory name on
+    /// disk). Validated kebab-case server-side; we don't pre-flight.
+    id: String,
+    /// Display name shown in the catalog.
+    name: String,
+    /// Free-text description.
+    description: String,
+    /// Embedder name from `[embedding_providers.*]`. Picker reflects
+    /// `ChatApp::embedding_providers`; empty TextEdit fallback when
+    /// the catalog hasn't arrived (or is empty server-side).
+    embedder: String,
+    /// Owning scope. `None` ⇒ server-scope (`<buckets_root>/<id>/`),
+    /// `Some(pod_id)` ⇒ pod-scope (`<pods_root>/<pod>/buckets/<id>/`).
+    pod_id: Option<String>,
+    /// Source kind tab. Drives which source-detail sub-fields the
+    /// renderer paints below the picker.
+    source_kind: SourceKindChoice,
+    /// Holds either `archive_path` (stored) or `path` (linked);
+    /// ignored for managed and tracked.
+    source_detail: String,
+    /// Picked driver for `kind=tracked` only.
+    tracked_driver: TrackedDriverChoice,
+    /// `kind=tracked, driver=wikipedia` — language code (`"en"`,
+    /// `"simple"`, `"de"`, …).
+    tracked_language: String,
+    /// `kind=tracked, driver=wikipedia` — optional mirror URL.
+    tracked_mirror: String,
+    /// `kind=tracked` delta-feed cadence.
+    tracked_delta_cadence: TrackedCadenceChoice,
+    /// `kind=tracked` resync-base cadence.
+    tracked_resync_cadence: TrackedCadenceChoice,
+    /// Chunker target size. `numeric_input`-shaped — the buffer is
+    /// the source of truth and is parsed into `chunk_tokens` on
+    /// every event.
+    chunk_tokens_buf: String,
+    chunk_tokens: u32,
+    /// Chunker overlap. Same buffer-then-parse pattern.
+    overlap_tokens_buf: String,
+    overlap_tokens: u32,
+    /// Toggle: build a dense vector index. Disabling collapses the
+    /// bucket to keyword-only.
+    dense_enabled: bool,
+    /// Toggle: build a sparse (BM25-like) index alongside dense.
+    sparse_enabled: bool,
+    /// Vectors-bin quantization frozen into the slot at build time.
+    quantization: QuantizationChoice,
+    /// `Some` once the user clicks Create — stamped with the
+    /// outbound correlation id by `submit_create_bucket`. The
+    /// wire-handler clears it on `BucketCreated` / `Error` echoes.
+    pending_correlation: Option<String>,
+    /// Inline error from a failed create attempt. Sticky until the
+    /// next Create click clears it.
+    error: Option<String>,
+}
+
+impl Default for CreateBucketForm {
+    fn default() -> Self {
+        Self {
+            id: String::new(),
+            name: String::new(),
+            description: String::new(),
+            embedder: String::new(),
+            pod_id: None,
+            source_kind: SourceKindChoice::Linked,
+            source_detail: String::new(),
+            tracked_driver: TrackedDriverChoice::default(),
+            tracked_language: String::new(),
+            tracked_mirror: String::new(),
+            tracked_delta_cadence: TrackedCadenceChoice::Daily,
+            tracked_resync_cadence: TrackedCadenceChoice::Monthly,
+            chunk_tokens_buf: "500".to_string(),
+            chunk_tokens: 500,
+            overlap_tokens_buf: "50".to_string(),
+            overlap_tokens: 50,
+            dense_enabled: true,
+            sparse_enabled: true,
+            quantization: QuantizationChoice::default(),
+            pending_correlation: None,
+            error: None,
+        }
+    }
+}
+
+#[derive(Copy, Clone, Eq, PartialEq, Default, Debug)]
+enum SourceKindChoice {
+    Stored,
+    #[default]
+    Linked,
+    Managed,
+    Tracked,
+}
+
+impl SourceKindChoice {
+    fn wire_value(self) -> &'static str {
+        match self {
+            SourceKindChoice::Stored => "stored",
+            SourceKindChoice::Linked => "linked",
+            SourceKindChoice::Managed => "managed",
+            SourceKindChoice::Tracked => "tracked",
+        }
+    }
+
+    fn from_wire(raw: &str) -> Option<Self> {
+        match raw {
+            "stored" => Some(SourceKindChoice::Stored),
+            "linked" => Some(SourceKindChoice::Linked),
+            "managed" => Some(SourceKindChoice::Managed),
+            "tracked" => Some(SourceKindChoice::Tracked),
+            _ => None,
+        }
+    }
+}
+
+impl std::fmt::Display for SourceKindChoice {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.wire_value())
+    }
+}
+
+/// UI mirror of `whisper_agent_protocol::TrackedDriverInput`.
+#[derive(Copy, Clone, Eq, PartialEq, Default, Debug)]
+enum TrackedDriverChoice {
+    #[default]
+    Wikipedia,
+}
+
+impl TrackedDriverChoice {
+    fn label(self) -> &'static str {
+        match self {
+            TrackedDriverChoice::Wikipedia => "wikipedia",
+        }
+    }
+}
+
+/// UI mirror of `whisper_agent_protocol::TrackedCadenceInput`.
+/// Vocabulary is shared between `delta_cadence` and `resync_cadence`
+/// — meaningful values per slot are driver-dependent.
+#[derive(Copy, Clone, Eq, PartialEq, Default, Debug)]
+enum TrackedCadenceChoice {
+    #[default]
+    Daily,
+    Weekly,
+    Monthly,
+    Quarterly,
+    Manual,
+}
+
+impl TrackedCadenceChoice {
+    fn label(self) -> &'static str {
+        match self {
+            TrackedCadenceChoice::Daily => "daily",
+            TrackedCadenceChoice::Weekly => "weekly",
+            TrackedCadenceChoice::Monthly => "monthly",
+            TrackedCadenceChoice::Quarterly => "quarterly",
+            TrackedCadenceChoice::Manual => "manual",
+        }
+    }
+
+    fn from_wire(raw: &str) -> Option<Self> {
+        match raw {
+            "daily" => Some(TrackedCadenceChoice::Daily),
+            "weekly" => Some(TrackedCadenceChoice::Weekly),
+            "monthly" => Some(TrackedCadenceChoice::Monthly),
+            "quarterly" => Some(TrackedCadenceChoice::Quarterly),
+            "manual" => Some(TrackedCadenceChoice::Manual),
+            _ => None,
+        }
+    }
+
+    fn to_wire(self) -> TrackedCadenceInput {
+        match self {
+            TrackedCadenceChoice::Daily => TrackedCadenceInput::Daily,
+            TrackedCadenceChoice::Weekly => TrackedCadenceInput::Weekly,
+            TrackedCadenceChoice::Monthly => TrackedCadenceInput::Monthly,
+            TrackedCadenceChoice::Quarterly => TrackedCadenceInput::Quarterly,
+            TrackedCadenceChoice::Manual => TrackedCadenceInput::Manual,
+        }
+    }
+}
+
+const TRACKED_CADENCE_CHOICES: [TrackedCadenceChoice; 5] = [
+    TrackedCadenceChoice::Daily,
+    TrackedCadenceChoice::Weekly,
+    TrackedCadenceChoice::Monthly,
+    TrackedCadenceChoice::Quarterly,
+    TrackedCadenceChoice::Manual,
+];
+
+/// UI mirror of `whisper_agent_protocol::QuantizationInput`. Frozen
+/// into the slot's manifest at build time; can't be changed without
+/// rebuilding.
+#[derive(Copy, Clone, Eq, PartialEq, Default, Debug)]
+enum QuantizationChoice {
+    #[default]
+    F32,
+    F16,
+    Int8,
+}
+
+impl QuantizationChoice {
+    fn label(self) -> &'static str {
+        match self {
+            QuantizationChoice::F32 => "f32",
+            QuantizationChoice::F16 => "f16",
+            QuantizationChoice::Int8 => "int8",
+        }
+    }
+
+    fn from_wire(raw: &str) -> Option<Self> {
+        match raw {
+            "f32" => Some(QuantizationChoice::F32),
+            "f16" => Some(QuantizationChoice::F16),
+            "int8" => Some(QuantizationChoice::Int8),
+            _ => None,
+        }
+    }
+
+    fn to_wire(self) -> QuantizationInput {
+        match self {
+            QuantizationChoice::F32 => QuantizationInput::F32,
+            QuantizationChoice::F16 => QuantizationInput::F16,
+            QuantizationChoice::Int8 => QuantizationInput::Int8,
+        }
+    }
+}
+
+const QUANTIZATION_CHOICES: [QuantizationChoice; 3] = [
+    QuantizationChoice::F32,
+    QuantizationChoice::F16,
+    QuantizationChoice::Int8,
+];
 
 /// Server-settings modal state. v1 has two tabs: a read-only LLM
 /// backends listing and an admin-only raw editor for the server's
@@ -1078,6 +1336,12 @@ pub struct ChatApp {
     /// Knowledge-bucket catalog. Populated from `BucketsList`. Read
     /// by the pod editor's Allow tab (multi-check over names).
     buckets: Vec<whisper_agent_protocol::BucketSummary>,
+    /// `[embedding_providers.*]` catalog from the server. Populated
+    /// from `EmbeddingProvidersList`. Drives the +New bucket form's
+    /// embedder picker — empty list collapses the picker to a plain
+    /// text input so the form remains typeable on a server with no
+    /// providers configured.
+    embedding_providers: Vec<EmbeddingProviderInfo>,
     /// Models per backend, keyed by `BackendSummary.name`. Populated
     /// lazily — we only fire `ListModels` for a backend when the user
     /// has actually picked it on the new-thread form, and we dedup
@@ -2082,6 +2346,7 @@ impl ChatApp {
             backends: Vec::new(),
             shared_mcp_hosts: Vec::new(),
             buckets: Vec::new(),
+            embedding_providers: Vec::new(),
             models_by_backend: HashMap::new(),
             requested_models_for: HashSet::new(),
             selected: None,
@@ -2185,6 +2450,11 @@ impl ChatApp {
                         correlation_id: None,
                     });
                     self.send(ClientToServer::ListBuckets {
+                        correlation_id: None,
+                    });
+                    // Embedder picker for the +New bucket form.
+                    // Cheap server-side (in-memory registry read).
+                    self.send(ClientToServer::ListEmbeddingProviders {
                         correlation_id: None,
                     });
                     self.list_requested = true;
@@ -2499,6 +2769,9 @@ impl ChatApp {
             ServerToClient::BackendsList { backends, .. } => {
                 self.backends = backends;
             }
+            ServerToClient::EmbeddingProvidersList { providers, .. } => {
+                self.embedding_providers = providers;
+            }
             ServerToClient::SharedMcpHostsList { hosts, .. } => {
                 // Server is authoritative — replace wholesale on
                 // every snapshot. Per-host add/remove broadcasts
@@ -2510,18 +2783,40 @@ impl ChatApp {
             ServerToClient::BucketsList { buckets, .. } => {
                 self.buckets = buckets;
             }
-            ServerToClient::BucketCreated { summary, .. }
+            ServerToClient::BucketCreated {
+                correlation_id,
+                summary,
+            } => {
                 // Append iff not already present — server re-broadcasts on
                 // every connected client, and a `ListBuckets` echo may
                 // race the per-row event during reconnect.
                 if !self
                     .buckets
                     .iter()
-                    .any(|b| b.id == summary.id && b.pod_id == summary.pod_id) =>
-            {
-                self.buckets.push(summary);
+                    .any(|b| b.id == summary.id && b.pod_id == summary.pod_id)
+                {
+                    self.buckets.push(summary);
+                }
+                // Close the create form if this is the echo of an
+                // outstanding submission. The originating client
+                // matches by correlation; other clients that didn't
+                // originate the create see no `creating` slot or a
+                // mismatched correlation and leave their form
+                // alone.
+                if let Some(modal) = self.buckets_modal.as_mut()
+                    && let Some(cf) = modal.creating.as_ref()
+                    && let Some(pending) = cf.pending_correlation.as_deref()
+                    && correlation_id.as_deref() == Some(pending)
+                {
+                    modal.creating = None;
+                    modal.create_scope_picker_open = false;
+                    modal.create_embedder_picker_open = false;
+                    modal.create_driver_picker_open = false;
+                    modal.create_delta_cadence_picker_open = false;
+                    modal.create_resync_cadence_picker_open = false;
+                    modal.create_quantization_picker_open = false;
+                }
             }
-            ServerToClient::BucketCreated { .. } => {}
             ServerToClient::BucketDeleted { id, pod_id, .. } => {
                 self.buckets.retain(|b| !(b.id == id && b.pod_id == pod_id));
                 let key = (pod_id, id);
@@ -3197,6 +3492,19 @@ impl ChatApp {
                         };
                         consumed = true;
                     }
+                    // +New bucket form — server rejected the
+                    // create. Surface the message into the form's
+                    // inline error and re-enable the Create button
+                    // by clearing `pending_correlation`.
+                    if !consumed
+                        && let Some(modal) = self.buckets_modal.as_mut()
+                        && let Some(cf) = modal.creating.as_mut()
+                        && cf.pending_correlation.as_ref() == Some(corr)
+                    {
+                        cf.error = Some(message.clone());
+                        cf.pending_correlation = None;
+                        consumed = true;
+                    }
                 }
                 // Thread-scoped errors land on the view's failure
                 // slot so the pane's destructive banner has
@@ -3706,6 +4014,10 @@ impl App for ChatApp {
                 if !modal.query_expanded.remove(chunk_id) {
                     modal.query_expanded.insert(chunk_id.to_string());
                 }
+                return;
+            }
+            // Create-form routing.
+            if self.handle_buckets_create_event(&event) {
                 return;
             }
         }
@@ -4317,6 +4629,39 @@ const BUCKETS_SEARCH_INPUT_KEY: &str = "buckets:search:input";
 const BUCKETS_SEARCH_SUBMIT_KEY: &str = "buckets:search:submit";
 const BUCKETS_SEARCH_TOP_K_KEY: &str = "buckets:search:top-k";
 const BUCKETS_SEARCH_HIT_PREFIX: &str = "buckets:search:hit:";
+
+/// Routed-key shapes for the buckets-modal `+ New bucket` create
+/// form. The toggle in the dialog header opens / closes the form;
+/// inside, every input + picker carries its own key so the standard
+/// `text_input::apply_event` / `select::classify_event` /
+/// `numeric_input::apply_event` / `toggle::apply_event_*` plumbing
+/// can fold events back into `CreateBucketForm`.
+const BUCKETS_CREATE_TOGGLE_KEY: &str = "buckets:create:toggle";
+const BUCKETS_CREATE_ID_KEY: &str = "buckets:create:id";
+const BUCKETS_CREATE_NAME_KEY: &str = "buckets:create:name";
+const BUCKETS_CREATE_DESCRIPTION_KEY: &str = "buckets:create:description";
+const BUCKETS_CREATE_EMBEDDER_INPUT_KEY: &str = "buckets:create:embedder-input";
+const BUCKETS_CREATE_EMBEDDER_PICKER_KEY: &str = "buckets:create:embedder-picker";
+const BUCKETS_CREATE_SCOPE_PICKER_KEY: &str = "buckets:create:scope-picker";
+const BUCKETS_CREATE_SOURCE_KIND_GROUP_KEY: &str = "buckets:create:source-kind";
+const BUCKETS_CREATE_SOURCE_DETAIL_KEY: &str = "buckets:create:source-detail";
+const BUCKETS_CREATE_DRIVER_PICKER_KEY: &str = "buckets:create:driver-picker";
+const BUCKETS_CREATE_LANGUAGE_KEY: &str = "buckets:create:language";
+const BUCKETS_CREATE_MIRROR_KEY: &str = "buckets:create:mirror";
+const BUCKETS_CREATE_DELTA_CADENCE_PICKER_KEY: &str = "buckets:create:delta-cadence-picker";
+const BUCKETS_CREATE_RESYNC_CADENCE_PICKER_KEY: &str = "buckets:create:resync-cadence-picker";
+const BUCKETS_CREATE_CHUNK_TOKENS_KEY: &str = "buckets:create:chunk-tokens";
+const BUCKETS_CREATE_OVERLAP_TOKENS_KEY: &str = "buckets:create:overlap-tokens";
+const BUCKETS_CREATE_DENSE_KEY: &str = "buckets:create:dense";
+const BUCKETS_CREATE_SPARSE_KEY: &str = "buckets:create:sparse";
+const BUCKETS_CREATE_QUANTIZATION_PICKER_KEY: &str = "buckets:create:quantization-picker";
+const BUCKETS_CREATE_SUBMIT_KEY: &str = "buckets:create:submit";
+
+/// Sentinel value the scope `select_menu` emits for the server-scope
+/// option, since `select::Pick` carries a `String` and `None` can't
+/// ride along directly. Picked to match the row-action sentinel so a
+/// real pod id can't collide.
+const BUCKET_CREATE_SCOPE_SERVER_VALUE: &str = "__server__";
 
 /// Compose the picker option value the bucket-picker `select_menu`
 /// emits. Encodes the (pod, id) pair the wire op needs in a single
@@ -6487,10 +6832,36 @@ impl ChatApp {
             // Bucket-picker menu rides above the dialog itself when
             // open — same topmost-layer pattern the behavior /
             // pod editor pickers use.
-            if let Some(modal) = self.buckets_modal.as_ref()
-                && modal.bucket_picker_open
-            {
-                out.push(Some(self.bucket_picker_menu()));
+            if let Some(modal) = self.buckets_modal.as_ref() {
+                if modal.bucket_picker_open {
+                    out.push(Some(self.bucket_picker_menu()));
+                }
+                // Create-form sub-pickers. At most one should be
+                // open at a time (the picker handlers close peers
+                // on Toggle / Pick) but the layer code defends
+                // against state drift by emitting whichever flags
+                // are set — `select_menu`'s own scrim takes care
+                // of dismiss bubbling.
+                if modal.creating.is_some() {
+                    if modal.create_scope_picker_open {
+                        out.push(Some(self.bucket_create_scope_menu()));
+                    }
+                    if modal.create_embedder_picker_open {
+                        out.push(Some(self.bucket_create_embedder_menu()));
+                    }
+                    if modal.create_driver_picker_open {
+                        out.push(Some(self.bucket_create_driver_menu()));
+                    }
+                    if modal.create_delta_cadence_picker_open {
+                        out.push(Some(self.bucket_create_cadence_menu(false)));
+                    }
+                    if modal.create_resync_cadence_picker_open {
+                        out.push(Some(self.bucket_create_cadence_menu(true)));
+                    }
+                    if modal.create_quantization_picker_open {
+                        out.push(Some(self.bucket_create_quantization_menu()));
+                    }
+                }
             }
         }
         if let Some(modal_el) = self.render_file_tree_modal() {
@@ -10690,6 +11061,46 @@ impl ChatApp {
         }
     }
 
+    /// Test fixture: open the +New bucket form pre-populated with
+    /// the supplied source kind and reasonable typed values. The
+    /// caller picks the kind to exercise (Tracked exposes the
+    /// driver / language / cadence sub-fields). Public so the
+    /// `dump_bundles` example can reach it; not part of the
+    /// production-app surface.
+    #[doc(hidden)]
+    pub fn dev_seed_bucket_create(&mut self, source_kind: &str) {
+        if self.buckets_modal.is_none() {
+            self.buckets_modal = Some(BucketsModalState::fresh());
+        }
+        let kind = SourceKindChoice::from_wire(source_kind).unwrap_or(SourceKindChoice::Linked);
+        let (source_detail, tracked_language, tracked_mirror) = match kind {
+            SourceKindChoice::Stored => (
+                "/data/wiki-en-2026-04-01.xml.bz2".to_string(),
+                String::new(),
+                String::new(),
+            ),
+            SourceKindChoice::Linked => ("/srv/notes".to_string(), String::new(), String::new()),
+            SourceKindChoice::Managed => (String::new(), String::new(), String::new()),
+            SourceKindChoice::Tracked => (String::new(), "en".to_string(), String::new()),
+        };
+        let form = CreateBucketForm {
+            id: "notes_2026".to_string(),
+            name: "Notes 2026".to_string(),
+            description: "Personal note dump for 2026.".to_string(),
+            embedder: "tei-bge-small".to_string(),
+            source_kind: kind,
+            source_detail,
+            tracked_language,
+            tracked_mirror,
+            tracked_delta_cadence: TrackedCadenceChoice::Daily,
+            tracked_resync_cadence: TrackedCadenceChoice::Monthly,
+            ..Default::default()
+        };
+        if let Some(modal) = self.buckets_modal.as_mut() {
+            modal.creating = Some(form);
+        }
+    }
+
     /// Fire `StartBucketBuild`. The server picks up the work and
     /// broadcasts `BucketBuildStarted`; that arm hydrates the
     /// per-row progress entry. Idempotent at the server: clicking
@@ -10825,6 +11236,371 @@ impl ChatApp {
             query,
             top_k,
         });
+    }
+
+    /// Route an event through the create-bucket form. Returns
+    /// `true` when the event was for one of the form's controls
+    /// (so the outer handler can `return`). Bails out early when
+    /// the form isn't open — the existing route checks above
+    /// already covered the toggle button before delegating here.
+    fn handle_buckets_create_event(&mut self, event: &UiEvent) -> bool {
+        // Toggle button: open / close the form. Lives at the
+        // top of the modal next to the search section, so it's
+        // routed even when the form is closed.
+        if event.is_click_or_activate(BUCKETS_CREATE_TOGGLE_KEY) {
+            if let Some(modal) = self.buckets_modal.as_mut() {
+                modal.creating = match modal.creating.take() {
+                    Some(_) => None,
+                    None => Some(CreateBucketForm::default()),
+                };
+                // Closing the form via the toggle drops every
+                // sub-picker open flag so a stale layer can't
+                // outlive the form. (Re-opening starts fresh
+                // anyway via `default()`.)
+                modal.create_scope_picker_open = false;
+                modal.create_embedder_picker_open = false;
+                modal.create_driver_picker_open = false;
+                modal.create_delta_cadence_picker_open = false;
+                modal.create_resync_cadence_picker_open = false;
+                modal.create_quantization_picker_open = false;
+            }
+            return true;
+        }
+        // Everything below operates on an open form.
+        let creating_open = self
+            .buckets_modal
+            .as_ref()
+            .map(|m| m.creating.is_some())
+            .unwrap_or(false);
+        if !creating_open {
+            return false;
+        }
+
+        // ---- text inputs ----
+        if let Some(key) = event.target_key() {
+            let mut handled = false;
+            if let Some(modal) = self.buckets_modal.as_mut()
+                && let Some(cf) = modal.creating.as_mut()
+                && cf.pending_correlation.is_none()
+            {
+                let touched = match key {
+                    BUCKETS_CREATE_ID_KEY => Some(&mut cf.id),
+                    BUCKETS_CREATE_NAME_KEY => Some(&mut cf.name),
+                    BUCKETS_CREATE_DESCRIPTION_KEY => Some(&mut cf.description),
+                    BUCKETS_CREATE_EMBEDDER_INPUT_KEY => Some(&mut cf.embedder),
+                    BUCKETS_CREATE_SOURCE_DETAIL_KEY => Some(&mut cf.source_detail),
+                    BUCKETS_CREATE_LANGUAGE_KEY => Some(&mut cf.tracked_language),
+                    BUCKETS_CREATE_MIRROR_KEY => Some(&mut cf.tracked_mirror),
+                    _ => None,
+                };
+                if let Some(buf) = touched {
+                    text_input::apply_event(buf, &mut self.selection, key, event);
+                    cf.error = None;
+                    handled = true;
+                }
+            }
+            if handled {
+                return true;
+            }
+        }
+
+        // ---- numeric inputs (chunk + overlap tokens) ----
+        if let Some(modal) = self.buckets_modal.as_mut()
+            && let Some(cf) = modal.creating.as_mut()
+            && cf.pending_correlation.is_none()
+        {
+            let chunk_opts = NumericInputOpts::default().min(50.0).max(4096.0).step(10.0);
+            if numeric_input::apply_event(
+                &mut cf.chunk_tokens_buf,
+                &mut self.selection,
+                BUCKETS_CREATE_CHUNK_TOKENS_KEY,
+                &chunk_opts,
+                event,
+            ) {
+                if let Ok(v) = cf.chunk_tokens_buf.parse::<u32>() {
+                    cf.chunk_tokens = v.clamp(50, 4096);
+                }
+                cf.error = None;
+                return true;
+            }
+            let overlap_opts = NumericInputOpts::default().min(0.0).max(512.0).step(5.0);
+            if numeric_input::apply_event(
+                &mut cf.overlap_tokens_buf,
+                &mut self.selection,
+                BUCKETS_CREATE_OVERLAP_TOKENS_KEY,
+                &overlap_opts,
+                event,
+            ) {
+                if let Ok(v) = cf.overlap_tokens_buf.parse::<u32>() {
+                    cf.overlap_tokens = v.clamp(0, 512);
+                }
+                cf.error = None;
+                return true;
+            }
+        }
+
+        // ---- source-kind toggle group ----
+        if let Some(modal) = self.buckets_modal.as_mut()
+            && let Some(cf) = modal.creating.as_mut()
+            && cf.pending_correlation.is_none()
+            && aetna_core::widgets::toggle::apply_event_single(
+                &mut cf.source_kind,
+                event,
+                BUCKETS_CREATE_SOURCE_KIND_GROUP_KEY,
+                SourceKindChoice::from_wire,
+            )
+        {
+            // Switching kinds invalidates source_detail's meaning;
+            // egui sibling clears it on switch only between
+            // stored/linked. We mirror by always clearing — keeps
+            // the field empty for managed/tracked too, which avoids
+            // dangling text confusing the user.
+            cf.source_detail.clear();
+            cf.error = None;
+            return true;
+        }
+
+        // ---- dense / sparse toggle buttons (standalone) ----
+        if let Some(modal) = self.buckets_modal.as_mut()
+            && let Some(cf) = modal.creating.as_mut()
+            && cf.pending_correlation.is_none()
+        {
+            if aetna_core::widgets::toggle::apply_event_pressed(
+                &mut cf.dense_enabled,
+                event,
+                BUCKETS_CREATE_DENSE_KEY,
+            ) {
+                cf.error = None;
+                return true;
+            }
+            if aetna_core::widgets::toggle::apply_event_pressed(
+                &mut cf.sparse_enabled,
+                event,
+                BUCKETS_CREATE_SPARSE_KEY,
+            ) {
+                cf.error = None;
+                return true;
+            }
+        }
+
+        // ---- pickers (scope / embedder / driver / cadences / quantization) ----
+        if let Some(action) = classify_select_event(event, BUCKETS_CREATE_SCOPE_PICKER_KEY) {
+            self.handle_create_scope_picker_event(action);
+            return true;
+        }
+        if let Some(action) = classify_select_event(event, BUCKETS_CREATE_EMBEDDER_PICKER_KEY) {
+            self.handle_create_embedder_picker_event(action);
+            return true;
+        }
+        if let Some(action) = classify_select_event(event, BUCKETS_CREATE_DRIVER_PICKER_KEY) {
+            self.handle_create_driver_picker_event(action);
+            return true;
+        }
+        if let Some(action) = classify_select_event(event, BUCKETS_CREATE_DELTA_CADENCE_PICKER_KEY)
+        {
+            self.handle_create_cadence_picker_event(action, false);
+            return true;
+        }
+        if let Some(action) = classify_select_event(event, BUCKETS_CREATE_RESYNC_CADENCE_PICKER_KEY)
+        {
+            self.handle_create_cadence_picker_event(action, true);
+            return true;
+        }
+        if let Some(action) = classify_select_event(event, BUCKETS_CREATE_QUANTIZATION_PICKER_KEY) {
+            self.handle_create_quantization_picker_event(action);
+            return true;
+        }
+
+        // ---- submit ----
+        if event.is_click_or_activate(BUCKETS_CREATE_SUBMIT_KEY) {
+            self.submit_create_bucket();
+            return true;
+        }
+
+        false
+    }
+
+    fn handle_create_scope_picker_event(&mut self, action: SelectAction) {
+        let Some(modal) = self.buckets_modal.as_mut() else {
+            return;
+        };
+        match action {
+            SelectAction::Toggle => {
+                modal.create_scope_picker_open = !modal.create_scope_picker_open;
+            }
+            SelectAction::Dismiss => {
+                modal.create_scope_picker_open = false;
+            }
+            SelectAction::Pick(value) => {
+                if let Some(cf) = modal.creating.as_mut() {
+                    cf.pod_id = if value == BUCKET_CREATE_SCOPE_SERVER_VALUE {
+                        None
+                    } else {
+                        Some(value)
+                    };
+                    cf.error = None;
+                }
+                modal.create_scope_picker_open = false;
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_create_embedder_picker_event(&mut self, action: SelectAction) {
+        let Some(modal) = self.buckets_modal.as_mut() else {
+            return;
+        };
+        match action {
+            SelectAction::Toggle => {
+                modal.create_embedder_picker_open = !modal.create_embedder_picker_open;
+            }
+            SelectAction::Dismiss => {
+                modal.create_embedder_picker_open = false;
+            }
+            SelectAction::Pick(value) => {
+                if let Some(cf) = modal.creating.as_mut() {
+                    cf.embedder = value;
+                    cf.error = None;
+                }
+                modal.create_embedder_picker_open = false;
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_create_driver_picker_event(&mut self, action: SelectAction) {
+        let Some(modal) = self.buckets_modal.as_mut() else {
+            return;
+        };
+        match action {
+            SelectAction::Toggle => {
+                modal.create_driver_picker_open = !modal.create_driver_picker_open;
+            }
+            SelectAction::Dismiss => {
+                modal.create_driver_picker_open = false;
+            }
+            SelectAction::Pick(value) => {
+                if let Some(cf) = modal.creating.as_mut() {
+                    if value == "wikipedia" {
+                        cf.tracked_driver = TrackedDriverChoice::Wikipedia;
+                    }
+                    cf.error = None;
+                }
+                modal.create_driver_picker_open = false;
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_create_cadence_picker_event(&mut self, action: SelectAction, resync: bool) {
+        let Some(modal) = self.buckets_modal.as_mut() else {
+            return;
+        };
+        match action {
+            SelectAction::Toggle => {
+                if resync {
+                    modal.create_resync_cadence_picker_open =
+                        !modal.create_resync_cadence_picker_open;
+                } else {
+                    modal.create_delta_cadence_picker_open =
+                        !modal.create_delta_cadence_picker_open;
+                }
+            }
+            SelectAction::Dismiss => {
+                if resync {
+                    modal.create_resync_cadence_picker_open = false;
+                } else {
+                    modal.create_delta_cadence_picker_open = false;
+                }
+            }
+            SelectAction::Pick(value) => {
+                if let Some(cf) = modal.creating.as_mut()
+                    && let Some(c) = TrackedCadenceChoice::from_wire(&value)
+                {
+                    if resync {
+                        cf.tracked_resync_cadence = c;
+                    } else {
+                        cf.tracked_delta_cadence = c;
+                    }
+                    cf.error = None;
+                }
+                if resync {
+                    modal.create_resync_cadence_picker_open = false;
+                } else {
+                    modal.create_delta_cadence_picker_open = false;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_create_quantization_picker_event(&mut self, action: SelectAction) {
+        let Some(modal) = self.buckets_modal.as_mut() else {
+            return;
+        };
+        match action {
+            SelectAction::Toggle => {
+                modal.create_quantization_picker_open = !modal.create_quantization_picker_open;
+            }
+            SelectAction::Dismiss => {
+                modal.create_quantization_picker_open = false;
+            }
+            SelectAction::Pick(value) => {
+                if let Some(cf) = modal.creating.as_mut()
+                    && let Some(q) = QuantizationChoice::from_wire(&value)
+                {
+                    cf.quantization = q;
+                    cf.error = None;
+                }
+                modal.create_quantization_picker_open = false;
+            }
+            _ => {}
+        }
+    }
+
+    /// Validate the form and dispatch `CreateBucket`. On a local
+    /// validation error, stamp `cf.error` and bail without firing
+    /// the wire op. On success: mint correlation, stamp
+    /// `pending_correlation`, send.
+    fn submit_create_bucket(&mut self) {
+        // Phase 1: read snapshot + validate (purely off the form).
+        let outcome: Result<(String, Option<String>, BucketCreateInput), String> = {
+            let Some(modal) = self.buckets_modal.as_ref() else {
+                return;
+            };
+            let Some(cf) = modal.creating.as_ref() else {
+                return;
+            };
+            if cf.pending_correlation.is_some() {
+                return;
+            }
+            build_create_bucket_request(cf)
+        };
+
+        match outcome {
+            Err(err) => {
+                if let Some(modal) = self.buckets_modal.as_mut()
+                    && let Some(cf) = modal.creating.as_mut()
+                {
+                    cf.error = Some(err);
+                }
+            }
+            Ok((id, pod_id, config)) => {
+                let correlation = self.next_correlation_id();
+                if let Some(modal) = self.buckets_modal.as_mut()
+                    && let Some(cf) = modal.creating.as_mut()
+                {
+                    cf.pending_correlation = Some(correlation.clone());
+                    cf.error = None;
+                }
+                self.send(ClientToServer::CreateBucket {
+                    correlation_id: Some(correlation),
+                    id,
+                    pod_id,
+                    config,
+                });
+            }
+        }
     }
 
     /// Lazy-fetch the server config TOML on first Server-config tab
@@ -11103,29 +11879,25 @@ impl ChatApp {
         const BUCKETS_W: f32 = 720.0;
         const BUCKETS_H: f32 = 640.0;
 
-        let search_section = self.render_buckets_search_section(modal);
-
-        let catalog_body: El = if self.buckets.is_empty() {
-            paragraph(
-                "No buckets yet. Create one via the wire (server-side \
-                 catalog config or a future +New bucket affordance \
-                 here).",
-            )
-            .muted()
+        // Toggle button: pressed when the create form is open;
+        // ghost otherwise. Label flips so the user always knows
+        // which direction the next click takes them.
+        let create_open = modal.creating.is_some();
+        let create_toggle = button(if create_open {
+            "\u{2212} Cancel new"
         } else {
-            let mut rows: Vec<El> = Vec::new();
-            for b in &self.buckets {
-                rows.push(self.render_bucket_row(modal, b));
-            }
-            scroll(rows)
-                .gap(tokens::SPACE_3)
-                .width(Size::Fill(1.0))
-                .height(Size::Fill(1.0))
+            "+ New bucket"
+        })
+        .key(BUCKETS_CREATE_TOGGLE_KEY);
+        let create_toggle = if create_open {
+            create_toggle.primary()
+        } else {
+            create_toggle
         };
 
         let close = button("Close").key(BUCKETS_MODAL_CLOSE_KEY);
 
-        let children: Vec<El> = vec![
+        let mut children: Vec<El> = vec![
             dialog_header([
                 dialog_title("Knowledge buckets"),
                 dialog_description(
@@ -11133,14 +11905,66 @@ impl ChatApp {
                      Build / Pause / Delete actions per row. Tracked \
                      buckets (Wikipedia today) carry Poll-now and \
                      Resync-now affordances. The search section above \
-                     queries any ready bucket. Create form lands in a \
-                     follow-up.",
+                     queries any ready bucket; \"+ New bucket\" opens a \
+                     create form.",
                 ),
             ]),
-            search_section,
-            catalog_body,
-            dialog_footer([close]),
+            row([create_toggle])
+                .gap(tokens::SPACE_2)
+                .align(Align::Center)
+                .width(Size::Fill(1.0)),
         ];
+
+        if create_open {
+            // Create-mode: focus the dialog body on the form.
+            // Search + catalog are hidden so the form gets the full
+            // body height — they're one Cancel click away. The
+            // form itself is wrapped in a scroll so even the
+            // tallest variant (tracked source with all sub-fields
+            // visible) fits inside the fixed dialog frame.
+            //
+            // Right padding reserves the standard scrollbar
+            // gutter so input focus rings + select_trigger borders
+            // don't get clipped by the active-state thumb (lint
+            // rule `FocusRingObscured`).
+            let inner = column([self.render_buckets_create_section(modal)])
+                .gap(tokens::SPACE_3)
+                .padding(Sides {
+                    // Left ring-gutter so input focus rings +
+                    // borders sitting flush against the scroll's
+                    // left scissor don't get clipped on the
+                    // single-pixel-wide outline band.
+                    left: tokens::RING_WIDTH,
+                    right: tokens::SCROLLBAR_THUMB_WIDTH_ACTIVE + tokens::SPACE_1,
+                    top: 0.0,
+                    bottom: 0.0,
+                })
+                .width(Size::Fill(1.0))
+                .height(Size::Hug);
+            children.push(
+                scroll([inner])
+                    .width(Size::Fill(1.0))
+                    .height(Size::Fill(1.0)),
+            );
+        } else {
+            let search_section = self.render_buckets_search_section(modal);
+            let catalog_body: El = if self.buckets.is_empty() {
+                paragraph("No buckets yet. Use \"+ New bucket\" above to create one.").muted()
+            } else {
+                let mut rows: Vec<El> = Vec::new();
+                for b in &self.buckets {
+                    rows.push(self.render_bucket_row(modal, b));
+                }
+                scroll(rows)
+                    .gap(tokens::SPACE_3)
+                    .width(Size::Fill(1.0))
+                    .height(Size::Fill(1.0))
+            };
+            children.push(search_section);
+            children.push(catalog_body);
+        }
+
+        children.push(dialog_footer([close]));
 
         Some(overlay([
             scrim(BUCKETS_MODAL_DISMISS_KEY),
@@ -11149,6 +11973,407 @@ impl ChatApp {
                 .height(Size::Fixed(BUCKETS_H))
                 .block_pointer(),
         ]))
+    }
+
+    /// `+ New bucket` form. Mirrors the egui sibling's create
+    /// section: id / scope / name / description / embedder / source
+    /// kind tabs / source-kind-specific sub-fields / chunk + overlap
+    /// tokens / dense+sparse toggles / quantization. Inline error
+    /// alert + Create button at the bottom. Every input + picker
+    /// rides on the standard `text_input` / `numeric_input` /
+    /// `select_trigger` / `toggle_group` plumbing.
+    fn render_buckets_create_section(&self, modal: &BucketsModalState) -> El {
+        let Some(cf) = modal.creating.as_ref() else {
+            return column(Vec::<El>::new()).width(Size::Fill(1.0));
+        };
+        let saving = cf.pending_correlation.is_some();
+
+        // ---- id ----
+        let id_input =
+            text_input(&cf.id, &self.selection, BUCKETS_CREATE_ID_KEY).width(Size::Fill(1.0));
+        let id_input = if saving {
+            id_input.disabled()
+        } else {
+            id_input
+        };
+
+        // ---- scope picker ----
+        let scope_label = match cf.pod_id.as_deref() {
+            None => "(server)".to_string(),
+            Some(p) => p.to_string(),
+        };
+        let mut scope_trigger =
+            select_trigger(BUCKETS_CREATE_SCOPE_PICKER_KEY, scope_label).width(Size::Fixed(220.0));
+        if saving {
+            scope_trigger = scope_trigger.disabled();
+        }
+
+        // ---- name / description ----
+        let name_input =
+            text_input(&cf.name, &self.selection, BUCKETS_CREATE_NAME_KEY).width(Size::Fill(1.0));
+        let name_input = if saving {
+            name_input.disabled()
+        } else {
+            name_input
+        };
+        let description_input = text_input(
+            &cf.description,
+            &self.selection,
+            BUCKETS_CREATE_DESCRIPTION_KEY,
+        )
+        .width(Size::Fill(1.0));
+        let description_input = if saving {
+            description_input.disabled()
+        } else {
+            description_input
+        };
+
+        // ---- embedder picker (or fallback text input) ----
+        let embedder_field: El = if self.embedding_providers.is_empty() {
+            let input = text_input(
+                &cf.embedder,
+                &self.selection,
+                BUCKETS_CREATE_EMBEDDER_INPUT_KEY,
+            )
+            .width(Size::Fixed(280.0));
+            if saving { input.disabled() } else { input }
+        } else {
+            let label = if cf.embedder.is_empty() {
+                "(select a provider)".to_string()
+            } else {
+                match self
+                    .embedding_providers
+                    .iter()
+                    .find(|p| p.name == cf.embedder)
+                {
+                    Some(p) => format!("{} ({})", p.name, p.kind),
+                    None => format!("{} (unknown)", cf.embedder),
+                }
+            };
+            let mut trigger =
+                select_trigger(BUCKETS_CREATE_EMBEDDER_PICKER_KEY, label).width(Size::Fixed(280.0));
+            if saving {
+                trigger = trigger.disabled();
+            }
+            trigger
+        };
+
+        // ---- source kind toggle group ----
+        let source_kind_group = toggle_group(
+            BUCKETS_CREATE_SOURCE_KIND_GROUP_KEY,
+            &cf.source_kind,
+            [
+                (SourceKindChoice::Stored, "stored"),
+                (SourceKindChoice::Linked, "linked"),
+                (SourceKindChoice::Managed, "managed"),
+                (SourceKindChoice::Tracked, "tracked"),
+            ],
+        );
+
+        // ---- per-kind sub-fields ----
+        let source_section: El = match cf.source_kind {
+            SourceKindChoice::Stored => {
+                let detail = text_input(
+                    &cf.source_detail,
+                    &self.selection,
+                    BUCKETS_CREATE_SOURCE_DETAIL_KEY,
+                )
+                .width(Size::Fill(1.0));
+                let detail = if saving { detail.disabled() } else { detail };
+                column([
+                    form_item([
+                        form_label("source.adapter"),
+                        form_control(text("mediawiki_xml").muted()),
+                    ]),
+                    form_item([
+                        form_label("source.archive_path"),
+                        form_control(detail),
+                        form_description(
+                            "Path to a MediaWiki XML dump (e.g. \
+                             /data/wiki.xml.bz2). Must exist on the server.",
+                        ),
+                    ]),
+                ])
+                .gap(tokens::SPACE_2)
+                .width(Size::Fill(1.0))
+            }
+            SourceKindChoice::Linked => {
+                let detail = text_input(
+                    &cf.source_detail,
+                    &self.selection,
+                    BUCKETS_CREATE_SOURCE_DETAIL_KEY,
+                )
+                .width(Size::Fill(1.0));
+                let detail = if saving { detail.disabled() } else { detail };
+                column([
+                    form_item([
+                        form_label("source.adapter"),
+                        form_control(text("markdown_dir").muted()),
+                    ]),
+                    form_item([
+                        form_label("source.path"),
+                        form_control(detail),
+                        form_description(
+                            "Server-side directory of markdown notes; \
+                             changes on disk feed back into the index.",
+                        ),
+                    ]),
+                ])
+                .gap(tokens::SPACE_2)
+                .width(Size::Fill(1.0))
+            }
+            SourceKindChoice::Managed => paragraph(
+                "Managed buckets carry no external source — content is \
+                 authored via the API.",
+            )
+            .muted(),
+            SourceKindChoice::Tracked => {
+                let mut driver_trigger =
+                    select_trigger(BUCKETS_CREATE_DRIVER_PICKER_KEY, cf.tracked_driver.label())
+                        .width(Size::Fixed(220.0));
+                if saving {
+                    driver_trigger = driver_trigger.disabled();
+                }
+
+                let mut entries: Vec<El> = vec![form_item([
+                    form_label("source.driver"),
+                    form_control(driver_trigger),
+                ])];
+
+                match cf.tracked_driver {
+                    TrackedDriverChoice::Wikipedia => {
+                        let lang = text_input(
+                            &cf.tracked_language,
+                            &self.selection,
+                            BUCKETS_CREATE_LANGUAGE_KEY,
+                        )
+                        .width(Size::Fixed(180.0));
+                        let lang = if saving { lang.disabled() } else { lang };
+                        let mirror = text_input(
+                            &cf.tracked_mirror,
+                            &self.selection,
+                            BUCKETS_CREATE_MIRROR_KEY,
+                        )
+                        .width(Size::Fill(1.0));
+                        let mirror = if saving { mirror.disabled() } else { mirror };
+                        entries.push(form_item([
+                            form_label("source.language"),
+                            form_control(lang),
+                            form_description("Wikipedia language code (en, simple, de, …)."),
+                        ]));
+                        entries.push(form_item([
+                            form_label("source.mirror"),
+                            form_control(mirror),
+                            form_description(
+                                "Optional. Defaults to https://dumps.wikimedia.org \
+                                 server-side when blank.",
+                            ),
+                        ]));
+                    }
+                }
+
+                let mut delta_trigger = select_trigger(
+                    BUCKETS_CREATE_DELTA_CADENCE_PICKER_KEY,
+                    cf.tracked_delta_cadence.label(),
+                )
+                .width(Size::Fixed(160.0));
+                if saving {
+                    delta_trigger = delta_trigger.disabled();
+                }
+                let mut resync_trigger = select_trigger(
+                    BUCKETS_CREATE_RESYNC_CADENCE_PICKER_KEY,
+                    cf.tracked_resync_cadence.label(),
+                )
+                .width(Size::Fixed(160.0));
+                if saving {
+                    resync_trigger = resync_trigger.disabled();
+                }
+                entries.push(form_item([
+                    form_label("source.delta_cadence"),
+                    form_control(delta_trigger),
+                ]));
+                entries.push(form_item([
+                    form_label("source.resync_cadence"),
+                    form_control(resync_trigger),
+                ]));
+
+                column(entries).gap(tokens::SPACE_2).width(Size::Fill(1.0))
+            }
+        };
+
+        // ---- chunk / overlap tokens ----
+        let chunk_widget = numeric_input(
+            &cf.chunk_tokens_buf,
+            &self.selection,
+            BUCKETS_CREATE_CHUNK_TOKENS_KEY,
+            NumericInputOpts::default().min(50.0).max(4096.0).step(10.0),
+        )
+        .width(Size::Fixed(120.0));
+        let chunk_widget = if saving {
+            chunk_widget.disabled()
+        } else {
+            chunk_widget
+        };
+        let overlap_widget = numeric_input(
+            &cf.overlap_tokens_buf,
+            &self.selection,
+            BUCKETS_CREATE_OVERLAP_TOKENS_KEY,
+            NumericInputOpts::default().min(0.0).max(512.0).step(5.0),
+        )
+        .width(Size::Fixed(120.0));
+        let overlap_widget = if saving {
+            overlap_widget.disabled()
+        } else {
+            overlap_widget
+        };
+
+        // ---- dense / sparse toggles ----
+        let dense_toggle = toggle(BUCKETS_CREATE_DENSE_KEY, cf.dense_enabled, "dense");
+        let sparse_toggle = toggle(BUCKETS_CREATE_SPARSE_KEY, cf.sparse_enabled, "sparse");
+        let paths_row = row([dense_toggle, sparse_toggle])
+            .gap(tokens::SPACE_2)
+            .align(Align::Center);
+
+        // ---- quantization picker ----
+        let mut quant_trigger = select_trigger(
+            BUCKETS_CREATE_QUANTIZATION_PICKER_KEY,
+            cf.quantization.label(),
+        )
+        .width(Size::Fixed(120.0));
+        if saving {
+            quant_trigger = quant_trigger.disabled();
+        }
+
+        // ---- submit button ----
+        let create_enabled = !saving
+            && !cf.id.trim().is_empty()
+            && !cf.name.trim().is_empty()
+            && !cf.embedder.trim().is_empty();
+        let mut submit = button(if saving { "Creating\u{2026}" } else { "Create" })
+            .key(BUCKETS_CREATE_SUBMIT_KEY)
+            .primary();
+        if !create_enabled {
+            submit = submit.disabled();
+        }
+
+        // ---- assemble ----
+        let mut entries: Vec<El> = Vec::new();
+        entries.push(text("New bucket").caption().muted());
+        entries.push(form([
+            form_item([
+                form_label("id"),
+                form_control(id_input),
+                form_description("Filesystem-safe id, becomes the bucket directory name on disk."),
+            ]),
+            form_item([
+                form_label("scope"),
+                form_control(scope_trigger),
+                form_description(
+                    "Server-scope buckets live under <buckets_root>; pod-scope \
+                     buckets are private to that pod's threads.",
+                ),
+            ]),
+            form_item([form_label("name"), form_control(name_input)]),
+            form_item([form_label("description"), form_control(description_input)]),
+            form_item([
+                form_label("embedder"),
+                form_control(embedder_field),
+                form_description(if self.embedding_providers.is_empty() {
+                    "No [embedding_providers.*] configured server-side — \
+                     type a name to bind to (must match a configured provider \
+                     before the build runs)."
+                } else {
+                    "Picks the [embedding_providers.*] entry that produces \
+                     the bucket's vectors."
+                }),
+            ]),
+            form_item([form_label("source kind"), form_control(source_kind_group)]),
+        ]));
+        entries.push(source_section);
+        entries.push(form([
+            form_item([form_label("chunk tokens"), form_control(chunk_widget)]),
+            form_item([form_label("overlap tokens"), form_control(overlap_widget)]),
+            form_item([form_label("paths"), form_control(paths_row)]),
+            form_item([
+                form_label("quantization"),
+                form_control(quant_trigger),
+                form_description(
+                    "Vectors-bin precision. f32 is full precision; f16 halves \
+                     the disk + RAM footprint with ~no recall loss; int8 quarters \
+                     it with a small recall hit.",
+                ),
+            ]),
+        ]));
+
+        if let Some(err) = cf.error.as_deref() {
+            entries.push(
+                alert([
+                    alert_title("couldn't create bucket"),
+                    alert_description(err.to_string()),
+                ])
+                .destructive(),
+            );
+        }
+
+        entries.push(
+            row([submit])
+                .gap(tokens::SPACE_2)
+                .align(Align::Center)
+                .width(Size::Fill(1.0)),
+        );
+
+        column(entries).gap(tokens::SPACE_3).width(Size::Fill(1.0))
+    }
+
+    // ---- create-form picker menu helpers ----
+
+    fn bucket_create_scope_menu(&self) -> El {
+        let mut options: Vec<(String, String)> = vec![(
+            BUCKET_CREATE_SCOPE_SERVER_VALUE.to_string(),
+            "(server)".to_string(),
+        )];
+        for p in self.sorted_pods() {
+            options.push((p.pod_id.clone(), p.pod_id.clone()));
+        }
+        select_menu(BUCKETS_CREATE_SCOPE_PICKER_KEY, options)
+    }
+
+    fn bucket_create_embedder_menu(&self) -> El {
+        let options: Vec<(String, String)> = self
+            .embedding_providers
+            .iter()
+            .map(|p| (p.name.clone(), format!("{} ({})", p.name, p.kind)))
+            .collect();
+        select_menu(BUCKETS_CREATE_EMBEDDER_PICKER_KEY, options)
+    }
+
+    fn bucket_create_driver_menu(&self) -> El {
+        let options: Vec<(String, String)> = vec![(
+            "wikipedia".to_string(),
+            TrackedDriverChoice::Wikipedia.label().to_string(),
+        )];
+        select_menu(BUCKETS_CREATE_DRIVER_PICKER_KEY, options)
+    }
+
+    fn bucket_create_cadence_menu(&self, resync: bool) -> El {
+        let options: Vec<(String, String)> = TRACKED_CADENCE_CHOICES
+            .iter()
+            .map(|c| (c.label().to_string(), c.label().to_string()))
+            .collect();
+        let key = if resync {
+            BUCKETS_CREATE_RESYNC_CADENCE_PICKER_KEY
+        } else {
+            BUCKETS_CREATE_DELTA_CADENCE_PICKER_KEY
+        };
+        select_menu(key, options)
+    }
+
+    fn bucket_create_quantization_menu(&self) -> El {
+        let options: Vec<(String, String)> = QUANTIZATION_CHOICES
+            .iter()
+            .map(|q| (q.label().to_string(), q.label().to_string()))
+            .collect();
+        select_menu(BUCKETS_CREATE_QUANTIZATION_PICKER_KEY, options)
     }
 
     /// Search-and-query section above the catalog. Three-row layout
@@ -12995,6 +14220,101 @@ fn via_chip_color(path: &str) -> Color {
 /// key. Used by `submit_bucket_query` as the auto-pick fallback
 /// when the user submits before touching the picker. `None` when
 /// no bucket is ready to serve queries.
+/// Translate the form's local state into the wire-shaped
+/// `CreateBucket` request (id + pod_id + config). Returns `Err`
+/// with a user-facing message for trivially-invalid forms (the
+/// server still validates authoritatively; this just keeps the
+/// round-trip count down for obviously-wrong submissions).
+fn build_create_bucket_request(
+    cf: &CreateBucketForm,
+) -> Result<(String, Option<String>, BucketCreateInput), String> {
+    let id = cf.id.trim();
+    if id.is_empty() {
+        return Err("id is required".into());
+    }
+    let name = cf.name.trim();
+    if name.is_empty() {
+        return Err("name is required".into());
+    }
+    let embedder = cf.embedder.trim();
+    if embedder.is_empty() {
+        return Err("embedder is required".into());
+    }
+    let source = match cf.source_kind {
+        SourceKindChoice::Stored => {
+            let detail = cf.source_detail.trim();
+            if detail.is_empty() {
+                return Err("archive_path is required for kind=stored".into());
+            }
+            BucketSourceInput::Stored {
+                adapter: "mediawiki_xml".into(),
+                archive_path: detail.to_string(),
+            }
+        }
+        SourceKindChoice::Linked => {
+            let detail = cf.source_detail.trim();
+            if detail.is_empty() {
+                return Err("path is required for kind=linked".into());
+            }
+            BucketSourceInput::Linked {
+                adapter: "markdown_dir".into(),
+                path: detail.to_string(),
+            }
+        }
+        SourceKindChoice::Managed => BucketSourceInput::Managed {},
+        SourceKindChoice::Tracked => {
+            let driver = match cf.tracked_driver {
+                TrackedDriverChoice::Wikipedia => {
+                    let language = cf.tracked_language.trim();
+                    if language.is_empty() {
+                        return Err("language is required for kind=tracked driver=wikipedia".into());
+                    }
+                    let mirror = cf.tracked_mirror.trim();
+                    let mirror = if mirror.is_empty() {
+                        None
+                    } else if !(mirror.starts_with("http://") || mirror.starts_with("https://")) {
+                        return Err("mirror must be an http(s):// URL when set".into());
+                    } else {
+                        Some(mirror.to_string())
+                    };
+                    TrackedDriverInput::Wikipedia {
+                        language: language.to_string(),
+                        mirror,
+                    }
+                }
+            };
+            BucketSourceInput::Tracked {
+                driver,
+                delta_cadence: cf.tracked_delta_cadence.to_wire(),
+                resync_cadence: cf.tracked_resync_cadence.to_wire(),
+            }
+        }
+    };
+    let description = {
+        let trimmed = cf.description.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        }
+    };
+    Ok((
+        id.to_string(),
+        cf.pod_id.clone(),
+        BucketCreateInput {
+            name: name.to_string(),
+            description,
+            source,
+            embedder: embedder.to_string(),
+            chunk_tokens: cf.chunk_tokens,
+            overlap_tokens: cf.overlap_tokens,
+            dense_enabled: cf.dense_enabled,
+            sparse_enabled: cf.sparse_enabled,
+            quantization: Some(cf.quantization.to_wire()),
+        },
+    ))
+}
+
 fn first_ready_bucket(buckets: &[BucketSummary]) -> Option<BucketRowKey> {
     buckets
         .iter()

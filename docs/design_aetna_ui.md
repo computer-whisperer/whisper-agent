@@ -1317,13 +1317,11 @@ trivial / small / medium / large.
   `ServerConfigFetched`). The egui sibling's success / error
   banners + the `ServerConfigUpdateResult` summary alert all
   paint via aetna's `alert` widget; both scenes lint clean.
-- 🌗 **Knowledge buckets.** Phases 1 and 3 landed: read-only catalog
+- ✅ **Knowledge buckets.** All three phases landed: read-only catalog
   modal with per-row chrome, live build-progress display, last-
   failed-build error banner, per-row actions (Build / Pause build /
-  Poll now / Resync now + arm-confirm Delete), and the
-  search-and-query interface above the catalog. Phase 2 (the +New
-  bucket create form: quantization / driver / cadence pickers,
-  dispatch validation) is the only remaining sub-slice.
+  Poll now / Resync now + arm-confirm Delete), the search-and-query
+  interface above the catalog, and the +New bucket create form.
 
   **Phase 3 detail (search-and-query):** the modal grew a search
   section above the catalog cards. State on `BucketsModalState`:
@@ -1402,9 +1400,34 @@ trivial / small / medium / large.
   `wiki-en` Delete button to render the destructive
   Confirm + Cancel pair. Lint clean.
 
-  Egui equivalent: `modals/buckets.rs` (1306 LOC) — the aetna
-  port is much smaller because Phase 2 + 3 (create + search)
-  are deferred.
+  **Phase 2 detail (+New bucket create form):** a header-row
+  toggle button flips `BucketsModalState::creating: Option<CreateBucketForm>`.
+  When the form is open the dialog body hides search + catalog
+  and devotes all available space to the form (wrapped in a
+  scroll so even the tallest variant — `tracked` source with
+  driver / language / mirror / cadences — fits inside the fixed
+  720 × 640 frame). Form fields mirror the egui sibling: id,
+  scope picker (server / per-pod), name, description, embedder
+  picker (drives off `EmbeddingProvidersList` — falls back to
+  a plain text input when the catalog is empty), source-kind
+  toggle group (stored / linked / managed / tracked), the
+  source-kind-specific sub-fields, chunk + overlap token
+  numeric inputs, dense + sparse standalone toggles, and
+  quantization picker. Submit goes through `submit_create_bucket`'s
+  phased-borrow validate → mint → stamp → send pattern;
+  `build_create_bucket_request` ports the egui sibling's local
+  validation (id / name / embedder required, archive_path /
+  path required for stored / linked, language required for
+  tracked-wikipedia, http(s):// mirror check). The form's
+  `pending_correlation` wires the round-trip: `BucketCreated`
+  with a matching id closes the form; a correlation-matching
+  `Error` surfaces into a destructive `alert`.
+
+  Bundle scenes: `BucketsModalCreateForm` (default `linked`
+  source) and `BucketsModalCreateFormTracked` (exercises the
+  tracked sub-fields + cadence pickers). Both lint clean.
+
+  Egui equivalent: `modals/buckets.rs` (1306 LOC).
 
 ### Sidebar / chrome
 
