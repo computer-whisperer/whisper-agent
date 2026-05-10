@@ -42,6 +42,16 @@ image = { version = "0.25", default-features = false, features = ["png", "jpeg",
 # uses; default features off since we only need the text path.
 similar = { version = "3", default-features = false, features = ["text"] }
 
+# Native-only file picker for the compose attach affordance.
+# `default-features = false` drops the GTK3 native backend in
+# favor of xdg-portal where available — same shape as the egui
+# sibling. `tokio = "rt"` is the smallest feature that gives us a
+# single-threaded executor we can `block_on` inside a background
+# thread to drive rfd's async API.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+rfd = { version = "0.17", default-features = false, features = ["xdg-portal"] }
+tokio = { workspace = true, features = ["rt"] }
+
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 wasm-bindgen = "0.2"
 wasm-bindgen-futures = "0.4"

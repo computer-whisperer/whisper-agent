@@ -518,7 +518,7 @@ Still deferred:
   a name-only `ToolCall` placeholder which works but doesn't
   signal "still arriving"
 
-### 🌗 Stage 7 — Images / attachments (rendering side done)
+### ✅ Stage 7 — Images / attachments
 
 Inbound rendering: `ContentBlock::Image { source: Bytes, .. }` and
 `ServerToClient::ThreadAssistantImage { source }` decode through the
@@ -532,12 +532,53 @@ a small dimensions caption. URL sources fall through to a muted
 placeholder + the URL caption (no fetch yet); decode errors surface
 as a destructive-text + reason caption row.
 
-Input/staging side deferred: `aetna-winit-wgpu` doesn't yet expose
-winit's `WindowEvent::DroppedFile`/`HoveredFile` or platform
-clipboard-image readers, so drag/drop/paste/filepicker need an
-upstream feature first. Track in a follow-up issue against aetna —
-the egui sibling's compose attachment strip becomes a thin port once
-those events ride into `UiEvent`.
+Input/staging landed once aetna upstream shipped
+`UiEventKind::FileDropped` / `FileHovered` /
+`FileHoverCancelled` and `aetna-winit-wgpu` wired the matching
+`WindowEvent::DroppedFile` into the renderer's event surface.
+
+`ChatApp` grew four fields:
+- `compose_attachments: Vec<StagedAttachment>` — staged image
+  rows. Each carries the canonical `Attachment` (drains into
+  outbound `SendUserMessage` / `CreateThread` on submit), a
+  pre-decoded `aetna_core::Image` for the thumbnail, and a
+  monotonic `id` so duplicates the user staged deliberately
+  remain individually addressable through
+  `compose:attach:remove:{id}`.
+- `next_attachment_id: u64` — counter for the id above.
+- `pending_picks: Arc<Mutex<Vec<RawPick>>>` — async handoff
+  queue from the rfd file picker thread. `before_build`
+  drains it through the same `stage_raw_pick` pipeline that
+  drag-drop uses, so success / rejection diagnostics don't
+  drift between input sources.
+- `compose_hint: Option<(String, Instant)>` — ephemeral
+  status line under the thumbnail strip, self-expiring after
+  4 seconds. Surfaces feedback on every attach attempt
+  (success, MIME mismatch, read errors) so silently-rejected
+  drops stop being silent.
+
+`on_event`'s `UiEventKind::FileDropped` arm reads the path
+synchronously, MIME-sniffs (`sniff_image_mime` mirrors the
+egui sibling — magic-byte checks for jpeg / png / gif / webp /
+heic / heif; unknown shapes get rejected with a hint), pre-
+decodes a thumbnail, and pushes onto `compose_attachments`.
+The compose bar grew a `paperclip` icon-button keyed
+`compose:attach`; native click spawns rfd's `AsyncFileDialog`
+on a background `std::thread::spawn` driven by a tokio
+current-thread runtime (xdg-portal backend; no GTK3
+dependency). Wasm-side click sets a "not yet" hint until
+Stage 11 wires the browser path.
+
+The compose bar's row now hosts text_area + paperclip + send
+horizontally, with a thumbnail strip + hint paragraph
+stacked above it via a wrapping column. Each thumbnail tile
+is 96×96 with an `x` icon-button overlaid for one-click
+removal and a truncated filename caption below.
+
+Clipboard-paste still pending: aetna upstream doesn't yet
+expose a `ClipboardImage` / paste event variant. The native
+binary handles drag-drop + filepicker today, so screenshots
+land via paste-into-temp + drag, or via the picker.
 
 Also still deferred:
 - URL fetching via the host shell (caching + a placeholder while

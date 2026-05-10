@@ -41,6 +41,15 @@ pub static ICON_SQUARE_PEN: LazyLock<SvgIcon> = LazyLock::new(|| {
 pub static ICON_TRASH: LazyLock<SvgIcon> =
     LazyLock::new(|| SvgIcon::parse_current_color(LUCIDE_TRASH).expect("lucide trash svg parses"));
 
+/// Paperclip — compose attach affordance.
+pub static ICON_PAPERCLIP: LazyLock<SvgIcon> = LazyLock::new(|| {
+    SvgIcon::parse_current_color(LUCIDE_PAPERCLIP).expect("lucide paperclip svg parses")
+});
+
+/// X mark — small "remove" affordance on staged thumbnails.
+pub static ICON_X: LazyLock<SvgIcon> =
+    LazyLock::new(|| SvgIcon::parse_current_color(LUCIDE_X).expect("lucide x svg parses"));
+
 const LUCIDE_ZAP: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 14a1 1 0 0 1-.78-1.63l9.9-10.2a.5.5 0 0 1 .86.46l-1.92 6.02A1 1 0 0 0 13 10h7a1 1 0 0 1 .78 1.63l-9.9 10.2a.5.5 0 0 1-.86-.46l1.92-6.02A1 1 0 0 0 11 14z"/></svg>"##;
 
 const LUCIDE_PLAY: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="6 3 20 12 6 21 6 3"/></svg>"##;
@@ -50,3 +59,7 @@ const LUCIDE_PAUSE: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="
 const LUCIDE_SQUARE_PEN: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3H5a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.375 2.625a1 1 0 0 1 3 3l-9.013 9.014a2 2 0 0 1-.853.505l-2.873.84a.5.5 0 0 1-.62-.62l.84-2.873a2 2 0 0 1 .506-.852z"/></svg>"##;
 
 const LUCIDE_TRASH: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6"/><path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>"##;
+
+const LUCIDE_PAPERCLIP: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M13.234 20.252 21 12.3"/><path d="m16 6-8.414 8.586a2 2 0 0 0 0 2.828 2 2 0 0 0 2.828 0l8.414-8.586a4 4 0 0 0 0-5.656 4 4 0 0 0-5.656 0l-8.415 8.585a6 6 0 1 0 8.486 8.486"/></svg>"##;
+
+const LUCIDE_X: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 6 6 18"/><path d="m6 6 12 12"/></svg>"##;

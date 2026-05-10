@@ -41,10 +41,10 @@ use crate::cron_preview;
 use aetna_core::prelude::*;
 use aetna_core::widgets::select::{SelectAction, classify_event as classify_select_event};
 use whisper_agent_protocol::{
-    ActivationSurface, AllowMap, BackendSummary, BehaviorConfig, BehaviorSummary,
+    ActivationSurface, AllowMap, Attachment, BackendSummary, BehaviorConfig, BehaviorSummary,
     BehaviorThreadOverride, CatchUp, ClientToServer, ContentBlock, CoreTools, Disposition,
-    ImageSource, InitialListing, ModelSummary, NamedHostEnv, Overlap, PodAllow, PodConfig,
-    PodLimits, PodSummary, RetentionPolicy, Role, ServerToClient, SystemPromptChoice,
+    ImageMime, ImageSource, InitialListing, ModelSummary, NamedHostEnv, Overlap, PodAllow,
+    PodConfig, PodLimits, PodSummary, RetentionPolicy, Role, ServerToClient, SystemPromptChoice,
     ThreadConfigOverride, ThreadDefaults, ThreadSummary, TriggerSpec,
 };
 
@@ -332,6 +332,68 @@ struct FusedToolResult {
     is_error: bool,
 }
 
+/// Sniff a `Content-Type` from the first few bytes of a dropped or
+/// picked file. Avoids trusting filename extensions (screenshots
+/// arrive without one) and keeps the MIME set tight to the
+/// protocol's [`ImageMime`] variants — anything else is rejected at
+/// the compose-area boundary with a visible hint. Mirrors the egui
+/// sibling's helper of the same name.
+fn sniff_image_mime(bytes: &[u8]) -> Option<ImageMime> {
+    if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        Some(ImageMime::Png)
+    } else if bytes.starts_with(&[0xff, 0xd8, 0xff]) {
+        Some(ImageMime::Jpeg)
+    } else if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        Some(ImageMime::Gif)
+    } else if bytes.len() >= 12 && bytes.starts_with(b"RIFF") && &bytes[8..12] == b"WEBP" {
+        Some(ImageMime::Webp)
+    } else if bytes.len() >= 12
+        && &bytes[4..8] == b"ftyp"
+        && matches!(
+            &bytes[8..12],
+            b"heic" | b"heix" | b"hevc" | b"hevx" | b"heim" | b"heis"
+        )
+    {
+        Some(ImageMime::Heic)
+    } else if bytes.len() >= 12
+        && &bytes[4..8] == b"ftyp"
+        && matches!(&bytes[8..12], b"mif1" | b"msf1")
+    {
+        Some(ImageMime::Heif)
+    } else {
+        None
+    }
+}
+
+/// Image attachment staged for the next send. Holds both the
+/// canonical [`Attachment`] (drained into outbound `SendUserMessage`
+/// / `CreateThread` on submit) and a pre-decoded `aetna_core::Image`
+/// for the thumbnail. `id` is a monotonic counter so the thumbnail
+/// widget's identity is stable across rebuilds — pixel-identical
+/// duplicates the user staged on purpose still count as distinct.
+struct StagedAttachment {
+    id: u64,
+    attachment: Attachment,
+    /// Decoded thumbnail. `None` when decode failed or when the
+    /// source is a URL (no bytes locally yet); the render path
+    /// shows a placeholder in that case.
+    thumbnail: Option<aetna_core::image::Image>,
+    /// Display label under the thumbnail — the file's basename for
+    /// drops/picks, `(URL attachment)` for url-source rows.
+    source_desc: String,
+}
+
+/// Async handoff from the rfd file picker into the UI thread. The
+/// picker runs off-thread (rfd is async; we drive it on a tokio
+/// current-thread runtime in a background `std::thread::spawn`);
+/// when the user picks a file, the handler pushes a `RawPick` onto
+/// `ChatApp::pending_picks` and `before_build` drains it on the
+/// next frame.
+struct RawPick {
+    bytes: Vec<u8>,
+    source_desc: String,
+}
+
 /// Three terminal states for an inline image: successfully decoded
 /// (we hold the `aetna_core::Image` and the original dimensions),
 /// remote URL (deferred — Stage 7 doesn't fetch yet), or a decode
@@ -495,6 +557,35 @@ pub struct ChatApp {
     /// In-progress text for the *new-thread* compose form (no thread
     /// selected). Per-thread follow-up drafts live in [`drafts`].
     compose_input: String,
+    /// Image attachments staged for the next send. Populated by the
+    /// `UiEventKind::FileDropped` arm of `on_event` and the
+    /// file-picker button on the compose bar; rendered as a
+    /// thumbnail strip above the `text_area`; drained into the
+    /// outbound `SendUserMessage` / `CreateThread` on submit. Lives
+    /// on `ChatApp` (not per-`ThreadView`) because the user can
+    /// stage a file before deciding which thread to send it on —
+    /// drafts cross thread boundaries the same way.
+    compose_attachments: Vec<StagedAttachment>,
+    /// Monotonic counter for the stable id stamped on each staged
+    /// attachment. Used by the `compose:attach:remove:{id}` route so
+    /// pixel-identical drops the user staged twice are still
+    /// addressable individually.
+    next_attachment_id: u64,
+    /// Async-picker handoff queue. The native file picker runs off
+    /// the UI thread (rfd is async, driven on a tokio current-
+    /// thread runtime in a background `std::thread::spawn`); when a
+    /// pick resolves, it pushes a `RawPick` onto this queue, and
+    /// `before_build` drains it on the next frame through the same
+    /// staging pipeline that handles drops. `Arc<Mutex<...>>`
+    /// rather than `Rc<RefCell<...>>` because the picker thread
+    /// isn't the UI thread.
+    pending_picks: std::sync::Arc<std::sync::Mutex<Vec<RawPick>>>,
+    /// Ephemeral status line under the compose thumbnail strip —
+    /// surfaces feedback on attach attempts (success, model
+    /// rejection, MIME mismatch, read errors) so silent failures
+    /// stop being silent. `(message, expires_at)` where
+    /// `expires_at` is wall-clock; cleared once the deadline passes.
+    compose_hint: Option<(String, std::time::Instant)>,
     /// Per-thread draft text, keyed by `thread_id`. Hydrated from
     /// [`ThreadSnapshot::draft`] on subscribe and from
     /// `ThreadDraftUpdated` broadcasts (other clients editing).
@@ -1435,6 +1526,10 @@ impl ChatApp {
             views: HashMap::new(),
             subscribed: HashSet::new(),
             compose_input: String::new(),
+            compose_attachments: Vec::new(),
+            next_attachment_id: 0,
+            pending_picks: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            compose_hint: None,
             drafts: HashMap::new(),
             prefill: HashMap::new(),
             selection: Selection::default(),
@@ -2219,6 +2314,15 @@ impl ChatApp {
 impl App for ChatApp {
     fn before_build(&mut self) {
         self.drain_inbound();
+        self.drain_pending_picks();
+        // Expire stale compose hint. Cheap: one `Instant::now()` +
+        // a comparison per frame. Idle apps never re-enter this
+        // branch since the slot is `None` until staging fires.
+        if let Some((_, expires)) = self.compose_hint.as_ref()
+            && std::time::Instant::now() > *expires
+        {
+            self.compose_hint = None;
+        }
     }
 
     fn build(&self, cx: &BuildCx) -> El {
@@ -2242,6 +2346,53 @@ impl App for ChatApp {
     }
 
     fn on_event(&mut self, event: UiEvent) {
+        // Window-level file drops route here regardless of which
+        // keyed leaf is under the pointer — the compose attachment
+        // strip is the only sink today, so we treat unrouted drops
+        // as compose-bar drops. Multi-file drags fire one
+        // `FileDropped` per file, so each iteration of `on_event`
+        // stages exactly one. Read the file synchronously: drops
+        // are typically modest (screenshots, paste-buffer images)
+        // and the sync read avoids the picker thread / queue
+        // round-trip a streaming staging path would need.
+        if matches!(event.kind, UiEventKind::FileDropped)
+            && let Some(path) = event.path.as_ref()
+        {
+            let source_desc = path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| path.to_string_lossy().into_owned());
+            match std::fs::read(path) {
+                Ok(bytes) => {
+                    self.stage_raw_pick(RawPick { bytes, source_desc });
+                }
+                Err(e) => {
+                    self.set_compose_hint(format!("couldn't read {source_desc}: {e}"));
+                }
+            }
+            return;
+        }
+
+        // Compose attach button — opens the OS file picker. Native
+        // runs rfd off-thread; wasm sets a "not yet" hint until
+        // Stage 11 wires the browser path.
+        if event.is_click_or_activate(COMPOSE_ATTACH_KEY) {
+            self.spawn_file_picker();
+            return;
+        }
+
+        // Compose thumbnail remove button. Routes are
+        // `compose:attach:remove:{id}`; parse the suffix and drop
+        // the matching staged attachment.
+        if let Some(key) = event.route()
+            && let Some(id_str) = key.strip_prefix(COMPOSE_ATTACH_REMOVE_PREFIX)
+            && let Ok(id) = id_str.parse::<u64>()
+            && matches!(event.kind, UiEventKind::Click | UiEventKind::Activate)
+        {
+            self.compose_attachments.retain(|s| s.id != id);
+            return;
+        }
+
         // Auto-disarm a pending behavior delete unless this click is
         // its matching second arm. The sidebar rebuilds every event,
         // so any other click — selecting a thread, opening a modal,
@@ -2591,6 +2742,14 @@ impl App for ChatApp {
 }
 
 const COMPOSE_KEY: &str = "compose";
+/// Compose attach affordance — paperclip icon-button next to the
+/// send button. Click spawns the OS file picker; drag-drop on the
+/// window stages files independently of this key.
+const COMPOSE_ATTACH_KEY: &str = "compose:attach";
+/// Per-thumbnail remove route prefix; suffix is the staged
+/// attachment's monotonic id. Lets duplicates be addressed
+/// individually.
+const COMPOSE_ATTACH_REMOVE_PREFIX: &str = "compose:attach:remove:";
 const SEND_KEY: &str = "send";
 
 /// Routed key for the sidebar's pod-tab strip. Per-tab option keys
@@ -3149,11 +3308,141 @@ const PICKER_POD: &str = "picker:pod";
 const PICKER_INHERIT: &str = "";
 
 impl ChatApp {
-    fn send_compose(&mut self) {
-        let text = self.active_compose_text().trim().to_string();
-        if text.is_empty() {
+    /// MIME-sniff a raw byte payload and stage it as a compose
+    /// attachment, surfacing a hint on every outcome (success and
+    /// failure). Used by both the drop handler and the file-picker
+    /// drain so the pipeline is identical regardless of input
+    /// source — silently-rejected drops were the prior pain point
+    /// the egui sibling fixed by always surfacing a hint.
+    fn stage_raw_pick(&mut self, pick: RawPick) {
+        if pick.bytes.is_empty() {
+            self.set_compose_hint(format!("{} was empty; ignored", pick.source_desc));
             return;
         }
+        let Some(mime) = sniff_image_mime(&pick.bytes) else {
+            self.set_compose_hint(format!(
+                "{} doesn't look like a supported image (jpeg / png / webp / gif)",
+                pick.source_desc
+            ));
+            return;
+        };
+        // Pre-decode for the thumbnail. HEIC/HEIF the protocol
+        // accepts but the `image` crate doesn't decode without an
+        // extra C library — so the staged row carries no thumbnail
+        // (placeholder), but the bytes still ride to the server
+        // (Gemini accepts them; other adapters reject at dispatch).
+        let thumbnail = image::load_from_memory(&pick.bytes).ok().map(|decoded| {
+            let rgba = decoded.to_rgba8();
+            let (w, h) = rgba.dimensions();
+            aetna_core::image::Image::from_rgba8(w, h, rgba.into_raw())
+        });
+        let id = self.next_attachment_id;
+        self.next_attachment_id += 1;
+        let source_desc = pick.source_desc.clone();
+        self.compose_attachments.push(StagedAttachment {
+            id,
+            attachment: Attachment::Image {
+                source: ImageSource::Bytes {
+                    media_type: mime,
+                    data: pick.bytes,
+                },
+            },
+            thumbnail,
+            source_desc: pick.source_desc,
+        });
+        self.set_compose_hint(format!(
+            "attached {} as {}",
+            source_desc,
+            mime.as_mime_str()
+        ));
+    }
+
+    /// Set the ephemeral compose hint with a fixed expiration
+    /// window. 4 seconds is enough to read the line without
+    /// lingering when the user moves on; matches the egui sibling's
+    /// timing.
+    fn set_compose_hint(&mut self, msg: String) {
+        let expires = std::time::Instant::now() + std::time::Duration::from_secs(4);
+        self.compose_hint = Some((msg, expires));
+    }
+
+    /// Drain the file-picker handoff queue into staged attachments.
+    /// Called once per frame from `before_build`; on the empty fast
+    /// path the lock cost is negligible, so the always-on poll
+    /// matches the egui sibling's `ingest_pending_picks` shape.
+    fn drain_pending_picks(&mut self) {
+        let picks: Vec<RawPick> = match self.pending_picks.lock() {
+            Ok(mut guard) => std::mem::take(&mut *guard),
+            Err(_) => return,
+        };
+        for pick in picks {
+            self.stage_raw_pick(pick);
+        }
+    }
+
+    /// Spawn the OS file picker. Native runs rfd's `AsyncFileDialog`
+    /// on a background thread driven by a current-thread tokio
+    /// runtime; the resolved bytes land on `pending_picks` and the
+    /// next `before_build` drains them through the same staging
+    /// pipeline as drag-drop. Wasm gets a no-op + hint until the
+    /// browser-entry slice lands (the rfd wasm path needs the same
+    /// `wasm-bindgen-futures::spawn_local` glue Stage 11 will set up).
+    #[cfg(not(target_arch = "wasm32"))]
+    fn spawn_file_picker(&self) {
+        let queue = self.pending_picks.clone();
+        std::thread::spawn(move || {
+            let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            else {
+                log::error!("failed to build tokio current-thread runtime for file picker");
+                return;
+            };
+            rt.block_on(async move {
+                let Some(handle) = rfd::AsyncFileDialog::new()
+                    .set_title("Attach image")
+                    .add_filter("Image", &["png", "jpg", "jpeg", "webp", "gif"])
+                    .pick_file()
+                    .await
+                else {
+                    return;
+                };
+                let name = handle.file_name();
+                let bytes = handle.read().await;
+                if let Ok(mut guard) = queue.lock() {
+                    guard.push(RawPick {
+                        bytes,
+                        source_desc: name,
+                    });
+                }
+            });
+        });
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn spawn_file_picker(&mut self) {
+        // Stage 11 wasm entry will wire rfd's wasm path; until then
+        // surface a hint so the user knows the click registered.
+        self.set_compose_hint("file picker not available in this build (drag-drop works)".into());
+    }
+
+    fn send_compose(&mut self) {
+        let text = self.active_compose_text().trim().to_string();
+        // Allow attachments-only messages (text empty + at least
+        // one staged image). Mirrors egui's gate; an entirely empty
+        // message wastes a turn either way.
+        if text.is_empty() && self.compose_attachments.is_empty() {
+            return;
+        }
+        // Drain staged attachments into the wire's `Vec<Attachment>`.
+        // Same order they were staged — the user expects "first
+        // dropped, first delivered" so the model sees a stable
+        // sequence.
+        let attachments: Vec<Attachment> = self
+            .compose_attachments
+            .drain(..)
+            .map(|s| s.attachment)
+            .collect();
         if let Some(thread_id) = self.selected.clone() {
             // Clear the per-thread draft both locally and on the
             // server. `SetThreadDraft { text: "" }` doubles as the
@@ -3167,7 +3456,7 @@ impl ChatApp {
             self.send(ClientToServer::SendUserMessage {
                 thread_id,
                 text,
-                attachments: Vec::new(),
+                attachments,
             });
         } else {
             // No selection -> the compose form is in new-thread
@@ -3180,7 +3469,7 @@ impl ChatApp {
                 correlation_id: None,
                 pod_id,
                 initial_message: text,
-                initial_attachments: Vec::new(),
+                initial_attachments: attachments,
                 config_override,
                 bindings_request: None,
             });
@@ -8214,31 +8503,139 @@ impl ChatApp {
     }
 
     fn compose_box(&self) -> El {
-        // Disable the send button while the input is whitespace-only —
-        // sending an empty message wastes an LLM turn.
+        // Allow attachments-only sends: the gate matches send_compose's
+        // mirror (text-or-attachments).
         let buf = self.active_compose_text();
-        let can_send = !buf.trim().is_empty();
+        let can_send = !buf.trim().is_empty() || !self.compose_attachments.is_empty();
         let mut send = button("Send").key(SEND_KEY).primary();
         if !can_send {
             // Aetna's button widget honors `.disabled()` to gray out
             // the surface and skip routing.
             send = send.disabled();
         }
+        let attach = icon_button(crate::icons::ICON_PAPERCLIP.clone())
+            .key(COMPOSE_ATTACH_KEY)
+            .ghost();
         let editor = text_area(buf, &self.selection, COMPOSE_KEY).height(Size::Fixed(120.0));
 
         // The compose row sits at the bottom of the pane: text_area
-        // takes the leftover width, the send button hugs to the
-        // right. `card([...])` would over-style this — it's part of
-        // the same content surface — so we use a thin top stroke as
-        // the visual divider from the chat log.
-        row([editor, send])
-            .gap(tokens::SPACE_3)
+        // takes the leftover width, attach + send hug to the right.
+        // `card([...])` would over-style this — it's part of the
+        // same content surface — so we use a thin top stroke as the
+        // visual divider from the chat log. Thumbnail strip + hint
+        // sit above the row when staged (otherwise they collapse to
+        // zero height).
+        let mut children: Vec<El> = Vec::new();
+        if let Some(strip) = self.render_compose_attachments() {
+            children.push(strip);
+        }
+        if let Some(hint_el) = self.render_compose_hint() {
+            children.push(hint_el);
+        }
+        children.push(
+            row([editor, attach, send])
+                .gap(tokens::SPACE_3)
+                .align(Align::End)
+                .width(Size::Fill(1.0)),
+        );
+        column(children)
+            .gap(tokens::SPACE_2)
             .padding(tokens::SPACE_3)
-            .align(Align::End)
             .width(Size::Fill(1.0))
             .stroke(tokens::BORDER)
             .fill(tokens::BACKGROUND)
     }
+
+    /// Thumbnail strip above the compose row. Each staged image
+    /// renders as a 96×96 thumbnail with a small `×` overlay
+    /// keyed `compose:attach:remove:{id}`. Hugs height when no
+    /// attachments are staged (callers omit the strip entirely
+    /// in that case).
+    fn render_compose_attachments(&self) -> Option<El> {
+        if self.compose_attachments.is_empty() {
+            return None;
+        }
+        let tiles: Vec<El> = self
+            .compose_attachments
+            .iter()
+            .map(compose_thumbnail_tile)
+            .collect();
+        Some(
+            row(tiles)
+                .gap(tokens::SPACE_2)
+                .align(Align::Start)
+                .width(Size::Fill(1.0)),
+        )
+    }
+
+    /// Render the ephemeral compose hint paragraph if one is live.
+    /// Self-expires through `before_build`'s deadline check; the
+    /// renderer only mirrors the slot's current contents.
+    fn render_compose_hint(&self) -> Option<El> {
+        let (msg, _expires) = self.compose_hint.as_ref()?;
+        Some(paragraph(msg.clone()).muted().small())
+    }
+}
+
+/// Build a single compose-thumbnail tile: 96×96 image (or
+/// "(URL)" placeholder), small file label below it, and an `×`
+/// remove button overlaid in the top-right corner. The `id`
+/// rides into the route key so duplicates the user staged
+/// deliberately are still individually addressable.
+fn compose_thumbnail_tile(s: &StagedAttachment) -> El {
+    let remove_key = format!("{COMPOSE_ATTACH_REMOVE_PREFIX}{}", s.id);
+    let preview: El = if let Some(img) = s.thumbnail.as_ref() {
+        El::new(Kind::Custom("compose-thumbnail"))
+            .image(img.clone())
+            .image_fit(ImageFit::Cover)
+            .width(Size::Fixed(96.0))
+            .height(Size::Fixed(96.0))
+            .radius(tokens::RADIUS_SM)
+            .clip()
+    } else {
+        // Decode failed (HEIC/HEIF without C lib, or a corrupt
+        // payload) — placeholder keeps layout stable. Bytes still
+        // ride to the server.
+        column([text("(no preview)").muted().small()])
+            .width(Size::Fixed(96.0))
+            .height(Size::Fixed(96.0))
+            .align(Align::Center)
+            .justify(Justify::Center)
+            .fill(tokens::MUTED)
+            .radius(tokens::RADIUS_SM)
+    };
+    let remove = icon_button(crate::icons::ICON_X.clone())
+        .key(&remove_key)
+        .ghost();
+    let label = text(truncate_filename(&s.source_desc, 20)).muted().small();
+    column([
+        row([preview, remove])
+            .gap(tokens::SPACE_1)
+            .align(Align::Start),
+        label,
+    ])
+    .gap(tokens::SPACE_1)
+    .width(Size::Hug)
+}
+
+/// Truncate a filename for display under a 96 px thumbnail tile.
+/// Preserves the start so the user can identify the file at a
+/// glance; ellipsizes the middle when needed.
+fn truncate_filename(name: &str, max_chars: usize) -> String {
+    if name.chars().count() <= max_chars {
+        return name.to_string();
+    }
+    let half = max_chars.saturating_sub(1) / 2;
+    let prefix: String = name.chars().take(half).collect();
+    let suffix: String = name
+        .chars()
+        .rev()
+        .take(half)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+    format!("{prefix}…{suffix}")
 }
 
 fn empty_state(label: &str) -> El {
