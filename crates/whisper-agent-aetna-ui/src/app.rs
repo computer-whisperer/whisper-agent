@@ -2647,6 +2647,22 @@ impl App for ChatApp {
         // reload via `SetThreadDraft`), or `compose_input` for the
         // new-thread form.
         if event.target_key() == Some(COMPOSE_KEY) {
+            // Plain Enter (no modifiers) submits — same UX as the
+            // egui sibling. Shift+Enter / Ctrl+Enter / etc. fall
+            // through to the text_area which inserts a newline.
+            // We branch *before* `text_area::apply_event` so the
+            // submit Enter never reaches the buffer.
+            if event.kind == UiEventKind::KeyDown
+                && let Some(kp) = event.key_press.as_ref()
+                && matches!(kp.key, UiKey::Enter)
+                && !kp.modifiers.shift
+                && !kp.modifiers.ctrl
+                && !kp.modifiers.alt
+                && !kp.modifiers.logo
+            {
+                self.send_compose();
+                return;
+            }
             let selected = self.selected.clone();
             // Field-level borrow split: `self.drafts` /
             // `self.compose_input` and `self.selection` are
