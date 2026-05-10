@@ -731,6 +731,26 @@ Plumbing that fetch is a separate slice; until it lands the
 two override fields ride through `working_config` unchanged
 on save.
 
+**Behavior editor — SystemPrompt tab (landed):** the
+behavior's optional override for the spawned thread's
+agent-personality preamble. An override checkbox flips
+`cfg.thread.system_prompt` between `None` (inherit pod
+default) and `Some(File { name = behaviors/<id>/system_prompt.md })`.
+When on with the File variant, a 280 px text_area binds to a
+new `working_system_prompt: Option<String>` buffer
+(hydrated from `snapshot.system_prompt`); `submit_behavior_editor`
+ships the buffer as `UpdateBehavior.system_prompt`, and the
+server writes it to the conventional sibling path. The Text
+variant binds the text_area directly to the inline string —
+no side-file write, content rides through `config` itself.
+
+Toggle-off drops the config reference but leaves
+`working_system_prompt` alone, so toggling back on doesn't
+lose the user's draft. Non-conventional file paths surface a
+muted "edits land at the conventional path" warning since
+`UpdateBehavior` only writes the canonical
+`behaviors/<id>/system_prompt.md`.
+
 **Behavior editor — Retention tab (landed):** the on-completion
 policy editor. A `select_trigger` 3-way kind picker (Keep /
 ArchiveAfterDays / DeleteAfterDays) plus a `numeric_input`

@@ -44,7 +44,7 @@ use whisper_agent_protocol::{
     AllowMap, BackendSummary, BehaviorConfig, BehaviorSummary, BehaviorThreadOverride, CatchUp,
     ClientToServer, ContentBlock, Disposition, ImageSource, ModelSummary, NamedHostEnv, Overlap,
     PodAllow, PodConfig, PodLimits, PodSummary, RetentionPolicy, Role, ServerToClient,
-    ThreadConfigOverride, ThreadDefaults, ThreadSummary, TriggerSpec,
+    SystemPromptChoice, ThreadConfigOverride, ThreadDefaults, ThreadSummary, TriggerSpec,
 };
 
 /// Inbound event variants the host shell pushes into the [`Inbound`]
@@ -701,6 +701,12 @@ pub(crate) struct BehaviorEditorSheetState {
     /// preserved across kind switches so toggling Keep ↔ Archive
     /// doesn't lose typed days.
     pub(crate) retention_days_buf: String,
+    /// SystemPrompt-tab content buffer for the side
+    /// `behaviors/<id>/system_prompt.md` file. Hydrated from
+    /// `snapshot.system_prompt`. Round-trips on save via
+    /// `UpdateBehavior.system_prompt`. `None` ⇒ no buffer to ship
+    /// (override is off, or the snapshot didn't carry content).
+    pub(crate) working_system_prompt: Option<String>,
     /// Validation message: load error from the snapshot, client-side
     /// validation failure, or server-side `Error` echo.
     pub(crate) error: Option<String>,
@@ -871,6 +877,7 @@ impl BehaviorEditorSheetState {
             thread_max_tokens_buf: String::new(),
             thread_max_turns_buf: String::new(),
             retention_days_buf: "30".into(),
+            working_system_prompt: None,
             error: None,
             pending_get: Some(pending_get),
             pending_save: None,
@@ -917,6 +924,7 @@ impl BehaviorEditorSheetState {
         }
         self.working_config = snapshot.config;
         self.working_prompt = snapshot.prompt;
+        self.working_system_prompt = snapshot.system_prompt;
         self.sync_thread_buffers_from_config();
         self.sync_retention_buffer_from_config();
     }
@@ -2636,6 +2644,25 @@ const BEHAVIOR_EDITOR_THREAD_BACKEND_KEY: &str = "behavior-editor:thread:backend
 /// Retention-tab routed keys.
 const BEHAVIOR_EDITOR_RETENTION_KIND_KEY: &str = "behavior-editor:retention:kind";
 const BEHAVIOR_EDITOR_RETENTION_DAYS_KEY: &str = "behavior-editor:retention:days";
+/// SystemPrompt-tab routed keys. The override checkbox flips
+/// `cfg.thread.system_prompt` between `None` and `Some(File {
+/// name = conventional_path })`; the editor's
+/// `working_system_prompt` buffer round-trips against the file at
+/// that path on save (server reads `UpdateBehavior.system_prompt`
+/// as the new content).
+const BEHAVIOR_EDITOR_SYSTEM_PROMPT_OVERRIDE_KEY: &str = "behavior-editor:system-prompt:override";
+const BEHAVIOR_EDITOR_SYSTEM_PROMPT_KEY: &str = "behavior-editor:system-prompt";
+
+/// Conventional pod-relative path for the system-prompt override
+/// associated with a behavior. The toggle in the System Prompt tab
+/// flips `config.thread.system_prompt` between `None` and
+/// `Some(File { name = behavior_system_prompt_path(id) })`; the
+/// editor buffer round-trips against this path through
+/// `UpdateBehavior.system_prompt`. Mirrors the pod-level
+/// `system_prompt.md` convention.
+fn behavior_system_prompt_path(behavior_id: &str) -> String {
+    format!("behaviors/{behavior_id}/system_prompt.md")
+}
 
 fn behavior_row_key(pod_id: &str, behavior_id: &str) -> String {
     format!("{BEHAVIOR_ROW_PREFIX}{pod_id}:{behavior_id}")
@@ -4440,6 +4467,61 @@ impl ChatApp {
             return true;
         }
 
+        // SystemPrompt-tab override checkbox. Toggling on binds the
+        // config to the conventional pod-relative path and seeds an
+        // empty buffer if none exists; toggling off drops the config
+        // reference but leaves the buffer alone (so a re-toggle
+        // doesn't lose the user's draft).
+        if event.is_click_or_activate(BEHAVIOR_EDITOR_SYSTEM_PROMPT_OVERRIDE_KEY) {
+            if let Some(editor) = self.behavior_editor.as_mut()
+                && let Some(cfg) = editor.working_config.as_mut()
+            {
+                if cfg.thread.system_prompt.is_some() {
+                    cfg.thread.system_prompt = None;
+                } else {
+                    let conv_path = behavior_system_prompt_path(&editor.behavior_id);
+                    cfg.thread.system_prompt = Some(SystemPromptChoice::File { name: conv_path });
+                    if editor.working_system_prompt.is_none() {
+                        editor.working_system_prompt = Some(String::new());
+                    }
+                }
+                editor.error = None;
+            }
+            return true;
+        }
+
+        // SystemPrompt-tab body text_area. Routes to either
+        // `working_system_prompt` (File variant — saved to the side
+        // file) or `cfg.thread.system_prompt.Text.text` (inline).
+        if event.target_key() == Some(BEHAVIOR_EDITOR_SYSTEM_PROMPT_KEY) {
+            if let Some(editor) = self.behavior_editor.as_mut()
+                && let Some(cfg) = editor.working_config.as_mut()
+            {
+                match cfg.thread.system_prompt.as_mut() {
+                    Some(SystemPromptChoice::File { .. }) => {
+                        let buf = editor.working_system_prompt.get_or_insert_with(String::new);
+                        text_area::apply_event(
+                            buf,
+                            &mut self.selection,
+                            BEHAVIOR_EDITOR_SYSTEM_PROMPT_KEY,
+                            event,
+                        );
+                    }
+                    Some(SystemPromptChoice::Text { text }) => {
+                        text_area::apply_event(
+                            text,
+                            &mut self.selection,
+                            BEHAVIOR_EDITOR_SYSTEM_PROMPT_KEY,
+                            event,
+                        );
+                    }
+                    None => {}
+                }
+                editor.error = None;
+            }
+            return true;
+        }
+
         // Retention-tab `days` numeric input. Only meaningful when
         // `cfg.on_completion` is a timed variant; we still parse and
         // write back when the kind happens to be Keep so the buffer
@@ -4781,24 +4863,27 @@ impl ChatApp {
         let pod_id = editor.pod_id.clone();
         let behavior_id = editor.behavior_id.clone();
         let prompt = editor.working_prompt.clone();
+        // Ship the side-file buffer when the override is on (File
+        // variant). For the Text variant the content is already in
+        // `config.thread.system_prompt`, so no side-file write is
+        // needed — `system_prompt = None` leaves the on-disk
+        // `system_prompt.md` alone. For override-off, also `None`.
+        let system_prompt = match config.thread.system_prompt.as_ref() {
+            Some(SystemPromptChoice::File { .. }) => editor.working_system_prompt.clone(),
+            _ => None,
+        };
         let correlation_id = self.next_correlation_id();
         if let Some(editor) = self.behavior_editor.as_mut() {
             editor.pending_save = Some(correlation_id.clone());
             editor.error = None;
         }
-        // `system_prompt = None` ⇒ leave the side `system_prompt.md`
-        // file alone. v1 doesn't expose the override editor, so a
-        // save mustn't accidentally clobber a hand-edited file. The
-        // System Prompt tab in the egui sibling is the conventional
-        // way to round-trip the file's contents; that lands in a
-        // follow-up slice.
         self.send(ClientToServer::UpdateBehavior {
             correlation_id: Some(correlation_id),
             pod_id,
             behavior_id,
             config,
             prompt,
-            system_prompt: None,
+            system_prompt,
         });
     }
 
@@ -5078,11 +5163,9 @@ impl ChatApp {
                 BehaviorEditorTab::Retention => {
                     self.render_behavior_editor_retention_tab(editor, cfg)
                 }
-                BehaviorEditorTab::SystemPrompt => paragraph(
-                    "System prompt tab — coming soon. The system_prompt \
-                     override field rides through unchanged on save.",
-                )
-                .muted(),
+                BehaviorEditorTab::SystemPrompt => {
+                    self.render_behavior_editor_system_prompt_tab(editor, cfg)
+                }
                 BehaviorEditorTab::RawToml => paragraph(
                     "Raw TOML tab — coming soon. Use the structured tabs \
                      for now.",
@@ -5616,6 +5699,111 @@ impl ChatApp {
             ]));
         }
 
+        form(items)
+    }
+
+    /// SystemPrompt tab body. Mirrors the egui sibling's
+    /// `render_behavior_editor_system_prompt_tab`. An override
+    /// checkbox flips `cfg.thread.system_prompt` between `None`
+    /// (inherit pod default) and `Some(File { name = conventional
+    /// path })`. When on, a text_area binds to
+    /// `working_system_prompt` (File variant) or directly to the
+    /// inline text (Text variant).
+    fn render_behavior_editor_system_prompt_tab(
+        &self,
+        editor: &BehaviorEditorSheetState,
+        cfg: &BehaviorConfig,
+    ) -> El {
+        let conv_path = behavior_system_prompt_path(&editor.behavior_id);
+        let override_on = cfg.thread.system_prompt.is_some();
+
+        let mut items: Vec<El> = vec![form_item([
+            form_label("override"),
+            form_control(
+                row([
+                    checkbox(override_on).key(BEHAVIOR_EDITOR_SYSTEM_PROMPT_OVERRIDE_KEY),
+                    text("override pod default system prompt").muted().small(),
+                ])
+                .gap(tokens::SPACE_2)
+                .align(Align::Center),
+            ),
+            form_description(
+                "Off = inherit the pod's default system prompt. On = use \
+                 the text below as the agent-personality preamble for \
+                 spawned threads. Stored as a sibling file in the \
+                 behavior's directory.",
+            ),
+        ])];
+
+        if !override_on {
+            items.push(form_item([
+                form_label("body"),
+                form_control(
+                    paragraph("(inheriting pod default — toggle override on to edit)")
+                        .muted()
+                        .small(),
+                ),
+            ]));
+            return form(items);
+        }
+
+        match cfg.thread.system_prompt.as_ref() {
+            Some(SystemPromptChoice::File { name }) => {
+                let non_conv = name != &conv_path;
+                let body = editor.working_system_prompt.as_deref().unwrap_or("");
+                let body_input =
+                    text_area(body, &self.selection, BEHAVIOR_EDITOR_SYSTEM_PROMPT_KEY)
+                        .height(Size::Fixed(280.0));
+                items.push(form_item([
+                    form_label("file"),
+                    form_control(mono(name.clone()).muted().small()),
+                ]));
+                if non_conv {
+                    items.push(form_item([
+                        form_label(""),
+                        form_control(
+                            paragraph(
+                                "Non-conventional path — `UpdateBehavior` only writes \
+                                 the conventional `behaviors/<id>/system_prompt.md`, so \
+                                 edits to this body land there. Use Raw TOML to retarget \
+                                 the pointer if you really want a different path.",
+                            )
+                            .muted()
+                            .small(),
+                        ),
+                    ]));
+                }
+                items.push(form_item([
+                    form_label("body"),
+                    form_control(body_input),
+                    form_description(
+                        "Side-file content for `behaviors/<id>/system_prompt.md`. \
+                         Saved alongside the config on the next Save.",
+                    ),
+                ]));
+            }
+            Some(SystemPromptChoice::Text { text: inline_text }) => {
+                let inline_input = text_area(
+                    inline_text,
+                    &self.selection,
+                    BEHAVIOR_EDITOR_SYSTEM_PROMPT_KEY,
+                )
+                .height(Size::Fixed(280.0));
+                items.push(form_item([
+                    form_label("inline"),
+                    form_control(paragraph("inline text (no side file)").muted().small()),
+                ]));
+                items.push(form_item([
+                    form_label("body"),
+                    form_control(inline_input),
+                    form_description(
+                        "Inline override text. Edits land directly on the config — no \
+                         side file involved.",
+                    ),
+                ]));
+            }
+            None => {}
+        }
         form(items)
     }
 
