@@ -29,11 +29,11 @@ use whisper_agent_aetna_ui::{
     ChatApp, Inbound, InboundEvent, LoginApp, LoginInput, SendFn, SubmitFn,
 };
 use whisper_agent_protocol::{
-    BackendSummary, BehaviorOrigin, BehaviorSummary, ClientToServer, CompactionConfig,
-    ContentBlock, ContentCapabilities, Conversation, FsEntry, ImageMime, ImageSource, Message,
-    ModelSummary, PodSummary, Role, ServerToClient, ThreadBindings, ThreadConfig, ThreadSnapshot,
-    ThreadStateLabel, ThreadSummary, ToolKind, ToolResultContent, TurnEntry, TurnLog, Usage,
-    permission::Scope,
+    ActiveSlotSummary, BackendSummary, BehaviorOrigin, BehaviorSummary, BucketBuildPhase,
+    BucketSummary, ClientToServer, CompactionConfig, ContentBlock, ContentCapabilities,
+    Conversation, FsEntry, ImageMime, ImageSource, Message, ModelSummary, PodSummary, Role,
+    ServerToClient, SlotStateLabel, ThreadBindings, ThreadConfig, ThreadSnapshot, ThreadStateLabel,
+    ThreadSummary, ToolKind, ToolResultContent, TurnEntry, TurnLog, Usage, permission::Scope,
 };
 
 fn main() -> std::io::Result<()> {
@@ -348,10 +348,18 @@ enum Scene {
     /// key/value rows for bindings, max-tokens / max-turns,
     /// cumulative usage, and any trigger origin.
     ThreadInspectorOpen,
+    /// Knowledge-buckets modal over a populated catalog. The
+    /// `BucketsList` wire seed carries three buckets covering the
+    /// three states the row chrome cares about: ready (with active
+    /// slot), in-flight build (driven by a synthetic
+    /// `BucketBuildStarted` + `BucketBuildProgress` pair), and
+    /// armed-delete (driven by a synthetic click that lands the
+    /// row in `delete_armed`).
+    BucketsModalCatalog,
 }
 
 impl Scene {
-    const ALL: [Scene; 50] = [
+    const ALL: [Scene; 51] = [
         Scene::Connecting,
         Scene::Connected,
         Scene::Closed,
@@ -402,6 +410,7 @@ impl Scene {
         Scene::SettingsBackends,
         Scene::SettingsServerConfig,
         Scene::ThreadInspectorOpen,
+        Scene::BucketsModalCatalog,
     ];
 
     fn slug(self) -> &'static str {
@@ -456,6 +465,7 @@ impl Scene {
             Scene::SettingsBackends => "settings_backends",
             Scene::SettingsServerConfig => "settings_server_config",
             Scene::ThreadInspectorOpen => "thread_inspector_open",
+            Scene::BucketsModalCatalog => "buckets_modal_catalog",
         }
     }
 
@@ -624,6 +634,11 @@ impl Scene {
             // fires. The per-scene SendFn answers with mock TOML;
             // the second `before_build` hydrates the editor.
             Scene::SettingsServerConfig => vec!["settings:tabs:tab:server-config"],
+            // Buckets-modal catalog scene: arm delete on the third
+            // (ready) bucket so the destructive Confirm + Cancel
+            // pair renders. The pre-seeded BucketBuildProgress
+            // already paints the second row's spinner inline.
+            Scene::BucketsModalCatalog => vec!["buckets:delete:__server__:wiki-en"],
             _ => Vec::new(),
         }
     }
@@ -1276,7 +1291,8 @@ fn build_app(scene: Scene) -> Box<dyn App> {
         | Scene::FileViewerReadOnly
         | Scene::FileTreeOpen
         | Scene::SettingsBackends
-        | Scene::SettingsServerConfig => {
+        | Scene::SettingsServerConfig
+        | Scene::BucketsModalCatalog => {
             // Populated baseline so the dialog overlays a non-empty
             // sidebar / pane (same idea as the modal scenes above).
             // The viewer itself is opened after the queue borrow
@@ -1303,6 +1319,41 @@ fn build_app(scene: Scene) -> Box<dyn App> {
                     backends: mock_backends(),
                 }));
             }
+            if matches!(scene, Scene::BucketsModalCatalog) {
+                // Three buckets covering each row-chrome state:
+                //   - notes — managed, no slot yet (Build disabled).
+                //   - design — linked, in-flight build (counters
+                //     populated by the BucketBuildProgress below).
+                //   - wiki-en — tracked, ready with active slot;
+                //     the click loop arms its Delete.
+                q.push_back(InboundEvent::Wire(ServerToClient::BucketsList {
+                    correlation_id: None,
+                    buckets: mock_buckets_modal_catalog(),
+                }));
+                // Build start + first progress tick for `design`,
+                // synthesized at known correlation_id::None and
+                // fields the renderer cares about. Fed *into* the
+                // queue so the first `before_build` drain in main
+                // hydrates `build_progress` before the body paints.
+                q.push_back(InboundEvent::Wire(ServerToClient::BucketBuildStarted {
+                    correlation_id: None,
+                    bucket_id: "design".into(),
+                    pod_id: None,
+                    slot_id: "20261103-0001".into(),
+                    started_at: Some("2026-05-10T14:00:00Z".into()),
+                }));
+                q.push_back(InboundEvent::Wire(ServerToClient::BucketBuildProgress {
+                    bucket_id: "design".into(),
+                    pod_id: None,
+                    slot_id: "20261103-0001".into(),
+                    phase: BucketBuildPhase::Indexing,
+                    source_records: 1_240,
+                    chunks: 8_973,
+                    started_at: Some("2026-05-10T14:00:00Z".into()),
+                    dense_inserted: None,
+                    dense_total: None,
+                }));
+            }
         }
         // Login scenes route through `build_login_app` above and
         // never reach here.
@@ -1322,6 +1373,9 @@ fn build_app(scene: Scene) -> Box<dyn App> {
     }
     if matches!(scene, Scene::SettingsBackends | Scene::SettingsServerConfig) {
         app.open_settings_modal();
+    }
+    if matches!(scene, Scene::BucketsModalCatalog) {
+        app.open_buckets_modal();
     }
     Box::new(app)
 }
@@ -1395,6 +1449,65 @@ fn mock_models() -> Vec<ModelSummary> {
             context_window: Some(200_000),
             max_output_tokens: Some(8192),
             capabilities: ContentCapabilities::default(),
+        },
+    ]
+}
+
+fn mock_buckets_modal_catalog() -> Vec<BucketSummary> {
+    vec![
+        BucketSummary {
+            id: "notes".into(),
+            scope: "server".into(),
+            pod_id: None,
+            name: "Field notes".into(),
+            description: Some("Managed bucket — corpus appended via the agent.".into()),
+            source_kind: "managed".into(),
+            source_detail: None,
+            embedder_provider: "voyage-3-lite".into(),
+            dense_enabled: true,
+            sparse_enabled: false,
+            created_at: "2026-04-12T09:30:00Z".into(),
+            active_slot: None,
+        },
+        BucketSummary {
+            id: "design".into(),
+            scope: "server".into(),
+            pod_id: None,
+            name: "Design docs".into(),
+            description: Some("Linked bucket — points at /var/whisper/docs/design.".into()),
+            source_kind: "linked".into(),
+            source_detail: Some("/var/whisper/docs/design".into()),
+            embedder_provider: "voyage-3-lite".into(),
+            dense_enabled: true,
+            sparse_enabled: true,
+            created_at: "2026-04-15T10:00:00Z".into(),
+            active_slot: None,
+        },
+        BucketSummary {
+            id: "wiki-en".into(),
+            scope: "server".into(),
+            pod_id: None,
+            name: "Wikipedia (en)".into(),
+            description: Some(
+                "Tracked bucket — monthly rebuild from enwiki dumps + daily deltas.".into(),
+            ),
+            source_kind: "tracked".into(),
+            source_detail: Some("wikipedia (en)".into()),
+            embedder_provider: "qwen3-embedding-0.6b".into(),
+            dense_enabled: true,
+            sparse_enabled: true,
+            created_at: "2026-02-01T00:00:00Z".into(),
+            active_slot: Some(ActiveSlotSummary {
+                slot_id: "20260301-0001-abcd".into(),
+                state: SlotStateLabel::Ready,
+                embedder_model: "Qwen/Qwen3-Embedding-0.6B".into(),
+                dimension: 1024,
+                chunk_count: 142_873_204,
+                vector_count: 142_873_204,
+                disk_size_bytes: 312_452_096_000,
+                created_at: "2026-03-01T00:00:00Z".into(),
+                built_at: Some("2026-03-14T18:42:00Z".into()),
+            }),
         },
     ]
 }

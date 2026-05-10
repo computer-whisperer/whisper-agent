@@ -1317,11 +1317,55 @@ trivial / small / medium / large.
   `ServerConfigFetched`). The egui sibling's success / error
   banners + the `ServerConfigUpdateResult` summary alert all
   paint via aetna's `alert` widget; both scenes lint clean.
-- ⏳ **Knowledge buckets.** Full CRUD for the bucket lifecycle:
-  create form (quantization / driver / cadence pickers for
-  tracked buckets), build progress, search / query interface,
-  two-click delete confirmation. Egui's `modals/buckets.rs`.
-  *Large — async build state, complex form, search UX.*
+- 🌗 **Knowledge buckets.** Phase 1 landed: read-only catalog
+  modal with per-row chrome (name + id, description, scope /
+  source / embedder chips, slot info), live build-progress
+  display, last-failed-build error banner, and per-row actions
+  (Build / Pause build / Poll now / Resync now + arm-confirm
+  Delete). Phase 2 (create form: quantization / driver / cadence
+  pickers, dispatch validation) and Phase 3 (search-and-query
+  with QueryHit rendering) ride on top in follow-up slices.
+
+  Entry point: a `database`-icon button in the sidebar footer
+  next to the existing settings cog (bundled SVG — aetna's
+  built-in registry doesn't ship `database`).
+  `open_buckets_modal` is idempotent — re-opens preserve any
+  live build-progress maps that were already populated.
+
+  Wire surface for Phase 1:
+  - Send: `StartBucketBuild`, `CancelBucketBuild`, `DeleteBucket`,
+    `PollFeedNow`, `ResyncBucket` (all `id` + `pod_id` only —
+    correlation ids unused since the broadcasts are
+    matched by `(pod_id, bucket_id)` on the reply side).
+  - Receive: `BucketCreated` (append iff not present), `BucketDeleted`
+    (drop the row + per-row state), `BucketBuildStarted` (seed
+    `build_progress`), `BucketBuildProgress` (update counters),
+    `BucketBuildEnded` (drop `build_progress` + adopt new
+    `summary` into the catalog when present, populate
+    `build_errors` on `Error` outcome).
+
+  Renderer is a 720 × 640 `dialog_content` over a scrolled
+  column of cards. Slot state badge is colored by lifecycle
+  (`ready` success, `building` / `planning` warning, `failed`
+  destructive, `archived` muted). Build progress paints as a
+  single warning-colored caption (`phase · count_body · elapsed`),
+  mirroring the egui sibling's spinner row visually. Action
+  keys carry pod-scope sentinel (`__server__` for `pod_id =
+  None`) so `split_once(':')` parses cleanly even with pod ids
+  that contain colons — kebab-case validator on the server
+  precludes the actual collision.
+
+  Bundle scene: `BucketsModalCatalog` synthesizes three
+  buckets covering each row-chrome state (managed-no-slot,
+  linked-in-flight-build, tracked-ready), plus a
+  `BucketBuildStarted` + `BucketBuildProgress` pair driving
+  the live counter row, plus a synthetic click that arms the
+  `wiki-en` Delete button to render the destructive
+  Confirm + Cancel pair. Lint clean.
+
+  Egui equivalent: `modals/buckets.rs` (1306 LOC) — the aetna
+  port is much smaller because Phase 2 + 3 (create + search)
+  are deferred.
 
 ### Sidebar / chrome
 

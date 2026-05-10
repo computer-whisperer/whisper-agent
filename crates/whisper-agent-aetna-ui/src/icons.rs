@@ -76,6 +76,13 @@ pub static ICON_RETURN: LazyLock<SvgIcon> = LazyLock::new(|| {
         .expect("lucide corner-down-left svg parses")
 });
 
+/// Stacked-cylinder database — sidebar-footer affordance opening the
+/// knowledge-buckets modal. Lucide doesn't ship `database` in aetna's
+/// built-in registry yet; bundled inline like the rest.
+pub static ICON_DATABASE: LazyLock<SvgIcon> = LazyLock::new(|| {
+    SvgIcon::parse_current_color(LUCIDE_DATABASE).expect("lucide database svg parses")
+});
+
 const LUCIDE_ZAP: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 14a1 1 0 0 1-.78-1.63l9.9-10.2a.5.5 0 0 1 .86.46l-1.92 6.02A1 1 0 0 0 13 10h7a1 1 0 0 1 .78 1.63l-9.9 10.2a.5.5 0 0 1-.86-.46l1.92-6.02A1 1 0 0 0 11 14z"/></svg>"##;
 
 const LUCIDE_PLAY: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="6 3 20 12 6 21 6 3"/></svg>"##;
@@ -99,3 +106,5 @@ const LUCIDE_SPARKLES: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBo
 const LUCIDE_SERVER: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="20" height="8" x="2" y="2" rx="2" ry="2"/><rect width="20" height="8" x="2" y="14" rx="2" ry="2"/><line x1="6" x2="6.01" y1="6" y2="6"/><line x1="6" x2="6.01" y1="18" y2="18"/></svg>"##;
 
 const LUCIDE_CORNER_DOWN_LEFT: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 10 4 15 9 20"/><path d="M20 4v7a4 4 0 0 1-4 4H4"/></svg>"##;
+
+const LUCIDE_DATABASE: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M3 5V19A9 3 0 0 0 21 19V5"/><path d="M3 12A9 3 0 0 0 21 12"/></svg>"##;

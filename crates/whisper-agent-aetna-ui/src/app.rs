@@ -36,7 +36,8 @@
 //! Surfaces still to land (full inventory in
 //! `docs/design_aetna_ui.md` § "Migration gaps from egui webui"):
 //! Codex auth rotate + Shared MCP CRUD sub-slices of the server
-//! settings modal, knowledge-buckets modal.
+//! settings modal, bucket create form + search-and-query
+//! sub-slices of the knowledge-buckets modal.
 //!
 //! Dispatch model: a single `dispatch_wire` walks `ServerToClient`
 //! variants — only the ones the current stage cares about have arms;
@@ -53,9 +54,10 @@ use aetna_core::widgets::resize_handle::{self, ResizeDrag, Side};
 use aetna_core::widgets::select::{SelectAction, classify_event as classify_select_event};
 use whisper_agent_protocol::{
     ActivationSurface, AllowMap, Attachment, BackendSummary, BehaviorConfig, BehaviorSummary,
-    BehaviorThreadOverride, CatchUp, ClientToServer, ContentBlock, CoreTools, Disposition, FsEntry,
-    ImageMime, ImageSource, InitialListing, ModelSummary, NamedHostEnv, Overlap, PodAllow,
-    PodConfig, PodLimits, PodSummary, RetentionPolicy, Role, ServerToClient, SystemPromptChoice,
+    BehaviorThreadOverride, BucketBuildOutcome, BucketBuildPhase, BucketSummary, CatchUp,
+    ClientToServer, ContentBlock, CoreTools, Disposition, FsEntry, ImageMime, ImageSource,
+    InitialListing, ModelSummary, NamedHostEnv, Overlap, PodAllow, PodConfig, PodLimits,
+    PodSummary, RetentionPolicy, Role, ServerToClient, SlotStateLabel, SystemPromptChoice,
     ThreadBindingsRequest, ThreadConfigOverride, ThreadDefaults, ThreadSummary, TriggerSpec,
     permission::SudoDecision,
 };
@@ -533,6 +535,53 @@ impl FileViewerModalState {
     }
 }
 
+/// `(pod_id, bucket_id)` key for per-row bucket state (build
+/// progress, build errors, delete-armed). Tuple key matches the egui
+/// sibling's `BucketRowKey` so the two clients have isomorphic state
+/// shapes — pod-scope and server-scope buckets with the same id can
+/// coexist after PB3b.
+type BucketRowKey = (Option<String>, String);
+
+/// Live per-bucket build progress snapshot. Inserted on
+/// `BucketBuildStarted`, updated on `BucketBuildProgress`, removed
+/// on `BucketBuildEnded`. Mirrors the egui sibling's
+/// `BuildProgressView`.
+#[derive(Clone)]
+struct BuildProgressView {
+    phase: BucketBuildPhase,
+    source_records: u64,
+    chunks: u64,
+    /// RFC3339 wall-clock dispatch time forwarded by `BucketBuildStarted`
+    /// and every `BucketBuildProgress`. `None` for legacy servers; renders
+    /// no elapsed stopwatch when missing.
+    started_at: Option<String>,
+    /// Resume-path HNSW-rebuild gauge. `Some` only during a resume
+    /// rebuild; `None` during fresh builds.
+    dense_inserted: Option<u64>,
+    dense_total: Option<u64>,
+}
+
+/// Knowledge-buckets modal state. v1 ships the read-only catalog
+/// surface, the live build-progress display, and the four row
+/// actions (Build / Pause build / Poll now / Resync now) plus
+/// arm-confirm Delete. Create form + search-and-query are deferred
+/// to follow-up sub-slices — `creating`, `query_input`, `top_k`,
+/// `query_status` aren't carried here yet.
+#[derive(Default)]
+struct BucketsModalState {
+    /// Bucket id whose Delete button is "armed" — clicked once,
+    /// waiting for a confirming second click. Cleared whenever the
+    /// user starts a different action, switches modals, or the
+    /// matching `BucketDeleted` lands.
+    delete_armed: Option<String>,
+    /// Live build-progress map. Keyed by `(pod_id, bucket_id)`.
+    build_progress: HashMap<BucketRowKey, BuildProgressView>,
+    /// Sticky last-failed-build error message per `(pod_id,
+    /// bucket_id)`. Overwritten by the next attempt; cleared when a
+    /// success lands for the same key.
+    build_errors: HashMap<BucketRowKey, String>,
+}
+
 /// Server-settings modal state. v1 has two tabs: a read-only LLM
 /// backends listing and an admin-only raw editor for the server's
 /// `whisper-agent.toml`. The Shared MCP hosts CRUD + Codex Rotate
@@ -833,6 +882,18 @@ pub struct ChatApp {
     /// set since only the selected thread renders its inspector;
     /// switching threads collapses the prior one.
     inspector_open: Option<String>,
+
+    // ----- modal: knowledge buckets -----
+    /// Knowledge-buckets modal state. `Some` while open. Opened via
+    /// the database icon-button in the sidebar footer. Live build
+    /// progress (`build_progress`) is hydrated by `BucketBuildStarted`
+    /// / `BucketBuildProgress` events that arrive even while the
+    /// modal is closed — they're cheap and the next open paints with
+    /// fresh counters. Sticky build errors (`build_errors`) follow
+    /// the same lifecycle. Both maps live inside `BucketsModalState`
+    /// so closing the modal collapses them; that's fine for v1 since
+    /// the modal is the only surface that displays them.
+    buckets_modal: Option<BucketsModalState>,
 
     // ----- modal: server settings -----
     /// Server-settings modal state. `Some` while open. Lifecycle:
@@ -1942,6 +2003,7 @@ impl ChatApp {
             sidebar_drag: ResizeDrag::default(),
             lightbox: None,
             inspector_open: None,
+            buckets_modal: None,
             settings_modal: None,
             file_viewer_modal: None,
             file_tree_modal_pod: None,
@@ -2394,6 +2456,114 @@ impl ChatApp {
             }
             ServerToClient::BucketsList { buckets, .. } => {
                 self.buckets = buckets;
+            }
+            ServerToClient::BucketCreated { summary, .. }
+                // Append iff not already present — server re-broadcasts on
+                // every connected client, and a `ListBuckets` echo may
+                // race the per-row event during reconnect.
+                if !self
+                    .buckets
+                    .iter()
+                    .any(|b| b.id == summary.id && b.pod_id == summary.pod_id) =>
+            {
+                self.buckets.push(summary);
+            }
+            ServerToClient::BucketCreated { .. } => {}
+            ServerToClient::BucketDeleted { id, pod_id, .. } => {
+                self.buckets.retain(|b| !(b.id == id && b.pod_id == pod_id));
+                let key = (pod_id, id);
+                if let Some(modal) = self.buckets_modal.as_mut() {
+                    modal.build_progress.remove(&key);
+                    modal.build_errors.remove(&key);
+                    if modal.delete_armed.as_deref() == Some(&key.1) {
+                        modal.delete_armed = None;
+                    }
+                }
+            }
+            ServerToClient::BucketBuildStarted {
+                bucket_id,
+                pod_id,
+                started_at,
+                ..
+            } => {
+                let key = (pod_id.clone(), bucket_id.clone());
+                if let Some(modal) = self.buckets_modal.as_mut() {
+                    modal.build_progress.insert(
+                        key.clone(),
+                        BuildProgressView {
+                            phase: BucketBuildPhase::Planning,
+                            source_records: 0,
+                            chunks: 0,
+                            started_at,
+                            dense_inserted: None,
+                            dense_total: None,
+                        },
+                    );
+                    modal.build_errors.remove(&key);
+                }
+            }
+            ServerToClient::BucketBuildProgress {
+                bucket_id,
+                pod_id,
+                phase,
+                source_records,
+                chunks,
+                started_at,
+                dense_inserted,
+                dense_total,
+                ..
+            } => {
+                let key = (pod_id, bucket_id);
+                if let Some(modal) = self.buckets_modal.as_mut() {
+                    modal.build_progress.insert(
+                        key,
+                        BuildProgressView {
+                            phase,
+                            source_records,
+                            chunks,
+                            started_at,
+                            dense_inserted,
+                            dense_total,
+                        },
+                    );
+                }
+            }
+            ServerToClient::BucketBuildEnded {
+                bucket_id,
+                pod_id,
+                outcome,
+                summary,
+                ..
+            } => {
+                let key = (pod_id.clone(), bucket_id.clone());
+                if let Some(modal) = self.buckets_modal.as_mut() {
+                    modal.build_progress.remove(&key);
+                    match outcome {
+                        BucketBuildOutcome::Error { message } => {
+                            modal.build_errors.insert(key.clone(), message);
+                        }
+                        BucketBuildOutcome::Success | BucketBuildOutcome::Cancelled => {
+                            modal.build_errors.remove(&key);
+                        }
+                    }
+                }
+                // Adopt the post-build summary into the catalog so the
+                // row's `active_slot` reflects the freshly-promoted slot
+                // without a follow-up `ListBuckets`.
+                if let Some(summary) = summary
+                    && let Some(existing) = self
+                        .buckets
+                        .iter_mut()
+                        .find(|b| b.id == bucket_id && b.pod_id == pod_id)
+                {
+                    *existing = summary;
+                }
+            }
+            ServerToClient::FeedPollAccepted { .. } => {
+                // No-op v1 — the egui sibling also doesn't surface a
+                // banner for the ack. The user clicks Poll now, the
+                // request fires, and the next `ListBuckets` /
+                // `BucketBuildEnded` reflects whatever the poll did.
             }
             ServerToClient::ModelsList {
                 backend, models, ..
@@ -3379,6 +3549,63 @@ impl App for ChatApp {
             self.open_settings_modal();
             return;
         }
+        if event.is_click_or_activate(SIDEBAR_BUCKETS_KEY) {
+            self.open_buckets_modal();
+            return;
+        }
+        // Buckets modal routing — close / dismiss + per-row action
+        // prefixes. Each row prefix carries `{pod}:{id}` (pod =
+        // sentinel for server-scope).
+        if event.is_click_or_activate(BUCKETS_MODAL_DISMISS_KEY)
+            || event.is_click_or_activate(BUCKETS_MODAL_CLOSE_KEY)
+        {
+            self.buckets_modal = None;
+            return;
+        }
+        if let Some(key) = event.route()
+            && matches!(event.kind, UiEventKind::Click | UiEventKind::Activate)
+        {
+            let parse = |prefix: &str| -> Option<(Option<String>, String)> {
+                let rest = key.strip_prefix(prefix)?;
+                let (pod, id) = rest.split_once(':')?;
+                Some((bucket_scope_from_token(pod), id.to_string()))
+            };
+            if let Some((pod, id)) = parse(BUCKETS_BUILD_PREFIX) {
+                self.start_bucket_build(id, pod);
+                return;
+            }
+            if let Some((pod, id)) = parse(BUCKETS_PAUSE_PREFIX) {
+                self.cancel_bucket_build(id, pod);
+                return;
+            }
+            if let Some((pod, id)) = parse(BUCKETS_POLL_PREFIX) {
+                self.poll_bucket_feed(id, pod);
+                return;
+            }
+            if let Some((pod, id)) = parse(BUCKETS_RESYNC_PREFIX) {
+                self.resync_bucket(id, pod);
+                return;
+            }
+            if let Some((_pod, id)) = parse(BUCKETS_DELETE_PREFIX) {
+                if let Some(modal) = self.buckets_modal.as_mut() {
+                    modal.delete_armed = Some(id);
+                }
+                return;
+            }
+            if let Some((pod, id)) = parse(BUCKETS_DELETE_CONFIRM_PREFIX) {
+                if let Some(modal) = self.buckets_modal.as_mut() {
+                    modal.delete_armed = None;
+                }
+                self.delete_bucket(id, pod);
+                return;
+            }
+            if let Some((_pod, _id)) = parse(BUCKETS_DELETE_CANCEL_PREFIX) {
+                if let Some(modal) = self.buckets_modal.as_mut() {
+                    modal.delete_armed = None;
+                }
+                return;
+            }
+        }
         if event.is_click_or_activate(CHAT_INSPECTOR_TOGGLE_KEY) {
             // Toggle the inspector for the active thread. Clicking
             // while open on the same thread collapses; clicking
@@ -3904,6 +4131,46 @@ const SIDEBAR_SERVER_SETTINGS_KEY: &str = "sidebar:server-settings";
 /// thread id and `None`; the renderer paints an inline detail
 /// panel between the header and the chat log when set.
 const CHAT_INSPECTOR_TOGGLE_KEY: &str = "chat:inspector-toggle";
+
+/// Sidebar footer database icon — opens the knowledge-buckets modal.
+/// Always visible, since buckets span both server-scope and pod-
+/// scope and aren't pinned to whichever pod is active. Lives in the
+/// footer next to the settings cog.
+const SIDEBAR_BUCKETS_KEY: &str = "sidebar:buckets";
+
+/// Routed-key shapes for the knowledge-buckets modal. Row actions
+/// (build / pause / poll / resync / delete-arm / delete-confirm /
+/// delete-cancel) carry `{pod}|{id}` suffixes — `pod` is the literal
+/// string `"server"` for server-scope buckets so `split_once(':')`
+/// on the `pod:id` boundary stays unambiguous (real pod ids don't
+/// match the sentinel).
+const BUCKETS_MODAL_DISMISS_KEY: &str = "buckets:dismiss";
+const BUCKETS_MODAL_CLOSE_KEY: &str = "buckets:close";
+const BUCKETS_BUILD_PREFIX: &str = "buckets:build:";
+const BUCKETS_PAUSE_PREFIX: &str = "buckets:pause:";
+const BUCKETS_POLL_PREFIX: &str = "buckets:poll:";
+const BUCKETS_RESYNC_PREFIX: &str = "buckets:resync:";
+const BUCKETS_DELETE_PREFIX: &str = "buckets:delete:";
+const BUCKETS_DELETE_CONFIRM_PREFIX: &str = "buckets:delete-confirm:";
+const BUCKETS_DELETE_CANCEL_PREFIX: &str = "buckets:delete-cancel:";
+
+/// Sentinel value baked into bucket row-action keys when the bucket
+/// is server-scope (no owning pod). Picked so real pod ids
+/// (kebab-case alphanumeric per the server's validator) can't
+/// collide.
+const BUCKET_SERVER_SCOPE_SENTINEL: &str = "__server__";
+
+fn bucket_scope_token(pod_id: &Option<String>) -> &str {
+    pod_id.as_deref().unwrap_or(BUCKET_SERVER_SCOPE_SENTINEL)
+}
+
+fn bucket_scope_from_token(tok: &str) -> Option<String> {
+    if tok == BUCKET_SERVER_SCOPE_SENTINEL {
+        None
+    } else {
+        Some(tok.to_string())
+    }
+}
 
 /// Routed-key shapes for the server-settings modal. The tab strip
 /// auto-derives `settings:tabs:tab:{value}` per trigger; per-tab
@@ -4946,6 +5213,10 @@ impl ChatApp {
     /// floating pill."
     fn sidebar_footer(&self) -> El {
         let mut rows: Vec<El> = Vec::new();
+        let buckets = icon_button(crate::icons::ICON_DATABASE.clone())
+            .key(SIDEBAR_BUCKETS_KEY)
+            .ghost()
+            .icon_size(tokens::ICON_XS);
         let cog = icon_button("settings")
             .key(SIDEBAR_SERVER_SETTINGS_KEY)
             .ghost()
@@ -4961,6 +5232,7 @@ impl ChatApp {
                         .muted()
                         .ellipsis()
                         .width(Size::Fill(1.0)),
+                    buckets,
                     cog,
                 ])
                 .gap(tokens::SPACE_2)
@@ -4968,10 +5240,14 @@ impl ChatApp {
                 .width(Size::Fill(1.0)),
             );
         } else {
-            // No server-URL row to host the cog — drop it onto a
-            // standalone right-aligned row so the affordance still
-            // exists.
-            rows.push(row([cog]).justify(Justify::End).width(Size::Fill(1.0)));
+            // No server-URL row to host the chrome — drop the
+            // affordances onto a standalone right-aligned row.
+            rows.push(
+                row([buckets, cog])
+                    .gap(tokens::SPACE_2)
+                    .justify(Justify::End)
+                    .width(Size::Fill(1.0)),
+            );
         }
         rows.push(self.connection_status_line());
         column(rows)
@@ -6033,6 +6309,9 @@ impl ChatApp {
             out.push(Some(modal_el));
         }
         if let Some(modal_el) = self.render_settings_modal() {
+            out.push(Some(modal_el));
+        }
+        if let Some(modal_el) = self.render_buckets_modal() {
             out.push(Some(modal_el));
         }
         if let Some(modal_el) = self.render_file_tree_modal() {
@@ -10194,6 +10473,77 @@ impl ChatApp {
         }
     }
 
+    /// Open the knowledge-buckets modal. Idempotent. Bucket-list
+    /// data already lives on `self.buckets` (hydrated by
+    /// `BucketsList` at connect), so no fetch is fired here — the
+    /// modal renders whatever the catalog already shows. Live build
+    /// progress arrives via `BucketBuildStarted` /
+    /// `BucketBuildProgress` whether the modal is open or closed;
+    /// keeping the maps inside `BucketsModalState` means closing
+    /// the modal drops them, which is fine for v1 (the modal is
+    /// the only consumer).
+    pub fn open_buckets_modal(&mut self) {
+        if self.buckets_modal.is_none() {
+            self.buckets_modal = Some(BucketsModalState::default());
+        }
+    }
+
+    /// Fire `StartBucketBuild`. The server picks up the work and
+    /// broadcasts `BucketBuildStarted`; that arm hydrates the
+    /// per-row progress entry. Idempotent at the server: clicking
+    /// twice when a build is already in flight is a no-op.
+    fn start_bucket_build(&mut self, id: String, pod_id: Option<String>) {
+        self.send(ClientToServer::StartBucketBuild {
+            correlation_id: None,
+            id,
+            pod_id,
+        });
+    }
+
+    /// Fire `CancelBucketBuild`. The server stops the build worker
+    /// and broadcasts `BucketBuildEnded { outcome: Cancelled }`.
+    /// Build state on disk is preserved (server resumes from
+    /// `build.state` on the next Build click).
+    fn cancel_bucket_build(&mut self, id: String, pod_id: Option<String>) {
+        self.send(ClientToServer::CancelBucketBuild {
+            correlation_id: None,
+            id,
+            pod_id,
+        });
+    }
+
+    /// Fire `DeleteBucket`. The server validates + broadcasts
+    /// `BucketDeleted`; the wire arm removes the row + clears any
+    /// per-row state. Two-click arm-confirm gates this call site.
+    fn delete_bucket(&mut self, id: String, pod_id: Option<String>) {
+        self.send(ClientToServer::DeleteBucket {
+            correlation_id: None,
+            id,
+            pod_id,
+        });
+    }
+
+    /// Fire `PollFeedNow` for a tracked bucket. The server's
+    /// trigger channel is bounded at 1 so multiple rapid clicks
+    /// coalesce server-side; we fire-and-forget.
+    fn poll_bucket_feed(&mut self, id: String, pod_id: Option<String>) {
+        self.send(ClientToServer::PollFeedNow {
+            correlation_id: None,
+            id,
+            pod_id,
+        });
+    }
+
+    /// Fire `ResyncBucket`. Server short-circuits if the recorded
+    /// base is already at latest, so a stray click is cheap.
+    fn resync_bucket(&mut self, id: String, pod_id: Option<String>) {
+        self.send(ClientToServer::ResyncBucket {
+            correlation_id: None,
+            id,
+            pod_id,
+        });
+    }
+
     /// Lazy-fetch the server config TOML on first Server-config tab
     /// open. Idempotent: a populated `original` or in-flight
     /// correlation short-circuits.
@@ -10455,6 +10805,292 @@ impl ChatApp {
             )));
         }
         alert(lines)
+    }
+
+    /// Knowledge-buckets modal renderer. Centered `dialog_content`
+    /// (720 × 640, matching the other editor modals) over a scrolled
+    /// column of per-bucket cards. Each card shows the catalog
+    /// metadata (name + id, description, scope / source / embedder
+    /// chips, slot info when present), live build progress when one
+    /// is in flight, the last build error if any, and a row of
+    /// action buttons. Create form + search-and-query land in
+    /// follow-up sub-slices.
+    fn render_buckets_modal(&self) -> Option<El> {
+        let modal = self.buckets_modal.as_ref()?;
+        const BUCKETS_W: f32 = 720.0;
+        const BUCKETS_H: f32 = 640.0;
+
+        let body: El = if self.buckets.is_empty() {
+            paragraph(
+                "No buckets yet. Create one via the wire (server-side \
+                 catalog config or a future +New bucket affordance \
+                 here).",
+            )
+            .muted()
+        } else {
+            let mut rows: Vec<El> = Vec::new();
+            for b in &self.buckets {
+                rows.push(self.render_bucket_row(modal, b));
+            }
+            scroll(rows)
+                .gap(tokens::SPACE_3)
+                .width(Size::Fill(1.0))
+                .height(Size::Fill(1.0))
+        };
+
+        let close = button("Close").key(BUCKETS_MODAL_CLOSE_KEY);
+
+        let children: Vec<El> = vec![
+            dialog_header([
+                dialog_title("Knowledge buckets"),
+                dialog_description(
+                    "Catalog of indexed-text buckets the agent can query. \
+                     Build / Pause / Delete actions per row. Tracked \
+                     buckets (Wikipedia today) carry Poll-now and \
+                     Resync-now affordances. Create form + search land \
+                     in a follow-up.",
+                ),
+            ]),
+            body,
+            dialog_footer([close]),
+        ];
+
+        Some(overlay([
+            scrim(BUCKETS_MODAL_DISMISS_KEY),
+            dialog_content(children)
+                .width(Size::Fixed(BUCKETS_W))
+                .height(Size::Fixed(BUCKETS_H))
+                .block_pointer(),
+        ]))
+    }
+
+    /// One bucket card. Name + id (mono) at the top, optional
+    /// description, then a row of metadata chips (scope, source,
+    /// embedder, dense/sparse flags), then slot info when present
+    /// (`<dim>-d · <chunks> chunks · <bytes>` + model + built-at),
+    /// then live progress / error / row actions.
+    fn render_bucket_row(&self, modal: &BucketsModalState, b: &BucketSummary) -> El {
+        let row_key = (b.pod_id.clone(), b.id.clone());
+        let in_flight_build = modal.build_progress.contains_key(&row_key);
+
+        let mut card_children: Vec<El> = Vec::new();
+
+        // Title row: bold name + muted id.
+        card_children.push(
+            row([
+                text(b.name.clone()).label().bold(),
+                text(format!("({})", b.id)).caption().muted(),
+            ])
+            .gap(tokens::SPACE_2)
+            .align(Align::Center),
+        );
+
+        if let Some(desc) = b.description.as_deref()
+            && !desc.is_empty()
+        {
+            card_children.push(paragraph(desc.to_string()).muted());
+        }
+
+        // Metadata chip row. `scope` carries server/pod, `source`
+        // the bucket.toml source-kind tag.
+        let mut chips: Vec<El> = vec![
+            self.render_bucket_chip("scope", &b.scope),
+            self.render_bucket_chip("source", &b.source_kind),
+            self.render_bucket_chip("embedder", &b.embedder_provider),
+        ];
+        chips.push(
+            text(if b.dense_enabled {
+                "dense \u{2713}"
+            } else {
+                "dense \u{2717}"
+            })
+            .caption()
+            .muted(),
+        );
+        chips.push(
+            text(if b.sparse_enabled {
+                "sparse \u{2713}"
+            } else {
+                "sparse \u{2717}"
+            })
+            .caption()
+            .muted(),
+        );
+        if let Some(detail) = b.source_detail.as_deref() {
+            chips.push(text(detail.to_string()).caption().muted());
+        }
+        card_children.push(
+            row(chips)
+                .gap(tokens::SPACE_3)
+                .align(Align::Center)
+                .width(Size::Fill(1.0)),
+        );
+
+        // Slot info row or "no active slot" hint.
+        match &b.active_slot {
+            None if !in_flight_build => {
+                card_children.push(
+                    text("no active slot \u{2014} bucket has not been built yet")
+                        .caption()
+                        .muted(),
+                );
+            }
+            None => {}
+            Some(slot) => {
+                card_children.push(
+                    row([
+                        text("slot").caption().muted(),
+                        text(short_slot(&slot.slot_id)).caption().code(),
+                        slot_state_chip(slot.state),
+                        text(format!(
+                            "{}-d \u{00B7} {} chunks \u{00B7} {}",
+                            slot.dimension,
+                            format_count(slot.chunk_count),
+                            format_bytes(slot.disk_size_bytes),
+                        ))
+                        .caption()
+                        .muted(),
+                    ])
+                    .gap(tokens::SPACE_3)
+                    .align(Align::Center)
+                    .width(Size::Fill(1.0)),
+                );
+                let mut model_row: Vec<El> = vec![
+                    text(format!("model: {}", slot.embedder_model))
+                        .caption()
+                        .muted(),
+                ];
+                if let Some(built) = slot.built_at.as_deref() {
+                    model_row.push(text(format!("built: {built}")).caption().muted());
+                }
+                card_children.push(
+                    row(model_row)
+                        .gap(tokens::SPACE_3)
+                        .align(Align::Center)
+                        .width(Size::Fill(1.0)),
+                );
+            }
+        }
+
+        // Live build-progress block (spinner-shaped row).
+        if let Some(progress) = modal.build_progress.get(&row_key) {
+            card_children.push(self.render_build_progress_row(progress));
+        }
+
+        // Sticky last-failed-build error.
+        if let Some(err) = modal.build_errors.get(&row_key) {
+            card_children.push(
+                alert([
+                    alert_title("last build error"),
+                    alert_description(err.to_string()),
+                ])
+                .destructive(),
+            );
+        }
+
+        // Action row.
+        card_children.push(self.render_bucket_row_actions(modal, b, in_flight_build));
+
+        card(card_children)
+            .gap(tokens::SPACE_2)
+            .width(Size::Fill(1.0))
+    }
+
+    fn render_bucket_chip(&self, label: &str, value: &str) -> El {
+        row([
+            text(format!("{label}:")).caption().muted(),
+            text(value.to_string()).caption(),
+        ])
+        .gap(tokens::SPACE_1)
+        .align(Align::Center)
+    }
+
+    fn render_build_progress_row(&self, p: &BuildProgressView) -> El {
+        let phase = match p.phase {
+            BucketBuildPhase::Downloading => "downloading",
+            BucketBuildPhase::Planning => "planning",
+            BucketBuildPhase::Indexing => "indexing",
+            BucketBuildPhase::BuildingDense => "building HNSW",
+            BucketBuildPhase::Finalizing => "finalizing",
+        };
+        let counts_body = match (p.dense_inserted, p.dense_total) {
+            (Some(inserted), Some(total)) if total > 0 => format!(
+                "{} / {} HNSW inserts",
+                format_count(inserted),
+                format_count(total),
+            ),
+            _ => format!(
+                "{} pages \u{00B7} {} chunks",
+                format_count(p.source_records),
+                format_count(p.chunks),
+            ),
+        };
+        let elapsed_str = p
+            .started_at
+            .as_deref()
+            .map(format_build_elapsed)
+            .filter(|s| !s.is_empty());
+        let body = match elapsed_str {
+            Some(elapsed) => format!("{phase} \u{00B7} {counts_body} \u{00B7} {elapsed}"),
+            None => format!("{phase} \u{00B7} {counts_body}"),
+        };
+        text(body).caption().color(tokens::WARNING)
+    }
+
+    fn render_bucket_row_actions(
+        &self,
+        modal: &BucketsModalState,
+        b: &BucketSummary,
+        in_flight_build: bool,
+    ) -> El {
+        let scope = bucket_scope_token(&b.pod_id);
+        let armed = modal.delete_armed.as_deref() == Some(b.id.as_str());
+
+        let mut buttons: Vec<El> = Vec::new();
+        if in_flight_build {
+            buttons
+                .push(button("Pause build").key(format!("{BUCKETS_PAUSE_PREFIX}{scope}:{}", b.id)));
+        } else {
+            let mut build = button("Build").key(format!("{BUCKETS_BUILD_PREFIX}{scope}:{}", b.id));
+            // Managed buckets have no external source — `Build` would
+            // bounce server-side. Gate at render so the affordance
+            // reads as "not applicable."
+            if b.source_kind == "managed" {
+                build = build.disabled();
+            }
+            buttons.push(build);
+        }
+        if !in_flight_build && b.source_kind == "tracked" {
+            buttons.push(button("Poll now").key(format!("{BUCKETS_POLL_PREFIX}{scope}:{}", b.id)));
+            buttons
+                .push(button("Resync now").key(format!("{BUCKETS_RESYNC_PREFIX}{scope}:{}", b.id)));
+        }
+        if armed {
+            buttons.push(
+                button("Confirm delete")
+                    .key(format!("{BUCKETS_DELETE_CONFIRM_PREFIX}{scope}:{}", b.id))
+                    .destructive(),
+            );
+            buttons.push(
+                button("Cancel").key(format!("{BUCKETS_DELETE_CANCEL_PREFIX}{scope}:{}", b.id)),
+            );
+        } else {
+            buttons.push(button("Delete").key(format!("{BUCKETS_DELETE_PREFIX}{scope}:{}", b.id)));
+        }
+
+        row(buttons)
+            .gap(tokens::SPACE_2)
+            .align(Align::Center)
+            .width(Size::Fill(1.0))
+            // Inset by a ring-width so the buttons' focus rings
+            // don't clip against the card / scroll scissor on the
+            // leading edge (lint catches the bare-edge case).
+            .padding(Sides {
+                left: tokens::RING_WIDTH,
+                right: tokens::RING_WIDTH,
+                top: 0.0,
+                bottom: 0.0,
+            })
     }
 
     /// Classify a pod-relative file path for the file-tree click
@@ -11773,6 +12409,92 @@ fn json_node_trigger(path: &str, header: &str, open: bool) -> El {
 /// screenshot at native dims would punch out of the dialog, and a
 /// tall portrait would push the close button off-screen. Aspect is
 /// preserved by picking the smaller of the two scale factors.
+/// Slot-state colored caption — `ready` green, `failed` destructive,
+/// `building` / `planning` warning, `archived` muted. Used in the
+/// bucket-row slot-info line. Mirrors the egui sibling's
+/// `state_chip` color choices.
+fn slot_state_chip(state: SlotStateLabel) -> El {
+    let (label, color) = match state {
+        SlotStateLabel::Planning => ("planning", tokens::WARNING),
+        SlotStateLabel::Building => ("building", tokens::WARNING),
+        SlotStateLabel::Ready => ("ready", tokens::SUCCESS),
+        SlotStateLabel::Failed => ("failed", tokens::DESTRUCTIVE),
+        SlotStateLabel::Archived => ("archived", tokens::MUTED_FOREGROUND),
+    };
+    text(label).caption().color(color)
+}
+
+/// Shorten a slot id to its leading 8 chars + ellipsis. Slot ids are
+/// ~30-char timestamps + random suffix; the 8-char prefix sorts and
+/// disambiguates without dominating the row.
+fn short_slot(slot_id: &str) -> String {
+    if slot_id.len() > 8 {
+        format!("{}\u{2026}", &slot_id[..8])
+    } else {
+        slot_id.to_string()
+    }
+}
+
+/// Compact human count: `1.5M` / `820k` / `42`. Used in the bucket
+/// chunk-count + per-page progress counters.
+fn format_count(n: u64) -> String {
+    if n >= 1_000_000 {
+        format!("{:.1}M", n as f64 / 1_000_000.0)
+    } else if n >= 1_000 {
+        format!("{:.1}k", n as f64 / 1_000.0)
+    } else {
+        format!("{n}")
+    }
+}
+
+/// Compact human size: `1.23 GiB` / `45.6 MiB` / `7.8 KiB` / `123 B`.
+/// Powers-of-2 units so the displayed value matches the on-disk
+/// reservation.
+fn format_bytes(bytes: u64) -> String {
+    const KIB: u64 = 1024;
+    const MIB: u64 = 1024 * KIB;
+    const GIB: u64 = 1024 * MIB;
+    if bytes >= GIB {
+        format!("{:.2} GiB", bytes as f64 / GIB as f64)
+    } else if bytes >= MIB {
+        format!("{:.1} MiB", bytes as f64 / MIB as f64)
+    } else if bytes >= KIB {
+        format!("{:.1} KiB", bytes as f64 / KIB as f64)
+    } else {
+        format!("{bytes} B")
+    }
+}
+
+/// Build-elapsed formatter — `2d 14h` / `3h 22m` / `5m 13s` / `42s`.
+/// Multi-day buckets (Wikipedia-scale builds) want days-and-hours;
+/// sub-minute builds want raw seconds. Returns empty string on
+/// unparseable input so the caller's `.filter(|s| !s.is_empty())`
+/// suppresses the elapsed segment.
+fn format_build_elapsed(started_at_rfc3339: &str) -> String {
+    let Ok(parsed) = chrono::DateTime::parse_from_rfc3339(started_at_rfc3339) else {
+        return String::new();
+    };
+    let secs = (chrono::Utc::now() - parsed.with_timezone(&chrono::Utc)).num_seconds();
+    if secs < 0 {
+        // Clock skew between server and client — surface as 0s.
+        return "0s elapsed".to_string();
+    }
+    let s = secs % 60;
+    let m = (secs / 60) % 60;
+    let h = (secs / 3600) % 24;
+    let d = secs / 86400;
+    let body = if d > 0 {
+        format!("{d}d {h}h")
+    } else if h > 0 {
+        format!("{h}h {m}m")
+    } else if m > 0 {
+        format!("{m}m {s}s")
+    } else {
+        format!("{s}s")
+    };
+    format!("{body} elapsed")
+}
+
 fn lightbox_display_dims(src_w: u32, src_h: u32, max_w: f32, max_h: f32) -> (f32, f32) {
     let src_w = src_w.max(1) as f32;
     let src_h = src_h.max(1) as f32;
