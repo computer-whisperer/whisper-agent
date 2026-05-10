@@ -696,6 +696,11 @@ pub(crate) struct BehaviorEditorSheetState {
     /// Thread-tab `max_turns` override numeric buffer. Same shape
     /// as [`Self::thread_max_tokens_buf`].
     pub(crate) thread_max_turns_buf: String,
+    /// Retention-tab `days` numeric buffer. Meaningful only when
+    /// `cfg.on_completion` is `ArchiveAfterDays` or `DeleteAfterDays`;
+    /// preserved across kind switches so toggling Keep ↔ Archive
+    /// doesn't lose typed days.
+    pub(crate) retention_days_buf: String,
     /// Validation message: load error from the snapshot, client-side
     /// validation failure, or server-side `Error` echo.
     pub(crate) error: Option<String>,
@@ -831,6 +836,9 @@ pub(crate) enum BehaviorEditorPicker {
     /// Thread-tab `thread.bindings.backend` override picker.
     /// Options are the server-known backend catalog.
     ThreadBackend,
+    /// Retention-tab kind picker (Keep / ArchiveAfterDays /
+    /// DeleteAfterDays).
+    RetentionKind,
 }
 
 impl BehaviorEditorPicker {
@@ -840,6 +848,7 @@ impl BehaviorEditorPicker {
             Self::CatchUp => BEHAVIOR_EDITOR_CATCH_UP_KEY,
             Self::ThreadModel => BEHAVIOR_EDITOR_THREAD_MODEL_KEY,
             Self::ThreadBackend => BEHAVIOR_EDITOR_THREAD_BACKEND_KEY,
+            Self::RetentionKind => BEHAVIOR_EDITOR_RETENTION_KIND_KEY,
         }
     }
 }
@@ -861,6 +870,7 @@ impl BehaviorEditorSheetState {
             open_picker: None,
             thread_max_tokens_buf: String::new(),
             thread_max_turns_buf: String::new(),
+            retention_days_buf: "30".into(),
             error: None,
             pending_get: Some(pending_get),
             pending_save: None,
@@ -908,6 +918,21 @@ impl BehaviorEditorSheetState {
         self.working_config = snapshot.config;
         self.working_prompt = snapshot.prompt;
         self.sync_thread_buffers_from_config();
+        self.sync_retention_buffer_from_config();
+    }
+
+    /// Pull the Retention tab's `days` buffer out of
+    /// `working_config.on_completion`. Called on hydrate. Defaulted
+    /// to "30" so a Keep → Archive flip in the live editor lands at
+    /// the same default the egui sibling uses.
+    fn sync_retention_buffer_from_config(&mut self) {
+        if let Some(cfg) = self.working_config.as_ref() {
+            self.retention_days_buf = match &cfg.on_completion {
+                RetentionPolicy::Keep => "30".to_string(),
+                RetentionPolicy::ArchiveAfterDays { days }
+                | RetentionPolicy::DeleteAfterDays { days } => days.to_string(),
+            };
+        }
     }
 
     /// Pull the Thread-tab numeric override buffers (`max_tokens` /
@@ -2608,6 +2633,9 @@ const BEHAVIOR_EDITOR_THREAD_MAX_TURNS_OVERRIDE_KEY: &str =
 const BEHAVIOR_EDITOR_THREAD_MAX_TURNS_KEY: &str = "behavior-editor:thread:max-turns";
 const BEHAVIOR_EDITOR_THREAD_BACKEND_OVERRIDE_KEY: &str = "behavior-editor:thread:backend:override";
 const BEHAVIOR_EDITOR_THREAD_BACKEND_KEY: &str = "behavior-editor:thread:backend";
+/// Retention-tab routed keys.
+const BEHAVIOR_EDITOR_RETENTION_KIND_KEY: &str = "behavior-editor:retention:kind";
+const BEHAVIOR_EDITOR_RETENTION_DAYS_KEY: &str = "behavior-editor:retention:days";
 
 fn behavior_row_key(pod_id: &str, behavior_id: &str) -> String {
     format!("{BEHAVIOR_ROW_PREFIX}{pod_id}:{behavior_id}")
@@ -2800,6 +2828,14 @@ fn catch_up_from_wire(s: &str) -> Option<CatchUp> {
         "one" => Some(CatchUp::One),
         "all" => Some(CatchUp::All),
         _ => None,
+    }
+}
+
+fn retention_kind_label(p: &RetentionPolicy) -> &'static str {
+    match p {
+        RetentionPolicy::Keep => "keep",
+        RetentionPolicy::ArchiveAfterDays { .. } => "archive_after_days",
+        RetentionPolicy::DeleteAfterDays { .. } => "delete_after_days",
     }
 }
 
@@ -4259,6 +4295,7 @@ impl ChatApp {
             BehaviorEditorPicker::CatchUp,
             BehaviorEditorPicker::ThreadModel,
             BehaviorEditorPicker::ThreadBackend,
+            BehaviorEditorPicker::RetentionKind,
         ] {
             if let Some(action) = classify_select_event(event, which.key()) {
                 self.handle_behavior_editor_picker(which, action);
@@ -4403,6 +4440,36 @@ impl ChatApp {
             return true;
         }
 
+        // Retention-tab `days` numeric input. Only meaningful when
+        // `cfg.on_completion` is a timed variant; we still parse and
+        // write back when the kind happens to be Keep so the buffer
+        // stays well-defined across kind switches.
+        if let Some(editor) = self.behavior_editor.as_mut() {
+            let opts = NumericInputOpts::default().min(1.0).max(3650.0).step(1.0);
+            if numeric_input::apply_event(
+                &mut editor.retention_days_buf,
+                &mut self.selection,
+                BEHAVIOR_EDITOR_RETENTION_DAYS_KEY,
+                &opts,
+                event,
+            ) {
+                if let Ok(v) = editor.retention_days_buf.parse::<u32>()
+                    && let Some(cfg) = editor.working_config.as_mut()
+                {
+                    let clamped = v.clamp(1, 3650);
+                    match &mut cfg.on_completion {
+                        RetentionPolicy::Keep => {}
+                        RetentionPolicy::ArchiveAfterDays { days }
+                        | RetentionPolicy::DeleteAfterDays { days } => {
+                            *days = clamped;
+                        }
+                    }
+                }
+                editor.error = None;
+                return true;
+            }
+        }
+
         // Thread-tab numeric inputs (max_tokens / max_turns). Same
         // buffer-then-parse-back pattern as the pod editor's
         // Defaults numeric inputs.
@@ -4543,6 +4610,25 @@ impl ChatApp {
                                 cfg.thread.model = cfg.thread.model.as_ref().map(|_| String::new());
                             }
                         }
+                        BehaviorEditorPicker::RetentionKind => {
+                            // Re-apply the live `retention_days_buf`
+                            // when transitioning into a timed variant
+                            // so the user's typed days survive a
+                            // Keep → Archive ↔ Delete flip.
+                            let days = editor.retention_days_buf.parse::<u32>().unwrap_or(30);
+                            if let Some(cfg) = editor.working_config.as_mut() {
+                                cfg.on_completion = match value.as_str() {
+                                    "keep" => RetentionPolicy::Keep,
+                                    "archive_after_days" => {
+                                        RetentionPolicy::ArchiveAfterDays { days }
+                                    }
+                                    "delete_after_days" => {
+                                        RetentionPolicy::DeleteAfterDays { days }
+                                    }
+                                    _ => cfg.on_completion.clone(),
+                                };
+                            }
+                        }
                     }
                     editor.open_picker = None;
                     editor.error = None;
@@ -4616,6 +4702,17 @@ impl ChatApp {
                     .iter()
                     .map(|b| (b.name.clone(), b.name.clone()))
                     .collect();
+                select_menu(which.key(), options)
+            }
+            BehaviorEditorPicker::RetentionKind => {
+                let options: Vec<(String, String)> = [
+                    ("keep", "keep"),
+                    ("archive_after_days", "archive_after_days"),
+                    ("delete_after_days", "delete_after_days"),
+                ]
+                .into_iter()
+                .map(|(v, l)| (v.to_string(), l.to_string()))
+                .collect();
                 select_menu(which.key(), options)
             }
         }
@@ -4978,11 +5075,9 @@ impl ChatApp {
                      ride through unchanged on save.",
                 )
                 .muted(),
-                BehaviorEditorTab::Retention => paragraph(
-                    "Retention tab — coming soon. Retention policy rides \
-                     through unchanged on save.",
-                )
-                .muted(),
+                BehaviorEditorTab::Retention => {
+                    self.render_behavior_editor_retention_tab(editor, cfg)
+                }
                 BehaviorEditorTab::SystemPrompt => paragraph(
                     "System prompt tab — coming soon. The system_prompt \
                      override field rides through unchanged on save.",
@@ -5470,6 +5565,58 @@ impl ChatApp {
                 ),
             ]),
         ])
+    }
+
+    /// Retention tab body. Mirrors the egui sibling's
+    /// `render_behavior_editor_retention_tab`: a 3-way kind picker
+    /// (Keep / ArchiveAfterDays / DeleteAfterDays) plus a `days`
+    /// `numeric_input` that's only shown for the timed variants.
+    fn render_behavior_editor_retention_tab(
+        &self,
+        editor: &BehaviorEditorSheetState,
+        cfg: &BehaviorConfig,
+    ) -> El {
+        let kind_label = retention_kind_label(&cfg.on_completion);
+        let kind_trigger = select_trigger(BEHAVIOR_EDITOR_RETENTION_KIND_KEY, kind_label);
+
+        let mut items: Vec<El> = vec![form_item([
+            form_label("policy"),
+            form_control(kind_trigger),
+            form_description(
+                "Applies only to behavior-spawned threads — interactive \
+                 threads always Keep. Sweep runs hourly server-side.",
+            ),
+        ])];
+
+        if matches!(
+            cfg.on_completion,
+            RetentionPolicy::ArchiveAfterDays { .. } | RetentionPolicy::DeleteAfterDays { .. }
+        ) {
+            let days_widget = numeric_input(
+                &editor.retention_days_buf,
+                &self.selection,
+                BEHAVIOR_EDITOR_RETENTION_DAYS_KEY,
+                NumericInputOpts::default().min(1.0).max(3650.0).step(1.0),
+            );
+            let hint = match cfg.on_completion {
+                RetentionPolicy::ArchiveAfterDays { .. } => {
+                    "Days past `last_active` before the JSON moves to \
+                     `<pod>/.archived/threads/`."
+                }
+                RetentionPolicy::DeleteAfterDays { .. } => {
+                    "Days past `last_active` before the JSON is rm'd. \
+                     No forensic copy."
+                }
+                _ => "",
+            };
+            items.push(form_item([
+                form_label("days"),
+                form_control(days_widget),
+                form_description(hint),
+            ]));
+        }
+
+        form(items)
     }
 
     /// `select_menu` for the behavior editor's trigger-kind picker.

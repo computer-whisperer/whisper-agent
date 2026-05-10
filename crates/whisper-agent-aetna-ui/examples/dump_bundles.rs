@@ -257,6 +257,11 @@ enum Scene {
     /// shape — a useful baseline for the structured layout, even if
     /// it doesn't exercise the override-on numeric inputs.
     BehaviorEditorThreadTab,
+    /// Behavior editor sheet, opened and switched to the Retention
+    /// tab. Architect mock has `RetentionPolicy::default()` (Keep),
+    /// so the days numeric input doesn't render — the tab shows
+    /// only the kind picker.
+    BehaviorEditorRetentionTab,
     /// Pod editor sheet, opened and switched to the Limits tab.
     /// Same hydration shape as `PodEditorHydrated`; an extra click
     /// on the `pod-editor:tabs:tab:limits` trigger flips the
@@ -275,7 +280,7 @@ enum Scene {
 }
 
 impl Scene {
-    const ALL: [Scene; 37] = [
+    const ALL: [Scene; 38] = [
         Scene::Connecting,
         Scene::Connected,
         Scene::Closed,
@@ -312,6 +317,7 @@ impl Scene {
         Scene::PodEditorDefaultsTab,
         Scene::PodEditorLimitsTab,
         Scene::BehaviorEditorThreadTab,
+        Scene::BehaviorEditorRetentionTab,
         Scene::ForkModalOpen,
     ];
 
@@ -353,6 +359,7 @@ impl Scene {
             Scene::PodEditorDefaultsTab => "pod_editor_defaults_tab",
             Scene::PodEditorLimitsTab => "pod_editor_limits_tab",
             Scene::BehaviorEditorThreadTab => "behavior_editor_thread_tab",
+            Scene::BehaviorEditorRetentionTab => "behavior_editor_retention_tab",
             Scene::ForkModalOpen => "fork_modal_open",
         }
     }
@@ -426,6 +433,15 @@ impl Scene {
                 "behavior-edit:default:architect",
                 "behavior-editor:tabs:tab:thread",
             ],
+            // Same as above plus a click on the Retention tab.
+            // Architect mock has RetentionPolicy::Keep so the days
+            // numeric input doesn't render — the tab shows only
+            // the kind picker.
+            Scene::BehaviorEditorRetentionTab => vec![
+                "behavior-row:default:architect",
+                "behavior-edit:default:architect",
+                "behavior-editor:tabs:tab:retention",
+            ],
             // Click the gear icon — sidebar header's pod-settings
             // affordance. Renders only when `pod_tab.is_some()`,
             // which it is here (PodList seeded a default).
@@ -485,7 +501,8 @@ fn build_app(scene: Scene) -> Box<dyn App> {
     let send_fn: SendFn = match scene {
         Scene::BehaviorEditorHydrated
         | Scene::BehaviorEditorTriggerKindOpen
-        | Scene::BehaviorEditorThreadTab => {
+        | Scene::BehaviorEditorThreadTab
+        | Scene::BehaviorEditorRetentionTab => {
             let queue = inbound.clone();
             Box::new(move |msg| {
                 if let ClientToServer::GetBehavior {
@@ -761,7 +778,8 @@ fn build_app(scene: Scene) -> Box<dyn App> {
         }
         Scene::BehaviorEditorHydrated
         | Scene::BehaviorEditorTriggerKindOpen
-        | Scene::BehaviorEditorThreadTab => {
+        | Scene::BehaviorEditorThreadTab
+        | Scene::BehaviorEditorRetentionTab => {
             // Same baseline as `SidebarBehaviorsExpanded` — pods +
             // threads + behaviors registry — so the click loop can
             // expand the architect row and click Edit. The

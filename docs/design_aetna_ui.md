@@ -731,6 +731,19 @@ Plumbing that fetch is a separate slice; until it lands the
 two override fields ride through `working_config` unchanged
 on save.
 
+**Behavior editor — Retention tab (landed):** the on-completion
+policy editor. A `select_trigger` 3-way kind picker (Keep /
+ArchiveAfterDays / DeleteAfterDays) plus a `numeric_input`
+`days` row that's only rendered for the timed variants.
+`BehaviorEditorPicker::RetentionKind` joins the picker family
+and `retention_days_buf: String` lives on
+`BehaviorEditorSheetState` (default `"30"` so a Keep → Archive
+flip lands at the same default the egui sibling uses).
+`sync_retention_buffer_from_config` seeds the buffer at hydrate.
+Picking a timed variant re-applies the live buffer's parsed
+days, so kind switches in the live editor preserve typed
+values.
+
 Deferred to follow-up sheet slices:
 - **Thread bindings host_env / mcp_hosts sub-slice** — needs
   pod_config plumbing on `BehaviorEditorSheetState`. Once the
