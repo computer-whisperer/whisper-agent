@@ -1,8 +1,7 @@
 //! Wasm browser entry for the aetna chat UI.
 //!
-//! Bundle layout mirrors `whisper-agent-webui` (egui sibling): the
-//! `#[wasm_bindgen(start)]` function below runs on bundle load, opens
-//! a WebSocket against `/ws`, builds a [`ChatApp`], installs
+//! The `#[wasm_bindgen(start)]` function below runs on bundle load,
+//! opens a WebSocket against `/ws`, builds a [`ChatApp`], installs
 //! document-level drag-drop + clipboard-paste listeners (winit
 //! doesn't deliver these to the canvas reliably across browsers),
 //! and hands the app to an aetna [`Host`] driving a `<canvas
@@ -10,9 +9,9 @@
 //!
 //! Auth: the static `assets/index.html` probes `/auth/check` before
 //! it imports this bundle and bounces to `login.html` on 401. Once
-//! the session cookie is good, the wasm bundle loads with credentials
-//! attached implicitly on the WS upgrade; we don't surface a login
-//! form in-canvas the way the native client does.
+//! the session cookie is good, the wasm bundle loads with the
+//! cookie attached implicitly on the WS upgrade; we don't surface a
+//! login form in-canvas the way the native client does.
 //!
 //! The bulk of this module is a lift of the wgpu+winit host shell
 //! from `aetna-web/src/lib.rs` — aetna ships a reusable browser host

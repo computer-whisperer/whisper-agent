@@ -1,10 +1,7 @@
 //! Persisted login credentials for the aetna desktop client.
 //!
-//! Same on-disk shape as `whisper-agent-desktop` (the egui sibling) —
-//! both clients read and write `$XDG_CONFIG_HOME/whisper-agent/desktop.toml`
-//! (falling back to `$HOME/.config/whisper-agent/desktop.toml`). A
-//! shared file means a user who installs both clients can switch
-//! between them without re-entering credentials.
+//! Reads and writes `$XDG_CONFIG_HOME/whisper-agent/desktop.toml`
+//! (falling back to `$HOME/.config/whisper-agent/desktop.toml`).
 //!
 //! The token is stored in plaintext — the config dir is already
 //! user-scoped and there's no platform keyring dep we're willing to

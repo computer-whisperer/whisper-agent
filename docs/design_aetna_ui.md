@@ -1,19 +1,19 @@
 # Aetna UI Pivot
 
-We're moving the chat UI off egui (`whisper-agent-webui`) onto
+We moved the chat UI off egui onto
 [aetna](https://github.com/computer-whisperer/aetna), a small declarative GPU
 UI library shaped around how an LLM authors UI. This doc tracks the why, the
 crate layout, the architectural choices that fall out of aetna's `App` model,
-and where each stage of the port stands.
+and where each stage of the port landed.
 
 **Current entry points:**
+- Browser: served by the agent itself at `http://$LISTEN_SERVER/` (wasm bundle baked into the release binary; build via `wasm-pack build crates/whisper-agent-aetna-ui --target web`).
 - Native: `cargo build -p whisper-agent-desktop-aetna && ./target/.../whisper-agent-desktop-aetna --server http://127.0.0.1:8080`
-- Dev all-in-one: `./scripts/dev_aetna.sh` (server + daemons + native binary)
+- Dev all-in-one: `./scripts/dev.sh` (server + daemons; browser at `http://127.0.0.1:8080/`) or `./scripts/dev_aetna.sh` (adds the native client on top).
 - Bundle dump: `cargo run -p whisper-agent-aetna-ui --example dump_bundles`
 
-The old egui stack (`whisper-agent-webui`, `whisper-agent-desktop`) stays
-shipping until aetna reaches feature parity and polish. Both build cleanly
-side-by-side; nothing in either crate depends on the other.
+The old egui stack (`whisper-agent-webui`, `whisper-agent-desktop`) has been
+removed; aetna is now the only browser + native UI implementation.
 
 ## Why aetna
 
@@ -48,8 +48,12 @@ trade-offs:
 crates/
   whisper-agent-aetna-ui/         ← platform-agnostic ChatApp (cdylib + rlib)
     src/
-      lib.rs                        re-exports + (eventually) wasm entry
+      lib.rs                        re-exports + wasm entry registration
       app.rs                        ChatApp impl of aetna_core::App
+      web_entry.rs                  wasm browser entry (winit + wgpu host)
+    assets/                         index.html / login.html / favicons
+                                    (rust-embed source for the server)
+    pkg/                            wasm-pack output (gitignored)
     examples/
       dump_bundles.rs               scene-driven bundle export
     out/                            bundle artifacts (gitignored)
@@ -58,9 +62,11 @@ crates/
     src/main.rs                     winit host + tokio + tungstenite bridge
 ```
 
-Sibling to `whisper-agent-webui` / `whisper-agent-desktop`. Same workspace
-membership, no new top-level deps spawned at the workspace level — both
-crates pull `aetna-core`, `aetna-winit-wgpu` in via path-deps.
+The aetna-ui crate replaces the deleted `whisper-agent-webui`
+(browser, egui) and `whisper-agent-desktop` (native, egui) crates —
+same workspace shape, single ui implementation across both targets.
+`aetna-core` and `aetna-winit-wgpu` come in via path-deps to a
+sibling worktree.
 
 ### Aetna as a path-dep
 
@@ -1183,26 +1189,33 @@ Future polish: GFM tables landed in `aetna-markdown 0.3.0` already;
 math + footnotes + task lists + raw HTML are still upstream
 deferreds.
 
-### ⏳ Stage 11 — wasm browser entry + server bundle switch
+### ✅ Stage 11 — wasm browser entry + server bundle switch
 
-The crate's `Cargo.toml` already lists wasm-only deps. Adding the
-`#[wasm_bindgen(start)]` entry mirrors `aetna-web/src/lib.rs`:
-- open a wgpu surface against a `<canvas>` from `aetna-web` shape
-- mount the same `ChatApp` impl, swapping the WS bridge for the browser
-  WebSocket via `web-sys`
+Landed. The crate's `src/web_entry.rs` carries the
+`#[wasm_bindgen(start)]` entry plus the wgpu+winit host shell — a
+lift of `aetna-web/src/lib.rs` with the gfx slot constructor-injected
+so the WebSocket / drag-drop / paste JS callbacks can call
+`request_redraw` on the same window after pushing inbound events.
+The HTML harness in `crates/whisper-agent-aetna-ui/assets/`
+(`index.html`, `login.html`, favicons) mirrors the deleted egui
+sibling's auth-probe pattern.
 
-Server-side: a workspace feature on `whisper-agent` (e.g.
-`--features aetna-ui`) that swaps the `RustEmbed` folder from
-`crates/whisper-agent-webui/pkg/` to `crates/whisper-agent-aetna-ui/pkg/`.
-At that point we can ship a single binary that defaults to whichever ui
-the build picks.
+Server-side: `src/server.rs` repoints rust-embed at
+`crates/whisper-agent-aetna-ui/{pkg,assets}/`. No feature flag — the
+cutover was full. `scripts/dev.sh` and `Dockerfile` wasm-pack the
+aetna-ui crate before building the agent so the embed sees fresh
+output.
+
+Eventual cleanup: upstream a public `aetna-web::start_with::<A>` so
+this crate can stop carrying its own ~500-line copy of the browser
+host shell. Until that lands, the duplication is intentional.
 
 ## Migration gaps from egui webui
 
-Once the staged surfaces above are green, the remaining diff between
-`whisper-agent-aetna-ui` and `whisper-agent-webui` is a pile of
-smaller features that don't slot under any one stage. Tracked here so
-they don't get lost in the long tail. Effort tags are
+Status of the long tail of smaller features that didn't slot under
+any one stage. Recorded for the historical record now that the
+cutover has landed; ✅ items are in tree, anything else marks a gap
+we intentionally accepted at cutover time. Effort tags are
 trivial / small / medium / large.
 
 ### Chat-log / per-message details

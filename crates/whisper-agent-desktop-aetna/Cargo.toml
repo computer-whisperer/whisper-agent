@@ -37,8 +37,7 @@ anyhow = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 url = { workspace = true }
-# Persistence for the login form's "remember on this device" checkbox.
-# Mirrors `whisper-agent-desktop`'s `desktop.toml` shape so the two
-# clients share a config file when both are installed.
+# Persistence for the login form's "remember on this device"
+# checkbox — `$XDG_CONFIG_HOME/whisper-agent/desktop.toml`.
 serde = { workspace = true }
 toml = "1"

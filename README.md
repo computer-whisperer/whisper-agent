@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="crates/whisper-agent-webui/assets/favicon-192.png" alt="whisper-agent" width="128" height="128">
+  <img src="crates/whisper-agent-aetna-ui/assets/favicon-192.png" alt="whisper-agent" width="128" height="128">
 </p>
 
 # whisper-agent
@@ -8,7 +8,7 @@ A self-hosted, headless agent loop. The conversation runs on a server you contro
 
 What you get out of the box:
 
-- A web UI (egui+wasm, served by the agent itself) for driving long-lived conversations from any browser.
+- A web UI (aetna+wgpu+wasm, served by the agent itself) for driving long-lived conversations from any browser.
 - Pluggable LLM backends: Anthropic, OpenAI Chat + Responses, Gemini, and any openai-compatible local endpoint (Ollama, LM Studio, llama.cpp).
 - One conversation can reach into multiple managed POSIX hosts simultaneously, each gated by per-thread Landlock-isolated MCP servers.
 - Optional shared MCP tools for web fetch and Brave web search.
@@ -26,7 +26,7 @@ See [`docs/design_headless_loop.md`](docs/design_headless_loop.md) for the ratio
 │  • pod / thread / resource scheduler                        │
 │  • provider clients (Anthropic, OpenAI, Gemini, openai-     │
 │    compatible local)                                        │
-│  • serves the webui (egui+wasm) and a CBOR/WebSocket        │
+│  • serves the webui (aetna+wgpu+wasm) and a CBOR/WebSocket  │
 │    protocol for clients                                     │
 └──────────────┬─────────────────────┬────────────────────────┘
                │ MCP over            │ host-env protocol
@@ -41,7 +41,7 @@ See [`docs/design_headless_loop.md`](docs/design_headless_loop.md) for the ratio
    └──────────────────────┘    └────────────────────────────┘
 ```
 
-**Server-side** (one container in deployment): `whisper-agent`, `whisper-agent-webui` (wasm bundle served by the agent), `whisper-agent-mcp-fetch`, `whisper-agent-mcp-search`.
+**Server-side** (one container in deployment): `whisper-agent`, `whisper-agent-aetna-ui` (wasm bundle served by the agent), `whisper-agent-mcp-fetch`, `whisper-agent-mcp-search`.
 
 **Host-side** (installed on each managed POSIX host as a systemd service): `whisper-agent-host-daemon` and the `whisper-agent-mcp-host` binary it spawns. The daemon dials into the central server's `/v1/host_env_link` endpoint and is admitted by token via `[[auth.daemons]]` — see [`docs/design_host_env_protocol.md`](docs/design_host_env_protocol.md).
 
@@ -52,7 +52,7 @@ Stand up the full stack on your laptop, talking to Anthropic with your API key. 
 ### Prerequisites
 
 - A recent stable Rust toolchain — `rustup default stable` if you don't have one.
-- `wasm-pack` for the webui bundle: `cargo install wasm-pack`.
+- `wasm-pack` for the browser-ui bundle: `cargo install wasm-pack`.
 - Linux 5.13+ (the sandbox uses Landlock).
 - An Anthropic API key.
 
@@ -134,8 +134,8 @@ sudo systemctl enable --now whisper-agent-host-daemon.service
 | Crate | Role |
 | --- | --- |
 | `whisper-agent` (root) | The agent loop, HTTP/WS server, webui host. |
-| `whisper-agent-webui` | Browser chat UI (egui + wasm), built with `wasm-pack`. |
-| `whisper-agent-protocol` | CBOR-over-WebSocket protocol shared by server and webui. |
+| `whisper-agent-aetna-ui` | Chat UI (aetna + wgpu + wasm), built with `wasm-pack`. Same crate produces the rlib that powers `whisper-agent-desktop-aetna`. |
+| `whisper-agent-protocol` | CBOR-over-WebSocket protocol shared by server and ui. |
 | `whisper-agent-host-daemon` | Per-host daemon that dials into the central server and provisions Landlock-isolated MCP host instances per thread. |
 | `whisper-agent-host-proto` | Wire-protocol types for the daemon ↔ server WebSocket link. |
 | `whisper-agent-worker-proto` | Wire-protocol types for the daemon ↔ per-thread worker IPC over Unix socketpair. |
@@ -143,7 +143,7 @@ sudo systemctl enable --now whisper-agent-host-daemon.service
 | `whisper-agent-mcp-fetch` | Shared MCP server exposing a guarded `web_fetch` tool. |
 | `whisper-agent-mcp-search` | Shared MCP server exposing `web_search` (Brave Search API). |
 | `whisper-agent-mcp-proto` | MCP / JSON-RPC types shared by the MCP servers. |
-| `whisper-agent-desktop` | Native desktop client — egui app sharing UI code with `whisper-agent-webui`. |
+| `whisper-agent-desktop-aetna` | Native desktop client (winit + wgpu) sharing UI code with `whisper-agent-aetna-ui`. |
 
 Native Android client: see `android/`.
 

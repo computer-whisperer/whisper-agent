@@ -65,8 +65,9 @@ use whisper_agent_protocol::{
 };
 
 /// Inbound event variants the host shell pushes into the [`Inbound`]
-/// queue. Mirrors `whisper-agent-webui`'s shape so the desktop bridge
-/// can be a one-liner replacement on the import side.
+/// queue. Each host (browser WebSocket callbacks, native tokio
+/// bridge) writes its own variants of these into the shared queue;
+/// `ChatApp::before_build` drains them on the next frame.
 // `ServerToClient` dwarfs the connection variants; matching the egui
 // sibling keeps the bridge code trivial. `Box` would change every
 // enqueue site without saving meaningfully on a shallow queue.
@@ -465,13 +466,10 @@ struct RawPick {
 /// uses to wire drag-drop and clipboard-paste listeners into the
 /// same staging queue.
 ///
-/// Mirrors `whisper-agent-webui::AttachmentIngress` — same name and
-/// `push(bytes, source_desc)` shape so the wasm entry's JS
-/// callbacks port over without semantic change. The browser host
-/// is responsible for calling `request_redraw` after a push so the
-/// next frame drains the queue; on aetna there's no thread-safe
-/// "wake the renderer" primitive baked into the type the way egui's
-/// `Context::request_repaint` is in the sibling.
+/// The browser host is responsible for calling `request_redraw`
+/// after a push so the next frame drains the queue; on aetna there's
+/// no thread-safe "wake the renderer" primitive baked into the type,
+/// so the wake side stays with the host.
 #[derive(Clone)]
 pub struct AttachmentIngress {
     queue: std::sync::Arc<std::sync::Mutex<Vec<RawPick>>>,
@@ -4838,8 +4836,7 @@ const POD_TABS_KEY: &str = "pod-tabs";
 const SIDEBAR_SHOWMORE_KEY: &str = "sidebar:showmore";
 
 /// Default-collapsed cap on per-pod thread rows in the sidebar.
-/// Mirrors `whisper-agent-webui::THREAD_ROW_PREVIEW_COUNT`. The
-/// "Show N more" toggle reveals the full list per pod.
+/// The "Show N more" toggle reveals the full list per pod.
 const SIDEBAR_THREAD_PREVIEW: usize = 10;
 
 /// Routed key for the "+" icon-button next to the Threads section

@@ -288,5 +288,5 @@ chronological — order may shuffle as the dataset reveals what hurts.
 - Bucket model: `src/knowledge/`
 - Wire types: `crates/whisper-agent-protocol/src/lib.rs` (search
   `BucketSummary`)
-- WebUI modal: `crates/whisper-agent-webui/src/app/modals/buckets.rs`
+- WebUI modal: `crates/whisper-agent-aetna-ui/src/app.rs` (search `render_buckets_modal`)
 - Targeted embedder for wikipedia plan: Qwen3-Embedding-0.6B (1024-dim).

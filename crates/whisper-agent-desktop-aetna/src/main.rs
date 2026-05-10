@@ -1,10 +1,9 @@
 //! whisper-agent-desktop-aetna — native window around the aetna chat UI.
 //!
-//! Sibling of `whisper-agent-desktop` (egui). Same WebSocket transport
-//! (tokio + tungstenite, CBOR over `/ws`); different render stack
-//! (`aetna-winit-wgpu` instead of eframe).
+//! WebSocket transport is tokio + tungstenite + CBOR over `/ws`;
+//! render stack is `aetna-winit-wgpu`.
 //!
-//! Two phases, mirroring the egui sibling's `RootApp`:
+//! Two phases:
 //!   - **Login**: a [`LoginApp`] form collects server URL + token.
 //!     Submission writes to `$XDG_CONFIG_HOME/whisper-agent/desktop.toml`
 //!     (when "Remember" is checked) and transitions to Connected.
@@ -162,8 +161,7 @@ fn non_empty(s: Option<String>) -> Option<String> {
 
 /// Top-level aetna [`App`] that switches between the login form and
 /// the connected chat UI. Only one WS task runs at a time (in the
-/// Connected phase). Mirrors `whisper-agent-desktop`'s `RootApp` so
-/// users get the same flow whether they pick the egui or aetna client.
+/// Connected phase).
 struct RootApp {
     rt: Arc<tokio::runtime::Runtime>,
     phase: Phase,

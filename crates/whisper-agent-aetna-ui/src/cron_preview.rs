@@ -1,6 +1,6 @@
 //! Cron-preview helpers for the behavior editor's Trigger tab.
 //!
-//! Parsing matches `whisper-agent-webui::cron_preview` exactly: a
+//! Parsing matches the server's behavior-trigger parser exactly: a
 //! 5-field UNIX crontab (`min hour dom mon dow`) is prefixed with
 //! `"0 "` for the seconds field before handing to the [`cron`] crate,
 //! so the preview's "next 5 firings" table agrees with what the

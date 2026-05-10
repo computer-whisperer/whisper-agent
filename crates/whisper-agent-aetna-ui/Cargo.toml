@@ -6,10 +6,9 @@ edition.workspace = true
 license.workspace = true
 
 [lib]
-# Mirrors `whisper-agent-webui`: `cdylib` is the wasm-pack bundle that
-# the server ships to the browser, `rlib` is what the native desktop
-# crate consumes. Browser entry will land alongside this; for the
-# initial scaffold the rlib path is the only consumer.
+# `cdylib` is the wasm-pack bundle the server ships to the browser
+# (entry point: `src/web_entry.rs`); `rlib` is what
+# `whisper-agent-desktop-aetna` consumes for the native client.
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
@@ -28,9 +27,8 @@ chrono = "0.4"
 chrono-tz = { workspace = true }
 cron = { workspace = true }
 # Round-trip the structured pod editor's `working_config` through
-# the raw-TOML tab. `default-features = false` mirrors the
-# whisper-agent-webui sibling — we only need the display/parse/serde
-# integration paths.
+# the raw-TOML tab. `default-features = false` drops `std` features
+# we don't need — only the display/parse/serde paths matter here.
 toml = { version = "1", default-features = false, features = ["display", "parse", "serde"] }
 # Decode inbound `ContentBlock::Image { source: Bytes }` at render
 # time. Format set mirrors the protocol's `ImageMime` variants the
@@ -38,16 +36,16 @@ toml = { version = "1", default-features = false, features = ["display", "parse"
 # the `image` crate doesn't decode them without an extra C library).
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "gif"] }
 # Line-granularity diff used to render `edit_file` / `write_file`
-# tool calls as +/- colored bodies. Same crate the egui sibling
-# uses; default features off since we only need the text path.
+# tool calls as +/- colored bodies. Default features off since we
+# only need the text path.
 similar = { version = "3", default-features = false, features = ["text"] }
 
 # Native-only file picker for the compose attach affordance.
 # `default-features = false` drops the GTK3 native backend in
-# favor of xdg-portal where available — same shape as the egui
-# sibling. `tokio = "rt"` is the smallest feature that gives us a
-# single-threaded executor we can `block_on` inside a background
-# thread to drive rfd's async API.
+# favor of xdg-portal where available. `tokio = "rt"` is the
+# smallest feature that gives us a single-threaded executor we
+# can `block_on` inside a background thread to drive rfd's async
+# API.
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 rfd = { version = "0.17", default-features = false, features = ["xdg-portal"] }
 tokio = { workspace = true, features = ["rt"] }
