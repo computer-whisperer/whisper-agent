@@ -56,7 +56,23 @@ tokio = { workspace = true, features = ["rt"] }
 wasm-bindgen = "0.2"
 wasm-bindgen-futures = "0.4"
 console_error_panic_hook = "0.1"
+# Routes `log` records to the browser console. The egui sibling
+# pulled the same role through `eframe::WebLogger`; aetna has no
+# bundled equivalent so we wire it explicitly.
+console_log = "1"
 js-sys = "0.3"
+# `web_time::Instant` is the wasm-safe shim for the per-frame timing
+# bucket in the host loop. `std::time::Instant::now()` panics on
+# wasm32-unknown-unknown; web-time backs it with `performance.now()`.
+web-time = "1"
+# Browser wgpu host stack. `aetna-wgpu` owns the Runner / MsaaTarget;
+# `wgpu` with `webgl` features picks up the browser backends; winit
+# drives the canvas-bound event loop. ResizeObserver wiring lives in
+# our own `web_entry` module since aetna doesn't expose a reusable
+# browser host the way `aetna-winit-wgpu` does for native.
+aetna-wgpu = { path = "../../../../aetna/aetna.main/crates/aetna-wgpu" }
+wgpu = { version = "29", features = ["webgl"] }
+winit = "0.30"
 web-sys = { version = "0.3", features = [
     "WebSocket",
     "MessageEvent",
@@ -66,9 +82,27 @@ web-sys = { version = "0.3", features = [
     "Location",
     "Window",
     "Document",
+    "Element",
     "HtmlCanvasElement",
     "HtmlElement",
     "BinaryType",
     "Storage",
+    # ResizeObserver re-syncs the canvas backing buffer to its CSS
+    # box size whenever the layout changes. Without it the canvas
+    # defaults to 300x150 device pixels and Firefox WebGPU fails the
+    # first present because surface texture and canvas drawing buffer
+    # disagree.
+    "ResizeObserver",
+    # Document-level drag/drop and clipboard-paste listeners feed
+    # AttachmentIngress. Mirrors the egui sibling: winit doesn't
+    # deliver these to the canvas reliably across browsers.
+    "DragEvent",
+    "DataTransfer",
+    "DataTransferItem",
+    "DataTransferItemList",
+    "File",
+    "FileList",
+    "Blob",
+    "ClipboardEvent",
 ] }
 getrandom = { version = "0.4", features = ["wasm_js"] }

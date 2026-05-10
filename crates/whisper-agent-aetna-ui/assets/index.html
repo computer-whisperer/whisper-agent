@@ -1,0 +1,63 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <link rel="icon" type="image/png" sizes="32x32" href="/assets/favicon.png" />
+    <link rel="icon" type="image/png" sizes="192x192" href="/assets/favicon-192.png" />
+    <link rel="apple-touch-icon" href="/assets/favicon-192.png" />
+    <title>whisper-agent</title>
+    <style>
+        html, body {
+            margin: 0;
+            padding: 0;
+            height: 100%;
+            overflow: hidden;
+            background: #1c1c1c;
+            font-family: system-ui, sans-serif;
+        }
+        canvas {
+            display: block;
+            width: 100%;
+            height: 100%;
+            /* aetna routes pointer + wheel through winit; without
+               touch-action:none, mobile browsers swallow horizontal
+               drags as page scrolls instead of routing them to the
+               canvas. */
+            touch-action: none;
+            outline: none;
+        }
+    </style>
+</head>
+<body>
+    <canvas id="the_canvas_id" tabindex="0"></canvas>
+    <script type="module">
+        // Probe the auth gate before fetching the wasm bundle. On 401
+        // (no/expired session cookie, or non-loopback client without
+        // auth configured) bounce to the login page so the user can
+        // paste a token. On 204 the cookie is good (or we're loopback
+        // and bypass applies); proceed to load the app.
+        (async () => {
+            try {
+                const r = await fetch('/auth/check', { credentials: 'same-origin' });
+                if (r.status === 401) {
+                    window.location.replace('/login.html');
+                    return;
+                }
+            } catch (err) {
+                // Network error — let init() proceed; the WS will surface
+                // the same failure with the existing reconnect indicator.
+                console.warn('auth probe failed:', err);
+            }
+            const init = (await import('/pkg/whisper_agent_aetna_ui.js')).default;
+            init().catch(err => {
+                console.error('failed to initialize whisper-agent-aetna-ui:', err);
+                document.body.innerHTML =
+                    '<pre style="color:#fff;padding:1em;">whisper-agent-aetna-ui failed to start. ' +
+                    'Did you run `wasm-pack build crates/whisper-agent-aetna-ui --target web`?\n\n' +
+                    String(err) + '</pre>';
+            });
+        })();
+    </script>
+</body>
+</html>

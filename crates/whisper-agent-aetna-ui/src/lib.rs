@@ -12,8 +12,10 @@ mod app;
 mod cron_preview;
 mod icons;
 mod login;
+#[cfg(target_arch = "wasm32")]
+mod web_entry;
 
-pub use app::{ChatApp, Inbound, InboundEvent, SendFn};
+pub use app::{AttachmentIngress, ChatApp, Inbound, InboundEvent, SendFn};
 pub use login::{LoginApp, LoginInput, SubmitFn};
 
 pub use aetna_core;

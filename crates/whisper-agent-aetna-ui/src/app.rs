@@ -458,6 +458,33 @@ struct RawPick {
     source_desc: String,
 }
 
+/// Cross-thread handle for pushing dropped / pasted / picked file
+/// bytes into [`ChatApp::pending_picks`]. The native file picker
+/// already pushes through the shared `Arc<Mutex<Vec<RawPick>>>`
+/// internally; this type is the public surface the browser host
+/// uses to wire drag-drop and clipboard-paste listeners into the
+/// same staging queue.
+///
+/// Mirrors `whisper-agent-webui::AttachmentIngress` — same name and
+/// `push(bytes, source_desc)` shape so the wasm entry's JS
+/// callbacks port over without semantic change. The browser host
+/// is responsible for calling `request_redraw` after a push so the
+/// next frame drains the queue; on aetna there's no thread-safe
+/// "wake the renderer" primitive baked into the type the way egui's
+/// `Context::request_repaint` is in the sibling.
+#[derive(Clone)]
+pub struct AttachmentIngress {
+    queue: std::sync::Arc<std::sync::Mutex<Vec<RawPick>>>,
+}
+
+impl AttachmentIngress {
+    pub fn push(&self, bytes: Vec<u8>, source_desc: String) {
+        if let Ok(mut q) = self.queue.lock() {
+            q.push(RawPick { bytes, source_desc });
+        }
+    }
+}
+
 /// Three terminal states for an inline image: successfully decoded
 /// (we hold the `aetna_core::Image` and the original dimensions),
 /// remote URL (deferred — Stage 7 doesn't fetch yet), or a decode
@@ -2437,6 +2464,19 @@ impl PodEditorSheetState {
 }
 
 impl ChatApp {
+    /// Cross-thread handle for the browser host's drag-drop / paste
+    /// listeners — they push into the same staging queue the native
+    /// file picker uses, and the next frame drains both through
+    /// `drain_pending_picks` like normal. The caller is responsible
+    /// for arranging a redraw after each push (winit's
+    /// `request_redraw` from the JS callback) so the queue doesn't
+    /// sit unread until unrelated input.
+    pub fn attachment_ingress(&self) -> AttachmentIngress {
+        AttachmentIngress {
+            queue: self.pending_picks.clone(),
+        }
+    }
+
     pub fn new(inbound: Inbound, send_fn: SendFn) -> Self {
         Self {
             inbound,
@@ -15663,10 +15703,10 @@ fn build_shared_mcp_submit_request(
 fn webui_origin() -> String {
     #[cfg(target_arch = "wasm32")]
     {
-        if let Some(window) = web_sys::window() {
-            if let Ok(origin) = window.location().origin() {
-                return origin;
-            }
+        if let Some(window) = web_sys::window()
+            && let Ok(origin) = window.location().origin()
+        {
+            return origin;
         }
         "http://127.0.0.1".into()
     }
