@@ -828,6 +828,9 @@ pub(crate) enum BehaviorEditorPicker {
     /// Thread-tab `thread.model` override picker. Options are the
     /// pod's effective backend's model catalog.
     ThreadModel,
+    /// Thread-tab `thread.bindings.backend` override picker.
+    /// Options are the server-known backend catalog.
+    ThreadBackend,
 }
 
 impl BehaviorEditorPicker {
@@ -836,6 +839,7 @@ impl BehaviorEditorPicker {
             Self::Overlap => BEHAVIOR_EDITOR_OVERLAP_KEY,
             Self::CatchUp => BEHAVIOR_EDITOR_CATCH_UP_KEY,
             Self::ThreadModel => BEHAVIOR_EDITOR_THREAD_MODEL_KEY,
+            Self::ThreadBackend => BEHAVIOR_EDITOR_THREAD_BACKEND_KEY,
         }
     }
 }
@@ -2602,6 +2606,8 @@ const BEHAVIOR_EDITOR_THREAD_MAX_TOKENS_KEY: &str = "behavior-editor:thread:max-
 const BEHAVIOR_EDITOR_THREAD_MAX_TURNS_OVERRIDE_KEY: &str =
     "behavior-editor:thread:max-turns:override";
 const BEHAVIOR_EDITOR_THREAD_MAX_TURNS_KEY: &str = "behavior-editor:thread:max-turns";
+const BEHAVIOR_EDITOR_THREAD_BACKEND_OVERRIDE_KEY: &str = "behavior-editor:thread:backend:override";
+const BEHAVIOR_EDITOR_THREAD_BACKEND_KEY: &str = "behavior-editor:thread:backend";
 
 fn behavior_row_key(pod_id: &str, behavior_id: &str) -> String {
     format!("{BEHAVIOR_ROW_PREFIX}{pod_id}:{behavior_id}")
@@ -4252,6 +4258,7 @@ impl ChatApp {
             BehaviorEditorPicker::Overlap,
             BehaviorEditorPicker::CatchUp,
             BehaviorEditorPicker::ThreadModel,
+            BehaviorEditorPicker::ThreadBackend,
         ] {
             if let Some(action) = classify_select_event(event, which.key()) {
                 self.handle_behavior_editor_picker(which, action);
@@ -4378,6 +4385,19 @@ impl ChatApp {
                     cfg.thread.max_turns = Some(30);
                     editor.thread_max_turns_buf = "30".to_string();
                 }
+                editor.error = None;
+            }
+            return true;
+        }
+        if event.is_click_or_activate(BEHAVIOR_EDITOR_THREAD_BACKEND_OVERRIDE_KEY) {
+            if let Some(editor) = self.behavior_editor.as_mut()
+                && let Some(cfg) = editor.working_config.as_mut()
+            {
+                cfg.thread.bindings.backend = if cfg.thread.bindings.backend.is_some() {
+                    None
+                } else {
+                    Some(String::new())
+                };
                 editor.error = None;
             }
             return true;
@@ -4511,6 +4531,18 @@ impl ChatApp {
                                 cfg.thread.model = Some(value);
                             }
                         }
+                        BehaviorEditorPicker::ThreadBackend => {
+                            if let Some(cfg) = editor.working_config.as_mut() {
+                                cfg.thread.bindings.backend = Some(value);
+                                // Backend changed — clear the model
+                                // override (if any) since the prior
+                                // model id is almost certainly invalid
+                                // for the new backend. Same shape as
+                                // the pod editor's Defaults backend
+                                // pick.
+                                cfg.thread.model = cfg.thread.model.as_ref().map(|_| String::new());
+                            }
+                        }
                     }
                     editor.open_picker = None;
                     editor.error = None;
@@ -4571,6 +4603,19 @@ impl ChatApp {
                 if options.is_empty() {
                     options.push((String::new(), "(no models)".to_string()));
                 }
+                select_menu(which.key(), options)
+            }
+            BehaviorEditorPicker::ThreadBackend => {
+                // Server-known backend catalog. Behaviors must bind
+                // to a backend the pod's `[allow.backends]` permits;
+                // showing the full list mirrors the pod editor's
+                // Defaults backend menu (and the server validates
+                // out-of-allow picks on save).
+                let options: Vec<(String, String)> = self
+                    .backends
+                    .iter()
+                    .map(|b| (b.name.clone(), b.name.clone()))
+                    .collect();
                 select_menu(which.key(), options)
             }
         }
@@ -5351,14 +5396,36 @@ impl ChatApp {
         .width(Size::Fill(1.0));
 
         let backend_hint = format!(
-            "Effective backend for the model picker: `{}`. Override via the \
-             bindings sub-slice (coming next).",
+            "Effective backend for the model picker: `{}`. Use the bindings \
+             override below to switch the spawned thread to a different \
+             backend.",
             if effective_backend.is_empty() {
-                "(none — pick a backend on the bindings sub-slice once it lands)"
+                "(inherit pod default)"
             } else {
                 effective_backend
             }
         );
+
+        // Bindings.backend row (Optional<String>).
+        let backend_override = cfg.thread.bindings.backend.is_some();
+        let backend_value: El = if let Some(name) = cfg.thread.bindings.backend.as_ref() {
+            let label = if name.is_empty() {
+                "(none)".to_string()
+            } else {
+                name.clone()
+            };
+            select_trigger(BEHAVIOR_EDITOR_THREAD_BACKEND_KEY, label)
+        } else {
+            paragraph("(inherit pod default)").muted().small()
+        };
+        let backend_row = row([
+            checkbox(backend_override).key(BEHAVIOR_EDITOR_THREAD_BACKEND_OVERRIDE_KEY),
+            text("override").muted().small(),
+            backend_value,
+        ])
+        .gap(tokens::SPACE_2)
+        .align(Align::Center)
+        .width(Size::Fill(1.0));
 
         form([
             form_item([
@@ -5383,11 +5450,20 @@ impl ChatApp {
                 ),
             ]),
             form_item([
-                form_label("bindings"),
+                form_label("backend binding"),
+                form_control(backend_row),
+                form_description(
+                    "Server-known backend catalog. The pod's `[allow.backends]` \
+                     is authoritative — picks outside it are rejected on save.",
+                ),
+            ]),
+            form_item([
+                form_label("host_env / mcp_hosts"),
                 form_control(
                     paragraph(
-                        "backend / host_env / mcp_host overrides land in the \
-                         next sub-slice.",
+                        "host_env and mcp_hosts override pickers land in a \
+                         follow-up sub-slice once the editor loads the pod's \
+                         allow lists.",
                     )
                     .muted()
                     .small(),

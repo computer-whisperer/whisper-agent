@@ -715,9 +715,27 @@ is deferred to its own sub-slice — they share the
 override-checkbox shape but each carries its own catalog
 lookup, and folding them into this commit doubled its size.
 
+**Behavior editor — Thread bindings backend (landed):**
+adds the `bindings.backend` override row using the global
+`self.backends` catalog. `BehaviorEditorPicker::ThreadBackend`
+joins the picker family. Picking a backend clears the model
+override (its prior id is almost certainly invalid for the
+new backend) — same shape as the pod editor's Defaults
+backend pick.
+
+`bindings.host_env` and `bindings.mcp_hosts` are still
+deferred — they want the pod's `[allow.host_env]` /
+`[allow.mcp_hosts]` lists as their option set, which means
+the behavior editor needs to load the pod's full config.
+Plumbing that fetch is a separate slice; until it lands the
+two override fields ride through `working_config` unchanged
+on save.
+
 Deferred to follow-up sheet slices:
-- **Thread bindings sub-slice** — backend / host_env /
-  mcp_host overrides on `BehaviorThreadOverride.bindings`.
+- **Thread bindings host_env / mcp_hosts sub-slice** — needs
+  pod_config plumbing on `BehaviorEditorSheetState`. Once the
+  editor fires `GetPod` alongside `GetBehavior`, the
+  multi-checks read from `pod.allow.{host_env,mcp_hosts}`.
 - **Scope tab** — per-behavior allow narrowing.
 - **Retention tab** — `RetentionPolicy::ArchiveAfterDays /
   DeleteAfterDays` controls.
