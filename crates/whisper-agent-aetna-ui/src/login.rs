@@ -205,6 +205,8 @@ impl App for LoginApp {
     }
 
     fn theme(&self) -> Theme {
-        Theme::aetna_dark()
+        // Match the chat phase so the post-login transition doesn't
+        // flash a different palette.
+        Theme::radix_slate_blue_dark()
     }
 }

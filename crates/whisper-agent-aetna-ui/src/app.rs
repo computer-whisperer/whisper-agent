@@ -1,32 +1,42 @@
 //! [`ChatApp`] — the platform-agnostic aetna [`App`] for the
 //! whisper-agent chat client.
 //!
-//! Surface so far: connection-status banner, sidebar with pods +
-//! threads, snapshot + delta-streamed chat log rendered as event-log
-//! rows (3px role-colored gutter + content), assistant turns through
-//! `aetna_markdown::md`, reasoning + tool rows in collapsible
-//! `accordion_item`s, decoded inline images (PNG/JPEG/WebP/GIF)
-//! rendered through aetna's `image()` widget, compose box that
-//! sends follow-up turns to the selected thread, per-thread compose
-//! drafts persisted via `SetThreadDraft`, prefill-progress indicator,
-//! and a new-thread compose form (card + form + `select_trigger`
-//! pickers for backend / model / pod) reachable when no thread is
-//! selected.
+//! Surface so far:
+//!
+//! - Brand-marked sidebar with draggable resize handle and a pinned
+//!   status footer (server URL + connection dot).
+//! - Pod tabs above a per-pod threads list (with dispatch nesting and
+//!   provenance markers) and behaviors list (run-now / pause / edit /
+//!   delete toolbar).
+//! - Snapshot + delta-streamed chat log rendered as event-log rows
+//!   (3 px role-colored gutter + content). Assistant turns flow
+//!   through `aetna_markdown::md`; reasoning and tool rows live in
+//!   collapsible `accordion_item`s.
+//! - Inline images (PNG / JPEG / WebP / GIF) with click-to-open
+//!   fullscreen lightbox.
+//! - Per-turn token-stats footer plus a cumulative
+//!   `backend/model · ↑in / ↓out / cache r/c` chip in the thread
+//!   header. Prefill progress bar above the chat log when active.
+//! - Compose box: text area, drag/drop and file-picker attachments,
+//!   Enter-to-send, keyboard hint when empty, paperclip + Send / Stop.
+//!   Per-thread drafts persisted via `SetThreadDraft`.
+//! - Pending-sudo approval banner above the affected thread.
+//! - Modals: fork-thread, "+ new pod", "+ new behavior".
+//! - Sheets: pod editor (Allow / Defaults / Limits + raw TOML),
+//!   behavior editor (Trigger / Thread / Scope / Retention / Prompt
+//!   / System Prompt / Raw TOML).
+//! - New-thread compose pane (backend / model / pod pickers + text
+//!   area) reachable when no thread is selected.
+//!
 //! Build/on_event split is the load-bearing test of the pivot — every
 //! interactive element routes through [`ChatApp::on_event`] via a
 //! key, every visual is a function of state read in
 //! [`ChatApp::build`].
 //!
-//! Things deliberately deferred:
-//! - inline diff rendering for `edit_file` / `write_file` tool calls
-//!   (currently shown as raw JSON args)
-//! - bindings surface (knowledge-db / behavior / shared MCP hosts) on
-//!   the new-thread form
-//! - attachment staging input side (drag/drop/paste/filepicker) —
-//!   blocked on aetna-winit-wgpu exposing winit drop / clipboard
-//!   image events; rendering inbound images already works
-//! - URL-source image fetching (currently a muted placeholder)
-//! - all settings / behavior / pod / bucket / fork modals
+//! Surfaces still to land (full inventory in
+//! `docs/design_aetna_ui.md` § "Migration gaps from egui webui"):
+//! server settings modal, knowledge-buckets modal, JSON tree viewer,
+//! file browser/editor, thread inspector popover.
 //!
 //! Dispatch model: a single `dispatch_wire` walks `ServerToClient`
 //! variants — only the ones the current stage cares about have arms;
@@ -39,6 +49,7 @@ use std::rc::Rc;
 use crate::cron_preview;
 
 use aetna_core::prelude::*;
+use aetna_core::widgets::resize_handle::{self, ResizeDrag, Side};
 use aetna_core::widgets::select::{SelectAction, classify_event as classify_select_event};
 use whisper_agent_protocol::{
     ActivationSurface, AllowMap, Attachment, BackendSummary, BehaviorConfig, BehaviorSummary,
@@ -46,6 +57,7 @@ use whisper_agent_protocol::{
     ImageMime, ImageSource, InitialListing, ModelSummary, NamedHostEnv, Overlap, PodAllow,
     PodConfig, PodLimits, PodSummary, RetentionPolicy, Role, ServerToClient, SystemPromptChoice,
     ThreadBindingsRequest, ThreadConfigOverride, ThreadDefaults, ThreadSummary, TriggerSpec,
+    permission::SudoDecision,
 };
 
 /// Inbound event variants the host shell pushes into the [`Inbound`]
@@ -281,6 +293,54 @@ fn turn_stats_text(usage: &whisper_agent_protocol::Usage) -> String {
     parts.join(" · ")
 }
 
+/// Right-aligned `backend/model` chip rendered in the thread
+/// header sub-line. Mirrors the egui sibling's `format!("{}/{}",
+/// backend_label, view.model)` strip. Returns `None` when the
+/// thread isn't bound to a backend yet (`bindings.backend` is
+/// empty) — the snapshot hasn't landed, the thread was rebound
+/// to nothing, or the server's a legacy version that didn't
+/// populate the field. The model alone with no backend reads as
+/// noise, so we suppress the whole strip rather than show half.
+fn thread_model_chip(backend: &str, model: &str) -> Option<El> {
+    if backend.is_empty() {
+        return None;
+    }
+    let label = if model.is_empty() {
+        backend.to_string()
+    } else {
+        format!("{backend}/{model}")
+    };
+    Some(text(label).caption().muted().ellipsis())
+}
+
+/// Right-aligned cumulative-usage chip for the thread header.
+/// Format: `↑ 12,345 · ↓ 2,345 · cache 800r/200c`. Suppressed
+/// when every field is zero — surfacing a dead "↑ 0 · ↓ 0"
+/// chip on a fresh thread before the first turn would fight the
+/// otherwise-tight chrome. Cache portion drops when both
+/// cache columns are zero so a non-cacheing model doesn't carry
+/// the noise.
+fn thread_usage_chip(usage: &whisper_agent_protocol::Usage) -> Option<El> {
+    if usage.input_tokens == 0
+        && usage.output_tokens == 0
+        && usage.cache_read_input_tokens == 0
+        && usage.cache_creation_input_tokens == 0
+    {
+        return None;
+    }
+    let mut parts: Vec<String> = Vec::with_capacity(3);
+    parts.push(format!("\u{2191} {}", fmt_count(usage.input_tokens)));
+    parts.push(format!("\u{2193} {}", fmt_count(usage.output_tokens)));
+    if usage.cache_read_input_tokens > 0 || usage.cache_creation_input_tokens > 0 {
+        parts.push(format!(
+            "cache {}r/{}c",
+            fmt_count(usage.cache_read_input_tokens),
+            fmt_count(usage.cache_creation_input_tokens),
+        ));
+    }
+    Some(text(parts.join(" \u{00B7} ")).caption().muted())
+}
+
 /// `12345` → `12,345`. Cheap enough per-rebuild that a dedicated
 /// helper is fine; keeps the format consistent across all four
 /// turn-stats columns.
@@ -398,6 +458,7 @@ struct RawPick {
 /// (we hold the `aetna_core::Image` and the original dimensions),
 /// remote URL (deferred — Stage 7 doesn't fetch yet), or a decode
 /// failure (we kept the reason for surfacing in the UI).
+#[derive(Clone)]
 enum ImageRenderState {
     Decoded {
         image: aetna_core::image::Image,
@@ -410,6 +471,39 @@ enum ImageRenderState {
     Failed {
         reason: String,
     },
+}
+
+/// State backing the fullscreen image-lightbox modal. The decoded
+/// image is cloned out of the originating chat-log row so the modal
+/// can paint at native dimensions without re-decoding the source
+/// bytes; width/height ride alongside for the bottom caption.
+#[derive(Clone)]
+struct LightboxState {
+    image: aetna_core::image::Image,
+    width: u32,
+    height: u32,
+}
+
+/// One pending `sudo(...)` approval the model is awaiting a decision
+/// on. The banner above the chat log surfaces these; the user picks
+/// Approve / Remember / Reject and we send `ResolveSudo`. Mirrors
+/// the egui sibling's `PendingSudo`.
+#[derive(Clone)]
+struct PendingSudoState {
+    /// Thread the model is running in. Used to gate which banners
+    /// render in which pane — only the selected thread's banners show.
+    thread_id: String,
+    /// Wrapped tool name (e.g. `"bash"`, `"write_file"`). The thing
+    /// the model wants to call.
+    tool_name: String,
+    /// Inner args the model would pass to the wrapped tool. Pretty-
+    /// printed for the banner body so the user can see what's about
+    /// to run.
+    args: serde_json::Value,
+    /// Free-form justification the model emitted alongside the call.
+    /// Surfaced verbatim — the model is selling the user on running
+    /// this, so the user reads it as the case for approval.
+    reason: String,
 }
 
 /// Decode an [`ImageSource::Bytes`] payload into an `aetna_core::Image`,
@@ -453,6 +547,23 @@ struct ThreadView {
     /// *and* the summary's state is `Failed` — the conjunction
     /// avoids surfacing stale failure text after a recovery.
     failure: Option<String>,
+    /// Backend alias the server resolved this thread to (e.g.
+    /// `"prod-anthropic"`). Hydrated from
+    /// `ThreadSnapshot::bindings.backend`. Empty string means the
+    /// thread isn't bound to a backend yet — surfaced as the muted
+    /// `—` placeholder in the header. Mirrors the egui sibling's
+    /// `TaskView::backend`.
+    backend: String,
+    /// Model id the thread was created with. Hydrated from
+    /// `ThreadSnapshot::config.model`. Pairs with `backend` to form
+    /// the thread-header `backend/model` badge.
+    model: String,
+    /// Running token tally for this thread. Hydrated from
+    /// `ThreadSnapshot::total_usage` and incremented on every
+    /// `ThreadAssistantEnd { usage }` arm. Mirrors the egui
+    /// sibling's `view.total_usage.add(&usage)` pattern. Surfaced
+    /// in the thread header as `↑ in · ↓ out · cache r/c`.
+    total_usage: whisper_agent_protocol::Usage,
     /// Index a freshly-arriving `ThreadUserMessage` lands at in the
     /// underlying [`whisper_agent_protocol::Conversation`]. Hydrated
     /// from `conv.messages().count()` on snapshot, then incremented
@@ -467,6 +578,56 @@ pub struct ChatApp {
     // ----- transport bridge -----
     inbound: Inbound,
     send_fn: SendFn,
+
+    // ----- branding / identity -----
+    /// Server URL the host shell connected this client to. Surfaced in
+    /// the sidebar footer so the user can see at a glance "which
+    /// whisper-agent am I talking to" without opening settings —
+    /// typical desktop sessions have one window per server, but
+    /// remote tunnels and shared machines benefit from the affordance.
+    /// `None` skips the URL line in the footer (e.g. when the host
+    /// hasn't supplied one), but the connection-status line still
+    /// renders. Set via [`Self::set_server_label`].
+    server_label: Option<String>,
+
+    // ----- sidebar resize -----
+    /// Current pinned width of the left sidebar in logical pixels.
+    /// Initialized to `tokens::SIDEBAR_WIDTH`; mutated by drag /
+    /// keyboard nudges on the `sidebar:resize` handle, clamped to
+    /// `[SIDEBAR_WIDTH_MIN, SIDEBAR_WIDTH_MAX]` by the helper. The
+    /// `sidebar()` widget bakes its own width default in, but a
+    /// chained `.width(...)` at the call site overrides it.
+    sidebar_width: f32,
+    /// Drag-anchor state for the sidebar resize handle. Holds the
+    /// pointer x-position at which the user pressed down and the
+    /// width at that moment, so each frame's drag delta can derive
+    /// an absolute target. Cleared on PointerUp.
+    sidebar_drag: ResizeDrag,
+
+    // ----- modal: image lightbox -----
+    /// Decoded image currently shown in the fullscreen lightbox modal,
+    /// alongside the original source dimensions for the caption. `Some`
+    /// while the modal is open — opened by clicking any inline image
+    /// row, closed by clicking the scrim or the close affordance.
+    /// Mirrors the egui sibling's `lightbox` slot. The decoded
+    /// `aetna_core::Image` is shared with the inline row so we don't
+    /// re-decode the bytes when the modal opens.
+    lightbox: Option<LightboxState>,
+
+    // ----- in-flight sudo approvals -----
+    /// Server-emitted `SudoRequested` events the user hasn't resolved
+    /// yet, keyed by `function_id`. Rendered as a banner stack above
+    /// the matching thread's chat log. Drained by `SudoResolved`
+    /// broadcasts (server-side resolution) and by the user clicking
+    /// Approve / Remember / Reject (optimistic — we drop the entry
+    /// before the server's echo lands so the banner doesn't flicker).
+    /// Mirrors the egui sibling's `pending_sudos`.
+    pending_sudos: HashMap<u64, PendingSudoState>,
+    /// Per-banner reject-reason draft buffer, keyed by `function_id`.
+    /// Populated only when the user types into the inline text input;
+    /// flushed alongside the `pending_sudos` entry on resolve. Mirrors
+    /// the egui sibling's `sudo_reject_drafts`.
+    sudo_reject_drafts: HashMap<u64, String>,
 
     // ----- connection state -----
     conn_status: ConnectionStatus,
@@ -1505,6 +1666,12 @@ impl ChatApp {
         Self {
             inbound,
             send_fn,
+            server_label: None,
+            sidebar_width: tokens::SIDEBAR_WIDTH,
+            sidebar_drag: ResizeDrag::default(),
+            lightbox: None,
+            pending_sudos: HashMap::new(),
+            sudo_reject_drafts: HashMap::new(),
             conn_status: ConnectionStatus::Connecting,
             conn_detail: None,
             list_requested: false,
@@ -1548,6 +1715,17 @@ impl ChatApp {
             pending_fork_seed: None,
             correlation_counter: 0,
         }
+    }
+
+    /// Tell the chat surface which server URL this client is connected
+    /// to. Surfaced as a small line in the sidebar footer so users on
+    /// machines with multiple windows / saved profiles can see at a
+    /// glance which agent they're talking to. The host shell typically
+    /// passes the same string the user typed at the login form (or the
+    /// `--server` CLI flag).
+    pub fn set_server_label(&mut self, label: impl Into<String>) {
+        let s = label.into();
+        self.server_label = if s.is_empty() { None } else { Some(s) };
     }
 
     /// Allocate the next correlation id. Counter-based string suffices
@@ -1969,6 +2147,9 @@ impl ChatApp {
                     items,
                     title: snapshot.title,
                     failure: snapshot.failure,
+                    backend: snapshot.bindings.backend,
+                    model: snapshot.config.model,
+                    total_usage: snapshot.total_usage,
                     next_msg_index,
                 };
                 // Hydrate the local draft from the snapshot — the
@@ -2007,7 +2188,9 @@ impl ChatApp {
             // egui sibling deliberately doesn't optimistically append
             // its own send), so we wait for this echo.
             ServerToClient::ThreadUserMessage {
-                thread_id, text, ..
+                thread_id,
+                text,
+                attachments,
             } => {
                 if let Some(view) = self.views.get_mut(&thread_id) {
                     if !text.is_empty() {
@@ -2015,6 +2198,24 @@ impl ChatApp {
                             text,
                             msg_index: view.next_msg_index,
                         });
+                    }
+                    // Inline-render any image attachments the user
+                    // sent. The snapshot path (conversation_to_display_items)
+                    // already does this via `ContentBlock::Image`, but
+                    // the live wire arm needs its own decode + push so
+                    // a streaming user message looks identical to
+                    // what a resubscribe would show. Each attachment
+                    // gets its own row so the role gutter colors the
+                    // strip the same way the user's text gutter does.
+                    for att in attachments {
+                        match att {
+                            Attachment::Image { source } => {
+                                view.items.push(DisplayItem::Image {
+                                    is_user: true,
+                                    state: decode_image_source(&source),
+                                });
+                            }
+                        }
                     }
                     // Bump regardless of empty-text guard — the
                     // server still records an empty user message in
@@ -2207,6 +2408,12 @@ impl ChatApp {
             } => {
                 if let Some(view) = self.views.get_mut(&thread_id) {
                     view.items.push(DisplayItem::TurnStats { usage });
+                    // Roll the per-turn usage into the thread total
+                    // so the header chip stays in step with the
+                    // server's snapshot tally between resubscribes.
+                    // Mirrors the egui sibling's
+                    // `view.total_usage.add(&usage)`.
+                    view.total_usage.add(&usage);
                     // Assistant turn just committed → conversation
                     // grew by one Message. Keeping `next_msg_index`
                     // honest is what makes per-row fork from a
@@ -2228,6 +2435,40 @@ impl ChatApp {
             ServerToClient::ThreadAssistantBegin { .. }
             | ServerToClient::ThreadLoopComplete { .. }
             | ServerToClient::ThreadCompacted { .. } => {}
+            // Model called `sudo(...)` — surface as an approval
+            // banner above the matching thread's chat log. Stay
+            // mounted until either `SudoResolved` echoes or the user
+            // picks a decision (the user-side path optimistically
+            // drops the entry to keep the banner from flickering
+            // through the wire round-trip).
+            ServerToClient::SudoRequested {
+                function_id,
+                thread_id,
+                tool_name,
+                args,
+                reason,
+            } => {
+                self.pending_sudos.insert(
+                    function_id,
+                    PendingSudoState {
+                        thread_id,
+                        tool_name,
+                        args,
+                        reason,
+                    },
+                );
+            }
+            // Server-side resolution (this client's, another
+            // client's, or a timeout). Drop the slot so the banner
+            // disappears even when we weren't the resolver. Reject
+            // draft is dropped alongside so a stale text input
+            // doesn't haunt a future request that happens to reuse
+            // the function_id (server is monotonic, but the cleanup
+            // is cheap and defensive).
+            ServerToClient::SudoResolved { function_id, .. } => {
+                self.pending_sudos.remove(&function_id);
+                self.sudo_reject_drafts.remove(&function_id);
+            }
             ServerToClient::Error {
                 correlation_id,
                 thread_id,
@@ -2336,16 +2577,44 @@ impl App for ChatApp {
         // the chat log can read `is_hovering_within(row_key)` to
         // surface per-row affordances (e.g. the user-row fork
         // button) without mirroring hover state through `on_event`.
+        // Override the sidebar's baked-in `Fixed(SIDEBAR_WIDTH)` with
+        // the user-controlled `sidebar_width` so the resize handle
+        // can shrink / grow it. The handle sits between the sidebar
+        // and the content pane; its drag events fold into
+        // `sidebar_width` via `apply_event_fixed` in `on_event`.
+        let sidebar_el = self.sidebar().width(Size::Fixed(self.sidebar_width));
         overlays(
-            row([self.sidebar(), self.content(cx)])
-                .width(Size::Fill(1.0))
-                .height(Size::Fill(1.0))
-                .gap(0.0),
+            row([
+                sidebar_el,
+                resize_handle(Axis::Row).key(SIDEBAR_RESIZE_KEY),
+                self.content(cx),
+            ])
+            .width(Size::Fill(1.0))
+            .height(Size::Fill(1.0))
+            .gap(0.0),
             self.popover_layers(),
         )
     }
 
     fn on_event(&mut self, event: UiEvent) {
+        // Sidebar resize handle — pointer drag / arrow keys / Home /
+        // End on `sidebar:resize` fold into `sidebar_width`. Helper
+        // returns `true` if the value changed (no-op for events on
+        // other keys), so we can short-circuit the rest of the
+        // dispatch when this consumed the event.
+        if resize_handle::apply_event_fixed(
+            &mut self.sidebar_width,
+            &mut self.sidebar_drag,
+            &event,
+            SIDEBAR_RESIZE_KEY,
+            Axis::Row,
+            Side::Start,
+            tokens::SIDEBAR_WIDTH_MIN,
+            tokens::SIDEBAR_WIDTH_MAX,
+        ) {
+            return;
+        }
+
         // Window-level file drops route here regardless of which
         // keyed leaf is under the pointer — the compose attachment
         // strip is the only sink today, so we treat unrouted drops
@@ -2419,6 +2688,81 @@ impl App for ChatApp {
         {
             let thread_id = thread_id.to_string();
             self.select_thread(thread_id);
+            return;
+        }
+
+        // Inline-image click → open lightbox. Suffix is the
+        // display-item index in the active thread's view; we look the
+        // image back up rather than packing it into the route. Any
+        // non-Decoded state (URL placeholder, decode failure) is
+        // skipped — those rows aren't given a click key in the first
+        // place, but the guard here defends against a stale state
+        // change between build and click.
+        if let Some(key) = event.route()
+            && let Some(idx_str) = key.strip_prefix(CHAT_IMAGE_LIGHTBOX_PREFIX)
+            && matches!(event.kind, UiEventKind::Click | UiEventKind::Activate)
+            && let Ok(idx) = idx_str.parse::<usize>()
+        {
+            self.open_lightbox(idx);
+            return;
+        }
+        // Lightbox dismiss / close — both keys collapse to clearing
+        // the slot. The dialog scrim auto-emits the dismiss key on
+        // outside-click; the close button uses the explicit one.
+        if event.is_click_or_activate(LIGHTBOX_MODAL_DISMISS_KEY)
+            || event.is_click_or_activate(LIGHTBOX_MODAL_CLOSE_KEY)
+        {
+            self.lightbox = None;
+            return;
+        }
+
+        // Sudo banner: approve / remember / reject buttons + reject-
+        // reason text input. All four routes carry the function_id as
+        // suffix; we match on the prefix and parse the tail back.
+        // Optimistic resolution — drop the local slot before the
+        // server's `SudoResolved` echo lands so the banner doesn't
+        // flicker.
+        if let Some(key) = event.route()
+            && let Some(id_str) = key.strip_prefix(SUDO_APPROVE_PREFIX)
+            && matches!(event.kind, UiEventKind::Click | UiEventKind::Activate)
+            && let Ok(fn_id) = id_str.parse::<u64>()
+        {
+            self.resolve_sudo(fn_id, SudoDecision::ApproveOnce, None);
+            return;
+        }
+        if let Some(key) = event.route()
+            && let Some(id_str) = key.strip_prefix(SUDO_REMEMBER_PREFIX)
+            && matches!(event.kind, UiEventKind::Click | UiEventKind::Activate)
+            && let Ok(fn_id) = id_str.parse::<u64>()
+        {
+            self.resolve_sudo(fn_id, SudoDecision::ApproveRemember, None);
+            return;
+        }
+        if let Some(key) = event.route()
+            && let Some(id_str) = key.strip_prefix(SUDO_REJECT_PREFIX)
+            && !key.starts_with(SUDO_REJECT_REASON_PREFIX)
+            && matches!(event.kind, UiEventKind::Click | UiEventKind::Activate)
+            && let Ok(fn_id) = id_str.parse::<u64>()
+        {
+            let reason = self
+                .sudo_reject_drafts
+                .get(&fn_id)
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty());
+            self.resolve_sudo(fn_id, SudoDecision::Reject, reason);
+            return;
+        }
+        // Reject-reason text input. Routed key carries function_id;
+        // text_input::apply_event mutates the per-banner draft in
+        // place. We have to look the key up indirectly because
+        // `apply_event` takes the key by `&str`.
+        if let Some(key) = event.target_key()
+            && let Some(id_str) = key.strip_prefix(SUDO_REJECT_REASON_PREFIX)
+            && let Ok(fn_id) = id_str.parse::<u64>()
+        {
+            let key_owned = sudo_reject_reason_key(fn_id);
+            let draft = self.sudo_reject_drafts.entry(fn_id).or_default();
+            text_input::apply_event(draft, &mut self.selection, &key_owned, &event);
             return;
         }
 
@@ -2789,7 +3133,11 @@ impl App for ChatApp {
     }
 
     fn theme(&self) -> Theme {
-        Theme::aetna_dark()
+        // Aetna's slate + blue dark palette (Radix Colors). Card and
+        // popover are lifted above background out of the box, so the
+        // sidebar / new-thread card / behavior editor sheet read as
+        // distinct surfaces without any palette overrides on our side.
+        Theme::radix_slate_blue_dark()
     }
 }
 
@@ -2902,6 +3250,48 @@ fn chat_user_row_key(idx: usize) -> String {
 
 fn chat_user_fork_key(msg_index: usize) -> String {
     format!("{CHAT_USER_FORK_PREFIX}{msg_index}")
+}
+
+/// Routed key for clicking an inline image to open the fullscreen
+/// lightbox modal. Suffix is the display-item index in the active
+/// thread's `view.items` so the click handler can fetch the matching
+/// `DisplayItem::Image`. Mirrors the fork prefix's idx-keyed shape.
+const CHAT_IMAGE_LIGHTBOX_PREFIX: &str = "chat:image-lightbox:";
+
+fn chat_image_lightbox_key(idx: usize) -> String {
+    format!("{CHAT_IMAGE_LIGHTBOX_PREFIX}{idx}")
+}
+
+/// Routed-key shapes for the image lightbox modal.
+/// `lightbox:dismiss` is the scrim's outside-click route; the
+/// explicit close button uses `lightbox:close`.
+const LIGHTBOX_MODAL_DISMISS_KEY: &str = "lightbox:dismiss";
+const LIGHTBOX_MODAL_CLOSE_KEY: &str = "lightbox:close";
+
+/// Routed key for the sidebar resize handle. Drag / arrow / Home /
+/// End events on this key fold through `resize_handle::apply_event_fixed`
+/// to mutate `sidebar_width`.
+const SIDEBAR_RESIZE_KEY: &str = "sidebar:resize";
+
+/// Routed-key shapes for the sudo-approval banner. All four routes
+/// carry the `function_id` as suffix so multiple banners (one per
+/// pending request, ordered by id) coexist without colliding.
+const SUDO_APPROVE_PREFIX: &str = "sudo:approve:";
+const SUDO_REMEMBER_PREFIX: &str = "sudo:remember:";
+const SUDO_REJECT_PREFIX: &str = "sudo:reject:";
+const SUDO_REJECT_REASON_PREFIX: &str = "sudo:reject-reason:";
+
+fn sudo_approve_key(fn_id: u64) -> String {
+    format!("{SUDO_APPROVE_PREFIX}{fn_id}")
+}
+fn sudo_remember_key(fn_id: u64) -> String {
+    format!("{SUDO_REMEMBER_PREFIX}{fn_id}")
+}
+fn sudo_reject_key(fn_id: u64) -> String {
+    format!("{SUDO_REJECT_PREFIX}{fn_id}")
+}
+fn sudo_reject_reason_key(fn_id: u64) -> String {
+    format!("{SUDO_REJECT_REASON_PREFIX}{fn_id}")
 }
 
 /// Routed-key prefix the fork dialog uses. Extended keys:
@@ -3775,24 +4165,26 @@ impl ChatApp {
         // egui sibling's pod-as-collapsible-section idiom doesn't
         // scale when one pod dominates and the others are empty —
         // tabs put the focus on the workspace the user is in.
-        // Sidebar header: title fills available width, "+" entry
-        // point for new pods sits inline before the connection
-        // badge so both pieces of chrome cluster on the right edge.
-        // The "+" is the global pod-creation affordance — it's
-        // pod-tab-agnostic (the threads-section "+" is per-pod), so
-        // putting it in the sidebar header keeps the two scopes
-        // visually distinct.
-        // Header chrome on the right: "+ new pod" first, then the
-        // active-pod settings gear (only when a pod is selected — a
-        // gear without a target would be confusing), then the
-        // connection badge. Settings sits adjacent to the pod tab
-        // strip below it, so visually scoped to "this pod" even
-        // though the click is on the header row.
+        //
+        // Sidebar header: brand mark + title fill the leading edge;
+        // the "+ new pod" affordance and the per-pod settings gear
+        // hug the trailing edge. The connection badge moved out of
+        // the header to the sidebar footer so the header reads as
+        // pure identity / actions, not "where am I connected." The
+        // "+" is the global pod-creation affordance (the threads-
+        // section "+" is per-pod), so it stays in the header to keep
+        // the two scopes visually distinct.
         let mut header_row: Vec<El> = vec![
+            // Sparkles brand mark — single-glyph identity that
+            // distinguishes whisper-agent from a generic shadcn
+            // shell. Sized just under the title so the two read as
+            // a single chip rather than the icon dominating.
+            icon(crate::icons::ICON_SPARKLES.clone())
+                .icon_size(tokens::ICON_SM)
+                .text_color(tokens::PRIMARY),
             // Title eats the slack and ellipses if the right-hand
-            // chrome grows past the remaining width (e.g. the wider
-            // "connecting…" badge during early connect). The app
-            // name is fixed and contextual; clipping it is fine.
+            // chrome grows past the remaining width. The app name
+            // is fixed and contextual; clipping it is fine.
             text("whisper-agent")
                 .title()
                 .ellipsis()
@@ -3810,42 +4202,187 @@ impl ChatApp {
                     .icon_size(tokens::ICON_XS),
             );
         }
-        header_row.push(self.connection_badge());
-        let mut entries: Vec<El> = vec![sidebar_header([row(header_row)
+        let header_el = sidebar_header([row(header_row)
             .align(Align::Center)
             .gap(tokens::SPACE_2)
-            .width(Size::Fill(1.0))])];
+            .width(Size::Fill(1.0))]);
+
+        // Inner scroll viewport keeps the header pinned at the top and
+        // the footer pinned at the bottom while the body (pod tabs,
+        // threads, behaviors) scrolls independently. Without this,
+        // long thread lists push the footer past the bottom edge of
+        // the viewport. Keyed so the offset persists across rebuilds.
+        let mut body_entries: Vec<El> = Vec::new();
 
         if self.pods.is_empty() {
-            entries.push(text("no pods yet").muted().small());
-            return sidebar(entries);
-        }
+            // Empty workspace: small inline icon + body so the
+            // sidebar doesn't read as a single dead "no pods yet"
+            // line. The "+" in the header above is the actionable
+            // affordance — this block just makes the empty state
+            // legible at a glance.
+            body_entries.push(self.sidebar_inline_empty(
+                crate::icons::ICON_INBOX.clone(),
+                "No pods yet",
+                "Use \u{2018}+\u{2019} above to create one.",
+            ));
+        } else {
+            body_entries.push(self.pod_tabs());
 
-        entries.push(self.pod_tabs());
+            if let Some(active) = self.pod_tab.as_deref() {
+                // Threads (interactive — `origin == None`) come first;
+                // they're the day-to-day reading order. Behavior-
+                // spawned threads (`origin == Some(behavior_id)`) nest
+                // under their parent behavior in the section below,
+                // since grouping per-behavior runs is more useful than
+                // mixing them into the interactive list. Mirrors the
+                // egui sibling's partition.
+                body_entries.push(self.threads_section(active));
 
-        if let Some(active) = self.pod_tab.as_deref() {
-            // Threads (interactive — `origin == None`) come first;
-            // they're the day-to-day reading order. Behavior-spawned
-            // threads (`origin == Some(behavior_id)`) nest under
-            // their parent behavior in the section below, since
-            // grouping per-behavior runs is more useful than mixing
-            // them into the interactive list. Mirrors the egui
-            // sibling's partition.
-            entries.push(self.threads_section(active));
-
-            // Render the section once the per-pod `BehaviorList`
-            // round-trip has landed — even if the list is empty,
-            // since the header carries the "+ New behavior"
-            // affordance the user still needs. Skip entirely
-            // before the round-trip arrives so a "just connected"
-            // sidebar doesn't flash an empty section that
-            // immediately repopulates a frame later.
-            if let Some(behaviors) = self.behaviors_by_pod.get(active) {
-                entries.push(self.behaviors_section(active, behaviors));
+                // Render the section once the per-pod `BehaviorList`
+                // round-trip has landed — even if the list is empty,
+                // since the header carries the "+ New behavior"
+                // affordance the user still needs. Skip entirely
+                // before the round-trip arrives so a "just connected"
+                // sidebar doesn't flash an empty section that
+                // immediately repopulates a frame later.
+                if let Some(behaviors) = self.behaviors_by_pod.get(active) {
+                    body_entries.push(self.behaviors_section(active, behaviors));
+                }
             }
         }
 
-        sidebar(entries)
+        // 2 px of horizontal padding gives the inner items' focus
+        // rings room to paint inside the scroll's clip rect (rings
+        // extend `tokens::RING_WIDTH` outside the row's bounding box).
+        // Without it the lint flags every keyboard-focusable thread
+        // row as clipped.
+        let body = scroll(body_entries)
+            .key("sidebar-content")
+            .gap(tokens::SPACE_4)
+            .padding(Sides {
+                left: tokens::RING_WIDTH,
+                right: tokens::RING_WIDTH,
+                top: 0.0,
+                bottom: 0.0,
+            })
+            .width(Size::Fill(1.0))
+            .height(Size::Fill(1.0));
+
+        sidebar([header_el, body, self.sidebar_footer()])
+    }
+
+    /// Sidebar footer block — server URL + connection status badge,
+    /// rendered as a thin top-bordered strip at the bottom of the
+    /// sidebar. The server URL line is suppressed when the host
+    /// hasn't supplied one (CLI flag missing, login-skip path);
+    /// the connection status line always renders.
+    ///
+    /// Both lines use the same small / muted typography with a
+    /// leading 8 px chrome dot — the server-URL row's lucide-server
+    /// icon and the status row's colored circle. Treating them as
+    /// a single visual family keeps the footer reading as one
+    /// quiet metadata strip rather than "icon-and-text plus a
+    /// floating pill."
+    fn sidebar_footer(&self) -> El {
+        let mut rows: Vec<El> = Vec::new();
+        if let Some(label) = self.server_label.as_deref() {
+            rows.push(
+                row([
+                    icon(crate::icons::ICON_SERVER.clone())
+                        .icon_size(tokens::ICON_XS)
+                        .text_color(tokens::MUTED_FOREGROUND),
+                    text(label)
+                        .small()
+                        .muted()
+                        .ellipsis()
+                        .width(Size::Fill(1.0)),
+                ])
+                .gap(tokens::SPACE_2)
+                .align(Align::Center)
+                .width(Size::Fill(1.0)),
+            );
+        }
+        rows.push(self.connection_status_line());
+        column(rows)
+            .gap(tokens::SPACE_2)
+            .padding(Sides {
+                left: tokens::SPACE_2,
+                right: tokens::SPACE_2,
+                top: tokens::SPACE_3,
+                bottom: tokens::SPACE_1,
+            })
+            .width(Size::Fill(1.0))
+            .stroke(tokens::BORDER)
+    }
+
+    /// Status-dot + label row used in the sidebar footer. The dot's
+    /// color carries the semantic (`success` / `muted` / `warning` /
+    /// `destructive`) and the label is muted text — same shape as
+    /// the server-URL row above it. `Connecting` reads as `…`-
+    /// suffixed; the others are single words. No colored fill on
+    /// the text — putting the color on the dot lets the row sit
+    /// quietly next to the server-URL line instead of competing.
+    fn connection_status_line(&self) -> El {
+        let dot_color = match self.conn_status {
+            ConnectionStatus::Connected => tokens::SUCCESS,
+            ConnectionStatus::Connecting => tokens::MUTED_FOREGROUND,
+            ConnectionStatus::Closed => tokens::WARNING,
+            ConnectionStatus::Error => tokens::DESTRUCTIVE,
+        };
+        // 8 px circle aligned to the same gutter the lucide-server
+        // icon occupies in the row above. `radius(4)` on an 8 px
+        // square gives a true circle on integer pixel boundaries.
+        let dot = El::new(Kind::Custom("status-dot"))
+            .width(Size::Fixed(8.0))
+            .height(Size::Fixed(8.0))
+            .fill(dot_color)
+            .radius(4.0);
+        // Center the dot inside the same 14 px box `tokens::ICON_XS`
+        // produces, so the dot's left edge lines up with the server
+        // icon's left edge — the two footer rows then share a clean
+        // leading gutter.
+        let dot_box = column([dot])
+            .width(Size::Fixed(tokens::ICON_XS))
+            .height(Size::Fixed(tokens::ICON_XS))
+            .align(Align::Center)
+            .justify(Justify::Center);
+
+        row([
+            dot_box,
+            text(self.conn_status.label())
+                .small()
+                .muted()
+                .width(Size::Fill(1.0)),
+        ])
+        .gap(tokens::SPACE_2)
+        .align(Align::Center)
+        .width(Size::Fill(1.0))
+    }
+
+    /// Compact inline empty-state strip used inside the sidebar (where
+    /// the chat-pane's full `empty_state(…)` medallion would dwarf the
+    /// 224 px column). Icon + headline on one line, muted body on a
+    /// second.
+    fn sidebar_inline_empty(
+        &self,
+        icon_src: aetna_core::SvgIcon,
+        headline: &str,
+        body: &str,
+    ) -> El {
+        column([
+            row([
+                icon(icon_src)
+                    .icon_size(tokens::ICON_SM)
+                    .text_color(tokens::MUTED_FOREGROUND),
+                text(headline).small().semibold(),
+            ])
+            .gap(tokens::SPACE_2)
+            .align(Align::Center),
+            text(body).xsmall().muted(),
+        ])
+        .gap(tokens::SPACE_1)
+        .padding(Sides::xy(tokens::SPACE_2, tokens::SPACE_2))
+        .width(Size::Fill(1.0))
     }
 
     /// Behaviors subsection for the active pod: header + per-behavior
@@ -3897,10 +4434,11 @@ impl ChatApp {
         if behaviors.is_empty() {
             return sidebar_group(vec![
                 header,
-                text("no behaviors in this pod yet")
-                    .muted()
-                    .small()
-                    .padding(Sides::xy(tokens::SPACE_2, tokens::SPACE_1)),
+                self.sidebar_inline_empty(
+                    crate::icons::ICON_ZAP.clone(),
+                    "No behaviors yet",
+                    "Triggered runs will appear here.",
+                ),
             ]);
         }
 
@@ -4155,12 +4693,11 @@ impl ChatApp {
         let mut group_children: Vec<El> = vec![header];
 
         if threads.is_empty() {
-            group_children.push(
-                text("no threads in this pod yet")
-                    .muted()
-                    .small()
-                    .padding(Sides::xy(tokens::SPACE_2, tokens::SPACE_1)),
-            );
+            group_children.push(self.sidebar_inline_empty(
+                crate::icons::ICON_MESSAGE_SQUARE.clone(),
+                "No threads in this pod",
+                "Hit \u{2018}+\u{2019} to start one.",
+            ));
             return sidebar_group(group_children);
         }
 
@@ -4241,17 +4778,6 @@ impl ChatApp {
             row_el = row_el.pl(tokens::SPACE_3 + tokens::SPACE_3 * depth as f32);
         }
         row_el
-    }
-
-    fn connection_badge(&self) -> El {
-        let label = self.conn_status.label();
-        let b = badge(label);
-        match self.conn_status {
-            ConnectionStatus::Connected => b.success(),
-            ConnectionStatus::Connecting => b.muted(),
-            ConnectionStatus::Closed => b.warning(),
-            ConnectionStatus::Error => b.destructive(),
-        }
     }
 
     /// Pods sorted for display: non-archived first, then by name
@@ -4387,8 +4913,27 @@ impl ChatApp {
             }
             toolbar_children.push(state_badge(s.state));
         }
-        let mut header_rows: Vec<El> =
-            vec![toolbar(toolbar_children), text(thread_id).muted().xsmall()];
+        // Sub-line under the toolbar: thread id (left) and the
+        // backend/model + cumulative-usage chrome (right). Both
+        // pieces are caption-sized muted metadata that doesn't
+        // compete with the title; right-aligning the model + usage
+        // mirrors the egui sibling's status bar where this lived.
+        let mut sub_line: Vec<El> = vec![text(thread_id).muted().xsmall().width(Size::Fill(1.0))];
+        if let Some(v) = view {
+            if let Some(model_chip) = thread_model_chip(&v.backend, &v.model) {
+                sub_line.push(model_chip);
+            }
+            if let Some(usage_chip) = thread_usage_chip(&v.total_usage) {
+                sub_line.push(usage_chip);
+            }
+        }
+        let mut header_rows: Vec<El> = vec![
+            toolbar(toolbar_children),
+            row(sub_line)
+                .gap(tokens::SPACE_3)
+                .align(Align::Center)
+                .width(Size::Fill(1.0)),
+        ];
         // Prefill progress: a thin progress bar plus a muted token
         // count, rendered while the model is ingesting the prompt.
         // Cleared automatically once the first text/reasoning delta
@@ -4408,8 +4953,16 @@ impl ChatApp {
         let scroll_key = format!("chat-scroll:{thread_id}");
 
         let body: El = match view {
-            None => empty_state("loading…"),
-            Some(v) if v.items.is_empty() => empty_state("no messages yet"),
+            None => empty_state(
+                crate::icons::ICON_MESSAGE_SQUARE.clone(),
+                "Loading thread",
+                "Catching up on this conversation\u{2026}",
+            ),
+            Some(v) if v.items.is_empty() => empty_state(
+                crate::icons::ICON_MESSAGE_SQUARE.clone(),
+                "No messages yet",
+                "Type below and hit Enter to start the conversation.",
+            ),
             Some(v) => {
                 // Thread the row index in as the accordion `value` so
                 // each reasoning / tool row has an independent open
@@ -4443,6 +4996,13 @@ impl ChatApp {
         let mut layers: Vec<El> = vec![header];
         if let Some(banner) = self.thread_failure_banner(thread_id) {
             layers.push(banner);
+        }
+        // Pending sudo banners ride above the chat log so the user
+        // can't miss an approval request hidden under a long stream
+        // of streaming output. Only this thread's banners surface —
+        // other threads' pending sudos stay scoped to their own pane.
+        if let Some(banners) = self.render_pending_sudo_banners(thread_id) {
+            layers.push(banners);
         }
         layers.push(body);
         layers.push(self.compose_box());
@@ -4655,6 +5215,12 @@ impl ChatApp {
             }
         }
         if let Some(modal_el) = self.render_fork_modal() {
+            out.push(Some(modal_el));
+        }
+        // Lightbox last so it paints on top of any other layer —
+        // clicking an image in the chat log is a deliberate "show me
+        // this big," and a stray modal underneath shouldn't clip it.
+        if let Some(modal_el) = self.render_lightbox_modal() {
             out.push(Some(modal_el));
         }
         out
@@ -8480,6 +9046,182 @@ impl ChatApp {
     /// `switch`-shaped form items (Archive original, Reset
     /// capabilities) with form_descriptions clarifying the
     /// non-obvious choice.
+    /// Optimistically resolve a pending sudo: drop the local entry
+    /// (so the banner clears immediately) and ship `ResolveSudo`. The
+    /// server's `SudoResolved` echo lands later as a no-op since the
+    /// slot is already gone. Mirrors the egui sibling's optimistic
+    /// drop pattern — keeping the banner mounted through the round-
+    /// trip flickered noticeably on the approve path, where the
+    /// thread's next turn fires immediately.
+    fn resolve_sudo(&mut self, function_id: u64, decision: SudoDecision, reason: Option<String>) {
+        self.pending_sudos.remove(&function_id);
+        self.sudo_reject_drafts.remove(&function_id);
+        self.send(ClientToServer::ResolveSudo {
+            function_id,
+            decision,
+            reason,
+        });
+    }
+
+    /// Render one approval banner per pending sudo whose `thread_id`
+    /// matches `thread_id`. Returns `None` when there are no banners
+    /// to surface — caller can short-circuit the section. Each banner
+    /// shows: tool name, pretty-printed args, model justification,
+    /// and three actions (Approve once / Remember / Reject) with an
+    /// optional reject-reason text input.
+    fn render_pending_sudo_banners(&self, thread_id: &str) -> Option<El> {
+        let mut ids: Vec<u64> = self
+            .pending_sudos
+            .iter()
+            .filter_map(|(id, s)| (s.thread_id == thread_id).then_some(*id))
+            .collect();
+        if ids.is_empty() {
+            return None;
+        }
+        ids.sort_unstable();
+
+        let mut banners: Vec<El> = Vec::with_capacity(ids.len());
+        for fn_id in ids {
+            let Some(s) = self.pending_sudos.get(&fn_id) else {
+                continue;
+            };
+            banners.push(self.sudo_banner(fn_id, s));
+        }
+        Some(
+            column(banners)
+                .gap(tokens::SPACE_2)
+                .padding(Sides::xy(tokens::SPACE_4, tokens::SPACE_2))
+                .width(Size::Fill(1.0)),
+        )
+    }
+
+    /// One sudo-approval banner. Built as an `alert(...).warning()`
+    /// so it visually announces "model is asking to do something"
+    /// without the destructive red used for failures. The body is
+    /// a column carrying the tool name + pretty-printed args + the
+    /// model's justification + the approve/remember/reject row + an
+    /// optional reject-reason text input.
+    fn sudo_banner(&self, fn_id: u64, s: &PendingSudoState) -> El {
+        let args_pretty =
+            serde_json::to_string_pretty(&s.args).unwrap_or_else(|_| s.args.to_string());
+
+        let approve = button("Approve").key(sudo_approve_key(fn_id)).primary();
+        let remember = button("Remember").key(sudo_remember_key(fn_id));
+        let reject = button("Reject").key(sudo_reject_key(fn_id)).destructive();
+        let reason_key = sudo_reject_reason_key(fn_id);
+        let reason_buf = self
+            .sudo_reject_drafts
+            .get(&fn_id)
+            .cloned()
+            .unwrap_or_default();
+        let reason_input = text_input_with(
+            &reason_buf,
+            &self.selection,
+            &reason_key,
+            TextInputOpts::default().placeholder("reject reason (optional)"),
+        );
+
+        let body = column([
+            text(format!("tool: {}", s.tool_name)).code(),
+            text(args_pretty).code().small(),
+            text(if s.reason.trim().is_empty() {
+                String::new()
+            } else {
+                format!("reason: {}", s.reason)
+            })
+            .small()
+            .muted(),
+            row([approve, remember, reject])
+                .gap(tokens::SPACE_2)
+                .align(Align::Center),
+            reason_input,
+        ])
+        .gap(tokens::SPACE_2)
+        .width(Size::Fill(1.0));
+
+        alert([
+            alert_title(format!("sudo requested · fn #{fn_id}")),
+            alert_description(""),
+            body,
+        ])
+        .warning()
+    }
+
+    /// Promote the inline `DisplayItem::Image` at `idx` into the
+    /// lightbox slot. No-op when the active view's item at `idx`
+    /// isn't an Image, or its state isn't Decoded — the click
+    /// affordance is only attached to Decoded rows in the first
+    /// place, but the guards defend against a snapshot rolling
+    /// between build and click.
+    fn open_lightbox(&mut self, idx: usize) {
+        let Some(thread_id) = self.selected.as_deref() else {
+            return;
+        };
+        let Some(view) = self.views.get(thread_id) else {
+            return;
+        };
+        let Some(item) = view.items.get(idx) else {
+            return;
+        };
+        if let DisplayItem::Image {
+            state:
+                ImageRenderState::Decoded {
+                    image,
+                    width,
+                    height,
+                },
+            ..
+        } = item
+        {
+            self.lightbox = Some(LightboxState {
+                image: image.clone(),
+                width: *width,
+                height: *height,
+            });
+        }
+    }
+
+    /// Fullscreen image-lightbox modal. The default `dialog(...)`
+    /// helper hard-codes `width = Fixed(420)` on its modal panel,
+    /// which would clip a wide screenshot to a narrow column — so we
+    /// reach for `dialog_content(...)` directly (still gets the
+    /// shadcn-shaped surface chrome, `Popover` role, padding, gap,
+    /// shadow) and override the width to `Hug` so it sizes to the
+    /// image's display dimensions instead. The `overlay + scrim`
+    /// frame is the same shape `dialog(...)` would have built.
+    fn render_lightbox_modal(&self) -> Option<El> {
+        let lb = self.lightbox.as_ref()?;
+        // Cap larger than the inline `MAX_DISPLAY_HEIGHT` so the
+        // lightbox is meaningfully bigger than the in-row preview;
+        // 720 fits comfortably inside a 1080-tall viewport once the
+        // dialog chrome + caption are accounted for.
+        const LIGHTBOX_MAX_W: f32 = 1100.0;
+        const LIGHTBOX_MAX_H: f32 = 720.0;
+        let (w, h) = lightbox_display_dims(lb.width, lb.height, LIGHTBOX_MAX_W, LIGHTBOX_MAX_H);
+
+        let body = column([
+            image(lb.image.clone())
+                .image_fit(ImageFit::Contain)
+                .width(Size::Fixed(w))
+                .height(Size::Fixed(h))
+                .radius(tokens::RADIUS_SM),
+            text(format!("{} \u{00D7} {}", lb.width, lb.height))
+                .caption()
+                .muted(),
+        ])
+        .gap(tokens::SPACE_2)
+        .align(Align::Center)
+        .width(Size::Hug);
+
+        let close = button("Close").key(LIGHTBOX_MODAL_CLOSE_KEY);
+        let children: Vec<El> = vec![body, dialog_footer([close])];
+
+        Some(overlay([
+            scrim(LIGHTBOX_MODAL_DISMISS_KEY),
+            dialog_content(children).width(Size::Hug).block_pointer(),
+        ]))
+    }
+
     fn render_fork_modal(&self) -> Option<El> {
         let modal = self.fork_modal.as_ref()?;
 
@@ -8608,10 +9350,12 @@ impl ChatApp {
 
         // The compose row sits at the bottom of the pane: text_area
         // takes the leftover width, attach + send hug to the right.
-        // `card([...])` would over-style this — it's part of the
-        // same content surface — so we use a thin top stroke as the
-        // visual divider from the chat log. Thread-action row +
-        // thumbnail strip + hint sit above when relevant.
+        // We lift its fill to `tokens::CARD` so it reads as an
+        // elevated bottom panel against the deeper chat-log
+        // background — the panel stops feeling continuous with the
+        // scroll area and the user has a clear "compose surface" to
+        // land on. Thread-action row + thumbnail strip + hint sit
+        // above when relevant.
         let mut children: Vec<El> = Vec::new();
         if let Some(actions) = self.thread_actions_row() {
             children.push(actions);
@@ -8628,12 +9372,48 @@ impl ChatApp {
                 .align(Align::End)
                 .width(Size::Fill(1.0)),
         );
+        // Static keyboard-shortcut footer beneath the compose row.
+        // Only visible when the buffer is empty + no attachments are
+        // staged — the moment the user starts typing the cue is no
+        // longer load-bearing. Mirrors how a placeholder would behave
+        // if `text_area` had one (it doesn't yet).
+        if buf.is_empty() && self.compose_attachments.is_empty() {
+            children.push(self.compose_kbd_hint());
+        }
         column(children)
             .gap(tokens::SPACE_2)
             .padding(tokens::SPACE_3)
             .width(Size::Fill(1.0))
+            // Panel role disambiguates this from a hand-rolled card —
+            // the bottom compose strip is a docked surface (no rounded
+            // corners, full bleed) that doesn't fit the `card([…])`
+            // recipe but does want the elevated CARD fill.
+            .surface_role(SurfaceRole::Panel)
             .stroke(tokens::BORDER)
-            .fill(tokens::BACKGROUND)
+            .fill(tokens::CARD)
+    }
+
+    /// Small caption row beneath the compose textarea that surfaces the
+    /// Enter-to-send convention. Two muted chips:
+    /// `↵ to send` and `⇧+↵ for newline`. Built as a single right-
+    /// aligned row so it lives just under the Send button without
+    /// stealing focus from anything else on the bar.
+    fn compose_kbd_hint(&self) -> El {
+        let return_chip = row([
+            icon(crate::icons::ICON_RETURN.clone())
+                .icon_size(tokens::ICON_XS)
+                .text_color(tokens::MUTED_FOREGROUND),
+            text("to send").xsmall().muted(),
+        ])
+        .gap(tokens::SPACE_1)
+        .align(Align::Center);
+
+        let shift_chip = text("Shift+\u{21B5} for newline").xsmall().muted();
+
+        row([spacer(), return_chip, shift_chip])
+            .gap(tokens::SPACE_3)
+            .align(Align::Center)
+            .width(Size::Fill(1.0))
     }
 
     /// Whether the currently-selected thread is in `Working` state.
@@ -8768,12 +9548,34 @@ fn truncate_filename(name: &str, max_chars: usize) -> String {
     format!("{prefix}…{suffix}")
 }
 
-fn empty_state(label: &str) -> El {
-    column([text(label).muted()])
-        .padding(tokens::SPACE_6)
-        .align(Align::Center)
-        .width(Size::Fill(1.0))
-        .height(Size::Fill(1.0))
+/// Centered empty-state block for the chat pane. Shows a soft-tint
+/// circular icon medallion above a headline and a muted body line.
+/// Lighter than `card([…])` (no border, no fill) so it doesn't compete
+/// with adjacent chrome; the icon medallion is the only colored
+/// element so the eye still has something to land on instead of bare
+/// text floating in the middle of the pane.
+fn empty_state(icon_src: aetna_core::SvgIcon, headline: &str, body: &str) -> El {
+    let medallion = column([icon(icon_src)
+        .icon_size(28.0)
+        .text_color(tokens::MUTED_FOREGROUND)])
+    .width(Size::Fixed(64.0))
+    .height(Size::Fixed(64.0))
+    .align(Align::Center)
+    .justify(Justify::Center)
+    .fill(tokens::MUTED)
+    .radius(32.0);
+
+    column([
+        medallion,
+        text(headline).label().semibold(),
+        paragraph(body).muted().small(),
+    ])
+    .padding(tokens::SPACE_6)
+    .gap(tokens::SPACE_3)
+    .align(Align::Center)
+    .justify(Justify::Center)
+    .width(Size::Fill(1.0))
+    .height(Size::Fill(1.0))
 }
 
 /// Map a `TriggerSpec` to the same short discriminator the server
@@ -9220,10 +10022,24 @@ impl ChatApp {
                     tokens::SUCCESS
                 };
                 let body = image_body(state);
-                if *is_user {
-                    log_row(gutter, Some(tokens::INFO.with_alpha(64)), body)
+                // Clickable wrapper opens the fullscreen lightbox.
+                // Only Decoded states get the click affordance — a
+                // URL placeholder and a decode-failure row are
+                // already non-interactive blocks. The route key
+                // carries the row idx so `on_event` can pull the
+                // matching display item out of the active view.
+                let is_clickable = matches!(state, ImageRenderState::Decoded { .. });
+                let body_keyed = if is_clickable {
+                    body.key(chat_image_lightbox_key(idx))
+                        .focusable()
+                        .cursor(Cursor::Pointer)
                 } else {
-                    log_row(gutter, None, body)
+                    body
+                };
+                if *is_user {
+                    log_row(gutter, Some(tokens::INFO.with_alpha(64)), body_keyed)
+                } else {
+                    log_row(gutter, None, body_keyed)
                 }
             }
         }
@@ -9292,6 +10108,20 @@ fn display_dims(src_w: u32, src_h: u32, max_h: f32) -> (f32, f32) {
     }
     let scale = max_h / src_h;
     (src_w * scale, max_h)
+}
+
+/// Same as [`display_dims`] but with a separate width cap. The
+/// lightbox modal needs both axes constrained: a wide ultrawide
+/// screenshot at native dims would punch out of the dialog, and a
+/// tall portrait would push the close button off-screen. Aspect is
+/// preserved by picking the smaller of the two scale factors.
+fn lightbox_display_dims(src_w: u32, src_h: u32, max_w: f32, max_h: f32) -> (f32, f32) {
+    let src_w = src_w.max(1) as f32;
+    let src_h = src_h.max(1) as f32;
+    let scale_w = max_w / src_w;
+    let scale_h = max_h / src_h;
+    let scale = scale_w.min(scale_h).min(1.0);
+    (src_w * scale, src_h * scale)
 }
 
 /// Collapsed-header label for a tool call. Three pieces compose

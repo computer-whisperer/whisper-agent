@@ -296,10 +296,21 @@ enum Scene {
     /// is verified live in the dev binary; the dump captures the
     /// post-click modal layout.)
     ForkModalOpen,
+    /// Image lightbox modal opened by clicking an inline image.
+    /// Exercises the `CHAT_IMAGE_LIGHTBOX_PREFIX` route, the
+    /// `LightboxState` slot, and the `render_lightbox_modal`
+    /// dialog layout (image at constrained dims + caption + close
+    /// button + scrim dismiss).
+    LightboxOpen,
+    /// Pending sudo approval banner. Seeded via a synthetic
+    /// `ServerToClient::SudoRequested` event so the renderer can
+    /// snapshot the warning-styled `alert` shape and the three
+    /// approve / remember / reject affordances above the chat log.
+    SudoPending,
 }
 
 impl Scene {
-    const ALL: [Scene; 41] = [
+    const ALL: [Scene; 43] = [
         Scene::Connecting,
         Scene::Connected,
         Scene::Closed,
@@ -341,6 +352,8 @@ impl Scene {
         Scene::BehaviorEditorSystemPromptTab,
         Scene::BehaviorEditorRawTab,
         Scene::ForkModalOpen,
+        Scene::LightboxOpen,
+        Scene::SudoPending,
     ];
 
     fn slug(self) -> &'static str {
@@ -386,6 +399,8 @@ impl Scene {
             Scene::BehaviorEditorSystemPromptTab => "behavior_editor_system_prompt_tab",
             Scene::BehaviorEditorRawTab => "behavior_editor_raw_tab",
             Scene::ForkModalOpen => "fork_modal_open",
+            Scene::LightboxOpen => "lightbox_open",
+            Scene::SudoPending => "sudo_pending",
         }
     }
 
@@ -516,6 +531,17 @@ impl Scene {
             // hit-test, so the hover-conditional render of the
             // affordance doesn't matter for the on_event dispatch.
             Scene::ForkModalOpen => vec!["thread:t-1", "chat:user-fork:1"],
+            // Select the image-bearing thread, then click the user's
+            // PNG screenshot to open the lightbox. `mock_image_snapshot`
+            // pushes [system(empty, skipped), user{Text, Image(bytes),
+            // Image(url)}, assistant{Text, Image}, TurnStats] — so the
+            // user's decoded PNG lands at display-item idx 1.
+            Scene::LightboxOpen => vec!["thread:t-1", "chat:image-lightbox:1"],
+            // Select the thread; the sudo wire seed lands during
+            // before_build, so the banner is already rendered by the
+            // time clicks finish. No further interaction needed —
+            // this scene just snapshots the pending-approval shape.
+            Scene::SudoPending => vec!["thread:t-1"],
             // Pick a backend (which fires a no-op `ListModels`),
             // then a model id from the pre-seeded `ModelsList`,
             // then a pod. Each `option:` click goes through
@@ -681,7 +707,9 @@ fn build_app(scene: Scene) -> Box<dyn App> {
         | Scene::ThreadWithSetup
         | Scene::ThreadWithDiff
         | Scene::ThreadWithProvenance
-        | Scene::ThreadWithFailure => {
+        | Scene::ThreadWithFailure
+        | Scene::LightboxOpen
+        | Scene::SudoPending => {
             q.push_back(InboundEvent::ConnectionOpened);
             q.push_back(InboundEvent::Wire(ServerToClient::PodList {
                 correlation_id: None,
@@ -740,7 +768,7 @@ fn build_app(scene: Scene) -> Box<dyn App> {
                     snapshot: mock_draft_snapshot(),
                 }));
             }
-            if matches!(scene, Scene::ThreadWithImages) {
+            if matches!(scene, Scene::ThreadWithImages | Scene::LightboxOpen) {
                 q.push_back(InboundEvent::Wire(ServerToClient::ThreadSnapshot {
                     thread_id: "t-1".into(),
                     snapshot: mock_image_snapshot(),
@@ -762,6 +790,27 @@ fn build_app(scene: Scene) -> Box<dyn App> {
                 q.push_back(InboundEvent::Wire(ServerToClient::ThreadSnapshot {
                     thread_id: "t-1".into(),
                     snapshot: mock_failure_snapshot(),
+                }));
+            }
+            if matches!(scene, Scene::SudoPending) {
+                // Bare snapshot first so the chat pane has something
+                // to render under the banner; then a synthetic sudo
+                // request the model would have emitted mid-turn.
+                q.push_back(InboundEvent::Wire(ServerToClient::ThreadSnapshot {
+                    thread_id: "t-1".into(),
+                    snapshot: mock_snapshot(),
+                }));
+                q.push_back(InboundEvent::Wire(ServerToClient::SudoRequested {
+                    function_id: 7,
+                    thread_id: "t-1".into(),
+                    tool_name: "bash".into(),
+                    args: serde_json::json!({
+                        "command": "rm -rf node_modules && npm ci",
+                        "cwd": "/repo",
+                    }),
+                    reason: "Need to wipe and reinstall to clear the corrupted lockfile state \
+                         before retrying the failing test."
+                        .into(),
                 }));
             }
         }
@@ -1625,10 +1674,24 @@ fn mock_snapshot() -> ThreadSnapshot {
             max_turns: 8,
             compaction: CompactionConfig::default(),
         },
-        bindings: ThreadBindings::default(),
+        // Seed a backend so the thread-header `backend/model` chip
+        // exercises the populated branch in dump scenes that ride
+        // this snapshot.
+        bindings: ThreadBindings {
+            backend: "anthropic-prod".into(),
+            ..ThreadBindings::default()
+        },
         state: ThreadStateLabel::Idle,
         conversation: conv,
-        total_usage: Usage::default(),
+        // Seed cumulative usage so the header's right-aligned
+        // ↑/↓/cache chip renders with realistic data instead of a
+        // suppressed-zero state.
+        total_usage: Usage {
+            input_tokens: 1234,
+            output_tokens: 287,
+            cache_read_input_tokens: 800,
+            cache_creation_input_tokens: 200,
+        },
         turn_log: TurnLog::default(),
         draft: String::new(),
         created_at: "2026-05-08T10:00:00Z".into(),
@@ -2041,10 +2104,24 @@ fn mock_tool_snapshot() -> ThreadSnapshot {
             max_turns: 8,
             compaction: CompactionConfig::default(),
         },
-        bindings: ThreadBindings::default(),
+        // Seed a backend so the thread-header `backend/model` chip
+        // exercises the populated branch in dump scenes that ride
+        // this snapshot.
+        bindings: ThreadBindings {
+            backend: "anthropic-prod".into(),
+            ..ThreadBindings::default()
+        },
         state: ThreadStateLabel::Idle,
         conversation: conv,
-        total_usage: Usage::default(),
+        // Seed cumulative usage so the header's right-aligned
+        // ↑/↓/cache chip renders with realistic data instead of a
+        // suppressed-zero state.
+        total_usage: Usage {
+            input_tokens: 1234,
+            output_tokens: 287,
+            cache_read_input_tokens: 800,
+            cache_creation_input_tokens: 200,
+        },
         turn_log: TurnLog::default(),
         draft: String::new(),
         created_at: "2026-05-08T10:00:00Z".into(),

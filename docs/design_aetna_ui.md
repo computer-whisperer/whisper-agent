@@ -1197,6 +1197,91 @@ Server-side: a workspace feature on `whisper-agent` (e.g.
 At that point we can ship a single binary that defaults to whichever ui
 the build picks.
 
+## Migration gaps from egui webui
+
+Once the staged surfaces above are green, the remaining diff between
+`whisper-agent-aetna-ui` and `whisper-agent-webui` is a pile of
+smaller features that don't slot under any one stage. Tracked here so
+they don't get lost in the long tail. Effort tags are
+trivial / small / medium / large.
+
+### Chat-log / per-message details
+
+- ✅ **Per-turn token & cache stats.** `DisplayItem::TurnStats` (rendered
+  via `turn_stats_text` in `app.rs`) emits `in 1,234 · cached 800 ·
+  created 200 · out 567` after every assistant turn. Mirrors the egui
+  sibling's `render_turn_stats` (chat_render.rs:865).
+- ✅ **User-message inline thumbnails.** Wire arm now decodes each
+  `Attachment::Image` in `ThreadUserMessage` and pushes a
+  `DisplayItem::Image { is_user: true, … }` row, mirroring the
+  snapshot path. (Snapshot path was already correct via
+  `conversation_to_display_items`; live wire arm caught up.)
+
+### Thread header / chrome
+
+- ✅ **Backend / model chip.** Right-aligned caption under the title:
+  `anthropic-prod/claude-opus-4-7`. Hydrated from
+  `ThreadSnapshot::bindings.backend` + `config.model`.
+- ✅ **Cumulative usage chip.** Right-aligned caption: `↑ in · ↓ out
+  · cache r/c`. Hydrated from `ThreadSnapshot::total_usage`,
+  incremented on each `ThreadAssistantEnd` arm. Mirrors egui's
+  status-bar strip (app.rs:2693 in webui).
+
+### Modals
+
+- ✅ **Image lightbox.** Decoded inline images carry a click route
+  (`chat:image-lightbox:{idx}`); the click hydrates a `LightboxState`
+  slot and `render_lightbox_modal` paints a fullscreen `dialog` with
+  the image at constrained max dims, a dimensions caption, and a
+  Close button. Scrim auto-dismisses on outside-click.
+- ⏳ **JSON tree viewer.** Read-only collapsible-tree display for
+  tool-result and server-config JSON payloads. Egui's
+  `render_json_viewer_modal` (modals/viewers.rs:175). *Small.*
+- ⏳ **File browser / editor.** Tree of pod files; click-to-edit in a
+  `text_area` with save. Egui's `render_file_viewer_modal`
+  (modals/viewers.rs:260). *Medium — tree navigation + dirty-tracking.*
+- ⏳ **Server settings.** Three tabs (LLM backends with Codex auth
+  rotate, Shared MCP hosts CRUD with auth config, raw server
+  TOML). Egui's `modals/settings.rs`. Reachable via the cog icon
+  in the egui top bar; aetna's equivalent surface is the sidebar
+  footer or an as-yet-unbuilt top bar. *Medium.*
+- ⏳ **Knowledge buckets.** Full CRUD for the bucket lifecycle:
+  create form (quantization / driver / cadence pickers for
+  tracked buckets), build progress, search / query interface,
+  two-click delete confirmation. Egui's `modals/buckets.rs`.
+  *Large — async build state, complex form, search UX.*
+
+### Sidebar / chrome
+
+- ✅ **Pending-sudo banner.** `SudoRequested` populates a
+  `pending_sudos: HashMap<u64, PendingSudoState>` slot keyed by
+  `function_id`; the matching thread's pane renders one
+  warning-styled `alert` per entry above the chat log, with
+  Approve / Remember / Reject buttons + an optional reject-reason
+  text input. Resolution is optimistic — the local slot is dropped
+  before `ResolveSudo` ships so the banner doesn't flicker through
+  the wire round-trip. `SudoResolved` echo cleans up server-side
+  resolutions from any client.
+- ⏳ **Thread inspector.** Egui's `ThreadInspector` struct surfaces
+  per-thread metadata the chip can't fit (allowlist breakdown,
+  resolved bindings, host envs in use). A popover on the thread
+  header would be the natural home. *Small to surface; depends
+  on which fields make the cut.*
+
+### Misc
+
+- ⏳ **Pod editor structured tabs.** v1 ships raw-TOML only (a
+  single `text_area` sheet). Egui's pod editor has tabs for
+  Allow / Defaults / Limits — aetna already has all three
+  (`render_pod_editor_*_tab`), so this gap is closed; track here
+  only as a note that future surfacing of MCP host CRUD lands
+  inside the existing tabs.
+- ⏳ **Behavior editor parity.** v1 ships the 80% form (name /
+  description / trigger kind / cron schedule / prompt). All
+  remaining tabs (Scope, Retention, Thread, System Prompt, Raw
+  TOML) have already landed (see Stage 8). Track here only as
+  an inventory note.
+
 ## Conventions
 
 Picked in this codebase, not enforced by aetna:

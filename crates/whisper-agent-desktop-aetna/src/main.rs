@@ -235,7 +235,11 @@ impl Phase {
 
         let inbound_shared = Inbound::default();
         let inbound_for_app = inbound_shared.clone();
-        let inner = ChatApp::new(inbound_for_app, send_fn);
+        let mut inner = ChatApp::new(inbound_for_app, send_fn);
+        // Surface the server URL the user typed (or `--server`-flagged)
+        // in the sidebar footer so multi-window setups disambiguate
+        // which agent is which without opening settings.
+        inner.set_server_label(server);
 
         Phase::Connected(DesktopApp {
             inner,
