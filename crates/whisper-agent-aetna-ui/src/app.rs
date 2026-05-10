@@ -12494,6 +12494,7 @@ impl ChatApp {
             rows.push(
                 card(card_children)
                     .gap(tokens::SPACE_1)
+                    .padding(Sides::all(tokens::SPACE_4))
                     .width(Size::Fill(1.0)),
             );
         }
@@ -12663,7 +12664,8 @@ impl ChatApp {
         card_children.push(action_row);
 
         card(card_children)
-            .gap(tokens::SPACE_1)
+            .gap(tokens::SPACE_2)
+            .padding(Sides::all(tokens::SPACE_4))
             .width(Size::Fill(1.0))
     }
 
@@ -13983,6 +13985,7 @@ impl ChatApp {
 
         card(card_children)
             .gap(tokens::SPACE_2)
+            .padding(Sides::all(tokens::SPACE_4))
             .width(Size::Fill(1.0))
     }
 
