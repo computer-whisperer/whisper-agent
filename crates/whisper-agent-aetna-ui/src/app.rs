@@ -58,8 +58,9 @@ use whisper_agent_protocol::{
     BucketSourceInput, BucketSummary, CatchUp, ClientToServer, ContentBlock, CoreTools,
     Disposition, EmbeddingProviderInfo, FsEntry, ImageMime, ImageSource, InitialListing,
     ModelSummary, NamedHostEnv, Overlap, PodAllow, PodConfig, PodLimits, PodSummary,
-    QuantizationInput, RetentionPolicy, Role, ServerToClient, SlotStateLabel, SystemPromptChoice,
-    ThreadBindingsRequest, ThreadConfigOverride, ThreadDefaults, ThreadSummary,
+    QuantizationInput, RetentionPolicy, Role, ServerToClient, SharedMcpAuthInput,
+    SharedMcpAuthPublic, SharedMcpHostInfo, SharedMcpPrefixInput, SlotStateLabel,
+    SystemPromptChoice, ThreadBindingsRequest, ThreadConfigOverride, ThreadDefaults, ThreadSummary,
     TrackedCadenceInput, TrackedDriverInput, TriggerSpec, permission::SudoDecision,
 };
 
@@ -893,10 +894,10 @@ const QUANTIZATION_CHOICES: [QuantizationChoice; 3] = [
     QuantizationChoice::Int8,
 ];
 
-/// Server-settings modal state. v1 has two tabs: a read-only LLM
-/// backends listing and an admin-only raw editor for the server's
-/// `whisper-agent.toml`. The Shared MCP hosts CRUD + Codex Rotate
-/// sub-form land in follow-up slices.
+/// Server-settings modal state. Three tabs: LLM backends (catalog
+/// plus Codex rotate), Shared MCP (CRUD), Server config (raw TOML).
+/// Mutation paths are admin-only server-side; non-admin connections
+/// receive an `Error` reply that the per-tab banner surfaces.
 #[derive(Default)]
 struct SettingsModalState {
     active_tab: SettingsTab,
@@ -904,12 +905,134 @@ struct SettingsModalState {
     /// has been opened at least once; persists across tab switches
     /// so in-progress edits survive.
     server_config: Option<ServerConfigEditorState>,
+
+    // ----- backends tab: codex rotate -----
+    /// Open state for the "rotate Codex credentials" sub-form. `Some`
+    /// while the user is composing a rotation; cleared on save success
+    /// (server's `CodexAuthUpdated` echo) or Cancel.
+    codex_rotate: Option<CodexRotateState>,
+    /// Most-recent rotation outcome. `Ok(backend)` paints a success
+    /// caption; `Err((backend, detail))` a destructive caption.
+    /// Cleared the next time the operator clicks Rotate.
+    codex_rotate_banner: Option<Result<String, (String, String)>>,
+
+    // ----- shared mcp tab -----
+    /// Open state for the Add / Edit sub-form. `Some` while open;
+    /// cleared on save echo or Cancel.
+    shared_mcp_editor: Option<SharedMcpEditorState>,
+    /// Most-recent shared-MCP CRUD outcome. `Ok(message)` paints a
+    /// success caption; `Err(message)` destructive. Set by the Add /
+    /// Update / Remove echoes (or their matching `Error`).
+    shared_mcp_banner: Option<Result<String, String>>,
+    /// Host names whose Remove button has been clicked once and is
+    /// armed for confirmation. The next click on the same row's
+    /// Confirm dispatches `RemoveSharedMcpHost`; clicking elsewhere
+    /// disarms.
+    shared_mcp_remove_armed: HashSet<String>,
 }
+
+/// In-flight Codex auth rotation. Lives behind
+/// `SettingsModalState::codex_rotate` so it survives re-render
+/// frames. The form stays open across the round-trip; success
+/// closes it via the wire echo, failure stamps the inline error
+/// and clears `pending_correlation` so the user can retry.
+struct CodexRotateState {
+    /// Backend the rotation targets (the `chatgpt_subscription`
+    /// row the user clicked Rotate on).
+    backend: String,
+    /// Pasted `auth.json` blob.
+    contents: String,
+    /// Inline error message from a failed rotation. Sticky until
+    /// the next Save click clears it.
+    error: Option<String>,
+    /// `Some` while the `UpdateCodexAuth` round-trip is in flight.
+    pending_correlation: Option<String>,
+}
+
+/// Inline add/edit form state for one Shared MCP host entry. `Add`
+/// collects name + url + auth + prefix from scratch; `Edit` locks
+/// `name` (pod bindings reference it) and pre-populates the rest
+/// from the catalog row.
+struct SharedMcpEditorState {
+    mode: SharedMcpEditorMode,
+    name: String,
+    url: String,
+    /// Which auth variant the operator is currently composing.
+    auth_choice: SharedMcpAuthChoice,
+    /// Staged bearer token (only consulted when `auth_choice` is
+    /// `Bearer`). Empty + existing-bearer ⇒ "keep existing" on Edit.
+    bearer: String,
+    /// Optional OAuth scope (space-separated). Empty ⇒ omit so the
+    /// server falls back to the AS metadata's `scopes_supported`.
+    oauth_scope: String,
+    /// Auth kind on the entry when the editor opened. Lets the UI
+    /// describe the "keep existing" semantic for Bearer hosts.
+    auth_kind_on_load: SharedMcpAuthPublic,
+    /// Tool-name prefix the operator is composing.
+    prefix_choice: SharedMcpPrefixChoice,
+    /// Staged custom prefix (only consulted when `prefix_choice` is
+    /// `Custom`).
+    prefix_custom: String,
+    error: Option<String>,
+    pending_correlation: Option<String>,
+    /// True while an OAuth Add flow has been started and the URL
+    /// has been opened. Cleared on `SharedMcpHostAdded` /
+    /// `Error` echoes or when the user cancels.
+    oauth_in_flight: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SharedMcpEditorMode {
+    Add,
+    Edit,
+}
+
+/// Auth variant the user is composing in the editor. The four-way
+/// "keep existing" semantic on Edit is modeled inline in
+/// `submit_shared_mcp_editor` rather than as a fourth variant —
+/// keeping the radio row simple.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SharedMcpAuthChoice {
+    Anonymous,
+    Bearer,
+    /// OAuth 2.1 authorization-code + PKCE. Only selectable on Add
+    /// (Edit of an OAuth entry routes refresh through a separate
+    /// path, not this form). And only when the deployment exposes
+    /// a webui origin we can use as the redirect base — native
+    /// builds gate it off via `OAUTH_AVAILABLE`.
+    Oauth2,
+}
+
+/// Prefix variant the user is composing. Maps to
+/// `SharedMcpPrefixInput` on save — the form always carries a
+/// concrete choice (seeded from the catalog on Edit, defaulted to
+/// `Default` on Add), so `Unchanged` is never emitted from here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SharedMcpPrefixChoice {
+    Default,
+    None,
+    Custom,
+}
+
+/// Whether the OAuth Add path is available in this build. Native
+/// targets can't (today) host the redirect callback the
+/// authorization server hits; OAuth Add is wasm-only. The radio
+/// option on the editor is greyed out when this is `false`.
+#[cfg(target_arch = "wasm32")]
+const OAUTH_AVAILABLE: bool = true;
+#[cfg(not(target_arch = "wasm32"))]
+const OAUTH_AVAILABLE: bool = false;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 enum SettingsTab {
     #[default]
     Backends,
+    /// Shared MCP hosts catalog. Admin-only mutation paths
+    /// (`AddSharedMcpHost` / `UpdateSharedMcpHost` /
+    /// `RemoveSharedMcpHost`); read tier (`SharedMcpHostsList`) is
+    /// open. The tab carries an Add+Edit sub-form for CRUD, with a
+    /// banner above the list for the most recent outcome.
+    SharedMcp,
     /// Raw editor for `whisper-agent.toml`. Admin-only — the server
     /// rejects `FetchServerConfig` / `UpdateServerConfig` from
     /// non-admin connections. On save, the server hot-swaps the
@@ -922,6 +1045,7 @@ impl SettingsTab {
     fn label(self) -> &'static str {
         match self {
             SettingsTab::Backends => "LLM backends",
+            SettingsTab::SharedMcp => "Shared MCP",
             SettingsTab::ServerConfig => "Server config",
         }
     }
@@ -929,6 +1053,7 @@ impl SettingsTab {
     fn wire_value(self) -> &'static str {
         match self {
             SettingsTab::Backends => "backends",
+            SettingsTab::SharedMcp => "shared-mcp",
             SettingsTab::ServerConfig => "server-config",
         }
     }
@@ -936,6 +1061,7 @@ impl SettingsTab {
     fn from_wire(raw: &str) -> Option<Self> {
         match raw {
             "backends" => Some(SettingsTab::Backends),
+            "shared-mcp" => Some(SettingsTab::SharedMcp),
             "server-config" => Some(SettingsTab::ServerConfig),
             _ => None,
         }
@@ -2773,12 +2899,103 @@ impl ChatApp {
                 self.embedding_providers = providers;
             }
             ServerToClient::SharedMcpHostsList { hosts, .. } => {
-                // Server is authoritative — replace wholesale on
-                // every snapshot. Per-host add/remove broadcasts
-                // (`SharedMcpHostAdded` / `Removed`) aren't surfaced
-                // here yet; the next reconnect or full-list re-fetch
-                // catches up.
                 self.shared_mcp_hosts = hosts;
+            }
+            ServerToClient::SharedMcpHostAdded {
+                host,
+                correlation_id,
+            }
+            | ServerToClient::SharedMcpHostUpdated {
+                host,
+                correlation_id,
+            } => {
+                // Replace-or-insert by name + keep the catalog
+                // sorted so the row order is stable across adds.
+                if let Some(existing) = self
+                    .shared_mcp_hosts
+                    .iter_mut()
+                    .find(|h| h.name == host.name)
+                {
+                    *existing = host.clone();
+                } else {
+                    self.shared_mcp_hosts.push(host.clone());
+                    self.shared_mcp_hosts.sort_by(|a, b| a.name.cmp(&b.name));
+                }
+                // Close the editor sub-form if this is the echo of
+                // an outstanding submission. Other clients (which
+                // didn't initiate the change) see no matching
+                // pending correlation and leave their form alone.
+                if let Some(modal) = self.settings_modal.as_mut() {
+                    let close = modal.shared_mcp_editor.as_ref().is_some_and(|s| {
+                        s.pending_correlation.is_some() && s.pending_correlation == correlation_id
+                    });
+                    if close {
+                        modal.shared_mcp_editor = None;
+                        modal.shared_mcp_banner = Some(Ok(format!("Saved `{}`.", host.name)));
+                    }
+                }
+            }
+            ServerToClient::SharedMcpHostRemoved {
+                name,
+                correlation_id: _,
+            } => {
+                self.shared_mcp_hosts.retain(|h| h.name != name);
+                if let Some(modal) = self.settings_modal.as_mut() {
+                    modal.shared_mcp_remove_armed.remove(&name);
+                    modal.shared_mcp_banner = Some(Ok(format!("Removed `{name}`.")));
+                }
+            }
+            ServerToClient::SharedMcpOauthFlowStarted {
+                authorization_url,
+                correlation_id,
+                name: _,
+            } => {
+                // Flip the editor into "waiting for authorization"
+                // mode so the operator can't dispatch another
+                // request while the AS is still consenting. The
+                // matching `SharedMcpHostAdded` (or `Error`)
+                // resolves the flow.
+                //
+                // Native builds can't open URLs from the UI today
+                // (no equivalent of `window.open`); the browser
+                // path is implemented in the wasm Stage-11 entry.
+                if let Some(modal) = self.settings_modal.as_mut()
+                    && let Some(sub) = modal.shared_mcp_editor.as_mut()
+                    && sub.pending_correlation.is_some()
+                    && sub.pending_correlation == correlation_id
+                {
+                    sub.oauth_in_flight = true;
+                }
+                #[cfg(target_arch = "wasm32")]
+                {
+                    if let Some(window) = web_sys::window() {
+                        let _ = window.open_with_url_and_target(&authorization_url, "_blank");
+                    }
+                }
+                #[cfg(not(target_arch = "wasm32"))]
+                {
+                    let _ = authorization_url;
+                }
+            }
+            ServerToClient::CodexAuthUpdated {
+                backend,
+                correlation_id,
+            } => {
+                // Match by correlation + backend so a stray
+                // broadcast (the server unicasts today, but the
+                // wire arm defends against a future fan-out) can't
+                // close someone else's form.
+                if let Some(modal) = self.settings_modal.as_mut() {
+                    let close = modal.codex_rotate.as_ref().is_some_and(|s| {
+                        s.pending_correlation.is_some()
+                            && s.pending_correlation == correlation_id
+                            && s.backend == backend
+                    });
+                    if close {
+                        modal.codex_rotate = None;
+                        modal.codex_rotate_banner = Some(Ok(backend));
+                    }
+                }
             }
             ServerToClient::BucketsList { buckets, .. } => {
                 self.buckets = buckets;
@@ -3505,6 +3722,44 @@ impl ChatApp {
                         cf.pending_correlation = None;
                         consumed = true;
                     }
+                    // Codex rotate sub-form. Keep it open so the
+                    // operator can fix the paste without retyping.
+                    if !consumed
+                        && let Some(modal) = self.settings_modal.as_mut()
+                        && let Some(sub) = modal.codex_rotate.as_mut()
+                        && sub.pending_correlation.as_ref() == Some(corr)
+                    {
+                        sub.error = Some(message.clone());
+                        sub.pending_correlation = None;
+                        consumed = true;
+                    }
+                    // Shared-MCP editor sub-form (Add / Update).
+                    // Same "stay open + surface inline" semantic as
+                    // codex_rotate so OAuth flow timing failures
+                    // (e.g. expired authorization) don't lose the
+                    // form.
+                    if !consumed
+                        && let Some(modal) = self.settings_modal.as_mut()
+                        && let Some(sub) = modal.shared_mcp_editor.as_mut()
+                        && sub.pending_correlation.as_ref() == Some(corr)
+                    {
+                        sub.error = Some(message.clone());
+                        sub.pending_correlation = None;
+                        sub.oauth_in_flight = false;
+                        consumed = true;
+                    }
+                    // Shared-MCP remove. The server prefixes
+                    // remove failures with `remove_shared_mcp_host:`;
+                    // surface them as a destructive tab banner so
+                    // the operator notices the host is still
+                    // present.
+                    if !consumed
+                        && message.starts_with("remove_shared_mcp_host:")
+                        && let Some(modal) = self.settings_modal.as_mut()
+                    {
+                        modal.shared_mcp_banner = Some(Err(message.clone()));
+                        consumed = true;
+                    }
                 }
                 // Thread-scoped errors land on the view's failure
                 // slot so the pane's destructive banner has
@@ -3795,6 +4050,98 @@ impl App for ChatApp {
                 }
                 return;
             }
+            // Codex Rotate: open / save / cancel / dismiss / body.
+            if let Some(key) = event.route()
+                && let Some(backend) = key.strip_prefix(SETTINGS_CODEX_ROTATE_OPEN_PREFIX)
+                && matches!(event.kind, UiEventKind::Click | UiEventKind::Activate)
+            {
+                if let Some(modal) = self.settings_modal.as_mut() {
+                    modal.codex_rotate_banner = None;
+                    modal.codex_rotate = Some(CodexRotateState {
+                        backend: backend.to_string(),
+                        contents: String::new(),
+                        error: None,
+                        pending_correlation: None,
+                    });
+                }
+                return;
+            }
+            if event.target_key() == Some(SETTINGS_CODEX_ROTATE_BODY_KEY) {
+                if let Some(modal) = self.settings_modal.as_mut()
+                    && let Some(sub) = modal.codex_rotate.as_mut()
+                    && sub.pending_correlation.is_none()
+                {
+                    text_area::apply_event(
+                        &mut sub.contents,
+                        &mut self.selection,
+                        SETTINGS_CODEX_ROTATE_BODY_KEY,
+                        &event,
+                    );
+                    sub.error = None;
+                }
+                return;
+            }
+            if event.is_click_or_activate(SETTINGS_CODEX_ROTATE_SAVE_KEY) {
+                self.submit_codex_rotate();
+                return;
+            }
+            if event.is_click_or_activate(SETTINGS_CODEX_ROTATE_CANCEL_KEY)
+                || event.is_click_or_activate(SETTINGS_CODEX_ROTATE_DISMISS_KEY)
+            {
+                if let Some(modal) = self.settings_modal.as_mut() {
+                    modal.codex_rotate = None;
+                }
+                return;
+            }
+
+            // Shared MCP: list-row Edit / Remove / arm-confirm / cancel.
+            if event.is_click_or_activate(SETTINGS_SHARED_MCP_ADD_KEY) {
+                self.open_shared_mcp_editor_add();
+                return;
+            }
+            if let Some(key) = event.route()
+                && matches!(event.kind, UiEventKind::Click | UiEventKind::Activate)
+            {
+                if let Some(name) = key.strip_prefix(SETTINGS_SHARED_MCP_EDIT_PREFIX) {
+                    let owned = name.to_string();
+                    self.open_shared_mcp_editor_edit(&owned);
+                    return;
+                }
+                if let Some(name) = key.strip_prefix(SETTINGS_SHARED_MCP_REMOVE_PREFIX)
+                    && !key.starts_with(SETTINGS_SHARED_MCP_REMOVE_CONFIRM_PREFIX)
+                    && !key.starts_with(SETTINGS_SHARED_MCP_REMOVE_CANCEL_PREFIX)
+                {
+                    if let Some(modal) = self.settings_modal.as_mut() {
+                        modal.shared_mcp_remove_armed.insert(name.to_string());
+                    }
+                    return;
+                }
+                if let Some(name) = key.strip_prefix(SETTINGS_SHARED_MCP_REMOVE_CONFIRM_PREFIX) {
+                    let owned = name.to_string();
+                    if let Some(modal) = self.settings_modal.as_mut() {
+                        modal.shared_mcp_remove_armed.remove(&owned);
+                    }
+                    let correlation_id = Some(self.next_correlation_id());
+                    self.send(ClientToServer::RemoveSharedMcpHost {
+                        correlation_id,
+                        name: owned,
+                    });
+                    return;
+                }
+                if let Some(name) = key.strip_prefix(SETTINGS_SHARED_MCP_REMOVE_CANCEL_PREFIX) {
+                    if let Some(modal) = self.settings_modal.as_mut() {
+                        modal.shared_mcp_remove_armed.remove(name);
+                    }
+                    return;
+                }
+            }
+
+            // Shared MCP editor sub-form: text inputs / pickers /
+            // submit / cancel / dismiss.
+            if self.handle_shared_mcp_editor_event(&event) {
+                return;
+            }
+
             if event.is_click_or_activate(SETTINGS_DISMISS_KEY)
                 || event.is_click_or_activate(SETTINGS_CLOSE_KEY)
             {
@@ -4697,6 +5044,36 @@ const SETTINGS_CLOSE_KEY: &str = "settings:close";
 const SETTINGS_SERVER_CONFIG_BODY_KEY: &str = "settings:server-config:body";
 const SETTINGS_SERVER_CONFIG_SAVE_KEY: &str = "settings:server-config:save";
 const SETTINGS_SERVER_CONFIG_REVERT_KEY: &str = "settings:server-config:revert";
+
+/// Routed-key shapes for the Backends-tab Codex-rotate sub-form.
+/// `prefix:{backend}` carries the backend alias the user clicked
+/// Rotate on (so the open handler can stamp `CodexRotateState`'s
+/// backend without a parallel lookup).
+const SETTINGS_CODEX_ROTATE_OPEN_PREFIX: &str = "settings:codex-rotate:open:";
+const SETTINGS_CODEX_ROTATE_BODY_KEY: &str = "settings:codex-rotate:body";
+const SETTINGS_CODEX_ROTATE_SAVE_KEY: &str = "settings:codex-rotate:save";
+const SETTINGS_CODEX_ROTATE_CANCEL_KEY: &str = "settings:codex-rotate:cancel";
+const SETTINGS_CODEX_ROTATE_DISMISS_KEY: &str = "settings:codex-rotate:dismiss";
+
+/// Routed-key shapes for the Shared MCP tab list + editor sub-form.
+/// Per-row edit / remove keys carry `{name}` as suffix; the parser
+/// forks on prefix and decodes the name straight back.
+const SETTINGS_SHARED_MCP_ADD_KEY: &str = "settings:shared-mcp:add";
+const SETTINGS_SHARED_MCP_EDIT_PREFIX: &str = "settings:shared-mcp:edit:";
+const SETTINGS_SHARED_MCP_REMOVE_PREFIX: &str = "settings:shared-mcp:remove:";
+const SETTINGS_SHARED_MCP_REMOVE_CONFIRM_PREFIX: &str = "settings:shared-mcp:remove-confirm:";
+const SETTINGS_SHARED_MCP_REMOVE_CANCEL_PREFIX: &str = "settings:shared-mcp:remove-cancel:";
+const SETTINGS_SHARED_MCP_EDITOR_NAME_KEY: &str = "settings:shared-mcp:editor:name";
+const SETTINGS_SHARED_MCP_EDITOR_URL_KEY: &str = "settings:shared-mcp:editor:url";
+const SETTINGS_SHARED_MCP_EDITOR_AUTH_GROUP_KEY: &str = "settings:shared-mcp:editor:auth";
+const SETTINGS_SHARED_MCP_EDITOR_BEARER_KEY: &str = "settings:shared-mcp:editor:bearer";
+const SETTINGS_SHARED_MCP_EDITOR_OAUTH_SCOPE_KEY: &str = "settings:shared-mcp:editor:oauth-scope";
+const SETTINGS_SHARED_MCP_EDITOR_PREFIX_GROUP_KEY: &str = "settings:shared-mcp:editor:prefix";
+const SETTINGS_SHARED_MCP_EDITOR_PREFIX_CUSTOM_KEY: &str =
+    "settings:shared-mcp:editor:prefix-custom";
+const SETTINGS_SHARED_MCP_EDITOR_SAVE_KEY: &str = "settings:shared-mcp:editor:save";
+const SETTINGS_SHARED_MCP_EDITOR_CANCEL_KEY: &str = "settings:shared-mcp:editor:cancel";
+const SETTINGS_SHARED_MCP_EDITOR_DISMISS_KEY: &str = "settings:shared-mcp:editor:dismiss";
 
 fn file_tree_dir_key(pod_id: &str, path: &str) -> String {
     format!("{FILE_TREE_DIR_PREFIX}{pod_id}:{path}")
@@ -6826,6 +7203,16 @@ impl ChatApp {
         }
         if let Some(modal_el) = self.render_settings_modal() {
             out.push(Some(modal_el));
+            // Codex auth-rotate sub-form rides above the settings
+            // dialog when open. Layer ordering: dialog → sub-form
+            // → (no sub-form picker overlays — the sub-form has
+            // none today).
+            if let Some(rotate_el) = self.render_settings_codex_rotate_modal() {
+                out.push(Some(rotate_el));
+            }
+            if let Some(editor_el) = self.render_settings_shared_mcp_editor_modal() {
+                out.push(Some(editor_el));
+            }
         }
         if let Some(modal_el) = self.render_buckets_modal() {
             out.push(Some(modal_el));
@@ -11634,6 +12021,305 @@ impl ChatApp {
     /// buffer is unchanged. Mints a fresh correlation; the matching
     /// `ServerConfigUpdateResult` arm populates `save_summary` and
     /// adopts the working buffer as the new baseline.
+    /// Codex auth-rotate Save click. Phased borrow: read+validate
+    /// snapshot → mint correlation → stamp `pending_correlation` →
+    /// send `UpdateCodexAuth`. The wire-handler closes the form on
+    /// matching `CodexAuthUpdated` (success) or `Error` (failure).
+    fn submit_codex_rotate(&mut self) {
+        let snapshot = match self.settings_modal.as_ref() {
+            Some(modal) => match modal.codex_rotate.as_ref() {
+                Some(sub)
+                    if sub.pending_correlation.is_none() && !sub.contents.trim().is_empty() =>
+                {
+                    Some((sub.backend.clone(), sub.contents.clone()))
+                }
+                _ => None,
+            },
+            _ => None,
+        };
+        let Some((backend, contents)) = snapshot else {
+            return;
+        };
+        let correlation = self.next_correlation_id();
+        if let Some(modal) = self.settings_modal.as_mut()
+            && let Some(sub) = modal.codex_rotate.as_mut()
+        {
+            sub.pending_correlation = Some(correlation.clone());
+            sub.error = None;
+        }
+        self.send(ClientToServer::UpdateCodexAuth {
+            correlation_id: Some(correlation),
+            backend,
+            contents,
+        });
+    }
+
+    /// Open the Shared-MCP editor sub-form in Add mode with empty
+    /// fields. Idempotent — re-opening clobbers any in-progress
+    /// add (matches the egui sibling's "+ Add host" semantic).
+    fn open_shared_mcp_editor_add(&mut self) {
+        let Some(modal) = self.settings_modal.as_mut() else {
+            return;
+        };
+        modal.shared_mcp_banner = None;
+        modal.shared_mcp_editor = Some(SharedMcpEditorState {
+            mode: SharedMcpEditorMode::Add,
+            name: String::new(),
+            url: String::new(),
+            auth_choice: SharedMcpAuthChoice::Anonymous,
+            bearer: String::new(),
+            oauth_scope: String::new(),
+            auth_kind_on_load: SharedMcpAuthPublic::None,
+            prefix_choice: SharedMcpPrefixChoice::Default,
+            prefix_custom: String::new(),
+            error: None,
+            pending_correlation: None,
+            oauth_in_flight: false,
+        });
+    }
+
+    /// Open the Shared-MCP editor sub-form in Edit mode, prefilled
+    /// from the catalog row matching `name`. Bails silently if the
+    /// row has been removed in flight (rare; the row would have
+    /// been gone from the most recent paint anyway).
+    fn open_shared_mcp_editor_edit(&mut self, name: &str) {
+        let Some(host) = self
+            .shared_mcp_hosts
+            .iter()
+            .find(|h| h.name == name)
+            .cloned()
+        else {
+            return;
+        };
+        let Some(modal) = self.settings_modal.as_mut() else {
+            return;
+        };
+        let auth_choice = match &host.auth {
+            SharedMcpAuthPublic::None => SharedMcpAuthChoice::Anonymous,
+            SharedMcpAuthPublic::Bearer => SharedMcpAuthChoice::Bearer,
+            // Edit doesn't support starting an OAuth flow; show as
+            // Bearer so the form has somewhere coherent to land
+            // (keep-existing semantics still apply via the empty
+            // bearer buffer).
+            SharedMcpAuthPublic::Oauth2 { .. } => SharedMcpAuthChoice::Bearer,
+        };
+        // `prefix: None` (catalog default) and `Some(name)`
+        // (redundant override matching the host name) both render
+        // as Default so the operator doesn't see noise.
+        let (prefix_choice, prefix_custom) = match host.prefix.as_deref() {
+            None => (SharedMcpPrefixChoice::Default, String::new()),
+            Some("") => (SharedMcpPrefixChoice::None, String::new()),
+            Some(p) if p == host.name => (SharedMcpPrefixChoice::Default, String::new()),
+            Some(p) => (SharedMcpPrefixChoice::Custom, p.to_string()),
+        };
+        modal.shared_mcp_banner = None;
+        modal.shared_mcp_editor = Some(SharedMcpEditorState {
+            mode: SharedMcpEditorMode::Edit,
+            name: host.name,
+            url: host.url,
+            auth_choice,
+            bearer: String::new(),
+            oauth_scope: String::new(),
+            auth_kind_on_load: host.auth,
+            prefix_choice,
+            prefix_custom,
+            error: None,
+            pending_correlation: None,
+            oauth_in_flight: false,
+        });
+    }
+
+    /// Route a UI event through the Shared-MCP editor sub-form.
+    /// Returns `true` when the event was for one of the sub-form's
+    /// controls (so the outer handler can `return`).
+    fn handle_shared_mcp_editor_event(&mut self, event: &UiEvent) -> bool {
+        let editor_open = self
+            .settings_modal
+            .as_ref()
+            .map(|m| m.shared_mcp_editor.is_some())
+            .unwrap_or(false);
+        if !editor_open {
+            return false;
+        }
+
+        // Cancel / Dismiss: drop the sub-form. Disallowed while a
+        // save is in-flight to keep the wire round-trip's pending
+        // correlation alive — Cancel reads as "I changed my mind"
+        // not "force-close mid-flight."
+        if event.is_click_or_activate(SETTINGS_SHARED_MCP_EDITOR_CANCEL_KEY)
+            || event.is_click_or_activate(SETTINGS_SHARED_MCP_EDITOR_DISMISS_KEY)
+        {
+            if let Some(modal) = self.settings_modal.as_mut()
+                && let Some(sub) = modal.shared_mcp_editor.as_ref()
+                && sub.pending_correlation.is_none()
+            {
+                modal.shared_mcp_editor = None;
+            }
+            return true;
+        }
+
+        // Text-input branches.
+        if let Some(key) = event.target_key() {
+            let mut handled = false;
+            if let Some(modal) = self.settings_modal.as_mut()
+                && let Some(sub) = modal.shared_mcp_editor.as_mut()
+                && sub.pending_correlation.is_none()
+                && !sub.oauth_in_flight
+            {
+                let touched = match key {
+                    SETTINGS_SHARED_MCP_EDITOR_NAME_KEY if sub.mode == SharedMcpEditorMode::Add => {
+                        Some(&mut sub.name)
+                    }
+                    SETTINGS_SHARED_MCP_EDITOR_URL_KEY => Some(&mut sub.url),
+                    SETTINGS_SHARED_MCP_EDITOR_BEARER_KEY
+                        if sub.auth_choice == SharedMcpAuthChoice::Bearer =>
+                    {
+                        Some(&mut sub.bearer)
+                    }
+                    SETTINGS_SHARED_MCP_EDITOR_OAUTH_SCOPE_KEY
+                        if sub.auth_choice == SharedMcpAuthChoice::Oauth2 =>
+                    {
+                        Some(&mut sub.oauth_scope)
+                    }
+                    SETTINGS_SHARED_MCP_EDITOR_PREFIX_CUSTOM_KEY
+                        if sub.prefix_choice == SharedMcpPrefixChoice::Custom =>
+                    {
+                        Some(&mut sub.prefix_custom)
+                    }
+                    _ => None,
+                };
+                if let Some(buf) = touched {
+                    text_input::apply_event(buf, &mut self.selection, key, event);
+                    sub.error = None;
+                    handled = true;
+                }
+            }
+            if handled {
+                return true;
+            }
+        }
+
+        // Auth-choice toggle group.
+        if let Some(modal) = self.settings_modal.as_mut()
+            && let Some(sub) = modal.shared_mcp_editor.as_mut()
+            && sub.pending_correlation.is_none()
+            && !sub.oauth_in_flight
+            && let Some(aetna_core::widgets::toggle::ToggleAction::Selected(raw)) =
+                aetna_core::widgets::toggle::classify_event(
+                    event,
+                    SETTINGS_SHARED_MCP_EDITOR_AUTH_GROUP_KEY,
+                )
+        {
+            let next = match raw {
+                "anonymous" => Some(SharedMcpAuthChoice::Anonymous),
+                "bearer" => Some(SharedMcpAuthChoice::Bearer),
+                "oauth2" if sub.mode == SharedMcpEditorMode::Add && OAUTH_AVAILABLE => {
+                    Some(SharedMcpAuthChoice::Oauth2)
+                }
+                _ => None,
+            };
+            if let Some(c) = next {
+                sub.auth_choice = c;
+                sub.error = None;
+            }
+            return true;
+        }
+
+        // Prefix-choice toggle group.
+        if let Some(modal) = self.settings_modal.as_mut()
+            && let Some(sub) = modal.shared_mcp_editor.as_mut()
+            && sub.pending_correlation.is_none()
+            && !sub.oauth_in_flight
+            && aetna_core::widgets::toggle::apply_event_single(
+                &mut sub.prefix_choice,
+                event,
+                SETTINGS_SHARED_MCP_EDITOR_PREFIX_GROUP_KEY,
+                |raw| match raw {
+                    "default" => Some(SharedMcpPrefixChoice::Default),
+                    "none" => Some(SharedMcpPrefixChoice::None),
+                    "custom" => Some(SharedMcpPrefixChoice::Custom),
+                    _ => None,
+                },
+            )
+        {
+            sub.error = None;
+            return true;
+        }
+
+        if event.is_click_or_activate(SETTINGS_SHARED_MCP_EDITOR_SAVE_KEY) {
+            self.submit_shared_mcp_editor();
+            return true;
+        }
+
+        false
+    }
+
+    /// Shared-MCP editor Save click. Validates the local form,
+    /// resolves auth / prefix into wire shapes, mints a correlation,
+    /// stamps `pending_correlation`, and dispatches the matching
+    /// Add or Update wire op.
+    fn submit_shared_mcp_editor(&mut self) {
+        // Phase 1: read snapshot, validate, build the wire request.
+        let outcome: Result<SharedMcpSubmitRequest, String> = match self
+            .settings_modal
+            .as_ref()
+            .and_then(|m| m.shared_mcp_editor.as_ref())
+        {
+            Some(sub) if sub.pending_correlation.is_none() && !sub.oauth_in_flight => {
+                build_shared_mcp_submit_request(sub)
+            }
+            _ => return,
+        };
+        match outcome {
+            Err(err) => {
+                if let Some(modal) = self.settings_modal.as_mut()
+                    && let Some(sub) = modal.shared_mcp_editor.as_mut()
+                {
+                    sub.error = Some(err);
+                }
+            }
+            Ok(req) => {
+                let correlation = self.next_correlation_id();
+                if let Some(modal) = self.settings_modal.as_mut()
+                    && let Some(sub) = modal.shared_mcp_editor.as_mut()
+                {
+                    sub.pending_correlation = Some(correlation.clone());
+                    sub.error = None;
+                }
+                match req {
+                    SharedMcpSubmitRequest::Add {
+                        name,
+                        url,
+                        auth,
+                        prefix,
+                    } => {
+                        self.send(ClientToServer::AddSharedMcpHost {
+                            correlation_id: Some(correlation),
+                            name,
+                            url,
+                            auth,
+                            prefix,
+                        });
+                    }
+                    SharedMcpSubmitRequest::Update {
+                        name,
+                        url,
+                        auth,
+                        prefix,
+                    } => {
+                        self.send(ClientToServer::UpdateSharedMcpHost {
+                            correlation_id: Some(correlation),
+                            name,
+                            url,
+                            auth,
+                            prefix,
+                        });
+                    }
+                }
+            }
+        }
+    }
+
     fn submit_server_config(&mut self) {
         // Phase 1: read the snapshot we'd ship and validate gates.
         // Phase 2: mint a correlation (re-borrows `self`).
@@ -11684,6 +12370,10 @@ impl ChatApp {
                     SettingsTab::Backends.label(),
                 ),
                 (
+                    SettingsTab::SharedMcp.wire_value(),
+                    SettingsTab::SharedMcp.label(),
+                ),
+                (
                     SettingsTab::ServerConfig.wire_value(),
                     SettingsTab::ServerConfig.label(),
                 ),
@@ -11691,7 +12381,8 @@ impl ChatApp {
         );
 
         let body: El = match modal.active_tab {
-            SettingsTab::Backends => self.render_settings_backends_tab(),
+            SettingsTab::Backends => self.render_settings_backends_tab(modal),
+            SettingsTab::SharedMcp => self.render_settings_shared_mcp_tab(modal),
             SettingsTab::ServerConfig => self.render_settings_server_config_tab(modal),
         };
 
@@ -11701,9 +12392,10 @@ impl ChatApp {
             dialog_header([
                 dialog_title("Server settings"),
                 dialog_description(
-                    "LLM backends are read-only here; edit the underlying \
-                     whisper-agent.toml on the Server config tab. Shared MCP \
-                     hosts CRUD and Codex auth rotation land in a follow-up.",
+                    "LLM backends, Shared MCP hosts, and the raw \
+                     whisper-agent.toml editor. Mutation paths are \
+                     admin-only — non-admin connections see an error \
+                     reply that surfaces in the per-tab banner.",
                 ),
             ]),
             tabs_strip,
@@ -11720,19 +12412,37 @@ impl ChatApp {
         ]))
     }
 
-    /// Backends tab — read-only catalog of configured LLM backends.
-    /// One card per backend: alias + kind, then the default model
-    /// and auth-mode badges (or a muted placeholder when the
-    /// backend declares neither). Codex rotation lives behind a
-    /// follow-up sub-form; nothing on this tab is wire-actionable
-    /// yet.
-    fn render_settings_backends_tab(&self) -> El {
+    /// Backends tab — catalog of configured LLM backends. One card
+    /// per backend: alias + kind + chips for default model / auth.
+    /// `chatgpt_subscription` rows carry a Rotate button (auth.json
+    /// paste sub-form). A success / failure banner from the most
+    /// recent rotation rides above the list.
+    fn render_settings_backends_tab(&self, modal: &SettingsModalState) -> El {
+        let mut entries: Vec<El> = Vec::new();
+        if let Some(banner) = modal.codex_rotate_banner.as_ref() {
+            match banner {
+                Ok(backend) => entries.push(
+                    paragraph(format!("Rotated Codex credentials for `{backend}`."))
+                        .color(tokens::SUCCESS),
+                ),
+                Err((backend, detail)) => entries.push(
+                    paragraph(format!("Rotation failed for `{backend}`: {detail}"))
+                        .color(tokens::DESTRUCTIVE),
+                ),
+            }
+        }
         if self.backends.is_empty() {
-            return paragraph(
-                "No backends configured. Seed them via [backends.*] in \
-                 whisper-agent.toml on the Server config tab.",
-            )
-            .muted();
+            entries.push(
+                paragraph(
+                    "No backends configured. Seed them via [backends.*] in \
+                     whisper-agent.toml on the Server config tab.",
+                )
+                .muted(),
+            );
+            return column(entries)
+                .gap(tokens::SPACE_2)
+                .width(Size::Fill(1.0))
+                .height(Size::Fill(1.0));
         }
         let mut rows: Vec<El> = Vec::new();
         for b in &self.backends {
@@ -11750,24 +12460,552 @@ impl ChatApp {
             } else {
                 row(chips).gap(tokens::SPACE_3).align(Align::Center)
             };
-            rows.push(
-                card([
-                    row([
-                        text(b.name.clone()).label().bold(),
-                        text(format!("\u{00B7} {}", b.kind)).caption().muted(),
-                    ])
-                    .gap(tokens::SPACE_2)
-                    .align(Align::Center),
-                    chip_row,
+            let mut card_children: Vec<El> = vec![
+                row([
+                    text(b.name.clone())
+                        .label()
+                        .bold()
+                        .ellipsis()
+                        .width(Size::Fill(1.0)),
+                    text(format!("\u{00B7} {}", b.kind)).caption().muted(),
                 ])
-                .gap(tokens::SPACE_1)
+                .gap(tokens::SPACE_2)
+                .align(Align::Center)
                 .width(Size::Fill(1.0)),
+                chip_row,
+            ];
+            // Rotate button only on `chatgpt_subscription` rows.
+            // Other backends (anthropic api_key, openai, …) don't
+            // have an in-band auth-rotate — admins edit the TOML.
+            if b.kind == "chatgpt_subscription" {
+                card_children.push(
+                    row([button("Rotate credentials")
+                        .key(format!("{SETTINGS_CODEX_ROTATE_OPEN_PREFIX}{}", b.name))])
+                    .gap(tokens::SPACE_2)
+                    .align(Align::Center)
+                    .padding(Sides {
+                        left: tokens::RING_WIDTH,
+                        right: tokens::RING_WIDTH,
+                        top: 0.0,
+                        bottom: 0.0,
+                    }),
+                );
+            }
+            rows.push(
+                card(card_children)
+                    .gap(tokens::SPACE_1)
+                    .width(Size::Fill(1.0)),
             );
         }
-        scroll(rows)
+        entries.push(
+            scroll(rows)
+                .gap(tokens::SPACE_2)
+                .width(Size::Fill(1.0))
+                .height(Size::Fill(1.0)),
+        );
+        column(entries)
             .gap(tokens::SPACE_2)
             .width(Size::Fill(1.0))
             .height(Size::Fill(1.0))
+    }
+
+    /// Shared MCP hosts tab — list of configured shared-MCP hosts
+    /// with admin-only Add / Edit / Remove. Banner above the list
+    /// shows the most recent CRUD outcome; "+ Add host" opens the
+    /// editor sub-form for a fresh entry.
+    fn render_settings_shared_mcp_tab(&self, modal: &SettingsModalState) -> El {
+        let mut entries: Vec<El> = Vec::new();
+        entries.push(
+            paragraph(
+                "Shared MCP hosts the scheduler connects to at startup \
+                 (one singleton session per name, shared across all \
+                 threads that opt in). Bearer tokens never come back \
+                 from the server \u{2014} the UI shows only auth kind.",
+            )
+            .muted(),
+        );
+        if let Some(banner) = modal.shared_mcp_banner.as_ref() {
+            match banner {
+                Ok(msg) => entries.push(paragraph(msg.clone()).color(tokens::SUCCESS)),
+                Err(detail) => entries.push(paragraph(detail.clone()).color(tokens::DESTRUCTIVE)),
+            }
+        }
+        entries.push(
+            row([button("+ Add host").key(SETTINGS_SHARED_MCP_ADD_KEY)])
+                .gap(tokens::SPACE_2)
+                .align(Align::Center),
+        );
+
+        if self.shared_mcp_hosts.is_empty() {
+            entries.push(
+                paragraph(
+                    "No shared MCP hosts configured. Add one above or \
+                     seed via [shared_mcp_hosts] in whisper-agent.toml.",
+                )
+                .muted(),
+            );
+            return column(entries)
+                .gap(tokens::SPACE_2)
+                .width(Size::Fill(1.0))
+                .height(Size::Fill(1.0));
+        }
+
+        let mut rows: Vec<El> = Vec::new();
+        for host in &self.shared_mcp_hosts {
+            rows.push(self.render_shared_mcp_host_row(modal, host));
+        }
+        entries.push(
+            scroll(rows)
+                .gap(tokens::SPACE_2)
+                .width(Size::Fill(1.0))
+                .height(Size::Fill(1.0)),
+        );
+        column(entries)
+            .gap(tokens::SPACE_2)
+            .width(Size::Fill(1.0))
+            .height(Size::Fill(1.0))
+    }
+
+    /// One row in the Shared MCP catalog. Top line carries name +
+    /// origin chip + connected indicator; second line the URL and
+    /// auth chip; optional last_error caption when present; row
+    /// actions Edit + Remove (two-click arm-confirm) at the bottom.
+    fn render_shared_mcp_host_row(
+        &self,
+        modal: &SettingsModalState,
+        host: &SharedMcpHostInfo,
+    ) -> El {
+        let armed = modal.shared_mcp_remove_armed.contains(&host.name);
+        let auth_label = match &host.auth {
+            SharedMcpAuthPublic::None => "anonymous".to_string(),
+            SharedMcpAuthPublic::Bearer => "bearer".to_string(),
+            SharedMcpAuthPublic::Oauth2 { issuer, scope } => match scope.as_deref() {
+                Some(s) if !s.is_empty() => format!("oauth · {issuer} · {s}"),
+                _ => format!("oauth · {issuer}"),
+            },
+        };
+        let connected_chip = if host.connected {
+            text("connected").caption().color(tokens::SUCCESS)
+        } else {
+            text("not connected").caption().color(tokens::WARNING)
+        };
+        let mut header_chips: Vec<El> = vec![
+            text(host.name.clone())
+                .label()
+                .bold()
+                .ellipsis()
+                .width(Size::Fill(1.0)),
+            text(format!("\u{00B7} {:?}", host.origin).to_lowercase())
+                .caption()
+                .muted(),
+            connected_chip,
+        ];
+        let _ = &mut header_chips;
+        let header = row(header_chips)
+            .gap(tokens::SPACE_2)
+            .align(Align::Center)
+            .width(Size::Fill(1.0));
+
+        let url_row = row([
+            text(format!("url: {}", host.url))
+                .caption()
+                .muted()
+                .ellipsis()
+                .width(Size::Fill(1.0)),
+            text(format!("auth: {auth_label}")).caption().muted(),
+        ])
+        .gap(tokens::SPACE_3)
+        .align(Align::Center)
+        .width(Size::Fill(1.0));
+
+        let mut card_children: Vec<El> = vec![header, url_row];
+        if !host.last_error.is_empty() {
+            card_children.push(paragraph(host.last_error.clone()).color(tokens::DESTRUCTIVE));
+        }
+
+        // Action row: Edit + Remove (or Confirm/Cancel when armed).
+        let action_row = if armed {
+            row([
+                text("really remove?").caption().color(tokens::DESTRUCTIVE),
+                button("Confirm")
+                    .key(format!(
+                        "{SETTINGS_SHARED_MCP_REMOVE_CONFIRM_PREFIX}{}",
+                        host.name
+                    ))
+                    .destructive(),
+                button("Cancel").key(format!(
+                    "{SETTINGS_SHARED_MCP_REMOVE_CANCEL_PREFIX}{}",
+                    host.name
+                )),
+            ])
+            .gap(tokens::SPACE_2)
+            .align(Align::Center)
+            .padding(Sides {
+                left: tokens::RING_WIDTH,
+                right: tokens::RING_WIDTH,
+                top: 0.0,
+                bottom: 0.0,
+            })
+        } else {
+            row([
+                button("Edit").key(format!("{SETTINGS_SHARED_MCP_EDIT_PREFIX}{}", host.name)),
+                button("Remove").key(format!("{SETTINGS_SHARED_MCP_REMOVE_PREFIX}{}", host.name)),
+            ])
+            .gap(tokens::SPACE_2)
+            .align(Align::Center)
+            .padding(Sides {
+                left: tokens::RING_WIDTH,
+                right: tokens::RING_WIDTH,
+                top: 0.0,
+                bottom: 0.0,
+            })
+        };
+        card_children.push(action_row);
+
+        card(card_children)
+            .gap(tokens::SPACE_1)
+            .width(Size::Fill(1.0))
+    }
+
+    /// Codex auth-rotate sub-form. Centered overlay above the
+    /// settings modal, painted via `popover_layers()` when
+    /// `codex_rotate.is_some()`. The text_area collects a pasted
+    /// `auth.json` blob; Save dispatches `UpdateCodexAuth` and
+    /// keeps the form open until `CodexAuthUpdated` (success
+    /// closes + banner) or a correlation-matching `Error`
+    /// (surfaced inline so the operator can retry).
+    fn render_settings_codex_rotate_modal(&self) -> Option<El> {
+        let modal = self.settings_modal.as_ref()?;
+        let sub = modal.codex_rotate.as_ref()?;
+        const ROTATE_W: f32 = 560.0;
+        const ROTATE_H: f32 = 420.0;
+        let saving = sub.pending_correlation.is_some();
+
+        let body = text_area(
+            &sub.contents,
+            &self.selection,
+            SETTINGS_CODEX_ROTATE_BODY_KEY,
+        )
+        .mono()
+        .width(Size::Fill(1.0))
+        .height(Size::Fill(1.0));
+
+        let mut save = button(if saving { "Saving\u{2026}" } else { "Save" })
+            .key(SETTINGS_CODEX_ROTATE_SAVE_KEY)
+            .primary();
+        if saving || sub.contents.trim().is_empty() {
+            save = save.disabled();
+        }
+        let mut cancel = button("Cancel").key(SETTINGS_CODEX_ROTATE_CANCEL_KEY);
+        if saving {
+            cancel = cancel.disabled();
+        }
+
+        let mut entries: Vec<El> = vec![
+            dialog_header([
+                dialog_title(format!("Rotate Codex credentials \u{2014} {}", sub.backend)),
+                dialog_description(
+                    "Paste the full contents of a working ~/.codex/auth.json \
+                     (the file produced by `codex login` on a machine with a \
+                     ChatGPT subscription). The server validates the JSON, \
+                     writes it to the backend's configured path, and swaps \
+                     the in-memory tokens \u{2014} no restart needed.",
+                ),
+            ]),
+            body,
+        ];
+        if let Some(err) = sub.error.as_deref() {
+            entries.push(
+                alert([
+                    alert_title("rotation failed"),
+                    alert_description(err.to_string()),
+                ])
+                .destructive(),
+            );
+        }
+        entries.push(dialog_footer([cancel, save]));
+
+        Some(overlay([
+            scrim(SETTINGS_CODEX_ROTATE_DISMISS_KEY),
+            dialog_content(entries)
+                .width(Size::Fixed(ROTATE_W))
+                .height(Size::Fixed(ROTATE_H))
+                .block_pointer(),
+        ]))
+    }
+
+    /// Shared-MCP Add / Edit sub-form. Centered overlay above the
+    /// settings modal. `name` is locked on Edit (pod bindings
+    /// reference it); url is always editable. Auth picker exposes
+    /// Anonymous / Bearer / OAuth (OAuth Add-only and only when
+    /// `OAUTH_AVAILABLE`). Prefix picker exposes
+    /// Default / None / Custom.
+    fn render_settings_shared_mcp_editor_modal(&self) -> Option<El> {
+        let modal = self.settings_modal.as_ref()?;
+        let sub = modal.shared_mcp_editor.as_ref()?;
+        const EDITOR_W: f32 = 560.0;
+        const EDITOR_H: f32 = 600.0;
+        let saving = sub.pending_correlation.is_some();
+        let waiting = saving || sub.oauth_in_flight;
+        let title = match sub.mode {
+            SharedMcpEditorMode::Add => "Add shared MCP host".to_string(),
+            SharedMcpEditorMode::Edit => format!("Edit shared MCP host \u{2014} {}", sub.name),
+        };
+
+        let name_input = text_input(
+            &sub.name,
+            &self.selection,
+            SETTINGS_SHARED_MCP_EDITOR_NAME_KEY,
+        )
+        .width(Size::Fill(1.0));
+        let name_input = if waiting || sub.mode == SharedMcpEditorMode::Edit {
+            name_input.disabled()
+        } else {
+            name_input
+        };
+        let url_input = text_input(
+            &sub.url,
+            &self.selection,
+            SETTINGS_SHARED_MCP_EDITOR_URL_KEY,
+        )
+        .width(Size::Fill(1.0));
+        let url_input = if waiting {
+            url_input.disabled()
+        } else {
+            url_input
+        };
+
+        // Auth row. OAuth disabled outside Add and outside
+        // wasm-OAUTH_AVAILABLE builds.
+        let auth_choice_str = match sub.auth_choice {
+            SharedMcpAuthChoice::Anonymous => "anonymous",
+            SharedMcpAuthChoice::Bearer => "bearer",
+            SharedMcpAuthChoice::Oauth2 => "oauth2",
+        };
+        let oauth_enabled = sub.mode == SharedMcpEditorMode::Add && OAUTH_AVAILABLE && !waiting;
+        let mut auth_items: Vec<El> = vec![
+            toggle_item(
+                SETTINGS_SHARED_MCP_EDITOR_AUTH_GROUP_KEY,
+                "anonymous",
+                "Anonymous",
+                sub.auth_choice == SharedMcpAuthChoice::Anonymous,
+            ),
+            toggle_item(
+                SETTINGS_SHARED_MCP_EDITOR_AUTH_GROUP_KEY,
+                "bearer",
+                "Bearer",
+                sub.auth_choice == SharedMcpAuthChoice::Bearer,
+            ),
+        ];
+        let mut oauth_toggle = toggle_item(
+            SETTINGS_SHARED_MCP_EDITOR_AUTH_GROUP_KEY,
+            "oauth2",
+            "OAuth",
+            sub.auth_choice == SharedMcpAuthChoice::Oauth2,
+        );
+        if !oauth_enabled {
+            oauth_toggle = oauth_toggle.disabled();
+        }
+        auth_items.push(oauth_toggle);
+        let auth_row = row(auth_items)
+            .gap(tokens::SPACE_1)
+            .align(Align::Center)
+            .key(SETTINGS_SHARED_MCP_EDITOR_AUTH_GROUP_KEY)
+            .width(Size::Hug);
+        let _ = auth_choice_str;
+
+        // Per-auth-choice sub-fields.
+        let auth_detail: El = match sub.auth_choice {
+            SharedMcpAuthChoice::Anonymous => {
+                if sub.mode == SharedMcpEditorMode::Edit
+                    && matches!(sub.auth_kind_on_load, SharedMcpAuthPublic::Bearer)
+                {
+                    paragraph("Saving will clear the existing bearer token.").color(tokens::WARNING)
+                } else {
+                    paragraph("No Authorization header sent.").muted()
+                }
+            }
+            SharedMcpAuthChoice::Bearer => {
+                let had_bearer = matches!(sub.auth_kind_on_load, SharedMcpAuthPublic::Bearer);
+                let bearer_input = text_input(
+                    &sub.bearer,
+                    &self.selection,
+                    SETTINGS_SHARED_MCP_EDITOR_BEARER_KEY,
+                )
+                .width(Size::Fill(1.0));
+                let bearer_input = if waiting {
+                    bearer_input.disabled()
+                } else {
+                    bearer_input
+                };
+                let hint = if had_bearer {
+                    "Leave blank to keep the existing bearer."
+                } else {
+                    "Paste the bearer token (kept server-side)."
+                };
+                column([form_item([
+                    form_label("bearer"),
+                    form_control(bearer_input),
+                    form_description(hint),
+                ])])
+                .width(Size::Fill(1.0))
+            }
+            SharedMcpAuthChoice::Oauth2 => {
+                let scope_input = text_input(
+                    &sub.oauth_scope,
+                    &self.selection,
+                    SETTINGS_SHARED_MCP_EDITOR_OAUTH_SCOPE_KEY,
+                )
+                .width(Size::Fill(1.0));
+                let scope_input = if waiting {
+                    scope_input.disabled()
+                } else {
+                    scope_input
+                };
+                column([
+                    form_item([
+                        form_label("scope"),
+                        form_control(scope_input),
+                        form_description(
+                            "Optional, space-separated. Empty falls back to \
+                             the AS metadata's scopes_supported.",
+                        ),
+                    ]),
+                    paragraph(
+                        "Saving opens the authorization server in a new tab. \
+                         Grant consent there; this window stays open until \
+                         the flow completes.",
+                    )
+                    .muted(),
+                ])
+                .gap(tokens::SPACE_2)
+                .width(Size::Fill(1.0))
+            }
+        };
+
+        // Prefix row.
+        let prefix_choice_str = match sub.prefix_choice {
+            SharedMcpPrefixChoice::Default => "default",
+            SharedMcpPrefixChoice::None => "none",
+            SharedMcpPrefixChoice::Custom => "custom",
+        };
+        let prefix_row = toggle_group(
+            SETTINGS_SHARED_MCP_EDITOR_PREFIX_GROUP_KEY,
+            &prefix_choice_str,
+            [
+                ("default", "Default (host name)"),
+                ("none", "None"),
+                ("custom", "Custom"),
+            ],
+        );
+        let prefix_detail: El = match sub.prefix_choice {
+            SharedMcpPrefixChoice::Default => {
+                let example = if sub.name.trim().is_empty() {
+                    "<host name>".to_string()
+                } else {
+                    sub.name.trim().to_string()
+                };
+                paragraph(format!(
+                    "Tools will appear to the model as `{example}_<tool>`."
+                ))
+                .muted()
+            }
+            SharedMcpPrefixChoice::None => paragraph(
+                "Tools will appear to the model with their bare server-side \
+                 names. Risks collisions across hosts.",
+            )
+            .color(tokens::WARNING),
+            SharedMcpPrefixChoice::Custom => {
+                let custom_input = text_input(
+                    &sub.prefix_custom,
+                    &self.selection,
+                    SETTINGS_SHARED_MCP_EDITOR_PREFIX_CUSTOM_KEY,
+                )
+                .width(Size::Fill(1.0));
+                let custom_input = if waiting {
+                    custom_input.disabled()
+                } else {
+                    custom_input
+                };
+                form_item([
+                    form_label("prefix"),
+                    form_control(custom_input),
+                    form_description("Tools surface as `<prefix>_<tool>`."),
+                ])
+            }
+        };
+
+        // Save / Cancel row. Label flips based on auth choice and
+        // in-flight state — matches the egui sibling.
+        let save_label = if sub.oauth_in_flight {
+            "Waiting\u{2026}"
+        } else if saving {
+            "Saving\u{2026}"
+        } else if sub.auth_choice == SharedMcpAuthChoice::Oauth2 {
+            "Authorize"
+        } else {
+            "Save"
+        };
+        let save_enabled = !waiting && !sub.name.trim().is_empty() && !sub.url.trim().is_empty();
+        let mut save = button(save_label)
+            .key(SETTINGS_SHARED_MCP_EDITOR_SAVE_KEY)
+            .primary();
+        if !save_enabled {
+            save = save.disabled();
+        }
+        let mut cancel = button("Cancel").key(SETTINGS_SHARED_MCP_EDITOR_CANCEL_KEY);
+        if saving {
+            cancel = cancel.disabled();
+        }
+
+        let mut entries: Vec<El> = vec![
+            dialog_header([
+                dialog_title(title),
+                dialog_description(
+                    "Configure how the scheduler connects to a third-party \
+                     MCP host. Bearer tokens are stored server-side and are \
+                     never echoed back to the client.",
+                ),
+            ]),
+            form([
+                form_item([form_label("name"), form_control(name_input)]),
+                form_item([form_label("url"), form_control(url_input)]),
+            ]),
+            text("Authentication").caption().muted(),
+            auth_row,
+            auth_detail,
+            text("Tool-name prefix").caption().muted(),
+            prefix_row,
+            prefix_detail,
+        ];
+
+        if sub.oauth_in_flight {
+            entries.push(
+                paragraph(
+                    "Waiting for authorization\u{2026} complete the flow in \
+                     the browser tab that opened.",
+                )
+                .color(tokens::INFO),
+            );
+        }
+        if let Some(err) = sub.error.as_deref() {
+            entries.push(
+                alert([
+                    alert_title("couldn't save host"),
+                    alert_description(err.to_string()),
+                ])
+                .destructive(),
+            );
+        }
+        entries.push(dialog_footer([cancel, save]));
+
+        Some(overlay([
+            scrim(SETTINGS_SHARED_MCP_EDITOR_DISMISS_KEY),
+            dialog_content(entries)
+                .width(Size::Fixed(EDITOR_W))
+                .height(Size::Fixed(EDITOR_H))
+                .block_pointer(),
+        ]))
     }
 
     /// Server-config tab — admin-only raw TOML editor over
@@ -14313,6 +15551,126 @@ fn build_create_bucket_request(
             quantization: Some(cf.quantization.to_wire()),
         },
     ))
+}
+
+/// Validated, wire-shaped request the Shared-MCP editor would
+/// dispatch on Save. Built off the editor's local state by
+/// `build_shared_mcp_submit_request`; the dispatcher folds it into
+/// the matching `AddSharedMcpHost` / `UpdateSharedMcpHost`.
+enum SharedMcpSubmitRequest {
+    Add {
+        name: String,
+        url: String,
+        auth: SharedMcpAuthInput,
+        prefix: SharedMcpPrefixInput,
+    },
+    Update {
+        name: String,
+        url: String,
+        auth: Option<SharedMcpAuthInput>,
+        prefix: SharedMcpPrefixInput,
+    },
+}
+
+fn build_shared_mcp_submit_request(
+    sub: &SharedMcpEditorState,
+) -> Result<SharedMcpSubmitRequest, String> {
+    let name = sub.name.trim();
+    if name.is_empty() {
+        return Err("name is required".into());
+    }
+    let url = sub.url.trim();
+    if url.is_empty() {
+        return Err("url is required".into());
+    }
+    let prefix = match sub.prefix_choice {
+        SharedMcpPrefixChoice::Default => SharedMcpPrefixInput::Default,
+        SharedMcpPrefixChoice::None => SharedMcpPrefixInput::None,
+        SharedMcpPrefixChoice::Custom => {
+            let trimmed = sub.prefix_custom.trim();
+            if trimmed.is_empty() {
+                return Err("custom prefix can't be empty".into());
+            }
+            SharedMcpPrefixInput::Custom {
+                value: trimmed.to_string(),
+            }
+        }
+    };
+    let bearer = sub.bearer.trim().to_string();
+    let scope = sub.oauth_scope.trim().to_string();
+
+    match sub.mode {
+        SharedMcpEditorMode::Add => {
+            let auth = match sub.auth_choice {
+                SharedMcpAuthChoice::Anonymous => SharedMcpAuthInput::None,
+                SharedMcpAuthChoice::Bearer => SharedMcpAuthInput::Bearer { token: bearer },
+                SharedMcpAuthChoice::Oauth2 => SharedMcpAuthInput::Oauth2Start {
+                    scope: (!scope.is_empty()).then_some(scope),
+                    redirect_base: webui_origin(),
+                },
+            };
+            Ok(SharedMcpSubmitRequest::Add {
+                name: name.to_string(),
+                url: url.to_string(),
+                auth,
+                prefix,
+            })
+        }
+        SharedMcpEditorMode::Edit => {
+            let had_bearer = matches!(sub.auth_kind_on_load, SharedMcpAuthPublic::Bearer);
+            let auth: Option<SharedMcpAuthInput> = match sub.auth_choice {
+                SharedMcpAuthChoice::Anonymous => Some(SharedMcpAuthInput::None),
+                SharedMcpAuthChoice::Bearer => {
+                    if bearer.is_empty() && had_bearer {
+                        // "Keep existing" — elide the auth field
+                        // so the server leaves the stored token
+                        // alone.
+                        None
+                    } else if bearer.is_empty() {
+                        // Explicit clear — empty bearer with no
+                        // existing bearer means the operator wants
+                        // anonymous access.
+                        Some(SharedMcpAuthInput::None)
+                    } else {
+                        Some(SharedMcpAuthInput::Bearer { token: bearer })
+                    }
+                }
+                // Edit doesn't support Oauth2Start; the renderer
+                // gates the option, but the type-system arm needs
+                // an answer. Elide auth so the server keeps the
+                // entry's existing OAuth tokens untouched.
+                SharedMcpAuthChoice::Oauth2 => None,
+            };
+            Ok(SharedMcpSubmitRequest::Update {
+                name: name.to_string(),
+                url: url.to_string(),
+                auth,
+                prefix,
+            })
+        }
+    }
+}
+
+/// Origin the running webui is served from. On wasm the browser
+/// gives us `window.location.origin`; native builds fall back to a
+/// placeholder (the OAuth Add path is gated off via
+/// `OAUTH_AVAILABLE` on native, so this string never reaches the
+/// server). Used by `Oauth2Start.redirect_base` so the AS can
+/// redirect back to the same origin the user is browsing on.
+fn webui_origin() -> String {
+    #[cfg(target_arch = "wasm32")]
+    {
+        if let Some(window) = web_sys::window() {
+            if let Ok(origin) = window.location().origin() {
+                return origin;
+            }
+        }
+        "http://127.0.0.1".into()
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        "http://127.0.0.1".into()
+    }
 }
 
 fn first_ready_bucket(buckets: &[BucketSummary]) -> Option<BucketRowKey> {

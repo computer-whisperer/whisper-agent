@@ -1286,37 +1286,76 @@ trivial / small / medium / large.
   Reconnect drops `pod_files` + `pod_files_requested` so the
   in-flight guard doesn't wedge if the server restarts with a
   different on-disk layout.
-- 🌗 **Server settings.** v1 ships two tabs of the egui sibling's
-  four: read-only LLM backends list + admin-only raw editor for
-  `whisper-agent.toml`. Shared MCP hosts CRUD and Codex auth
-  rotation sub-form are deferred to follow-up sub-slices.
+- ✅ **Server settings.** All three tabs of the egui sibling's
+  modal landed: LLM backends (catalog + per-`chatgpt_subscription`
+  Codex auth rotate sub-form), Shared MCP (CRUD), and admin-only
+  raw editor for `whisper-agent.toml`.
 
   Entry point is a `settings` icon-button in the sidebar footer
   (next to the server-URL line, since server settings aren't
   pod-scoped). State on `ChatApp`:
-  `settings_modal: Option<SettingsModalState>` with
-  `active_tab: SettingsTab` and `server_config: Option<ServerConfigEditorState>`.
+  `settings_modal: Option<SettingsModalState>` carries
+  `active_tab` plus per-tab slots — `server_config`
+  (lazy-fetched), `codex_rotate` + `codex_rotate_banner`,
+  `shared_mcp_editor` + `shared_mcp_banner` +
+  `shared_mcp_remove_armed`.
 
-  Backends tab: read-only column of per-backend cards (alias +
-  kind row, optional default-model / auth-mode chips). No wire
-  interaction — Codex rotate stub lands in the follow-up.
+  Backends tab: per-backend cards (alias + kind row, optional
+  default-model / auth-mode chips). `chatgpt_subscription` rows
+  carry a "Rotate credentials" button that opens the
+  `CodexRotateState` sub-form (pasted-auth.json text_area + Save +
+  inline error). Save dispatches `UpdateCodexAuth` with a fresh
+  correlation; `CodexAuthUpdated` echo with matching correlation
+  closes the form and stamps the success banner above the catalog.
+  Correlation-matching `Error` surfaces inline so the operator
+  can fix the paste without retyping.
+
+  Shared MCP tab: a "+ Add host" button + scrolled list of host
+  rows, each with name + origin chip + connected indicator + URL +
+  auth chip + last_error caption + Edit / Remove (two-click
+  arm-confirm) buttons. The Add / Edit sub-form (a centered
+  overlay above the settings dialog) collects name (locked on
+  Edit) + url + auth picker (Anonymous / Bearer / OAuth, OAuth
+  Add-only and only when `OAUTH_AVAILABLE`, which is the wasm
+  target — native gates the option off) + bearer / scope per
+  choice + tool-name prefix picker (Default / None / Custom).
+  `submit_shared_mcp_editor` validates the form, builds a
+  `SharedMcpSubmitRequest::{Add,Update}` via
+  `build_shared_mcp_submit_request`, and dispatches the matching
+  wire op. The "keep existing bearer" semantic on Edit is
+  modeled inline: empty buffer + existing-bearer → elide the
+  auth field; empty + no-existing → explicit clear; non-empty →
+  set bearer.
+
+  Wire arms: `SharedMcpHostAdded` / `SharedMcpHostUpdated`
+  replace-or-insert by name, sort the list, and close the editor
+  on correlation match (banner stamped). `SharedMcpHostRemoved`
+  drops the row + clears the armed set. `SharedMcpOauthFlowStarted`
+  flips `oauth_in_flight = true` and (on wasm) opens the
+  authorization URL via `web_sys::window().open(...)`. Error arm
+  fans out: matching codex_rotate / shared_mcp_editor /
+  remove_shared_mcp_host correlations land inline.
 
   Server config tab: lazy-fetches via `FetchServerConfig` on
-  first tab open (`ensure_server_config_fetched` is idempotent —
-  re-opens don't refire). `ServerConfigFetched` hydrates
-  `original` + `working`. Save mints a fresh correlation and
-  ships `UpdateServerConfig`; the `ServerConfigUpdateResult`
-  reply adopts the working buffer as the new baseline and
-  populates `save_summary` (cancelled threads, restart-required
-  sections, pods referencing removed backends). Save / Revert
-  are tab-scoped affordances above the text_area, not in the
-  dialog footer.
+  first tab open (`ensure_server_config_fetched` is idempotent).
+  `ServerConfigFetched` hydrates `original` + `working`. Save
+  mints a fresh correlation and ships `UpdateServerConfig`; the
+  `ServerConfigUpdateResult` reply adopts the working buffer as
+  the new baseline and populates `save_summary` (cancelled
+  threads, restart-required sections, pods referencing removed
+  backends). Save / Revert are tab-scoped affordances above the
+  text_area.
 
-  Bundle scenes: `SettingsBackends` (read-only catalog) and
+  Bundle scenes: `SettingsBackends` (read-only catalog),
   `SettingsServerConfig` (text_area populated via synthesized
-  `ServerConfigFetched`). The egui sibling's success / error
-  banners + the `ServerConfigUpdateResult` summary alert all
-  paint via aetna's `alert` widget; both scenes lint clean.
+  `ServerConfigFetched`), `SettingsCodexRotate` (sub-form open
+  over a `chatgpt_subscription` backend),
+  `SettingsSharedMcpList` (populated tab with the third row
+  armed for removal — Confirm + Cancel pair renders),
+  `SettingsSharedMcpEditorAdd` (Add sub-form fresh; OAuth toggle
+  greyed because `OAUTH_AVAILABLE = false` on the bundle's
+  native target), `SettingsSharedMcpEditorEdit` (Edit sub-form
+  pre-populated from a bearer-auth host). All scenes lint clean.
 - ✅ **Knowledge buckets.** All three phases landed: read-only catalog
   modal with per-row chrome, live build-progress display, last-
   failed-build error banner, per-row actions (Build / Pause build /

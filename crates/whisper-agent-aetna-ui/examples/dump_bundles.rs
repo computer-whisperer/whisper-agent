@@ -373,10 +373,32 @@ enum Scene {
     /// source kind switched to `tracked` so the driver / language /
     /// mirror / cadence sub-fields render.
     BucketsModalCreateFormTracked,
+    /// Server-settings modal on Backends with the Codex rotate
+    /// sub-form open above it. Seeded backend list includes a
+    /// `chatgpt_subscription` entry whose Rotate button the click
+    /// loop activates; the sub-form text_area paints the empty
+    /// state so the inline hint reads.
+    SettingsCodexRotate,
+    /// Server-settings modal on the Shared MCP tab over a
+    /// populated `SharedMcpHostsList`. Three rows: anonymous
+    /// connected, bearer connected, oauth disconnected (with
+    /// last_error). The third row is armed for removal so the
+    /// destructive Confirm + Cancel pair renders.
+    SettingsSharedMcpList,
+    /// Shared MCP editor sub-form open in Add mode over the
+    /// settings modal. Auth picker shows Anonymous / Bearer /
+    /// OAuth (OAuth disabled on native — `OAUTH_AVAILABLE` is
+    /// false), prefix picker shows the three Default / None /
+    /// Custom options.
+    SettingsSharedMcpEditorAdd,
+    /// Shared MCP editor sub-form open in Edit mode pre-populated
+    /// from a seeded bearer host. Name field is locked; bearer
+    /// input shows the "leave blank to keep existing" hint.
+    SettingsSharedMcpEditorEdit,
 }
 
 impl Scene {
-    const ALL: [Scene; 54] = [
+    const ALL: [Scene; 58] = [
         Scene::Connecting,
         Scene::Connected,
         Scene::Closed,
@@ -431,6 +453,10 @@ impl Scene {
         Scene::BucketsModalSearchResults,
         Scene::BucketsModalCreateForm,
         Scene::BucketsModalCreateFormTracked,
+        Scene::SettingsCodexRotate,
+        Scene::SettingsSharedMcpList,
+        Scene::SettingsSharedMcpEditorAdd,
+        Scene::SettingsSharedMcpEditorEdit,
     ];
 
     fn slug(self) -> &'static str {
@@ -489,6 +515,10 @@ impl Scene {
             Scene::BucketsModalSearchResults => "buckets_modal_search_results",
             Scene::BucketsModalCreateForm => "buckets_modal_create_form",
             Scene::BucketsModalCreateFormTracked => "buckets_modal_create_form_tracked",
+            Scene::SettingsCodexRotate => "settings_codex_rotate",
+            Scene::SettingsSharedMcpList => "settings_shared_mcp_list",
+            Scene::SettingsSharedMcpEditorAdd => "settings_shared_mcp_editor_add",
+            Scene::SettingsSharedMcpEditorEdit => "settings_shared_mcp_editor_edit",
         }
     }
 
@@ -668,6 +698,29 @@ impl Scene {
             Scene::BucketsModalSearchResults => vec![
                 "buckets:search:submit",
                 "buckets:search:hit:0a1b2c3d4e5f6789a0b1c2d3e4f56789",
+            ],
+            // Settings Codex rotate: click the Rotate button on the
+            // pre-seeded `chatgpt_subscription` backend so the
+            // sub-form opens.
+            Scene::SettingsCodexRotate => vec!["settings:codex-rotate:open:codex"],
+            // Settings Shared MCP list: switch to the tab, then arm
+            // the third row's Remove so the Confirm / Cancel pair
+            // renders.
+            Scene::SettingsSharedMcpList => vec![
+                "settings:tabs:tab:shared-mcp",
+                "settings:shared-mcp:remove:legacy",
+            ],
+            // Shared MCP editor (Add): switch to the tab, then click
+            // "+ Add host" to open the sub-form fresh.
+            Scene::SettingsSharedMcpEditorAdd => {
+                vec!["settings:tabs:tab:shared-mcp", "settings:shared-mcp:add"]
+            }
+            // Shared MCP editor (Edit): switch to the tab, then
+            // click Edit on the bearer-auth host so the sub-form
+            // opens with that row's values pre-populated.
+            Scene::SettingsSharedMcpEditorEdit => vec![
+                "settings:tabs:tab:shared-mcp",
+                "settings:shared-mcp:edit:slack",
             ],
             _ => Vec::new(),
         }
@@ -1380,6 +1433,10 @@ fn build_app(scene: Scene) -> Box<dyn App> {
         | Scene::FileTreeOpen
         | Scene::SettingsBackends
         | Scene::SettingsServerConfig
+        | Scene::SettingsCodexRotate
+        | Scene::SettingsSharedMcpList
+        | Scene::SettingsSharedMcpEditorAdd
+        | Scene::SettingsSharedMcpEditorEdit
         | Scene::BucketsModalCatalog
         | Scene::BucketsModalSearchResults
         | Scene::BucketsModalCreateForm
@@ -1400,14 +1457,43 @@ fn build_app(scene: Scene) -> Box<dyn App> {
                 correlation_id: None,
                 tasks: mock_threads(),
             }));
-            if matches!(scene, Scene::SettingsBackends | Scene::SettingsServerConfig) {
+            if matches!(
+                scene,
+                Scene::SettingsBackends
+                    | Scene::SettingsServerConfig
+                    | Scene::SettingsCodexRotate
+                    | Scene::SettingsSharedMcpList
+                    | Scene::SettingsSharedMcpEditorAdd
+                    | Scene::SettingsSharedMcpEditorEdit
+            ) {
                 // Backends tab reads from the server-known catalog;
                 // seed it so the per-backend cards have content
                 // even on the Server-config tab variant (the Backends
-                // tab is the modal's default).
+                // tab is the modal's default). The Codex rotate
+                // scene needs a `chatgpt_subscription` row so the
+                // Rotate button appears.
                 q.push_back(InboundEvent::Wire(ServerToClient::BackendsList {
                     correlation_id: None,
-                    backends: mock_backends(),
+                    backends: if matches!(scene, Scene::SettingsCodexRotate) {
+                        mock_backends_with_codex()
+                    } else {
+                        mock_backends()
+                    },
+                }));
+            }
+            if matches!(
+                scene,
+                Scene::SettingsSharedMcpList
+                    | Scene::SettingsSharedMcpEditorAdd
+                    | Scene::SettingsSharedMcpEditorEdit
+            ) {
+                // SharedMcp tab catalog. Three rows: anonymous
+                // connected, bearer connected, oauth disconnected
+                // (with a last_error so the destructive caption
+                // paints).
+                q.push_back(InboundEvent::Wire(ServerToClient::SharedMcpHostsList {
+                    correlation_id: None,
+                    hosts: mock_settings_shared_mcp_hosts(),
                 }));
             }
             if matches!(
@@ -1490,7 +1576,15 @@ fn build_app(scene: Scene) -> Box<dyn App> {
     if matches!(scene, Scene::FileTreeOpen) {
         app.open_file_tree_modal("default".into());
     }
-    if matches!(scene, Scene::SettingsBackends | Scene::SettingsServerConfig) {
+    if matches!(
+        scene,
+        Scene::SettingsBackends
+            | Scene::SettingsServerConfig
+            | Scene::SettingsCodexRotate
+            | Scene::SettingsSharedMcpList
+            | Scene::SettingsSharedMcpEditorAdd
+            | Scene::SettingsSharedMcpEditorEdit
+    ) {
         app.open_settings_modal();
     }
     if matches!(scene, Scene::BucketsModalCatalog) {
@@ -1551,6 +1645,53 @@ fn mock_backends() -> Vec<BackendSummary> {
             kind: "openai_chat".into(),
             default_model: None,
             auth_mode: None,
+        },
+    ]
+}
+
+fn mock_backends_with_codex() -> Vec<BackendSummary> {
+    let mut v = mock_backends();
+    v.push(BackendSummary {
+        name: "codex".into(),
+        kind: "chatgpt_subscription".into(),
+        default_model: Some("gpt-5-codex".into()),
+        auth_mode: Some("auth.json".into()),
+    });
+    v
+}
+
+fn mock_settings_shared_mcp_hosts() -> Vec<whisper_agent_protocol::SharedMcpHostInfo> {
+    use whisper_agent_protocol::{CatalogOrigin, SharedMcpAuthPublic, SharedMcpHostInfo};
+    vec![
+        SharedMcpHostInfo {
+            name: "fetch".into(),
+            url: "http://localhost:8123/mcp".into(),
+            origin: CatalogOrigin::Seeded,
+            auth: SharedMcpAuthPublic::None,
+            prefix: None,
+            connected: true,
+            last_error: String::new(),
+        },
+        SharedMcpHostInfo {
+            name: "slack".into(),
+            url: "https://slack.example.com/mcp".into(),
+            origin: CatalogOrigin::Manual,
+            auth: SharedMcpAuthPublic::Bearer,
+            prefix: Some("slack".into()),
+            connected: true,
+            last_error: String::new(),
+        },
+        SharedMcpHostInfo {
+            name: "legacy".into(),
+            url: "https://legacy.example.com/mcp".into(),
+            origin: CatalogOrigin::Manual,
+            auth: SharedMcpAuthPublic::Oauth2 {
+                issuer: "https://idp.example.com".into(),
+                scope: Some("read write".into()),
+            },
+            prefix: Some(String::new()),
+            connected: false,
+            last_error: "tcp connect refused: 503".into(),
         },
     ]
 }
