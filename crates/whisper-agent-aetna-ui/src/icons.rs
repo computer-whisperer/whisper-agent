@@ -59,11 +59,6 @@ pub static ICON_MESSAGE_SQUARE: LazyLock<SvgIcon> = LazyLock::new(|| {
 pub static ICON_INBOX: LazyLock<SvgIcon> =
     LazyLock::new(|| SvgIcon::parse_current_color(LUCIDE_INBOX).expect("lucide inbox svg parses"));
 
-/// Sparkles — small brand mark next to the sidebar title.
-pub static ICON_SPARKLES: LazyLock<SvgIcon> = LazyLock::new(|| {
-    SvgIcon::parse_current_color(LUCIDE_SPARKLES).expect("lucide sparkles svg parses")
-});
-
 /// Network plug — server status icon shown in the sidebar footer.
 pub static ICON_SERVER: LazyLock<SvgIcon> = LazyLock::new(|| {
     SvgIcon::parse_current_color(LUCIDE_SERVER).expect("lucide server svg parses")
@@ -100,8 +95,6 @@ const LUCIDE_X: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 
 const LUCIDE_MESSAGE_SQUARE: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>"##;
 
 const LUCIDE_INBOX: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="22 12 16 12 14 15 10 15 8 12 2 12"/><path d="M5.45 5.11 2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.45-6.89A2 2 0 0 0 16.76 4H7.24a2 2 0 0 0-1.79 1.11z"/></svg>"##;
-
-const LUCIDE_SPARKLES: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9.937 15.5A2 2 0 0 0 8.5 14.063l-6.135-1.582a.5.5 0 0 1 0-.962L8.5 9.936A2 2 0 0 0 9.937 8.5l1.582-6.135a.5.5 0 0 1 .963 0L14.063 8.5A2 2 0 0 0 15.5 9.937l6.135 1.581a.5.5 0 0 1 0 .964L15.5 14.063a2 2 0 0 0-1.437 1.437l-1.582 6.135a.5.5 0 0 1-.963 0z"/><path d="M20 3v4"/><path d="M22 5h-4"/><path d="M4 17v2"/><path d="M5 18H3"/></svg>"##;
 
 const LUCIDE_SERVER: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="20" height="8" x="2" y="2" rx="2" ry="2"/><rect width="20" height="8" x="2" y="14" rx="2" ry="2"/><line x1="6" x2="6.01" y1="6" y2="6"/><line x1="6" x2="6.01" y1="18" y2="18"/></svg>"##;
 

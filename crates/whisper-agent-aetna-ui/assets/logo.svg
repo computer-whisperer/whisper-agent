@@ -1,0 +1,85 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1254" height="1254" viewBox="0 0 1254 1254">
+  <defs>
+    <radialGradient id="bg" cx="50%" cy="48%" r="74%">
+      <stop offset="0%" stop-color="#061b43"/>
+      <stop offset="50%" stop-color="#03152f"/>
+      <stop offset="100%" stop-color="#020912"/>
+    </radialGradient>
+    <radialGradient id="halo" cx="50%" cy="50%" r="50%">
+      <stop offset="0%" stop-color="#0b3a86" stop-opacity="0.34"/>
+      <stop offset="70%" stop-color="#06245a" stop-opacity="0.10"/>
+      <stop offset="100%" stop-color="#06245a" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="blue" x1="350" y1="950" x2="910" y2="235" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#1b62ff"/>
+      <stop offset="0.46" stop-color="#31a9ff"/>
+      <stop offset="1" stop-color="#2578ff"/>
+    </linearGradient>
+    <linearGradient id="blueH" x1="395" y1="590" x2="860" y2="590" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#2274ff"/>
+      <stop offset="0.5" stop-color="#31a7ff"/>
+      <stop offset="1" stop-color="#2575ff"/>
+    </linearGradient>
+    <filter id="glow" x="-55%" y="-55%" width="210%" height="210%">
+      <feGaussianBlur stdDeviation="7" result="blur"/>
+      <feColorMatrix in="blur" type="matrix" values="0 0 0 0 0.02 0 0 0 0 0.38 0 0 0 0 1 0 0 0 0.65 0" result="blueblur"/>
+      <feMerge><feMergeNode in="blueblur"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+    <filter id="shadow" x="-35%" y="-35%" width="170%" height="180%">
+      <feDropShadow dx="0" dy="14" stdDeviation="18" flood-color="#00060e" flood-opacity="0.92"/>
+    </filter>
+    <filter id="whiteGlow" x="-60%" y="-60%" width="220%" height="220%">
+      <feDropShadow dx="0" dy="1" stdDeviation="1" flood-color="#fff" flood-opacity="0.7"/>
+      <feDropShadow dx="0" dy="5" stdDeviation="5" flood-color="#000" flood-opacity="0.45"/>
+    </filter>
+  </defs>
+
+  <rect width="1254" height="1254" fill="url(#bg)"/>
+  <circle cx="627" cy="616" r="420" fill="url(#halo)"/>
+
+  <!-- outer cloud / home outline -->
+  <path d="M382 817
+           C346 803 320 770 320 729
+           V456
+           C320 426 337 399 363 382
+           L578 244
+           C608 225 646 225 676 244
+           L891 382
+           C917 399 934 426 934 456
+           V729
+           C934 770 908 803 872 817"
+        fill="none" stroke="url(#blue)" stroke-width="25" stroke-linecap="round" stroke-linejoin="round" filter="url(#glow)"/>
+
+  <!-- side pads, partially hidden by terminal -->
+  <path d="M444 505 H488 V672 H444 C417 672 395 650 395 623 V554 C395 527 417 505 444 505 Z" fill="url(#blueH)" filter="url(#glow)"/>
+  <path d="M810 505 H766 V672 H810 C837 672 859 650 859 623 V554 C859 527 837 505 810 505 Z" fill="url(#blueH)" filter="url(#glow)"/>
+
+  <!-- blue rounded terminal shell visible around the top and sides -->
+  <path d="M542 395 H712 C763 395 803 436 803 487 V672 H451 V487 C451 436 491 395 542 395 Z" fill="url(#blueH)" filter="url(#glow)"/>
+
+  <!-- black terminal face -->
+  <path d="M543 421 H711 C749 421 779 451 779 489 V675 C779 682 773 688 766 688 H488 C481 688 475 682 475 675 V489 C475 451 505 421 543 421 Z" fill="#020a11" filter="url(#shadow)"/>
+
+  <!-- prompt: explicit filled shapes so all renderers show them -->
+  <path d="M555 496 C559 496 563 497 566 500 L618 538 C624 543 624 553 618 558 L566 597 C560 602 551 601 546 594 C542 588 543 580 549 575 L592 548 L549 521 C543 516 542 507 547 501 C549 498 552 496 555 496 Z" fill="#fbfaf5" filter="url(#whiteGlow)"/>
+  <rect x="636" y="600" width="75" height="20" rx="7" fill="#fbfaf5" filter="url(#whiteGlow)"/>
+
+  <!-- bright lower blue lip, sits on top of black face -->
+  <rect x="496" y="676" width="264" height="21" rx="10.5" fill="url(#blue)" filter="url(#glow)"/>
+
+  <!-- circuit traces -->
+  <g fill="none" stroke="url(#blue)" stroke-width="18" stroke-linecap="round" stroke-linejoin="round" filter="url(#glow)">
+    <path d="M523 722 V759 L429 853"/>
+    <path d="M576 722 V807 L527 856 V895"/>
+    <path d="M627 722 V947"/>
+    <path d="M678 722 V807 L727 856 V895"/>
+    <path d="M731 722 V759 L825 853"/>
+  </g>
+  <g fill="#031229" stroke="url(#blue)" stroke-width="18" filter="url(#glow)">
+    <circle cx="423" cy="868" r="23"/>
+    <circle cx="526" cy="922" r="23"/>
+    <circle cx="627" cy="976" r="23"/>
+    <circle cx="728" cy="922" r="23"/>
+    <circle cx="831" cy="868" r="23"/>
+  </g>
+</svg>

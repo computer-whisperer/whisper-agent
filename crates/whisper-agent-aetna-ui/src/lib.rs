@@ -17,6 +17,7 @@
 //! their choosing.
 
 mod app;
+mod branding;
 mod cron_preview;
 mod icons;
 mod login;

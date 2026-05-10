@@ -6027,13 +6027,12 @@ impl ChatApp {
         // section "+" is per-pod), so it stays in the header to keep
         // the two scopes visually distinct.
         let mut header_row: Vec<El> = vec![
-            // Sparkles brand mark — single-glyph identity that
-            // distinguishes whisper-agent from a generic shadcn
-            // shell. Sized just under the title so the two read as
-            // a single chip rather than the icon dominating.
-            icon(crate::icons::ICON_SPARKLES.clone())
-                .icon_size(tokens::ICON_SM)
-                .text_color(tokens::PRIMARY),
+            // Brand chip — the bundled `logo.svg` parsed as a full-
+            // color SvgIcon (authored paint, gradients preserved).
+            // Sized at 48px so the mark reads as an app-tile-style
+            // brand presence above the rest of the sidebar chrome
+            // rather than a small inline glyph.
+            icon(crate::branding::LOGO.clone()).icon_size(48.0),
             // Title eats the slack and ellipses if the right-hand
             // chrome grows past the remaining width. The app name
             // is fixed and contextual; clipping it is fine.
