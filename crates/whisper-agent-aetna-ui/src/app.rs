@@ -45,7 +45,7 @@ use whisper_agent_protocol::{
     BehaviorThreadOverride, CatchUp, ClientToServer, ContentBlock, CoreTools, Disposition,
     ImageMime, ImageSource, InitialListing, ModelSummary, NamedHostEnv, Overlap, PodAllow,
     PodConfig, PodLimits, PodSummary, RetentionPolicy, Role, ServerToClient, SystemPromptChoice,
-    ThreadConfigOverride, ThreadDefaults, ThreadSummary, TriggerSpec,
+    ThreadBindingsRequest, ThreadConfigOverride, ThreadDefaults, ThreadSummary, TriggerSpec,
 };
 
 /// Inbound event variants the host shell pushes into the [`Inbound`]
@@ -3479,7 +3479,7 @@ impl ChatApp {
             // mode. Materialize the picker state into a
             // `CreateThread` request. `ThreadCreated` will land in
             // `dispatch_wire` and auto-select the result.
-            let (config_override, pod_id) = self.build_creation_request();
+            let (config_override, bindings_request, pod_id) = self.build_creation_request();
             self.compose_input.clear();
             self.send(ClientToServer::CreateThread {
                 correlation_id: None,
@@ -3487,7 +3487,7 @@ impl ChatApp {
                 initial_message: text,
                 initial_attachments: attachments,
                 config_override,
-                bindings_request: None,
+                bindings_request,
             });
         }
         // Reset selection inside the now-empty compose box so the
@@ -3506,11 +3506,24 @@ impl ChatApp {
         }
     }
 
-    /// Pick the best (`config_override`, `pod_id`) pair for the next
-    /// `CreateThread` from the compose-form picker state. Mirrors the
-    /// egui sibling's `build_creation_override` shape so server-side
-    /// behavior stays identical between the two clients.
-    fn build_creation_request(&self) -> (Option<ThreadConfigOverride>, Option<String>) {
+    /// Pick the best `(config_override, bindings_request, pod_id)` triple
+    /// for the next `CreateThread` from the compose-form picker state.
+    /// Mirrors the egui sibling's `build_creation_override` shape so the
+    /// two clients send identical wire requests.
+    ///
+    /// Critical: when the user picks a backend, the matching
+    /// `ThreadBindingsRequest { backend, .. }` MUST ride alongside the
+    /// `ThreadConfigOverride { model, .. }` — otherwise the server pairs
+    /// the user-picked model with the pod's `thread_defaults.backend`
+    /// and the upstream API rejects the request as "unknown model".
+    fn build_creation_request(
+        &self,
+    ) -> (
+        Option<ThreadConfigOverride>,
+        Option<ThreadBindingsRequest>,
+        Option<String>,
+    ) {
+        let backend = self.picker_backend.clone();
         // If the user picked a backend but didn't touch the model
         // dropdown, pin down the model explicitly so the server
         // doesn't fall back to the *default backend's* default_model
@@ -3518,7 +3531,7 @@ impl ChatApp {
         // picked backend's `default_model`; else the first model the
         // backend's `/models` returned; else `None`.
         let model = self.picker_model.clone().or_else(|| {
-            let b = self.picker_backend.as_ref()?;
+            let b = backend.as_ref()?;
             self.backends
                 .iter()
                 .find(|bs| &bs.name == b)
@@ -3538,7 +3551,12 @@ impl ChatApp {
         } else {
             None
         };
-        (config_override, self.picker_pod.clone())
+        let bindings_request = backend.as_ref().map(|_| ThreadBindingsRequest {
+            backend: backend.clone(),
+            host_env: None,
+            mcp_hosts: None,
+        });
+        (config_override, bindings_request, self.picker_pod.clone())
     }
 
     fn handle_backend_pick(&mut self, action: SelectAction) {
