@@ -1286,11 +1286,37 @@ trivial / small / medium / large.
   Reconnect drops `pod_files` + `pod_files_requested` so the
   in-flight guard doesn't wedge if the server restarts with a
   different on-disk layout.
-- ⏳ **Server settings.** Three tabs (LLM backends with Codex auth
-  rotate, Shared MCP hosts CRUD with auth config, raw server
-  TOML). Egui's `modals/settings.rs`. Reachable via the cog icon
-  in the egui top bar; aetna's equivalent surface is the sidebar
-  footer or an as-yet-unbuilt top bar. *Medium.*
+- 🌗 **Server settings.** v1 ships two tabs of the egui sibling's
+  four: read-only LLM backends list + admin-only raw editor for
+  `whisper-agent.toml`. Shared MCP hosts CRUD and Codex auth
+  rotation sub-form are deferred to follow-up sub-slices.
+
+  Entry point is a `settings` icon-button in the sidebar footer
+  (next to the server-URL line, since server settings aren't
+  pod-scoped). State on `ChatApp`:
+  `settings_modal: Option<SettingsModalState>` with
+  `active_tab: SettingsTab` and `server_config: Option<ServerConfigEditorState>`.
+
+  Backends tab: read-only column of per-backend cards (alias +
+  kind row, optional default-model / auth-mode chips). No wire
+  interaction — Codex rotate stub lands in the follow-up.
+
+  Server config tab: lazy-fetches via `FetchServerConfig` on
+  first tab open (`ensure_server_config_fetched` is idempotent —
+  re-opens don't refire). `ServerConfigFetched` hydrates
+  `original` + `working`. Save mints a fresh correlation and
+  ships `UpdateServerConfig`; the `ServerConfigUpdateResult`
+  reply adopts the working buffer as the new baseline and
+  populates `save_summary` (cancelled threads, restart-required
+  sections, pods referencing removed backends). Save / Revert
+  are tab-scoped affordances above the text_area, not in the
+  dialog footer.
+
+  Bundle scenes: `SettingsBackends` (read-only catalog) and
+  `SettingsServerConfig` (text_area populated via synthesized
+  `ServerConfigFetched`). The egui sibling's success / error
+  banners + the `ServerConfigUpdateResult` summary alert all
+  paint via aetna's `alert` widget; both scenes lint clean.
 - ⏳ **Knowledge buckets.** Full CRUD for the bucket lifecycle:
   create form (quantization / driver / cadence pickers for
   tracked buckets), build progress, search / query interface,

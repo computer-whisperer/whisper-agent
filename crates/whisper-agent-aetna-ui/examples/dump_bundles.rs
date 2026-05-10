@@ -332,10 +332,20 @@ enum Scene {
     /// expands the `behaviors/` subdir. The per-scene SendFn
     /// answers both `ListPodDir` requests with mock entries.
     FileTreeOpen,
+    /// Server-settings modal on the Backends tab — read-only
+    /// catalog over a pre-seeded `BackendsList`. No wire
+    /// interaction; just snapshots the per-backend card shape.
+    SettingsBackends,
+    /// Server-settings modal on the Server-config tab — the lazy
+    /// `FetchServerConfig` round-trip is answered by the per-scene
+    /// SendFn with a mock whisper-agent.toml, so the text_area
+    /// paints populated and the Save / Revert affordances render
+    /// disabled (buffer == baseline).
+    SettingsServerConfig,
 }
 
 impl Scene {
-    const ALL: [Scene; 47] = [
+    const ALL: [Scene; 49] = [
         Scene::Connecting,
         Scene::Connected,
         Scene::Closed,
@@ -383,6 +393,8 @@ impl Scene {
         Scene::FileViewerEditable,
         Scene::FileViewerReadOnly,
         Scene::FileTreeOpen,
+        Scene::SettingsBackends,
+        Scene::SettingsServerConfig,
     ];
 
     fn slug(self) -> &'static str {
@@ -434,6 +446,8 @@ impl Scene {
             Scene::FileViewerEditable => "file_viewer_editable",
             Scene::FileViewerReadOnly => "file_viewer_readonly",
             Scene::FileTreeOpen => "file_tree_open",
+            Scene::SettingsBackends => "settings_backends",
+            Scene::SettingsServerConfig => "settings_server_config",
         }
     }
 
@@ -594,6 +608,11 @@ impl Scene {
             // the second `before_build` drains the response into
             // `pod_files`.
             Scene::FileTreeOpen => vec!["file-tree:dir:default:behaviors"],
+            // Settings modal Server-config scene: switch to the
+            // Server-config tab so the lazy `FetchServerConfig`
+            // fires. The per-scene SendFn answers with mock TOML;
+            // the second `before_build` hydrates the editor.
+            Scene::SettingsServerConfig => vec!["settings:tabs:tab:server-config"],
             _ => Vec::new(),
         }
     }
@@ -671,6 +690,30 @@ fn build_app(scene: Scene) -> Box<dyn App> {
                             correlation_id,
                             snapshot: mock_default_pod_snapshot(),
                         }));
+                }
+            })
+        }
+        Scene::SettingsServerConfig => {
+            // Answer the lazy `FetchServerConfig` with a small mock
+            // TOML so the text_area paints content rather than the
+            // loading placeholder.
+            let queue = inbound.clone();
+            Box::new(move |msg| {
+                if let ClientToServer::FetchServerConfig { correlation_id } = msg {
+                    let toml_text = "[server]\n\
+                                     host = \"0.0.0.0\"\n\
+                                     port = 8080\n\
+                                     \n\
+                                     [backends.anthropic-prod]\n\
+                                     kind = \"anthropic\"\n\
+                                     auth = \"api_key\"\n"
+                        .to_string();
+                    queue.borrow_mut().push_back(InboundEvent::Wire(
+                        ServerToClient::ServerConfigFetched {
+                            toml_text,
+                            correlation_id,
+                        },
+                    ));
                 }
             })
         }
@@ -1216,7 +1259,9 @@ fn build_app(scene: Scene) -> Box<dyn App> {
         Scene::JsonViewerOpen
         | Scene::FileViewerEditable
         | Scene::FileViewerReadOnly
-        | Scene::FileTreeOpen => {
+        | Scene::FileTreeOpen
+        | Scene::SettingsBackends
+        | Scene::SettingsServerConfig => {
             // Populated baseline so the dialog overlays a non-empty
             // sidebar / pane (same idea as the modal scenes above).
             // The viewer itself is opened after the queue borrow
@@ -1233,6 +1278,16 @@ fn build_app(scene: Scene) -> Box<dyn App> {
                 correlation_id: None,
                 tasks: mock_threads(),
             }));
+            if matches!(scene, Scene::SettingsBackends | Scene::SettingsServerConfig) {
+                // Backends tab reads from the server-known catalog;
+                // seed it so the per-backend cards have content
+                // even on the Server-config tab variant (the Backends
+                // tab is the modal's default).
+                q.push_back(InboundEvent::Wire(ServerToClient::BackendsList {
+                    correlation_id: None,
+                    backends: mock_backends(),
+                }));
+            }
         }
         // Login scenes route through `build_login_app` above and
         // never reach here.
@@ -1249,6 +1304,9 @@ fn build_app(scene: Scene) -> Box<dyn App> {
     }
     if matches!(scene, Scene::FileTreeOpen) {
         app.open_file_tree_modal("default".into());
+    }
+    if matches!(scene, Scene::SettingsBackends | Scene::SettingsServerConfig) {
+        app.open_settings_modal();
     }
     Box::new(app)
 }

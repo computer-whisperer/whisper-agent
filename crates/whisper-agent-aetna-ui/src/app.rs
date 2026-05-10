@@ -35,8 +35,9 @@
 //!
 //! Surfaces still to land (full inventory in
 //! `docs/design_aetna_ui.md` § "Migration gaps from egui webui"):
-//! server settings modal, knowledge-buckets modal, thread
-//! inspector popover.
+//! Codex auth rotate + Shared MCP CRUD sub-slices of the server
+//! settings modal, knowledge-buckets modal, thread inspector
+//! popover.
 //!
 //! Dispatch model: a single `dispatch_wire` walks `ServerToClient`
 //! variants — only the ones the current stage cares about have arms;
@@ -533,6 +534,107 @@ impl FileViewerModalState {
     }
 }
 
+/// Server-settings modal state. v1 has two tabs: a read-only LLM
+/// backends listing and an admin-only raw editor for the server's
+/// `whisper-agent.toml`. The Shared MCP hosts CRUD + Codex Rotate
+/// sub-form land in follow-up slices.
+#[derive(Default)]
+struct SettingsModalState {
+    active_tab: SettingsTab,
+    /// Editor state for the Server-config tab. `None` until the tab
+    /// has been opened at least once; persists across tab switches
+    /// so in-progress edits survive.
+    server_config: Option<ServerConfigEditorState>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum SettingsTab {
+    #[default]
+    Backends,
+    /// Raw editor for `whisper-agent.toml`. Admin-only — the server
+    /// rejects `FetchServerConfig` / `UpdateServerConfig` from
+    /// non-admin connections. On save, the server hot-swaps the
+    /// backend catalog and cancels any thread using a
+    /// removed / modified backend.
+    ServerConfig,
+}
+
+impl SettingsTab {
+    fn label(self) -> &'static str {
+        match self {
+            SettingsTab::Backends => "LLM backends",
+            SettingsTab::ServerConfig => "Server config",
+        }
+    }
+
+    fn wire_value(self) -> &'static str {
+        match self {
+            SettingsTab::Backends => "backends",
+            SettingsTab::ServerConfig => "server-config",
+        }
+    }
+
+    fn from_wire(raw: &str) -> Option<Self> {
+        match raw {
+            "backends" => Some(SettingsTab::Backends),
+            "server-config" => Some(SettingsTab::ServerConfig),
+            _ => None,
+        }
+    }
+}
+
+/// Summary of a successful `UpdateServerConfig` — shown as a banner
+/// on the server-config editor. Mirrors the egui sibling's
+/// `ServerConfigSaveSummary`.
+#[derive(Debug, Clone, Default)]
+struct ServerConfigSaveSummary {
+    cancelled_threads: Vec<String>,
+    restart_required_sections: Vec<String>,
+    pods_with_missing_backends: Vec<String>,
+}
+
+/// Editor state for the server-config tab. Fetched lazily on first
+/// open — `original` is populated only after the server replies with
+/// `ServerConfigFetched`.
+struct ServerConfigEditorState {
+    /// Raw TOML as last fetched from the server. `None` while the
+    /// fetch round-trip is in flight (renderer shows "loading…").
+    original: Option<String>,
+    /// Text the user is currently editing. Seeded from `original`
+    /// when fetch completes; survives tab switches.
+    working: String,
+    /// In-flight `FetchServerConfig` correlation, if any.
+    fetch_correlation: Option<String>,
+    /// In-flight `UpdateServerConfig` correlation, if any.
+    save_correlation: Option<String>,
+    /// Success banner data from the most recent save. Cleared when
+    /// the user starts a new edit or kicks off another save.
+    save_summary: Option<ServerConfigSaveSummary>,
+    /// Last save / fetch error. Mutually exclusive with
+    /// `save_summary` in practice.
+    error: Option<String>,
+}
+
+impl ServerConfigEditorState {
+    fn new() -> Self {
+        Self {
+            original: None,
+            working: String::new(),
+            fetch_correlation: None,
+            save_correlation: None,
+            save_summary: None,
+            error: None,
+        }
+    }
+
+    fn dirty(&self) -> bool {
+        self.original
+            .as_deref()
+            .map(|o| o != self.working)
+            .unwrap_or(false)
+    }
+}
+
 /// Click-dispatch outcome for a path picked out of the file tree.
 /// Each known-shaped file routes to its specialized editor; everything
 /// else falls through to the generic [`FileViewerModalState`]
@@ -712,6 +814,13 @@ pub struct ChatApp {
     /// `aetna_core::Image` is shared with the inline row so we don't
     /// re-decode the bytes when the modal opens.
     lightbox: Option<LightboxState>,
+
+    // ----- modal: server settings -----
+    /// Server-settings modal state. `Some` while open. Lifecycle:
+    /// opened by `open_settings_modal` (cog button in the sidebar
+    /// footer). The Server-config tab lazy-fetches its TOML on first
+    /// open via `ensure_server_config_fetched`.
+    settings_modal: Option<SettingsModalState>,
 
     // ----- modal: file viewer -----
     /// Generic edit-with-save modal over a pod file (anything not
@@ -1813,6 +1922,7 @@ impl ChatApp {
             sidebar_width: tokens::SIDEBAR_WIDTH,
             sidebar_drag: ResizeDrag::default(),
             lightbox: None,
+            settings_modal: None,
             file_viewer_modal: None,
             file_tree_modal_pod: None,
             pod_files: HashMap::new(),
@@ -2269,6 +2379,43 @@ impl ChatApp {
                 backend, models, ..
             } => {
                 self.models_by_backend.insert(backend, models);
+            }
+            ServerToClient::ServerConfigFetched {
+                toml_text,
+                correlation_id,
+            } => {
+                if let Some(modal) = self.settings_modal.as_mut()
+                    && let Some(editor) = modal.server_config.as_mut()
+                    && editor.fetch_correlation == correlation_id
+                {
+                    editor.fetch_correlation = None;
+                    editor.original = Some(toml_text.clone());
+                    editor.working = toml_text;
+                    editor.error = None;
+                }
+            }
+            ServerToClient::ServerConfigUpdateResult {
+                cancelled_threads,
+                restart_required_sections,
+                pods_with_missing_backends,
+                correlation_id,
+            } => {
+                if let Some(modal) = self.settings_modal.as_mut()
+                    && let Some(editor) = modal.server_config.as_mut()
+                    && editor.save_correlation == correlation_id
+                {
+                    // Adopt the working buffer as the new baseline —
+                    // the server-side write atomically swapped to
+                    // exactly what we sent.
+                    editor.original = Some(editor.working.clone());
+                    editor.save_correlation = None;
+                    editor.error = None;
+                    editor.save_summary = Some(ServerConfigSaveSummary {
+                        cancelled_threads,
+                        restart_required_sections,
+                        pods_with_missing_backends,
+                    });
+                }
             }
             ServerToClient::PodDirListing {
                 pod_id,
@@ -2981,6 +3128,73 @@ impl App for ChatApp {
             self.file_viewer_modal = None;
             return;
         }
+        // Server-settings modal routing — tab strip, body text_area,
+        // save / revert / close / dismiss. Body edits clear the save
+        // summary banner so a fresh edit reads as "in progress" not
+        // "just saved."
+        if self.settings_modal.is_some() {
+            // Tab strip. Read the active tab into a local, apply, then
+            // write back. Dropping the modal borrow before calling
+            // `ensure_server_config_fetched` (which re-borrows
+            // `settings_modal` to populate the editor slot) keeps
+            // borrow-check happy.
+            let mut tab = self
+                .settings_modal
+                .as_ref()
+                .map(|m| m.active_tab)
+                .unwrap_or_default();
+            if aetna_core::widgets::tabs::apply_event(
+                &mut tab,
+                &event,
+                SETTINGS_TABS_KEY,
+                SettingsTab::from_wire,
+            ) {
+                if let Some(modal) = self.settings_modal.as_mut() {
+                    modal.active_tab = tab;
+                }
+                if matches!(tab, SettingsTab::ServerConfig) {
+                    self.ensure_server_config_fetched();
+                }
+                return;
+            }
+            if event.target_key() == Some(SETTINGS_SERVER_CONFIG_BODY_KEY) {
+                if let Some(modal) = self.settings_modal.as_mut()
+                    && let Some(editor) = modal.server_config.as_mut()
+                    && editor.save_correlation.is_none()
+                {
+                    text_area::apply_event(
+                        &mut editor.working,
+                        &mut self.selection,
+                        SETTINGS_SERVER_CONFIG_BODY_KEY,
+                        &event,
+                    );
+                    editor.save_summary = None;
+                    editor.error = None;
+                }
+                return;
+            }
+            if event.is_click_or_activate(SETTINGS_SERVER_CONFIG_SAVE_KEY) {
+                self.submit_server_config();
+                return;
+            }
+            if event.is_click_or_activate(SETTINGS_SERVER_CONFIG_REVERT_KEY) {
+                if let Some(modal) = self.settings_modal.as_mut()
+                    && let Some(editor) = modal.server_config.as_mut()
+                    && let Some(original) = editor.original.clone()
+                {
+                    editor.working = original;
+                    editor.save_summary = None;
+                    editor.error = None;
+                }
+                return;
+            }
+            if event.is_click_or_activate(SETTINGS_DISMISS_KEY)
+                || event.is_click_or_activate(SETTINGS_CLOSE_KEY)
+            {
+                self.settings_modal = None;
+                return;
+            }
+        }
         // File tree modal routing — close / dismiss, plus dir toggle
         // and file pick. Both row prefixes carry `{pod}:{path}` so
         // multi-pod state can't alias across opens.
@@ -3112,6 +3326,10 @@ impl App for ChatApp {
             if let Some(pod) = self.pod_tab.clone() {
                 self.open_file_tree_modal(pod);
             }
+            return;
+        }
+        if event.is_click_or_activate(SIDEBAR_SERVER_SETTINGS_KEY) {
+            self.open_settings_modal();
             return;
         }
         if event.is_click_or_activate(SIDEBAR_NEW_POD_KEY) {
@@ -3614,6 +3832,22 @@ const FILE_TREE_FILE_PREFIX: &str = "file-tree:file:";
 /// only when some pod tab is active. Single key (no pod-id suffix)
 /// since exactly one pod is active at any moment.
 const SIDEBAR_POD_FILES_KEY: &str = "sidebar:pod-files";
+
+/// Sidebar footer cog — opens the server-settings modal. Always
+/// visible (server settings aren't pod-scoped). Lives in the footer
+/// next to the server URL so the icon associates with "where am I
+/// connected" rather than "what am I working on."
+const SIDEBAR_SERVER_SETTINGS_KEY: &str = "sidebar:server-settings";
+
+/// Routed-key shapes for the server-settings modal. The tab strip
+/// auto-derives `settings:tabs:tab:{value}` per trigger; per-tab
+/// field keys live under `settings:{tab}:{field}`.
+const SETTINGS_TABS_KEY: &str = "settings:tabs";
+const SETTINGS_DISMISS_KEY: &str = "settings:dismiss";
+const SETTINGS_CLOSE_KEY: &str = "settings:close";
+const SETTINGS_SERVER_CONFIG_BODY_KEY: &str = "settings:server-config:body";
+const SETTINGS_SERVER_CONFIG_SAVE_KEY: &str = "settings:server-config:save";
+const SETTINGS_SERVER_CONFIG_REVERT_KEY: &str = "settings:server-config:revert";
 
 fn file_tree_dir_key(pod_id: &str, path: &str) -> String {
     format!("{FILE_TREE_DIR_PREFIX}{pod_id}:{path}")
@@ -4646,6 +4880,10 @@ impl ChatApp {
     /// floating pill."
     fn sidebar_footer(&self) -> El {
         let mut rows: Vec<El> = Vec::new();
+        let cog = icon_button("settings")
+            .key(SIDEBAR_SERVER_SETTINGS_KEY)
+            .ghost()
+            .icon_size(tokens::ICON_XS);
         if let Some(label) = self.server_label.as_deref() {
             rows.push(
                 row([
@@ -4657,11 +4895,17 @@ impl ChatApp {
                         .muted()
                         .ellipsis()
                         .width(Size::Fill(1.0)),
+                    cog,
                 ])
                 .gap(tokens::SPACE_2)
                 .align(Align::Center)
                 .width(Size::Fill(1.0)),
             );
+        } else {
+            // No server-URL row to host the cog — drop it onto a
+            // standalone right-aligned row so the affordance still
+            // exists.
+            rows.push(row([cog]).justify(Justify::End).width(Size::Fill(1.0)));
         }
         rows.push(self.connection_status_line());
         column(rows)
@@ -5576,6 +5820,9 @@ impl ChatApp {
             }
         }
         if let Some(modal_el) = self.render_fork_modal() {
+            out.push(Some(modal_el));
+        }
+        if let Some(modal_el) = self.render_settings_modal() {
             out.push(Some(modal_el));
         }
         if let Some(modal_el) = self.render_file_tree_modal() {
@@ -9722,6 +9969,282 @@ impl ChatApp {
                 .height(Size::Fixed(FILE_VIEWER_H))
                 .block_pointer(),
         ]))
+    }
+
+    /// Open the server-settings modal. Idempotent: re-opening keeps
+    /// the active tab + any in-flight server-config edit alive (the
+    /// user likely wants to switch tabs and come back). The
+    /// Server-config tab's lazy fetch is deferred to the tab-switch
+    /// handler so that a fresh open on the Backends tab doesn't
+    /// fire an admin-only request the operator might not have
+    /// privileges for.
+    pub fn open_settings_modal(&mut self) {
+        if self.settings_modal.is_none() {
+            self.settings_modal = Some(SettingsModalState::default());
+        }
+    }
+
+    /// Lazy-fetch the server config TOML on first Server-config tab
+    /// open. Idempotent: a populated `original` or in-flight
+    /// correlation short-circuits.
+    fn ensure_server_config_fetched(&mut self) {
+        let needs_fetch = match self.settings_modal.as_ref() {
+            Some(modal) => match modal.server_config.as_ref() {
+                Some(editor) => editor.original.is_none() && editor.fetch_correlation.is_none(),
+                None => true,
+            },
+            None => return,
+        };
+        if !needs_fetch {
+            return;
+        }
+        let correlation = self.next_correlation_id();
+        if let Some(modal) = self.settings_modal.as_mut() {
+            let editor = modal
+                .server_config
+                .get_or_insert_with(ServerConfigEditorState::new);
+            editor.fetch_correlation = Some(correlation.clone());
+        }
+        self.send(ClientToServer::FetchServerConfig {
+            correlation_id: Some(correlation),
+        });
+    }
+
+    /// Save the server-config working buffer. No-ops while a save is
+    /// already in flight, while a fetch hasn't landed, or when the
+    /// buffer is unchanged. Mints a fresh correlation; the matching
+    /// `ServerConfigUpdateResult` arm populates `save_summary` and
+    /// adopts the working buffer as the new baseline.
+    fn submit_server_config(&mut self) {
+        // Phase 1: read the snapshot we'd ship and validate gates.
+        // Phase 2: mint a correlation (re-borrows `self`).
+        // Phase 3: stamp the editor and send.
+        let toml_text = match self
+            .settings_modal
+            .as_ref()
+            .and_then(|m| m.server_config.as_ref())
+        {
+            Some(editor) if editor.save_correlation.is_none() && editor.dirty() => {
+                editor.working.clone()
+            }
+            _ => return,
+        };
+        let correlation = self.next_correlation_id();
+        if let Some(modal) = self.settings_modal.as_mut()
+            && let Some(editor) = modal.server_config.as_mut()
+        {
+            editor.save_correlation = Some(correlation.clone());
+            editor.save_summary = None;
+            editor.error = None;
+        }
+        self.send(ClientToServer::UpdateServerConfig {
+            correlation_id: Some(correlation),
+            toml_text,
+        });
+    }
+
+    /// Server-settings modal renderer. Centered `dialog_content`
+    /// (720 × 640, matching the pod / behavior editors) over a tab
+    /// strip + per-tab body + Close footer. Save / Revert affordances
+    /// for the Server-config tab live in the body, not the dialog
+    /// footer, since they're tab-scoped — switching to Backends
+    /// shouldn't leave a Save button hanging at the bottom of the
+    /// dialog with no live edit to ship.
+    fn render_settings_modal(&self) -> Option<El> {
+        let modal = self.settings_modal.as_ref()?;
+        const SETTINGS_W: f32 = 720.0;
+        const SETTINGS_H: f32 = 640.0;
+
+        let tab_value = modal.active_tab.wire_value().to_string();
+        let tabs_strip = tabs_list(
+            SETTINGS_TABS_KEY,
+            &tab_value,
+            [
+                (
+                    SettingsTab::Backends.wire_value(),
+                    SettingsTab::Backends.label(),
+                ),
+                (
+                    SettingsTab::ServerConfig.wire_value(),
+                    SettingsTab::ServerConfig.label(),
+                ),
+            ],
+        );
+
+        let body: El = match modal.active_tab {
+            SettingsTab::Backends => self.render_settings_backends_tab(),
+            SettingsTab::ServerConfig => self.render_settings_server_config_tab(modal),
+        };
+
+        let close = button("Close").key(SETTINGS_CLOSE_KEY);
+
+        let children: Vec<El> = vec![
+            dialog_header([
+                dialog_title("Server settings"),
+                dialog_description(
+                    "LLM backends are read-only here; edit the underlying \
+                     whisper-agent.toml on the Server config tab. Shared MCP \
+                     hosts CRUD and Codex auth rotation land in a follow-up.",
+                ),
+            ]),
+            tabs_strip,
+            body,
+            dialog_footer([close]),
+        ];
+
+        Some(overlay([
+            scrim(SETTINGS_DISMISS_KEY),
+            dialog_content(children)
+                .width(Size::Fixed(SETTINGS_W))
+                .height(Size::Fixed(SETTINGS_H))
+                .block_pointer(),
+        ]))
+    }
+
+    /// Backends tab — read-only catalog of configured LLM backends.
+    /// One card per backend: alias + kind, then the default model
+    /// and auth-mode badges (or a muted placeholder when the
+    /// backend declares neither). Codex rotation lives behind a
+    /// follow-up sub-form; nothing on this tab is wire-actionable
+    /// yet.
+    fn render_settings_backends_tab(&self) -> El {
+        if self.backends.is_empty() {
+            return paragraph(
+                "No backends configured. Seed them via [backends.*] in \
+                 whisper-agent.toml on the Server config tab.",
+            )
+            .muted();
+        }
+        let mut rows: Vec<El> = Vec::new();
+        for b in &self.backends {
+            let mut chips: Vec<El> = Vec::new();
+            if let Some(model) = b.default_model.as_deref() {
+                chips.push(text(format!("default: {model}")).caption().muted());
+            }
+            if let Some(auth) = b.auth_mode.as_deref() {
+                chips.push(text(format!("auth: {auth}")).caption().muted());
+            }
+            let chip_row: El = if chips.is_empty() {
+                text("(no default model / auth mode declared)")
+                    .caption()
+                    .muted()
+            } else {
+                row(chips).gap(tokens::SPACE_3).align(Align::Center)
+            };
+            rows.push(
+                card([
+                    row([
+                        text(b.name.clone()).label().bold(),
+                        text(format!("\u{00B7} {}", b.kind)).caption().muted(),
+                    ])
+                    .gap(tokens::SPACE_2)
+                    .align(Align::Center),
+                    chip_row,
+                ])
+                .gap(tokens::SPACE_1)
+                .width(Size::Fill(1.0)),
+            );
+        }
+        scroll(rows)
+            .gap(tokens::SPACE_2)
+            .width(Size::Fill(1.0))
+            .height(Size::Fill(1.0))
+    }
+
+    /// Server-config tab — admin-only raw TOML editor over
+    /// `whisper-agent.toml`. Lazy-loaded on first tab open; renders
+    /// a "loading…" placeholder while the fetch is in flight.
+    /// Save / Revert sit directly above the text_area (tab-scoped).
+    fn render_settings_server_config_tab(&self, modal: &SettingsModalState) -> El {
+        let editor = match modal.server_config.as_ref() {
+            Some(e) => e,
+            None => {
+                return paragraph(
+                    "Server config tab not yet primed — switch back to it once \
+                     the fetch lands.",
+                )
+                .muted();
+            }
+        };
+        if editor.fetch_correlation.is_some() && editor.original.is_none() {
+            return paragraph("loading whisper-agent.toml\u{2026}").muted();
+        }
+        if editor.original.is_none()
+            && let Some(err) = editor.error.as_deref()
+        {
+            return paragraph(err).color(tokens::DESTRUCTIVE);
+        }
+        let dirty = editor.dirty();
+        let saving = editor.save_correlation.is_some();
+
+        let body = text_area(
+            &editor.working,
+            &self.selection,
+            SETTINGS_SERVER_CONFIG_BODY_KEY,
+        )
+        .mono()
+        .width(Size::Fill(1.0))
+        .height(Size::Fill(1.0));
+
+        let mut save = button(if saving { "Saving\u{2026}" } else { "Save" })
+            .key(SETTINGS_SERVER_CONFIG_SAVE_KEY)
+            .primary();
+        if !dirty || saving {
+            save = save.disabled();
+        }
+        let mut revert = button("Revert").key(SETTINGS_SERVER_CONFIG_REVERT_KEY);
+        if !dirty || saving {
+            revert = revert.disabled();
+        }
+
+        let mut entries: Vec<El> = Vec::new();
+        if let Some(summary) = editor.save_summary.as_ref() {
+            entries.push(self.render_server_config_summary(summary));
+        }
+        if let Some(err) = editor.error.as_deref() {
+            entries.push(
+                alert([
+                    alert_title("couldn't save server config"),
+                    alert_description(err.to_string()),
+                ])
+                .destructive(),
+            );
+        }
+        entries.push(body);
+        entries.push(
+            row([revert, save])
+                .gap(tokens::SPACE_2)
+                .align(Align::Center),
+        );
+
+        column(entries)
+            .gap(tokens::SPACE_3)
+            .width(Size::Fill(1.0))
+            .height(Size::Fill(1.0))
+    }
+
+    fn render_server_config_summary(&self, s: &ServerConfigSaveSummary) -> El {
+        let mut lines: Vec<El> = vec![text("Saved.").bold()];
+        if !s.cancelled_threads.is_empty() {
+            lines.push(text(format!(
+                "Cancelled {} thread(s): {}",
+                s.cancelled_threads.len(),
+                s.cancelled_threads.join(", "),
+            )));
+        }
+        if !s.restart_required_sections.is_empty() {
+            lines.push(text(format!(
+                "Restart required for: {}",
+                s.restart_required_sections.join(", "),
+            )));
+        }
+        if !s.pods_with_missing_backends.is_empty() {
+            lines.push(text(format!(
+                "Pods referencing removed backends: {}",
+                s.pods_with_missing_backends.join(", "),
+            )));
+        }
+        alert(lines)
     }
 
     /// Classify a pod-relative file path for the file-tree click
