@@ -12,11 +12,12 @@ license.workspace = true
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-# Aetna lives in a sibling worktree under active development; the path
-# spec keeps us in lockstep with whatever is checked out at HEAD without
-# round-tripping through crates.io.
-aetna-core = { path = "../../../../aetna/aetna.main/crates/aetna-core" }
-aetna-markdown = { path = "../../../../aetna/aetna.main/crates/aetna-markdown" }
+# Aetna is published to crates.io. For live-development against a
+# sibling worktree, override these in a top-level `Cargo.toml`
+# `[patch.crates-io]` table or a `.cargo/config.toml`; CI builds
+# against the registry version verbatim.
+aetna-core = "0.3.2"
+aetna-markdown = "0.3.2"
 
 whisper-agent-protocol = { workspace = true }
 serde = { workspace = true }
@@ -73,7 +74,7 @@ web-time = "1"
 # drives the canvas-bound event loop. ResizeObserver wiring lives in
 # our own `web_entry` module since aetna doesn't expose a reusable
 # browser host the way `aetna-winit-wgpu` does for native.
-aetna-wgpu = { path = "../../../../aetna/aetna.main/crates/aetna-wgpu" }
+aetna-wgpu = "0.3.2"
 wgpu = { version = "29", features = ["webgl"] }
 winit = "0.30"
 web-sys = { version = "0.3", features = [
