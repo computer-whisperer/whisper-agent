@@ -1438,6 +1438,20 @@ pub struct ChatApp {
     /// for the sidebar's pod tabs on first connect, and as the
     /// "Default pod" sentinel resolution target.
     default_pod_id: Option<String>,
+    /// Cached config of the server's default pod, fetched lazily
+    /// after `PodList`. Used as the template for the `+ New pod`
+    /// modal so a fresh pod inherits the working sandbox /
+    /// shared-MCP setup instead of starting from a stub. `None`
+    /// until the `GetPod` round-trip lands; cleared on reconnect
+    /// so the next `PodList` re-fetches against the live server.
+    /// Mirrors the egui sibling's `default_pod_template`.
+    default_pod_template: Option<PodConfig>,
+    /// In-flight `GetPod` correlation for the default-pod template
+    /// fetch. `Some` between request and response so a second
+    /// `PodList` (which fires often) doesn't fan out duplicate
+    /// `GetPod`s. `None` once the snapshot lands or the request
+    /// races a different `PodSnapshot` consumer.
+    pending_default_pod_get: Option<String>,
 
     // ----- sidebar nav -----
     /// Pod whose threads the sidebar is currently showing. Single
@@ -2501,6 +2515,8 @@ impl ChatApp {
             pods: HashMap::new(),
             threads: HashMap::new(),
             default_pod_id: None,
+            default_pod_template: None,
+            pending_default_pod_get: None,
             pod_tab: None,
             expanded_pod_threads: HashSet::new(),
             behaviors_by_pod: HashMap::new(),
@@ -2596,6 +2612,11 @@ impl ChatApp {
                 // pending-request guard would otherwise wedge.
                 self.pod_files.clear();
                 self.pod_files_requested.clear();
+                // Default-pod template caches die too; the next
+                // `PodList` re-fires `GetPod` against whatever the
+                // (possibly-restarted) server now says is default.
+                self.default_pod_template = None;
+                self.pending_default_pod_get = None;
                 if !self.list_requested {
                     self.send(ClientToServer::ListPods {
                         correlation_id: None,
@@ -2647,6 +2668,28 @@ impl ChatApp {
                 if !default_pod_id.is_empty() {
                     self.default_pod_id = Some(default_pod_id);
                 }
+                // Prime the default-pod template fetch: the `+ New
+                // pod` modal clones it on Create so a fresh pod
+                // inherits the working sandbox / shared-MCP setup.
+                // Idempotent: only fires when we don't already have
+                // a cached template *and* there's no in-flight
+                // request, so repeated `PodList` broadcasts don't
+                // fan out duplicate `GetPod`s. Skipped when the
+                // server has no default pod (empty string), or when
+                // the named default isn't in the registry yet (rare
+                // — would mean the broadcast itself is malformed).
+                if self.default_pod_template.is_none()
+                    && self.pending_default_pod_get.is_none()
+                    && let Some(pod_id) = self.default_pod_id.clone()
+                    && self.pods.contains_key(&pod_id)
+                {
+                    let correlation = self.next_correlation_id();
+                    self.pending_default_pod_get = Some(correlation.clone());
+                    self.send(ClientToServer::GetPod {
+                        correlation_id: Some(correlation),
+                        pod_id,
+                    });
+                }
                 // Seed the sidebar's active pod tab on first PodList
                 // (or after a reconnect that cleared it). Prefer the
                 // server-declared default; fall back to whichever
@@ -2675,10 +2718,12 @@ impl ChatApp {
                 snapshot,
                 correlation_id,
             } => {
-                // Two senders today: the pod editor (whole-snapshot
-                // hydrate) and the behavior editor (pod_config slot
-                // for the Thread tab's host_env / mcp_hosts override
-                // pickers). Match by correlation; the pod_id check
+                // Three senders today: the pod editor (whole-snapshot
+                // hydrate), the behavior editor (pod_config slot for
+                // the Thread tab's host_env / mcp_hosts override
+                // pickers), and the default-pod template fetch (cached
+                // on `self.default_pod_template` for the `+ New pod`
+                // modal). Match by correlation; the pod_id check
                 // guards against close-then-reopen for a different
                 // pod within the round-trip window.
                 if let Some(editor) = self.pod_editor.as_mut()
@@ -2692,6 +2737,11 @@ impl ChatApp {
                 {
                     editor.pending_pod_get = None;
                     editor.pod_config = Some(snapshot.config);
+                } else if self.pending_default_pod_get.as_ref() == correlation_id.as_ref()
+                    && self.default_pod_id.as_deref() == Some(snapshot.pod_id.as_str())
+                {
+                    self.pending_default_pod_get = None;
+                    self.default_pod_template = Some(snapshot.config);
                 }
             }
             ServerToClient::PodConfigUpdated {
@@ -7450,6 +7500,26 @@ impl ChatApp {
     /// client-side failures (empty fields, illegal id chars,
     /// duplicate id, no backends) by setting `modal.error`. On
     /// success, allocates a correlation id, stamps it onto the
+    /// Build a sensible default `PodConfig` for a fresh pod. Prefers
+    /// the cached server-default pod template (lazily fetched after
+    /// `PodList`) so the new pod inherits the working sandbox /
+    /// shared-MCP setup; falls back to a minimal stub keyed off the
+    /// backend catalog when the template hasn't arrived yet (rare —
+    /// only on first connect before the `GetPod` round-trip lands).
+    /// Mirrors the egui sibling's `fresh_pod_config`. `created_at` is
+    /// left empty; the server stamps it on `CreatePod`.
+    fn fresh_pod_config(&self, name: String) -> PodConfig {
+        if let Some(template) = self.default_pod_template.as_ref() {
+            let mut cfg = template.clone();
+            cfg.name = name;
+            cfg.description = None;
+            cfg.created_at = String::new();
+            return cfg;
+        }
+        let backend_names: Vec<String> = self.backends.iter().map(|b| b.name.clone()).collect();
+        fresh_pod_config_stub(name, backend_names)
+    }
+
     /// modal, and sends `CreatePod` — keeping the modal open and
     /// disabled until the wire round-trip finishes.
     fn submit_new_pod_modal(&mut self) {
@@ -7476,8 +7546,7 @@ impl ChatApp {
             return;
         }
 
-        let backend_names: Vec<String> = self.backends.iter().map(|b| b.name.clone()).collect();
-        let config = fresh_pod_config(name, backend_names);
+        let config = self.fresh_pod_config(name);
         let correlation_id = self.next_correlation_id();
         if let Some(modal) = self.new_pod_modal.as_mut() {
             modal.pending_correlation = Some(correlation_id.clone());
@@ -15108,8 +15177,10 @@ fn validate_behavior_id_client(id: &str) -> Result<(), &'static str> {
 ///
 /// `backend_names` should be the full list of configured backends —
 /// the new pod is allowed to use any of them. The first by sort
-/// order becomes the `thread_defaults.backend`.
-fn fresh_pod_config(name: String, mut backend_names: Vec<String>) -> PodConfig {
+/// order becomes the `thread_defaults.backend`. Used as the
+/// fall-through when no cached default-pod template is available
+/// yet (see [`ChatApp::fresh_pod_config`]).
+fn fresh_pod_config_stub(name: String, mut backend_names: Vec<String>) -> PodConfig {
     backend_names.sort();
     let default_backend = backend_names.first().cloned().unwrap_or_default();
     PodConfig {

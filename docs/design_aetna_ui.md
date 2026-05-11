@@ -642,11 +642,17 @@ lines:
 Validation lives client-side (`validate_pod_id_client`,
 empty-fields and duplicate-id checks); the server runs the same
 checks plus a few more during `CreatePod` and any rejection
-echoes back through the `Error` path. `fresh_pod_config` is
-deliberately the lighter of the two egui paths — it only knows
-about `backends`, not the default-pod TOML template — so it
-lands a working pod the user can edit afterwards. A
-`GetPod`-based default-template clone is a follow-up.
+echoes back through the `Error` path. `ChatApp::fresh_pod_config`
+prefers `default_pod_template` (the server-default pod's full
+`PodConfig`, fetched lazily after `PodList` via the
+`pending_default_pod_get` correlation) so a freshly-created pod
+inherits the working sandbox / shared-MCP / host-env setup
+instead of starting from a stub. Falls back to
+`fresh_pod_config_stub` (the minimal `backends`-only shape) when
+the template hasn't arrived yet — rare, only on first connect
+before the `GetPod` round-trip lands. Reconnect drops the
+cached template so the next `PodList` re-fetches against the
+live (possibly restarted) server.
 
 The remaining modals slot into this scaffolding pattern.
 
@@ -1566,13 +1572,15 @@ trivial / small / medium / large.
   remaining tabs (Scope, Retention, Thread, System Prompt, Raw
   TOML) have already landed (see Stage 8). Track here only as
   an inventory note.
-- ⏳ **`+ New pod` default-template clone.** Egui caches the
-  server-default pod's `PodConfig` (lazily `GetPod`d after
-  `PodList`) and `fresh_pod_config` clones it on Create so a
-  new pod inherits the working sandbox / shared-MCP setup.
-  Aetna only has the minimal-stub fallback path
-  (`fresh_pod_config` builds a `PodConfig` from
-  `state.backends` alone).
+- ✅ **`+ New pod` default-template clone.**
+  `default_pod_template: Option<PodConfig>` caches the
+  server-default pod's full config, fetched lazily by
+  `pending_default_pod_get`-correlated `GetPod` after the first
+  `PodList`. `ChatApp::fresh_pod_config` clones the template on
+  Create (resetting name / description / created_at); falls back
+  to `fresh_pod_config_stub` only when the template hasn't
+  arrived yet. Reconnect clears both fields so the next
+  `PodList` re-fetches.
 
 ## Conventions
 
