@@ -1234,13 +1234,16 @@ fn build_app(scene: Scene) -> Box<dyn App> {
                 correlation_id: None,
                 tasks: threads,
             }));
-            if matches!(
-                scene,
-                Scene::ThreadWithMessages | Scene::ThreadInspectorOpen
-            ) {
+            if matches!(scene, Scene::ThreadWithMessages) {
                 q.push_back(InboundEvent::Wire(ServerToClient::ThreadSnapshot {
                     thread_id: "t-1".into(),
                     snapshot: mock_snapshot(),
+                }));
+            }
+            if matches!(scene, Scene::ThreadInspectorOpen) {
+                q.push_back(InboundEvent::Wire(ServerToClient::ThreadSnapshot {
+                    thread_id: "t-1".into(),
+                    snapshot: mock_inspector_snapshot(),
                 }));
             }
             if matches!(scene, Scene::ThreadWithToolCall) {
@@ -2496,6 +2499,63 @@ fn mock_snapshot() -> ThreadSnapshot {
         dispatched_by: None,
         scope: Scope::default(),
     }
+}
+
+/// Snapshot for the `ThreadInspectorOpen` scene. Same conversation
+/// as `mock_snapshot` but with a populated `scope` (mixed `All` /
+/// `Only` shapes so every `set_or_all_label` arm renders) and a
+/// `BehaviorOrigin` (cron-style fired_at plus a small JSON payload)
+/// so the inspector's new Scope + Trigger origin sections paint.
+fn mock_inspector_snapshot() -> ThreadSnapshot {
+    use whisper_agent_protocol::permission::{
+        AllowMap, BehaviorOpsCap, DispatchCap, Disposition, Escalation, PodModifyCap, SetOrAll,
+    };
+    use whisper_agent_protocol::{BehaviorOrigin, HostEnvBinding};
+
+    let mut base = mock_snapshot();
+    base.bindings = ThreadBindings {
+        backend: "anthropic-prod".into(),
+        host_env: vec![HostEnvBinding::Named {
+            name: "c-dtop".into(),
+            workspace_root: Some(std::path::PathBuf::from(
+                "/home/user/workspace/whisper-agent",
+            )),
+        }],
+        mcp_hosts: vec!["filesystem".into(), "memory".into()],
+        ..ThreadBindings::default()
+    };
+    base.scope = Scope {
+        backends: SetOrAll::Only {
+            items: std::iter::once("anthropic-prod".to_string()).collect(),
+        },
+        host_envs: SetOrAll::All,
+        mcp_hosts: SetOrAll::Only {
+            items: ["filesystem".to_string(), "memory".to_string()]
+                .into_iter()
+                .collect(),
+        },
+        tools: {
+            let mut tools = AllowMap::allow_all();
+            tools
+                .overrides
+                .insert("shell_exec".into(), Disposition::Deny);
+            tools
+        },
+        pod_modify: PodModifyCap::ModifyAllow,
+        dispatch: DispatchCap::WithinScope,
+        behaviors: BehaviorOpsCap::AuthorAny,
+        escalation: Escalation::None,
+    };
+    base.origin = Some(BehaviorOrigin {
+        behavior_id: "nightly-summary".into(),
+        fired_at: "2026-05-09T03:00:00Z".into(),
+        trigger_payload: serde_json::json!({
+            "schedule": "0 3 * * *",
+            "tz": "UTC",
+            "fired_by": "scheduler",
+        }),
+    });
+    base
 }
 
 /// Snapshot for the `ThreadPrefilling` scene — one user turn, no

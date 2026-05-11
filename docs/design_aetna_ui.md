@@ -1535,15 +1535,20 @@ trivial / small / medium / large.
   `HostEnvBinding::Named`), `mcp_hosts`, cumulative usage
   (`total_in` / `total_out`, plus cache r/w when nonzero), and
   `origin behavior` when the thread was spawned by a behavior.
-  Hydration is one-shot on `ThreadSnapshot`. Two egui-parity
-  gaps remain: the Scope section (backends/host_envs/mcp_hosts
-  as `SetOrAll`, tools default + overrides count, pod_modify /
-  dispatch / behaviors caps, escalation) and trigger-origin
-  detail (`fired_at` + pretty-printed `trigger_payload` — today
-  we surface only `behavior_id`). An OAuth-aware MCP host
-  detail row was previously listed as a deferred item; the egui
-  sibling never carried that — it just joined host names — so
-  it's not actually a port gap.
+  Hydration is one-shot on `ThreadSnapshot`. Scope and
+  Trigger-origin sections also render now: Scope mirrors the
+  egui sibling's `render_scope_summary`
+  (`backends`/`host_envs`/`mcp_hosts` via a shared
+  `set_or_all_label`, `tools default` + optional overrides
+  list, `pod_modify`/`dispatch`/`behaviors` caps, and
+  `escalation`). Trigger origin renders only when
+  `view.origin_behavior_id` is `Some` and surfaces
+  `behavior_id` + `fired_at` plus a wrap-mode code block of
+  the pretty-printed `trigger_payload` (suppressed when the
+  payload is `null`). The whole panel is wrapped in a fixed-
+  height `scroll(...)` (240 px) so a long inspector scrolls
+  inside the header instead of pushing the chat body
+  offscreen.
 
   Bundle scene: `ThreadInspectorOpen`.
 

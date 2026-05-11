@@ -1296,6 +1296,25 @@ struct ThreadView {
     /// trigger. `BehaviorSummary`-style display name lookup happens
     /// at render time.
     origin_behavior_id: Option<String>,
+    /// RFC-3339 timestamp the originating trigger fired at. `None`
+    /// when this thread wasn't spawned by a behavior (i.e.
+    /// `origin_behavior_id` is also `None`). Inspector-only field;
+    /// the chat log doesn't use it.
+    origin_fired_at: Option<String>,
+    /// Trigger-defined JSON payload from `BehaviorOrigin`.
+    /// `serde_json::Value::Null` for manual / cron fires that didn't
+    /// supply data; arbitrary JSON for webhook fires. Pretty-printed
+    /// into the inspector's "Trigger origin" section when non-null;
+    /// `None` (rather than `Null`) when there's no origin at all so
+    /// the absence-of-payload caption can distinguish "behavior with
+    /// no payload" from "not behavior-spawned".
+    origin_trigger_payload: Option<serde_json::Value>,
+    /// The thread's effective permission scope, snapshotted at
+    /// creation and widened by any escalation grants. Hydrated
+    /// from `ThreadSnapshot::scope`. The inspector's Scope section
+    /// reads this to render the resource sets / caps / escalation
+    /// rows the egui sibling shipped.
+    scope: whisper_agent_protocol::permission::Scope,
 }
 
 pub struct ChatApp {
@@ -3391,6 +3410,9 @@ impl ChatApp {
                 let max_tokens = snapshot.config.max_tokens;
                 let max_turns = snapshot.config.max_turns;
                 let origin_behavior_id = snapshot.origin.as_ref().map(|o| o.behavior_id.clone());
+                let origin_fired_at = snapshot.origin.as_ref().map(|o| o.fired_at.clone());
+                let origin_trigger_payload =
+                    snapshot.origin.as_ref().map(|o| o.trigger_payload.clone());
                 let view = ThreadView {
                     items,
                     title: snapshot.title,
@@ -3405,6 +3427,9 @@ impl ChatApp {
                     max_turns,
                     created_at: snapshot.created_at,
                     origin_behavior_id,
+                    origin_fired_at,
+                    origin_trigger_payload,
+                    scope: snapshot.scope,
                 };
                 // Hydrate the local draft from the snapshot — the
                 // server's stored draft is authoritative on initial
@@ -6892,7 +6917,7 @@ impl ChatApp {
     ) -> Option<El> {
         let view = view?;
         let mut rows: Vec<El> = Vec::new();
-        let mut push = |label: &str, value: String| {
+        fn push_kv(rows: &mut Vec<El>, label: &str, value: String) {
             rows.push(
                 row([
                     text(label.to_string())
@@ -6905,17 +6930,32 @@ impl ChatApp {
                 .align(Align::Start)
                 .width(Size::Fill(1.0)),
             );
-        };
+        }
+        // Small bold-ish caption with a tiny top margin so it reads as
+        // a divider between groups of kv rows. Same idiom the egui
+        // sibling uses (`section_heading` in app/widgets.rs).
+        fn push_section(rows: &mut Vec<El>, label: &str) {
+            rows.push(
+                text(label.to_string())
+                    .caption()
+                    .muted()
+                    .width(Size::Fill(1.0))
+                    .padding(Sides {
+                        top: tokens::SPACE_2,
+                        ..Sides::default()
+                    }),
+            );
+        }
 
-        push("thread_id", thread_id.to_string());
+        push_kv(&mut rows, "thread_id", thread_id.to_string());
         if let Some(s) = summary {
-            push("pod_id", s.pod_id.clone());
+            push_kv(&mut rows, "pod_id", s.pod_id.clone());
             if !s.last_active.is_empty() {
-                push("last_active", s.last_active.clone());
+                push_kv(&mut rows, "last_active", s.last_active.clone());
             }
         }
         if !view.created_at.is_empty() {
-            push("created_at", view.created_at.clone());
+            push_kv(&mut rows, "created_at", view.created_at.clone());
         }
         let backend_val = if view.backend.is_empty() {
             "(server default)".to_string()
@@ -6927,32 +6967,41 @@ impl ChatApp {
         } else {
             view.model.clone()
         };
-        push("backend", backend_val);
-        push("model", model_val);
+        push_kv(&mut rows, "backend", backend_val);
+        push_kv(&mut rows, "model", model_val);
         if view.max_tokens > 0 {
-            push("max_tokens", view.max_tokens.to_string());
+            push_kv(&mut rows, "max_tokens", view.max_tokens.to_string());
         }
         if view.max_turns > 0 {
-            push("max_turns", view.max_turns.to_string());
+            push_kv(&mut rows, "max_turns", view.max_turns.to_string());
         }
         let host_env_val = if view.host_env_labels.is_empty() {
             "(none \u{2014} shared MCPs only)".to_string()
         } else {
             view.host_env_labels.join(", ")
         };
-        push("host_env", host_env_val);
+        push_kv(&mut rows, "host_env", host_env_val);
         let mcp_val = if view.mcp_hosts.is_empty() {
             "(none)".to_string()
         } else {
             view.mcp_hosts.join(", ")
         };
-        push("mcp_hosts", mcp_val);
-        push("total_in", view.total_usage.input_tokens.to_string());
-        push("total_out", view.total_usage.output_tokens.to_string());
+        push_kv(&mut rows, "mcp_hosts", mcp_val);
+        push_kv(
+            &mut rows,
+            "total_in",
+            view.total_usage.input_tokens.to_string(),
+        );
+        push_kv(
+            &mut rows,
+            "total_out",
+            view.total_usage.output_tokens.to_string(),
+        );
         if view.total_usage.cache_read_input_tokens > 0
             || view.total_usage.cache_creation_input_tokens > 0
         {
-            push(
+            push_kv(
+                &mut rows,
                 "cache r/w",
                 format!(
                     "{}/{}",
@@ -6961,13 +7010,106 @@ impl ChatApp {
                 ),
             );
         }
+
+        // Scope section — mirrors the egui sibling's
+        // `render_scope_summary`. Set-shaped fields render through
+        // `set_or_all_label` so `All` / empty `Only` / populated
+        // `Only` all read clearly. `tools overrides` only renders
+        // when non-empty (rare in practice).
+        push_section(&mut rows, "Scope");
+        push_kv(
+            &mut rows,
+            "backends",
+            set_or_all_label(&view.scope.backends),
+        );
+        push_kv(
+            &mut rows,
+            "host_envs",
+            set_or_all_label(&view.scope.host_envs),
+        );
+        push_kv(
+            &mut rows,
+            "mcp_hosts",
+            set_or_all_label(&view.scope.mcp_hosts),
+        );
+        push_kv(
+            &mut rows,
+            "tools default",
+            format!("{:?}", view.scope.tools.default),
+        );
+        if !view.scope.tools.overrides.is_empty() {
+            let overrides = view
+                .scope
+                .tools
+                .overrides
+                .iter()
+                .map(|(k, v)| format!("{k}={v:?}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            push_kv(&mut rows, "tools overrides", overrides);
+        }
+        push_kv(
+            &mut rows,
+            "pod_modify",
+            format!("{:?}", view.scope.pod_modify),
+        );
+        push_kv(&mut rows, "dispatch", format!("{:?}", view.scope.dispatch));
+        push_kv(
+            &mut rows,
+            "behaviors",
+            format!("{:?}", view.scope.behaviors),
+        );
+        push_kv(
+            &mut rows,
+            "escalation",
+            match view.scope.escalation {
+                whisper_agent_protocol::permission::Escalation::Interactive { .. } => {
+                    "interactive".to_string()
+                }
+                whisper_agent_protocol::permission::Escalation::None => "autonomous".to_string(),
+            },
+        );
+
+        // Trigger origin — only renders for behavior-spawned threads.
+        // Mirrors the egui sibling's "Trigger origin" grid +
+        // `serde_json::to_string_pretty(trigger_payload)` body.
         if let Some(behavior_id) = view.origin_behavior_id.as_deref() {
-            push("origin behavior", behavior_id.to_string());
+            push_section(&mut rows, "Trigger origin");
+            push_kv(&mut rows, "behavior_id", behavior_id.to_string());
+            if let Some(fired_at) = view.origin_fired_at.as_deref() {
+                push_kv(&mut rows, "fired_at", fired_at.to_string());
+            }
+            if let Some(payload) = view.origin_trigger_payload.as_ref()
+                && !payload.is_null()
+            {
+                let pretty = serde_json::to_string_pretty(payload).unwrap_or_default();
+                rows.push(
+                    text("trigger_payload")
+                        .caption()
+                        .muted()
+                        .width(Size::Fill(1.0)),
+                );
+                rows.push(
+                    text(pretty)
+                        .code()
+                        .small()
+                        .wrap_text()
+                        .width(Size::Fill(1.0)),
+                );
+            }
         }
 
+        // The inspector sits inside the thread-pane header, whose
+        // height has to leave room for the chat scroll body. With the
+        // Scope + Trigger origin sections, content easily exceeds the
+        // header's available vertical budget, so wrap in a scroll
+        // bounded at `INSPECTOR_MAX_H` — long inspectors scroll
+        // in-place rather than push the chat body offscreen.
+        const INSPECTOR_MAX_H: f32 = 240.0;
+        let body = column(rows).gap(tokens::SPACE_1).width(Size::Fill(1.0));
         Some(
-            column(rows)
-                .gap(tokens::SPACE_1)
+            scroll([body])
+                .key(format!("inspector:{thread_id}"))
                 .padding(Sides {
                     left: tokens::SPACE_2,
                     right: tokens::SPACE_2,
@@ -6975,6 +7117,7 @@ impl ChatApp {
                     bottom: tokens::SPACE_2,
                 })
                 .width(Size::Fill(1.0))
+                .height(Size::Fixed(INSPECTOR_MAX_H))
                 .fill(tokens::MUTED.with_alpha(40))
                 .radius(tokens::RADIUS_SM),
         )
@@ -15208,6 +15351,19 @@ fn fresh_pod_config_stub(name: String, mut backend_names: Vec<String>) -> PodCon
             tool_surface: Default::default(),
         },
         limits: PodLimits::default(),
+    }
+}
+
+/// Human-readable rendering of a `SetOrAll<String>` for the
+/// inspector's Scope rows. Mirrors the egui sibling's `fmt_set`:
+/// `All` → `"(all)"`; empty `Only` → `"(none)"`; populated `Only`
+/// → comma-joined items in the set's natural order.
+fn set_or_all_label(set: &whisper_agent_protocol::permission::SetOrAll<String>) -> String {
+    use whisper_agent_protocol::permission::SetOrAll;
+    match set {
+        SetOrAll::All => "(all)".to_string(),
+        SetOrAll::Only { items } if items.is_empty() => "(none)".to_string(),
+        SetOrAll::Only { items } => items.iter().cloned().collect::<Vec<_>>().join(", "),
     }
 }
 
