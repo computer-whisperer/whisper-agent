@@ -1310,6 +1310,16 @@ trivial / small / medium / large.
   Reconnect drops `pod_files` + `pod_files_requested` so the
   in-flight guard doesn't wedge if the server restarts with a
   different on-disk layout.
+
+  ⏳ **Per-tab deep-link still pending.** The egui sibling's
+  `classify_pod_file_path` routes `behaviors/<id>/prompt.md` to
+  `open_behavior_editor_on_tab(..., BehaviorEditorTab::Prompt)`;
+  aetna's classifier already returns the `BehaviorPrompt(id)`
+  variant but both `BehaviorConfig` and `BehaviorPrompt` collapse
+  to the same `open_behavior_editor(pod, id)` call. Folding in a
+  tab-parameterized opener will close this.
+  `behaviors/<id>/system_prompt.md` falls through to the generic
+  text editor in egui too — not a parity gap there.
 - ✅ **Server settings.** All three tabs of the egui sibling's
   modal landed: LLM backends (catalog + per-`chatgpt_subscription`
   Codex auth rotate sub-form), Shared MCP (CRUD), and admin-only
@@ -1516,10 +1526,15 @@ trivial / small / medium / large.
   `HostEnvBinding::Named`), `mcp_hosts`, cumulative usage
   (`total_in` / `total_out`, plus cache r/w when nonzero), and
   `origin behavior` when the thread was spawned by a behavior.
-  Hydration is one-shot on `ThreadSnapshot`. Scope rendering,
-  the OAuth-aware MCP host detail, and the trigger payload
-  pretty-print are deferred — they add substantial surface that
-  the v1 inspector doesn't need.
+  Hydration is one-shot on `ThreadSnapshot`. Two egui-parity
+  gaps remain: the Scope section (backends/host_envs/mcp_hosts
+  as `SetOrAll`, tools default + overrides count, pod_modify /
+  dispatch / behaviors caps, escalation) and trigger-origin
+  detail (`fired_at` + pretty-printed `trigger_payload` — today
+  we surface only `behavior_id`). An OAuth-aware MCP host
+  detail row was previously listed as a deferred item; the egui
+  sibling never carried that — it just joined host names — so
+  it's not actually a port gap.
 
   Bundle scene: `ThreadInspectorOpen`.
 
@@ -1539,12 +1554,22 @@ trivial / small / medium / large.
   Allow / Defaults / Limits — aetna already has all three
   (`render_pod_editor_*_tab`), so this gap is closed; track here
   only as a note that future surfacing of MCP host CRUD lands
-  inside the existing tabs.
+  inside the existing tabs. (Per-tool override map editing is
+  *not* a gap — the egui sibling also shows just an "edit via
+  Raw TOML" stub, since `allow.tools.overrides` is an unbounded
+  `String → Disposition` map.)
 - ⏳ **Behavior editor parity.** v1 ships the 80% form (name /
   description / trigger kind / cron schedule / prompt). All
   remaining tabs (Scope, Retention, Thread, System Prompt, Raw
   TOML) have already landed (see Stage 8). Track here only as
   an inventory note.
+- ⏳ **`+ New pod` default-template clone.** Egui caches the
+  server-default pod's `PodConfig` (lazily `GetPod`d after
+  `PodList`) and `fresh_pod_config` clones it on Create so a
+  new pod inherits the working sandbox / shared-MCP setup.
+  Aetna only has the minimal-stub fallback path
+  (`fresh_pod_config` builds a `PodConfig` from
+  `state.backends` alone).
 
 ## Conventions
 
