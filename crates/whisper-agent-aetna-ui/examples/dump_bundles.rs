@@ -1026,6 +1026,7 @@ fn build_app(scene: Scene) -> Box<dyn App> {
                         "thread_id": "t-mock",
                         "title": "Investigate failing test",
                         "state": "Idle",
+                        "summary": "Looking into the failure — the test expects a sorted result but the underlying query returns rows in insertion order. The fix is either to add an ORDER BY clause or to sort client-side before comparing. I'll go with ORDER BY so the contract is enforced at the data layer rather than relying on every call site to remember.",
                         "messages": [
                             { "role": "user", "text": "Why does test_foo fail?" },
                             { "role": "assistant", "text": "Looking…" },

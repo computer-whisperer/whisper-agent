@@ -4662,6 +4662,21 @@ impl App for ChatApp {
                 self.send_compose();
                 return;
             }
+            // Ctrl/Cmd+V with an image on the clipboard → stage as an
+            // attachment instead of inserting text. Mirrors aetna's
+            // text_input.rs guidance ("apps that accept image paste
+            // handle the Paste branch themselves"). Wasm has a
+            // document-level paste handler that bypasses this code
+            // entirely; the wasm-side stub of
+            // `try_clipboard_image_paste` returns false so the routed
+            // Paste falls through to the text_area as normal.
+            if matches!(
+                text_input::clipboard_request(&event),
+                Some(text_input::ClipboardKind::Paste),
+            ) && self.try_clipboard_image_paste()
+            {
+                return;
+            }
             let selected = self.selected.clone();
             // Field-level borrow split: `self.drafts` /
             // `self.compose_input` and `self.selection` are
@@ -5625,6 +5640,69 @@ impl ChatApp {
     /// drain so the pipeline is identical regardless of input
     /// source — silently-rejected drops were the prior pain point
     /// the egui sibling fixed by always surfacing a hint.
+    /// Native clipboard image-paste handler. Returns `true` when the
+    /// paste consumed the event (image was on the clipboard — either
+    /// staged successfully or failed in a way the user should hear
+    /// about). Returns `false` when there is no image to paste, so the
+    /// caller can fall through to other paste paths.
+    ///
+    /// Wasm uses the document-level `install_paste_handler` in
+    /// `web_entry.rs` which pushes directly into the same staging
+    /// queue this app reads, so the in-app paste route never fires for
+    /// images on wasm — the stub returns `false`.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn try_clipboard_image_paste(&mut self) -> bool {
+        let mut clipboard = match arboard::Clipboard::new() {
+            Ok(c) => c,
+            Err(e) => {
+                log::warn!("clipboard open failed: {e}");
+                return false;
+            }
+        };
+        let img = match clipboard.get_image() {
+            Ok(img) => img,
+            Err(_) => return false,
+        };
+        let width = match u32::try_from(img.width) {
+            Ok(w) if w > 0 => w,
+            _ => {
+                self.set_compose_hint("clipboard image has invalid width".into());
+                return true;
+            }
+        };
+        let height = match u32::try_from(img.height) {
+            Ok(h) if h > 0 => h,
+            _ => {
+                self.set_compose_hint("clipboard image has invalid height".into());
+                return true;
+            }
+        };
+        let rgba = img.bytes.into_owned();
+        let Some(buf) = image::ImageBuffer::<image::Rgba<u8>, _>::from_raw(width, height, rgba)
+        else {
+            self.set_compose_hint("clipboard image byte length doesn't match dimensions".into());
+            return true;
+        };
+        let mut png_bytes: Vec<u8> = Vec::new();
+        if let Err(e) = image::DynamicImage::ImageRgba8(buf).write_to(
+            &mut std::io::Cursor::new(&mut png_bytes),
+            image::ImageFormat::Png,
+        ) {
+            self.set_compose_hint(format!("clipboard image: PNG encode failed: {e}"));
+            return true;
+        }
+        self.stage_raw_pick(RawPick {
+            bytes: png_bytes,
+            source_desc: "clipboard image".into(),
+        });
+        true
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn try_clipboard_image_paste(&mut self) -> bool {
+        false
+    }
+
     fn stage_raw_pick(&mut self, pick: RawPick) {
         if pick.bytes.is_empty() {
             self.set_compose_hint(format!("{} was empty; ignored", pick.source_desc));
@@ -14418,10 +14496,12 @@ impl ChatApp {
     /// Recursive emitter for one JSON node into `rows`. Mirrors the
     /// egui sibling's `render_json_node`: scalars become one-line
     /// monospace labels; objects and arrays become collapsible rows
-    /// whose body indents children by `depth + 1`. Long strings render
-    /// as `"…"`-suffixed previews so wide payloads don't blow up the
-    /// row height. (The egui sibling exposes the full text on hover —
-    /// a follow-up once aetna grows a row-level tooltip primitive.)
+    /// whose body indents children by `depth + 1`. String values
+    /// render the full quoted form with `.ellipsis()` so wide payloads
+    /// clamp at the modal width — hover the row to read more via an
+    /// aetna tooltip (capped at `STRING_TOOLTIP_BYTES` since aetna's
+    /// v1 tooltip is single-line / no-wrap; anything past the cap is
+    /// only readable via the file viewer).
     ///
     /// `path` is a JSON-pointer-style string used as the accordion
     /// value so sibling collapsibles don't share state (per-node
@@ -14435,7 +14515,7 @@ impl ChatApp {
         value: &serde_json::Value,
         depth: usize,
     ) {
-        const STRING_PREVIEW_BYTES: usize = 80;
+        const STRING_TOOLTIP_BYTES: usize = 600;
         let indent = tokens::SPACE_3 * depth as f32;
         match value {
             serde_json::Value::Null => {
@@ -14464,23 +14544,28 @@ impl ChatApp {
             }
             serde_json::Value::String(s) => {
                 let full = format!("{s:?}");
-                let preview = if full.len() > STRING_PREVIEW_BYTES {
-                    let mut cut = STRING_PREVIEW_BYTES;
-                    while !full.is_char_boundary(cut) && cut > 0 {
-                        cut -= 1;
-                    }
-                    format!("{}\u{2026}", &full[..cut])
+                let body = format!("{label}: {full}");
+                let mut tip_cut = body.len().min(STRING_TOOLTIP_BYTES);
+                while !body.is_char_boundary(tip_cut) && tip_cut > 0 {
+                    tip_cut -= 1;
+                }
+                let tip = if tip_cut < body.len() {
+                    format!("{}\u{2026}", &body[..tip_cut])
                 } else {
-                    full
+                    body.clone()
                 };
                 rows.push(
-                    text(format!("{label}: {preview}"))
+                    text(body)
                         .code()
                         .small()
+                        .ellipsis()
+                        .width(Size::Fill(1.0))
                         .padding(Sides {
                             left: indent,
                             ..Sides::default()
-                        }),
+                        })
+                        .key(format!("json-tree:string:{path}"))
+                        .tooltip(tip),
                 );
             }
             serde_json::Value::Array(arr) => {

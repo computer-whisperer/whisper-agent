@@ -49,6 +49,11 @@ similar = { version = "3", default-features = false, features = ["text"] }
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 rfd = { version = "0.17", default-features = false, features = ["xdg-portal"] }
 tokio = { workspace = true, features = ["rt"] }
+# Native clipboard read for image paste in the compose bar. Default
+# features (including `image-data`) are required for
+# `Clipboard::get_image()`. Wasm handles paste via the document-level
+# `install_paste_handler` in web_entry.rs and doesn't need this dep.
+arboard = "3"
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 wasm-bindgen = "0.2"

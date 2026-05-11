@@ -332,11 +332,12 @@ tab strip rather than ported piecemeal. Multi-slice rollout:
 
   Edit landed via the per-behavior editor sheet (see Stage 8).
   Archive-pod and other danger ops will reuse the same
-  arm-confirm shape when they land. **Cron schedule humanization
-  in the sidebar description still pending** — needs a server-
-  side `BehaviorSummary` field (the schedule string isn't
-  carried today, only the trigger kind), so it's a wire-protocol
-  change, not aetna-side work.
+  arm-confirm shape when they land. (Sidebar parity check: the
+  egui sibling rendered `name [{kind}]` where kind is the
+  discriminator string — `manual` / `cron` / `webhook`. The
+  aetna sidebar's `{kind} · {status}` description already
+  matches that. Humanizing the actual cron expression in this
+  row was a "would be nice" idea, not a port gap.)
 - **✅ Slice δ — entry points.** Three "+" affordances landed,
   each scoped to where it appears:
     - **Per-pod "new thread"** — `icon_button("plus")` keyed
@@ -581,10 +582,16 @@ stacked above it via a wrapping column. Each thumbnail tile
 is 96×96 with an `x` icon-button overlaid for one-click
 removal and a truncated filename caption below.
 
-Clipboard-paste still pending: aetna upstream doesn't yet
-expose a `ClipboardImage` / paste event variant. The native
-binary handles drag-drop + filepicker today, so screenshots
-land via paste-into-temp + drag, or via the picker.
+Clipboard image paste landed. Wasm goes through the document-
+level `install_paste_handler` in `web_entry.rs` (already in
+place since Stage 11). Native intercepts Ctrl/Cmd+V on the
+compose `text_area` via `text_input::clipboard_request`, then
+calls `arboard::Clipboard::get_image()`; on success the RGBA8
+bytes get PNG-encoded and pushed through the same
+`stage_raw_pick` pipeline drag-drop uses. No clipboard image →
+the routed Paste falls through to `text_area::apply_event` —
+text paste in this app's text inputs is a separate gap (no
+text-paste path is wired in any on_event branch today).
 
 Also still deferred:
 - URL fetching via the host shell (caching + a placeholder while
@@ -1185,9 +1192,9 @@ into headings, paragraphs, lists, code blocks, inline runs, and
 emphasis — identical to a hand-authored aetna tree. Got picked up as
 part of the event-log refactor since both touched the same code.
 
-Future polish: GFM tables landed in `aetna-markdown 0.3.0` already;
-math + footnotes + task lists + raw HTML are still upstream
-deferreds.
+Future polish: per `aetna-markdown/src/lib.rs` at the version we
+build against, tables, footnotes, task lists, raw HTML, and math
+(`$…$` / `$$…$$`) are all still deferred upstream.
 
 ### ✅ Stage 11 — wasm browser entry + server bundle switch
 
@@ -1258,9 +1265,13 @@ trivial / small / medium / large.
   built-in `accordion_trigger` was too heavy for a deep tree).
   Per-node collapse state lives in `json_tree_open` (separate from
   chat `open_accordions` so modal-close can drop it independently).
-  Strings preview at 80 bytes with a `…` suffix — full text on
-  hover is deferred until aetna grows a row-level tooltip
-  primitive. Entry point is public so the future file-tree slice
+  String rows render the full quoted text with `.ellipsis()` +
+  `Size::Fill(1.0)` so wide payloads clamp at the modal's inner
+  width; each row carries a keyed `.tooltip(...)` (up to
+  `STRING_TOOLTIP_BYTES = 600` since aetna's v1 tooltip is
+  single-line / no-wrap) so hover reveals what was clipped, with
+  the file viewer remaining the escape hatch for payloads beyond
+  the cap. Entry point is public so the future file-tree slice
   can route `.json` clicks straight here.
 - ✅ **File browser / editor.** Two slices, both landed.
 
@@ -1592,13 +1603,16 @@ the gap with the egui webui:
   aetna; once a `pinned_to_end` (or `auto_follow_tail`)
   flag lands, the aetna chat-log scroll picks it up in one
   line.
-- **`winit` drag/drop + clipboard-image events on
-  `aetna-winit-wgpu`.** Stage 7's input side (image attachment
-  via paste / drop / file picker) is gated on this. egui has
-  it natively; aetna needs the host to surface
-  `WindowEvent::DroppedFile` / clipboard-image readers via a
-  `UiEvent::FileDropped` style variant before this side becomes
-  a thin port.
+- ~~**`winit` drag/drop events on `aetna-winit-wgpu`.**~~ Landed
+  upstream as `UiEventKind::FileHovered` / `FileHoverCancelled`
+  / `FileDropped` (one event per file, path on
+  `event.path`); the agent's compose bar consumes the drop arm.
+  Clipboard-image paste remains app-side — aetna's
+  `text_input.rs` doc explicitly notes "no new aetna API is
+  needed": the app intercepts Ctrl+V via `clipboard_request`
+  and calls the clipboard backend's `get_image()` (arboard
+  native, web-sys on wasm) before falling through to text
+  paste.
 - **Markdown viewer scroll-from-source.** The aetna-markdown
   body re-builds when the source string grows past a threshold;
   a streaming assistant turn occasionally scrolls flat to the
