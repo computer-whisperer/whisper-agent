@@ -1311,15 +1311,18 @@ trivial / small / medium / large.
   in-flight guard doesn't wedge if the server restarts with a
   different on-disk layout.
 
-  ⏳ **Per-tab deep-link still pending.** The egui sibling's
-  `classify_pod_file_path` routes `behaviors/<id>/prompt.md` to
-  `open_behavior_editor_on_tab(..., BehaviorEditorTab::Prompt)`;
-  aetna's classifier already returns the `BehaviorPrompt(id)`
-  variant but both `BehaviorConfig` and `BehaviorPrompt` collapse
-  to the same `open_behavior_editor(pod, id)` call. Folding in a
-  tab-parameterized opener will close this.
-  `behaviors/<id>/system_prompt.md` falls through to the generic
-  text editor in egui too — not a parity gap there.
+  ✅ **Per-tab deep-link.** `open_behavior_editor_on_tab(pod,
+  behavior, tab)` parameterizes the editor's starting tab;
+  `open_behavior_editor` is the thin wrapper that picks
+  `Trigger`. The file-tree dispatch routes `BehaviorConfig` to
+  the default (Trigger) tab and `BehaviorPrompt` to the
+  Prompt tab. Already-open `(pod, behavior)` re-clicks just
+  call `switch_tab` on the existing state — no second
+  `GetBehavior`/`GetPod` round-trip. Bundle scene
+  `FileTreeBehaviorPromptDeepLink` exercises the full flow
+  (file tree → expand → click `prompt.md` → Prompt tab
+  active). `behaviors/<id>/system_prompt.md` falls through to
+  the generic text editor in egui too — not a parity gap.
 - ✅ **Server settings.** All three tabs of the egui sibling's
   modal landed: LLM backends (catalog + per-`chatgpt_subscription`
   Codex auth rotate sub-form), Shared MCP (CRUD), and admin-only

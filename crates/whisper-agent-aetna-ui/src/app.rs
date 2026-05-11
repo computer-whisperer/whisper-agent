@@ -7624,20 +7624,39 @@ impl ChatApp {
     /// in `pending_get` so the matching `BehaviorSnapshot` reply
     /// hydrates the form.
     fn open_behavior_editor(&mut self, pod_id: String, behavior_id: String) {
-        if let Some(existing) = self.behavior_editor.as_ref()
+        self.open_behavior_editor_on_tab(pod_id, behavior_id, BehaviorEditorTab::Trigger);
+    }
+
+    /// Same as [`Self::open_behavior_editor`] but lets the caller pick
+    /// which tab the editor lands on. Used by the file-tree dispatch
+    /// so a click on `behaviors/<id>/prompt.md` lands directly on the
+    /// Prompt tab instead of forcing the user to navigate there. If
+    /// the editor is already open on the same `(pod, behavior)` we
+    /// just switch the tab (no new `GetBehavior` / `GetPod`
+    /// round-trip).
+    fn open_behavior_editor_on_tab(
+        &mut self,
+        pod_id: String,
+        behavior_id: String,
+        tab: BehaviorEditorTab,
+    ) {
+        if let Some(existing) = self.behavior_editor.as_mut()
             && existing.pod_id == pod_id
             && existing.behavior_id == behavior_id
         {
+            existing.switch_tab(tab);
             return;
         }
         let behavior_correlation = self.next_correlation_id();
         let pod_correlation = self.next_correlation_id();
-        self.behavior_editor = Some(BehaviorEditorSheetState::new(
+        let mut state = BehaviorEditorSheetState::new(
             pod_id.clone(),
             behavior_id.clone(),
             behavior_correlation.clone(),
             pod_correlation.clone(),
-        ));
+        );
+        state.tab = tab;
+        self.behavior_editor = Some(state);
         self.send(ClientToServer::GetBehavior {
             correlation_id: Some(behavior_correlation),
             pod_id: pod_id.clone(),
@@ -14409,13 +14428,15 @@ impl ChatApp {
             PodFileDispatch::PodConfig => {
                 self.open_pod_editor(pod_id.to_string());
             }
-            PodFileDispatch::BehaviorConfig(behavior_id)
-            | PodFileDispatch::BehaviorPrompt(behavior_id) => {
-                // v1 opens the behavior editor on its default tab —
-                // the egui sibling deep-links Prompt clicks to the
-                // Prompt tab, which we'll wire when `open_behavior_editor`
-                // grows a per-tab variant.
+            PodFileDispatch::BehaviorConfig(behavior_id) => {
                 self.open_behavior_editor(pod_id.to_string(), behavior_id);
+            }
+            PodFileDispatch::BehaviorPrompt(behavior_id) => {
+                self.open_behavior_editor_on_tab(
+                    pod_id.to_string(),
+                    behavior_id,
+                    BehaviorEditorTab::Prompt,
+                );
             }
             PodFileDispatch::JsonViewer(p) => {
                 self.open_json_viewer(pod_id.to_string(), p);

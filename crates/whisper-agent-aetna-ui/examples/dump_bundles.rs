@@ -282,6 +282,18 @@ enum Scene {
     /// structured tab reparses; a parse error keeps the user on
     /// Raw with the message in the destructive alert.
     BehaviorEditorRawTab,
+    /// File-tree → behavior editor deep-link. Opens the file tree
+    /// modal, expands `behaviors/` and `behaviors/architect/`, then
+    /// clicks `prompt.md`. The dispatch routes
+    /// `PodFileDispatch::BehaviorPrompt(architect)` to
+    /// `open_behavior_editor_on_tab(..., Prompt)`, so the resulting
+    /// editor lands on the Prompt tab (mirroring the egui sibling's
+    /// `open_behavior_editor_on_tab(..., BehaviorEditorTab::Prompt)`
+    /// call). Same `mock_architect_snapshot` + `mock_default_pod_snapshot`
+    /// replies the BehaviorEditor* scenes use; the second
+    /// `before_build` drain hydrates the editor's tab body before
+    /// the dump paints.
+    FileTreeBehaviorPromptDeepLink,
     /// Pod editor sheet, opened and switched to the Limits tab.
     /// Same hydration shape as `PodEditorHydrated`; an extra click
     /// on the `pod-editor:tabs:tab:limits` trigger flips the
@@ -398,7 +410,7 @@ enum Scene {
 }
 
 impl Scene {
-    const ALL: [Scene; 58] = [
+    const ALL: [Scene; 59] = [
         Scene::Connecting,
         Scene::Connected,
         Scene::Closed,
@@ -439,6 +451,7 @@ impl Scene {
         Scene::BehaviorEditorRetentionTab,
         Scene::BehaviorEditorSystemPromptTab,
         Scene::BehaviorEditorRawTab,
+        Scene::FileTreeBehaviorPromptDeepLink,
         Scene::ForkModalOpen,
         Scene::LightboxOpen,
         Scene::SudoPending,
@@ -501,6 +514,7 @@ impl Scene {
             Scene::BehaviorEditorRetentionTab => "behavior_editor_retention_tab",
             Scene::BehaviorEditorSystemPromptTab => "behavior_editor_system_prompt_tab",
             Scene::BehaviorEditorRawTab => "behavior_editor_raw_tab",
+            Scene::FileTreeBehaviorPromptDeepLink => "file_tree_behavior_prompt_deep_link",
             Scene::ForkModalOpen => "fork_modal_open",
             Scene::LightboxOpen => "lightbox_open",
             Scene::SudoPending => "sudo_pending",
@@ -629,6 +643,18 @@ impl Scene {
                 "behavior-edit:default:architect",
                 "behavior-editor:tabs:tab:raw",
             ],
+            // Open the file tree, drill down to
+            // `behaviors/architect/prompt.md`, and click it. The
+            // file-tree dispatch routes the BehaviorPrompt variant
+            // to `open_behavior_editor_on_tab(..., Prompt)`, so the
+            // resulting editor renders with the Prompt tab active —
+            // the deep-link behavior the egui sibling shipped.
+            Scene::FileTreeBehaviorPromptDeepLink => vec![
+                "sidebar:pod-files",
+                "file-tree:dir:default:behaviors",
+                "file-tree:dir:default:behaviors/architect",
+                "file-tree:file:default:behaviors/architect/prompt.md",
+            ],
             // Click the gear icon — sidebar header's pod-settings
             // affordance. Renders only when `pod_tab.is_some()`,
             // which it is here (PodList seeded a default).
@@ -750,7 +776,8 @@ fn build_app(scene: Scene) -> Box<dyn App> {
         | Scene::BehaviorEditorScopeTab
         | Scene::BehaviorEditorRetentionTab
         | Scene::BehaviorEditorSystemPromptTab
-        | Scene::BehaviorEditorRawTab => {
+        | Scene::BehaviorEditorRawTab
+        | Scene::FileTreeBehaviorPromptDeepLink => {
             let queue = inbound.clone();
             Box::new(move |msg| match msg {
                 // The behavior editor opens with a `GetBehavior` /
@@ -780,6 +807,62 @@ fn build_app(scene: Scene) -> Box<dyn App> {
                             correlation_id,
                             snapshot: mock_default_pod_snapshot(),
                         }));
+                }
+                // FileTreeBehaviorPromptDeepLink also drives the
+                // file-tree dispatch through `ListPodDir`s — same
+                // mock entries shape as `FileTreeOpen`, restricted to
+                // the path that leads to `behaviors/architect/prompt.md`.
+                ClientToServer::ListPodDir {
+                    correlation_id,
+                    pod_id,
+                    path,
+                } if pod_id == "default" => {
+                    let p = path.unwrap_or_default();
+                    let entries: Vec<FsEntry> = match p.as_str() {
+                        "" => vec![
+                            FsEntry {
+                                name: "pod.toml".into(),
+                                is_dir: false,
+                                size: 320,
+                                readonly: false,
+                            },
+                            FsEntry {
+                                name: "behaviors".into(),
+                                is_dir: true,
+                                size: 0,
+                                readonly: false,
+                            },
+                        ],
+                        "behaviors" => vec![FsEntry {
+                            name: "architect".into(),
+                            is_dir: true,
+                            size: 0,
+                            readonly: false,
+                        }],
+                        "behaviors/architect" => vec![
+                            FsEntry {
+                                name: "behavior.toml".into(),
+                                is_dir: false,
+                                size: 480,
+                                readonly: false,
+                            },
+                            FsEntry {
+                                name: "prompt.md".into(),
+                                is_dir: false,
+                                size: 760,
+                                readonly: false,
+                            },
+                        ],
+                        _ => Vec::new(),
+                    };
+                    queue.borrow_mut().push_back(InboundEvent::Wire(
+                        ServerToClient::PodDirListing {
+                            correlation_id,
+                            pod_id,
+                            path: p,
+                            entries,
+                        },
+                    ));
                 }
                 _ => {}
             })
@@ -1432,6 +1515,7 @@ fn build_app(scene: Scene) -> Box<dyn App> {
         | Scene::FileViewerEditable
         | Scene::FileViewerReadOnly
         | Scene::FileTreeOpen
+        | Scene::FileTreeBehaviorPromptDeepLink
         | Scene::SettingsBackends
         | Scene::SettingsServerConfig
         | Scene::SettingsCodexRotate
