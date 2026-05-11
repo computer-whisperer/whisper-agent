@@ -36,14 +36,17 @@ jobs:
           # verifying the action no longer regresses.
           version: 'v0.13.1'
 
-      # `src/server.rs` embeds `crates/whisper-agent-webui/pkg/` via
+      # `src/server.rs` embeds `crates/whisper-agent-aetna-ui/pkg/` via
       # `rust-embed`; the macro checks the folder exists at compile time.
       # `pkg/` is wasm-pack output and gitignored — we have to build it
       # here before clippy/test touch the host-side workspace. Debug
       # build is fine: CI only needs the files to exist so the embed
       # macro resolves; size and speed matter more than optimization.
-      - name: Build webui (wasm-pack)
-        run: wasm-pack build crates/whisper-agent-webui --target web
+      # (Was `whisper-agent-webui` until the egui frontend was dropped
+      # in `chore: drop egui webui + desktop crates`; mirrors the path
+      # `scripts/dev.sh` and the Dockerfile now use.)
+      - name: Build aetna-ui (wasm-pack)
+        run: wasm-pack build crates/whisper-agent-aetna-ui --target web
 
       - name: rustfmt
         run: cargo fmt --all -- --check
