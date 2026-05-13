@@ -38,10 +38,12 @@ use whisper_agent_protocol::{
 };
 
 fn main() -> std::io::Result<()> {
-    // Native window viewport — the bug, if any, shouldn't depend on
-    // viewport size. Keeping it identical to the desktop binary's
-    // window dimensions makes the SVG read like the live UI at idle.
-    let viewport = Rect::new(0.0, 0.0, 1200.0, 800.0);
+    // Native window viewport. Keep this identical to the desktop
+    // binary's default so the SVG reads like the live UI at idle.
+    // 1600x900 logical pixels is conservative for a 3840x2160 display
+    // at scale=2 while avoiding an unrealistically cramped desktop
+    // validation target.
+    let viewport = Rect::new(0.0, 0.0, 1600.0, 900.0);
     let out_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("out");
 
     for scene in Scene::ALL {

@@ -143,7 +143,7 @@ fn main() -> Result<()> {
         phase_signal,
     };
 
-    let viewport = Rect::new(0.0, 0.0, 1200.0, 800.0);
+    let viewport = Rect::new(0.0, 0.0, 1600.0, 900.0);
     // 30Hz cadence so WS frames get drained promptly without us
     // depending on user input to redraw. See the wakeup-caveat note at
     // the top of the file — this trades idle CPU for visibility into

@@ -6218,6 +6218,23 @@ fn checkbox_column(group_prefix: &str, selected: &[String], options: Vec<(String
     column(rows).gap(tokens::SPACE_1).width(Size::Fill(1.0))
 }
 
+fn scroll_gutter_column<I, E>(children: I, gap: f32) -> El
+where
+    I: IntoIterator<Item = E>,
+    E: Into<El>,
+{
+    column(children)
+        .gap(gap)
+        .padding(Sides {
+            left: tokens::RING_WIDTH,
+            right: tokens::SCROLLBAR_THUMB_WIDTH_ACTIVE + tokens::SPACE_1,
+            top: 0.0,
+            bottom: 0.0,
+        })
+        .width(Size::Fill(1.0))
+        .height(Size::Hug)
+}
+
 fn host_env_edit_key(idx: usize) -> String {
     format!("{POD_EDITOR_HOST_ENV_EDIT_PREFIX}{idx}")
 }
@@ -10405,9 +10422,8 @@ impl ChatApp {
                 .destructive(),
             );
         }
-        let scroll_body = scroll(body_children)
-            .key("behavior-editor:scroll")
-            .gap(tokens::SPACE_4);
+        let scroll_body = scroll([scroll_gutter_column(body_children, tokens::SPACE_4)])
+            .key("behavior-editor:scroll");
 
         let children: Vec<El> = vec![header, scroll_body, dialog_footer([cancel, save])];
 
@@ -12464,9 +12480,8 @@ impl ChatApp {
                 .destructive(),
             );
         }
-        let scroll_body = scroll(body_children)
-            .key("pod-editor:scroll")
-            .gap(tokens::SPACE_4);
+        let scroll_body =
+            scroll([scroll_gutter_column(body_children, tokens::SPACE_4)]).key("pod-editor:scroll");
 
         let children: Vec<El> = vec![header, scroll_body, dialog_footer([cancel, save])];
 
@@ -16409,7 +16424,7 @@ impl ChatApp {
                 let inner = column(rows)
                     .gap(tokens::SPACE_2)
                     .padding(Sides {
-                        left: 0.0,
+                        left: tokens::RING_WIDTH,
                         // Active-state thumb width plus a small
                         // breathing margin — the scroll widget's
                         // own outer padding consumes a couple of
@@ -16977,8 +16992,7 @@ impl ChatApp {
 
         let mut rows: Vec<El> = Vec::new();
         self.render_pod_dir(&mut rows, pod_id, "", 0);
-        let body = scroll(rows)
-            .gap(tokens::SPACE_1)
+        let body = scroll([scroll_gutter_column(rows, tokens::SPACE_1)])
             .width(Size::Fill(1.0))
             .height(Size::Fill(1.0));
 
@@ -17069,8 +17083,7 @@ impl ChatApp {
         let body: El = if let Some(value) = modal.parsed.as_ref() {
             let mut rows: Vec<El> = Vec::new();
             self.render_json_node(&mut rows, "$", "(root)", value, 0);
-            scroll(rows)
-                .gap(tokens::SPACE_1)
+            scroll([scroll_gutter_column(rows, tokens::SPACE_1)])
                 .width(Size::Fill(1.0))
                 .height(Size::Fill(1.0))
         } else if let Some(err) = modal.error.as_deref() {
