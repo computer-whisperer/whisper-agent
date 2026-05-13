@@ -57,9 +57,9 @@ use whisper_agent_protocol::{
     ActivationSurface, AllowMap, Attachment, BackendSummary, BehaviorConfig, BehaviorSummary,
     BehaviorThreadOverride, BucketBuildOutcome, BucketBuildPhase, BucketCreateInput,
     BucketSourceInput, BucketSummary, CatchUp, ClientToServer, ContentBlock, CoreTools,
-    Disposition, EmbeddingProviderInfo, FsEntry, ImageMime, ImageSource, InitialListing,
-    ModelSummary, NamedHostEnv, Overlap, PodAllow, PodConfig, PodLimits, PodSummary,
-    QuantizationInput, RetentionPolicy, Role, ServerToClient, SharedMcpAuthInput,
+    Disposition, EmbeddingProviderInfo, FsEntry, HostEnvBindingRequest, ImageMime, ImageSource,
+    InitialListing, ModelSummary, NamedHostEnv, Overlap, PodAllow, PodConfig, PodLimits,
+    PodSummary, QuantizationInput, RetentionPolicy, Role, ServerToClient, SharedMcpAuthInput,
     SharedMcpAuthPublic, SharedMcpHostInfo, SharedMcpPrefixInput, SlotStateLabel,
     SystemPromptChoice, ThreadBindingsRequest, ThreadConfigOverride, ThreadDefaults, ThreadSummary,
     TrackedCadenceInput, TrackedDriverInput, TriggerSpec, permission::SudoDecision,
@@ -1684,6 +1684,51 @@ pub struct ChatApp {
     /// server's `compose_pod_id` default.
     picker_pod: Option<String>,
     picker_pod_open: bool,
+    /// Host-env bindings picked for the next `CreateThread`. Empty
+    /// means "inherit pod default"; non-empty replaces the default
+    /// list exactly. Each entry carries an editable string buffer for
+    /// the workspace_root override — empty draft falls through to the
+    /// scheduler's first-RW-path default at compose time, non-empty
+    /// promotes to `Some(PathBuf::from(draft))` in
+    /// `build_creation_request`.
+    picker_host_envs: Vec<PickerHostEnv>,
+    picker_host_envs_open: bool,
+    /// Name of the host-env chip whose inline workspace_root editor is
+    /// currently expanded, if any. Only one editor at a time — clicking
+    /// the body of another chip swaps the open editor. Cleared on pod
+    /// change (chip vec gets cleared too).
+    picker_host_env_expanded: Option<String>,
+    /// MCP host names picked for the next `CreateThread`. Same
+    /// inherit-vs-replace semantics as `picker_host_envs`.
+    picker_mcp_hosts: Vec<String>,
+    picker_mcp_hosts_open: bool,
+    /// Full `PodConfig` cache, populated lazily via `GetPod` —
+    /// `PodSummary` (what `PodList` carries) doesn't have the
+    /// `allow.host_env` / `allow.mcp_hosts` tables the new-thread
+    /// pickers need. Fetched on demand by `ensure_pod_config`.
+    pod_configs: HashMap<String, whisper_agent_protocol::PodConfig>,
+    /// In-flight `GetPod` correlations keyed by `pod_id` so we don't
+    /// fan out duplicate requests for the same pod. Cleared when the
+    /// matching `PodSnapshot` lands.
+    pending_pod_config_gets: HashMap<String, String>,
+    /// Correlation id of an in-flight `CreateThread` submitted from
+    /// the new-thread compose form. Used to recognize the matching
+    /// `ThreadCreated` echo or `Error` reply so we can dismiss the
+    /// pending state and (on failure) restore the submitted text /
+    /// surface the message inline. `None` whenever no submission is
+    /// pending.
+    pending_new_thread: Option<String>,
+    /// Text the user submitted on the in-flight `CreateThread`,
+    /// stashed alongside `pending_new_thread` so a server-side error
+    /// can repopulate `compose_input` instead of leaving the user
+    /// staring at an empty form after typing was already cleared.
+    /// Cleared in lockstep with `pending_new_thread`.
+    pending_new_thread_text: String,
+    /// Last server-reported error from a `CreateThread` attempt.
+    /// Rendered as a destructive alert above the new-thread form;
+    /// cleared on dismiss, on next submit, or when the user edits any
+    /// of the form's fields.
+    new_thread_error: Option<String>,
 
     // ----- modals -----
     /// "+ New pod" dialog state. `Some` while the modal is open;
@@ -2624,6 +2669,16 @@ impl ChatApp {
             picker_model_open: false,
             picker_pod: None,
             picker_pod_open: false,
+            picker_host_envs: Vec::new(),
+            picker_host_envs_open: false,
+            picker_host_env_expanded: None,
+            picker_mcp_hosts: Vec::new(),
+            picker_mcp_hosts_open: false,
+            pod_configs: HashMap::new(),
+            pending_pod_config_gets: HashMap::new(),
+            pending_new_thread: None,
+            pending_new_thread_text: String::new(),
+            new_thread_error: None,
             new_pod_modal: None,
             new_behavior_modal: None,
             behavior_editor: None,
@@ -2803,6 +2858,23 @@ impl ChatApp {
                 // modal). Match by correlation; the pod_id check
                 // guards against close-then-reopen for a different
                 // pod within the round-trip window.
+                // Multi-consumer: the pod editor, behavior editor,
+                // default-pod template fetch, and new-thread picker
+                // cache all match `PodSnapshot` deliveries by
+                // correlation_id. Order matters less than it looks —
+                // each branch's correlation is unique to its
+                // requester, so at most one branch consumes the
+                // payload. The new-thread cache populator (last) runs
+                // even when one of the editor branches already
+                // consumed `config` (we clone) so a snapshot fetched
+                // by, say, the pod editor still primes the picker
+                // cache for the same pod id — saves a duplicate
+                // round-trip if the user closes the editor and starts
+                // a new thread.
+                self.pod_configs
+                    .insert(snapshot.pod_id.clone(), snapshot.config.clone());
+                self.pending_pod_config_gets.remove(&snapshot.pod_id);
+
                 if let Some(editor) = self.pod_editor.as_mut()
                     && editor.pending_get.as_ref() == correlation_id.as_ref()
                     && editor.pod_id == snapshot.pod_id
@@ -3055,6 +3127,18 @@ impl ChatApp {
                     self.picker_model = None;
                     self.picker_pod = None;
                     self.compose_input.clear();
+                }
+                // Clear the pending-new-thread tracking when the
+                // echoed correlation matches our outstanding submit.
+                // Distinct from the `selected.is_none()` branch above
+                // so a broadcast `ThreadCreated` for somebody else's
+                // create doesn't unilaterally clear our error state.
+                if let Some(echoed) = correlation_id.as_ref()
+                    && self.pending_new_thread.as_ref() == Some(echoed)
+                {
+                    self.pending_new_thread = None;
+                    self.pending_new_thread_text.clear();
+                    self.new_thread_error = None;
                 }
             }
             ServerToClient::BackendsList { backends, .. } => {
@@ -4022,6 +4106,24 @@ impl ChatApp {
                         modal.shared_mcp_banner = Some(Err(message.clone()));
                         consumed = true;
                     }
+                    // New-thread submit. The server rejected the
+                    // `CreateThread` (invalid workspace_root, unknown
+                    // host_env name, unknown model, missing
+                    // backend…). Restore the user's text into the
+                    // compose box so they don't lose what they wrote,
+                    // surface the message as a destructive alert
+                    // above the form, and drop the pending slot so
+                    // Start re-enables for retry.
+                    if !consumed && self.pending_new_thread.as_ref() == Some(corr) {
+                        self.new_thread_error = Some(message.clone());
+                        if self.compose_input.is_empty() {
+                            self.compose_input = std::mem::take(&mut self.pending_new_thread_text);
+                        } else {
+                            self.pending_new_thread_text.clear();
+                        }
+                        self.pending_new_thread = None;
+                        consumed = true;
+                    }
                 }
                 // Thread-scoped errors land on the view's failure
                 // slot so the pane's destructive banner has
@@ -4953,6 +5055,14 @@ impl App for ChatApp {
             return;
         }
 
+        // New-thread error-banner dismiss. Just clears the slot —
+        // the next submit also clears it implicitly, so this is the
+        // explicit-acknowledge path.
+        if event.is_click_or_activate(NEW_THREAD_ERROR_DISMISS_KEY) {
+            self.new_thread_error = None;
+            return;
+        }
+
         // Thread-level action buttons. Each fires its matching wire
         // command for the currently-selected thread; the server's
         // broadcast updates `threads` and the next build reflects
@@ -4996,6 +5106,68 @@ impl App for ChatApp {
         }
         if let Some(action) = classify_select_event(&event, PICKER_POD) {
             self.handle_pod_pick(action);
+            return;
+        }
+        if let Some(action) = classify_select_event(&event, PICKER_HOST_ENVS) {
+            self.handle_host_envs_pick(action);
+            return;
+        }
+        if let Some(action) = classify_select_event(&event, PICKER_MCP_HOSTS) {
+            self.handle_mcp_hosts_pick(action);
+            return;
+        }
+        // Per-chip × removes. Route keys live under
+        // `picker:host-envs:remove:<name>` / `picker:mcp-hosts:remove:<name>`.
+        // Chip-body click toggles the inline workspace_root editor for
+        // that host-env entry; the matching "Default" button clears the
+        // entry's draft. Single-click activate covers all of these.
+        if matches!(event.kind, UiEventKind::Click | UiEventKind::Activate)
+            && let Some(key) = event.route()
+        {
+            if let Some(name) = key.strip_prefix(PICKER_HOST_ENVS_REMOVE_PREFIX) {
+                self.picker_host_envs.retain(|e| e.name != name);
+                if self.picker_host_env_expanded.as_deref() == Some(name) {
+                    self.picker_host_env_expanded = None;
+                }
+                return;
+            }
+            if let Some(name) = key.strip_prefix(PICKER_HOST_ENVS_EXPAND_PREFIX) {
+                if self.picker_host_env_expanded.as_deref() == Some(name) {
+                    self.picker_host_env_expanded = None;
+                } else {
+                    self.picker_host_env_expanded = Some(name.to_string());
+                }
+                return;
+            }
+            if let Some(name) = key.strip_prefix(PICKER_HOST_ENVS_DEFAULT_PREFIX) {
+                if let Some(entry) = self.picker_host_envs.iter_mut().find(|e| e.name == name) {
+                    entry.workspace_root_draft.clear();
+                }
+                return;
+            }
+            if let Some(name) = key.strip_prefix(PICKER_MCP_HOSTS_REMOVE_PREFIX) {
+                self.picker_mcp_hosts.retain(|n| n != name);
+                return;
+            }
+        }
+
+        // Per-entry workspace_root text input. Route keys live under
+        // `picker:host-envs:wsroot:<name>` and dispatch into the
+        // matching entry's `workspace_root_draft` via
+        // `text_input::apply_event` — same shape as every other text
+        // input in the app so cursor / IME / paste all behave.
+        if let Some(target) = event.target_key()
+            && let Some(name) = target.strip_prefix(PICKER_HOST_ENVS_WSROOT_PREFIX)
+        {
+            let key = format!("{PICKER_HOST_ENVS_WSROOT_PREFIX}{name}");
+            if let Some(entry) = self.picker_host_envs.iter_mut().find(|e| e.name == name) {
+                text_input::apply_event(
+                    &mut entry.workspace_root_draft,
+                    &mut self.selection,
+                    &key,
+                    &event,
+                );
+            }
             return;
         }
 
@@ -5162,6 +5334,52 @@ fn chat_text_key(idx: usize, part: &str) -> String {
 
 fn chat_user_fork_key(msg_index: usize) -> String {
     format!("{CHAT_USER_FORK_PREFIX}{msg_index}")
+}
+
+/// Per-entry picker state for a host-env binding selected for the next
+/// `CreateThread`. Pairs the catalog entry name with an editable string
+/// buffer for the optional workspace_root override; the buffer is what
+/// the inline text_input binds to. Converted back to the wire
+/// `HostEnvBindingRequest` (empty draft ⇒ `None`, else
+/// `Some(PathBuf::from(draft))`) in `build_creation_request`.
+#[derive(Default, Clone)]
+struct PickerHostEnv {
+    name: String,
+    workspace_root_draft: String,
+}
+
+/// Chip for a picked host-env entry — a body button (label = entry
+/// name) that toggles the inline workspace_root editor, and a separate
+/// `×` ghost icon-button that removes the entry. Body chip flips to
+/// primary when expanded so the open editor visually anchors back to
+/// its owner. Override draft glyph (`*`) hints when the user has
+/// edited the workspace_root away from the spec default.
+fn host_env_chip(name: &str, expanded: bool, has_override: bool) -> El {
+    let label = if has_override {
+        format!("{name} *")
+    } else {
+        name.to_string()
+    };
+    let mut body = button(label).key(format!("{PICKER_HOST_ENVS_EXPAND_PREFIX}{name}"));
+    body = if expanded {
+        body.primary()
+    } else {
+        body.secondary()
+    };
+    let remove = icon_button(crate::icons::ICON_X.clone())
+        .key(format!("{PICKER_HOST_ENVS_REMOVE_PREFIX}{name}"))
+        .ghost();
+    row([body, remove])
+        .gap(tokens::SPACE_1)
+        .align(Align::Center)
+}
+
+/// Mirror of [`host_env_chip`] for the MCP-hosts row. No expansion or
+/// per-chip override — clicking removes the entry directly.
+fn mcp_host_chip(name: &str) -> El {
+    button(format!("{name} \u{00d7}"))
+        .key(format!("{PICKER_MCP_HOSTS_REMOVE_PREFIX}{name}"))
+        .secondary()
 }
 
 /// Routed key for clicking an inline image to open the fullscreen
@@ -5855,6 +6073,33 @@ const PICKER_BACKEND: &str = "picker:backend";
 const PICKER_MODEL: &str = "picker:model";
 const PICKER_POD: &str = "picker:pod";
 
+/// Routed keys for the multi-select chip pickers — host envs and MCP
+/// hosts. `*_TRIGGER` is the "+ Add" button at the end of the chip
+/// row; `*_REMOVE_PREFIX` keys the per-chip × buttons with the entry
+/// name as the suffix. The popover menu shares its trigger key with
+/// the trigger button so anchoring picks up the right element.
+/// Dismiss button on the destructive alert that surfaces a server-side
+/// `CreateThread` rejection above the new-thread form. Click clears
+/// `new_thread_error` without touching anything else.
+const NEW_THREAD_ERROR_DISMISS_KEY: &str = "new-thread:error:dismiss";
+
+const PICKER_HOST_ENVS: &str = "picker:host-envs";
+const PICKER_HOST_ENVS_REMOVE_PREFIX: &str = "picker:host-envs:remove:";
+/// Routed-key prefix for the chip body button on each picked host-env
+/// entry. Clicking toggles inline workspace_root editing for that
+/// entry — only one expanded at a time across the picker.
+const PICKER_HOST_ENVS_EXPAND_PREFIX: &str = "picker:host-envs:expand:";
+/// Routed-key prefix for the per-entry workspace_root text input. The
+/// suffix is the host-env entry name so the apply_event dispatch can
+/// locate the matching draft buffer in `picker_host_envs`.
+const PICKER_HOST_ENVS_WSROOT_PREFIX: &str = "picker:host-envs:wsroot:";
+/// Routed-key prefix for the "Default" reset button next to an
+/// expanded workspace_root input — clearing the draft is what restores
+/// the inherit-from-spec behavior.
+const PICKER_HOST_ENVS_DEFAULT_PREFIX: &str = "picker:host-envs:default:";
+const PICKER_MCP_HOSTS: &str = "picker:mcp-hosts";
+const PICKER_MCP_HOSTS_REMOVE_PREFIX: &str = "picker:mcp-hosts:remove:";
+
 /// Sentinel option value emitted by the "inherit / auto / default"
 /// menu row each picker prepends. Empty string can't collide with a
 /// real backend / model id / pod id. Picker pick handlers map this
@@ -6078,12 +6323,19 @@ impl ChatApp {
         } else {
             // No selection -> the compose form is in new-thread
             // mode. Materialize the picker state into a
-            // `CreateThread` request. `ThreadCreated` will land in
-            // `dispatch_wire` and auto-select the result.
+            // `CreateThread` request with a correlation id we can
+            // match against either the `ThreadCreated` echo (success)
+            // or a `ServerToClient::Error` reply (failure — bad
+            // workspace_root, unknown host_env name, missing model,
+            // etc.). `dispatch_wire` routes on this correlation.
             let (config_override, bindings_request, pod_id) = self.build_creation_request();
+            let correlation = self.next_correlation_id();
+            self.pending_new_thread = Some(correlation.clone());
+            self.pending_new_thread_text = text.clone();
+            self.new_thread_error = None;
             self.compose_input.clear();
             self.send(ClientToServer::CreateThread {
-                correlation_id: None,
+                correlation_id: Some(correlation),
                 pod_id,
                 initial_message: text,
                 initial_attachments: attachments,
@@ -6152,11 +6404,49 @@ impl ChatApp {
         } else {
             None
         };
-        let bindings_request = backend.as_ref().map(|_| ThreadBindingsRequest {
-            backend: backend.clone(),
-            host_env: None,
-            mcp_hosts: None,
-        });
+        // Bindings request lights up when the user touched *any* of
+        // the backend / host_envs / mcp_hosts pickers. Each field maps
+        // independently: `None` ⇒ inherit pod default, `Some(empty)`
+        // ⇒ explicit-empty (the wire treats `Some(vec![])` as "no
+        // bindings — bare thread"), `Some(non-empty)` ⇒ explicit
+        // replacement. We only send `Some(empty)` for host_env /
+        // mcp_hosts if the user actually picked something and then
+        // removed it all in the same session; otherwise the field
+        // stays `None` so the pod default still wins.
+        let host_env = if self.picker_host_envs.is_empty() {
+            None
+        } else {
+            Some(
+                self.picker_host_envs
+                    .iter()
+                    .map(|entry| {
+                        let workspace_root = if entry.workspace_root_draft.trim().is_empty() {
+                            None
+                        } else {
+                            Some(std::path::PathBuf::from(entry.workspace_root_draft.trim()))
+                        };
+                        HostEnvBindingRequest {
+                            name: entry.name.clone(),
+                            workspace_root,
+                        }
+                    })
+                    .collect(),
+            )
+        };
+        let mcp_hosts = if self.picker_mcp_hosts.is_empty() {
+            None
+        } else {
+            Some(self.picker_mcp_hosts.clone())
+        };
+        let bindings_request = if backend.is_some() || host_env.is_some() || mcp_hosts.is_some() {
+            Some(ThreadBindingsRequest {
+                backend: backend.clone(),
+                host_env,
+                mcp_hosts,
+            })
+        } else {
+            None
+        };
         (config_override, bindings_request, self.picker_pod.clone())
     }
 
@@ -6224,9 +6514,93 @@ impl ChatApp {
                     Some(value)
                 };
                 self.picker_pod_open = false;
+                // Pod changed → previously-picked host_envs / mcp_hosts
+                // may no longer be in the new pod's allow list. Clear
+                // both so the user re-picks against the right surface;
+                // partial-validity is too clever for v1.
+                self.picker_host_envs.clear();
+                self.picker_host_env_expanded = None;
+                self.picker_mcp_hosts.clear();
+                self.ensure_pod_config_for_picker();
             }
             _ => {}
         }
+    }
+
+    /// Toggle handler for the host_envs popover. `Pick` *adds* the
+    /// option to `picker_host_envs` (multi-select semantics) rather
+    /// than replacing — that's the difference between this and the
+    /// single-pick backend/model/pod handlers above. The sentinel
+    /// `PICKER_INHERIT` value (used by the "(no more entries)"
+    /// placeholder row) is a no-op so the placeholder doesn't act as
+    /// a button.
+    fn handle_host_envs_pick(&mut self, action: SelectAction) {
+        match action {
+            SelectAction::Toggle => {
+                self.close_other_pickers(PICKER_HOST_ENVS);
+                self.picker_host_envs_open = !self.picker_host_envs_open;
+                if self.picker_host_envs_open {
+                    self.ensure_pod_config_for_picker();
+                }
+            }
+            SelectAction::Dismiss => self.picker_host_envs_open = false,
+            SelectAction::Pick(value) => {
+                if value != PICKER_INHERIT && !self.picker_host_envs.iter().any(|e| e.name == value)
+                {
+                    self.picker_host_envs.push(PickerHostEnv {
+                        name: value,
+                        workspace_root_draft: String::new(),
+                    });
+                }
+                self.picker_host_envs_open = false;
+            }
+            _ => {}
+        }
+    }
+
+    /// Mirror of [`handle_host_envs_pick`] for the MCP hosts picker.
+    fn handle_mcp_hosts_pick(&mut self, action: SelectAction) {
+        match action {
+            SelectAction::Toggle => {
+                self.close_other_pickers(PICKER_MCP_HOSTS);
+                self.picker_mcp_hosts_open = !self.picker_mcp_hosts_open;
+                if self.picker_mcp_hosts_open {
+                    self.ensure_pod_config_for_picker();
+                }
+            }
+            SelectAction::Dismiss => self.picker_mcp_hosts_open = false,
+            SelectAction::Pick(value) => {
+                if value != PICKER_INHERIT && !self.picker_mcp_hosts.contains(&value) {
+                    self.picker_mcp_hosts.push(value);
+                }
+                self.picker_mcp_hosts_open = false;
+            }
+            _ => {}
+        }
+    }
+
+    /// Fire a `GetPod` for the picker's currently-targeted pod if we
+    /// don't already have its `PodConfig` cached and there's no
+    /// in-flight request. Idempotent on both fronts. Hit on
+    /// host_envs / mcp_hosts popover open so the menu can populate
+    /// without the user having to wait until next pod-tab switch.
+    fn ensure_pod_config_for_picker(&mut self) {
+        let Some(pod_id) = self.picker_effective_pod_id().map(str::to_owned) else {
+            return;
+        };
+        if self.pod_configs.contains_key(&pod_id) {
+            return;
+        }
+        if self.pending_pod_config_gets.contains_key(&pod_id) {
+            return;
+        }
+        let correlation = self.next_correlation_id();
+        self.pending_pod_config_gets
+            .insert(pod_id.clone(), correlation.clone());
+        self.send(ClientToServer::GetPod {
+            correlation_id: Some(correlation),
+            pod_id,
+        });
     }
 
     /// Close every picker except the one identified by `keep_open`.
@@ -6242,6 +6616,12 @@ impl ChatApp {
         }
         if keep_open != PICKER_POD {
             self.picker_pod_open = false;
+        }
+        if keep_open != PICKER_HOST_ENVS {
+            self.picker_host_envs_open = false;
+        }
+        if keep_open != PICKER_MCP_HOSTS {
+            self.picker_mcp_hosts_open = false;
         }
         // The behavior editor's trigger-kind picker shares the same
         // single-open-at-a-time discipline. Its key isn't one of the
@@ -7512,40 +7892,273 @@ impl ChatApp {
             .width(Size::Fill(1.0))
             .align(Align::Center);
 
+        // Top row: three side-by-side pickers (Backend / Model / Pod).
+        // Each lives in its own `form_item` so the label+control+hint
+        // stack is consistent with single-column rows below.
+        let top_row = row([
+            form_item([
+                form_label("Backend"),
+                form_control(backend_trigger),
+                form_description(self.backend_hint()),
+            ]),
+            form_item([
+                form_label("Model"),
+                form_control(model_trigger),
+                form_description(self.model_hint()),
+            ]),
+            form_item([
+                form_label("Pod"),
+                form_control(pod_trigger),
+                form_description(self.pod_hint_for_picker()),
+            ]),
+        ])
+        .gap(tokens::SPACE_4)
+        .width(Size::Fill(1.0))
+        .align(Align::Start);
+
         let body = card([
             card_header([
                 card_title("Start a new conversation"),
                 card_description(
-                    "Pick a backend and pod, then type a message to begin. \
-                     Leaving a picker on its inherit row falls through to the \
-                     pod's defaults.",
+                    "Pick a backend, model, and pod, then layer on host-env / MCP \
+                     bindings if the defaults don't fit. Empty pickers fall through \
+                     to the pod's `thread_defaults`.",
                 ),
             ]),
             card_content([form([
-                form_item([
-                    form_label("Backend"),
-                    form_control(backend_trigger),
-                    form_description(self.backend_hint()),
-                ]),
-                form_item([
-                    form_label("Model"),
-                    form_control(model_trigger),
-                    form_description(self.model_hint()),
-                ]),
-                form_item([form_label("Pod"), form_control(pod_trigger)]),
+                top_row,
+                self.host_envs_picker_row(),
+                self.mcp_hosts_picker_row(),
                 form_item([form_label("Message"), form_control(editor)]),
             ])]),
             card_footer([footer]),
         ])
-        .width(Size::Fixed(640.0));
+        .width(Size::Fixed(900.0));
+
+        // Stack the destructive alert above the card when the last
+        // submit attempt was rejected by the server. Width matches
+        // the card so it reads as part of the same surface.
+        let mut stack_items: Vec<El> = Vec::new();
+        if let Some(err) = self.new_thread_error.as_deref() {
+            stack_items.push(self.new_thread_error_banner(err));
+        }
+        stack_items.push(body);
 
         // Center the card in the pane; padding keeps it off the
         // pane edges on small windows.
-        column([body])
-            .padding(tokens::SPACE_6)
+        column([column(stack_items)
+            .gap(tokens::SPACE_3)
+            .width(Size::Fixed(900.0))])
+        .padding(tokens::SPACE_6)
+        .align(Align::Center)
+        .width(Size::Fill(1.0))
+        .height(Size::Fill(1.0))
+    }
+
+    /// Destructive alert rendered above the new-thread card when a
+    /// recent `CreateThread` submit was rejected. Dismiss button
+    /// (`×`) clears the slot via [`NEW_THREAD_ERROR_DISMISS_KEY`];
+    /// re-submitting also clears it.
+    fn new_thread_error_banner(&self, detail: &str) -> El {
+        let dismiss = icon_button(crate::icons::ICON_X.clone())
+            .key(NEW_THREAD_ERROR_DISMISS_KEY)
+            .ghost();
+        let head = row([alert_title("couldn't start thread"), spacer(), dismiss])
             .align(Align::Center)
-            .width(Size::Fill(1.0))
-            .height(Size::Fill(1.0))
+            .width(Size::Fill(1.0));
+        alert([head, alert_description(detail.to_string())]).destructive()
+    }
+
+    /// Resolve the picker's effective pod_id — either the explicitly
+    /// picked one or the server-default pod when the user is on the
+    /// inherit row. `None` while we haven't received a `PodList` yet.
+    fn picker_effective_pod_id(&self) -> Option<&str> {
+        self.picker_pod
+            .as_deref()
+            .or(self.default_pod_id.as_deref())
+    }
+
+    /// Pod-allow snapshot for the currently-targeted pod, or `None`
+    /// when we haven't fetched it yet. The popover-open paths trigger
+    /// a `GetPod` fan-out via `ensure_pod_config_for_picker`; this
+    /// reader just returns whatever's cached.
+    fn picker_pod_allow(&self) -> Option<&PodAllow> {
+        let pod_id = self.picker_effective_pod_id()?;
+        self.pod_configs.get(pod_id).map(|c| &c.allow)
+    }
+
+    /// One-line hint under the Pod picker — surfaces what the picker
+    /// allows after compose-time defaults are applied. Mirrors the
+    /// Backend / Model hints so the three columns read symmetrically.
+    fn pod_hint_for_picker(&self) -> String {
+        match self.picker_effective_pod_id() {
+            None => "no pods loaded yet".to_string(),
+            Some(pid) => match self.pods.get(pid) {
+                Some(p) if p.archived => "archived pod".to_string(),
+                Some(_) => format!(
+                    "{} pod{} configured",
+                    self.pods.len(),
+                    if self.pods.len() == 1 { "" } else { "s" }
+                ),
+                None => format!("unknown pod `{pid}`"),
+            },
+        }
+    }
+
+    /// Render the Host envs row — chip list of picked entries + an
+    /// "Add" trigger that opens [`host_envs_menu`]. Each chip is a
+    /// body button (toggles inline workspace_root editing) paired with
+    /// a ghost × icon-button (removes the entry). When one chip is
+    /// expanded, an inline editor row drops below the chip row with a
+    /// text_input bound to the entry's `workspace_root_draft` plus a
+    /// "Default" reset button. The hint surfaces the inherit vs.
+    /// replace semantics so users don't have to read the docs.
+    fn host_envs_picker_row(&self) -> El {
+        let label = if self.picker_host_envs.is_empty() {
+            "Inherit pod default".to_string()
+        } else {
+            format!(
+                "{} env{} selected",
+                self.picker_host_envs.len(),
+                if self.picker_host_envs.len() == 1 {
+                    ""
+                } else {
+                    "s"
+                },
+            )
+        };
+        let trigger = select_trigger(PICKER_HOST_ENVS, label);
+
+        let mut chips: Vec<El> = self
+            .picker_host_envs
+            .iter()
+            .map(|entry| {
+                let expanded =
+                    self.picker_host_env_expanded.as_deref() == Some(entry.name.as_str());
+                host_env_chip(
+                    &entry.name,
+                    expanded,
+                    !entry.workspace_root_draft.is_empty(),
+                )
+            })
+            .collect();
+        chips.push(trigger);
+        let chip_row = row(chips).gap(tokens::SPACE_2).align(Align::Center);
+
+        let mut control_children: Vec<El> = vec![chip_row];
+        if let Some(editor) = self.host_envs_workspace_root_editor() {
+            control_children.push(editor);
+        }
+        let control = column(control_children).gap(tokens::SPACE_2);
+
+        form_item([
+            form_label("Host envs"),
+            form_control(control),
+            form_description(self.host_envs_hint()),
+        ])
+    }
+
+    /// Inline workspace_root editor below the host-envs chip row when
+    /// a chip is expanded. Renders a text_input bound to the entry's
+    /// `workspace_root_draft` plus a "Default" reset button that
+    /// clears the draft (falling back to the spec's first-RW-path).
+    /// Returns `None` when no chip is expanded or the expanded name
+    /// no longer matches any picked entry.
+    fn host_envs_workspace_root_editor(&self) -> Option<El> {
+        let name = self.picker_host_env_expanded.as_deref()?;
+        let entry = self.picker_host_envs.iter().find(|e| e.name == name)?;
+        let key = format!("{PICKER_HOST_ENVS_WSROOT_PREFIX}{name}");
+        let default_key = format!("{PICKER_HOST_ENVS_DEFAULT_PREFIX}{name}");
+        let input = text_input(&entry.workspace_root_draft, &self.selection, &key);
+        let mut reset = button("Default").key(default_key).ghost();
+        if entry.workspace_root_draft.is_empty() {
+            reset = reset.disabled();
+        }
+        let label = text(format!("Workspace root for {name}")).muted().small();
+        let placeholder = self
+            .picker_pod_allow()
+            .and_then(|allow| allow.host_env.iter().find(|n| n.name == name))
+            .and_then(|n| match &n.spec {
+                whisper_agent_protocol::sandbox::HostEnvSpec::Landlock {
+                    allowed_paths, ..
+                } => allowed_paths
+                    .iter()
+                    .find(|p| p.mode == whisper_agent_protocol::sandbox::AccessMode::ReadWrite)
+                    .map(|p| p.path.clone()),
+                whisper_agent_protocol::sandbox::HostEnvSpec::Container { .. } => None,
+            });
+        let hint = match placeholder {
+            Some(p) => text(format!("defaults to {p}")).muted().small(),
+            None => text("defaults to the entry's first RW allowed path")
+                .muted()
+                .small(),
+        };
+        Some(
+            column([
+                label,
+                row([input, reset])
+                    .gap(tokens::SPACE_2)
+                    .align(Align::Center),
+                hint,
+            ])
+            .gap(tokens::SPACE_1),
+        )
+    }
+
+    /// Render the MCP hosts row — same shape as
+    /// [`host_envs_picker_row`] but reads from the pod's
+    /// `allow.mcp_hosts` rather than `allow.host_env`.
+    fn mcp_hosts_picker_row(&self) -> El {
+        let label = if self.picker_mcp_hosts.is_empty() {
+            "Inherit pod default".to_string()
+        } else {
+            format!(
+                "{} host{} selected",
+                self.picker_mcp_hosts.len(),
+                if self.picker_mcp_hosts.len() == 1 {
+                    ""
+                } else {
+                    "s"
+                },
+            )
+        };
+        let trigger = select_trigger(PICKER_MCP_HOSTS, label);
+
+        let mut chips: Vec<El> = self
+            .picker_mcp_hosts
+            .iter()
+            .map(|name| mcp_host_chip(name))
+            .collect();
+        chips.push(trigger);
+        let chip_row = row(chips).gap(tokens::SPACE_2).align(Align::Center);
+
+        form_item([
+            form_label("MCP hosts"),
+            form_control(chip_row),
+            form_description(self.mcp_hosts_hint()),
+        ])
+    }
+
+    fn host_envs_hint(&self) -> String {
+        match self.picker_pod_allow() {
+            None => "fetching pod config…".to_string(),
+            Some(allow) => format!(
+                "{} env{} allowed by the active pod",
+                allow.host_env.len(),
+                if allow.host_env.len() == 1 { "" } else { "s" },
+            ),
+        }
+    }
+
+    fn mcp_hosts_hint(&self) -> String {
+        match self.picker_pod_allow() {
+            None => "fetching pod config…".to_string(),
+            Some(allow) => format!(
+                "{} MCP host{} allowed by the active pod",
+                allow.mcp_hosts.len(),
+                if allow.mcp_hosts.len() == 1 { "" } else { "s" },
+            ),
+        }
     }
 
     fn backend_label(&self) -> String {
@@ -7628,6 +8241,12 @@ impl ChatApp {
         }
         if self.picker_pod_open {
             out.push(Some(self.pod_menu()));
+        }
+        if self.picker_host_envs_open {
+            out.push(Some(self.host_envs_menu()));
+        }
+        if self.picker_mcp_hosts_open {
+            out.push(Some(self.mcp_hosts_menu()));
         }
         // Modals layer last so they paint above the picker
         // popovers — though in practice the two are mutually
@@ -15100,6 +15719,64 @@ impl ChatApp {
             options.push((p.pod_id.clone(), p.name.clone()));
         }
         select_menu(PICKER_POD, options)
+    }
+
+    /// Popover listing host-env entries from the active pod's
+    /// `allow.host_env` that aren't already in `picker_host_envs`.
+    /// Click an option to add it; the chip row re-renders with the
+    /// new entry and the popover closes (single-select shape of
+    /// `select_menu` — the multi-select semantics live in the
+    /// `select` handler, not here).
+    fn host_envs_menu(&self) -> El {
+        let mut options: Vec<(String, String)> = Vec::new();
+        if let Some(allow) = self.picker_pod_allow() {
+            let already: HashSet<&str> = self
+                .picker_host_envs
+                .iter()
+                .map(|e| e.name.as_str())
+                .collect();
+            for entry in &allow.host_env {
+                if already.contains(entry.name.as_str()) {
+                    continue;
+                }
+                let label = format!("{}  ({})", entry.name, entry.provider);
+                options.push((entry.name.clone(), label));
+            }
+        }
+        if options.is_empty() {
+            // Empty popover is unhelpful — surface a single muted
+            // "(no more entries available)" sentinel row so the
+            // popover is meaningful when the user has either picked
+            // them all or the pod allow-list is empty.
+            options.push((
+                PICKER_INHERIT.to_string(),
+                "(no more entries available)".to_string(),
+            ));
+        }
+        select_menu(PICKER_HOST_ENVS, options)
+    }
+
+    /// MCP-hosts popover. Same shape as [`host_envs_menu`] but reads
+    /// from the pod's `allow.mcp_hosts` and skips entries already in
+    /// `picker_mcp_hosts`.
+    fn mcp_hosts_menu(&self) -> El {
+        let mut options: Vec<(String, String)> = Vec::new();
+        if let Some(allow) = self.picker_pod_allow() {
+            let already: HashSet<&str> = self.picker_mcp_hosts.iter().map(String::as_str).collect();
+            for name in &allow.mcp_hosts {
+                if already.contains(name.as_str()) {
+                    continue;
+                }
+                options.push((name.clone(), name.clone()));
+            }
+        }
+        if options.is_empty() {
+            options.push((
+                PICKER_INHERIT.to_string(),
+                "(no more hosts available)".to_string(),
+            ));
+        }
+        select_menu(PICKER_MCP_HOSTS, options)
     }
 
     /// Bucket-picker menu — one option per ready bucket. Value is
