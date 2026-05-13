@@ -182,14 +182,11 @@ enum DisplayItem {
         text: String,
         is_error: bool,
     },
-    /// Inline image — user-supplied (drag/paste/file picker on the
-    /// egui sibling, eventually here) or model-generated (Gemini
-    /// native image output, OpenAI Responses `image_generation`).
-    /// Decoded once at push time and cached as an `aetna_core::Image`
-    /// so rebuilds don't re-decode the bytes. The `is_user` flag
-    /// drives the role gutter color in `event_log_row`.
+    /// Inline image — user-supplied, model-generated, or returned by
+    /// a tool. Decoded once at push time and cached as an
+    /// `aetna_core::Image` so rebuilds don't re-decode the bytes.
     Image {
-        is_user: bool,
+        role: ImageRole,
         state: ImageRenderState,
     },
     /// Anything else we don't yet render purpose-built (images,
@@ -428,6 +425,13 @@ struct FusedToolResult {
     is_error: bool,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ImageRole {
+    User,
+    Assistant,
+    Tool,
+}
+
 /// Sniff a `Content-Type` from the first few bytes of a dropped or
 /// picked file. Avoids trusting filename extensions (screenshots
 /// arrive without one) and keeps the MIME set tight to the
@@ -524,6 +528,8 @@ enum ImageRenderState {
         image: aetna_core::image::Image,
         width: u32,
         height: u32,
+        bytes: Vec<u8>,
+        mime: ImageMime,
     },
     Url {
         url: String,
@@ -542,6 +548,9 @@ struct LightboxState {
     image: aetna_core::image::Image,
     width: u32,
     height: u32,
+    bytes: Vec<u8>,
+    mime: ImageMime,
+    status: Option<String>,
 }
 
 /// Generic text-editor modal over one pod file. Opened by clicking
@@ -1256,7 +1265,7 @@ struct PendingSudoState {
 fn decode_image_source(source: &ImageSource) -> ImageRenderState {
     match source {
         ImageSource::Url { url } => ImageRenderState::Url { url: url.clone() },
-        ImageSource::Bytes { data, .. } => match image::load_from_memory(data) {
+        ImageSource::Bytes { data, media_type } => match image::load_from_memory(data) {
             Ok(decoded) => {
                 let rgba = decoded.to_rgba8();
                 let (w, h) = rgba.dimensions();
@@ -1265,6 +1274,8 @@ fn decode_image_source(source: &ImageSource) -> ImageRenderState {
                     image: aetna_core::image::Image::from_rgba8(w, h, pixels),
                     width: w,
                     height: h,
+                    bytes: data.clone(),
+                    mime: *media_type,
                 }
             }
             Err(err) => ImageRenderState::Failed {
@@ -3690,7 +3701,7 @@ impl ChatApp {
                         match att {
                             Attachment::Image { source } => {
                                 view.items.push(DisplayItem::Image {
-                                    is_user: true,
+                                    role: ImageRole::User,
                                     state: decode_image_source(&source),
                                 });
                             }
@@ -3810,7 +3821,7 @@ impl ChatApp {
                 tool_use_id,
                 result_preview,
                 is_error,
-                ..
+                attachments,
             } => {
                 if let Some(view) = self.views.get_mut(&thread_id) {
                     if let Some(DisplayItem::ToolCall {
@@ -3833,6 +3844,12 @@ impl ChatApp {
                             tool_use_id,
                             text: result_preview,
                             is_error,
+                        });
+                    }
+                    for source in attachments {
+                        view.items.push(DisplayItem::Image {
+                            role: ImageRole::Tool,
+                            state: decode_image_source(&source),
                         });
                     }
                 }
@@ -3878,7 +3895,7 @@ impl ChatApp {
                 // log rows).
                 if let Some(view) = self.views.get_mut(&thread_id) {
                     view.items.push(DisplayItem::Image {
-                        is_user: false,
+                        role: ImageRole::Assistant,
                         state: decode_image_source(&source),
                     });
                 }
@@ -4297,6 +4314,14 @@ impl App for ChatApp {
             && let Ok(idx) = idx_str.parse::<usize>()
         {
             self.open_lightbox(idx);
+            return;
+        }
+        if event.is_click_or_activate(LIGHTBOX_MODAL_COPY_KEY) {
+            self.copy_lightbox_image();
+            return;
+        }
+        if event.is_click_or_activate(LIGHTBOX_MODAL_DOWNLOAD_KEY) {
+            self.download_lightbox_image();
             return;
         }
         // Lightbox dismiss / close — both keys collapse to clearing
@@ -5397,6 +5422,8 @@ fn chat_image_lightbox_key(idx: usize) -> String {
 /// explicit close button uses `lightbox:close`.
 const LIGHTBOX_MODAL_DISMISS_KEY: &str = "lightbox:dismiss";
 const LIGHTBOX_MODAL_CLOSE_KEY: &str = "lightbox:close";
+const LIGHTBOX_MODAL_COPY_KEY: &str = "lightbox:copy";
+const LIGHTBOX_MODAL_DOWNLOAD_KEY: &str = "lightbox:download";
 
 /// Routed-key shapes for the JSON tree viewer modal. The accordion
 /// group key is shared across every collapsible node — the per-node
@@ -12350,6 +12377,8 @@ impl ChatApp {
                     image,
                     width,
                     height,
+                    bytes,
+                    mime,
                 },
             ..
         } = item
@@ -12358,7 +12387,37 @@ impl ChatApp {
                 image: image.clone(),
                 width: *width,
                 height: *height,
+                bytes: bytes.clone(),
+                mime: *mime,
+                status: None,
             });
+        }
+    }
+
+    fn set_lightbox_status(&mut self, status: impl Into<String>) {
+        if let Some(lb) = self.lightbox.as_mut() {
+            lb.status = Some(status.into());
+        }
+    }
+
+    fn copy_lightbox_image(&mut self) {
+        let Some(lb) = self.lightbox.as_ref() else {
+            return;
+        };
+        match copy_image_to_clipboard(&lb.bytes, lb.mime) {
+            Ok(()) => self.set_lightbox_status("copy requested"),
+            Err(err) => self.set_lightbox_status(format!("copy failed: {err}")),
+        }
+    }
+
+    fn download_lightbox_image(&mut self) {
+        let Some(lb) = self.lightbox.as_ref() else {
+            return;
+        };
+        let filename = lightbox_download_filename(lb.mime);
+        match download_image_bytes(lb.bytes.clone(), lb.mime, filename) {
+            Ok(()) => self.set_lightbox_status("download requested"),
+            Err(err) => self.set_lightbox_status(format!("download failed: {err}")),
         }
     }
 
@@ -12380,7 +12439,7 @@ impl ChatApp {
         const LIGHTBOX_MAX_H: f32 = 720.0;
         let (w, h) = lightbox_display_dims(lb.width, lb.height, LIGHTBOX_MAX_W, LIGHTBOX_MAX_H);
 
-        let body = column([
+        let mut body_children = vec![
             image(lb.image.clone())
                 .image_fit(ImageFit::Contain)
                 .width(Size::Fixed(w))
@@ -12389,13 +12448,20 @@ impl ChatApp {
             text(format!("{} \u{00D7} {}", lb.width, lb.height))
                 .caption()
                 .muted(),
-        ])
-        .gap(tokens::SPACE_2)
-        .align(Align::Center)
-        .width(Size::Hug);
+        ];
+        if let Some(status) = &lb.status {
+            body_children.push(text(status.clone()).caption().muted());
+        }
 
+        let body = column(body_children)
+            .gap(tokens::SPACE_2)
+            .align(Align::Center)
+            .width(Size::Hug);
+
+        let copy = button("Copy").key(LIGHTBOX_MODAL_COPY_KEY);
+        let download = button("Download").key(LIGHTBOX_MODAL_DOWNLOAD_KEY);
         let close = button("Close").key(LIGHTBOX_MODAL_CLOSE_KEY);
-        let children: Vec<El> = vec![body, dialog_footer([close])];
+        let children: Vec<El> = vec![body, dialog_footer([copy, download, close])];
 
         Some(overlay([
             scrim(LIGHTBOX_MODAL_DISMISS_KEY),
@@ -16566,11 +16632,11 @@ impl ChatApp {
                 .padding(Sides::xy(tokens::SPACE_3, 0.0))
                 .width(Size::Fill(1.0))
             }
-            DisplayItem::Image { is_user, state } => {
-                let gutter = if *is_user {
-                    tokens::INFO
-                } else {
-                    tokens::SUCCESS
+            DisplayItem::Image { role, state } => {
+                let gutter = match role {
+                    ImageRole::User => tokens::INFO,
+                    ImageRole::Assistant => tokens::SUCCESS,
+                    ImageRole::Tool => tokens::WARNING,
                 };
                 let body = image_body(idx, state);
                 // Clickable wrapper opens the fullscreen lightbox.
@@ -16587,7 +16653,7 @@ impl ChatApp {
                 } else {
                     body
                 };
-                if *is_user {
+                if *role == ImageRole::User {
                     log_row(gutter, Some(tokens::INFO.with_alpha(64)), body_keyed)
                 } else {
                     log_row(gutter, None, body_keyed)
@@ -16613,6 +16679,7 @@ fn image_body(idx: usize, state: &ImageRenderState) -> El {
             image: img,
             width,
             height,
+            ..
         } => {
             // Choose displayed dimensions: never up-scale, never
             // exceed the cap. Width is derived from the aspect ratio
@@ -17048,6 +17115,162 @@ fn format_build_elapsed(started_at_rfc3339: &str) -> String {
     format!("{body} elapsed")
 }
 
+fn lightbox_download_filename(mime: ImageMime) -> String {
+    format!("whisper-agent-image.{}", image_mime_extension(mime))
+}
+
+fn image_mime_extension(mime: ImageMime) -> &'static str {
+    match mime {
+        ImageMime::Jpeg => "jpg",
+        ImageMime::Png => "png",
+        ImageMime::Gif => "gif",
+        ImageMime::Webp => "webp",
+        ImageMime::Heic => "heic",
+        ImageMime::Heif => "heif",
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn copy_image_to_clipboard(bytes: &[u8], _mime: ImageMime) -> Result<(), String> {
+    use std::borrow::Cow;
+
+    let decoded = image::load_from_memory(bytes).map_err(|err| err.to_string())?;
+    let rgba = decoded.to_rgba8();
+    let (width, height) = rgba.dimensions();
+    let image = arboard::ImageData {
+        width: width as usize,
+        height: height as usize,
+        bytes: Cow::Owned(rgba.into_raw()),
+    };
+    let mut clipboard = arboard::Clipboard::new().map_err(|err| err.to_string())?;
+    clipboard.set_image(image).map_err(|err| err.to_string())
+}
+
+#[cfg(target_arch = "wasm32")]
+fn copy_image_to_clipboard(bytes: &[u8], mime: ImageMime) -> Result<(), String> {
+    let bytes = bytes.to_vec();
+    wasm_bindgen_futures::spawn_local(async move {
+        if let Err(err) = write_image_to_browser_clipboard(bytes, mime).await {
+            log::warn!("clipboard image write failed: {err}");
+        }
+    });
+    Ok(())
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn write_image_to_browser_clipboard(bytes: Vec<u8>, mime: ImageMime) -> Result<(), String> {
+    use wasm_bindgen::JsCast;
+    use wasm_bindgen::JsValue;
+
+    let window = web_sys::window().ok_or_else(|| "window unavailable".to_string())?;
+    let clipboard = window.navigator().clipboard();
+    let blob = image_blob(&bytes, mime)?;
+
+    let ctor = js_sys::Reflect::get(&js_sys::global(), &JsValue::from_str("ClipboardItem"))
+        .map_err(js_error_to_string)?;
+    if ctor.is_undefined() || ctor.is_null() {
+        return Err("ClipboardItem unavailable".to_string());
+    }
+    let ctor: js_sys::Function = ctor.dyn_into().map_err(js_error_to_string)?;
+
+    let item_data = js_sys::Object::new();
+    js_sys::Reflect::set(
+        &item_data,
+        &JsValue::from_str(mime.as_mime_str()),
+        blob.as_ref(),
+    )
+    .map_err(js_error_to_string)?;
+    let args = js_sys::Array::new();
+    args.push(&item_data);
+    let item = js_sys::Reflect::construct(&ctor, &args).map_err(js_error_to_string)?;
+
+    let items = js_sys::Array::new();
+    items.push(&item);
+    let promise = clipboard.write(items.as_ref());
+    wasm_bindgen_futures::JsFuture::from(promise)
+        .await
+        .map_err(js_error_to_string)?;
+    Ok(())
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn download_image_bytes(bytes: Vec<u8>, _mime: ImageMime, filename: String) -> Result<(), String> {
+    std::thread::Builder::new()
+        .name("whisper-agent-image-save".to_string())
+        .spawn(move || {
+            let rt = match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(rt) => rt,
+                Err(err) => {
+                    log::warn!("image save dialog runtime failed: {err}");
+                    return;
+                }
+            };
+            let picked = rt.block_on(async {
+                rfd::AsyncFileDialog::new()
+                    .set_file_name(&filename)
+                    .save_file()
+                    .await
+            });
+            let Some(file) = picked else {
+                return;
+            };
+            if let Err(err) = std::fs::write(file.path(), &bytes) {
+                log::warn!("image save failed: {err}");
+            }
+        })
+        .map(|_| ())
+        .map_err(|err| err.to_string())
+}
+
+#[cfg(target_arch = "wasm32")]
+fn download_image_bytes(bytes: Vec<u8>, mime: ImageMime, filename: String) -> Result<(), String> {
+    use wasm_bindgen::JsCast;
+
+    let window = web_sys::window().ok_or_else(|| "window unavailable".to_string())?;
+    let document = window
+        .document()
+        .ok_or_else(|| "document unavailable".to_string())?;
+    let body = document
+        .body()
+        .ok_or_else(|| "document body unavailable".to_string())?;
+    let blob = image_blob(&bytes, mime)?;
+    let url = web_sys::Url::create_object_url_with_blob(&blob).map_err(js_error_to_string)?;
+
+    let anchor_el = document.create_element("a").map_err(js_error_to_string)?;
+    let anchor: web_sys::HtmlAnchorElement = anchor_el
+        .clone()
+        .dyn_into()
+        .map_err(|_| "created element was not an anchor".to_string())?;
+    anchor.set_href(&url);
+    anchor.set_download(&filename);
+    body.unchecked_ref::<web_sys::Element>()
+        .append_with_node_1(anchor_el.unchecked_ref::<web_sys::Node>())
+        .map_err(js_error_to_string)?;
+    anchor.unchecked_ref::<web_sys::HtmlElement>().click();
+    anchor_el.remove();
+    web_sys::Url::revoke_object_url(&url).map_err(js_error_to_string)?;
+    Ok(())
+}
+
+#[cfg(target_arch = "wasm32")]
+fn image_blob(bytes: &[u8], mime: ImageMime) -> Result<web_sys::Blob, String> {
+    let chunk = js_sys::Uint8Array::from(bytes);
+    let parts = js_sys::Array::new();
+    parts.push(&chunk);
+    let options = web_sys::BlobPropertyBag::new();
+    options.set_type(mime.as_mime_str());
+    web_sys::Blob::new_with_u8_array_sequence_and_options(parts.as_ref(), &options)
+        .map_err(js_error_to_string)
+}
+
+#[cfg(target_arch = "wasm32")]
+fn js_error_to_string(err: wasm_bindgen::JsValue) -> String {
+    err.as_string().unwrap_or_else(|| format!("{err:?}"))
+}
+
 fn lightbox_display_dims(src_w: u32, src_h: u32, max_w: f32, max_h: f32) -> (f32, f32) {
     let src_w = src_w.max(1) as f32;
     let src_h = src_h.max(1) as f32;
@@ -17377,6 +17600,7 @@ fn conversation_to_display_items(
                                 is_error: *is_error,
                             });
                         }
+                        out.extend(tool_result_image_items(content));
                     }
                 }
             }
@@ -17435,10 +17659,15 @@ fn push_block(block: &ContentBlock, user_role: bool, msg_index: usize, out: &mut
                     is_error: *is_error,
                 });
             }
+            out.extend(tool_result_image_items(content));
         }
         ContentBlock::Image { source, .. } => {
             out.push(DisplayItem::Image {
-                is_user: user_role,
+                role: if user_role {
+                    ImageRole::User
+                } else {
+                    ImageRole::Assistant
+                },
                 state: decode_image_source(source),
             });
         }
@@ -17503,14 +17732,36 @@ fn tool_result_text_summary(content: &whisper_agent_protocol::ToolResultContent)
     use whisper_agent_protocol::ToolResultContent;
     match content {
         ToolResultContent::Text(text) => preview(text, 200),
-        ToolResultContent::Blocks(blocks) => blocks
-            .iter()
-            .find_map(|b| match b {
+        ToolResultContent::Blocks(blocks) => {
+            let text = blocks.iter().find_map(|b| match b {
                 ContentBlock::Text { text } => Some(preview(text, 200)),
                 _ => None,
-            })
-            .unwrap_or_default(),
+            });
+            let image_count = blocks
+                .iter()
+                .filter(|b| matches!(b, ContentBlock::Image { .. }))
+                .count();
+            match (text, image_count) {
+                (Some(text), 0) => text,
+                (Some(text), n) => format!("{text} [+{n} image{}]", if n == 1 { "" } else { "s" }),
+                (None, 0) => String::new(),
+                (None, n) => format!("{n} image{}", if n == 1 { "" } else { "s" }),
+            }
+        }
     }
+}
+
+fn tool_result_image_items(
+    content: &whisper_agent_protocol::ToolResultContent,
+) -> Vec<DisplayItem> {
+    content
+        .image_sources()
+        .into_iter()
+        .map(|source| DisplayItem::Image {
+            role: ImageRole::Tool,
+            state: decode_image_source(source),
+        })
+        .collect()
 }
 
 fn preview(s: &str, max_chars: usize) -> String {
