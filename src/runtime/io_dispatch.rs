@@ -825,6 +825,36 @@ async fn consume_stream(
                 stop_reason,
                 usage,
             }) => {
+                // Route `ThreadAssistantEnd` through `stream_tx`
+                // *here*, immediately after any trailing delta events
+                // we just forwarded for the same turn. The natural
+                // place to fire this wire event would be from
+                // [`thread_router::dispatch_events`] when it processes
+                // the `ThreadEvent::AssistantEnd` that
+                // `integrate_model_response` pushes — but that path
+                // runs from `pending_io` in the scheduler's main
+                // select!, which races with `stream_rx`. When both
+                // are ready (model finished AND a trailing
+                // `ThreadOutputTokensProgress` is sitting in the
+                // queue), `tokio::select!` picks randomly, so the
+                // wire could see `AssistantEnd` before its preceding
+                // `OutputTokensProgress` — which puts the UI's live
+                // tok/s chip into a phantom-live state. Sending End
+                // through `stream_tx` ourselves means it rides the
+                // *same* FIFO channel as the deltas, so the wire
+                // order matches the emission order. The
+                // `ThreadEvent::AssistantEnd` is still produced for
+                // persistence + internal bookkeeping; only the wire
+                // broadcast moves channels (see the matching no-op
+                // in `thread_router::dispatch_events`).
+                let _ = stream_tx.send(StreamUpdate {
+                    thread_id: thread_id.to_string(),
+                    event: ServerToClient::ThreadAssistantEnd {
+                        thread_id: thread_id.to_string(),
+                        stop_reason: stop_reason.clone(),
+                        usage,
+                    },
+                });
                 return Ok(crate::providers::model::ModelResponse {
                     content,
                     stop_reason,

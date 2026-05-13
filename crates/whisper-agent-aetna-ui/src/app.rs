@@ -1355,6 +1355,18 @@ struct ThreadView {
     /// `ThreadAssistantBegin`. `None` / 0 means no turn is in flight.
     streaming_started_at: Option<web_time::Instant>,
     streaming_output_tokens: u32,
+    /// `true` between `ThreadAssistantBegin` and the matching
+    /// `ThreadAssistantEnd` (or a `Cancelled` / `Failed` state
+    /// transition). Gates `ThreadOutputTokensProgress` mutations so a
+    /// progress event that arrives *after* `ThreadAssistantEnd` —
+    /// possible because the server's `stream_tx` and the
+    /// `dispatch_events` path historically raced; see the
+    /// `consume_stream` ordering note — can't re-anchor the chip's
+    /// elapsed clock to "now" and produce a phantom decaying live
+    /// rate. Kept as a UI-side defense even after the server-side
+    /// fix landed: cheap, and protects against any future channel
+    /// reordering we haven't anticipated.
+    streaming_active: bool,
     /// Tokens-per-second from the most recently completed assistant
     /// turn. Set on `ThreadAssistantEnd` from
     /// `usage.output_tokens / elapsed`. Surfaced in the header chip
@@ -3438,6 +3450,7 @@ impl ChatApp {
                 {
                     view.streaming_started_at = None;
                     view.streaming_output_tokens = 0;
+                    view.streaming_active = false;
                 }
             }
             ServerToClient::ThreadTitleUpdated { thread_id, title } => {
@@ -3499,6 +3512,7 @@ impl ChatApp {
                     scope: snapshot.scope,
                     streaming_started_at: None,
                     streaming_output_tokens: 0,
+                    streaming_active: false,
                     last_turn_tokens_per_sec: None,
                 };
                 // Hydrate the local draft from the snapshot — the
@@ -3533,15 +3547,27 @@ impl ChatApp {
                     .insert(thread_id, (tokens_processed, tokens_total));
             }
             // Cumulative output-token count for the in-flight turn —
-            // emitted by Anthropic + Gemini today. Drives the live
-            // tok/s chip in the thread header; capped to monotonic
-            // non-decreasing values per the wire contract so a delayed
-            // packet can't make the chip jitter backwards.
+            // emitted by Anthropic + Gemini + llama.cpp today. Drives
+            // the live tok/s chip in the thread header; capped to
+            // monotonic non-decreasing values per the wire contract
+            // so a delayed packet can't make the chip jitter
+            // backwards.
+            //
+            // Gated on `streaming_active` so progress events that
+            // arrive *after* `ThreadAssistantEnd` (possible if any
+            // wire-channel reordering bypasses the
+            // `consume_stream`-side ordering fix) can't re-anchor
+            // `streaming_started_at` to a fresh `now()` post-turn —
+            // doing so would put the chip into a phantom-live state
+            // where the displayed rate decays as elapsed grows
+            // without any new tokens arriving.
             ServerToClient::ThreadOutputTokensProgress {
                 thread_id,
                 output_tokens,
             } => {
-                if let Some(view) = self.views.get_mut(&thread_id) {
+                if let Some(view) = self.views.get_mut(&thread_id)
+                    && view.streaming_active
+                {
                     view.streaming_output_tokens = view.streaming_output_tokens.max(output_tokens);
                     if view.streaming_started_at.is_none() {
                         // First progress for the turn may land before
@@ -3798,6 +3824,7 @@ impl ChatApp {
                         }
                     }
                     view.streaming_output_tokens = 0;
+                    view.streaming_active = false;
 
                     view.items.push(DisplayItem::TurnStats { usage });
                     // Roll the per-turn usage into the thread total
@@ -3831,6 +3858,7 @@ impl ChatApp {
                 if let Some(view) = self.views.get_mut(&thread_id) {
                     view.streaming_started_at = None;
                     view.streaming_output_tokens = 0;
+                    view.streaming_active = true;
                 }
             }
             // Per-turn append events not yet surfaced.

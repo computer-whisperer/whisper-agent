@@ -262,15 +262,26 @@ impl ThreadEventRouter {
                         },
                     );
                 }
-                ThreadEvent::AssistantEnd { stop_reason, usage } => {
-                    self.broadcast_to_subscribers(
-                        thread_id,
-                        ServerToClient::ThreadAssistantEnd {
-                            thread_id: thread_id.to_string(),
-                            stop_reason,
-                            usage,
-                        },
-                    );
+                ThreadEvent::AssistantEnd {
+                    stop_reason: _,
+                    usage: _,
+                } => {
+                    // Wire broadcast for `ThreadAssistantEnd` happens
+                    // earlier, inside `consume_stream` in
+                    // `runtime::io_dispatch`. It's routed through the
+                    // same `stream_tx` mpsc that carries the deltas
+                    // and other live updates so the wire sees this
+                    // event strictly after every preceding delta for
+                    // the same turn (in particular,
+                    // `ThreadOutputTokensProgress` events that the
+                    // model emitted right before `Completed`). Doing
+                    // the broadcast from here would re-introduce the
+                    // race against `stream_rx` in the scheduler's
+                    // main `select!`. The `ThreadEvent::AssistantEnd`
+                    // variant still flows through this loop so
+                    // persistence + internal bookkeeping that depend
+                    // on the event log keep working unchanged — only
+                    // the live broadcast moved channels.
                 }
                 ThreadEvent::LoopComplete => {
                     self.broadcast_to_subscribers(

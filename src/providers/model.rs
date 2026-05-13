@@ -214,11 +214,13 @@ pub enum ModelEvent {
     },
     /// Mid-prefill progress heartbeat. Emitted by providers that can observe
     /// how many prompt tokens have been ingested before the first output
-    /// token arrives — today only the llama.cpp driver does, via a parallel
-    /// `/slots` poller. Ephemeral: not persisted, just broadcast to
-    /// connected clients so long prefills show a progress bar instead of
-    /// dead air. Providers stop emitting once the first `TextDelta` /
-    /// `ThinkingDelta` / `ToolCall` has been sent on the same stream.
+    /// token arrives — today only the llama.cpp driver does, via the
+    /// inline `prompt_progress` field on SSE chunks that the
+    /// `return_progress: true` request flag enables. Ephemeral: not
+    /// persisted, just broadcast to connected clients so long prefills
+    /// show a progress bar instead of dead air. Providers stop emitting
+    /// once the first `TextDelta` / `ThinkingDelta` / `ToolCall` has
+    /// been sent on the same stream.
     PrefillProgress {
         tokens_processed: u32,
         tokens_total: u32,
@@ -228,10 +230,20 @@ pub enum ModelEvent {
     /// drive a live tokens-per-second indicator without estimating from
     /// delta character counts. Cumulative (not incremental), monotonically
     /// non-decreasing across the stream, terminal value matches
-    /// `Completed.usage.output_tokens`. Providers that only learn the
-    /// final count at end-of-stream (OpenAI Responses today) don't emit
-    /// this — clients fall back to deriving the rate from
-    /// `Completed.usage` once it lands. Ephemeral: not persisted.
+    /// `Completed.usage.output_tokens`. Emitter coverage today:
+    ///
+    /// - Gemini — per-chunk `usageMetadata.candidatesTokenCount`,
+    ///   continuous live updates.
+    /// - llama.cpp — `/slots` side-channel polled at ~2 Hz during
+    ///   decode (post-prefill), continuous live updates.
+    /// - Anthropic — single emission near end-of-stream when
+    ///   `message_delta` lands its terminal `usage`. Not a "live"
+    ///   stream of values; clients shouldn't expect a smooth chip.
+    /// - OpenAI Responses — silent. The SSE has no per-chunk usage;
+    ///   the rate can only be derived from `Completed.usage` /
+    ///   elapsed once it lands.
+    ///
+    /// Ephemeral: not persisted.
     OutputTokensProgress { output_tokens: u32 },
     /// Terminal event. `content` is the assistant-turn content block list the
     /// scheduler should persist. Deltas emitted before this are strictly for

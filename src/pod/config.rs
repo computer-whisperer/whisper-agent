@@ -176,12 +176,15 @@ pub enum BackendConfig {
     },
     /// llama.cpp's native HTTP server. Uses the same `/v1/chat/completions`
     /// wire shape as the generic `openai_chat` kind for the actual request,
-    /// but additionally polls llama.cpp's `/slots` endpoint during prefill
-    /// to emit real prefill-progress events — the only backend here that
-    /// can give UIs an honest "X of Y tokens ingested" progress bar.
-    /// Room for llama.cpp-specific extensions down the road
-    /// (GBNF-constrained tool calls, cache_prompt tuning, /tokenize, slot
-    /// save/restore) without polluting `openai_chat`.
+    /// plus two side-channels that surface real progress to UIs:
+    /// inline `prompt_progress` on SSE chunks (via `return_progress:
+    /// true`) feeds prefill bars, and a `/slots` poll during decode
+    /// feeds the live tokens-per-second indicator. The only backend
+    /// here that can give an honest "X of Y tokens ingested" prefill
+    /// bar *and* a running tok/s number. Room for llama.cpp-specific
+    /// extensions down the road (GBNF-constrained tool calls,
+    /// cache_prompt tuning, /tokenize, slot save/restore) without
+    /// polluting `openai_chat`.
     #[serde(rename = "llamacpp")]
     LlamaCpp {
         /// Server origin, e.g. `http://localhost:8080`. The driver appends
