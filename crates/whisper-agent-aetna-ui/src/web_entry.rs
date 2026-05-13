@@ -30,7 +30,8 @@ use std::sync::Arc;
 
 use aetna_core::{
     App, BuildCx, Cursor, FrameTrigger, HostDiagnostics, KeyModifiers, Palette, PointerButton,
-    Rect, UiKey,
+    Rect, UiEvent, UiEventKind, UiKey, clipboard,
+    widgets::text_input::{self, ClipboardKind},
 };
 use aetna_wgpu::{MsaaTarget, PrepareTimings, Runner};
 use wasm_bindgen::JsCast;
@@ -76,16 +77,17 @@ pub fn start() {
     let (inbound, send_fn) = open_websocket(gfx_slot.clone());
     let app = ChatApp::new(inbound, send_fn);
 
-    // Drag-drop + clipboard-paste land in the same staging queue the
-    // native file picker uses (via `AttachmentIngress`). Wake the
-    // canvas after each push so the staged thumbnail appears
-    // immediately instead of on the next user input.
+    // Drag-drop + clipboard-paste land in queues that the host drains
+    // through normal app/renderer paths. Wake the canvas after each
+    // push so changes appear immediately instead of on the next
+    // unrelated input.
     let ingress = app.attachment_ingress();
+    let pending_text_pastes: Rc<RefCell<VecDeque<String>>> = Rc::new(RefCell::new(VecDeque::new()));
     install_drop_handlers(ingress.clone(), gfx_slot.clone());
-    install_paste_handler(ingress, gfx_slot.clone());
+    install_paste_handler(ingress, pending_text_pastes.clone(), gfx_slot.clone());
 
     let event_loop = EventLoop::new().expect("EventLoop::new");
-    let host = Host::<ChatApp>::new(VIEWPORT, app, gfx_slot);
+    let host = Host::<ChatApp>::new(VIEWPORT, app, gfx_slot, pending_text_pastes);
     // spawn_app hands control to the browser raf loop; native uses
     // run_app(...) which blocks the calling thread instead.
     event_loop.spawn_app(host);
@@ -279,11 +281,15 @@ fn install_drop_handlers(ingress: AttachmentIngress, gfx_slot: Rc<RefCell<Option
 }
 
 /// Install a document-level `paste` listener that extracts image
-/// items from the clipboard. We don't `preventDefault` — egui's
-/// sibling depended on letting text paste continue to the focused
-/// input; aetna's text inputs read paste through their own handler
-/// driven by `key_down` + clipboard, so the same restraint applies.
-fn install_paste_handler(ingress: AttachmentIngress, gfx_slot: Rc<RefCell<Option<Gfx>>>) {
+/// items from the clipboard and queues plain text for the focused
+/// Aetna input. The browser has no native DOM input to receive this
+/// paste, so handled payloads are turned into app events instead of
+/// falling through to default page behavior.
+fn install_paste_handler(
+    ingress: AttachmentIngress,
+    pending_text_pastes: Rc<RefCell<VecDeque<String>>>,
+    gfx_slot: Rc<RefCell<Option<Gfx>>>,
+) {
     let Some(window) = web_sys::window() else {
         log::warn!("install_paste_handler: no window; skipping");
         return;
@@ -303,6 +309,7 @@ fn install_paste_handler(ingress: AttachmentIngress, gfx_slot: Rc<RefCell<Option
         };
         let items = dt.items();
         let len = items.length();
+        let mut handled_image = false;
         for i in 0..len {
             let Some(item) = items.get(i) else { continue };
             if item.kind() != "file" {
@@ -315,6 +322,7 @@ fn install_paste_handler(ingress: AttachmentIngress, gfx_slot: Rc<RefCell<Option
             let Ok(Some(file)) = item.get_as_file() else {
                 continue;
             };
+            handled_image = true;
             let name = if file.name().is_empty() {
                 format!("clipboard-image.{}", mime_to_ext(&mime))
             } else {
@@ -336,6 +344,25 @@ fn install_paste_handler(ingress: AttachmentIngress, gfx_slot: Rc<RefCell<Option
                     }
                 }
             });
+        }
+
+        if handled_image {
+            e.prevent_default();
+            e.stop_propagation();
+            return;
+        }
+
+        match dt.get_data("text/plain") {
+            Ok(text) if !text.is_empty() => {
+                e.prevent_default();
+                e.stop_propagation();
+                pending_text_pastes.borrow_mut().push_back(text);
+                wake(&gfx_slot);
+            }
+            Ok(_) => {}
+            Err(err) => {
+                log::warn!("paste: failed to read clipboard text: {err:?}");
+            }
         }
     }) as Box<dyn FnMut(web_sys::ClipboardEvent)>);
     if let Err(e) = body.add_event_listener_with_callback("paste", cb.as_ref().unchecked_ref()) {
@@ -496,6 +523,8 @@ struct Host<A: App> {
     viewport: Rect,
     app: A,
     gfx: Rc<RefCell<Option<Gfx>>>,
+    pending_text_pastes: Rc<RefCell<VecDeque<String>>>,
+    primary_selection: String,
     last_pointer: Option<(f32, f32)>,
     modifiers: KeyModifiers,
     stats: FrameStats,
@@ -529,11 +558,18 @@ fn surface_extent(config: &wgpu::SurfaceConfiguration) -> wgpu::Extent3d {
 }
 
 impl<A: App> Host<A> {
-    fn new(viewport: Rect, app: A, gfx: Rc<RefCell<Option<Gfx>>>) -> Self {
+    fn new(
+        viewport: Rect,
+        app: A,
+        gfx: Rc<RefCell<Option<Gfx>>>,
+        pending_text_pastes: Rc<RefCell<VecDeque<String>>>,
+    ) -> Self {
         Self {
             viewport,
             app,
             gfx,
+            pending_text_pastes,
+            primary_selection: String::new(),
             last_pointer: None,
             modifiers: KeyModifiers::default(),
             stats: FrameStats::default(),
@@ -576,7 +612,12 @@ impl<A: App + 'static> ApplicationHandler for Host<A> {
         }
         let canvas = locate_canvas();
 
-        let attrs = Window::default_attributes().with_canvas(Some(canvas.clone()));
+        let attrs = Window::default_attributes()
+            .with_canvas(Some(canvas.clone()))
+            // Browser paste is delivered as a DOM ClipboardEvent.
+            // Let that event reach our document listener; Aetna
+            // handles clipboard shortcut suppression itself.
+            .with_prevent_default(false);
         let window = Arc::new(event_loop.create_window(attrs).expect("create window"));
 
         let (initial_w, initial_h) = measure_canvas(&canvas);
@@ -792,7 +833,12 @@ impl<A: App + 'static> ApplicationHandler for Host<A> {
                 self.last_pointer = Some((lx, ly));
                 let moved = gfx.renderer.pointer_moved(lx, ly);
                 for event in moved.events {
-                    self.app.on_event(event);
+                    dispatch_app_event(
+                        &mut self.app,
+                        event,
+                        gfx.renderer.ui_state(),
+                        &mut self.primary_selection,
+                    );
                 }
                 if moved.needs_redraw {
                     self.next_trigger = FrameTrigger::Pointer;
@@ -803,7 +849,12 @@ impl<A: App + 'static> ApplicationHandler for Host<A> {
             WindowEvent::CursorLeft { .. } => {
                 self.last_pointer = None;
                 for event in gfx.renderer.pointer_left() {
-                    self.app.on_event(event);
+                    dispatch_app_event(
+                        &mut self.app,
+                        event,
+                        gfx.renderer.ui_state(),
+                        &mut self.primary_selection,
+                    );
                 }
                 self.next_trigger = FrameTrigger::Pointer;
                 gfx.window.request_redraw();
@@ -815,7 +866,12 @@ impl<A: App + 'static> ApplicationHandler for Host<A> {
             WindowEvent::HoveredFile(path) => {
                 let (lx, ly) = self.last_pointer.unwrap_or((0.0, 0.0));
                 for event in gfx.renderer.file_hovered(path, lx, ly) {
-                    self.app.on_event(event);
+                    dispatch_app_event(
+                        &mut self.app,
+                        event,
+                        gfx.renderer.ui_state(),
+                        &mut self.primary_selection,
+                    );
                 }
                 self.next_trigger = FrameTrigger::Pointer;
                 gfx.window.request_redraw();
@@ -823,7 +879,12 @@ impl<A: App + 'static> ApplicationHandler for Host<A> {
 
             WindowEvent::HoveredFileCancelled => {
                 for event in gfx.renderer.file_hover_cancelled() {
-                    self.app.on_event(event);
+                    dispatch_app_event(
+                        &mut self.app,
+                        event,
+                        gfx.renderer.ui_state(),
+                        &mut self.primary_selection,
+                    );
                 }
                 self.next_trigger = FrameTrigger::Pointer;
                 gfx.window.request_redraw();
@@ -832,7 +893,12 @@ impl<A: App + 'static> ApplicationHandler for Host<A> {
             WindowEvent::DroppedFile(path) => {
                 let (lx, ly) = self.last_pointer.unwrap_or((0.0, 0.0));
                 for event in gfx.renderer.file_dropped(path, lx, ly) {
-                    self.app.on_event(event);
+                    dispatch_app_event(
+                        &mut self.app,
+                        event,
+                        gfx.renderer.ui_state(),
+                        &mut self.primary_selection,
+                    );
                 }
                 self.next_trigger = FrameTrigger::Pointer;
                 gfx.window.request_redraw();
@@ -848,14 +914,26 @@ impl<A: App + 'static> ApplicationHandler for Host<A> {
                 match state {
                     ElementState::Pressed => {
                         for event in gfx.renderer.pointer_down(lx, ly, button) {
-                            self.app.on_event(event);
+                            dispatch_app_event(
+                                &mut self.app,
+                                event,
+                                gfx.renderer.ui_state(),
+                                &mut self.primary_selection,
+                            );
                         }
                         self.next_trigger = FrameTrigger::Pointer;
                         gfx.window.request_redraw();
                     }
                     ElementState::Released => {
                         for event in gfx.renderer.pointer_up(lx, ly, button) {
-                            self.app.on_event(event);
+                            let event =
+                                attach_primary_selection_text(event, &self.primary_selection);
+                            dispatch_app_event(
+                                &mut self.app,
+                                event,
+                                gfx.renderer.ui_state(),
+                                &mut self.primary_selection,
+                            );
                         }
                         self.next_trigger = FrameTrigger::Pointer;
                         gfx.window.request_redraw();
@@ -893,20 +971,56 @@ impl<A: App + 'static> ApplicationHandler for Host<A> {
             } => {
                 if let Some(key) = map_key(&key_event.logical_key) {
                     for event in gfx.renderer.key_down(key, self.modifiers, key_event.repeat) {
-                        self.app.on_event(event);
+                        match text_input::clipboard_request(&event) {
+                            Some(ClipboardKind::Copy) => {
+                                copy_current_selection(&self.app, gfx.renderer.ui_state());
+                                dispatch_app_event(
+                                    &mut self.app,
+                                    event,
+                                    gfx.renderer.ui_state(),
+                                    &mut self.primary_selection,
+                                );
+                            }
+                            Some(ClipboardKind::Cut) => {
+                                copy_current_selection(&self.app, gfx.renderer.ui_state());
+                                dispatch_app_event(
+                                    &mut self.app,
+                                    clipboard::delete_selection_event(event),
+                                    gfx.renderer.ui_state(),
+                                    &mut self.primary_selection,
+                                );
+                            }
+                            Some(ClipboardKind::Paste) => {}
+                            None => dispatch_app_event(
+                                &mut self.app,
+                                event,
+                                gfx.renderer.ui_state(),
+                                &mut self.primary_selection,
+                            ),
+                        }
                     }
                 }
                 if let Some(text) = &key_event.text
                     && let Some(event) = gfx.renderer.text_input(text.to_string())
                 {
-                    self.app.on_event(event);
+                    dispatch_app_event(
+                        &mut self.app,
+                        event,
+                        gfx.renderer.ui_state(),
+                        &mut self.primary_selection,
+                    );
                 }
                 self.next_trigger = FrameTrigger::Keyboard;
                 gfx.window.request_redraw();
             }
             WindowEvent::Ime(winit::event::Ime::Commit(text)) => {
                 if let Some(event) = gfx.renderer.text_input(text) {
-                    self.app.on_event(event);
+                    dispatch_app_event(
+                        &mut self.app,
+                        event,
+                        gfx.renderer.ui_state(),
+                        &mut self.primary_selection,
+                    );
                 }
                 self.next_trigger = FrameTrigger::Keyboard;
                 gfx.window.request_redraw();
@@ -914,6 +1028,15 @@ impl<A: App + 'static> ApplicationHandler for Host<A> {
 
             WindowEvent::RedrawRequested => {
                 let frame_start = Instant::now();
+                let clipboard_drained = drain_pending_clipboard_text(
+                    &mut self.app,
+                    &mut gfx.renderer,
+                    &self.pending_text_pastes,
+                    &mut self.primary_selection,
+                );
+                if clipboard_drained {
+                    self.next_trigger = FrameTrigger::Keyboard;
+                }
                 let frame = match gfx.surface.get_current_texture() {
                     wgpu::CurrentSurfaceTexture::Success(frame)
                     | wgpu::CurrentSurfaceTexture::Suboptimal(frame) => frame,
@@ -1038,6 +1161,63 @@ impl<A: App + 'static> ApplicationHandler for Host<A> {
             _ => {}
         }
     }
+}
+
+fn copy_current_selection<A: App>(app: &A, ui_state: &aetna_core::UiState) {
+    let Some(text) = clipboard::selected_text_for_app(app, ui_state).filter(|s| !s.is_empty())
+    else {
+        return;
+    };
+    let Some(window) = web_sys::window() else {
+        log::warn!("clipboard write failed: no window");
+        return;
+    };
+    let promise = window.navigator().clipboard().write_text(&text);
+    wasm_bindgen_futures::spawn_local(async move {
+        if let Err(err) = wasm_bindgen_futures::JsFuture::from(promise).await {
+            log::warn!("clipboard write failed: {err:?}");
+        }
+    });
+}
+
+fn attach_primary_selection_text(mut event: UiEvent, primary_selection: &str) -> UiEvent {
+    if event.kind == UiEventKind::MiddleClick && !primary_selection.is_empty() {
+        event.text = Some(primary_selection.to_string());
+    }
+    event
+}
+
+fn dispatch_app_event<A: App>(
+    app: &mut A,
+    event: UiEvent,
+    ui_state: &aetna_core::UiState,
+    primary_selection: &mut String,
+) {
+    let before = app.selection();
+    app.on_event(event);
+    if app.selection() != before {
+        *primary_selection = clipboard::selected_text_for_app(app, ui_state)
+            .filter(|text| !text.is_empty())
+            .unwrap_or_default();
+    }
+}
+
+fn drain_pending_clipboard_text<A: App>(
+    app: &mut A,
+    renderer: &mut Runner,
+    pending_text: &Rc<RefCell<VecDeque<String>>>,
+    primary_selection: &mut String,
+) -> bool {
+    let mut drained = false;
+    while let Some(text) = pending_text.borrow_mut().pop_front() {
+        let Some(event) = renderer.text_input(text.clone()) else {
+            continue;
+        };
+        drained = true;
+        let event = clipboard::paste_text_event(event, text);
+        dispatch_app_event(app, event, renderer.ui_state(), primary_selection);
+    }
+    drained
 }
 
 fn map_key(key: &Key) -> Option<UiKey> {

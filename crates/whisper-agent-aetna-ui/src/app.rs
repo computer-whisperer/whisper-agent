@@ -10,8 +10,8 @@
 //!   delete toolbar).
 //! - Snapshot + delta-streamed chat log rendered as event-log rows
 //!   (3 px role-colored gutter + content). Assistant turns flow
-//!   through `aetna_markdown::md`; reasoning and tool rows live in
-//!   collapsible `accordion_item`s.
+//!   through `aetna_markdown` with math enabled; reasoning and tool
+//!   rows live in collapsible `accordion_item`s.
 //! - Inline images (PNG / JPEG / WebP / GIF) with click-to-open
 //!   fullscreen lightbox.
 //! - Per-turn token-stats footer plus a cumulative
@@ -50,6 +50,7 @@ use std::rc::Rc;
 use crate::cron_preview;
 
 use aetna_core::prelude::*;
+use aetna_core::selection::SelectionSource;
 use aetna_core::widgets::resize_handle::{self, ResizeDrag, Side};
 use aetna_core::widgets::select::{SelectAction, classify_event as classify_select_event};
 use whisper_agent_protocol::{
@@ -5007,6 +5008,10 @@ fn chat_user_row_key(idx: usize) -> String {
     format!("chat:user-row:{idx}")
 }
 
+fn chat_text_key(idx: usize, part: &str) -> String {
+    format!("chat:text:{idx}:{part}")
+}
+
 fn chat_user_fork_key(msg_index: usize) -> String {
     format!("{CHAT_USER_FORK_PREFIX}{msg_index}")
 }
@@ -7280,6 +7285,7 @@ impl ChatApp {
                     .height(Size::Hug);
                 scroll([content])
                     .key(scroll_key)
+                    .pin_end()
                     .width(Size::Fill(1.0))
                     .height(Size::Fill(1.0))
             }
@@ -15515,6 +15521,8 @@ impl ChatApp {
                 // wrap-width hint correctly. Only diverge into a
                 // row layout when the affordance is actually
                 // present.
+                let text_key = chat_text_key(idx, "user");
+                let text_el = selectable_paragraph(text_key, t).width(Size::Fill(1.0));
                 let inner = if hovered {
                     // `git-branch` ships in aetna's built-in icon
                     // registry — close enough to a "fork" semantic
@@ -15523,13 +15531,13 @@ impl ChatApp {
                         .key(chat_user_fork_key(*msg_index))
                         .ghost()
                         .icon_size(tokens::ICON_XS);
-                    row([paragraph(t.clone()).width(Size::Fill(1.0)), fork])
+                    row([text_el, fork])
                         .gap(tokens::SPACE_2)
                         .align(Align::Start)
                         .width(Size::Fill(1.0))
                         .key(row_key)
                 } else {
-                    paragraph(t.clone()).width(Size::Fill(1.0)).key(row_key)
+                    column([text_el]).width(Size::Fill(1.0)).key(row_key)
                 };
                 // Upstream README's worked example uses
                 // `with_alpha(18)` (~7%) for the user fill — too low
@@ -15543,7 +15551,11 @@ impl ChatApp {
                 // Markdown rendering for assistant content. The egui
                 // sibling renders user input verbatim and assistant
                 // output as markdown — same pattern here.
-                let body = aetna_markdown::md(t);
+                let body = aetna_markdown::md_with_options(
+                    t,
+                    aetna_markdown::MarkdownOptions::default().math(true),
+                );
+                let body = prefix_selectable_keys(body, &chat_text_key(idx, "assistant"));
                 log_row(tokens::SUCCESS, None, body)
             }
             DisplayItem::Reasoning { text: t } => {
@@ -15552,7 +15564,13 @@ impl ChatApp {
                 let value = format!("{idx}");
                 let routed = accordion_item_key(key, &value);
                 let open = self.open_accordions.contains(&routed);
-                let item_el = accordion_item(key, value, preview, open, [paragraph(t.clone())]);
+                let item_el = accordion_item(
+                    key,
+                    value,
+                    preview,
+                    open,
+                    [selectable_paragraph(chat_text_key(idx, "reasoning"), t)],
+                );
                 log_row(tokens::MUTED_FOREGROUND, None, item_el)
             }
             DisplayItem::SetupPrompt { text: t } => {
@@ -15567,7 +15585,13 @@ impl ChatApp {
                 let routed = accordion_item_key(key, &value);
                 let open = self.open_accordions.contains(&routed);
                 let header = format!("SYSTEM · {preview}");
-                let item_el = accordion_item(key, value, header, open, [code_block(t.clone())]);
+                let item_el = accordion_item(
+                    key,
+                    value,
+                    header,
+                    open,
+                    [selectable_code_block(chat_text_key(idx, "setup-prompt"), t)],
+                );
                 log_row(tokens::MUTED_FOREGROUND, None, item_el)
             }
             DisplayItem::SetupTools { entries } => {
@@ -15585,10 +15609,22 @@ impl ChatApp {
                 let header = format!("TOOLS · {count} tool{}", if count == 1 { "" } else { "s" });
                 let body_blocks: Vec<El> = entries
                     .iter()
-                    .map(|t| {
+                    .enumerate()
+                    .map(|(i, t)| {
                         column([
-                            text(t.name.clone()).label().bold(),
-                            text(t.description.clone()).muted().small().wrap_text(),
+                            text(t.name.clone())
+                                .key(chat_text_key(idx, &format!("tool-name:{i}")))
+                                .selectable()
+                                .selection_source(SelectionSource::identity(t.name.clone()))
+                                .label()
+                                .bold(),
+                            text(t.description.clone())
+                                .key(chat_text_key(idx, &format!("tool-desc:{i}")))
+                                .selectable()
+                                .selection_source(SelectionSource::identity(t.description.clone()))
+                                .muted()
+                                .small()
+                                .wrap_text(),
                         ])
                         .gap(tokens::SPACE_1)
                         .width(Size::Fill(1.0))
@@ -15620,6 +15656,7 @@ impl ChatApp {
                 let open = streaming || self.open_accordions.contains(&routed);
                 let header = tool_call_header(name, summary.as_deref(), result.as_ref());
                 let body_blocks = tool_call_body(
+                    idx,
                     diff.as_ref(),
                     args_pretty.as_deref(),
                     streaming_output,
@@ -15647,7 +15684,13 @@ impl ChatApp {
                 } else {
                     "tool result".to_string()
                 };
-                let item_el = accordion_item(key, value, header, open, [code_block(t.clone())]);
+                let item_el = accordion_item(
+                    key,
+                    value,
+                    header,
+                    open,
+                    [selectable_code_block(chat_text_key(idx, "tool-result"), t)],
+                );
                 let _ = tool_use_id;
                 let gutter = if *is_error {
                     tokens::DESTRUCTIVE
@@ -15661,8 +15704,13 @@ impl ChatApp {
                 let value = format!("{idx}");
                 let routed = accordion_item_key(key, &value);
                 let open = self.open_accordions.contains(&routed);
-                let item_el =
-                    accordion_item(key, value, label.clone(), open, [paragraph(label.clone())]);
+                let item_el = accordion_item(
+                    key,
+                    value,
+                    label.clone(),
+                    open,
+                    [selectable_paragraph(chat_text_key(idx, "generic"), label)],
+                );
                 log_row(tokens::MUTED_FOREGROUND, None, item_el)
             }
             DisplayItem::TurnStats { usage } => {
@@ -15671,10 +15719,14 @@ impl ChatApp {
                 // sits where the assistant's gutter ends so it
                 // visually attaches to the turn it summarizes
                 // without dominating the chat.
-                row([spacer(), text(turn_stats_text(usage)).caption().muted()])
-                    .align(Align::Center)
-                    .padding(Sides::xy(tokens::SPACE_3, 0.0))
-                    .width(Size::Fill(1.0))
+                let stats = turn_stats_text(usage);
+                row([
+                    spacer(),
+                    selectable_caption(chat_text_key(idx, "turn-stats"), stats).muted(),
+                ])
+                .align(Align::Center)
+                .padding(Sides::xy(tokens::SPACE_3, 0.0))
+                .width(Size::Fill(1.0))
             }
             DisplayItem::Image { is_user, state } => {
                 let gutter = if *is_user {
@@ -15682,7 +15734,7 @@ impl ChatApp {
                 } else {
                     tokens::SUCCESS
                 };
-                let body = image_body(state);
+                let body = image_body(idx, state);
                 // Clickable wrapper opens the fullscreen lightbox.
                 // Only Decoded states get the click affordance — a
                 // URL placeholder and a decode-failure row are
@@ -15711,7 +15763,7 @@ impl ChatApp {
 /// through aetna's [`image()`] widget at a capped display height
 /// (so a 4K screenshot doesn't dominate the chat log); URL sources
 /// and decode failures fall through to small annotated placeholders.
-fn image_body(state: &ImageRenderState) -> El {
+fn image_body(idx: usize, state: &ImageRenderState) -> El {
     /// Cap on the displayed height of a single image row. Width is
     /// chosen by `ImageFit::Contain` to preserve aspect — a wide
     /// screenshot stays full-width but shrinks vertically; a tall
@@ -15728,7 +15780,11 @@ fn image_body(state: &ImageRenderState) -> El {
             // exceed the cap. Width is derived from the aspect ratio
             // of the source so long-aspect images keep their shape.
             let (w, h) = display_dims(*width, *height, MAX_DISPLAY_HEIGHT);
-            let caption = text(format!("{width}×{height}")).caption().muted();
+            let caption = selectable_caption(
+                chat_text_key(idx, "image-dimensions"),
+                format!("{width}×{height}"),
+            )
+            .muted();
             column([
                 image(img.clone())
                     .image_fit(ImageFit::Contain)
@@ -15744,14 +15800,19 @@ fn image_body(state: &ImageRenderState) -> El {
             // know what was meant to render. Stage 7 follow-up: fetch
             // + cache via the host shell.
             column([
-                text("[image at remote URL — fetch deferred]").muted(),
-                text(url.clone()).caption().muted(),
+                selectable_paragraph(
+                    chat_text_key(idx, "image-url-placeholder"),
+                    "[image at remote URL — fetch deferred]",
+                )
+                .muted(),
+                selectable_caption(chat_text_key(idx, "image-url"), url.clone()).muted(),
             ])
             .gap(tokens::SPACE_1)
         }
         ImageRenderState::Failed { reason } => column([
-            text("[image decode failed]").destructive(),
-            text(reason.clone()).caption().muted(),
+            selectable_paragraph(chat_text_key(idx, "image-failed"), "[image decode failed]")
+                .destructive(),
+            selectable_caption(chat_text_key(idx, "image-failed-reason"), reason.clone()).muted(),
         ])
         .gap(tokens::SPACE_1),
     }
@@ -16197,6 +16258,7 @@ fn tool_call_header(name: &str, summary: Option<&str>, result: Option<&FusedTool
 /// separated by small muted captions so the structure reads at a
 /// glance.
 fn tool_call_body(
+    idx: usize,
     diff: Option<&DiffPayload>,
     args_pretty: Option<&str>,
     streaming_output: &str,
@@ -16213,22 +16275,29 @@ fn tool_call_body(
         } else {
             d.path.clone()
         };
-        blocks.push(text(header_text).caption().muted().bold());
-        blocks.push(diff_body(&d.old_text, &d.new_text));
+        blocks.push(
+            selectable_caption(chat_text_key(idx, "diff-path"), header_text)
+                .muted()
+                .bold(),
+        );
+        blocks.push(diff_body(idx, &d.old_text, &d.new_text));
     } else if let Some(args) = args_pretty
         && !args.trim().is_empty()
     {
         blocks.push(text("args").caption().muted());
-        blocks.push(code_block(args.to_string()));
+        blocks.push(selectable_code_block(chat_text_key(idx, "args"), args));
     }
     if !streaming_output.trim().is_empty() {
         blocks.push(text("output").caption().muted());
-        blocks.push(code_block(streaming_output.to_string()));
+        blocks.push(selectable_code_block(
+            chat_text_key(idx, "streaming-output"),
+            streaming_output,
+        ));
     }
     if let Some(r) = result {
         let label = if r.is_error { "error" } else { "result" };
         blocks.push(text(label).caption().muted());
-        blocks.push(code_block(r.text.clone()));
+        blocks.push(selectable_code_block(chat_text_key(idx, "result"), &r.text));
     }
     if blocks.is_empty() {
         blocks.push(text("(no detail)").muted());
@@ -16251,12 +16320,12 @@ const DIFF_ADD_FG: Color = Color::token("diff-add-foreground", 150, 220, 170, 25
 /// change becomes one mono row prefixed with `+` / `-` / ` ` and
 /// colored to match the change kind. Equal lines stay muted so
 /// the eye lands on the additions / deletions.
-fn diff_body(old_text: &str, new_text: &str) -> El {
+fn diff_body(idx: usize, old_text: &str, new_text: &str) -> El {
     use similar::{ChangeTag, TextDiff};
 
     let text_diff = TextDiff::from_lines(old_text, new_text);
     let mut rows: Vec<El> = Vec::new();
-    for change in text_diff.iter_all_changes() {
+    for (line_idx, change) in text_diff.iter_all_changes().enumerate() {
         let (prefix, color) = match change.tag() {
             ChangeTag::Equal => (' ', tokens::MUTED_FOREGROUND),
             ChangeTag::Delete => ('-', DIFF_DEL_FG),
@@ -16264,8 +16333,12 @@ fn diff_body(old_text: &str, new_text: &str) -> El {
         };
         let raw = change.value();
         let trimmed = raw.strip_suffix('\n').unwrap_or(raw);
+        let line = format!("{prefix}{trimmed}");
         rows.push(
-            mono(format!("{prefix}{trimmed}"))
+            mono(line.clone())
+                .key(chat_text_key(idx, &format!("diff:{line_idx}")))
+                .selectable()
+                .selection_source(SelectionSource::identity(line))
                 .small()
                 .text_color(color)
                 .width(Size::Fill(1.0)),
@@ -16277,6 +16350,56 @@ fn diff_body(old_text: &str, new_text: &str) -> El {
         .fill(tokens::MUTED)
         .radius(tokens::RADIUS_MD)
         .width(Size::Fill(1.0))
+}
+
+fn selectable_paragraph(key: impl Into<String>, value: &str) -> El {
+    paragraph(value.to_string())
+        .key(key.into())
+        .selectable()
+        .selection_source(SelectionSource::identity(value.to_string()))
+}
+
+fn selectable_caption(key: impl Into<String>, value: impl Into<String>) -> El {
+    let value = value.into();
+    text(value.clone())
+        .caption()
+        .key(key.into())
+        .selectable()
+        .selection_source(SelectionSource::identity(value))
+}
+
+fn selectable_code_block(key: impl Into<String>, value: &str) -> El {
+    let body = text(value.to_string())
+        .key(key.into())
+        .selectable()
+        .selection_source(SelectionSource::identity(value.to_string()))
+        .mono()
+        .font_size(tokens::TEXT_SM.size)
+        .nowrap_text()
+        .width(Size::Hug)
+        .height(Size::Hug);
+    code_block_chrome(body)
+}
+
+fn prefix_selectable_keys(mut el: El, prefix: &str) -> El {
+    fn visit(el: &mut El, prefix: &str) {
+        if (el.selectable || el.selection_source.is_some())
+            && let Some(key) = el.key.as_mut()
+        {
+            *key = format!("{prefix}:{key}");
+        }
+        if let Some(source) = el.selection_source.as_mut()
+            && let Some(group) = source.full_selection_group.as_mut()
+        {
+            *group = format!("{prefix}:{group}");
+        }
+        for child in &mut el.children {
+            visit(child, prefix);
+        }
+    }
+
+    visit(&mut el, prefix);
+    el
 }
 
 /// Event-log row — narrow role-colored gutter + content with

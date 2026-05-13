@@ -220,11 +220,12 @@ purpose-built widgets. The rules of thumb:
   assistant stream. Local helper `log_row(role_color, faint_fill,
   content)` in `app.rs`.
 - **Markdown for assistant text.** Assistant content goes through
-  `aetna_markdown::md(text)`, which walks pulldown-cmark's event API
-  into `paragraph` / `bullet_list` / `code_block` / `inlines` /
-  `text(...).code()` etc. — same surface a hand-authored aetna tree
-  would use. User text stays as `paragraph(text)` (we don't render
-  user-typed markdown).
+  `aetna_markdown::md_with_options(text, MarkdownOptions::default().math(true))`,
+  which walks pulldown-cmark's event API into `paragraph` /
+  `bullet_list` / `code_block` / `inlines` / `text(...).code()` etc.
+  — same surface a hand-authored aetna tree would use, with native
+  `$...$` / `$$...$$` math rendering enabled. User text stays as
+  selectable plain text (we don't render user-typed markdown).
 - **Accordion for noisy rows.** Reasoning and tool-call rows nest
   `accordion_item(group, value, label, open, [body])`. Open state
   lives on `ChatApp.open_accordions: HashSet<String>` keyed by
@@ -472,8 +473,10 @@ emitting output.
 Deferred to a later slice:
 - per-keystroke fanout debounce (chrono-backed wall clock or a
   frame-counter) — currently every keystroke hits the wire
-- per-message hover affordances (copy, fork-from-here) — wants
-  precedent from Stage 8's modals (fork dialog) first
+
+Closed in follow-up slices: fork-from-here landed via the Stage 8
+modal path; conversation text is now wired into Aetna selection
+sources so visible chat text can be copied with Ctrl/Cmd+C.
 
 ### ✅ Stage 6 — Tool calls and tool results
 
@@ -588,10 +591,15 @@ place since Stage 11). Native intercepts Ctrl/Cmd+V on the
 compose `text_area` via `text_input::clipboard_request`, then
 calls `arboard::Clipboard::get_image()`; on success the RGBA8
 bytes get PNG-encoded and pushed through the same
-`stage_raw_pick` pipeline drag-drop uses. No clipboard image →
-the routed Paste falls through to `text_area::apply_event` —
-text paste in this app's text inputs is a separate gap (no
-text-paste path is wired in any on_event branch today).
+`stage_raw_pick` pipeline drag-drop uses. Text paste follows
+the standard Aetna path: native `aetna-winit-wgpu` turns
+clipboard text into a `TextInput` event, and the wasm host queues
+trusted DOM `ClipboardEvent` text for the focused widget after
+opting the winit web window out of default event suppression. Both
+hosts share `aetna_core::clipboard::{selected_text_for_app,
+paste_text_event, delete_selection_event}` for copy/cut/paste event
+rewrites. Ctrl/Cmd+C copies the current `App::selection`; Ctrl/Cmd+X
+copies and then routes a Delete event through the focused widget.
 
 Also still deferred:
 - URL fetching via the host shell (caching + a placeholder while
@@ -1193,14 +1201,18 @@ without reshaping the loop.
 ### ✅ Stage 10 — Markdown rendering
 
 `aetna-markdown` landed upstream and we now route assistant text
-through `aetna_markdown::md(text)`. Pulldown-cmark walks the source
-into headings, paragraphs, lists, code blocks, inline runs, and
-emphasis — identical to a hand-authored aetna tree. Got picked up as
-part of the event-log refactor since both touched the same code.
+through `aetna_markdown::md_with_options(text, MarkdownOptions::default().math(true))`.
+Pulldown-cmark walks the source into headings, paragraphs, lists, code
+blocks, inline runs, and emphasis — identical to a hand-authored
+aetna tree. Got picked up as part of the event-log refactor since
+both touched the same code.
 
 Future polish: per `aetna-markdown/src/lib.rs` at the version we
-build against, tables, footnotes, task lists, raw HTML, and math
-(`$…$` / `$$…$$`) are all still deferred upstream.
+build against, footnotes, raw HTML, full TeX / MathML import,
+definition lists, heading attributes, metadata blocks,
+superscript/subscript, and wikilinks are still deferred upstream.
+Native math for `$…$` / `$$…$$` is enabled for assistant markdown
+through `MarkdownOptions::math(true)`.
 
 ### ✅ Stage 11 — wasm browser entry + server bundle switch
 
@@ -1633,17 +1645,10 @@ Picked in this codebase, not enforced by aetna:
 Items the aetna sibling needs from upstream before we can close
 the gap with the egui webui:
 
-- **`scroll` widget stick-to-bottom mode.** The egui sibling
-  uses `egui::ScrollArea::stick_to_bottom(true)` so the chat log
-  hugs the most recent turn during streaming. Aetna's `scroll`
-  widget exposes only an offset; the App trait can read /
-  `set_scroll_offset` on `UiState`, but the App can only see
-  `BuildCx { theme }` — the scroll-state setter is host-private,
-  so even a "watch the offset and clamp it on each rebuild"
-  workaround isn't available from this side. File against
-  aetna; once a `pinned_to_end` (or `auto_follow_tail`)
-  flag lands, the aetna chat-log scroll picks it up in one
-  line.
+- ~~**`scroll` widget stick-to-bottom mode.**~~ Landed upstream
+  as `El::pin_end()` in aetna 0.3.2; the chat-log scroll now opts
+  in so streaming output follows the tail until the user scrolls
+  away, then re-engages when they return to the bottom.
 - ~~**`winit` drag/drop events on `aetna-winit-wgpu`.**~~ Landed
   upstream as `UiEventKind::FileHovered` / `FileHoverCancelled`
   / `FileDropped` (one event per file, path on
@@ -1654,11 +1659,9 @@ the gap with the egui webui:
   and calls the clipboard backend's `get_image()` (arboard
   native, web-sys on wasm) before falling through to text
   paste.
-- **Markdown viewer scroll-from-source.** The aetna-markdown
-  body re-builds when the source string grows past a threshold;
-  a streaming assistant turn occasionally scrolls flat to the
-  top of the body. Probably tied to the stick-to-bottom gap
-  above; revisit after that lands.
+- ~~**Markdown viewer scroll-from-source.**~~ Re-tested after
+  `El::pin_end()` landed; streaming markdown now follows the
+  tail correctly.
 
 ## Files of interest
 
