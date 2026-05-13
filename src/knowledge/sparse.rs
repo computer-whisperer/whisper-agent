@@ -16,10 +16,11 @@
 //!   read when populating Candidate fields.
 //!
 //! Tokenizer is the tantivy default (`SimpleTokenizer + RemoveLongFilter
-//! + LowerCaser`). Per-bucket tokenizer config
-//! (`[search_paths.sparse] tokenizer = "..."` from `bucket.toml`) wires
-//! through here in a future slice when we have multiple options to swap
-//! between.
+//! + LowerCaser`).
+//!
+//! Per-bucket tokenizer config (`[search_paths.sparse] tokenizer = "..."`
+//! from `bucket.toml`) wires through here in a future slice when we have
+//! multiple options to swap between.
 
 use std::collections::HashSet;
 use std::path::Path;

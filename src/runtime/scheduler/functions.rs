@@ -1858,15 +1858,17 @@ impl Scheduler {
                 let load = match tgt.scope {
                     crate::knowledge::BucketScope::Server => {
                         crate::runtime::scheduler::buckets::load_bucket_with_progress(
-                            registry.clone(),
-                            tgt.name.clone(),
-                            None,
-                            slot_id.clone(),
-                            serving_mode.clone(),
-                            task_tx.clone(),
-                            None,
-                            None,
-                            false,
+                            crate::runtime::scheduler::buckets::BucketLoadProgressRequest {
+                                registry: registry.clone(),
+                                bucket_id: tgt.name.clone(),
+                                pod_id: None,
+                                slot_id: slot_id.clone(),
+                                serving_mode: serving_mode.clone(),
+                                task_tx: task_tx.clone(),
+                                requester_conn: None,
+                                correlation_id: None,
+                                emit_cached: false,
+                            },
                         )
                         .await
                     }
@@ -1876,15 +1878,17 @@ impl Scheduler {
                             .as_deref()
                             .expect("pod-scope target carries pod_id");
                         crate::runtime::scheduler::buckets::load_bucket_with_progress(
-                            registry.clone(),
-                            tgt.name.clone(),
-                            Some(pod.to_string()),
-                            slot_id.clone(),
-                            serving_mode.clone(),
-                            task_tx.clone(),
-                            None,
-                            None,
-                            false,
+                            crate::runtime::scheduler::buckets::BucketLoadProgressRequest {
+                                registry: registry.clone(),
+                                bucket_id: tgt.name.clone(),
+                                pod_id: Some(pod.to_string()),
+                                slot_id: slot_id.clone(),
+                                serving_mode: serving_mode.clone(),
+                                task_tx: task_tx.clone(),
+                                requester_conn: None,
+                                correlation_id: None,
+                                emit_cached: false,
+                            },
                         )
                         .await
                     }

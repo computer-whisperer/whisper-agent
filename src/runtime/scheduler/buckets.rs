@@ -1521,17 +1521,33 @@ async fn run_build(
     });
 }
 
+pub(crate) struct BucketLoadProgressRequest {
+    pub(crate) registry: crate::knowledge::BucketRegistry,
+    pub(crate) bucket_id: String,
+    pub(crate) pod_id: Option<String>,
+    pub(crate) slot_id: String,
+    pub(crate) serving_mode: String,
+    pub(crate) task_tx: mpsc::UnboundedSender<BucketTaskUpdate>,
+    pub(crate) requester_conn: Option<ConnId>,
+    pub(crate) correlation_id: Option<String>,
+    pub(crate) emit_cached: bool,
+}
+
 pub(crate) async fn load_bucket_with_progress(
-    registry: crate::knowledge::BucketRegistry,
-    bucket_id: String,
-    pod_id: Option<String>,
-    slot_id: String,
-    serving_mode: String,
-    task_tx: mpsc::UnboundedSender<BucketTaskUpdate>,
-    requester_conn: Option<ConnId>,
-    correlation_id: Option<String>,
-    emit_cached: bool,
+    request: BucketLoadProgressRequest,
 ) -> Result<Arc<DiskBucket>, BucketError> {
+    let BucketLoadProgressRequest {
+        registry,
+        bucket_id,
+        pod_id,
+        slot_id,
+        serving_mode,
+        task_tx,
+        requester_conn,
+        correlation_id,
+        emit_cached,
+    } = request;
+
     let progress = Arc::new(LoadProgressShared::default());
     let observer: Arc<dyn LoadObserver> = Arc::new(SchedulerLoadObserver {
         bucket_id: bucket_id.clone(),

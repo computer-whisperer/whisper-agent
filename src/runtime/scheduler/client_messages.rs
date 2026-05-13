@@ -1405,15 +1405,17 @@ impl Scheduler {
 
         tokio::spawn(async move {
             let _ = super::buckets::load_bucket_with_progress(
-                registry,
-                id,
-                pod_id,
-                slot_id,
-                serving_mode,
-                task_tx,
-                Some(conn_id),
-                correlation_id,
-                true,
+                super::buckets::BucketLoadProgressRequest {
+                    registry,
+                    bucket_id: id,
+                    pod_id,
+                    slot_id,
+                    serving_mode,
+                    task_tx,
+                    requester_conn: Some(conn_id),
+                    correlation_id,
+                    emit_cached: true,
+                },
             )
             .await;
         });
@@ -1545,15 +1547,17 @@ impl Scheduler {
         tokio::spawn(async move {
             let cancel = CancellationToken::new();
             let load_result = super::buckets::load_bucket_with_progress(
-                registry,
-                bucket_id.clone(),
-                pod_id_for_load.clone(),
-                slot_id,
-                serving_mode,
-                task_tx,
-                Some(conn_id),
-                correlation_id.clone(),
-                false,
+                super::buckets::BucketLoadProgressRequest {
+                    registry,
+                    bucket_id: bucket_id.clone(),
+                    pod_id: pod_id_for_load.clone(),
+                    slot_id,
+                    serving_mode,
+                    task_tx,
+                    requester_conn: Some(conn_id),
+                    correlation_id: correlation_id.clone(),
+                    emit_cached: false,
+                },
             )
             .await;
             let bucket = match load_result {

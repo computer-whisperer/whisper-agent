@@ -11921,17 +11921,16 @@ impl ChatApp {
                     sub.error = None;
                     return true;
                 }
-                if let Some(route) = event.route() {
-                    if let Some(raw) =
+                if let Some(route) = event.route()
+                    && let Some(raw) =
                         route.strip_prefix(HOST_ENV_EDITOR_LANDLOCK_PATH_DELETE_PREFIX)
-                        && matches!(event.kind, UiEventKind::Click | UiEventKind::Activate)
-                        && let Ok(idx) = raw.parse::<usize>()
-                        && idx < allowed_paths.len()
-                    {
-                        allowed_paths.remove(idx);
-                        sub.error = None;
-                        return true;
-                    }
+                    && matches!(event.kind, UiEventKind::Click | UiEventKind::Activate)
+                    && let Ok(idx) = raw.parse::<usize>()
+                    && idx < allowed_paths.len()
+                {
+                    allowed_paths.remove(idx);
+                    sub.error = None;
+                    return true;
                 }
                 for (idx, path) in allowed_paths.iter_mut().enumerate() {
                     let path_key = format!("{HOST_ENV_EDITOR_LANDLOCK_PATH_PREFIX}{idx}");
