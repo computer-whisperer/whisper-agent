@@ -46,6 +46,7 @@
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::rc::Rc;
+use std::sync::Arc;
 
 use crate::cron_preview;
 
@@ -103,6 +104,7 @@ impl ConnectionStatus {
 }
 
 /// One row in the chat log.
+#[derive(Clone)]
 enum DisplayItem {
     User {
         text: String,
@@ -420,6 +422,7 @@ struct ToolSchemaSummary {
 }
 
 /// Tool-result body fused onto its originating [`DisplayItem::ToolCall`].
+#[derive(Clone)]
 struct FusedToolResult {
     text: String,
     is_error: bool,
@@ -5343,6 +5346,7 @@ const BEHAVIOR_EDIT_PREFIX: &str = "behavior-edit:";
 /// opens the fork dialog pre-populated with the clicked message's
 /// index + seed text.
 const CHAT_USER_FORK_PREFIX: &str = "chat:user-fork:";
+const CHAT_ROW_ESTIMATED_HEIGHT: f32 = 220.0;
 
 /// Key for a User row's hover-detection wrapper. `idx` is the
 /// display-item index (stable per build), distinct from `msg_index`
@@ -7820,42 +7824,41 @@ impl ChatApp {
                 "Type below and hit Enter to start the conversation.",
             ),
             Some(v) => {
-                // Thread the row index in as the accordion `value` so
-                // each reasoning / tool row has an independent open
-                // state stable across rebuilds.
-                let rows: Vec<El> = v
-                    .items
-                    .iter()
-                    .enumerate()
-                    .map(|(idx, item)| self.event_log_row(idx, item, cx))
-                    .collect();
                 // Inter-row breathing room. Upstream's README example
                 // has no explicit gap; with the row content sitting
                 // flush, adjacent unfilled rows visually blur into one
                 // text flow. SPACE_2 (8px) reads as a log-style line
                 // gap rather than card-isolation.
                 //
-                // Right padding lives on the *content* column rather
-                // than the scroll itself so the scrollbar thumb sits
-                // in a reserved gutter outside the focusable rows
-                // (lint flags otherwise — `ScrollbarObscuresFocusable`
-                // — once the body overflows, which the inspector
-                // panel can trigger by shrinking available height).
-                let content = column(rows)
-                    .gap(tokens::SPACE_2)
-                    .padding(Sides {
-                        left: tokens::SPACE_2,
-                        right: tokens::SPACE_2 + tokens::SCROLLBAR_THUMB_WIDTH,
-                        top: tokens::SPACE_2,
-                        bottom: tokens::SPACE_2,
-                    })
-                    .width(Size::Fill(1.0))
-                    .height(Size::Hug);
-                scroll([content])
-                    .key(scroll_key)
-                    .pin_end()
-                    .width(Size::Fill(1.0))
-                    .height(Size::Fill(1.0))
+                // Row padding, rather than viewport padding, keeps
+                // the scrollbar thumb in its outer gutter while each
+                // realized row reserves space so focus rings and
+                // selectable text do not sit under the thumb.
+                let items = Arc::new(v.items.clone());
+                let item_count = items.len();
+                let open_accordions = Arc::new(self.open_accordions.clone());
+                let hovered_key = cx.hovered_key().map(str::to_owned);
+                virtual_list_dyn(item_count, CHAT_ROW_ESTIMATED_HEIGHT, move |idx| {
+                    let row = Self::event_log_row(
+                        idx,
+                        &items[idx],
+                        open_accordions.as_ref(),
+                        hovered_key.as_deref(),
+                    );
+                    column([row])
+                        .padding(Sides {
+                            left: tokens::SPACE_2,
+                            right: tokens::SPACE_2 + tokens::SCROLLBAR_THUMB_WIDTH,
+                            top: if idx == 0 { tokens::SPACE_2 } else { 0.0 },
+                            bottom: tokens::SPACE_2,
+                        })
+                        .width(Size::Fill(1.0))
+                        .height(Size::Hug)
+                })
+                .key(scroll_key)
+                .pin_end()
+                .width(Size::Fill(1.0))
+                .height(Size::Fill(1.0))
             }
         };
 
@@ -16401,7 +16404,12 @@ impl ChatApp {
     /// Reasoning + tool rows nest an `accordion_item` so their
     /// bodies collapse — typical thread reads are noisy with these
     /// otherwise.
-    fn event_log_row(&self, idx: usize, item: &DisplayItem, cx: &BuildCx) -> El {
+    fn event_log_row(
+        idx: usize,
+        item: &DisplayItem,
+        open_accordions: &HashSet<String>,
+        hovered_key: Option<&str>,
+    ) -> El {
         match item {
             DisplayItem::User { text: t, msg_index } => {
                 // Wrap the body in a keyed container so
@@ -16416,7 +16424,11 @@ impl ChatApp {
                 // `fork:{msg_index}` (msg_index is what the wire
                 // needs).
                 let row_key = chat_user_row_key(idx);
-                let hovered = cx.is_hovering_within(&row_key);
+                let text_prefix = format!("chat:text:{idx}:");
+                let fork_key = chat_user_fork_key(*msg_index);
+                let hovered = hovered_key.is_some_and(|key| {
+                    key == row_key || key == fork_key || key.starts_with(&text_prefix)
+                });
                 // Plain paragraph for the unhovered case keeps the
                 // wrap calculation identical to the pre-fork-
                 // affordance render — wrapping a paragraph in a
@@ -16467,7 +16479,7 @@ impl ChatApp {
                 let key = "reasoning";
                 let value = format!("{idx}");
                 let routed = accordion_item_key(key, &value);
-                let open = self.open_accordions.contains(&routed);
+                let open = open_accordions.contains(&routed);
                 let item_el = accordion_item(
                     key,
                     value,
@@ -16487,7 +16499,7 @@ impl ChatApp {
                 let key = "setup-prompt";
                 let value = format!("{idx}");
                 let routed = accordion_item_key(key, &value);
-                let open = self.open_accordions.contains(&routed);
+                let open = open_accordions.contains(&routed);
                 let header = format!("SYSTEM · {preview}");
                 let item_el = accordion_item(
                     key,
@@ -16509,7 +16521,7 @@ impl ChatApp {
                 let key = "setup-tools";
                 let value = format!("{idx}");
                 let routed = accordion_item_key(key, &value);
-                let open = self.open_accordions.contains(&routed);
+                let open = open_accordions.contains(&routed);
                 let header = format!("TOOLS · {count} tool{}", if count == 1 { "" } else { "s" });
                 let body_blocks: Vec<El> = entries
                     .iter()
@@ -16557,7 +16569,7 @@ impl ChatApp {
                 // `open_accordions` membership keeps a finished
                 // call open if they manually expanded it.
                 let streaming = result.is_none() && !streaming_output.is_empty();
-                let open = streaming || self.open_accordions.contains(&routed);
+                let open = streaming || open_accordions.contains(&routed);
                 let header = tool_call_header(name, summary.as_deref(), result.as_ref());
                 let body_blocks = tool_call_body(
                     idx,
@@ -16582,7 +16594,7 @@ impl ChatApp {
                 let key = "tool-result";
                 let value = format!("{idx}");
                 let routed = accordion_item_key(key, &value);
-                let open = self.open_accordions.contains(&routed);
+                let open = open_accordions.contains(&routed);
                 let header = if *is_error {
                     "tool result (error)".to_string()
                 } else {
@@ -16607,7 +16619,7 @@ impl ChatApp {
                 let key = "generic";
                 let value = format!("{idx}");
                 let routed = accordion_item_key(key, &value);
-                let open = self.open_accordions.contains(&routed);
+                let open = open_accordions.contains(&routed);
                 let item_el = accordion_item(
                     key,
                     value,

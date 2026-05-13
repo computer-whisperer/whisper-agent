@@ -15,16 +15,20 @@
 //!   here — saves disk and ram, at the cost of an extra `chunks.bin`
 //!   read when populating Candidate fields.
 //!
-//! Tokenizer is the tantivy default (`SimpleTokenizer + LowerCaser +
-//! StopWordFilter`). Per-bucket tokenizer config (`[search_paths.sparse]
-//! tokenizer = "..."` from `bucket.toml`) wires through here in a future
-//! slice when we have multiple options to swap between.
+//! Tokenizer is the tantivy default (`SimpleTokenizer + RemoveLongFilter
+//! + LowerCaser`). Per-bucket tokenizer config
+//! (`[search_paths.sparse] tokenizer = "..."` from `bucket.toml`) wires
+//! through here in a future slice when we have multiple options to swap
+//! between.
 
+use std::collections::HashSet;
 use std::path::Path;
+use std::time::Instant;
 
 use tantivy::collector::TopDocs;
-use tantivy::query::QueryParser;
-use tantivy::schema::{Field, INDEXED, STORED, Schema, TEXT, Value};
+use tantivy::query::{BooleanQuery, Query, QueryParser, TermQuery};
+use tantivy::schema::{Field, INDEXED, IndexRecordOption, STORED, Schema, TEXT, Value};
+use tantivy::tokenizer::TokenStream;
 use tantivy::{Index, IndexReader, IndexWriter, ReloadPolicy, TantivyDocument, Term};
 
 use super::types::{BucketError, ChunkId};
@@ -34,6 +38,13 @@ use super::types::{BucketError, ChunkId};
 /// build throughput. Tunable when wikipedia-scale build perf becomes
 /// the constraint.
 const WRITER_MEMORY_BUDGET: usize = 50_000_000;
+
+/// Natural-language sparse queries over enwiki get expensive when the
+/// query parser expands every common word into a scoring clause. Keep a
+/// small rare-term disjunction instead; dense retrieval already covers
+/// the broad semantic side of the query.
+const MAX_PLAIN_QUERY_TERMS: usize = 6;
+const HIGH_DF_RATIO: f32 = 0.05;
 
 const FIELD_CHUNK_ID: &str = "chunk_id";
 const FIELD_TEXT: &str = "text";
@@ -242,15 +253,40 @@ impl SparseIndex {
         if top_k == 0 || self.is_empty() {
             return Ok(Vec::new());
         }
+        let total_t = Instant::now();
         let searcher = self.reader.searcher();
-        let parser = QueryParser::for_index(&self.index, vec![self.text_field]);
-        let query = parser
-            .parse_query(query_text)
-            .map_err(|e| BucketError::Other(format!("tantivy parse_query: {e}")))?;
+        let doc_count = searcher.num_docs();
+
+        let parse_t = Instant::now();
+        let (query, query_diag) = if looks_like_tantivy_syntax(query_text) {
+            let parser = QueryParser::for_index(&self.index, vec![self.text_field]);
+            let query = parser
+                .parse_query(query_text)
+                .map_err(|e| BucketError::Other(format!("tantivy parse_query: {e}")))?;
+            (
+                query,
+                SparseQueryDiag {
+                    mode: "parser",
+                    raw_terms: 0,
+                    used_terms: 0,
+                    zero_df_terms: 0,
+                    high_df_terms: 0,
+                    max_df: 0,
+                    df_ms: 0,
+                },
+            )
+        } else {
+            self.build_pruned_plain_query(query_text, doc_count)?
+        };
+        let parse_ms = parse_t.elapsed().as_millis();
+
+        let search_t = Instant::now();
         let top_docs = searcher
             .search(&query, &TopDocs::with_limit(top_k).order_by_score())
             .map_err(|e| BucketError::Other(format!("tantivy search: {e}")))?;
+        let search_ms = search_t.elapsed().as_millis();
 
+        let doc_fetch_t = Instant::now();
         let mut out = Vec::with_capacity(top_docs.len());
         for (score, addr) in top_docs {
             let doc: TantivyDocument = searcher
@@ -272,8 +308,180 @@ impl SparseIndex {
             id_bytes.copy_from_slice(bytes);
             out.push((ChunkId(id_bytes), score));
         }
+        let doc_fetch_ms = doc_fetch_t.elapsed().as_millis();
+        tracing::info!(
+            mode = query_diag.mode,
+            docs = doc_count,
+            raw_terms = query_diag.raw_terms,
+            used_terms = query_diag.used_terms,
+            zero_df_terms = query_diag.zero_df_terms,
+            high_df_terms = query_diag.high_df_terms,
+            max_df = query_diag.max_df,
+            hits = out.len(),
+            parse_ms = parse_ms as u64,
+            df_ms = query_diag.df_ms,
+            search_ms = search_ms as u64,
+            doc_fetch_ms = doc_fetch_ms as u64,
+            total_ms = total_t.elapsed().as_millis() as u64,
+            "knowledge_sparse: tantivy timing",
+        );
         Ok(out)
     }
+
+    fn build_pruned_plain_query(
+        &self,
+        query_text: &str,
+        doc_count: u64,
+    ) -> Result<(Box<dyn Query>, SparseQueryDiag), BucketError> {
+        let mut analyzer = self
+            .index
+            .tokenizer_for_field(self.text_field)
+            .map_err(|e| BucketError::Other(format!("tantivy tokenizer_for_field: {e}")))?;
+        let mut stream = analyzer.token_stream(query_text);
+        let mut seen: HashSet<String> = HashSet::new();
+        let mut raw_terms = 0usize;
+        let mut terms = Vec::new();
+        while stream.advance() {
+            raw_terms += 1;
+            let text = stream.token().text.clone();
+            if seen.insert(text.clone()) {
+                terms.push(text);
+            }
+        }
+
+        if terms.is_empty() {
+            let parser = QueryParser::for_index(&self.index, vec![self.text_field]);
+            let query = parser
+                .parse_query(query_text)
+                .map_err(|e| BucketError::Other(format!("tantivy parse_query: {e}")))?;
+            return Ok((
+                query,
+                SparseQueryDiag {
+                    mode: "parser_empty_plain",
+                    raw_terms,
+                    used_terms: 0,
+                    zero_df_terms: 0,
+                    high_df_terms: 0,
+                    max_df: 0,
+                    df_ms: 0,
+                },
+            ));
+        }
+
+        let searcher = self.reader.searcher();
+        let mut term_stats = Vec::with_capacity(terms.len());
+        let mut zero_df_terms = 0usize;
+        let mut high_df_terms = 0usize;
+        let mut max_df = 0u64;
+        let df_t = Instant::now();
+        for term_text in terms {
+            let term = Term::from_field_text(self.text_field, &term_text);
+            let df = searcher
+                .doc_freq(&term)
+                .map_err(|e| BucketError::Other(format!("tantivy doc_freq: {e}")))?;
+            max_df = max_df.max(df);
+            if df == 0 {
+                zero_df_terms += 1;
+                continue;
+            }
+            let high_df = doc_count > 0 && (df as f32 / doc_count as f32) > HIGH_DF_RATIO;
+            if high_df {
+                high_df_terms += 1;
+            }
+            term_stats.push((term, df, high_df));
+        }
+        let df_ms = df_t.elapsed().as_millis() as u64;
+        term_stats.sort_by_key(|(_, df, _)| *df);
+
+        let mut selected: Vec<Term> = term_stats
+            .iter()
+            .filter(|(_, _, high_df)| !*high_df)
+            .take(MAX_PLAIN_QUERY_TERMS)
+            .map(|(term, _, _)| term.clone())
+            .collect();
+
+        // If every matching term is broad, keep the least-broad terms
+        // instead of falling back to a parser query over all broad terms.
+        if selected.is_empty() {
+            selected = term_stats
+                .iter()
+                .take(MAX_PLAIN_QUERY_TERMS.min(3))
+                .map(|(term, _, _)| term.clone())
+                .collect();
+        }
+
+        let used_terms = selected.len();
+        let query: Box<dyn Query> = match selected.len() {
+            0 => {
+                let parser = QueryParser::for_index(&self.index, vec![self.text_field]);
+                parser
+                    .parse_query(query_text)
+                    .map_err(|e| BucketError::Other(format!("tantivy parse_query: {e}")))?
+            }
+            1 => Box::new(TermQuery::new(
+                selected.remove(0),
+                IndexRecordOption::WithFreqs,
+            )),
+            _ => {
+                let term_queries: Vec<Box<dyn Query>> = selected
+                    .into_iter()
+                    .map(|term| {
+                        Box::new(TermQuery::new(term, IndexRecordOption::WithFreqs))
+                            as Box<dyn Query>
+                    })
+                    .collect();
+                let min_should = if term_queries.len() >= 4 { 2 } else { 1 };
+                Box::new(BooleanQuery::union_with_minimum_required_clauses(
+                    term_queries,
+                    min_should,
+                ))
+            }
+        };
+
+        Ok((
+            query,
+            SparseQueryDiag {
+                mode: "plain_pruned",
+                raw_terms,
+                used_terms,
+                zero_df_terms,
+                high_df_terms,
+                max_df,
+                df_ms,
+            },
+        ))
+    }
+}
+
+#[derive(Debug, Clone)]
+struct SparseQueryDiag {
+    mode: &'static str,
+    raw_terms: usize,
+    used_terms: usize,
+    zero_df_terms: usize,
+    high_df_terms: usize,
+    max_df: u64,
+    df_ms: u64,
+}
+
+fn looks_like_tantivy_syntax(query_text: &str) -> bool {
+    query_text.bytes().any(|b| {
+        matches!(
+            b,
+            b'"' | b':'
+                | b'+'
+                | b'-'
+                | b'('
+                | b')'
+                | b'['
+                | b']'
+                | b'{'
+                | b'}'
+                | b'*'
+                | b'~'
+                | b'^'
+        )
+    })
 }
 
 #[cfg(test)]
@@ -391,5 +599,23 @@ mod tests {
         // Unclosed quote — tantivy's parser rejects this.
         let res = index.search("\"unclosed", 5);
         assert!(res.is_err(), "expected parser error, got {res:?}");
+    }
+
+    #[test]
+    fn plain_query_pruning_keeps_rare_matching_terms() {
+        let id_common = ChunkId::from_source(&[1; 32], 0);
+        let id_needle = ChunkId::from_source(&[2; 32], 0);
+        let mut chunks = vec![(id_needle, "common filler needle")];
+        for i in 0..20 {
+            let id = ChunkId::from_source(&[3 + i as u8; 32], 0);
+            chunks.push((id, "common filler"));
+        }
+        let tmp = build_index_with(&chunks);
+        let index = open(&tmp);
+
+        let results = index.search("missing common needle", 5).unwrap();
+        assert!(!results.is_empty());
+        assert_eq!(results[0].0, id_needle);
+        assert!(!results.iter().any(|(id, _)| *id == id_common));
     }
 }

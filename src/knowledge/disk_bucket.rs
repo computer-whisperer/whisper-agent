@@ -2361,6 +2361,7 @@ impl Bucket for DiskBucket {
         _cancel: &'a CancellationToken,
     ) -> BoxFuture<'a, Result<Vec<Candidate>, BucketError>> {
         Box::pin(async move {
+            let total_t = std::time::Instant::now();
             let Some(active) = self.active_snapshot() else {
                 return Ok(Vec::new());
             };
@@ -2371,21 +2372,32 @@ impl Bucket for DiskBucket {
                 return Ok(Vec::new());
             };
 
-            let hits = sparse.search(query_text, top_k)?;
+            let query_owned = query_text.to_string();
+            let index_t = std::time::Instant::now();
+            let hits = tokio::task::spawn_blocking(move || sparse.search(&query_owned, top_k))
+                .await
+                .map_err(|e| BucketError::Other(format!("sparse search task: {e}")))??;
+            let index_ms = index_t.elapsed().as_millis();
             let tombstones = active.tombstones();
             let mut out = Vec::with_capacity(hits.len());
+            let raw_hits = hits.len();
+            let mut tombstoned_hits = 0usize;
+            let mut missing_hits = 0usize;
+            let hydrate_t = std::time::Instant::now();
             for (chunk_id, score) in hits {
                 // Tombstoned chunks may still be in tantivy until the
                 // delete-by-term path lands with the insert commit;
                 // until then the query-side filter is the source of
                 // truth.
                 if tombstones.contains(chunk_id) {
+                    tombstoned_hits += 1;
                     continue;
                 }
                 // Same skip-on-miss as the dense path: a tantivy
                 // commit may have outpaced the chunks-store snapshot
                 // by one batch. Resolve from base, fall back to delta.
                 let Some(chunk) = active.fetch_chunk_any(chunk_id).map_err(BucketError::Io)? else {
+                    missing_hits += 1;
                     continue;
                 };
                 out.push(Candidate {
@@ -2397,6 +2409,17 @@ impl Bucket for DiskBucket {
                     path: SearchPath::Sparse,
                 });
             }
+            tracing::info!(
+                bucket = %self.id,
+                index_ms = index_ms as u64,
+                hydrate_ms = hydrate_t.elapsed().as_millis() as u64,
+                total_ms = total_t.elapsed().as_millis() as u64,
+                raw_hits,
+                returned = out.len(),
+                tombstoned_hits,
+                missing_hits,
+                "knowledge_query: sparse hydrate timing",
+            );
             Ok(out)
         })
     }

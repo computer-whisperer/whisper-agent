@@ -27,7 +27,7 @@
 
 use std::collections::HashSet;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use tokio_util::sync::CancellationToken;
 
@@ -48,6 +48,12 @@ pub struct QueryParams {
     pub top_k_dense_per_bucket: usize,
     /// Per-bucket over-fetch on the sparse path.
     pub top_k_sparse_per_bucket: usize,
+    /// Skip sparse for non-lexical queries when dense already returns
+    /// at least this many candidates. Set to `0` to always run sparse.
+    pub skip_sparse_when_dense_hits_at_least: usize,
+    /// Optional per-bucket sparse budget. On timeout, keep dense hits
+    /// and log the timeout instead of blocking the whole query.
+    pub sparse_timeout_ms: Option<u64>,
 }
 
 impl Default for QueryParams {
@@ -56,6 +62,8 @@ impl Default for QueryParams {
             top_k: 10,
             top_k_dense_per_bucket: 16,
             top_k_sparse_per_bucket: 16,
+            skip_sparse_when_dense_hits_at_least: 8,
+            sparse_timeout_ms: Some(250),
         }
     }
 }
@@ -120,40 +128,33 @@ impl QueryEngine {
         let query_vec = self.embed_query(text, cancel).await?;
         let embed_ms = t_embed.elapsed().as_millis();
 
-        // Fan out per-bucket dense + sparse searches concurrently
-        // across all buckets, not just within a single bucket. With
-        // a pod-memory bucket (small, ms-latency) and a wikipedia
-        // bucket (HNSW search over millions of vectors, hundreds of
-        // ms) in scope at once, sequential iteration meant total
-        // latency = sum-of-per-bucket; parallel pulls it down to
-        // max-of-per-bucket. The dimension-mismatch tolerance
-        // (drop dense silently if dimensions disagree, keep sparse)
-        // is preserved per-bucket inside the closure.
+        // Fan out across buckets, but within each bucket run dense
+        // first. Dense is single-digit ms at enwiki scale, while
+        // sparse can be 600-2000ms for broad queries. This lets us
+        // skip sparse when dense already produced enough candidates
+        // and the query does not look like an exact lexical lookup.
+        // Dimension mismatch still falls through to sparse.
         use futures::future::join_all;
         let t_buckets = Instant::now();
+        let force_sparse = query_looks_lexical(text);
         let per_bucket: Vec<_> = buckets
             .iter()
             .map(|bucket| {
                 let qv = &query_vec;
                 let dense_k = params.top_k_dense_per_bucket;
                 let sparse_k = params.top_k_sparse_per_bucket;
+                let sparse_skip_threshold = params
+                    .skip_sparse_when_dense_hits_at_least
+                    .max(params.top_k);
+                let sparse_timeout_ms = params.sparse_timeout_ms;
                 let bucket_id = bucket.id().clone();
                 async move {
                     let t_dense = Instant::now();
-                    let dense_fut = async {
-                        let r = bucket.dense_search(qv, dense_k, cancel).await;
-                        (r, t_dense.elapsed().as_millis())
-                    };
-                    let t_sparse = Instant::now();
-                    let sparse_fut = async {
-                        let r = bucket.sparse_search(text, sparse_k, cancel).await;
-                        (r, t_sparse.elapsed().as_millis())
-                    };
-                    let ((dense_res, dense_ms), (sparse_res, sparse_ms)) =
-                        tokio::join!(dense_fut, sparse_fut);
                     let mut out: Vec<Candidate> = Vec::new();
                     let mut dense_hits = 0usize;
                     let mut dense_skipped = false;
+                    let dense_res = bucket.dense_search(qv, dense_k, cancel).await;
+                    let dense_ms = t_dense.elapsed().as_millis();
                     match dense_res {
                         Ok(cands) => {
                             dense_hits = cands.len();
@@ -167,14 +168,53 @@ impl QueryEngine {
                         }
                         Err(e) => return Err(e),
                     }
-                    let sparse_hits = match sparse_res {
-                        Ok(cands) => {
-                            let n = cands.len();
-                            out.extend(cands);
-                            n
+
+                    let mut sparse_hits = 0usize;
+                    let mut sparse_ms = 0u128;
+                    let mut sparse_skipped = false;
+                    let mut sparse_timed_out = false;
+                    let sparse_skip_reason: &'static str;
+
+                    let should_run_sparse = sparse_k > 0
+                        && (dense_skipped
+                            || force_sparse
+                            || sparse_skip_threshold == 0
+                            || dense_hits < sparse_skip_threshold);
+                    if should_run_sparse {
+                        sparse_skip_reason = "ran";
+                        let t_sparse = Instant::now();
+                        let sparse_fut = bucket.sparse_search(text, sparse_k, cancel);
+                        let sparse_res = if let Some(ms) = sparse_timeout_ms {
+                            match tokio::time::timeout(Duration::from_millis(ms), sparse_fut).await
+                            {
+                                Ok(r) => r,
+                                Err(_) => {
+                                    sparse_timed_out = true;
+                                    sparse_ms = t_sparse.elapsed().as_millis();
+                                    Ok(Vec::new())
+                                }
+                            }
+                        } else {
+                            sparse_fut.await
+                        };
+                        if !sparse_timed_out {
+                            sparse_ms = t_sparse.elapsed().as_millis();
                         }
-                        Err(e) => return Err(e),
-                    };
+                        match sparse_res {
+                            Ok(cands) => {
+                                sparse_hits = cands.len();
+                                out.extend(cands);
+                            }
+                            Err(e) => return Err(e),
+                        }
+                    } else {
+                        sparse_skipped = true;
+                        sparse_skip_reason = if sparse_k == 0 {
+                            "disabled_by_top_k"
+                        } else {
+                            "dense_sufficient"
+                        };
+                    }
                     tracing::info!(
                         bucket = %bucket_id,
                         dense_ms,
@@ -182,6 +222,10 @@ impl QueryEngine {
                         dense_hits,
                         sparse_hits,
                         dense_skipped,
+                        sparse_skipped,
+                        sparse_timed_out,
+                        sparse_skip_reason,
+                        force_sparse,
                         "knowledge_query: bucket search timing",
                     );
                     Ok::<Vec<Candidate>, BucketError>(out)
@@ -312,14 +356,30 @@ fn dedupe_candidates(candidates: Vec<Candidate>) -> Vec<Candidate> {
     out
 }
 
+fn query_looks_lexical(text: &str) -> bool {
+    if text
+        .bytes()
+        .any(|b| matches!(b, b'"' | b':' | b'_' | b'-' | b'/' | b'\\' | b'#' | b'@'))
+    {
+        return true;
+    }
+    text.split_whitespace().any(|token| {
+        token.chars().any(|c| c.is_ascii_digit())
+            || token.len() >= 20
+            || token.chars().any(|c| !c.is_alphanumeric() && c != '\'')
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashSet;
     use std::path::Path;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::*;
     use crate::knowledge::{
-        BucketId, ChunkId, Chunker, DiskBucket, MarkdownDir, SourceRecord, TokenBasedChunker,
+        BucketId, BucketStatus, Chunk, ChunkId, Chunker, DiskBucket, MarkdownDir, NewChunk,
+        SourceRecord, SourceRef, TokenBasedChunker,
     };
     use crate::providers::embedding::{
         BoxFuture as EmbedBoxFuture, EmbeddingError, EmbeddingModelInfo, EmbeddingResponse,
@@ -439,6 +499,114 @@ mod tests {
                     max_input_tokens: Some(512),
                 }])
             })
+        }
+    }
+
+    struct CountingBucket {
+        id: BucketId,
+        dense: Vec<Candidate>,
+        sparse: Vec<Candidate>,
+        sparse_calls: Arc<AtomicUsize>,
+    }
+
+    impl CountingBucket {
+        fn new(dense_count: usize, sparse_count: usize, sparse_calls: Arc<AtomicUsize>) -> Self {
+            let id = BucketId::server("counting");
+            let dense = (0..dense_count)
+                .map(|i| test_candidate(&id, i, SearchPath::Dense))
+                .collect();
+            let sparse = (0..sparse_count)
+                .map(|i| test_candidate(&id, 10_000 + i, SearchPath::Sparse))
+                .collect();
+            Self {
+                id,
+                dense,
+                sparse,
+                sparse_calls,
+            }
+        }
+    }
+
+    impl Bucket for CountingBucket {
+        fn id(&self) -> &BucketId {
+            &self.id
+        }
+
+        fn status(&self) -> BucketStatus {
+            BucketStatus::Ready
+        }
+
+        fn dense_search<'a>(
+            &'a self,
+            _query_vec: &'a [f32],
+            top_k: usize,
+            _cancel: &'a CancellationToken,
+        ) -> super::super::bucket::BoxFuture<'a, Result<Vec<Candidate>, BucketError>> {
+            Box::pin(async move { Ok(self.dense.iter().take(top_k).cloned().collect()) })
+        }
+
+        fn sparse_search<'a>(
+            &'a self,
+            _query_text: &'a str,
+            top_k: usize,
+            _cancel: &'a CancellationToken,
+        ) -> super::super::bucket::BoxFuture<'a, Result<Vec<Candidate>, BucketError>> {
+            Box::pin(async move {
+                self.sparse_calls.fetch_add(1, Ordering::SeqCst);
+                Ok(self.sparse.iter().take(top_k).cloned().collect())
+            })
+        }
+
+        fn fetch_chunk<'a>(
+            &'a self,
+            chunk_id: ChunkId,
+        ) -> super::super::bucket::BoxFuture<'a, Result<Chunk, BucketError>> {
+            Box::pin(async move {
+                Ok(Chunk {
+                    id: chunk_id,
+                    text: "unused".into(),
+                    source_ref: SourceRef {
+                        source_id: "unused".into(),
+                        locator: None,
+                    },
+                })
+            })
+        }
+
+        fn insert<'a>(
+            &'a self,
+            _new_chunks: Vec<NewChunk>,
+            _cancel: &'a CancellationToken,
+        ) -> super::super::bucket::BoxFuture<'a, Result<Vec<ChunkId>, BucketError>> {
+            Box::pin(async move { Ok(Vec::new()) })
+        }
+
+        fn tombstone<'a>(
+            &'a self,
+            _chunk_ids: Vec<ChunkId>,
+        ) -> super::super::bucket::BoxFuture<'a, Result<(), BucketError>> {
+            Box::pin(async move { Ok(()) })
+        }
+
+        fn compact<'a>(
+            &'a self,
+            _cancel: &'a CancellationToken,
+        ) -> super::super::bucket::BoxFuture<'a, Result<(), BucketError>> {
+            Box::pin(async move { Ok(()) })
+        }
+    }
+
+    fn test_candidate(bucket_id: &BucketId, ordinal: usize, path: SearchPath) -> Candidate {
+        Candidate {
+            bucket_id: bucket_id.clone(),
+            chunk_id: ChunkId::from_source(&[ordinal as u8; 32], ordinal as u64),
+            chunk_text: format!("semantic retrieval candidate {ordinal}"),
+            source_ref: SourceRef {
+                source_id: format!("doc-{ordinal}"),
+                locator: None,
+            },
+            source_score: ordinal as f32,
+            path,
         }
     }
 
@@ -678,6 +846,60 @@ embedder = "tei_test"
             "expected ≤5 results, got {}",
             results.len()
         );
+    }
+
+    #[tokio::test]
+    async fn plain_query_skips_sparse_when_dense_is_sufficient() {
+        let embedder: Arc<dyn EmbeddingProvider> = Arc::new(MockEmbedder::new(4));
+        let reranker: Arc<dyn RerankProvider> = Arc::new(MockReranker);
+        let engine = QueryEngine::new(embedder, reranker);
+        let sparse_calls = Arc::new(AtomicUsize::new(0));
+        let bucket: Arc<dyn Bucket> = Arc::new(CountingBucket::new(8, 3, sparse_calls.clone()));
+        let cancel = CancellationToken::new();
+
+        let results = engine
+            .query(
+                &[bucket],
+                "plain semantic query",
+                &QueryParams {
+                    top_k: 5,
+                    skip_sparse_when_dense_hits_at_least: 8,
+                    ..QueryParams::default()
+                },
+                &cancel,
+            )
+            .await
+            .unwrap();
+
+        assert!(!results.is_empty());
+        assert_eq!(sparse_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn lexical_query_runs_sparse_even_when_dense_is_sufficient() {
+        let embedder: Arc<dyn EmbeddingProvider> = Arc::new(MockEmbedder::new(4));
+        let reranker: Arc<dyn RerankProvider> = Arc::new(MockReranker);
+        let engine = QueryEngine::new(embedder, reranker);
+        let sparse_calls = Arc::new(AtomicUsize::new(0));
+        let bucket: Arc<dyn Bucket> = Arc::new(CountingBucket::new(8, 3, sparse_calls.clone()));
+        let cancel = CancellationToken::new();
+
+        let results = engine
+            .query(
+                &[bucket],
+                "doc_123",
+                &QueryParams {
+                    top_k: 5,
+                    skip_sparse_when_dense_hits_at_least: 8,
+                    ..QueryParams::default()
+                },
+                &cancel,
+            )
+            .await
+            .unwrap();
+
+        assert!(!results.is_empty());
+        assert_eq!(sparse_calls.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
