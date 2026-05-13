@@ -71,14 +71,16 @@ console_error_panic_hook = "0.1"
 # bundled equivalent so we wire it explicitly.
 console_log = "1"
 js-sys = "0.3"
-# Browser wgpu host stack. `aetna-wgpu` owns the Runner / MsaaTarget;
-# `wgpu` with `webgl` features picks up the browser backends; winit
-# drives the canvas-bound event loop. ResizeObserver wiring lives in
-# our own `web_entry` module since aetna doesn't expose a reusable
-# browser host the way `aetna-winit-wgpu` does for native.
-aetna-wgpu = "0.3.2"
-wgpu = { version = "29", features = ["webgl"] }
-winit = "0.30"
+# Reusable wgpu+winit browser host for Aetna apps. `aetna-web`
+# parameterizes its `Host<A: App>` and exposes `start_with_config` +
+# a `WebHandle::request_redraw` shim, so `web_entry.rs` only carries
+# whisper-agent-specific glue (WebSocket, drag-drop files, image-paste)
+# instead of the full wgpu/winit bootstrap. The aetna-side fix for
+# this lives at https://github.com/computer-whisperer/aetna/issues/28
+# / commit 03cb02c "Make aetna-web reusable". When the upstream cuts
+# a new release we bump the pin; until then `[patch.crates-io]` in
+# the workspace root overlays the sibling worktree.
+aetna-web = "0.3.3"
 web-sys = { version = "0.3", features = [
     "WebSocket",
     "MessageEvent",
