@@ -200,13 +200,7 @@ impl ModelProvider for LlamaCppClient {
     }
 
     fn capabilities_for(&self, model_id: &str) -> whisper_agent_protocol::ContentCapabilities {
-        // Delegate to the wrapped OpenAI-shaped client. Today this
-        // returns text-only for every llama.cpp model id (the OpenAI
-        // heuristic doesn't match `llama-3`, `qwen-vl`, etc.) so
-        // vision-capable local models won't see `view_image`. Refining
-        // this is a config-side concern — we'll need the user to
-        // declare per-model capabilities in the backend config.
-        self.inner.capabilities_for(model_id)
+        llamacpp_capabilities_for(model_id)
     }
 
     fn list_models<'a>(&'a self) -> BoxFuture<'a, Result<Vec<ModelInfo>, ModelError>> {
@@ -221,9 +215,115 @@ impl ModelProvider for LlamaCppClient {
                     m.context_window = Some(n_ctx);
                 }
             }
+            for m in &mut models {
+                m.capabilities = llamacpp_capabilities_for(&m.id);
+            }
             Ok(models)
         })
     }
+}
+
+/// Best-effort capability lookup for llama.cpp model ids.
+///
+/// llama.cpp serves multimodal input through the OpenAI-compatible
+/// `/v1/chat/completions` shape when the loaded model has a matching
+/// multimodal projector. Its `/v1/models` payload is still just a
+/// model id, so the scheduler has no reliable in-band capability bit
+/// to consult while assembling the tool list. Keep OpenAI aliases
+/// working first, then recognize common GGUF vision-family names so
+/// local VLMs receive media tools such as `view_image`.
+fn llamacpp_capabilities_for(model_id: &str) -> whisper_agent_protocol::ContentCapabilities {
+    let openai_caps = crate::providers::model::openai_vision_capabilities(model_id);
+    if !openai_caps.input.image.is_empty() || !openai_caps.input.document.is_empty() {
+        return llamacpp_vision_capabilities();
+    }
+
+    if looks_like_llamacpp_vision_model(model_id) {
+        llamacpp_vision_capabilities()
+    } else {
+        whisper_agent_protocol::ContentCapabilities::default()
+    }
+}
+
+fn llamacpp_vision_capabilities() -> whisper_agent_protocol::ContentCapabilities {
+    whisper_agent_protocol::ContentCapabilities {
+        input: whisper_agent_protocol::MediaSupport::standard_image_input(),
+        output: whisper_agent_protocol::MediaSupport::default(),
+    }
+}
+
+fn looks_like_llamacpp_vision_model(model_id: &str) -> bool {
+    let lower = model_id.to_ascii_lowercase();
+    let normalized: String = lower
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect();
+    let compact: String = lower
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .collect();
+
+    // Gemma 4 is natively multimodal. Gemma 3 vision checkpoints are
+    // the 4B+ family; the 1B checkpoint is text-only, so avoid a broad
+    // `gemma-3` match.
+    if normalized.contains("gemma-4")
+        || compact.contains("gemma4")
+        || normalized.contains("gemma-3n")
+        || compact.contains("gemma3n")
+        || normalized.contains("gemma-3-4b")
+        || normalized.contains("gemma-3-12b")
+        || normalized.contains("gemma-3-27b")
+        || compact.contains("gemma34b")
+        || compact.contains("gemma312b")
+        || compact.contains("gemma327b")
+    {
+        return true;
+    }
+
+    const NEEDLES: &[&str] = &[
+        "llava",
+        "bakllava",
+        "moondream",
+        "minicpm-v",
+        "minicpmv",
+        "internvl",
+        "pixtral",
+        "smolvlm",
+        "idefics",
+        "cogvlm",
+        "deepseek-vl",
+        "deepseekvl",
+        "glm-4v",
+        "glm4v",
+        "qwen-vl",
+        "qwenvl",
+        "qwen2-vl",
+        "qwen2vl",
+        "qwen2-5-vl",
+        "qwen25vl",
+        "qwen3-vl",
+        "qwen3vl",
+        "qwen2-5-omni",
+        "qwen25omni",
+        "llama-3-2-vision",
+        "llama32vision",
+        "llama-4-scout",
+        "llama4scout",
+        "llama-4-maverick",
+        "llama4maverick",
+        "phi-3-vision",
+        "phi3vision",
+        "phi-3-5-vision",
+        "phi35vision",
+        "yi-vl",
+        "yivl",
+        "lfm2-vl",
+        "lfm2vl",
+    ];
+
+    NEEDLES
+        .iter()
+        .any(|needle| normalized.contains(needle) || compact.contains(needle))
 }
 
 impl LlamaCppClient {
@@ -392,5 +492,24 @@ mod tests {
         let slots: Vec<SlotInfo> = serde_json::from_str("[]").unwrap();
         let warned = AtomicBool::new(false);
         assert_eq!(pick_n_decoded(&slots, &warned), None);
+    }
+
+    #[test]
+    fn capabilities_mark_gemma_4_as_vision() {
+        let caps = llamacpp_capabilities_for("ggml-org/gemma-4-E4B-it-GGUF");
+        assert!(!caps.input.image.is_empty());
+        assert!(caps.input.document.is_empty());
+    }
+
+    #[test]
+    fn capabilities_do_not_mark_text_only_local_ids_as_vision() {
+        let caps = llamacpp_capabilities_for("qwen2.5-coder-7b");
+        assert!(caps.input.image.is_empty());
+    }
+
+    #[test]
+    fn capabilities_keep_openai_vision_aliases_working() {
+        let caps = llamacpp_capabilities_for("gpt-4o");
+        assert!(!caps.input.image.is_empty());
     }
 }

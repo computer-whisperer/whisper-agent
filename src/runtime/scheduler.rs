@@ -119,6 +119,20 @@ struct BoundMcp<'a> {
     source_name: String,
 }
 
+fn tool_requires_image_input(name: &str) -> bool {
+    matches!(
+        name,
+        "view_image"
+            | "save_image"
+            | crate::tools::builtin_tools::LIST_IMAGES
+            | crate::tools::builtin_tools::RECALL_IMAGE
+    )
+}
+
+fn tool_requires_document_input(name: &str) -> bool {
+    name == "view_pdf"
+}
+
 /// Snapshot of a pod's on-disk directory + parsed config + behavior ids.
 /// Cloned out of the scheduler when dispatching a builtin tool future so
 /// the future doesn't need a back-borrow of scheduler state.
@@ -1741,12 +1755,12 @@ impl Scheduler {
         // The runtime side of "MCP has no in-band signal for whether
         // the client model accepts image / document input": ask the
         // bound provider synchronously what the active model can
-        // consume, then drop media-producing tools (`view_image`,
-        // `view_pdf`) from the advertised set when the answer is
-        // "nothing". Belt-and-suspenders only — even if a tool sneaks
-        // through, the MCP media content the runtime surfaces back is
-        // structurally inert for a text-only model; the filter is
-        // purely to keep the model from trying.
+        // consume, then drop media tools (`view_image`, `list_images`,
+        // `recall_image`, `save_image`, `view_pdf`) from the advertised
+        // set when the answer is "nothing". Belt-and-suspenders only
+        // — even if a tool sneaks through, media content the runtime
+        // surfaces back is structurally inert for a text-only model;
+        // the filter is purely to keep the model from trying.
         let active_caps = self
             .backends
             .get(&task.bindings.backend)
@@ -1762,6 +1776,9 @@ impl Scheduler {
         };
 
         for tool in crate::tools::builtin_tools::descriptors() {
+            if tool_requires_image_input(&tool.name) && !model_takes_images {
+                continue;
+            }
             // `sudo` is only meaningful with an interactive approver
             // attached. Autonomous threads hide the tool entirely — no
             // use listing a tool whose calls would go nowhere.
@@ -1788,14 +1805,14 @@ impl Scheduler {
 
         for bound in self.bound_mcp_hosts(thread_id) {
             for tool in &bound.entry.tools {
-                // Hide media-producing tools from models that can't
-                // ingest the matching modality. Tools still live in
-                // the host catalog and dispatch if invoked — this
-                // filter is just to keep them out of sight.
-                if !model_takes_images && tool.name == "view_image" {
+                // Hide media tools from models that can't ingest the
+                // matching modality. Tools still live in the host
+                // catalog and dispatch if invoked — this filter is
+                // just to keep them out of sight.
+                if tool_requires_image_input(&tool.name) && !model_takes_images {
                     continue;
                 }
-                if !model_takes_documents && tool.name == "view_pdf" {
+                if tool_requires_document_input(&tool.name) && !model_takes_documents {
                     continue;
                 }
                 let public_name = match bound.prefix {
@@ -1854,10 +1871,10 @@ impl Scheduler {
                 continue;
             };
             for tool in &handle.capabilities().tools {
-                if !model_takes_images && tool.name == "view_image" {
+                if tool_requires_image_input(&tool.name) && !model_takes_images {
                     continue;
                 }
-                if !model_takes_documents && tool.name == "view_pdf" {
+                if tool_requires_document_input(&tool.name) && !model_takes_documents {
                     continue;
                 }
                 let public_name = format!("{name}_{}", tool.name);
@@ -4298,6 +4315,34 @@ async fn connect_shared_mcp_on_boot(
         .map(|t| (t.name.clone(), t.annotations.clone()))
         .collect();
     resources.populate_mcp_tools(&id, tools, annotations);
+}
+
+#[cfg(test)]
+mod media_tool_gate_tests {
+    use super::*;
+
+    #[test]
+    fn image_gate_covers_builtin_and_host_image_tools() {
+        for name in [
+            "view_image",
+            "save_image",
+            crate::tools::builtin_tools::LIST_IMAGES,
+            crate::tools::builtin_tools::RECALL_IMAGE,
+        ] {
+            assert!(
+                tool_requires_image_input(name),
+                "{name} should be image-gated"
+            );
+        }
+    }
+
+    #[test]
+    fn document_gate_is_separate_from_image_gate() {
+        assert!(tool_requires_document_input("view_pdf"));
+        assert!(!tool_requires_image_input("view_pdf"));
+        assert!(!tool_requires_image_input("read_file"));
+        assert!(!tool_requires_document_input("view_image"));
+    }
 }
 
 #[cfg(test)]
