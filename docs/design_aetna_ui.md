@@ -928,6 +928,26 @@ Vec<SharedMcpHostInfo>` and `buckets: Vec<BucketSummary>`, both
 hydrated from `ClientToServer::List{SharedMcpHosts,Buckets}` at
 boot (mirrors the existing `ListPods` / `ListBackends` arms).
 
+**Pod editor — host-env entry editor (landed):** fills the
+remaining structured Allow-tab gap from the egui pod editor.
+The Allow tab now lists `[[allow.host_env]]` entries with
+name / provider / type / summary rows plus Add / Edit / Delete
+actions. Add/Edit opens a centered sub-modal staged on
+`PodEditorSheetState::host_env_editor`; Save validates required
+name/provider and duplicate names before writing back to
+`working_config.allow.host_env`. Deleting an entry also removes
+that name from `thread_defaults.host_env`, reseeding the first
+remaining allow entry when needed so the structured form stays
+valid before the server sees it.
+
+The sub-modal covers both current `HostEnvSpec` variants:
+Landlock exposes allowed paths with read-only/read-write access
+and the shared network-policy editor; Container exposes image,
+mounts, network, optional cpus/memory/timeout limits, and env
+vars. Provider names are free-text because v2 provider admission
+lives in server `[[auth.daemons]]`; the Server Config tab remains
+the admin surface for editing those daemon entries.
+
 Multi-checks use a custom `checkbox_column` helper rather than
 aetna's `toggle_group_multi`, since the latter doesn't wrap and
 the 360px sheet width truncates 4+ items. The helper renders a
@@ -1341,10 +1361,11 @@ trivial / small / medium / large.
   (file tree → expand → click `prompt.md` → Prompt tab
   active). `behaviors/<id>/system_prompt.md` falls through to
   the generic text editor in egui too — not a parity gap.
-- ✅ **Server settings.** All three tabs of the egui sibling's
-  modal landed: LLM backends (catalog + per-`chatgpt_subscription`
-  Codex auth rotate sub-form), Shared MCP (CRUD), and admin-only
-  raw editor for `whisper-agent.toml`.
+- ✅ **Server settings.** Four operational tabs have landed in the
+  Aetna modal: LLM backends (catalog + per-`chatgpt_subscription`
+  Codex auth rotate sub-form), Host env (v2 daemon registry),
+  Shared MCP (CRUD), and admin-only raw editor for
+  `whisper-agent.toml`.
 
   Entry point is a `settings` icon-button in the sidebar footer
   (next to the server-URL line, since server settings aren't
@@ -1353,7 +1374,9 @@ trivial / small / medium / large.
   `active_tab` plus per-tab slots — `server_config`
   (lazy-fetched), `codex_rotate` + `codex_rotate_banner`,
   `shared_mcp_editor` + `shared_mcp_banner` +
-  `shared_mcp_remove_armed`.
+  `shared_mcp_remove_armed`; the daemon registry itself lives on
+  `ChatApp::host_env_daemons` because it is hydrated by the
+  shared request/response tier.
 
   Backends tab: per-backend cards (alias + kind row, optional
   default-model / auth-mode chips). `chatgpt_subscription` rows
@@ -1364,6 +1387,21 @@ trivial / small / medium / large.
   closes the form and stamps the success banner above the catalog.
   Correlation-matching `Error` surfaces inline so the operator
   can fix the paste without retyping.
+
+  Host env tab: read-only v2 registry inspection. The client sends
+  `ListHostEnvDaemons` on connect, on settings open, on tab switch,
+  and from the Refresh button. The server snapshots
+  `LiveDaemonRegistry` into name-sorted `HostEnvDaemonSummary`
+  rows covering both admitted names from `[[auth.daemons]]` and
+  currently connected `/v1/host_env_link` handles. Connected rows
+  show daemon/protocol version, advertised spec kinds, max sessions,
+  background-task support, last activity, and a tool-name preview;
+  offline rows make the configured-but-not-connected state visible.
+  There is deliberately no resurrected v1 provider CRUD/provision
+  modal here: in v2, new provider capacity is admitted in Server
+  config and becomes usable when an external host daemon connects
+  with the matching name/token. On-demand daemon spawning remains
+  outside the current protocol surface.
 
   Shared MCP tab: a "+ Add host" button + scrolled list of host
   rows, each with name + origin chip + connected indicator + URL +
@@ -1402,6 +1440,7 @@ trivial / small / medium / large.
   text_area.
 
   Bundle scenes: `SettingsBackends` (read-only catalog),
+  `SettingsHostEnv` (connected + offline daemon registry),
   `SettingsServerConfig` (text_area populated via synthesized
   `ServerConfigFetched`), `SettingsCodexRotate` (sub-form open
   over a `chatgpt_subscription` backend),

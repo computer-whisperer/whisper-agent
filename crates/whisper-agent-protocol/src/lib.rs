@@ -714,6 +714,33 @@ impl ResourceSnapshot {
     }
 }
 
+/// One v2 host-env daemon entry as seen by the scheduler.
+///
+/// `admitted` reflects `[[auth.daemons]]`; `connected` reflects a
+/// currently-open `/v1/host_env_link` WebSocket. Capability fields are
+/// present only for connected daemons because the scheduler learns them
+/// during the daemon handshake.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct HostEnvDaemonSummary {
+    pub name: String,
+    pub admitted: bool,
+    pub connected: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub daemon_version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub protocol_version: Option<u32>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub spec_kinds: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tools: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_concurrent_sessions: Option<u32>,
+    #[serde(default)]
+    pub supports_background_tasks: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_active_ms_ago: Option<u64>,
+}
+
 /// Full per-task snapshot. Sent in response to a `SubscribeToThread` so the client can
 /// render the entire conversation from a cold start.
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -1270,6 +1297,14 @@ pub enum ClientToServer {
     /// Enumerate shared-MCP-host catalog entries. Server responds with
     /// `SharedMcpHostsList`.
     ListSharedMcpHosts {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        correlation_id: Option<String>,
+    },
+
+    /// Enumerate v2 host-env daemons admitted by `[[auth.daemons]]`
+    /// and any currently connected daemon handles. Server responds
+    /// with `HostEnvDaemonsList`.
+    ListHostEnvDaemons {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         correlation_id: Option<String>,
     },
@@ -1995,6 +2030,13 @@ pub enum ServerToClient {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         correlation_id: Option<String>,
         hosts: Vec<SharedMcpHostInfo>,
+    },
+    /// Snapshot response to `ListHostEnvDaemons`. Entries in
+    /// name-sorted order.
+    HostEnvDaemonsList {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        correlation_id: Option<String>,
+        daemons: Vec<HostEnvDaemonSummary>,
     },
     /// Successful response to `AddSharedMcpHost`. Broadcast so every
     /// connected client's view stays in sync without re-fetching the

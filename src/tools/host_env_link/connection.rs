@@ -129,7 +129,7 @@ pub(super) async fn run_connection(
     registry: Arc<LiveDaemonRegistry>,
 ) {
     let (mut sink, mut stream) = socket.split();
-    let capabilities = match handshake(&name, &mut sink, &mut stream).await {
+    let handshake = match handshake(&name, &mut sink, &mut stream).await {
         Ok(c) => c,
         Err(e) => {
             warn!(daemon = %name, error = %e, "host-env link handshake failed");
@@ -140,7 +140,9 @@ pub(super) async fn run_connection(
     let (cmd_tx, cmd_rx) = mpsc::channel::<Command>(COMMAND_CHANNEL_BOUND);
     let handle = Arc::new(LiveDaemonHandle {
         name: name.clone(),
-        capabilities,
+        daemon_version: handshake.daemon_version,
+        protocol_version: handshake.protocol_version,
+        capabilities: handshake.capabilities,
         cmd_tx,
         next_session_seq: AtomicU64::new(1),
         last_active_at_ms: AtomicI64::new(unix_millis_now()),
@@ -197,7 +199,7 @@ async fn handshake(
     name: &str,
     sink: &mut SplitSink<WebSocket, Message>,
     stream: &mut SplitStream<WebSocket>,
-) -> anyhow::Result<DaemonCapabilities> {
+) -> anyhow::Result<HandshakeInfo> {
     let frame = recv_frame(stream)
         .await?
         .ok_or_else(|| anyhow!("daemon closed before sending Hello"))?;
@@ -250,7 +252,17 @@ async fn handshake(
         protocol_version = daemon_proto_version,
         "v2 host-env daemon authenticated"
     );
-    Ok(capabilities)
+    Ok(HandshakeInfo {
+        daemon_version,
+        protocol_version: daemon_proto_version,
+        capabilities,
+    })
+}
+
+struct HandshakeInfo {
+    daemon_version: String,
+    protocol_version: u32,
+    capabilities: DaemonCapabilities,
 }
 
 async fn event_loop(

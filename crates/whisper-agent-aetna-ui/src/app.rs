@@ -44,7 +44,8 @@
 //! the rest drop on the floor.
 
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::hash::{Hash, Hasher};
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -54,16 +55,20 @@ use aetna_core::prelude::*;
 use aetna_core::selection::SelectionSource;
 use aetna_core::widgets::resize_handle::{self, ResizeDrag, Side};
 use aetna_core::widgets::select::{SelectAction, classify_event as classify_select_event};
+use whisper_agent_protocol::sandbox::{
+    AccessMode, HostEnvSpec, Mount, NetworkPolicy, PathAccess, ResourceLimits,
+};
 use whisper_agent_protocol::{
     ActivationSurface, AllowMap, Attachment, BackendSummary, BehaviorConfig, BehaviorSummary,
     BehaviorThreadOverride, BucketBuildOutcome, BucketBuildPhase, BucketCreateInput,
     BucketSourceInput, BucketSummary, CatchUp, ClientToServer, ContentBlock, CoreTools,
-    Disposition, EmbeddingProviderInfo, FsEntry, HostEnvBindingRequest, ImageMime, ImageSource,
-    InitialListing, ModelSummary, NamedHostEnv, Overlap, PodAllow, PodConfig, PodLimits,
-    PodSummary, QuantizationInput, RetentionPolicy, Role, ServerToClient, SharedMcpAuthInput,
-    SharedMcpAuthPublic, SharedMcpHostInfo, SharedMcpPrefixInput, SlotStateLabel,
-    SystemPromptChoice, ThreadBindingsRequest, ThreadConfigOverride, ThreadDefaults, ThreadSummary,
-    TrackedCadenceInput, TrackedDriverInput, TriggerSpec, permission::SudoDecision,
+    Disposition, EmbeddingProviderInfo, FsEntry, HostEnvBindingRequest, HostEnvDaemonSummary,
+    ImageMime, ImageSource, InitialListing, ModelSummary, NamedHostEnv, Overlap, PodAllow,
+    PodConfig, PodLimits, PodSummary, QuantizationInput, RetentionPolicy, Role, ServerToClient,
+    SharedMcpAuthInput, SharedMcpAuthPublic, SharedMcpHostInfo, SharedMcpPrefixInput,
+    SlotStateLabel, SystemPromptChoice, ThreadBindingsRequest, ThreadConfigOverride,
+    ThreadDefaults, ThreadSummary, TrackedCadenceInput, TrackedDriverInput, TriggerSpec,
+    permission::SudoDecision,
 };
 
 /// Inbound event variants the host shell pushes into the [`Inbound`]
@@ -962,8 +967,9 @@ const QUANTIZATION_CHOICES: [QuantizationChoice; 3] = [
     QuantizationChoice::Int8,
 ];
 
-/// Server-settings modal state. Three tabs: LLM backends (catalog
-/// plus Codex rotate), Shared MCP (CRUD), Server config (raw TOML).
+/// Server-settings modal state. Tabs: LLM backends (catalog plus
+/// Codex rotate), host-env daemons (read-only live registry), Shared
+/// MCP (CRUD), Server config (raw TOML).
 /// Mutation paths are admin-only server-side; non-admin connections
 /// receive an `Error` reply that the per-tab banner surfaces.
 #[derive(Default)]
@@ -1095,6 +1101,11 @@ const OAUTH_AVAILABLE: bool = false;
 enum SettingsTab {
     #[default]
     Backends,
+    /// V2 host-env daemon registry. Provider admission lives in
+    /// `[[auth.daemons]]`; live capability data comes from currently
+    /// connected `/v1/host_env_link` daemons. Runtime provisioning is
+    /// intentionally not a separate client-side CRUD surface in v2.
+    HostEnv,
     /// Shared MCP hosts catalog. Admin-only mutation paths
     /// (`AddSharedMcpHost` / `UpdateSharedMcpHost` /
     /// `RemoveSharedMcpHost`); read tier (`SharedMcpHostsList`) is
@@ -1113,6 +1124,7 @@ impl SettingsTab {
     fn label(self) -> &'static str {
         match self {
             SettingsTab::Backends => "LLM backends",
+            SettingsTab::HostEnv => "Host env",
             SettingsTab::SharedMcp => "Shared MCP",
             SettingsTab::ServerConfig => "Server config",
         }
@@ -1121,6 +1133,7 @@ impl SettingsTab {
     fn wire_value(self) -> &'static str {
         match self {
             SettingsTab::Backends => "backends",
+            SettingsTab::HostEnv => "host-env",
             SettingsTab::SharedMcp => "shared-mcp",
             SettingsTab::ServerConfig => "server-config",
         }
@@ -1129,6 +1142,7 @@ impl SettingsTab {
     fn from_wire(raw: &str) -> Option<Self> {
         match raw {
             "backends" => Some(SettingsTab::Backends),
+            "host-env" => Some(SettingsTab::HostEnv),
             "shared-mcp" => Some(SettingsTab::SharedMcp),
             "server-config" => Some(SettingsTab::ServerConfig),
             _ => None,
@@ -1589,6 +1603,11 @@ pub struct ChatApp {
     /// Allow tab (multi-check over names) and the behavior editor's
     /// scope tab (resource list narrowing).
     shared_mcp_hosts: Vec<whisper_agent_protocol::SharedMcpHostInfo>,
+    /// V2 host-env daemon registry. Populated from
+    /// `HostEnvDaemonsList`; surfaced in Server settings so operators
+    /// can distinguish configured-but-offline providers from connected
+    /// daemons and inspect their advertised capabilities.
+    host_env_daemons: Vec<HostEnvDaemonSummary>,
     /// Knowledge-bucket catalog. Populated from `BucketsList`. Read
     /// by the pod editor's Allow tab (multi-check over names).
     buckets: Vec<whisper_agent_protocol::BucketSummary>,
@@ -1832,6 +1851,72 @@ impl NewBehaviorModalState {
             name: String::new(),
             error: None,
             pending_correlation: None,
+        }
+    }
+}
+
+/// Sub-modal state for editing one `[[allow.host_env]]` entry from
+/// the pod editor's Allow tab. The edited entry is staged here until
+/// Save validates name/provider uniqueness, then it is written back
+/// into `PodEditorSheetState.working_config`.
+pub(crate) struct HostEnvEntryEditorState {
+    pub(crate) index: Option<usize>,
+    pub(crate) entry: NamedHostEnv,
+    pub(crate) error: Option<String>,
+    pub(crate) limits_cpus_buf: String,
+    pub(crate) limits_memory_buf: String,
+    pub(crate) limits_timeout_buf: String,
+}
+
+impl HostEnvEntryEditorState {
+    fn new_for_index(index: usize, entry: NamedHostEnv) -> Self {
+        let mut state = Self {
+            index: Some(index),
+            entry,
+            error: None,
+            limits_cpus_buf: String::new(),
+            limits_memory_buf: String::new(),
+            limits_timeout_buf: String::new(),
+        };
+        state.sync_limit_buffers();
+        state
+    }
+
+    fn new_for_add() -> Self {
+        Self {
+            index: None,
+            entry: NamedHostEnv {
+                name: String::new(),
+                provider: String::new(),
+                spec: HostEnvSpec::Landlock {
+                    allowed_paths: Vec::new(),
+                    network: NetworkPolicy::default(),
+                },
+            },
+            error: None,
+            limits_cpus_buf: String::new(),
+            limits_memory_buf: String::new(),
+            limits_timeout_buf: String::new(),
+        }
+    }
+
+    fn sync_limit_buffers(&mut self) {
+        if let HostEnvSpec::Container { limits, .. } = &self.entry.spec {
+            self.limits_cpus_buf = limits
+                .as_ref()
+                .and_then(|l| l.cpus)
+                .map(|v| v.to_string())
+                .unwrap_or_default();
+            self.limits_memory_buf = limits
+                .as_ref()
+                .and_then(|l| l.memory_mb)
+                .map(|v| v.to_string())
+                .unwrap_or_default();
+            self.limits_timeout_buf = limits
+                .as_ref()
+                .and_then(|l| l.timeout_s)
+                .map(|v| v.to_string())
+                .unwrap_or_default();
         }
     }
 }
@@ -2405,6 +2490,8 @@ pub(crate) struct PodEditorSheetState {
     /// `core_tools` is `Named`; toggling to `All` leaves the buffer
     /// alone so a user's draft survives the round-trip.
     pub(crate) tool_surface_named_buf: String,
+    /// Sub-modal for adding/editing one `[[allow.host_env]]` entry.
+    pub(crate) host_env_editor: Option<HostEnvEntryEditorState>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2504,6 +2591,7 @@ impl PodEditorSheetState {
             max_turns_buf: String::new(),
             max_concurrent_threads_buf: String::new(),
             tool_surface_named_buf: String::new(),
+            host_env_editor: None,
         }
     }
 
@@ -2661,6 +2749,7 @@ impl ChatApp {
             delete_armed_behavior: None,
             backends: Vec::new(),
             shared_mcp_hosts: Vec::new(),
+            host_env_daemons: Vec::new(),
             buckets: Vec::new(),
             embedding_providers: Vec::new(),
             models_by_backend: HashMap::new(),
@@ -2778,6 +2867,9 @@ impl ChatApp {
                     // tabs. Cheap on the server side; both replies
                     // are pure registry reads with no I/O.
                     self.send(ClientToServer::ListSharedMcpHosts {
+                        correlation_id: None,
+                    });
+                    self.send(ClientToServer::ListHostEnvDaemons {
                         correlation_id: None,
                     });
                     self.send(ClientToServer::ListBuckets {
@@ -3163,6 +3255,9 @@ impl ChatApp {
             }
             ServerToClient::SharedMcpHostsList { hosts, .. } => {
                 self.shared_mcp_hosts = hosts;
+            }
+            ServerToClient::HostEnvDaemonsList { daemons, .. } => {
+                self.host_env_daemons = daemons;
             }
             ServerToClient::SharedMcpHostAdded {
                 host,
@@ -4408,7 +4503,13 @@ impl App for ChatApp {
                 }
                 if matches!(tab, SettingsTab::ServerConfig) {
                     self.ensure_server_config_fetched();
+                } else if matches!(tab, SettingsTab::HostEnv) {
+                    self.request_host_env_daemons();
                 }
+                return;
+            }
+            if event.is_click_or_activate(SETTINGS_HOST_ENV_REFRESH_KEY) {
+                self.request_host_env_daemons();
                 return;
             }
             if event.target_key() == Some(SETTINGS_SERVER_CONFIG_BODY_KEY) {
@@ -5357,6 +5458,93 @@ fn chat_user_row_key(idx: usize) -> String {
     format!("chat:user-row:{idx}")
 }
 
+fn chat_virtual_row_key(_idx: usize, item: &DisplayItem) -> String {
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    let kind = match item {
+        DisplayItem::User { text, msg_index } => {
+            msg_index.hash(&mut h);
+            text.hash(&mut h);
+            "user"
+        }
+        DisplayItem::Assistant { text } => {
+            text.hash(&mut h);
+            "assistant"
+        }
+        DisplayItem::Reasoning { text } => {
+            text.hash(&mut h);
+            "reasoning"
+        }
+        DisplayItem::SetupPrompt { text } => {
+            text.hash(&mut h);
+            "setup-prompt"
+        }
+        DisplayItem::SetupTools { entries } => {
+            for entry in entries {
+                entry.name.hash(&mut h);
+                entry.description.hash(&mut h);
+            }
+            "setup-tools"
+        }
+        DisplayItem::ToolCall { tool_use_id, .. } => {
+            tool_use_id.hash(&mut h);
+            "tool-call"
+        }
+        DisplayItem::ToolResult {
+            tool_use_id,
+            text,
+            is_error,
+        } => {
+            tool_use_id.hash(&mut h);
+            text.hash(&mut h);
+            is_error.hash(&mut h);
+            "tool-result"
+        }
+        DisplayItem::Image { role, state } => {
+            match role {
+                ImageRole::User => "user".hash(&mut h),
+                ImageRole::Assistant => "assistant".hash(&mut h),
+                ImageRole::Tool => "tool".hash(&mut h),
+            }
+            match state {
+                ImageRenderState::Decoded {
+                    width,
+                    height,
+                    bytes,
+                    mime,
+                    ..
+                } => {
+                    "decoded".hash(&mut h);
+                    width.hash(&mut h);
+                    height.hash(&mut h);
+                    std::mem::discriminant(mime).hash(&mut h);
+                    bytes.hash(&mut h);
+                }
+                ImageRenderState::Url { url } => {
+                    "url".hash(&mut h);
+                    url.hash(&mut h);
+                }
+                ImageRenderState::Failed { reason } => {
+                    "failed".hash(&mut h);
+                    reason.hash(&mut h);
+                }
+            }
+            "image"
+        }
+        DisplayItem::GenericPlaceholder { label } => {
+            label.hash(&mut h);
+            "generic"
+        }
+        DisplayItem::TurnStats { usage } => {
+            usage.input_tokens.hash(&mut h);
+            usage.output_tokens.hash(&mut h);
+            usage.cache_read_input_tokens.hash(&mut h);
+            usage.cache_creation_input_tokens.hash(&mut h);
+            "turn-stats"
+        }
+    };
+    format!("chat:row:{kind}:{:016x}", h.finish())
+}
+
 fn chat_text_key(idx: usize, part: &str) -> String {
     format!("chat:text:{idx}:{part}")
 }
@@ -5580,6 +5768,7 @@ const SETTINGS_CLOSE_KEY: &str = "settings:close";
 const SETTINGS_SERVER_CONFIG_BODY_KEY: &str = "settings:server-config:body";
 const SETTINGS_SERVER_CONFIG_SAVE_KEY: &str = "settings:server-config:save";
 const SETTINGS_SERVER_CONFIG_REVERT_KEY: &str = "settings:server-config:revert";
+const SETTINGS_HOST_ENV_REFRESH_KEY: &str = "settings:host-env:refresh";
 
 /// Routed-key shapes for the Backends-tab Codex-rotate sub-form.
 /// `prefix:{backend}` carries the backend alias the user clicked
@@ -5680,6 +5869,46 @@ const POD_EDITOR_ALLOW_BUCKETS_KEY: &str = "pod-editor:allow:buckets";
 const POD_EDITOR_ALLOW_CAPS_POD_MODIFY_KEY: &str = "pod-editor:allow:caps:pod-modify";
 const POD_EDITOR_ALLOW_CAPS_DISPATCH_KEY: &str = "pod-editor:allow:caps:dispatch";
 const POD_EDITOR_ALLOW_CAPS_BEHAVIORS_KEY: &str = "pod-editor:allow:caps:behaviors";
+const POD_EDITOR_HOST_ENV_ADD_KEY: &str = "pod-editor:allow:host-env:add";
+const POD_EDITOR_HOST_ENV_EDIT_PREFIX: &str = "pod-editor:allow:host-env:edit:";
+const POD_EDITOR_HOST_ENV_DELETE_PREFIX: &str = "pod-editor:allow:host-env:delete:";
+const HOST_ENV_EDITOR_DISMISS_KEY: &str = "pod-editor:host-env:dismiss";
+const HOST_ENV_EDITOR_NAME_KEY: &str = "pod-editor:host-env:name";
+const HOST_ENV_EDITOR_PROVIDER_KEY: &str = "pod-editor:host-env:provider";
+const HOST_ENV_EDITOR_TYPE_KEY: &str = "pod-editor:host-env:type";
+const HOST_ENV_EDITOR_SAVE_KEY: &str = "pod-editor:host-env:save";
+const HOST_ENV_EDITOR_CANCEL_KEY: &str = "pod-editor:host-env:cancel";
+const HOST_ENV_EDITOR_LANDLOCK_PATH_ADD_KEY: &str = "pod-editor:host-env:landlock:path:add";
+const HOST_ENV_EDITOR_LANDLOCK_PATH_PREFIX: &str = "pod-editor:host-env:landlock:path:";
+const HOST_ENV_EDITOR_LANDLOCK_PATH_DELETE_PREFIX: &str =
+    "pod-editor:host-env:landlock:path:delete:";
+const HOST_ENV_EDITOR_LANDLOCK_MODE_PREFIX: &str = "pod-editor:host-env:landlock:mode:";
+const HOST_ENV_EDITOR_CONTAINER_IMAGE_KEY: &str = "pod-editor:host-env:container:image";
+const HOST_ENV_EDITOR_CONTAINER_MOUNT_ADD_KEY: &str = "pod-editor:host-env:container:mount:add";
+const HOST_ENV_EDITOR_CONTAINER_MOUNT_HOST_PREFIX: &str =
+    "pod-editor:host-env:container:mount:host:";
+const HOST_ENV_EDITOR_CONTAINER_MOUNT_GUEST_PREFIX: &str =
+    "pod-editor:host-env:container:mount:guest:";
+const HOST_ENV_EDITOR_CONTAINER_MOUNT_MODE_PREFIX: &str =
+    "pod-editor:host-env:container:mount:mode:";
+const HOST_ENV_EDITOR_CONTAINER_MOUNT_DELETE_PREFIX: &str =
+    "pod-editor:host-env:container:mount:delete:";
+const HOST_ENV_EDITOR_CONTAINER_LIMITS_ENABLED_KEY: &str =
+    "pod-editor:host-env:container:limits:enabled";
+const HOST_ENV_EDITOR_CONTAINER_LIMITS_CPUS_KEY: &str = "pod-editor:host-env:container:limits:cpus";
+const HOST_ENV_EDITOR_CONTAINER_LIMITS_MEMORY_KEY: &str =
+    "pod-editor:host-env:container:limits:memory";
+const HOST_ENV_EDITOR_CONTAINER_LIMITS_TIMEOUT_KEY: &str =
+    "pod-editor:host-env:container:limits:timeout";
+const HOST_ENV_EDITOR_CONTAINER_ENV_ADD_KEY: &str = "pod-editor:host-env:container:env:add";
+const HOST_ENV_EDITOR_CONTAINER_ENV_KEY_PREFIX: &str = "pod-editor:host-env:container:env:key:";
+const HOST_ENV_EDITOR_CONTAINER_ENV_VALUE_PREFIX: &str = "pod-editor:host-env:container:env:value:";
+const HOST_ENV_EDITOR_CONTAINER_ENV_DELETE_PREFIX: &str =
+    "pod-editor:host-env:container:env:delete:";
+const HOST_ENV_EDITOR_NETWORK_PREFIX: &str = "pod-editor:host-env:network:";
+const HOST_ENV_EDITOR_NETWORK_HOST_ADD_PREFIX: &str = "pod-editor:host-env:network:host:add:";
+const HOST_ENV_EDITOR_NETWORK_HOST_PREFIX: &str = "pod-editor:host-env:network:host:";
+const HOST_ENV_EDITOR_NETWORK_HOST_DELETE_PREFIX: &str = "pod-editor:host-env:network:host:delete:";
 /// Defaults-tab field keys.
 const POD_EDITOR_DEFAULTS_BACKEND_KEY: &str = "pod-editor:defaults:backend";
 const POD_EDITOR_DEFAULTS_MODEL_KEY: &str = "pod-editor:defaults:model";
@@ -5906,6 +6135,161 @@ fn checkbox_column(group_prefix: &str, selected: &[String], options: Vec<(String
         })
         .collect();
     column(rows).gap(tokens::SPACE_1).width(Size::Fill(1.0))
+}
+
+fn host_env_edit_key(idx: usize) -> String {
+    format!("{POD_EDITOR_HOST_ENV_EDIT_PREFIX}{idx}")
+}
+
+fn host_env_delete_key(idx: usize) -> String {
+    format!("{POD_EDITOR_HOST_ENV_DELETE_PREFIX}{idx}")
+}
+
+fn host_env_spec_type_label(spec: &HostEnvSpec) -> &'static str {
+    match spec {
+        HostEnvSpec::Landlock { .. } => "landlock",
+        HostEnvSpec::Container { .. } => "container",
+    }
+}
+
+fn access_mode_wire(mode: AccessMode) -> &'static str {
+    match mode {
+        AccessMode::ReadOnly => "ro",
+        AccessMode::ReadWrite => "rw",
+    }
+}
+
+fn access_mode_from_wire(raw: &str) -> Option<AccessMode> {
+    match raw {
+        "ro" => Some(AccessMode::ReadOnly),
+        "rw" => Some(AccessMode::ReadWrite),
+        _ => None,
+    }
+}
+
+fn host_env_spec_summary(spec: &HostEnvSpec) -> String {
+    match spec {
+        HostEnvSpec::Landlock {
+            allowed_paths,
+            network,
+        } => {
+            let paths = if allowed_paths.is_empty() {
+                "no paths".to_string()
+            } else {
+                format!(
+                    "{} path{}",
+                    allowed_paths.len(),
+                    if allowed_paths.len() == 1 { "" } else { "s" }
+                )
+            };
+            format!("{paths}, {}", network_policy_label(network))
+        }
+        HostEnvSpec::Container {
+            image,
+            mounts,
+            network,
+            limits,
+            env,
+        } => {
+            let image = if image.trim().is_empty() {
+                "(no image)"
+            } else {
+                image.as_str()
+            };
+            let limits = if limits.is_some() { ", limits" } else { "" };
+            format!(
+                "{image}, {} mount{}, {} env{}{}, {}",
+                mounts.len(),
+                if mounts.len() == 1 { "" } else { "s" },
+                env.len(),
+                if env.len() == 1 { "" } else { "s" },
+                limits,
+                network_policy_label(network)
+            )
+        }
+    }
+}
+
+fn network_policy_label(policy: &NetworkPolicy) -> String {
+    match policy {
+        NetworkPolicy::Unrestricted => "network unrestricted".to_string(),
+        NetworkPolicy::Isolated => "network isolated".to_string(),
+        NetworkPolicy::AllowList { hosts } => {
+            format!(
+                "network allow-list ({} host{})",
+                hosts.len(),
+                if hosts.len() == 1 { "" } else { "s" }
+            )
+        }
+    }
+}
+
+fn network_policy_wire(policy: &NetworkPolicy) -> &'static str {
+    match policy {
+        NetworkPolicy::Unrestricted => "unrestricted",
+        NetworkPolicy::Isolated => "isolated",
+        NetworkPolicy::AllowList { .. } => "allow_list",
+    }
+}
+
+fn host_env_network_key(salt: &str) -> String {
+    format!("{HOST_ENV_EDITOR_NETWORK_PREFIX}{salt}:policy")
+}
+
+fn host_env_network_host_add_key(salt: &str) -> String {
+    format!("{HOST_ENV_EDITOR_NETWORK_HOST_ADD_PREFIX}{salt}")
+}
+
+fn host_env_network_host_key(salt: &str, idx: usize) -> String {
+    format!("{HOST_ENV_EDITOR_NETWORK_HOST_PREFIX}{salt}:{idx}")
+}
+
+fn host_env_network_host_delete_key(salt: &str, idx: usize) -> String {
+    format!("{HOST_ENV_EDITOR_NETWORK_HOST_DELETE_PREFIX}{salt}:{idx}")
+}
+
+fn render_network_policy_editor(salt: &str, policy: &NetworkPolicy, selection: &Selection) -> El {
+    let mut children = vec![radio_group(
+        host_env_network_key(salt),
+        &network_policy_wire(policy),
+        [
+            ("unrestricted", "unrestricted"),
+            ("isolated", "isolated"),
+            ("allow_list", "allow-list"),
+        ],
+    )];
+    if let NetworkPolicy::AllowList { hosts } = policy {
+        let mut host_rows: Vec<El> = hosts
+            .iter()
+            .enumerate()
+            .map(|(idx, host)| {
+                row([
+                    text_input(host, selection, &host_env_network_host_key(salt, idx))
+                        .width(Size::Fill(1.0)),
+                    icon_button(crate::icons::ICON_X.clone())
+                        .key(host_env_network_host_delete_key(salt, idx))
+                        .ghost(),
+                ])
+                .gap(tokens::SPACE_2)
+                .align(Align::Center)
+                .width(Size::Fill(1.0))
+            })
+            .collect();
+        if host_rows.is_empty() {
+            host_rows.push(paragraph("(no allowed hosts)").muted().small());
+        }
+        host_rows.push(
+            button("+ Add host")
+                .key(host_env_network_host_add_key(salt))
+                .secondary(),
+        );
+        children.push(column(host_rows).gap(tokens::SPACE_2));
+    }
+    column(children).gap(tokens::SPACE_2).width(Size::Fill(1.0))
+}
+
+fn env_key_at(env: &BTreeMap<String, String>, idx: usize) -> Option<String> {
+    env.keys().nth(idx).cloned()
 }
 
 fn pod_modify_cap_label(cap: whisper_agent_protocol::PodModifyCap) -> &'static str {
@@ -7835,26 +8219,32 @@ impl ChatApp {
                 // realized row reserves space so focus rings and
                 // selectable text do not sit under the thumb.
                 let items = Arc::new(v.items.clone());
+                let items_for_keys = items.clone();
                 let item_count = items.len();
                 let open_accordions = Arc::new(self.open_accordions.clone());
                 let hovered_key = cx.hovered_key().map(str::to_owned);
-                virtual_list_dyn(item_count, CHAT_ROW_ESTIMATED_HEIGHT, move |idx| {
-                    let row = Self::event_log_row(
-                        idx,
-                        &items[idx],
-                        open_accordions.as_ref(),
-                        hovered_key.as_deref(),
-                    );
-                    column([row])
-                        .padding(Sides {
-                            left: tokens::SPACE_2,
-                            right: tokens::SPACE_2 + tokens::SCROLLBAR_THUMB_WIDTH,
-                            top: if idx == 0 { tokens::SPACE_2 } else { 0.0 },
-                            bottom: tokens::SPACE_2,
-                        })
-                        .width(Size::Fill(1.0))
-                        .height(Size::Hug)
-                })
+                virtual_list_dyn(
+                    item_count,
+                    CHAT_ROW_ESTIMATED_HEIGHT,
+                    move |idx| chat_virtual_row_key(idx, &items_for_keys[idx]),
+                    move |idx| {
+                        let row = Self::event_log_row(
+                            idx,
+                            &items[idx],
+                            open_accordions.as_ref(),
+                            hovered_key.as_deref(),
+                        );
+                        column([row])
+                            .padding(Sides {
+                                left: tokens::SPACE_2,
+                                right: tokens::SPACE_2 + tokens::SCROLLBAR_THUMB_WIDTH,
+                                top: if idx == 0 { tokens::SPACE_2 } else { 0.0 },
+                                bottom: tokens::SPACE_2,
+                            })
+                            .width(Size::Fill(1.0))
+                            .height(Size::Hug)
+                    },
+                )
                 .key(scroll_key)
                 .pin_end()
                 .width(Size::Fill(1.0))
@@ -10985,6 +11375,15 @@ impl ChatApp {
             return false;
         }
 
+        if self
+            .pod_editor
+            .as_ref()
+            .and_then(|e| e.host_env_editor.as_ref())
+            .is_some()
+        {
+            return self.handle_host_env_entry_editor_event(event);
+        }
+
         // Tab strip: route through `tabs::apply_event`, then call
         // `switch_tab` so the structured/raw sync invariants run.
         // The widget mutates a String via the closure; we map it back
@@ -11069,6 +11468,38 @@ impl ChatApp {
         if let Some(editor) = self.pod_editor.as_mut()
             && let Some(cfg) = editor.working_config.as_mut()
         {
+            if event.is_click_or_activate(POD_EDITOR_HOST_ENV_ADD_KEY) {
+                editor.host_env_editor = Some(HostEnvEntryEditorState::new_for_add());
+                editor.error = None;
+                return true;
+            }
+            if let Some(route) = event.route() {
+                if let Some(raw) = route.strip_prefix(POD_EDITOR_HOST_ENV_EDIT_PREFIX)
+                    && matches!(event.kind, UiEventKind::Click | UiEventKind::Activate)
+                    && let Ok(idx) = raw.parse::<usize>()
+                    && let Some(entry) = cfg.allow.host_env.get(idx).cloned()
+                {
+                    editor.host_env_editor =
+                        Some(HostEnvEntryEditorState::new_for_index(idx, entry));
+                    editor.error = None;
+                    return true;
+                }
+                if let Some(raw) = route.strip_prefix(POD_EDITOR_HOST_ENV_DELETE_PREFIX)
+                    && matches!(event.kind, UiEventKind::Click | UiEventKind::Activate)
+                    && let Ok(idx) = raw.parse::<usize>()
+                    && idx < cfg.allow.host_env.len()
+                {
+                    let removed = cfg.allow.host_env.remove(idx);
+                    cfg.thread_defaults.host_env.retain(|n| n != &removed.name);
+                    if cfg.thread_defaults.host_env.is_empty()
+                        && let Some(fallback) = cfg.allow.host_env.first()
+                    {
+                        cfg.thread_defaults.host_env = vec![fallback.name.clone()];
+                    }
+                    editor.error = None;
+                    return true;
+                }
+            }
             if apply_checkbox_list_to_vec(
                 &mut cfg.allow.backends,
                 event,
@@ -11301,6 +11732,443 @@ impl ChatApp {
         false
     }
 
+    fn handle_host_env_entry_editor_event(&mut self, event: &UiEvent) -> bool {
+        if event.is_click_or_activate(HOST_ENV_EDITOR_CANCEL_KEY)
+            || event.is_click_or_activate(HOST_ENV_EDITOR_DISMISS_KEY)
+        {
+            if let Some(editor) = self.pod_editor.as_mut() {
+                editor.host_env_editor = None;
+            }
+            return true;
+        }
+        if event.is_click_or_activate(HOST_ENV_EDITOR_SAVE_KEY) {
+            self.save_host_env_entry_editor();
+            return true;
+        }
+
+        let Some(sub) = self
+            .pod_editor
+            .as_mut()
+            .and_then(|editor| editor.host_env_editor.as_mut())
+        else {
+            return false;
+        };
+
+        if event.target_key() == Some(HOST_ENV_EDITOR_NAME_KEY) {
+            text_input::apply_event(
+                &mut sub.entry.name,
+                &mut self.selection,
+                HOST_ENV_EDITOR_NAME_KEY,
+                event,
+            );
+            sub.error = None;
+            return true;
+        }
+        if event.target_key() == Some(HOST_ENV_EDITOR_PROVIDER_KEY) {
+            text_input::apply_event(
+                &mut sub.entry.provider,
+                &mut self.selection,
+                HOST_ENV_EDITOR_PROVIDER_KEY,
+                event,
+            );
+            sub.error = None;
+            return true;
+        }
+
+        let mut type_pick: Option<String> = None;
+        if radio::apply_event(&mut type_pick, event, HOST_ENV_EDITOR_TYPE_KEY, |raw| {
+            Some(Some(raw.to_string()))
+        }) {
+            match type_pick.as_deref() {
+                Some("landlock") if !matches!(sub.entry.spec, HostEnvSpec::Landlock { .. }) => {
+                    sub.entry.spec = HostEnvSpec::Landlock {
+                        allowed_paths: Vec::new(),
+                        network: NetworkPolicy::default(),
+                    };
+                }
+                Some("container") if !matches!(sub.entry.spec, HostEnvSpec::Container { .. }) => {
+                    sub.entry.spec = HostEnvSpec::Container {
+                        image: String::new(),
+                        mounts: Vec::new(),
+                        network: NetworkPolicy::default(),
+                        limits: None,
+                        env: BTreeMap::new(),
+                    };
+                    sub.sync_limit_buffers();
+                }
+                _ => {}
+            }
+            sub.error = None;
+            return true;
+        }
+
+        match &mut sub.entry.spec {
+            HostEnvSpec::Landlock {
+                allowed_paths,
+                network,
+            } => {
+                if Self::handle_network_policy_event(
+                    &mut self.selection,
+                    event,
+                    "landlock",
+                    network,
+                ) {
+                    sub.error = None;
+                    return true;
+                }
+                if event.is_click_or_activate(HOST_ENV_EDITOR_LANDLOCK_PATH_ADD_KEY) {
+                    allowed_paths.push(PathAccess {
+                        path: String::new(),
+                        mode: AccessMode::ReadOnly,
+                    });
+                    sub.error = None;
+                    return true;
+                }
+                if let Some(route) = event.route() {
+                    if let Some(raw) =
+                        route.strip_prefix(HOST_ENV_EDITOR_LANDLOCK_PATH_DELETE_PREFIX)
+                        && matches!(event.kind, UiEventKind::Click | UiEventKind::Activate)
+                        && let Ok(idx) = raw.parse::<usize>()
+                        && idx < allowed_paths.len()
+                    {
+                        allowed_paths.remove(idx);
+                        sub.error = None;
+                        return true;
+                    }
+                }
+                for (idx, path) in allowed_paths.iter_mut().enumerate() {
+                    let path_key = format!("{HOST_ENV_EDITOR_LANDLOCK_PATH_PREFIX}{idx}");
+                    if event.target_key() == Some(path_key.as_str()) {
+                        text_input::apply_event(
+                            &mut path.path,
+                            &mut self.selection,
+                            &path_key,
+                            event,
+                        );
+                        sub.error = None;
+                        return true;
+                    }
+                    let mode_key = format!("{HOST_ENV_EDITOR_LANDLOCK_MODE_PREFIX}{idx}");
+                    let mut mode_pick: Option<String> = None;
+                    if radio::apply_event(&mut mode_pick, event, &mode_key, |raw| {
+                        Some(Some(raw.to_string()))
+                    }) {
+                        if let Some(mode) = mode_pick.as_deref().and_then(access_mode_from_wire) {
+                            path.mode = mode;
+                        }
+                        sub.error = None;
+                        return true;
+                    }
+                }
+            }
+            HostEnvSpec::Container {
+                image,
+                mounts,
+                network,
+                limits,
+                env,
+            } => {
+                if event.target_key() == Some(HOST_ENV_EDITOR_CONTAINER_IMAGE_KEY) {
+                    text_input::apply_event(
+                        image,
+                        &mut self.selection,
+                        HOST_ENV_EDITOR_CONTAINER_IMAGE_KEY,
+                        event,
+                    );
+                    sub.error = None;
+                    return true;
+                }
+                if Self::handle_network_policy_event(
+                    &mut self.selection,
+                    event,
+                    "container",
+                    network,
+                ) {
+                    sub.error = None;
+                    return true;
+                }
+                if event.is_click_or_activate(HOST_ENV_EDITOR_CONTAINER_MOUNT_ADD_KEY) {
+                    mounts.push(Mount {
+                        host: String::new(),
+                        guest: String::new(),
+                        mode: AccessMode::ReadOnly,
+                    });
+                    sub.error = None;
+                    return true;
+                }
+                if event.is_click_or_activate(HOST_ENV_EDITOR_CONTAINER_LIMITS_ENABLED_KEY) {
+                    if limits.is_some() {
+                        *limits = None;
+                    } else {
+                        *limits = Some(ResourceLimits {
+                            cpus: None,
+                            memory_mb: None,
+                            timeout_s: None,
+                        });
+                    }
+                    sub.sync_limit_buffers();
+                    sub.error = None;
+                    return true;
+                }
+                if limits.is_some() {
+                    if Self::apply_optional_u32_input(
+                        &mut self.selection,
+                        event,
+                        HOST_ENV_EDITOR_CONTAINER_LIMITS_CPUS_KEY,
+                        &mut sub.limits_cpus_buf,
+                        |v| {
+                            if let Some(lim) = limits.as_mut() {
+                                lim.cpus = v;
+                            }
+                        },
+                    ) {
+                        sub.error = None;
+                        return true;
+                    }
+                    if Self::apply_optional_u32_input(
+                        &mut self.selection,
+                        event,
+                        HOST_ENV_EDITOR_CONTAINER_LIMITS_MEMORY_KEY,
+                        &mut sub.limits_memory_buf,
+                        |v| {
+                            if let Some(lim) = limits.as_mut() {
+                                lim.memory_mb = v;
+                            }
+                        },
+                    ) {
+                        sub.error = None;
+                        return true;
+                    }
+                    if Self::apply_optional_u32_input(
+                        &mut self.selection,
+                        event,
+                        HOST_ENV_EDITOR_CONTAINER_LIMITS_TIMEOUT_KEY,
+                        &mut sub.limits_timeout_buf,
+                        |v| {
+                            if let Some(lim) = limits.as_mut() {
+                                lim.timeout_s = v;
+                            }
+                        },
+                    ) {
+                        sub.error = None;
+                        return true;
+                    }
+                }
+                if event.is_click_or_activate(HOST_ENV_EDITOR_CONTAINER_ENV_ADD_KEY) {
+                    let mut idx = 0u32;
+                    let mut key = "KEY".to_string();
+                    while env.contains_key(&key) {
+                        idx += 1;
+                        key = format!("KEY_{idx}");
+                    }
+                    env.insert(key, String::new());
+                    sub.error = None;
+                    return true;
+                }
+                if let Some(route) = event.route() {
+                    if let Some(raw) =
+                        route.strip_prefix(HOST_ENV_EDITOR_CONTAINER_MOUNT_DELETE_PREFIX)
+                        && matches!(event.kind, UiEventKind::Click | UiEventKind::Activate)
+                        && let Ok(idx) = raw.parse::<usize>()
+                        && idx < mounts.len()
+                    {
+                        mounts.remove(idx);
+                        sub.error = None;
+                        return true;
+                    }
+                    if let Some(raw) =
+                        route.strip_prefix(HOST_ENV_EDITOR_CONTAINER_ENV_DELETE_PREFIX)
+                        && matches!(event.kind, UiEventKind::Click | UiEventKind::Activate)
+                        && let Ok(idx) = raw.parse::<usize>()
+                        && let Some(key) = env_key_at(env, idx)
+                    {
+                        env.remove(&key);
+                        sub.error = None;
+                        return true;
+                    }
+                }
+                for (idx, mount) in mounts.iter_mut().enumerate() {
+                    let host_key = format!("{HOST_ENV_EDITOR_CONTAINER_MOUNT_HOST_PREFIX}{idx}");
+                    if event.target_key() == Some(host_key.as_str()) {
+                        text_input::apply_event(
+                            &mut mount.host,
+                            &mut self.selection,
+                            &host_key,
+                            event,
+                        );
+                        sub.error = None;
+                        return true;
+                    }
+                    let guest_key = format!("{HOST_ENV_EDITOR_CONTAINER_MOUNT_GUEST_PREFIX}{idx}");
+                    if event.target_key() == Some(guest_key.as_str()) {
+                        text_input::apply_event(
+                            &mut mount.guest,
+                            &mut self.selection,
+                            &guest_key,
+                            event,
+                        );
+                        sub.error = None;
+                        return true;
+                    }
+                    let mode_key = format!("{HOST_ENV_EDITOR_CONTAINER_MOUNT_MODE_PREFIX}{idx}");
+                    let mut mode_pick: Option<String> = None;
+                    if radio::apply_event(&mut mode_pick, event, &mode_key, |raw| {
+                        Some(Some(raw.to_string()))
+                    }) {
+                        if let Some(mode) = mode_pick.as_deref().and_then(access_mode_from_wire) {
+                            mount.mode = mode;
+                        }
+                        sub.error = None;
+                        return true;
+                    }
+                }
+                let env_len = env.len();
+                for idx in 0..env_len {
+                    let Some(old_key) = env_key_at(env, idx) else {
+                        continue;
+                    };
+                    let key_key = format!("{HOST_ENV_EDITOR_CONTAINER_ENV_KEY_PREFIX}{idx}");
+                    if event.target_key() == Some(key_key.as_str()) {
+                        let mut key_buf = old_key.clone();
+                        text_input::apply_event(&mut key_buf, &mut self.selection, &key_key, event);
+                        if key_buf != old_key
+                            && !env.contains_key(&key_buf)
+                            && let Some(value) = env.remove(&old_key)
+                        {
+                            env.insert(key_buf, value);
+                        }
+                        sub.error = None;
+                        return true;
+                    }
+                    let value_key = format!("{HOST_ENV_EDITOR_CONTAINER_ENV_VALUE_PREFIX}{idx}");
+                    if event.target_key() == Some(value_key.as_str()) {
+                        if let Some(value) = env.get_mut(&old_key) {
+                            text_input::apply_event(value, &mut self.selection, &value_key, event);
+                        }
+                        sub.error = None;
+                        return true;
+                    }
+                }
+            }
+        }
+
+        true
+    }
+
+    fn apply_optional_u32_input(
+        selection: &mut Selection,
+        event: &UiEvent,
+        key: &str,
+        buffer: &mut String,
+        mut set: impl FnMut(Option<u32>),
+    ) -> bool {
+        if event.target_key() != Some(key) {
+            return false;
+        }
+        text_input::apply_event(buffer, selection, key, event);
+        let trimmed = buffer.trim();
+        if trimmed.is_empty() {
+            set(None);
+        } else if let Ok(v) = trimmed.parse::<u32>() {
+            set(Some(v));
+        }
+        true
+    }
+
+    fn handle_network_policy_event(
+        selection: &mut Selection,
+        event: &UiEvent,
+        salt: &str,
+        policy: &mut NetworkPolicy,
+    ) -> bool {
+        let key = host_env_network_key(salt);
+        let mut pick: Option<String> = None;
+        if radio::apply_event(&mut pick, event, &key, |raw| Some(Some(raw.to_string()))) {
+            match pick.as_deref() {
+                Some("unrestricted") => *policy = NetworkPolicy::Unrestricted,
+                Some("isolated") => *policy = NetworkPolicy::Isolated,
+                Some("allow_list") if !matches!(policy, NetworkPolicy::AllowList { .. }) => {
+                    *policy = NetworkPolicy::AllowList { hosts: Vec::new() };
+                }
+                _ => {}
+            }
+            return true;
+        }
+        if event.is_click_or_activate(&host_env_network_host_add_key(salt)) {
+            if let NetworkPolicy::AllowList { hosts } = policy {
+                hosts.push(String::new());
+            }
+            return true;
+        }
+        if let Some(route) = event.route() {
+            let prefix = format!("{HOST_ENV_EDITOR_NETWORK_HOST_DELETE_PREFIX}{salt}:");
+            if let Some(raw) = route.strip_prefix(&prefix)
+                && matches!(event.kind, UiEventKind::Click | UiEventKind::Activate)
+                && let Ok(idx) = raw.parse::<usize>()
+                && let NetworkPolicy::AllowList { hosts } = policy
+                && idx < hosts.len()
+            {
+                hosts.remove(idx);
+                return true;
+            }
+        }
+        if let NetworkPolicy::AllowList { hosts } = policy {
+            for (idx, host) in hosts.iter_mut().enumerate() {
+                let host_key = host_env_network_host_key(salt, idx);
+                if event.target_key() == Some(host_key.as_str()) {
+                    text_input::apply_event(host, selection, &host_key, event);
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    fn save_host_env_entry_editor(&mut self) {
+        let Some(editor) = self.pod_editor.as_mut() else {
+            return;
+        };
+        let Some(mut sub) = editor.host_env_editor.take() else {
+            return;
+        };
+        let Some(cfg) = editor.working_config.as_mut() else {
+            return;
+        };
+        let name = sub.entry.name.trim().to_string();
+        let provider = sub.entry.provider.trim().to_string();
+        if name.is_empty() {
+            sub.error = Some("name is required".into());
+            editor.host_env_editor = Some(sub);
+            return;
+        }
+        if provider.is_empty() {
+            sub.error = Some("provider is required".into());
+            editor.host_env_editor = Some(sub);
+            return;
+        }
+        let duplicate = cfg
+            .allow
+            .host_env
+            .iter()
+            .enumerate()
+            .any(|(idx, existing)| existing.name == name && Some(idx) != sub.index);
+        if duplicate {
+            sub.error = Some(format!("a host env named `{name}` already exists"));
+            editor.host_env_editor = Some(sub);
+            return;
+        }
+        sub.entry.name = name.clone();
+        sub.entry.provider = provider;
+        match sub.index {
+            Some(idx) if idx < cfg.allow.host_env.len() => cfg.allow.host_env[idx] = sub.entry,
+            _ => cfg.allow.host_env.push(sub.entry),
+        }
+        if cfg.thread_defaults.host_env.is_empty() {
+            cfg.thread_defaults.host_env = vec![name];
+        }
+        editor.error = None;
+    }
+
     /// Pick handler for the pod editor's `select_trigger` family.
     /// `which` identifies the slot driving the action; on `Pick`, the
     /// value is parsed into whichever cap / disposition / catalog
@@ -11530,19 +12398,21 @@ impl ChatApp {
             .block_pointer()
             .width(Size::Fixed(720.0))
             .height(Size::Fixed(640.0));
-        let layer = overlay([scrim(format!("{POD_EDITOR_KEY}:dismiss")), panel])
+        let mut layers = vec![scrim(format!("{POD_EDITOR_KEY}:dismiss")), panel];
+        if let Some(sub) = editor.host_env_editor.as_ref() {
+            layers.push(scrim(HOST_ENV_EDITOR_DISMISS_KEY));
+            layers.push(self.render_host_env_entry_modal(sub));
+        }
+        let layer = overlay(layers)
             .align(Align::Center)
             .justify(Justify::Center);
         Some(layer)
     }
 
-    /// Allow tab body. Identity (name + description) + multi-checks
-    /// for the three resource lists (backends / shared MCP hosts /
-    /// knowledge buckets) over the server-known catalogs + cap
-    /// ceilings (3 select_triggers). Host-envs editor is deferred —
-    /// it needs a sandbox-entry sub-modal that's a separate slice.
-    /// Per-tool overrides defer to the Raw TOML tab (the egui
-    /// sibling does the same).
+    /// Allow tab body. Identity (name + description), allowed
+    /// resources including host-env specs, and cap ceilings. Per-tool
+    /// overrides defer to the Raw TOML tab (the egui sibling does the
+    /// same).
     fn render_pod_editor_allow_tab(&self, editor: &PodEditorSheetState) -> El {
         let Some(cfg) = editor.working_config.as_ref() else {
             return paragraph("no parsed config — fix the on-disk pod.toml from the Raw tab")
@@ -11561,6 +12431,7 @@ impl ChatApp {
         let backends_widget = self.render_pod_editor_backends_check(cfg);
         let mcp_hosts_widget = self.render_pod_editor_mcp_hosts_check(cfg);
         let buckets_widget = self.render_pod_editor_buckets_check(cfg);
+        let host_envs_widget = self.render_pod_editor_host_envs(cfg);
 
         // Cap select_triggers — the trigger label always shows the
         // current value; the menu rides on `popover_layers()` when
@@ -11614,6 +12485,14 @@ impl ChatApp {
                 ),
             ]),
             form_item([
+                form_label("Host environments"),
+                form_control(host_envs_widget),
+                form_description(
+                    "Named daemon/spec pairs threads in this pod may bind to. \
+                     `provider` names a daemon admitted via `[[auth.daemons]]`.",
+                ),
+            ]),
+            form_item([
                 form_label("pod_modify ceiling"),
                 form_control(pod_modify_trigger),
             ]),
@@ -11626,6 +12505,47 @@ impl ChatApp {
                 form_control(behaviors_trigger),
             ]),
         ])
+    }
+
+    fn render_pod_editor_host_envs(&self, cfg: &PodConfig) -> El {
+        let mut rows: Vec<El> = Vec::new();
+        if cfg.allow.host_env.is_empty() {
+            rows.push(
+                paragraph("(no host envs — threads here run with shared MCPs only)")
+                    .muted()
+                    .small(),
+            );
+        } else {
+            for (idx, entry) in cfg.allow.host_env.iter().enumerate() {
+                let summary = format!(
+                    "{} · {} · {}",
+                    entry.provider,
+                    host_env_spec_type_label(&entry.spec),
+                    host_env_spec_summary(&entry.spec)
+                );
+                rows.push(
+                    row([
+                        column([
+                            text(entry.name.clone()).label().bold(),
+                            paragraph(summary).muted().small(),
+                        ])
+                        .gap(tokens::SPACE_1)
+                        .width(Size::Fill(1.0)),
+                        button("Edit").key(host_env_edit_key(idx)).secondary(),
+                        button("Delete").key(host_env_delete_key(idx)).destructive(),
+                    ])
+                    .gap(tokens::SPACE_2)
+                    .align(Align::Center)
+                    .width(Size::Fill(1.0)),
+                );
+            }
+        }
+        rows.push(
+            button("+ Add host env")
+                .key(POD_EDITOR_HOST_ENV_ADD_KEY)
+                .secondary(),
+        );
+        column(rows).gap(tokens::SPACE_2).width(Size::Fill(1.0))
     }
 
     fn render_pod_editor_backends_check(&self, cfg: &PodConfig) -> El {
@@ -11889,6 +12809,303 @@ impl ChatApp {
             &cfg.thread_defaults.mcp_hosts,
             options,
         )
+    }
+
+    fn render_host_env_entry_modal(&self, editor: &HostEnvEntryEditorState) -> El {
+        let title = if editor.index.is_some() {
+            "Edit host env"
+        } else {
+            "Add host env"
+        };
+        let header = dialog_header([
+            dialog_title(title),
+            dialog_description(
+                "Define a named host environment entry for this pod's \
+                 `allow.host_env` list.",
+            ),
+        ]);
+        let top = form([
+            form_item([
+                form_label("name"),
+                form_control(text_input(
+                    &editor.entry.name,
+                    &self.selection,
+                    HOST_ENV_EDITOR_NAME_KEY,
+                )),
+                form_description("Name used by thread bindings and defaults."),
+            ]),
+            form_item([
+                form_label("provider"),
+                form_control(text_input(
+                    &editor.entry.provider,
+                    &self.selection,
+                    HOST_ENV_EDITOR_PROVIDER_KEY,
+                )),
+                form_description("Daemon name from server `[[auth.daemons]]`."),
+            ]),
+            form_item([
+                form_label("type"),
+                form_control(radio_group(
+                    HOST_ENV_EDITOR_TYPE_KEY,
+                    &host_env_spec_type_label(&editor.entry.spec),
+                    [("landlock", "landlock"), ("container", "container")],
+                )),
+            ]),
+        ]);
+        let spec_body = match &editor.entry.spec {
+            HostEnvSpec::Landlock {
+                allowed_paths,
+                network,
+            } => self.render_host_env_landlock_body(allowed_paths, network),
+            HostEnvSpec::Container {
+                image,
+                mounts,
+                network,
+                limits,
+                env,
+            } => self.render_host_env_container_body(editor, image, mounts, network, limits, env),
+        };
+        let mut body_children = vec![top, spec_body];
+        if let Some(err) = editor.error.as_deref() {
+            body_children.push(
+                alert([
+                    alert_title("couldn't save host env"),
+                    alert_description(err.to_string()),
+                ])
+                .destructive(),
+            );
+        }
+        let body = scroll(body_children)
+            .key("pod-editor:host-env:scroll")
+            .gap(tokens::SPACE_4);
+        let footer = dialog_footer([
+            button("Cancel").key(HOST_ENV_EDITOR_CANCEL_KEY),
+            button("Save").key(HOST_ENV_EDITOR_SAVE_KEY).primary(),
+        ]);
+        dialog_content([header, body, footer])
+            .block_pointer()
+            .width(Size::Fixed(640.0))
+            .height(Size::Fixed(600.0))
+    }
+
+    fn render_host_env_landlock_body(
+        &self,
+        allowed_paths: &[PathAccess],
+        network: &NetworkPolicy,
+    ) -> El {
+        let mut path_rows: Vec<El> = allowed_paths
+            .iter()
+            .enumerate()
+            .map(|(idx, p)| {
+                let path_key = format!("{HOST_ENV_EDITOR_LANDLOCK_PATH_PREFIX}{idx}");
+                let mode_key = format!("{HOST_ENV_EDITOR_LANDLOCK_MODE_PREFIX}{idx}");
+                row([
+                    text_input(&p.path, &self.selection, &path_key).width(Size::Fill(1.0)),
+                    radio_group(
+                        mode_key,
+                        &access_mode_wire(p.mode),
+                        [("ro", "read-only"), ("rw", "read-write")],
+                    )
+                    .width(Size::Fixed(140.0)),
+                    icon_button(crate::icons::ICON_X.clone())
+                        .key(format!(
+                            "{HOST_ENV_EDITOR_LANDLOCK_PATH_DELETE_PREFIX}{idx}"
+                        ))
+                        .ghost(),
+                ])
+                .gap(tokens::SPACE_2)
+                .align(Align::Start)
+                .width(Size::Fill(1.0))
+            })
+            .collect();
+        if path_rows.is_empty() {
+            path_rows.push(paragraph("(no explicit paths)").muted().small());
+        }
+        path_rows.push(
+            button("+ Add path")
+                .key(HOST_ENV_EDITOR_LANDLOCK_PATH_ADD_KEY)
+                .secondary(),
+        );
+        form([
+            form_item([
+                form_label("allowed paths"),
+                form_control(column(path_rows).gap(tokens::SPACE_2)),
+                form_description("Each path grants read-only or read-write filesystem access."),
+            ]),
+            form_item([
+                form_label("network"),
+                form_control(render_network_policy_editor(
+                    "landlock",
+                    network,
+                    &self.selection,
+                )),
+            ]),
+        ])
+    }
+
+    fn render_host_env_container_body(
+        &self,
+        editor: &HostEnvEntryEditorState,
+        image: &str,
+        mounts: &[Mount],
+        network: &NetworkPolicy,
+        limits: &Option<ResourceLimits>,
+        env: &BTreeMap<String, String>,
+    ) -> El {
+        let mut mount_rows: Vec<El> = mounts
+            .iter()
+            .enumerate()
+            .map(|(idx, m)| {
+                let host_key = format!("{HOST_ENV_EDITOR_CONTAINER_MOUNT_HOST_PREFIX}{idx}");
+                let guest_key = format!("{HOST_ENV_EDITOR_CONTAINER_MOUNT_GUEST_PREFIX}{idx}");
+                let mode_key = format!("{HOST_ENV_EDITOR_CONTAINER_MOUNT_MODE_PREFIX}{idx}");
+                column([
+                    row([
+                        text_input(&m.host, &self.selection, &host_key).width(Size::Fill(1.0)),
+                        text_input(&m.guest, &self.selection, &guest_key).width(Size::Fill(1.0)),
+                        icon_button(crate::icons::ICON_X.clone())
+                            .key(format!(
+                                "{HOST_ENV_EDITOR_CONTAINER_MOUNT_DELETE_PREFIX}{idx}"
+                            ))
+                            .ghost(),
+                    ])
+                    .gap(tokens::SPACE_2)
+                    .align(Align::Center)
+                    .width(Size::Fill(1.0)),
+                    radio_group(
+                        mode_key,
+                        &access_mode_wire(m.mode),
+                        [("ro", "read-only"), ("rw", "read-write")],
+                    ),
+                ])
+                .gap(tokens::SPACE_1)
+                .width(Size::Fill(1.0))
+            })
+            .collect();
+        if mount_rows.is_empty() {
+            mount_rows.push(paragraph("(no mounts)").muted().small());
+        }
+        mount_rows.push(
+            button("+ Add mount")
+                .key(HOST_ENV_EDITOR_CONTAINER_MOUNT_ADD_KEY)
+                .secondary(),
+        );
+
+        let limits_enabled = limits.is_some();
+        let mut limit_rows = vec![
+            row([
+                checkbox(limits_enabled).key(HOST_ENV_EDITOR_CONTAINER_LIMITS_ENABLED_KEY),
+                text("set explicit limits").muted().small(),
+            ])
+            .gap(tokens::SPACE_2)
+            .align(Align::Center),
+        ];
+        if limits_enabled {
+            limit_rows.extend([
+                row([
+                    text("cpus").width(Size::Fixed(120.0)),
+                    text_input(
+                        &editor.limits_cpus_buf,
+                        &self.selection,
+                        HOST_ENV_EDITOR_CONTAINER_LIMITS_CPUS_KEY,
+                    )
+                    .width(Size::Fill(1.0)),
+                ])
+                .gap(tokens::SPACE_2)
+                .align(Align::Center),
+                row([
+                    text("memory MiB").width(Size::Fixed(120.0)),
+                    text_input(
+                        &editor.limits_memory_buf,
+                        &self.selection,
+                        HOST_ENV_EDITOR_CONTAINER_LIMITS_MEMORY_KEY,
+                    )
+                    .width(Size::Fill(1.0)),
+                ])
+                .gap(tokens::SPACE_2)
+                .align(Align::Center),
+                row([
+                    text("timeout sec").width(Size::Fixed(120.0)),
+                    text_input(
+                        &editor.limits_timeout_buf,
+                        &self.selection,
+                        HOST_ENV_EDITOR_CONTAINER_LIMITS_TIMEOUT_KEY,
+                    )
+                    .width(Size::Fill(1.0)),
+                ])
+                .gap(tokens::SPACE_2)
+                .align(Align::Center),
+            ]);
+        }
+
+        let mut env_rows: Vec<El> = env
+            .iter()
+            .enumerate()
+            .map(|(idx, (k, v))| {
+                row([
+                    text_input(
+                        k,
+                        &self.selection,
+                        &format!("{HOST_ENV_EDITOR_CONTAINER_ENV_KEY_PREFIX}{idx}"),
+                    )
+                    .width(Size::Fill(1.0)),
+                    text_input(
+                        v,
+                        &self.selection,
+                        &format!("{HOST_ENV_EDITOR_CONTAINER_ENV_VALUE_PREFIX}{idx}"),
+                    )
+                    .width(Size::Fill(1.0)),
+                    icon_button(crate::icons::ICON_X.clone())
+                        .key(format!(
+                            "{HOST_ENV_EDITOR_CONTAINER_ENV_DELETE_PREFIX}{idx}"
+                        ))
+                        .ghost(),
+                ])
+                .gap(tokens::SPACE_2)
+                .align(Align::Center)
+                .width(Size::Fill(1.0))
+            })
+            .collect();
+        if env_rows.is_empty() {
+            env_rows.push(paragraph("(no env vars)").muted().small());
+        }
+        env_rows.push(
+            button("+ Add env var")
+                .key(HOST_ENV_EDITOR_CONTAINER_ENV_ADD_KEY)
+                .secondary(),
+        );
+
+        form([
+            form_item([
+                form_label("image"),
+                form_control(text_input(
+                    image,
+                    &self.selection,
+                    HOST_ENV_EDITOR_CONTAINER_IMAGE_KEY,
+                )),
+            ]),
+            form_item([
+                form_label("mounts"),
+                form_control(column(mount_rows).gap(tokens::SPACE_2)),
+                form_description("Bind-mount host paths into the container."),
+            ]),
+            form_item([
+                form_label("network"),
+                form_control(render_network_policy_editor(
+                    "container",
+                    network,
+                    &self.selection,
+                )),
+            ]),
+            form_item([
+                form_label("resource limits"),
+                form_control(column(limit_rows).gap(tokens::SPACE_2)),
+            ]),
+            form_item([
+                form_label("environment"),
+                form_control(column(env_rows).gap(tokens::SPACE_2)),
+            ]),
+        ])
     }
 
     /// Structured editor for `thread_defaults.tool_surface`. Three
@@ -12615,6 +13832,13 @@ impl ChatApp {
         if self.settings_modal.is_none() {
             self.settings_modal = Some(SettingsModalState::default());
         }
+        self.request_host_env_daemons();
+    }
+
+    fn request_host_env_daemons(&self) {
+        self.send(ClientToServer::ListHostEnvDaemons {
+            correlation_id: None,
+        });
     }
 
     /// Open the knowledge-buckets modal. Idempotent. Bucket-list
@@ -13577,6 +14801,10 @@ impl ChatApp {
                     SettingsTab::Backends.label(),
                 ),
                 (
+                    SettingsTab::HostEnv.wire_value(),
+                    SettingsTab::HostEnv.label(),
+                ),
+                (
                     SettingsTab::SharedMcp.wire_value(),
                     SettingsTab::SharedMcp.label(),
                 ),
@@ -13589,6 +14817,7 @@ impl ChatApp {
 
         let body: El = match modal.active_tab {
             SettingsTab::Backends => self.render_settings_backends_tab(modal),
+            SettingsTab::HostEnv => self.render_settings_host_env_tab(),
             SettingsTab::SharedMcp => self.render_settings_shared_mcp_tab(modal),
             SettingsTab::ServerConfig => self.render_settings_server_config_tab(modal),
         };
@@ -13599,7 +14828,7 @@ impl ChatApp {
             dialog_header([
                 dialog_title("Server settings"),
                 dialog_description(
-                    "LLM backends, Shared MCP hosts, and the raw \
+                    "LLM backends, host-env daemons, Shared MCP hosts, and the raw \
                      whisper-agent.toml editor. Mutation paths are \
                      admin-only — non-admin connections see an error \
                      reply that surfaces in the per-tab banner.",
@@ -13715,6 +14944,159 @@ impl ChatApp {
             .gap(tokens::SPACE_2)
             .width(Size::Fill(1.0))
             .height(Size::Fill(1.0))
+    }
+
+    /// Host-env daemons tab — read-only view over the v2 daemon
+    /// registry. Admission is configured in `[[auth.daemons]]`;
+    /// connection/capability state comes from live `/v1/host_env_link`
+    /// handshakes and is refreshed on demand.
+    fn render_settings_host_env_tab(&self) -> El {
+        let mut entries: Vec<El> = Vec::new();
+        entries.push(
+            paragraph(
+                "Host-env providers admitted by [[auth.daemons]] and \
+                 currently connected host daemons. Add or rename \
+                 admissions on the Server config tab, then start a \
+                 daemon with the matching name and token.",
+            )
+            .muted(),
+        );
+        entries.push(
+            row([button("Refresh").key(SETTINGS_HOST_ENV_REFRESH_KEY)])
+                .gap(tokens::SPACE_2)
+                .align(Align::Center),
+        );
+
+        if self.host_env_daemons.is_empty() {
+            entries.push(
+                paragraph(
+                    "No host-env daemon admissions are configured. Pods \
+                     can still define allow.host_env entries, but their \
+                     provider names will stay offline until admitted and \
+                     connected.",
+                )
+                .muted(),
+            );
+            return column(entries)
+                .gap(tokens::SPACE_2)
+                .width(Size::Fill(1.0))
+                .height(Size::Fill(1.0));
+        }
+
+        let mut rows: Vec<El> = Vec::new();
+        for daemon in &self.host_env_daemons {
+            rows.push(self.render_host_env_daemon_row(daemon));
+        }
+        entries.push(
+            scroll(rows)
+                .gap(tokens::SPACE_2)
+                .width(Size::Fill(1.0))
+                .height(Size::Fill(1.0)),
+        );
+        column(entries)
+            .gap(tokens::SPACE_2)
+            .width(Size::Fill(1.0))
+            .height(Size::Fill(1.0))
+    }
+
+    fn render_host_env_daemon_row(&self, daemon: &HostEnvDaemonSummary) -> El {
+        let status = if daemon.connected {
+            text("connected").caption().color(tokens::SUCCESS)
+        } else if daemon.admitted {
+            text("offline").caption().color(tokens::WARNING)
+        } else {
+            text("not admitted").caption().color(tokens::DESTRUCTIVE)
+        };
+        let version = daemon
+            .daemon_version
+            .as_deref()
+            .map(|v| match daemon.protocol_version {
+                Some(proto) => format!("v{v} / proto {proto}"),
+                None => format!("v{v}"),
+            })
+            .unwrap_or_else(|| "no handshake".to_string());
+
+        let spec_kinds = if daemon.spec_kinds.is_empty() {
+            "specs: none advertised".to_string()
+        } else {
+            format!("specs: {}", daemon.spec_kinds.join(", "))
+        };
+        let max_sessions = daemon
+            .max_concurrent_sessions
+            .map(|n| n.to_string())
+            .unwrap_or_else(|| "unlimited".to_string());
+        let background = if daemon.supports_background_tasks {
+            "background tasks: yes"
+        } else {
+            "background tasks: no"
+        };
+        let activity = daemon
+            .last_active_ms_ago
+            .map(format_ms_ago)
+            .unwrap_or_else(|| "not connected".to_string());
+
+        let mut card_children: Vec<El> = vec![
+            row([
+                text(daemon.name.clone())
+                    .label()
+                    .bold()
+                    .ellipsis()
+                    .width(Size::Fill(1.0)),
+                status,
+            ])
+            .gap(tokens::SPACE_2)
+            .align(Align::Center)
+            .width(Size::Fill(1.0)),
+            text(version)
+                .caption()
+                .muted()
+                .ellipsis()
+                .width(Size::Fill(1.0)),
+            text(spec_kinds)
+                .caption()
+                .muted()
+                .ellipsis()
+                .width(Size::Fill(1.0)),
+            row([
+                text(format!("max sessions: {max_sessions}"))
+                    .caption()
+                    .muted(),
+                text(background).caption().muted(),
+                text(format!("last active: {activity}")).caption().muted(),
+            ])
+            .gap(tokens::SPACE_3)
+            .align(Align::Center)
+            .width(Size::Fill(1.0)),
+        ];
+
+        if daemon.connected {
+            let tools = if daemon.tools.is_empty() {
+                "tools: none".to_string()
+            } else {
+                let preview: Vec<&str> = daemon.tools.iter().take(6).map(String::as_str).collect();
+                let suffix = daemon.tools.len().saturating_sub(preview.len());
+                if suffix == 0 {
+                    format!("tools: {}", preview.join(", "))
+                } else {
+                    format!("tools: {} (+{suffix} more)", preview.join(", "))
+                }
+            };
+            card_children.push(text(tools).caption().muted().ellipsis());
+        } else {
+            card_children.push(
+                paragraph(
+                    "Admitted daemon is not connected. Start the host daemon \
+                     with this provider name and its configured token before \
+                     threads can use it.",
+                )
+                .color(tokens::WARNING),
+            );
+        }
+
+        card(card_children)
+            .gap(tokens::SPACE_2)
+            .padding(Sides::all(tokens::SPACE_4))
+            .width(Size::Fill(1.0))
     }
 
     /// Shared MCP hosts tab — list of configured shared-MCP hosts
@@ -17125,6 +18507,21 @@ fn format_build_elapsed(started_at_rfc3339: &str) -> String {
         format!("{s}s")
     };
     format!("{body} elapsed")
+}
+
+fn format_ms_ago(ms: u64) -> String {
+    let secs = ms / 1000;
+    if secs < 1 {
+        "just now".to_string()
+    } else if secs < 60 {
+        format!("{secs}s ago")
+    } else if secs < 3600 {
+        format!("{}m ago", secs / 60)
+    } else if secs < 86400 {
+        format!("{}h ago", secs / 3600)
+    } else {
+        format!("{}d ago", secs / 86400)
+    }
 }
 
 fn lightbox_download_filename(mime: ImageMime) -> String {

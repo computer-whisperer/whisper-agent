@@ -16,11 +16,9 @@ whisper-agent-protocol = { workspace = true }
 
 # Aetna's optional native winit + wgpu host. Owns window creation,
 # event loop, surface configuration, and frame submission so this
-# binary only has to plug a `ChatApp` into it. Both come from
-# crates.io; override via `[patch.crates-io]` for live-dev against
-# a sibling aetna worktree.
-aetna-core = "0.3.3"
-aetna-winit-wgpu = "0.3.3"
+# binary only has to plug a `ChatApp` into it.
+aetna-core = { path = "../../../../aetna/aetna.main/crates/aetna-core" }
+aetna-winit-wgpu = { path = "../../../../aetna/aetna.main/crates/aetna-winit-wgpu" }
 
 # Tokio hosts the WS task on a background thread; the UI runs on the
 # main thread inside winit's event loop.

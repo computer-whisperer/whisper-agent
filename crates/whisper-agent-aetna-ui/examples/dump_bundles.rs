@@ -355,6 +355,10 @@ enum Scene {
     /// paints populated and the Save / Revert affordances render
     /// disabled (buffer == baseline).
     SettingsServerConfig,
+    /// Server-settings modal on the Host env tab over a pre-seeded
+    /// daemon registry: one connected daemon advertising landlock +
+    /// container support, one admitted-but-offline daemon.
+    SettingsHostEnv,
     /// Thread inspector panel expanded over a populated thread.
     /// Same baseline as `ThreadWithMessages`; the click loop selects
     /// the thread, then toggles the inspector. The panel paints
@@ -410,7 +414,7 @@ enum Scene {
 }
 
 impl Scene {
-    const ALL: [Scene; 59] = [
+    const ALL: [Scene; 60] = [
         Scene::Connecting,
         Scene::Connected,
         Scene::Closed,
@@ -461,6 +465,7 @@ impl Scene {
         Scene::FileTreeOpen,
         Scene::SettingsBackends,
         Scene::SettingsServerConfig,
+        Scene::SettingsHostEnv,
         Scene::ThreadInspectorOpen,
         Scene::BucketsModalCatalog,
         Scene::BucketsModalSearchResults,
@@ -524,6 +529,7 @@ impl Scene {
             Scene::FileTreeOpen => "file_tree_open",
             Scene::SettingsBackends => "settings_backends",
             Scene::SettingsServerConfig => "settings_server_config",
+            Scene::SettingsHostEnv => "settings_host_env",
             Scene::ThreadInspectorOpen => "thread_inspector_open",
             Scene::BucketsModalCatalog => "buckets_modal_catalog",
             Scene::BucketsModalSearchResults => "buckets_modal_search_results",
@@ -713,6 +719,7 @@ impl Scene {
             // fires. The per-scene SendFn answers with mock TOML;
             // the second `before_build` hydrates the editor.
             Scene::SettingsServerConfig => vec!["settings:tabs:tab:server-config"],
+            Scene::SettingsHostEnv => vec!["settings:tabs:tab:host-env"],
             // Buckets-modal catalog scene: arm delete on the third
             // (ready) bucket so the destructive Confirm + Cancel
             // pair renders. The pre-seeded BucketBuildProgress
@@ -1521,6 +1528,7 @@ fn build_app(scene: Scene) -> Box<dyn App> {
         | Scene::FileTreeBehaviorPromptDeepLink
         | Scene::SettingsBackends
         | Scene::SettingsServerConfig
+        | Scene::SettingsHostEnv
         | Scene::SettingsCodexRotate
         | Scene::SettingsSharedMcpList
         | Scene::SettingsSharedMcpEditorAdd
@@ -1549,6 +1557,7 @@ fn build_app(scene: Scene) -> Box<dyn App> {
                 scene,
                 Scene::SettingsBackends
                     | Scene::SettingsServerConfig
+                    | Scene::SettingsHostEnv
                     | Scene::SettingsCodexRotate
                     | Scene::SettingsSharedMcpList
                     | Scene::SettingsSharedMcpEditorAdd
@@ -1567,6 +1576,12 @@ fn build_app(scene: Scene) -> Box<dyn App> {
                     } else {
                         mock_backends()
                     },
+                }));
+            }
+            if matches!(scene, Scene::SettingsHostEnv) {
+                q.push_back(InboundEvent::Wire(ServerToClient::HostEnvDaemonsList {
+                    correlation_id: None,
+                    daemons: mock_host_env_daemons(),
                 }));
             }
             if matches!(
@@ -1668,6 +1683,7 @@ fn build_app(scene: Scene) -> Box<dyn App> {
         scene,
         Scene::SettingsBackends
             | Scene::SettingsServerConfig
+            | Scene::SettingsHostEnv
             | Scene::SettingsCodexRotate
             | Scene::SettingsSharedMcpList
             | Scene::SettingsSharedMcpEditorAdd
@@ -1780,6 +1796,43 @@ fn mock_settings_shared_mcp_hosts() -> Vec<whisper_agent_protocol::SharedMcpHost
             prefix: Some(String::new()),
             connected: false,
             last_error: "tcp connect refused: 503".into(),
+        },
+    ]
+}
+
+fn mock_host_env_daemons() -> Vec<whisper_agent_protocol::HostEnvDaemonSummary> {
+    vec![
+        whisper_agent_protocol::HostEnvDaemonSummary {
+            name: "local-dev".into(),
+            admitted: true,
+            connected: true,
+            daemon_version: Some("0.3.19".into()),
+            protocol_version: Some(2),
+            spec_kinds: vec!["landlock".into(), "container".into()],
+            tools: vec![
+                "bash".into(),
+                "read_file".into(),
+                "write_file".into(),
+                "list_dir".into(),
+                "apply_patch".into(),
+                "git_status".into(),
+                "cargo_check".into(),
+            ],
+            max_concurrent_sessions: Some(4),
+            supports_background_tasks: true,
+            last_active_ms_ago: Some(3_200),
+        },
+        whisper_agent_protocol::HostEnvDaemonSummary {
+            name: "linux-builder".into(),
+            admitted: true,
+            connected: false,
+            daemon_version: None,
+            protocol_version: None,
+            spec_kinds: Vec::new(),
+            tools: Vec::new(),
+            max_concurrent_sessions: None,
+            supports_background_tasks: false,
+            last_active_ms_ago: None,
         },
     ]
 }

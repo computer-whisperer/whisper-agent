@@ -33,8 +33,9 @@ use thiserror::Error;
 use tokio::sync::{Notify, mpsc, oneshot};
 use whisper_agent_host_proto::{
     CallId, CallToolResult, ContentBlock, DaemonCapabilities, GoodbyeReason, HostEnvSpec,
-    ProvisionPhase, SessionId, ThreadContext,
+    HostEnvSpecKind, ProvisionPhase, SessionId, ThreadContext,
 };
+use whisper_agent_protocol::HostEnvDaemonSummary;
 
 pub use auth::{AdmittedDaemon, DaemonAuthState};
 pub use endpoint::link_handler;
@@ -143,6 +144,75 @@ impl LiveDaemonRegistry {
             admitted,
             connected,
         }
+    }
+
+    /// Host-env daemon rows for the client settings UI. Includes the
+    /// union of admitted names and connected handles so an unexpected
+    /// live handle is visible even if admission state changes later.
+    pub fn daemon_summaries(&self) -> Vec<HostEnvDaemonSummary> {
+        let now_ms = unix_millis_now();
+        let inner = self.inner.lock().expect("registry mutex poisoned");
+        let mut names: Vec<String> = inner
+            .admitted
+            .iter()
+            .chain(inner.connected.keys())
+            .cloned()
+            .collect();
+        names.sort();
+        names.dedup();
+
+        names
+            .into_iter()
+            .map(|name| {
+                let admitted = inner.admitted.contains(&name);
+                let handle = inner.connected.get(&name);
+                match handle {
+                    Some(handle) => {
+                        let mut tools: Vec<String> = handle
+                            .capabilities
+                            .tools
+                            .iter()
+                            .map(|tool| tool.name.clone())
+                            .collect();
+                        tools.sort();
+                        HostEnvDaemonSummary {
+                            name,
+                            admitted,
+                            connected: true,
+                            daemon_version: Some(handle.daemon_version.clone()),
+                            protocol_version: Some(handle.protocol_version),
+                            spec_kinds: handle
+                                .capabilities
+                                .spec_kinds
+                                .iter()
+                                .map(host_env_spec_kind_label)
+                                .collect(),
+                            tools,
+                            max_concurrent_sessions: handle.capabilities.max_concurrent_sessions,
+                            supports_background_tasks: handle
+                                .capabilities
+                                .supports_background_tasks,
+                            last_active_ms_ago: Some(
+                                (now_ms - handle.last_active_at_ms.load(Ordering::Acquire)).max(0)
+                                    as u64,
+                            ),
+                        }
+                    }
+                    None => HostEnvDaemonSummary {
+                        name,
+                        admitted,
+                        connected: false,
+                        daemon_version: None,
+                        protocol_version: None,
+                        spec_kinds: Vec::new(),
+                        tools: Vec::new(),
+                        max_concurrent_sessions: None,
+                        supports_background_tasks: false,
+                        last_active_ms_ago: None,
+                    },
+                }
+            })
+            .collect()
     }
 
     /// Block until `name` has a live connection. Returns the handle
@@ -285,6 +355,14 @@ pub(super) fn unix_millis_now() -> i64 {
         .unwrap_or(0)
 }
 
+fn host_env_spec_kind_label(kind: &HostEnvSpecKind) -> String {
+    match kind {
+        HostEnvSpecKind::Landlock => "landlock",
+        HostEnvSpecKind::Container => "container",
+    }
+    .to_string()
+}
+
 /// Sorted snapshot of registry state for logging / introspection.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RegistrySnapshot {
@@ -295,6 +373,8 @@ pub struct RegistrySnapshot {
 /// Handle on a connected v2 daemon. Cheap to clone (`Arc`).
 pub struct LiveDaemonHandle {
     name: String,
+    daemon_version: String,
+    protocol_version: u32,
     capabilities: DaemonCapabilities,
     cmd_tx: mpsc::Sender<Command>,
     next_session_seq: AtomicU64,

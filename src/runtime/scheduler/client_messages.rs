@@ -454,6 +454,16 @@ impl Scheduler {
                     },
                 );
             }
+            ClientToServer::ListHostEnvDaemons { correlation_id } => {
+                let daemons = self.v2_daemon_registry.daemon_summaries();
+                self.router.send_to_client(
+                    conn_id,
+                    ServerToClient::HostEnvDaemonsList {
+                        correlation_id,
+                        daemons,
+                    },
+                );
+            }
             ClientToServer::AddSharedMcpHost {
                 correlation_id,
                 name,

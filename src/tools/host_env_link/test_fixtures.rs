@@ -127,6 +127,8 @@ impl LiveDaemonHandle {
     ) -> Self {
         Self {
             name,
+            daemon_version: "test".into(),
+            protocol_version: whisper_agent_host_proto::PROTOCOL_VERSION,
             capabilities,
             cmd_tx,
             next_session_seq: AtomicU64::new(1),

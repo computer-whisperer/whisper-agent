@@ -12,12 +12,10 @@ license.workspace = true
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-# Aetna is published to crates.io. For live-development against a
-# sibling worktree, override these in a top-level `Cargo.toml`
-# `[patch.crates-io]` table or a `.cargo/config.toml`; CI builds
-# against the registry version verbatim.
-aetna-core = "0.3.3"
-aetna-markdown = "0.3.3"
+# Aetna lives in a sibling worktree under active development; the path
+# spec keeps us in lockstep with unreleased UI/runtime fixes.
+aetna-core = { path = "../../../../aetna/aetna.main/crates/aetna-core" }
+aetna-markdown = { path = "../../../../aetna/aetna.main/crates/aetna-markdown" }
 
 whisper-agent-protocol = { workspace = true }
 serde = { workspace = true }
@@ -75,12 +73,8 @@ js-sys = "0.3"
 # parameterizes its `Host<A: App>` and exposes `start_with_config` +
 # a `WebHandle::request_redraw` shim, so `web_entry.rs` only carries
 # whisper-agent-specific glue (WebSocket, drag-drop files, image-paste)
-# instead of the full wgpu/winit bootstrap. The aetna-side fix for
-# this lives at https://github.com/computer-whisperer/aetna/issues/28
-# / commit 03cb02c "Make aetna-web reusable". When the upstream cuts
-# a new release we bump the pin; until then `[patch.crates-io]` in
-# the workspace root overlays the sibling worktree.
-aetna-web = "0.3.3"
+# instead of the full wgpu/winit bootstrap.
+aetna-web = { path = "../../../../aetna/aetna.main/crates/aetna-web" }
 web-sys = { version = "0.3", features = [
     "WebSocket",
     "MessageEvent",
