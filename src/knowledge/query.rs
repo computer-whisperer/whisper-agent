@@ -27,6 +27,7 @@
 
 use std::collections::HashSet;
 use std::sync::Arc;
+use std::time::Instant;
 
 use tokio_util::sync::CancellationToken;
 
@@ -110,7 +111,14 @@ impl QueryEngine {
             return Ok(Vec::new());
         }
 
+        // Phase timings emitted at info level so server-stdout shows
+        // an end-to-end breakdown per query. Per-bucket dense/sparse
+        // are also logged individually because the parallel fan-out
+        // makes the aggregate number hide which path is the long pole.
+        let t_total = Instant::now();
+        let t_embed = Instant::now();
         let query_vec = self.embed_query(text, cancel).await?;
+        let embed_ms = t_embed.elapsed().as_millis();
 
         // Fan out per-bucket dense + sparse searches concurrently
         // across all buckets, not just within a single bucket. With
@@ -122,30 +130,60 @@ impl QueryEngine {
         // (drop dense silently if dimensions disagree, keep sparse)
         // is preserved per-bucket inside the closure.
         use futures::future::join_all;
+        let t_buckets = Instant::now();
         let per_bucket: Vec<_> = buckets
             .iter()
             .map(|bucket| {
                 let qv = &query_vec;
                 let dense_k = params.top_k_dense_per_bucket;
                 let sparse_k = params.top_k_sparse_per_bucket;
+                let bucket_id = bucket.id().clone();
                 async move {
-                    let (dense_res, sparse_res) = tokio::join!(
-                        bucket.dense_search(qv, dense_k, cancel),
-                        bucket.sparse_search(text, sparse_k, cancel),
-                    );
+                    let t_dense = Instant::now();
+                    let dense_fut = async {
+                        let r = bucket.dense_search(qv, dense_k, cancel).await;
+                        (r, t_dense.elapsed().as_millis())
+                    };
+                    let t_sparse = Instant::now();
+                    let sparse_fut = async {
+                        let r = bucket.sparse_search(text, sparse_k, cancel).await;
+                        (r, t_sparse.elapsed().as_millis())
+                    };
+                    let ((dense_res, dense_ms), (sparse_res, sparse_ms)) =
+                        tokio::join!(dense_fut, sparse_fut);
                     let mut out: Vec<Candidate> = Vec::new();
+                    let mut dense_hits = 0usize;
+                    let mut dense_skipped = false;
                     match dense_res {
-                        Ok(cands) => out.extend(cands),
+                        Ok(cands) => {
+                            dense_hits = cands.len();
+                            out.extend(cands);
+                        }
                         // Bucket built with a different-dimension
                         // embedder. Sparse path can still contribute;
                         // skip dense silently.
-                        Err(BucketError::DimensionMismatch { .. }) => {}
+                        Err(BucketError::DimensionMismatch { .. }) => {
+                            dense_skipped = true;
+                        }
                         Err(e) => return Err(e),
                     }
-                    match sparse_res {
-                        Ok(cands) => out.extend(cands),
+                    let sparse_hits = match sparse_res {
+                        Ok(cands) => {
+                            let n = cands.len();
+                            out.extend(cands);
+                            n
+                        }
                         Err(e) => return Err(e),
-                    }
+                    };
+                    tracing::info!(
+                        bucket = %bucket_id,
+                        dense_ms,
+                        sparse_ms,
+                        dense_hits,
+                        sparse_hits,
+                        dense_skipped,
+                        "knowledge_query: bucket search timing",
+                    );
                     Ok::<Vec<Candidate>, BucketError>(out)
                 }
             })
@@ -155,9 +193,24 @@ impl QueryEngine {
         for r in results {
             all_candidates.extend(r?);
         }
+        let buckets_ms = t_buckets.elapsed().as_millis();
+        let total_candidates = all_candidates.len();
 
+        let t_dedupe = Instant::now();
         let deduped = dedupe_candidates(all_candidates);
+        let dedupe_ms = t_dedupe.elapsed().as_millis();
+        let deduped_candidates = deduped.len();
         if deduped.is_empty() {
+            tracing::info!(
+                total_ms = t_total.elapsed().as_millis() as u64,
+                embed_ms = embed_ms as u64,
+                buckets_ms = buckets_ms as u64,
+                rerank_ms = 0u64,
+                total_candidates,
+                deduped_candidates,
+                bucket_count = buckets.len(),
+                "knowledge_query: empty after dedupe",
+            );
             return Ok(Vec::new());
         }
 
@@ -171,11 +224,13 @@ impl QueryEngine {
             documents: &documents,
             top_n: Some(params.top_k as u32),
         };
+        let t_rerank = Instant::now();
         let resp = self
             .reranker
             .rerank(&req, cancel)
             .await
             .map_err(|e| BucketError::Provider(e.to_string()))?;
+        let rerank_ms = t_rerank.elapsed().as_millis();
 
         // Defensive truncation: the request asks the reranker for
         // `top_n = params.top_k`, but not every server honors it
@@ -201,6 +256,21 @@ impl QueryEngine {
                 rerank_score: r.score,
             });
         }
+        let rerank_doc_chars: usize = documents.iter().map(|d| d.len()).sum();
+        tracing::info!(
+            total_ms = t_total.elapsed().as_millis() as u64,
+            embed_ms = embed_ms as u64,
+            buckets_ms = buckets_ms as u64,
+            dedupe_ms = dedupe_ms as u64,
+            rerank_ms = rerank_ms as u64,
+            total_candidates,
+            deduped_candidates,
+            rerank_docs = documents.len(),
+            rerank_doc_chars,
+            returned = out.len(),
+            bucket_count = buckets.len(),
+            "knowledge_query: timing",
+        );
         Ok(out)
     }
 
