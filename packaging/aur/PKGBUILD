@@ -18,7 +18,7 @@
 #   5. Push to AUR (separate `aur:whisper-agent-host` git remote).
 
 pkgname=whisper-agent-host
-pkgver=0.3.18
+pkgver=0.3.19
 pkgrel=1
 pkgdesc="Host-side daemon for whisper-agent (landlock-isolated per-thread MCP hosts; dials a central server)"
 arch=('x86_64' 'aarch64')
@@ -39,14 +39,13 @@ source=(
     'host-daemon.env'
     'whisper-agent-host-daemon.service'
 )
-# Refresh the first checksum with `updpkgsums` whenever pkgver bumps.
-# The other two are local files maintained alongside this PKGBUILD;
-# 'SKIP' is fine because they're versioned in the upstream repo.
-sha256sums=(
-    '68e996cb41e95ce3e2a17e69fab1b87ce9db735b2f31b4b75478c4bdf9bfd1fe'
-    'SKIP'
-    'SKIP'
-)
+# Refresh with `updpkgsums` whenever pkgver bumps or either local file
+# changes — the second two checksums pin the in-repo `host-daemon.env`
+# and `whisper-agent-host-daemon.service`. `SKIP` would also be fine
+# (those files are versioned upstream) but updpkgsums fills them in.
+sha256sums=('fce7b18158eb9ad55f8f77fe7b63ea96de36628fc4cd251fa8f9314990c5dd60'
+            '956f642a3524ddbfe00c729fd4aee07d1c422e1a423606786276f886a259dc7f'
+            '563f1b720b08a4f086d523ebacfea32b06adf44470efa9fcf64347268c54fea7')
 
 prepare() {
     cd "${srcdir}/whisper-agent-${pkgver}"
