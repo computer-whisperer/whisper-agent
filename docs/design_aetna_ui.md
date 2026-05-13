@@ -1575,20 +1575,17 @@ trivial / small / medium / large.
 
 ### Misc
 
-- ⏳ **Pod editor structured tabs.** v1 ships raw-TOML only (a
-  single `text_area` sheet). Egui's pod editor has tabs for
-  Allow / Defaults / Limits — aetna already has all three
-  (`render_pod_editor_*_tab`), so this gap is closed; track here
-  only as a note that future surfacing of MCP host CRUD lands
-  inside the existing tabs. (Per-tool override map editing is
-  *not* a gap — the egui sibling also shows just an "edit via
-  Raw TOML" stub, since `allow.tools.overrides` is an unbounded
-  `String → Disposition` map.)
-- ⏳ **Behavior editor parity.** v1 ships the 80% form (name /
-  description / trigger kind / cron schedule / prompt). All
-  remaining tabs (Scope, Retention, Thread, System Prompt, Raw
-  TOML) have already landed (see Stage 8). Track here only as
-  an inventory note.
+- ✅ **Pod editor structured tabs.** Allow / Defaults / Limits /
+  Raw TOML tabs all dispatch through `render_pod_editor_modal` →
+  `render_pod_editor_{allow,defaults,limits}_tab` (`app.rs`).
+  Future surfacing of MCP host CRUD lands inside the existing
+  tabs. (Per-tool override map editing is *not* a gap — the egui
+  sibling also shows just an "edit via Raw TOML" stub, since
+  `allow.tools.overrides` is an unbounded `String → Disposition`
+  map.)
+- ✅ **Behavior editor parity.** All seven tabs (Trigger / Prompt /
+  Thread / Scope / Retention / SystemPrompt / RawToml) dispatch
+  through `render_behavior_editor_modal` (`app.rs`). See Stage 8.
 - ✅ **`+ New pod` default-template clone.**
   `default_pod_template: Option<PodConfig>` caches the
   server-default pod's full config, fetched lazily by

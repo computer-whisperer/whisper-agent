@@ -17,15 +17,22 @@
 
 ARG RUST_VERSION=1.92
 ARG DEBIAN_VERSION=bookworm
+# Pin to match `.github/workflows/ci.yml` so the image and CI cannot
+# silently diverge if upstream wasm-pack ships a regression. The init.sh
+# script doesn't pin reliably; download the prebuilt binary directly.
+ARG WASM_PACK_VERSION=0.13.1
 
 # ---- chef base ---------------------------------------------------------------
 # Shared base for planner and builder: pinned cargo-chef, the wasm32
-# target, and a wasm-pack binary.
+# target, and a pinned wasm-pack binary.
 FROM rust:${RUST_VERSION}-${DEBIAN_VERSION} AS chef
+ARG WASM_PACK_VERSION
 WORKDIR /app
 RUN cargo install cargo-chef --locked --version 0.1.77 \
     && rustup target add wasm32-unknown-unknown \
-    && curl -sSfL https://rustwasm.github.io/wasm-pack/installer/init.sh | sh
+    && curl -sSfL "https://github.com/rustwasm/wasm-pack/releases/download/v${WASM_PACK_VERSION}/wasm-pack-v${WASM_PACK_VERSION}-x86_64-unknown-linux-musl.tar.gz" \
+        | tar -xz --strip-components=1 -C /usr/local/bin \
+        "wasm-pack-v${WASM_PACK_VERSION}-x86_64-unknown-linux-musl/wasm-pack"
 
 # ---- planner: emit the dependency recipe ------------------------------------
 # Reads only Cargo.toml + Cargo.lock content, so the resulting recipe.json
