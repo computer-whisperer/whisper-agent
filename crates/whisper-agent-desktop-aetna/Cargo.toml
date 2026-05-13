@@ -19,8 +19,8 @@ whisper-agent-protocol = { workspace = true }
 # binary only has to plug a `ChatApp` into it. Both come from
 # crates.io; override via `[patch.crates-io]` for live-dev against
 # a sibling aetna worktree.
-aetna-core = "0.3.2"
-aetna-winit-wgpu = "0.3.2"
+aetna-core = "0.3.3"
+aetna-winit-wgpu = "0.3.3"
 
 # Tokio hosts the WS task on a background thread; the UI runs on the
 # main thread inside winit's event loop.

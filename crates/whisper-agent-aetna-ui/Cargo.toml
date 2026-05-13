@@ -16,8 +16,8 @@ crate-type = ["cdylib", "rlib"]
 # sibling worktree, override these in a top-level `Cargo.toml`
 # `[patch.crates-io]` table or a `.cargo/config.toml`; CI builds
 # against the registry version verbatim.
-aetna-core = "0.3.2"
-aetna-markdown = "0.3.2"
+aetna-core = "0.3.3"
+aetna-markdown = "0.3.3"
 
 whisper-agent-protocol = { workspace = true }
 serde = { workspace = true }
