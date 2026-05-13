@@ -27,6 +27,12 @@ log = "0.4"
 chrono = "0.4"
 chrono-tz = { workspace = true }
 cron = { workspace = true }
+# Cross-target Instant — `std::time::Instant::now()` panics on
+# wasm32-unknown-unknown, so we use the web-time shim which aliases
+# std on native and backs to `performance.now()` in the browser. Used
+# by `web_entry.rs` (per-frame timing buckets) and `app.rs` (live
+# tokens-per-second header chip's elapsed-time anchor).
+web-time = "1"
 # Round-trip the structured pod editor's `working_config` through
 # the raw-TOML tab. `default-features = false` drops `std` features
 # we don't need — only the display/parse/serde paths matter here.
@@ -65,10 +71,6 @@ console_error_panic_hook = "0.1"
 # bundled equivalent so we wire it explicitly.
 console_log = "1"
 js-sys = "0.3"
-# `web_time::Instant` is the wasm-safe shim for the per-frame timing
-# bucket in the host loop. `std::time::Instant::now()` panics on
-# wasm32-unknown-unknown; web-time backs it with `performance.now()`.
-web-time = "1"
 # Browser wgpu host stack. `aetna-wgpu` owns the Runner / MsaaTarget;
 # `wgpu` with `webgl` features picks up the browser backends; winit
 # drives the canvas-bound event loop. ResizeObserver wiring lives in

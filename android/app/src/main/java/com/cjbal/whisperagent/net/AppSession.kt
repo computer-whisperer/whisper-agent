@@ -633,6 +633,12 @@ class AppSession(
                     }
                 }
             }
+            is ServerToClient.OutputTokensProgress -> {
+                // Decoded so the Kotlin wire stays in lockstep with
+                // the server, but no Android UI surface for live
+                // tok/s yet. Wire it into a chrome indicator when
+                // mirroring the Aetna chip lands here.
+            }
             is ServerToClient.ToolCallStreaming -> {
                 if (_threads.value[event.threadId]?.state == ThreadStateLabel.Working) {
                     _streamingToolCalls.update { outer ->

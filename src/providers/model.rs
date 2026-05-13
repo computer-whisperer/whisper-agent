@@ -223,6 +223,16 @@ pub enum ModelEvent {
         tokens_processed: u32,
         tokens_total: u32,
     },
+    /// Mid-decode running output-token count. Emitted by providers that
+    /// expose cumulative `output_tokens` during streaming so clients can
+    /// drive a live tokens-per-second indicator without estimating from
+    /// delta character counts. Cumulative (not incremental), monotonically
+    /// non-decreasing across the stream, terminal value matches
+    /// `Completed.usage.output_tokens`. Providers that only learn the
+    /// final count at end-of-stream (OpenAI Responses today) don't emit
+    /// this — clients fall back to deriving the rate from
+    /// `Completed.usage` once it lands. Ephemeral: not persisted.
+    OutputTokensProgress { output_tokens: u32 },
     /// Terminal event. `content` is the assistant-turn content block list the
     /// scheduler should persist. Deltas emitted before this are strictly for
     /// broadcast; the canonical state comes from here.

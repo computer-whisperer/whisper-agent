@@ -805,6 +805,21 @@ async fn consume_stream(
                     },
                 });
             }
+            Ok(ModelEvent::OutputTokensProgress { output_tokens }) => {
+                // Decorative heartbeat for the live tokens-per-second
+                // indicator. Arrives after the first real output token,
+                // so `any_delta_emitted` is set — a rate-limit error
+                // after this is mid-stream and fatal (matches the
+                // TextDelta / ThinkingDelta arms).
+                any_delta_emitted = true;
+                let _ = stream_tx.send(StreamUpdate {
+                    thread_id: thread_id.to_string(),
+                    event: ServerToClient::ThreadOutputTokensProgress {
+                        thread_id: thread_id.to_string(),
+                        output_tokens,
+                    },
+                });
+            }
             Ok(ModelEvent::Completed {
                 content,
                 stop_reason,

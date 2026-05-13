@@ -95,6 +95,20 @@ sealed class ServerToClient {
     ) : ServerToClient()
 
     /**
+     * Mid-decode running output-token count from backends that expose
+     * cumulative `output_tokens` during streaming (Anthropic / Gemini
+     * today). Silent for OpenAI Responses + llama.cpp. Cumulative,
+     * monotonically non-decreasing; terminal value matches
+     * `AssistantEnd.usage.outputTokens` for the same turn. Ephemeral:
+     * clients drive a live tokens-per-second indicator off this and
+     * drop it when streaming ends; nothing is persisted.
+     */
+    data class OutputTokensProgress(
+        val threadId: String,
+        val outputTokens: Int,
+    ) : ServerToClient()
+
+    /**
      * In-flight tool call placeholder. Model is still streaming args
      * JSON; the scheduler hasn't dispatched this call yet. Clients
      * render a name + spinner + char count; swap it out for the real

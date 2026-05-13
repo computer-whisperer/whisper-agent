@@ -61,6 +61,7 @@ object ServerToClientSerializer : KSerializer<ServerToClient> {
     private const val IDX_TOKENS_PROCESSED = 35
     private const val IDX_TOKENS_TOTAL = 36
     private const val IDX_ARGS_CHARS = 37
+    private const val IDX_OUTPUT_TOKENS = 38
 
     private val tasksSerializer = ListSerializer(ThreadSummary.serializer())
     private val podsSerializer = ListSerializer(PodSummary.serializer())
@@ -107,6 +108,7 @@ object ServerToClientSerializer : KSerializer<ServerToClient> {
         element("tokens_processed", Int.serializer().descriptor, isOptional = true)
         element("tokens_total", Int.serializer().descriptor, isOptional = true)
         element("args_chars", Int.serializer().descriptor, isOptional = true)
+        element("output_tokens", Int.serializer().descriptor, isOptional = true)
         // Note: `summary` (IDX_SUMMARY) is shared between ThreadCreated and
         // BehaviorCreated; `state` (IDX_STATE) is shared between
         // ThreadStateChanged and BehaviorStateChanged. The decode loop
@@ -192,6 +194,11 @@ object ServerToClientSerializer : KSerializer<ServerToClient> {
                     encodeStringElement(descriptor, IDX_THREAD_ID, value.threadId)
                     encodeIntElement(descriptor, IDX_TOKENS_PROCESSED, value.tokensProcessed)
                     encodeIntElement(descriptor, IDX_TOKENS_TOTAL, value.tokensTotal)
+                }
+                is ServerToClient.OutputTokensProgress -> {
+                    encodeStringElement(descriptor, IDX_TYPE, "thread_output_tokens_progress")
+                    encodeStringElement(descriptor, IDX_THREAD_ID, value.threadId)
+                    encodeIntElement(descriptor, IDX_OUTPUT_TOKENS, value.outputTokens)
                 }
                 is ServerToClient.ToolCallStreaming -> {
                     encodeStringElement(descriptor, IDX_TYPE, "thread_tool_call_streaming")
@@ -387,6 +394,7 @@ object ServerToClientSerializer : KSerializer<ServerToClient> {
             var tokensProcessed: Int? = null
             var tokensTotal: Int? = null
             var argsChars: Int? = null
+            var outputTokens: Int? = null
 
             loop@ while (true) {
                 when (val i = decodeElementIndex(descriptor)) {
@@ -470,6 +478,7 @@ object ServerToClientSerializer : KSerializer<ServerToClient> {
                     IDX_TOKENS_PROCESSED -> tokensProcessed = decodeIntElement(descriptor, i)
                     IDX_TOKENS_TOTAL -> tokensTotal = decodeIntElement(descriptor, i)
                     IDX_ARGS_CHARS -> argsChars = decodeIntElement(descriptor, i)
+                    IDX_OUTPUT_TOKENS -> outputTokens = decodeIntElement(descriptor, i)
                     else -> throw SerializationException("unexpected element index $i")
                 }
             }
@@ -521,6 +530,10 @@ object ServerToClientSerializer : KSerializer<ServerToClient> {
                     threadId = requireNotNull(threadId) { "missing thread_id" },
                     tokensProcessed = requireNotNull(tokensProcessed) { "missing tokens_processed" },
                     tokensTotal = requireNotNull(tokensTotal) { "missing tokens_total" },
+                )
+                "thread_output_tokens_progress" -> ServerToClient.OutputTokensProgress(
+                    threadId = requireNotNull(threadId) { "missing thread_id" },
+                    outputTokens = requireNotNull(outputTokens) { "missing output_tokens" },
                 )
                 "thread_tool_call_streaming" -> ServerToClient.ToolCallStreaming(
                     threadId = requireNotNull(threadId) { "missing thread_id" },

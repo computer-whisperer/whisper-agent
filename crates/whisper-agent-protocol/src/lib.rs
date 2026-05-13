@@ -1846,6 +1846,21 @@ pub enum ServerToClient {
         /// Total prompt length the backend is working through.
         tokens_total: u32,
     },
+    /// Mid-decode running output-token count. Emitted by backends that
+    /// expose cumulative `output_tokens` during streaming (Anthropic
+    /// `message_delta.usage`, Gemini per-chunk `usageMetadata`) so the UI
+    /// can drive a live tokens-per-second indicator without estimating
+    /// from delta character counts. Cumulative (not incremental),
+    /// monotonically non-decreasing, terminal value matches the
+    /// `ThreadAssistantEnd.usage.output_tokens` for the same turn.
+    /// Providers that only learn the final count at end-of-stream
+    /// (OpenAI Responses, llama.cpp today) don't emit this — clients
+    /// fall back to computing the rate from `usage.output_tokens` /
+    /// elapsed once `ThreadAssistantEnd` lands. Ephemeral: not persisted.
+    ThreadOutputTokensProgress {
+        thread_id: String,
+        output_tokens: u32,
+    },
     /// In-flight tool-call placeholder. Emitted while the model is
     /// still streaming its arguments JSON — before the scheduler has
     /// dispatched the call and fired

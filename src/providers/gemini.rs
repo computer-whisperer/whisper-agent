@@ -1127,13 +1127,23 @@ impl GeminiStreamState {
             self.stop_reason = Some(fr.to_string());
         }
         if let Some(u) = chunk.usage_metadata {
+            // Gemini sends cumulative `usage_metadata` on every chunk;
+            // surface `output_tokens` as a progress event so clients can
+            // drive a live tokens-per-second indicator without
+            // estimating from delta chars. Match the same sum used for
+            // the terminal `Completed.usage.output_tokens` so the
+            // progress series ends exactly where usage lands.
+            let output_tokens =
+                u.candidates_token_count.unwrap_or(0) + u.thoughts_token_count.unwrap_or(0);
             self.usage = Some(Usage {
                 input_tokens: u.prompt_token_count.unwrap_or(0),
-                output_tokens: u.candidates_token_count.unwrap_or(0)
-                    + u.thoughts_token_count.unwrap_or(0),
+                output_tokens,
                 cache_read_input_tokens: u.cached_content_token_count.unwrap_or(0),
                 cache_creation_input_tokens: 0,
             });
+            if output_tokens > 0 {
+                out.push(ModelEvent::OutputTokensProgress { output_tokens });
+            }
         }
 
         let candidate = chunk.candidates.into_iter().next();
@@ -2214,6 +2224,35 @@ mod tests {
         }
         out.extend(state.finish());
         out
+    }
+
+    #[test]
+    fn usage_metadata_per_chunk_emits_output_tokens_progress() {
+        // Gemini sends cumulative `usageMetadata` on every streaming
+        // chunk. Each non-zero `candidatesTokenCount` should produce a
+        // `ModelEvent::OutputTokensProgress` so the client can drive a
+        // live tok/s indicator. `thoughtsTokenCount` rolls into the
+        // same sum (matches what the terminal `Completed.usage`
+        // exposes).
+        let chunks = [
+            r#"{"candidates":[{"content":{"role":"model","parts":[{"text":"a"}]}}],"usageMetadata":{"promptTokenCount":4,"candidatesTokenCount":1}}"#,
+            r#"{"candidates":[{"content":{"role":"model","parts":[{"text":"bb"}]}}],"usageMetadata":{"promptTokenCount":4,"candidatesTokenCount":3,"thoughtsTokenCount":1}}"#,
+            r#"{"candidates":[{"content":{"role":"model","parts":[]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":4,"candidatesTokenCount":3,"thoughtsTokenCount":2}}"#,
+        ];
+        let evs = feed_chunks(&chunks);
+        let progress: Vec<u32> = evs
+            .iter()
+            .filter_map(|e| match e {
+                ModelEvent::OutputTokensProgress { output_tokens } => Some(*output_tokens),
+                _ => None,
+            })
+            .collect();
+        // 1, 3+1=4, 3+2=5.
+        assert_eq!(progress, vec![1, 4, 5]);
+        match evs.last().unwrap() {
+            ModelEvent::Completed { usage, .. } => assert_eq!(usage.output_tokens, 5),
+            _ => panic!("last event must be Completed"),
+        }
     }
 
     #[test]

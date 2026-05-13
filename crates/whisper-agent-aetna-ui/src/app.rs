@@ -319,6 +319,36 @@ fn thread_model_chip(backend: &str, model: &str) -> Option<El> {
     Some(text(label).caption().muted().ellipsis())
 }
 
+/// Tokens-per-second chip for the thread header.
+///
+/// When the thread is currently streaming an assistant turn that has
+/// produced at least one cumulative-tokens progress event, the chip
+/// renders the *live* rate with a leading bullet (`• 42 tok/s`).
+/// Otherwise — between turns or for providers that don't emit
+/// progress mid-stream (OpenAI Responses, llama.cpp today) — the
+/// chip falls back to the last completed turn's rate without a
+/// bullet, so the user still gets a number to anchor on. Returns
+/// `None` for a never-streamed-yet thread so the chrome stays clean
+/// on freshly-created threads.
+fn thread_tok_per_sec_chip(view: &ThreadView) -> Option<El> {
+    let live = match (view.streaming_started_at, view.streaming_output_tokens) {
+        (Some(t0), n) if n > 0 => {
+            let elapsed = t0.elapsed().as_secs_f32();
+            if elapsed > 0.0 {
+                Some((n as f32) / elapsed)
+            } else {
+                None
+            }
+        }
+        _ => None,
+    };
+    match (live, view.last_turn_tokens_per_sec) {
+        (Some(rate), _) => Some(text(format!("\u{2022} {rate:.0} tok/s")).caption().muted()),
+        (None, Some(rate)) => Some(text(format!("{rate:.0} tok/s")).caption().muted()),
+        (None, None) => None,
+    }
+}
+
 /// Right-aligned cumulative-usage chip for the thread header.
 /// Format: `↑ 12,345 · ↓ 2,345 · cache 800r/200c`. Suppressed
 /// when every field is zero — surfacing a dead "↑ 0 · ↓ 0"
@@ -1316,6 +1346,21 @@ struct ThreadView {
     /// reads this to render the resource sets / caps / escalation
     /// rows the egui sibling shipped.
     scope: whisper_agent_protocol::permission::Scope,
+    /// Live tokens-per-second tracking for the *currently streaming*
+    /// assistant turn. `started_at` is stamped at the first output
+    /// delta (text or reasoning), not `ThreadAssistantBegin` — the gap
+    /// between Begin and the first token is prefill and shouldn't dilute
+    /// the rate. `output_tokens` mirrors the most recent cumulative
+    /// count from `ThreadOutputTokensProgress`. Both reset on the next
+    /// `ThreadAssistantBegin`. `None` / 0 means no turn is in flight.
+    streaming_started_at: Option<web_time::Instant>,
+    streaming_output_tokens: u32,
+    /// Tokens-per-second from the most recently completed assistant
+    /// turn. Set on `ThreadAssistantEnd` from
+    /// `usage.output_tokens / elapsed`. Surfaced in the header chip
+    /// while idle so the user can see the last rate without having to
+    /// catch the live indicator. `None` until the first turn ends.
+    last_turn_tokens_per_sec: Option<f32>,
 }
 
 pub struct ChatApp {
@@ -3373,6 +3418,27 @@ impl ChatApp {
                 if let Some(t) = self.threads.get_mut(&thread_id) {
                     t.state = state;
                 }
+                // Cancelled / failed turns don't fire `ThreadAssistantEnd`,
+                // so the live tok/s chip would otherwise stay anchored to
+                // the in-flight turn's start (elapsed grows, output_tokens
+                // doesn't — the chip drifts toward zero forever). Drop the
+                // live state on either terminal-without-success transition;
+                // `last_turn_tokens_per_sec` from a *prior* successful turn
+                // stays so the chip still surfaces that rate. We
+                // deliberately don't try to compute a rate from the
+                // interrupted turn's partial data — Anthropic doesn't send
+                // a `message_delta` until end-of-stream, so the count is
+                // unreliable, and the user prefers "no number" to a fake
+                // one.
+                if matches!(
+                    state,
+                    whisper_agent_protocol::ThreadStateLabel::Cancelled
+                        | whisper_agent_protocol::ThreadStateLabel::Failed
+                ) && let Some(view) = self.views.get_mut(&thread_id)
+                {
+                    view.streaming_started_at = None;
+                    view.streaming_output_tokens = 0;
+                }
             }
             ServerToClient::ThreadTitleUpdated { thread_id, title } => {
                 let opt = if title.is_empty() { None } else { Some(title) };
@@ -3431,6 +3497,9 @@ impl ChatApp {
                     origin_fired_at,
                     origin_trigger_payload,
                     scope: snapshot.scope,
+                    streaming_started_at: None,
+                    streaming_output_tokens: 0,
+                    last_turn_tokens_per_sec: None,
                 };
                 // Hydrate the local draft from the snapshot — the
                 // server's stored draft is authoritative on initial
@@ -3462,6 +3531,26 @@ impl ChatApp {
             } => {
                 self.prefill
                     .insert(thread_id, (tokens_processed, tokens_total));
+            }
+            // Cumulative output-token count for the in-flight turn —
+            // emitted by Anthropic + Gemini today. Drives the live
+            // tok/s chip in the thread header; capped to monotonic
+            // non-decreasing values per the wire contract so a delayed
+            // packet can't make the chip jitter backwards.
+            ServerToClient::ThreadOutputTokensProgress {
+                thread_id,
+                output_tokens,
+            } => {
+                if let Some(view) = self.views.get_mut(&thread_id) {
+                    view.streaming_output_tokens = view.streaming_output_tokens.max(output_tokens);
+                    if view.streaming_started_at.is_none() {
+                        // First progress for the turn may land before
+                        // the first text/reasoning delta on some
+                        // providers; anchor the clock here too so the
+                        // rate has a defined denominator either way.
+                        view.streaming_started_at = Some(web_time::Instant::now());
+                    }
+                }
             }
             // Per-turn streaming append: a user message just landed on
             // the conversation. Server is the source of truth (the
@@ -3510,6 +3599,9 @@ impl ChatApp {
                 // assistant starts emitting output.
                 self.prefill.remove(&thread_id);
                 if let Some(view) = self.views.get_mut(&thread_id) {
+                    if view.streaming_started_at.is_none() {
+                        view.streaming_started_at = Some(web_time::Instant::now());
+                    }
                     // Coalesce onto the trailing AssistantText if
                     // there is one — same shape as the egui sibling
                     // so a long generation doesn't fan out into one
@@ -3524,6 +3616,9 @@ impl ChatApp {
             ServerToClient::ThreadAssistantReasoningDelta { thread_id, delta } => {
                 self.prefill.remove(&thread_id);
                 if let Some(view) = self.views.get_mut(&thread_id) {
+                    if view.streaming_started_at.is_none() {
+                        view.streaming_started_at = Some(web_time::Instant::now());
+                    }
                     if let Some(DisplayItem::Reasoning { text }) = view.items.last_mut() {
                         text.push_str(&delta);
                     } else {
@@ -3687,6 +3782,23 @@ impl ChatApp {
                 thread_id, usage, ..
             } => {
                 if let Some(view) = self.views.get_mut(&thread_id) {
+                    // Finalize the live tok/s indicator: snap to the
+                    // real value derived from the authoritative
+                    // `usage.output_tokens` and the elapsed wall-clock
+                    // since the first output delta. Skip if we never
+                    // stamped a start (no output produced, e.g. an
+                    // empty turn) or elapsed rounds to zero (sub-ms
+                    // turn — meaningless rate). Reset streaming state
+                    // either way so the chip drops out of live mode.
+                    if let Some(started_at) = view.streaming_started_at.take() {
+                        let elapsed = started_at.elapsed().as_secs_f32();
+                        if elapsed > 0.0 && usage.output_tokens > 0 {
+                            view.last_turn_tokens_per_sec =
+                                Some(usage.output_tokens as f32 / elapsed);
+                        }
+                    }
+                    view.streaming_output_tokens = 0;
+
                     view.items.push(DisplayItem::TurnStats { usage });
                     // Roll the per-turn usage into the thread total
                     // so the header chip stays in step with the
@@ -3711,10 +3823,18 @@ impl ChatApp {
                     view.next_msg_index += 1;
                 }
             }
+            // New turn boundary — clear any in-flight live tok/s state
+            // before the first delta arrives. `last_turn_tokens_per_sec`
+            // stays so the header chip keeps showing the previous
+            // turn's rate until output of this turn starts ticking.
+            ServerToClient::ThreadAssistantBegin { thread_id, .. } => {
+                if let Some(view) = self.views.get_mut(&thread_id) {
+                    view.streaming_started_at = None;
+                    view.streaming_output_tokens = 0;
+                }
+            }
             // Per-turn append events not yet surfaced.
-            ServerToClient::ThreadAssistantBegin { .. }
-            | ServerToClient::ThreadLoopComplete { .. }
-            | ServerToClient::ThreadCompacted { .. } => {}
+            ServerToClient::ThreadLoopComplete { .. } | ServerToClient::ThreadCompacted { .. } => {}
             // Model called `sudo(...)` — surface as an approval
             // banner above the matching thread's chat log. Stay
             // mounted until either `SudoResolved` echoes or the user
@@ -7200,6 +7320,9 @@ impl ChatApp {
         if let Some(v) = view {
             if let Some(model_chip) = thread_model_chip(&v.backend, &v.model) {
                 sub_line.push(model_chip);
+            }
+            if let Some(rate_chip) = thread_tok_per_sec_chip(v) {
+                sub_line.push(rate_chip);
             }
             if let Some(usage_chip) = thread_usage_chip(&v.total_usage) {
                 sub_line.push(usage_chip);

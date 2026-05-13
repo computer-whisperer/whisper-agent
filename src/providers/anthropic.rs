@@ -894,13 +894,23 @@ impl StreamState {
                 if let Some(sr) = delta.stop_reason {
                     self.stop_reason = Some(sr);
                 }
-                // message_delta carries the final output_tokens on
-                // `usage.output_tokens`; input_tokens were set at
-                // message_start and don't change.
+                // `usage.output_tokens` arrives on the terminal
+                // `message_delta` near end-of-stream — see the
+                // `AnthropicUsage::output_tokens` comment. Anthropic
+                // doesn't surface a running cumulative token count
+                // mid-decode, so this fires at most once per turn,
+                // milliseconds before `MessageStop`. We still emit
+                // `OutputTokensProgress` for parity with providers
+                // that DO stream periodic updates (Gemini), and so the
+                // UI's live-rate path has a defined terminal value
+                // before `ThreadAssistantEnd` snaps to the
+                // authoritative figure — but downstream UIs should not
+                // expect this to drive a "live" indicator on Anthropic.
                 if let Some(u) = usage
                     && let Some(ot) = u.output_tokens
                 {
                     self.output_tokens = ot;
+                    out.push(ModelEvent::OutputTokensProgress { output_tokens: ot });
                 }
             }
             AnthropicStreamEvent::MessageStop => {
@@ -1417,6 +1427,44 @@ mod tests {
             out.extend(state.consume(ev).unwrap());
         }
         (out, state)
+    }
+
+    #[test]
+    fn message_delta_with_usage_emits_output_tokens_progress() {
+        // Parser-level guarantee: every `message_delta` carrying
+        // `usage.output_tokens` produces a `ModelEvent::OutputTokensProgress`.
+        // In practice Anthropic sends only one such event per turn
+        // (right before `message_stop`), so the live-rate use case
+        // doesn't get continuous updates from this provider — but the
+        // parser shape stays uniform across providers, which is what
+        // the io_dispatch + UI layers downstream rely on. This test
+        // feeds two such events to verify both are forwarded (matters
+        // if Anthropic ever does start emitting periodic usage).
+        let events = [
+            r#"{"type":"message_start","message":{"usage":{"input_tokens":5,"output_tokens":0}}}"#,
+            r#"{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#,
+            r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"a"}}"#,
+            r#"{"type":"message_delta","delta":{},"usage":{"output_tokens":3}}"#,
+            r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"bb"}}"#,
+            r#"{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":7}}"#,
+            r#"{"type":"content_block_stop","index":0}"#,
+            r#"{"type":"message_stop"}"#,
+        ];
+        let (evs, _) = feed_events(&events);
+        let progress: Vec<u32> = evs
+            .iter()
+            .filter_map(|e| match e {
+                ModelEvent::OutputTokensProgress { output_tokens } => Some(*output_tokens),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(progress, vec![3, 7], "cumulative output_tokens stream");
+        // Terminal Completed.usage.output_tokens matches the last
+        // progress value (state still keeps the running total).
+        match evs.last().unwrap() {
+            ModelEvent::Completed { usage, .. } => assert_eq!(usage.output_tokens, 7),
+            _ => panic!("last event must be Completed"),
+        }
     }
 
     #[test]

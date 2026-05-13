@@ -608,6 +608,17 @@ class CodecTest {
         assertEquals(original, decoded)
     }
 
+    @Test
+    fun serverToClient_outputTokensProgress_roundTrip() {
+        val original = ServerToClient.OutputTokensProgress(
+            threadId = "t-42",
+            outputTokens = 1234,
+        )
+        val bytes = cbor.encodeToByteArray(ServerToClient.serializer(), original)
+        val decoded = Codec.decodeFromServer(bytes)
+        assertEquals(original, decoded)
+    }
+
     // --- Smoke check on the old-broken shape ----------------------------------
 
     @Test
