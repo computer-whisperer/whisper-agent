@@ -6916,12 +6916,22 @@ impl ChatApp {
             .align(Align::Center)
             .justify(Justify::Center);
 
+        // Build version pinned to the right edge of the row so the
+        // footer reads as `● connected     v0.3.18` — a quiet build
+        // marker next to the live state, no extra row of chrome.
+        // Source is the aetna-ui crate's own `CARGO_PKG_VERSION` (the
+        // server bumps in lockstep with this crate, so they're the
+        // same string).
+        let version = text(concat!("v", env!("CARGO_PKG_VERSION")))
+            .small()
+            .muted();
         row([
             dot_box,
             text(self.conn_status.label())
                 .small()
                 .muted()
                 .width(Size::Fill(1.0)),
+            version,
         ])
         .gap(tokens::SPACE_2)
         .align(Align::Center)
