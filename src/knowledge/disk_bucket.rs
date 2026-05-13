@@ -289,6 +289,29 @@ pub trait BuildObserver: Send + Sync {
     fn on_dense_rebuild_progress(&self, _inserted: u64, _total: u64) {}
 }
 
+/// Coarse active-slot loading phase. Mirrors the protocol-level
+/// `BucketLoadPhase`, but stays in the knowledge layer so `DiskBucket`
+/// does not depend on the wire crate for its internal observer API.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoadPhase {
+    OpeningBucket,
+    OpeningSlot,
+    LoadingChunks,
+    LoadingVectors,
+    LoadingDense,
+    OpeningSparse,
+    LoadingDelta,
+    BuildingSourceIndex,
+    Ready,
+}
+
+/// Optional progress hook for `DiskBucket::open_with_load_observer`.
+/// Implementations must be cheap and non-blocking; this callback runs
+/// on the blocking thread performing the load.
+pub trait LoadObserver: Send + Sync {
+    fn on_phase(&self, phase: LoadPhase);
+}
+
 pub struct DiskBucket {
     id: BucketId,
     root: PathBuf,
@@ -428,12 +451,28 @@ impl DiskBucket {
     /// slot is loaded; otherwise the bucket is opened with no active
     /// slot ([`BucketStatus::NoActiveSlot`]).
     pub fn open(root: impl Into<PathBuf>, id: BucketId) -> Result<Self, BucketError> {
+        Self::open_with_load_observer(root, id, None)
+    }
+
+    /// Open an existing bucket while reporting coarse load phases. Used
+    /// by the scheduler's explicit/cold-query load lifecycle so an
+    /// operator can see progress while a large RAM-mode slot hydrates.
+    pub fn open_with_load_observer(
+        root: impl Into<PathBuf>,
+        id: BucketId,
+        observer: Option<&dyn LoadObserver>,
+    ) -> Result<Self, BucketError> {
+        publish_load_phase(LoadPhase::OpeningBucket, observer);
         let root = root.into();
         let config = read_bucket_config(&root)?;
+        publish_load_phase(LoadPhase::OpeningSlot, observer);
         let active = match slot::read_active_slot(&root)? {
-            Some(slot_id) => Some(Arc::new(load_slot(&root, &slot_id)?)),
+            Some(slot_id) => Some(Arc::new(load_slot_with_observer(
+                &root, &slot_id, observer,
+            )?)),
             None => None,
         };
+        publish_load_phase(LoadPhase::Ready, observer);
         Ok(Self {
             id,
             root,
@@ -3356,6 +3395,14 @@ fn read_bucket_config(root: &Path) -> Result<BucketConfig, BucketError> {
 }
 
 fn load_slot(bucket_root: &Path, slot_id: &str) -> Result<LoadedSlot, BucketError> {
+    load_slot_with_observer(bucket_root, slot_id, None)
+}
+
+fn load_slot_with_observer(
+    bucket_root: &Path,
+    slot_id: &str,
+    observer: Option<&dyn LoadObserver>,
+) -> Result<LoadedSlot, BucketError> {
     let slot_path = slot::slot_dir(bucket_root, slot_id);
     let manifest_path = slot::manifest_path(&slot_path);
     let manifest_text = fs::read_to_string(&manifest_path).map_err(|e| match e.kind() {
@@ -3374,11 +3421,13 @@ fn load_slot(bucket_root: &Path, slot_id: &str) -> Result<LoadedSlot, BucketErro
 
     let chunks_bin = slot::chunks_bin_path(&slot_path);
     let chunks_idx = slot::chunks_idx_path(&slot_path);
+    publish_load_phase(LoadPhase::LoadingChunks, observer);
     let chunks = ChunkStoreReader::open_with_mode(&chunks_bin, &chunks_idx, load_mode)
         .map_err(BucketError::Io)?;
 
     let vectors_bin = slot::vectors_bin_path(&slot_path);
     let vectors_idx = slot::vectors_idx_path(&slot_path);
+    publish_load_phase(LoadPhase::LoadingVectors, observer);
     let vectors = VectorStoreReader::open_with_mode(&vectors_bin, &vectors_idx, load_mode)
         .map_err(BucketError::Io)?;
 
@@ -3398,6 +3447,7 @@ fn load_slot(bucket_root: &Path, slot_id: &str) -> Result<LoadedSlot, BucketErro
     // fallback for slots built before persistence existed (or
     // recovered from a partial write where the dump is missing /
     // count-mismatched).
+    publish_load_phase(LoadPhase::LoadingDense, observer);
     let dense = match DenseIndex::load_from(&slot_path, &vectors) {
         Ok(d) => d,
         Err(e) => {
@@ -3423,6 +3473,7 @@ fn load_slot(bucket_root: &Path, slot_id: &str) -> Result<LoadedSlot, BucketErro
     // Sparse index — open if the slot manifest says it has one.
     // Tantivy persistence is segment-based, so this is a real on-disk
     // open (no rebuild equivalent needed; tantivy reload is fast).
+    publish_load_phase(LoadPhase::OpeningSparse, observer);
     let sparse = if manifest.sparse.is_some() {
         Some(SparseIndex::open(&slot::tantivy_dir(&slot_path))?)
     } else {
@@ -3449,6 +3500,7 @@ fn load_slot(bucket_root: &Path, slot_id: &str) -> Result<LoadedSlot, BucketErro
     let delta_chunks_bin = slot::delta_chunks_bin_path(&slot_path);
     let delta_chunks_idx = slot::delta_chunks_idx_path(&slot_path);
 
+    publish_load_phase(LoadPhase::LoadingDelta, observer);
     let delta_chunks = if delta_chunks_bin.exists() && delta_chunks_idx.exists() {
         Some(Arc::new(
             ChunkStoreReader::open_with_mode(&delta_chunks_bin, &delta_chunks_idx, load_mode)
@@ -3490,6 +3542,7 @@ fn load_slot(bucket_root: &Path, slot_id: &str) -> Result<LoadedSlot, BucketErro
     // follow-up. Slot-open is unconditional today — no callers need
     // the index lazy, and the cost is small enough to pay up front.
     let chunks_arc = Arc::new(chunks);
+    publish_load_phase(LoadPhase::BuildingSourceIndex, observer);
     let source_index = Arc::new(SourceIndex::build(
         chunks_arc.as_ref(),
         delta_chunks.as_deref(),
@@ -3505,6 +3558,12 @@ fn load_slot(bucket_root: &Path, slot_id: &str) -> Result<LoadedSlot, BucketErro
         delta_chunks: RwLock::new(delta_chunks),
         source_index,
     })
+}
+
+fn publish_load_phase(phase: LoadPhase, observer: Option<&dyn LoadObserver>) {
+    if let Some(obs) = observer {
+        obs.on_phase(phase);
+    }
 }
 
 /// Translate the slot manifest's [`ServingMode`] into the storage

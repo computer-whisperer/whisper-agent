@@ -26,16 +26,16 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::warn;
 use whisper_agent_protocol::{
-    BucketBuildOutcome, BucketBuildPhase, BucketCreateInput, BucketSourceInput, QuantizationInput,
-    ServerToClient, TrackedCadenceInput, TrackedDriverInput,
+    BucketBuildOutcome, BucketBuildPhase, BucketCreateInput, BucketLoadOutcome, BucketLoadPhase,
+    BucketSourceInput, QuantizationInput, ServerToClient, TrackedCadenceInput, TrackedDriverInput,
 };
 
 use super::{ConnId, Scheduler};
 use crate::knowledge::{BucketError, BucketId};
 use crate::knowledge::{
-    BuildObserver, BuildPhase, Chunker, DeltaId, DiskBucket, FeedDriver, FeedState, MarkdownDir,
-    MediaWikiXml, SnapshotId, SourceAdapter, base_cache_dir, registry::entry_to_summary,
-    resolve_chunker, source::feed::driver_for,
+    BuildObserver, BuildPhase, Chunker, DeltaId, DiskBucket, FeedDriver, FeedState, LoadObserver,
+    LoadPhase, MarkdownDir, MediaWikiXml, SnapshotId, SourceAdapter, base_cache_dir,
+    registry::entry_to_summary, resolve_chunker, source::feed::driver_for,
 };
 use crate::providers::embedding::EmbeddingProvider;
 use crate::server::thread_router::ThreadEventRouter;
@@ -108,6 +108,31 @@ pub enum BucketTaskUpdate {
         pod_id: Option<String>,
         slot_id: String,
         outcome: BucketBuildOutcome,
+        requester_conn: Option<ConnId>,
+        correlation_id: Option<String>,
+    },
+    LoadStarted {
+        bucket_id: String,
+        pod_id: Option<String>,
+        slot_id: String,
+        serving_mode: String,
+        snapshot: LoadProgressSnapshot,
+        requester_conn: Option<ConnId>,
+        correlation_id: Option<String>,
+    },
+    LoadProgress {
+        bucket_id: String,
+        pod_id: Option<String>,
+        slot_id: String,
+        serving_mode: String,
+        snapshot: LoadProgressSnapshot,
+    },
+    LoadEnded {
+        bucket_id: String,
+        pod_id: Option<String>,
+        slot_id: String,
+        serving_mode: String,
+        outcome: BucketLoadOutcome,
         requester_conn: Option<ConnId>,
         correlation_id: Option<String>,
     },
@@ -339,6 +364,7 @@ impl Scheduler {
         if let Some(token) = self.active_bucket_builds.remove(&key) {
             token.cancel();
         }
+        self.active_bucket_load_progress.remove(&key);
 
         // Stop the per-tracked-bucket feed worker, if any. Looked up
         // by scope-aware `BucketKey` so a server-scope worker named
@@ -850,6 +876,63 @@ impl Scheduler {
         }
     }
 
+    pub(crate) fn replay_active_loads_to_client(&self, conn_id: ConnId) {
+        for (key, progress) in &self.active_bucket_load_progress {
+            let started_at = progress.started_at().to_rfc3339();
+            let slot_id = self
+                .bucket_registry
+                .find_entry(
+                    match key.pod_id.as_ref() {
+                        Some(_) => crate::knowledge::BucketScope::Pod,
+                        None => crate::knowledge::BucketScope::Server,
+                    },
+                    key.pod_id.as_deref(),
+                    &key.name,
+                )
+                .and_then(|e| e.active_slot.as_ref())
+                .map(|s| s.slot_id.clone())
+                .unwrap_or_default();
+            let serving_mode = self
+                .bucket_registry
+                .find_entry(
+                    match key.pod_id.as_ref() {
+                        Some(_) => crate::knowledge::BucketScope::Pod,
+                        None => crate::knowledge::BucketScope::Server,
+                    },
+                    key.pod_id.as_deref(),
+                    &key.name,
+                )
+                .and_then(|e| e.active_slot.as_ref())
+                .map(|s| format!("{:?}", s.serving.mode).to_lowercase())
+                .unwrap_or_default();
+            self.router.send_to_client(
+                conn_id,
+                ServerToClient::BucketLoadStarted {
+                    correlation_id: None,
+                    bucket_id: key.name.clone(),
+                    pod_id: key.pod_id.clone(),
+                    slot_id: slot_id.clone(),
+                    serving_mode: serving_mode.clone(),
+                    started_at: Some(started_at.clone()),
+                },
+            );
+            let snap = progress.snapshot();
+            self.router.send_to_client(
+                conn_id,
+                ServerToClient::BucketLoadProgress {
+                    bucket_id: key.name.clone(),
+                    pod_id: key.pod_id.clone(),
+                    slot_id,
+                    serving_mode,
+                    phase: snap.phase,
+                    phase_index: snap.phase_index,
+                    phase_count: snap.phase_count,
+                    started_at: Some(started_at),
+                },
+            );
+        }
+    }
+
     /// Drain a `BucketTaskUpdate` from the channel. Called from the
     /// scheduler loop's `select!` arm.
     pub(crate) async fn apply_bucket_task_update(&mut self, update: BucketTaskUpdate) {
@@ -963,6 +1046,112 @@ impl Scheduler {
                             summary,
                         },
                     );
+                }
+            }
+            BucketTaskUpdate::LoadStarted {
+                bucket_id,
+                pod_id,
+                slot_id,
+                serving_mode,
+                snapshot,
+                requester_conn,
+                correlation_id,
+            } => {
+                let key = BucketKey::from_optional(pod_id.clone(), bucket_id.clone());
+                let progress = Arc::new(LoadProgressShared::from_snapshot(snapshot));
+                self.active_bucket_load_progress.insert(key, progress);
+
+                let started = ServerToClient::BucketLoadStarted {
+                    correlation_id: None,
+                    bucket_id: bucket_id.clone(),
+                    pod_id: pod_id.clone(),
+                    slot_id: slot_id.clone(),
+                    serving_mode: serving_mode.clone(),
+                    started_at: Some(snapshot.started_at.to_rfc3339()),
+                };
+                match requester_conn {
+                    Some(conn) => {
+                        self.router.broadcast_task_list_except(started, conn);
+                        self.router.send_to_client(
+                            conn,
+                            ServerToClient::BucketLoadStarted {
+                                correlation_id,
+                                bucket_id,
+                                pod_id,
+                                slot_id,
+                                serving_mode,
+                                started_at: Some(snapshot.started_at.to_rfc3339()),
+                            },
+                        );
+                    }
+                    None => {
+                        broadcast_all(&self.router, started);
+                    }
+                }
+            }
+            BucketTaskUpdate::LoadProgress {
+                bucket_id,
+                pod_id,
+                slot_id,
+                serving_mode,
+                snapshot,
+            } => {
+                let key = BucketKey::from_optional(pod_id.clone(), bucket_id.clone());
+                if let Some(progress) = self.active_bucket_load_progress.get(&key) {
+                    progress.phase.store(
+                        load_phase_to_u8(load_phase_to_internal(snapshot.phase)),
+                        Ordering::Release,
+                    );
+                }
+                self.router
+                    .broadcast_task_list(ServerToClient::BucketLoadProgress {
+                        bucket_id,
+                        pod_id,
+                        slot_id,
+                        serving_mode,
+                        phase: snapshot.phase,
+                        phase_index: snapshot.phase_index,
+                        phase_count: snapshot.phase_count,
+                        started_at: Some(snapshot.started_at.to_rfc3339()),
+                    });
+            }
+            BucketTaskUpdate::LoadEnded {
+                bucket_id,
+                pod_id,
+                slot_id,
+                serving_mode,
+                outcome,
+                requester_conn,
+                correlation_id,
+            } => {
+                let key = BucketKey::from_optional(pod_id.clone(), bucket_id.clone());
+                self.active_bucket_load_progress.remove(&key);
+                let ended = ServerToClient::BucketLoadEnded {
+                    correlation_id: None,
+                    bucket_id: bucket_id.clone(),
+                    pod_id: pod_id.clone(),
+                    slot_id: slot_id.clone(),
+                    serving_mode: serving_mode.clone(),
+                    outcome: outcome.clone(),
+                };
+                match requester_conn {
+                    Some(conn) => {
+                        self.router.broadcast_task_list_except(ended, conn);
+                        self.router.send_to_client(
+                            conn,
+                            ServerToClient::BucketLoadEnded {
+                                correlation_id,
+                                bucket_id,
+                                pod_id,
+                                slot_id,
+                                serving_mode,
+                                outcome,
+                            },
+                        );
+                    }
+                    None => {
+                        broadcast_all(&self.router, ended);
+                    }
                 }
             }
         }
@@ -1332,6 +1521,151 @@ async fn run_build(
     });
 }
 
+pub(crate) async fn load_bucket_with_progress(
+    registry: crate::knowledge::BucketRegistry,
+    bucket_id: String,
+    pod_id: Option<String>,
+    slot_id: String,
+    serving_mode: String,
+    task_tx: mpsc::UnboundedSender<BucketTaskUpdate>,
+    requester_conn: Option<ConnId>,
+    correlation_id: Option<String>,
+    emit_cached: bool,
+) -> Result<Arc<DiskBucket>, BucketError> {
+    let progress = Arc::new(LoadProgressShared::default());
+    let observer: Arc<dyn LoadObserver> = Arc::new(SchedulerLoadObserver {
+        bucket_id: bucket_id.clone(),
+        pod_id: pod_id.clone(),
+        slot_id: slot_id.clone(),
+        serving_mode: serving_mode.clone(),
+        progress: progress.clone(),
+        task_tx: task_tx.clone(),
+        requester_conn,
+        correlation_id: correlation_id.clone(),
+    });
+
+    let heartbeat_progress = progress.clone();
+    let heartbeat_tx = task_tx.clone();
+    let heartbeat_bucket = bucket_id.clone();
+    let heartbeat_pod = pod_id.clone();
+    let heartbeat_slot = slot_id.clone();
+    let heartbeat_mode = serving_mode.clone();
+    let heartbeat = tokio::spawn(async move {
+        let mut tick = tokio::time::interval(PROGRESS_THROTTLE);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tick.tick().await;
+            if heartbeat_progress.is_done() {
+                break;
+            }
+            if heartbeat_progress.is_started() {
+                let _ = heartbeat_tx.send(BucketTaskUpdate::LoadProgress {
+                    bucket_id: heartbeat_bucket.clone(),
+                    pod_id: heartbeat_pod.clone(),
+                    slot_id: heartbeat_slot.clone(),
+                    serving_mode: heartbeat_mode.clone(),
+                    snapshot: heartbeat_progress.snapshot(),
+                });
+            }
+        }
+    });
+
+    let load_result = match pod_id.as_deref() {
+        Some(pid) => {
+            registry
+                .loaded_bucket_pod_with_observer(pid, &bucket_id, Some(observer))
+                .await
+        }
+        None => {
+            registry
+                .loaded_bucket_with_observer(&bucket_id, Some(observer))
+                .await
+        }
+    };
+
+    progress.mark_done();
+    heartbeat.abort();
+
+    if progress.is_started() {
+        let outcome = match &load_result {
+            Ok(_) => BucketLoadOutcome::Success,
+            Err(e) => BucketLoadOutcome::Error {
+                message: e.to_string(),
+            },
+        };
+        let _ = task_tx.send(BucketTaskUpdate::LoadEnded {
+            bucket_id: bucket_id.clone(),
+            pod_id: pod_id.clone(),
+            slot_id,
+            serving_mode,
+            outcome,
+            requester_conn,
+            correlation_id,
+        });
+    } else if emit_cached && load_result.is_ok() {
+        let snapshot = progress.snapshot();
+        let _ = task_tx.send(BucketTaskUpdate::LoadStarted {
+            bucket_id: bucket_id.clone(),
+            pod_id: pod_id.clone(),
+            slot_id: slot_id.clone(),
+            serving_mode: serving_mode.clone(),
+            snapshot,
+            requester_conn,
+            correlation_id: correlation_id.clone(),
+        });
+        let _ = task_tx.send(BucketTaskUpdate::LoadEnded {
+            bucket_id: bucket_id.clone(),
+            pod_id: pod_id.clone(),
+            slot_id,
+            serving_mode,
+            outcome: BucketLoadOutcome::Success,
+            requester_conn,
+            correlation_id,
+        });
+    }
+
+    load_result
+}
+
+struct SchedulerLoadObserver {
+    bucket_id: String,
+    pod_id: Option<String>,
+    slot_id: String,
+    serving_mode: String,
+    progress: Arc<LoadProgressShared>,
+    task_tx: mpsc::UnboundedSender<BucketTaskUpdate>,
+    requester_conn: Option<ConnId>,
+    correlation_id: Option<String>,
+}
+
+impl LoadObserver for SchedulerLoadObserver {
+    fn on_phase(&self, phase: LoadPhase) {
+        self.progress
+            .phase
+            .store(load_phase_to_u8(phase), Ordering::Release);
+        let snapshot = self.progress.snapshot();
+        if self.progress.mark_started() {
+            let _ = self.task_tx.send(BucketTaskUpdate::LoadStarted {
+                bucket_id: self.bucket_id.clone(),
+                pod_id: self.pod_id.clone(),
+                slot_id: self.slot_id.clone(),
+                serving_mode: self.serving_mode.clone(),
+                snapshot,
+                requester_conn: self.requester_conn,
+                correlation_id: self.correlation_id.clone(),
+            });
+        } else {
+            let _ = self.task_tx.send(BucketTaskUpdate::LoadProgress {
+                bucket_id: self.bucket_id.clone(),
+                pod_id: self.pod_id.clone(),
+                slot_id: self.slot_id.clone(),
+                serving_mode: self.serving_mode.clone(),
+                snapshot,
+            });
+        }
+    }
+}
+
 pub struct ProgressShared {
     source_records: AtomicU64,
     chunks: AtomicU64,
@@ -1401,6 +1735,131 @@ pub struct ProgressSnapshot {
     pub started_at: chrono::DateTime<chrono::Utc>,
     pub dense_inserted: Option<u64>,
     pub dense_total: Option<u64>,
+}
+
+pub struct LoadProgressShared {
+    phase: AtomicU8,
+    started: AtomicBool,
+    done: AtomicBool,
+    started_at: chrono::DateTime<chrono::Utc>,
+}
+
+impl Default for LoadProgressShared {
+    fn default() -> Self {
+        Self {
+            phase: AtomicU8::new(load_phase_to_u8(LoadPhase::OpeningBucket)),
+            started: AtomicBool::new(false),
+            done: AtomicBool::new(false),
+            started_at: chrono::Utc::now(),
+        }
+    }
+}
+
+impl LoadProgressShared {
+    fn from_snapshot(snapshot: LoadProgressSnapshot) -> Self {
+        Self {
+            phase: AtomicU8::new(load_phase_to_u8(load_phase_to_internal(snapshot.phase))),
+            started: AtomicBool::new(true),
+            done: AtomicBool::new(false),
+            started_at: snapshot.started_at,
+        }
+    }
+
+    pub fn snapshot(&self) -> LoadProgressSnapshot {
+        let phase = load_phase_from_u8(self.phase.load(Ordering::Acquire));
+        LoadProgressSnapshot {
+            phase,
+            phase_index: load_phase_index(phase),
+            phase_count: LOAD_PHASE_COUNT,
+            started_at: self.started_at,
+        }
+    }
+
+    pub fn started_at(&self) -> chrono::DateTime<chrono::Utc> {
+        self.started_at
+    }
+
+    fn mark_started(&self) -> bool {
+        !self.started.swap(true, Ordering::AcqRel)
+    }
+
+    fn is_started(&self) -> bool {
+        self.started.load(Ordering::Acquire)
+    }
+
+    fn mark_done(&self) {
+        self.done.store(true, Ordering::Release);
+    }
+
+    fn is_done(&self) -> bool {
+        self.done.load(Ordering::Acquire)
+    }
+}
+
+#[derive(Clone, Copy)]
+pub struct LoadProgressSnapshot {
+    pub phase: BucketLoadPhase,
+    pub phase_index: u32,
+    pub phase_count: u32,
+    pub started_at: chrono::DateTime<chrono::Utc>,
+}
+
+const LOAD_PHASE_COUNT: u32 = 9;
+
+fn load_phase_to_u8(p: LoadPhase) -> u8 {
+    match p {
+        LoadPhase::OpeningBucket => 0,
+        LoadPhase::OpeningSlot => 1,
+        LoadPhase::LoadingChunks => 2,
+        LoadPhase::LoadingVectors => 3,
+        LoadPhase::LoadingDense => 4,
+        LoadPhase::OpeningSparse => 5,
+        LoadPhase::LoadingDelta => 6,
+        LoadPhase::BuildingSourceIndex => 7,
+        LoadPhase::Ready => 8,
+    }
+}
+
+fn load_phase_from_u8(b: u8) -> BucketLoadPhase {
+    match b {
+        1 => BucketLoadPhase::OpeningSlot,
+        2 => BucketLoadPhase::LoadingChunks,
+        3 => BucketLoadPhase::LoadingVectors,
+        4 => BucketLoadPhase::LoadingDense,
+        5 => BucketLoadPhase::OpeningSparse,
+        6 => BucketLoadPhase::LoadingDelta,
+        7 => BucketLoadPhase::BuildingSourceIndex,
+        8 => BucketLoadPhase::Ready,
+        _ => BucketLoadPhase::OpeningBucket,
+    }
+}
+
+fn load_phase_index(p: BucketLoadPhase) -> u32 {
+    match p {
+        BucketLoadPhase::OpeningBucket => 1,
+        BucketLoadPhase::OpeningSlot => 2,
+        BucketLoadPhase::LoadingChunks => 3,
+        BucketLoadPhase::LoadingVectors => 4,
+        BucketLoadPhase::LoadingDense => 5,
+        BucketLoadPhase::OpeningSparse => 6,
+        BucketLoadPhase::LoadingDelta => 7,
+        BucketLoadPhase::BuildingSourceIndex => 8,
+        BucketLoadPhase::Ready => 9,
+    }
+}
+
+fn load_phase_to_internal(p: BucketLoadPhase) -> LoadPhase {
+    match p {
+        BucketLoadPhase::OpeningBucket => LoadPhase::OpeningBucket,
+        BucketLoadPhase::OpeningSlot => LoadPhase::OpeningSlot,
+        BucketLoadPhase::LoadingChunks => LoadPhase::LoadingChunks,
+        BucketLoadPhase::LoadingVectors => LoadPhase::LoadingVectors,
+        BucketLoadPhase::LoadingDense => LoadPhase::LoadingDense,
+        BucketLoadPhase::OpeningSparse => LoadPhase::OpeningSparse,
+        BucketLoadPhase::LoadingDelta => LoadPhase::LoadingDelta,
+        BucketLoadPhase::BuildingSourceIndex => LoadPhase::BuildingSourceIndex,
+        BucketLoadPhase::Ready => LoadPhase::Ready,
+    }
 }
 
 // Phase ↔ u8 mapping. Planning is encoded as 0 so the AtomicU8's

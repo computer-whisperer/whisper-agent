@@ -61,14 +61,14 @@ use whisper_agent_protocol::sandbox::{
 use whisper_agent_protocol::{
     ActivationSurface, AllowMap, Attachment, BackendSummary, BehaviorConfig, BehaviorSummary,
     BehaviorThreadOverride, BucketBuildOutcome, BucketBuildPhase, BucketCreateInput,
-    BucketSourceInput, BucketSummary, CatchUp, ClientToServer, ContentBlock, CoreTools,
-    Disposition, EmbeddingProviderInfo, FsEntry, HostEnvBindingRequest, HostEnvDaemonSummary,
-    ImageMime, ImageSource, InitialListing, ModelSummary, NamedHostEnv, Overlap, PodAllow,
-    PodConfig, PodLimits, PodSummary, QuantizationInput, RetentionPolicy, Role, ServerToClient,
-    SharedMcpAuthInput, SharedMcpAuthPublic, SharedMcpHostInfo, SharedMcpPrefixInput,
-    SlotStateLabel, SystemPromptChoice, ThreadBindingsRequest, ThreadConfigOverride,
-    ThreadDefaults, ThreadSummary, TrackedCadenceInput, TrackedDriverInput, TriggerSpec,
-    permission::SudoDecision,
+    BucketLoadOutcome, BucketLoadPhase, BucketSourceInput, BucketSummary, CatchUp, ClientToServer,
+    ContentBlock, CoreTools, Disposition, EmbeddingProviderInfo, FsEntry, HostEnvBindingRequest,
+    HostEnvDaemonSummary, ImageMime, ImageSource, InitialListing, ModelSummary, NamedHostEnv,
+    Overlap, PodAllow, PodConfig, PodLimits, PodSummary, QuantizationInput, RetentionPolicy, Role,
+    ServerToClient, SharedMcpAuthInput, SharedMcpAuthPublic, SharedMcpHostInfo,
+    SharedMcpPrefixInput, SlotStateLabel, SystemPromptChoice, ThreadBindingsRequest,
+    ThreadConfigOverride, ThreadDefaults, ThreadSummary, TrackedCadenceInput, TrackedDriverInput,
+    TriggerSpec, permission::SudoDecision,
 };
 
 /// Inbound event variants the host shell pushes into the [`Inbound`]
@@ -636,6 +636,18 @@ struct BuildProgressView {
     dense_total: Option<u64>,
 }
 
+/// Live per-bucket active-slot load progress. Query-triggered and
+/// explicit Load clicks both hydrate this map from the same wire
+/// events.
+#[derive(Clone)]
+struct LoadProgressView {
+    phase: BucketLoadPhase,
+    phase_index: u32,
+    phase_count: u32,
+    serving_mode: String,
+    started_at: Option<String>,
+}
+
 /// Knowledge-buckets modal state. Catalog surface + Phase 3
 /// search-and-query + Phase 2 +New bucket create form (the form
 /// itself lives behind the optional `creating` slot).
@@ -648,6 +660,8 @@ struct BucketsModalState {
     delete_armed: Option<String>,
     /// Live build-progress map. Keyed by `(pod_id, bucket_id)`.
     build_progress: HashMap<BucketRowKey, BuildProgressView>,
+    /// Live load-progress map. Keyed by `(pod_id, bucket_id)`.
+    load_progress: HashMap<BucketRowKey, LoadProgressView>,
     /// Sticky last-failed-build error message per `(pod_id,
     /// bucket_id)`. Overwritten by the next attempt; cleared when a
     /// success lands for the same key.
@@ -3397,6 +3411,7 @@ impl ChatApp {
                 let key = (pod_id, id);
                 if let Some(modal) = self.buckets_modal.as_mut() {
                     modal.build_progress.remove(&key);
+                    modal.load_progress.remove(&key);
                     modal.build_errors.remove(&key);
                     if modal.delete_armed.as_deref() == Some(&key.1) {
                         modal.delete_armed = None;
@@ -3480,6 +3495,67 @@ impl ChatApp {
                         .find(|b| b.id == bucket_id && b.pod_id == pod_id)
                 {
                     *existing = summary;
+                }
+            }
+            ServerToClient::BucketLoadStarted {
+                bucket_id,
+                pod_id,
+                serving_mode,
+                started_at,
+                ..
+            } => {
+                let key = (pod_id, bucket_id);
+                if let Some(modal) = self.buckets_modal.as_mut() {
+                    modal.load_progress.insert(
+                        key,
+                        LoadProgressView {
+                            phase: BucketLoadPhase::OpeningBucket,
+                            phase_index: 1,
+                            phase_count: 9,
+                            serving_mode,
+                            started_at,
+                        },
+                    );
+                }
+            }
+            ServerToClient::BucketLoadProgress {
+                bucket_id,
+                pod_id,
+                serving_mode,
+                phase,
+                phase_index,
+                phase_count,
+                started_at,
+                ..
+            } => {
+                let key = (pod_id, bucket_id);
+                if let Some(modal) = self.buckets_modal.as_mut() {
+                    modal.load_progress.insert(
+                        key,
+                        LoadProgressView {
+                            phase,
+                            phase_index,
+                            phase_count,
+                            serving_mode,
+                            started_at,
+                        },
+                    );
+                }
+            }
+            ServerToClient::BucketLoadEnded {
+                bucket_id,
+                pod_id,
+                outcome,
+                ..
+            } => {
+                let key = (pod_id.clone(), bucket_id.clone());
+                if let Some(modal) = self.buckets_modal.as_mut() {
+                    modal.load_progress.remove(&key);
+                    if let BucketLoadOutcome::Error { message } = outcome {
+                        modal
+                            .build_errors
+                            .insert(key, format!("load error: {message}"));
+                    }
                 }
             }
             ServerToClient::QueryResults {
@@ -4877,6 +4953,10 @@ impl App for ChatApp {
                 self.cancel_bucket_build(id, pod);
                 return;
             }
+            if let Some((pod, id)) = parse(BUCKETS_LOAD_PREFIX) {
+                self.load_bucket(id, pod);
+                return;
+            }
             if let Some((pod, id)) = parse(BUCKETS_POLL_PREFIX) {
                 self.poll_bucket_feed(id, pod);
                 return;
@@ -5678,6 +5758,7 @@ const BUCKETS_MODAL_DISMISS_KEY: &str = "buckets:dismiss";
 const BUCKETS_MODAL_CLOSE_KEY: &str = "buckets:close";
 const BUCKETS_BUILD_PREFIX: &str = "buckets:build:";
 const BUCKETS_PAUSE_PREFIX: &str = "buckets:pause:";
+const BUCKETS_LOAD_PREFIX: &str = "buckets:load:";
 const BUCKETS_POLL_PREFIX: &str = "buckets:poll:";
 const BUCKETS_RESYNC_PREFIX: &str = "buckets:resync:";
 const BUCKETS_DELETE_PREFIX: &str = "buckets:delete:";
@@ -13943,6 +14024,17 @@ impl ChatApp {
         });
     }
 
+    /// Fire `LoadBucket`. Cold queries trigger this same server-side
+    /// lifecycle automatically; this button lets the user hydrate a
+    /// RAM-mode slot deliberately before querying it.
+    fn load_bucket(&mut self, id: String, pod_id: Option<String>) {
+        self.send(ClientToServer::LoadBucket {
+            correlation_id: None,
+            id,
+            pod_id,
+        });
+    }
+
     /// Fire `DeleteBucket`. The server validates + broadcasts
     /// `BucketDeleted`; the wire arm removes the row + clears any
     /// per-row state. Two-click arm-confirm gates this call site.
@@ -16453,6 +16545,7 @@ impl ChatApp {
     fn render_bucket_row(&self, modal: &BucketsModalState, b: &BucketSummary) -> El {
         let row_key = (b.pod_id.clone(), b.id.clone());
         let in_flight_build = modal.build_progress.contains_key(&row_key);
+        let in_flight_load = modal.load_progress.contains_key(&row_key);
 
         let mut card_children: Vec<El> = Vec::new();
 
@@ -16557,6 +16650,9 @@ impl ChatApp {
         if let Some(progress) = modal.build_progress.get(&row_key) {
             card_children.push(self.render_build_progress_row(progress));
         }
+        if let Some(progress) = modal.load_progress.get(&row_key) {
+            card_children.push(self.render_load_progress_row(progress));
+        }
 
         // Sticky last-failed-build error.
         if let Some(err) = modal.build_errors.get(&row_key) {
@@ -16570,7 +16666,12 @@ impl ChatApp {
         }
 
         // Action row.
-        card_children.push(self.render_bucket_row_actions(modal, b, in_flight_build));
+        card_children.push(self.render_bucket_row_actions(
+            modal,
+            b,
+            in_flight_build,
+            in_flight_load,
+        ));
 
         card(card_children)
             .gap(tokens::SPACE_2)
@@ -16619,11 +16720,43 @@ impl ChatApp {
         text(body).caption().color(tokens::WARNING)
     }
 
+    fn render_load_progress_row(&self, p: &LoadProgressView) -> El {
+        let phase = match p.phase {
+            BucketLoadPhase::OpeningBucket => "opening bucket",
+            BucketLoadPhase::OpeningSlot => "opening slot",
+            BucketLoadPhase::LoadingChunks => "loading chunks",
+            BucketLoadPhase::LoadingVectors => "loading vectors",
+            BucketLoadPhase::LoadingDense => "loading HNSW",
+            BucketLoadPhase::OpeningSparse => "opening sparse",
+            BucketLoadPhase::LoadingDelta => "loading delta",
+            BucketLoadPhase::BuildingSourceIndex => "building source index",
+            BucketLoadPhase::Ready => "ready",
+        };
+        let elapsed_str = p
+            .started_at
+            .as_deref()
+            .map(format_build_elapsed)
+            .filter(|s| !s.is_empty());
+        let stage = format!("step {} / {}", p.phase_index, p.phase_count);
+        let body = match elapsed_str {
+            Some(elapsed) => format!(
+                "loading ({}) \u{00B7} {phase} \u{00B7} {stage} \u{00B7} {elapsed}",
+                p.serving_mode
+            ),
+            None => format!(
+                "loading ({}) \u{00B7} {phase} \u{00B7} {stage}",
+                p.serving_mode
+            ),
+        };
+        text(body).caption().color(tokens::WARNING)
+    }
+
     fn render_bucket_row_actions(
         &self,
         modal: &BucketsModalState,
         b: &BucketSummary,
         in_flight_build: bool,
+        in_flight_load: bool,
     ) -> El {
         let scope = bucket_scope_token(&b.pod_id);
         let armed = modal.delete_armed.as_deref() == Some(b.id.as_str());
@@ -16642,6 +16775,11 @@ impl ChatApp {
             }
             buttons.push(build);
         }
+        let mut load = button("Load").key(format!("{BUCKETS_LOAD_PREFIX}{scope}:{}", b.id));
+        if in_flight_build || in_flight_load || b.active_slot.is_none() {
+            load = load.disabled();
+        }
+        buttons.push(load);
         if !in_flight_build && b.source_kind == "tracked" {
             buttons.push(button("Poll now").key(format!("{BUCKETS_POLL_PREFIX}{scope}:{}", b.id)));
             buttons

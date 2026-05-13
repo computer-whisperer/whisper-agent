@@ -12,10 +12,12 @@ license.workspace = true
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-# Aetna lives in a sibling worktree under active development; the path
-# spec keeps us in lockstep with unreleased UI/runtime fixes.
-aetna-core = { path = "../../../../aetna/aetna.main/crates/aetna-core" }
-aetna-markdown = { path = "../../../../aetna/aetna.main/crates/aetna-markdown" }
+# Aetna lives in a sibling worktree under active development; uncomment
+# the path specs when testing unreleased UI/runtime fixes locally.
+aetna-core = "0.3.4"
+aetna-markdown = "0.3.4"
+# aetna-core = { path = "../../../../aetna/aetna.main/crates/aetna-core" }
+# aetna-markdown = { path = "../../../../aetna/aetna.main/crates/aetna-markdown" }
 
 whisper-agent-protocol = { workspace = true }
 serde = { workspace = true }
@@ -74,7 +76,8 @@ js-sys = "0.3"
 # a `WebHandle::request_redraw` shim, so `web_entry.rs` only carries
 # whisper-agent-specific glue (WebSocket, drag-drop files, image-paste)
 # instead of the full wgpu/winit bootstrap.
-aetna-web = { path = "../../../../aetna/aetna.main/crates/aetna-web" }
+aetna-web = "0.3.4"
+# aetna-web = { path = "../../../../aetna/aetna.main/crates/aetna-web" }
 web-sys = { version = "0.3", features = [
     "WebSocket",
     "MessageEvent",

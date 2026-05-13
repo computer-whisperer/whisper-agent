@@ -525,6 +525,14 @@ pub struct Scheduler {
         crate::runtime::scheduler::buckets::BucketKey,
         std::sync::Arc<crate::runtime::scheduler::buckets::ProgressShared>,
     >,
+    /// Live progress state for every in-flight bucket active-slot load.
+    /// Query-triggered and explicit operator-triggered loads share the
+    /// same event stream so clients see cold-bucket hydration instead
+    /// of a stuck query.
+    active_bucket_load_progress: HashMap<
+        crate::runtime::scheduler::buckets::BucketKey,
+        std::sync::Arc<crate::runtime::scheduler::buckets::LoadProgressShared>,
+    >,
     /// Control handles for the per-tracked-bucket
     /// [`FeedWorker`](crate::knowledge::FeedWorker) tasks spawned at
     /// scheduler-construction time. Keyed by `BucketKey` so server-
@@ -689,6 +697,7 @@ impl Scheduler {
                 stream_tx,
                 active_bucket_builds: HashMap::new(),
                 active_bucket_progress: HashMap::new(),
+                active_bucket_load_progress: HashMap::new(),
                 active_feed_workers,
                 bucket_task_tx,
                 active_functions: HashMap::new(),
@@ -2589,6 +2598,7 @@ impl Scheduler {
                 // snapshot rather than waiting until the next terminal
                 // `BuildEnded`.
                 self.replay_active_builds_to_client(conn_id);
+                self.replay_active_loads_to_client(conn_id);
             }
             SchedulerMsg::UnregisterClient { conn_id } => {
                 self.router.unregister_client(conn_id);

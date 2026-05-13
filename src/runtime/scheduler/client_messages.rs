@@ -430,6 +430,13 @@ impl Scheduler {
             } => {
                 self.handle_cancel_bucket_build(conn_id, correlation_id, id, pod_id);
             }
+            ClientToServer::LoadBucket {
+                correlation_id,
+                id,
+                pod_id,
+            } => {
+                self.handle_load_bucket(conn_id, correlation_id, id, pod_id);
+            }
             ClientToServer::PollFeedNow {
                 correlation_id,
                 id,
@@ -1349,6 +1356,69 @@ impl Scheduler {
         }
     }
 
+    fn handle_load_bucket(
+        &self,
+        conn_id: ConnId,
+        correlation_id: Option<String>,
+        id: String,
+        pod_id: Option<String>,
+    ) {
+        use crate::knowledge::BucketScope;
+
+        let send_err = |msg: String| {
+            self.router.send_to_client(
+                conn_id,
+                ServerToClient::Error {
+                    correlation_id: correlation_id.clone(),
+                    thread_id: None,
+                    message: msg,
+                },
+            );
+        };
+
+        let scope = if pod_id.is_some() {
+            BucketScope::Pod
+        } else {
+            BucketScope::Server
+        };
+        let entry = match self
+            .bucket_registry
+            .find_entry(scope, pod_id.as_deref(), &id)
+        {
+            Some(e) => e,
+            None => {
+                send_err(match &pod_id {
+                    Some(pid) => format!("unknown bucket id: {id} (pod `{pid}`)"),
+                    None => format!("unknown bucket id: {id}"),
+                });
+                return;
+            }
+        };
+        let Some(active) = entry.active_slot.as_ref() else {
+            send_err(format!("bucket `{id}` has no active slot to load"));
+            return;
+        };
+        let slot_id = active.slot_id.clone();
+        let serving_mode = format!("{:?}", active.serving.mode).to_lowercase();
+        let registry = self.bucket_registry.clone();
+        let task_tx = self.bucket_task_sender();
+
+        tokio::spawn(async move {
+            let _ = super::buckets::load_bucket_with_progress(
+                registry,
+                id,
+                pod_id,
+                slot_id,
+                serving_mode,
+                task_tx,
+                Some(conn_id),
+                correlation_id,
+                true,
+            )
+            .await;
+        });
+    }
+
     /// `QueryBuckets` body — extracted because the handler is large
     /// (resolve providers, spawn the async query, format results) and
     /// the giant match in `apply_client_message` already runs long.
@@ -1422,6 +1492,23 @@ impl Scheduler {
         };
 
         let embedder_name = entry.config.defaults.embedder.clone();
+        let active_load_meta = entry
+            .active_slot
+            .as_ref()
+            .map(|slot| {
+                (
+                    slot.slot_id.clone(),
+                    format!("{:?}", slot.serving.mode).to_lowercase(),
+                )
+            })
+            .ok_or_else(|| format!("bucket `{bucket_id}` has no active slot to query"));
+        let (slot_id, serving_mode) = match active_load_meta {
+            Ok(meta) => meta,
+            Err(msg) => {
+                send_err(msg);
+                return;
+            }
+        };
         let embedder = match self.embedding_providers.get(&embedder_name) {
             Some(e) => e.provider.clone(),
             None => {
@@ -1450,16 +1537,25 @@ impl Scheduler {
         };
         let registry = self.bucket_registry.clone();
         let pod_id_for_load = pod_id.clone();
+        let task_tx = self.bucket_task_sender();
 
         // Detached task: HNSW rebuild on first load and the subsequent
         // dense+sparse+rerank round trip both want to be off the
         // scheduler thread.
         tokio::spawn(async move {
             let cancel = CancellationToken::new();
-            let load_result = match pod_id_for_load.as_deref() {
-                Some(pid) => registry.loaded_bucket_pod(pid, &bucket_id).await,
-                None => registry.loaded_bucket(&bucket_id).await,
-            };
+            let load_result = super::buckets::load_bucket_with_progress(
+                registry,
+                bucket_id.clone(),
+                pod_id_for_load.clone(),
+                slot_id,
+                serving_mode,
+                task_tx,
+                Some(conn_id),
+                correlation_id.clone(),
+                false,
+            )
+            .await;
             let bucket = match load_result {
                 Ok(b) => b,
                 Err(e) => {

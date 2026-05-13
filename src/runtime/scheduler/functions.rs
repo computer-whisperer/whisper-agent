@@ -1764,7 +1764,8 @@ impl Scheduler {
         // Validate each target's entry exists in the registry up-front
         // so the failure message names the bad ref, not a generic load
         // error from inside the future.
-        let mut bucket_configs: Vec<(QueryTarget, String)> = Vec::with_capacity(targets.len());
+        let mut bucket_configs: Vec<(QueryTarget, String, String, String)> =
+            Vec::with_capacity(targets.len());
         for tgt in &targets {
             let entry =
                 match self
@@ -1788,7 +1789,25 @@ impl Scheduler {
                         return;
                     }
                 };
-            bucket_configs.push((tgt.clone(), entry.config.defaults.embedder.clone()));
+            let Some(active) = entry.active_slot.as_ref() else {
+                pending_io.push(immediate_tool_error(
+                    thread_id.to_string(),
+                    op_id,
+                    tool_use_id,
+                    format!(
+                        "knowledge_query: bucket `{}:{}` has no active slot to query.",
+                        tgt.scope.as_str(),
+                        tgt.name,
+                    ),
+                ));
+                return;
+            };
+            bucket_configs.push((
+                tgt.clone(),
+                entry.config.defaults.embedder.clone(),
+                active.slot_id.clone(),
+                format!("{:?}", active.serving.mode).to_lowercase(),
+            ));
         }
 
         // Resolve each bucket's embedder by its bucket.toml `defaults.embedder`.
@@ -1821,6 +1840,7 @@ impl Scheduler {
         };
 
         let registry = self.bucket_registry.clone();
+        let task_tx = self.bucket_task_sender();
         let thread_id_s = thread_id.to_string();
         let query_text = args.query.clone();
         let display_targets: Vec<String> = targets
@@ -1834,17 +1854,39 @@ impl Scheduler {
             // pays the slot-load cost; hot loads come from the cache.
             let mut buckets: Vec<std::sync::Arc<dyn crate::knowledge::Bucket>> =
                 Vec::with_capacity(targets.len());
-            for tgt in &targets {
+            for (tgt, _embedder_name, slot_id, serving_mode) in &bucket_configs {
                 let load = match tgt.scope {
                     crate::knowledge::BucketScope::Server => {
-                        registry.loaded_bucket(&tgt.name).await
+                        crate::runtime::scheduler::buckets::load_bucket_with_progress(
+                            registry.clone(),
+                            tgt.name.clone(),
+                            None,
+                            slot_id.clone(),
+                            serving_mode.clone(),
+                            task_tx.clone(),
+                            None,
+                            None,
+                            false,
+                        )
+                        .await
                     }
                     crate::knowledge::BucketScope::Pod => {
                         let pod = tgt
                             .pod_id
                             .as_deref()
                             .expect("pod-scope target carries pod_id");
-                        registry.loaded_bucket_pod(pod, &tgt.name).await
+                        crate::runtime::scheduler::buckets::load_bucket_with_progress(
+                            registry.clone(),
+                            tgt.name.clone(),
+                            Some(pod.to_string()),
+                            slot_id.clone(),
+                            serving_mode.clone(),
+                            task_tx.clone(),
+                            None,
+                            None,
+                            false,
+                        )
+                        .await
                     }
                 };
                 match load {

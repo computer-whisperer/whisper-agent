@@ -32,7 +32,7 @@ use tracing::{info, warn};
 use whisper_agent_protocol::{ActiveSlotSummary, BucketSummary, SlotStateLabel};
 
 use super::config::{BucketConfig, SourceConfig};
-use super::disk_bucket::DiskBucket;
+use super::disk_bucket::{DiskBucket, LoadObserver};
 use super::manifest::{SlotManifest, SlotState};
 use super::slot;
 use super::types::{BucketError, BucketId, BucketScope};
@@ -103,10 +103,16 @@ pub struct BucketRegistry {
     /// Lazy `DiskBucket` cache for server-scope buckets, keyed by
     /// bucket name.
     loaded: Arc<Mutex<HashMap<String, Arc<DiskBucket>>>>,
+    /// Per-server-bucket cold-load locks. Prevents a query-triggered
+    /// load and an explicit operator-triggered load from doing duplicate
+    /// slot activation work.
+    loading: ServerLoadingLocks,
     /// Lazy `DiskBucket` cache for pod-scope buckets, keyed by
     /// `(pod_id, bucket_name)` so two pods with the same bucket name
     /// don't share a cache entry.
     loaded_pod: PodLoadedCache,
+    /// Pod-scope counterpart to [`Self::loading`].
+    loading_pod: PodLoadingLocks,
 }
 
 /// Type alias for the pod-scope `DiskBucket` cache. The
@@ -114,6 +120,8 @@ pub struct BucketRegistry {
 /// buckets distinct; the alias avoids the very-complex-type clippy
 /// lint at the field site.
 type PodLoadedCache = Arc<Mutex<HashMap<(String, String), Arc<DiskBucket>>>>;
+type ServerLoadingLocks = Arc<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>;
+type PodLoadingLocks = Arc<Mutex<HashMap<(String, String), Arc<tokio::sync::Mutex<()>>>>>;
 
 impl BucketRegistry {
     /// Walk `root/*/bucket.toml` and build a registry. Missing or
@@ -181,7 +189,9 @@ impl BucketRegistry {
             buckets,
             pod_buckets: BTreeMap::new(),
             loaded: Arc::new(Mutex::new(HashMap::new())),
+            loading: Arc::new(Mutex::new(HashMap::new())),
             loaded_pod: Arc::new(Mutex::new(HashMap::new())),
+            loading_pod: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
@@ -412,6 +422,31 @@ impl BucketRegistry {
     /// when it tries to insert. Acceptable for v1; if HNSW rebuild
     /// becomes hot path we can graduate to a per-bucket OnceCell.
     pub async fn loaded_bucket(&self, id: &str) -> Result<Arc<DiskBucket>, BucketError> {
+        self.loaded_bucket_with_observer(id, None).await
+    }
+
+    /// Same as [`Self::loaded_bucket`], with optional phase callbacks
+    /// for the caller that actually wins the cold-load lock.
+    pub async fn loaded_bucket_with_observer(
+        &self,
+        id: &str,
+        observer: Option<Arc<dyn LoadObserver>>,
+    ) -> Result<Arc<DiskBucket>, BucketError> {
+        {
+            let g = self.loaded.lock().expect("loaded mutex poisoned");
+            if let Some(b) = g.get(id) {
+                return Ok(b.clone());
+            }
+        }
+
+        let load_lock = {
+            let mut g = self.loading.lock().expect("loading mutex poisoned");
+            g.entry(id.to_string())
+                .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+                .clone()
+        };
+        let _guard = load_lock.lock().await;
+
         {
             let g = self.loaded.lock().expect("loaded mutex poisoned");
             if let Some(b) = g.get(id) {
@@ -428,18 +463,39 @@ impl BucketRegistry {
 
         // `DiskBucket::open` is sync but slow (HNSW rebuild). Push it
         // off the runtime so we don't stall the scheduler thread.
-        let bucket =
-            tokio::task::spawn_blocking(move || DiskBucket::open(dir, BucketId::server(id_owned)))
-                .await
-                .map_err(|e| BucketError::Other(format!("spawn_blocking: {e}")))??;
+        let bucket_result = tokio::task::spawn_blocking(move || {
+            DiskBucket::open_with_load_observer(
+                dir,
+                BucketId::server(id_owned),
+                observer.as_deref(),
+            )
+        })
+        .await
+        .map_err(|e| BucketError::Other(format!("spawn_blocking: {e}")))
+        .and_then(|r| r);
+        if bucket_result.is_err() {
+            self.loading
+                .lock()
+                .expect("loading mutex poisoned")
+                .remove(id);
+        }
+        let bucket = bucket_result?;
         let arc = Arc::new(bucket);
 
         let mut g = self.loaded.lock().expect("loaded mutex poisoned");
         if let Some(existing) = g.get(id) {
             // Lost the race; throw away our load and use the winner.
+            self.loading
+                .lock()
+                .expect("loading mutex poisoned")
+                .remove(id);
             return Ok(existing.clone());
         }
         g.insert(id.to_string(), arc.clone());
+        self.loading
+            .lock()
+            .expect("loading mutex poisoned")
+            .remove(id);
         Ok(arc)
     }
 
@@ -453,7 +509,33 @@ impl BucketRegistry {
         pod_id: &str,
         name: &str,
     ) -> Result<Arc<DiskBucket>, BucketError> {
+        self.loaded_bucket_pod_with_observer(pod_id, name, None)
+            .await
+    }
+
+    /// Pod-scope counterpart to [`Self::loaded_bucket_with_observer`].
+    pub async fn loaded_bucket_pod_with_observer(
+        &self,
+        pod_id: &str,
+        name: &str,
+        observer: Option<Arc<dyn LoadObserver>>,
+    ) -> Result<Arc<DiskBucket>, BucketError> {
         let key = (pod_id.to_string(), name.to_string());
+        {
+            let g = self.loaded_pod.lock().expect("loaded_pod mutex poisoned");
+            if let Some(b) = g.get(&key) {
+                return Ok(b.clone());
+            }
+        }
+
+        let load_lock = {
+            let mut g = self.loading_pod.lock().expect("loading_pod mutex poisoned");
+            g.entry(key.clone())
+                .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+                .clone()
+        };
+        let _guard = load_lock.lock().await;
+
         {
             let g = self.loaded_pod.lock().expect("loaded_pod mutex poisoned");
             if let Some(b) = g.get(&key) {
@@ -473,17 +555,34 @@ impl BucketRegistry {
         let dir = entry.dir.clone();
         let id_owned = name.to_string();
 
-        let bucket =
-            tokio::task::spawn_blocking(move || DiskBucket::open(dir, BucketId::pod(id_owned)))
-                .await
-                .map_err(|e| BucketError::Other(format!("spawn_blocking: {e}")))??;
+        let bucket_result = tokio::task::spawn_blocking(move || {
+            DiskBucket::open_with_load_observer(dir, BucketId::pod(id_owned), observer.as_deref())
+        })
+        .await
+        .map_err(|e| BucketError::Other(format!("spawn_blocking: {e}")))
+        .and_then(|r| r);
+        if bucket_result.is_err() {
+            self.loading_pod
+                .lock()
+                .expect("loading_pod mutex poisoned")
+                .remove(&(pod_id.to_string(), name.to_string()));
+        }
+        let bucket = bucket_result?;
         let arc = Arc::new(bucket);
 
         let mut g = self.loaded_pod.lock().expect("loaded_pod mutex poisoned");
         if let Some(existing) = g.get(&key) {
+            self.loading_pod
+                .lock()
+                .expect("loading_pod mutex poisoned")
+                .remove(&(pod_id.to_string(), name.to_string()));
             return Ok(existing.clone());
         }
         g.insert(key, arc.clone());
+        self.loading_pod
+            .lock()
+            .expect("loading_pod mutex poisoned")
+            .remove(&(pod_id.to_string(), name.to_string()));
         Ok(arc)
     }
 

@@ -1057,6 +1057,32 @@ pub enum BucketBuildOutcome {
     Cancelled,
 }
 
+/// Coarse phase tag emitted while a bucket's active slot is being
+/// loaded into the scheduler-side serving cache. This is distinct from
+/// building: loading does not create or mutate a slot, it activates the
+/// already-built slot for queries.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum BucketLoadPhase {
+    OpeningBucket,
+    OpeningSlot,
+    LoadingChunks,
+    LoadingVectors,
+    LoadingDense,
+    OpeningSparse,
+    LoadingDelta,
+    BuildingSourceIndex,
+    Ready,
+}
+
+/// Terminal state for a bucket load, carried by `BucketLoadEnded`.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(tag = "tag", rename_all = "snake_case")]
+pub enum BucketLoadOutcome {
+    Success,
+    Error { message: String },
+}
+
 // ---------- Wire enums ----------
 
 /// Messages the client sends to the server.
@@ -1582,6 +1608,18 @@ pub enum ClientToServer {
     /// cancelling when no build is running returns `Error` rather than
     /// silently succeeding so the UI can keep its model honest.
     CancelBucketBuild {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        correlation_id: Option<String>,
+        id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pod_id: Option<String>,
+    },
+    /// Explicitly load the bucket's active slot into the serving cache.
+    /// Queries against a cold bucket trigger the same load machinery
+    /// automatically, but this request lets an operator pay the RAM /
+    /// disk-read cost deliberately and watch progress before issuing a
+    /// query.
+    LoadBucket {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         correlation_id: Option<String>,
         id: String,
@@ -2312,6 +2350,51 @@ pub enum ServerToClient {
         outcome: BucketBuildOutcome,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         summary: Option<BucketSummary>,
+    },
+    /// A bucket active-slot load was accepted. Broadcast so all clients
+    /// can show that a cold bucket is being hydrated even if the load
+    /// was triggered by somebody else's first query.
+    BucketLoadStarted {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        correlation_id: Option<String>,
+        bucket_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pod_id: Option<String>,
+        /// Active slot being loaded. Empty only for legacy/error paths;
+        /// new servers fill it from the registry manifest before the
+        /// blocking load task starts.
+        slot_id: String,
+        /// `"ram"` or `"disk"` from the active slot manifest.
+        serving_mode: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        started_at: Option<String>,
+    },
+    /// Periodic load-progress heartbeat. Some phases, notably HNSW load,
+    /// do not expose byte counters, so progress is phase-based with an
+    /// elapsed-time anchor rather than pretending to know a percentage.
+    BucketLoadProgress {
+        bucket_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pod_id: Option<String>,
+        slot_id: String,
+        serving_mode: String,
+        phase: BucketLoadPhase,
+        phase_index: u32,
+        phase_count: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        started_at: Option<String>,
+    },
+    /// Terminal event for a bucket load. On success, subsequent queries
+    /// reuse the hot scheduler-side `DiskBucket` cache.
+    BucketLoadEnded {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        correlation_id: Option<String>,
+        bucket_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pod_id: Option<String>,
+        slot_id: String,
+        serving_mode: String,
+        outcome: BucketLoadOutcome,
     },
     /// `PollFeedNow` was accepted — the worker has been signalled.
     /// Sent only to the requesting client (it's an ack of *their*
