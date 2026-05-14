@@ -29,8 +29,9 @@ pub use conversation::{
 };
 pub use permission::{BehaviorOpsCap, DispatchCap, PodModifyCap};
 pub use pod::{
-    CompactionConfig, FsEntry, NamedHostEnv, PodAllow, PodAllowCaps, PodConfig, PodLimits,
-    PodSnapshot, PodState, PodSummary, ThreadDefaultCaps, ThreadDefaults,
+    CompactionConfig, FsEntry, KnowledgeAutoqueryConfig, KnowledgeAutoquerySource, NamedHostEnv,
+    PodAllow, PodAllowCaps, PodConfig, PodLimits, PodSnapshot, PodState, PodSummary,
+    ThreadDefaultCaps, ThreadDefaults,
 };
 pub use tool_schema::{ParamSpec, ParamType, ToolKind, ToolSchema};
 pub use tool_surface::{ActivationSurface, CoreTools, InitialListing, ToolSurface};
@@ -136,6 +137,12 @@ pub struct ThreadConfig {
     /// overrides come in via [`ThreadConfigOverride.compaction`].
     #[serde(default)]
     pub compaction: CompactionConfig,
+    /// Automatic knowledge-bucket nudges driven by recent model
+    /// output. Inherits from the pod's `thread_defaults.autoquery`;
+    /// per-thread overrides come in via
+    /// [`ThreadConfigOverride.autoquery`].
+    #[serde(default)]
+    pub autoquery: KnowledgeAutoqueryConfig,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
@@ -165,6 +172,10 @@ pub struct ThreadConfigOverride {
     /// the pod's defaults; any set field replaces it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub compaction: Option<CompactionConfigOverride>,
+    /// Per-field autoquery override. Fields left `None` inherit from
+    /// the pod's defaults; any set field replaces it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub autoquery: Option<KnowledgeAutoqueryConfigOverride>,
 }
 
 /// How a thread-creation caller specifies the system prompt to seed
@@ -198,6 +209,30 @@ pub struct CompactionConfigOverride {
     pub token_threshold: Option<Option<u32>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub continuation_template: Option<String>,
+}
+
+/// Per-thread autoquery override. Shape mirrors
+/// [`KnowledgeAutoqueryConfig`] but every field is optional.
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+pub struct KnowledgeAutoqueryConfigOverride {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub buckets: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hot_only: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub top_k: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_rerank_score: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_query_chars: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snippet_chars: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub query_source: Option<KnowledgeAutoquerySource>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inject_at_terminal: Option<bool>,
 }
 
 /// Concrete resource bindings for a thread. Each field names an entry in

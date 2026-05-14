@@ -77,6 +77,7 @@ pub fn build_default_pod_config(
             host_env: default_host_env_names,
             mcp_hosts: shared_host_names.to_vec(),
             compaction: CompactionConfig::default(),
+            autoquery: Default::default(),
             caps: Default::default(),
             tool_surface: Default::default(),
         },
@@ -98,6 +99,7 @@ pub(super) fn base_thread_config_from_pod(pod: &Pod) -> ThreadConfig {
         max_tokens: defaults.max_tokens,
         max_turns: defaults.max_turns,
         compaction: defaults.compaction.clone(),
+        autoquery: defaults.autoquery.clone(),
     }
 }
 
@@ -107,11 +109,13 @@ pub(super) fn apply_config_override(
 ) -> ThreadConfig {
     let Some(ov) = ov else { return base };
     let compaction = apply_compaction_override(base.compaction, ov.compaction);
+    let autoquery = apply_autoquery_override(base.autoquery, ov.autoquery);
     ThreadConfig {
         model: ov.model.unwrap_or(base.model),
         max_tokens: ov.max_tokens.unwrap_or(base.max_tokens),
         max_turns: ov.max_turns.unwrap_or(base.max_turns),
         compaction,
+        autoquery,
     }
 }
 
@@ -135,6 +139,25 @@ fn apply_compaction_override(
     }
 }
 
+/// Layer a partial autoquery override on top of a pod-inherited base.
+fn apply_autoquery_override(
+    base: whisper_agent_protocol::KnowledgeAutoqueryConfig,
+    ov: Option<whisper_agent_protocol::KnowledgeAutoqueryConfigOverride>,
+) -> whisper_agent_protocol::KnowledgeAutoqueryConfig {
+    let Some(ov) = ov else { return base };
+    whisper_agent_protocol::KnowledgeAutoqueryConfig {
+        enabled: ov.enabled.unwrap_or(base.enabled),
+        buckets: ov.buckets.unwrap_or(base.buckets),
+        hot_only: ov.hot_only.unwrap_or(base.hot_only),
+        top_k: ov.top_k.unwrap_or(base.top_k),
+        min_rerank_score: ov.min_rerank_score.unwrap_or(base.min_rerank_score),
+        max_query_chars: ov.max_query_chars.unwrap_or(base.max_query_chars),
+        snippet_chars: ov.snippet_chars.unwrap_or(base.snippet_chars),
+        query_source: ov.query_source.unwrap_or(base.query_source),
+        inject_at_terminal: ov.inject_at_terminal.unwrap_or(base.inject_at_terminal),
+    }
+}
+
 /// Translate a behavior's thread-override block into the
 /// (ThreadConfigOverride, ThreadBindingsRequest) pair `create_task`
 /// consumes. `None` returns for either side mean "inherit everything
@@ -153,6 +176,7 @@ pub(super) fn behavior_override_to_requests(
             max_turns: ov.max_turns,
             system_prompt: ov.system_prompt.clone(),
             compaction: None, // behaviors inherit pod compaction policy
+            autoquery: None,
         })
     } else {
         None

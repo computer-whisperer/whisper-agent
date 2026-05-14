@@ -17,7 +17,7 @@
 //! sub-phases (e.g. `NeedsModelCall` vs `AwaitingModelCall`) without touching
 //! the wire.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -142,6 +142,24 @@ pub struct Thread {
     /// Function state).
     #[serde(default, skip)]
     pub pending_tool_result_followups: Vec<String>,
+    /// Server-generated knowledge nudges waiting to be inserted before
+    /// the next model sub-turn. Transient: autoquery is opportunistic,
+    /// so a restart can drop an in-flight nudge without corrupting the
+    /// conversation.
+    #[serde(default, skip)]
+    pub pending_knowledge_nudges: Vec<String>,
+    /// Knowledge hit keys already surfaced to this thread, either via
+    /// explicit `knowledge_query` tool results or automatic knowledge
+    /// nudges. Persisted with the thread so opportunistic retrieval
+    /// does not repeat the same source record after a restart.
+    #[serde(default)]
+    pub seen_knowledge_hits: HashSet<String>,
+    /// One-shot suppression flag for auto-injected nudges after the
+    /// model explicitly asked for knowledge (`knowledge_query`) or
+    /// manually drained queued nudges. Transient: after a restart,
+    /// the persisted conversation already carries what was shown.
+    #[serde(default, skip)]
+    pub suppress_next_knowledge_nudge: bool,
     /// Parent thread id when this thread was spawned by a parent's
     /// `dispatch_thread` tool call. `None` for top-level threads. Set
     /// once at spawn; never mutated afterward. Distinct from the
@@ -330,6 +348,9 @@ impl Thread {
             continued_from: None,
             in_flight: InFlightOps::empty(),
             pending_tool_result_followups: Vec::new(),
+            pending_knowledge_nudges: Vec::new(),
+            seen_knowledge_hits: HashSet::new(),
+            suppress_next_knowledge_nudge: false,
             dispatched_by: None,
             dispatch_depth: 0,
             draft: String::new(),
@@ -435,6 +456,9 @@ impl Thread {
             continued_from: None,
             in_flight: InFlightOps::empty(),
             pending_tool_result_followups: Vec::new(),
+            pending_knowledge_nudges: Vec::new(),
+            seen_knowledge_hits: HashSet::new(),
+            suppress_next_knowledge_nudge: false,
             dispatched_by: None,
             dispatch_depth: 0,
             // Client seeds the new thread's draft with the forked-from
@@ -541,6 +565,22 @@ impl Thread {
         };
         self.conversation.push(msg);
         self.turns_in_cycle = 0;
+        self.internal = if pending_resources.is_empty() {
+            ThreadInternalState::NeedsModelCall
+        } else {
+            ThreadInternalState::WaitingOnResources {
+                needed: pending_resources,
+            }
+        };
+        self.touch();
+    }
+
+    /// Append a server-generated system reminder that should be
+    /// consumed by the model as part of the current user cycle. Unlike
+    /// a real user message, this does not reset `turns_in_cycle`; it is
+    /// an agent sub-turn nudge, not a new user request.
+    pub fn submit_server_nudge(&mut self, text: String, pending_resources: Vec<String>) {
+        self.conversation.push(Message::system_text(text));
         self.internal = if pending_resources.is_empty() {
             ThreadInternalState::NeedsModelCall
         } else {
@@ -1265,6 +1305,7 @@ mod tests {
             max_tokens: 100,
             max_turns: 10,
             compaction: Default::default(),
+            autoquery: Default::default(),
         }
     }
 

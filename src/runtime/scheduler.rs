@@ -48,8 +48,9 @@ use futures::stream::FuturesUnordered;
 use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 use whisper_agent_protocol::{
-    ClientToServer, HostEnvBinding, ResourceKind, ServerToClient, ThreadBindings,
-    ThreadBindingsRequest, ThreadConfigOverride, ThreadStateLabel,
+    ClientToServer, ContentBlock, HostEnvBinding, KnowledgeAutoqueryConfig,
+    KnowledgeAutoquerySource, ResourceKind, ServerToClient, ThreadBindings, ThreadBindingsRequest,
+    ThreadConfigOverride, ThreadStateLabel,
 };
 
 use crate::knowledge::BucketRegistry;
@@ -60,7 +61,9 @@ use crate::providers::embedding::EmbeddingProvider;
 use crate::providers::model::ModelProvider;
 use crate::providers::rerank::RerankProvider;
 use crate::runtime::audit::AuditLog;
-use crate::runtime::io_dispatch::{self, IoCompletion, SchedulerCompletion, SchedulerFuture};
+use crate::runtime::io_dispatch::{
+    self, IoCompletion, KnowledgeAutoqueryCompletion, SchedulerCompletion, SchedulerFuture,
+};
 use crate::runtime::thread::{IoResult, OpId, StepOutcome, Thread, derive_title, new_task_id};
 use crate::server::thread_router::ThreadEventRouter;
 use crate::tools::mcp::{McpSession, ToolAnnotations, ToolDescriptor as McpTool};
@@ -117,6 +120,151 @@ struct BoundMcp<'a> {
     /// Used for listing categorization; distinct from `entry.id` which
     /// is a registry-internal opaque handle.
     source_name: String,
+}
+
+fn autoquery_text_from_blocks(
+    blocks: &[ContentBlock],
+    source: KnowledgeAutoquerySource,
+    max_chars: usize,
+) -> String {
+    let reasoning = collect_assistant_text(blocks, true);
+    let text = collect_assistant_text(blocks, false);
+    let selected = match source {
+        KnowledgeAutoquerySource::ReasoningThenText => {
+            if reasoning.trim().is_empty() {
+                text
+            } else {
+                reasoning
+            }
+        }
+        KnowledgeAutoquerySource::TextThenReasoning => {
+            if text.trim().is_empty() {
+                reasoning
+            } else {
+                text
+            }
+        }
+        KnowledgeAutoquerySource::ReasoningAndText => match (reasoning.is_empty(), text.is_empty())
+        {
+            (true, true) => String::new(),
+            (false, true) => reasoning,
+            (true, false) => text,
+            (false, false) => format!("{reasoning}\n\n{text}"),
+        },
+        KnowledgeAutoquerySource::ReasoningOnly => reasoning,
+        KnowledgeAutoquerySource::TextOnly => text,
+    };
+    tail_chars(selected.trim(), max_chars)
+}
+
+fn collect_assistant_text(blocks: &[ContentBlock], reasoning: bool) -> String {
+    let mut out = String::new();
+    for block in blocks {
+        match (reasoning, block) {
+            (true, ContentBlock::Thinking { thinking, .. }) => {
+                append_block_text(&mut out, thinking)
+            }
+            (false, ContentBlock::Text { text }) => append_block_text(&mut out, text),
+            _ => {}
+        }
+    }
+    out
+}
+
+pub(crate) fn knowledge_hit_key(hit: &crate::knowledge::RerankedCandidate) -> String {
+    if hit.source_ref.source_id.is_empty() {
+        format!("{}\tchunk:{}", hit.bucket_id, hit.chunk_id)
+    } else {
+        format!("{}\tsource:{}", hit.bucket_id, hit.source_ref.source_id)
+    }
+}
+
+pub(crate) fn knowledge_hit_keys(hits: &[crate::knowledge::RerankedCandidate]) -> Vec<String> {
+    hits.iter().map(knowledge_hit_key).collect()
+}
+
+fn append_block_text(out: &mut String, text: &str) {
+    if text.trim().is_empty() {
+        return;
+    }
+    if !out.is_empty() {
+        out.push_str("\n\n");
+    }
+    out.push_str(text);
+}
+
+fn tail_chars(text: &str, max_chars: usize) -> String {
+    if max_chars == 0 {
+        return String::new();
+    }
+    let len = text.chars().count();
+    if len <= max_chars {
+        return text.to_string();
+    }
+    text.chars()
+        .skip(len - max_chars)
+        .collect::<String>()
+        .trim_start()
+        .to_string()
+}
+
+fn head_chars(text: &str, max_chars: usize) -> String {
+    if max_chars == 0 {
+        return String::new();
+    }
+    let mut out: String = text.chars().take(max_chars).collect();
+    if text.chars().count() > max_chars {
+        out.push('…');
+    }
+    out
+}
+
+fn format_autoquery_nudge(
+    query: &str,
+    labels: &[String],
+    hits: &[crate::knowledge::RerankedCandidate],
+    config: &KnowledgeAutoqueryConfig,
+) -> Option<String> {
+    let filtered: Vec<_> = hits
+        .iter()
+        .filter(|h| h.rerank_score >= config.min_rerank_score)
+        .collect();
+    if filtered.is_empty() {
+        return None;
+    }
+    let mut out = String::from(
+        "A hot knowledge bucket surfaced material related to the current reasoning trace. Use `knowledge_query` if you need more context.\n",
+    );
+    out.push_str("Queried hot buckets: ");
+    out.push_str(&labels.join(", "));
+    out.push('\n');
+    out.push_str("Trace query excerpt: ");
+    out.push_str(&format!("{:?}", head_chars(query, 240)));
+    out.push_str("\n\n");
+    for (idx, hit) in filtered.into_iter().enumerate() {
+        let title = if hit.source_ref.source_id.is_empty() {
+            format!("chunk {}", hit.chunk_id)
+        } else {
+            hit.source_ref.source_id.clone()
+        };
+        let locator = hit
+            .source_ref
+            .locator
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .map(|s| format!(" ({s})"))
+            .unwrap_or_default();
+        out.push_str(&format!(
+            "{}. [{}] {}{} — rerank={:.3}\n{}\n\n",
+            idx + 1,
+            hit.bucket_id,
+            title,
+            locator,
+            hit.rerank_score,
+            head_chars(&hit.chunk_text, config.snippet_chars as usize),
+        ));
+    }
+    Some(out)
 }
 
 fn tool_requires_image_input(name: &str) -> bool {
@@ -468,6 +616,11 @@ pub struct Scheduler {
     /// next refresh works or the boot reconnect fails with its own
     /// clear error.
     oauth_refresh_failure_counts: HashMap<String, u32>,
+    /// Threads with an opportunistic knowledge autoquery currently in
+    /// flight. A fast tool result can otherwise advance the thread to
+    /// the next model call before retrieval finishes, making the nudge
+    /// arrive after the turn is already terminal.
+    knowledge_autoquery_in_flight: HashSet<String>,
 
     tasks: HashMap<String, Thread>,
     /// Per-thread cancel signal. Cloned into every dispatched I/O
@@ -687,6 +840,7 @@ impl Scheduler {
                 oauth_refresh_in_flight: HashSet::new(),
                 oauth_refresh_no_refresh_token_warned: HashSet::new(),
                 oauth_refresh_failure_counts: HashMap::new(),
+                knowledge_autoquery_in_flight: HashSet::new(),
                 tasks: HashMap::new(),
                 cancel_tokens: HashMap::new(),
                 router: ThreadEventRouter::new(audit, host_id),
@@ -3432,6 +3586,7 @@ impl Scheduler {
             result,
             pod_update,
             scheduler_command,
+            knowledge_hit_keys,
         } = completion;
         let mut events = Vec::new();
 
@@ -3462,6 +3617,7 @@ impl Scheduler {
             }
             _ => {}
         }
+        self.maybe_launch_knowledge_autoquery(&thread_id, &result, pending_io);
 
         // Build per-tool-name annotation map so the task's approval policy can consult it.
         let annotations = self.annotations_for(&thread_id);
@@ -3481,9 +3637,24 @@ impl Scheduler {
         };
         if let Some(task) = self.tasks.get_mut(&thread_id) {
             task.apply_io_result(op_id, result, &annotations, &mut events);
+            if !knowledge_hit_keys.is_empty() {
+                task.seen_knowledge_hits.extend(knowledge_hit_keys);
+            }
         } else {
             warn!(%thread_id, op_id, "io completion for unknown task");
             return;
+        }
+        let suppress_knowledge_nudge = events.iter().any(|event| {
+            matches!(
+                event,
+                crate::runtime::thread::ThreadEvent::AuditToolCall { tool_name, .. }
+                    if tool_name == crate::tools::builtin_tools::KNOWLEDGE_QUERY
+                        || tool_name == crate::tools::builtin_tools::DRAIN_KNOWLEDGE_NUDGES
+            )
+        });
+        if suppress_knowledge_nudge && let Some(task) = self.tasks.get_mut(&thread_id) {
+            task.pending_knowledge_nudges.clear();
+            task.suppress_next_knowledge_nudge = true;
         }
         self.mark_dirty(&thread_id);
         self.router.dispatch_events(&thread_id, events);
@@ -3495,6 +3666,240 @@ impl Scheduler {
         if let Some((tool_use_id, tc_result)) = tool_result_snapshot {
             self.complete_tool_function(&thread_id, &tool_use_id, &tc_result, pending_io);
         }
+    }
+
+    fn maybe_launch_knowledge_autoquery(
+        &mut self,
+        thread_id: &str,
+        result: &IoResult,
+        pending_io: &mut FuturesUnordered<SchedulerFuture>,
+    ) {
+        let IoResult::ModelCall(Ok(response)) = result else {
+            return;
+        };
+        let Some(task) = self.tasks.get(thread_id) else {
+            return;
+        };
+        let config = task.config.autoquery.clone();
+        if !config.enabled || config.top_k == 0 {
+            return;
+        }
+        let has_tool_use = response
+            .content
+            .iter()
+            .any(|b| matches!(b, ContentBlock::ToolUse { .. }));
+        if !has_tool_use && !config.inject_at_terminal {
+            return;
+        }
+        let query_text = autoquery_text_from_blocks(
+            &response.content,
+            config.query_source,
+            config.max_query_chars as usize,
+        );
+        if query_text.trim().is_empty() {
+            return;
+        }
+        let caller_pod_id = task.pod_id.clone();
+        let in_scope_server: Vec<String> = self
+            .pods
+            .get(&caller_pod_id)
+            .map(|pod| pod.config.allow.knowledge_buckets.clone())
+            .unwrap_or_default();
+        let in_scope_pod: Vec<String> = self
+            .bucket_registry
+            .pod_buckets
+            .get(&caller_pod_id)
+            .map(|m| m.keys().cloned().collect())
+            .unwrap_or_default();
+        let targets = match functions::resolve_query_targets(
+            &config.buckets,
+            &in_scope_server,
+            &in_scope_pod,
+            &caller_pod_id,
+        ) {
+            Ok(t) => t,
+            Err(e) => {
+                warn!(%thread_id, error = %e, "knowledge autoquery target resolution failed");
+                return;
+            }
+        };
+        if targets.is_empty() {
+            return;
+        }
+        let Some(reranker) = self
+            .rerank_providers
+            .values()
+            .next()
+            .map(|r| r.provider.clone())
+        else {
+            warn!(%thread_id, "knowledge autoquery skipped: no rerank provider configured");
+            return;
+        };
+
+        let mut buckets: Vec<Arc<dyn crate::knowledge::Bucket>> = Vec::new();
+        let mut labels: Vec<String> = Vec::new();
+        let mut embedder_name: Option<String> = None;
+        for tgt in targets {
+            let Some(entry) =
+                self.bucket_registry
+                    .find_entry(tgt.scope, tgt.pod_id.as_deref(), &tgt.name)
+            else {
+                continue;
+            };
+            if entry.active_slot.is_none() {
+                continue;
+            }
+            let hot = match tgt.scope {
+                crate::knowledge::BucketScope::Server => self.bucket_registry.hot_bucket(&tgt.name),
+                crate::knowledge::BucketScope::Pod => {
+                    let Some(pid) = tgt.pod_id.as_deref() else {
+                        continue;
+                    };
+                    self.bucket_registry.hot_bucket_pod(pid, &tgt.name)
+                }
+            };
+            let Some(bucket) = hot else {
+                if !config.hot_only {
+                    warn!(
+                        thread_id,
+                        bucket = %tgt.name,
+                        scope = %tgt.scope.as_str(),
+                        "knowledge autoquery skipped cold bucket; live path is hot-only",
+                    );
+                }
+                continue;
+            };
+            if embedder_name.is_none() {
+                embedder_name = Some(entry.config.defaults.embedder.clone());
+            }
+            labels.push(format!("{}:{}", tgt.scope.as_str(), tgt.name));
+            buckets.push(bucket);
+        }
+        if buckets.is_empty() {
+            return;
+        }
+        let Some(embedder_name) = embedder_name else {
+            return;
+        };
+        let Some(embedder) = self
+            .embedding_providers
+            .get(&embedder_name)
+            .map(|e| e.provider.clone())
+        else {
+            warn!(
+                %thread_id,
+                %embedder_name,
+                "knowledge autoquery skipped: embedder missing",
+            );
+            return;
+        };
+
+        let thread_id_s = thread_id.to_string();
+        if !self
+            .knowledge_autoquery_in_flight
+            .insert(thread_id_s.clone())
+        {
+            return;
+        }
+        pending_io.push(Box::pin(async move {
+            let cancel = tokio_util::sync::CancellationToken::new();
+            let engine = crate::knowledge::QueryEngine::new(embedder, reranker);
+            let params = crate::knowledge::QueryParams {
+                top_k: config.top_k as usize,
+                ..Default::default()
+            };
+            let result = match engine.query(&buckets, &query_text, &params, &cancel).await {
+                Ok(hits) => {
+                    let top_rerank_score = hits.first().map(|h| h.rerank_score);
+                    let injecting = hits
+                        .iter()
+                        .any(|hit| hit.rerank_score >= config.min_rerank_score);
+                    tracing::info!(
+                        thread_id = %thread_id_s,
+                        hits = hits.len(),
+                        top_rerank_score = ?top_rerank_score,
+                        min_rerank_score = config.min_rerank_score,
+                        injecting,
+                        "knowledge autoquery completed",
+                    );
+                    Ok(io_dispatch::KnowledgeAutoqueryResult {
+                        query: query_text,
+                        labels,
+                        hits,
+                    })
+                }
+                Err(e) => Err(e.to_string()),
+            };
+            SchedulerCompletion::KnowledgeAutoquery(KnowledgeAutoqueryCompletion {
+                thread_id: thread_id_s,
+                result,
+            })
+        }));
+    }
+
+    fn apply_knowledge_autoquery_completion(
+        &mut self,
+        completion: KnowledgeAutoqueryCompletion,
+        pending_io: &mut FuturesUnordered<SchedulerFuture>,
+    ) {
+        self.knowledge_autoquery_in_flight
+            .remove(&completion.thread_id);
+        match completion.result {
+            Ok(payload) => {
+                let mut dirty = false;
+                let Some(task) = self.tasks.get_mut(&completion.thread_id) else {
+                    return;
+                };
+                if task.suppress_next_knowledge_nudge {
+                    task.suppress_next_knowledge_nudge = false;
+                    dirty = true;
+                } else {
+                    let unseen_hits: Vec<_> = payload
+                        .hits
+                        .into_iter()
+                        .filter(|hit| {
+                            hit.rerank_score >= task.config.autoquery.min_rerank_score
+                                && !task.seen_knowledge_hits.contains(&knowledge_hit_key(hit))
+                        })
+                        .collect();
+                    if let Some(nudge) = format_autoquery_nudge(
+                        &payload.query,
+                        &payload.labels,
+                        &unseen_hits,
+                        &task.config.autoquery,
+                    ) {
+                        task.seen_knowledge_hits
+                            .extend(knowledge_hit_keys(&unseen_hits));
+                        match task.internal {
+                            crate::runtime::thread::ThreadInternalState::AwaitingTools {
+                                ..
+                            }
+                            | crate::runtime::thread::ThreadInternalState::NeedsModelCall => {
+                                task.pending_knowledge_nudges.push(nudge);
+                            }
+                            crate::runtime::thread::ThreadInternalState::Completed
+                                if task.config.autoquery.inject_at_terminal =>
+                            {
+                                task.pending_knowledge_nudges.push(nudge);
+                            }
+                            _ => {}
+                        }
+                        dirty = true;
+                    }
+                }
+                if dirty {
+                    self.mark_dirty(&completion.thread_id);
+                }
+            }
+            Err(e) => {
+                warn!(
+                    thread_id = %completion.thread_id,
+                    error = %e,
+                    "knowledge autoquery failed",
+                );
+            }
+        }
+        self.step_until_blocked(&completion.thread_id, pending_io);
     }
 
     fn annotations_for(&self, thread_id: &str) -> HashMap<String, ToolAnnotations> {
@@ -3527,6 +3932,12 @@ impl Scheduler {
     ) {
         self.mark_dirty(thread_id);
         loop {
+            if self.inject_pending_knowledge_nudge(thread_id) {
+                continue;
+            }
+            if self.should_wait_for_knowledge_autoquery(thread_id) {
+                break;
+            }
             let mut events = Vec::new();
             let outcome = {
                 let Some(task) = self.tasks.get_mut(thread_id) else {
@@ -3605,6 +4016,64 @@ impl Scheduler {
         // targeting it as their `ThreadToolCall` caller.
         self.complete_functions_awaiting_thread(thread_id, pending_io);
         self.cascade_cancel_caller_gone(thread_id, pending_io);
+    }
+
+    fn should_wait_for_knowledge_autoquery(&self, thread_id: &str) -> bool {
+        self.knowledge_autoquery_in_flight.contains(thread_id)
+            && self
+                .tasks
+                .get(thread_id)
+                .map(|task| {
+                    matches!(
+                        task.internal,
+                        crate::runtime::thread::ThreadInternalState::NeedsModelCall
+                    )
+                })
+                .unwrap_or(false)
+    }
+
+    fn inject_pending_knowledge_nudge(&mut self, thread_id: &str) -> bool {
+        let should_inject = self
+            .tasks
+            .get(thread_id)
+            .map(|task| {
+                !task.pending_knowledge_nudges.is_empty()
+                    && matches!(
+                        task.internal,
+                        crate::runtime::thread::ThreadInternalState::NeedsModelCall
+                            | crate::runtime::thread::ThreadInternalState::Completed
+                    )
+                    && (matches!(
+                        task.internal,
+                        crate::runtime::thread::ThreadInternalState::NeedsModelCall
+                    ) || task.config.autoquery.inject_at_terminal)
+            })
+            .unwrap_or(false);
+        if !should_inject {
+            return false;
+        }
+        let pending_resources = self.pending_resources_for(thread_id);
+        let Some((new_state, snapshot)) = self.tasks.get_mut(thread_id).map(|task| {
+            let text = task.pending_knowledge_nudges.remove(0);
+            task.submit_server_nudge(text, pending_resources);
+            (task.public_state(), task.snapshot())
+        }) else {
+            return false;
+        };
+        self.mark_dirty(thread_id);
+        self.router.broadcast_to_subscribers(
+            thread_id,
+            ServerToClient::ThreadSnapshot {
+                thread_id: thread_id.to_string(),
+                snapshot,
+            },
+        );
+        self.router
+            .broadcast_task_list(ServerToClient::ThreadStateChanged {
+                thread_id: thread_id.to_string(),
+                state: new_state,
+            });
+        true
     }
 
     /// If the task is in a terminal state, tear down its sandbox (if any).
@@ -4203,6 +4672,9 @@ pub async fn run(
                             scheduler.apply_io_completion(io, &mut pending_io);
                             scheduler.step_until_blocked(&thread_id, &mut pending_io);
                         }
+                        SchedulerCompletion::KnowledgeAutoquery(done) => {
+                            scheduler.apply_knowledge_autoquery_completion(done, &mut pending_io);
+                        }
                         SchedulerCompletion::SharedMcp(done) => {
                             scheduler.apply_shared_mcp_completion(done);
                         }
@@ -4325,6 +4797,78 @@ async fn connect_shared_mcp_on_boot(
         .map(|t| (t.name.clone(), t.annotations.clone()))
         .collect();
     resources.populate_mcp_tools(&id, tools, annotations);
+}
+
+#[cfg(test)]
+mod autoquery_tests {
+    use super::{autoquery_text_from_blocks, format_autoquery_nudge};
+    use crate::knowledge::{BucketId, ChunkId, RerankedCandidate, SearchPath, SourceRef};
+    use whisper_agent_protocol::{
+        ContentBlock, KnowledgeAutoqueryConfig, KnowledgeAutoquerySource,
+    };
+
+    #[test]
+    fn autoquery_prefers_reasoning_and_tails_long_trace() {
+        let blocks = vec![
+            ContentBlock::Thinking {
+                replay: None,
+                thinking: "first part. second part. third part.".into(),
+            },
+            ContentBlock::Text {
+                text: "visible answer".into(),
+            },
+        ];
+        let text =
+            autoquery_text_from_blocks(&blocks, KnowledgeAutoquerySource::ReasoningThenText, 18);
+        assert_eq!(text, "part. third part.");
+    }
+
+    #[test]
+    fn autoquery_can_fall_back_to_visible_text() {
+        let blocks = vec![ContentBlock::Text {
+            text: "attention mechanism failure mode".into(),
+        }];
+        let text =
+            autoquery_text_from_blocks(&blocks, KnowledgeAutoquerySource::ReasoningThenText, 200);
+        assert_eq!(text, "attention mechanism failure mode");
+    }
+
+    #[test]
+    fn autoquery_nudge_respects_score_threshold() {
+        let hit = RerankedCandidate {
+            bucket_id: BucketId::server("enwiki"),
+            chunk_id: ChunkId([7; 32]),
+            chunk_text: "Transformers use attention to model dependencies.".into(),
+            source_ref: SourceRef {
+                source_id: "Attention Is All You Need".into(),
+                locator: None,
+            },
+            source_score: 1.0,
+            source_path: SearchPath::Dense,
+            rerank_score: 0.42,
+        };
+        let mut cfg = KnowledgeAutoqueryConfig {
+            enabled: true,
+            min_rerank_score: 0.9,
+            ..Default::default()
+        };
+        assert!(
+            format_autoquery_nudge(
+                "attention",
+                &["server:enwiki".into()],
+                std::slice::from_ref(&hit),
+                &cfg,
+            )
+            .is_none()
+        );
+
+        cfg.min_rerank_score = 0.1;
+        let nudge = format_autoquery_nudge("attention", &["server:enwiki".into()], &[hit], &cfg)
+            .expect("hit above threshold should produce a nudge");
+        assert!(nudge.contains("A hot knowledge bucket"));
+        assert!(nudge.contains("Attention Is All You Need"));
+        assert!(nudge.contains("knowledge_query"));
+    }
 }
 
 #[cfg(test)]

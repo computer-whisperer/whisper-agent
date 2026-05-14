@@ -989,6 +989,7 @@ fn synthesize_pod_config(task: &Thread) -> PodConfig {
             host_env: Vec::new(),
             mcp_hosts: Vec::new(),
             compaction: task.config.compaction.clone(),
+            autoquery: task.config.autoquery.clone(),
             caps: Default::default(),
             tool_surface: Default::default(),
         },
@@ -1035,6 +1036,7 @@ mod tests {
                 host_env: Vec::new(),
                 mcp_hosts: Vec::new(),
                 compaction: Default::default(),
+                autoquery: Default::default(),
                 caps: Default::default(),
                 tool_surface: Default::default(),
             },
@@ -1048,6 +1050,7 @@ mod tests {
             max_tokens: 8000,
             max_turns: 50,
             compaction: Default::default(),
+            autoquery: Default::default(),
         };
         let bindings = ThreadBindings {
             backend: "anthropic".into(),

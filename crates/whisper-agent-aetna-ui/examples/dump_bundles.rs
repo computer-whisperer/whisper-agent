@@ -2345,6 +2345,7 @@ mcp_hosts = ["filesystem", "git"]
             host_env: vec!["main".into()],
             mcp_hosts: vec!["filesystem".into(), "git".into()],
             compaction: CompactionConfig::default(),
+            autoquery: Default::default(),
             caps: Default::default(),
             tool_surface: Default::default(),
         },
@@ -2525,6 +2526,7 @@ fn mock_snapshot() -> ThreadSnapshot {
             max_tokens: 4096,
             max_turns: 8,
             compaction: CompactionConfig::default(),
+            autoquery: Default::default(),
         },
         // Seed a backend so the thread-header `backend/model` chip
         // exercises the populated branch in dump scenes that ride
@@ -2663,6 +2665,7 @@ fn base_snapshot(
             max_tokens: 4096,
             max_turns: 8,
             compaction: CompactionConfig::default(),
+            autoquery: Default::default(),
         },
         bindings: ThreadBindings::default(),
         state,
@@ -3012,6 +3015,7 @@ fn mock_tool_snapshot() -> ThreadSnapshot {
             max_tokens: 4096,
             max_turns: 8,
             compaction: CompactionConfig::default(),
+            autoquery: Default::default(),
         },
         // Seed a backend so the thread-header `backend/model` chip
         // exercises the populated branch in dump scenes that ride

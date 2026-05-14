@@ -27,6 +27,7 @@ mod about;
 mod behavior_control;
 pub mod describe_tool;
 pub mod dispatch_thread;
+pub mod drain_knowledge_nudges;
 mod filesystem;
 pub mod find_tool;
 mod grep;
@@ -145,6 +146,7 @@ pub const DISPATCH_THREAD: &str = "dispatch_thread";
 pub const SUDO: &str = "sudo";
 pub const DESCRIBE_TOOL: &str = "describe_tool";
 pub const FIND_TOOL: &str = "find_tool";
+pub const DRAIN_KNOWLEDGE_NUDGES: &str = "drain_knowledge_nudges";
 pub const LIST_LLM_PROVIDERS: &str = "list_llm_providers";
 pub const LIST_MCP_HOSTS: &str = "list_mcp_hosts";
 pub const KNOWLEDGE_QUERY: &str = "knowledge_query";
@@ -172,6 +174,7 @@ pub fn is_builtin(name: &str) -> bool {
             | SUDO
             | DESCRIBE_TOOL
             | FIND_TOOL
+            | DRAIN_KNOWLEDGE_NUDGES
             | LIST_LLM_PROVIDERS
             | LIST_MCP_HOSTS
             | KNOWLEDGE_QUERY
@@ -206,6 +209,7 @@ pub fn reserved_env_name_prefixes() -> Vec<&'static str> {
         SUDO,
         DESCRIBE_TOOL,
         FIND_TOOL,
+        DRAIN_KNOWLEDGE_NUDGES,
         LIST_LLM_PROVIDERS,
         LIST_MCP_HOSTS,
         KNOWLEDGE_QUERY,
@@ -241,6 +245,7 @@ pub fn descriptors() -> Vec<McpTool> {
         sudo::descriptor(),
         describe_tool::descriptor(),
         find_tool::descriptor(),
+        drain_knowledge_nudges::descriptor(),
         list_llm_providers::descriptor(),
         list_mcp_hosts::descriptor(),
         knowledge_query::descriptor(),
@@ -449,6 +454,11 @@ pub async fn dispatch(
         FIND_TOOL => no_update_error(
             "find_tool must be intercepted at the scheduler layer \
              (complete_find_tool_call); reaching this arm is a bug"
+                .into(),
+        ),
+        DRAIN_KNOWLEDGE_NUDGES => no_update_error(
+            "drain_knowledge_nudges must be intercepted at the scheduler layer \
+             (complete_drain_knowledge_nudges_call); reaching this arm is a bug"
                 .into(),
         ),
         LIST_LLM_PROVIDERS => no_update_error(

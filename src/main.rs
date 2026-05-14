@@ -560,6 +560,7 @@ async fn run_serve(args: ServeArgs) -> Result<()> {
             max_tokens: args.max_tokens,
             max_turns: args.max_turns,
             compaction: Default::default(),
+            autoquery: Default::default(),
         },
         default_system_prompt: args.system_prompt,
         default_host_env,

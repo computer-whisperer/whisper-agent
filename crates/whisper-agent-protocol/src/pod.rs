@@ -13,7 +13,7 @@ use crate::permission::{AllowMap, BehaviorOpsCap, DispatchCap, PodModifyCap};
 use crate::sandbox::HostEnvSpec;
 use crate::tool_surface::ToolSurface;
 
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub struct PodConfig {
     pub name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -122,7 +122,7 @@ pub struct NamedHostEnv {
     pub spec: HostEnvSpec,
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub struct ThreadDefaults {
     pub backend: String,
     pub model: String,
@@ -154,6 +154,10 @@ pub struct ThreadDefaults {
     /// override via [`crate::ThreadConfigOverride.compaction`].
     #[serde(default)]
     pub compaction: CompactionConfig,
+    /// Automatic knowledge-bucket nudge defaults. Threads override via
+    /// [`crate::ThreadConfigOverride.autoquery`].
+    #[serde(default)]
+    pub autoquery: KnowledgeAutoqueryConfig,
     /// Starting typed-cap values for a freshly-created thread. Each
     /// must be ≤ the matching entry in `allow.caps`; the pod validator
     /// enforces this. Omitted on disk → conservative defaults that
@@ -300,6 +304,95 @@ impl Default for CompactionConfig {
             continuation_template: default_continuation_template(),
         }
     }
+}
+
+/// Opportunistic retrieval nudges driven by a model's own recent
+/// output. This is deliberately separate from the explicit
+/// `knowledge_query` tool: autoquery must be low-latency and must not
+/// load cold buckets just because a model turn ended.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct KnowledgeAutoqueryConfig {
+    /// Master switch. Default-off so existing pods do not change
+    /// behavior until an operator deliberately enables live retrieval.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Bucket refs to consider. Empty means every bucket already
+    /// in-scope for this pod/thread. Same grammar as `knowledge_query`:
+    /// bare, `server:name`, or `pod:name`.
+    #[serde(default)]
+    pub buckets: Vec<String>,
+    /// If true, skip buckets whose active slot is not already loaded in
+    /// RAM/cache. Live nudges are meant to be second-scale; explicit
+    /// `knowledge_query` remains the load-triggering path.
+    #[serde(default = "autoquery_hot_only_default")]
+    pub hot_only: bool,
+    /// Final hit count after reranking. Small by default because the
+    /// nudge is only a pointer, not a full RAG payload.
+    #[serde(default = "autoquery_top_k_default")]
+    pub top_k: u32,
+    /// Minimum reranker score required before injecting a nudge.
+    #[serde(default)]
+    pub min_rerank_score: f32,
+    /// Maximum characters of model output used as the query.
+    #[serde(default = "autoquery_max_query_chars_default")]
+    pub max_query_chars: u32,
+    /// Maximum characters of chunk text included in the nudge.
+    #[serde(default = "autoquery_snippet_chars_default")]
+    pub snippet_chars: u32,
+    /// Where to draw query text from inside the assistant response.
+    #[serde(default)]
+    pub query_source: KnowledgeAutoquerySource,
+    /// Inject at completed/terminal turn boundaries. Default false:
+    /// v1 only feeds the next agent sub-turn, avoiding surprise extra
+    /// assistant turns after a final answer.
+    #[serde(default)]
+    pub inject_at_terminal: bool,
+}
+
+fn autoquery_hot_only_default() -> bool {
+    true
+}
+
+fn autoquery_top_k_default() -> u32 {
+    1
+}
+
+fn autoquery_max_query_chars_default() -> u32 {
+    4_000
+}
+
+fn autoquery_snippet_chars_default() -> u32 {
+    500
+}
+
+impl Default for KnowledgeAutoqueryConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            buckets: Vec::new(),
+            hot_only: autoquery_hot_only_default(),
+            top_k: autoquery_top_k_default(),
+            min_rerank_score: 0.0,
+            max_query_chars: autoquery_max_query_chars_default(),
+            snippet_chars: autoquery_snippet_chars_default(),
+            query_source: KnowledgeAutoquerySource::default(),
+            inject_at_terminal: false,
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum KnowledgeAutoquerySource {
+    /// Prefer visible/thinking reasoning; fall back to assistant text.
+    #[default]
+    ReasoningThenText,
+    /// Prefer assistant text; fall back to reasoning.
+    TextThenReasoning,
+    /// Concatenate reasoning and assistant text, in that order.
+    ReasoningAndText,
+    ReasoningOnly,
+    TextOnly,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]

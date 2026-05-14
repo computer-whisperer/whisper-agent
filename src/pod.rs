@@ -324,6 +324,7 @@ mod tests {
                 host_env: vec!["landlock-rw".into()],
                 mcp_hosts: vec!["fetch".into(), "search".into()],
                 compaction: Default::default(),
+                autoquery: Default::default(),
                 caps: ThreadDefaultCaps::default(),
                 tool_surface: Default::default(),
             },

@@ -63,12 +63,12 @@ use whisper_agent_protocol::{
     BehaviorThreadOverride, BucketBuildOutcome, BucketBuildPhase, BucketCreateInput,
     BucketLoadOutcome, BucketLoadPhase, BucketSourceInput, BucketSummary, CatchUp, ClientToServer,
     ContentBlock, CoreTools, Disposition, EmbeddingProviderInfo, FsEntry, HostEnvBindingRequest,
-    HostEnvDaemonSummary, ImageMime, ImageSource, InitialListing, ModelSummary, NamedHostEnv,
-    Overlap, PodAllow, PodConfig, PodLimits, PodSummary, QuantizationInput, RetentionPolicy, Role,
-    ServerToClient, SharedMcpAuthInput, SharedMcpAuthPublic, SharedMcpHostInfo,
-    SharedMcpPrefixInput, SlotStateLabel, SystemPromptChoice, ThreadBindingsRequest,
-    ThreadConfigOverride, ThreadDefaults, ThreadSummary, TrackedCadenceInput, TrackedDriverInput,
-    TriggerSpec, permission::SudoDecision,
+    HostEnvDaemonSummary, ImageMime, ImageSource, InitialListing, KnowledgeAutoquerySource,
+    ModelSummary, NamedHostEnv, Overlap, PodAllow, PodConfig, PodLimits, PodSummary,
+    QuantizationInput, RetentionPolicy, Role, ServerToClient, SharedMcpAuthInput,
+    SharedMcpAuthPublic, SharedMcpHostInfo, SharedMcpPrefixInput, SlotStateLabel,
+    SystemPromptChoice, ThreadBindingsRequest, ThreadConfigOverride, ThreadDefaults, ThreadSummary,
+    TrackedCadenceInput, TrackedDriverInput, TriggerSpec, permission::SudoDecision,
 };
 
 /// Inbound event variants the host shell pushes into the [`Inbound`]
@@ -2495,6 +2495,14 @@ pub(crate) struct PodEditorSheetState {
     /// Same shape as [`Self::max_tokens_buf`], for
     /// `limits.max_concurrent_threads`.
     pub(crate) max_concurrent_threads_buf: String,
+    /// Defaults-tab autoquery `top_k` edit buffer.
+    pub(crate) autoquery_top_k_buf: String,
+    /// Defaults-tab autoquery reranker threshold edit buffer.
+    pub(crate) autoquery_min_score_buf: String,
+    /// Defaults-tab autoquery query-text character budget edit buffer.
+    pub(crate) autoquery_max_query_chars_buf: String,
+    /// Defaults-tab autoquery nudge snippet character budget edit buffer.
+    pub(crate) autoquery_snippet_chars_buf: String,
     /// Visible string for the Defaults-tab tool-surface
     /// `core_tools` named-list `text_area`. Holds the multiline
     /// edit buffer (one tool name per line) while the user types;
@@ -2531,6 +2539,8 @@ pub(crate) enum PodEditorPicker {
     DefaultsCapsDispatch,
     /// `thread_defaults.caps.behaviors` selector.
     DefaultsCapsBehaviors,
+    /// `thread_defaults.autoquery.query_source` selector.
+    DefaultsAutoquerySource,
 }
 
 impl PodEditorPicker {
@@ -2545,6 +2555,7 @@ impl PodEditorPicker {
             Self::DefaultsCapsPodModify => POD_EDITOR_DEFAULTS_CAPS_POD_MODIFY_KEY,
             Self::DefaultsCapsDispatch => POD_EDITOR_DEFAULTS_CAPS_DISPATCH_KEY,
             Self::DefaultsCapsBehaviors => POD_EDITOR_DEFAULTS_CAPS_BEHAVIORS_KEY,
+            Self::DefaultsAutoquerySource => POD_EDITOR_DEFAULTS_AUTOQUERY_SOURCE_KEY,
         }
     }
 }
@@ -2604,6 +2615,10 @@ impl PodEditorSheetState {
             max_tokens_buf: String::new(),
             max_turns_buf: String::new(),
             max_concurrent_threads_buf: String::new(),
+            autoquery_top_k_buf: String::new(),
+            autoquery_min_score_buf: String::new(),
+            autoquery_max_query_chars_buf: String::new(),
+            autoquery_snippet_chars_buf: String::new(),
             tool_surface_named_buf: String::new(),
             host_env_editor: None,
         }
@@ -2630,6 +2645,13 @@ impl PodEditorSheetState {
             self.max_tokens_buf = cfg.thread_defaults.max_tokens.to_string();
             self.max_turns_buf = cfg.thread_defaults.max_turns.to_string();
             self.max_concurrent_threads_buf = cfg.limits.max_concurrent_threads.to_string();
+            self.autoquery_top_k_buf = cfg.thread_defaults.autoquery.top_k.to_string();
+            self.autoquery_min_score_buf =
+                format_float_for_input(cfg.thread_defaults.autoquery.min_rerank_score);
+            self.autoquery_max_query_chars_buf =
+                cfg.thread_defaults.autoquery.max_query_chars.to_string();
+            self.autoquery_snippet_chars_buf =
+                cfg.thread_defaults.autoquery.snippet_chars.to_string();
             // Seed the tool_surface named buffer from the parsed
             // CoreTools. `All` leaves the buffer at the conventional
             // default (describe_tool / find_tool / request_escalation)
@@ -5996,6 +6018,17 @@ const POD_EDITOR_DEFAULTS_MODEL_KEY: &str = "pod-editor:defaults:model";
 const POD_EDITOR_DEFAULTS_SYSTEM_PROMPT_FILE_KEY: &str = "pod-editor:defaults:system-prompt-file";
 const POD_EDITOR_DEFAULTS_MAX_TOKENS_KEY: &str = "pod-editor:defaults:max-tokens";
 const POD_EDITOR_DEFAULTS_MAX_TURNS_KEY: &str = "pod-editor:defaults:max-turns";
+const POD_EDITOR_DEFAULTS_AUTOQUERY_ENABLED_KEY: &str = "pod-editor:defaults:autoquery:enabled";
+const POD_EDITOR_DEFAULTS_AUTOQUERY_HOT_ONLY_KEY: &str = "pod-editor:defaults:autoquery:hot-only";
+const POD_EDITOR_DEFAULTS_AUTOQUERY_TERMINAL_KEY: &str = "pod-editor:defaults:autoquery:terminal";
+const POD_EDITOR_DEFAULTS_AUTOQUERY_BUCKETS_KEY: &str = "pod-editor:defaults:autoquery:buckets";
+const POD_EDITOR_DEFAULTS_AUTOQUERY_SOURCE_KEY: &str = "pod-editor:defaults:autoquery:source";
+const POD_EDITOR_DEFAULTS_AUTOQUERY_TOP_K_KEY: &str = "pod-editor:defaults:autoquery:top-k";
+const POD_EDITOR_DEFAULTS_AUTOQUERY_MIN_SCORE_KEY: &str = "pod-editor:defaults:autoquery:min-score";
+const POD_EDITOR_DEFAULTS_AUTOQUERY_MAX_QUERY_CHARS_KEY: &str =
+    "pod-editor:defaults:autoquery:max-query-chars";
+const POD_EDITOR_DEFAULTS_AUTOQUERY_SNIPPET_CHARS_KEY: &str =
+    "pod-editor:defaults:autoquery:snippet-chars";
 const POD_EDITOR_DEFAULTS_TOOL_GATE_KEY: &str = "pod-editor:defaults:tool-gate";
 const POD_EDITOR_DEFAULTS_HOST_ENV_KEY: &str = "pod-editor:defaults:host-env";
 /// Defaults-tab tool-surface routed keys. The structured editor for
@@ -6502,6 +6535,36 @@ fn parse_core_tools_named(buf: &str) -> Vec<String> {
         .filter(|l| !l.is_empty())
         .map(|l| l.to_string())
         .collect()
+}
+
+fn format_float_for_input(v: f32) -> String {
+    let s = format!("{v:.3}");
+    s.trim_end_matches('0').trim_end_matches('.').to_string()
+}
+
+fn autoquery_source_label(source: KnowledgeAutoquerySource) -> &'static str {
+    match source {
+        KnowledgeAutoquerySource::ReasoningThenText => "reasoning_then_text",
+        KnowledgeAutoquerySource::TextThenReasoning => "text_then_reasoning",
+        KnowledgeAutoquerySource::ReasoningAndText => "reasoning_and_text",
+        KnowledgeAutoquerySource::ReasoningOnly => "reasoning_only",
+        KnowledgeAutoquerySource::TextOnly => "text_only",
+    }
+}
+
+fn autoquery_source_wire(source: KnowledgeAutoquerySource) -> &'static str {
+    autoquery_source_label(source)
+}
+
+fn autoquery_source_from_wire(s: &str) -> Option<KnowledgeAutoquerySource> {
+    match s {
+        "reasoning_then_text" => Some(KnowledgeAutoquerySource::ReasoningThenText),
+        "text_then_reasoning" => Some(KnowledgeAutoquerySource::TextThenReasoning),
+        "reasoning_and_text" => Some(KnowledgeAutoquerySource::ReasoningAndText),
+        "reasoning_only" => Some(KnowledgeAutoquerySource::ReasoningOnly),
+        "text_only" => Some(KnowledgeAutoquerySource::TextOnly),
+        _ => None,
+    }
 }
 
 fn initial_listing_label(l: InitialListing) -> &'static str {
@@ -11514,6 +11577,7 @@ impl ChatApp {
             PodEditorPicker::DefaultsCapsPodModify,
             PodEditorPicker::DefaultsCapsDispatch,
             PodEditorPicker::DefaultsCapsBehaviors,
+            PodEditorPicker::DefaultsAutoquerySource,
         ] {
             if let Some(action) = classify_select_event(event, which.key()) {
                 self.handle_pod_editor_picker(which, action);
@@ -11676,6 +11740,110 @@ impl ChatApp {
                     && let Some(cfg) = editor.working_config.as_mut()
                 {
                     cfg.thread_defaults.max_turns = v.clamp(1, 10_000);
+                }
+                editor.error = None;
+                return true;
+            }
+        }
+
+        // Defaults tab autoquery controls. These mutate
+        // `thread_defaults.autoquery`; per-thread overrides reuse the
+        // same protocol shape but are not exposed in this pod editor.
+        if let Some(editor) = self.pod_editor.as_mut()
+            && let Some(cfg) = editor.working_config.as_mut()
+        {
+            if event.is_click_or_activate(POD_EDITOR_DEFAULTS_AUTOQUERY_ENABLED_KEY) {
+                cfg.thread_defaults.autoquery.enabled = !cfg.thread_defaults.autoquery.enabled;
+                editor.error = None;
+                return true;
+            }
+            if event.is_click_or_activate(POD_EDITOR_DEFAULTS_AUTOQUERY_HOT_ONLY_KEY) {
+                cfg.thread_defaults.autoquery.hot_only = !cfg.thread_defaults.autoquery.hot_only;
+                editor.error = None;
+                return true;
+            }
+            if event.is_click_or_activate(POD_EDITOR_DEFAULTS_AUTOQUERY_TERMINAL_KEY) {
+                cfg.thread_defaults.autoquery.inject_at_terminal =
+                    !cfg.thread_defaults.autoquery.inject_at_terminal;
+                editor.error = None;
+                return true;
+            }
+            if apply_checkbox_list_to_vec(
+                &mut cfg.thread_defaults.autoquery.buckets,
+                event,
+                POD_EDITOR_DEFAULTS_AUTOQUERY_BUCKETS_KEY,
+            ) {
+                editor.error = None;
+                return true;
+            }
+        }
+        if let Some(editor) = self.pod_editor.as_mut() {
+            let top_k_opts = NumericInputOpts::default().min(0.0).max(20.0).step(1.0);
+            if numeric_input::apply_event(
+                &mut editor.autoquery_top_k_buf,
+                &mut self.selection,
+                POD_EDITOR_DEFAULTS_AUTOQUERY_TOP_K_KEY,
+                &top_k_opts,
+                event,
+            ) {
+                if let Ok(v) = editor.autoquery_top_k_buf.parse::<u32>()
+                    && let Some(cfg) = editor.working_config.as_mut()
+                {
+                    cfg.thread_defaults.autoquery.top_k = v.min(20);
+                }
+                editor.error = None;
+                return true;
+            }
+            let score_opts = NumericInputOpts::default()
+                .min(-100.0)
+                .max(100.0)
+                .step(0.05);
+            if numeric_input::apply_event(
+                &mut editor.autoquery_min_score_buf,
+                &mut self.selection,
+                POD_EDITOR_DEFAULTS_AUTOQUERY_MIN_SCORE_KEY,
+                &score_opts,
+                event,
+            ) {
+                if let Ok(v) = editor.autoquery_min_score_buf.parse::<f32>()
+                    && let Some(cfg) = editor.working_config.as_mut()
+                {
+                    cfg.thread_defaults.autoquery.min_rerank_score = v.clamp(-100.0, 100.0);
+                }
+                editor.error = None;
+                return true;
+            }
+            let max_query_opts = NumericInputOpts::default()
+                .min(0.0)
+                .max(50_000.0)
+                .step(250.0);
+            if numeric_input::apply_event(
+                &mut editor.autoquery_max_query_chars_buf,
+                &mut self.selection,
+                POD_EDITOR_DEFAULTS_AUTOQUERY_MAX_QUERY_CHARS_KEY,
+                &max_query_opts,
+                event,
+            ) {
+                if let Ok(v) = editor.autoquery_max_query_chars_buf.parse::<u32>()
+                    && let Some(cfg) = editor.working_config.as_mut()
+                {
+                    cfg.thread_defaults.autoquery.max_query_chars = v.min(50_000);
+                }
+                editor.error = None;
+                return true;
+            }
+            let snippet_opts = NumericInputOpts::default().min(0.0).max(5_000.0).step(50.0);
+            if numeric_input::apply_event(
+                &mut editor.autoquery_snippet_chars_buf,
+                &mut self.selection,
+                POD_EDITOR_DEFAULTS_AUTOQUERY_SNIPPET_CHARS_KEY,
+                &snippet_opts,
+                event,
+            ) {
+                if let Ok(v) = editor.autoquery_snippet_chars_buf.parse::<u32>()
+                    && let Some(cfg) = editor.working_config.as_mut()
+                {
+                    cfg.thread_defaults.autoquery.snippet_chars = v.min(5_000);
                 }
                 editor.error = None;
                 return true;
@@ -12340,6 +12508,11 @@ impl ChatApp {
                                 cfg.thread_defaults.caps.behaviors = v;
                             }
                         }
+                        PodEditorPicker::DefaultsAutoquerySource => {
+                            if let Some(v) = autoquery_source_from_wire(&value) {
+                                cfg.thread_defaults.autoquery.query_source = v;
+                            }
+                        }
                     }
                     editor.open_picker = None;
                     editor.error = None;
@@ -12743,6 +12916,7 @@ impl ChatApp {
             POD_EDITOR_DEFAULTS_MAX_TURNS_KEY,
             NumericInputOpts::default().min(1.0).max(10_000.0).step(1.0),
         );
+        let autoquery_widget = self.render_pod_editor_defaults_autoquery(editor, cfg);
 
         let tool_gate_trigger = select_trigger(
             POD_EDITOR_DEFAULTS_TOOL_GATE_KEY,
@@ -12818,6 +12992,14 @@ impl ChatApp {
                 ),
             ]),
             form_item([
+                form_label("autoquery"),
+                form_control(autoquery_widget),
+                form_description(
+                    "Optional hot-bucket retrieval after model sub-turns. Cold buckets are \
+                     skipped so live nudges never stall on index loading.",
+                ),
+            ]),
+            form_item([
                 form_label("tool gate default"),
                 form_control(tool_gate_trigger),
                 form_description(
@@ -12866,6 +13048,111 @@ impl ChatApp {
                 ),
             ]),
         ])
+    }
+
+    fn render_pod_editor_defaults_autoquery(
+        &self,
+        editor: &PodEditorSheetState,
+        cfg: &PodConfig,
+    ) -> El {
+        let aq = &cfg.thread_defaults.autoquery;
+        let source_trigger = select_trigger(
+            POD_EDITOR_DEFAULTS_AUTOQUERY_SOURCE_KEY,
+            autoquery_source_label(aq.query_source),
+        );
+        let top_k = numeric_input(
+            &editor.autoquery_top_k_buf,
+            &self.selection,
+            POD_EDITOR_DEFAULTS_AUTOQUERY_TOP_K_KEY,
+            NumericInputOpts::default().min(0.0).max(20.0).step(1.0),
+        );
+        let min_score = numeric_input(
+            &editor.autoquery_min_score_buf,
+            &self.selection,
+            POD_EDITOR_DEFAULTS_AUTOQUERY_MIN_SCORE_KEY,
+            NumericInputOpts::default()
+                .min(-100.0)
+                .max(100.0)
+                .step(0.05),
+        );
+        let max_query_chars = numeric_input(
+            &editor.autoquery_max_query_chars_buf,
+            &self.selection,
+            POD_EDITOR_DEFAULTS_AUTOQUERY_MAX_QUERY_CHARS_KEY,
+            NumericInputOpts::default()
+                .min(0.0)
+                .max(50_000.0)
+                .step(250.0),
+        );
+        let snippet_chars = numeric_input(
+            &editor.autoquery_snippet_chars_buf,
+            &self.selection,
+            POD_EDITOR_DEFAULTS_AUTOQUERY_SNIPPET_CHARS_KEY,
+            NumericInputOpts::default().min(0.0).max(5_000.0).step(50.0),
+        );
+        let bucket_options = self.autoquery_bucket_options(cfg);
+        let bucket_widget = if bucket_options.is_empty() {
+            paragraph("(no in-scope buckets)").muted().small()
+        } else {
+            checkbox_column(
+                POD_EDITOR_DEFAULTS_AUTOQUERY_BUCKETS_KEY,
+                &aq.buckets,
+                bucket_options,
+            )
+        };
+        let bucket_hint = if aq.buckets.is_empty() {
+            "empty = all in-scope hot buckets"
+        } else {
+            "selected subset only"
+        };
+
+        column([
+            row([
+                checkbox(aq.enabled).key(POD_EDITOR_DEFAULTS_AUTOQUERY_ENABLED_KEY),
+                text("enabled").text_color(tokens::FOREGROUND),
+            ])
+            .gap(tokens::SPACE_2)
+            .align(Align::Center),
+            row([
+                checkbox(aq.hot_only).key(POD_EDITOR_DEFAULTS_AUTOQUERY_HOT_ONLY_KEY),
+                text("hot buckets only").text_color(tokens::FOREGROUND),
+            ])
+            .gap(tokens::SPACE_2)
+            .align(Align::Center),
+            row([
+                checkbox(aq.inject_at_terminal).key(POD_EDITOR_DEFAULTS_AUTOQUERY_TERMINAL_KEY),
+                text("inject at terminal turns").text_color(tokens::FOREGROUND),
+            ])
+            .gap(tokens::SPACE_2)
+            .align(Align::Center),
+            form_item([form_label("query source"), form_control(source_trigger)]),
+            form_item([form_label("buckets"), form_control(bucket_widget)]),
+            paragraph(bucket_hint).muted().small(),
+            form_item([form_label("top k"), form_control(top_k)]),
+            form_item([form_label("min rerank"), form_control(min_score)]),
+            form_item([form_label("query chars"), form_control(max_query_chars)]),
+            form_item([form_label("snippet chars"), form_control(snippet_chars)]),
+        ])
+        .gap(tokens::SPACE_2)
+        .width(Size::Fill(1.0))
+    }
+
+    fn autoquery_bucket_options(&self, cfg: &PodConfig) -> Vec<(String, String)> {
+        let mut out = Vec::new();
+        for name in &cfg.allow.knowledge_buckets {
+            out.push((format!("server:{name}"), format!("server:{name}")));
+        }
+        let pod_id = self.pod_editor.as_ref().map(|e| e.pod_id.as_str());
+        if let Some(pod_id) = pod_id {
+            for b in &self.buckets {
+                if b.scope == "pod" && b.pod_id.as_deref() == Some(pod_id) {
+                    out.push((format!("pod:{}", b.id), format!("pod:{}", b.id)));
+                }
+            }
+        }
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out.dedup_by(|a, b| a.0 == b.0);
+        out
     }
 
     fn render_pod_editor_defaults_host_env_check(&self, cfg: &PodConfig) -> El {
@@ -13458,6 +13745,22 @@ impl ChatApp {
                         (lbl.to_string(), lbl.to_string())
                     })
                     .collect();
+                select_menu(which.key(), options)
+            }
+            PodEditorPicker::DefaultsAutoquerySource => {
+                let options: Vec<(String, String)> = [
+                    KnowledgeAutoquerySource::ReasoningThenText,
+                    KnowledgeAutoquerySource::TextThenReasoning,
+                    KnowledgeAutoquerySource::ReasoningAndText,
+                    KnowledgeAutoquerySource::ReasoningOnly,
+                    KnowledgeAutoquerySource::TextOnly,
+                ]
+                .into_iter()
+                .map(|s| {
+                    let wire = autoquery_source_wire(s).to_string();
+                    (wire, autoquery_source_label(s).to_string())
+                })
+                .collect();
                 select_menu(which.key(), options)
             }
         }
@@ -17792,6 +18095,7 @@ fn fresh_pod_config_stub(name: String, mut backend_names: Vec<String>) -> PodCon
             host_env: Vec::new(),
             mcp_hosts: Vec::new(),
             compaction: Default::default(),
+            autoquery: Default::default(),
             caps: Default::default(),
             tool_surface: Default::default(),
         },

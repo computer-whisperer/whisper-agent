@@ -262,11 +262,12 @@ impl QueryEngine {
         // the reranker provider call is the only signal that's
         // credibly comparable across heterogeneous paths and buckets.
         let documents: Vec<String> = deduped.iter().map(|c| c.chunk_text.clone()).collect();
+        let rerank_top_n = params.top_k.saturating_mul(3).min(deduped.len());
         let req = RerankRequest {
             model: "",
             query: text,
             documents: &documents,
-            top_n: Some(params.top_k as u32),
+            top_n: Some(rerank_top_n as u32),
         };
         let t_rerank = Instant::now();
         let resp = self
@@ -276,13 +277,15 @@ impl QueryEngine {
             .map_err(|e| BucketError::Provider(e.to_string()))?;
         let rerank_ms = t_rerank.elapsed().as_millis();
 
-        // Defensive truncation: the request asks the reranker for
-        // `top_n = params.top_k`, but not every server honors it
-        // (observed: TEI 1.9.3 ignores top_n and returns scores for
-        // every document). The contract here is "capped at top_k", so
-        // enforce it locally regardless.
+        // Ask the reranker for a small overfetch, then collapse
+        // multiple chunks from the same source record. Without this,
+        // broad records (Wikipedia year/deaths pages, long markdown
+        // docs) can crowd out all other records in top_k even when
+        // those chunks are only marginally different. Some rerankers
+        // ignore top_n, so we still enforce the final cap locally.
         let mut out = Vec::with_capacity(params.top_k.min(resp.results.len()));
-        for r in resp.results.into_iter().take(params.top_k) {
+        let mut seen_records: HashSet<(BucketId, RecordKey)> = HashSet::new();
+        for r in resp.results {
             let Some(c) = deduped.get(r.index as usize) else {
                 return Err(BucketError::Provider(format!(
                     "reranker returned out-of-range index {} for {} documents",
@@ -290,6 +293,10 @@ impl QueryEngine {
                     deduped.len(),
                 )));
             };
+            let record_key = record_key_for(c);
+            if !seen_records.insert((c.bucket_id.clone(), record_key)) {
+                continue;
+            }
             out.push(RerankedCandidate {
                 bucket_id: c.bucket_id.clone(),
                 chunk_id: c.chunk_id,
@@ -299,6 +306,9 @@ impl QueryEngine {
                 source_path: c.path,
                 rerank_score: r.score,
             });
+            if out.len() >= params.top_k {
+                break;
+            }
         }
         let rerank_doc_chars: usize = documents.iter().map(|d| d.len()).sum();
         tracing::info!(
@@ -309,6 +319,7 @@ impl QueryEngine {
             rerank_ms = rerank_ms as u64,
             total_candidates,
             deduped_candidates,
+            record_deduped_candidates = out.len(),
             rerank_docs = documents.len(),
             rerank_doc_chars,
             returned = out.len(),
@@ -354,6 +365,20 @@ fn dedupe_candidates(candidates: Vec<Candidate>) -> Vec<Candidate> {
         }
     }
     out
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum RecordKey {
+    Source(String),
+    Chunk(ChunkId),
+}
+
+fn record_key_for(candidate: &Candidate) -> RecordKey {
+    if candidate.source_ref.source_id.is_empty() {
+        RecordKey::Chunk(candidate.chunk_id)
+    } else {
+        RecordKey::Source(candidate.source_ref.source_id.clone())
+    }
 }
 
 fn query_looks_lexical(text: &str) -> bool {
@@ -597,12 +622,21 @@ mod tests {
     }
 
     fn test_candidate(bucket_id: &BucketId, ordinal: usize, path: SearchPath) -> Candidate {
+        test_candidate_with_source(bucket_id, ordinal, path, format!("doc-{ordinal}"))
+    }
+
+    fn test_candidate_with_source(
+        bucket_id: &BucketId,
+        ordinal: usize,
+        path: SearchPath,
+        source_id: impl Into<String>,
+    ) -> Candidate {
         Candidate {
             bucket_id: bucket_id.clone(),
             chunk_id: ChunkId::from_source(&[ordinal as u8; 32], ordinal as u64),
             chunk_text: format!("semantic retrieval candidate {ordinal}"),
             source_ref: SourceRef {
-                source_id: format!("doc-{ordinal}"),
+                source_id: source_id.into(),
                 locator: None,
             },
             source_score: ordinal as f32,
@@ -800,6 +834,50 @@ embedder = "tei_test"
 
         assert_eq!(results.len(), 1, "deduped to one chunk; got {results:?}");
         assert_eq!(results[0].chunk_id, chunk_id);
+    }
+
+    #[tokio::test]
+    async fn query_dedupes_final_results_to_one_hit_per_source_record() {
+        let embedder: Arc<dyn EmbeddingProvider> = Arc::new(MockEmbedder::new(4));
+        let reranker: Arc<dyn RerankProvider> = Arc::new(MockReranker);
+        let engine = QueryEngine::new(embedder, reranker);
+        let id = BucketId::server("counting");
+        let sparse_calls = Arc::new(AtomicUsize::new(0));
+        let mut doc_a_1 = test_candidate_with_source(&id, 1, SearchPath::Dense, "same-record.md");
+        doc_a_1.chunk_text = "needle unique first chunk".into();
+        let mut doc_a_2 = test_candidate_with_source(&id, 2, SearchPath::Dense, "same-record.md");
+        doc_a_2.chunk_text = "needle unique second chunk".into();
+        let mut doc_b = test_candidate_with_source(&id, 3, SearchPath::Dense, "other-record.md");
+        doc_b.chunk_text = "needle fallback chunk".into();
+        let bucket: Arc<dyn Bucket> = Arc::new(CountingBucket {
+            id,
+            dense: vec![doc_a_1, doc_a_2, doc_b],
+            sparse: Vec::new(),
+            sparse_calls,
+        });
+        let cancel = CancellationToken::new();
+
+        let results = engine
+            .query(
+                &[bucket],
+                "needle unique",
+                &QueryParams {
+                    top_k: 2,
+                    ..QueryParams::default()
+                },
+                &cancel,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(results.len(), 2, "overfetch should refill after dedupe");
+        let source_ids: HashSet<&str> = results
+            .iter()
+            .map(|r| r.source_ref.source_id.as_str())
+            .collect();
+        assert_eq!(source_ids.len(), 2, "one hit per source: {results:?}");
+        assert!(source_ids.contains("same-record.md"));
+        assert!(source_ids.contains("other-record.md"));
     }
 
     #[tokio::test]

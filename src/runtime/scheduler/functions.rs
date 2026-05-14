@@ -773,6 +773,17 @@ impl Scheduler {
             );
             return;
         }
+        if name == crate::tools::builtin_tools::DRAIN_KNOWLEDGE_NUDGES {
+            self.complete_drain_knowledge_nudges_call(
+                thread_id,
+                op_id,
+                tool_use_id,
+                input,
+                disposition,
+                pending_io,
+            );
+            return;
+        }
         if name == crate::tools::builtin_tools::LIST_LLM_PROVIDERS {
             self.complete_list_llm_providers_call(
                 thread_id,
@@ -1027,6 +1038,7 @@ impl Scheduler {
                         },
                         pod_update: None,
                         scheduler_command: None,
+                        knowledge_hit_keys: Vec::new(),
                     },
                 )
             }));
@@ -1078,6 +1090,7 @@ impl Scheduler {
                         },
                         pod_update: None,
                         scheduler_command: None,
+                        knowledge_hit_keys: Vec::new(),
                     },
                 )
             }));
@@ -1244,6 +1257,63 @@ impl Scheduler {
             op_id,
             tool_use_id,
             out,
+        ));
+    }
+
+    /// `drain_knowledge_nudges`-specific synchronous path. Drains the
+    /// same transient queue used by automatic knowledge nudge
+    /// insertion, giving models a portable explicit handle at provider
+    /// turn/tool boundaries without removing the auto-insert path.
+    fn complete_drain_knowledge_nudges_call(
+        &mut self,
+        thread_id: &str,
+        op_id: crate::runtime::thread::OpId,
+        tool_use_id: String,
+        input: serde_json::Value,
+        disposition: crate::permission::Disposition,
+        pending_io: &mut FuturesUnordered<SchedulerFuture>,
+    ) {
+        if matches!(disposition, crate::permission::Disposition::Deny) {
+            pending_io.push(make_denial_future(
+                thread_id.to_string(),
+                tool_use_id,
+                op_id,
+                crate::tools::builtin_tools::DRAIN_KNOWLEDGE_NUDGES.to_string(),
+            ));
+            return;
+        }
+        if let Err(e) = crate::tools::builtin_tools::drain_knowledge_nudges::parse_args(input) {
+            pending_io.push(immediate_tool_error(
+                thread_id.to_string(),
+                op_id,
+                tool_use_id,
+                e,
+            ));
+            return;
+        }
+
+        let in_flight = self.knowledge_autoquery_in_flight.contains(thread_id);
+        let Some(nudges) = self.tasks.get_mut(thread_id).map(|task| {
+            task.suppress_next_knowledge_nudge = true;
+            std::mem::take(&mut task.pending_knowledge_nudges)
+        }) else {
+            pending_io.push(immediate_tool_error(
+                thread_id.to_string(),
+                op_id,
+                tool_use_id,
+                format!("no such thread `{thread_id}`"),
+            ));
+            return;
+        };
+        if !nudges.is_empty() {
+            self.mark_dirty(thread_id);
+        }
+        let body = crate::tools::builtin_tools::drain_knowledge_nudges::render(&nudges, in_flight);
+        pending_io.push(immediate_tool_success(
+            thread_id.to_string(),
+            op_id,
+            tool_use_id,
+            body,
         ));
     }
 
@@ -1547,6 +1617,7 @@ impl Scheduler {
                     result,
                     pod_update: None,
                     scheduler_command: None,
+                    knowledge_hit_keys: Vec::new(),
                 },
             )
         }));
@@ -1678,8 +1749,13 @@ impl Scheduler {
 
         // Caller pod id — required to derive the pod-scope in-scope
         // set and to construct typed `pod` targets.
-        let caller_pod_id = match self.tasks.get(thread_id).map(|t| t.pod_id.clone()) {
-            Some(p) => p,
+        let (caller_pod_id, cleared_pending_nudges) = match self.tasks.get_mut(thread_id) {
+            Some(task) => {
+                let had_pending_nudges = !task.pending_knowledge_nudges.is_empty();
+                task.pending_knowledge_nudges.clear();
+                task.suppress_next_knowledge_nudge = true;
+                (task.pod_id.clone(), had_pending_nudges)
+            }
             None => {
                 pending_io.push(immediate_tool_error(
                     thread_id.to_string(),
@@ -1690,6 +1766,9 @@ impl Scheduler {
                 return;
             }
         };
+        if cleared_pending_nudges {
+            self.mark_dirty(thread_id);
+        }
 
         // In-scope sets:
         // - server: pod's `[allow.knowledge_buckets]` (today's allow list
@@ -1927,8 +2006,15 @@ impl Scheduler {
                 }
             };
 
+            let knowledge_hit_keys = crate::runtime::scheduler::knowledge_hit_keys(&hits);
             let body = format_hits(&query_text, &display_targets, &hits);
-            tool_success_completion(thread_id_s, op_id, tool_use_id, body)
+            tool_success_completion_with_knowledge_hits(
+                thread_id_s,
+                op_id,
+                tool_use_id,
+                body,
+                knowledge_hit_keys,
+            )
         }));
     }
 
@@ -2314,6 +2400,7 @@ impl Scheduler {
                     },
                     pod_update: None,
                     scheduler_command: None,
+                    knowledge_hit_keys: Vec::new(),
                 },
             )
         }));
@@ -3482,6 +3569,7 @@ fn immediate_tool_error(
                 },
                 pod_update: None,
                 scheduler_command: None,
+                knowledge_hit_keys: Vec::new(),
             },
         )
     })
@@ -3512,6 +3600,7 @@ fn immediate_tool_success(
                 },
                 pod_update: None,
                 scheduler_command: None,
+                knowledge_hit_keys: Vec::new(),
             },
         )
     })
@@ -3542,6 +3631,7 @@ fn immediate_tool_success_blocks(
                 },
                 pod_update: None,
                 scheduler_command: None,
+                knowledge_hit_keys: Vec::new(),
             },
         )
     })
@@ -3557,6 +3647,22 @@ fn tool_success_completion(
     tool_use_id: String,
     text: String,
 ) -> crate::runtime::io_dispatch::SchedulerCompletion {
+    tool_success_completion_with_knowledge_hits(
+        parent_thread_id,
+        op_id,
+        tool_use_id,
+        text,
+        Vec::new(),
+    )
+}
+
+fn tool_success_completion_with_knowledge_hits(
+    parent_thread_id: String,
+    op_id: crate::runtime::thread::OpId,
+    tool_use_id: String,
+    text: String,
+    knowledge_hit_keys: Vec<String>,
+) -> crate::runtime::io_dispatch::SchedulerCompletion {
     crate::runtime::io_dispatch::SchedulerCompletion::Io(
         crate::runtime::io_dispatch::IoCompletion {
             thread_id: parent_thread_id,
@@ -3570,6 +3676,7 @@ fn tool_success_completion(
             },
             pod_update: None,
             scheduler_command: None,
+            knowledge_hit_keys,
         },
     )
 }
@@ -3592,6 +3699,7 @@ fn tool_error_completion(
             },
             pod_update: None,
             scheduler_command: None,
+            knowledge_hit_keys: Vec::new(),
         },
     )
 }
@@ -3703,6 +3811,7 @@ fn make_denial_future(
                 },
                 pod_update: None,
                 scheduler_command: None,
+                knowledge_hit_keys: Vec::new(),
             },
         )
     })

@@ -27,7 +27,7 @@ use std::path::Path;
 use std::time::Instant;
 
 use tantivy::collector::TopDocs;
-use tantivy::query::{BooleanQuery, Query, QueryParser, TermQuery};
+use tantivy::query::{BooleanQuery, EmptyQuery, Query, QueryParser, TermQuery};
 use tantivy::schema::{Field, INDEXED, IndexRecordOption, STORED, Schema, TEXT, Value};
 use tantivy::tokenizer::TokenStream;
 use tantivy::{Index, IndexReader, IndexWriter, ReloadPolicy, TantivyDocument, Term};
@@ -244,8 +244,11 @@ impl SparseIndex {
     /// by descending score (highest match first). Empty if `top_k`
     /// is 0, the index is empty, or no documents match.
     ///
-    /// A malformed query (e.g. unclosed quote) surfaces as
-    /// [`BucketError::Other`] — tantivy's query parser is strict.
+    /// Query-parser syntax is honored when it parses cleanly. If prose
+    /// happens to contain parser metacharacters or malformed syntax, we
+    /// fall back to the same pruned plain-term query used for natural
+    /// language so `knowledge_query` remains robust for LLM-generated
+    /// text.
     pub fn search(
         &self,
         query_text: &str,
@@ -261,23 +264,33 @@ impl SparseIndex {
         let parse_t = Instant::now();
         let (query, query_diag) = if looks_like_tantivy_syntax(query_text) {
             let parser = QueryParser::for_index(&self.index, vec![self.text_field]);
-            let query = parser
-                .parse_query(query_text)
-                .map_err(|e| BucketError::Other(format!("tantivy parse_query: {e}")))?;
-            (
-                query,
-                SparseQueryDiag {
-                    mode: "parser",
-                    raw_terms: 0,
-                    used_terms: 0,
-                    zero_df_terms: 0,
-                    high_df_terms: 0,
-                    max_df: 0,
-                    df_ms: 0,
-                },
-            )
+            match parser.parse_query(query_text) {
+                Ok(query) => (
+                    query,
+                    SparseQueryDiag {
+                        mode: "parser",
+                        raw_terms: 0,
+                        used_terms: 0,
+                        zero_df_terms: 0,
+                        high_df_terms: 0,
+                        max_df: 0,
+                        df_ms: 0,
+                    },
+                ),
+                Err(e) => {
+                    tracing::debug!(
+                        error = %e,
+                        "knowledge_sparse: parser rejected query; falling back to plain terms",
+                    );
+                    self.build_pruned_plain_query(
+                        query_text,
+                        doc_count,
+                        "plain_after_parser_error",
+                    )?
+                }
+            }
         } else {
-            self.build_pruned_plain_query(query_text, doc_count)?
+            self.build_pruned_plain_query(query_text, doc_count, "plain_pruned")?
         };
         let parse_ms = parse_t.elapsed().as_millis();
 
@@ -333,6 +346,7 @@ impl SparseIndex {
         &self,
         query_text: &str,
         doc_count: u64,
+        mode: &'static str,
     ) -> Result<(Box<dyn Query>, SparseQueryDiag), BucketError> {
         let mut analyzer = self
             .index
@@ -351,14 +365,10 @@ impl SparseIndex {
         }
 
         if terms.is_empty() {
-            let parser = QueryParser::for_index(&self.index, vec![self.text_field]);
-            let query = parser
-                .parse_query(query_text)
-                .map_err(|e| BucketError::Other(format!("tantivy parse_query: {e}")))?;
             return Ok((
-                query,
+                Box::new(EmptyQuery),
                 SparseQueryDiag {
-                    mode: "parser_empty_plain",
+                    mode,
                     raw_terms,
                     used_terms: 0,
                     zero_df_terms: 0,
@@ -413,12 +423,7 @@ impl SparseIndex {
 
         let used_terms = selected.len();
         let query: Box<dyn Query> = match selected.len() {
-            0 => {
-                let parser = QueryParser::for_index(&self.index, vec![self.text_field]);
-                parser
-                    .parse_query(query_text)
-                    .map_err(|e| BucketError::Other(format!("tantivy parse_query: {e}")))?
-            }
+            0 => Box::new(EmptyQuery),
             1 => Box::new(TermQuery::new(
                 selected.remove(0),
                 IndexRecordOption::WithFreqs,
@@ -442,7 +447,7 @@ impl SparseIndex {
         Ok((
             query,
             SparseQueryDiag {
-                mode: "plain_pruned",
+                mode,
                 raw_terms,
                 used_terms,
                 zero_df_terms,
@@ -593,13 +598,35 @@ mod tests {
     }
 
     #[test]
-    fn malformed_query_surfaces_as_error() {
+    fn malformed_query_falls_back_to_plain_terms() {
         let id_a = ChunkId::from_source(&[1; 32], 0);
-        let tmp = build_index_with(&[(id_a, "hello world")]);
+        let tmp = build_index_with(&[(id_a, "hello unclosed world")]);
         let index = open(&tmp);
-        // Unclosed quote — tantivy's parser rejects this.
-        let res = index.search("\"unclosed", 5);
-        assert!(res.is_err(), "expected parser error, got {res:?}");
+        // Unclosed quote: tantivy's parser rejects this, but LLM
+        // query text often contains stray punctuation. Sparse search
+        // should keep retrieval alive by treating it as plain text.
+        let results = index.search("\"unclosed", 5).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].0, id_a);
+    }
+
+    #[test]
+    fn prose_with_parser_punctuation_searches_as_plain_terms() {
+        let id_a = ChunkId::from_source(&[1; 32], 0);
+        let tmp = build_index_with(&[(
+            id_a,
+            "Burger King is a chain of hamburger fast food restaurants founded in Florida",
+        )]);
+        let index = open(&tmp);
+
+        let results = index
+            .search(
+                "Let's try `about(topic=\"burger joints in Florida\")`: maybe Burger King?",
+                5,
+            )
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].0, id_a);
     }
 
     #[test]

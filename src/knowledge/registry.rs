@@ -425,6 +425,15 @@ impl BucketRegistry {
         self.loaded_bucket_with_observer(id, None).await
     }
 
+    /// Return a loaded server-scope bucket only if it is already hot
+    /// in the registry cache. Does not acquire the cold-load lock and
+    /// never opens files from disk; live autoquery uses this to keep
+    /// retrieval opportunistic.
+    pub fn hot_bucket(&self, id: &str) -> Option<Arc<DiskBucket>> {
+        let g = self.loaded.lock().expect("loaded mutex poisoned");
+        g.get(id).cloned()
+    }
+
     /// Same as [`Self::loaded_bucket`], with optional phase callbacks
     /// for the caller that actually wins the cold-load lock.
     pub async fn loaded_bucket_with_observer(
@@ -511,6 +520,13 @@ impl BucketRegistry {
     ) -> Result<Arc<DiskBucket>, BucketError> {
         self.loaded_bucket_pod_with_observer(pod_id, name, None)
             .await
+    }
+
+    /// Pod-scope counterpart to [`Self::hot_bucket`].
+    pub fn hot_bucket_pod(&self, pod_id: &str, name: &str) -> Option<Arc<DiskBucket>> {
+        let key = (pod_id.to_string(), name.to_string());
+        let g = self.loaded_pod.lock().expect("loaded_pod mutex poisoned");
+        g.get(&key).cloned()
     }
 
     /// Pod-scope counterpart to [`Self::loaded_bucket_with_observer`].
@@ -928,6 +944,21 @@ embedder = "tei_local"
         assert_eq!(summaries[1].id, "memory");
         assert_eq!(summaries[1].scope, "pod");
         assert_eq!(summaries[1].pod_id.as_deref(), Some("alpha"));
+    }
+
+    #[tokio::test]
+    async fn hot_bucket_lookup_does_not_load_cold_entries() {
+        let tmp = tempfile::tempdir().unwrap();
+        let buckets_root = tmp.path().join("buckets_root");
+        std::fs::create_dir_all(&buckets_root).unwrap();
+        write_minimal_bucket(&buckets_root, "world");
+        let reg = BucketRegistry::load(buckets_root).await.unwrap();
+
+        assert!(reg.buckets.contains_key("world"));
+        assert!(
+            reg.hot_bucket("world").is_none(),
+            "hot lookup must not open a cold bucket"
+        );
     }
 
     #[tokio::test]

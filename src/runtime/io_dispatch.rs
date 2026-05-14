@@ -39,11 +39,17 @@ pub(crate) struct IoCompletion {
     pub(crate) result: IoResult,
     pub(crate) pod_update: Option<crate::tools::builtin_tools::PodUpdate>,
     pub(crate) scheduler_command: Option<crate::tools::builtin_tools::SchedulerCommand>,
+    /// Knowledge-hit keys surfaced by this IO completion. Explicit
+    /// `knowledge_query` tool calls populate this so opportunistic
+    /// autoquery can avoid repeating the same records later in the
+    /// thread.
+    pub(crate) knowledge_hit_keys: Vec<String>,
 }
 
 /// Unified completion type the scheduler's `FuturesUnordered` carries.
 pub(crate) enum SchedulerCompletion {
     Io(IoCompletion),
+    KnowledgeAutoquery(KnowledgeAutoqueryCompletion),
     SharedMcp(SharedMcpCompletion),
     OauthStart(OauthStartCompletion),
     OauthComplete(OauthCompleteCompletion),
@@ -52,6 +58,17 @@ pub(crate) enum SchedulerCompletion {
     /// loop routes this to `complete_function` on the Function::Sudo
     /// entry, firing the parked parent tool call's oneshot delivery.
     SudoInner(SudoInnerCompletion),
+}
+
+pub(crate) struct KnowledgeAutoqueryCompletion {
+    pub(crate) thread_id: String,
+    pub(crate) result: Result<KnowledgeAutoqueryResult, String>,
+}
+
+pub(crate) struct KnowledgeAutoqueryResult {
+    pub(crate) query: String,
+    pub(crate) labels: Vec<String>,
+    pub(crate) hits: Vec<crate::knowledge::RerankedCandidate>,
 }
 
 /// Result of a sudo'd inner tool invocation. `result` is the usual
@@ -565,6 +582,7 @@ fn model_call(scheduler: &Scheduler, thread_id: String, op_id: OpId) -> Schedule
                     result: IoResult::ModelCall(Err(msg)),
                     pod_update: None,
                     scheduler_command: None,
+                    knowledge_hit_keys: Vec::new(),
                 })
             });
         }
@@ -593,6 +611,7 @@ fn model_call(scheduler: &Scheduler, thread_id: String, op_id: OpId) -> Schedule
             result,
             pod_update: None,
             scheduler_command: None,
+            knowledge_hit_keys: Vec::new(),
         })
     })
 }
@@ -905,6 +924,7 @@ fn tool_call(
                             },
                             pod_update: None,
                             scheduler_command: None,
+                            knowledge_hit_keys: Vec::new(),
                         })
                     });
                 }
@@ -927,6 +947,7 @@ fn tool_call(
                         },
                         pod_update: None,
                         scheduler_command: None,
+                        knowledge_hit_keys: Vec::new(),
                     })
                 });
             }
@@ -957,6 +978,7 @@ fn tool_call(
                             },
                             pod_update: None,
                             scheduler_command: None,
+                            knowledge_hit_keys: Vec::new(),
                         });
                     }
                 };
@@ -983,6 +1005,7 @@ fn tool_call(
                     },
                     pod_update,
                     scheduler_command,
+                    knowledge_hit_keys: Vec::new(),
                 })
             })
         }
@@ -1040,6 +1063,7 @@ fn tool_call(
                     },
                     pod_update: None,
                     scheduler_command: None,
+                    knowledge_hit_keys: Vec::new(),
                 })
             })
         }
@@ -1087,6 +1111,7 @@ fn tool_call(
                                 },
                                 pod_update: None,
                                 scheduler_command: None,
+                                knowledge_hit_keys: Vec::new(),
                             })
                         });
                     }
@@ -1125,6 +1150,7 @@ fn tool_call(
                     },
                     pod_update: None,
                     scheduler_command: None,
+                    knowledge_hit_keys: Vec::new(),
                 })
             })
         }
@@ -1138,6 +1164,7 @@ fn tool_call(
                 },
                 pod_update: None,
                 scheduler_command: None,
+                knowledge_hit_keys: Vec::new(),
             })
         }),
     }

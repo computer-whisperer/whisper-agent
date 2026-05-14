@@ -288,6 +288,7 @@ mod tests {
                 host_env: vec!["wide".into()],
                 mcp_hosts: vec!["fetch".into()],
                 compaction: Default::default(),
+                autoquery: Default::default(),
                 caps: Default::default(),
                 tool_surface: Default::default(),
             },
