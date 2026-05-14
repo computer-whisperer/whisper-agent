@@ -1770,23 +1770,8 @@ impl Scheduler {
             self.mark_dirty(thread_id);
         }
 
-        // In-scope sets:
-        // - server: pod's `[allow.knowledge_buckets]` (today's allow list
-        //   refers to server-scope ids).
-        // - pod: every pod-scope bucket the registry knows under this
-        //   pod. A pod's own pod-scope buckets are auto-allowed; no
-        //   explicit grant needed.
-        let in_scope_server: Vec<String> = self
-            .pods
-            .get(&caller_pod_id)
-            .map(|pod| pod.config.allow.knowledge_buckets.clone())
-            .unwrap_or_default();
-        let in_scope_pod: Vec<String> = self
-            .bucket_registry
-            .pod_buckets
-            .get(&caller_pod_id)
-            .map(|m| m.keys().cloned().collect())
-            .unwrap_or_default();
+        let (in_scope_server, in_scope_pod) =
+            self.in_scope_knowledge_bucket_names_for_thread(thread_id);
 
         if in_scope_server.is_empty() && in_scope_pod.is_empty() {
             pending_io.push(immediate_tool_error(
@@ -2073,17 +2058,8 @@ impl Scheduler {
                 return;
             }
         };
-        let in_scope_server: Vec<String> = self
-            .pods
-            .get(&caller_pod_id)
-            .map(|pod| pod.config.allow.knowledge_buckets.clone())
-            .unwrap_or_default();
-        let in_scope_pod: Vec<String> = self
-            .bucket_registry
-            .pod_buckets
-            .get(&caller_pod_id)
-            .map(|m| m.keys().cloned().collect())
-            .unwrap_or_default();
+        let (in_scope_server, in_scope_pod) =
+            self.in_scope_knowledge_bucket_names_for_thread(thread_id);
 
         let mut targets = match resolve_query_targets(
             std::slice::from_ref(&args.bucket_id),

@@ -51,6 +51,8 @@ pub struct BehaviorScope {
     pub host_envs: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mcp_hosts: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub knowledge_buckets: Option<Vec<String>>,
     /// Tool-level allow map. `None` = inherit the pod's `allow.tools`
     /// (every admitted tool). `Some(map)` narrows per-tool.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -111,6 +113,7 @@ impl BehaviorScope {
             backends: list_to_setorall(&self.backends),
             host_envs: list_to_setorall(&self.host_envs),
             mcp_hosts: list_to_setorall(&self.mcp_hosts),
+            knowledge_buckets: list_to_setorall(&self.knowledge_buckets),
             tools: self.tools.clone().unwrap_or_else(AllowMap::allow_all),
             pod_modify: self.caps.pod_modify.unwrap_or(PodModifyCap::ModifyAllow),
             dispatch: self.caps.dispatch.unwrap_or(DispatchCap::WithinScope),
@@ -251,6 +254,8 @@ impl BehaviorThreadOverride {
             compaction: None,
             autoquery: None,
             caps: None,
+            tools: None,
+            knowledge_buckets: None,
             tool_surface: None,
         };
         let config = (!config.is_empty()).then_some(config);
@@ -537,6 +542,7 @@ mod tests {
             backends: Some(vec!["anthropic".into()]),
             host_envs: Some(vec!["narrow".into()]),
             mcp_hosts: None,
+            knowledge_buckets: None,
             tools: None,
             caps: BehaviorScopeCaps {
                 pod_modify: Some(PodModifyCap::None),
@@ -575,6 +581,7 @@ mod tests {
                 backends: Some(vec!["anthropic".into()]),
                 host_envs: None,
                 mcp_hosts: Some(vec!["fetch".into()]),
+                knowledge_buckets: None,
                 tools: None,
                 caps: BehaviorScopeCaps {
                     pod_modify: Some(crate::permission::PodModifyCap::None),

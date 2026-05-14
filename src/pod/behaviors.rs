@@ -673,6 +673,7 @@ days = 0
                 backends: Some(vec!["anthropic".into()]),
                 host_envs: None,
                 mcp_hosts: Some(vec!["fetch".into()]),
+                knowledge_buckets: None,
                 tools: None,
                 caps: BehaviorScopeCaps {
                     pod_modify: Some(PodModifyCap::None),

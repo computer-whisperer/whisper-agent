@@ -22,7 +22,7 @@ use crate::tools::mcp::ToolAnnotations;
 /// prompt listing and for `find_tool`'s `category` filter.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ToolCategory {
-    /// Server builtin (`pod_*`, `dispatch_thread`, `request_escalation`,
+    /// Server builtin (`pod_*`, `dispatch_thread`, `sudo`,
     /// `describe_tool`, `find_tool`).
     Builtin,
     /// From a host-env MCP. `env_name` is the `[[allow.host_env]]`

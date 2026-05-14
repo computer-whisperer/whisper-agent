@@ -95,9 +95,8 @@ pub struct Thread {
     /// `[allow]` table at creation. Stored on the thread rather than
     /// looked up from the pod so mid-flight edits to the pod's allow
     /// table don't retroactively change a thread's active scope —
-    /// pod-file edits apply to *future* threads. Escalation grants
-    /// (when the request_escalation family lands in task #5) widen this
-    /// in place.
+    /// pod-file edits apply to *future* threads. `sudo` grants widen
+    /// this in place for one approved call.
     #[serde(default)]
     pub scope: Scope,
     /// How the thread presents its tool catalog. Composed at creation

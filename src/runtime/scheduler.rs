@@ -281,6 +281,137 @@ fn tool_requires_document_input(name: &str) -> bool {
     name == "view_pdf"
 }
 
+fn cap_admission(current: bool, ceiling: bool) -> crate::runtime::tool_listing::ToolAdmission {
+    use crate::runtime::tool_listing::ToolAdmission;
+    if current {
+        ToolAdmission::Admitted
+    } else if ceiling {
+        ToolAdmission::Askable
+    } else {
+        ToolAdmission::OutOfReach
+    }
+}
+
+fn combine_admission(
+    name_admission: crate::runtime::tool_listing::ToolAdmission,
+    cap_admission: crate::runtime::tool_listing::ToolAdmission,
+    escalation_available: bool,
+) -> crate::runtime::tool_listing::ToolAdmission {
+    use crate::runtime::tool_listing::ToolAdmission;
+    match (name_admission, cap_admission) {
+        (ToolAdmission::OutOfReach, _) | (_, ToolAdmission::OutOfReach) => {
+            ToolAdmission::OutOfReach
+        }
+        (ToolAdmission::Admitted, ToolAdmission::Admitted) => ToolAdmission::Admitted,
+        _ if escalation_available => ToolAdmission::Askable,
+        _ => ToolAdmission::OutOfReach,
+    }
+}
+
+fn builtin_sudo_wrappable(name: &str) -> bool {
+    use crate::tools::builtin_tools as builtin;
+    matches!(
+        name,
+        builtin::POD_READ_FILE
+            | builtin::POD_WRITE_FILE
+            | builtin::POD_EDIT_FILE
+            | builtin::POD_REMOVE_FILE
+            | builtin::POD_LIST_FILES
+            | builtin::POD_GREP
+            | builtin::POD_LIST_THREADS
+            | builtin::POD_SHOW_THREAD
+            | builtin::ABOUT
+            | builtin::POD_RUN_BEHAVIOR
+            | builtin::POD_SET_BEHAVIOR_ENABLED
+    )
+}
+
+fn builtin_cap_admission(
+    name: &str,
+    current: &crate::permission::Scope,
+    ceiling: &crate::permission::Scope,
+    has_knowledge_targets: bool,
+    has_editable_knowledge_targets: bool,
+) -> crate::runtime::tool_listing::ToolAdmission {
+    use crate::permission::{BehaviorOpsCap, DispatchCap, PodModifyCap};
+    use crate::runtime::tool_listing::ToolAdmission;
+    use crate::tools::builtin_tools as builtin;
+
+    match name {
+        // `dispatch_thread` is a Function-spawning alias. The current
+        // sudo path cannot wrap it, so a denied dispatch cap is hidden
+        // rather than surfaced as askable.
+        builtin::DISPATCH_THREAD => {
+            if current.dispatch != DispatchCap::None {
+                ToolAdmission::Admitted
+            } else {
+                ToolAdmission::OutOfReach
+            }
+        }
+        builtin::POD_WRITE_FILE | builtin::POD_EDIT_FILE | builtin::POD_REMOVE_FILE => {
+            cap_admission(
+                current.pod_modify != PodModifyCap::None,
+                ceiling.pod_modify != PodModifyCap::None,
+            )
+        }
+        builtin::POD_RUN_BEHAVIOR | builtin::POD_SET_BEHAVIOR_ENABLED => cap_admission(
+            current.behaviors >= BehaviorOpsCap::Read,
+            ceiling.behaviors >= BehaviorOpsCap::Read,
+        ),
+        // Keep knowledge tools out of the catalog when the selected pod
+        // has no reachable bucket targets at all. Per-bucket validation
+        // still happens at call time.
+        builtin::KNOWLEDGE_QUERY => {
+            if has_knowledge_targets {
+                ToolAdmission::Admitted
+            } else {
+                ToolAdmission::OutOfReach
+            }
+        }
+        builtin::KNOWLEDGE_MODIFY => {
+            if has_editable_knowledge_targets {
+                ToolAdmission::Admitted
+            } else {
+                ToolAdmission::OutOfReach
+            }
+        }
+        _ => ToolAdmission::Admitted,
+    }
+}
+
+fn knowledge_bucket_token(scope: crate::knowledge::BucketScope, name: &str) -> String {
+    format!("{}:{name}", scope.as_str())
+}
+
+fn normalize_knowledge_bucket_token(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if trimmed.starts_with("server:") || trimmed.starts_with("pod:") {
+        Some(trimmed.to_string())
+    } else {
+        Some(knowledge_bucket_token(
+            crate::knowledge::BucketScope::Server,
+            trimmed,
+        ))
+    }
+}
+
+fn split_knowledge_bucket_token(raw: &str) -> Option<(crate::knowledge::BucketScope, &str)> {
+    let token = raw.trim();
+    if token.is_empty() {
+        return None;
+    }
+    if let Some(name) = token.strip_prefix("server:") {
+        (!name.is_empty()).then_some((crate::knowledge::BucketScope::Server, name))
+    } else if let Some(name) = token.strip_prefix("pod:") {
+        (!name.is_empty()).then_some((crate::knowledge::BucketScope::Pod, name))
+    } else {
+        Some((crate::knowledge::BucketScope::Server, token))
+    }
+}
+
 /// Snapshot of a pod's on-disk directory + parsed config + behavior ids.
 /// Cloned out of the scheduler when dispatching a builtin tool future so
 /// the future doesn't need a back-borrow of scheduler state.
@@ -1887,8 +2018,8 @@ impl Scheduler {
     }
 
     /// Enumerate every tool the thread could reach — either admitted
-    /// by scope now, or askable via `request_escalation` (in scope's
-    /// pod ceiling but denied by current scope).
+    /// by scope now, or askable via `sudo` (in scope's pod ceiling but
+    /// denied by current scope).
     ///
     /// Single primitive used by four surfaces: the wire `tools:`
     /// array (`wire_tool_descriptors`), the system-prompt listing
@@ -1909,12 +2040,18 @@ impl Scheduler {
         let Some(task) = self.tasks.get(thread_id) else {
             return Vec::new();
         };
-        let pod_ceiling_tools = self
-            .pods
-            .get(&task.pod_id)
-            .map(|p| p.config.allow.tools.clone())
-            .unwrap_or_else(whisper_agent_protocol::AllowMap::deny_all);
+        let pod_ceiling = self.pod_scope_ceiling(&task.pod_id);
+        let pod_ceiling_tools = pod_ceiling.tools.clone();
         let escalation_available = task.scope.escalation.is_interactive();
+        let (queryable_knowledge_server, queryable_knowledge_pod) =
+            self.in_scope_knowledge_bucket_names_for_thread(thread_id);
+        let has_knowledge_targets =
+            !queryable_knowledge_server.is_empty() || !queryable_knowledge_pod.is_empty();
+        let has_editable_knowledge_targets = self.has_editable_knowledge_bucket_target(
+            &queryable_knowledge_server,
+            &queryable_knowledge_pod,
+            &task.pod_id,
+        );
         // The runtime side of "MCP has no in-band signal for whether
         // the client model accepts image / document input": ask the
         // bound provider synchronously what the active model can
@@ -1935,20 +2072,46 @@ impl Scheduler {
         let mut seen: HashSet<String> = HashSet::new();
 
         let classify = |name: &str| -> ToolAdmission {
-            classify_admission(&task.scope.tools, &pod_ceiling_tools, name)
+            let admission = classify_admission(&task.scope.tools, &pod_ceiling_tools, name);
+            if admission == ToolAdmission::Askable && !escalation_available {
+                ToolAdmission::OutOfReach
+            } else {
+                admission
+            }
         };
 
         for tool in crate::tools::builtin_tools::descriptors() {
             if tool_requires_image_input(&tool.name) && !model_takes_images {
                 continue;
             }
+            let name_admission = classify(&tool.name);
             // `sudo` is only meaningful with an interactive approver
-            // attached. Autonomous threads hide the tool entirely — no
-            // use listing a tool whose calls would go nowhere.
-            if tool.name == crate::tools::builtin_tools::SUDO && !escalation_available {
-                continue;
+            // attached and must be directly admitted. Listing sudo as
+            // "askable via sudo" is recursive noise.
+            if tool.name == crate::tools::builtin_tools::SUDO {
+                if !escalation_available
+                    || name_admission != crate::runtime::tool_listing::ToolAdmission::Admitted
+                {
+                    continue;
+                }
             }
-            let admission = classify(&tool.name);
+            let cap_admission = builtin_cap_admission(
+                &tool.name,
+                &task.scope,
+                &pod_ceiling,
+                has_knowledge_targets,
+                has_editable_knowledge_targets,
+            );
+            let mut admission =
+                combine_admission(name_admission, cap_admission, escalation_available);
+            // Some builtins are scheduler intercepts, not plain builtin
+            // dispatches. The current sudo path cannot wrap them, so
+            // do not advertise them as askable.
+            if admission == crate::runtime::tool_listing::ToolAdmission::Askable
+                && !builtin_sudo_wrappable(&tool.name)
+            {
+                admission = crate::runtime::tool_listing::ToolAdmission::OutOfReach;
+            }
             let requires_escalation = match admission {
                 ToolAdmission::Admitted => false,
                 ToolAdmission::Askable => true,
@@ -2427,6 +2590,7 @@ impl Scheduler {
             backends: SetOrAll::only(allow.backends.iter().cloned()),
             host_envs: SetOrAll::only(allow.host_env.iter().map(|h| h.name.clone())),
             mcp_hosts: SetOrAll::only(allow.mcp_hosts.iter().cloned()),
+            knowledge_buckets: SetOrAll::only(self.knowledge_scope_tokens_for_pod(pod_id)),
             tools: allow.tools.clone(),
             pod_modify: td_caps.pod_modify,
             dispatch: td_caps.dispatch,
@@ -2451,12 +2615,90 @@ impl Scheduler {
             backends: SetOrAll::only(allow.backends.iter().cloned()),
             host_envs: SetOrAll::only(allow.host_env.iter().map(|h| h.name.clone())),
             mcp_hosts: SetOrAll::only(allow.mcp_hosts.iter().cloned()),
+            knowledge_buckets: SetOrAll::only(self.knowledge_scope_tokens_for_pod(pod_id)),
             tools: allow.tools.clone(),
             pod_modify: allow.caps.pod_modify,
             dispatch: allow.caps.dispatch,
             behaviors: allow.caps.behaviors,
             escalation: Escalation::None,
         }
+    }
+
+    pub(super) fn knowledge_scope_tokens_for_pod(&self, pod_id: &str) -> Vec<String> {
+        let mut tokens: Vec<String> = self
+            .pods
+            .get(pod_id)
+            .map(|pod| {
+                pod.config
+                    .allow
+                    .knowledge_buckets
+                    .iter()
+                    .filter_map(|name| normalize_knowledge_bucket_token(name))
+                    .collect()
+            })
+            .unwrap_or_default();
+        if let Some(pod_buckets) = self.bucket_registry.pod_buckets.get(pod_id) {
+            tokens.extend(
+                pod_buckets
+                    .keys()
+                    .map(|name| knowledge_bucket_token(crate::knowledge::BucketScope::Pod, name)),
+            );
+        }
+        tokens.sort();
+        tokens.dedup();
+        tokens
+    }
+
+    pub(super) fn in_scope_knowledge_bucket_names_for_thread(
+        &self,
+        thread_id: &str,
+    ) -> (Vec<String>, Vec<String>) {
+        let Some(task) = self.tasks.get(thread_id) else {
+            return (Vec::new(), Vec::new());
+        };
+        let ceiling_tokens = self.knowledge_scope_tokens_for_pod(&task.pod_id);
+        let mut server = Vec::new();
+        let mut pod = Vec::new();
+        for token in ceiling_tokens {
+            if !task.scope.knowledge_buckets.admits(&token) {
+                continue;
+            }
+            match split_knowledge_bucket_token(&token) {
+                Some((crate::knowledge::BucketScope::Server, name)) => server.push(name.into()),
+                Some((crate::knowledge::BucketScope::Pod, name)) => pod.push(name.into()),
+                None => {}
+            }
+        }
+        (server, pod)
+    }
+
+    fn has_editable_knowledge_bucket_target(
+        &self,
+        server: &[String],
+        pod: &[String],
+        pod_id: &str,
+    ) -> bool {
+        server.iter().any(|name| {
+            self.bucket_registry
+                .find_entry(crate::knowledge::BucketScope::Server, None, name)
+                .map(|entry| {
+                    matches!(
+                        &entry.config.source,
+                        crate::knowledge::SourceConfig::Managed { .. }
+                    )
+                })
+                .unwrap_or(false)
+        }) || pod.iter().any(|name| {
+            self.bucket_registry
+                .find_entry(crate::knowledge::BucketScope::Pod, Some(pod_id), name)
+                .map(|entry| {
+                    matches!(
+                        &entry.config.source,
+                        crate::knowledge::SourceConfig::Managed { .. }
+                    )
+                })
+                .unwrap_or(false)
+        })
     }
 
     pub fn with_persister(mut self, persister: Persister) -> Self {
@@ -2833,6 +3075,10 @@ impl Scheduler {
             .as_ref()
             .and_then(|o| o.system_prompt.clone());
         let caps_override = config_override.as_ref().and_then(|o| o.caps);
+        let tools_override = config_override.as_ref().and_then(|o| o.tools.clone());
+        let knowledge_buckets_override = config_override
+            .as_ref()
+            .and_then(|o| o.knowledge_buckets.clone());
         let create_tool_surface_override = config_override
             .as_ref()
             .and_then(|o| o.tool_surface.clone());
@@ -2909,8 +3155,20 @@ impl Scheduler {
         //     revokes it.
         //   - Top-level WS create: attach `Interactive{via_conn: conn_id}`.
         //   - Behavior fire / auto-compact / cron: stays `None`;
-        //     `request_escalation` is filtered out of the catalog.
+        //     `sudo` is filtered out of the catalog.
         let mut base_scope = base_scope_override.unwrap_or_else(|| self.pod_thread_scope(&pod_id));
+        if let Some(tools) = tools_override {
+            base_scope.tools = base_scope.tools.narrow(&tools);
+        }
+        if let Some(knowledge_buckets) = knowledge_buckets_override {
+            use crate::permission::SetOrAll;
+            let requested = SetOrAll::only(
+                knowledge_buckets
+                    .iter()
+                    .filter_map(|name| normalize_knowledge_bucket_token(name)),
+            );
+            base_scope.knowledge_buckets = base_scope.knowledge_buckets.narrow(&requested);
+        }
         if let Some(caps) = caps_override {
             let ceiling = self.pod_scope_ceiling(&pod_id);
             if caps.pod_modify > ceiling.pod_modify {
@@ -3730,17 +3988,8 @@ impl Scheduler {
             return;
         }
         let caller_pod_id = task.pod_id.clone();
-        let in_scope_server: Vec<String> = self
-            .pods
-            .get(&caller_pod_id)
-            .map(|pod| pod.config.allow.knowledge_buckets.clone())
-            .unwrap_or_default();
-        let in_scope_pod: Vec<String> = self
-            .bucket_registry
-            .pod_buckets
-            .get(&caller_pod_id)
-            .map(|m| m.keys().cloned().collect())
-            .unwrap_or_default();
+        let (in_scope_server, in_scope_pod) =
+            self.in_scope_knowledge_bucket_names_for_thread(thread_id);
         let targets = match functions::resolve_query_targets(
             &config.buckets,
             &in_scope_server,
@@ -4926,6 +5175,91 @@ mod media_tool_gate_tests {
         assert!(!tool_requires_image_input("view_pdf"));
         assert!(!tool_requires_image_input("read_file"));
         assert!(!tool_requires_document_input("view_image"));
+    }
+}
+
+#[cfg(test)]
+mod builtin_catalog_gate_tests {
+    use super::*;
+    use crate::permission::{BehaviorOpsCap, DispatchCap, PodModifyCap, Scope};
+    use crate::runtime::tool_listing::ToolAdmission;
+    use crate::tools::builtin_tools as builtin;
+
+    #[test]
+    fn dispatch_thread_is_hidden_when_dispatch_cap_is_none() {
+        let mut current = Scope::allow_all();
+        current.dispatch = DispatchCap::None;
+        let ceiling = Scope::allow_all();
+        assert_eq!(
+            builtin_cap_admission(builtin::DISPATCH_THREAD, &current, &ceiling, true, true),
+            ToolAdmission::OutOfReach
+        );
+    }
+
+    #[test]
+    fn pod_write_is_askable_when_only_current_cap_is_too_low() {
+        let mut current = Scope::allow_all();
+        current.pod_modify = PodModifyCap::None;
+        let mut ceiling = Scope::allow_all();
+        ceiling.pod_modify = PodModifyCap::Content;
+        assert_eq!(
+            builtin_cap_admission(builtin::POD_WRITE_FILE, &current, &ceiling, true, true),
+            ToolAdmission::Askable
+        );
+    }
+
+    #[test]
+    fn behavior_runtime_tools_require_read_cap() {
+        let mut current = Scope::allow_all();
+        current.behaviors = BehaviorOpsCap::None;
+        let mut ceiling = Scope::allow_all();
+        ceiling.behaviors = BehaviorOpsCap::Read;
+        assert_eq!(
+            builtin_cap_admission(builtin::POD_RUN_BEHAVIOR, &current, &ceiling, true, true),
+            ToolAdmission::Askable
+        );
+
+        ceiling.behaviors = BehaviorOpsCap::None;
+        assert_eq!(
+            builtin_cap_admission(builtin::POD_RUN_BEHAVIOR, &current, &ceiling, true, true),
+            ToolAdmission::OutOfReach
+        );
+    }
+
+    #[test]
+    fn askable_collapses_without_interactive_escalation() {
+        assert_eq!(
+            combine_admission(ToolAdmission::Admitted, ToolAdmission::Askable, false),
+            ToolAdmission::OutOfReach
+        );
+    }
+
+    #[test]
+    fn scheduler_intercept_builtins_are_not_sudo_wrappable() {
+        assert!(!builtin_sudo_wrappable(builtin::KNOWLEDGE_QUERY));
+        assert!(!builtin_sudo_wrappable(builtin::DESCRIBE_TOOL));
+        assert!(builtin_sudo_wrappable(builtin::POD_WRITE_FILE));
+    }
+
+    #[test]
+    fn knowledge_tools_require_at_least_one_target() {
+        let scope = Scope::allow_all();
+        assert_eq!(
+            builtin_cap_admission(builtin::KNOWLEDGE_QUERY, &scope, &scope, false, false),
+            ToolAdmission::OutOfReach
+        );
+        assert_eq!(
+            builtin_cap_admission(builtin::KNOWLEDGE_QUERY, &scope, &scope, true, false),
+            ToolAdmission::Admitted
+        );
+        assert_eq!(
+            builtin_cap_admission(builtin::KNOWLEDGE_MODIFY, &scope, &scope, true, false),
+            ToolAdmission::OutOfReach
+        );
+        assert_eq!(
+            builtin_cap_admission(builtin::KNOWLEDGE_MODIFY, &scope, &scope, true, true),
+            ToolAdmission::Admitted
+        );
     }
 }
 

@@ -55,7 +55,7 @@ pub struct PodAllow {
     pub tools: AllowMap<String>,
     /// Ceiling for each typed capability any thread in this pod can
     /// hold. Threads can start below or equal to these bounds;
-    /// `request_escalation` cannot widen a thread past them. Omitted
+    /// `sudo` cannot widen a thread past them. Omitted
     /// defaults to the most-permissive ceiling so pre-schema pods
     /// behave the way they did before caps landed on the wire.
     #[serde(default)]
@@ -166,7 +166,7 @@ pub struct ThreadDefaults {
     pub caps: ThreadDefaultCaps,
     /// How the thread presents its tool catalog to the model. Default
     /// is a small core set (`describe_tool`, `find_tool`,
-    /// `request_escalation`) with an all-names listing appended to
+    /// `sudo`) with an all-names listing appended to
     /// the system prompt — everything else is fetched on demand.
     /// Authoring a pod with `core_tools = "all"` and `initial_listing
     /// = "none"` restores the pre-rework "dump every schema upfront"

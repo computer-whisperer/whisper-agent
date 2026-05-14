@@ -413,6 +413,8 @@ pub struct Scope {
     pub host_envs: SetOrAll<String>,
     #[serde(default)]
     pub mcp_hosts: SetOrAll<String>,
+    #[serde(default = "SetOrAll::all")]
+    pub knowledge_buckets: SetOrAll<String>,
     #[serde(default = "AllowMap::allow_all")]
     pub tools: AllowMap<String>,
     #[serde(default)]
@@ -434,6 +436,7 @@ impl Scope {
             backends: SetOrAll::all(),
             host_envs: SetOrAll::all(),
             mcp_hosts: SetOrAll::all(),
+            knowledge_buckets: SetOrAll::all(),
             tools: AllowMap::allow_all(),
             pod_modify: PodModifyCap::ModifyAllow,
             dispatch: DispatchCap::WithinScope,
@@ -448,6 +451,7 @@ impl Scope {
             backends: SetOrAll::none(),
             host_envs: SetOrAll::none(),
             mcp_hosts: SetOrAll::none(),
+            knowledge_buckets: SetOrAll::none(),
             tools: AllowMap::deny_all(),
             pod_modify: PodModifyCap::None,
             dispatch: DispatchCap::None,
@@ -465,6 +469,7 @@ impl Scope {
             backends: self.backends.narrow(&other.backends),
             host_envs: self.host_envs.narrow(&other.host_envs),
             mcp_hosts: self.mcp_hosts.narrow(&other.mcp_hosts),
+            knowledge_buckets: self.knowledge_buckets.narrow(&other.knowledge_buckets),
             tools: self.tools.narrow(&other.tools),
             pod_modify: self.pod_modify.narrow(other.pod_modify),
             dispatch: self.dispatch.narrow(other.dispatch),

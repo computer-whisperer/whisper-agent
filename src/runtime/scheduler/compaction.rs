@@ -283,6 +283,8 @@ impl Scheduler {
             compaction: None, // inherit pod's compaction defaults again
             autoquery: None,
             caps: None,
+            tools: None,
+            knowledge_buckets: None,
             tool_surface: None,
         });
         // Compaction inherits the parent's host-env list verbatim —

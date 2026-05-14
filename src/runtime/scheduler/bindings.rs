@@ -311,6 +311,7 @@ mod tests {
             backends: SetOrAll::only(backends.iter().map(|s| s.to_string())),
             host_envs: SetOrAll::only(host_envs.iter().map(|s| s.to_string())),
             mcp_hosts: SetOrAll::only(mcp_hosts.iter().map(|s| s.to_string())),
+            knowledge_buckets: SetOrAll::all(),
             tools: crate::permission::AllowMap::allow_all(),
             pod_modify: PodModifyCap::Memories,
             dispatch: DispatchCap::WithinScope,

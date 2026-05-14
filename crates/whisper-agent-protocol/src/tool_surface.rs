@@ -99,7 +99,7 @@ fn default_core_tools() -> CoreTools {
     CoreTools::Named(vec![
         "describe_tool".to_string(),
         "find_tool".to_string(),
-        "request_escalation".to_string(),
+        "sudo".to_string(),
     ])
 }
 
@@ -180,7 +180,7 @@ mod tests {
                 assert_eq!(v.len(), 3);
                 assert!(v.iter().any(|n| n == "describe_tool"));
                 assert!(v.iter().any(|n| n == "find_tool"));
-                assert!(v.iter().any(|n| n == "request_escalation"));
+                assert!(v.iter().any(|n| n == "sudo"));
             }
             CoreTools::All => panic!("default should be a small named set, not All"),
         }

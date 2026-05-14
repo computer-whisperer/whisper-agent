@@ -214,6 +214,18 @@ pub struct ThreadConfigOverride {
     /// and is still bounded by the pod's `allow.caps` ceiling.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub caps: Option<ThreadDefaultCaps>,
+    /// Optional narrowing of the thread's tool allow map. `None`
+    /// inherits the pod/default-composed tool scope; `Some` narrows it
+    /// before the thread starts. This can disable individual builtins
+    /// without editing the pod ceiling.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tools: Option<AllowMap<String>>,
+    /// Optional narrowing of the knowledge buckets available to this
+    /// thread. Entries use the same target grammar as `knowledge_query`
+    /// (`server:id`, `pod:id`; bare names are treated as server scope
+    /// for compatibility). `None` inherits the pod-derived set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub knowledge_buckets: Option<Vec<String>>,
     /// Tool-catalog presentation for the new thread. `None` inherits
     /// `thread_defaults.tool_surface`; `Some` replaces it wholesale.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -230,6 +242,8 @@ impl ThreadConfigOverride {
             && self.compaction.is_none()
             && self.autoquery.is_none()
             && self.caps.is_none()
+            && self.tools.is_none()
+            && self.knowledge_buckets.is_none()
             && self.tool_surface.is_none()
     }
 }
@@ -2749,6 +2763,8 @@ mod tests {
                 ..Default::default()
             }),
             caps: None,
+            tools: None,
+            knowledge_buckets: None,
             tool_surface: None,
         }));
 

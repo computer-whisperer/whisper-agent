@@ -2708,6 +2708,7 @@ fn mock_inspector_snapshot() -> ThreadSnapshot {
                 .into_iter()
                 .collect(),
         },
+        knowledge_buckets: SetOrAll::All,
         tools: {
             let mut tools = AllowMap::allow_all();
             tools

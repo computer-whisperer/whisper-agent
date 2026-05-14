@@ -1771,6 +1771,8 @@ pub struct ChatApp {
     new_thread_autoquery_max_query_chars_buf: String,
     new_thread_autoquery_snippet_chars_buf: String,
     new_thread_caps: Option<ThreadDefaultCaps>,
+    new_thread_tools: Option<AllowMap<String>>,
+    new_thread_knowledge_buckets: Option<Vec<String>>,
     new_thread_tool_surface: Option<ToolSurface>,
     new_thread_tool_surface_named_buf: String,
     /// Full `PodConfig` cache, populated lazily via `GetPod` —
@@ -2696,7 +2698,7 @@ impl PodEditorSheetState {
                 cfg.thread_defaults.autoquery.snippet_chars.to_string();
             // Seed the tool_surface named buffer from the parsed
             // CoreTools. `All` leaves the buffer at the conventional
-            // default (describe_tool / find_tool / request_escalation)
+            // default (describe_tool / find_tool / sudo)
             // so the textarea isn't blank when the user toggles
             // `All` → `Named`.
             self.tool_surface_named_buf = match &cfg.thread_defaults.tool_surface.core_tools {
@@ -2873,6 +2875,8 @@ impl ChatApp {
             new_thread_autoquery_max_query_chars_buf: String::new(),
             new_thread_autoquery_snippet_chars_buf: String::new(),
             new_thread_caps: None,
+            new_thread_tools: None,
+            new_thread_knowledge_buckets: None,
             new_thread_tool_surface: None,
             new_thread_tool_surface_named_buf: default_core_tools_text(),
             pod_configs: HashMap::new(),
@@ -6214,6 +6218,7 @@ const POD_EDITOR_DEFAULTS_AUTOQUERY_MAX_QUERY_CHARS_KEY: &str =
 const POD_EDITOR_DEFAULTS_AUTOQUERY_SNIPPET_CHARS_KEY: &str =
     "pod-editor:defaults:autoquery:snippet-chars";
 const POD_EDITOR_ALLOW_TOOL_GATE_KEY: &str = "pod-editor:allow:tool-gate";
+const POD_EDITOR_ALLOW_INTERNAL_TOOLS_KEY: &str = "pod-editor:allow:internal-tools";
 const POD_EDITOR_DEFAULTS_HOST_ENV_KEY: &str = "pod-editor:defaults:host-env";
 /// Defaults-tab tool-surface routed keys. The structured editor for
 /// `thread_defaults.tool_surface` rides directly under the Defaults
@@ -6307,8 +6312,12 @@ const BEHAVIOR_EDITOR_SCOPE_HOST_ENVS_KEY: &str = "behavior-editor:scope:host-en
 const BEHAVIOR_EDITOR_SCOPE_MCP_HOSTS_OVERRIDE_KEY: &str =
     "behavior-editor:scope:mcp-hosts:override";
 const BEHAVIOR_EDITOR_SCOPE_MCP_HOSTS_KEY: &str = "behavior-editor:scope:mcp-hosts";
+const BEHAVIOR_EDITOR_SCOPE_KNOWLEDGE_BUCKETS_OVERRIDE_KEY: &str =
+    "behavior-editor:scope:knowledge-buckets:override";
+const BEHAVIOR_EDITOR_SCOPE_KNOWLEDGE_BUCKETS_KEY: &str = "behavior-editor:scope:knowledge-buckets";
 const BEHAVIOR_EDITOR_SCOPE_TOOLS_OVERRIDE_KEY: &str = "behavior-editor:scope:tools:override";
 const BEHAVIOR_EDITOR_SCOPE_TOOLS_DEFAULT_KEY: &str = "behavior-editor:scope:tools:default";
+const BEHAVIOR_EDITOR_SCOPE_TOOLS_INTERNAL_KEY: &str = "behavior-editor:scope:tools:internal";
 const BEHAVIOR_EDITOR_SCOPE_CAPS_POD_MODIFY_OVERRIDE_KEY: &str =
     "behavior-editor:scope:caps:pod-modify:override";
 const BEHAVIOR_EDITOR_SCOPE_CAPS_POD_MODIFY_KEY: &str = "behavior-editor:scope:caps:pod-modify";
@@ -6725,7 +6734,32 @@ fn disposition_from_wire(s: &str) -> Option<Disposition> {
 /// `default_core_tools_text`. The actual `CoreTools::Named(default)`
 /// at protocol level is the same three names.
 fn default_core_tools_text() -> String {
-    "describe_tool\nfind_tool\nrequest_escalation".to_string()
+    "describe_tool\nfind_tool\nsudo".to_string()
+}
+
+const INTERNAL_BUILTIN_TOOL_OPTIONS: &[(&str, &str)] = &[
+    ("drain_knowledge_nudges", "drain knowledge nudges"),
+    ("list_llm_providers", "list LLM providers"),
+    ("list_mcp_hosts", "list MCP hosts"),
+];
+
+fn set_tool_disposition(map: &mut AllowMap<String>, name: &str, disposition: Disposition) {
+    if map.default == disposition {
+        map.overrides.remove(name);
+    } else {
+        map.overrides.insert(name.to_string(), disposition);
+    }
+}
+
+fn allowed_internal_tools(map: &AllowMap<String>) -> Vec<String> {
+    INTERNAL_BUILTIN_TOOL_OPTIONS
+        .iter()
+        .filter_map(|(name, _)| {
+            map.disposition(&(*name).to_string())
+                .admits()
+                .then(|| (*name).to_string())
+        })
+        .collect()
 }
 
 /// Parse the multi-line named-tools buffer back into a sorted-by-
@@ -6894,6 +6928,11 @@ const NEW_THREAD_CAPS_OVERRIDE_KEY: &str = "new-thread:overrides:caps:override";
 const NEW_THREAD_CAPS_POD_MODIFY_KEY: &str = "new-thread:overrides:caps:pod-modify";
 const NEW_THREAD_CAPS_DISPATCH_KEY: &str = "new-thread:overrides:caps:dispatch";
 const NEW_THREAD_CAPS_BEHAVIORS_KEY: &str = "new-thread:overrides:caps:behaviors";
+const NEW_THREAD_TOOLS_OVERRIDE_KEY: &str = "new-thread:overrides:tools:override";
+const NEW_THREAD_TOOLS_INTERNAL_KEY: &str = "new-thread:overrides:tools:internal";
+const NEW_THREAD_KNOWLEDGE_BUCKETS_OVERRIDE_KEY: &str =
+    "new-thread:overrides:knowledge-buckets:override";
+const NEW_THREAD_KNOWLEDGE_BUCKETS_KEY: &str = "new-thread:overrides:knowledge-buckets";
 const NEW_THREAD_TOOL_SURFACE_OVERRIDE_KEY: &str = "new-thread:overrides:tool-surface:override";
 const NEW_THREAD_TOOL_SURFACE_CORE_TOOLS_KEY: &str = "new-thread:overrides:tool-surface:core-tools";
 const NEW_THREAD_TOOL_SURFACE_CORE_TOOLS_NAMED_KEY: &str =
@@ -7226,6 +7265,8 @@ impl ChatApp {
             compaction: self.new_thread_compaction.clone(),
             autoquery: self.new_thread_autoquery.clone(),
             caps: self.new_thread_caps,
+            tools: self.new_thread_tools.clone(),
+            knowledge_buckets: self.new_thread_knowledge_buckets.clone(),
             tool_surface: self.new_thread_tool_surface.clone(),
         };
         // Each binding field maps independently: `None` inherits,
@@ -7284,6 +7325,8 @@ impl ChatApp {
         count += usize::from(self.new_thread_compaction.is_some());
         count += usize::from(self.new_thread_autoquery.is_some());
         count += usize::from(self.new_thread_caps.is_some());
+        count += usize::from(self.new_thread_tools.is_some());
+        count += usize::from(self.new_thread_knowledge_buckets.is_some());
         count += usize::from(self.new_thread_tool_surface.is_some());
         count
     }
@@ -7315,6 +7358,8 @@ impl ChatApp {
         self.new_thread_autoquery_max_query_chars_buf.clear();
         self.new_thread_autoquery_snippet_chars_buf.clear();
         self.new_thread_caps = None;
+        self.new_thread_tools = None;
+        self.new_thread_knowledge_buckets = None;
         self.new_thread_tool_surface = None;
         self.new_thread_tool_surface_named_buf = default_core_tools_text();
         self.new_thread_error = None;
@@ -7372,6 +7417,27 @@ impl ChatApp {
                 .map(|cfg| cfg.thread_defaults.caps)
                 .unwrap_or_default(),
         );
+    }
+
+    fn seed_new_thread_tools_override(&mut self) {
+        self.new_thread_tools = Some(
+            self.picker_pod_config()
+                .map(|cfg| cfg.allow.tools.clone())
+                .unwrap_or_else(AllowMap::allow_all),
+        );
+    }
+
+    fn seed_new_thread_knowledge_buckets_override(&mut self) {
+        let buckets = self
+            .picker_pod_config()
+            .map(|cfg| {
+                self.autoquery_bucket_groups_for(cfg, self.picker_effective_pod_id())
+                    .into_iter()
+                    .flat_map(|(_, options)| options.into_iter().map(|(value, _)| value))
+                    .collect()
+            })
+            .unwrap_or_default();
+        self.new_thread_knowledge_buckets = Some(buckets);
     }
 
     fn seed_new_thread_tool_surface_override(&mut self) {
@@ -7713,6 +7779,48 @@ impl ChatApp {
             ) {
                 return true;
             }
+        }
+
+        if event.is_click_or_activate(NEW_THREAD_TOOLS_OVERRIDE_KEY) {
+            if self.new_thread_tools.is_some() {
+                self.new_thread_tools = None;
+            } else {
+                self.seed_new_thread_tools_override();
+            }
+            return true;
+        }
+        if let Some(map) = self.new_thread_tools.as_mut() {
+            let mut selected = allowed_internal_tools(map);
+            if apply_checkbox_list_to_vec(&mut selected, event, NEW_THREAD_TOOLS_INTERNAL_KEY) {
+                for (name, _) in INTERNAL_BUILTIN_TOOL_OPTIONS {
+                    let disposition = if selected.iter().any(|v| v == name) {
+                        Disposition::Allow
+                    } else {
+                        Disposition::Deny
+                    };
+                    set_tool_disposition(map, name, disposition);
+                }
+                return true;
+            }
+        }
+
+        if event.is_click_or_activate(NEW_THREAD_KNOWLEDGE_BUCKETS_OVERRIDE_KEY) {
+            if self.new_thread_knowledge_buckets.is_some() {
+                self.new_thread_knowledge_buckets = None;
+            } else {
+                self.seed_new_thread_knowledge_buckets_override();
+            }
+            return true;
+        }
+        if let Some(buckets) = self.new_thread_knowledge_buckets.as_mut()
+            && apply_checkbox_list_to_vec(buckets, event, NEW_THREAD_KNOWLEDGE_BUCKETS_KEY)
+        {
+            if let Some(autoquery) = self.new_thread_autoquery.as_mut()
+                && let Some(autoquery_buckets) = autoquery.buckets.as_mut()
+            {
+                autoquery_buckets.retain(|name| buckets.iter().any(|allowed| allowed == name));
+            }
+            return true;
         }
 
         if event.is_click_or_activate(NEW_THREAD_TOOL_SURFACE_OVERRIDE_KEY) {
@@ -9477,6 +9585,16 @@ impl ChatApp {
             "Override the thread's starting typed caps, bounded by the pod allow ceiling.",
             self.render_new_thread_caps_override(),
         );
+        let knowledge_access_section = editor_section(
+            "Knowledge Access",
+            "Override which in-scope knowledge buckets manual tools and autoquery may reach.",
+            self.render_new_thread_knowledge_buckets_override(),
+        );
+        let tools_section = editor_section(
+            "Builtin Tools",
+            "Narrow availability for internal builtins that are otherwise inherited from the pod.",
+            self.render_new_thread_tools_override(),
+        );
         let tool_surface_section = editor_section(
             "Tool Surface",
             "Override how this thread presents and discovers tools.",
@@ -9485,7 +9603,14 @@ impl ChatApp {
 
         let body = editor_columns(
             column([execution_section, bindings_section, compaction_section]).gap(tokens::SPACE_5),
-            column([autoquery_section, caps_section, tool_surface_section]).gap(tokens::SPACE_5),
+            column([
+                knowledge_access_section,
+                autoquery_section,
+                tools_section,
+                caps_section,
+                tool_surface_section,
+            ])
+            .gap(tokens::SPACE_5),
         );
 
         let footer = dialog_footer([
@@ -9864,6 +9989,92 @@ impl ChatApp {
         ])
     }
 
+    fn render_new_thread_knowledge_buckets_override(&self) -> El {
+        let Some(buckets) = self.new_thread_knowledge_buckets.as_ref() else {
+            return self.render_override_activation_row(
+                false,
+                NEW_THREAD_KNOWLEDGE_BUCKETS_OVERRIDE_KEY,
+                "",
+                "Using all pod-visible knowledge buckets.",
+            );
+        };
+        let Some(cfg) = self.picker_pod_config() else {
+            return self.render_override_activation_row(
+                true,
+                NEW_THREAD_KNOWLEDGE_BUCKETS_OVERRIDE_KEY,
+                "Knowledge bucket override active.",
+                "",
+            );
+        };
+        let groups = self.autoquery_bucket_groups_for(cfg, self.picker_effective_pod_id());
+        let has_options = groups.iter().any(|(_, options)| !options.is_empty());
+        let control = if has_options {
+            grouped_checkbox_column(NEW_THREAD_KNOWLEDGE_BUCKETS_KEY, buckets, groups)
+        } else {
+            paragraph("(no buckets available to this pod)")
+                .muted()
+                .small()
+        };
+        form([
+            form_item([
+                form_label("override"),
+                form_control(self.render_override_activation_row(
+                    true,
+                    NEW_THREAD_KNOWLEDGE_BUCKETS_OVERRIDE_KEY,
+                    "Knowledge bucket override active.",
+                    "",
+                )),
+            ]),
+            form_item([
+                form_label("available buckets"),
+                form_control(control),
+                form_description(
+                    "This narrows the thread's manual `knowledge_query`, \
+                     editable `knowledge_modify`, and autoquery target set.",
+                ),
+            ]),
+        ])
+    }
+
+    fn render_new_thread_tools_override(&self) -> El {
+        let Some(map) = self.new_thread_tools.as_ref() else {
+            return self.render_override_activation_row(
+                false,
+                NEW_THREAD_TOOLS_OVERRIDE_KEY,
+                "",
+                "Using pod tool availability.",
+            );
+        };
+        let selected = allowed_internal_tools(map);
+        let options: Vec<(String, String)> = INTERNAL_BUILTIN_TOOL_OPTIONS
+            .iter()
+            .map(|(name, label)| ((*name).to_string(), (*label).to_string()))
+            .collect();
+        form([
+            form_item([
+                form_label("override"),
+                form_control(self.render_override_activation_row(
+                    true,
+                    NEW_THREAD_TOOLS_OVERRIDE_KEY,
+                    "Tool override active.",
+                    "",
+                )),
+            ]),
+            form_item([
+                form_label("internal tools"),
+                form_control(checkbox_column(
+                    NEW_THREAD_TOOLS_INTERNAL_KEY,
+                    &selected,
+                    options,
+                )),
+                form_description(
+                    "Unchecked tools are denied for this thread. Checked tools still \
+                     cannot exceed the pod's tool ceiling.",
+                ),
+            ]),
+        ])
+    }
+
     fn render_new_thread_tool_surface_override(&self) -> El {
         let Some(surface) = self.new_thread_tool_surface.as_ref() else {
             return self.render_override_activation_row(
@@ -10213,7 +10424,22 @@ impl ChatApp {
             return Vec::new();
         };
         let pod_id = self.picker_effective_pod_id();
-        self.autoquery_bucket_groups_for(cfg, pod_id)
+        let groups = self.autoquery_bucket_groups_for(cfg, pod_id);
+        let Some(allowed) = self.new_thread_knowledge_buckets.as_ref() else {
+            return groups;
+        };
+        groups
+            .into_iter()
+            .map(|(label, options)| {
+                (
+                    label,
+                    options
+                        .into_iter()
+                        .filter(|(value, _)| allowed.iter().any(|v| v == value))
+                        .collect(),
+                )
+            })
+            .collect()
     }
 
     fn backend_label(&self) -> String {
@@ -11066,6 +11292,31 @@ impl ChatApp {
             }
             return true;
         }
+        if event.is_click_or_activate(BEHAVIOR_EDITOR_SCOPE_KNOWLEDGE_BUCKETS_OVERRIDE_KEY) {
+            let seed = self
+                .behavior_editor
+                .as_ref()
+                .and_then(|editor| {
+                    editor.pod_config.as_ref().map(|pod_cfg| {
+                        self.autoquery_bucket_groups_for(pod_cfg, Some(&editor.pod_id))
+                            .into_iter()
+                            .flat_map(|(_, options)| options.into_iter().map(|(value, _)| value))
+                            .collect::<Vec<_>>()
+                    })
+                })
+                .unwrap_or_default();
+            if let Some(editor) = self.behavior_editor.as_mut()
+                && let Some(cfg) = editor.working_config.as_mut()
+            {
+                cfg.scope.knowledge_buckets = if cfg.scope.knowledge_buckets.is_some() {
+                    None
+                } else {
+                    Some(seed)
+                };
+                editor.error = None;
+            }
+            return true;
+        }
         if event.is_click_or_activate(BEHAVIOR_EDITOR_SCOPE_TOOLS_OVERRIDE_KEY) {
             if let Some(editor) = self.behavior_editor.as_mut()
                 && let Some(cfg) = editor.working_config.as_mut()
@@ -11165,6 +11416,36 @@ impl ChatApp {
         {
             editor.error = None;
             return true;
+        }
+        if let Some(editor) = self.behavior_editor.as_mut()
+            && let Some(cfg) = editor.working_config.as_mut()
+            && let Some(vec) = cfg.scope.knowledge_buckets.as_mut()
+            && apply_checkbox_list_to_vec(vec, event, BEHAVIOR_EDITOR_SCOPE_KNOWLEDGE_BUCKETS_KEY)
+        {
+            editor.error = None;
+            return true;
+        }
+        if let Some(editor) = self.behavior_editor.as_mut()
+            && let Some(cfg) = editor.working_config.as_mut()
+            && let Some(map) = cfg.scope.tools.as_mut()
+        {
+            let mut internal_tools = allowed_internal_tools(map);
+            if apply_checkbox_list_to_vec(
+                &mut internal_tools,
+                event,
+                BEHAVIOR_EDITOR_SCOPE_TOOLS_INTERNAL_KEY,
+            ) {
+                for (name, _) in INTERNAL_BUILTIN_TOOL_OPTIONS {
+                    let disposition = if internal_tools.iter().any(|v| v == name) {
+                        Disposition::Allow
+                    } else {
+                        Disposition::Deny
+                    };
+                    set_tool_disposition(map, name, disposition);
+                }
+                editor.error = None;
+                return true;
+            }
         }
 
         // SystemPrompt-tab override checkbox. Toggling on binds the
@@ -12667,6 +12948,10 @@ impl ChatApp {
             |pod_cfg| pod_cfg.allow.mcp_hosts.clone(),
             "(no shared MCP hosts in pod [allow])",
         );
+        let knowledge_buckets_row = self.render_behavior_editor_scope_knowledge_buckets_row(
+            editor,
+            cfg.scope.knowledge_buckets.as_deref(),
+        );
 
         // Tools row: override on ⇒ Disposition select_trigger +
         // override-count text; off ⇒ inherit hint. Per-tool
@@ -12677,16 +12962,26 @@ impl ChatApp {
                 BEHAVIOR_EDITOR_SCOPE_TOOLS_DEFAULT_KEY,
                 disposition_label(map.default),
             );
+            let selected = allowed_internal_tools(map);
+            let options: Vec<(String, String)> = INTERNAL_BUILTIN_TOOL_OPTIONS
+                .iter()
+                .map(|(name, label)| ((*name).to_string(), (*label).to_string()))
+                .collect();
             let override_count = map.overrides.len();
             let count_label = if override_count == 0 {
                 "(no per-tool overrides)".to_string()
             } else {
                 format!("{override_count} per-tool override(s) — edit via Raw TOML")
             };
-            row([trigger, text(count_label).muted().small()])
-                .gap(tokens::SPACE_2)
-                .align(Align::Center)
-                .width(Size::Fill(1.0))
+            column([
+                row([trigger, text(count_label).muted().small()])
+                    .gap(tokens::SPACE_2)
+                    .align(Align::Center)
+                    .width(Size::Fill(1.0)),
+                checkbox_column(BEHAVIOR_EDITOR_SCOPE_TOOLS_INTERNAL_KEY, &selected, options),
+            ])
+            .gap(tokens::SPACE_2)
+            .width(Size::Fill(1.0))
         } else {
             paragraph("")
         };
@@ -12767,6 +13062,14 @@ impl ChatApp {
                     form_description(
                         "Restrict the spawned thread to a subset of pod-allowed \
                      shared MCP hosts.",
+                    ),
+                ]),
+                form_item([
+                    form_label("knowledge buckets"),
+                    form_control(knowledge_buckets_row),
+                    form_description(
+                        "Restrict manual knowledge tools and autoquery to a subset \
+                         of pod-visible buckets.",
                     ),
                 ]),
             ]),
@@ -12868,6 +13171,40 @@ impl ChatApp {
             override_key,
             value,
             "Using pod allow ceiling.",
+            "Use pod ceiling",
+            Align::Start,
+        )
+    }
+
+    fn render_behavior_editor_scope_knowledge_buckets_row(
+        &self,
+        editor: &BehaviorEditorSheetState,
+        selected: Option<&[String]>,
+    ) -> El {
+        let on = selected.is_some();
+        let value: El = if editor.pending_pod_get.is_some() {
+            paragraph("(loading pod bucket list…)").muted().small()
+        } else if let Some(pod_cfg) = editor.pod_config.as_ref() {
+            let groups = self.autoquery_bucket_groups_for(pod_cfg, Some(&editor.pod_id));
+            if groups.iter().all(|(_, options)| options.is_empty()) {
+                paragraph("(no buckets visible to this pod)")
+                    .muted()
+                    .small()
+            } else {
+                grouped_checkbox_column(
+                    BEHAVIOR_EDITOR_SCOPE_KNOWLEDGE_BUCKETS_KEY,
+                    selected.unwrap_or(&[]),
+                    groups,
+                )
+            }
+        } else {
+            paragraph("(pod config unavailable)").muted().small()
+        };
+        self.render_override_control_row(
+            on,
+            BEHAVIOR_EDITOR_SCOPE_KNOWLEDGE_BUCKETS_OVERRIDE_KEY,
+            value,
+            "Using pod-visible buckets.",
             "Use pod ceiling",
             Align::Start,
         )
@@ -13285,6 +13622,23 @@ impl ChatApp {
                 event,
                 POD_EDITOR_ALLOW_BUCKETS_KEY,
             ) {
+                editor.error = None;
+                return true;
+            }
+            let mut internal_tools = allowed_internal_tools(&cfg.allow.tools);
+            if apply_checkbox_list_to_vec(
+                &mut internal_tools,
+                event,
+                POD_EDITOR_ALLOW_INTERNAL_TOOLS_KEY,
+            ) {
+                for (name, _) in INTERNAL_BUILTIN_TOOL_OPTIONS {
+                    let disposition = if internal_tools.iter().any(|v| v == name) {
+                        Disposition::Allow
+                    } else {
+                        Disposition::Deny
+                    };
+                    set_tool_disposition(&mut cfg.allow.tools, name, disposition);
+                }
                 editor.error = None;
                 return true;
             }
@@ -14371,6 +14725,16 @@ impl ChatApp {
             tool_gate_label(cfg.allow.tools.default),
         );
         let override_count = cfg.allow.tools.overrides.len();
+        let internal_tools_selected = allowed_internal_tools(&cfg.allow.tools);
+        let internal_tools_options: Vec<(String, String)> = INTERNAL_BUILTIN_TOOL_OPTIONS
+            .iter()
+            .map(|(name, label)| ((*name).to_string(), (*label).to_string()))
+            .collect();
+        let internal_tools_widget = checkbox_column(
+            POD_EDITOR_ALLOW_INTERNAL_TOOLS_KEY,
+            &internal_tools_selected,
+            internal_tools_options,
+        );
         let overrides_label: El = if override_count == 0 {
             paragraph("(none — edit per-tool overrides via the Raw tab)")
                 .muted()
@@ -14436,6 +14800,14 @@ impl ChatApp {
                     ),
                 ]),
                 form_item([form_label("tool overrides"), form_control(overrides_label)]),
+                form_item([
+                    form_label("internal tools"),
+                    form_control(internal_tools_widget),
+                    form_description(
+                        "Common scheduler builtins written into `allow.tools.overrides`. \
+                         Other per-tool entries can still be edited in Raw TOML.",
+                    ),
+                ]),
                 form_item([
                     form_label("pod_modify ceiling"),
                     form_control(pod_modify_trigger),
